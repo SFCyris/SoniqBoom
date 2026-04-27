@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<!-- SPDX-FileCopyrightText: 2026 S.F. Cyris -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SoniqBoom</title>
+  <link rel="stylesheet" href="/assets/css/app.css?v=45">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Header ──────────────────────────────────────────────────────── -->
+    <header id="header">
+      <div id="header-glow"></div>
+      <div class="logo">
+        <span class="logo-icon" aria-hidden="true">
+          <span class="logo-icon-glow">🔊</span><span class="logo-icon-top">🔊</span>
+        </span>
+        <div class="logo-text">
+          <span class="logo-title">SoniqBoom</span>
+          <span class="logo-byline">by S.F.Cyris</span>
+        </div>
+      </div>
+      <div class="search-wrap">
+        <input id="search-input" type="search" placeholder="Search library…" autocomplete="off">
+        <span id="search-clear" class="search-clear" hidden>&times;</span>
+      </div>
+      <div class="header-actions">
+        <span id="scan-badge" class="scan-badge" hidden></span>
+        <button id="btn-admin" title="Admin settings">&#9881;</button>
+      </div>
+    </header>
+
+    <!-- ── Main layout ─────────────────────────────────────────────────── -->
+    <div id="main-layout">
+
+      <!-- ── Sidebar ───────────────────────────────────────────────────── -->
+      <nav id="sidebar">
+        <div id="sidebar-glow"></div>
+
+        <section id="section-library">
+          <h3>Library</h3>
+          <ul id="nav-library">
+            <li data-view="all"          class="active">All Tracks</li>
+            <li data-view="artists">Artists</li>
+            <li data-view="album_artists">Album Artists</li>
+            <li data-view="albums" >Albums</li>
+            <li data-view="genres" >Genres</li>
+            <li data-view="years"  >Years</li>
+          </ul>
+          <div id="browse-filter-wrap" hidden>
+            <input id="browse-filter" type="search" placeholder="Filter…" autocomplete="off">
+          </div>
+        </section>
+
+        <div class="sidebar-h-splitter" id="splitter-library-folders" title="Drag to resize"></div>
+
+        <section id="section-folders">
+          <h3 class="section-hdr-collapsible">
+            <span>Folders</span>
+            <button id="btn-folders-toggle" class="btn-section-toggle" title="Collapse/Expand">&#9660;</button>
+          </h3>
+          <div id="folder-tree-wrap">
+            <ul id="folder-tree" class="folder-tree"></ul>
+            <div id="folder-tree-empty" class="tree-empty" hidden>
+              No folders added yet.<br>Click <strong>+ Folder</strong>.
+            </div>
+          </div>
+        </section>
+
+        <div class="sidebar-h-splitter" id="splitter-folders-smart" title="Drag to resize"></div>
+
+        <section id="section-smart">
+          <h3>Smart</h3>
+          <ul id="nav-smart">
+            <li data-view="history">History</li>
+            <li data-view="most-played">Most Played</li>
+            <li data-view="recently-added">Recently Added</li>
+            <li data-view="top-rated">Top Rated</li>
+            <li data-view="unplayed">Unplayed</li>
+            <li data-view="duplicates">Duplicates</li>
+          </ul>
+        </section>
+
+        <section id="sidebar-plugins" hidden>
+          <h3>Plugins</h3>
+          <ul id="nav-plugins"></ul>
+        </section>
+
+        <!-- ── Sidebar splitter ─────────────────────────────────────── -->
+        <div id="sidebar-splitter" title="Drag to resize"></div>
+
+        <!-- ── Sidebar playlists ────────────────────────────────────── -->
+        <section id="section-playlists">
+          <h3 class="section-hdr-collapsible">
+            <span>Playlists</span>
+            <button id="btn-sidebar-playlist-new" class="btn-section-action" title="New playlist">+</button>
+          </h3>
+          <ul id="sidebar-playlist-list" class="sidebar-playlist-list"></ul>
+        </section>
+
+      </nav>
+
+      <!-- ── Sidebar resize handle ────────────────────────────────────── -->
+      <div id="sidebar-resize" title="Drag to resize sidebar"></div>
+
+      <!-- ── Content pane ──────────────────────────────────────────────── -->
+      <main id="content">
+
+        <div id="browse-header" hidden>
+          <span id="browse-crumb"></span>
+          <button id="browse-back">&#8592; Back</button>
+        </div>
+
+        <!-- Group list filter bar (Artists / Albums / Genres / etc.) -->
+        <div id="group-filter-bar" hidden>
+          <span id="group-filter-label"></span>
+          <div class="group-filter-search">
+            <input id="group-filter-input" type="search" placeholder="Filter…" autocomplete="off">
+          </div>
+        </div>
+
+        <div id="selection-bar" hidden>
+          <span id="sel-count"></span>
+          <button id="sel-play">&#9654; Play</button>
+          <button id="sel-queue">+ Queue</button>
+          <button id="sel-add-playlist">+ Playlist</button>
+          <button id="sel-clear">&times; Clear</button>
+        </div>
+
+        <div id="browse-toolbar">
+          <button id="btn-grid-toggle" class="btn-grid-toggle" hidden>&#8862;</button>
+        </div>
+
+        <div id="album-grid" hidden></div>
+
+        <canvas id="visualizer-canvas"></canvas>
+        <div id="now-playing-art" class="now-playing-art" hidden>
+          <img id="now-playing-art-img" alt="Now Playing" decoding="async">
+          <div class="now-playing-art-info">
+            <div id="np-title" class="np-title"></div>
+            <div id="np-artist" class="np-artist"></div>
+            <div id="np-album" class="np-album"></div>
+          </div>
+        </div>
+        <div id="converting-badge" class="converting-badge" hidden>Converting…</div>
+        <div id="buffering-badge"  class="buffering-badge"  hidden>Buffering…</div>
+        <div id="track-list-wrap">
+          <table id="track-table">
+            <thead>
+              <tr>
+                <th class="col-num">#</th>
+                <th class="col-title"        data-sort="title"       >Title</th>
+                <th class="col-album-artist" data-sort="album_artist">Album Artist</th>
+                <th class="col-artist"       data-sort="artist"      >Artist</th>
+                <th class="col-album"        data-sort="album"       >Album</th>
+                <th class="col-track"        data-sort="track_number">Track</th>
+                <th class="col-year"         data-sort="year"        >Year</th>
+                <th class="col-dur">Duration</th>
+                <th class="col-format"       data-sort="format"      >Type</th>
+                <th class="col-rating">★</th>
+              </tr>
+            </thead>
+            <tbody id="track-tbody"></tbody>
+          </table>
+          <div id="track-empty"   hidden>No tracks found.</div>
+          <div id="track-loading" hidden>Loading…</div>
+        </div>
+
+        <div id="similar-panel" hidden>
+          <h3>More Like This</h3>
+          <ul id="similar-list"></ul>
+        </div>
+
+      </main>
+
+      <div id="lyrics-panel" hidden>
+        <div class="lyrics-resize" id="lyrics-resize"></div>
+        <div class="lyrics-header">
+          <h3>Lyrics</h3>
+          <span id="lyrics-source" class="lyrics-source"></span>
+        </div>
+        <div id="lyrics-body" class="lyrics-body">
+          <div id="lyrics-content" class="lyrics-content"></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ── Player bar ───────────────────────────────────────────────────── -->
+    <footer id="player-bar">
+      <div id="player-art-bg"></div>
+      <div id="vu-meters" class="vu-meters" hidden></div>
+
+      <div class="player-art-info">
+        <div id="player-art" class="art-thumb">
+          <span class="art-placeholder">&#128266;</span>
+        </div>
+        <div class="player-meta">
+          <span id="player-title" class="meta-title">—</span>
+          <div id="player-meta-tags" class="meta-tags"></div>
+          <div id="player-path-crumb" class="meta-path-crumb"></div>
+        </div>
+        <button id="btn-track-info" class="btn-track-info" title="Track Info">&#9432;</button>
+      </div>
+
+      <div class="player-center">
+        <div class="player-controls">
+          <button id="btn-prev" title="Previous">&#9664;&#9664;</button>
+          <button id="btn-play" class="btn-play-pause" title="Play/Pause">&#9654;</button>
+          <button id="btn-next" title="Next">&#9654;&#9654;</button>
+        </div>
+        <div class="player-progress">
+          <span id="time-cur">0:00</span>
+          <canvas id="waveform-canvas"></canvas>
+          <input id="seek-bar" type="range" min="0" max="100" value="0" step="0.1">
+          <span id="time-dur">0:00</span>
+        </div>
+      </div>
+
+      <div class="player-right">
+        <div class="player-extra-controls">
+          <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle">&#8652;</button>
+          <button id="btn-repeat"  class="ctrl-toggle" title="Repeat">&#8635;</button>
+          <button id="btn-eq"      class="ctrl-toggle" title="Equalizer">EQ</button>
+          <button id="btn-similar" class="ctrl-toggle" title="More like this" hidden>&#9670;</button>
+          <button id="btn-lyrics" class="ctrl-toggle" title="Lyrics"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 1h8c.6 0 1 .4 1 1v12c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1V2c0-.6.4-1 1-1z"/><line x1="5.5" y1="4.5" x2="10.5" y2="4.5"/><line x1="5.5" y1="7" x2="10.5" y2="7"/><line x1="5.5" y1="9.5" x2="8.5" y2="9.5"/></svg></button>
+          <button id="btn-playlist" class="ctrl-toggle" title="Playlists">&#9836;</button>
+          <button id="btn-queue"  class="ctrl-toggle" title="Queue">&#9776;</button>
+        </div>
+        <div class="volume-wrap">
+          <span>&#128266;</span>
+          <input id="volume-bar" type="range" min="0" max="1" value="0.8" step="0.01">
+        </div>
+      </div>
+
+    </footer>
+  </div>
+
+  <!-- ── Admin overlay ──────────────────────────────────────────────────── -->
+  <div id="admin-overlay" class="hidden">
+
+    <!-- Auth dialog -->
+    <div class="admin-dialog" id="admin-auth-dialog">
+      <h2>&#128274; Admin Access</h2>
+      <p class="dialog-sub">Enter your system login credentials to continue.</p>
+      <label for="admin-username">Username</label>
+      <input id="admin-username" type="text" autocomplete="username" placeholder="your-username">
+      <label for="admin-password">Password</label>
+      <input id="admin-password" type="password" autocomplete="current-password" placeholder="••••••••">
+      <div id="admin-auth-error" class="dialog-error"></div>
+      <div class="dialog-actions">
+        <button class="btn-secondary" id="btn-admin-cancel">Cancel</button>
+        <button class="btn-primary"   id="btn-admin-login">Unlock</button>
+      </div>
+    </div>
+
+    <!-- Alias dialog (styled in-app prompt) -->
+    <div class="admin-dialog hidden" id="admin-alias-dialog">
+      <h2>&#128193; Folder Alias</h2>
+      <p class="dialog-sub" id="alias-dialog-path"></p>
+      <label for="alias-dialog-input">Alias</label>
+      <input id="alias-dialog-input" type="text" placeholder="Display name (optional)" autocomplete="off">
+      <div class="dialog-actions">
+        <button class="btn-secondary" id="btn-alias-cancel">Cancel</button>
+        <button class="btn-primary"   id="btn-alias-save">Save</button>
+      </div>
+    </div>
+
+    <!-- Reusable confirm dialog (replaces native confirm()) -->
+    <div class="admin-dialog hidden" id="confirm-dialog">
+      <h2 id="confirm-dialog-title">Confirm</h2>
+      <p class="dialog-sub" id="confirm-dialog-message"></p>
+      <div class="dialog-actions">
+        <button class="btn-secondary" id="btn-confirm-cancel">Cancel</button>
+        <button class="btn-danger-action" id="btn-confirm-ok">OK</button>
+      </div>
+    </div>
+
+    <!-- Admin panel (hidden until authenticated) -->
+    <div id="admin-panel" class="hidden">
+      <div class="admin-panel-header">
+        <h2>&#9881; Admin</h2>
+        <button class="btn-close" id="btn-admin-close">&times;</button>
+      </div>
+      <div class="admin-tabs">
+        <button class="admin-tab active" data-tab="tab-library">&#128218; Library</button>
+        <button class="admin-tab" data-tab="tab-renderers">&#127911; Renderers</button>
+        <button class="admin-tab" data-tab="tab-backup">&#128190; Backup</button>
+        <button class="admin-tab" data-tab="tab-system">&#9881;&#65039; System</button>
+        <button class="admin-tab" data-tab="tab-log">&#128220; Log</button>
+      </div>
+      <div class="admin-panel-body">
+
+        <!-- Tab: Library -->
+        <div class="admin-tab-pane active" id="tab-library">
+
+          <!-- Stats -->
+          <div class="admin-section">
+            <h3>&#128154; Library Health</h3>
+            <div class="stats-grid" id="admin-stats-grid">
+              <div class="stat-card">
+                <div class="stat-value" id="stat-tracks">—</div>
+                <div class="stat-label">Tracks indexed</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" id="stat-dirs">—</div>
+                <div class="stat-label">Scan roots</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value stat-ok" id="stat-index">—</div>
+                <div class="stat-label">Search index</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" id="stat-docs">—</div>
+                <div class="stat-label">Index documents</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Folder management -->
+          <div class="admin-section">
+            <h3>&#128193; Music Folders</h3>
+            <div class="admin-dir-list" id="admin-dir-list"></div>
+            <div class="admin-source-toggle">
+              <button class="source-tab active" data-source="local">Local Path</button>
+              <button class="source-tab" data-source="network">Network Share</button>
+            </div>
+            <div id="admin-add-local" class="admin-add-row">
+              <input id="admin-add-path" type="text" placeholder="/path/to/music">
+              <input id="admin-add-alias" type="text" placeholder="Alias (optional)" style="max-width:140px">
+              <label class="admin-zip-label">
+                <input id="admin-scan-zips" type="checkbox" checked> Scan ZIPs
+              </label>
+              <button id="btn-admin-add-dir">+ Add</button>
+            </div>
+            <div id="admin-add-network" class="admin-add-network" style="display:none">
+              <div class="net-form-row">
+                <select id="net-protocol"><option value="smb">SMB</option><option value="ftp">FTP</option></select>
+                <input id="net-host" type="text" placeholder="Host (e.g. nas.local)">
+                <input id="net-share" type="text" placeholder="Share name">
+                <input id="net-path" type="text" placeholder="Path" value="/">
+              </div>
+              <div class="net-form-row net-auth-row">
+                <label class="net-anon-label">
+                  <input id="net-anonymous" type="checkbox"> <span id="net-anon-text">Guest access</span>
+                </label>
+                <input id="net-user" type="text" placeholder="Username">
+                <input id="net-pass" type="password" placeholder="Password">
+              </div>
+              <div class="net-form-row">
+                <input id="net-alias" type="text" placeholder="Alias (optional)">
+              </div>
+              <div class="net-form-row net-form-actions">
+                <button id="btn-net-test" class="btn-secondary">Test</button>
+                <button id="btn-net-connect">+ Connect</button>
+                <span id="net-status-msg" class="net-status-msg"></span>
+              </div>
+            </div>
+            <div id="admin-dir-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Scan progress (visible when scanning) -->
+          <div class="admin-section" id="admin-scan-section" style="display:none">
+            <h3>&#9881; Scan Progress</h3>
+            <div class="scan-progress-wrap">
+              <div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill"></div></div>
+              <div class="scan-progress-text" id="scan-progress-text"></div>
+              <div class="scan-progress-file" id="scan-progress-file"></div>
+              <div class="scan-queue-list" id="scan-queue-list"></div>
+            </div>
+          </div>
+
+          <!-- Index actions -->
+          <div class="admin-section">
+            <h3>&#128269; Index</h3>
+            <div class="admin-io-row">
+              <button class="btn-reindex" id="btn-admin-reindex">&#8635; Rebuild Index</button>
+            </div>
+            <div id="admin-index-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+        </div>
+
+        <!-- Tab: Renderers & Soundfonts -->
+        <div class="admin-tab-pane" id="tab-renderers">
+
+          <!-- Renderer Status -->
+          <div class="admin-section">
+            <h3>&#127899;&#65039; Renderer Status</h3>
+            <div class="renderer-grid" id="renderer-grid">
+              <div class="renderer-item" id="renderer-ffmpeg">
+                <span class="renderer-icon" id="renderer-icon-ffmpeg">&#8943;</span>
+                <span class="renderer-name">FFmpeg</span>
+              </div>
+              <div class="renderer-item" id="renderer-sidplayfp">
+                <span class="renderer-icon" id="renderer-icon-sidplayfp">&#8943;</span>
+                <span class="renderer-name">SID Player (sidplayfp)</span>
+              </div>
+              <div class="renderer-item" id="renderer-fluidsynth">
+                <span class="renderer-icon" id="renderer-icon-fluidsynth">&#8943;</span>
+                <span class="renderer-name">MIDI Synth (FluidSynth)</span>
+              </div>
+              <div class="renderer-item" id="renderer-openmpt123">
+                <span class="renderer-icon" id="renderer-icon-openmpt123">&#8943;</span>
+                <span class="renderer-name">Tracker (openmpt123)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Soundfonts -->
+          <div class="admin-section">
+            <h3>&#127928; Soundfonts</h3>
+            <div class="admin-sf-list" id="admin-sf-list"></div>
+            <div class="admin-sf-actions">
+              <button class="btn-sf-upload" id="btn-sf-upload">&#8593; Upload .sf2/.sf3</button>
+              <input id="sf-upload-file" type="file" accept=".sf2,.sf3" style="display:none">
+            </div>
+            <div id="admin-sf-msg" class="admin-msg" style="display:none"></div>
+
+            <div class="admin-sf-known">
+              <h4>Download Known Soundfonts</h4>
+              <div id="admin-sf-known-list" class="admin-sf-known-list"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Tab: Backup -->
+        <div class="admin-tab-pane" id="tab-backup">
+
+          <!-- Export / Import -->
+          <div class="admin-section">
+            <h3>&#128190; Database Backup</h3>
+            <div class="admin-io-row">
+              <button id="btn-admin-export">&#8595; Export .sbz</button>
+              <button id="btn-admin-import-trigger">&#8593; Import .sbz</button>
+              <input id="admin-import-file" type="file" accept=".sbz" style="display:none">
+            </div>
+            <div id="admin-io-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+        </div>
+
+        <!-- Tab: System -->
+        <div class="admin-tab-pane" id="tab-system">
+
+          <!-- Disk Usage -->
+          <div class="admin-section">
+            <h3>&#128200; Disk Usage</h3>
+            <div class="stats-grid" id="disk-stats-grid">
+              <div class="stat-card">
+                <div class="stat-value" id="disk-data">—</div>
+                <div class="stat-label">Library Data</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" id="disk-art">—</div>
+                <div class="stat-label">Art Cache</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" id="disk-sf">—</div>
+                <div class="stat-label">Soundfonts</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" id="disk-remote">—</div>
+                <div class="stat-label">Remote Cache</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Cache Management -->
+          <div class="admin-section">
+            <h3>&#128465;&#65039; Cache Management</h3>
+            <div class="admin-io-row">
+              <button id="btn-clear-art-cache">Clear Art Cache</button>
+              <button id="btn-clear-waveforms">Clear Waveforms</button>
+              <button id="btn-clear-agg-cache">Clear Aggregation Cache</button>
+              <button id="btn-clear-remote-cache">Clear Remote Cache</button>
+            </div>
+            <div id="admin-cache-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Settings -->
+          <div class="admin-section">
+            <h3>&#9881;&#65039; Settings</h3>
+            <div class="admin-settings-grid" id="admin-settings-grid">
+              <div class="admin-setting">
+                <label>Crossfade (seconds) <span class="setting-info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
+                <input id="setting-crossfade" type="number" min="0" max="12" step="0.5" value="0">
+              </div>
+              <div class="admin-setting">
+                <label>Preload Buffer (seconds) <span class="setting-info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
+                <input id="setting-preload-buffer" type="number" min="0" max="30" step="1" value="5">
+              </div>
+              <div class="admin-setting">
+                <label>Convert Delay (ms) <span class="setting-info" data-tip="Wait before converting SID/MIDI/tracker formats">&#9432;</span></label>
+                <input id="setting-convert-delay" type="number" min="0" max="5000" step="50" value="300">
+              </div>
+              <div class="admin-setting">
+                <label>Scan ZIPs <span class="setting-info" data-tip="Index audio files inside ZIP archives">&#9432;</span></label>
+                <input id="setting-scan-zips" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label>Filter Duplicates <span class="setting-info" data-tip="Hide lower-quality copies of the same track">&#9432;</span></label>
+                <input id="setting-filter-duplicates" type="checkbox">
+              </div>
+              <div class="admin-setting">
+                <label>Use Folder Art <span class="setting-info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
+                <input id="setting-use-folder-art" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label>SID Duration (seconds) <span class="setting-info" data-tip="Default play length for SID chiptune tracks">&#9432;</span></label>
+                <input id="setting-sid-duration" type="number" min="30" max="600" step="10" value="180">
+              </div>
+              <div class="admin-setting">
+                <label>Remote Cache (MB) <span class="setting-info" data-tip="Max disk space for cached network files">&#9432;</span></label>
+                <input id="setting-remote-cache-mb" type="number" min="100" max="50000" step="100" value="2048">
+              </div>
+              <div class="admin-setting">
+                <label>Skip Authentication <span class="setting-info" data-tip="Open admin panel without OS credentials">&#9432;</span></label>
+                <input id="setting-skip-auth" type="checkbox">
+              </div>
+            </div>
+            <div class="admin-io-row" style="margin-top:24px">
+              <button id="btn-save-settings">Save Settings</button>
+            </div>
+            <div id="admin-settings-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Application -->
+          <div class="admin-section">
+            <h3>&#128260; Application</h3>
+            <div class="admin-io-row">
+              <button id="btn-restart-app">Restart SoniqBoom</button>
+            </div>
+            <div id="admin-restart-msg" class="admin-msg" style="display:none"></div>
+            <div class="admin-hint">
+              Restarts the server process.  Playback will continue from the
+              browser buffer; if the restart takes longer than the buffer,
+              audio fades out and blends back in once the server is back.
+            </div>
+          </div>
+
+          <!-- About -->
+          <div class="admin-section about-section">
+            <h3>&#8505;&#65039; About</h3>
+            <div class="about-grid">
+              <div class="about-logo" aria-hidden="true">
+                <span class="about-logo-glow">&#128266;</span>
+                <span class="about-logo-top">&#128266;</span>
+              </div>
+              <div class="about-info">
+                <div class="about-title">SoniqBoom</div>
+                <div class="about-byline">by S.F.Cyris</div>
+                <div class="about-version">Version <span id="about-version">—</span></div>
+                <div class="about-links">
+                  <a href="https://github.com/SFCyris/SoniqBoom" target="_blank" rel="noopener noreferrer">
+                    <span aria-hidden="true">&#128279;</span> github.com/SFCyris/SoniqBoom
+                  </a>
+                </div>
+                <div class="about-license">AGPL-3.0-or-later · &copy; 2026 S.F.&nbsp;Cyris</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Tab: Log -->
+        <div class="admin-tab-pane" id="tab-log">
+          <div class="admin-section">
+            <div class="admin-log-toolbar">
+              <label>Lines: <select id="log-lines-select">
+                <option value="100">100</option>
+                <option value="200" selected>200</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select></label>
+              <label><input id="log-auto-refresh" type="checkbox"> Auto-refresh (5 s)</label>
+              <button id="btn-refresh-logs">Refresh</button>
+            </div>
+            <pre id="admin-log-viewer" class="admin-log-viewer">Click Refresh or switch to this tab to load logs...</pre>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Equalizer overlay ─────────────────────────────────────────────────── -->
+  <div id="eq-overlay" class="hidden">
+    <div id="eq-panel">
+
+      <div class="eq-header">
+        <span class="eq-title">Equalizer</span>
+        <select id="eq-preset">
+          <option value="flat">Flat</option>
+          <option value="bass">Bass Boost</option>
+          <option value="rock">Rock</option>
+          <option value="pop">Pop</option>
+          <option value="jazz">Jazz</option>
+          <option value="classical">Classical</option>
+          <option value="vocal">Vocal</option>
+          <option value="" disabled hidden>Custom</option>
+        </select>
+        <button id="eq-reset">Reset</button>
+        <button id="eq-close">&times;</button>
+      </div>
+
+      <div class="eq-body">
+        <div class="eq-scale">
+          <span>+12</span><span>+6</span><span>0</span><span>&minus;6</span><span>&minus;12</span>
+        </div>
+        <div class="eq-bands">
+          <div class="eq-band" data-band="0">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">32 Hz</span>
+          </div>
+          <div class="eq-band" data-band="1">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">64 Hz</span>
+          </div>
+          <div class="eq-band" data-band="2">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">125 Hz</span>
+          </div>
+          <div class="eq-band" data-band="3">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">250 Hz</span>
+          </div>
+          <div class="eq-band" data-band="4">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">500 Hz</span>
+          </div>
+          <div class="eq-band" data-band="5">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">1 kHz</span>
+          </div>
+          <div class="eq-band" data-band="6">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">2 kHz</span>
+          </div>
+          <div class="eq-band" data-band="7">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">4 kHz</span>
+          </div>
+          <div class="eq-band" data-band="8">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">8 kHz</span>
+          </div>
+          <div class="eq-band" data-band="9">
+            <span class="eq-db-val">0</span>
+            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
+            <span class="eq-freq">16 kHz</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Track Info overlay ────────────────────────────────────────────────── -->
+  <div id="ti-overlay" class="hidden">
+    <div id="ti-panel">
+
+      <!-- Navigation header -->
+      <div class="ti-nav">
+        <button id="ti-prev" class="ti-nav-btn" title="Previous track (←)">&#9664;</button>
+        <span id="ti-nav-label" class="ti-nav-label">Track 1 of 1</span>
+        <button id="ti-next" class="ti-nav-btn" title="Next track (→)">&#9654;</button>
+        <button id="ti-close" class="ti-close" title="Close (Esc)">&times;</button>
+      </div>
+
+      <!-- Two-column body -->
+      <div class="ti-body">
+
+        <!-- Left: artwork + audio stats badge -->
+        <div class="ti-left">
+          <div id="ti-art" class="ti-art-box ti-art-loading">
+            <img id="ti-art-img" alt="Album art" loading="lazy" decoding="async" style="display:none">
+            <span id="ti-art-ph" class="ti-art-placeholder">&#128266;</span>
+          </div>
+          <!-- Quick stats under artwork -->
+          <div class="ti-stats">
+            <div class="ti-stat-row"><span id="ti-format">—</span></div>
+            <div class="ti-stat-row"><span id="ti-bit-depth">—</span> / <span id="ti-sample-rate">—</span></div>
+            <div class="ti-stat-row"><span id="ti-channels">—</span> · <span id="ti-bitrate">—</span></div>
+            <div class="ti-stat-row ti-stat-size"><span id="ti-file-size">—</span></div>
+          </div>
+        </div>
+
+        <!-- Right: tabs + panes -->
+        <div class="ti-right">
+
+          <!-- Tab bar -->
+          <div class="ti-tabs">
+            <button id="ti-tab-info"   class="ti-tab-btn active">Info</button>
+            <button id="ti-tab-lyrics" class="ti-tab-btn">Lyrics</button>
+          </div>
+
+          <!-- Metadata pane -->
+          <div id="ti-meta-pane" class="ti-meta-pane">
+
+            <div class="ti-section">
+              <div class="ti-section-hdr">Track Info</div>
+              <div class="ti-field"><span class="ti-label">Title</span><span class="ti-value" id="ti-title">—</span></div>
+              <div class="ti-field"><span class="ti-label">Artist</span><span class="ti-value" id="ti-artist">—</span></div>
+              <div class="ti-field"><span class="ti-label">Album Artist</span><span class="ti-value" id="ti-album-artist">—</span></div>
+              <div class="ti-field"><span class="ti-label">Album</span><span class="ti-value" id="ti-album">—</span></div>
+              <div class="ti-field"><span class="ti-label">Composer</span><span class="ti-value" id="ti-composer">—</span></div>
+              <div class="ti-field"><span class="ti-label">Year</span><span class="ti-value" id="ti-year">—</span></div>
+            </div>
+
+            <div class="ti-section">
+              <div class="ti-section-hdr">Numbering</div>
+              <div class="ti-field"><span class="ti-label">Track</span><span class="ti-value" id="ti-track">—</span></div>
+              <div class="ti-field"><span class="ti-label">Disc</span><span class="ti-value" id="ti-disc">—</span></div>
+            </div>
+
+            <div class="ti-section">
+              <div class="ti-section-hdr">Details</div>
+              <div class="ti-field"><span class="ti-label">Genre</span><span class="ti-value" id="ti-genre">—</span></div>
+              <div class="ti-field"><span class="ti-label">Duration</span><span class="ti-value" id="ti-duration">—</span></div>
+              <div class="ti-field"><span class="ti-label">BPM</span><span class="ti-value" id="ti-bpm">—</span></div>
+              <div class="ti-field"><span class="ti-label">Comment</span><span class="ti-value ti-value-wrap" id="ti-comment">—</span></div>
+              <div class="ti-field"><span class="ti-label">ISRC</span><span class="ti-value" id="ti-isrc">—</span></div>
+              <div class="ti-field"><span class="ti-label">Label</span><span class="ti-value" id="ti-label">—</span></div>
+            </div>
+
+            <!-- Module / SID / MIDI details (hidden for regular audio) -->
+            <div class="ti-section" id="ti-section-module" style="display:none">
+              <div class="ti-section-hdr">Module Details</div>
+              <div class="ti-field" id="ti-field-channels-ext"><span class="ti-label">Channels</span><span class="ti-value" id="ti-channels-ext">—</span></div>
+              <div class="ti-field" id="ti-field-patterns"><span class="ti-label">Patterns</span><span class="ti-value" id="ti-patterns">—</span></div>
+              <div class="ti-field" id="ti-field-subsongs"><span class="ti-label">Subsongs</span><span class="ti-value" id="ti-subsongs">—</span></div>
+              <div class="ti-field ti-field-instruments" id="ti-field-instruments">
+                <span class="ti-label">Instruments</span>
+                <div class="ti-instrument-list" id="ti-instrument-list"></div>
+              </div>
+            </div>
+
+            <div class="ti-section">
+              <div class="ti-section-hdr">File</div>
+              <div class="ti-field"><span class="ti-label">Added</span><span class="ti-value" id="ti-added">—</span></div>
+              <div class="ti-field ti-field-path"><span class="ti-label">Path</span><span class="ti-value ti-value-path" id="ti-path">—</span></div>
+            </div>
+
+          </div>
+
+          <!-- Lyrics pane -->
+          <div id="ti-lyrics-pane" class="ti-lyrics-pane">
+            <div id="ti-lyrics-state" class="ti-lyrics-state">No lyrics loaded.</div>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Queue panel ───────────────────────────────────────────────────────── -->
+  <div id="queue-panel" class="hidden">
+    <div class="queue-header">
+      <span class="queue-title">Queue <span id="queue-count"></span></span>
+      <button id="btn-queue-clear" title="Clear queue">Clear</button>
+      <button id="btn-queue-close">&times;</button>
+    </div>
+    <div id="queue-list" class="queue-list">
+      <div class="queue-empty">No tracks queued.</div>
+    </div>
+    <div id="queue-drop-zone" class="queue-drop-zone">
+      Drop tracks here to add
+    </div>
+  </div>
+
+  <!-- ── Playlist panel ──────────────────────────────────────────────────── -->
+  <div id="playlist-panel" class="hidden">
+    <!-- List-view header: shows when browsing playlists -->
+    <div class="playlist-header" id="pl-hdr-list">
+      <span class="playlist-title">Playlists</span>
+      <button id="btn-playlist-new" title="New playlist">+ New</button>
+      <button id="btn-playlist-close">&times;</button>
+    </div>
+    <!-- Track-view header: shows when a playlist is open -->
+    <div class="playlist-header" id="pl-hdr-tracks" hidden>
+      <button id="btn-playlist-back" class="pl-back-btn" title="All playlists">&#8592;</button>
+      <span class="playlist-title" id="pl-active-name">Playlist</span>
+      <span class="pl-track-count" id="pl-active-count"></span>
+      <button id="btn-playlist-close2" class="playlist-close-btn">&times;</button>
+    </div>
+    <!-- Playlist selector (list view) -->
+    <div id="playlist-list" class="playlist-list"></div>
+    <!-- Playlist tracks (track view) — same style as queue-list -->
+    <div id="playlist-tracks" class="queue-list" hidden></div>
+    <!-- Selection action bar: shown when tracks are selected -->
+    <div id="pl-sel-bar" hidden>
+      <span id="pl-sel-count"></span>
+      <button id="pl-sel-remove">Remove</button>
+      <button id="pl-sel-deselect" title="Clear selection">&times; Deselect</button>
+    </div>
+    <!-- Drop zone: always present -->
+    <div id="playlist-drop-zone" class="playlist-drop-zone">
+      Drop tracks here to add to playlist
+    </div>
+  </div>
+
+  <!-- ── Keyboard shortcuts overlay ─────────────────────────────────────── -->
+  <div id="shortcuts-overlay" class="hidden">
+    <div id="shortcuts-panel">
+      <div class="shortcuts-header">
+        <span class="shortcuts-title">Keyboard Shortcuts</span>
+        <button id="shortcuts-close">&times;</button>
+      </div>
+      <div class="shortcuts-body">
+        <div class="shortcuts-col">
+          <h4>Playback</h4>
+          <div class="sc-row"><kbd>Space</kbd><span>Play / Pause</span></div>
+          <div class="sc-row"><kbd>⌘ →</kbd><span>Next track</span></div>
+          <div class="sc-row"><kbd>⌘ ←</kbd><span>Previous track</span></div>
+          <div class="sc-row"><kbd>↑</kbd><span>Volume up</span></div>
+          <div class="sc-row"><kbd>↓</kbd><span>Volume down</span></div>
+          <div class="sc-row"><kbd>M</kbd><span>Mute / Unmute</span></div>
+          <div class="sc-row"><kbd>S</kbd><span>Toggle shuffle</span></div>
+          <div class="sc-row"><kbd>R</kbd><span>Cycle repeat mode</span></div>
+        </div>
+        <div class="shortcuts-col">
+          <h4>Navigation</h4>
+          <div class="sc-row"><kbd>/</kbd><span>Focus search</span></div>
+          <div class="sc-row"><kbd>Escape</kbd><span>Close overlay / Clear search</span></div>
+          <div class="sc-row"><kbd>E</kbd><span>Toggle equalizer</span></div>
+          <div class="sc-row"><kbd>Q</kbd><span>Toggle queue</span></div>
+          <div class="sc-row"><kbd>I</kbd><span>Track info</span></div>
+          <div class="sc-row"><kbd>V</kbd><span>Toggle visualizer mode</span></div>
+          <div class="sc-row"><kbd>1–6</kbd><span>Sidebar views (All, Artists, ...)</span></div>
+        </div>
+        <div class="shortcuts-col">
+          <h4>Library</h4>
+          <div class="sc-row"><kbd>/</kbd><span>Focus search</span></div>
+          <div class="sc-row"><kbd>Enter</kbd><span>Play selected</span></div>
+          <div class="sc-row"><kbd>A</kbd><span>Add focused to queue</span></div>
+          <div class="sc-row"><kbd>J / K</kbd><span>Navigate tracks down / up</span></div>
+          <div class="sc-row"><kbd>H</kbd><span>Toggle history view</span></div>
+          <div class="sc-row"><kbd>D</kbd><span>Toggle duplicates view</span></div>
+          <div class="sc-row"><kbd>?</kbd><span>Show this help</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- `crossorigin="anonymous"` is required on Safari: without it, the
+       MediaElementSource output is treated as opaque and Web Audio's
+       destination produces silence (the analyser still receives data,
+       so visualizers keep twitching — but no sound hits the speakers). -->
+  <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
+  <script type="module" src="/assets/js/app.js?v=42"></script>
+</body>
+</html>

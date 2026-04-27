@@ -1,0 +1,75 @@
+# ─── macOS metadata ────────────────────────────────────────────────────────
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+Icon?
+
+# ─── Python bytecode ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ─── Python packaging / build outputs ──────────────────────────────────────
+*.egg-info/
+*.egg
+build/
+dist/
+*.whl
+*.tar.gz
+pip-log.txt
+pip-wheel-metadata/
+.eggs/
+
+# ─── Virtual environments ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Test / lint / type-check caches ───────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# ─── Editors / IDEs ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+*~
+
+# ─── Claude / agent config ─────────────────────────────────────────────────
+.claude/
+
+# ─── SoniqBoom build artefacts ─────────────────────────────────────────────
+# The macOS packaging tooling is local only — not part of the public source
+# tree. Build outputs likewise stay out.
+installer/
+soniqboom_app.py
+nuitka-crash-report*.xml
+*.dmg
+*.app/
+
+# ─── User-supplied runtime data (too large for source control) ─────────────
+# Soundfonts (.sf2 / .sf3) are user-installed instrument banks (~250 MB).
+# The folder is recreated on demand; drop your own files here at runtime.
+soundfonts/
+
+# Plugins are user-loaded at runtime. Only the bundled README is tracked.
+plugins/*
+!plugins/README.md
+!plugins/.gitkeep
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log

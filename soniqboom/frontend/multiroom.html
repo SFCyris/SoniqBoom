@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<!-- SPDX-FileCopyrightText: 2026 S.F. Cyris -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SoniqBoom — Multi-room</title>
+  <link rel="stylesheet" href="/assets/css/multiroom.css?v=1">
+</head>
+<body data-view="landing">
+  <div id="mr-app">
+
+    <!-- ── Landing view ─────────────────────────────────────────────────── -->
+    <section id="mr-view-landing" class="mr-view">
+      <header class="mr-header">
+        <div class="mr-logo">🔊 SoniqBoom</div>
+        <div class="mr-subtitle">Multi-room sync</div>
+      </header>
+
+      <div class="mr-card">
+        <label class="mr-field">
+          <span>Your device label</span>
+          <input id="mr-label" type="text" placeholder="Kitchen speaker">
+        </label>
+        <button id="mr-btn-new" class="mr-btn mr-btn-primary">+ Create new room</button>
+      </div>
+
+      <div class="mr-card">
+        <h2>Active rooms</h2>
+        <ul id="mr-rooms-list" class="mr-rooms-list">
+          <li class="mr-empty">No active rooms yet.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ── Room picker (after clicking Create) ─────────────────────────── -->
+    <section id="mr-view-newroom" class="mr-view">
+      <header class="mr-header">
+        <button id="mr-btn-back-landing" class="mr-btn mr-btn-ghost">← Back</button>
+        <div class="mr-logo">New room</div>
+      </header>
+      <div class="mr-card">
+        <label class="mr-field">
+          <span>Room name</span>
+          <input id="mr-newroom-name" type="text" placeholder="Living Room" maxlength="64">
+        </label>
+        <button id="mr-btn-create" class="mr-btn mr-btn-primary">Create &amp; become master</button>
+      </div>
+    </section>
+
+    <!-- ── Master view ─────────────────────────────────────────────────── -->
+    <section id="mr-view-master" class="mr-view">
+      <header class="mr-header mr-header-room">
+        <button id="mr-btn-master-leave" class="mr-btn mr-btn-ghost">← Leave</button>
+        <div>
+          <div class="mr-logo" id="mr-master-room-name">Room</div>
+          <div class="mr-subtitle">You are the master</div>
+        </div>
+        <div class="mr-clients-chip">
+          <span id="mr-master-client-count">1</span> listener(s)
+        </div>
+      </header>
+
+      <div class="mr-master-layout">
+        <div class="mr-card mr-now">
+          <div class="mr-now-art" id="mr-now-art">🎵</div>
+          <div class="mr-now-meta">
+            <div id="mr-now-title" class="mr-now-title">No track</div>
+            <div id="mr-now-artist" class="mr-now-artist"></div>
+            <div class="mr-now-progress">
+              <div id="mr-now-progress-fill" class="mr-now-progress-fill"></div>
+            </div>
+            <div class="mr-now-times">
+              <span id="mr-now-cur">0:00</span>
+              <span id="mr-now-dur">0:00</span>
+            </div>
+            <div class="mr-now-controls">
+              <button id="mr-ctrl-shuffle" class="mr-btn mr-btn-round mr-btn-toggle" data-emoji="🔀" title="Shuffle">🔀</button>
+              <button id="mr-ctrl-prev" class="mr-btn mr-btn-round" title="Previous">⏮</button>
+              <button id="mr-ctrl-play" class="mr-btn mr-btn-round mr-btn-primary" title="Play/Pause">▶</button>
+              <button id="mr-ctrl-next" class="mr-btn mr-btn-round" title="Next">⏭</button>
+              <button id="mr-ctrl-repeat" class="mr-btn mr-btn-round mr-btn-toggle" data-emoji="🔁" title="Repeat: off">🔁</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mr-card mr-library">
+          <div class="mr-library-head">
+            <div class="mr-tabs" id="mr-tabs">
+              <button class="mr-tab active" data-tab="tracks">Tracks</button>
+              <button class="mr-tab" data-tab="playlists">Playlists</button>
+              <button class="mr-tab" data-tab="albums">Albums</button>
+            </div>
+            <input id="mr-lib-search" type="search" placeholder="Search…">
+          </div>
+
+          <div id="mr-pane-tracks" class="mr-pane">
+            <ul id="mr-lib-list" class="mr-lib-list"></ul>
+          </div>
+          <div id="mr-pane-playlists" class="mr-pane hidden">
+            <ul id="mr-pl-list" class="mr-lib-list"></ul>
+          </div>
+          <div id="mr-pane-albums" class="mr-pane hidden">
+            <ul id="mr-album-list" class="mr-lib-list"></ul>
+          </div>
+          <div id="mr-pane-detail" class="mr-pane hidden">
+            <div class="mr-detail-head">
+              <button id="mr-detail-back" class="mr-btn mr-btn-ghost">← Back</button>
+              <div class="mr-detail-title-wrap">
+                <div id="mr-detail-title" class="mr-detail-title"></div>
+                <div id="mr-detail-sub" class="mr-detail-sub"></div>
+              </div>
+              <button id="mr-detail-play-all" class="mr-btn mr-btn-primary">▶ Play all</button>
+            </div>
+            <ul id="mr-detail-list" class="mr-lib-list"></ul>
+          </div>
+        </div>
+
+        <div class="mr-card mr-listeners">
+          <h2>Listeners</h2>
+          <ul id="mr-listener-list" class="mr-listener-list"></ul>
+        </div>
+
+        <div class="mr-card mr-queue">
+          <div class="mr-queue-head">
+            <h2>Up next</h2>
+            <button id="mr-queue-clear" class="mr-btn mr-btn-ghost hidden">Clear</button>
+          </div>
+          <ul id="mr-queue-list" class="mr-queue-list">
+            <li class="mr-empty">Pick a playlist or album to queue tracks.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Slave view ──────────────────────────────────────────────────── -->
+    <section id="mr-view-slave" class="mr-view">
+      <header class="mr-header mr-header-room">
+        <button id="mr-btn-slave-leave" class="mr-btn mr-btn-ghost">← Leave</button>
+        <div>
+          <div class="mr-logo" id="mr-slave-room-name">Room</div>
+          <div class="mr-subtitle" id="mr-slave-role">Listening</div>
+        </div>
+        <div id="mr-sync-dot" class="mr-sync-dot" title="Sync status">●</div>
+      </header>
+
+      <div class="mr-slave-card">
+        <div class="mr-slave-art" id="mr-slave-art">🎵</div>
+        <div id="mr-slave-title" class="mr-slave-title">Waiting for master…</div>
+        <div id="mr-slave-artist" class="mr-slave-artist"></div>
+        <div class="mr-now-progress">
+          <div id="mr-slave-progress-fill" class="mr-now-progress-fill"></div>
+        </div>
+        <div class="mr-now-times">
+          <span id="mr-slave-cur">0:00</span>
+          <span id="mr-slave-dur">0:00</span>
+        </div>
+        <div id="mr-slave-banner" class="mr-banner hidden"></div>
+        <div id="mr-sync-meter" class="mr-sync-meter">
+          <span class="mr-sync-label">Sync</span>
+          <span id="mr-sync-drift" class="mr-sync-drift">— ms</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Toast ───────────────────────────────────────────────────────── -->
+    <div id="mr-toast" class="mr-toast hidden"></div>
+
+  </div>
+
+  <!-- Must match the id player.js grabs on line 11. crossorigin is required
+       on Safari for the Web Audio MediaElementSource path. -->
+  <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
+
+  <!-- Hidden badges referenced by player.js; unused here but prevent null errors. -->
+  <span id="buffering-badge" hidden></span>
+  <span id="converting-badge" hidden></span>
+
+  <script type="module" src="/assets/js/multiroom/app.js?v=1"></script>
+</body>
+</html>
