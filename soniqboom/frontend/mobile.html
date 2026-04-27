@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<!-- SPDX-FileCopyrightText: 2026 S.F. Cyris -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="SoniqBoom">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="format-detection" content="telephone=no">
+  <title>SoniqBoom</title>
+  <link rel="manifest" href="/assets/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/icons/apple-touch-icon-180.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=1">
+</head>
+<body>
+  <div id="m-app">
+
+    <!-- ── Top bar (per-view title) ─────────────────────────────────────── -->
+    <header id="m-topbar">
+      <span id="m-topbar-title">Library</span>
+    </header>
+
+    <!-- ── Main content area: the active view is rendered here ──────────── -->
+    <main id="m-content">
+      <section id="m-view-library"    class="m-view active"></section>
+      <section id="m-view-search"     class="m-view"></section>
+      <section id="m-view-queue"      class="m-view"></section>
+      <section id="m-view-nowplaying" class="m-view"></section>
+      <section id="m-view-settings"   class="m-view"></section>
+    </main>
+
+    <!-- ── Mini player (above tab bar) ──────────────────────────────────── -->
+    <div id="m-miniplayer" class="m-miniplayer hidden" role="button" aria-label="Open Now Playing">
+      <div id="m-mp-art" class="m-mp-art"><span class="m-mp-art-ph">🔊</span></div>
+      <div class="m-mp-meta">
+        <div id="m-mp-title" class="m-mp-title">—</div>
+        <div id="m-mp-artist" class="m-mp-artist"></div>
+      </div>
+      <button id="m-mp-play" class="m-mp-play" aria-label="Play/Pause">▶</button>
+      <button id="m-mp-next" class="m-mp-next" aria-label="Next">⏭</button>
+      <div id="m-mp-progress" class="m-mp-progress"><div id="m-mp-progress-fill"></div></div>
+    </div>
+
+    <!-- ── Bottom tab bar ───────────────────────────────────────────────── -->
+    <nav id="m-tabs" role="tablist">
+      <button class="m-tab active" data-view="library"    aria-label="Library">
+        <span class="m-tab-icon">🎵</span><span class="m-tab-label">Library</span>
+      </button>
+      <button class="m-tab" data-view="search"     aria-label="Search">
+        <span class="m-tab-icon">🔍</span><span class="m-tab-label">Search</span>
+      </button>
+      <button class="m-tab" data-view="queue"      aria-label="Queue">
+        <span class="m-tab-icon">≡</span><span class="m-tab-label">Queue</span>
+      </button>
+      <button class="m-tab" data-view="nowplaying" aria-label="Now Playing">
+        <span class="m-tab-icon">♪</span><span class="m-tab-label">Now</span>
+      </button>
+      <button class="m-tab" data-view="settings"   aria-label="Settings">
+        <span class="m-tab-icon">⚙</span><span class="m-tab-label">Settings</span>
+      </button>
+    </nav>
+
+    <!-- ── Action sheet (long-press menu) ───────────────────────────────── -->
+    <div id="m-sheet-backdrop" class="m-sheet-backdrop hidden"></div>
+    <div id="m-sheet" class="m-sheet hidden" role="dialog" aria-modal="true">
+      <div class="m-sheet-header" id="m-sheet-title">Actions</div>
+      <ul id="m-sheet-actions" class="m-sheet-actions"></ul>
+      <button id="m-sheet-cancel" class="m-sheet-cancel">Cancel</button>
+    </div>
+
+    <!-- ── Toast (transient feedback) ───────────────────────────────────── -->
+    <div id="m-toast" class="m-toast hidden"></div>
+
+  </div>
+
+  <!-- The Player module grabs this element by id at module load. -->
+  <!-- `crossorigin="anonymous"` is required on Safari: without it, the
+       MediaElementSource output is treated as opaque and Web Audio's
+       destination produces silence (the analyser still receives data,
+       so visualizers keep twitching — but no sound hits the speakers). -->
+  <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
+
+  <script type="module" src="/assets/js/mobile/app.js?v=1"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# ── Core runtime — installed by install.sh ─────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0       # pulls websockets, uvloop, watchfiles
+mutagen>=1.47.0
+aiofiles>=23.2.1
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+Pillow>=10.0.0
+mido>=1.3.0
+smbprotocol>=1.13.0
+cryptography>=42.0.0
+PyYAML>=6.0
+python-dotenv>=1.0.0
+websockets>=11.0                # explicit pin — multi-room WS uses it directly
+
+# ── macOS menu bar (used by run.sh + soniqboom-menubar.py) ─────────────────
+# Linux / Windows installs can skip these; install.sh gates by platform.
+rumps>=0.4.0                    ; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0    ; sys_platform == "darwin"
+pyobjc-framework-WebKit>=10.0   ; sys_platform == "darwin"
