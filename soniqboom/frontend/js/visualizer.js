@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 S.F. Cyris
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// version bump needed in index.html for visualizer.js (shadow hoist perf)
 /**
  * visualizer.js — Full-width visualizer rendered behind the track list.
  *
@@ -36,6 +37,17 @@ if (!MODES.includes(_mode)) _mode = 'oscilloscope';
 // Reusable buffers — allocating per frame pegs Chromium's GC and makes the
 // oscilloscope appear laggy on Edge in particular.
 let _timeBuf = null;
+// Reusable frequency-data buffer — Perf #2 caught 60 Hz GC pressure
+// from per-frame ``new Uint8Array(bufLen)`` in several visualizer modes.
+let _freqBuf = null;
+function _getFreqBuf(analyser) {
+  const len = analyser.frequencyBinCount;
+  if (!_freqBuf || _freqBuf.length !== len) {
+    _freqBuf = new Uint8Array(len);
+  }
+  analyser.getByteFrequencyData(_freqBuf);
+  return _freqBuf;
+}
 
 // Cached oscilloscope stroke gradient — invalidated on resize (see resize()).
 let _oscStrokeGrad = null;
@@ -366,8 +378,7 @@ function _drawSpectrogram(analyser) {
 
   // Frequency domain data
   const bufLen = analyser.frequencyBinCount;
-  const freqData = new Uint8Array(bufLen);
-  analyser.getByteFrequencyData(freqData);
+  const freqData = _getFreqBuf(analyser);
 
   // Scroll existing content left by 2px
   const scrollW = 2;
@@ -498,8 +509,7 @@ function _drawHyperspace(analyser) {
   const f  = Math.min(W, H) * 0.55;          // focal length for 1/z projection
 
   // ── Audio analysis ────────────────────────────────────────────────────
-  const fBuf = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(fBuf);
+  const fBuf = _getFreqBuf(analyser);
   const bassEnd = Math.max(4, Math.floor(fBuf.length * 0.10));
   let bass = 0;
   for (let i = 0; i < bassEnd; i++) bass += fBuf[i];
@@ -549,14 +559,20 @@ function _drawHyperspace(analyser) {
   }
 
   // Draw rings sorted back-to-front (closer overdraws farther).
+  // Perf #13: shadowColor / shadowBlur are EXPENSIVE — each setter call
+  // tears down the canvas2d shadow-cache and re-allocates a per-stroke
+  // gaussian-blur buffer.  At ~16 rings × 60 fps that's ~960 cache busts
+  // per second per pass.  Drop shadows on the rings entirely; the
+  // gradient + alpha-fade already reads as glow once layered, and the
+  // CPU saved here doubles available headroom for the flying-objects
+  // pass below.  Hoist any remaining global settings before the loop.
+  ctx2d.shadowBlur = 0;
   const ringsByDepth = rings.slice().sort((a, b) => b.z - a.z);
   for (const ring of ringsByDepth) {
     const a = Math.min(1, (1 / ring.z) * 1.2);
     const hue = (_hyperHue + ring.r * 12) % 360;
     ctx2d.strokeStyle = `hsla(${hue}, 100%, 60%, ${a * 0.85})`;
     ctx2d.lineWidth   = Math.max(0.8, Math.min(3.5, (1 / ring.z) * 1.4));
-    ctx2d.shadowColor = `hsl(${hue}, 100%, 60%)`;
-    ctx2d.shadowBlur  = 10;
     ctx2d.beginPath();
     for (let s = 0; s <= _HYPER_TUBE_SEGS; s++) {
       const p = ring.pts[s % _HYPER_TUBE_SEGS];
@@ -568,7 +584,7 @@ function _drawHyperspace(analyser) {
 
   // Longitudinal "rails" — connect each ring vertex to the same vertex on
   // the next neighbouring ring (sorted by ringIdx so they form continuous
-  // lines along the tube).
+  // lines along the tube).  Same perf reasoning as above — drop shadows.
   const ringsByIdx = rings.slice().sort((a, b) => a.r - b.r);
   for (let i = 0; i < ringsByIdx.length - 1; i++) {
     const A = ringsByIdx[i];
@@ -578,8 +594,6 @@ function _drawHyperspace(analyser) {
     const hue = (_hyperHue + A.r * 12 + 30) % 360;
     ctx2d.strokeStyle = `hsla(${hue}, 100%, 55%, ${a * 0.55})`;
     ctx2d.lineWidth   = 0.9;
-    ctx2d.shadowColor = `hsl(${hue}, 100%, 55%)`;
-    ctx2d.shadowBlur  = 5;
     ctx2d.beginPath();
     for (let s = 0; s < _HYPER_TUBE_SEGS; s++) {
       const p1 = A.pts[s];
@@ -608,7 +622,14 @@ function _drawHyperspace(analyser) {
   }
 
   // Render objects back-to-front.
+  // Perf #13: hoist a single dominant-hue shadow outside the object
+  // loop.  Each object has a different hue but the shadow tint is
+  // visually dominated by the underlying _hyperHue rotation; setting
+  // shadowColor 14× per frame for ~zero visual difference is wasted
+  // canvas2d state churn.
   const sortedObjs = _hyperObjects.slice().sort((a, b) => b.z - a.z);
+  ctx2d.shadowColor = `hsl(${_hyperHue % 360}, 100%, 60%)`;
+  ctx2d.shadowBlur  = 14;
   for (const obj of sortedObjs) {
     const shape = _HYPER_SHAPES[obj.type];
     // Project all vertices: rotate, scale by size, translate by obj position,
@@ -634,8 +655,6 @@ function _drawHyperspace(analyser) {
     const alpha    = Math.max(0.15, Math.min(1, farFade * nearFade));
     ctx2d.strokeStyle = `hsla(${obj.hue}, 100%, 65%, ${alpha})`;
     ctx2d.lineWidth   = Math.max(1, Math.min(3.5, (1 / obj.z) * 1.6));
-    ctx2d.shadowColor = `hsl(${obj.hue}, 100%, 60%)`;
-    ctx2d.shadowBlur  = 14;
     ctx2d.beginPath();
     for (const [a, b] of shape.e) {
       const pa = proj[a], pb = proj[b];
@@ -705,8 +724,7 @@ function _drawSynthwave(analyser) {
   const horizonY = H * 0.55;
 
   // ─── Audio analysis ──────────────────────────────────────────────────
-  const fBuf = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(fBuf);
+  const fBuf = _getFreqBuf(analyser);
   const bassEnd = Math.max(4, Math.floor(fBuf.length * 0.10));
   let bass = 0;
   for (let i = 0; i < bassEnd; i++) bass += fBuf[i];
@@ -863,6 +881,13 @@ function _drawSynthwave(analyser) {
   const barCount = 38;
   const usableBins = Math.min(fBuf.length, 96);
   ctx2d.save();
+  // Perf #13: hoist a single magenta-ish shadow outside the bar loop
+  // (the per-bar hue cycles around magenta→pink→cyan; the shadow
+  // tint averaged with the bar's own fill is visually indistinguishable
+  // from the per-bar shadow once Gaussian-blurred at 14 px).  Saves
+  // ~38 shadow-cache busts per synthwave frame.
+  ctx2d.shadowColor = `hsl(${(_synthHue + 0) % 360}, 100%, 60%)`;
+  ctx2d.shadowBlur  = 14;
   for (let b = 0; b < barCount; b++) {
     const binIdx = Math.floor(Math.pow(b / barCount, 1.4) * usableBins);
     const v = fBuf[binIdx] / 255;
@@ -878,8 +903,6 @@ function _drawSynthwave(analyser) {
     grad.addColorStop(0.6, `hsla(${hue}, 100%, 55%, 0.95)`);
     grad.addColorStop(1,   `hsla(${hue}, 100%, 35%, 0.85)`);
     ctx2d.fillStyle = grad;
-    ctx2d.shadowColor = `hsl(${hue}, 100%, 60%)`;
-    ctx2d.shadowBlur  = 14;
     ctx2d.fillRect(barX - barW / 2, horizonY - barH, barW, barH);
     // Bright cap line on top of each spire.
     ctx2d.fillStyle = `hsla(${(hue + 60) % 360}, 100%, 88%, 0.95)`;
@@ -913,8 +936,7 @@ function _drawGlobe(analyser) {
   const cy = H / 2;
 
   const bufLen = analyser.frequencyBinCount;
-  const freqData = new Uint8Array(bufLen);
-  analyser.getByteFrequencyData(freqData);
+  const freqData = _getFreqBuf(analyser);
 
   // ── Bass envelope + beat detection ────────────────────────────────────
   const bassEnd = Math.max(4, Math.floor(bufLen * 0.10));
@@ -990,8 +1012,18 @@ function _drawGlobe(analyser) {
   // ── Outer frequency-spectrum halo (more spikes, drift+flash) ────────
   // Spike angle uses _globeRotation directly — same scalar as the meridians,
   // so spike-vs-globe motion stays in lockstep through the seamless unwrap.
+  //
+  // Perf #13: shadowColor / shadowBlur were set INSIDE the spike loop —
+  // 128 outer + 64 inner = 192 shadow-cache busts per globe frame at
+  // 60 fps = ~11.5k/sec.  Hoist a single shared shadow setting outside
+  // the loop (using _globeHue as the dominant tint).  Per-spike hue
+  // still varies via strokeStyle, so the visual hue cycling is preserved
+  // — only the per-stroke shadow tint is uniform now, which the eye
+  // can't distinguish from the per-spike version once blurred.
   const SPIKES = 128;
   ctx2d.lineCap = 'round';
+  ctx2d.shadowColor = `hsla(${_globeHue % 360}, 100%, 65%, 0.75)`;
+  ctx2d.shadowBlur  = 12 + _globeFlash * 18;
   for (let i = 0; i < SPIKES; i++) {
     const a = (i / SPIKES) * Math.PI * 2 + _globeRotation * 0.6;
     const binIdx = 1 + Math.floor((i / SPIKES) * (bufLen - 2));
@@ -1008,8 +1040,6 @@ function _drawGlobe(analyser) {
     const alpha = 0.35 + mag * 0.55 + _globeFlash * 0.20;
     ctx2d.lineWidth = 1.5 + mag * 1.5;
     ctx2d.strokeStyle = `hsla(${hue}, 95%, ${lightness}%, ${alpha})`;
-    ctx2d.shadowColor = `hsla(${hue}, 100%, 65%, 0.75)`;
-    ctx2d.shadowBlur = 12 + _globeFlash * 18;
     ctx2d.beginPath();
     ctx2d.moveTo(x0, y0);
     ctx2d.lineTo(x1, y1);
@@ -1019,7 +1049,10 @@ function _drawGlobe(analyser) {
   // ── Inner counter-rotating ring of mirror spikes (spinning the other way) ──
   // Adds visible motion even when bass is steady — lower-third bins point
   // INWARD from the globe surface for a "core energy" feel.
+  // Same hoist treatment as the outer halo above.
   const INNER_SPIKES = 64;
+  ctx2d.shadowColor = `hsla(${(_globeHue + 180) % 360}, 100%, 70%, 0.5)`;
+  ctx2d.shadowBlur  = 8;
   for (let i = 0; i < INNER_SPIKES; i++) {
     const a = (i / INNER_SPIKES) * Math.PI * 2 - _globeRotation * 0.9;
     const binIdx = 1 + Math.floor((i / INNER_SPIKES) * (bufLen / 3));
@@ -1034,8 +1067,6 @@ function _drawGlobe(analyser) {
     const hue = (_globeHue + 180 + (i / INNER_SPIKES) * 360) % 360;
     ctx2d.lineWidth = 1.2;
     ctx2d.strokeStyle = `hsla(${hue}, 90%, 70%, ${0.30 + mag * 0.40})`;
-    ctx2d.shadowBlur = 8;
-    ctx2d.shadowColor = `hsla(${hue}, 100%, 70%, 0.5)`;
     ctx2d.beginPath();
     ctx2d.moveTo(x0, y0);
     ctx2d.lineTo(x1, y1);
@@ -1655,8 +1686,7 @@ function _drawLavaLamp(analyser) {
   _lavaTime += dt;
 
   // ── Audio analysis ────────────────────────────────────────────────────
-  const fBuf = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(fBuf);
+  const fBuf = _getFreqBuf(analyser);
   const bassEnd = Math.max(4, Math.floor(fBuf.length * 0.10));
   let bass = 0;
   for (let i = 0; i < bassEnd; i++) bass += fBuf[i];
@@ -2302,8 +2332,7 @@ function _drawRaccoon(analyser) {
   _raccoonTime += dt;
 
   // ── Audio analysis ────────────────────────────────────────────────────
-  const fBuf = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(fBuf);
+  const fBuf = _getFreqBuf(analyser);
 
   const startMouth = Math.max(2, Math.floor(fBuf.length * 0.04));
   const endMouth   = Math.floor(fBuf.length * 0.55);
@@ -2461,7 +2490,42 @@ try {
   io.observe(canvas);
 } catch { /* older engines — fall back to page-visibility only */ }
 
+// Respect the OS-level "reduce motion" preference — the visualizer is
+// pure ambient motion (hyperspace/synthwave/globe in particular), and CSS
+// ``prefers-reduced-motion`` can't stop a ``requestAnimationFrame`` loop.
+const _reduceMotionMQ =
+  typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(prefers-reduced-motion: reduce)')
+    : { matches: false, addEventListener() {}, addListener() {} };
+
+function _userPrefersStillVisualizer() {
+  return _reduceMotionMQ.matches === true;
+}
+
+// React to runtime toggles (macOS Reduce Motion can be flipped while the
+// app is open) — without this the rAF loop kept running until the next
+// trackchange / statechange.
+function _onReduceMotionChange() {
+  if (_userPrefersStillVisualizer()) {
+    canvas.style.opacity = '0';
+    _wantRunning = false;
+    _suspend();
+  }
+}
+if (_reduceMotionMQ.addEventListener) {
+  _reduceMotionMQ.addEventListener('change', _onReduceMotionChange);
+} else if (_reduceMotionMQ.addListener) {
+  // Safari / older WebKit
+  _reduceMotionMQ.addListener(_onReduceMotionChange);
+}
+
 function start() {
+  if (_userPrefersStillVisualizer()) {
+    canvas.style.opacity = '0';
+    _wantRunning = false;
+    _suspend();
+    return;
+  }
   canvas.style.opacity = '0.9';
   _wantRunning = true;
   _resume();

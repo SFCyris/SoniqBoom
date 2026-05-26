@@ -14,11 +14,23 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import heapq
 import logging
 import re
 import time
 from collections import Counter
 from typing import Any, Callable
+
+
+def normalise_year(y):
+    """Collapse YYYYMMDD-form year ints to YYYY so the sorted index and the
+    aggregation Counter agree.  Single source of truth — both
+    ``TrackStore._index_track`` and ``scanner._async_exit_batch_mode``
+    call this so neither path can drift from the other again.
+    """
+    if isinstance(y, int) and y > 9999:
+        return y // 10000
+    return y
 
 from soniqboom.models.track import Track, TrackMeta
 
@@ -86,6 +98,11 @@ class TrackStore:
         self._hash_lookups: dict[str, str] = {}
         self._config: dict[str, Any] = {}
         self._art_absent: set[str] = set()
+        # Mutation sequence number — bumps on every track upsert / field
+        # update / delete so caches keyed on store state can detect
+        # changes even when the *count* doesn't move (rescan, retag,
+        # set-primary).
+        self._mutation_seq: int = 0
 
         # ── Inverted word index ──────────────────────────────────────────
         self._word_index: dict[str, set[str]] = {}
@@ -105,8 +122,26 @@ class TrackStore:
         # ── Sorted indexes: list of (value, track_id) ───────────────────
         self._sorted_year: list[tuple[int, str]] = []
         self._sorted_added_at: list[tuple[int, str]] = []
+        # Parallel index tracking only primary (non-secondary-dup) tracks so
+        # ``filter_tracks(filter_duplicates=True)`` and ``_paginate_all`` can
+        # walk a shorter pre-filtered list rather than testing every entry's
+        # ``is_duplicate_primary`` flag per request.
+        self._sorted_added_at_primary: list[tuple[int, str]] = []
         self._sorted_duration: list[tuple[float, str]] = []
         self._sorted_bpm: list[tuple[float, str]] = []
+        # Lexical sort indexes for column-header sort in the All Tracks
+        # windowed view.  Keys are lower-cased so the order is locale-
+        # agnostic case-insensitive — matches the user's expectation that
+        # "ABBA" and "abba" sort adjacent.  Cost: ~2 MB each at 267K
+        # tracks (interned string pointers + tuple overhead), ~10 MB
+        # total for the four new indexes vs the 280 MB snapshot already
+        # in RAM.  Insert/remove cost: bisect O(log N) per index, same
+        # shape as the numeric sort indexes above.
+        self._sorted_title: list[tuple[str, str]] = []
+        self._sorted_artist: list[tuple[str, str]] = []
+        self._sorted_album_artist: list[tuple[str, str]] = []
+        self._sorted_album: list[tuple[str, str]] = []
+        self._sorted_format: list[tuple[str, str]] = []
 
         # ── Pre-computed aggregations ────────────────────────────────────
         self._agg_artists: Counter[str] = Counter()
@@ -116,6 +151,19 @@ class TrackStore:
         self._agg_years: Counter[int] = Counter()
         self._agg_albums_by_artist: dict[str, Counter[str]] = {}
         self._agg_albums_by_album_artist: dict[str, Counter[str]] = {}
+
+        # ── Memoised aggregations keyed on _mutation_seq ─────────────────
+        # Each entry is ``(seq, key, value)`` so a single ``_mutation_seq``
+        # bump invalidates every cached aggregation in lock-step.  Mirrors
+        # the (already-existing) duplicate-snapshot cache in api/smart.py.
+        self._agg_cache: dict[str, tuple[int, Any]] = {}
+
+        # ── Track IDs that have never been played ────────────────────────
+        # Mirrors `play_stats` keys; updated on every track upsert / delete
+        # and on `record_play`.  Lets api/smart.py serve the "unplayed"
+        # view by walking ``_sorted_added_at`` filtered through this set
+        # instead of scanning every track in the library.
+        self._unplayed_ids: set[str] = set()
 
         # ── AOF hook (set by aof module after init) ──────────────────────
         self._aof_append: Callable[..., None] | None = None
@@ -152,23 +200,53 @@ class TrackStore:
         for g in t.get("genre", []):
             self._tag_set(self._tag_genre, g, tid)
 
-        # Extract numeric fields used by both sorted indexes and aggregations
-        year = t.get("year")
+        # Extract numeric fields used by both sorted indexes and aggregations.
+        # ``normalise_year`` collapses YYYYMMDD-form ints down to YYYY so the
+        # sorted index agrees with the aggregation Counter — the same rule
+        # is reused by scanner._async_exit_batch_mode via the module helper.
+        year = normalise_year(t.get("year"))
         added = t.get("added_at", 0)
         dur = t.get("duration", 0.0)
         bpm = t.get("bpm")
+
+        # Lexical sort keys for the column-header sort (windowed view).
+        # Lower-cased so ABBA and abba sort adjacent; empty values fall
+        # to the end of asc / start of desc — we use the ``￿``
+        # sentinel for empties to keep that behaviour without a separate
+        # filter pass at query time.  Using a high-BMP unicode codepoint
+        # not present in real metadata.
+        EMPTY_SORT_KEY = "￿"
+        title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
+        artist_key       = (t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY
+        album_artist_key = (t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY
+        album_key        = (t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY
+        fmt_key          = (t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY
 
         if not self._batch_mode:
             if year is not None:
                 _sorted_insert(self._sorted_year, (year, tid))
             if added:
                 _sorted_insert(self._sorted_added_at, (added, tid))
+                if t.get("is_duplicate_primary", True):
+                    _sorted_insert(self._sorted_added_at_primary, (added, tid))
             if dur:
                 _sorted_insert(self._sorted_duration, (dur, tid))
             if bpm is not None:
                 _sorted_insert(self._sorted_bpm, (bpm, tid))
+            _sorted_insert(self._sorted_title,        (title_key,        tid))
+            _sorted_insert(self._sorted_artist,       (artist_key,       tid))
+            _sorted_insert(self._sorted_album_artist, (album_artist_key, tid))
+            _sorted_insert(self._sorted_album,        (album_key,        tid))
+            _sorted_insert(self._sorted_format,       (fmt_key,          tid))
         else:
             self._sorted_dirty = True
+
+        # Unplayed bookkeeping — a freshly-indexed track has no play stats yet
+        # so it counts as unplayed unless ``record_play`` has already fired
+        # (e.g. AOF replay applied "record_play" before the track upsert in
+        # rare reorder cases — we still respect the existing entry).
+        if tid not in self._play_stats:
+            self._unplayed_ids.add(tid)
 
         # Aggregations
         artist = (t.get("artist") or "").strip()
@@ -213,23 +291,44 @@ class TrackStore:
         for g in t.get("genre", []):
             self._tag_del(self._tag_genre, g, tid)
 
-        # Extract numeric fields used by both sorted indexes and aggregations
-        year = t.get("year")
+        # Extract numeric fields used by both sorted indexes and aggregations.
+        # ``normalise_year`` keeps insert/remove in agreement.
+        year = normalise_year(t.get("year"))
         added = t.get("added_at", 0)
         dur = t.get("duration", 0.0)
         bpm = t.get("bpm")
+
+        # Same lexical key derivation as ``_index_track`` — must match
+        # exactly or the remove turns into a no-op and the index drifts.
+        EMPTY_SORT_KEY = "￿"
+        title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
+        artist_key       = (t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY
+        album_artist_key = (t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY
+        album_key        = (t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY
+        fmt_key          = (t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY
 
         if not self._batch_mode:
             if year is not None:
                 _sorted_remove(self._sorted_year, (year, tid))
             if added:
                 _sorted_remove(self._sorted_added_at, (added, tid))
+                if t.get("is_duplicate_primary", True):
+                    _sorted_remove(self._sorted_added_at_primary, (added, tid))
             if dur:
                 _sorted_remove(self._sorted_duration, (dur, tid))
             if bpm is not None:
                 _sorted_remove(self._sorted_bpm, (bpm, tid))
+            _sorted_remove(self._sorted_title,        (title_key,        tid))
+            _sorted_remove(self._sorted_artist,       (artist_key,       tid))
+            _sorted_remove(self._sorted_album_artist, (album_artist_key, tid))
+            _sorted_remove(self._sorted_album,        (album_key,        tid))
+            _sorted_remove(self._sorted_format,       (fmt_key,          tid))
         else:
             self._sorted_dirty = True
+
+        # Unplayed bookkeeping — when a track is removed it can't be unplayed
+        # anymore; this stops the set leaking entries for deleted tracks.
+        self._unplayed_ids.discard(tid)
 
         artist = (t.get("artist") or "").strip()
         album_artist = (t.get("album_artist") or "").strip()
@@ -314,11 +413,25 @@ class TrackStore:
         self._config = config
 
     def rebuild_indexes(self) -> None:
-        """Rebuild all indexes from current data.  ~50-100ms for 7K tracks."""
+        """Rebuild all indexes from current data.
+
+        Runs in batch mode so the 9 sorted indexes are built by one O(N log N)
+        ``sort()`` at the end rather than N × ``bisect.insort`` (which is
+        O(N) per call thanks to the memmove, so the per-track loop ends up
+        O(N²) wall-clock and goes from ~17 s baseline to >70 s once we
+        started maintaining the 5 lexical indexes too).
+        """
         self.clear_indexes()
-        for tid, t in self._tracks.items():
-            self._index_track(tid, t)
+        self.enter_batch_mode()
+        try:
+            for tid, t in self._tracks.items():
+                self._index_track(tid, t)
+        finally:
+            self.exit_batch_mode()
         self._rebuild_word_list()
+        # ``_index_track`` adds every track to ``_unplayed_ids`` whose key
+        # isn't already in ``_play_stats`` — the order above guarantees that
+        # snapshot-loaded play stats correctly suppress those tids.
         log.info("Indexes rebuilt for %d tracks", len(self._tracks))
 
     def clear_indexes(self) -> None:
@@ -334,8 +447,19 @@ class TrackStore:
             tag_idx.clear()
         self._sorted_year.clear()
         self._sorted_added_at.clear()
+        self._sorted_added_at_primary.clear()
         self._sorted_duration.clear()
         self._sorted_bpm.clear()
+        # Lexical sort indexes — must be cleared in lock-step with the
+        # numeric ones, otherwise a ``rebuild_indexes()`` after a snapshot
+        # load would leave stale ``(key, tid)`` entries from a previous
+        # snapshot alongside the fresh inserts, and the windowed sort
+        # would point at deleted track ids.
+        self._sorted_title.clear()
+        self._sorted_artist.clear()
+        self._sorted_album_artist.clear()
+        self._sorted_album.clear()
+        self._sorted_format.clear()
         self._agg_artists.clear()
         self._agg_album_artists.clear()
         self._agg_albums.clear()
@@ -343,6 +467,8 @@ class TrackStore:
         self._agg_years.clear()
         self._agg_albums_by_artist.clear()
         self._agg_albums_by_album_artist.clear()
+        self._agg_cache.clear()
+        self._unplayed_ids.clear()
 
     def index_tracks_batch(self, items: list[tuple[str, dict]]) -> None:
         """Index a batch of (track_id, track_dict) tuples."""
@@ -373,6 +499,7 @@ class TrackStore:
             self._unindex_track(tid, old)
         self._tracks[tid] = track
         self._index_track(tid, track)
+        self._mutation_seq += 1
         self._aof("upsert_track", id=tid, data=track)
 
     def upsert_tracks_batch(self, tracks: list[dict]) -> int:
@@ -383,6 +510,7 @@ class TrackStore:
                 self._unindex_track(tid, old)
             self._tracks[tid] = t
             self._index_track(tid, t)
+        self._mutation_seq += 1
         self._aof("batch_upsert_tracks", count=len(tracks), data=tracks)
         return len(tracks)
 
@@ -401,28 +529,57 @@ class TrackStore:
             self._sorted_dirty = False
 
     def _rebuild_sorted_indexes(self) -> None:
-        """Rebuild all 4 sorted indexes from scratch.  O(n log n) via sort."""
-        year, added, dur, bpm = [], [], [], []
+        """Rebuild all sorted indexes from scratch.  O(n log n) via sort.
+
+        Also rebuilds ``_sorted_added_at_primary`` (subset of
+        ``_sorted_added_at`` for tracks that are the primary copy of their
+        duplicate group, or aren't duplicates at all).
+        """
+        EMPTY_SORT_KEY = "￿"
+        year, added, added_primary, dur, bpm = [], [], [], [], []
+        title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
         for tid, t in self._tracks.items():
-            y = t.get("year")
+            y = normalise_year(t.get("year"))
             if y is not None:
                 year.append((y, tid))
             a = t.get("added_at", 0)
             if a:
                 added.append((a, tid))
+                if t.get("is_duplicate_primary", True):
+                    added_primary.append((a, tid))
             d = t.get("duration", 0.0)
             if d:
                 dur.append((d, tid))
             b = t.get("bpm")
             if b is not None:
                 bpm.append((b, tid))
-        year.sort(); added.sort(); dur.sort(); bpm.sort()
+            # Lexical keys mirror ``_index_track`` exactly — same
+            # ``.strip().lower()`` + EMPTY sentinel — so per-track
+            # incremental insert/remove and the full rebuild produce
+            # byte-identical index contents.
+            title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+            artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+            album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
+            album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+            fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+        year.sort(); added.sort(); added_primary.sort(); dur.sort(); bpm.sort()
+        title.sort(); artist_s.sort(); album_artist_s.sort(); album_s.sort(); fmt.sort()
         self._sorted_year = year
         self._sorted_added_at = added
+        self._sorted_added_at_primary = added_primary
         self._sorted_duration = dur
         self._sorted_bpm = bpm
-        log.info("Sorted indexes rebuilt: %d year, %d added, %d dur, %d bpm",
-                 len(year), len(added), len(dur), len(bpm))
+        self._sorted_title = title
+        self._sorted_artist = artist_s
+        self._sorted_album_artist = album_artist_s
+        self._sorted_album = album_s
+        self._sorted_format = fmt
+        log.info(
+            "Sorted indexes rebuilt: %d year, %d added (%d primary), %d dur, %d bpm, "
+            "%d title, %d artist, %d album_artist, %d album, %d fmt",
+            len(year), len(added), len(added_primary), len(dur), len(bpm),
+            len(title), len(artist_s), len(album_artist_s), len(album_s), len(fmt),
+        )
 
     def delete_track(self, track_id: str) -> bool:
         t = self._tracks.pop(track_id, None)
@@ -430,6 +587,7 @@ class TrackStore:
             return False
         self._unindex_track(track_id, t)
         self._waveforms.pop(track_id, None)
+        self._mutation_seq += 1
         self._aof("delete_tracks", ids=[track_id])
         return True
 
@@ -444,6 +602,7 @@ class TrackStore:
                 deleted += 1
                 ids.append(tid)
         if ids:
+            self._mutation_seq += 1
             self._aof("delete_tracks", ids=ids)
         return deleted
 
@@ -471,8 +630,34 @@ class TrackStore:
         self._unindex_track(track_id, t)
         t.update(updates)
         self._index_track(track_id, t)
+        self._mutation_seq += 1
         self._aof("update_track_fields", id=track_id, data=updates)
         return True
+
+    def update_track_fields_batch(self, items: list[tuple[str, dict]]) -> int:
+        """Apply many field-updates in one batch AOF record.
+
+        Recompute-duplicates and bulk-tag-edit paths used to call
+        ``update_track_fields`` once per track — for a 170K-track library
+        that's 170K AOF records and hundreds of MB of journal data, which
+        starved every other write during the recompute.  One batched record
+        plus a single ``_mutation_seq`` bump is dramatically cheaper.
+        """
+        applied = 0
+        records: list[dict] = []
+        for tid, updates in items:
+            t = self._tracks.get(tid)
+            if not t:
+                continue
+            self._unindex_track(tid, t)
+            t.update(updates)
+            self._index_track(tid, t)
+            applied += 1
+            records.append({"id": tid, "data": updates})
+        if applied:
+            self._mutation_seq += 1
+            self._aof("update_track_fields_batch", data=records)
+        return applied
 
     # ── Search ───────────────────────────────────────────────────────────
 
@@ -488,9 +673,51 @@ class TrackStore:
         if result_ids is None:
             return []
 
-        ids = sorted(result_ids, key=lambda tid: self._tracks[tid].get("added_at", 0), reverse=True)
-        page = ids[offset : offset + limit]
+        # ``heapq.nlargest`` is O(N log K) vs. the previous full
+        # ``sorted(...)`` which was O(N log N).  For a query that matches
+        # tens of thousands of tracks but only needs the first page back,
+        # this collapses the work to the top ``offset+limit`` entries.
+        top = heapq.nlargest(
+            offset + limit,
+            result_ids,
+            key=lambda tid: self._tracks[tid].get("added_at", 0),
+        )
+        page = top[offset : offset + limit]
         return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+
+    # Map a public ``sort_by`` value (the one the API exposes and the
+    # column-header click sends) to the in-memory sorted index that drives
+    # the paginated walk.  Single source of truth so the All Tracks /tracks
+    # endpoint, ``filter_tracks``, and ``_paginate_all`` can't drift.
+    #
+    # ``added`` defaults to descending (newest first) because that's the
+    # historical contract — every other key defaults to ascending and the
+    # column header click flips with each press (handled at the API layer).
+    _SORT_INDEX_MAP: dict[str, str] = {
+        "added":        "_sorted_added_at",
+        "year":         "_sorted_year",
+        "duration":     "_sorted_duration",
+        "bpm":          "_sorted_bpm",
+        "title":        "_sorted_title",
+        "artist":       "_sorted_artist",
+        "album_artist": "_sorted_album_artist",
+        "album":        "_sorted_album",
+        "format":       "_sorted_format",
+    }
+
+    def _pick_sort_index(self, sort_by: str | None, *, filter_duplicates: bool) -> list[tuple]:
+        """Return the sorted index list matching ``sort_by``.
+
+        Falls back to ``_sorted_added_at`` (or its ``_primary`` variant when
+        ``filter_duplicates`` is set) so callers that don't pass an explicit
+        sort key still get the historical newest-first behaviour.
+        """
+        if not sort_by or sort_by == "added":
+            return self._sorted_added_at_primary if filter_duplicates else self._sorted_added_at
+        attr = self._SORT_INDEX_MAP.get(sort_by)
+        if not attr:
+            return self._sorted_added_at_primary if filter_duplicates else self._sorted_added_at
+        return getattr(self, attr)
 
     def filter_tracks(
         self,
@@ -507,8 +734,18 @@ class TrackStore:
         limit: int = 200,
         offset: int = 0,
         filter_duplicates: bool = False,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
     ) -> list[dict]:
-        """Filter tracks by tag and/or range criteria, intersecting results."""
+        """Filter tracks by tag and/or range criteria, intersecting results.
+
+        ``sort_by`` selects which pre-computed sorted index drives the page
+        walk: one of ``title``, ``artist``, ``album``, ``format``, ``year``,
+        ``duration``, ``bpm``, or ``added`` (default).  ``sort_order`` is
+        ``"asc"`` or ``"desc"`` — falsy / unknown values default to ``desc``
+        for ``added`` (newest first, historical) and ``asc`` for everything
+        else (the natural reading order for a column header click).
+        """
         sets: list[set[str]] = []
 
         if artist:
@@ -535,7 +772,11 @@ class TrackStore:
                 sets.append(q_ids)
 
         if not sets:
-            return self._paginate_all(limit, offset, filter_duplicates=filter_duplicates)
+            return self._paginate_all(
+                limit, offset,
+                filter_duplicates=filter_duplicates,
+                sort_by=sort_by, sort_order=sort_order,
+            )
 
         result = sets[0]
         for s in sets[1:]:
@@ -547,9 +788,42 @@ class TrackStore:
             result = {tid for tid in result
                       if self._tracks.get(tid, {}).get("is_duplicate_primary", True)}
 
-        ids = sorted(result, key=lambda tid: self._tracks.get(tid, {}).get("added_at", 0), reverse=True)
-        page = ids[offset : offset + limit]
+        # Pick the right sorted index for the requested sort, then walk it
+        # in the requested direction keeping only tids that are in the
+        # candidate set.  ``descending`` walk = reversed iterator over the
+        # ascending index — Python's reversed() over a list is O(1) setup +
+        # O(k) for k items consumed, same shape as the original code.
+        idx = self._pick_sort_index(sort_by, filter_duplicates=filter_duplicates)
+        descending = self._is_descending(sort_by, sort_order)
+        walk_iter = reversed(idx) if descending else iter(idx)
+
+        need = offset + limit
+        collected: list[str] = []
+        for _, tid in walk_iter:
+            if tid in result:
+                collected.append(tid)
+                if len(collected) >= need:
+                    break
+        page = collected[offset : offset + limit]
         return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+
+    @staticmethod
+    def _is_descending(sort_by: str | None, sort_order: str | None) -> bool:
+        """Resolve the effective sort direction.
+
+        Explicit ``sort_order`` wins; otherwise ``added`` defaults to desc
+        (newest first, historical behaviour) and everything else defaults
+        to asc (natural reading order for a fresh column click).
+        """
+        if sort_order:
+            o = sort_order.strip().lower()
+            if o in ("desc", "descending", "down", "d"):
+                return True
+            if o in ("asc", "ascending", "up", "a"):
+                return False
+        # No explicit order: only ``added`` (and its default-empty alias)
+        # defaults to descending.
+        return not sort_by or sort_by == "added"
 
     def _resolve_query(self, query: str) -> set[str] | None:
         """Resolve a text query to a set of matching track IDs."""
@@ -587,32 +861,87 @@ class TrackStore:
             result |= self._word_index.get(word, set())
         return result
 
-    def _paginate_all(self, limit: int, offset: int, *, filter_duplicates: bool = False) -> list[dict]:
-        """Return a paginated slice of all tracks, newest first."""
-        if not filter_duplicates:
-            n = len(self._sorted_added_at)
-            start = max(0, n - offset - limit)
-            end = n - offset
-            if end <= 0:
-                return []
-            page = self._sorted_added_at[max(start, 0) : end]
-            return [self._meta_dict(tid) for _, tid in reversed(page) if tid in self._tracks]
+    def _paginate_all(
+        self,
+        limit: int,
+        offset: int,
+        *,
+        filter_duplicates: bool = False,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ) -> list[dict]:
+        """Return a paginated slice of all tracks.
 
-        results: list[dict] = []
+        Default sort = ``added`` desc (newest first, historical contract).
+        With ``filter_duplicates=True`` the pre-built
+        ``_sorted_added_at_primary`` index drives a pure slice when the
+        default sort is in use; for other sort keys ``filter_duplicates`` is
+        applied per-row at walk time (no primary-variant index exists for
+        every sortable column — the cost would be 8 extra indexes × 4–8 MB
+        each, not worth it for the duplicates-hidden case which is the
+        minority view).
+        """
+        descending = self._is_descending(sort_by, sort_order)
+
+        # Fast path: default sort + no filter_duplicates ⇒ pure slice
+        # off the already-sorted ``_sorted_added_at`` index.  This is the
+        # path the windowed All Tracks view hits on the very first page
+        # so it stays O(limit) regardless of library size.
+        if (not sort_by or sort_by == "added") and not filter_duplicates:
+            idx = self._sorted_added_at
+            n = len(idx)
+            if descending:
+                # newest first → walk from the tail
+                start = max(0, n - offset - limit)
+                end = n - offset
+                if end <= 0:
+                    return []
+                page = idx[max(start, 0) : end]
+                return [self._meta_dict(tid) for _, tid in reversed(page) if tid in self._tracks]
+            else:
+                # oldest first → slice from the head
+                page = idx[offset : offset + limit]
+                return [self._meta_dict(tid) for _, tid in page if tid in self._tracks]
+
+        # filter_duplicates + default sort retains its primary-variant fast
+        # path so the duplicates-hidden default page is still O(limit).
+        if (not sort_by or sort_by == "added") and filter_duplicates:
+            idx = self._sorted_added_at_primary
+            n = len(idx)
+            if descending:
+                start = max(0, n - offset - limit)
+                end = n - offset
+                if end <= 0:
+                    return []
+                page = idx[max(start, 0) : end]
+                return [self._meta_dict(tid) for _, tid in reversed(page) if tid in self._tracks]
+            else:
+                page = idx[offset : offset + limit]
+                return [self._meta_dict(tid) for _, tid in page if tid in self._tracks]
+
+        # General path for non-default sort keys: walk the chosen sorted
+        # index in the requested direction, optionally filtering duplicates
+        # per row.  For 267K tracks the inner ``in self._tracks`` membership
+        # test is a dict lookup (~70 ns), so a full page draw costs
+        # ~limit×100 ns + the sort-time work we did once at index build.
+        idx = self._pick_sort_index(sort_by, filter_duplicates=filter_duplicates)
+        walk_iter = reversed(idx) if descending else iter(idx)
+
+        # Consume offset items first, then collect limit items.
         skipped = 0
-        for _, tid in reversed(self._sorted_added_at):
-            t = self._tracks.get(tid)
-            if not t:
-                continue
-            if not t.get("is_duplicate_primary", True):
-                continue
+        collected: list[str] = []
+        for _, tid in walk_iter:
+            if filter_duplicates:
+                t = self._tracks.get(tid)
+                if not t or not t.get("is_duplicate_primary", True):
+                    continue
             if skipped < offset:
                 skipped += 1
                 continue
-            results.append(self._meta_dict(tid))
-            if len(results) >= limit:
+            collected.append(tid)
+            if len(collected) >= limit:
                 break
-        return results
+        return [self._meta_dict(tid) for tid in collected if tid in self._tracks]
 
     def _meta_dict(self, tid: str) -> dict:
         t = self._tracks.get(tid)
@@ -622,8 +951,28 @@ class TrackStore:
 
     # ── Aggregations ─────────────────────────────────────────────────────
 
+    def _agg_cache_get(self, key: str) -> Any | None:
+        """Return the cached aggregation result for ``key`` if still valid.
+
+        The cache is keyed on ``_mutation_seq`` so any track upsert / update /
+        delete since the previous call automatically invalidates every entry
+        without an explicit ``clear()`` — mirrors the duplicate-snapshot
+        cache pattern in api/smart.py.
+        """
+        entry = self._agg_cache.get(key)
+        if entry is not None and entry[0] == self._mutation_seq:
+            return entry[1]
+        return None
+
+    def _agg_cache_set(self, key: str, value: Any) -> Any:
+        self._agg_cache[key] = (self._mutation_seq, value)
+        return value
+
     def aggregate_artists(self) -> list[dict]:
         """All artists with track counts, sorted alphabetically."""
+        cached = self._agg_cache_get("artists")
+        if cached is not None:
+            return cached
         results: list[dict] = []
         for key, count in self._agg_artists.items():
             tids = self._tag_artist.get(key)
@@ -633,9 +982,13 @@ class TrackStore:
             t = self._tracks.get(tid)
             name = (t.get("artist") or "").strip() if t else key
             results.append({"artist": name or key, "count": count})
-        return sorted(results, key=lambda x: x["artist"].lower())
+        results.sort(key=lambda x: x["artist"].lower())
+        return self._agg_cache_set("artists", results)
 
     def aggregate_album_artists(self) -> list[dict]:
+        cached = self._agg_cache_get("album_artists")
+        if cached is not None:
+            return cached
         results: list[dict] = []
         for key, count in self._agg_album_artists.items():
             tids = self._tag_album_artist.get(key)
@@ -645,12 +998,20 @@ class TrackStore:
             t = self._tracks.get(tid)
             name = (t.get("album_artist") or "").strip() if t else key
             results.append({"album_artist": name or key, "count": count})
-        return sorted(results, key=lambda x: x["album_artist"].lower())
+        results.sort(key=lambda x: x["album_artist"].lower())
+        return self._agg_cache_set("album_artists", results)
 
     def aggregate_albums(
         self, artist: str | None = None, album_artist: str | None = None,
     ) -> list[dict]:
         """Albums, optionally filtered by artist/album_artist."""
+        # Cache key embeds the filter args so different (artist, album_artist)
+        # combinations cache independently.
+        cache_key = f"albums::{(artist or '').lower()}::{(album_artist or '').lower()}"
+        cached = self._agg_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         if artist:
             album_counter = self._agg_albums_by_artist.get(
                 artist.lower(), Counter(),
@@ -671,9 +1032,13 @@ class TrackStore:
             t = self._tracks.get(tid)
             name = (t.get("album") or "").strip() if t else key
             results.append({"album": name or key, "count": count})
-        return sorted(results, key=lambda x: x["album"].lower())
+        results.sort(key=lambda x: x["album"].lower())
+        return self._agg_cache_set(cache_key, results)
 
     def aggregate_genres(self) -> list[dict]:
+        cached = self._agg_cache_get("genres")
+        if cached is not None:
+            return cached
         results: list[dict] = []
         for key, count in self._agg_genres.items():
             tids = self._tag_genre.get(key)
@@ -689,27 +1054,50 @@ class TrackStore:
                         name = g.strip()
                         break
             results.append({"genre": name, "count": count})
-        return sorted(results, key=lambda x: x["genre"].lower())
+        results.sort(key=lambda x: x["genre"].lower())
+        return self._agg_cache_set("genres", results)
 
     def aggregate_years(self) -> list[dict]:
-        # Counter stores raw year values; normalize YYYYMMDD → YYYY
+        cached = self._agg_cache_get("years")
+        if cached is not None:
+            return cached
+        # Counter stores raw year values; normalize YYYYMMDD → YYYY.  The
+        # previous code had two branches that performed the same division —
+        # the first was unreachable because the second matched first for any
+        # 5-or-more-digit value.
         merged: dict[int, int] = {}
         for y, count in self._agg_years.items():
-            if isinstance(y, int) and y > 99991231:
-                y = y // 10000
-            elif isinstance(y, int) and y > 9999:
+            if isinstance(y, int) and y > 9999:
                 y = y // 10000
             merged[y] = merged.get(y, 0) + count
-        return sorted(
+        results = sorted(
             [{"year": y, "count": c} for y, c in merged.items()],
             key=lambda x: -x["year"],
         )
+        return self._agg_cache_set("years", results)
 
     # ── Recently added (sorted index) ────────────────────────────────────
 
     def recently_added(self, limit: int = 100) -> list[dict]:
         ids = _sorted_tail(self._sorted_added_at, limit)
         return [self._meta_dict(tid) for tid in ids if tid in self._tracks]
+
+    def list_unplayed(self, limit: int = 100) -> list[dict]:
+        """Return tracks never played, newest-first.
+
+        Backed by the incrementally-maintained ``_unplayed_ids`` set — walks
+        ``_sorted_added_at`` in reverse, filtering membership.  This is
+        O(limit + misses) instead of the previous O(N) scan over every
+        track + ``get_all_play_stats`` snapshot in api/smart.py.
+        """
+        results: list[dict] = []
+        unplayed = self._unplayed_ids
+        for _, tid in reversed(self._sorted_added_at):
+            if tid in unplayed and tid in self._tracks:
+                results.append(self._meta_dict(tid))
+                if len(results) >= limit:
+                    break
+        return results
 
     # ── Waveforms ────────────────────────────────────────────────────────
 
@@ -759,6 +1147,10 @@ class TrackStore:
         else:
             stats = {"count": 1, "last_played": now}
             self._play_stats[track_id] = stats
+            # First play — track is no longer unplayed.  Discard rather than
+            # remove() so the set stays consistent if a play event arrives
+            # before the corresponding track upsert (rare AOF replay reorder).
+            self._unplayed_ids.discard(track_id)
         self._aof("record_play", id=track_id, ts=now)
         return dict(stats)
 
@@ -773,12 +1165,22 @@ class TrackStore:
 
     # ── Playlists ────────────────────────────────────────────────────────
 
-    def create_playlist(self, playlist_id: str, name: str, track_ids: list[str] | None = None) -> dict:
+    def create_playlist(
+        self,
+        playlist_id: str,
+        name: str,
+        track_ids: list[str] | None = None,
+        owner_user_id: str | None = None,
+    ) -> dict:
         now = int(time.time())
+        # The API layer reads/writes ``track_ids`` consistently — historically
+        # this code wrote ``tracks`` instead, so freshly-created playlists
+        # appeared empty to every reader.  Use the same key everywhere.
         pl = {
             "id": playlist_id,
             "name": name,
-            "tracks": track_ids or [],
+            "track_ids": list(track_ids or []),
+            "owner_user_id": owner_user_id,  # None ⇒ legacy/shared
             "created_at": now,
             "updated_at": now,
         }
@@ -786,21 +1188,82 @@ class TrackStore:
         self._aof("upsert_playlist", id=playlist_id, data=pl)
         return dict(pl)
 
+    def list_playlists_for_user(self, user_id: str | None) -> list[dict]:
+        """Return playlists visible to ``user_id``.  Visibility rule:
+          * owner_user_id == user_id  → always visible (their own)
+          * owner_user_id is None     → legacy/shared, visible to all
+          * otherwise                 → hidden
+        Pass ``user_id=None`` to get every playlist (admin view).
+        """
+        out = []
+        for pl in self._playlists.values():
+            pl = self._migrate_playlist(pl)
+            owner = pl.get("owner_user_id")
+            if user_id is None or owner is None or owner == user_id:
+                out.append(dict(pl))
+        return out
+
+    def _migrate_playlist(self, pl: dict) -> dict:
+        # Legacy playlists persisted with ``tracks`` instead of ``track_ids``.
+        # Normalise on read so the API sees the canonical key without forcing
+        # a full snapshot rewrite.
+        if "track_ids" not in pl and "tracks" in pl:
+            pl["track_ids"] = pl.pop("tracks")
+        return pl
+
     def get_playlist(self, playlist_id: str) -> dict | None:
-        pl = self._playlists.get(playlist_id)
-        return dict(pl) if pl else None
-
-    def list_playlists(self) -> list[dict]:
-        return [dict(pl) for pl in self._playlists.values()]
-
-    def update_playlist(self, playlist_id: str, updates: dict) -> dict | None:
         pl = self._playlists.get(playlist_id)
         if not pl:
             return None
-        pl.update(updates)
+        return dict(self._migrate_playlist(pl))
+
+    def list_playlists(self) -> list[dict]:
+        return [dict(self._migrate_playlist(pl)) for pl in self._playlists.values()]
+
+    def update_playlist(
+        self, playlist_id: str, updates: dict,
+    ) -> dict | None:
+        """Apply ``updates`` to a playlist.
+
+        When ``updates`` contains ``track_ids`` (or the legacy ``tracks``
+        alias), any ids that don't exist in the track store are silently
+        dropped and recorded under ``dropped_ids`` on the returned dict —
+        a stale client clinging to deleted tracks no longer leaves orphan
+        ids inside the playlist after a save.  Callers that want strict
+        validation can inspect ``dropped_ids`` and 400 the response.
+        """
+        pl = self._playlists.get(playlist_id)
+        if not pl:
+            return None
+        # Normalise legacy "tracks" → "track_ids" *before* applying the
+        # update; otherwise PUT /playlists/{id} would leave both keys behind
+        # and ``_migrate_playlist`` (guarded on "track_ids" not in pl) would
+        # never run again on this playlist.
+        self._migrate_playlist(pl)
+        # Also strip a legacy "tracks" key from inbound updates: callers
+        # should only send "track_ids", but accepting "tracks" here would
+        # reintroduce the duplicate key that the migration just cleared.
+        cleaned = {k: v for k, v in updates.items() if k != "tracks"}
+        if "tracks" in updates and "track_ids" not in cleaned:
+            cleaned["track_ids"] = updates["tracks"]
+        # Prune unknown track ids from the inbound list so a playlist
+        # update can't silently pin references to deleted tracks.
+        dropped: list[str] = []
+        if "track_ids" in cleaned and isinstance(cleaned["track_ids"], list):
+            kept: list[str] = []
+            for tid in cleaned["track_ids"]:
+                if tid in self._tracks:
+                    kept.append(tid)
+                else:
+                    dropped.append(tid)
+            cleaned["track_ids"] = kept
+        pl.update(cleaned)
         pl["updated_at"] = int(time.time())
         self._aof("upsert_playlist", id=playlist_id, data=dict(pl))
-        return dict(pl)
+        out = dict(pl)
+        if dropped:
+            out["dropped_ids"] = dropped
+        return out
 
     def delete_playlist(self, playlist_id: str) -> bool:
         if self._playlists.pop(playlist_id, None) is not None:
@@ -813,7 +1276,9 @@ class TrackStore:
     def push_history(self, entry: dict) -> None:
         self._history.append(entry)
         if len(self._history) > self.history_max:
-            self._history = self._history[-self.history_max :]
+            # In-place slice delete — avoids the previous full-list
+            # reallocation that fired on every recorded play.
+            del self._history[: -self.history_max]
         self._aof("push_history", data=entry)
 
     def get_history(self, limit: int = 50) -> list[dict]:
@@ -826,6 +1291,10 @@ class TrackStore:
                         status: str = "ok") -> dict:
         existing = self._scan_dirs.get(path, {})
         now = int(time.time())
+        # Cache the path_hash once at upsert time so ``list_scan_dirs`` no
+        # longer recomputes ``hashlib.sha256(path).hexdigest()[:16]`` for
+        # every dir on every request (admin UI polls this endpoint).
+        ph = existing.get("path_hash") or hashlib.sha256(path.encode()).hexdigest()[:16]
         sd = {
             "path": path,
             # Preserve the existing count when no explicit value is given
@@ -836,13 +1305,13 @@ class TrackStore:
             "last_scanned": now,
             "network_share_id": network_share_id or existing.get("network_share_id"),
             "status": status,
+            "path_hash": ph,
         }
         self._scan_dirs[path] = sd
         self._aof("upsert_scan_dir", path=path, data=sd)
         return dict(sd)
 
     def list_scan_dirs(self) -> list[dict]:
-        import hashlib
         result = []
         for sd in self._scan_dirs.values():
             d = dict(sd)
@@ -850,7 +1319,14 @@ class TrackStore:
             # instead of relying on the cached field (which can be stale
             # if a scan was interrupted or the old code reset it to 0).
             path = d.get("path", "")
-            h = hashlib.sha256(path.encode()).hexdigest()[:16]
+            # ``upsert_scan_dir`` writes ``path_hash`` at insert time; for
+            # legacy entries persisted before this cache existed, fall back
+            # to a one-shot recompute and stash it for next call.
+            h = d.get("path_hash")
+            if not h:
+                h = hashlib.sha256(path.encode()).hexdigest()[:16]
+                sd["path_hash"] = h
+                d["path_hash"] = h
             d["track_count"] = len(self._tag_scan_root_hash.get(h, set()))
             result.append(d)
         return result
@@ -893,7 +1369,21 @@ class TrackStore:
 
     # ── Art absent tracking ──────────────────────────────────────────────
 
+    # Soft cap on the "art known to be absent" set so it can't grow
+    # unboundedly across a long-running session (Perf #1 flagged a
+    # 170K-entry set on a fully-browsed library ≈ 9 MB).
+    _ART_ABSENT_CAP = 20_000
+
     def mark_art_absent(self, track_id: str) -> None:
+        if len(self._art_absent) >= self._ART_ABSENT_CAP:
+            # Drop ~5% — pop_random would be O(1) but unstable; pop a few
+            # arbitrary elements via ``pop()`` until under cap.
+            drop_n = max(1, self._ART_ABSENT_CAP // 20)
+            for _ in range(drop_n):
+                try:
+                    self._art_absent.pop()
+                except KeyError:
+                    break
         self._art_absent.add(track_id)
 
     def is_art_absent(self, track_id: str) -> bool:

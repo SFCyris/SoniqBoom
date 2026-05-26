@@ -24,16 +24,74 @@ from soniqboom.core.store import get_store
 router = APIRouter(prefix="/library", tags=["library"])
 
 _ws_clients: set[WebSocket] = set()
+# Parallel dict so the auth re-check on every broadcast tick knows which
+# user_id each open socket belongs to (without having to re-parse the
+# cookie + hit the user store on every tick).  Populated on accept,
+# cleared on disconnect.
+_ws_user_id: dict[WebSocket, str] = {}
+
+
+def _verify_ws_session(ws: WebSocket) -> bool:
+    """Re-check that the user behind ``ws`` is still valid.
+
+    Cheap dict lookup against the in-memory session store — runs once per
+    broadcast tick so a session revoked / user disabled mid-stream
+    immediately stops receiving scan-progress events.  Pre-bootstrap
+    installs (no users registered yet) keep the anonymous-open behaviour.
+    """
+    try:
+        from soniqboom.core.users import get_user_store
+        store = get_user_store()
+    except Exception:
+        return True
+    if not store.has_any():
+        return True
+    cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
+    if not cookie:
+        return False
+    user = store.lookup_session(cookie)
+    return user is not None and user.enabled
 
 
 async def _broadcast(data: dict) -> None:
-    dead = set()
-    for ws in _ws_clients:
+    """Push *data* to every connected library WebSocket in parallel.
+
+    Sends were previously serial — a single slow / back-pressured client
+    blocked every other listener from receiving scan-progress ticks.  Each
+    send now has its own 2 s timeout so one stuck socket can't stall the
+    whole fan-out.
+
+    Each tick also re-verifies the WebSocket's session; if revoked (the
+    user was disabled / had their role removed / explicit logout) we
+    close the socket with code ``4401`` before sending.  Without this a
+    long-lived WS could keep streaming events well after its owner's
+    privileges were revoked.
+    """
+    if not _ws_clients:
+        return
+
+    async def _send(ws):
         try:
-            await ws.send_json(data)
+            if not _verify_ws_session(ws):
+                try:
+                    await asyncio.wait_for(ws.close(code=4401), timeout=1.0)
+                except Exception:
+                    pass
+                return ws
+            await asyncio.wait_for(ws.send_json(data), timeout=2.0)
+            return None
         except Exception:
-            dead.add(ws)
-    _ws_clients.difference_update(dead)
+            return ws
+
+    results = await asyncio.gather(
+        *(_send(ws) for ws in list(_ws_clients)),
+        return_exceptions=True,
+    )
+    dead = {r for r in results if r is not None and not isinstance(r, BaseException)}
+    if dead:
+        _ws_clients.difference_update(dead)
+        for ws in dead:
+            _ws_user_id.pop(ws, None)
 
 
 # ── Aggregation cache (event-driven: cached until scan invalidates) ───────────
@@ -86,8 +144,21 @@ def _etag_response(request: Request, cache_key: str, result: list) -> Response:
         # existing Cache-Control and leaves this alone.
         "Cache-Control": "private, max-age=0, must-revalidate",
     }
-    if inm and etag in inm:
-        return Response(status_code=304, headers=headers)
+    # Parse the If-None-Match header per RFC 7232 instead of using substring
+    # ``etag in inm`` — substring match falsely 304s when one md5 is a prefix
+    # of another in a multi-tag header, or when a token happens to appear
+    # inside another value.  Also strip the optional weak-validator ``W/``
+    # prefix so clients that hedge (per RFC 7232) still hit the 304 path.
+    def _normalise_etag(token: str) -> str:
+        t = token.strip()
+        if t.startswith(("W/", "w/")):
+            t = t[2:]
+        return t.strip('"')
+
+    if inm:
+        candidates = {_normalise_etag(e) for e in inm.split(",") if e.strip()}
+        if etag in candidates or "*" in candidates:
+            return Response(status_code=304, headers=headers)
     return Response(content=payload, media_type="application/json", headers=headers)
 
 
@@ -211,10 +282,48 @@ async def scan_status():
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
+def _ws_auth_ok(ws: WebSocket) -> tuple[bool, str | None]:
+    """Gate a WebSocket on the session cookie.  Pre-bootstrap installs
+    (no users at all) keep the old anonymous-open behaviour so the
+    initial setup UI still works.
+
+    Returns ``(allowed, user_id)`` so the caller can record the user_id
+    in the per-user open-socket registry.  ``user_id`` is None for
+    anonymous-bootstrap connections (registry no-ops on None).
+    """
+    try:
+        from soniqboom.core.users import get_user_store
+        store = get_user_store()
+    except Exception:
+        return True, None
+    if not store.has_any():
+        return True, None
+    cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
+    if not cookie:
+        return False, None
+    user = store.lookup_session(cookie)
+    if user is None or not user.enabled:
+        return False, None
+    return True, user.id
+
+
 @router.websocket("/ws")
 async def library_ws(ws: WebSocket):
+    allowed, user_id = _ws_auth_ok(ws)
+    if not allowed:
+        await ws.close(code=4401)  # custom code: unauthorized
+        return
     await ws.accept()
     _ws_clients.add(ws)
+    if user_id is not None:
+        _ws_user_id[ws] = user_id
+        # Cross-module registry so admin demote/disable can iterate this
+        # user's open sockets and slam them shut.
+        try:
+            from soniqboom.api.users import register_open_ws
+            register_open_ws(user_id, ws)
+        except Exception:
+            pass
     try:
         await ws.send_json({"event": "scan_progress", **get_progress().to_dict()})
         while True:
@@ -223,6 +332,13 @@ async def library_ws(ws: WebSocket):
         pass
     finally:
         _ws_clients.discard(ws)
+        _ws_user_id.pop(ws, None)
+        if user_id is not None:
+            try:
+                from soniqboom.api.users import unregister_open_ws
+                unregister_open_ws(user_id, ws)
+            except Exception:
+                pass
 
 
 # ── Aggregations ──────────────────────────────────────────────────────────────

@@ -12,7 +12,60 @@
  *   TrackInfo.openSingle(track)        — open panel for a single track
  */
 import { Player }              from './player.js';
-import { artPlaceholderEmoji } from './utils.js';
+import { artPlaceholderEmoji, trapFocus } from './utils.js';
+
+// ── Chapters (E-18) ────────────────────────────────────────────────────────
+
+async function _loadChapters(track) {
+  const host = document.getElementById('ti-chapters');
+  if (!host) return;
+  host.innerHTML = '';
+  host.hidden = true;
+  if (!track || !track.id) return;
+  try {
+    const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/chapters`,
+                            { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const { chapters } = await res.json();
+    if (!Array.isArray(chapters) || chapters.length === 0) return;
+    const header = document.createElement('div');
+    header.className = 'ti-chapter-header';
+    header.textContent = `Chapters (${chapters.length})`;
+    const list = document.createElement('div');
+    list.className = 'ti-chapter-list';
+    list.setAttribute('role', 'list');
+    list.setAttribute('aria-label', 'Chapters');
+    chapters.forEach((ch, i) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'ti-chapter-row';
+      row.setAttribute('role', 'listitem');
+      const start = Number(ch.start) || 0;
+      const mm = Math.floor(start / 60);
+      const ss = String(Math.floor(start % 60)).padStart(2, '0');
+      const label = ch.title || `Chapter ${i + 1}`;
+      const timeEl = document.createElement('span');
+      timeEl.className = 'ti-chapter-time';
+      timeEl.textContent = `${mm}:${ss}`;
+      const titleEl = document.createElement('span');
+      titleEl.className = 'ti-chapter-title';
+      titleEl.textContent = label;
+      row.append(timeEl, titleEl);
+      row.addEventListener('click', () => {
+        const cur = Player.currentTrack;
+        if (cur && cur.id === track.id) {
+          Player.seek(start);
+        } else {
+          Player.playTrack(track);
+          setTimeout(() => Player.seek(start), 400);
+        }
+      });
+      list.appendChild(row);
+    });
+    host.append(header, list);
+    host.hidden = false;
+  } catch { /* silent — chapters are best-effort */ }
+}
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const overlay      = document.getElementById('ti-overlay');
@@ -39,6 +92,7 @@ let _activeTab   = 'info';   // 'info' | 'lyrics'
 let _lyricsCache = {};        // track_id → {lyrics, synced, source, lines} | 'loading' | 'error'
 let _syncedLines = [];        // [{time: seconds, text: '...'}, ...]
 let _activeLine  = -1;        // index of currently highlighted line
+let _focusReturn = null;      // Element that had focus when the panel opened
 
 // ── Format helpers ────────────────────────────────────────────────────────────
 function _fmt(sec) {
@@ -105,7 +159,12 @@ function _render(track) {
     artEl.classList.remove('ti-art-loading');
     // Placeholder emoji (above) is shown automatically when ti-has-art is absent
   };
-  img.src = `/api/art/${track.id}`;
+  // Request the ``lg`` thumbnail rather than the raw embedded JPEG —
+  // tracks with high-res cover art (1400×1248+) would otherwise download
+  // several MB into a ~260×260 dialog box.  The ``lg`` cache is shared
+  // with the now-playing overlay so the bytes are typically already on
+  // disk by the time the dialog opens.
+  img.src = `/api/art/${track.id}?size=lg`;
 
   // ── Navigation label ──
   const title = track.title || track.path?.split('/').pop() || '—';
@@ -151,6 +210,10 @@ function _render(track) {
   _show('ti-file-size',   track.file_size,   _fmtSize);
   _show('ti-added',       track.added_at,    _fmtDate);
   _show('ti-path',        track.path);
+
+  // ── Chapters (podcast/audiobook) — appended after the regular tags
+  // when the file has them.  Click jumps the player.
+  _loadChapters(track);
 
   // Reset lyrics pane if navigating away from current lyrics
   if (_activeTab === 'lyrics') {
@@ -240,12 +303,31 @@ async function _loadExtendedInfo(track) {
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
+// Mark the panes as tabpanels once at startup so screen readers see the
+// pair as a real tab/tabpanel relationship instead of two unrelated divs.
+if (metaPane && lyricsPane) {
+  metaPane.setAttribute('role', 'tabpanel');
+  metaPane.setAttribute('aria-labelledby', 'ti-tab-info');
+  metaPane.tabIndex = 0;
+  lyricsPane.setAttribute('role', 'tabpanel');
+  lyricsPane.setAttribute('aria-labelledby', 'ti-tab-lyrics');
+  lyricsPane.tabIndex = 0;
+}
+
 function _switchTab(tab) {
   _activeTab = tab;
   tabInfo.classList.toggle('active', tab === 'info');
   tabLyrics.classList.toggle('active', tab === 'lyrics');
+  tabInfo.setAttribute('aria-selected',   tab === 'info'   ? 'true' : 'false');
+  tabLyrics.setAttribute('aria-selected', tab === 'lyrics' ? 'true' : 'false');
+  // Single show/hide convention: both panes default to ``hidden`` and we
+  // add ``active`` for the visible one.  Previously meta used ``hidden``
+  // while lyrics used ``active``, so during the open animation both
+  // panes could be visible (Visual-Test #1 caught the race).
+  metaPane.classList.toggle('active', tab === 'info');
   metaPane.classList.toggle('hidden', tab !== 'info');
   lyricsPane.classList.toggle('active', tab === 'lyrics');
+  lyricsPane.classList.toggle('hidden', tab !== 'lyrics');
   if (tab === 'lyrics') _loadLyrics(_queue[_idx]);
 }
 
@@ -286,6 +368,11 @@ function _showLyrics(data) {
           ).join('')}
         </div>
         <div class="ti-lyrics-source">${_escHtml(data.source)}</div>`;
+      // Prime the active line immediately so the user sees the current
+      // verse highlighted the moment lyrics load — previously this had to
+      // wait for the next ``timeupdate`` tick (up to 250 ms) which felt
+      // like the lyrics were "behind" the audio (REG-3).
+      try { _updateSyncedLine(Player.currentTime); } catch (_) {}
       return;
     }
   }
@@ -350,13 +437,29 @@ function _updateSyncedLine(currentTime) {
     const el = container.querySelector(`.lrc-line[data-idx="${idx}"]`);
     if (el) {
       el.classList.add('active');
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // ``smooth`` adds a ~300 ms scroll animation per line, which on fast
+      // verses (rap, chiptune) cumulatively makes the visible highlight
+      // trail the audio.  Instant scroll keeps the active verse pinned to
+      // centre without the trailing animation; the ``transition`` on
+      // ``.lrc-line.active`` still gives the colour fade (REG-3).
+      el.scrollIntoView({ block: 'center', behavior: 'auto' });
     }
   }
 }
 
 Player.on('timeupdate', ({ current }) => {
   if (isOpen()) _updateSyncedLine(current);
+});
+
+// Re-sync the active lyric line the instant a seek lands, instead of
+// waiting for the next ``timeupdate`` tick (~250 ms).  Fixes the
+// perception that lyrics drift after scrubbing the seek bar (REG-3).
+Player.on('seeked', ({ current }) => {
+  if (isOpen()) {
+    // Force-refresh the highlight by invalidating the cached line index.
+    _activeLine = -1;
+    _updateSyncedLine(current);
+  }
 });
 
 // ── Navigation ────────────────────────────────────────────────────────────────
@@ -371,14 +474,79 @@ btnPrev.addEventListener('click', () => _go(-1));
 btnNext.addEventListener('click', () => _go(+1));
 
 // ── Open / close ──────────────────────────────────────────────────────────────
+// trapFocus release callback held across open/close so close() can let go.
+let _focusTrapRelease = null;
+
 function open(queue, idx) {
-  _queue = Array.isArray(queue) ? queue : [queue];
+  // ``queue`` can be:
+  //   1. A plain Array (small-library views, group views, Player.queue)
+  //   2. A WindowedTrackStore Proxy (the All Tracks view above 5,000
+  //      tracks).  The proxy implements ``.length`` and numeric indexing
+  //      so it walks like an array — but ``Array.isArray`` returns false
+  //      on it, so the old code wrapped it as ``[proxy]`` and tried to
+  //      render the proxy itself as a track, which produced an info
+  //      panel with "Track 1 of 1 · —" and every field empty.
+  //   3. A single track object (legacy callers; openSingle path)
+  // Accept (1) and (2) as-is; only wrap (3).
+  const isArrayLike =
+    Array.isArray(queue) ||
+    (queue && queue._isWindowedStore);
+  _queue = isArrayLike ? queue : [queue];
   _idx   = Math.max(0, Math.min(_queue.length - 1, idx ?? 0));
+  // Capture the previously-focused element so close() can restore focus
+  // there — keyboard users expect to land back at the row/button they
+  // activated, not on document.body.  Skip null/body to avoid sending
+  // focus to no-op targets.
+  const prev = document.activeElement;
+  _focusReturn = (prev && prev !== document.body) ? prev : null;
   // Always open on Info tab
   _switchTab('info');
   overlay.classList.remove('hidden');
   document.body.classList.add('ti-open');
-  _render(_queue[_idx]);
+
+  // Windowed store: nudge the chunk containing this index in case the
+  // LRU has evicted it.  ``ensureRange`` is async fire-and-forget; the
+  // synchronous render below sees whatever's already cached.  If the
+  // chunk hasn't arrived yet we poll up to ~3 seconds for it to land
+  // and re-render once.  We deliberately don't hook the store's
+  // ``setOnChunkLoad`` because library.js already owns that single slot
+  // (table virtual-scroll repaint).
+  if (_queue._isWindowedStore && typeof _queue.ensureRange === 'function') {
+    try { _queue.ensureRange(_idx, _idx + 1); } catch (_) {}
+  }
+
+  let t = _queue[_idx];
+  _render(t);
+
+  if (!t && _queue._isWindowedStore) {
+    // Poll briefly for the chunk to arrive; bail when it lands or the
+    // panel closes / navigates away.  6 retries × 500ms = 3 s budget,
+    // matches the user's tolerance for "did the click do something?".
+    const capturedIdx = _idx;
+    let tries = 0;
+    const pump = setInterval(() => {
+      tries += 1;
+      if (!isOpen() || _idx !== capturedIdx || tries > 6) {
+        clearInterval(pump);
+        return;
+      }
+      const arrived = _queue[capturedIdx];
+      if (arrived) {
+        clearInterval(pump);
+        _render(arrived);
+      }
+    }, 500);
+  }
+  // Trap focus inside the panel so Tab doesn't escape into the dimmed
+  // app behind (WCAG 2.4.3).  Defer to next tick so the just-revealed
+  // overlay's focusable elements are queryable.
+  try {
+    if (_focusTrapRelease) { _focusTrapRelease(); _focusTrapRelease = null; }
+    requestAnimationFrame(() => {
+      try { _focusTrapRelease = trapFocus(panel || overlay); }
+      catch (_) { _focusTrapRelease = null; }
+    });
+  } catch (_) {}
 }
 
 function openSingle(track) {
@@ -386,8 +554,22 @@ function openSingle(track) {
 }
 
 function close() {
+  // Release the focus trap BEFORE moving focus, otherwise the trap's
+  // refocus-on-blur logic fights the restore.
+  if (_focusTrapRelease) {
+    try { _focusTrapRelease(); } catch (_) {}
+    _focusTrapRelease = null;
+  }
   overlay.classList.add('hidden');
   document.body.classList.remove('ti-open');
+  // Restore focus to the element that opened the panel.  Guarded against
+  // the element being removed from the DOM in the meantime (defensive —
+  // ``focus`` is a no-op on detached nodes but we don't want to throw if
+  // the host is null / undefined).
+  if (_focusReturn && typeof _focusReturn.focus === 'function') {
+    try { _focusReturn.focus(); } catch (_) {}
+  }
+  _focusReturn = null;
 }
 
 function isOpen() { return !overlay.classList.contains('hidden'); }

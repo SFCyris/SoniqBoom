@@ -5,11 +5,23 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Cookie, HTTPException, Query, Response
+
+# Dedicated thread-pool for ``_compute_waveform`` — that helper spawns a
+# 60s-timeout ffmpeg subprocess per call and ties up its worker the whole
+# time.  Letting it share the default executor with AOF flush + art reads
+# led to flush starvation under 5 concurrent users (Perf #1).  Sized
+# small so a flood of waveform requests can't drown the rest of the app.
+_WAVEFORM_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(4, (os.cpu_count() or 4) // 2)),
+    thread_name_prefix="sb-waveform",
+)
 
 from soniqboom.core.data import (
     delete_track, get_track, track_count,
@@ -30,17 +42,59 @@ _lrclib_client: httpx.AsyncClient | None = None
 def _get_lrclib_client() -> httpx.AsyncClient:
     global _lrclib_client
     if _lrclib_client is None:
-        _lrclib_client = httpx.AsyncClient(timeout=8.0)
+        # Cap connection use so a track-change storm (5 users + 3 rooms
+        # all switching together) doesn't open 100 concurrent connections
+        # to LRClib — Perf #1 flagged the missing limits.
+        _lrclib_client = httpx.AsyncClient(
+            timeout=8.0,
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+            ),
+        )
     return _lrclib_client
+
+
+_ALLOWED_SORT_KEYS = {
+    "added", "year", "duration", "bpm",
+    "title", "artist", "album_artist", "album", "format",
+}
 
 
 @router.get("", response_model=list[TrackMeta])
 async def list_tracks(
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
+    sort: str | None = Query(
+        None,
+        description=(
+            "Sort key: added (default, newest first), year, duration, bpm, "
+            "title, artist, album, format."
+        ),
+    ),
+    order: str | None = Query(
+        None,
+        description=(
+            "Sort direction: asc or desc.  Defaults to desc for 'added' and "
+            "asc for every other key."
+        ),
+    ),
 ):
-    """Return all tracks (paginated), sorted by added_at desc."""
-    return await ft_search("*", limit=limit, offset=offset)
+    """Return all tracks (paginated), sorted by added_at desc by default.
+
+    The All Tracks windowed view passes ``sort=<col>&order=<asc|desc>`` to
+    drive the per-column lexical / numeric sort indexes maintained by the
+    in-memory store, so a sort click on a 267K-row library remains O(limit)
+    per page instead of O(N log N) per click.
+    """
+    # Defensive whitelist — silently ignore unknown sort keys so a stale
+    # frontend can't 400 the page; we fall back to the default sort instead.
+    sort_by = sort if sort in _ALLOWED_SORT_KEYS else None
+    sort_order = order if order in ("asc", "desc") else None
+    return await ft_search(
+        "*", limit=limit, offset=offset,
+        sort_by=sort_by, sort_order=sort_order,
+    )
 
 
 @router.get("/count")
@@ -109,6 +163,74 @@ async def get_track_extended(track_id: str):
     return result
 
 
+@router.get("/{track_id}/patterns")
+async def get_patterns(track_id: str):
+    """Return the tracker pattern grid + order list for the file, when
+    the operator has ``pyopenmpt`` installed.  Used by the Now-Playing
+    pattern viewer for tracker modules (E-15).  Returns
+    ``{"available": False}`` for non-tracker files or when the binding
+    isn't available."""
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+    fmt = str(track.format or "").upper()
+    # Cheap reject: skip anything that isn't a known tracker format.
+    if not any(fmt.startswith(prefix) for prefix in (
+        "PROTRACKER", "FASTTRACKER", "SCREAMTRACKER", "IMPULSE",
+        "MULTITRACKER", "OCTAMED", "COMPOSER", "DIGIBOOSTER",
+        "ULTRATRACKER", "FARANDOLE", "OKTALYZER", "AHX", "HIVELY",
+    )):
+        return {"id": track_id, "available": False, "channels": 0,
+                "order": [], "patterns": []}
+    path_str = track.path
+    if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+        from soniqboom.core.filesource import parse_remote_path
+        from soniqboom.core.remote_cache import get_cache
+        scan_root, remote_path = parse_remote_path(path_str)
+        cached = get_cache().get_cached(scan_root, remote_path) if remote_path else None
+        path = cached if cached and cached.exists() else None
+    else:
+        path = Path(path_str)
+    if not path or not path.exists():
+        return {"id": track_id, "available": False, "channels": 0,
+                "order": [], "patterns": []}
+    from soniqboom.core.tracker_patterns import extract_patterns
+    loop = asyncio.get_event_loop()
+    payload = await loop.run_in_executor(None, extract_patterns, path)
+    payload["id"] = track_id
+    return payload
+
+
+@router.get("/{track_id}/chapters")
+async def get_chapters(track_id: str):
+    """Return chapter markers for podcasts / audiobooks / long tracks.
+
+    Reads MP4 ``chpl`` atoms and ID3 ``CHAP`` frames from the file.
+    Empty list if the file has no chapters."""
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+    path_str = track.path
+    if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+        # Remote / WebDAV path — only check the locally cached copy.
+        from soniqboom.core.filesource import parse_remote_path
+        from soniqboom.core.remote_cache import get_cache
+        scan_root, remote_path = parse_remote_path(path_str)
+        if remote_path:
+            cached = get_cache().get_cached(scan_root, remote_path)
+            path = cached if cached and cached.exists() else None
+        else:
+            path = None
+    else:
+        path = Path(path_str)
+    if not path or not path.exists():
+        return {"id": track_id, "chapters": []}
+    from soniqboom.core.chapters import extract_chapters
+    loop = asyncio.get_event_loop()
+    chapters = await loop.run_in_executor(None, extract_chapters, path)
+    return {"id": track_id, "chapters": chapters}
+
+
 @router.get("/{track_id}/lyrics")
 async def get_lyrics(track_id: str):
     """Return lyrics for a track: embedded tags first, LRCLib fallback."""
@@ -121,11 +243,14 @@ async def get_lyrics(track_id: str):
     path_str = track.path
     # For remote tracks, try the locally cached copy
     if path_str.startswith(("smb://", "ftp://")):
+        from soniqboom.core.filesource import parse_remote_path
         from soniqboom.core.remote_cache import get_cache
-        sep = path_str.index(":", 6)
-        scan_root, remote_path = path_str[:sep], path_str[sep + 1:]
-        cached = get_cache().get_cached(scan_root, remote_path)
-        path = cached if cached and cached.exists() else None
+        scan_root, remote_path = parse_remote_path(path_str)
+        if remote_path:
+            cached = get_cache().get_cached(scan_root, remote_path)
+            path = cached if cached and cached.exists() else None
+        else:
+            path = None
     else:
         path = Path(path_str)
         if not path.exists():
@@ -179,8 +304,8 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     import tempfile
     from pathlib import Path as _Path
     from soniqboom.api.stream import (
-        _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS,
-        _render_sid, _render_midi, _render_tracker,
+        _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS,
+        _render_sid, _render_midi, _render_tracker, _render_uade,
     )
     from soniqboom.core.conversion_cache import get_or_render
 
@@ -208,6 +333,12 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             sf = get_active_soundfont()
             fmt, sf_path = "midi", (str(sf) if sf else "")
             render_fn = lambda: _render_midi(path)
+        elif ext in _UADE_EXTS:
+            # AHX / Hively — uade123, distinct cache namespace so an
+            # accidental tracker-render of the same file (if we ever
+            # mis-route) doesn't poison the right output.
+            fmt, sf_path = "uade", None
+            render_fn = lambda: _render_uade(path, subsong=0)
         else:  # tracker
             fmt, sf_path = "tracker", None
             render_fn = lambda: _render_tracker(path, subsong=0)
@@ -222,8 +353,54 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             _zip_tmp.unlink(missing_ok=True)
 
 
+def _normalise_waveform(result):
+    """Normalise ``_compute_waveform`` output to ``(stored, response)``.
+
+    ``_compute_waveform`` returns either a flat list (pure-Python path)
+    or a ``{"peaks", "rms"}`` dict (numpy path).  The store layer only
+    accepts a flat list, so we keep one of the two arrays for storage.
+
+    User observation (2026-05-23) on a high-dynamic-range DSF: storing
+    RMS produced a waveform display where the loud transients dominated
+    visually and quieter passages rendered as 1-pixel bars indistinct
+    from the seek-track background — read as "blocks with gaps".  PEAKS
+    are visually more uniform (less compressed by averaging) and match
+    user expectation of a waveform display.  Store peaks when the numpy
+    path produced them; fall back to the rms array (or the bare list
+    from the pure-Python path) otherwise.  The API response carries the
+    full dict when available so the client can mix the two views.
+    """
+    if isinstance(result, dict):
+        stored = result.get("peaks") or result.get("rms") or []
+        return stored, result
+    return result, result
+
+
+def _waveform_is_blank(stored) -> bool:
+    """Return True if ``stored`` is empty or all-zero.
+
+    Used as the gate before persisting a freshly-computed waveform.
+    ``_compute_waveform`` returns ``[0.0] * points`` when ffmpeg's decode
+    produces no audio bytes — most commonly because the source path
+    couldn't be opened (remote URL ffmpeg doesn't speak, in-flight
+    ``.partial`` not yet promoted to the final cache name, malformed
+    file).  Storing that blank result would lock the waveform endpoint
+    into the cache fast-path forever and the user would never see the
+    real waveform after the transcode finished.  Skipping the store on a
+    blank result lets the next call (e.g. the one app.js fires when
+    ``transcode-ready`` lands) recompute from the now-available cached
+    WAV and store a real waveform.
+    """
+    if not stored:
+        return True
+    try:
+        return all(float(v) == 0.0 for v in stored)
+    except (TypeError, ValueError):
+        return False
+
+
 @router.get("/{track_id}/waveform")
-async def get_track_waveform(track_id: str):
+async def get_track_waveform(track_id: str, response: Response):
     """Return waveform amplitude data, computing on-demand if not cached.
 
     For converted formats (SID, MIDI, tracker modules) the waveform is
@@ -233,11 +410,30 @@ async def get_track_waveform(track_id: str):
     from pathlib import Path as _Path
     from soniqboom.core.data import get_waveform, get_track, store_waveform
     from soniqboom.core.scanner import _compute_waveform
-    from soniqboom.api.stream import _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS
+    from soniqboom.api.stream import _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS
 
-    # Fast path: already cached
+    # ``no-store`` on every response so the browser never serves a stale
+    # body when the frontend re-fetches after ``transcode-ready``.  The
+    # initial fetch on a fresh DSF/SACD track returns the silent-padded
+    # reading taken off the in-flight WAV; the transcode-ready refresh
+    # is supposed to return the real one once the full conversion lands.
+    # Without this header (or the frontend's matching ``cache: no-cache``
+    # on its fetch) Chrome happily caches the first body under the URL
+    # key and reuses it for the refresh — manifests as "the waveform
+    # updates sometimes but not always", because Chrome's disk-cache
+    # eviction is LRU+size-bound so what gets reused varies per session.
+    response.headers["Cache-Control"] = "no-store"
+
+    # Fast path: already cached — but treat a blank (all-zero / empty)
+    # cached entry as a miss so we recompute against a now-available
+    # source.  Tracks that were waveform-computed against an unreachable
+    # source (remote URL ffmpeg couldn't open, in-flight WAV not yet
+    # promoted) wrote zeros into the cache under the pre-fix code; this
+    # makes the next call self-heal instead of forever-serving the
+    # poisoned zeros, no manual ``/api/admin/cache/waveforms`` clear
+    # required.
     waveform = await get_waveform(track_id)
-    if waveform is not None:
+    if waveform is not None and not _waveform_is_blank(waveform):
         return {"waveform": waveform}
 
     track = await get_track(track_id)
@@ -253,11 +449,192 @@ async def get_track_waveform(track_id: str):
     loop = asyncio.get_event_loop()
 
     # ── Converted formats: compute waveform from conversion-cache WAV ────
-    if ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS:
+    if ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS or ext in _UADE_EXTS:
         wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
-        waveform = await loop.run_in_executor(None, _compute_waveform, str(wav_path))
-        await store_waveform(track_id, waveform)
-        return {"waveform": waveform}
+        result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(wav_path))
+        stored, response = _normalise_waveform(result)
+        if not _waveform_is_blank(stored):
+            await store_waveform(track_id, stored)
+        return {"waveform": response}
+
+    # ── Transcoded formats (DSD / ALAC / AIFF / WavPack / Musepack) ──────
+    # These also have a cached FLAC the stream endpoint produces.  Using
+    # that instead of the raw source means ffmpeg decodes a ~10 MB FLAC
+    # instead of a ~60 MB DSD or ~50 MB ALAC, and it shares one render
+    # with the stream path (thundering-herd guard prevents duplicate work).
+    # Perception payoff: the waveform appears within ~1 s of the audio
+    # starting, instead of ~5–10 s in the old code path.
+    from soniqboom.api.stream import _DSD_EXTS, _inflight_cache_key
+    _TRANSCODED_WAVEFORM_EXTS = _DSD_EXTS | {
+        ".m4a", ".aac", ".aiff", ".aif", ".wv", ".mpc",
+    }
+    if ext in _TRANSCODED_WAVEFORM_EXTS:
+        # Prefer the final cached WAV when it exists — fastest path
+        # (file already on disk, no ffmpeg invocation needed beyond the
+        # 8 kHz mono downsample inside _compute_waveform).
+        from soniqboom.core.conversion_cache import get_cached
+        from soniqboom.api.stream import (
+            _DSD_OUTPUT_RATE, _INFLIGHT_TRANSCODES,
+        )
+        import logging
+        _log = logging.getLogger("soniqboom.waveform-dbg")
+        target_rate = _DSD_OUTPUT_RATE if ext in _DSD_EXTS else None
+        cache_key = _inflight_cache_key(track_id, target_rate)
+        cached_path = await get_cached(cache_key)
+        _log.debug("waveform %s ext=%s cache=%s",
+                  track_id[:8], ext,
+                  "HIT" if cached_path else "MISS")
+
+        # Cache MISS recovery.  Two sub-cases:
+        #
+        # 1. An in-flight pump is ALREADY rendering this track — await it.
+        # 2. No pump yet — wait briefly for one to appear, then await it.
+        #
+        # Sub-case 2 was the killer the diagnostic logs exposed: the
+        # frontend's ``trackchange`` listener fires _fetchWaveform BEFORE
+        # the audio element issues its first range GET, so /waveform
+        # arrives at the backend a tiny moment ahead of /stream — and
+        # /stream is what triggers ``_get_or_start_inflight_wav`` to
+        # create the pump.  Without the appear-wait below, our
+        # ``_INFLIGHT_TRANSCODES.get(track_id)`` reads ``None``, we skip
+        # the await, fall through to ``_compute_waveform(ftp://...)``,
+        # ffmpeg can't decode that pseudo-URL, returns zeros, user sees
+        # blank.  Polling for the inflight to appear (cheap dict lookup
+        # every 100 ms for up to 2 s) gives the streaming side a chance
+        # to spawn the pump first; once it's there we join it.
+        if cached_path is None:
+            # Wait window for one of three exit conditions:
+            #   (a) ``get_cached(cache_key)`` flips HIT — some other
+            #       concurrent request finished the pump before we did.
+            #   (b) ``_INFLIGHT_TRANSCODES[track_id]`` appears — the
+            #       streaming-side audio request landed and spawned the
+            #       pump; we'll join it.
+            #   (c) Wait ceiling exceeded — fall through to blank.
+            #
+            # 8 s ceiling: prior 2 s missed the cases where the browser
+            # delayed its first audio range GET (HTTP/2 prioritisation,
+            # connection pool exhaustion under rapid track-skip, etc.).
+            # The audio request usually arrives within 50-500 ms, but
+            # observed worst case in the diagnostic was ~2.5 s — 8 s
+            # gives a comfortable margin without hanging on the genuinely-
+            # not-played case for too long.  Re-checks BOTH the cache
+            # (covers a concurrent fetch that finished while we slept)
+            # and the inflight registry every 100 ms so we exit as soon
+            # as either condition is met.
+            _log.debug("waveform %s waiting (cache+inflight)...",
+                      track_id[:8])
+            inflight = None
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + 8.0
+            while loop.time() < deadline:
+                cached_path = await get_cached(cache_key)
+                if cached_path is not None:
+                    _log.debug("waveform %s cache flipped to HIT during wait",
+                              track_id[:8])
+                    break
+                inflight = _INFLIGHT_TRANSCODES.get(track_id)
+                if inflight is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+            if cached_path is None:
+                # The inflight dict is inserted into _INFLIGHT_TRANSCODES
+                # BEFORE its ``pump_task`` key is populated — stream.py
+                # holds _INFLIGHT_LOCK only long enough to claim the slot,
+                # then drops it for the slow ffprobe + WAV header pre-write
+                # (200-500 ms), THEN re-acquires the lock to add
+                # ``pump_task`` + ``wav_path`` + the events.  If we look
+                # up ``pump_task`` during that window we get ``None`` and
+                # silently fall through to blank.  Wait for
+                # ``setup_ready`` to fire (the same coordination event
+                # other inflight subscribers use, ``stream.py:1245``) so
+                # we read the dict only after it's fully populated.
+                if inflight is not None:
+                    setup_ready = inflight.get("setup_ready")
+                    if setup_ready is not None and not setup_ready.is_set():
+                        _log.debug("waveform %s awaiting inflight setup...",
+                                  track_id[:8])
+                        try:
+                            await asyncio.wait_for(
+                                setup_ready.wait(), timeout=10.0,
+                            )
+                        except asyncio.TimeoutError:
+                            _log.debug(
+                                "waveform %s setup_ready timed out",
+                                track_id[:8],
+                            )
+                        # Re-read in case the inflight was replaced.
+                        inflight = (
+                            _INFLIGHT_TRANSCODES.get(track_id) or inflight
+                        )
+
+                pump_task = inflight.get("pump_task") if inflight else None
+                if pump_task is not None and not pump_task.done():
+                    try:
+                        # 120 s ceiling — enough for any reasonable
+                        # DSD/ALAC pass, short enough that a wedged pump
+                        # fails the request rather than hanging the
+                        # worker forever.
+                        _log.debug("waveform %s awaiting inflight pump...",
+                                  track_id[:8])
+                        await asyncio.wait_for(pump_task, timeout=120.0)
+                        _log.debug("waveform %s pump finished", track_id[:8])
+                    except asyncio.TimeoutError:
+                        _log.debug("waveform %s pump timed out after 120s",
+                                     track_id[:8])
+                    except Exception as exc:
+                        _log.debug("waveform %s pump errored: %s: %s",
+                                  track_id[:8], type(exc).__name__, exc)
+                elif inflight is None:
+                    _log.debug("waveform %s no inflight after 8s wait",
+                              track_id[:8])
+                else:
+                    # inflight exists but pump_task still missing or
+                    # already done — log so we can spot it.
+                    _log.debug(
+                        "waveform %s inflight present but no live pump "
+                        "(keys=%s, done=%s)",
+                        track_id[:8],
+                        sorted(inflight.keys()),
+                        pump_task.done() if pump_task else "N/A",
+                    )
+
+                # Final cache re-check — covers both the post-pump path
+                # and the race where the pump completed between our last
+                # in-loop check and the pump_task await.
+                cached_path = await get_cached(cache_key)
+                _log.debug("waveform %s post-wait cache=%s",
+                          track_id[:8],
+                          "HIT" if cached_path else "STILL MISS")
+        # ``_compute_waveform`` runs its own ``ffmpeg -ac 1 -ar 8000 -f f32le``
+        # which handles every source format ffmpeg can demux — DSD via the
+        # built-in dsf / iff (DFF) / wsd demuxers, ALAC inside .m4a, AIFF,
+        # WavPack, Musepack.  Going straight to source means the waveform
+        # appears in ~3 s on a typical 5-min DSD instead of waiting the full
+        # transcode (~30–50 s) — the single biggest perception polish
+        # remaining after the cold-start fix.
+        src_for_waveform = str(cached_path) if cached_path else path_str
+        result = await loop.run_in_executor(
+            _WAVEFORM_POOL, _compute_waveform, src_for_waveform,
+        )
+        stored, response = _normalise_waveform(result)
+        # Cache-poisoning guard: when ``cached_path`` is None (the
+        # in-flight pump hasn't promoted .partial yet) and ``path_str``
+        # is a remote URL ffmpeg can't read directly (e.g. our internal
+        # ``ftp://host/scan:/relative`` form), ``_compute_waveform``
+        # returns all-zeros — storing that locks the fast-path forever.
+        # Pump-completion reordering (api/stream.py) now closes the race
+        # on the happy path; this guard is the belt-and-braces fallback.
+        blank = _waveform_is_blank(stored)
+        if not blank:
+            await store_waveform(track_id, stored)
+        _log.debug(
+            "waveform %s computed: len=%d shape=%s first5=%s blank=%s",
+            track_id[:8], len(stored) if stored else 0,
+            type(response).__name__,
+            (stored[:5] if stored else []), blank,
+        )
+        return {"waveform": response}
 
     # ── Non-converted ZIP files: skip (ffmpeg can't read ZIP directly) ───
     if '::' in path_str:
@@ -265,10 +642,11 @@ async def get_track_waveform(track_id: str):
 
     # ── Remote files: compute from cached local copy ─────────────────────
     if path_str.startswith(("smb://", "ftp://")):
-        from soniqboom.core.filesource import get_source
+        from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
-        sep = path_str.index(":", 6)
-        scan_root, remote_path = path_str[:sep], path_str[sep + 1:]
+        scan_root, remote_path = parse_remote_path(path_str)
+        if not remote_path:
+            raise HTTPException(400, "Remote path is malformed")
         source = get_source(scan_root)
         if source is None:
             raise HTTPException(503, "Network share unavailable")
@@ -276,14 +654,18 @@ async def get_track_waveform(track_id: str):
             local_path = get_cache().fetch(scan_root, remote_path, source)
         except Exception as exc:
             raise HTTPException(502, f"Could not fetch remote file: {exc}")
-        waveform = await loop.run_in_executor(None, _compute_waveform, str(local_path))
-        await store_waveform(track_id, waveform)
-        return {"waveform": waveform}
+        result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(local_path))
+        stored, response = _normalise_waveform(result)
+        if not _waveform_is_blank(stored):
+            await store_waveform(track_id, stored)
+        return {"waveform": response}
 
     # ── Standard local files: compute directly from source ───────────────
-    waveform = await loop.run_in_executor(None, _compute_waveform, track.path)
-    await store_waveform(track_id, waveform)
-    return {"waveform": waveform}
+    result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, track.path)
+    stored, response = _normalise_waveform(result)
+    if not _waveform_is_blank(stored):
+        await store_waveform(track_id, stored)
+    return {"waveform": response}
 
 
 # ── Ratings ──────────────────────────────────────────────────────────────────
@@ -309,10 +691,12 @@ async def read_rating(track_id: str):
 # ── Play stats (per-track endpoints) ─────────────────────────────────────────
 
 @router.post("/{track_id}/played")
-async def mark_played(track_id: str):
+async def mark_played(track_id: str, sb_session: str | None = Cookie(default=None)):
     """Record a play event for the track (increments count, sets last_played).
 
-    Also pushes the event to the listening history log (smart.py).
+    Also pushes the event to the listening history log (smart.py) and
+    forwards the play to last.fm / ListenBrainz if the signed-in user
+    has scrobble tokens configured.
     """
     track = await get_track(track_id)
     if not track:
@@ -325,6 +709,21 @@ async def mark_played(track_id: str):
         await push_history(track_id, title=track.title or "", artist=track.artist or "")
     except Exception:
         pass  # history is best-effort, don't fail the play recording
+
+    # External scrobble (last.fm / ListenBrainz) for the signed-in user —
+    # queued + retried on network failure inside core.scrobble.
+    try:
+        from soniqboom.core.scrobble import submit_play
+        from soniqboom.core.store import get_store
+        from soniqboom.core.users import get_user_store
+        store = get_store()
+        full_track = store.get_track(track_id)
+        if full_track and sb_session:
+            user = get_user_store().lookup_session(sb_session)
+            if user:
+                await submit_play(user, full_track)
+    except Exception:
+        pass
 
     return {"id": track_id, **stats}
 

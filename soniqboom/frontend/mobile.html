@@ -5,7 +5,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="SoniqBoom">
@@ -25,6 +25,16 @@
     <!-- ── Top bar (per-view title) ─────────────────────────────────────── -->
     <header id="m-topbar">
       <span id="m-topbar-title">Library</span>
+      <!-- Escape hatch: the auto-redirect at / pins ``sb_ui=mobile`` so a
+           phone that landed here once stays here.  This link lets the
+           user opt back into the desktop UI (useful on iPads forced to
+           mobile by a quirky UA, or for testing). -->
+      <a id="m-desktop-link"
+         href="/?ui=desktop"
+         class="m-desktop-link"
+         title="Switch to desktop site">
+        Desktop site
+      </a>
     </header>
 
     <!-- ── Main content area: the active view is rendered here ──────────── -->
@@ -38,14 +48,73 @@
 
     <!-- ── Mini player (above tab bar) ──────────────────────────────────── -->
     <div id="m-miniplayer" class="m-miniplayer hidden" role="button" aria-label="Open Now Playing">
-      <div id="m-mp-art" class="m-mp-art"><span class="m-mp-art-ph">🔊</span></div>
+      <div id="m-mp-art" class="m-mp-art"><span class="m-mp-art-ph"></span></div>
       <div class="m-mp-meta">
         <div id="m-mp-title" class="m-mp-title">—</div>
         <div id="m-mp-artist" class="m-mp-artist"></div>
       </div>
       <button id="m-mp-play" class="m-mp-play" aria-label="Play/Pause">▶</button>
       <button id="m-mp-next" class="m-mp-next" aria-label="Next">⏭</button>
+      <!-- UX-3 P0: mobile shell now has a cast affordance.  The button
+           opens the same picker overlay the desktop shell uses (#btn-cast
+           is a synonym so cast_picker.js wires both transparently).
+           Hidden on viewports the picker doesn't fit gracefully (the
+           bottom-sheet pattern handles ≤600 px). -->
+      <button id="btn-cast" class="m-mp-cast" aria-label="Cast to device" aria-haspopup="dialog" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
+          <line x1="2" y1="20" x2="2.01" y2="20"/>
+        </svg>
+      </button>
       <div id="m-mp-progress" class="m-mp-progress"><div id="m-mp-progress-fill"></div></div>
+    </div>
+
+    <!-- Cast picker overlay — same markup the desktop shell exposes,
+         so cast_picker.js can run unchanged on the mobile route.
+         All ids match the picker's _ensureRefs lookups. -->
+    <div id="cast-overlay" class="hidden" role="dialog"
+         aria-labelledby="cast-title" aria-modal="true">
+      <div id="cast-panel">
+        <div class="cast-header">
+          <h3 id="cast-title">Cast to device</h3>
+          <button id="cast-refresh" class="cast-icon-btn" aria-label="Refresh device list">&#8635;</button>
+          <button id="cast-close" class="cast-icon-btn" aria-label="Close cast picker">&times;</button>
+        </div>
+        <div id="cast-active" class="cast-active hidden" aria-live="polite">
+          <div class="cast-active-row">
+            <div class="cast-active-info">
+              <div class="cast-active-label">Casting to</div>
+              <div class="cast-active-name" id="cast-active-name">—</div>
+            </div>
+            <button id="cast-stop" class="cast-stop-btn" aria-label="Stop casting">Stop casting</button>
+          </div>
+        </div>
+        <div id="cast-loading" class="cast-state hidden" aria-live="polite">
+          <div class="cast-spinner" aria-hidden="true"></div>
+          <div class="cast-state-text">Searching for devices…</div>
+        </div>
+        <div id="cast-empty" class="cast-state hidden">
+          <div class="cast-state-icon" aria-hidden="true">&#128268;</div>
+          <div class="cast-state-text">No cast devices found.</div>
+          <div class="cast-state-hint" id="cast-empty-hint">Devices must be on the same Wi-Fi.</div>
+          <button type="button" id="cast-empty-retry" class="cast-error-btn">Search again</button>
+        </div>
+        <div id="cast-error" class="cast-state hidden">
+          <div class="cast-state-icon" aria-hidden="true">&#9888;</div>
+          <div class="cast-state-text" id="cast-error-text">Couldn't reach the cast service.</div>
+          <div class="cast-state-hint" id="cast-error-hint"></div>
+        </div>
+        <ul id="cast-list" class="cast-list" role="list"></ul>
+        <details id="cast-pref-disclosure" class="cast-pref">
+          <summary>Audio quality</summary>
+          <div class="cast-pref-options" role="radiogroup" aria-label="Audio quality preference">
+            <label><input type="radio" name="cast-pref" value="auto" checked>
+              <span>Auto</span><span class="cast-pref-hint">Lossless when supported</span></label>
+            <label><input type="radio" name="cast-pref" value="force-mp3">
+              <span>MP3 320</span><span class="cast-pref-hint">Universal compatibility</span></label>
+          </div>
+        </details>
+      </div>
     </div>
 
     <!-- ── Bottom tab bar ───────────────────────────────────────────────── -->
@@ -87,6 +156,9 @@
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
 
-  <script type="module" src="/assets/js/mobile/app.js?v=1"></script>
+  <script type="module" src="/assets/js/mobile/app.js?v=2"></script>
+  <!-- Same cast picker the desktop shell loads.  Picker is a classic
+       script that wires itself to #btn-cast on either route. -->
+  <script src="/assets/js/cast_picker.js?v=2" defer></script>
 </body>
 </html>

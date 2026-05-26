@@ -82,13 +82,29 @@ function newClientId() {
   return `c-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
 }
 
+// Persist the clientId across reloads so reconnects rejoin under the
+// same identity — without this, every F5 leaks a ghost slave into the
+// room (Perf #2 flagged this for the 3-room load).
+function persistentClientId() {
+  try {
+    let id = localStorage.getItem('sb_mr_client_id');
+    if (!id) {
+      id = newClientId();
+      localStorage.setItem('sb_mr_client_id', id);
+    }
+    return id;
+  } catch {
+    return newClientId();
+  }
+}
+
 function nowMs() { return Date.now(); }
 
 class SyncEngine extends EventTarget {
   constructor() {
     super();
     this.role        = null;            // 'master' | 'slave'
-    this.clientId    = newClientId();
+    this.clientId    = persistentClientId();
     this.roomId      = null;
     this.roomName    = null;
     this.label       = 'Device';
@@ -400,9 +416,17 @@ class SyncEngine extends EventTarget {
       serverEpochMs:   startServerEpoch,
       positionAtStart: seek,
     });
-    // Schedule our own audio.play() on the same wall clock
+    // Schedule our own audio.play() on the same wall clock.  Clear any
+    // previous scheduled start so a rapid track-skip can't fire two
+    // ``audio.play()`` calls against the new src in succession (Perf #2
+    // caught the race after barrier cancellation).
+    if (this._scheduledPlayTimer) {
+      clearTimeout(this._scheduledPlayTimer);
+      this._scheduledPlayTimer = null;
+    }
     const delay = startServerEpoch - Date.now();
-    setTimeout(() => {
+    this._scheduledPlayTimer = setTimeout(() => {
+      this._scheduledPlayTimer = null;
       Player.audio.play().catch(() => {});
       this._emitStateUpdate();
     }, Math.max(0, delay));
@@ -476,6 +500,14 @@ class SyncEngine extends EventTarget {
     clearTimeout(pending.timeoutId);
     this._pendingBarrier = null;
     pending.resolve('cancelled');
+    // Also drop any already-scheduled audio.play() — see masterPlayTrack
+    // above.  Without this a skip mid-barrier can leave the previous
+    // timer queued and fire play() against the new track right after we
+    // schedule the *new* play.
+    if (this._scheduledPlayTimer) {
+      clearTimeout(this._scheduledPlayTimer);
+      this._scheduledPlayTimer = null;
+    }
   }
 
   masterSeek(pct) {

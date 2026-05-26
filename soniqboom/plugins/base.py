@@ -108,15 +108,43 @@ class PluginRegistry:
 registry = PluginRegistry()
 
 
-def load_entry_point_plugins() -> None:
-    """Auto-discover plugins via Python package entry points."""
+def load_entry_point_plugins(config: dict | None = None) -> None:
+    """Auto-discover plugins via Python package entry points.
+
+    Each plugin is isolated: a single bad ``ep.load()`` or constructor used
+    to abort the iteration via an uncaught exception (the loop body wrapped
+    everything in one try, but anything during ``entry_points()`` iteration
+    itself still escaped).  Wrap each step so one broken plugin can't take
+    down the rest.
+
+    Calls ``instance.setup(plugin_config)`` after construction so plugins
+    that document a ``setup`` hook actually receive configuration — the
+    previous loader instantiated but never set anything up.
+    """
     try:
-        eps = importlib.metadata.entry_points(group="soniqboom_plugin")
-    except Exception:
+        eps = list(importlib.metadata.entry_points(group="soniqboom_plugin"))
+    except Exception as exc:
+        log.warning("entry_points lookup failed: %s", exc)
         return
     for ep in eps:
         try:
             cls = ep.load()
-            registry.register(cls())
         except Exception as exc:
-            log.warning("Failed to load plugin %s: %s", ep.name, exc)
+            log.warning("Failed to import plugin entry point %s: %s", ep.name, exc)
+            continue
+        try:
+            instance = cls()
+        except Exception as exc:
+            log.warning("Plugin %s __init__ failed: %s", ep.name, exc)
+            continue
+        try:
+            plugin_config = (config or {}).get(getattr(instance, "name", ep.name), {})
+            if hasattr(instance, "setup"):
+                instance.setup(plugin_config)
+        except Exception as exc:
+            log.warning("Plugin %s setup() failed: %s", ep.name, exc)
+            continue
+        try:
+            registry.register(instance)
+        except Exception as exc:
+            log.warning("Plugin %s register failed: %s", ep.name, exc)

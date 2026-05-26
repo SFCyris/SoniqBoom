@@ -13,6 +13,7 @@ Runs as a daemon subprocess.  Periodically:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -48,6 +49,14 @@ def _apply_entry(state: dict, entry: dict) -> None:
         t = state.get("tracks", {}).get(entry["id"])
         if t:
             t.update(entry.get("data", {}))
+
+    elif op == "update_track_fields_batch":
+        tracks = state.get("tracks", {})
+        for rec in entry.get("data", []):
+            tid = rec.get("id")
+            t = tracks.get(tid)
+            if t and isinstance(rec.get("data"), dict):
+                t.update(rec["data"])
 
     elif op == "set_rating":
         ratings = state.setdefault("ratings", {})
@@ -111,12 +120,21 @@ def _do_merge(data_dir: Path) -> int:
     if not aof_path.exists() or aof_path.stat().st_size == 0:
         return 0
 
-    with open(aof_path, "r") as f:
-        lines = f.readlines()
+    # Read under flock so the writer (AOFWriter._write_sync) can't append
+    # between our read and the later shift+truncate.  We record the exact
+    # byte length we consumed; any bytes the writer appends *after* we
+    # release the lock will be preserved verbatim during the truncate step.
+    with open(aof_path, "rb+") as aof_f:
+        fcntl.flock(aof_f.fileno(), fcntl.LOCK_EX)
+        try:
+            initial_data = aof_f.read()
+        finally:
+            fcntl.flock(aof_f.fileno(), fcntl.LOCK_UN)
+    size_consumed = len(initial_data)
 
     entries = []
-    for line in lines:
-        line = line.strip()
+    for raw_line in initial_data.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -213,8 +231,30 @@ def _do_merge(data_dir: Path) -> int:
         log.error("Merger: temp file vanished before replace — skipping this cycle")
         return 0
 
-    with open(aof_path, "w") as f:
-        f.truncate(0)
+    # Remove only the prefix we consumed.  Anything the writer appended after
+    # our initial read is shifted to the front of the file so it's processed
+    # in the next merge cycle rather than lost.  fsync after truncate so a
+    # power loss between the snapshot rotation above and this point can't
+    # replay already-merged ``record_play`` / ``push_history`` entries.
+    with open(aof_path, "rb+") as aof_f:
+        fcntl.flock(aof_f.fileno(), fcntl.LOCK_EX)
+        try:
+            current_size = os.fstat(aof_f.fileno()).st_size
+            if current_size > size_consumed:
+                aof_f.seek(size_consumed)
+                tail = aof_f.read()
+                aof_f.seek(0)
+                aof_f.write(tail)
+                aof_f.truncate()
+            else:
+                aof_f.truncate(0)
+            aof_f.flush()
+            try:
+                os.fsync(aof_f.fileno())
+            except OSError:
+                pass
+        finally:
+            fcntl.flock(aof_f.fileno(), fcntl.LOCK_UN)
 
     return len(entries)
 
@@ -223,24 +263,37 @@ def merger_loop(data_dir_str: str, interval: int = 120) -> None:
     """Main loop for the background merger process.
 
     Designed to be the target of ``multiprocessing.Process``.
+
+    Uses a ``threading.Event`` for the wait between merges so SIGTERM /
+    SIGINT / SIGHUP can wake us immediately — ``time.sleep()`` is NOT
+    interrupted by signals on Python 3.5+ (PEP 475: EINTR is auto-retried
+    transparently).  The previous implementation sat in ``time.sleep(120)``
+    ignoring SIGTERM, so the parent's ``join(timeout=3)`` would always
+    time out and we'd be SIGKILL'd a few seconds later — the final merge
+    promised in the comment below never ran.
     """
+    import threading as _threading
+
     data_dir = Path(data_dir_str)
     logging.basicConfig(level=logging.INFO, format="%(name)s %(message)s")
 
-    running = True
+    stop_event = _threading.Event()
 
     def _handle_signal(signum, frame):
-        nonlocal running
-        running = False
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+    # macOS terminal-close sends SIGHUP — previously this killed the merger
+    # without the final merge running, which left the AOF un-applied.
+    signal.signal(signal.SIGHUP, _handle_signal)
 
     log.info("Merger started (dir=%s, interval=%ds)", data_dir, interval)
 
-    while running:
-        time.sleep(interval)
-        if not running:
+    while not stop_event.is_set():
+        # ``Event.wait`` returns True the moment the signal handler sets
+        # the flag; otherwise it returns False after ``interval`` seconds.
+        if stop_event.wait(interval):
             break
         try:
             n = _do_merge(data_dir)
@@ -259,10 +312,94 @@ def merger_loop(data_dir_str: str, interval: int = 120) -> None:
     log.info("Merger stopped")
 
 
+def _is_bundled() -> bool:
+    """True when running inside the Nuitka-built .app bundle.
+
+    ``spawn`` / ``forkserver`` both bootstrap a fresh interpreter from the
+    sys.executable — in the bundle that re-execs the compiled .app entry
+    point and breaks merging.  ``fork`` from a uvicorn-multithreaded parent
+    can deadlock on inherited locks.  In the bundle we sidestep
+    multiprocessing entirely (see ``start_merger_async`` below).
+    """
+    import sys
+    return (
+        getattr(sys, "frozen", False)
+        or "__compiled__" in globals()
+        or "Contents/MacOS" in (sys.executable or "")
+    )
+
+
+async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None):
+    """Run the merger inside the parent process as an asyncio task.
+
+    Used in the bundled (Nuitka) deployment where neither ``spawn`` nor
+    ``forkserver`` is safe: spawn re-execs the binary, fork-from-uvicorn
+    can deadlock.  The merge work itself is dispatched via
+    ``asyncio.to_thread`` so the event loop stays responsive.
+    """
+    import asyncio as _aio
+    log.info("Merger (async) started (dir=%s, interval=%ds)", data_dir, interval)
+
+    async def _sleep_or_stop(secs: float) -> bool:
+        if stop_event is None:
+            await _aio.sleep(secs)
+            return False
+        try:
+            await _aio.wait_for(stop_event.wait(), timeout=secs)
+            return True  # stop requested
+        except _aio.TimeoutError:
+            return False
+
+    try:
+        while True:
+            if await _sleep_or_stop(interval):
+                break
+            try:
+                n = await _aio.to_thread(_do_merge, data_dir)
+                if n:
+                    log.info("Merger (async): applied %d AOF entries", n)
+            except Exception:
+                log.exception("Merger (async) error")
+    finally:
+        # Final merge on shutdown so we don't leave AOF entries unmerged.
+        try:
+            n = await _aio.to_thread(_do_merge, data_dir)
+            if n:
+                log.info("Merger (async) final: applied %d AOF entries", n)
+        except Exception:
+            log.exception("Merger (async) final merge error")
+        log.info("Merger (async) stopped")
+
+
 def start_merger(data_dir: Path, interval: int = 120):
-    """Spawn the background merger as a daemon process."""
+    """Spawn the background merger.
+
+    Returns either a ``multiprocessing.Process`` (non-bundled) or an
+    ``asyncio.Task`` (bundled).  Callers should rely on
+    ``stop_merger(handle)`` / inspecting ``.is_alive()`` rather than
+    type-checking.
+    """
+    if _is_bundled():
+        import asyncio as _aio
+        stop_event = _aio.Event()
+        task = _aio.create_task(
+            merger_loop_async(data_dir, interval, stop_event),
+            name="soniqboom-merger",
+        )
+        task._sb_stop_event = stop_event  # type: ignore[attr-defined]
+        log.info("Merger started as asyncio task (bundled mode)")
+        return task
+
     import multiprocessing
-    proc = multiprocessing.Process(
+    # macOS Python 3.8+ defaults to ``spawn`` — outside the bundle that's
+    # safe, but ``forkserver`` is the gold standard for safety from a
+    # multithreaded uvicorn parent (the helper itself is single-threaded
+    # so its fork is safe).  Fall back to default if neither works.
+    try:
+        ctx = multiprocessing.get_context("forkserver")
+    except (ValueError, RuntimeError):
+        ctx = multiprocessing
+    proc = ctx.Process(
         target=merger_loop,
         args=(str(data_dir), interval),
         daemon=True,
@@ -271,3 +408,32 @@ def start_merger(data_dir: Path, interval: int = 120):
     proc.start()
     log.info("Merger process started (pid=%d)", proc.pid)
     return proc
+
+
+async def stop_merger(handle) -> None:
+    """Stop a merger handle returned by ``start_merger`` cooperatively."""
+    import asyncio as _aio
+
+    if handle is None:
+        return
+    # asyncio.Task path
+    if isinstance(handle, _aio.Task):
+        stop_event = getattr(handle, "_sb_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        try:
+            await _aio.wait_for(handle, timeout=10)
+        except _aio.TimeoutError:
+            handle.cancel()
+        except Exception:
+            log.exception("Async merger shutdown error")
+        return
+    # multiprocessing.Process path — preserve legacy behaviour
+    try:
+        handle.terminate()
+        handle.join(timeout=5)
+        if handle.is_alive():
+            handle.kill()
+            handle.join(timeout=2)
+    except Exception:
+        log.exception("Merger process shutdown error")

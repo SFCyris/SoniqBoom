@@ -29,7 +29,21 @@ def encrypt(plaintext: str) -> str:
 
 
 def decrypt(ciphertext: str) -> str | None:
+    if not ciphertext:
+        return None
     try:
         return Fernet(_derive_key()).decrypt(ciphertext.encode()).decode()
-    except (InvalidToken, Exception):
+    except InvalidToken:
+        # The machine-derived key didn't authenticate this ciphertext —
+        # most often means the user's machine identity (or hostname) has
+        # changed since the share was saved.  Surface it so the operator
+        # knows to re-enter the password instead of seeing "share fails"
+        # with no clue why.
+        import logging
+        logging.getLogger(__name__).warning(
+            "credentials: stored password could not be decrypted "
+            "(machine key mismatch?); the share will need its password re-entered",
+        )
+        return None
+    except Exception:
         return None

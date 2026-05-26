@@ -5,16 +5,93 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="SoniqBoom">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="format-detection" content="telephone=no">
   <title>SoniqBoom</title>
-  <link rel="stylesheet" href="/assets/css/app.css?v=45">
+  <link rel="manifest" href="/assets/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/icons/apple-touch-icon-180.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
+  <!-- Reusable password dialog (styled replacement for prompt())  -->
+  <div id="password-dialog" class="hidden" role="dialog" aria-modal="true" aria-labelledby="password-dialog-title">
+    <div class="password-dialog-card">
+      <h3 id="password-dialog-title">Set password</h3>
+      <p id="password-dialog-message" class="password-dialog-message"></p>
+      <form id="password-dialog-form" autocomplete="off">
+        <label class="password-dialog-field" id="password-dialog-current-wrap">
+          <span>Current password</span>
+          <input id="password-dialog-current" type="password" autocomplete="current-password">
+        </label>
+        <label class="password-dialog-field">
+          <span>New password <em>(≥ 8 chars)</em></span>
+          <input id="password-dialog-new" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <label class="password-dialog-field">
+          <span>Confirm new password</span>
+          <input id="password-dialog-confirm" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <div id="password-dialog-error" class="password-dialog-error" hidden></div>
+        <div class="password-dialog-actions">
+          <button type="button" id="password-dialog-cancel" class="btn-secondary">Cancel</button>
+          <button type="submit" id="password-dialog-ok">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Apply saved theme BEFORE the stylesheet paints so users on Light
+       Mode macOS don't see a white flash before flipping to dark. -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('sb_theme');
+        if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      } catch (_) { /* private mode — fall back to default dark */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="/assets/css/app.css?v=60">
+
+  <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
+       these alongside the HTML/CSS so they're already in cache by the
+       time app.js imports them.  Don't preload everything — only the 4-5
+       modules every page boot will hit synchronously. -->
+  <link rel="modulepreload" href="/assets/js/player.js"  fetchpriority="high">
+  <link rel="modulepreload" href="/assets/js/library.js" fetchpriority="high">
+  <link rel="modulepreload" href="/assets/js/utils.js"   fetchpriority="high">
+  <link rel="modulepreload" href="/assets/js/queue.js"   fetchpriority="high">
 </head>
 <body>
+  <noscript>
+    <div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0d0f12;color:#e8eaed;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:24px;text-align:center;z-index:99999">
+      <div style="max-width:480px">
+        <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#f0722a">SoniqBoom needs JavaScript</h1>
+        <p style="font-size:13px;line-height:1.5;color:#b5bccb">The desktop UI is a single-page app — enable JavaScript and reload, or visit <a href="/m" style="color:#6bc8f0">/m</a> for the lighter mobile shell.</p>
+      </div>
+    </div>
+  </noscript>
+  <a class="skip-to-main" href="#content">Skip to main content</a>
   <div id="app">
 
     <!-- ── Header ──────────────────────────────────────────────────────── -->
     <header id="header">
       <div id="header-glow"></div>
+      <!-- Hamburger toggle for the off-canvas sidebar drawer (visible
+           below 900px viewports; hidden at desktop width via CSS). -->
+      <button id="sidebar-toggle" type="button"
+              aria-label="Toggle sidebar" aria-expanded="false"
+              aria-controls="sidebar">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <line x1="3" y1="6"  x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
       <div class="logo">
         <span class="logo-icon" aria-hidden="true">
           <span class="logo-icon-glow">🔊</span><span class="logo-icon-top">🔊</span>
@@ -25,12 +102,24 @@
         </div>
       </div>
       <div class="search-wrap">
-        <input id="search-input" type="search" placeholder="Search library…" autocomplete="off">
-        <span id="search-clear" class="search-clear" hidden>&times;</span>
+        <input id="search-input" type="search"
+               placeholder="Search… try  artist:Ghost  year:&gt;2020  format:FLAC"
+               title='Field search: artist: album: album_artist: genre: format: year:>2020 (or <2020, or 2010-2020).  Quote values with spaces.'
+               aria-label="Search library — supports artist:, album:, year:, format: filters"
+               autocomplete="off">
+        <button id="search-clear" type="button" class="search-clear" hidden
+                aria-label="Clear search">&times;</button>
       </div>
       <div class="header-actions">
         <span id="scan-badge" class="scan-badge" hidden></span>
-        <button id="btn-admin" title="Admin settings">&#9881;</button>
+        <span id="user-chip" class="user-chip" hidden>
+          <span aria-hidden="true">&#128100;</span>
+          <span class="user-chip-name" id="user-chip-name">—</span>
+          <button type="button" id="user-chip-logout"
+                  title="Sign out" aria-label="Sign out"
+                  style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:13px;padding:0 0 0 4px">⎋</button>
+        </span>
+        <button id="btn-admin" title="Admin settings" aria-label="Admin settings">&#9881;</button>
       </div>
     </header>
 
@@ -38,18 +127,18 @@
     <div id="main-layout">
 
       <!-- ── Sidebar ───────────────────────────────────────────────────── -->
-      <nav id="sidebar">
+      <nav id="sidebar" aria-label="Library and playlist navigation">
         <div id="sidebar-glow"></div>
 
         <section id="section-library">
           <h3>Library</h3>
           <ul id="nav-library">
-            <li data-view="all"          class="active">All Tracks</li>
-            <li data-view="artists">Artists</li>
-            <li data-view="album_artists">Album Artists</li>
-            <li data-view="albums" >Albums</li>
-            <li data-view="genres" >Genres</li>
-            <li data-view="years"  >Years</li>
+            <li data-view="all"          class="active" tabindex="0" role="button" aria-current="page">All Tracks</li>
+            <li data-view="artists"      tabindex="0" role="button">Artists</li>
+            <li data-view="album_artists" tabindex="0" role="button">Album Artists</li>
+            <li data-view="albums"       tabindex="0" role="button">Albums</li>
+            <li data-view="genres"       tabindex="0" role="button">Genres</li>
+            <li data-view="years"        tabindex="0" role="button">Years</li>
           </ul>
           <div id="browse-filter-wrap" hidden>
             <input id="browse-filter" type="search" placeholder="Filter…" autocomplete="off">
@@ -61,12 +150,15 @@
         <section id="section-folders">
           <h3 class="section-hdr-collapsible">
             <span>Folders</span>
-            <button id="btn-folders-toggle" class="btn-section-toggle" title="Collapse/Expand">&#9660;</button>
+            <button id="btn-folders-toggle" class="btn-section-toggle"
+                    title="Collapse/Expand" aria-label="Collapse or expand Folders section"
+                    aria-expanded="true">&#9660;</button>
           </h3>
           <div id="folder-tree-wrap">
             <ul id="folder-tree" class="folder-tree"></ul>
             <div id="folder-tree-empty" class="tree-empty" hidden>
-              No folders added yet.<br>Click <strong>+ Folder</strong>.
+              No folders yet.<br>
+              Open <strong>Settings → Library</strong> to add one.
             </div>
           </div>
         </section>
@@ -76,12 +168,12 @@
         <section id="section-smart">
           <h3>Smart</h3>
           <ul id="nav-smart">
-            <li data-view="history">History</li>
-            <li data-view="most-played">Most Played</li>
-            <li data-view="recently-added">Recently Added</li>
-            <li data-view="top-rated">Top Rated</li>
-            <li data-view="unplayed">Unplayed</li>
-            <li data-view="duplicates">Duplicates</li>
+            <li data-view="history"        tabindex="0" role="button">History</li>
+            <li data-view="most-played"    tabindex="0" role="button">Most Played</li>
+            <li data-view="recently-added" tabindex="0" role="button">Recently Added</li>
+            <li data-view="top-rated"      tabindex="0" role="button">Top Rated</li>
+            <li data-view="unplayed"       tabindex="0" role="button">Unplayed</li>
+            <li data-view="duplicates"     tabindex="0" role="button">Duplicates</li>
           </ul>
         </section>
 
@@ -97,18 +189,23 @@
         <section id="section-playlists">
           <h3 class="section-hdr-collapsible">
             <span>Playlists</span>
-            <button id="btn-sidebar-playlist-new" class="btn-section-action" title="New playlist">+</button>
+            <button id="btn-sidebar-playlist-new" class="btn-section-action"
+                    title="New playlist" aria-label="Create new playlist">+</button>
           </h3>
           <ul id="sidebar-playlist-list" class="sidebar-playlist-list"></ul>
         </section>
 
       </nav>
 
+      <!-- Drawer scrim: closes the off-canvas sidebar on tap below 900px.
+           Pointer-events are off until ``body.sidebar-open`` is set. -->
+      <div id="sidebar-scrim" aria-hidden="true"></div>
+
       <!-- ── Sidebar resize handle ────────────────────────────────────── -->
       <div id="sidebar-resize" title="Drag to resize sidebar"></div>
 
       <!-- ── Content pane ──────────────────────────────────────────────── -->
-      <main id="content">
+      <main id="content" tabindex="-1">
 
         <div id="browse-header" hidden>
           <span id="browse-crumb"></span>
@@ -132,12 +229,13 @@
         </div>
 
         <div id="browse-toolbar">
-          <button id="btn-grid-toggle" class="btn-grid-toggle" hidden>&#8862;</button>
+          <button id="btn-grid-toggle" class="btn-grid-toggle" hidden
+                  aria-label="Toggle grid view">&#8862;</button>
         </div>
 
         <div id="album-grid" hidden></div>
 
-        <canvas id="visualizer-canvas"></canvas>
+        <canvas id="visualizer-canvas" aria-hidden="true"></canvas>
         <div id="now-playing-art" class="now-playing-art" hidden>
           <img id="now-playing-art-img" alt="Now Playing" decoding="async">
           <div class="now-playing-art-info">
@@ -146,28 +244,53 @@
             <div id="np-album" class="np-album"></div>
           </div>
         </div>
-        <div id="converting-badge" class="converting-badge" hidden>Converting…</div>
+        <div id="converting-badge" class="converting-badge" hidden role="status" aria-live="polite">
+          <span class="badge-label">Converting…</span>
+          <!-- Inline cancel button — hidden by default; CSS reveals it when
+               the badge has `.cancellable`.  JS wires the click handler. -->
+          <button type="button" class="badge-cancel" id="converting-badge-cancel"
+                  aria-label="Cancel conversion" title="Cancel conversion" hidden>&times;</button>
+        </div>
         <div id="buffering-badge"  class="buffering-badge"  hidden>Buffering…</div>
         <div id="track-list-wrap">
           <table id="track-table">
             <thead>
               <tr>
                 <th class="col-num">#</th>
-                <th class="col-title"        data-sort="title"       >Title</th>
-                <th class="col-album-artist" data-sort="album_artist">Album Artist</th>
-                <th class="col-artist"       data-sort="artist"      >Artist</th>
-                <th class="col-album"        data-sort="album"       >Album</th>
-                <th class="col-track"        data-sort="track_number">Track</th>
-                <th class="col-year"         data-sort="year"        >Year</th>
-                <th class="col-dur">Duration</th>
-                <th class="col-format"       data-sort="format"      >Type</th>
+                <th class="col-title"        data-sort="title"        aria-sort="none">Title</th>
+                <th class="col-album-artist" data-sort="album_artist" aria-sort="none">Album Artist</th>
+                <th class="col-artist"       data-sort="artist"       aria-sort="none">Artist</th>
+                <th class="col-album"        data-sort="album"        aria-sort="none">Album</th>
+                <th class="col-track"        data-sort="track_number" aria-sort="none">Track</th>
+                <th class="col-year"         data-sort="year"         aria-sort="none">Year</th>
+                <th class="col-dur"          data-sort="duration"     aria-sort="none">Duration</th>
+                <th class="col-format"       data-sort="format"       aria-sort="none">Type</th>
+                <th class="col-location"     data-sort="path"         aria-sort="none">Location</th>
                 <th class="col-rating">★</th>
               </tr>
             </thead>
             <tbody id="track-tbody"></tbody>
           </table>
-          <div id="track-empty"   hidden>No tracks found.</div>
-          <div id="track-loading" hidden>Loading…</div>
+          <div id="track-empty" class="empty-state" hidden role="status" aria-live="polite">
+            <span class="empty-icon" aria-hidden="true">♫</span>
+            <h4>No tracks found</h4>
+            <p>Try adjusting your filter, or add a folder via <strong>Settings → Library</strong>.</p>
+          </div>
+          <!-- Skeleton screen: shown while a track list is loading.  Rows
+               are pure CSS shimmer; no JS needed once the markup is in
+               place.  Eliminates the empty-state "did this break?"
+               micro-moment that a plain ``Loading…`` text leaves.       -->
+          <div id="track-loading" class="track-skeleton" hidden aria-live="polite" aria-busy="true">
+            <span class="sr-only">Loading tracks…</span>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+            <div class="skel-row"><div class="skel-cell skel-cell-num"></div><div class="skel-cell skel-cell-title"></div><div class="skel-cell skel-cell-artist"></div><div class="skel-cell skel-cell-dur"></div></div>
+          </div>
         </div>
 
         <div id="similar-panel" hidden>
@@ -204,36 +327,66 @@
           <div id="player-meta-tags" class="meta-tags"></div>
           <div id="player-path-crumb" class="meta-path-crumb"></div>
         </div>
-        <button id="btn-track-info" class="btn-track-info" title="Track Info">&#9432;</button>
+        <button id="btn-track-info" class="btn-track-info" title="Track Info" aria-label="Track info">&#9432;</button>
       </div>
 
       <div class="player-center">
         <div class="player-controls">
-          <button id="btn-prev" title="Previous">&#9664;&#9664;</button>
-          <button id="btn-play" class="btn-play-pause" title="Play/Pause">&#9654;</button>
-          <button id="btn-next" title="Next">&#9654;&#9654;</button>
+          <button id="btn-prev" title="Previous" aria-label="Previous track">&#9664;&#9664;</button>
+          <button id="btn-play" class="btn-play-pause" title="Play/Pause" aria-label="Play or pause">&#9654;</button>
+          <button id="btn-next" title="Next" aria-label="Next track">&#9654;&#9654;</button>
         </div>
         <div class="player-progress">
           <span id="time-cur">0:00</span>
-          <canvas id="waveform-canvas"></canvas>
-          <input id="seek-bar" type="range" min="0" max="100" value="0" step="0.1">
+          <canvas id="waveform-canvas" aria-hidden="true"></canvas>
+          <input id="seek-bar" type="range" min="0" max="100" value="0" step="0.1"
+                 aria-label="Seek position">
           <span id="time-dur">0:00</span>
         </div>
       </div>
 
       <div class="player-right">
         <div class="player-extra-controls">
-          <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle">&#8652;</button>
-          <button id="btn-repeat"  class="ctrl-toggle" title="Repeat">&#8635;</button>
-          <button id="btn-eq"      class="ctrl-toggle" title="Equalizer">EQ</button>
-          <button id="btn-similar" class="ctrl-toggle" title="More like this" hidden>&#9670;</button>
-          <button id="btn-lyrics" class="ctrl-toggle" title="Lyrics"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 1h8c.6 0 1 .4 1 1v12c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1V2c0-.6.4-1 1-1z"/><line x1="5.5" y1="4.5" x2="10.5" y2="4.5"/><line x1="5.5" y1="7" x2="10.5" y2="7"/><line x1="5.5" y1="9.5" x2="8.5" y2="9.5"/></svg></button>
-          <button id="btn-playlist" class="ctrl-toggle" title="Playlists">&#9836;</button>
-          <button id="btn-queue"  class="ctrl-toggle" title="Queue">&#9776;</button>
+          <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle" aria-label="Toggle shuffle">&#8652;</button>
+          <button id="btn-repeat"  class="ctrl-toggle" title="Repeat"  aria-label="Toggle repeat mode">&#8635;</button>
+          <button id="btn-eq"      class="ctrl-toggle" title="Equalizer" aria-label="Equalizer">EQ</button>
+          <button id="btn-similar" class="ctrl-toggle" title="More like this" aria-label="More like this" hidden>&#9670;</button>
+          <button id="btn-lyrics"  class="ctrl-toggle" title="Lyrics" aria-label="Lyrics"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M4 1h8c.6 0 1 .4 1 1v12c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1V2c0-.6.4-1 1-1z"/><line x1="5.5" y1="4.5" x2="10.5" y2="4.5"/><line x1="5.5" y1="7" x2="10.5" y2="7"/><line x1="5.5" y1="9.5" x2="8.5" y2="9.5"/></svg></button>
+          <!-- Cast picker.  The icon uses the standard "broadcast" glyph that
+               every major player (Spotify, YouTube Music, Apple Music) picked
+               for the same affordance — Fitts's Law: tap target must be
+               instantly recognisable.  Active-cast state is signalled by a
+               highlighted ring + the target name in the title attribute
+               (which keyboard / screen-reader users see via :focus). -->
+          <!-- The cast control is a 2-element cluster: the button itself
+               plus a sibling "Casting to <name>" pill that's hidden when
+               idle and surfaced when a session is active.  UX-3 P1:
+               persistent indicator must be visible at a 1 m glance once
+               the picker is closed (matches AirPlay's Now-Playing pill +
+               iOS Control-Centre output strip). -->
+          <button id="btn-cast" class="ctrl-toggle" title="Cast to device" aria-label="Cast to device" aria-haspopup="dialog" aria-expanded="false">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
+              <line x1="2" y1="20" x2="2.01" y2="20"/>
+            </svg>
+          </button>
+          <button id="cast-active-pill" class="cast-active-pill hidden"
+                  type="button"
+                  aria-label="Casting active — click to manage device"
+                  title="Click to manage cast device">
+            <span class="cast-active-pill-icon" aria-hidden="true">&#128251;</span>
+            <span class="cast-active-pill-text">—</span>
+          </button>
+          <button id="btn-playlist" class="ctrl-toggle" title="Playlists" aria-label="Playlists">&#9836;</button>
+          <button id="btn-queue"   class="ctrl-toggle" title="Queue" aria-label="Queue">&#9776;</button>
         </div>
         <div class="volume-wrap">
-          <span>&#128266;</span>
-          <input id="volume-bar" type="range" min="0" max="1" value="0.8" step="0.01">
+          <!-- 🔉 ``speaker with one wave`` instead of 🔊 ``speaker with three
+               waves`` so the volume control doesn't share its glyph with
+               the app logo (UX/UI #2 #11). -->
+          <span aria-hidden="true">&#128265;</span>
+          <input id="volume-bar" type="range" min="0" max="1" value="0.8" step="0.01"
+                 aria-label="Volume">
         </div>
       </div>
 
@@ -271,7 +424,10 @@
     </div>
 
     <!-- Reusable confirm dialog (replaces native confirm()) -->
-    <div class="admin-dialog hidden" id="confirm-dialog">
+    <div class="admin-dialog hidden" id="confirm-dialog"
+         role="dialog" aria-modal="true"
+         aria-labelledby="confirm-dialog-title"
+         aria-describedby="confirm-dialog-message">
       <h2 id="confirm-dialog-title">Confirm</h2>
       <p class="dialog-sub" id="confirm-dialog-message"></p>
       <div class="dialog-actions">
@@ -284,14 +440,21 @@
     <div id="admin-panel" class="hidden">
       <div class="admin-panel-header">
         <h2>&#9881; Admin</h2>
-        <button class="btn-close" id="btn-admin-close">&times;</button>
+        <button class="btn-close" id="btn-admin-close" aria-label="Close admin panel">&times;</button>
       </div>
-      <div class="admin-tabs">
-        <button class="admin-tab active" data-tab="tab-library">&#128218; Library</button>
-        <button class="admin-tab" data-tab="tab-renderers">&#127911; Renderers</button>
-        <button class="admin-tab" data-tab="tab-backup">&#128190; Backup</button>
-        <button class="admin-tab" data-tab="tab-system">&#9881;&#65039; System</button>
-        <button class="admin-tab" data-tab="tab-log">&#128220; Log</button>
+      <div class="admin-tabs" role="tablist" aria-label="Admin sections">
+        <button class="admin-tab active" data-tab="tab-library"
+                role="tab" aria-controls="tab-library" aria-selected="true">&#128218; Library</button>
+        <button class="admin-tab" data-tab="tab-renderers"
+                role="tab" aria-controls="tab-renderers" aria-selected="false">&#127911; Renderers</button>
+        <button class="admin-tab" data-tab="tab-backup"
+                role="tab" aria-controls="tab-backup" aria-selected="false">&#128190; Backup</button>
+        <button class="admin-tab" data-tab="tab-system"
+                role="tab" aria-controls="tab-system" aria-selected="false">&#9881;&#65039; System</button>
+        <button class="admin-tab admin-tab-admin-only" data-tab="tab-users"
+                role="tab" aria-controls="tab-users" aria-selected="false" hidden>&#128100; Users</button>
+        <button class="admin-tab" data-tab="tab-log"
+                role="tab" aria-controls="tab-log" aria-selected="false">&#128220; Log</button>
       </div>
       <div class="admin-panel-body">
 
@@ -339,10 +502,22 @@
             </div>
             <div id="admin-add-network" class="admin-add-network" style="display:none">
               <div class="net-form-row">
-                <select id="net-protocol"><option value="smb">SMB</option><option value="ftp">FTP</option></select>
+                <select id="net-protocol">
+                  <option value="smb">SMB</option>
+                  <option value="ftp">FTP</option>
+                  <option value="webdav">WebDAV (http)</option>
+                  <option value="webdavs">WebDAV (https)</option>
+                </select>
                 <input id="net-host" type="text" placeholder="Host (e.g. nas.local)">
                 <input id="net-share" type="text" placeholder="Share name">
                 <input id="net-path" type="text" placeholder="Path" value="/">
+              </div>
+              <div class="net-form-row" id="net-webdav-row" style="display:none">
+                <input id="net-webdav-url" type="url"
+                       autocapitalize="off" autocorrect="off" spellcheck="false"
+                       inputmode="url"
+                       placeholder="https://cloud.example.com/remote.php/dav/files/USERNAME/"
+                       style="flex:1;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
               </div>
               <div class="net-form-row net-auth-row">
                 <label class="net-anon-label">
@@ -363,9 +538,50 @@
             <div id="admin-dir-msg" class="admin-msg" style="display:none"></div>
           </div>
 
+          <!-- ── FTP Connection Pools ──────────────────────────────────
+               Per-share scan / stream worker budget + auto-detected
+               server cap.  Hidden when there are no FTP shares
+               configured (populated by admin.js on tab open). -->
+          <div class="admin-section" id="admin-ftp-pool-section" style="display:none">
+            <h3>🚦 FTP Connection Pools</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              Tune how many concurrent FTP connections the scanner and the
+              player can use per server.  Stream borrows always get
+              queue-jump priority — so playing a track during a heavy scan
+              still feels instant.  If the server allows fewer than your
+              configured total, we automatically clamp to its limit.
+            </p>
+            <div class="admin-ftp-pool-list" id="admin-ftp-pool-list"></div>
+            <div id="admin-ftp-pool-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- ── Remote Freshness ──────────────────────────────────────
+               Adaptive background polling for FTP/SMB/WebDAV shares.
+               One row per share with last-checked + next-check + a
+               "Check now" button.  Hidden when there are no remote
+               shares (populated by admin.js on tab open).  -->
+          <div class="admin-section" id="admin-freshness-section" style="display:none">
+            <h3>📡 Auto-Refresh (Remote Shares)</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              FTP / SMB shares have no native push notifications, so the
+              server polls them on an adaptive schedule (5 min for active
+              shares, 4 h for stable ones).  Click "Check now" to force a
+              refresh.  A toast appears only when new tracks are found —
+              quiet otherwise.
+            </p>
+            <div class="admin-freshness-list" id="admin-freshness-list"></div>
+            <div id="admin-freshness-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
           <!-- Scan progress (visible when scanning) -->
           <div class="admin-section" id="admin-scan-section" style="display:none">
-            <h3>&#9881; Scan Progress</h3>
+            <h3>
+              <span>&#9881; Scan Progress</span>
+              <button id="btn-scan-pause" class="btn-secondary scan-pause-btn"
+                      title="Pause scan — in-flight files finish, no new ones start until you Resume">
+                Pause
+              </button>
+            </h3>
             <div class="scan-progress-wrap">
               <div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill"></div></div>
               <div class="scan-progress-text" id="scan-progress-text"></div>
@@ -383,6 +599,45 @@
             <div id="admin-index-msg" class="admin-msg" style="display:none"></div>
           </div>
 
+          <!-- Metadata repair — fix tracks whose stored title/artist/album
+               contains U+FFFD (the diamond '?' marker from the old broken
+               ASCII-replace tracker-header decoder).  Local files extract
+               in place; remote files re-download on the scan lane so
+               streaming stays responsive. -->
+          <div class="admin-section" id="admin-repair-section">
+            <h3>&#129526; Repair Garbled Metadata</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              Re-extracts titles / artists / albums for tracks containing the
+              U+FFFD replacement character (the diamond <code>&#65533;</code>),
+              left behind by the old tracker / chiptune header decoder. Mostly
+              affects SID / NSF / SPC / MOD / S3M / IT / XM files.
+            </p>
+            <div class="admin-io-row" style="gap:8px;flex-wrap:wrap">
+              <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px">
+                <input type="checkbox" id="repair-tracker-only" checked>
+                Only tracker / chiptune files (faster — skips remote FLAC/MP3)
+              </label>
+            </div>
+            <div class="admin-io-row" style="gap:8px;flex-wrap:wrap;margin-top:8px">
+              <button class="btn-secondary" id="btn-repair-scan" type="button">
+                Scan for Garbled Titles
+              </button>
+              <button class="btn-secondary" id="btn-repair-start" type="button" disabled>
+                Repair Now
+              </button>
+              <button class="btn-secondary" id="btn-repair-cancel" type="button"
+                      disabled style="display:none">
+                Cancel
+              </button>
+            </div>
+            <div id="admin-repair-status" class="admin-msg" style="display:none"></div>
+            <div id="admin-repair-progress" class="scan-progress-wrap" style="display:none;margin-top:10px">
+              <div class="scan-progress-bar"><div class="scan-progress-fill" id="repair-progress-fill"></div></div>
+              <div class="scan-progress-text" id="repair-progress-text"></div>
+              <div class="scan-progress-file" id="repair-progress-file"></div>
+            </div>
+          </div>
+
         </div>
 
         <!-- Tab: Renderers & Soundfonts -->
@@ -390,7 +645,13 @@
 
           <!-- Renderer Status -->
           <div class="admin-section">
-            <h3>&#127899;&#65039; Renderer Status</h3>
+            <h3>
+              &#127899;&#65039; Renderer Status
+              <button id="btn-renderer-refresh" class="btn-secondary"
+                      type="button" title="Re-check renderers"
+                      aria-label="Refresh renderer status"
+                      style="margin-left:8px;padding:2px 8px;font-size:11px">↻</button>
+            </h3>
             <div class="renderer-grid" id="renderer-grid">
               <div class="renderer-item" id="renderer-ffmpeg">
                 <span class="renderer-icon" id="renderer-icon-ffmpeg">&#8943;</span>
@@ -409,6 +670,227 @@
                 <span class="renderer-name">Tracker (openmpt123)</span>
               </div>
             </div>
+            <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
+                 in admin.js when the running ffmpeg is missing required
+                 encoders (libmp3lame, libvorbis) or DSD demuxers. -->
+            <div id="ffmpeg-banner" class="ffmpeg-banner hidden"
+                 role="status" aria-live="polite"></div>
+          </div>
+
+          <!-- Conversion cache (transcodes + SID/MIDI/tracker renders) -->
+          <div class="admin-section">
+            <h3>
+              &#128190; Transcode &amp; render cache
+              <button id="btn-cache-refresh" class="btn-secondary"
+                      type="button" title="Refresh cache stats"
+                      aria-label="Refresh cache stats"
+                      style="margin-left:8px;padding:2px 8px;font-size:11px">↻</button>
+            </h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Cached WAV / FLAC files generated by SID, MIDI, tracker, and DSD/ALAC
+              transcoding.  Bigger cache &rarr; more instant replays + smoother
+              playlist look-ahead.  When the cache fills, oldest entries are
+              evicted automatically.
+            </p>
+            <div class="cache-fill-wrap">
+              <div class="cache-fill-bar" id="cache-fill-bar" role="progressbar"
+                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+                   aria-label="Conversion cache fill">
+                <div class="cache-fill-bar-inner" id="cache-fill-bar-inner"></div>
+              </div>
+              <div class="cache-fill-label" id="cache-fill-label"
+                   role="status" aria-live="polite" aria-atomic="true">
+                — used of — (—)
+              </div>
+            </div>
+            <div class="admin-setting" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0">
+              <label for="setting-conv-cache-mb" style="flex:1 1 auto;min-width:160px">
+                Cache size (MB)
+              </label>
+              <input id="setting-conv-cache-mb" type="number"
+                     min="256" max="102400" step="256"
+                     style="width:120px"
+                     aria-describedby="setting-conv-cache-mb-hint">
+              <button id="btn-conv-cache-apply" class="btn-secondary" type="button">
+                Apply
+              </button>
+            </div>
+            <p id="setting-conv-cache-mb-hint" class="admin-hint" style="margin:0 0 12px 0;font-size:11px;opacity:0.7">
+              Default 4096 MB (4 GB).  Range 256 MB – 100 GB.  Lowering the
+              limit evicts the oldest entries immediately; raising it just
+              gives future renders more headroom.
+            </p>
+            <ul class="cache-breakdown" id="cache-breakdown">
+              <li><span class="cache-type">SID</span>      <span class="cache-bytes" id="cache-bytes-sid">—</span></li>
+              <li><span class="cache-type">MIDI</span>     <span class="cache-bytes" id="cache-bytes-midi">—</span></li>
+              <li><span class="cache-type">Tracker</span>  <span class="cache-bytes" id="cache-bytes-tracker">—</span></li>
+              <li><span class="cache-type">Chiptune (GME)</span> <span class="cache-bytes" id="cache-bytes-gme">—</span></li>
+              <li><span class="cache-type">Transcoded</span> <span class="cache-bytes" id="cache-bytes-transcoded">—</span></li>
+            </ul>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="btn-cache-clear-transcoded" class="btn-secondary" type="button">
+                Clear transcoded only
+              </button>
+              <button id="btn-cache-clear-all" class="btn-danger" type="button">
+                Clear all conversion cache
+              </button>
+            </div>
+            <p class="admin-hint" style="margin-top:8px;font-size:11px;opacity:0.7">
+              "Clear transcoded only" reclaims DSD/ALAC/AIFF disk without
+              losing the slower-to-regenerate SID, MIDI, and tracker renders.
+            </p>
+          </div>
+
+          <!-- HVSC (High Voltage SID Collection) -->
+          <div class="admin-section">
+            <h3>
+              &#127908;&#65039; HVSC SID database
+              <span id="hvsc-status" class="hvsc-status off">disabled</span>
+            </h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Point at the HVSC <code>DOCUMENTS/</code> folder (download from
+              <a href="https://www.hvsc.de/" target="_blank" rel="noopener noreferrer">hvsc.de</a>)
+              to upgrade every SID track with per-subsong durations and STIL commentary.
+              Leave empty to use the default-duration estimate.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-hvsc-path">HVSC DOCUMENTS folder</label>
+              <input id="setting-hvsc-path" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     inputmode="text"
+                     placeholder="/path/to/HVSC/DOCUMENTS"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-io-row" style="margin-top:12px">
+              <button id="btn-save-hvsc">Save &amp; reload</button>
+              <button id="btn-rescan-sids" class="btn-secondary"
+                      title="Apply HVSC durations + STIL to every SID track in the library (no rescan, no extra folders added)">
+                Re-extract SID metadata
+              </button>
+              <button id="btn-hvsc-cleanup" class="btn-secondary"
+                      title="Remove scan-dir entries that an older release auto-imported from the HVSC tree (e.g. .../MUSICIANS/A/Artist/). Only removes dirs that contain only SID tracks.">
+                Clean up auto-imported HVSC folders
+              </button>
+            </div>
+            <div id="admin-hvsc-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Chiptune & tracker archives — external catalogs the user
+               can browse for source files.  We don't ingest them
+               automatically; the operator downloads what they want,
+               drops it in a scan dir, and SoniqBoom indexes it. -->
+          <div class="admin-section">
+            <h3>&#127760; Chiptune &amp; tracker archives</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              <strong>External links</strong> — each card opens an archive
+              in a new tab.  SoniqBoom does <em>not</em> auto-ingest from
+              these.  Download what you want, drop it in a scan directory,
+              and the renderers (sidplayfp / libgme / openmpt) handle
+              playback.  HVSC metadata + Songlengths wire in via the HVSC
+              panel above.
+            </p>
+            <ul class="archive-grid" id="archive-grid">
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://www.hvsc.de/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">HVSC</span>
+                    <span class="archive-desc">
+                      High Voltage SID Collection &mdash; the canonical
+                      Commodore 64 .sid archive (~60k tunes).  Pair with
+                      Songlengths.md5 for per-tune durations.
+                    </span>
+                    <span class="archive-fmt">.sid / .psid</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://modarchive.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">The Mod Archive</span>
+                    <span class="archive-desc">
+                      Largest tracker module collection on the web
+                      (~280k modules).  Curated genres and Amiga/PC
+                      tracker scene compilations.
+                    </span>
+                    <span class="archive-fmt">.mod / .xm / .it / .s3m / &hellip;</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="http://sndh.atari.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">SNDH archive</span>
+                    <span class="archive-desc">
+                      Atari ST / STe / Falcon YM2149 chiptunes.  Use the
+                      libgme renderer (covers SNDH via .sndh / .ym).
+                    </span>
+                    <span class="archive-fmt">.sndh / .ym</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://zxart.ee/eng/music/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">ZXAART (ZX-Art)</span>
+                    <span class="archive-desc">
+                      ZX Spectrum AY-3-8910 chiptunes plus demoscene
+                      classics.  AY files render via libgme; raw
+                      Spectrum modules via openmpt.
+                    </span>
+                    <span class="archive-fmt">.ay / .pt3</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://amp.dascene.net/list.php?fcat=AHX"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">AMP / AHX</span>
+                    <span class="archive-desc">
+                      Amiga Music Preservation's AHX section.  AHX is
+                      Amiga's 4-channel chiptune format; rendered via
+                      openmpt's AHX support.
+                    </span>
+                    <span class="archive-fmt">.ahx / .hvl</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://amp.dascene.net/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">Amiga Music Preservation</span>
+                    <span class="archive-desc">
+                      Top-level AMP catalog: ProTracker / OctaMED /
+                      FastTracker / Composer modules from the Amiga
+                      demoscene.  Browse by author or by year.
+                    </span>
+                    <span class="archive-fmt">.mod / .med / &hellip;</span>
+                  </span>
+                </a>
+              </li>
+            </ul>
+            <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
+              Want a real remote-source ingest of one of these?  Open an
+              issue with the FTP / HTTP listing format and we'll plumb it
+              through the FileSource backend.
+            </p>
           </div>
 
           <!-- Soundfonts -->
@@ -480,6 +962,14 @@
               <button id="btn-clear-agg-cache">Clear Aggregation Cache</button>
               <button id="btn-clear-remote-cache">Clear Remote Cache</button>
             </div>
+            <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
+              Transcode &amp; SID/MIDI/tracker render cache lives under
+              <button type="button" class="admin-inline-link"
+                      data-tab-target="tab-renderers">
+                Renderers &rarr; Transcode &amp; render cache
+              </button>
+              — has its own fill bar + size config + selective clear.
+            </p>
             <div id="admin-cache-msg" class="admin-msg" style="display:none"></div>
           </div>
 
@@ -488,46 +978,163 @@
             <h3>&#9881;&#65039; Settings</h3>
             <div class="admin-settings-grid" id="admin-settings-grid">
               <div class="admin-setting">
-                <label>Crossfade (seconds) <span class="setting-info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
+                <label>Crossfade (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
                 <input id="setting-crossfade" type="number" min="0" max="12" step="0.5" value="0">
               </div>
               <div class="admin-setting">
-                <label>Preload Buffer (seconds) <span class="setting-info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
+                <label>Preload Buffer (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
                 <input id="setting-preload-buffer" type="number" min="0" max="30" step="1" value="5">
               </div>
               <div class="admin-setting">
-                <label>Convert Delay (ms) <span class="setting-info" data-tip="Wait before converting SID/MIDI/tracker formats">&#9432;</span></label>
+                <label>Convert Delay (ms) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait before converting SID/MIDI/tracker formats">&#9432;</span></label>
                 <input id="setting-convert-delay" type="number" min="0" max="5000" step="50" value="300">
               </div>
               <div class="admin-setting">
-                <label>Scan ZIPs <span class="setting-info" data-tip="Index audio files inside ZIP archives">&#9432;</span></label>
+                <label>Scan ZIPs <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Index audio files inside ZIP archives">&#9432;</span></label>
                 <input id="setting-scan-zips" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>Filter Duplicates <span class="setting-info" data-tip="Hide lower-quality copies of the same track">&#9432;</span></label>
+                <label>Filter Duplicates <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Hide lower-quality copies of the same track">&#9432;</span></label>
                 <input id="setting-filter-duplicates" type="checkbox">
               </div>
               <div class="admin-setting">
-                <label>Use Folder Art <span class="setting-info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
+                <label>Use Folder Art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
                 <input id="setting-use-folder-art" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>SID Duration (seconds) <span class="setting-info" data-tip="Default play length for SID chiptune tracks">&#9432;</span></label>
-                <input id="setting-sid-duration" type="number" min="30" max="600" step="10" value="180">
+                <label for="setting-folder-art-names">Folder art filenames <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Comma-separated, case-insensitive list of filenames to look for in the same folder as the audio file. First match wins. Leave blank to use the built-in default (cover.jpg, folder.jpg, front.jpg, album.jpg + .png/.jpeg variants).">&#9432;</span></label>
+                <input id="setting-folder-art-names" type="text" placeholder="cover.jpg,folder.jpg,front.jpg,album.jpg" autocomplete="off" spellcheck="false">
               </div>
               <div class="admin-setting">
-                <label>Remote Cache (MB) <span class="setting-info" data-tip="Max disk space for cached network files">&#9432;</span></label>
+                <label>SID Duration (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fallback play length used only when HVSC has no entry for the tune. Tunes with HVSC data play their exact length instead.">&#9432;</span></label>
+                <input id="setting-sid-duration" type="number" min="30" max="600" step="10" value="180">
+                <div id="setting-sid-duration-hint"
+                     class="setting-hint"
+                     style="font-size:11px;color:var(--text2);margin-top:2px"></div>
+              </div>
+              <div class="admin-setting">
+                <label>Remote Cache (MB) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Max disk space for cached network files">&#9432;</span></label>
                 <input id="setting-remote-cache-mb" type="number" min="100" max="50000" step="100" value="2048">
               </div>
               <div class="admin-setting">
-                <label>Skip Authentication <span class="setting-info" data-tip="Open admin panel without OS credentials">&#9432;</span></label>
+                <label>Skip Authentication <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Open admin panel without OS credentials">&#9432;</span></label>
                 <input id="setting-skip-auth" type="checkbox">
+              </div>
+              <div class="admin-setting">
+                <label for="setting-theme">Theme <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Dark is the default. Light flips surfaces to a near-white palette.">&#9432;</span></label>
+                <select id="setting-theme">
+                  <option value="dark">Dark</option>
+                  <option value="light">Light</option>
+                </select>
               </div>
             </div>
             <div class="admin-io-row" style="margin-top:24px">
               <button id="btn-save-settings">Save Settings</button>
             </div>
             <div id="admin-settings-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- ─── Services panel (Subsonic / Multiroom / Cast / DLNA Media Server) -->
+          <!-- PhD-UX rationale: services are *capabilities*, not preferences.        -->
+          <!-- Toggling one off has network-visible consequences (the service stops   -->
+          <!-- responding), so we use a single panel with explicit on/off state +    -->
+          <!-- a "restart required" indicator rather than burying them in a generic  -->
+          <!-- settings list.  Each row carries a one-line "what this is for" hint   -->
+          <!-- so a user toggling Subsonic off knows what they're losing (Hick's     -->
+          <!-- Law: explicit consequences shorten decision time).                    -->
+          <div class="admin-section" id="services-section">
+            <h3>&#128268; Services</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Optional network services SoniqBoom exposes on the LAN.
+              Disabling a service removes it from the network entirely
+              (404 to clients).  Changes take effect on the next server
+              restart.
+            </p>
+            <!-- Permanent restart-required banner.  Inactive by default
+                 (informational).  Once any toggle changes, JS adds the
+                 .is-active class which surfaces the "Restart Now" button.
+                 UX-2 P1: don't hide the hard requirement behind a first-
+                 toggle reveal — Nielsen H5 (error prevention). -->
+            <div class="services-restart-banner" role="status" aria-live="polite">
+              <span class="services-restart-msg">
+                Service changes apply on next restart.
+              </span>
+            </div>
+            <div id="services-list" class="services-list" aria-live="polite">
+              <div class="services-empty">Loading services…</div>
+            </div>
+            <div id="services-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Subsonic / OpenSubsonic connection card -->
+          <div class="admin-section">
+            <h3>&#128226; Subsonic / OpenSubsonic API</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Point any Subsonic-compatible client at SoniqBoom — your
+              library, playlists, and play history sync automatically.
+            </p>
+            <div class="subsonic-card">
+              <div class="subsonic-card-row">
+                <label>Server URL</label>
+                <code id="subsonic-server-url">—</code>
+                <button id="btn-copy-subsonic-url" title="Copy to clipboard">Copy</button>
+              </div>
+              <div class="subsonic-card-row">
+                <label>Username</label>
+                <code id="subsonic-username">—</code>
+              </div>
+              <div class="subsonic-card-row">
+                <label>Password</label>
+                <code>your SoniqBoom password</code>
+              </div>
+              <div class="subsonic-card-row">
+                <label>API version</label>
+                <code>1.16.1 / OpenSubsonic</code>
+              </div>
+              <div>
+                <label style="font-size:11px;color:var(--text2)">Tested clients</label>
+                <div class="subsonic-clients">
+                  <span class="subsonic-client-chip">DSub</span>
+                  <span class="subsonic-client-chip">Substreamer</span>
+                  <span class="subsonic-client-chip">play:Sub</span>
+                  <span class="subsonic-client-chip">Symfonium</span>
+                  <span class="subsonic-client-chip">Tempo</span>
+                  <span class="subsonic-client-chip">Feishin</span>
+                  <span class="subsonic-client-chip">Sublime Music</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- My Account (per-user scrobble tokens) -->
+          <div class="admin-section">
+            <h3>&#128100; My Account</h3>
+            <div id="my-account-info" class="admin-hint" style="margin-bottom:14px"></div>
+            <div class="admin-settings-grid">
+              <div class="admin-setting">
+                <label for="setting-lb-token">ListenBrainz user token <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Find under https://listenbrainz.org/profile">&#9432;</span></label>
+                <input id="setting-lb-token" type="text"
+                       autocomplete="off" autocapitalize="off"
+                       autocorrect="off" spellcheck="false"
+                       data-1p-ignore="true" data-lpignore="true"
+                       placeholder="Paste token to enable scrobbling"
+                       style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+              </div>
+              <div class="admin-setting">
+                <label for="setting-lastfm-sk">last.fm session key <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Use last.fm's auth.getSession flow externally and paste the session key here.">&#9432;</span></label>
+                <input id="setting-lastfm-sk" type="text"
+                       autocomplete="off" autocapitalize="off"
+                       autocorrect="off" spellcheck="false"
+                       data-1p-ignore="true" data-lpignore="true"
+                       placeholder="Paste session key to enable scrobbling"
+                       style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+              </div>
+            </div>
+            <div class="admin-io-row" style="margin-top:16px">
+              <button id="btn-save-account">Save scrobble tokens</button>
+              <button id="btn-change-password" class="btn-secondary">Change password…</button>
+            </div>
+            <div id="admin-account-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- Application -->
@@ -568,6 +1175,60 @@
 
         </div>
 
+        <!-- Tab: Users (admin only) -->
+        <div class="admin-tab-pane" id="tab-users">
+          <div class="admin-section">
+            <h3>&#128100; Add user</h3>
+            <form id="users-new-form" class="users-new-form" autocomplete="off">
+              <label>Username
+                <input id="users-new-username" type="text"
+                       autocapitalize="off" autocorrect="off" spellcheck="false"
+                       inputmode="text"
+                       minlength="2" maxlength="64"
+                       pattern="[A-Za-z0-9._\-]+" required>
+              </label>
+              <label>Password
+                <input id="users-new-password" type="password"
+                       minlength="8" autocomplete="new-password" required>
+              </label>
+              <label>Role
+                <select id="users-new-role">
+                  <option value="readonly" selected>Read-only</option>
+                  <option value="edit">Edit</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </label>
+              <label>Display name
+                <input id="users-new-display" type="text" maxlength="64">
+              </label>
+              <button type="submit" id="users-new-submit">Add</button>
+            </form>
+            <div id="users-new-msg" class="admin-msg" style="display:none"></div>
+          </div>
+          <div class="admin-section">
+            <h3>&#128101; Accounts</h3>
+            <table class="users-table" id="users-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Display name</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Last sign-in</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="users-tbody"></tbody>
+            </table>
+            <div id="users-list-msg" class="admin-msg" style="display:none"></div>
+            <div class="admin-hint">
+              The first administrator must be created on the server with
+              <code>soniqboom-setadm -user &lt;name&gt; -passwd &lt;pass&gt;</code>.
+              Self-registration on the login page creates read-only accounts.
+            </div>
+          </div>
+        </div>
+
         <!-- Tab: Log -->
         <div class="admin-tab-pane" id="tab-log">
           <div class="admin-section">
@@ -589,6 +1250,111 @@
     </div>
   </div>
 
+  <!-- ── Cast picker overlay ──────────────────────────────────────────────── -->
+  <!-- PhD-UX rationale (Spotify Connect / Apple AirPlay / YouTube Music — all
+       converged on the same pattern over 5+ years of iteration):
+         • Popover anchored to the trigger button, NOT a full-screen modal —
+           the user wants to keep listening context visible.
+         • List items are buttons (not radio), each with protocol icon +
+           device name; selection is the action, not a confirm step.
+         • Empty / loading / error states each get a dedicated panel so
+           a "no devices" outcome looks different from "still searching"
+           (Nielsen H4: visibility of system status).
+         • Currently-casting state surfaces a "Stop casting" CTA inline —
+           one click to disconnect, no nested menus (Hick's Law).
+         • role=dialog + aria-labelledby + focus management on open/close
+           (WCAG 2.1 AA + WAI-ARIA Authoring Practices).
+  -->
+  <!-- aria-modal="true" because the picker now sets ``inert`` on
+       #main-content while open, captures focus, and intercepts Escape +
+       arrow keys — UX-1 P2: don't half-commit to modal vs popover, pick
+       one.  AirPlay's picker is the modal exemplar. -->
+  <div id="cast-overlay" class="hidden" role="dialog"
+       aria-labelledby="cast-title" aria-modal="true">
+    <div id="cast-panel">
+      <div class="cast-header">
+        <h3 id="cast-title">Cast to device</h3>
+        <button id="cast-refresh" class="cast-icon-btn"
+                title="Refresh device list" aria-label="Refresh device list">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+        <button id="cast-close" class="cast-icon-btn"
+                title="Close" aria-label="Close cast picker">&times;</button>
+      </div>
+
+      <!-- Currently casting indicator (shown when a session is active) -->
+      <div id="cast-active" class="cast-active hidden" aria-live="polite">
+        <div class="cast-active-row">
+          <div class="cast-active-info">
+            <div class="cast-active-label">Casting to</div>
+            <div class="cast-active-name" id="cast-active-name">—</div>
+          </div>
+          <button id="cast-stop" class="cast-stop-btn"
+                  aria-label="Stop casting to this device">Stop casting</button>
+        </div>
+      </div>
+
+      <!-- Output mode selector — local vs cast.  Radio-style, but
+           "Local" is implicit when no cast session is active. -->
+
+      <!-- Device list / states.  Only one of these is visible at a time. -->
+      <div id="cast-loading" class="cast-state hidden" aria-live="polite">
+        <div class="cast-spinner" aria-hidden="true"></div>
+        <div class="cast-state-text">Searching for devices…</div>
+      </div>
+
+      <div id="cast-empty" class="cast-state hidden">
+        <div class="cast-state-icon" aria-hidden="true">&#128268;</div>
+        <div class="cast-state-text">No cast devices found.</div>
+        <div class="cast-state-hint" id="cast-empty-hint">
+          Devices must be on the same Wi-Fi as this computer.
+        </div>
+        <button type="button" id="cast-empty-retry" class="cast-error-btn">
+          Search again
+        </button>
+      </div>
+
+      <div id="cast-error" class="cast-state hidden">
+        <div class="cast-state-icon" aria-hidden="true">&#9888;</div>
+        <div class="cast-state-text" id="cast-error-text">
+          Couldn't reach the cast service.
+        </div>
+        <div class="cast-state-hint" id="cast-error-hint"></div>
+      </div>
+
+      <ul id="cast-list" class="cast-list" role="list">
+        <!-- Populated dynamically by cast_picker.js -->
+      </ul>
+
+      <!-- Codec preference — collapses by default; power-user disclosure. -->
+      <details id="cast-pref-disclosure" class="cast-pref">
+        <summary>Audio quality</summary>
+        <div class="cast-pref-options" role="radiogroup" aria-label="Audio quality preference">
+          <label><input type="radio" name="cast-pref" value="auto" checked>
+            <span>Auto</span>
+            <span class="cast-pref-hint">Lossless when supported, else MP3 320 kbps</span>
+          </label>
+          <label><input type="radio" name="cast-pref" value="force-original">
+            <span>Original</span>
+            <span class="cast-pref-hint">No transcoding (renderer may refuse some formats)</span>
+          </label>
+          <label><input type="radio" name="cast-pref" value="force-flac">
+            <span>FLAC</span>
+            <span class="cast-pref-hint">Lossless transcode for every track</span>
+          </label>
+          <label><input type="radio" name="cast-pref" value="force-mp3">
+            <span>MP3 320</span>
+            <span class="cast-pref-hint">Smallest bandwidth, universal compatibility</span>
+          </label>
+        </div>
+      </details>
+    </div>
+  </div>
+
   <!-- ── Equalizer overlay ─────────────────────────────────────────────────── -->
   <div id="eq-overlay" class="hidden">
     <div id="eq-panel">
@@ -606,7 +1372,7 @@
           <option value="" disabled hidden>Custom</option>
         </select>
         <button id="eq-reset">Reset</button>
-        <button id="eq-close">&times;</button>
+        <button id="eq-close" aria-label="Close equalizer">&times;</button>
       </div>
 
       <div class="eq-body">
@@ -679,7 +1445,8 @@
         <button id="ti-prev" class="ti-nav-btn" title="Previous track (←)">&#9664;</button>
         <span id="ti-nav-label" class="ti-nav-label">Track 1 of 1</span>
         <button id="ti-next" class="ti-nav-btn" title="Next track (→)">&#9654;</button>
-        <button id="ti-close" class="ti-close" title="Close (Esc)">&times;</button>
+        <button id="ti-close" class="ti-close" title="Close (Esc)"
+                aria-label="Close track info">&times;</button>
       </div>
 
       <!-- Two-column body -->
@@ -704,9 +1471,11 @@
         <div class="ti-right">
 
           <!-- Tab bar -->
-          <div class="ti-tabs">
-            <button id="ti-tab-info"   class="ti-tab-btn active">Info</button>
-            <button id="ti-tab-lyrics" class="ti-tab-btn">Lyrics</button>
+          <div class="ti-tabs" role="tablist" aria-label="Track info sections">
+            <button id="ti-tab-info"   class="ti-tab-btn active"
+                    role="tab" aria-controls="ti-meta-pane"   aria-selected="true">Info</button>
+            <button id="ti-tab-lyrics" class="ti-tab-btn"
+                    role="tab" aria-controls="ti-lyrics-pane" aria-selected="false">Lyrics</button>
           </div>
 
           <!-- Metadata pane -->
@@ -756,6 +1525,10 @@
               <div class="ti-field ti-field-path"><span class="ti-label">Path</span><span class="ti-value ti-value-path" id="ti-path">—</span></div>
             </div>
 
+            <!-- Chapters (E-18) — populated by trackinfo._loadChapters when
+                 the file has MP4 chpl atoms or ID3 CHAP frames. -->
+            <div id="ti-chapters" class="ti-chapters" hidden></div>
+
           </div>
 
           <!-- Lyrics pane -->
@@ -774,7 +1547,7 @@
     <div class="queue-header">
       <span class="queue-title">Queue <span id="queue-count"></span></span>
       <button id="btn-queue-clear" title="Clear queue">Clear</button>
-      <button id="btn-queue-close">&times;</button>
+      <button id="btn-queue-close" aria-label="Close queue">&times;</button>
     </div>
     <div id="queue-list" class="queue-list">
       <div class="queue-empty">No tracks queued.</div>
@@ -790,14 +1563,14 @@
     <div class="playlist-header" id="pl-hdr-list">
       <span class="playlist-title">Playlists</span>
       <button id="btn-playlist-new" title="New playlist">+ New</button>
-      <button id="btn-playlist-close">&times;</button>
+      <button id="btn-playlist-close" aria-label="Close playlist panel">&times;</button>
     </div>
     <!-- Track-view header: shows when a playlist is open -->
     <div class="playlist-header" id="pl-hdr-tracks" hidden>
       <button id="btn-playlist-back" class="pl-back-btn" title="All playlists">&#8592;</button>
       <span class="playlist-title" id="pl-active-name">Playlist</span>
       <span class="pl-track-count" id="pl-active-count"></span>
-      <button id="btn-playlist-close2" class="playlist-close-btn">&times;</button>
+      <button id="btn-playlist-close2" class="playlist-close-btn" aria-label="Close playlist panel">&times;</button>
     </div>
     <!-- Playlist selector (list view) -->
     <div id="playlist-list" class="playlist-list"></div>
@@ -820,7 +1593,7 @@
     <div id="shortcuts-panel">
       <div class="shortcuts-header">
         <span class="shortcuts-title">Keyboard Shortcuts</span>
-        <button id="shortcuts-close">&times;</button>
+        <button id="shortcuts-close" aria-label="Close keyboard shortcuts">&times;</button>
       </div>
       <div class="shortcuts-body">
         <div class="shortcuts-col">
@@ -842,7 +1615,8 @@
           <div class="sc-row"><kbd>Q</kbd><span>Toggle queue</span></div>
           <div class="sc-row"><kbd>I</kbd><span>Track info</span></div>
           <div class="sc-row"><kbd>V</kbd><span>Toggle visualizer mode</span></div>
-          <div class="sc-row"><kbd>1–6</kbd><span>Sidebar views (All, Artists, ...)</span></div>
+          <div class="sc-row"><kbd>1–6</kbd><span>Library views (All, Artists, …)</span></div>
+          <div class="sc-row"><kbd>⌥ 1–6</kbd><span>Smart views (History, Most Played, …)</span></div>
         </div>
         <div class="shortcuts-col">
           <h4>Library</h4>
@@ -863,6 +1637,16 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=42"></script>
+  <script type="module" src="/assets/js/app.js?v=80"></script>
+  <!-- Cast picker is intentionally a plain script (not a module) — it
+       wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
+       on window for tests + the dev console.  Loading it as a sibling
+       rather than a child of app.js keeps the cast feature truly
+       optional: if the file 404s, the rest of the app keeps working.
+       ``defer`` ensures cast_picker runs AFTER the deferred app.js module
+       has executed — without it the classic-script ran inline on parse
+       and would invoke its DOMContentLoaded handler before app.js had
+       set window.SoniqBoom.player + window.Toast.  QA-2 P0 / UX-3 P2. -->
+  <script src="/assets/js/cast_picker.js?v=2" defer></script>
 </body>
 </html>

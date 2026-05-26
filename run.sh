@@ -15,12 +15,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
 SONIQBOOM="$VENV/bin/soniqboom"
 
-# ── Paths (platform-aware) ───────────────────────────────────────────────────
-case "$(uname -s)" in
-  Darwin) DATA_DIR="$HOME/Library/Application Support/SoniqBoom" ;;
-  Linux)  DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soniqboom" ;;
-  *)      DATA_DIR="$HOME/.soniqboom" ;;
-esac
+# ── Paths (platform-aware, env-overridable) ──────────────────────────────────
+# Honour SONIQBOOM_DATA_DIR so an operator who points the server at a custom
+# location sees the menubar / shutdown scripts read the right pidfile.
+if [ -n "${SONIQBOOM_DATA_DIR:-}" ]; then
+  DATA_DIR="$SONIQBOOM_DATA_DIR"
+else
+  case "$(uname -s)" in
+    Darwin) DATA_DIR="$HOME/Library/Application Support/SoniqBoom" ;;
+    Linux)  DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soniqboom" ;;
+    *)      DATA_DIR="$HOME/.soniqboom" ;;
+  esac
+fi
 PID_FILE="$DATA_DIR/soniqboom.pid"
 LOG_DIR="$DATA_DIR/log"
 LOG_FILE="$LOG_DIR/soniqboom.log"
@@ -105,8 +111,12 @@ VERSION=$(curl -s "http://127.0.0.1:${PORT}/api/health" 2>/dev/null \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null || echo "")
 [ -z "$VERSION" ] && VERSION="1.0.0"
 
-# Network addresses
-HOSTNAME_LOCAL="$(hostname 2>/dev/null || echo "localhost").local"
+# Network addresses.  ``hostname`` on macOS sometimes already returns the
+# fully-qualified ``name.local`` form, so naively appending ``.local`` would
+# produce ``name.local.local``.  Strip a trailing ``.local`` before adding
+# our own so the banner shows a single, valid mDNS name.
+_HOSTNAME_RAW="$(hostname 2>/dev/null || echo "localhost")"
+HOSTNAME_LOCAL="${_HOSTNAME_RAW%.local}.local"
 NET_ADDRS=()
 if command -v ifconfig &>/dev/null; then
   while IFS= read -r ip; do
@@ -138,6 +148,43 @@ for addr in "${NET_ADDRS[@]}"; do
   echo -e "  Network:   ${CYAN}✓${NC}  http://${addr}:${PORT}"
 done
 echo -e "  Hostname:  ${CYAN}✓${NC}  http://${HOSTNAME_LOCAL}:${PORT}"
+
+# ── Optional services (subsonic / multiroom / cast) ─────────────────────────
+# Rendered from /api/health so the banner mirrors what the server has
+# actually mounted.  A disabled service is shown with a ✗ mark and a
+# hint pointing at the toggle command.  Pick the first network address
+# as the base URL — falls back to localhost if no NIC bound.
+#
+# Note on the python invocation below: we pass the script via ``-c``
+# (NOT ``python3 -``) so the heredoc-piped JSON stays the only thing
+# arriving on stdin.  Mixing ``python3 -`` with a heredoc collides both
+# inputs on stdin and Python errors out with a SyntaxError on the JSON.
+SVC_BASE="http://${NET_ADDRS[0]:-localhost}:${PORT}"
+SVC_JSON=$(curl -s "http://127.0.0.1:${PORT}/api/health" 2>/dev/null)
+if [ -n "$SVC_JSON" ]; then
+  echo ""
+  echo -e "  Services:"
+  echo "$SVC_JSON" | python3 -c "
+import sys, json
+base = sys.argv[1]
+urls = {
+    'subsonic':  f'{base}/rest/ping.view',
+    'multiroom': f'{base}/multiroom',
+    'cast':      f'{base}/api/cast/targets',
+}
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for s in data.get('services', []):
+    mark = '✓' if s.get('enabled') else '✗'
+    url  = urls.get(s.get('name'), '') if s.get('enabled') else '(disabled — enable in Settings → Services)'
+    label = s.get('label') or s.get('name')
+    print(f'             {mark}  {label:<24} {url}')
+" "$SVC_BASE" 2>/dev/null || true
+fi
+
+echo ""
 echo -e "  Config:    ${DIM}$CONF_FILE${NC}"
 echo -e "  Data:      ${DIM}$DATA_DIR${NC}"
 echo -e "  Log:       ${DIM}$LOG_FILE${NC}"

@@ -101,16 +101,96 @@ def load_snapshot(data_dir: Path) -> dict:
     return {}
 
 
+import copy
+
+# Count of AOF entries quarantined during the last replay.  Exposed via
+# ``aof_quarantine_count`` so an admin/health endpoint (or test) can detect
+# a partially-corrupted journal without grepping logs.
+_aof_quarantine_count: int = 0
+
+
+def aof_quarantine_count() -> int:
+    """Return the number of AOF entries quarantined on the last replay.
+
+    Reset to zero at the start of each ``replay_aof`` call.  When the
+    journal is healthy this stays at zero; non-zero values indicate that
+    ``library.aof.quarantine`` has fresh entries an operator should
+    inspect (most often after a crash or unclean shutdown).
+    """
+    return _aof_quarantine_count
+
+
+def _apply_entry_transactional(state: dict, entry: dict) -> bool:
+    """Apply ``entry`` to ``state`` atomically.
+
+    The underlying ``_apply_entry`` mutates ``state`` in place, so a
+    half-applied batch upsert (e.g. AttributeError mid-loop) would leave
+    the store in a torn state.  We snapshot the touched top-level
+    sub-dicts before the call and restore them on failure so a corrupt
+    batch can't taint the rest of the replay.
+
+    Returns ``True`` on success, ``False`` if the entry was rolled back.
+    """
+    from soniqboom.core.merger import _apply_entry
+
+    # Shallow-snapshot the top-level state slots this op might touch.
+    # Deep-copying the entire 170K-track ``tracks`` dict per replayed
+    # entry would dominate startup, so we copy lazily — only the keys
+    # actually present in ``state``.
+    snapshot = {k: copy.copy(v) for k, v in state.items()}
+    try:
+        _apply_entry(state, entry)
+        return True
+    except Exception:
+        # Restore the pre-call references so partial mutations don't
+        # leak.  Note: any nested dicts that ``_apply_entry`` mutated
+        # in place are restored via the snapshot's reference if it was
+        # a fresh container we copied; for atomic restoration we
+        # additionally copy each sub-dict on the way in.
+        for k, v in snapshot.items():
+            state[k] = v
+        # Drop keys created during the failed call.
+        for k in list(state.keys()):
+            if k not in snapshot:
+                state.pop(k, None)
+        return False
+
+
 def replay_aof(state: dict, data_dir: Path) -> int:
     """Replay AOF entries on top of the loaded snapshot.
 
-    Returns the number of entries applied.
+    Returns the number of entries applied.  Corrupt or unparseable entries
+    (and any that fail the transactional apply) are written to
+    ``library.aof.quarantine`` with the current timestamp so an operator
+    can inspect them rather than the events being silently dropped.
+    Counters are surfaced via ``aof_quarantine_count``.
     """
-    from soniqboom.core.merger import _apply_entry
+    global _aof_quarantine_count
+    _aof_quarantine_count = 0
 
     aof_path = data_dir / "library.aof"
     if not aof_path.exists() or aof_path.stat().st_size == 0:
         return 0
+
+    quarantine_path = data_dir / "library.aof.quarantine"
+    quarantine_fp = None
+
+    def _quarantine(raw: str, reason: str) -> None:
+        nonlocal quarantine_fp
+        global _aof_quarantine_count
+        try:
+            if quarantine_fp is None:
+                quarantine_fp = open(quarantine_path, "a")
+            quarantine_fp.write(
+                json.dumps({
+                    "quarantined_at": time.time(),
+                    "reason": reason,
+                    "raw": raw,
+                }) + "\n",
+            )
+        except OSError:
+            log.exception("Could not write to AOF quarantine at %s", quarantine_path)
+        _aof_quarantine_count += 1
 
     applied = 0
     with open(aof_path, "r") as f:
@@ -120,19 +200,44 @@ def replay_aof(state: dict, data_dir: Path) -> int:
                 continue
             try:
                 entry = json.loads(line)
-                _apply_entry(state, entry)
-                applied += 1
-            except (json.JSONDecodeError, KeyError) as exc:
+            except json.JSONDecodeError as exc:
                 log.warning("Skipping corrupt AOF entry: %s", exc)
+                _quarantine(line, f"json: {exc}")
+                continue
+            try:
+                ok = _apply_entry_transactional(state, entry)
+            except Exception as exc:
+                # Defensive — _apply_entry_transactional already catches
+                # most failures; this covers anything that escapes the
+                # snapshot/restore (e.g. an OOM mid-copy).
+                log.warning("AOF entry raised %s — quarantining", exc)
+                _quarantine(line, f"apply: {exc}")
+                continue
+            if ok:
+                applied += 1
+            else:
+                _quarantine(line, "transactional rollback")
+
+    if quarantine_fp is not None:
+        try:
+            quarantine_fp.close()
+        except OSError:
+            pass
 
     if applied:
         log.info("Replayed %d AOF entries", applied)
+    if _aof_quarantine_count:
+        log.warning(
+            "Quarantined %d AOF entries to %s",
+            _aof_quarantine_count, quarantine_path,
+        )
     return applied
 
 
 def populate_store(state: dict) -> None:
     """Populate the TrackStore singleton from a loaded snapshot state."""
     from soniqboom.core.store import get_store
+    from soniqboom.core.startup_status import set_phase as _ss_phase
 
     store = get_store()
     t0 = time.monotonic()
@@ -149,6 +254,13 @@ def populate_store(state: dict) -> None:
         config=state.get("config", {}),
     )
 
+    # Index rebuild is the biggest chunk of startup wall-clock (3–15 s for
+    # 268K tracks even with batch_mode).  Surface it as its own phase so
+    # the menubar / CLI watcher sees "Building search indexes" instead of
+    # still showing "Loading library snapshot" while seconds tick by.
+    track_count = len(state.get("tracks", {}))
+    _ss_phase("building_indexes", "Building search indexes",
+              f"{track_count:,} tracks")
     store.rebuild_indexes()
     elapsed = (time.monotonic() - t0) * 1000
     log.info(

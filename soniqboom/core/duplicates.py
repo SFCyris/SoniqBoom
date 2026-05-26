@@ -165,8 +165,26 @@ def compute_duplicate_groups(
         key_for_track[tid] = key
         groups.setdefault(key, []).append(t)
 
-    # Step 2: for each group, score formats and pick primary
+    # Step 2: for each group, score formats and pick primary.  Hoist the
+    # ``_pick_primary`` + best-score computation out of the per-track loop
+    # — they're a function of the group, not of the track — so the cost
+    # collapses from O(K² log K) to O(K log K) per K-sized group.
     result: dict[str, dict[str, Any]] = {}
+
+    group_meta: dict[str, dict[str, Any]] = {}
+    for key, group in groups.items():
+        if len(group) < 2 or not key:
+            continue
+        primary_id = _pick_primary(group).get("id", "")
+        best_score = max(
+            format_quality_score(g.get("format", ""), g.get("bitrate"))
+            for g in group
+        )
+        group_meta[key] = {
+            "gid": _group_id(key),
+            "primary_id": primary_id,
+            "best_score": best_score,
+        }
 
     for t in tracks:
         tid     = t.get("id", "")
@@ -175,8 +193,8 @@ def compute_duplicate_groups(
         score   = format_quality_score(fmt, bitrate)
         key     = key_for_track.get(tid, "")
 
-        group = groups.get(key, [])
-        if len(group) < 2 or not key:
+        meta = group_meta.get(key)
+        if meta is None:
             # Unique track — no duplicate group
             result[tid] = {
                 "duplicate_group_id": None,
@@ -184,18 +202,12 @@ def compute_duplicate_groups(
                 "is_duplicate_primary": True,
             }
         else:
-            # Part of a duplicate group — pick the highest-scored as primary
-            gid = _group_id(key)
-            # Determine the best score in this group
-            best_score = max(
-                format_quality_score(g.get("format", ""), g.get("bitrate"))
-                for g in group
-            )
             result[tid] = {
-                "duplicate_group_id": gid,
+                "duplicate_group_id": meta["gid"],
                 "format_score": score,
-                "is_duplicate_primary": (score == best_score and
-                    tid == _pick_primary(group)["id"]),
+                "is_duplicate_primary": (
+                    score == meta["best_score"] and tid == meta["primary_id"]
+                ),
             }
 
     return result

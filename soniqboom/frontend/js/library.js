@@ -6,6 +6,7 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
+import { artPlaceholderEmoji } from './utils.js';
 
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
@@ -33,6 +34,183 @@ let currentTracks = [];
 let sortKey = null;
 let sortAsc = true;
 let activeRow = null;
+
+// ── Windowed track store (large-library viewing) ──────────────────────────────
+//
+// For libraries above the /tracks page cap (5000) we replace the plain
+// Array assigned to ``currentTracks`` with a Proxy that LOOKS like an
+// array (numeric indexing + ``.length``) but only keeps a sliding window
+// of chunks loaded.  The scrollbar reflects the FULL library size; rows
+// the user scrolls into are fetched in the background and rendered when
+// they land.  This is the Apple Photos / Spotify model — one logical
+// list, bounded memory footprint, no pagination chrome.
+//
+// Why a Proxy and not a class with explicit ``get(i)`` calls: every
+// existing call site uses ``currentTracks[i]`` and ``currentTracks.length``.
+// Replacing 27 call sites would be invasive and bug-prone; intercepting
+// the access at the variable boundary keeps the refactor localised here.
+//
+// Tunables:
+//   * CHUNK_SIZE = 2000 — one round-trip per ~75 rows × 27 visible per
+//     viewport ≈ ~4 viewports of headroom before the next fetch fires.
+//     Small enough that re-sort or jump-to-unfetched-region pays only
+//     2000 rows of latency, not the full 5000.
+//   * MAX_CHUNKS = 10 — keeps ~20 000 tracks (≈ 10 MB at our row size)
+//     in memory at any time, evicting least-recently-touched chunks.
+const CHUNK_SIZE = 2000;
+const MAX_CHUNKS = 10;
+
+function createWindowedStore(total, fetcher, opts = {}) {
+  const chunks  = new Map();   // chunkIdx → Track[]
+  const pending = new Map();   // chunkIdx → Promise (dedup)
+  const lru     = [];          // chunkIdx access order, oldest first
+  let onChunkLoad = null;      // called with chunkIdx when a fetch lands
+  // Sort metadata is carried on the store so callers (e.g. column-header
+  // click) can read the current key+direction back without re-deriving it
+  // from the persisted localStorage state.  Mutation of these fields
+  // requires ``invalidate()`` from the caller — the store does not auto-
+  // refetch on its own (showAll owns the lifecycle).
+  const target = {
+    _isWindowedStore: true,
+    _total: total,
+    _chunks: chunks,
+    _pending: pending,
+    _sortBy: opts.sortBy || null,
+    _sortOrder: opts.sortOrder || null,
+    setOnChunkLoad(cb) { onChunkLoad = cb; },
+    // Fetch every chunk that overlaps [start, end).  Callers fire this
+    // from the scroll handler so the data shows up before the user
+    // gets to it.
+    ensureRange(start, end) {
+      if (end <= start) return;
+      const first = Math.max(0, Math.floor(start / CHUNK_SIZE));
+      const last  = Math.min(
+        Math.ceil(total / CHUNK_SIZE) - 1,
+        Math.floor((end - 1) / CHUNK_SIZE),
+      );
+      for (let c = first; c <= last; c++) fetchChunk(c);
+    },
+    // ``Array.findIndex``-compat: search only loaded chunks.  Returns
+    // ``-1`` for tracks outside the loaded window — callers already have
+    // a graceful fallback when the search fails (the queue-from-now-
+    // playing button hits ``Player.playTrack(t)`` as the alternative).
+    findIndex(pred) {
+      for (const [c, arr] of chunks) {
+        const localIdx = arr.findIndex(pred);
+        if (localIdx >= 0) return c * CHUNK_SIZE + localIdx;
+      }
+      return -1;
+    },
+    // Discard every chunk + any in-flight fetches.  Used when the user
+    // changes sort (the existing data is in a different order now) or
+    // switches off this view entirely.
+    invalidate() {
+      chunks.clear();
+      pending.clear();
+      lru.length = 0;
+    },
+    // Slice-like helper for cases where the caller needs the currently
+    // loaded contiguous window starting at idx (Player.setQueue path).
+    // Returns at most ``count`` loaded entries; stops at the first
+    // unloaded slot so the queue is dense, not sparse.
+    loadedSliceFrom(idx, count) {
+      const out = [];
+      for (let i = idx; i < total && out.length < count; i++) {
+        const t = readSlot(i);
+        if (!t) break;
+        out.push(t);
+      }
+      return out;
+    },
+    // Iterator yielding only the LOADED tracks across all chunks, in
+    // their chunk-index order.  Lets ``[...store]`` work without
+    // crashing (it'd otherwise throw "is not iterable" on the Proxy)
+    // and gives reasonable behaviour to any incidental iteration
+    // (selection-bar batch helpers, dev-console inspection).  Callers
+    // who need a fully-loaded array must use loadedSliceFrom + extend
+    // or push every chunk to load first; iteration over the proxy
+    // never triggers fetches by design.
+    *[Symbol.iterator]() {
+      const sorted = [...chunks.keys()].sort((a, b) => a - b);
+      for (const c of sorted) {
+        for (const t of chunks.get(c)) yield t;
+      }
+    },
+  };
+
+  function fetchChunk(chunkIdx) {
+    if (chunks.has(chunkIdx) || pending.has(chunkIdx)) return;
+    const offset = chunkIdx * CHUNK_SIZE;
+    const limit  = Math.min(CHUNK_SIZE, total - offset);
+    if (limit <= 0) return;
+    const p = fetcher(offset, limit).then(arr => {
+      chunks.set(chunkIdx, arr);
+      pending.delete(chunkIdx);
+      // LRU bookkeeping — push then trim from the front, skipping the
+      // chunk we just loaded so a single-chunk window can't evict
+      // itself.
+      const ix = lru.indexOf(chunkIdx);
+      if (ix >= 0) lru.splice(ix, 1);
+      lru.push(chunkIdx);
+      while (lru.length > MAX_CHUNKS) {
+        const evict = lru.shift();
+        if (evict !== chunkIdx) chunks.delete(evict);
+      }
+      if (onChunkLoad) {
+        try { onChunkLoad(chunkIdx); } catch (_) { /* listener isolation */ }
+      }
+    }).catch(() => {
+      // Don't keep the failed chunk in ``pending`` forever — let the
+      // next access retry.
+      pending.delete(chunkIdx);
+    });
+    pending.set(chunkIdx, p);
+  }
+
+  function readSlot(i) {
+    if (i < 0 || i >= total) return undefined;
+    const chunkIdx = Math.floor(i / CHUNK_SIZE);
+    const arr = chunks.get(chunkIdx);
+    if (arr) {
+      // Touch LRU on access so a chunk we're actively rendering doesn't
+      // get evicted by a jump-to-far-away chunk fetch.
+      const ix = lru.indexOf(chunkIdx);
+      if (ix >= 0) { lru.splice(ix, 1); lru.push(chunkIdx); }
+      return arr[i - chunkIdx * CHUNK_SIZE];
+    }
+    fetchChunk(chunkIdx);  // trigger background fetch on first access
+    return undefined;
+  }
+
+  // Proxy presents the store as an array-shaped object: numeric indexing
+  // returns the track (or undefined while loading), ``.length`` reports
+  // the FULL library size, and named members (ensureRange, invalidate,
+  // findIndex, etc.) pass through unchanged.
+  return new Proxy(target, {
+    get(t, prop) {
+      if (prop === 'length') return total;
+      if (typeof prop === 'string') {
+        // Convert numeric-string indexes ("0", "47", …) into reads.
+        // ``Number.isInteger`` accepts the parsed integer; non-numeric
+        // string props ("length", "ensureRange", "_chunks", etc.) fall
+        // through to the target.
+        const n = Number(prop);
+        if (Number.isInteger(n) && n >= 0 && String(n) === prop) {
+          return readSlot(n);
+        }
+      }
+      return t[prop];
+    },
+    has(t, prop) {
+      if (prop === 'length') return true;
+      if (typeof prop === 'string') {
+        const n = Number(prop);
+        if (Number.isInteger(n) && n >= 0) return n < total;
+      }
+      return prop in t;
+    },
+  });
+}
 let _infoCallback = null;
 let _focusedIdx = -1;   // keyboard-navigated row index (J/K navigation)
 let _dupViewActive = false;  // true while in duplicates view (forces Location column visible)
@@ -44,11 +222,20 @@ let _groupLabel     = '';
 let _groupOnClick   = null;
 
 // ── Virtual scroll state ───────────────────────────────────────────────────────
-const ROW_H  = 28;   // px per row (approximate, matches td padding)
+let ROW_H    = 28;   // px per row (measured after first paint; default matches td padding)
 const VS_BUF = 10;   // rows to render above/below viewport
+let _rowHMeasured = false;  // becomes true after the first measurement
 
 let _vsStart = 0;    // first rendered data index
 let _vsEnd   = 0;    // one past last rendered data index
+
+// Row pool for virtual scroll — pre-built TRs reused across scroll events.
+// Each entry is the same DOM node lifecycle: we mutate text/dataset/classes
+// instead of detaching + recreating, which keeps scroll inexpensive at large
+// row counts (the react-window pattern).
+const _rowPool   = [];
+let   _vsTopSpacer = null;
+let   _vsBotSpacer = null;
 
 // ── Multi-select state ─────────────────────────────────────────────────────────
 let _selected     = new Set();
@@ -58,9 +245,10 @@ let _lastClickIdx = -1;
 let _gridView = false;
 
 // ── Column visibility state ────────────────────────────────────────────────────
-const ALL_COLS = ['col-num','col-title','col-album-artist','col-artist','col-album','col-track','col-year','col-dur','col-format','col-location','col-rating'];
+const ALL_COLS = ['col-num','col-cover','col-title','col-album-artist','col-artist','col-album','col-track','col-year','col-dur','col-format','col-location','col-rating'];
 const COL_LABELS = {
   'col-num':          '#',
+  'col-cover':        'Cover',
   'col-title':        'Title',
   'col-album-artist': 'Album Artist',
   'col-artist':       'Artist',
@@ -133,11 +321,26 @@ function _fmtClass(fmt) {
 }
 
 function _renderStars(rating) {
-  let html = '';
+  // The radiogroup pattern requires exactly one ``aria-checked="true"``
+  // child at a time — the *current value*, not "all the stars up to it".
+  // Visual fill is still cumulative; only the screen-reader marker is
+  // single-selected.  Tabindex goes on whichever star is currently
+  // checked (or the first star when rating is 0) so Tab lands there.
+  const checkedIdx = rating > 0 ? rating : 1;
+  let html = `<span class="star-group" role="radiogroup" aria-label="Rating, ${rating} of 5 stars">`;
   for (let i = 1; i <= 5; i++) {
-    const cls = i <= rating ? 'star star-filled' : 'star star-empty';
-    html += `<span class="${cls}" data-val="${i}">★</span>`;
+    const filled = i <= rating;
+    const cls = filled ? 'star star-filled' : 'star star-empty';
+    const glyph = filled ? '★' : '☆';
+    const isChecked = i === checkedIdx && rating > 0;
+    const tabindex = i === checkedIdx ? 0 : -1;
+    html += (
+      `<span class="${cls}" role="radio" tabindex="${tabindex}"`
+      + ` data-val="${i}" aria-checked="${isChecked}"`
+      + ` aria-label="${i} star${i === 1 ? '' : 's'}">${glyph}</span>`
+    );
   }
+  html += '</span>';
   return html;
 }
 
@@ -146,6 +349,10 @@ function _showSkeletonRows(count = 18) {
   const albumGrid = document.getElementById('album-grid');
   if (albumGrid) albumGrid.hidden = true;
   document.getElementById('track-table').style.display = '';
+  // The skeleton view replaces the entire tbody contents, so the pool
+  // detaches.  Clearing it here makes the next _vsRender treat the pool as
+  // empty rather than try to reuse phantom nodes.
+  _vsResetPool();
   tbody.innerHTML = '';
   emptyEl.hidden = true;
   loadingEl.hidden = true;
@@ -154,6 +361,7 @@ function _showSkeletonRows(count = 18) {
     tr.className = 'skeleton';
     tr.innerHTML = `
       <td class="col-num"><span class="skel-bar" style="width:${16 + Math.random() * 8|0}px"></span></td>
+      <td class="col-cover"><span class="skel-bar" style="width:28px;height:28px;border-radius:4px;display:inline-block"></span></td>
       <td class="col-title"><span class="skel-bar" style="width:${80 + Math.random() * 80|0}px"></span></td>
       <td class="col-album-artist"><span class="skel-bar" style="width:${50 + Math.random() * 50|0}px"></span></td>
       <td class="col-artist"><span class="skel-bar" style="width:${40 + Math.random() * 50|0}px"></span></td>
@@ -169,7 +377,12 @@ function _showSkeletonRows(count = 18) {
 }
 
 // ── Sidebar count badges ──────────────────────────────────────────────────────
-function _updateNavBadge(view, count) {
+// ``truncated`` = the value was capped at the API page-size and the real
+// total may be higher.  We append a literal ``+`` to communicate "at least
+// this many" instead of misleading the user with a hard ceiling.  The
+// All-Tracks view uses /tracks?limit=5000 and hits the cap on big libraries
+// — without the ``+`` a 50 000-track library looks like exactly 5 000.
+function _updateNavBadge(view, count, truncated = false) {
   const li = document.querySelector(`#nav-library li[data-view="${view}"]`);
   if (!li) return;
   let badge = li.querySelector('.nav-count');
@@ -178,7 +391,11 @@ function _updateNavBadge(view, count) {
     badge.className = 'nav-count';
     li.appendChild(badge);
   }
-  badge.textContent = count != null ? count.toLocaleString() : '';
+  if (count == null) {
+    badge.textContent = '';
+  } else {
+    badge.textContent = count.toLocaleString() + (truncated ? '+' : '');
+  }
 }
 
 async function _refreshTrackCount() {
@@ -189,130 +406,228 @@ async function _refreshTrackCount() {
 }
 
 // ── Make a single track row element ───────────────────────────────────────────
-function _makeTrackRow(t, i) {
+//
+// Rows are produced by ``_makeRowSkeleton`` (no data) and filled via
+// ``_fillTrackRow``.  All event handling is delegated to ``tbody`` (see the
+// listener block below ``_vsRender``) — that lets the virtual-scroll loop
+// reuse a fixed pool of DOM nodes instead of attaching ~7 listeners per row
+// on every scroll frame.
+const _CANONICAL_ROW_HTML = `
+    <td class="col-num"><span class="row-play-glyph" aria-hidden="true" title="Double-click to play">▶</span><span class="row-num"></span></td>
+    <td class="col-cover"><div class="col-cover-frame"><span class="art-placeholder row-art-placeholder"></span><img class="row-cover-img" loading="lazy" decoding="async" alt=""></div></td>
+    <td class="col-title"></td>
+    <td class="col-album-artist"></td>
+    <td class="col-artist"></td>
+    <td class="col-album"></td>
+    <td class="col-track"></td>
+    <td class="col-year"></td>
+    <td class="col-dur"></td>
+    <td class="col-format"><span class="fmt-badge"></span></td>
+    <td class="col-location"></td>
+    <td class="col-rating"></td>`;
+
+function _makeRowSkeleton() {
   const tr = document.createElement('tr');
+  tr.setAttribute('draggable', 'true');
+  tr.innerHTML = _CANONICAL_ROW_HTML;
+  return tr;
+}
+
+function _fillTrackRow(tr, t, i) {
+  // Windowed-store skeleton path: when the row at global index ``i``
+  // hasn't been fetched yet, ``t`` is undefined.  Render a row-shaped
+  // skeleton (matches _showSkeletonRows visually) so the layout stays
+  // stable while the chunk fetch lands.  Once it does the windowed
+  // store fires its onChunkLoad callback which forces a re-render and
+  // this row gets the real data on the next pass.
+  if (!t) {
+    tr.removeAttribute('data-id');
+    tr.dataset.idx = i;
+    tr.className = 'skeleton';
+    tr.innerHTML = `
+      <td class="col-num"><span class="skel-bar" style="width:24px"></span></td>
+      <td class="col-cover"><span class="skel-bar" style="width:28px;height:28px;border-radius:4px;display:inline-block"></span></td>
+      <td class="col-title"><span class="skel-bar" style="width:120px"></span></td>
+      <td class="col-album-artist"><span class="skel-bar" style="width:80px"></span></td>
+      <td class="col-artist"><span class="skel-bar" style="width:80px"></span></td>
+      <td class="col-album"><span class="skel-bar" style="width:90px"></span></td>
+      <td class="col-track"><span class="skel-bar" style="width:20px"></span></td>
+      <td class="col-year"><span class="skel-bar" style="width:28px"></span></td>
+      <td class="col-dur"><span class="skel-bar" style="width:32px"></span></td>
+      <td class="col-format"><span class="skel-bar" style="width:36px"></span></td>
+      <td class="col-location"><span class="skel-bar" style="width:80px"></span></td>
+      <td class="col-rating"><span class="skel-bar" style="width:44px"></span></td>`;
+    return;
+  }
+  // If the row was previously rendered as a skeleton (different cell
+  // structure — shimmer bars instead of row-num / cover-frame / etc.),
+  // restore the canonical layout so the field assignments below find
+  // the elements they ``querySelector`` for.
+  if (tr.classList.contains('skeleton')) {
+    tr.innerHTML = _CANONICAL_ROW_HTML;
+  }
   tr.dataset.id  = t.id;
   tr.dataset.idx = i;
 
+  // Reset class list to base + apply state-dependent classes.  We keep
+  // ``kb-focused`` / ``playing`` / ``dragging`` off the row by default —
+  // the surrounding code re-applies them after a render finishes.
+  tr.className = '';
   if (_selected.has(i)) tr.classList.add('multi-selected');
   if (t._scanned === false) tr.classList.add('unscanned');
-
-  // Duplicate group styling (set by showDuplicates)
   if (t._dupGroupFirst) tr.classList.add('dup-group-first');
   if (t._dupIsPrimary)  tr.classList.add('dup-primary');
   if (t._dupGroupId && !t._dupIsPrimary) tr.classList.add('dup-variant');
 
-  // Format disc + track as "D1-01" (disc only shown when present alongside track)
   const disc = t.disc_number != null ? `D${t.disc_number}` : '';
   const trk  = t.track_number != null ? String(t.track_number).padStart(2, '0') : '';
   const trackStr = disc && trk ? `${disc}-${trk}` : (trk || disc || '');
 
   const rating = _ratingsCache[t.id] || 0;
-  const stars = _renderStars(rating);
   const unscan = t._scanned === false;
-
-  // Clickable metadata cells + dim dashes for empty values
   const hasAA = !unscan && t.album_artist;
   const hasAr = !unscan && t.artist;
   const hasAl = !unscan && t.album;
-  const aaHtml = unscan ? '' : hasAA ? `<span class="cell-link" data-action="album-artist">${esc(t.album_artist)}</span>` : '—';
-  const arHtml = unscan ? '' : esc(t.artist || '—');
-  const alHtml = unscan ? '' : hasAl ? `<span class="cell-link" data-action="album">${esc(t.album)}</span>` : '—';
 
-  tr.innerHTML = `
-    <td class="col-num">${i + 1}</td>
-    <td class="col-title"        title="${esc(t.title)}"       >${esc(t.title        || '—')}</td>
-    <td class="col-album-artist${!unscan && !hasAA ? ' col-empty' : ''}" title="${esc(t.album_artist)}">${aaHtml}</td>
-    <td class="col-artist${!unscan && !hasAr ? ' col-empty' : ''}"       title="${esc(t.artist)}"      >${arHtml}</td>
-    <td class="col-album${!unscan && !hasAl ? ' col-empty' : ''}"        title="${esc(t.album)}"       >${alHtml}</td>
-    <td class="col-track">${trackStr}</td>
-    <td class="col-year">${t.year || ''}</td>
-    <td class="col-dur${!unscan && !t.duration ? ' col-empty' : ''}">${unscan ? '' : fmtDur(t.duration)}</td>
-    <td class="col-format"><span class="fmt-badge fmt-${_fmtClass(t.format)}">${esc(t.format || '')}</span></td>
-    <td class="col-location" title="${_exposeLocalFiles ? esc(t.path) : ''}">${esc(_displayPath(t.path || ''))}</td>
-    <td class="col-rating">${stars}</td>`;
+  const cells = tr.children;
+  // col-num: keep play glyph + numbered span
+  const numSpan = cells[0].querySelector('.row-num');
+  if (numSpan) numSpan.textContent = String(i + 1);
 
-  // Rating click handler — uses event delegation on the td (survives innerHTML replacement)
-  const ratingTd = tr.querySelector('.col-rating');
-  function _handleRatingClick(e) {
-    e.stopPropagation();
-    const star = e.target.closest('.star');
-    if (!star) return;
-    const newRating = parseInt(star.dataset.val);
-    const finalRating = (_ratingsCache[t.id] === newRating) ? 0 : newRating;
-    _ratingsCache[t.id] = finalRating;
-    ratingTd.innerHTML = _renderStars(finalRating);
-    fetch(`/api/tracks/${t.id}/rating`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rating: finalRating }),
-    }).catch(() => {});
-  }
-  ratingTd.addEventListener('click', _handleRatingClick);
-
-  tr.setAttribute('draggable', 'true');
-  tr.addEventListener('dragstart', (e) => {
-    e.dataTransfer.effectAllowed = 'copy';
-    // If the dragged row is part of a multi-selection, carry all selected tracks
-    const dragTracks = _selected.size > 1 && _selected.has(i)
-      ? [..._selected].sort((a, b) => a - b).map(j => currentTracks[j]).filter(Boolean)
-      : [currentTracks[i]];
-    e.dataTransfer.setData('application/x-soniqboom-track', JSON.stringify(dragTracks));
-    tr.classList.add('dragging');
-    if (dragTracks.length > 1) {
-      tbody.querySelectorAll('tr.multi-selected').forEach(r => r.classList.add('dragging'));
-    }
-  });
-  tr.addEventListener('dragend', () => {
-    tbody.querySelectorAll('tr.dragging').forEach(r => r.classList.remove('dragging'));
-  });
-
-  tr.addEventListener('click', (e) => {
-    // Handle clickable metadata cells (album artist / album)
-    const cellLink = e.target.closest('.cell-link');
-    if (cellLink) {
-      e.stopPropagation();
-      const action = cellLink.dataset.action;
-      if (action === 'album-artist' && t.album_artist) {
-        showAlbums(null, t.album_artist, 'album_artist');
-      } else if (action === 'album' && t.album) {
-        showAlbumTracks(t.artist, t.album_artist, t.album,
-          () => showAlbums(t.artist, t.album_artist, t.album_artist ? 'album_artist' : 'artist'));
+  // col-cover: format-aware emoji placeholder sitting under a lazy <img>.
+  // The placeholder is always painted (matching the bottom-left player and
+  // the mobile row) so a missing cover never shows a broken-image glyph.
+  // On successful load the <img> picks up ``.loaded`` and its opacity goes
+  // to 1, hiding the placeholder behind it.  ``onerror`` keeps the
+  // placeholder visible so 404 art still reads as the format icon.
+  const coverCell  = cells[1];
+  const coverFrame = coverCell.firstElementChild;
+  const coverPh    = coverFrame?.firstElementChild;
+  const coverImg   = coverFrame?.lastElementChild;
+  if (coverPh) coverPh.textContent = artPlaceholderEmoji(t);
+  if (coverImg) {
+    const wantedSrc = t.id ? `/api/art/${t.id}?size=sm` : '';
+    if (coverImg.dataset.src !== wantedSrc) {
+      coverImg.dataset.src = wantedSrc;
+      coverImg.removeAttribute('src');
+      coverImg.classList.remove('loaded');
+      if (wantedSrc) {
+        coverImg.onload = () => coverImg.classList.add('loaded');
+        coverImg.onerror = () => coverImg.classList.remove('loaded');
+        coverImg.src = wantedSrc;
       }
-      return;
     }
-    if (e.shiftKey && _lastClickIdx >= 0) {
-      // Select range
-      const lo = Math.min(_lastClickIdx, i), hi = Math.max(_lastClickIdx, i);
-      if (!e.metaKey && !e.ctrlKey) _selected.clear();
-      for (let j = lo; j <= hi; j++) _selected.add(j);
-    } else if (e.metaKey || e.ctrlKey) {
-      // Toggle individual row
-      if (_selected.has(i)) _selected.delete(i); else _selected.add(i);
-      _lastClickIdx = i;
-    } else {
-      // Single select — clear multi-selection first
-      _selected.clear();
-      _selected.add(i);
-      _lastClickIdx = i;
-      selectRow(tr, i);
-    }
-    // Update .multi-selected classes directly — avoids _vsRender() early-return
-    // when the virtual scroll viewport hasn't changed (no scroll between clicks)
-    _refreshSelectionClasses();
-    _updateSelectionBar();
-  });
+  }
 
-  tr.addEventListener('dblclick', () => playFrom(i));
-  tr.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    if (_infoCallback) _infoCallback(currentTracks, i);
-  });
+  // col-title
+  const titleTd = cells[2];
+  titleTd.textContent = t.title || '—';
+  titleTd.title = t.title || '';
 
-  return tr;
+  // col-album-artist
+  const aaTd = cells[3];
+  aaTd.classList.toggle('col-empty', !unscan && !hasAA);
+  aaTd.title = t.album_artist || '';
+  if (unscan) {
+    aaTd.textContent = '';
+  } else if (hasAA) {
+    aaTd.innerHTML = `<span class="cell-link" data-action="album-artist">${esc(t.album_artist)}</span>`;
+  } else {
+    aaTd.textContent = '—';
+  }
+
+  // col-artist
+  const arTd = cells[4];
+  arTd.classList.toggle('col-empty', !unscan && !hasAr);
+  arTd.title = t.artist || '';
+  arTd.textContent = unscan ? '' : (t.artist || '—');
+
+  // col-album
+  const alTd = cells[5];
+  alTd.classList.toggle('col-empty', !unscan && !hasAl);
+  alTd.title = t.album || '';
+  if (unscan) {
+    alTd.textContent = '';
+  } else if (hasAl) {
+    alTd.innerHTML = `<span class="cell-link" data-action="album">${esc(t.album)}</span>`;
+  } else {
+    alTd.textContent = '—';
+  }
+
+  // col-track / col-year
+  cells[6].textContent = trackStr;
+  cells[7].textContent = t.year || '';
+
+  // col-dur
+  const durTd = cells[8];
+  durTd.classList.toggle('col-empty', !unscan && !t.duration);
+  durTd.textContent = unscan ? '' : fmtDur(t.duration);
+
+  // col-format
+  const fmtBadge = cells[9].firstElementChild;
+  fmtBadge.className = `fmt-badge fmt-${_fmtClass(t.format)}`;
+  fmtBadge.textContent = t.format || '';
+
+  // col-location
+  const locTd = cells[10];
+  locTd.title = _exposeLocalFiles ? (t.path || '') : '';
+  locTd.textContent = _displayPath(t.path || '');
+
+  // col-rating — innerHTML required because stars use nested elements
+  cells[11].innerHTML = _renderStars(rating);
+}
+
+// Persist rating + bring focus back into the star group after a change.
+//
+// ``preventScroll: true`` on the focus() call is critical — without it the
+// browser auto-scrolls the focused star into view, which on a virtualised
+// list can land a long way from the user's actual viewport if the row was
+// re-keyed during a pending VS render.  The autoscroll then triggers our
+// scroll listener, which renders the new window and may end up shifting
+// the spacers further; the user perceives this as the list "running away"
+// on its own until it bottoms out.
+function _setRowRating(trackId, newRating, ratingTd) {
+  const finalRating = (_ratingsCache[trackId] === newRating) ? 0 : newRating;
+  _ratingsCache[trackId] = finalRating;
+  ratingTd.innerHTML = _renderStars(finalRating);
+  const focusTarget = ratingTd.querySelector(`.star[data-val="${Math.max(1, finalRating)}"]`);
+  if (focusTarget) {
+    ratingTd.querySelectorAll('.star').forEach(s => { s.tabIndex = -1; });
+    focusTarget.tabIndex = 0;
+    focusTarget.focus({ preventScroll: true });
+  }
+  fetch(`/api/tracks/${trackId}/rating`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rating: finalRating }),
+  }).catch(() => {});
 }
 
 // ── Virtual scroll render ──────────────────────────────────────────────────────
+//
+// We keep a row-pool of pre-built TRs (``_rowPool``).  On each scroll we
+// resize the pool to cover the new visible window, mutate each pool row's
+// contents/dataset, and let the top/bottom spacer TRs hold the height of
+// the off-screen ranges.  This avoids the per-scroll
+// ``tbody.innerHTML = ''`` + DOM-build cycle that dominated profiles.
+function _vsResetPool() {
+  _rowPool.length = 0;
+  _vsTopSpacer = null;
+  _vsBotSpacer = null;
+}
+
+function _ensureSpacer(which) {
+  // Lazy-create the top/bottom spacer TRs.  We never destroy them — they
+  // just get their height set to 0 when not needed.
+  const ref = which === 'top' ? _vsTopSpacer : _vsBotSpacer;
+  if (ref) return ref;
+  const sp = document.createElement('tr');
+  sp.className = 'vs-spacer';
+  sp.innerHTML = `<td colspan="11" style="height:0;padding:0;border:none"></td>`;
+  if (which === 'top') _vsTopSpacer = sp; else _vsBotSpacer = sp;
+  return sp;
+}
+
 function _vsRender(force = false) {
   if (!currentTracks.length) return;
   const wrap    = document.getElementById('track-list-wrap');
@@ -328,42 +643,93 @@ function _vsRender(force = false) {
   _vsStart = newStart;
   _vsEnd   = newEnd;
 
-  // Rebuild tbody: top spacer + visible rows + bottom spacer
+  const visibleCount = _vsEnd - _vsStart;
   const topH = _vsStart * ROW_H;
   const botH = (currentTracks.length - _vsEnd) * ROW_H;
 
-  tbody.innerHTML = '';
+  // If tbody was wiped by a sibling renderer (group view / skeleton),
+  // _rowPool's nodes are detached.  Detect that and reattach.  We compare
+  // by parentNode rather than re-querying because that's O(1).
+  const topSp = _ensureSpacer('top');
+  const botSp = _ensureSpacer('bot');
+  const needsReattach = topSp.parentNode !== tbody;
 
-  // Top spacer
-  if (topH > 0) {
-    const sp = document.createElement('tr');
-    sp.className = 'vs-spacer';
-    sp.innerHTML = `<td colspan="11" style="height:${topH}px;padding:0;border:none"></td>`;
-    tbody.appendChild(sp);
+  if (needsReattach) {
+    tbody.innerHTML = '';
+    tbody.appendChild(topSp);
+    for (const row of _rowPool) tbody.appendChild(row);
+    tbody.appendChild(botSp);
   }
 
-  // Visible rows
-  for (let i = _vsStart; i < _vsEnd; i++) {
-    tbody.appendChild(_makeTrackRow(currentTracks[i], i));
+  // Resize the pool to match the visible window.  Grow by appending new
+  // skeleton rows; shrink by removing trailing rows from the DOM and pool.
+  while (_rowPool.length < visibleCount) {
+    const tr = _makeRowSkeleton();
+    _rowPool.push(tr);
+    tbody.insertBefore(tr, botSp);
+  }
+  while (_rowPool.length > visibleCount) {
+    const tr = _rowPool.pop();
+    if (tr.parentNode) tr.parentNode.removeChild(tr);
   }
 
-  // Bottom spacer
-  if (botH > 0) {
-    const sp = document.createElement('tr');
-    sp.className = 'vs-spacer';
-    sp.innerHTML = `<td colspan="11" style="height:${botH}px;padding:0;border:none"></td>`;
-    tbody.appendChild(sp);
+  // Update spacer heights (single style write, no innerHTML).
+  topSp.firstElementChild.style.height = topH + 'px';
+  botSp.firstElementChild.style.height = botH + 'px';
+
+  // Fill the visible rows.  For a WindowedTrackStore, ``currentTracks[i]``
+  // returns ``undefined`` while the chunk fetches; ``_fillTrackRow``
+  // renders a shimmer skeleton for those.  Once the chunk lands the
+  // store's onChunkLoad callback re-fires _vsRender(true) and the
+  // skeleton gets replaced with real data.
+  for (let n = 0; n < visibleCount; n++) {
+    _fillTrackRow(_rowPool[n], currentTracks[_vsStart + n], _vsStart + n);
+  }
+  // Trigger lazy chunk loading for the visible window plus the buffer.
+  // No-op for plain arrays (no ``ensureRange`` method).
+  if (currentTracks && typeof currentTracks.ensureRange === 'function') {
+    currentTracks.ensureRange(_vsStart, _vsEnd);
   }
 
   markPlayingRow();
   _applyColVisibility();
 
-  // Restore keyboard focus indicator after virtual scroll rebuild
+  // Restore keyboard focus indicator after a rebuild
   if (_focusedIdx >= _vsStart && _focusedIdx < _vsEnd) {
     const focusRow = tbody.querySelector(`tr[data-idx="${_focusedIdx}"]`);
     if (focusRow) focusRow.classList.add('kb-focused');
   }
+
+  // Measure row height on the first paint with real data and re-render
+  // once with the corrected ROW_H so the spacer maths matches actual layout.
+  if (!_rowHMeasured && _rowPool.length) {
+    requestAnimationFrame(() => _measureRowHeight());
+  }
 }
+
+// Measure the rendered height of the first visible row and update ROW_H
+// if it diverges from the current default.  Dispatched once per data load
+// (gated by ``_rowHMeasured``) plus on a ``themechange`` custom event so
+// theme-driven padding changes don't desync the virtual scroll math.
+function _measureRowHeight() {
+  if (!_rowPool.length) return;
+  const rect = _rowPool[0].getBoundingClientRect();
+  const h = Math.round(rect.height);
+  if (h > 0 && Math.abs(h - ROW_H) >= 1) {
+    ROW_H = h;
+    _vsStart = _vsEnd = 0;   // force the next _vsRender to recompute
+    _vsRender(true);
+  }
+  _rowHMeasured = true;
+}
+
+// Optional theme-change hook — if the app dispatches ``themechange`` on
+// document we'll re-measure.  Absent the event we simply rely on the
+// per-load measurement above.
+document.addEventListener('themechange', () => {
+  _rowHMeasured = false;
+  _vsRender(true);
+});
 
 async function renderTracks(tracks) {
   currentTracks = tracks;
@@ -372,6 +738,13 @@ async function renderTracks(tracks) {
   _focusedIdx   = -1;
   _vsStart = 0;
   _vsEnd   = 0;
+  _rowHMeasured = false;     // re-measure for the next dataset
+
+  // Reset the empty-state heading every time — ``showDuplicates`` mutates
+  // it to "No duplicate tracks found." for its specific empty case, and
+  // we don't want that copy leaking into every subsequent empty view.
+  const _emptyHeading = emptyEl.querySelector('h4');
+  if (_emptyHeading) _emptyHeading.textContent = 'No tracks found';
 
   emptyEl.hidden  = tracks.length > 0;
   loadingEl.hidden = true;
@@ -381,6 +754,9 @@ async function renderTracks(tracks) {
   if (albumGrid) albumGrid.hidden = true;
   document.getElementById('track-table').style.display = '';
 
+  // Tear down the pool — switching datasets (and group/track views toggle
+  // tbody anyway) so the old DOM nodes don't belong here.
+  _vsResetPool();
   tbody.innerHTML = '';
 
   if (tracks.length > 0) {
@@ -389,9 +765,11 @@ async function renderTracks(tracks) {
     _fetchVisibleRatings();
   }
 
-  // Scroll to top
+  // Scroll to top — also reset the scroll-throttle cache so the first
+  // post-render scroll event isn't dropped by the same-position guard.
   const wrap = document.getElementById('track-list-wrap');
   if (wrap) wrap.scrollTop = 0;
+  _scrollLastY = -1;
 
   _updateSelectionBar();
   _applyColVisibility();
@@ -419,8 +797,19 @@ async function _fetchVisibleRatings() {
     Object.assign(_ratingsCache, data);
     // Mark fetched IDs that had no rating as 0 so we don't re-fetch
     for (const id of ids) if (_ratingsCache[id] === undefined) _ratingsCache[id] = 0;
-    // Re-render to show the ratings
-    _vsRender(true);
+    // Patch the rating cell on visible rows in place.  Previously we
+    // called ``_vsRender(true)`` here which rebuilt the entire virtual
+    // window — any spacer-height or row-pool resize that happened in the
+    // forced render could cascade into a scroll-event feedback loop
+    // (autoscroll regression).  In-place mutation only touches the cells
+    // whose rating actually changed, so the scroll position never moves
+    // and the listener never re-fires.
+    for (const row of _rowPool) {
+      const id = row.dataset.id;
+      if (!id || !(id in _ratingsCache)) continue;
+      const ratingTd = row.children[11];   // col-rating is index 11
+      if (ratingTd) ratingTd.innerHTML = _renderStars(_ratingsCache[id]);
+    }
   } catch { /* non-fatal */ }
   _ratingsFetchPending = false;
 }
@@ -434,10 +823,173 @@ function _refreshSelectionClasses() {
 }
 
 // ── Scroll listener for virtual scroll ────────────────────────────────────────
+//
+// rAF-throttled with a same-position short-circuit.  Why both:
+//
+//   1) rAF coalesces — Chrome on macOS fires `scroll` faster than 60 Hz
+//      on a trackpad fling, especially after layout shifts.  Without a
+//      throttle, _vsRender ran multiple times per frame.  More
+//      importantly, any side effect of _vsRender (a spacer-height
+//      adjustment, a pool resize) could in turn trigger another scroll
+//      event in the same task, and we'd be in a feedback loop that
+//      drifted scrollTop in one direction until the list bottomed out
+//      — the "phantom autoscroll that only stops at the end" defect.
+//
+//   2) Same-position short-circuit — even with rAF throttling we can be
+//      handed a scroll event where scrollTop hasn't actually changed
+//      since the previous render (browsers fire scroll on layout shifts
+//      that happen to leave scrollTop alone).  Skipping the re-render
+//      keeps _vsStart/_vsEnd stable and the spacer heights untouched,
+//      which is what breaks the feedback loop in step 1.
+let _scrollRafPending = false;
+let _scrollLastY      = -1;
 document.getElementById('track-list-wrap').addEventListener('scroll', () => {
-  _vsRender();
-  _fetchVisibleRatings();
+  if (_scrollRafPending) return;
+  _scrollRafPending = true;
+  requestAnimationFrame(() => {
+    _scrollRafPending = false;
+    const wrap = document.getElementById('track-list-wrap');
+    const y = wrap.scrollTop;
+    if (y === _scrollLastY) return;
+    _scrollLastY = y;
+    _vsRender();
+    _fetchVisibleRatings();
+  });
 }, { passive: true });
+
+// ── Delegated row event listeners ─────────────────────────────────────────────
+//
+// All click/dblclick/contextmenu/keydown/dragstart for track rows are
+// handled here on ``tbody`` instead of per row.  Saves ~7 listener
+// attach/detach pairs per row on every virtual-scroll frame.
+function _rowFromEvent(e) {
+  return e.target.closest('tr[data-idx]');
+}
+
+tbody.addEventListener('click', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  const i = parseInt(tr.dataset.idx, 10);
+  if (!Number.isFinite(i)) return;
+  const t = currentTracks[i];
+  if (!t) return;
+
+  // Star rating cell — handle clicks here before the row-select logic.
+  const ratingTd = e.target.closest('.col-rating');
+  if (ratingTd && tr.contains(ratingTd)) {
+    const star = e.target.closest('.star');
+    if (star) {
+      e.stopPropagation();
+      _setRowRating(t.id, parseInt(star.dataset.val, 10), ratingTd);
+    }
+    return;
+  }
+
+  // Clickable metadata cells (album artist / album)
+  const cellLink = e.target.closest('.cell-link');
+  if (cellLink) {
+    e.stopPropagation();
+    const action = cellLink.dataset.action;
+    if (action === 'album-artist' && t.album_artist) {
+      showAlbums(null, t.album_artist, 'album_artist');
+    } else if (action === 'album' && t.album) {
+      showAlbumTracks(t.artist, t.album_artist, t.album,
+        () => showAlbums(t.artist, t.album_artist, t.album_artist ? 'album_artist' : 'artist'));
+    }
+    return;
+  }
+
+  if (e.shiftKey && _lastClickIdx >= 0) {
+    const lo = Math.min(_lastClickIdx, i), hi = Math.max(_lastClickIdx, i);
+    if (!e.metaKey && !e.ctrlKey) _selected.clear();
+    for (let j = lo; j <= hi; j++) _selected.add(j);
+  } else if (e.metaKey || e.ctrlKey) {
+    if (_selected.has(i)) _selected.delete(i); else _selected.add(i);
+    _lastClickIdx = i;
+  } else {
+    _selected.clear();
+    _selected.add(i);
+    _lastClickIdx = i;
+    selectRow(tr, i);
+  }
+  _refreshSelectionClasses();
+  _updateSelectionBar();
+});
+
+tbody.addEventListener('dblclick', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  const i = parseInt(tr.dataset.idx, 10);
+  if (Number.isFinite(i)) playFrom(i);
+});
+
+tbody.addEventListener('contextmenu', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  const i = parseInt(tr.dataset.idx, 10);
+  if (!Number.isFinite(i)) return;
+  e.preventDefault();
+  if (_infoCallback) _infoCallback(currentTracks, i);
+});
+
+tbody.addEventListener('keydown', (e) => {
+  // Star ratings — the col-rating td contains focusable stars.
+  const ratingTd = e.target.closest('.col-rating');
+  if (ratingTd) {
+    const tr = _rowFromEvent(e);
+    if (!tr) return;
+    const i = parseInt(tr.dataset.idx, 10);
+    const t = currentTracks[i];
+    if (!t) return;
+    const star = e.target.closest('.star');
+    if (!star) return;
+    const current = parseInt(star.dataset.val, 10);
+    const cur = _ratingsCache[t.id] || 0;
+    if (e.key === ' ' || e.key === 'Enter') {
+      e.preventDefault(); e.stopPropagation();
+      _setRowRating(t.id, current, ratingTd);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault(); e.stopPropagation();
+      _setRowRating(t.id, Math.max(1, cur - 1), ratingTd);
+    } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      _setRowRating(t.id, Math.min(5, cur + 1 || 1), ratingTd);
+    } else if (e.key === 'Home') {
+      e.preventDefault(); _setRowRating(t.id, 1, ratingTd);
+    } else if (e.key === 'End') {
+      e.preventDefault(); _setRowRating(t.id, 5, ratingTd);
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      _ratingsCache[t.id] = 0;
+      ratingTd.innerHTML = _renderStars(0);
+      fetch(`/api/tracks/${t.id}/rating`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rating: 0 }),
+      }).catch(() => {});
+    }
+  }
+});
+
+tbody.addEventListener('dragstart', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  const i = parseInt(tr.dataset.idx, 10);
+  if (!Number.isFinite(i)) return;
+  e.dataTransfer.effectAllowed = 'copy';
+  const dragTracks = _selected.size > 1 && _selected.has(i)
+    ? [..._selected].sort((a, b) => a - b).map(j => currentTracks[j]).filter(Boolean)
+    : [currentTracks[i]];
+  e.dataTransfer.setData('application/x-soniqboom-track', JSON.stringify(dragTracks));
+  tr.classList.add('dragging');
+  if (dragTracks.length > 1) {
+    tbody.querySelectorAll('tr.multi-selected').forEach(r => r.classList.add('dragging'));
+  }
+});
+
+tbody.addEventListener('dragend', () => {
+  tbody.querySelectorAll('tr.dragging').forEach(r => r.classList.remove('dragging'));
+});
 
 // ── Selection bar ──────────────────────────────────────────────────────────────
 const selBar   = document.getElementById('selection-bar');
@@ -474,9 +1026,14 @@ function selectRow(tr, idx) {
   activeRow?.classList.remove('selected');
   tr.classList.add('selected');
   activeRow = tr;
-  // Show "More Like This" button
-  simBtn.hidden = false;
-  simBtn.dataset.id = currentTracks[idx]?.id;
+  // "More like this" is gated on the backend ``/search/similar`` endpoint,
+  // which currently returns 501.  Keep the button hidden until the
+  // backend ships a vector / embedding index — otherwise the UI advertises
+  // a feature that errors when clicked.
+  if (window.__sbFeatures?.similar) {
+    simBtn.hidden = false;
+    simBtn.dataset.id = currentTracks[idx]?.id;
+  }
 }
 
 function markPlayingRow() {
@@ -488,6 +1045,26 @@ function markPlayingRow() {
 }
 
 function playFrom(idx) {
+  // For a plain array (small libraries, group views, search results, etc.)
+  // the queue IS the full list — Player handles auto-next from the array.
+  // For the WindowedTrackStore (large All-Tracks view) we can't pass the
+  // 267 000-entry proxy as the queue — Player would iterate it and force
+  // every chunk to load.  Instead, slice the currently-loaded contiguous
+  // window starting at ``idx`` and queue THAT.  When the user's auto-next
+  // reaches the end of that window, the played-track listener can extend
+  // the queue further from the store.  This is the same lazy-queue model
+  // Spotify / Apple Music use for "Songs" view in large libraries.
+  if (currentTracks && currentTracks._isWindowedStore) {
+    // 500 lookahead is plenty: at typical track lengths that's 30+ hours
+    // of music in the queue.  If the user keeps it playing for that long
+    // the ``played`` event handler extends.  We also kick off background
+    // chunk loads ahead so auto-next can keep flowing without bursts of
+    // skeleton placeholders.
+    currentTracks.ensureRange(idx, idx + 500);
+    const queue = currentTracks.loadedSliceFrom(idx, 500);
+    if (queue.length) Player.setQueue(queue, 0);
+    return;
+  }
   Player.setQueue(currentTracks, idx);
 }
 
@@ -499,15 +1076,34 @@ function _saveSortState() {
   }
 }
 
+function _updateAriaSort(activeTh, asc) {
+  document.querySelectorAll('th[data-sort]').forEach(t => {
+    if (!t.dataset.sort) return;
+    if (t === activeTh) {
+      t.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+    } else {
+      t.setAttribute('aria-sort', 'none');
+    }
+  });
+}
+
 function _restoreSortState() {
   const key = localStorage.getItem('sb_sort_key');
   const asc = localStorage.getItem('sb_sort_asc');
+  // Default state: every sortable header advertises "none" so screen
+  // readers don't claim a column is sorted before the user clicks.
+  document.querySelectorAll('th[data-sort]').forEach(t => {
+    if (t.dataset.sort) t.setAttribute('aria-sort', 'none');
+  });
   if (key) {
     sortKey = key;
     sortAsc = asc !== '0';
-    // Apply visual indicator to the header
+    // Apply visual + aria indicator to the header
     const th = document.querySelector(`th[data-sort="${sortKey}"]`);
-    if (th) th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
+    if (th) {
+      th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
+      _updateAriaSort(th, sortAsc);
+    }
   }
 }
 
@@ -524,58 +1120,85 @@ function _compareTrack(a, b, key, asc) {
   return asc ? (av > bv ? 1 : av < bv ? -1 : 0) : (av < bv ? 1 : av > bv ? -1 : 0);
 }
 
-document.querySelectorAll('#track-table th[data-sort]').forEach(th => {
-  th.addEventListener('click', () => {
-    const key = th.dataset.sort;
-    if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
-    document.querySelectorAll('th[data-sort]').forEach(t => {
-      t.classList.remove('sorted', 'sorted-asc', 'sorted-desc');
-    });
-    th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
-    _saveSortState();
-    const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
-    renderTracks(sorted);
+// Shared sort-click handler — wired here for the initial header render,
+// and re-wired by ``restoreFullHeader()`` after a header-rebuild (group
+// view / duplicates view exit).  Hoisted into a function so the two
+// attach sites can't drift.
+function _onSortHeaderClick(th) {
+  const key = th.dataset.sort;
+  if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
+  document.querySelectorAll('th[data-sort]').forEach(t => {
+    t.classList.remove('sorted', 'sorted-asc', 'sorted-desc');
   });
+  th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
+  _updateAriaSort(th, sortAsc);
+  _saveSortState();
+
+  // Windowed mode: the loaded chunks cover ~20K of N rows, so an
+  // in-memory sort would lie about positions outside the loaded window.
+  // Round-trip to the backend instead, which has pre-computed sorted
+  // indexes per column (store.py _SORT_INDEX_MAP).  Keys without a
+  // backend index (track_number, path) toast-explain instead of producing
+  // a partial sort.
+  if (currentTracks && currentTracks._isWindowedStore) {
+    if (!WINDOWED_SORT_KEYS.has(key)) {
+      if (window.Toast?.info) {
+        window.Toast.info(
+          `Sort by ${key.replace('_', ' ')} isn't available in the full-library view yet.`,
+        );
+      }
+      return;
+    }
+    const total = currentTracks._total;
+    _rebuildWindowedStore(total, key, sortAsc ? 'asc' : 'desc');
+    return;
+  }
+
+  // Small-library path: client-side sort over the full in-memory array.
+  const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
+  renderTracks(sorted);
+}
+
+document.querySelectorAll('#track-table th[data-sort]').forEach(th => {
+  // Skip non-sortable columns (#, ★) — they have data-sort="" purely as a
+  // marker, but clicking them should be a no-op and they shouldn't look
+  // sortable to assistive tech.
+  if (!th.dataset.sort) return;
+  th.addEventListener('click', () => _onSortHeaderClick(th));
 });
 
 // ── Table header helpers ───────────────────────────────────────────────────────
 const trackTableHead = document.querySelector('#track-table thead tr');
 const FULL_HEADERS = `
-  <th class="col-num"          data-sort="">#</th>
-  <th class="col-title"        data-sort="title">Title</th>
-  <th class="col-album-artist" data-sort="album_artist">Album Artist</th>
-  <th class="col-artist"       data-sort="artist">Artist</th>
-  <th class="col-album"        data-sort="album">Album</th>
-  <th class="col-track"        data-sort="track_number">Track</th>
-  <th class="col-year"         data-sort="year">Year</th>
-  <th class="col-dur"          data-sort="duration">Duration</th>
-  <th class="col-format"       data-sort="format">Type</th>
-  <th class="col-location"     data-sort="path">Location</th>
-  <th class="col-rating"       data-sort="">★</th>`.trim();
+  <th class="col-num">#</th>
+  <th class="col-cover" aria-label="Cover"></th>
+  <th class="col-title"        data-sort="title"        aria-sort="none">Title</th>
+  <th class="col-album-artist" data-sort="album_artist" aria-sort="none">Album Artist</th>
+  <th class="col-artist"       data-sort="artist"       aria-sort="none">Artist</th>
+  <th class="col-album"        data-sort="album"        aria-sort="none">Album</th>
+  <th class="col-track"        data-sort="track_number" aria-sort="none">Track</th>
+  <th class="col-year"         data-sort="year"         aria-sort="none">Year</th>
+  <th class="col-dur"          data-sort="duration"     aria-sort="none">Duration</th>
+  <th class="col-format"       data-sort="format"       aria-sort="none">Type</th>
+  <th class="col-location"     data-sort="path"         aria-sort="none">Location</th>
+  <th class="col-rating">★</th>`.trim();
 
 function setGroupHeader(label) {
   if (!trackTableHead) return;
-  trackTableHead.innerHTML = `<th colspan="11" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`;
+  trackTableHead.innerHTML = `<th colspan="12" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`;
 }
 
 function restoreFullHeader() {
   _dupViewActive = false;  // leaving duplicates view — restore user column prefs
   if (!trackTableHead) return;
   trackTableHead.innerHTML = FULL_HEADERS;
-  // Re-attach sort listeners after rebuilding the header
+  // Re-attach sort listeners after rebuilding the header.  Uses the same
+  // ``_onSortHeaderClick`` as the initial wire-up — single source of
+  // truth so the two attach sites can't drift on what counts as a
+  // sortable header click.
   trackTableHead.querySelectorAll('th[data-sort]').forEach(th => {
     if (!th.dataset.sort) return;
-    th.addEventListener('click', () => {
-      const key = th.dataset.sort;
-      if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
-      document.querySelectorAll('th[data-sort]').forEach(t => {
-        t.classList.remove('sorted', 'sorted-asc', 'sorted-desc');
-      });
-      th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
-      _saveSortState();
-      const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
-      renderTracks(sorted);
-    });
+    th.addEventListener('click', () => _onSortHeaderClick(th));
   });
   // Restore persisted sort indicator
   _restoreSortState();
@@ -691,15 +1314,87 @@ function _hideGroupFilter() {
   if (groupFilterInput) groupFilterInput.value = '';
 }
 
+// Sort keys the backend has a pre-computed index for — keys outside this
+// set use legacy in-memory sort (which only works in non-windowed mode).
+// Mirrors api/tracks.py _ALLOWED_SORT_KEYS exactly; if they drift the API
+// silently falls back to default order, but the windowed UX will still
+// behave correctly because the spinner shows for ANY remote re-fetch.
+const WINDOWED_SORT_KEYS = new Set([
+  'title', 'artist', 'album_artist', 'album',
+  'year', 'duration', 'format',
+]);
+
 async function showAll() {
   hideBrowseHeader();
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
   _showSkeletonRows();
-  const tracks = await API('/tracks', { limit: 5000 });
+  const limit = 5000;
+  // Probe the real total first.  Cheap (one count() in the store) and
+  // tells us whether to use the simple-array path (small libraries) or
+  // the windowed-store path (large libraries) without round-tripping
+  // 5000 rows we may not even render.
+  let total = 0;
+  try {
+    const { count } = await API('/tracks/count');
+    total = Number(count) || 0;
+  } catch { /* fall through to legacy path */ }
+
+  if (total > limit) {
+    // Pick up persisted sort state so the windowed view comes back the
+    // same way the user left it.  ``sortKey`` and ``sortAsc`` are the
+    // module-level state already restored by ``_restoreSortState()``
+    // (called inside restoreFullHeader above).  Only keys the backend
+    // can drive get honoured — others would silently fall back to
+    // default order in the API; better to skip the round-trip and stay
+    // on the default explicitly.
+    const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
+    const sortOrder = sortBy ? (sortAsc ? 'asc' : 'desc') : null;
+    _rebuildWindowedStore(total, sortBy, sortOrder);
+    _updateNavBadge('all', total);  // exact total, no "+" needed
+    return;
+  }
+
+  // Small-library path (≤ 5000): legacy single-fetch array — simpler,
+  // no chunking overhead, no skeleton rows for unloaded slots.
+  const tracks = await API('/tracks', { limit });
   renderTracks(tracks);
-  _updateNavBadge('all', tracks.length);
+  const truncated = tracks.length >= limit;
+  _updateNavBadge('all', tracks.length, truncated);
+  if (truncated) _refreshTrackCount();
+}
+
+// Build (or rebuild) the windowed store for the All Tracks view.  Sort
+// re-application calls this with new sort params so the chunked fetcher
+// requests pre-sorted pages from the backend instead of trying to sort the
+// partial in-memory window (which would only sort the ~20K loaded rows,
+// not all 267K).  Track-list container is scrolled to top so the user sees
+// the fresh ordering from the start, and selection is cleared because the
+// previous selection indexes refer to the old ordering.
+function _rebuildWindowedStore(total, sortBy, sortOrder) {
+  const store = createWindowedStore(
+    total,
+    (offset, lim) => {
+      const params = { limit: lim, offset };
+      if (sortBy)    params.sort  = sortBy;
+      if (sortOrder) params.order = sortOrder;
+      return API('/tracks', params);
+    },
+    { sortBy, sortOrder },
+  );
+  // When a chunk lands, re-paint the visible window so the skeleton
+  // rows we showed get replaced with real data.  ``_vsRender(true)``
+  // forces the render even though _vsStart/_vsEnd didn't move.
+  store.setOnChunkLoad(() => _vsRender(true));
+  // Reset scroll + selection — the indexes the user was looking at no
+  // longer point at the same tracks.
+  _selected.clear();
+  _lastClickIdx = -1;
+  _focusedIdx = -1;
+  const wrap = document.getElementById('track-list-wrap');
+  if (wrap) wrap.scrollTop = 0;
+  renderTracks(store);
 }
 
 async function showArtists() {
@@ -892,7 +1587,15 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
           const artEl = card.querySelector('.album-card-art');
           if (!artEl) return;
           const img = new Image();
-          img.onload = () => {
+          img.decoding = 'async';
+          img.onload = async () => {
+            // Decode off the main thread when the API is available —
+            // ``backgroundImage`` commits paint atomically once the
+            // decode promise resolves, so we never paint a half-decoded
+            // bitmap during the card's scroll-in.
+            try {
+              if (typeof img.decode === 'function') await img.decode();
+            } catch (_) { /* fallback to onload-only timing */ }
             artEl.style.backgroundImage = `url("${img.src}")`;
             artEl.style.backgroundSize = 'cover';
             artEl.style.backgroundPosition = 'center';
@@ -923,6 +1626,12 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
     card.dataset.name = name;
     card.dataset.album = name;
     card.dataset.artist = artist;
+    // Keyboard activation — cards behave like buttons (Enter/Space activates).
+    // The `keyboard-focus` class is added on keyboard-induced focus so CSS
+    // can render a focus-visible ring without lighting up on every click.
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-label', `${name}, ${count} ${countLabel}`);
     card.innerHTML = `
       <div class="album-card-art">
         <span class="album-card-initials">${esc(initials)}</span>
@@ -932,6 +1641,21 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
         <div class="album-card-sub">${count} ${countLabel}</div>
       </div>`;
     card.addEventListener('click', () => onClick(item));
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        onClick(item);
+      }
+    });
+    // Show focus ring only for keyboard-driven focus (not mouse clicks).
+    card.addEventListener('focus', () => {
+      // :focus-visible may not be supported by ancient browsers — wrap in
+      // try/catch so the focus handler never throws.
+      try {
+        if (card.matches(':focus-visible')) card.classList.add('keyboard-focus');
+      } catch (_) { /* selector unsupported — skip the ring */ }
+    });
+    card.addEventListener('blur', () => card.classList.remove('keyboard-focus'));
     albumGrid.appendChild(card);
 
     // Observe for lazy-load
@@ -981,7 +1705,9 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
         browseFilter.value = groupFilterInput.value;
         browseFilter.dispatchEvent(new Event('input'));
       };
-      setTimeout(() => groupFilterInput.focus(), 50);
+      // ``preventScroll`` keeps the freshly-opened group view from
+      // jumping if the filter input was previously below the viewport.
+      setTimeout(() => groupFilterInput.focus({ preventScroll: true }), 50);
     }
   } else {
     browseFilterWrap.hidden = true;
@@ -1003,12 +1729,15 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
 }
 
 function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
+  // Group rows replace the tbody — drop any pool nodes that were here.
+  _vsResetPool();
   tbody.innerHTML = '';
   emptyEl.hidden = items.length > 0;
   items.forEach(item => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="col-num"></td>
+      <td class="col-cover"></td>
       <td class="col-title" colspan="7" style="font-weight:500;${item.label ? 'font-style:italic;color:var(--text2)' : ''}">${esc(item.label || item[nameKey] || '—')}</td>
       <td class="col-dur" style="color:var(--text2)">${item[countKey]} ${countLabel}</td>
       <td class="col-rating"></td>`;
@@ -1271,6 +2000,7 @@ Player.on('timeupdate', ({ current }) => {
     if (_lyricsLines[i].time !== null && _lyricsLines[i].time <= t) active = i;
   }
   if (active === _lyricsSyncLastActive) return;
+  const prevActive = _lyricsSyncLastActive;
   _lyricsSyncLastActive = active;
 
   const lineEls = lyricsContent.querySelectorAll('.lyrics-line');
@@ -1282,9 +2012,16 @@ Player.on('timeupdate', ({ current }) => {
     el.classList.toggle('past', ln.time !== null && i < active);
   }
 
-  // Scroll active line into view (centered)
+  // Scroll active line into view (centered).  Smooth scroll for big jumps
+  // (seek / scrub) where the animation provides spatial context; instant
+  // scroll for line-by-line progression so the highlight doesn't visibly
+  // trail the audio on fast verses.
   if (active >= 0 && lineEls[active]) {
-    lineEls[active].scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const bigJump = prevActive < 0 || Math.abs(active - prevActive) >= 3;
+    lineEls[active].scrollIntoView({
+      block: 'center',
+      behavior: bigJump ? 'smooth' : 'instant',
+    });
   }
 });
 
@@ -1379,14 +2116,21 @@ lyricsBtn.addEventListener('click', () => {
   }
 });
 
-// When track changes, update button state and reload lyrics if panel is open
+// When track changes, update button state and reload lyrics if panel is open.
+// Player.emit already isolates listener exceptions, but historically a stray
+// throw here broke the trackchange chain for downstream subscribers — guard
+// internally so a fetch/render glitch can't poison the event.
 Player.on('trackchange', (track) => {
-  _updateLyricsBtn(track);
-  if (!lyricsPanel.hidden) {
-    _loadLyrics(track);
-  } else {
-    _lyricsTrackId = null;
-    _stopLyricsSync();
+  try {
+    _updateLyricsBtn(track);
+    if (!lyricsPanel.hidden) {
+      _loadLyrics(track);
+    } else {
+      _lyricsTrackId = null;
+      _stopLyricsSync();
+    }
+  } catch (err) {
+    console.warn('Lyrics trackchange handler failed:', err);
   }
 });
 
@@ -1399,12 +2143,35 @@ async function showFolder(path, recursive = false) {
     document.querySelectorAll('#nav-library li')[0]?.click();
   });
 
-  try {
+  const fetchTracks = async (rec) => {
     const res = await fetch(
-      `/api/fstree/tracks-with-meta?path=${encodeURIComponent(path)}&recursive=${recursive}`
+      `/api/fstree/tracks-with-meta?path=${encodeURIComponent(path)}&recursive=${rec}`
     );
     const tracks = await res.json();
-    renderTracks(Array.isArray(tracks) ? tracks : []);
+    return Array.isArray(tracks) ? tracks : [];
+  };
+
+  try {
+    let tracks = await fetchTracks(recursive);
+    // Folders that contain only sub-albums (no direct audio files) would
+    // otherwise show "No tracks found" — fall back to a recursive listing
+    // so clicking e.g. an artist or top-level share shows everything below.
+    if (!recursive && tracks.length === 0) {
+      tracks = await fetchTracks(true);
+    }
+    // Collapse duplicate-groups to their primary track.  SACDs that ship
+    // both a stereo and a multichannel (``Multi/``) fold tend to scan into
+    // two near-identical tracks per song; the scanner's duplicate detector
+    // groups them and marks one ``is_duplicate_primary: true``.  The
+    // dedicated Duplicates view still surfaces both for management, but
+    // the regular folder listing should show one row per song.  Tracks
+    // not part of any group (``duplicate_group_id`` falsy) are always
+    // kept.  Unscanned stubs (``_scanned === false``) carry neither flag
+    // and are kept too.
+    tracks = tracks.filter(t =>
+      !t.duplicate_group_id || t.is_duplicate_primary !== false
+    );
+    renderTracks(tracks);
   } catch {
     loadingEl.hidden = true;
     emptyEl.hidden = false;
@@ -1530,8 +2297,12 @@ async function showDuplicates() {
 
     if (!groups.length) {
       renderTracks([]);
+      // Mutate just the heading so the leading icon + body paragraph
+      // survive — ``textContent = …`` would have stripped them, leaving a
+      // bare line of text on every subsequent empty state until reload.
+      const heading = emptyEl.querySelector('h4');
+      if (heading) heading.textContent = 'No duplicate tracks found.';
       emptyEl.hidden = false;
-      emptyEl.textContent = 'No duplicate tracks found.';
       return;
     }
 

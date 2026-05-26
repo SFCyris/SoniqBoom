@@ -11,10 +11,11 @@ RESET=$(tput sgr0 2>/dev/null || true)
 GREEN='\033[0;32m'; RED='\033[0;31m'; DIM='\033[2m'; NC='\033[0m'
 
 case "$(uname -s)" in
-  Darwin) DATA_DIR="$HOME/Library/Application Support/SoniqBoom" ;;
-  Linux)  DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soniqboom" ;;
-  *)      DATA_DIR="$HOME/.soniqboom" ;;
+  Darwin) DEFAULT_DATA_DIR="$HOME/Library/Application Support/SoniqBoom" ;;
+  Linux)  DEFAULT_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soniqboom" ;;
+  *)      DEFAULT_DATA_DIR="$HOME/.soniqboom" ;;
 esac
+DATA_DIR="${SONIQBOOM_DATA_DIR:-$DEFAULT_DATA_DIR}"
 PID_FILE="$DATA_DIR/soniqboom.pid"
 LOG_FILE="$DATA_DIR/log/soniqboom.log"
 
@@ -31,9 +32,13 @@ if [ -f "$PID_FILE" ]; then
   fi
 fi
 
-# Fallback: search by process name
+# Fallback: search by process name.  Previously this used the substring
+# 'soniqboom' which matched editor windows, this script itself, and any
+# log-viewer whose argv contained the word.  Anchor on the actual entry
+# scripts/modules we know are real soniqboom processes.
 if [ -z "$PID" ]; then
-  PID=$(pgrep -f 'soniqboom' 2>/dev/null | head -1 || true)
+  PID=$(pgrep -f 'soniqboom\.main|soniqboom_app\.py|soniqboom-menubar\.py|uvicorn.*soniqboom' 2>/dev/null \
+    | head -1 || true)
 fi
 
 if [ -z "$PID" ]; then

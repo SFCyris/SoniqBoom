@@ -13,6 +13,25 @@
   --accent:    #8adbff;
   --warm:      #ff895c;
   --danger:    #ff5e5e;
+}
+
+/* Light-mode palette — mirrors desktop app.css.  Keeps accent identity but
+   flips the surfaces and bumps text-dim so body copy clears WCAG AA. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:        #f5f6f8;
+    --surface:   #ffffff;
+    --surface-2: #eef0f3;
+    --border:    rgba(0,0,0,0.10);
+    --text:      #1a1d22;
+    --text-dim:  #555c6b;
+    --accent:    #2b89c0;
+    --warm:      #c4490d;
+    --danger:    #c43030;
+  }
+}
+
+:root {
 
   --topbar-h:    52px;
   --tabbar-h:    56px;
@@ -39,8 +58,29 @@ html, body {
   overscroll-behavior: none;
   -webkit-text-size-adjust: 100%;
   -webkit-touch-callout: none;
+  /* user-select stays on for content (track names, lyrics) so AT and
+     copy/paste keep working — see the chrome-only suppression below. */
+}
+
+/* Suppress text selection on chrome (top bar, tab bar, buttons) without
+   stripping it from content like track names and lyrics. */
+.topbar, .tabbar, button, .row-handle, .mini-now-playing {
   -webkit-user-select: none;
   user-select: none;
+}
+
+/* Honour reduced-motion and add a visible keyboard focus ring even on
+   mobile (Bluetooth keyboard users still benefit). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+:focus-visible {
+  outline: 2px solid var(--accent) !important;
+  outline-offset: 2px !important;
 }
 
 button, input { font: inherit; color: inherit; }
@@ -64,10 +104,30 @@ input, select, textarea { touch-action: manipulation; }
   padding: var(--safe-top) 16px 0;
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   font-weight: 600;
   font-size: 17px;
+}
+#m-topbar-title { flex: 1 1 auto; min-width: 0; overflow: hidden;
+                  text-overflow: ellipsis; white-space: nowrap; }
+.m-desktop-link {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent, #4ea8de);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.m-desktop-link:active,
+.m-desktop-link:hover {
+  background: rgba(78, 168, 222, 0.08);
+  border-color: rgba(78, 168, 222, 0.3);
 }
 
 #m-content {
@@ -132,6 +192,7 @@ input, select, textarea { touch-action: manipulation; }
 .m-miniplayer.hidden { display: none; }
 
 .m-mp-art {
+  position: relative;
   width: 48px; height: 48px;
   border-radius: 6px;
   overflow: hidden;
@@ -139,7 +200,38 @@ input, select, textarea { touch-action: manipulation; }
   display: flex; align-items: center; justify-content: center;
   font-size: 24px;
 }
-.m-mp-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Layered placeholder + cover img.  Matches the desktop player and
+   library-row pattern so the "no cover" state reads the same on every
+   surface: glowing-blue format glyph behind a transparent <img> that
+   only becomes visible when a real bitmap decodes. */
+.m-mp-art > span,
+.m-row-art > span,
+.m-np-art > span {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(107,200,240,0.82);
+  filter: drop-shadow(0 0 4px rgba(107,200,240,0.85))
+          drop-shadow(0 0 10px rgba(107,200,240,0.45));
+  pointer-events: none;
+  user-select: none;
+}
+.m-mp-art img,
+.m-row-art img,
+.m-np-art img {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.m-mp-art img.loaded,
+.m-row-art img.loaded,
+.m-np-art img.loaded { opacity: 1; }
 
 .m-mp-meta { min-width: 0; overflow: hidden; }
 .m-mp-title  { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -186,6 +278,7 @@ input, select, textarea { touch-action: manipulation; }
 .m-row:active { background: var(--surface); }
 
 .m-row-art {
+  position: relative;
   width: 44px; height: 44px;
   flex-shrink: 0;
   border-radius: 4px;
@@ -194,7 +287,8 @@ input, select, textarea { touch-action: manipulation; }
   display: flex; align-items: center; justify-content: center;
   font-size: 22px;
 }
-.m-row-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* placeholder + img positioning is shared with .m-mp-art / .m-np-art —
+   see the consolidated selector list above .m-mp-art. */
 
 .m-row-meta { flex: 1 1 auto; min-width: 0; }
 .m-row-title  { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -288,6 +382,7 @@ input, select, textarea { touch-action: manipulation; }
   gap: 16px;
 }
 .m-np-art {
+  position: relative;
   width: min(80vw, 360px);
   aspect-ratio: 1 / 1;
   border-radius: 12px;

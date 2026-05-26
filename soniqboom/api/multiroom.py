@@ -43,6 +43,9 @@ class Room:
     master_id: str | None = None
     last_state: dict[str, Any] | None = None   # most recent state_update from master
     current_track: dict[str, Any] | None = None  # last broadcast track (for landing preview)
+    # Serialises the master-promotion check so two clients sending
+    # ``take_master`` concurrently can't both win.
+    master_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _rooms: dict[str, Room] = {}
@@ -52,20 +55,36 @@ _rooms_lock = asyncio.Lock()
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 async def _broadcast(room_id: str, data: dict, exclude: str | None = None) -> None:
-    """Send `data` to every client in `room_id` except optionally one."""
+    """Send `data` to every client in `room_id` except optionally one.
+
+    Parallel fan-out with per-client timeout — a single back-pressured
+    multiroom slave used to stall every other listener (and master) on
+    every state_update / play_at tick.
+    """
     room = _rooms.get(room_id)
     if not room:
         return
-    dead: list[str] = []
-    for cid, client in list(room.clients.items()):
-        if exclude and cid == exclude:
-            continue
+    targets = [
+        (cid, client) for cid, client in list(room.clients.items())
+        if not (exclude and cid == exclude)
+    ]
+    if not targets:
+        return
+
+    async def _send(cid, client):
         try:
-            await client.ws.send_json(data)
+            await asyncio.wait_for(client.ws.send_json(data), timeout=2.0)
+            return None
         except Exception:
-            dead.append(cid)
-    for cid in dead:
-        room.clients.pop(cid, None)
+            return cid
+
+    results = await asyncio.gather(
+        *(_send(cid, client) for cid, client in targets),
+        return_exceptions=True,
+    )
+    for r in results:
+        if r is not None and not isinstance(r, BaseException):
+            room.clients.pop(r, None)
 
 
 def _roster_payload(room: Room) -> list[dict]:
@@ -130,16 +149,102 @@ async def room_state(room_id: str):
 
 # ── WebSocket endpoint ──────────────────────────────────────────────────────
 
+def _ws_auth_ok(ws: WebSocket) -> bool:
+    """Gate a WS on the sb_session cookie.  Pre-bootstrap installs (no
+    users at all) keep the old anonymous-open behaviour so single-user
+    setups aren't broken on upgrade."""
+    try:
+        from soniqboom.core.users import get_user_store
+        store = get_user_store()
+    except Exception:
+        return True
+    if not store.has_any():
+        return True
+    cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
+    if not cookie:
+        return False
+    user = store.lookup_session(cookie)
+    return user is not None and user.enabled
+
+
+def _ws_session_still_valid(ws: WebSocket) -> bool:
+    """Cheap revalidation called on every incoming message.
+
+    Without this, a user disabled or demoted mid-session would keep
+    pushing state_update / play_at messages to other clients in the
+    room until they disconnected on their own.  Looking the session up
+    in the in-memory dict is a single read, so the overhead is
+    negligible vs the cost of an audio decision being driven by a
+    revoked operator.
+    """
+    try:
+        from soniqboom.core.users import get_user_store
+        store = get_user_store()
+    except Exception:
+        return True
+    if not store.has_any():
+        return True
+    cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
+    if not cookie:
+        return False
+    user = store.lookup_session(cookie)
+    return user is not None and user.enabled
+
+
+def _resolve_ws_user_id(ws: WebSocket) -> str | None:
+    """Return the user_id behind the WS cookie, or None for pre-bootstrap.
+
+    Used to register the socket with ``api.users`` so an admin demote /
+    disable / delete on the user can broadcast-close the socket
+    immediately — without this, the multiroom socket survived
+    revocation until the next inbound message (R2 finding).
+    """
+    try:
+        from soniqboom.core.users import get_user_store
+        store = get_user_store()
+    except Exception:
+        return None
+    if not store.has_any():
+        return None
+    cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
+    if not cookie:
+        return None
+    user = store.lookup_session(cookie)
+    return user.id if user else None
+
+
 @router.websocket("/ws")
 async def multiroom_ws(ws: WebSocket):
     """One WS endpoint handles all rooms; first `hello` message assigns room."""
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
     await ws.accept()
+    # Register this socket with the user registry so admin-driven
+    # revocation can close it.  Lazy-import to avoid circular deps.
+    _registered_user_id: str | None = _resolve_ws_user_id(ws)
+    if _registered_user_id:
+        try:
+            from soniqboom.api.users import register_open_ws
+            register_open_ws(_registered_user_id, ws)
+        except Exception:
+            _registered_user_id = None
     client: Client | None = None
     room: Room | None = None
 
     try:
         while True:
             msg = await ws.receive_json()
+            # Per-message auth re-check: a user disabled/demoted between
+            # initial WS accept and now must stop driving the room.  Close
+            # with 4401 (custom "auth revoked") so the client surfaces it
+            # distinctly from a transport error.
+            if not _ws_session_still_valid(ws):
+                try:
+                    await ws.close(code=4401)
+                except Exception:
+                    pass
+                return
             mtype = msg.get("type")
 
             # ── First message must be `hello` ──────────────────────────────
@@ -210,10 +315,16 @@ async def multiroom_ws(ws: WebSocket):
                 break
 
             if mtype == "take_master":
-                # First-come-first-master: only promote if room currently has none
-                if room.master_id is None:
-                    room.master_id = client.client_id
-                    client.role = "master"
+                # Serialised check-then-set so two clients sending
+                # ``take_master`` at the same time can't both become master.
+                async with room.master_lock:
+                    if room.master_id is None:
+                        room.master_id = client.client_id
+                        client.role = "master"
+                        promoted = True
+                    else:
+                        promoted = False
+                if promoted:
                     await _broadcast(room.room_id, {
                         "type": "master_changed", "ts": _now_ms(),
                         "master_id": room.master_id,
@@ -311,6 +422,12 @@ async def multiroom_ws(ws: WebSocket):
     except Exception as exc:
         log.warning("multiroom ws error: %s", exc)
     finally:
+        if _registered_user_id:
+            try:
+                from soniqboom.api.users import unregister_open_ws
+                unregister_open_ws(_registered_user_id, ws)
+            except Exception:
+                pass
         if client is not None and room is not None:
             room.clients.pop(client.client_id, None)
             master_vacated = (room.master_id == client.client_id)

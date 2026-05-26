@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 S.F. Cyris
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { Toast } from './utils.js';
 
 /**
  * foldertree.js — Lazy-loading folder tree in the sidebar.
@@ -50,6 +51,15 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
 
   const row = document.createElement('div');
   row.className = 'tree-node';
+  // Keyboard-reach the tree row.  ``role="treeitem"`` would be more
+  // accurate, but the surrounding markup isn't a proper ARIA tree —
+  // ``button`` semantics are accurate enough that screen readers announce
+  // the activation gesture without lying about a tree relationship.
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  // Start collapsed; the helper below keeps aria-expanded synced whenever
+  // we toggle the open class.
+  if (hasChildren) row.setAttribute('aria-expanded', 'false');
 
   // Chevron
   const chev = document.createElement('span');
@@ -92,6 +102,7 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
     if (isOpen) {
       children.classList.remove('open');
       chev.classList.remove('open');
+      row.setAttribute('aria-expanded', 'false');
       return;
     }
     // Lazy-load children on first open
@@ -112,30 +123,64 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
           });
           chev.innerHTML = '&#9658;';
         } else {
-          // No subfolders — hide the chevron, nothing to expand
+          // No subfolders — hide the chevron, nothing to expand.
+          // Drop ``aria-expanded`` so screen readers stop announcing
+          // "collapsed" for a row that isn't actually expandable.
           chev.classList.add('leaf');
           chev.innerHTML = '&#9658;';
+          row.removeAttribute('aria-expanded');
           return;  // don't open an empty children list
         }
-      } catch {
+      } catch (err) {
         loaded = false;
         chev.innerHTML = '&#9658;';
+        console.warn('Folder tree: expansion failed for', path, err);
+        Toast.error("Couldn't list folder — the share or path may be unavailable.");
         return;
       }
       chev.innerHTML = '&#9658;';
     }
     children.classList.add('open');
     chev.classList.add('open');
+    row.setAttribute('aria-expanded', 'true');
   }
 
   chev.addEventListener('click', (e) => { e.stopPropagation(); expand(); });
 
   // Click label → show tracks in this directory
-  row.addEventListener('click', () => {
+  function selectAndExpand() {
     document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
     row.classList.add('active');
     _onSelect(path);
     if (!children.classList.contains('open')) expand();
+  }
+  row.addEventListener('click', selectAndExpand);
+  // Keyboard:
+  //   Enter / Space → select+expand (same as click)
+  //   ArrowRight   → expand without selecting (if collapsed)
+  //   ArrowLeft    → collapse if open
+  //   ArrowDown / ArrowUp → move focus to next/prev visible tree row
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); e.stopPropagation();
+      selectAndExpand();
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (!children.classList.contains('open')) expand();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      if (children.classList.contains('open')) {
+        children.classList.remove('open');
+        chev.classList.remove('open');
+        row.setAttribute('aria-expanded', 'false');
+      }
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const rows = Array.from(treeEl.querySelectorAll('.tree-node'));
+      const idx = rows.indexOf(row);
+      const next = rows[idx + (e.key === 'ArrowDown' ? 1 : -1)];
+      if (next) next.focus();
+    }
   });
 
   li.appendChild(row);

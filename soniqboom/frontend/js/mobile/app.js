@@ -5,7 +5,12 @@
  * app.js — Mobile shell entry: view router, tab bar, mini-player, action sheet.
  */
 import { Player } from '../player.js';
-import { artPlaceholderEmoji } from '../utils.js';
+import { artPlaceholderEmoji, Toast } from '../utils.js';
+// UX-3 P0: mobile shell exposes the same globals desktop does so the
+// classic-script cast_picker.js can read currentTrackId + emit toasts.
+window.SoniqBoom = window.SoniqBoom || {};
+window.SoniqBoom.player = Player;
+window.Toast = Toast;
 
 import { mountLibrary }    from './views/library.js';
 import { mountSearch }     from './views/search.js';
@@ -88,7 +93,9 @@ function renderMini(track) {
   miniTitle.textContent  = track.title  || '—';
   miniArtist.textContent = track.artist || track.album_artist || '';
 
-  // Artwork: emoji placeholder first; swap in real art async if available.
+  // Artwork: glowing-blue format-emoji placeholder behind a faded <img>.
+  // The .loaded class triggers the CSS opacity fade-in; onerror removes
+  // the img so the placeholder stays visible (no broken-image glyph).
   miniArt.innerHTML = '';
   const span = document.createElement('span');
   span.className = 'm-mp-art-ph';
@@ -98,7 +105,9 @@ function renderMini(track) {
   if (artSrc) {
     const img = new Image();
     img.alt = '';
-    img.onload = () => { miniArt.innerHTML = ''; miniArt.appendChild(img); };
+    img.onload  = () => img.classList.add('loaded');
+    img.onerror = () => img.remove();
+    miniArt.appendChild(img);
     img.src = artSrc;
   }
 }
