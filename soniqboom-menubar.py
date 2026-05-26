@@ -49,30 +49,63 @@ except ImportError:
 
 # ── Singleton ────────────────────────────────────────────────────────────────
 
-def _kill_existing_instances() -> None:
-    """Kill any other soniqboom-menubar.py processes (keeps only this one)."""
+import time as _time
+
+
+def _kill_existing_instances(wait_seconds: float = 2.0) -> None:
+    """SIGTERM any other soniqboom-menubar.py processes, then wait briefly
+    for them to actually exit so we don't end up with two menubar icons
+    fighting over the NSStatusItem.
+    """
     my_pid = os.getpid()
+    others: list[int] = []
     try:
         out = subprocess.check_output(
             ["pgrep", "-f", "soniqboom-menubar\\.py"],
             text=True,
         )
         for line in out.strip().splitlines():
-            pid = int(line.strip())
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
             if pid != my_pid:
-                os.kill(pid, signal.SIGTERM)
-    except (subprocess.CalledProcessError, ValueError, ProcessLookupError):
-        pass  # no other instances found, or already gone
+                others.append(pid)
+    except subprocess.CalledProcessError:
+        return  # no other instances
 
+    for pid in others:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
 
-_kill_existing_instances()
+    deadline = _time.monotonic() + wait_seconds
+    remaining = list(others)
+    while remaining and _time.monotonic() < deadline:
+        still_alive = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                still_alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not still_alive:
+            return
+        remaining = still_alive
+        _time.sleep(0.05)
+
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8080"
 SCRIPT_DIR = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent
-DATA_DIR = Path.home() / "Library" / "Application Support" / "SoniqBoom"
+_DATA_DIR_ENV = os.environ.get("SONIQBOOM_DATA_DIR")
+DATA_DIR = Path(_DATA_DIR_ENV).expanduser() if _DATA_DIR_ENV else (
+    Path.home() / "Library" / "Application Support" / "SoniqBoom"
+)
 PID_FILE = DATA_DIR / "soniqboom.pid"
+STARTUP_STATUS_FILE = DATA_DIR / "startup-status.json"
 
 RUN_SH = SCRIPT_DIR / "run.sh"
 SHUTDOWN_SH = SCRIPT_DIR / "shutdown.sh"
@@ -91,14 +124,66 @@ def _is_running() -> int | None:
         return None
 
 
+def _read_startup_status() -> dict | None:
+    """Return the most recent startup-status.json contents, or None.
+
+    Written by the server's :mod:`soniqboom.core.startup_status` at every
+    phase boundary.  The menubar polls this so it can show the current
+    phase ("Building search indexes…") in the title and tooltip while
+    the HTTP API isn't yet listening — uvicorn doesn't start accepting
+    requests until the lifespan startup handler completes, which is
+    exactly when this file is at its most useful.
+
+    Failures (file gone, mid-rename race, corrupt JSON) return None so
+    callers fall back to the existing pid-only state.
+    """
+    try:
+        if not STARTUP_STATUS_FILE.exists():
+            return None
+        with open(STARTUP_STATUS_FILE, "r") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# Hold strong refs to spawned shell scripts so we can ``poll()`` them and
+# reap their zombies, rather than letting defunct entries accumulate.
+_spawned_children: list[subprocess.Popen] = []
+
+
+def _reap_finished_children() -> None:
+    """Best-effort: drop any spawned Popen objects whose process has exited.
+
+    ``poll()`` is non-blocking and triggers waitpid() if the child has died,
+    which is enough to clear the zombie.  Called from the status-poll timer.
+    """
+    if not _spawned_children:
+        return
+    still_alive: list[subprocess.Popen] = []
+    for proc in _spawned_children:
+        try:
+            if proc.poll() is None:
+                still_alive.append(proc)
+        except Exception:
+            pass
+    _spawned_children[:] = still_alive
+
+
 def _run_script(script: Path, *args: str) -> None:
-    """Run a shell script detached from this process."""
-    subprocess.Popen(
+    """Run a shell script detached from this process.
+
+    The Popen object is tracked in ``_spawned_children`` so the status-poll
+    timer can reap it once the shell exits — previously the children sat
+    around as defunct/zombie processes until the menubar quit.
+    """
+    proc = subprocess.Popen(
         ["bash", str(script)] + list(args),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    _spawned_children.append(proc)
+    _reap_finished_children()
 
 
 # ── Native windows ───────────────────────────────────────────────────────────
@@ -395,31 +480,88 @@ class SoniqBoomMenuBar(rumps.App):
             rumps.MenuItem("Source on GitHub", callback=self.open_source),
             rumps.MenuItem("About SoniqBoom", callback=self.show_about),
             None,  # separator
-            rumps.MenuItem("Quit Menu Icon", callback=self.quit_app),
+            rumps.MenuItem("Quit Menu Icon (server keeps running)", callback=self.quit_app),
         ]
         # Update state on launch
         self._update_menu_state()
 
-        # Poll server status every 5 seconds
-        self._timer = rumps.Timer(self._poll_status, 5)
+        # Poll server status.  Default cadence is 5s once steady, but while
+        # the server is mid-startup we tighten to 1s so the title chip
+        # ("Loading library…", "Building search indexes…") tracks the
+        # actual phase boundaries instead of lagging a window behind.
+        self._poll_interval_idle = 5
+        self._poll_interval_busy = 1
+        self._timer = rumps.Timer(self._poll_status, self._poll_interval_idle)
         self._timer.start()
+
+    def _startup_phase_chip(self) -> str | None:
+        """Build a short title suffix from startup-status.json, e.g.
+        ``"Loading library snapshot…"``.
+
+        Returns None when the server isn't mid-startup (file missing, or
+        marked ready, or the on-disk status is stale relative to the
+        running PID).  None means the title falls back to plain "🔊".
+        """
+        status = _read_startup_status()
+        if not status:
+            return None
+        # ``ready`` set → startup is done; we should show the normal title.
+        if status.get("ready"):
+            return None
+        # Stale status file (left from a previous run that crashed before
+        # mark_ready()) can confuse the title.  If the file's PID doesn't
+        # match the running PID, ignore it.
+        running_pid = _is_running()
+        file_pid = status.get("pid")
+        if file_pid and running_pid and int(file_pid) != int(running_pid):
+            return None
+        label = status.get("label") or ""
+        msg = status.get("message") or ""
+        if msg:
+            return f"{label} ({msg})"
+        return label or None
 
     def _update_menu_state(self):
         """Enable/disable menu items based on whether the server is running."""
         running = _is_running() is not None
         self.menu["Start SoniqBoom"].set_callback(None if running else self.start_server)
         self.menu["Stop SoniqBoom"].set_callback(self.stop_server if running else None)
+        # Restart is only meaningful while the server is running.  Earlier
+        # we wired it unconditionally so the "cold start" fallback in
+        # restart_server() was reachable, but that gave the menu two
+        # indistinguishable Start/Restart entries when stopped — cold start
+        # is what the dedicated Start item is for.
         self.menu["Restart SoniqBoom"].set_callback(self.restart_server if running else None)
         self.menu["Open SoniqBoom"].set_callback(self.open_browser if running else None)
         self.menu["Settings"].set_callback(self.show_settings if running else None)
         # Status is always available — it shows "stopped" state too.
         self.menu["Status"].set_callback(self.show_status)
 
-        # Dim the title when stopped
-        self.title = "🔊" if running else "🔇"
+        # Title precedence:
+        #   1. Mid-startup (server PID exists but startup-status says not
+        #      ready) → show "🔊  Loading library snapshot…" so the user
+        #      knows the menubar IS launched and what it's doing
+        #   2. Running and ready → plain "🔊"
+        #   3. Not running → dimmed "🔇"
+        startup_chip = self._startup_phase_chip() if running else None
+        if startup_chip:
+            self.title = f"🔊  {startup_chip}"
+        elif running:
+            self.title = "🔊"
+        else:
+            self.title = "🔇"
 
     def _poll_status(self, _sender):
         self._update_menu_state()
+        _reap_finished_children()
+        # Adaptive cadence: tighten the poll while mid-startup so the chip
+        # updates feel snappy, relax once steady-state to keep idle CPU
+        # cost negligible.  rumps.Timer.interval is a plain attribute so
+        # we can mutate it directly between fires.
+        is_starting = bool(self._startup_phase_chip()) if _is_running() else False
+        target = self._poll_interval_busy if is_starting else self._poll_interval_idle
+        if self._timer.interval != target:
+            self._timer.interval = target
 
     def open_browser(self, _sender):
         subprocess.Popen(["open", f"http://127.0.0.1:{PORT}"])
@@ -432,6 +574,13 @@ class SoniqBoomMenuBar(rumps.App):
         rumps.notification("SoniqBoom", "", "Server starting...")
 
     def restart_server(self, _sender):
+        if not _is_running():
+            # Previously this said "Server restarting..." even when nothing
+            # was running — restart.sh then just starts a new instance, so
+            # the message was technically wrong on a cold start.
+            _run_script(RUN_SH, "--port", PORT)
+            rumps.notification("SoniqBoom", "", "Server starting...")
+            return
         _run_script(RESTART_SH, "--port", PORT)
         rumps.notification("SoniqBoom", "", "Server restarting...")
 
@@ -468,4 +617,5 @@ class SoniqBoomMenuBar(rumps.App):
 
 
 if __name__ == "__main__":
+    _kill_existing_instances()
     SoniqBoomMenuBar().run()

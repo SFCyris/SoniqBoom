@@ -34,15 +34,27 @@ def _is_remote(path: str) -> bool:
 
 
 def _has_audio(path: Path) -> bool:
-    """Return True if the directory contains at least one supported audio file (shallow)."""
+    """Return True if the directory contains at least one supported audio file (shallow).
+
+    Uses ``os.scandir`` which caches each entry's type — ``entry.is_file()``
+    no longer triggers a separate ``stat()`` syscall per child, cutting
+    syscall count in half on wide directories.
+    """
     try:
-        return any(
-            f.suffix.lower() in SUPPORTED_EXTENSIONS
-            for f in path.iterdir()
-            if f.is_file() and not _is_junk_filename(f.name)
-        )
-    except PermissionError:
+        with os.scandir(path) as it:
+            for entry in it:
+                if _is_junk_filename(entry.name):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                if os.path.splitext(entry.name)[1].lower() in SUPPORTED_EXTENSIONS:
+                    return True
+    except (PermissionError, FileNotFoundError, OSError):
         return False
+    return False
 
 
 def _dir_node(path: Path, root: Path) -> dict:
@@ -138,14 +150,35 @@ async def tracks_in_dir(
     if not p.exists() or not p.is_dir():
         raise HTTPException(404, f"Directory not found: {path}")
 
+    ext_set = {e.lower() for e in SUPPORTED_EXTENSIONS}
+
     def _list_files() -> list[Path]:
+        # Previous implementation ran ``rglob`` once per supported extension —
+        # that's ~40 full recursive walks of the same tree per request.
+        # One ``os.walk`` covers them all in a single pass.
         result: list[Path] = []
         if recursive:
-            for ext in SUPPORTED_EXTENSIONS:
-                result.extend(p.rglob(f"*{ext}"))
+            for dirpath, _dirs, filenames in os.walk(p):
+                for fn in filenames:
+                    if _is_junk_filename(fn):
+                        continue
+                    if os.path.splitext(fn)[1].lower() in ext_set:
+                        result.append(Path(os.path.join(dirpath, fn)))
         else:
-            result = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
-        result = [f for f in result if not _is_junk_filename(f.name)]
+            try:
+                with os.scandir(p) as it:
+                    for entry in it:
+                        if _is_junk_filename(entry.name):
+                            continue
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        if os.path.splitext(entry.name)[1].lower() in ext_set:
+                            result.append(Path(entry.path))
+            except (PermissionError, FileNotFoundError, OSError):
+                return []
         result.sort(key=lambda f: f.name.lower())
         return result
 
@@ -267,6 +300,40 @@ def _make_stub(filepath: Path) -> dict:
     }
 
 
+# ── tracks-with-meta result cache ──────────────────────────────────────────
+#
+# The endpoint is hot — Files-app-style browsers poll it every time the user
+# clicks into a directory.  Re-running ``_discover_audio`` (os.walk + maybe
+# zipfile reads) plus 1000s of ``uuid5`` calls on every navigate is wasted
+# work when the directory and the store haven't changed.
+#
+# Cache key: ``(absolute path, recursive flag)``.  Cache entry stores the
+# directory's mtime at the time of capture plus the store's
+# ``_mutation_seq``.  A hit returns the cached ``files`` + ``id_map`` when
+# *both* are still current — otherwise we recompute.  We don't cache the
+# final response because the per-track metadata may include user-specific
+# state (rating, play count) that we let the rest of the handler resolve
+# fresh from the store on every call.
+_TRACKS_META_CACHE: dict[tuple[str, bool], dict] = {}
+
+
+def _dir_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _build_id_map(files: list[Path]) -> dict[str, Path]:
+    """Compute deterministic uuid5 ids for ``files``.
+
+    Wrapped in its own helper so the discover + uuid generation can be
+    pushed onto a thread-pool together (UUID generation for a 5K-file
+    directory is non-trivial CPU work).
+    """
+    return {_track_id(f): f for f in files}
+
+
 @router.get("/tracks-with-meta")
 async def tracks_with_meta(
     path: str = Query(..., description="Absolute directory path"),
@@ -278,6 +345,10 @@ async def tracks_with_meta(
     in the store (file was previously scanned), the full TrackMeta is returned.
     For unscanned files, a minimal stub derived from the filename is returned
     with ``_scanned: false``.
+
+    File discovery + id-map generation are cached on ``(path, recursive)``
+    keyed by the directory's mtime *and* the store's mutation sequence;
+    a cache hit lets the metadata lookup proceed without re-walking disk.
     """
     if _is_remote(path):
         return await _remote_tracks_with_meta(path, recursive)
@@ -286,15 +357,52 @@ async def tracks_with_meta(
     if not p.exists() or not p.is_dir():
         raise HTTPException(404, f"Directory not found: {path}")
 
-    # _discover_audio does os.walk + zipfile I/O — offload to thread-pool so
-    # the event loop isn't blocked while scanning large directories.
+    from soniqboom.core.store import get_store
+    store = get_store()
+    seq = getattr(store, "_mutation_seq", 0)
+
     loop = asyncio.get_running_loop()
-    files = await loop.run_in_executor(None, _discover_audio, p, recursive)
+    cache_key = (str(p), recursive)
+    cached = _TRACKS_META_CACHE.get(cache_key)
+    mtime_now = await loop.run_in_executor(None, _dir_mtime, p)
+
+    if (
+        cached is not None
+        and cached.get("mtime") == mtime_now
+        and cached.get("seq") == seq
+    ):
+        files = cached["files"]
+        id_map = cached["id_map"]
+    else:
+        # _discover_audio does os.walk + zipfile I/O — offload to
+        # thread-pool so the event loop isn't blocked while scanning
+        # large directories.  UUID generation joins the same thread call
+        # so we don't bounce twice through the executor.
+        def _discover_and_id() -> tuple[list[Path], dict[str, Path]]:
+            files_local = _discover_audio(p, recursive)
+            return files_local, _build_id_map(files_local)
+
+        files, id_map = await loop.run_in_executor(None, _discover_and_id)
+        if not files:
+            # Cache the empty result too — empty dirs are otherwise polled
+            # forever without ever caching anything.
+            _TRACKS_META_CACHE[cache_key] = {
+                "mtime": mtime_now,
+                "seq": seq,
+                "files": files,
+                "id_map": id_map,
+            }
+            return []
+        _TRACKS_META_CACHE[cache_key] = {
+            "mtime": mtime_now,
+            "seq": seq,
+            "files": files,
+            "id_map": id_map,
+        }
+
     if not files:
         return []
 
-    # Build ID map — same deterministic uuid5 the scanner uses
-    id_map: dict[str, Path] = {_track_id(f): f for f in files}
     track_ids = list(id_map.keys())
 
     # Batch-fetch metadata from the in-memory store

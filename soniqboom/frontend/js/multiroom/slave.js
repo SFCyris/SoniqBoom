@@ -7,6 +7,7 @@
  */
 import { Player } from '../player.js';
 import { Sync } from './sync.js';
+import { artPlaceholderEmoji } from '../utils.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -113,23 +114,32 @@ function _onAutoplayBlocked() {
 }
 
 function _renderCard(track) {
+  const artEl = $('mr-slave-art');
   if (!track) {
     $('mr-slave-title').textContent = 'Waiting for master…';
     $('mr-slave-artist').textContent = '';
-    $('mr-slave-art').innerHTML = '🎵';
+    artEl.innerHTML = '<span class="mr-art-ph">\u{1F50A}</span>';
     return;
   }
   $('mr-slave-title').textContent = track.title || '(Untitled)';
   $('mr-slave-artist').textContent = track.artist || track.album_artist || '';
-  if (track.cover_art) {
-    $('mr-slave-art').innerHTML = `<img src="${_esc(track.cover_art)}" alt="">`;
-  } else {
-    $('mr-slave-art').innerHTML = '🎵';
+  // Same format-aware fallback as master.js — see comment there.
+  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg` : '');
+  artEl.innerHTML = `<span class="mr-art-ph">${artPlaceholderEmoji(track)}</span>` +
+    (src ? `<img class="mr-art-img" src="${_esc(src)}" alt="">` : '');
+  const _mrImg = artEl.querySelector('.mr-art-img');
+  if (_mrImg) {
+    _mrImg.onload  = () => _mrImg.classList.add('loaded');
+    _mrImg.onerror = () => _mrImg.remove();
   }
   $('mr-slave-dur').textContent = fmt(track.duration || 0);
 }
 
 function _tickLocalProgress() {
+  // Skip the layout work when the tab is hidden — the user can't see the
+  // progress bar anyway, and 4 Hz layout writes survive tab-hide otherwise
+  // (Perf #2).
+  if (document.hidden) return;
   const cur = Player.audio.currentTime || 0;
   const dur = Player.audio.duration || 0;
   $('mr-slave-cur').textContent = fmt(cur);

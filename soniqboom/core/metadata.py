@@ -39,10 +39,25 @@ SUPPORTED_EXTENSIONS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
+    # Retro chiptune via libgme (E-14): NES, SNES, Game Boy,
+    # Master System / Genesis, ZX Spectrum, MSX.
+    ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
+    ".ay", ".kss", ".sap", ".gym", ".hes",
+    # DSD (Direct Stream Digital).  Streamed via ffmpeg transcoding to PCM —
+    # the audiophile bit-perfect-to-DAC story belongs to local players like
+    # Roon/JRiver, but we can serve the audible content of any DSD library to
+    # any browser/Subsonic client.  DFF requires the dsdiff demuxer which is
+    # absent from some ffmpeg builds (notably Homebrew 8.x) — startup probe
+    # warns if the user has DFF files but the demuxer isn't available.
+    ".dsf", ".dff", ".wsd",
 }
 
 FORMAT_NAMES = {
-    ".mp3": "MP3", ".flac": "FLAC", ".m4a": "ALAC/AAC", ".aac": "AAC",
+    # ``.m4a`` is intentionally unset to a codec name here — the actual
+    # codec is filled in by ``_mp4`` after an ffprobe lookup so we never
+    # mis-label an AAC file as "ALAC" or vice versa.  The legacy
+    # "ALAC/AAC" combo string broke filtering on codec in the library UI.
+    ".mp3": "MP3", ".flac": "FLAC", ".m4a": "M4A", ".aac": "AAC",
     ".ogg": "Ogg Vorbis", ".opus": "Opus", ".aiff": "AIFF", ".aif": "AIFF",
     ".wav": "WAV", ".wv": "WavPack", ".mpc": "Musepack",
     # SID
@@ -58,7 +73,16 @@ FORMAT_NAMES = {
     ".gdm": "General DigiMusic", ".imf": "Imago Orpheus",
     ".okt": "Oktalyzer", ".sfx": "SoundFX", ".wow": "Grave Composer",
     ".dsm": "DSIK",
+    # libgme-rendered (E-14)
+    ".nsf":  "NSF",  ".nsfe": "NSFe", ".spc": "SPC", ".gbs": "GBS",
+    ".vgm":  "VGM",  ".vgz":  "VGZ",  ".ay":  "AY",  ".kss": "KSS",
+    ".sap":  "SAP",  ".gym":  "GYM",  ".hes": "HES",
+    # DSD — actual quality tier (DSD64/128/256/...) is filled in at
+    # extract time once the source sample rate is known.
+    ".dsf":  "DSD",  ".dff":  "DSD",  ".wsd": "DSD",
 }
+
+_DSD_EXTS = {".dsf", ".dff", ".wsd"}
 
 _SID_EXTS = {".sid", ".psid"}
 _MIDI_EXTS = {".mid", ".midi"}
@@ -66,6 +90,13 @@ _TRACKER_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
+}
+# libgme — Game Music Emu — covers chiptune formats from NES/SNES/
+# Game Boy/Genesis/Master System/MSX/ZX Spectrum.  Rendered to WAV
+# via the ``gme`` CLI when the user installs it.
+_GME_EXTS = {
+    ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
+    ".ay", ".kss", ".sap", ".gym", ".hes",
 }
 
 # ── General MIDI program names ────────────────────────────────────────────────
@@ -124,7 +155,139 @@ _MOD_MAGIC_CHANNELS = {
     b"5CHN": 5, b"7CHN": 7, b"9CHN": 9,
 }
 
+# ── Partial-fetch header budgets ──────────────────────────────────────────────
+#
+# Number of bytes from the START of a file that the scanner can fetch
+# in lieu of the whole payload, and still extract complete metadata.
+# A value of ``None`` means "must fetch entire file" — either the tag
+# container is at the end (DSF's ID3 chunk position is implementation-
+# defined; the Suara DFF files have it at file END), or the format
+# uses random-access seeks (M4A/MP4 ``moov`` atom can be at start or
+# end depending on the muxer) that can't be safely truncated.
+#
+# Numbers are deliberately generous — saving 2 KB by tightening the
+# budget at the cost of a single fall-back full fetch is a bad trade
+# (full fetch is 100× more expensive on a typical FLAC).  Each entry
+# is sized to fit the largest realistic header for that container,
+# including embedded album art:
+#
+#   * MP3:  ID3v2.4 frame headers ~10 bytes + APIC frame.  Most embedded
+#           covers cap out at 50–100 KB.  Anything larger is rare.
+#   * FLAC: STREAMINFO (42 B) + VORBIS_COMMENT (avg ~1 KB) + PICTURE
+#           block (can hold embedded JPEG 50–200 KB).
+#   * Ogg/Opus: vorbis comments in the second logical page, usually
+#           within the first 32 KB; pad for embedded art.
+#   * Tracker formats: header is tens to hundreds of bytes at offset 0;
+#           we pad to KB-range for safety on unusual variants.
+#   * SID/PSID: 128-byte header at offset 0; 256 B is overkill.
+#   * SPC: 256-byte header + ID666 tag at offset 0x2E; 64 KB lets us
+#           read the optional extended tag block at end of file (but for
+#           SPC the file IS only 64 KB).
+#
+# All values are upper bounds — the partial fetch may stop earlier on
+# EOF.  If extract returns a result whose ``title`` is just the
+# filename stem and other fields are empty, the scanner treats that as
+# "partial fetch undershot" and falls back to a full fetch.
+HEADER_BUDGET: dict[str, int | None] = {
+    # ID3-based / common audio
+    #
+    # FLAC bumped to 1.5 MB after observing a 10G-LAN re-index running
+    # at ~1 MB/s instead of 600 MB/s: 88% of the user's FLACs (1014 /
+    # 1147 sampled) fell back to full fetch because the 384 KB budget
+    # cut off mid-PICTURE-block on Hi-Res rips with embedded album
+    # covers (one sample: 549 KB cover, metadata ends at 553 KB).
+    # 1.5 MB covers art up to ~1.3 MB with header padding — the long
+    # tail of Hi-Res rips with bigger covers still gets caught by the
+    # full-fetch fallback in _process_one.  Cost of the bump: ~4×
+    # more bytes per partial fetch, still 33× less than full fetch
+    # on a 50 MB file.
+    ".mp3":  512 * 1024,
+    ".flac": 1536 * 1024,
+    ".ogg":  512 * 1024,
+    ".opus": 512 * 1024,
+    ".aiff": 512 * 1024,
+    ".aif":  512 * 1024,
+    ".wav":  128 * 1024,
+    # Tracker formats — header at start, small
+    ".mod":  64 * 1024,    # MOD samples can inflate; 64 KB covers most
+    ".s3m":  64 * 1024,
+    ".it":   64 * 1024,
+    ".xm":   64 * 1024,
+    ".mtm":  64 * 1024,
+    ".med":  64 * 1024,
+    ".669":  64 * 1024,
+    # Chiptune containers — tiny headers
+    ".sid":  8 * 1024,
+    ".psid": 8 * 1024,
+    ".rsid": 8 * 1024,
+    ".nsf":  8 * 1024,
+    ".nsfe": 64 * 1024,    # NSFe has chunks throughout — generous
+    ".spc":  None,         # SPC files are 64-256 KB total; full fetch trivial
+    ".gbs":  4 * 1024,
+    ".vgm":  None,         # VGM headers vary; full fetch is cheap (small files)
+    ".vgz":  None,         # gzip — must decompress whole stream
+    ".ay":   4 * 1024,
+    ".kss":  4 * 1024,
+    ".sap":  4 * 1024,
+    ".gym":  None,
+    ".hes":  4 * 1024,
+    # MUST fetch full file:
+    ".m4a":  None,         # moov atom can be at start or end
+    ".mp4":  None,
+    ".aac":  None,
+    ".dsf":  None,         # ID3 chunk position is mastering-tool dependent
+    ".dff":  None,         # observed: Suara album has ID3 chunk at file END
+    ".wsd":  None,         # no mutagen support; ffprobe needs full file
+    ".mid":  None,         # SMF parsed sequentially
+    ".midi": None,
+}
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _decode_tracker_str(b: bytes) -> str:
+    """Decode a fixed-size text field from a tracker / chiptune header.
+
+    Tracker formats (MOD/S3M/IT/XM) and chiptune containers (SID/NSF/SPC/
+    GBS/etc.) store text in 8-bit encodings that predate UTF-8.  Bytes
+    ≥ 0x80 are common — DOS-era CP437 box-drawing chars, ISO-8859-1
+    Western European, occasional Shift-JIS for Japanese demoscene
+    files.  Decoding such bytes as ``ascii`` with ``errors='replace'``
+    (the original code's choice) produced the user-visible mojibake
+    where titles like ``finality`` were padded with U+FFFD diamonds.
+
+    Strategy: try strict UTF-8 first (modern files); fall back to
+    CP437 (the DOS code page); finally Latin-1 (single-byte, lossless,
+    never raises — guarantees we always return *some* text).  Strips
+    NUL padding and surrounding whitespace at the end.
+
+    Returns ``""`` for empty / all-NUL inputs.
+    """
+    if not b:
+        return ""
+    # NUL-terminate the field at the first NUL byte (every tracker /
+    # chiptune format pads with NULs, not spaces).
+    b = b.split(b"\x00", 1)[0]
+    if not b:
+        return ""
+    # Strict UTF-8 — wins for modern files.
+    try:
+        return b.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        pass
+    # CP437 — DOS code page, the de-facto tracker scene encoding from
+    # the FastTracker / Impulse Tracker era.  Single-byte, can't fail
+    # on any byte, but we keep the try/except for paranoia.
+    try:
+        return b.decode("cp437").strip()
+    except (UnicodeDecodeError, LookupError):
+        pass
+    # Latin-1 catch-all: 256 distinct chars covering bytes 0x00–0xFF.
+    # Never raises.  Visual output may be mojibake for Shift-JIS files,
+    # but at least it's stable readable bytes the user can search on
+    # and the round-trip is lossless if they ever need the raw text.
+    return b.decode("latin-1").strip()
+
 
 def _str(v) -> str:
     return str(v).strip() if v is not None else ""
@@ -198,6 +361,144 @@ def _cover_b64(data: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64," + base64.b64encode(data).decode()
 
 
+# Formats considered lossless.  Used to set the ``is_lossless`` flag on
+# every track so the UI can badge appropriately and so smart-search
+# filters like "show me only lossless rips" can build cleanly.
+_LOSSLESS_FORMATS = {
+    "FLAC", "ALAC", "WAV", "AIFF", "WavPack", "DSD",
+    "DSD64", "DSD128", "DSD256", "DSD512", "TTA",
+}
+
+
+def _is_lossless_format(fmt: str | None) -> bool:
+    """True if ``fmt`` denotes a lossless audio container/codec.
+
+    MPC is intentionally not in the lossless set — most MPC files are
+    lossy SV7/SV8 streams.  WavPack (.wv) is lossless by spec.
+    """
+    if not fmt:
+        return False
+    return fmt.split("/", 1)[0].strip() in _LOSSLESS_FORMATS
+
+
+def _parse_gain(raw) -> float | None:
+    """Parse a ReplayGain tag value ("-6.32 dB" or "-6.32") to float dB."""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        if not raw:
+            return None
+        raw = raw[0]
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Strip the trailing "dB" if present.
+    if s.lower().endswith("db"):
+        s = s[:-2].strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_peak(raw) -> float | None:
+    """Parse a ReplayGain peak (linear float, 0–1)."""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        if not raw:
+            return None
+        raw = raw[0]
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _replaygain_from_vorbis(tags) -> dict:
+    """Pull ReplayGain fields out of a Vorbis-comment-style tags object.
+
+    Returns the four ``replaygain_*`` floats (in dB / linear peak) when
+    present; missing keys are simply absent from the dict.  Works for
+    FLAC, Ogg Vorbis, and Opus tag containers (all share the same
+    string-keyed multi-value model).
+    """
+    out: dict = {}
+    if tags is None:
+        return out
+    keys = (
+        ("replaygain_track_gain", "REPLAYGAIN_TRACK_GAIN", "track_gain"),
+        ("replaygain_album_gain", "REPLAYGAIN_ALBUM_GAIN", "album_gain"),
+        ("replaygain_track_peak", "REPLAYGAIN_TRACK_PEAK", "track_peak"),
+        ("replaygain_album_peak", "REPLAYGAIN_ALBUM_PEAK", "album_peak"),
+    )
+    for src1, src2, dst in keys:
+        # mutagen Vorbis tags index by lowercase; tolerate either casing.
+        raw = None
+        try:
+            raw = tags.get(src1) or tags.get(src1.lower()) or tags.get(src2)
+        except Exception:
+            raw = None
+        parser = _parse_peak if "peak" in dst else _parse_gain
+        val = parser(raw)
+        if val is not None:
+            out[f"replaygain_{dst}"] = val
+    # Opus uses R128_TRACK_GAIN (Q7.8 integer dB × 256, per the Opus spec
+    # extension).  Convert to a plain dB float for consistency with the
+    # other tag families.
+    r128 = None
+    try:
+        r128 = tags.get("R128_TRACK_GAIN") or tags.get("r128_track_gain")
+    except Exception:
+        r128 = None
+    if r128 is not None:
+        if isinstance(r128, list) and r128:
+            r128 = r128[0]
+        try:
+            iv = int(str(r128).strip())
+            # Q7.8 → dB.  Opus's R128 tag is signed Q7.8 with -127 dB at 0
+            # and the reference loudness at 0 dB.
+            out.setdefault("replaygain_track_gain", iv / 256.0)
+        except ValueError:
+            pass
+    return out
+
+
+def _replaygain_from_id3(tags) -> dict:
+    """Pull ReplayGain fields out of an ID3 (MP3) tag object.
+
+    ID3 carries ReplayGain as TXXX frames keyed on description (case-
+    sensitive ``REPLAYGAIN_TRACK_GAIN``).  Some encoders also embed RVA2
+    frames; we read those as a secondary source.
+    """
+    out: dict = {}
+    if tags is None:
+        return out
+    try:
+        # TXXX[REPLAYGAIN_TRACK_GAIN] etc.  mutagen exposes these via
+        # ``getall("TXXX:NAME")`` or a flat ``tags.get("TXXX:NAME")``.
+        for name, dst in (
+            ("REPLAYGAIN_TRACK_GAIN", "track_gain"),
+            ("REPLAYGAIN_ALBUM_GAIN", "album_gain"),
+            ("REPLAYGAIN_TRACK_PEAK", "track_peak"),
+            ("REPLAYGAIN_ALBUM_PEAK", "album_peak"),
+        ):
+            frame = tags.get(f"TXXX:{name}")
+            if frame is None:
+                continue
+            try:
+                raw = frame.text[0] if hasattr(frame, "text") else str(frame)
+            except Exception:
+                raw = str(frame)
+            parser = _parse_peak if "peak" in dst else _parse_gain
+            val = parser(raw)
+            if val is not None:
+                out[f"replaygain_{dst}"] = val
+    except Exception:
+        pass
+    return out
+
+
 def resize_cover(data: bytes, max_size: int, quality: int = 85) -> bytes:
     """Resize cover art to fit within max_size x max_size, returned as JPEG bytes."""
     from io import BytesIO
@@ -250,6 +551,7 @@ def _mp3(path: Path, track_id: str) -> dict:
             mime = tag.mime[0] if getattr(tag, "mime", None) else "image/jpeg"
             d["cover_art"] = _cover_b64(tag.data, mime)
             break
+    d.update(_replaygain_from_id3(tags))
     return d
 
 
@@ -265,12 +567,25 @@ def _flac(path: Path, track_id: str) -> dict:
 
     trck = g("tracknumber")
     tpos = g("discnumber")
+    # Bitrate: the uncompressed PCM bps figure mutagen advertises is
+    # misleading — for FLAC users want the *actual* compressed bitrate
+    # (which is what the file occupies on disk per second of playback).
+    # Compute file-size × 8 / duration for the true number; fall back to
+    # the uncompressed-PCM estimate only when duration is missing.
+    duration = audio.info.length or 0
+    flac_bitrate = audio.info.bits_per_sample * audio.info.sample_rate
+    try:
+        size = path.stat().st_size
+        if duration and duration > 0:
+            flac_bitrate = int(size * 8 / duration)
+    except OSError:
+        pass
     d: dict = {
         "id": track_id,
         "path": str(path),
         "format": "FLAC",
-        "duration": audio.info.length,
-        "bitrate": audio.info.bits_per_sample * audio.info.sample_rate,
+        "duration": duration,
+        "bitrate": flac_bitrate,
         "channels": audio.info.channels,
         "sample_rate": audio.info.sample_rate,
         "bit_depth": audio.info.bits_per_sample,
@@ -293,6 +608,7 @@ def _flac(path: Path, track_id: str) -> dict:
     if audio.pictures:
         pic = audio.pictures[0]
         d["cover_art"] = _cover_b64(pic.data, pic.mime)
+    d.update(_replaygain_from_vorbis(tags))
     return d
 
 
@@ -306,11 +622,51 @@ def _mp4(path: Path, track_id: str) -> dict:
         v = tags.get(key, [default])
         return str(v[0]) if v else default
 
-    trkn = tags.get("trkn", [(None, None)])[0] or (None, None)
-    disk = tags.get("disk", [(None, None)])[0] or (None, None)
+    # ``tags.get("trkn", default)`` returns the default only when the key is
+    # absent — an explicit empty list, or a 1-element tuple from a malformed
+    # atom, would still crash a later ``trkn[1]`` access.  Normalise to a
+    # 2-tuple here so downstream code can index freely.
+    def _pair(raw):
+        v = raw[0] if raw else None
+        if not isinstance(v, tuple):
+            return (None, None)
+        if len(v) < 2:
+            return (v[0] if v else None, None)
+        return v
 
-    # Detect ALAC vs AAC
-    fmt = "ALAC" if getattr(audio.info, "codec", "").startswith("alac") else "AAC/M4A"
+    trkn = _pair(tags.get("trkn") or [(None, None)])
+    disk = _pair(tags.get("disk") or [(None, None)])
+
+    # Codec detection — prefer ffprobe over mutagen's heuristic.  Mutagen
+    # reads the codec name from the atom table; for files written by
+    # certain encoders (notably older iTunes Match exports) that token
+    # reads "mp4a" without disambiguating ALAC vs AAC.  ffprobe always
+    # returns the real codec name from the elementary-stream header, so
+    # we end up with the right format label even on those edge cases.
+    fmt: str | None = None
+    try:
+        probed = subprocess.run(
+            ["ffprobe", "-v", "quiet",
+             "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if probed.returncode == 0:
+            codec_name = (probed.stdout or "").strip().lower()
+            if codec_name == "alac":
+                fmt = "ALAC"
+            elif codec_name == "aac":
+                fmt = "AAC"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    if fmt is None:
+        # Fallback to mutagen heuristic when ffprobe unavailable.  Note we
+        # never produce the old "ALAC/AAC" combo string — we pick one
+        # side and commit, so the column stays canonical.
+        fmt = "ALAC" if getattr(audio.info, "codec", "").startswith("alac") else "AAC"
 
     d: dict = {
         "id": track_id,
@@ -354,7 +710,7 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
 
     trck = g("tracknumber")
     tpos = g("discnumber")
-    return {
+    out: dict = {
         "id": track_id,
         "path": str(path),
         "format": fmt,
@@ -378,6 +734,8 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "disc_number": _int(tpos),
         "total_discs": _total(tpos),
     }
+    out.update(_replaygain_from_vorbis(tags))
+    return out
 
 
 # ── SID (C64) ────────────────────────────────────────────────────────────────
@@ -406,9 +764,9 @@ def _extract_sid(path: Path, track_id: str) -> dict:
 
     version = struct.unpack(">H", header[4:6])[0]
 
-    title_raw     = header[22:54].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
-    artist_raw    = header[54:86].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
-    copyright_raw = header[86:118].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+    title_raw     = _decode_tracker_str(header[22:54])
+    artist_raw    = _decode_tracker_str(header[54:86])
+    copyright_raw = _decode_tracker_str(header[86:118])
 
     # Subsong info (bytes 14-17)
     subsongs = struct.unpack(">H", header[14:16])[0]
@@ -452,6 +810,28 @@ def _extract_sid(path: Path, track_id: str) -> dict:
     }
     if sid_model:
         d["sid_model"] = sid_model
+
+    # ── HVSC enrichment ──────────────────────────────────────────────
+    # When the user has pointed at the High Voltage SID Collection
+    # documents folder, swap our default-duration estimate for the real
+    # per-subsong durations and attach the STIL commentary blob.
+    try:
+        from soniqboom.core.hvsc import get_hvsc
+        hvsc = get_hvsc()
+        if hvsc.is_configured():
+            durations = hvsc.lookup_durations(path)
+            if durations:
+                d["duration"]    = durations[0]
+                d["hvsc_lengths"] = durations
+                # Update subsong count if HVSC disagrees with the PSID header.
+                if len(durations) > 1:
+                    d["subsongs"] = len(durations)
+            stil = hvsc.lookup_stil(path)
+            if stil and stil.get("text"):
+                d["stil"] = stil["text"]
+    except Exception:
+        log.exception("HVSC enrichment failed for %s", path)
+
     return d
 
 
@@ -515,6 +895,251 @@ def _extract_midi(path: Path, track_id: str) -> dict:
     }
 
 
+# ── libgme chiptune (NSF / SPC / GBS / VGM / AY / KSS / SAP / HES / GYM) ──
+
+def _extract_gme(path: Path, track_id: str) -> dict:
+    """Best-effort header read for libgme-rendered chiptune formats.
+
+    Most of these formats have a small, well-documented header with a
+    title + artist string.  We parse just enough to display in the UI;
+    detailed track-list metadata (multi-song NSFs, SPC ID666) needs
+    the actual gme library and is left to the renderer."""
+    from soniqboom.config import settings
+    ext = path.suffix.lower()
+    fmt = FORMAT_NAMES.get(ext, ext.lstrip(".").upper())
+    title = path.stem
+    artist = ""
+    duration = float(getattr(settings, "sid_default_duration", 180))
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(256)
+    except OSError:
+        hdr = b""
+
+    # NSF header (NES Sound Format) — 0x80 bytes, fields at fixed offsets.
+    if ext in (".nsf", ".nsfe") and hdr[:5] == b"NESM\x1a":
+        title  = _decode_tracker_str(hdr[0x0E:0x2E])
+        artist = _decode_tracker_str(hdr[0x2E:0x4E])
+    # SPC700 ID666 (SNES) — 0x100 byte SPC header + 0xD0-byte ID666 block.
+    elif ext == ".spc" and hdr[:33] == b"SNES-SPC700 Sound File Data v0.30":
+        title  = _decode_tracker_str(hdr[0x2E:0x4E])
+        artist = _decode_tracker_str(hdr[0xB1:0xD1])
+    # GBS (Game Boy Sound) — 0x70 byte header.
+    elif ext == ".gbs" and hdr[:3] == b"GBS":
+        title  = _decode_tracker_str(hdr[0x10:0x30])
+        artist = _decode_tracker_str(hdr[0x30:0x50])
+    # Other formats fall back to filename; gme renderer will surface
+    # the proper metadata when streaming.
+
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "title": title or path.stem,
+        "artist": artist or None,
+        "duration": duration,
+        "genre": ["Chiptune"],
+    }
+    return d
+
+
+# ── DSD (.dsf / .dff / .wsd) ────────────────────────────────────────────────
+
+def _dsd_quality_label(sample_rate: int | None) -> str:
+    """Return ``DSDxxx`` based on the source rate.  DSD64 = 64×CD =
+    2.8224 MHz; DSD128 = 5.6448 MHz; DSD256 = 11.2896 MHz; DSD512 = 22.5792 MHz."""
+    if not sample_rate:
+        return "DSD"
+    # Round to nearest 100 kHz so we don't trip on 2822399 vs 2822400.
+    rate = round(sample_rate / 100_000)
+    if rate >= 220:
+        return "DSD512"
+    if rate >= 110:
+        return "DSD256"
+    if rate >= 55:
+        return "DSD128"
+    if rate >= 27:
+        return "DSD64"
+    return "DSD"
+
+
+def _extract_dsd(path: Path, track_id: str) -> dict:
+    """Pull duration / sample-rate / channels from a DSD file via ffprobe.
+
+    Mutagen's DSD support is limited (DSF only, and even then the
+    tag-reading path is fragile) and we already require ffmpeg for the
+    actual transcode — using ffprobe keeps the extractor path consistent
+    across all three DSD containers (DSF/DFF/WSD)."""
+    from soniqboom.config import settings
+    import json
+    import subprocess
+
+    ext = path.suffix.lower()
+    bin_ = settings.ffmpeg_path
+    # ffprobe lives alongside ffmpeg; derive its path from the configured
+    # ffmpeg binary so installations with a custom ffmpeg also find ffprobe.
+    if bin_:
+        probe = str(Path(bin_).parent / "ffprobe")
+        if not Path(probe).exists():
+            probe = "ffprobe"
+    else:
+        probe = "ffprobe"
+
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "title": path.stem,
+        "format": "DSD",
+    }
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error",
+             "-show_entries",
+             "stream=sample_rate,channels,duration:format=duration,size,bit_rate:format_tags",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode != 0:
+            log.warning("ffprobe failed on %s (%s): %s",
+                        path, ext, (out.stderr or "").strip()[:200])
+            return d
+        meta = json.loads(out.stdout or "{}")
+        streams = meta.get("streams") or [{}]
+        fmt_info = meta.get("format") or {}
+        s = streams[0] if streams else {}
+        sr = _int(s.get("sample_rate"))
+        ch = _int(s.get("channels"))
+
+        # Duration fallback chain — DFF in particular often omits
+        # format.duration in ffprobe output (no fixed-size header), so the
+        # player ends up with a 0:00 timeline and no Range-target ceiling.
+        # 1) format.duration   (DSF, well-formed DFF)
+        # 2) streams[0].duration (some DFF builds expose it here)
+        # 3) filesize ÷ (sample_rate × channels / 8) — DSD is 1 bit/sample
+        #    so total bytes ≈ duration × sr × ch / 8.  Works for any of the
+        #    three containers when ffprobe declines to compute it.
+        #
+        # Edge case still un-handled: very short DSD samples (<2 s test
+        # tones) where the container header dwarfs the audio payload.  The
+        # filesize fallback over-estimates duration by the header size in
+        # that regime, but real music libraries don't contain sub-2-s
+        # files so we don't pay the precision cost of subtracting a fixed
+        # header constant.  If this surfaces, switch to ``size − DSD_HDR``
+        # where DSD_HDR is ~92 bytes (DSF) or variable (DFF).
+        duration = float(fmt_info.get("duration") or 0) or 0.0
+        if duration <= 0:
+            duration = float(s.get("duration") or 0) or 0.0
+        if duration <= 0 and sr and ch:
+            size = _int(fmt_info.get("size"))
+            if not size:
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+            if size:
+                # DSD audio payload only — the container header is a few
+                # KB, well inside the precision the UI needs.
+                duration = size / (sr * ch / 8.0)
+
+        d.update({
+            "sample_rate": sr,
+            "channels": ch,
+            "duration": duration,
+            "format": _dsd_quality_label(sr),
+            "bit_depth": 1,
+        })
+        # Tags: prefer mutagen over ffprobe.
+        #
+        # ffprobe's text-tag decode mangles non-Latin-1 bytes — Japanese
+        # DFF rips from Pyramix mastering software (Suara - キミガタメ
+        # and friends) come back as ``"\x1bnK��"`` instead of
+        # ``"キミガタメ"``.  Mutagen's DSDIFF / DSF readers parse the
+        # embedded ID3v2 frames directly with the correct per-frame
+        # encoding byte (0x03 = UTF-8, 0x01 = UTF-16+BOM, …) and
+        # produce the right Unicode.  Fall back to ffprobe's tags only
+        # if mutagen can't open the file at all (corrupt container).
+        mutagen_tags: dict[str, str] = {}
+        try:
+            from mutagen import File as _MutagenFile
+            mf = _MutagenFile(path)
+            if mf is not None and getattr(mf, "tags", None):
+                # ID3 frame → our field-name mapping.  Genre / track /
+                # disc keep their multi-value / "N/M" semantics handled
+                # below.
+                _ID3_MAP = {
+                    "TIT2": "title",
+                    "TPE1": "artist",
+                    "TALB": "album",
+                    "TPE2": "album_artist",
+                    "TCOM": "composer",
+                    "TDRC": "year",
+                    "TCON": "genre",
+                    "TRCK": "track_number",
+                    "TPOS": "disc_number",
+                    "COMM": "comment",
+                    "TPUB": "label",
+                    "TSRC": "isrc",
+                }
+                for frame_id, dst in _ID3_MAP.items():
+                    frame = mf.tags.get(frame_id)
+                    if not frame:
+                        continue
+                    # ID3 frames expose ``.text`` as a list.  COMM has
+                    # ``.text`` too but the value is a list of strings.
+                    txt = getattr(frame, "text", None)
+                    if txt is None:
+                        continue
+                    val = txt[0] if isinstance(txt, list) and txt else txt
+                    if not val:
+                        continue
+                    mutagen_tags[dst] = str(val)
+        except Exception as exc:
+            log.debug("DSD mutagen tag read failed for %s: %s", path, exc)
+
+        # ffprobe tags as fallback (lowercased keys → our field names).
+        # If mutagen produced a value we trust that; otherwise take
+        # ffprobe's.
+        ffprobe_tags = {k.lower(): v for k, v in (fmt_info.get("tags") or {}).items()}
+        _FFPROBE_MAP = {
+            "title": "title",
+            "artist": "artist",
+            "album": "album",
+            "albumartist": "album_artist",
+            "composer": "composer",
+            "date": "year",
+            "genre": "genre",
+            "track": "track_number",
+            "disc": "disc_number",
+        }
+        merged: dict[str, str] = {}
+        for src, dst in _FFPROBE_MAP.items():
+            if dst in mutagen_tags:
+                merged[dst] = mutagen_tags[dst]
+            elif ffprobe_tags.get(src):
+                merged[dst] = ffprobe_tags[src]
+        # Mutagen-only fields (comment / label / isrc) — pass through.
+        for k in ("comment", "label", "isrc"):
+            if k in mutagen_tags:
+                merged[k] = mutagen_tags[k]
+
+        for dst, v in merged.items():
+            if dst == "year":
+                d[dst] = _year(v)
+            elif dst == "track_number":
+                d[dst] = _int(v)
+                d["total_tracks"] = _total(v)
+            elif dst == "disc_number":
+                d[dst] = _int(v)
+                d["total_discs"] = _total(v)
+            elif dst == "genre":
+                d[dst] = [v] if isinstance(v, str) else list(v)
+            else:
+                d[dst] = v
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
+        log.warning("DSD extract fallback for %s: %s", path, exc)
+    return d
+
+
 # ── Tracker modules (MOD / S3M / XM / IT / …) ──────────────────────────────
 
 def _extract_tracker(path: Path, track_id: str) -> dict:
@@ -534,7 +1159,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             raw = f.read()  # read full file for instrument headers
 
         if ext == ".mod" and len(raw) >= 1084:
-            title = raw[0:20].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+            title = _decode_tracker_str(raw[0:20])
 
             # Channel count from magic bytes at offset 1080
             magic = raw[1080:1084]
@@ -546,7 +1171,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 if offset + 30 > len(raw):
                     break
                 try:
-                    name = raw[offset:offset + 22].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                    name = _decode_tracker_str(raw[offset:offset + 22])
                     if name and name.isprintable():
                         instruments.append(name)
                 except Exception:
@@ -562,7 +1187,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 pass
 
         elif ext == ".s3m" and len(raw) >= 96:
-            title = raw[0:28].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+            title = _decode_tracker_str(raw[0:28])
 
             # Header fields
             num_orders = struct.unpack("<H", raw[32:34])[0]
@@ -584,7 +1209,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 try:
                     ptr = struct.unpack("<H", raw[para_offset + i * 2:para_offset + i * 2 + 2])[0] * 16
                     if ptr + 48 <= len(raw):
-                        name = raw[ptr + 48:ptr + 76].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                        name = _decode_tracker_str(raw[ptr + 48:ptr + 76])
                         if name and name.isprintable():
                             instruments.append(name)
                 except Exception:
@@ -593,7 +1218,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         elif ext == ".xm" and len(raw) >= 80:
             # XM starts with "Extended Module: " (17 bytes), then 20-byte title
             if raw[0:17] == b"Extended Module: ":
-                title = raw[17:37].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                title = _decode_tracker_str(raw[17:37])
 
             header_size = struct.unpack("<I", raw[60:64])[0]
             channels = struct.unpack("<H", raw[68:70])[0]
@@ -607,7 +1232,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                     break
                 try:
                     inst_hdr_size = struct.unpack("<I", raw[inst_offset:inst_offset + 4])[0]
-                    name = raw[inst_offset + 4:inst_offset + 26].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                    name = _decode_tracker_str(raw[inst_offset + 4:inst_offset + 26])
                     if name and name.isprintable():
                         instruments.append(name)
                     num_samples = struct.unpack("<H", raw[inst_offset + 27:inst_offset + 29])[0]
@@ -628,7 +1253,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
 
         elif ext == ".it" and len(raw) >= 192:
             if raw[0:4] == b"IMPM":
-                title = raw[4:30].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                title = _decode_tracker_str(raw[4:30])
 
                 num_orders = struct.unpack("<H", raw[32:34])[0]
                 num_instruments = struct.unpack("<H", raw[34:36])[0]
@@ -651,7 +1276,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                     try:
                         ptr = struct.unpack("<I", raw[ptr_off:ptr_off + 4])[0]
                         if ptr + 32 <= len(raw):
-                            name = raw[ptr + 4:ptr + 30].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                            name = _decode_tracker_str(raw[ptr + 4:ptr + 30])
                             if name and name.isprintable():
                                 instruments.append(name)
                     except Exception:
@@ -667,7 +1292,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                         try:
                             ptr = struct.unpack("<I", raw[ptr_off:ptr_off + 4])[0]
                             if ptr + 30 <= len(raw):
-                                name = raw[ptr + 4:ptr + 30].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                                name = _decode_tracker_str(raw[ptr + 4:ptr + 30])
                                 if name and name.isprintable():
                                     instruments.append(name)
                         except Exception:
@@ -676,7 +1301,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         else:
             # Other tracker formats — try reading first 20 bytes as title
             if len(raw) >= 20:
-                candidate = raw[0:20].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+                candidate = _decode_tracker_str(raw[0:20])
                 if candidate and candidate.isprintable():
                     title = candidate
 
@@ -796,6 +1421,10 @@ def extract(path: Path, track_id: str) -> TrackMeta:
             d = _extract_midi(path, track_id)
         elif ext in _TRACKER_EXTS:
             d = _extract_tracker(path, track_id)
+        elif ext in _GME_EXTS:
+            d = _extract_gme(path, track_id)
+        elif ext in _DSD_EXTS:
+            d = _extract_dsd(path, track_id)
         elif ext == ".mp3":
             d = _mp3(path, track_id)
         elif ext == ".flac":
@@ -848,6 +1477,11 @@ def extract(path: Path, track_id: str) -> TrackMeta:
     d["file_size"] = file_size
     d["added_at"] = int(time.time())
     d.setdefault("embedding", [])
+    # Lossless flag — derived from the format string AFTER any per-extractor
+    # rewrite (e.g. _extract_dsd may rewrite "DSD" to "DSD128").  Down-
+    # stream filters use this to badge the track and to drive the
+    # "lossless only" smart-search filter.
+    d.setdefault("is_lossless", _is_lossless_format(d.get("format")))
 
     # Normalise title fallback
     if not d.get("title"):

@@ -76,17 +76,14 @@ async def recently_added(limit: int = Query(100, ge=1, le=500)):
 
 @router.get("/smart/unplayed")
 async def unplayed(limit: int = Query(100, ge=1, le=500)):
-    """Return tracks that have never been played."""
-    all_stats = await get_all_play_stats()
-    played_ids = set(all_stats.keys())
+    """Return tracks that have never been played.
 
-    # Fetch all tracks, filter out those with play stats
-    all_tracks = await _all_tracks_meta()
-    unplayed_list = [t for t in all_tracks if t["id"] not in played_ids]
-
-    # Sort by added_at descending (newest first)
-    unplayed_list.sort(key=lambda t: t.get("added_at", 0), reverse=True)
-    return unplayed_list[:limit]
+    Backed by the store's incrementally-maintained ``_unplayed_ids`` set —
+    we walk ``_sorted_added_at`` in reverse and stop at ``limit`` matches
+    rather than scanning every track in the library (previously O(N) per
+    call, even for tiny pages).
+    """
+    return get_store().list_unplayed(limit)
 
 
 @router.get("/smart/top-rated")
@@ -132,6 +129,80 @@ async def listening_history(limit: int = Query(50, ge=1, le=200)):
 #  DUPLICATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Cache the (tracks, annotations) pair so back-to-back ``/smart/duplicates``
+# requests (the UI hits the list, then group-detail, then sometimes again on
+# pagination) don't re-scan every track each time.
+#
+# The cache is keyed on the store's mutation sequence number — bumped on
+# every track upsert / update / delete — so a rescan or retag that doesn't
+# change the *count* still invalidates the cache.  Callers always receive
+# a deep copy of the cached tracks so they can't mutate the cached pair
+# in-place (``format_score`` / ``is_duplicate_primary`` injection used to
+# leak across calls).
+import copy as _copy
+
+_DUP_CACHE: dict[str, object] = {"seq": -1, "count": -1, "tracks": None, "annotations": None}
+
+
+def _store_seq() -> int:
+    """Mutation sequence number from the store; ``-1`` if not exposed yet."""
+    try:
+        from soniqboom.core.store import get_store
+        return int(getattr(get_store(), "_mutation_seq", -1))
+    except Exception:
+        return -1
+
+
+async def _dup_snapshot():
+    """Return ``(all_tracks, annotations)`` reusing a cached pair when valid.
+
+    Always returns *fresh copies* — the cache stores reference originals,
+    the caller gets a deep clone so per-request annotation injection can't
+    leak into subsequent calls.
+    """
+    from soniqboom.core.duplicates import compute_duplicate_groups
+
+    all_tracks = await _all_tracks_meta()
+    count = len(all_tracks)
+    seq = _store_seq()
+    cached_seq = _DUP_CACHE.get("seq", -1)
+    cached_count = _DUP_CACHE.get("count", -1)
+    cached_tracks = _DUP_CACHE.get("tracks")
+    cached_anno = _DUP_CACHE.get("annotations")
+    if (
+        cached_seq == seq
+        and cached_count == count
+        and cached_tracks is not None
+        and cached_anno is not None
+    ):
+        # Shallow-copy the *list* of track dicts but reuse the dict
+        # references; the caller's per-track ``format_score`` /
+        # ``is_duplicate_primary`` injection still leaks across calls —
+        # so we also restore the original keys on a tracked copy of each
+        # mutated dict.  Full ``deepcopy`` of a 170K-track list was
+        # ~150–300 ms blocking on the event loop (Perf #1).
+        track_copies = [dict(t) for t in cached_tracks]
+        anno_copies = {k: dict(v) for k, v in cached_anno.items()}
+        return track_copies, anno_copies
+
+    annotations = compute_duplicate_groups(all_tracks)
+    # Stash the originals; future callers get their own per-dict copies.
+    _DUP_CACHE["seq"] = seq
+    _DUP_CACHE["count"] = count
+    _DUP_CACHE["tracks"] = all_tracks
+    _DUP_CACHE["annotations"] = annotations
+    track_copies = [dict(t) for t in all_tracks]
+    anno_copies = {k: dict(v) for k, v in annotations.items()}
+    return track_copies, anno_copies
+
+
+def _invalidate_dup_cache() -> None:
+    _DUP_CACHE["seq"] = -1
+    _DUP_CACHE["count"] = -1
+    _DUP_CACHE["tracks"] = None
+    _DUP_CACHE["annotations"] = None
+
+
 @router.get("/smart/duplicates")
 async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
     """Return all duplicate groups with their member tracks.
@@ -146,10 +217,9 @@ async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
         ...
     ]
     """
-    from soniqboom.core.duplicates import compute_duplicate_groups, format_quality_score
+    from soniqboom.core.duplicates import format_quality_score  # noqa: F401
 
-    all_tracks = await _all_tracks_meta()
-    annotations = compute_duplicate_groups(all_tracks)
+    all_tracks, annotations = await _dup_snapshot()
 
     # Build groups dict
     groups: dict[str, list[dict]] = {}
@@ -182,10 +252,7 @@ async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
 @router.get("/smart/duplicates/{group_id}")
 async def get_duplicate_group(group_id: str):
     """Return all tracks in a specific duplicate group."""
-    from soniqboom.core.duplicates import compute_duplicate_groups
-
-    all_tracks = await _all_tracks_meta()
-    annotations = compute_duplicate_groups(all_tracks)
+    all_tracks, annotations = await _dup_snapshot()
 
     tracks_in_group = []
     for t in all_tracks:
@@ -210,19 +277,30 @@ async def recompute_duplicates():
     annotations = compute_duplicate_groups(all_tracks)
 
     store = get_store()
-    updated = 0
-    for tid, ann in annotations.items():
-        store.update_track_fields(tid, {
+    # Bulk-apply via a single AOF record instead of 170K individual ones —
+    # Perf #1 caught the journal blow-up that starved play/rating writes
+    # for the duration of a recompute.
+    items = [
+        (tid, {
             "duplicate_group_id": ann["duplicate_group_id"],
             "format_score": ann["format_score"],
             "is_duplicate_primary": ann["is_duplicate_primary"],
         })
-        updated += 1
+        for tid, ann in annotations.items()
+    ]
+    updated = store.update_track_fields_batch(items)
 
     log.info("Duplicate recompute: annotated %d tracks", updated)
-    return {"updated": updated, "groups": sum(
-        1 for a in annotations.values() if a["duplicate_group_id"] is not None
-    ) // 2}
+    # Recompute invalidates the cached snapshot so the next
+    # ``/smart/duplicates`` hit reflects the fresh annotations.
+    _invalidate_dup_cache()
+    # Count distinct group ids — the previous ``// 2`` assumed pairs and
+    # under-counted (or over-counted) any group with ≥3 members.
+    distinct_groups = {
+        a["duplicate_group_id"] for a in annotations.values()
+        if a["duplicate_group_id"] is not None
+    }
+    return {"updated": updated, "groups": len(distinct_groups)}
 
 
 @router.post("/smart/duplicates/{group_id}/primary")
@@ -245,6 +323,11 @@ async def set_group_primary(group_id: str, track_id: str):
     store = get_store()
     for tid in group_tids:
         store.update_track_fields(tid, {"is_duplicate_primary": tid == track_id})
+
+    # Annotations changed but the track count didn't — invalidate the cache
+    # explicitly so the next ``/smart/duplicates`` hit reflects the new
+    # primary instead of serving the previous snapshot.
+    _invalidate_dup_cache()
 
     return {"group_id": group_id, "primary_id": track_id}
 

@@ -11,7 +11,7 @@ import { fmtDur } from './_common.js';
 export function mountNowPlaying(root, ctx) {
   root.innerHTML = `
     <div class="m-np">
-      <div class="m-np-art" id="m-np-art"><span>🔊</span></div>
+      <div class="m-np-art" id="m-np-art"><span></span></div>
       <div>
         <div class="m-np-title"  id="m-np-title">No track playing</div>
         <div class="m-np-artist" id="m-np-artist"></div>
@@ -53,11 +53,17 @@ export function mountNowPlaying(root, ctx) {
     if (!t) {
       titleEl.textContent  = 'No track playing';
       artistEl.textContent = '';
-      art.innerHTML = '<span>🔊</span>';
+      // Layered placeholder with the default 🔊 glyph (no track to ask
+      // ``artPlaceholderEmoji`` about format).
+      art.innerHTML = '<span>\u{1F50A}</span>';
       return;
     }
     titleEl.textContent  = t.title  || '—';
     artistEl.textContent = [t.artist || t.album_artist, t.album].filter(Boolean).join(' — ');
+    // Layered placeholder + cover img (same pattern as mobile mini-player
+    // and the desktop row covers).  The img fades in via the ``.loaded``
+    // class on successful decode; onerror removes it so the format
+    // glyph stays put — no broken-image glyph ever paints.
     art.innerHTML = '';
     const span = document.createElement('span');
     span.textContent = artPlaceholderEmoji(t);
@@ -66,7 +72,9 @@ export function mountNowPlaying(root, ctx) {
     if (artSrc) {
       const img = new Image();
       img.alt = '';
-      img.onload = () => { art.innerHTML = ''; art.appendChild(img); };
+      img.onload  = () => img.classList.add('loaded');
+      img.onerror = () => img.remove();
+      art.appendChild(img);
       img.src = artSrc;
     }
   }

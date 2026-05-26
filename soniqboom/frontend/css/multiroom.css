@@ -12,9 +12,14 @@
   --accent-glow: rgba(240,114,42,0.18);
   --text0: #e8eaed;
   --text1: #a8adb6;
-  --text2: #5e6472;
+  /* Bumped #5e6472 → #b5bccb so secondary text clears WCAG AA against
+     every dark surface here, matching the desktop --text2 token. */
+  --text2: #b5bccb;
   --border: rgba(255,255,255,0.07);
   --border-bright: rgba(255,255,255,0.12);
+  --art-glow: rgba(107,200,240,0.82);
+  --art-glow-soft: rgba(107,200,240,0.55);
+  --art-glow-faint: rgba(107,200,240,0.25);
 
   --good: #26c281;
   --warn: #f0c020;
@@ -24,6 +29,26 @@
   font-size: 14px;
   color: var(--text0);
   -webkit-font-smoothing: antialiased;
+}
+
+/* Light-mode parity with the desktop app — multiroom previously never
+   responded to the user's theme choice.  Honouring ``data-theme="light"``
+   on the root keeps the brand identity consistent when the same user
+   switches between tabs. */
+:root[data-theme="light"] {
+  --bg0: #fafbfc;
+  --bg1: #ffffff;
+  --bg2: #f5f7fa;
+  --bg3: #e8ecf2;
+  --bg4: #dde3eb;
+  --text0: #1a1d22;
+  --text1: #3d4250;
+  --text2: #3d4250;
+  --border: rgba(0,0,0,0.10);
+  --border-bright: rgba(0,0,0,0.16);
+  --art-glow: rgba(20,120,180,0.65);
+  --art-glow-soft: rgba(20,120,180,0.40);
+  --art-glow-faint: rgba(20,120,180,0.18);
 }
 
 * { box-sizing: border-box; }
@@ -263,6 +288,7 @@ body[data-view="slave"]     #mr-view-slave { display: block; }
   align-items: center;
 }
 .mr-now-art {
+  position: relative;
   width: 128px;
   height: 128px;
   border-radius: 10px;
@@ -273,6 +299,35 @@ body[data-view="slave"]     #mr-view-slave { display: block; }
   font-size: 48px;
   overflow: hidden;
 }
+/* Glowing-blue placeholder + opacity-faded img, same language as the
+   desktop player and rows.  ``.mr-art-img`` starts transparent and
+   becomes ``.loaded`` on successful decode; ``onerror`` removes it so
+   the placeholder shows through (no broken-image glyph). */
+.mr-now-art .mr-art-ph,
+.mr-slave-art .mr-art-ph {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--art-glow);
+  filter: drop-shadow(0 0 8px  var(--art-glow))
+          drop-shadow(0 0 18px var(--art-glow-soft));
+  user-select: none;
+  pointer-events: none;
+}
+.mr-now-art .mr-art-img,
+.mr-slave-art .mr-art-img {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+.mr-now-art .mr-art-img.loaded,
+.mr-slave-art .mr-art-img.loaded { opacity: 1; }
 .mr-now-art img { width: 100%; height: 100%; object-fit: cover; }
 .mr-now-title {
   font-size: 20px;

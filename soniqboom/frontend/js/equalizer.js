@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 S.F. Cyris
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// version bump needed in index.html for equalizer.js (pre-gain headroom)
 /**
  * equalizer.js  —  10-band EQ with fully custom pointer-event sliders.
  *
@@ -46,6 +47,21 @@ const tracks   = bands.map(b => b.querySelector('.eq-track'));
 const thumbs   = bands.map(b => b.querySelector('.eq-thumb'));
 const fills    = bands.map(b => b.querySelector('.eq-fill'));
 
+// Promote each .eq-track to a real ARIA slider so screen readers + keyboard
+// users can drive it.  The previous implementation was pointer-only on a
+// plain <div>.  We keep the existing pointer handlers below — Tab + arrow
+// keys now do everything they do, just with announce / focus semantics.
+const FREQ_LABELS = ['32 Hz','64 Hz','125 Hz','250 Hz','500 Hz','1 kHz','2 kHz','4 kHz','8 kHz','16 kHz'];
+tracks.forEach((track, i) => {
+  track.setAttribute('role', 'slider');
+  track.setAttribute('tabindex', '0');
+  track.setAttribute('aria-valuemin', String(GAIN_MIN));
+  track.setAttribute('aria-valuemax', String(GAIN_MAX));
+  track.setAttribute('aria-valuenow', '0');
+  track.setAttribute('aria-orientation', 'vertical');
+  track.setAttribute('aria-label', `${FREQ_LABELS[i] || ''} gain in decibels`);
+});
+
 // Current gain values (mirror of filter nodes)
 const gains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -86,6 +102,28 @@ function renderBand(i, gain) {
                'var(--text2)';
 }
 
+// ── EQ headroom (pre-gain) — clipping prevention ─────────────────────────────
+// Boosting any band can push the signal past 0 dBFS and clip the output.
+// To keep the chain headroom-safe without changing perceived loudness,
+// we attenuate the *input* to the EQ chain by the actual peak boost
+// (NOT by GAIN_MAX) — so a single +3 dB band only costs 3 dB of input
+// headroom, not the full 12 dB the slider could in theory produce.
+//
+// When all bands are <= 0 dB, the pre-gain stays at unity (1.0) so cuts
+// don't lose any signal — only boosts trigger the attenuation.
+function _updateEqPreGain() {
+  const pre = Player.eqPreGain;
+  if (!pre) return;        // Web Audio not initialised yet (no first play)
+  const peakBoost = Math.max(0, ...gains);
+  if (peakBoost <= 0) {
+    pre.gain.value = 1.0;
+  } else {
+    // 1 / 10^(peakBoost/20) — exactly cancels the maximum band's boost
+    // at the unity-pre-EQ point, leaving headroom for the boost itself.
+    pre.gain.value = 1.0 / Math.pow(10, peakBoost / 20);
+  }
+}
+
 // ── Apply gain to audio filter + visuals ──────────────────────────────────────
 function setGain(i, gain) {
   const clamped = Math.max(GAIN_MIN, Math.min(GAIN_MAX, gain));
@@ -93,10 +131,29 @@ function setGain(i, gain) {
   const filters = Player.eqFilters;
   if (filters[i]) filters[i].gain.value = clamped;
   renderBand(i, clamped);
+  // Keep ARIA value in sync so screen readers announce the new dB level
+  // whenever pointer / keyboard / preset changes the band.
+  if (tracks[i]) {
+    tracks[i].setAttribute('aria-valuenow', String(clamped));
+    tracks[i].setAttribute('aria-valuetext', `${clamped > 0 ? '+' : ''}${clamped} dB`);
+  }
+  _updateEqPreGain();
+  _refreshEqBadge();
 }
 
+// Debounce the localStorage write — a wheel drag fires `saveGains` per
+// 0.5 dB tick, which was sync JSON.stringify + storage write per pointer
+// event (Perf #2).  Coalesce to 150 ms so a scrub flushes once at the
+// end of the gesture.
+let _saveGainsTimer = null;
 function saveGains() {
-  localStorage.setItem('sb_eq', JSON.stringify(gains));
+  if (_saveGainsTimer) clearTimeout(_saveGainsTimer);
+  _saveGainsTimer = setTimeout(() => {
+    _saveGainsTimer = null;
+    try {
+      localStorage.setItem('sb_eq', JSON.stringify(gains));
+    } catch { /* quota or private-mode — fine to drop */ }
+  }, 150);
 }
 
 // ── Pointer-event drag handling ───────────────────────────────────────────────
@@ -126,6 +183,30 @@ tracks.forEach((track, i) => {
   track.addEventListener('pointerup', () => { dragging = false; });
   track.addEventListener('pointercancel', () => { dragging = false; });
 
+  // Keyboard equivalents — required for the role="slider" promise above.
+  track.addEventListener('keydown', (e) => {
+    const STEP = 0.5;
+    const BIG = 3;
+    let next = gains[i];
+    switch (e.key) {
+      case 'ArrowUp':
+      case 'ArrowRight':  next = gains[i] + STEP; break;
+      case 'ArrowDown':
+      case 'ArrowLeft':   next = gains[i] - STEP; break;
+      case 'PageUp':      next = gains[i] + BIG;  break;
+      case 'PageDown':    next = gains[i] - BIG;  break;
+      case 'Home':        next = GAIN_MAX;        break;
+      case 'End':         next = GAIN_MIN;        break;
+      case 'Enter':
+      case ' ':           next = 0;               break;  // quick reset to flat
+      default: return;
+    }
+    e.preventDefault();
+    setGain(i, next);
+    presetSel.value = '';
+    saveGains();
+  });
+
   // Scroll wheel: ±0.5 dB per tick
   track.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -154,14 +235,29 @@ btnReset.addEventListener('click', () => {
   presetSel.value = 'flat';
 });
 
+// "EQ active" indicator on the toolbar button: ``on`` while the overlay
+// is open *or* whenever any band is non-flat.  Previously the button only
+// glowed while the overlay was open, so non-default gains went unnoticed
+// after closing it (UX/UI #1 #18).
+function _eqIsActive() {
+  return gains.some(g => Math.abs(g) > 0.05);
+}
+function _refreshEqBadge() {
+  const open = !overlay.classList.contains('hidden');
+  btnToggle.classList.toggle('on', open || _eqIsActive());
+  btnToggle.title = _eqIsActive() && !open
+    ? 'Equalizer (active — non-flat preset)'
+    : 'Equalizer';
+}
+
 // ── Overlay open/close ────────────────────────────────────────────────────────
 function open() {
   overlay.classList.remove('hidden');
-  btnToggle.classList.add('on');
+  _refreshEqBadge();
 }
 function close() {
   overlay.classList.add('hidden');
-  btnToggle.classList.remove('on');
+  _refreshEqBadge();
 }
 function toggle() {
   overlay.classList.contains('hidden') ? open() : close();

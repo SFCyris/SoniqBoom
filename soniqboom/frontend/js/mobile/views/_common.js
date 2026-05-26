@@ -37,7 +37,13 @@ export function buildTrackRow(track, opts = {}) {
     const img = new Image();
     img.alt = '';
     img.loading = 'lazy';
-    img.onload = () => { art.innerHTML = ''; art.appendChild(img); };
+    // Append the img alongside the placeholder span (no innerHTML wipe)
+    // so a 404 / decode failure leaves the format glyph visible.  The
+    // .loaded class triggers the CSS opacity fade-in defined in
+    // mobile.css.
+    img.onload  = () => img.classList.add('loaded');
+    img.onerror = () => img.remove();
+    art.appendChild(img);
     img.src = artSrc;
   }
   content.appendChild(art);

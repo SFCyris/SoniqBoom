@@ -9,6 +9,7 @@
  */
 import { Player } from '../player.js';
 import { Sync } from './sync.js';
+import { artPlaceholderEmoji } from '../utils.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -65,9 +66,14 @@ export function enterMaster() {
 
   Sync.addEventListener('roster', _renderListeners);
 
-  // Periodically relay our state (drives slave drift correction)
+  // Periodically relay our state (drives slave drift correction) — but
+  // only while we're actually playing.  An idle/paused master used to
+  // broadcast 2Hz to every slave in every room (3 rooms × 9 listeners =
+  // sustained WS chatter even with nothing playing).
   if (_stateTimer) clearInterval(_stateTimer);
-  _stateTimer = setInterval(() => Sync._emitStateUpdate(), 500);
+  _stateTimer = setInterval(() => {
+    if (Player.audio && !Player.audio.paused) Sync._emitStateUpdate();
+  }, 500);
 
   Player.on('trackchange', () => Sync._emitStateUpdate());
   Player.on('statechange', () => Sync._emitStateUpdate());
@@ -524,10 +530,13 @@ function _renderQueue() {
 // ── Now-playing card ────────────────────────────────────────────────────────
 
 function _renderNow(track) {
+  const artEl = $('mr-now-art');
   if (!track) {
     $('mr-now-title').textContent = 'No track';
     $('mr-now-artist').textContent = '';
-    $('mr-now-art').innerHTML = '🎵';
+    // Default state: no track means no specific format → use the generic
+    // 🔊 glyph the rest of the app uses for "unspecified".
+    artEl.innerHTML = '<span class="mr-art-ph">\u{1F50A}</span>';
     $('mr-now-cur').textContent = '0:00';
     $('mr-now-dur').textContent = '0:00';
     $('mr-now-progress-fill').style.width = '0%';
@@ -535,10 +544,19 @@ function _renderNow(track) {
   }
   $('mr-now-title').textContent = track.title || '(Untitled)';
   $('mr-now-artist').textContent = track.artist || track.album_artist || '';
-  if (track.cover_art) {
-    $('mr-now-art').innerHTML = `<img src="${_esc(track.cover_art)}" alt="">`;
-  } else {
-    $('mr-now-art').innerHTML = '🎵';
+  // Format-aware placeholder + on-demand cover fetch.  Previously this
+  // only rendered ``track.cover_art`` (null on FTP/SMB libraries) so
+  // every track on a remote share painted the bare 🎵 emoji.  Now we
+  // layer the same format-emoji + ``/api/art/{id}`` fallback the
+  // desktop player uses, so the multiroom controller shows real album
+  // art consistently with the bottom-left bar.
+  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg` : '');
+  artEl.innerHTML = `<span class="mr-art-ph">${artPlaceholderEmoji(track)}</span>` +
+    (src ? `<img class="mr-art-img" src="${_esc(src)}" alt="">` : '');
+  const _mrImg = artEl.querySelector('.mr-art-img');
+  if (_mrImg) {
+    _mrImg.onload  = () => _mrImg.classList.add('loaded');
+    _mrImg.onerror = () => _mrImg.remove();
   }
   $('mr-now-dur').textContent = fmt(track.duration || 0);
 }

@@ -23,7 +23,7 @@
  */
 import { Player } from './player.js';
 import { Library } from './library.js';
-import { artPlaceholderEmoji } from './utils.js';
+import { artPlaceholderEmoji, Toast } from './utils.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -58,6 +58,59 @@ let _anchorIdx    = null;        // Shift-click anchor
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Inline styled confirm — installed synchronously so playlist.js never falls
+// back to the OS-native ``confirm()`` (which is blocking, ugly, and ignores
+// title/okLabel options).  If admin.js later overrides ``__sbConfirm`` with
+// a richer dialog the playlist will pick that up automatically because the
+// callers read ``window.__sbConfirm`` lazily on each invocation.
+function _inlineConfirm(message, { title = 'Confirm', okLabel = 'OK' } = {}) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'pl-modal-backdrop';
+    const dialog = document.createElement('div');
+    dialog.className = 'pl-modal-dialog';
+    dialog.innerHTML = `
+      <div class="pl-modal-title"></div>
+      <div class="pl-modal-body"
+           style="padding:6px 0 14px;color:var(--text2,#bbb);font-size:13px"></div>
+      <div class="pl-modal-actions">
+        <button class="pl-modal-btn pl-modal-cancel">Cancel</button>
+        <button class="pl-modal-btn pl-modal-ok"></button>
+      </div>
+    `;
+    // textContent assignments — message/title come from caller code, but we
+    // still avoid HTML interpolation as a defence-in-depth measure.
+    dialog.querySelector('.pl-modal-title').textContent = title;
+    dialog.querySelector('.pl-modal-body').textContent  = message;
+    dialog.querySelector('.pl-modal-ok').textContent    = okLabel;
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+    const btnOk  = dialog.querySelector('.pl-modal-ok');
+    const btnCan = dialog.querySelector('.pl-modal-cancel');
+    btnOk.focus();
+    function finish(value) {
+      backdrop.classList.add('pl-modal-out');
+      setTimeout(() => backdrop.remove(), 150);
+      resolve(value);
+    }
+    btnOk.addEventListener('click',  () => finish(true));
+    btnCan.addEventListener('click', () => finish(false));
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(false); });
+    dialog.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') finish(false);
+      if (e.key === 'Enter')  finish(true);
+    });
+  });
+}
+
+// Guarantee a global confirm helper at module load.  If admin.js later
+// installs its richer ``__sbConfirm`` we leave it alone — admin.js runs
+// after this module so the override path is preserved by checking that the
+// property isn't already set.
+if (!window.__sbConfirm) {
+  window.__sbConfirm = _inlineConfirm;
 }
 function fmtDur(sec) {
   if (!sec) return '';
@@ -122,7 +175,11 @@ function _buildDupMaps(tracks) {
 // ── Fetch all playlists ───────────────────────────────────────────────────────
 async function refresh() {
   try { _playlists = await _api('/playlists'); }
-  catch { _playlists = []; }
+  catch (err) {
+    _playlists = [];
+    console.warn('Failed to load playlists:', err);
+    Toast.error("Couldn't load playlists — the list may be out of date.");
+  }
   _renderSidebar();
   if (!panel.classList.contains('hidden')) {
     if (_activeId) {
@@ -197,11 +254,20 @@ function _renderListView() {
     });
     row.querySelector('.playlist-delete-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
-      const confirmFn = window.__sbConfirm || confirm;
-      const ok = await confirmFn(`Delete "${pl.name}"?`, { title: 'Delete Playlist', okLabel: 'Delete' });
+      // __sbConfirm is installed synchronously at module load (see top of
+      // this file), so we don't fall back to the OS-native confirm() here.
+      const ok = await window.__sbConfirm(
+        `Delete "${pl.name}"?`,
+        { title: 'Delete Playlist', okLabel: 'Delete' },
+      );
       if (!ok) return;
-      await _api(`/playlists/${pl.id}`, { method: 'DELETE' });
-      await refresh();
+      try {
+        await _api(`/playlists/${pl.id}`, { method: 'DELETE' });
+        await refresh();
+      } catch (err) {
+        console.warn('Failed to delete playlist:', err);
+        Toast.error('Could not delete playlist — the server rejected the request.');
+      }
     });
     listEl.appendChild(row);
   });
@@ -211,10 +277,23 @@ function _renderListView() {
 async function _openPlaylist(id, name, _focusPanel = true) {
   _activeId = id;
   _clearSelection();
+  // Load BEFORE swapping the panel header — on failure we keep the list
+  // view visible so the user sees the existing playlists rather than a
+  // "0 tracks" empty-state that looks identical to a real empty playlist.
+  let loadFailed = false;
   try {
     const data    = await _api(`/playlists/${id}`);
     _activeTracks = data.tracks || [];
-  } catch { _activeTracks = []; }
+  } catch (err) {
+    loadFailed = true;
+    console.warn('Failed to open playlist:', err);
+    Toast.error("Couldn't load this playlist's tracks — staying on the list view.");
+  }
+
+  if (loadFailed) {
+    _activeId = null;
+    return;
+  }
 
   plActiveNm.textContent = name;
   plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
@@ -256,7 +335,9 @@ function _renderTracks() {
       + (isCurrent  ? ' playing'  : '')
       + (isSelected ? ' selected' : '')
       + (isIdDup    ? ' dup-id'   : '');
-    row.draggable  = true;
+    // Drag begins from the handle only — see _enableHandleDrag below.  The
+    // row itself becomes transiently draggable during a touch long-press.
+    row.draggable  = false;
     row.dataset.idx = i;
 
     // ── Duplicate badge ─────────────────────────────────────────────────────
@@ -268,12 +349,20 @@ function _renderTracks() {
       dupBadge = `<span class="dup-badge dup-loc-badge" title="Same song also found at:\n${others}">⧉</span>`;
     }
 
-    const artHtml = track.cover_art
-      ? `<div class="queue-row-art"><img src="${esc(track.cover_art)}" loading="lazy" alt=""></div>`
-      : `<div class="queue-row-art"><span class="qr-art-ph">${artPlaceholderEmoji(track)}</span></div>`;
+    // Always render both placeholder and <img>.  ``track.cover_art`` is
+    // only set when mutagen extracted art at scan time — many FTP/SMB
+    // tracks scan with ``cover_art: null`` even though ``/api/art/{id}``
+    // would happily extract on-demand, so we ask for that endpoint
+    // unconditionally and let the img stay transparent (placeholder
+    // shows through) when the request 404s.
+    const artSrc = track.id ? `/api/art/${track.id}?size=sm` : '';
+    const artHtml = `<div class="queue-row-art">
+      <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
+      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" alt="">` : ''}
+    </div>`;
 
     row.innerHTML = `
-      <span class="queue-drag-handle" title="Drag to reorder">&#10783;</span>
+      <span class="queue-drag-handle" draggable="true" title="Drag to reorder">&#10783;</span>
       <span class="queue-playing-icon">${isCurrent ? '&#9654;' : ''}</span>
       ${artHtml}
       <div class="queue-track-info">
@@ -286,6 +375,49 @@ function _renderTracks() {
       <span class="queue-track-dur">${fmtDur(track.duration)}</span>
       <button class="queue-remove-btn" title="Remove from playlist">&times;</button>
     `;
+
+    // Wire the cover thumbnail: fade in on successful decode, drop the
+    // <img> on error so the placeholder stays put.  No broken-image
+    // glyph ever ends up rendered in the row.
+    const _artImg = row.querySelector('.qr-art-img');
+    if (_artImg) {
+      _artImg.onload  = () => _artImg.classList.add('loaded');
+      _artImg.onerror = () => _artImg.remove();
+    }
+
+    // ── Touch long-press to begin drag ────────────────────────────────────
+    // Mirror queue.js: drag starts only after a 350 ms hold on the handle,
+    // and only after the finger hasn't moved more than 8 px.  Movement
+    // before the timer fires cancels — protects against accidental swipe
+    // drags during scroll on touch screens.
+    const handleEl = row.querySelector('.queue-drag-handle');
+    let _lpTimer = null, _lpStartX = 0, _lpStartY = 0;
+    handleEl.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      _lpStartX = e.touches[0].clientX;
+      _lpStartY = e.touches[0].clientY;
+      _lpTimer = setTimeout(() => {
+        row.draggable = true;
+        try { navigator.vibrate?.(8); } catch (_) {}
+      }, 350);
+    }, { passive: true });
+    handleEl.addEventListener('touchmove', (e) => {
+      if (!_lpTimer) return;
+      const t = e.touches[0];
+      if (!t) return;
+      if (Math.hypot(t.clientX - _lpStartX, t.clientY - _lpStartY) > 8) {
+        clearTimeout(_lpTimer);
+        _lpTimer = null;
+      }
+    }, { passive: true });
+    handleEl.addEventListener('touchend', () => {
+      if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+      setTimeout(() => { row.draggable = false; }, 0);
+    });
+    handleEl.addEventListener('touchcancel', () => {
+      if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+      row.draggable = false;
+    });
 
     // ── Click: play / select ────────────────────────────────────────────────
     row.addEventListener('click', (e) => {
@@ -337,6 +469,9 @@ function _renderTracks() {
     row.addEventListener('dragend', () => {
       tracksEl.querySelectorAll('.queue-row.dragging, .queue-row.dragging-over')
         .forEach(r => r.classList.remove('dragging', 'dragging-over'));
+      // Drop the transient draggable flag (set during a touch long-press) so
+      // the next tap on the row isn't treated as a drag-handle gesture.
+      row.draggable = false;
     });
 
     // ── Drag over ───────────────────────────────────────────────────────────
@@ -367,6 +502,11 @@ function _renderTracks() {
       const fromSet = new Set(fromIndices);
       if (fromSet.has(i)) return; // dropped onto a dragged row — no-op
 
+      // Keep a snapshot for rollback so we can revert the local order if
+      // the server PUT fails — the optimistic UI shouldn't lie to the user
+      // about what was persisted.
+      const previousOrder = _activeTracks.slice();
+
       // Extract items being moved and the rest
       const toInsert = fromIndices.map(idx => _activeTracks[idx]);
       const rest     = _activeTracks.filter((_, idx) => !fromSet.has(idx));
@@ -377,11 +517,19 @@ function _renderTracks() {
       _activeTracks = rest;
 
       _clearSelection();
-      await _api(`/playlists/${_activeId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ track_ids: _activeTracks.map(t => t.id) }),
-      }).catch(() => {});
+      try {
+        await _api(`/playlists/${_activeId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ track_ids: _activeTracks.map(t => t.id) }),
+        });
+      } catch (err) {
+        // Revert the optimistic local order and re-render so the displayed
+        // state matches what's actually on the server.
+        _activeTracks = previousOrder;
+        console.warn('Drag-reorder save failed:', err);
+        Toast.error("Reorder couldn't be saved — order reverted.");
+      }
       _renderTracks();
     });
 
@@ -404,7 +552,10 @@ async function _addTracks(playlistId, trackIds) {
       _renderTracks();
     }
     await refresh();
-  } catch (err) { console.warn('Failed to add to playlist:', err); }
+  } catch (err) {
+    console.warn('Failed to add to playlist:', err);
+    Toast.error('Add to playlist failed — the change was not saved.');
+  }
 }
 
 async function _removeTrack(playlistId, trackId) {
@@ -419,11 +570,32 @@ async function _removeTrack(playlistId, trackId) {
     _clearSelection();
     _renderTracks();
     await refresh();
-  } catch (err) { console.warn('Failed to remove track:', err); }
+  } catch (err) {
+    console.warn('Failed to remove track:', err);
+    Toast.error('Remove failed — the playlist was not changed.');
+  }
 }
 
 async function _removeSelected() {
   if (!_selectedIdxs.size || !_activeId) return;
+  // Multi-track delete is a destructive action.  Single-row removal stays
+  // instant — the row's own "x" button is already an explicit gesture — but
+  // sweeping out a multi-row selection (especially via Delete/Backspace)
+  // deserves an explicit OK first.
+  // Always confirm — the selection-bar "Remove" reaches here regardless of
+  // selection size, and a single accidental keystroke shouldn't drop a
+  // track without a chance to cancel.  The row-level "x" button has its
+  // own behaviour and isn't affected.
+  // __sbConfirm is installed synchronously at module load, so the
+  // OS-native confirm fallback is gone (it didn't support title/okLabel).
+  const promptText = _selectedIdxs.size > 1
+    ? `Remove ${_selectedIdxs.size} tracks from this playlist?`
+    : `Remove this track from the playlist?`;
+  const ok = await window.__sbConfirm(
+    promptText,
+    { title: 'Remove Tracks', okLabel: 'Remove' },
+  );
+  if (!ok) return;
   const indices    = [..._selectedIdxs].sort((a, b) => a - b);
   const idsToRemove = indices.map(i => _activeTracks[i].id);
   try {
@@ -437,7 +609,10 @@ async function _removeSelected() {
     _clearSelection();
     _renderTracks();
     await refresh();
-  } catch (err) { console.warn('Failed to remove selected:', err); }
+  } catch (err) {
+    console.warn('Failed to remove selected:', err);
+    Toast.error('Remove failed — the playlist was not changed.');
+  }
 }
 
 function _updateSidebarActive() {
@@ -494,7 +669,10 @@ async function createPlaylist() {
     await refresh();
     open();
     await _openPlaylist(pl.id ?? pl.playlist_id, name.trim());
-  } catch (err) { console.warn('Failed to create playlist:', err); }
+  } catch (err) {
+    console.warn('Failed to create playlist:', err);
+    Toast.error('Could not create playlist — the server rejected the request.');
+  }
 }
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -630,7 +808,10 @@ function showAddDropdown(anchorEl) {
     document.body.appendChild(dd);
     _addDropdown = dd;
     setTimeout(() => document.addEventListener('click', _handleOutsideClick), 0);
-  }).catch(() => {});
+  }).catch((err) => {
+    console.warn('Failed to load playlists for dropdown:', err);
+    Toast.error("Couldn't load playlists — please try again.");
+  });
 }
 
 function _handleOutsideClick(e) {

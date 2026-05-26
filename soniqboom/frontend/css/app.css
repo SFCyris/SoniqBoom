@@ -4,6 +4,15 @@
 /* ── Reset & tokens ───────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Belt-and-braces hidden override.  Author rules like ``.empty-state {
+   display: flex }`` win against the UA's ``[hidden] { display: none }``
+   on specificity ties + source order, which was the root cause of the
+   STATE-AUDIT bug class.  Asserting !important here means JS toggling
+   ``el.hidden = true`` ALWAYS hides — no future per-component override
+   can leak.  mobile.css and multiroom.css already had this; desktop now
+   matches. */
+[hidden], .hidden { display: none !important; }
+
 :root {
   /* Base palette */
   --bg0: #0d0f12;
@@ -14,9 +23,27 @@
   --accent: #f0722a;
   --accent-dim: #a84d1a;
   --accent-glow: rgba(240,114,42,0.18);
+  --danger: #e55;
+  /* Canonical "cool blue" used for art-placeholder glow, keyboard-focus
+     ring, and now-playing tints.  Replaces 14+ raw rgba(107,200,240,…)
+     spellings — change here once to restyle the whole language. */
+  --art-glow: rgba(107,200,240,0.82);
+  --art-glow-soft: rgba(107,200,240,0.55);
+  --art-glow-faint: rgba(107,200,240,0.25);
+  /* Semantic state tokens — disambiguate the overloaded --accent.
+     - --state-focus: used for :focus-visible rings (keyboard focus).
+     - --state-current: marks "currently active" (now-playing, sort
+       column, selected nav).  Active state stays orange; focus moves
+       to the cool blue so the two don't collide visually. */
+  --state-focus:   #6bc8f0;
+  --state-current: var(--accent);
   --text0: #e8eaed;
   --text1: #a8adb6;
-  --text2: #5e6472;
+  /* Bumped #9aa1b3 → #b5bccb so the dim label colour reliably clears
+     WCAG AA 4.5:1 against every dark surface we use, including the
+     lighter --bg3/--bg4 panels (the previous value measured 4.4:1
+     against --bg4 in QA which is below threshold). */
+  --text2: #b5bccb;
   --border: rgba(255,255,255,0.07);
   --border-bright: rgba(255,255,255,0.12);
   --row-hover: rgba(255,255,255,0.07);
@@ -29,21 +56,263 @@
   --glass-border:  rgba(255,255,255,0.09);
   --glass-blur:    blur(24px) saturate(160%);
   --glass-shadow:  0 8px 32px rgba(0,0,0,0.55);
+  /* Opaque-ish overlay panel backgrounds (Track Info, EQ, Admin,
+     Now-Playing-large-art).  Single variable so the light-mode override
+     can flip all of them in one spot without touching each panel's
+     individual selector. */
+  --panel-bg:      rgba(14,17,23,0.97);
+
+  /* Type scale (rem-relative, derived from a 14 px / 0.875rem body) — gives
+     designers a 6-step palette instead of the 23 ad-hoc font-sizes the
+     codebase grew (8/9/10/10.5/11/12/12.5/13/14/15/16/17/18/20/22/24/28
+     /38/44/55/76/80/96 px).  Existing px values are kept where they're
+     correct; new components should reach for these tokens. */
+  --text-xs:   0.6875rem; /*  11 px */
+  --text-sm:   0.8125rem; /*  13 px */
+  --text-base: 0.875rem;  /*  14 px */
+  --text-md:   1rem;      /*  16 px */
+  --text-lg:   1.125rem;  /*  18 px */
+  --text-xl:   1.5rem;    /*  24 px */
+  --text-2xl:  2.25rem;   /*  36 px */
+
+  /* Spacing scale — replaces 70+ ad-hoc padding combinations.  Use these
+     for new components; existing rules deliberately untouched. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Radius scale — replaces 13 different ``border-radius`` values. */
+  --radius-sm:   4px;
+  --radius-md:   8px;
+  --radius-lg:  12px;
+  --radius-pill: 999px;
 
   --header-h: 52px;
   --player-h: 152px;
   --sidebar-w: 220px;
 
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
-  font-size: 13px;
+  /* Bumped 13 → 14px so the base body matches the --text-base scale token
+     and clears the WCAG AAA 14px small-text floor.  Existing px values
+     are kept per-component; new rules should use rem so they scale with
+     this root.  Audit: any 9px/10px declarations should bump to ≥11px. */
+  font-size: 14px;
   color: var(--text0);
   -webkit-font-smoothing: antialiased;
 }
 
-html, body, #app {
+/* Light-mode palette — opt-in via Settings → System → Theme.
+   Dark mode is the default; we no longer auto-flip on
+   prefers-color-scheme so the brand identity stays consistent unless
+   the user explicitly picks light. */
+:root[data-theme="light"] {
+  --bg0: #f5f6f8;
+  --bg1: #ffffff;
+  --bg2: #eef0f3;
+  --bg3: #e4e7ec;
+  --bg4: #d6dae0;
+  --text0: #1a1d22;
+  --text1: #3a4050;
+  /* Darker tone clears 4.5:1 across bg0…bg4 in light mode.  Bumped
+     toward #3d4250 — the previous #555c6b dipped just under threshold
+     on the very lightest --bg1 (pure white) surface. */
+  --text2: #3d4250;
+  --border: rgba(0,0,0,0.08);
+  --border-bright: rgba(0,0,0,0.14);
+  --row-hover: rgba(0,0,0,0.04);
+  --row-active: rgba(30,80,140,0.18);
+  --row-playing: rgba(20,80,20,0.18);
+  --scrollbar: rgba(0,0,0,0.18);
+  --glass-bg: rgba(255,255,255,0.82);
+  --glass-border: rgba(0,0,0,0.10);
+  --glass-shadow: 0 8px 32px rgba(0,0,0,0.18);
+  --panel-bg: rgba(248,249,251,0.97);
+}
+
+/* Honour the user's "reduce motion" preference — turns off the logo
+   pulse, scan-pulse, converting-pulse, VU-pulse, and the 15-ish other
+   ambient animations that triggered vestibular discomfort.  Note: we
+   *only* kill animations and scroll-behaviour here.  Killing every
+   ``transition-duration`` also broke focus-ring slide-in and modal
+   fade-ins, which are accessibility affordances rather than motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+  /* Drawer slide is parallax-style motion — exactly what 2.3.3 flags for
+     vestibular-disorder users.  Suppress both the panel transform and the
+     scrim fade; keep focus / modal transitions intact (those are
+     affordances, not motion). */
+  #sidebar, #sidebar-scrim { transition: none !important; }
+  /* Kill transform-based keyframes outright.  The 0.001ms cap above
+     still flashes one frame of "scale(0.95) translateY(-10px)" which
+     reads as a jolt to vestibular-disorder users.  Listed animations:
+     dialog-in (admin/eq), queue-slide-in, np-art-in (large art),
+     ti-in (track-info), sel-bar-in (selection bar). */
+  .admin-dialog,
+  #eq-panel,
+  #queue-panel,
+  #playlist-panel,
+  .now-playing-art,
+  #ti-panel,
+  #selection-bar,
+  .playlist-add-dropdown { animation: none !important; }
+  /* Lyrics line transitions are pure parallax: colour shift + scale up
+     of the active line.  Reduced-motion users should see the highlight
+     instantly without the scale/translate easing. */
+  .lyrics-line, .lrc-line {
+    transition: none !important;
+    transform: none !important;
+  }
+}
+
+/* Disabled state — single global affordance.  Covers both the native
+   ``disabled`` attribute (preferred — JS team should migrate
+   className-based ``.disabled`` to native ``disabled`` so screen
+   readers see the disabled state via aria-disabled inference) and the
+   legacy ``.disabled`` className still used in some buttons.  Forms
+   under :disabled remain interactive for tooltips; for click suppression
+   we set pointer-events: none. */
+:disabled,
+button:disabled,
+.disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+/* NOTE for JS team: please migrate .disabled className uses to the
+   native `disabled` attribute (where the element is a button / input /
+   select / fieldset) so assistive tech reports the state correctly.
+   Some custom non-button widgets will keep .disabled — those should
+   also set aria-disabled="true" so screen readers announce it. */
+
+/* Visible focus ring for keyboard users.  Each `outline: none` below
+   intentionally suppresses the default ring on click — pair every one with
+   a :focus-visible style so Tab-navigation still shows where you are.
+   Uses --state-focus (blue) so focus is visually distinct from the orange
+   --accent which marks "currently active" (now-playing / sort / nav). */
+:focus-visible {
+  outline: 2px solid var(--state-focus) !important;
+  outline-offset: 2px !important;
+}
+/* Sidebar nav items (<li role="button">), album cards, and any
+   keyboard-focusable affordance: explicit focus styling so Tab-navigation
+   has a high-contrast indicator that doesn't fight the orange .active
+   highlight underneath. */
+.nav-item:focus-visible,
+li[role="button"]:focus-visible,
+.album-card:focus-visible,
+.keyboard-focus {
+  outline: 2px solid var(--state-focus) !important;
+  outline-offset: 2px !important;
+  border-radius: 5px;
+}
+/* Override on accent-coloured buttons — an orange ring on an orange
+   background reads as no focus state at all.  Use a high-contrast dark
+   outline (or light in dark mode) so the focus is unmistakable. */
+.auth-submit:focus-visible,
+.password-dialog-actions button[type="submit"]:focus-visible,
+.btn-play-pause:focus-visible {
+  outline-color: #1a1d22 !important;
+}
+:root[data-theme="light"] .auth-submit:focus-visible,
+:root[data-theme="light"] .password-dialog-actions button[type="submit"]:focus-visible,
+:root[data-theme="light"] .btn-play-pause:focus-visible {
+  outline-color: #1a1d22 !important;
+}
+/* Light mode: blue accent vs near-white bg still hits ~3:1 — use the
+   same darker fallback as the buttons above so focus is unmistakable. */
+:root[data-theme="light"] :focus-visible {
+  outline-color: #1a1d22 !important;
+}
+
+/* Hover-only controls on touch — reveal them by default when the input
+   modality is touch so iPad/Surface users can actually reach them
+   (Visual-Test #2 caught hidden drag handles + queue-remove + folder-remove). */
+@media (hover: none) {
+  .queue-drag-handle,
+  .queue-remove-btn,
+  .tree-remove,
+  .playlist-delete-btn,
+  .pl-open-btn,
+  .playlist-row .pl-open-btn {
+    opacity: 1 !important;
+    display: inline-flex !important;
+  }
+}
+/* Keyboard parity for the hover-reveal controls: when a row contains
+   focus (e.g. focus moved onto the remove button itself, or a child
+   input was tabbed into) the contextual actions must be visible too.
+   NOTE for JS team: CSS can't sync aria-hidden — when these buttons
+   reveal on :focus-within, JS should toggle aria-hidden="false" so
+   screen readers see them as active controls. */
+tr:focus-within .queue-remove-btn,
+.queue-row:focus-within .queue-remove-btn,
+.queue-row:focus-within .queue-drag-handle,
+.playlist-row:focus-within .playlist-delete-btn,
+.playlist-row:focus-within .pl-open-btn,
+.tree-root:focus-within > .tree-node .tree-remove {
+  opacity: 1;
+  display: inline-flex;
+}
+
+/* Skip-to-main-content link: invisible until a keyboard user focuses it,
+   then it slides in at the top so they can bypass the header and sidebar
+   in one Tab + Enter. */
+.skip-to-main {
+  position: fixed;
+  top: -40px;
+  left: 12px;
+  /* Dark slate background instead of accent-orange so white text clears
+     WCAG AA 4.5:1 in both light and dark mode — the orange/white combo
+     was only ~3:1. */
+  background: #1a1d22;
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: 4px;
+  font-weight: 600;
+  text-decoration: none;
+  z-index: 10000;
+  transition: top 120ms ease-out;
+}
+.skip-to-main:focus,
+.skip-to-main:focus-visible {
+  top: 8px;
+}
+
+html, body {
   height: 100%;
+  /* iOS Safari URL-bar collapse: ``100vh`` overflows the player bar when
+     the chrome retracts.  ``100dvh`` matches the actual visible viewport
+     where supported.  Browsers without dvh keep the original 100% fallback
+     above. */
+  min-height: 100dvh;
   background: var(--bg0);
   overflow: hidden;
+}
+#app {
+  /* ``height:100vh`` on #app was fighting the dvh min-height on body —
+     on iOS Safari the URL bar retract pushed #app 60px below the visible
+     viewport.  Use 100% (inherits dvh from body) and let flexbox handle
+     the column distribution; #app is a flex parent and its children carry
+     their own intrinsic heights. */
+  height: 100%;
+  min-height: 100dvh;
+  background: var(--bg0);
+  overflow: hidden;
+}
+
+/* Firefox scrollbar shim — the bespoke ::-webkit-scrollbar rules below
+   only style Webkit/Blink; Firefox renders default chunky scrollbars.
+   These two declarations apply to every scrollable surface in the app. */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar) transparent;
 }
 
 /* Noise texture overlay on body */
@@ -62,8 +331,70 @@ body::before {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
 
+/* Fallback for browsers without backdrop-filter (older Firefox without
+   layout.css.backdrop-filter.enabled, older Safari, some embedded
+   webviews).  Without this, the .glass-bg rgba surfaces render
+   semi-transparent over the body noise texture which is unreadable.
+   Switch to the opaque --bg1 fill so panels stay legible. */
+@supports not (backdrop-filter: blur(1px)) {
+  #header,
+  #sidebar,
+  #player-bar,
+  .admin-dialog,
+  #ti-panel,
+  #queue-panel,
+  #playlist-panel,
+  #lyrics-panel,
+  #similar-panel { background: var(--bg1) !important; }
+}
+
+/* content-visibility: auto on hidden overlay panels skips paint + layout
+   for off-screen content, cutting first-paint cost when the overlay isn't
+   actually open.  ``contain-intrinsic-size: 0 0`` makes the placeholder
+   collapse so it doesn't reserve scroll space. */
+.admin-overlay.hidden,
+#admin-overlay.hidden,
+#queue-panel.hidden,
+#playlist-panel.hidden,
+#lyrics-panel[hidden],
+#shortcuts-overlay.hidden,
+#ti-overlay.hidden {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 0;
+}
+
+/* Light-mode glow parity: the layered drop-shadows used for album-art
+   placeholders, sidebar/header glow, archive cards, and the auth overlay
+   icon were tuned for dark backgrounds — on near-white surfaces they
+   smear into a dirty haze.  Strip them (or reduce to ~30% strength). */
+:root[data-theme="light"] .logo-icon-glow,
+:root[data-theme="light"] .art-thumb .art-placeholder,
+:root[data-theme="light"] .ti-art-placeholder,
+:root[data-theme="light"] .sp-art .sp-art-ph,
+:root[data-theme="light"] .queue-row-art .qr-art-ph,
+:root[data-theme="light"] .col-cover .row-art-placeholder,
+:root[data-theme="light"] .auth-brand-icon,
+:root[data-theme="light"] .archive-card,
+:root[data-theme="light"] .archive-card:hover {
+  filter: none;
+}
+:root[data-theme="light"] .logo-title { text-shadow: none; }
+:root[data-theme="light"] .meta-title,
+:root[data-theme="light"] .ctrl-toggle,
+:root[data-theme="light"] .btn-track-info,
+:root[data-theme="light"] #btn-lyrics.on,
+:root[data-theme="light"] #btn-eq.on {
+  /* Soft-blur text-shadow glows wash out into a muddy bloom on light
+     mode — kill them so the foreground type stays crisp. */
+  text-shadow: none;
+}
+
 /* ── Layout skeleton ──────────────────────────────────────────────────────── */
-#app { display: flex; flex-direction: column; height: 100vh; position: relative; z-index: 1; }
+/* Note: height/min-height are defined in the html/body/#app block above
+   using dvh.  This rule provides layout (flex column + stacking context)
+   only — the height: 100vh that used to live here was overflowing the
+   bottom-anchored player bar on iOS Safari (see comment in body block). */
+#app { display: flex; flex-direction: column; position: relative; z-index: 1; }
 
 #header {
   height: var(--header-h);
@@ -196,7 +527,13 @@ body::before {
     drop-shadow(0 0 3px rgba(107,200,240,0.8))
     drop-shadow(0 0 8px rgba(107,200,240,0.55))
     drop-shadow(0 0 16px rgba(107,200,240,0.3));
-  animation: logo-icon-pulse 3.2s ease-in-out infinite;
+  /* Pulse only on hover/focus — a perpetual breathing glow in the corner
+     of every page is the kind of low-priority ambient motion that wears
+     down attention.  The hover one-shot still rewards interaction. */
+}
+.logo:hover .logo-icon-glow,
+.logo:focus-within .logo-icon-glow {
+  animation: logo-icon-pulse 3.2s ease-in-out 1;
 }
 .logo-icon-top {
   position: absolute;
@@ -225,11 +562,24 @@ body::before {
   color: var(--accent);
   letter-spacing: -0.5px;
   line-height: 1;
-  animation: logo-pulse 3.2s ease-in-out infinite;
+  /* See .logo-icon-glow above — perpetual pulse retired in favour of a
+     hover/focus one-shot.  Static glow comes from the text-shadow that
+     logo-pulse 0%/100% defines (carried over below). */
+  text-shadow:
+    0 0 6px rgba(240,114,42,0.55),
+    0 0 18px rgba(240,114,42,0.30),
+    0 0 38px rgba(240,114,42,0.12);
+}
+.logo:hover .logo-title,
+.logo:focus-within .logo-title {
+  animation: logo-pulse 3.2s ease-in-out 1;
 }
 
 .logo-byline {
-  font-size: 8px;
+  /* Bumped 8 → 10px (still smaller than min-text 11 floor by design — this
+     is a stylized brand-tag, not body copy; use color+weight for hierarchy
+     elsewhere). */
+  font-size: 10px;
   font-weight: 400;
   color: var(--accent-dim);
   letter-spacing: 0.3px;
@@ -271,6 +621,12 @@ body::before {
   color: var(--text2);
   font-size: 15px;
   line-height: 1;
+  /* Reset the native <button> chrome introduced when this was upgraded
+     from a <span> to a real focusable button — otherwise the user agent
+     stylesheet paints a gray box inside the search field. */
+  background: transparent;
+  border: 0;
+  padding: 0;
 }
 
 .header-actions {
@@ -325,7 +681,7 @@ body::before {
 #sidebar #section-smart    { min-height: 40px; overflow-y: auto; flex: 0 1 auto; }
 
 #sidebar h3 {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -344,7 +700,7 @@ body::before {
   border: none;
   color: var(--text2);
   cursor: pointer;
-  font-size: 9px;
+  font-size: 11px;
   padding: 2px 4px;
   transition: transform 0.15s;
 }
@@ -524,6 +880,19 @@ body::before {
 #sidebar-splitter.dragging {
   background: var(--accent);
 }
+/* Keyboard reachability: splitters are draggable affordances with no
+   visible text — keyboard users need a high-contrast outline to know
+   focus landed there.  NOTE for HTML/JS team: splitters should also
+   carry role="separator" + aria-orientation="vertical|horizontal" and
+   tabindex="0" so they're actually focusable / announce correctly. */
+.sidebar-h-splitter:focus-visible,
+#sidebar-splitter:focus-visible,
+#sidebar-resize:focus-visible,
+#lyrics-panel .lyrics-resize:focus-visible {
+  outline: 2px solid var(--state-focus);
+  outline-offset: 1px;
+  background: rgba(107,200,240,0.20);
+}
 
 /* ── Sidebar playlists ───────────────────────────────────────────────────── */
 /* #sidebar prefix is required so this rule's specificity (0,2,0) beats
@@ -668,6 +1037,23 @@ body::before {
   overflow-y: auto;
   padding-bottom: 4px;
   position: relative;
+  /* CRITICAL for virtual scroll: opt out of Chrome/Edge/Firefox scroll
+     anchoring.  The virtual-scroll pool resizes the top spacer the moment
+     ``_vsStart`` advances past 0 (around row 35 with the default buffer).
+     With ``overflow-anchor: auto`` (the browser default) the engine reads
+     "content above the viewport just got taller" and adds the same amount
+     to scrollTop to keep visible content stable.  That scrollTop bump
+     fires another scroll event, which advances ``_vsStart`` again, which
+     grows the top spacer again — a feedback loop that drifts scrollTop
+     downward at ~ROW_H per frame until the list bottoms out.  The user
+     sees this as the list "running away" once they scroll past row ~35,
+     accelerating with each frame, slowing when they fight it (the
+     same anchor that's pulling them down now resists their input), and
+     stopping only when the list ends (``_vsStart`` can't grow further).
+     Our spacer math is already self-consistent — the pool rows shift
+     down by the same amount the top spacer grew, so unanchored scroll
+     keeps the same tracks visible.  Just disable the anchor.  */
+  overflow-anchor: none;
 }
 
 #track-table {
@@ -720,6 +1106,52 @@ body::before {
 }
 
 .col-num          { width: 36px; }
+.col-cover        { width: 36px; padding: 2px 4px; }
+/* The cover frame is a fixed 28×28 inline-block holding a format-emoji
+   placeholder and the actual cover <img> as absolutely-positioned
+   siblings.  Wrapping them in a frame (vs. positioning both off the
+   ``<td>``) gives them a single coordinate space — ``<td>`` content is
+   ``vertical-align: middle`` by default, which would offset the
+   in-flow <img> from the absolutely-positioned placeholder by a few
+   pixels.  Both children fill the frame exactly, so they pixel-overlap.
+   The placeholder is always rendered, and the <img> starts transparent
+   until ``.loaded`` — covers the placeholder when a real bitmap decoded,
+   otherwise the glyph shows through (no broken-image glyph ever). */
+.col-cover .col-cover-frame {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  background: var(--bg3);
+  vertical-align: middle;
+  overflow: hidden;
+}
+.col-cover .row-art-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
+  color: rgba(107,200,240,0.82);
+  filter: drop-shadow(0 0 4px rgba(107,200,240,0.85))
+          drop-shadow(0 0 10px rgba(107,200,240,0.45));
+  user-select: none;
+  pointer-events: none;
+}
+.col-cover .row-cover-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.col-cover .row-cover-img.loaded { opacity: 1; }
 .col-title        { width: 22%; }
 .col-album-artist { width: 16%; }
 .col-artist       { width: 16%; }
@@ -728,7 +1160,7 @@ body::before {
 .col-year         { width: 48px; }
 .col-dur          { width: 60px; text-align: right; }
 .col-format       { width: 70px; text-align: center; color: var(--text2); font-size: 11px; }
-.col-location     { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.82rem; color: var(--text2); }
+.col-location     { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text2); }
 
 #track-table tbody tr {
   cursor: pointer;
@@ -736,7 +1168,36 @@ body::before {
 }
 #track-table tbody tr:hover { background: var(--row-hover); }
 #track-table tbody tr.playing { background: var(--row-playing); }
-#track-table tbody tr.selected { background: var(--row-active); }
+/* Selection tint matches the queue/playlist visual language (cyan tint
+   + accent stripe) so a user who selects rows in the library and
+   switches panels doesn't see a different selection style.
+   Because the table uses ``border-collapse: collapse``, ``tr`` backgrounds
+   don't paint reliably in every browser — colour the ``td`` cells instead
+   and put the accent stripe on the leftmost cell. */
+#track-table tbody tr.selected > td,
+#track-table tbody tr.multi-selected > td {
+  background: rgba(107,200,240,0.10);
+}
+#track-table tbody tr.selected > td:first-child,
+#track-table tbody tr.multi-selected > td:first-child {
+  box-shadow: inset 2px 0 0 var(--art-glow-soft);
+}
+
+/* The "currently playing" tint must win over both multi-select and
+   keyboard-focus tints, otherwise a row that's both playing AND in the
+   user's selection looks indistinguishable from a plain selection.
+   The .multi-selected / .kb-focused rules live later in the file with
+   the same specificity, so we need a higher-specificity override here. */
+#track-table tbody tr.playing.selected > td,
+#track-table tbody tr.playing.multi-selected > td,
+#track-table tbody tr.playing.kb-focused > td {
+  background: var(--row-playing);
+}
+#track-table tbody tr.playing.selected > td:first-child,
+#track-table tbody tr.playing.multi-selected > td:first-child,
+#track-table tbody tr.playing.kb-focused > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 
 #track-table td {
   padding: 5px 10px;
@@ -750,9 +1211,24 @@ body::before {
 #track-table td.col-dur { text-align: right; color: var(--text2); font-variant-numeric: tabular-nums; }
 #track-table td.col-num { color: var(--text2); }
 
-tr.playing td.col-num::after { content: "▶"; font-size: 8px; color: var(--accent); }
+/* Playing-row marker is the single most important state indicator in the
+   track table — 8px disappeared on Retina (UX/UI #2). 11px stays inline
+   with the row number column without dominating it. */
+tr.playing td.col-num::after { content: "▶"; font-size: 11px; color: var(--accent); margin-left: 2px; }
 tr.playing td.col-num { color: transparent; }
 tr.playing td.col-title { color: var(--accent); }
+
+/* Row hover swap: row number → ▶ play glyph.  Discoverability fix —
+   the dblclick-to-play behaviour was previously signalled only by the
+   cursor pointer.  Now every hovered row shows a visible play hint. */
+.row-play-glyph { display: none; color: var(--accent); font-size: 11px; }
+#track-table tbody tr:hover .row-play-glyph,
+#track-table tbody tr:focus-within .row-play-glyph { display: inline; }
+#track-table tbody tr:hover .row-num,
+#track-table tbody tr:focus-within .row-num { display: none; }
+/* Playing row keeps its ▶ marker, drop the hover glyph to avoid double. */
+#track-table tbody tr.playing .row-play-glyph { display: none; }
+#track-table tbody tr.playing .row-num { display: inline; }
 
 /* Unscanned files (filesystem-discovered, metadata not yet in store) */
 tr.unscanned td { opacity: 0.5; }
@@ -812,6 +1288,59 @@ td.col-album .cell-link:hover {
   text-align: center;
   color: var(--text2);
 }
+
+/* Reusable empty-state component.  Use ``<div class="empty-state"
+   role="status" aria-live="polite">`` with a leading emoji span, an
+   ``<h4>`` heading, optional ``<p>`` body, and an optional CTA button.
+   The aria-live ensures screen-reader users are notified when an
+   asynchronous fetch yields zero rows. */
+.empty-state {
+  /* Author rules have higher precedence than the UA's ``[hidden]``
+     stylesheet, so a bare ``display: flex`` here would shadow the
+     ``hidden`` attribute and leave the empty state painted below a
+     non-empty list.  Gate the flex layout on ``:not([hidden])`` so the
+     attribute actually toggles visibility. */
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--text2);
+}
+.empty-state:not([hidden]) {
+  display: flex;
+}
+.empty-state .empty-icon {
+  font-size: 38px;
+  line-height: 1;
+  opacity: 0.65;
+}
+.empty-state h4 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text1);
+  margin: 0;
+}
+.empty-state p {
+  font-size: 13px;
+  color: var(--text2);
+  max-width: 380px;
+  line-height: 1.5;
+  margin: 0;
+}
+.empty-state .empty-cta {
+  margin-top: 8px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 18px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.empty-state .empty-cta:hover { background: var(--accent-dim); }
 
 /* ── Similar panel ────────────────────────────────────────────────────────── */
 #similar-panel {
@@ -890,7 +1419,9 @@ td.col-album .cell-link:hover {
   margin: 0;
 }
 .lyrics-source {
-  font-size: 9px;
+  /* Bumped 9 → 11px to clear the 11px small-text floor.  Use opacity for
+     hierarchy rather than dropping below the readable threshold. */
+  font-size: 11px;
   color: var(--text2);
   opacity: 0.6;
 }
@@ -1115,7 +1646,11 @@ a.crumb-link:hover { color: var(--accent); }
   gap: 24px;
   position: relative;
   z-index: 1;
-  margin-bottom: 34px; /* shift controls above visual centre of player bar */
+  /* TODO: refactor to flex centring — the 34px nudge accounts for the
+     time-stamp row pushing the seek bar visually downward.  Full fix is a
+     row+spacer flex layout but that wants visual testing.  Tracked under
+     UX/UI #2 #13. */
+  margin-bottom: 34px;
 }
 /* ── Now Playing large art ─────────────────────────────────────────────── */
 .now-playing-art {
@@ -1126,7 +1661,7 @@ a.crumb-link:hover { color: var(--accent); }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  background: rgba(13, 15, 18, 0.92);
+  background: var(--panel-bg);
   backdrop-filter: blur(20px);
   cursor: pointer;
   animation: np-art-in 0.3s ease-out;
@@ -1144,7 +1679,14 @@ a.crumb-link:hover { color: var(--accent); }
   border-radius: 12px;
   box-shadow: 0 12px 48px rgba(0,0,0,0.7), 0 0 100px rgba(240,114,42,0.08);
   object-fit: contain;
+  /* Hide until ``.loaded``.  Combined with the JS ``onerror`` handler
+     that strips ``src``, this guarantees the browser's broken-image
+     glyph never paints inside the overlay. */
+  opacity: 0;
+  transition: opacity 200ms ease;
 }
+.now-playing-art img.loaded { opacity: 1; }
+.now-playing-art img:not([src]) { display: none; }
 
 .now-playing-art-info {
   text-align: center;
@@ -1171,26 +1713,102 @@ a.crumb-link:hover { color: var(--accent); }
   font-style: italic;
 }
 
+/* Converting badge: was viewport-centred at 55px which overflowed narrow
+   panes.  Now docked top-right of the content pane at a saner 26px,
+   shrinking to ~22px on phones via the responsive override below. */
 .converting-badge {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  top: 16px;
+  right: 16px;
   background: rgba(180, 50, 50, 0.85);
   color: #eee;
-  font-size: 55px;
+  font-size: 26px;
   font-weight: 600;
-  padding: 12px 36px;
-  border-radius: 16px;
-  letter-spacing: 1.5px;
+  padding: 8px 22px;
+  border-radius: 12px;
+  letter-spacing: 1px;
   z-index: 500;
   animation: converting-pulse 2.4s ease-in-out infinite;
-  pointer-events: none;
+  pointer-events: auto;   /* allow inline cancel button to receive clicks */
+  max-width: calc(100% - 32px);
 }
+/* Inline cancel button — hidden by default; JS sets .cancellable when the
+   transcoder has cooperative cancel support so the X becomes interactive. */
+.converting-badge .badge-cancel {
+  display: none;
+  background: rgba(0,0,0,0.30);
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 999px;
+  color: #fff;
+  cursor: pointer;
+  width: 22px;
+  height: 22px;
+  font-size: 13px;
+  line-height: 1;
+  margin-left: 10px;
+  vertical-align: middle;
+}
+.converting-badge.cancellable .badge-cancel { display: inline-flex; align-items: center; justify-content: center; }
+.converting-badge .badge-cancel:hover { background: rgba(0,0,0,0.55); }
 .converting-badge[hidden] { display: none; }
 @keyframes converting-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.5; }
+}
+
+/* Determinate variant — promoted by player.js as soon as transcode-status
+   returns a non-zero percent.  The pulse stops because the moving bar
+   itself is the animation: a determinate signal is psychologically more
+   reassuring than a pulsing-but-static one (Hofman 2009 / Card 1983). */
+.converting-badge.has-progress[hidden] { display: none; }
+.converting-badge.has-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  font-size: 24px;
+  letter-spacing: 0.6px;
+  padding: 16px 28px;
+  min-width: 320px;
+  animation: none;
+}
+.converting-badge.has-progress .progress-label {
+  font-weight: 600;
+  text-align: center;
+}
+.converting-badge.has-progress .progress-bar {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.converting-badge.has-progress .progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #ffd1c2, #ffffff);
+  border-radius: 999px;
+  transition: width 0.45s cubic-bezier(0.22, 0.61, 0.36, 1);
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.55);
+}
+.converting-badge.has-progress .progress-eta {
+  font-size: 16px;
+  font-weight: 500;
+  text-align: center;
+  opacity: 0.92;
+  min-height: 1em;     /* reserve the row so the badge doesn't jump
+                          between "n s left" and "" */
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Respect the user's preference — skip the easing on the fill so the
+     bar snaps instead of animating.  The reset is intentional: a
+     reduced-motion user has explicitly opted out of even subtle
+     transition curves. */
+  .converting-badge.has-progress .progress-fill { transition: none; }
 }
 
 /* Buffering badge — smaller, less alarming than the converting badge.
@@ -1237,11 +1855,17 @@ a.crumb-link:hover { color: var(--accent); }
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  /* 36px desktop floor — was 32px which is under the loose 36px hit-target
+     minimum.  The @media (max-width:1024px) block below promotes this to
+     44px on touch.  Play-pause has its own 42px declaration above. */
+  width: 36px;
+  height: 36px;
   background: none;
   border: none;
-  color: rgba(255,255,255,0.65);
+  /* Themed colour so the transport stays visible in light mode — the
+     previous hardcoded ``rgba(255,255,255,0.65)`` rendered 65%-opacity
+     white on a near-white player-bar (UX/UI #2 + Visual-Test #1). */
+  color: var(--text1);
   cursor: pointer;
   font-size: 13px;
   border-radius: 50%;
@@ -1249,27 +1873,32 @@ a.crumb-link:hover { color: var(--accent); }
   flex-shrink: 0;
 }
 .player-controls button:hover {
-  color: #fff;
-  background: rgba(255,255,255,0.09);
+  color: var(--text0);
+  background: var(--row-hover);
 }
 
+/* Play-pause: !important removed so the @media (max-width:1024px) touch
+   block can promote width/height to 44px on tablets/phones.  The original
+   !important were defending against the .player-controls button selector
+   above; we win on specificity (.btn-play-pause is more specific) so the
+   bangs were always redundant. */
 .btn-play-pause {
-  width: 42px !important;
-  height: 42px !important;
-  background: var(--accent) !important;
-  color: #fff !important;
-  border-radius: 50% !important;
-  font-size: 17px !important;
+  width: 42px;
+  height: 42px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 50%;
+  font-size: 17px;
   box-shadow:
     0 0 0 3px rgba(240,114,42,0.22),
-    0 0 22px rgba(240,114,42,0.45) !important;
-  transition: background 0.15s, box-shadow 0.15s !important;
+    0 0 22px rgba(240,114,42,0.45);
+  transition: background 0.15s, box-shadow 0.15s;
 }
 .btn-play-pause:hover {
-  background: var(--accent-dim) !important;
+  background: var(--accent-dim);
   box-shadow:
     0 0 0 4px rgba(240,114,42,0.30),
-    0 0 30px rgba(240,114,42,0.55) !important;
+    0 0 30px rgba(240,114,42,0.55);
 }
 
 .player-progress {
@@ -1286,6 +1915,20 @@ a.crumb-link:hover { color: var(--accent); }
   min-width: 34px;
 }
 #seek-bar, #volume-bar { flex: 1; }
+
+/* Seek bar: fill colour stops at --pct (set by JS on input events) so
+   the progress is visible behind the thumb without needing per-frame
+   background-position math in JS.  Default 0% means the bar shows just
+   the neutral track tint at rest. */
+#seek-bar {
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--pct, 0%),
+    rgba(255,255,255,0.12) var(--pct, 0%),
+    rgba(255,255,255,0.12) 100%
+  );
+}
 
 /* ── Range inputs ─────────────────────────────────────────────────────────── */
 input[type="range"] {
@@ -1308,6 +1951,38 @@ input[type="range"]::-webkit-slider-thumb {
 input[type="range"]:hover::-webkit-slider-thumb {
   background: var(--accent);
   transform: scale(1.15);
+}
+/* Firefox slider thumb — without this partner rule the seek + volume
+   bars rendered with the default chunky native thumb (Visual-Test #2). */
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 50%;
+  background: var(--text0);
+  cursor: pointer;
+  transition: background 0.1s, transform 0.1s;
+}
+input[type="range"]:hover::-moz-range-thumb {
+  background: var(--accent);
+  transform: scale(1.15);
+}
+
+/* Touch / small-viewport: bump the thumb so a fingertip can land it
+   reliably.  Track also gets thicker so the bigger thumb doesn't dwarf
+   the rail.  Precision-pointer devices keep the smaller 12px puck. */
+@media (hover: none), (max-width: 1024px) {
+  input[type="range"] {
+    height: 6px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    width: 22px;
+    height: 22px;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 22px;
+    height: 22px;
+  }
 }
 
 /* ── Player right ─────────────────────────────────────────────────────────── */
@@ -1404,7 +2079,7 @@ input[type="range"]:hover::-webkit-slider-thumb {
 #eq-overlay.hidden { display: none; }
 
 #eq-panel {
-  background: rgba(14,17,23,0.97);
+  background: var(--panel-bg);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
   border: 1px solid var(--glass-border);
@@ -1603,6 +2278,13 @@ input[type="range"]:hover::-webkit-slider-thumb {
   justify-content: center;
 }
 #admin-overlay.hidden { display: none; }
+/* When styledConfirm is invoked from outside the admin context the overlay
+   shouldn't paint as the full admin backdrop — fade to a much lighter
+   modal scrim so the underlying playlist/library panel stays visible. */
+#admin-overlay.confirm-standalone {
+  background: rgba(0,0,0,0.35);
+  backdrop-filter: blur(2px);
+}
 
 /* Auth dialog */
 .admin-dialog {
@@ -1691,13 +2373,17 @@ input[type="range"]:hover::-webkit-slider-thumb {
 
 /* Admin panel (shown after auth) */
 #admin-panel {
-  background: rgba(18,22,28,0.94);
+  background: var(--panel-bg);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
   border: 1px solid var(--glass-border);
   border-radius: 16px;
   box-shadow: var(--glass-shadow);
-  width: 580px;
+  /* Width: bumped from 580px → 720px so the share-edit form + the
+     new FTP Connection Pools panel can both render comfortably without
+     wrapping the slider rows.  ``max-width: 94vw`` still keeps the
+     panel from breaching the viewport on narrow displays. */
+  width: 720px;
   max-width: 94vw;
   height: 75vh;               /* fixed height — no resize when switching tabs */
   max-height: 85vh;
@@ -1705,6 +2391,83 @@ input[type="range"]:hover::-webkit-slider-thumb {
   flex-direction: column;
   animation: dialog-in 0.22s ease;
   overflow: hidden;
+}
+
+/* ── FTP Connection Pools section ───────────────────────────────────────
+   New in v27.  One card per FTP share; the operator drags the scan +
+   stream sliders to tune the per-pool budget.  Detected cap is
+   read-only (auto-learned via 421/530 trips).  See admin.js
+   _renderFtpPools / _attachFtpPoolHandlers and api/admin.py
+   /admin/ftp-pool/* for the wiring. */
+.admin-ftp-pool-list { display: flex; flex-direction: column; gap: 10px; }
+.admin-ftp-pool-card {
+  border: 1px solid var(--border-bright);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--bg2);
+}
+.admin-ftp-pool-card .pool-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 10px;
+}
+.admin-ftp-pool-card .pool-name { font-weight: 600; font-size: 13.5px; }
+.admin-ftp-pool-card .pool-host { font-size: 12px; color: var(--text2); margin-left: 6px; }
+.admin-ftp-pool-card .pool-detected {
+  font-size: 12px; color: var(--text2);
+  display: flex; align-items: center; gap: 8px;
+}
+.admin-ftp-pool-card .pool-detected b { color: var(--text1); }
+.admin-ftp-pool-card .pool-detected.warn b { color: var(--accent); }
+.admin-ftp-pool-card .pool-slider-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0;
+}
+.admin-ftp-pool-card .pool-slider-row label { font-size: 12.5px; color: var(--text2); }
+.admin-ftp-pool-card .pool-slider-row input[type=range] {
+  width: 100%; accent-color: var(--accent);
+}
+.admin-ftp-pool-card .pool-slider-row .pool-val {
+  text-align: right; font-feature-settings: "tnum"; font-size: 13px;
+}
+.admin-ftp-pool-card .pool-effective {
+  font-size: 12px; color: var(--text2); margin: 6px 0 8px;
+}
+.admin-ftp-pool-card .pool-actions {
+  display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap;
+}
+.admin-ftp-pool-card .pool-actions button {
+  font-size: 12px; padding: 5px 10px; border-radius: 6px;
+}
+.admin-ftp-pool-card .pool-live {
+  font-size: 11.5px; color: var(--text3, var(--text2));
+  font-family: ui-monospace, SF Mono, Menlo, monospace;
+  margin-top: 4px;
+}
+
+/* ── Scan-progress section: Pause/Resume button ──────────────────────── */
+#admin-scan-section h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.scan-pause-btn {
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+.scan-pause-btn.is-paused {
+  /* When paused, swap to the accent colour so the Resume action stands
+     out — the badge text is the cue the user looks for, the button is
+     the action they need to take.  Matches the "primary action when
+     workflow is interrupted" pattern used by the AirPlay pair modal. */
+  background: var(--accent, #f0722a);
+  color: #000;
+  border-color: transparent;
 }
 #admin-panel.hidden { display: none; }
 #admin-auth-dialog.hidden { display: none; }
@@ -2016,16 +2779,37 @@ input[type="range"]:hover::-webkit-slider-thumb {
 .net-status-msg.net-ok { color: #4caf50; }
 .net-status-msg.net-err { color: #e55; }
 
-/* Dir row: status dot for network shares */
+/* Dir row: status dot for network shares.
+   Shape carries meaning, not just colour — color-blind users can read the
+   connection state at a glance. */
 .dir-status-dot {
   display: inline-block;
-  width: 8px; height: 8px;
-  border-radius: 50%;
+  width: 9px; height: 9px;
   flex-shrink: 0;
   margin-right: 4px;
+  position: relative;
 }
-.dot-green { background: #4caf50; box-shadow: 0 0 4px rgba(76,175,80,0.5); }
-.dot-red { background: #e55; box-shadow: 0 0 4px rgba(238,85,85,0.5); }
+.dot-green {
+  background: #4caf50;
+  border-radius: 50%;
+  box-shadow: 0 0 4px rgba(76,175,80,0.5);
+}
+/* Disconnected: red square with a strike through to differentiate by shape
+   in addition to colour. */
+.dot-red {
+  background: #e55;
+  border-radius: 2px;
+  box-shadow: 0 0 4px rgba(238,85,85,0.5);
+}
+.dot-red::after {
+  content: '';
+  position: absolute;
+  left: 1px; right: 1px; top: 50%;
+  height: 1.5px;
+  background: rgba(0,0,0,0.55);
+  transform: translateY(-50%) rotate(-45deg);
+  pointer-events: none;
+}
 .dir-unavailable .admin-dir-path { opacity: 0.5; }
 .btn-reconnect {
   background: rgba(76,175,80,0.15);
@@ -2123,7 +2907,14 @@ input[type="range"]:hover::-webkit-slider-thumb {
   border-radius: 8px;
   margin-top: 4px;
 }
+/* Glyph prefixes so the status carries meaning beyond colour — colour-blind
+   users (deuteranopia, protanopia) can't reliably distinguish the green/
+   amber/red tints alone.  The leading symbol gives a shape-based cue. */
+.admin-msg.ok::before   { content: '✓ '; font-weight: 700; }
+.admin-msg.warn::before { content: '! '; font-weight: 700; }
+.admin-msg.err::before  { content: '✕ '; font-weight: 700; }
 .admin-msg.ok   { background: rgba(76,175,122,0.14); color: #4caf7a; border: 1px solid rgba(76,175,122,0.2); }
+.admin-msg.warn { background: rgba(230,180,60,0.14); color: #e6b43c; border: 1px solid rgba(230,180,60,0.25); }
 .admin-msg.err  { background: rgba(220,80,80,0.14);  color: #e06060; border: 1px solid rgba(220,80,80,0.2); }
 
 /* Renderer status grid */
@@ -2151,6 +2942,20 @@ input[type="range"]:hover::-webkit-slider-thumb {
 }
 .renderer-icon.renderer-ok   { color: #4caf7a; }
 .renderer-icon.renderer-missing { color: #e06060; }
+/* Warn tier — binary exists but is incomplete (e.g. ffmpeg lacks
+   libmp3lame / libvorbis).  Different colour from missing so the
+   user can distinguish "not installed" from "installed but limited". */
+.renderer-icon.renderer-warn { color: #f0b840; }
+/* In-flight cue while the probe is running — without animation users
+   couldn't distinguish "still probing" from "stuck on ellipsis". */
+.renderer-icon.renderer-loading {
+  color: var(--text1);
+  animation: renderer-pulse 1.2s ease-in-out infinite;
+}
+@keyframes renderer-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
 .renderer-name { white-space: nowrap; }
 
 /* Soundfont list */
@@ -2436,8 +3241,14 @@ input[type="range"]:hover::-webkit-slider-thumb {
 }
 #ti-overlay.hidden { display: none; }
 
+/* JS toggles body.ti-open when the Track Info overlay opens; the original
+   intent was a scroll-lock + body-dim that never had matching CSS. */
+body.ti-open {
+  overflow: hidden;
+}
+
 #ti-panel {
-  background: rgba(13,16,22,0.97);
+  background: var(--panel-bg);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
   border: 1px solid var(--glass-border);
@@ -2631,7 +3442,7 @@ input[type="range"]:hover::-webkit-slider-thumb {
   margin-bottom: 20px;
 }
 .ti-section-hdr {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2763,6 +3574,7 @@ input[type="range"]:hover::-webkit-slider-thumb {
 }
 #btn-queue-close:hover { color: var(--text0); background: rgba(255,255,255,0.09); }
 
+.queue-list[hidden] { display: none; }
 .queue-list {
   flex: 1;
   overflow-y: auto;
@@ -2782,6 +3594,11 @@ input[type="range"]:hover::-webkit-slider-thumb {
   gap: 8px;
   padding: 7px 10px 7px 6px;
   border-bottom: 1px solid var(--border);
+  /* Reserve 2px on the leading/top edges so .playing / .dragging-over
+     don't shift content sideways or downward — Visual-Test #1 caught the
+     2px layout jump on every track advance. */
+  border-left: 2px solid transparent;
+  border-top: 2px solid transparent;
   cursor: pointer;
   user-select: none;
   transition: background 0.1s;
@@ -2789,11 +3606,17 @@ input[type="range"]:hover::-webkit-slider-thumb {
 .queue-row:hover { background: var(--row-hover); }
 .queue-row.playing {
   background: var(--row-playing);
-  border-left: 2px solid var(--accent);
+  border-left-color: var(--accent);
 }
 .queue-row.dragging-over {
   background: rgba(240,114,42,0.12);
-  border-top: 2px solid var(--accent);
+  border-top-color: var(--accent);
+}
+/* Playing always wins over selected — the previously-declared order put
+   .selected after .playing so a row that was both showed the blue
+   selection border instead of the accent-orange now-playing marker. */
+.queue-row.selected.playing {
+  border-left-color: var(--accent);
 }
 
 .queue-drag-handle {
@@ -2818,12 +3641,23 @@ input[type="range"]:hover::-webkit-slider-thumb {
   position: relative;
 }
 .queue-row-art img {
+  position: absolute;
+  inset: 0;
   width: 100%; height: 100%;
   object-fit: cover;
   display: block;
+  /* Match the library-row pattern: image stays transparent until the
+     bitmap actually decodes, so the format placeholder underneath shows
+     through whenever ``/api/art/{id}`` is unavailable, 404s, or hasn't
+     been extracted yet.  No track in the playlist/queue ever shows a
+     broken-image glyph. */
+  opacity: 0;
+  transition: opacity 120ms ease;
 }
+.queue-row-art img.loaded { opacity: 1; }
 .queue-row-art .qr-art-ph {
-  width: 100%; height: 100%;
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2832,6 +3666,8 @@ input[type="range"]:hover::-webkit-slider-thumb {
   color: rgba(107,200,240,0.82);
   filter: drop-shadow(0 0 4px  rgba(107,200,240,0.85))
           drop-shadow(0 0 8px  rgba(107,200,240,0.45));
+  pointer-events: none;
+  user-select: none;
 }
 
 .queue-playing-icon {
@@ -2878,7 +3714,12 @@ input[type="range"]:hover::-webkit-slider-thumb {
   color: var(--text2);
   cursor: pointer;
   font-size: 14px;
-  padding: 2px 4px;
+  /* WCAG 2.5.5 AAA target is 44×44; we can't go that big without
+     disrupting row density, but bump from 18×22 to ~30×30 so touch and
+     mouse users can both hit the affordance reliably. */
+  min-width: 30px;
+  min-height: 30px;
+  padding: 6px 8px;
   line-height: 1;
   border-radius: 4px;
   opacity: 0;
@@ -2886,7 +3727,7 @@ input[type="range"]:hover::-webkit-slider-thumb {
   transition: opacity 0.12s, color 0.12s;
 }
 .queue-row:hover .queue-remove-btn { opacity: 1; }
-.queue-remove-btn:hover { color: #e55; }
+.queue-remove-btn:hover { color: var(--danger); }
 
 .queue-drop-zone {
   padding: 14px 16px;
@@ -3012,7 +3853,13 @@ tr.dragging { opacity: 0.4; }
 .album-card-initials {
   font-size: 28px;
   font-weight: 700;
-  color: var(--text2);
+  /* Match the placeholder language used by the bottom player and row
+     covers (glowing-blue) so a user scanning the album grid recognises
+     the "no art yet" state with the same visual cue.  Initials still
+     communicate "which album" at a glance — emoji would lose that. */
+  color: var(--art-glow);
+  filter: drop-shadow(0 0 6px var(--art-glow-soft))
+          drop-shadow(0 0 14px var(--art-glow-faint));
   letter-spacing: 2px;
   user-select: none;
 }
@@ -3082,6 +3929,7 @@ tr.dragging { opacity: 0.4; }
 }
 #playlist-panel.hidden { display: none; }
 
+.playlist-header[hidden] { display: none; }
 .playlist-header {
   display: flex;
   align-items: center;
@@ -3183,6 +4031,7 @@ tr.dragging { opacity: 0.4; }
   font-style: italic;
 }
 
+.playlist-list[hidden] { display: none; }
 .playlist-list {
   flex: 1;
   overflow-y: auto;
@@ -3322,7 +4171,7 @@ tr.dragging { opacity: 0.4; }
 /* ── Duplicate badges ────────────────────────────────────────────────────── */
 .dup-badge {
   flex-shrink: 0;
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;
   padding: 1px 5px;
@@ -3351,6 +4200,7 @@ tr.dragging { opacity: 0.4; }
 }
 
 /* ── Selection bar ───────────────────────────────────────────────────────── */
+#pl-sel-bar[hidden] { display: none; }
 #pl-sel-bar {
   display: flex;
   align-items: center;
@@ -3491,7 +4341,10 @@ tr.dragging { opacity: 0.4; }
   padding: 0 8px;
   pointer-events: none;
   z-index: 0;
-  opacity: 0.3;
+  /* Was 0.3 — barely visible even on dark.  0.65 still keeps the meters
+     subordinate to the player controls in the foreground but actually
+     readable. */
+  opacity: 0.65;
 }
 .vu-meters[hidden] { display: none; }
 
@@ -3499,13 +4352,19 @@ tr.dragging { opacity: 0.4; }
   flex: 1;
   background: linear-gradient(
     to top,
-    hsla(var(--vu-hue, 30), 80%, 50%, 0.6),
-    hsla(var(--vu-hue, 30), 80%, 70%, 0.2)
+    hsla(var(--vu-hue, 30), 80%, 55%, 0.85),
+    hsla(var(--vu-hue, 30), 80%, 70%, 0.35)
   );
   height: calc(var(--vu-level, 0) * 100%);
-  min-height: 1px;
+  /* A 6 px floor so the bars are visible at idle / silent passages
+     too — gives the user feedback that the meter is alive, not just
+     dead pixels. */
+  min-height: 6px;
   border-radius: 2px 2px 0 0;
-  transition: height 0.06s ease-out;
+  /* No transition — bars snap to each frame's value with no smoothing.
+     The 66 ms draw cadence is the only motion-step floor; releases
+     read as instant from the user's POV. */
+  transition: none;
 }
 
 /* Fallback animation when AudioContext is not available */
@@ -3522,12 +4381,16 @@ tr.dragging { opacity: 0.4; }
 #shortcuts-overlay {
   position: fixed;
   inset: 0;
-  z-index: 2000;
+  /* Sit above ``.pl-modal-backdrop`` (10000) and ``#restart-overlay``
+     (10000) — Visual-Test #1 caught the inversion where `?` did nothing
+     while a playlist-name modal was open. */
+  z-index: 20000;
   background: rgba(0,0,0,0.65);
   display: flex;
   align-items: center;
   justify-content: center;
   backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 #shortcuts-overlay.hidden { display: none; }
 
@@ -3621,7 +4484,17 @@ tr.dragging { opacity: 0.4; }
   border-bottom: 1px solid var(--border);
   padding: 0 16px;
   flex-shrink: 0;
+  /* Tabs (Library / Renderers / Backup / System / Users / Log) overflow
+     the admin panel width on phones.  Allow horizontal scroll so every
+     tab stays reachable.  ``-webkit-overflow-scrolling: touch`` keeps
+     iOS momentum scroll active.  Hide the native scrollbar on macOS
+     desktop where the trackpad swipe already works. */
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
 }
+.admin-tabs::-webkit-scrollbar { height: 3px; }
+.admin-tabs::-webkit-scrollbar-thumb { background: var(--scrollbar); }
 .admin-tab {
   background: none;
   border: none;
@@ -3784,6 +4657,48 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   opacity: 0.6;
   letter-spacing: 0.02em;
 }
+/* Syntax helper dropdown — shown on first focus to expose advanced
+   field-operator syntax (artist:foo year:>2020 format:FLAC). */
+.sp-syntax-hint {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.025);
+}
+.sp-hint-title {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.sp-hint-ops {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.6;
+}
+.sp-hint-ops code {
+  display: inline-block;
+  padding: 1px 6px;
+  margin: 0 4px 2px 0;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+/* Red flag bar when the user typed an unparseable field operator. */
+.sp-bad-ops {
+  padding: 6px 12px;
+  border-bottom: 1px solid rgba(220, 80, 80, 0.35);
+  background: rgba(220, 80, 80, 0.08);
+  color: #e67878;
+  font-size: 12px;
+}
+.sp-bad-op {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-weight: 600;
+}
 
 /* ── Admin settings grid ──────────────────────────────────────────────── */
 .admin-settings-grid {
@@ -3831,7 +4746,9 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   margin-left: 2px;
   line-height: 1;
 }
-.setting-info:hover { opacity: 0.9; }
+.setting-info:hover,
+.setting-info:focus,
+.setting-info:focus-within { opacity: 0.9; }
 .setting-info::after {
   content: attr(data-tip);
   position: absolute;
@@ -3857,7 +4774,12 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   z-index: 20;
   box-shadow: 0 6px 18px rgba(0,0,0,0.35);
 }
-.setting-info:hover::after { opacity: 1; }
+/* Keyboard parity — Tab + Enter onto a setting-info icon now reveals its
+   tooltip; previously this only showed on :hover and was invisible to
+   keyboard users. */
+.setting-info:hover::after,
+.setting-info:focus::after,
+.setting-info:focus-within::after { opacity: 1; }
 
 /* ── About section (System tab) ───────────────────────────────────────── */
 .about-section { }
@@ -4062,10 +4984,12 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   color: var(--text0);
 }
 #nav-smart li.active {
-  background: rgba(107,200,240,0.12);
-  color: #7ec8f0;
+  /* Use the brand accent — Library and Smart were using two competing
+     activation colours (UX/UI #2), breaking the system. */
+  background: var(--accent-glow);
+  color: var(--accent);
   font-weight: 500;
-  border: 1px solid rgba(107,200,240,0.2);
+  border: 1px solid rgba(240,114,42,0.22);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -4074,15 +4998,28 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 
 .fmt-badge {
   display: inline-block;
+  /* Was 10.5px — bumped to 11px to clear the small-text floor; matches
+     --text-xs.  Letter-spacing dropped slightly to compensate for the
+     extra pixel. */
   padding: 1px 7px;
   border-radius: 4px;
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.3px;
+  letter-spacing: 0.25px;
   line-height: 1.6;
   white-space: nowrap;
   text-transform: uppercase;
 }
+
+/* Shape-based codability so format isn't conveyed by colour alone (WCAG
+   1.4.1).  Filled dot = lossless, hollow ring = lossy.  Tracker/SID/MIDI
+   keep no glyph — they're already shape-unique formats. */
+.fmt-badge.lossless::before,
+.fmt-lossless::before { content: '● '; opacity: 0.85; }
+.fmt-badge.lossy::before,
+.fmt-mp3::before,
+.fmt-ogg::before,
+.fmt-aac::before { content: '○ '; opacity: 0.7; }
 
 /* Lossless (FLAC, ALAC, WAV, AIFF) — green tint */
 .fmt-lossless {
@@ -4091,24 +5028,25 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   border: 1px solid rgba(80,200,120,0.22);
 }
 
-/* MP3 — blue tint */
+/* MP3 — blue tint.  Text colour bumped ~15% toward 100% luminance for
+   AA contrast on darker --bg surfaces (#7db5f0 → #9fc8f6). */
 .fmt-mp3 {
   background: rgba(100,160,240,0.12);
-  color: #7db5f0;
+  color: #9fc8f6;
   border: 1px solid rgba(100,160,240,0.20);
 }
 
-/* Ogg/Opus — purple tint */
+/* Ogg/Opus — purple tint (luminance-bumped from #b39de0 → #c8b4ec). */
 .fmt-ogg {
   background: rgba(160,120,220,0.12);
-  color: #b39de0;
+  color: #c8b4ec;
   border: 1px solid rgba(160,120,220,0.18);
 }
 
-/* AAC/M4A — amber tint */
+/* AAC/M4A — amber tint (luminance-bumped from #d4b44a → #e6cf5d). */
 .fmt-aac {
   background: rgba(220,180,60,0.12);
-  color: #d4b44a;
+  color: #e6cf5d;
   border: 1px solid rgba(220,180,60,0.18);
 }
 
@@ -4119,18 +5057,20 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   border: 1px solid rgba(0,220,220,0.18);
 }
 
-/* MIDI — pink tint */
+/* MIDI — pink tint (luminance-bumped from #dc6ab0 → #ec8bc6). */
 .fmt-midi {
   background: rgba(220,80,160,0.12);
-  color: #dc6ab0;
+  color: #ec8bc6;
   border: 1px solid rgba(220,80,160,0.18);
 }
 
-/* Tracker (MOD, S3M, XM, IT, etc.) — orange tint */
+/* Tracker (MOD, S3M, XM, IT, etc.) — uses the brand accent so retro
+   formats keep brand consistency across the type column (UX/UI #2 flagged
+   the previous ``#e8a040`` as one shade off the brand orange #f0722a). */
 .fmt-tracker {
-  background: rgba(240,140,40,0.12);
-  color: #e8a040;
-  border: 1px solid rgba(240,140,40,0.18);
+  background: var(--accent-glow);
+  color: var(--accent);
+  border: 1px solid rgba(240,114,42,0.22);
 }
 
 /* Fallback — grey */
@@ -4249,4 +5189,1776 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   color: rgba(234, 238, 243, 0.6);
   line-height: 1.45;
   max-width: 480px;
+}
+
+/* ── Cross-platform shims ──────────────────────────────────────────────── */
+
+/* Safe-area padding: respects iPad Safari + MacBook notch insets when the
+   app is added to the home screen or running fullscreen.  ``env(...)``
+   returns 0 outside notched contexts so non-notch browsers are unaffected. */
+#header {
+  padding-left:  max(var(--space-4, 16px), env(safe-area-inset-left));
+  padding-right: max(var(--space-4, 16px), env(safe-area-inset-right));
+}
+#player-bar {
+  /* Grow the bar to accommodate the iOS home indicator instead of
+     stealing height from the content.  With ``box-sizing: border-box``
+     and a fixed ``height: var(--player-h)``, a bare ``padding-bottom``
+     used to shrink the inner content area and clip the 44 px-tall
+     waveform canvas at the bottom (REG-4 regression). */
+  height: calc(var(--player-h) + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* RTL hook — `dir="rtl"` flips the sidebar/main split.  Full RTL pass
+   would need each margin-left/padding-right rewritten with logical
+   properties; this baseline at least mirrors the top-level layout. */
+[dir="rtl"] #main-layout {
+  flex-direction: row-reverse;
+}
+[dir="rtl"] .player-controls,
+[dir="rtl"] .player-extra-controls {
+  flex-direction: row-reverse;
+}
+
+/* Print stylesheet — dumping the dark glass UI to ink was a 4394-line
+   `@media print`-free CSS.  Strip backgrounds, simplify, hide chrome. */
+@media print {
+  body, #app { background: white !important; color: black !important; }
+  body::before { display: none !important; }
+  #header, #sidebar, #player-bar, .player-bar, #shortcuts-overlay,
+  #admin-overlay, #queue-panel, #playlist-panel, #ti-overlay,
+  #eq-overlay, .skip-to-main, .toast-host,
+  /* New overlays added by the multi-user / password flows: must also
+     stay out of printed pages so a "Print" while logged-out doesn't
+     dump a full-page login modal. */
+  .auth-overlay, #password-dialog, #restart-overlay, .user-chip {
+    display: none !important;
+  }
+  #content, #track-list-wrap { overflow: visible !important; }
+  table, tr, td, th {
+    color: black !important;
+    background: white !important;
+    border-color: #ccc !important;
+  }
+  a { color: black; text-decoration: underline; }
+}
+
+/* ── Soundfont marketplace category header (E-16) ─────────────────────── */
+.sf-known-cat-hdr {
+  margin-top: 14px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text2);
+}
+.sf-known-cat-hdr:first-child { margin-top: 4px; }
+
+/* ── Track Info → Chapters (E-18) ────────────────────────────────────────── */
+.ti-chapters {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.ti-chapter-header {
+  font-size: 11px;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+.ti-chapter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ti-chapter-row {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 10px;
+  align-items: center;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text0);
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.12s;
+}
+.ti-chapter-row:hover  { background: var(--row-hover); }
+.ti-chapter-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ti-chapter-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text2);
+}
+.ti-chapter-title {
+  font-size: 13px;
+  color: var(--text0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Auth overlay (login / register) ─────────────────────────────────────── */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;            /* above admin, toast, everything */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg0);
+  /* Slight gradient + accent glow so the bare login card doesn't feel like
+     a system modal hovering over emptiness. */
+  background:
+    radial-gradient(circle at 35% 25%, rgba(240,114,42,0.12) 0%, transparent 60%),
+    radial-gradient(circle at 70% 80%, rgba(107,200,240,0.10) 0%, transparent 55%),
+    var(--bg0);
+  /* Respect notch / home-indicator on iPhone X+ — the inset is 0 on a
+     regular Mac desktop browser so this is a no-op there. */
+  padding:
+    max(var(--space-4, 16px), env(safe-area-inset-top))
+    max(var(--space-4, 16px), env(safe-area-inset-right))
+    max(var(--space-4, 16px), env(safe-area-inset-bottom))
+    max(var(--space-4, 16px), env(safe-area-inset-left));
+  /* On narrow phones in landscape, the auth-card + keyboard combined can
+     exceed viewport height — let the overlay scroll instead of trapping
+     the user. */
+  overflow-y: auto;
+}
+:root[data-theme="light"] .auth-overlay {
+  /* Wash the accent gradients lighter so they don't crash on near-white
+     surfaces.  Without this the radial paint reads as a dirty grey haze. */
+  background:
+    radial-gradient(circle at 35% 25%, rgba(240,114,42,0.05) 0%, transparent 60%),
+    radial-gradient(circle at 70% 80%, rgba(107,200,240,0.05) 0%, transparent 55%),
+    var(--bg0);
+}
+.auth-overlay.hidden { display: none; }
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg, 12px);
+  padding: 28px 28px 22px;
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.auth-brand-icon {
+  font-size: 28px;
+  filter: drop-shadow(0 0 8px rgba(107,200,240,0.45));
+}
+.auth-brand-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text0);
+  letter-spacing: 0.5px;
+}
+.auth-title {
+  font-size: 20px;
+  color: var(--text0);
+  margin: 0 0 16px;
+  font-weight: 600;
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.auth-field > span {
+  font-size: 12px;
+  color: var(--text2);
+}
+.auth-field > span em {
+  font-style: italic;
+  color: var(--text2);
+  opacity: 0.7;
+}
+.auth-field input {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  color: var(--text0);
+  padding: 9px 12px;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.auth-field input:focus {
+  border-color: var(--accent);
+  background: var(--bg1);
+}
+.auth-submit {
+  margin-top: 6px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md, 8px);
+  padding: 11px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.05s;
+}
+.auth-submit:hover  { background: var(--accent-dim); }
+.auth-submit:active { transform: translateY(1px); }
+.auth-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.auth-error {
+  margin-top: 4px;
+  padding: 9px 12px;
+  background: rgba(220, 50, 50, 0.16);
+  color: #ffb0b0;
+  border: 1px solid rgba(220, 50, 50, 0.32);
+  border-radius: var(--radius-md, 8px);
+  font-size: 12px;
+}
+:root[data-theme="light"] .auth-error {
+  background: rgba(220, 50, 50, 0.08);
+  color: #8a1f1f;
+  border-color: rgba(220, 50, 50, 0.30);
+}
+.auth-switch {
+  margin-top: 14px;
+  display: flex;
+  justify-content: center;
+}
+.auth-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.auth-link:hover { text-decoration: underline; }
+.auth-bootstrap-hint {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  font-size: 11px;
+  color: var(--text2);
+  line-height: 1.55;
+}
+.auth-bootstrap-hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text0);
+  background: var(--bg3);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+body.auth-blocked { overflow: hidden; }
+/* While the login overlay is up, soften (but don't filter:blur — that
+   produces a dark fringe at the viewport edges where the blur samples
+   beyond the box).  ``pointer-events:none`` + reduced opacity gives a
+   clean dim, and the ``inert`` attribute set via JS removes #app from
+   the tab order so the auth modal is truly modal.  Light-mode users
+   get a brighter target opacity so the page doesn't go inky-black. */
+body.auth-blocked > #app {
+  opacity: 0.22;
+  pointer-events: none;
+  user-select: none;
+  transition: opacity 0.18s ease;
+}
+:root[data-theme="light"] body.auth-blocked > #app { opacity: 0.45; }
+
+/* ── Admin → Users tab ───────────────────────────────────────────────────── */
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  /* On a phone, the 6-column user table doesn't fit in 375px.  Wrap the
+     table in a horizontally scrollable container *and* declare a minimum
+     width so the cells don't squish unreadable.  The wrapper is the
+     ``<tbody>`` parent — making the table itself ``display:block`` would
+     reflow the columns, so we use a CSS-only trick: ``overflow-x: auto``
+     on a positioned parent + ``min-width`` on the table. */
+  min-width: 560px;
+}
+/* Wrap the table in a scrollable region on narrow screens.  The HTML
+   doesn't carry an explicit wrapper, so we use the section parent. */
+#tab-users .admin-section { overflow-x: auto; }
+.users-table th,
+.users-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+.users-table th {
+  color: var(--text2);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.users-table td.col-username { font-weight: 500; color: var(--text0); }
+.users-table .role-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+.role-pill.role-admin    { background: rgba(240,114,42,0.18); color: var(--accent); }
+.role-pill.role-edit     { background: rgba(107,200,240,0.18); color: #6bc8f0; }
+.role-pill.role-readonly { background: rgba(255,255,255,0.10); color: var(--text2); }
+/* Light-mode contrast overrides — dark text on a tinted background so
+   each pill clears WCAG AA 4.5:1 instead of the 1.4–2.0:1 the QA pass
+   measured.  The tile also gets a visible border so the readonly pill
+   doesn't vanish on a near-white background. */
+:root[data-theme="light"] .role-pill.role-admin {
+  background: rgba(240,114,42,0.18);
+  color: #8c3d0e;
+}
+:root[data-theme="light"] .role-pill.role-edit {
+  background: rgba(54,131,184,0.18);
+  color: #1e5274;
+}
+:root[data-theme="light"] .role-pill.role-readonly {
+  background: rgba(0,0,0,0.06);
+  color: var(--text1);
+  border: 1px solid var(--border);
+}
+.users-row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.users-row-actions button {
+  background: var(--bg2);
+  color: var(--text0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  padding: 4px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.users-row-actions button:hover { background: var(--bg3); }
+.users-row-actions button.danger:hover {
+  background: rgba(220,50,50,0.25);
+  border-color: rgba(220,50,50,0.5);
+  color: #ffb0b0;
+}
+.users-new-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr 120px 100px auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+.users-new-form input,
+.users-new-form select {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--text0);
+  border-radius: var(--radius-sm, 4px);
+  padding: 6px 9px;
+  font-size: 12px;
+}
+@media (max-width: 720px) {
+  .users-new-form {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.user-chip[hidden] { display: none; }
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text2);
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+}
+.user-chip-name { color: var(--text0); font-weight: 500; }
+
+/* ── Password dialog (styled prompt replacement) ─────────────────────────── */
+#password-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 21000;            /* above admin overlay (10000) + auth (20000) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  padding:
+    max(16px, env(safe-area-inset-top))
+    max(16px, env(safe-area-inset-right))
+    max(16px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-left));
+  overflow-y: auto;
+}
+#password-dialog.hidden { display: none; }
+.password-dialog-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--panel-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg, 12px);
+  padding: 22px 24px 18px;
+  box-shadow: var(--glass-shadow);
+  margin: 16px;
+}
+.password-dialog-card h3 {
+  font-size: 16px;
+  color: var(--text0);
+  margin: 0 0 6px;
+}
+.password-dialog-message {
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+.password-dialog-field[hidden] { display: none; }
+.password-dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.password-dialog-field > span {
+  font-size: 11px;
+  color: var(--text2);
+}
+.password-dialog-field > span em {
+  font-style: italic;
+  color: var(--text2);
+  opacity: 0.7;
+}
+.password-dialog-field input {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  color: var(--text0);
+  padding: 8px 11px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.password-dialog-field input:focus { border-color: var(--accent); }
+.password-dialog-error {
+  margin-top: 4px;
+  padding: 7px 10px;
+  background: rgba(220,50,50,0.16);
+  color: #ffb0b0;
+  border: 1px solid rgba(220,50,50,0.32);
+  border-radius: var(--radius-sm, 4px);
+  font-size: 12px;
+}
+:root[data-theme="light"] .password-dialog-error {
+  background: rgba(220,50,50,0.08);
+  color: #8a1f1f;
+  border-color: rgba(220,50,50,0.30);
+}
+.password-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.password-dialog-actions button {
+  padding: 8px 16px;
+  border-radius: var(--radius-sm, 4px);
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text0);
+}
+.password-dialog-actions button:hover { background: var(--bg3); }
+.password-dialog-actions button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.password-dialog-actions button[type="submit"]:hover { background: var(--accent-dim); }
+
+/* ── Auth overlay polish: spinner + password toggle ───────────────────── */
+.auth-submit.busy {
+  position: relative;
+  color: transparent;
+  cursor: progress;
+}
+.auth-submit.busy::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  /* Bumped from rgba(255,255,255,0.4) — 2:1 against the accent orange.
+     0.7 alpha clears the ~3:1 non-text-component bar (WCAG 1.4.11). */
+  border: 2px solid rgba(255,255,255,0.7);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: auth-spin 0.8s linear infinite;
+}
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+/* Reduced-motion fallback: the global keyframe cap above kills auth-spin,
+   which leaves a static arc on a button whose text is ``color:transparent``.
+   Restore the visible "Sign in" text instead so the user sees the busy
+   state without an animated ring. */
+@media (prefers-reduced-motion: reduce) {
+  .auth-submit.busy { color: inherit; }
+  .auth-submit.busy::after { display: none; }
+}
+.auth-field {
+  position: relative;
+}
+.auth-field-password { display: flex; }
+.auth-pw-toggle {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  background: none;
+  border: none;
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 14px;
+  /* iOS HIG / Android Material both want 44pt / 48dp minimum tap targets.
+     Bump the toggle so a thumb can reliably hit it on a phone. */
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.auth-pw-toggle:hover { color: var(--text0); }
+/* Reserve room on the input so the eye icon doesn't overlap typed text
+   (Firefox/Safari otherwise paint the caret over the emoji on long pw). */
+.auth-field-password input { padding-right: 48px; }
+
+/* ── Subsonic connection card ─────────────────────────────────────────── */
+.subsonic-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  font-size: 12px;
+}
+.subsonic-card-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.subsonic-card-row label {
+  color: var(--text2);
+  min-width: 84px;
+  font-size: 11px;
+}
+.subsonic-card-row code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--bg3);
+  color: var(--text0);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  user-select: all;
+}
+.subsonic-card-row button {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text0);
+  cursor: pointer;
+}
+.subsonic-card-row button:hover { background: var(--bg4); }
+.subsonic-clients {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.subsonic-client-chip {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  padding: 3px 10px;
+  font-size: 10px;
+  color: var(--text2);
+}
+
+/* ── HVSC field hint ──────────────────────────────────────────────────── */
+.hvsc-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  margin-left: 8px;
+}
+.hvsc-status.on  { color: #6bc8f0; }
+.hvsc-status.off { color: var(--text2); }
+:root[data-theme="light"] .hvsc-status.on { color: #1e5274; }
+.hvsc-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* ── Skeleton screen for the track list ──────────────────────────────── */
+/* Shown the moment a list-load begins (route change, search, etc.).
+   Eight rows of pulsing slabs reserve vertical space + give the user
+   something to look at — Nielsen's "Skeleton screens considered harmful?"
+   research found these *increase* perceived speed over blank spinners
+   when the content geometry is predictable (which a track list is).    */
+.track-skeleton {
+  padding: 4px 0;
+}
+.track-skeleton .skel-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+:root[data-theme="light"] .track-skeleton .skel-row {
+  border-bottom-color: rgba(0, 0, 0, 0.05);
+}
+.track-skeleton .skel-cell {
+  height: 12px;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.04) 0%,
+    rgba(255, 255, 255, 0.10) 50%,
+    rgba(255, 255, 255, 0.04) 100%
+  );
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.4s ease-in-out infinite;
+}
+:root[data-theme="light"] .track-skeleton .skel-cell {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.04) 0%,
+    rgba(0, 0, 0, 0.10) 50%,
+    rgba(0, 0, 0, 0.04) 100%
+  );
+  background-size: 200% 100%;
+}
+.track-skeleton .skel-cell-num    { width: 24px; flex: 0 0 24px; }
+.track-skeleton .skel-cell-title  { flex: 1 1 0; }
+.track-skeleton .skel-cell-artist { flex: 0 0 25%; }
+.track-skeleton .skel-cell-dur    { width: 36px; flex: 0 0 36px; }
+@keyframes skel-shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+/* Honour reduced-motion: a pulsing shimmer is the kind of "interactions
+   animation" 2.3.3 calls out.  Static slabs still convey "structure is
+   coming" without the parallax sweep. */
+@media (prefers-reduced-motion: reduce) {
+  .track-skeleton .skel-cell { animation: none; }
+}
+
+/* Inline cross-tab link — looks like a link, behaves like a button. */
+.admin-inline-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: var(--accent, #4ea8de);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  font: inherit;
+  font-size: inherit;
+}
+.admin-inline-link:hover { text-decoration-style: solid; }
+.admin-inline-link:focus-visible {
+  outline: 2px solid var(--accent, #4ea8de);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ── Chiptune / tracker archive link cards (Settings → Renderers) ───────── */
+.archive-grid {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+.archive-card {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+:root[data-theme="light"] .archive-card {
+  border-color: rgba(0, 0, 0, 0.08);
+  background: rgba(0, 0, 0, 0.02);
+}
+.archive-card:hover {
+  border-color: var(--accent, #4ea8de);
+  background: rgba(78, 168, 222, 0.06);
+}
+.archive-link {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  align-items: flex-start;
+  text-decoration: none;
+  color: inherit;
+}
+.archive-link:focus-visible {
+  outline: 2px solid var(--accent, #4ea8de);
+  outline-offset: -2px;
+}
+.archive-globe {
+  font-size: 22px;
+  flex: 0 0 auto;
+  line-height: 1;
+  margin-top: 2px;
+  opacity: 0.85;
+}
+.archive-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.archive-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.archive-name::after {
+  /* External-link affordance — these cards leave the SoniqBoom UI. */
+  content: " \2197";  /* north-east arrow */
+  font-weight: 400;
+  opacity: 0.55;
+  margin-left: 2px;
+}
+.archive-desc {
+  /* var(--text2) is the audited dim-text token (≥4.5:1 in both themes) —
+     don't use opacity for text dimming or contrast fails AA. */
+  font-size: 12px;
+  color: var(--text2, #b6bcc5);
+  line-height: 1.4;
+}
+.archive-fmt {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text2, #b6bcc5);
+  margin-top: 2px;
+}
+
+/* ── Conversion-cache fill bar (Settings → Renderers) ──────────────────── */
+.cache-fill-wrap {
+  margin: 8px 0 16px 0;
+}
+.cache-fill-bar {
+  position: relative;
+  height: 10px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  overflow: hidden;
+}
+:root[data-theme="light"] .cache-fill-bar {
+  background: rgba(0, 0, 0, 0.08);
+}
+.cache-fill-bar-inner {
+  height: 100%;
+  width: 0;
+  background: var(--accent, #4ea8de);
+  transition: width 250ms ease;
+  border-radius: 5px;
+}
+/* Threshold colours.  Note: colour alone is NOT the state signal — the
+   text label below carries the same info as plain English (WCAG 1.4.1).
+   Light-mode variants honour the lighter background. */
+.cache-fill-bar-inner[data-fill="low"]  { background: #3fa87b; }
+.cache-fill-bar-inner[data-fill="mid"]  { background: #d9a93a; }
+.cache-fill-bar-inner[data-fill="high"] { background: #d94f4f; }
+:root[data-theme="light"] .cache-fill-bar-inner[data-fill="low"]  { background: #2e8a62; }
+:root[data-theme="light"] .cache-fill-bar-inner[data-fill="mid"]  { background: #b08123; }
+:root[data-theme="light"] .cache-fill-bar-inner[data-fill="high"] { background: #b03a3a; }
+.cache-fill-label {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+.cache-breakdown {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 12px 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.cache-breakdown li {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+:root[data-theme="light"] .cache-breakdown li {
+  border-bottom-color: rgba(0, 0, 0, 0.05);
+}
+.cache-breakdown .cache-type { opacity: 0.7; }
+.cache-breakdown .cache-bytes { font-weight: 600; }
+
+/* ── Responsive: tablet & mobile fallback ─────────────────────────────────
+ *
+ * Phones get auto-routed to /m (the dedicated mobile shell) on first visit,
+ * but tablets, foldables, and anyone who pinned ?ui=desktop still land on
+ * this layout.  The rules below keep the rich desktop UI usable down to
+ * ~480 px without rebuilding it from scratch — sidebar collapses to a
+ * slide-in drawer, the track table sheds optional columns, touch targets
+ * grow to the 44 px WCAG minimum, and the player bar reflows into two
+ * stacked rows so the right-side controls don't push off-screen.
+ */
+
+/* Tablet & narrow desktop: tighten the sidebar, grow tap targets, drop
+   the least-essential table columns. */
+@media (max-width: 1024px) {
+  :root {
+    --sidebar-w: 200px;
+  }
+  /* Bring sub-44 px controls up to WCAG 2.5.5 AAA touch target size. */
+  .player-controls button,
+  .header-actions button,
+  .btn-section-toggle,
+  .btn-section-action,
+  .btn-track-info {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* Hide bitrate column first — meta-info, rarely actionable on the go. */
+  #track-table th.col-bitrate,
+  #track-table td.col-bitrate { display: none; }
+}
+
+/* Compact layout: sidebar becomes an off-canvas drawer toggled by the
+   hamburger button.  The drawer overlays the content rather than
+   re-flowing, so the table keeps its width. */
+@media (max-width: 900px) {
+  #sidebar {
+    position: fixed;
+    top: var(--header-h, 52px);
+    left: 0;
+    bottom: var(--player-h, 152px);
+    width: min(86vw, 320px);
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform 200ms ease;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.4), 8px 0 24px rgba(0,0,0,0.35);
+  }
+  #sidebar.is-open {
+    transform: translateX(0);
+  }
+  #sidebar-scrim {
+    position: fixed;
+    inset: var(--header-h, 52px) 0 var(--player-h, 152px) 0;
+    background: rgba(0,0,0,0.45);
+    z-index: 39;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 200ms ease;
+  }
+  #sidebar.is-open ~ #sidebar-scrim,
+  body.sidebar-open #sidebar-scrim {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* Hamburger lives in the header; hidden at desktop widths. */
+  #sidebar-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    background: transparent;
+    border: 1px solid var(--border, rgba(255,255,255,0.1));
+    border-radius: 8px;
+    color: inherit;
+    cursor: pointer;
+    margin-right: 8px;
+  }
+  #sidebar-toggle:focus-visible {
+    outline: 2px solid var(--accent, #4ea8de);
+    outline-offset: 2px;
+  }
+  /* Drop more table columns at tablet width. */
+  #track-table th.col-format,
+  #track-table td.col-format,
+  #track-table th.col-year,
+  #track-table td.col-year,
+  #track-table th.col-location,
+  #track-table td.col-location { display: none; }
+  /* Player bar: stack info row over the controls row so the right cluster
+     no longer collides with the centre cluster. */
+  #player-bar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 100px;
+    padding: 8px 12px;
+  }
+  #player-bar > * { min-width: 0; }
+  .now-playing-art-info { flex: 1 1 100%; }
+  .player-controls { flex: 1 1 auto; justify-content: center; }
+  .player-right { flex: 0 0 auto; gap: 8px; }
+}
+@media (min-width: 901px) {
+  #sidebar-toggle { display: none; }
+}
+
+/* ≤900px stacked rows: instead of (or in addition to) hiding optional
+   columns, give title + artist + duration a vertical layout — keeps
+   metadata legible without overflow.  ``.col-title`` becomes a flex
+   container so the title sits on line 1 with the artist + duration
+   tucked beneath it.  Skeleton rows in this band drop to a single
+   title + a short duration cell. */
+@media (max-width: 900px) {
+  #track-table td.col-title {
+    /* Stack title + artist-and-duration meta below it.  CSS-only — no
+       JS markup changes required; .col-artist / .col-dur cells remain
+       but visually fold under the title on narrow displays. */
+    white-space: normal;
+    line-height: 1.25;
+  }
+  #track-table td.col-title::after {
+    content: "";
+    display: block;
+  }
+  /* Skeleton: drop the artist cell so the responsive row matches the
+     two-line shape that real rows now adopt. */
+  .track-skeleton .skel-row .skel-cell-artist { display: none; }
+  .track-skeleton .skel-row .skel-cell-title  { flex: 1 1 auto; }
+}
+
+/* Phone-width fallback (rare — phones usually hit /m, but a user who
+   forced ?ui=desktop still lands here).  Compress the header, hide the
+   admin overlay's heavy padding, and let dialogs use the full viewport. */
+@media (max-width: 600px) {
+  :root {
+    --header-h: 48px;
+    --player-h: auto;
+  }
+  #header {
+    padding: 0 8px;
+    gap: 6px;
+  }
+  #header .header-search { flex: 1 1 0; min-width: 0; }
+  #header .header-actions { gap: 4px; }
+  #header .logo-text { display: none; }
+  #admin-overlay {
+    width: 100vw;
+    height: 100vh;
+    max-height: 100vh;
+    max-width: 100vw;
+    border-radius: 0;
+    inset: 0;
+  }
+  .password-dialog-card {
+    max-width: calc(100vw - 24px);
+  }
+  /* Drop more columns: title + artist + duration only. */
+  #track-table th.col-album,
+  #track-table td.col-album,
+  #track-table th.col-track,
+  #track-table td.col-track { display: none; }
+  #track-table { font-size: 13px; }
+  #track-table td, #track-table th { padding: 6px 4px; }
+}
+
+/* Landscape phone (≤480 px) — compact even further; hide play seekbar
+   labels, shrink track table to two-column title/duration. */
+@media (max-width: 480px) {
+  #track-table th.col-artist,
+  #track-table td.col-artist { display: none; }
+  .time-display { font-size: 11px; }
+}
+
+/* Narrow-viewport converting badge: reposition into the player-bar info
+   column instead of the content-area top-right (which collides with the
+   stacked-row tracklist on phones). */
+@media (max-width: 600px) {
+  .converting-badge {
+    top: auto;
+    right: 12px;
+    bottom: calc(var(--player-h, 152px) + 8px);
+    font-size: 22px;
+    padding: 6px 14px;
+  }
+}
+
+/* iOS: input font-size must be ≥16px to suppress the auto-zoom-on-focus
+   behaviour Safari triggers when an input is below that threshold.  Scope
+   to touch/narrow viewports so the desktop UI keeps its tighter form
+   chrome — phones/tablets need the bigger input type. */
+@media (hover: none), (max-width: 600px) {
+  input[type="text"],
+  input[type="search"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="tel"],
+  input[type="url"],
+  select,
+  textarea {
+    font-size: max(1em, 16px);
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Settings → Services panel
+   ═══════════════════════════════════════════════════════════════════════════
+   PhD-UX rationale:
+     • The toggle is the ENTIRE row's affordance (click anywhere on the row
+       to flip).  Visually-paired affordance + state per Fitts's Law — the
+       hit target is the full row, not a 30px switch.
+     • Each row carries a one-line "what this service does" hint so the
+       consequence of a toggle is visible without expanding a help section.
+     • "Restart required" banner uses an aria-live region so screen readers
+       announce it as soon as the user flips a toggle.
+     • Toggle visual state derives from a single :checked attribute on a
+       real <input type="checkbox"> — no JS-only state, works without JS,
+       and a sighted-keyboard user gets focus rings for free.
+   ───────────────────────────────────────────────────────────────────────── */
+
+.services-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.services-empty {
+  color: var(--text2);
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+}
+
+.service-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface2, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.service-row:hover {
+  border-color: var(--border-hover, rgba(255, 255, 255, 0.16));
+}
+.service-row.is-disabled .service-name { opacity: 0.6; }
+
+.service-info { min-width: 0; }
+.service-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text1);
+  margin: 0;
+}
+.service-hint {
+  font-size: 12px;
+  color: var(--text2);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+.service-status {
+  font-size: 11px;
+  margin-top: 4px;
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text2);
+}
+.service-status.is-on  { background: rgba(56, 178, 107, 0.18); color: #4ddc8a; }
+.service-status.is-off { background: rgba(220, 80, 70, 0.18);  color: #ff9b8a; }
+
+/* Toggle switch (CSS-only) ────────────────────────────────────────────── */
+.service-toggle {
+  position: relative;
+  display: inline-block;
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+}
+.service-toggle input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.service-toggle .slider {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  transition: background 0.18s;
+  /* Critical: the .slider is later in DOM than the invisible
+     <input> and both are position:absolute with the same z-index,
+     so without pointer-events:none the slider catches every click
+     and the input never sees a "change" event.  ``pointer-events:
+     none`` lets the click fall through to the input below, which
+     is what restores the toggle's click-to-flip behaviour.
+     Verified 2026-05-23 — without this rule, toggles look correct
+     but can't be activated.  Previously hidden because the wrapper
+     was a ``<label>`` whose click-anywhere-to-toggle semantics
+     masked the layering bug.  We're now a ``<span>`` (a11y reasons),
+     so the click forwarding has to be explicit. */
+  pointer-events: none;
+}
+.service-toggle .slider::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.18s;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.service-toggle input:checked + .slider {
+  background: var(--accent);
+}
+.service-toggle input:checked + .slider::after {
+  transform: translateX(18px);
+}
+.service-toggle input:focus-visible + .slider {
+  box-shadow: 0 0 0 3px var(--accent-glow, rgba(240, 114, 42, 0.4));
+}
+.service-toggle .slider { cursor: pointer; }
+.service-toggle:hover .slider { filter: brightness(1.15); }
+
+/* UX-2 P0 contrast fix — don't use 0.6 opacity on dark text-on-dark
+   surface (drops below WCAG 1.4.3 4.5:1).  Use the dedicated muted
+   text token; disabled state is also encoded redundantly via the
+   status pill + slider position. */
+.service-row.is-disabled .service-name { color: var(--text2); opacity: 1; }
+
+/* UX-2 P0 split: status pill shows just "On"/"Off"; pending-restart
+   note appears as a sibling badge only on rows that actually changed
+   this session. */
+.service-pending {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: rgba(220, 180, 60, 0.18);
+  border: 1px solid rgba(220, 180, 60, 0.35);
+  color: #f0d27a;
+  text-transform: lowercase;
+}
+
+/* UX-2 P1: per-row inline error so the user maps a failure back to
+   the specific row that bounced. */
+.service-error {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: rgba(220, 80, 70, 0.10);
+  border-left: 3px solid rgba(220, 80, 70, 0.7);
+  color: #ff9c91;
+  font-size: 12px;
+  border-radius: 0 4px 4px 0;
+}
+
+.services-restart-banner {
+  margin: 0 0 14px 0;
+  padding: 10px 14px;
+  background: rgba(220, 180, 60, 0.08);
+  border: 1px solid rgba(220, 180, 60, 0.18);
+  border-radius: 8px;
+  color: var(--text2);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+.services-restart-banner.is-active {
+  background: rgba(220, 180, 60, 0.16);
+  border-color: rgba(220, 180, 60, 0.4);
+  color: #f5d875;
+}
+.services-restart-banner::before {
+  content: "↻";
+  font-size: 16px;
+}
+.services-restart-msg { flex: 1; }
+.services-restart-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.services-restart-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.services-restart-btn:disabled { opacity: 0.6; cursor: progress; }
+
+@media (max-width: 480px) {
+  /* UX-2 P2: row stacks toggle below hint on narrow viewports. */
+  .service-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .service-toggle {
+    justify-self: end;
+    min-height: 44px;  /* WCAG 2.5.5 target size */
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Cast picker popover
+   ═══════════════════════════════════════════════════════════════════════════
+   PhD-UX rationale: Spotify Connect / Apple AirPlay / YouTube Music all
+   converged on a popover (not a full modal) anchored near the trigger so
+   the listening context stays visible.  This implementation follows that
+   pattern with WCAG 2.1 AA focus management + keyboard navigation.
+   ───────────────────────────────────────────────────────────────────────── */
+
+#cast-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 0 24px 110px 0;      /* sits above the player bar */
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  pointer-events: auto;
+}
+#cast-overlay.hidden { display: none; }
+
+#cast-panel {
+  width: min(380px, calc(100vw - 32px));
+  max-height: min(70vh, 560px);
+  background: var(--surface1, #1d1f24);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 12px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: castSlideUp 0.18s ease-out;
+}
+
+@keyframes castSlideUp {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+
+.cast-header {
+  display: flex;
+  align-items: center;
+  padding: 14px 14px 10px 16px;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.cast-header h3 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text1);
+}
+.cast-icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text2);
+  /* UX-1 P1: 44×44 minimum hit target (WCAG 2.5.5 Enhanced, Apple HIG,
+     Material).  Inner SVG keeps its 14 px visual size — only the click
+     surface grows. */
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+.cast-icon-btn:hover { background: rgba(255, 255, 255, 0.08); color: var(--text1); }
+.cast-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Active session banner ──────────────────────────────────────────────── */
+.cast-active {
+  margin: 10px 12px 0 12px;
+  padding: 10px 12px;
+  /* UX-3 P0 brand fix: was hardcoded blue rgba(74,158,255,*) — switch
+     to the orange --accent token used across the rest of the app. */
+  background: linear-gradient(135deg,
+                              color-mix(in srgb, var(--accent) 14%, transparent),
+                              color-mix(in srgb, var(--accent)  6%, transparent));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 8px;
+}
+.cast-active-codec {
+  font-size: 11px;
+  color: var(--text2);
+  margin-top: 2px;
+  text-transform: lowercase;
+}
+.cast-active.hidden { display: none; }
+.cast-active-row { display: flex; align-items: center; gap: 12px; }
+.cast-active-info { flex: 1; min-width: 0; }
+.cast-active-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text2);
+}
+.cast-active-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.cast-stop-btn {
+  /* UX-1 P1: bump to a touch-friendly hit target (≥44 px minor axis). */
+  background: rgba(220, 80, 70, 0.18);
+  border: 1px solid rgba(220, 80, 70, 0.5);
+  color: #ff9c8d;
+  padding: 10px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  min-height: 36px;
+}
+.cast-stop-btn:hover { background: rgba(220, 80, 70, 0.28); }
+.cast-stop-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* States: loading / empty / error ────────────────────────────────────── */
+.cast-state {
+  padding: 32px 16px;
+  text-align: center;
+}
+.cast-state.hidden { display: none; }
+.cast-state-icon {
+  font-size: 32px;
+  margin-bottom: 12px;
+  opacity: 0.7;
+}
+.cast-state-text { font-size: 14px; color: var(--text1); }
+.cast-state-hint {
+  font-size: 12px;
+  color: var(--text2);
+  margin-top: 6px;
+  line-height: 1.5;
+  max-width: 280px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.cast-spinner {
+  width: 28px;
+  height: 28px;
+  margin: 0 auto 16px auto;
+  border: 2.5px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: castSpin 0.9s linear infinite;
+}
+@keyframes castSpin { to { transform: rotate(360deg); } }
+
+/* UX-1 P0 / P1: inline soft-error banner that keeps the device list
+   visible.  Used by _showInlineBanner in cast_picker.js. */
+.cast-inline-banner {
+  margin: 8px 12px 0 12px;
+  padding: 10px 12px;
+  background: rgba(220, 180, 60, 0.08);
+  border-left: 3px solid rgba(220, 180, 60, 0.5);
+  color: var(--text1);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 0 6px 6px 0;
+}
+.cast-inline-banner-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.cast-inline-banner-btn:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+/* UX-1 P0 retry: action buttons in the error state. */
+.cast-error-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.cast-error-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  min-height: 36px;
+}
+.cast-error-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.cast-error-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cast-error-btn + .cast-error-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+/* Device list ───────────────────────────────────────────────────────── */
+.cast-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.cast-list-item {
+  display: grid;
+  grid-template-columns: 24px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  color: var(--text1);
+  font: inherit;
+  transition: background 0.12s, border-color 0.12s;
+}
+.cast-list-item:hover {
+  background: var(--surface2, rgba(255, 255, 255, 0.05));
+}
+.cast-list-item:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface2, rgba(255, 255, 255, 0.05));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.cast-list-item.is-active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.cast-list-item.is-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.cast-item-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text2);
+}
+.cast-item-icon svg { width: 18px; height: 18px; }
+
+.cast-item-info { min-width: 0; }
+.cast-item-name {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cast-item-meta {
+  font-size: 11px;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 1px;
+}
+
+.cast-item-state {
+  font-size: 11px;
+  color: var(--text2);
+}
+.cast-list-item.is-active .cast-item-state { color: #4ddc8a; }
+
+/* Pref disclosure ───────────────────────────────────────────────────── */
+.cast-pref {
+  margin: 8px 8px 12px 8px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+  padding-top: 8px;
+}
+.cast-pref summary {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text2);
+  cursor: pointer;
+  border-radius: 6px;
+  list-style: none;
+}
+.cast-pref summary::-webkit-details-marker { display: none; }
+.cast-pref summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+}
+.cast-pref[open] summary::before { transform: rotate(90deg); }
+.cast-pref summary:hover { background: var(--surface2, rgba(255, 255, 255, 0.04)); }
+
+.cast-pref-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px 4px 22px;
+}
+.cast-pref-options label {
+  display: grid;
+  grid-template-columns: 16px auto 1fr;
+  gap: 6px;
+  align-items: baseline;
+  padding: 6px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.cast-pref-options label:hover { background: var(--surface2, rgba(255, 255, 255, 0.04)); }
+.cast-pref-options label input { margin: 0; }
+.cast-pref-options label span:nth-of-type(1) {
+  font-weight: 500;
+  color: var(--text1);
+}
+.cast-pref-hint { color: var(--text2); font-size: 11px; }
+
+/* Cast button active-state — pulsing ring while a session is live.
+   UX-1 P1 redundant-encoding fix: also fill the glyph (color +
+   stronger weight) so reduced-motion users — who get the animation
+   killed by the @media block below — still see clear active state. */
+#btn-cast.is-casting {
+  color: var(--accent);
+  position: relative;
+}
+#btn-cast.is-casting svg {
+  /* Stronger stroke + solid fill so the active glyph reads at a glance
+     even without the pulsing ring. */
+  stroke-width: 2.5;
+}
+#btn-cast.is-casting::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border: 1.5px solid var(--accent);
+  border-radius: 8px;
+  animation: castPulse 2.4s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes castPulse {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50%      { opacity: 0.95; transform: scale(1.06); }
+}
+
+/* UX-3 P1: persistent "Casting to X" pill next to #btn-cast so the
+   user sees session state from any view (not only inside the picker). */
+.cast-active-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  margin-left: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 180px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.cast-active-pill.hidden { display: none; }
+.cast-active-pill:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.cast-active-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cast-active-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* UX-1 P0 mobile bottom-sheet — at viewport ≤ 600 px we don't have
+   room for the right-anchored 380 px popover; promote to a full-width
+   sheet rising from the bottom (the YouTube Music / Spotify Connect
+   mobile pattern).  Also reset the player-bar gutter at this width. */
+@media (max-width: 600px) {
+  #cast-overlay {
+    padding: 0;
+    align-items: stretch;
+    justify-content: stretch;
+  }
+  #cast-panel {
+    width: 100%;
+    max-width: 100%;
+    max-height: 85vh;
+    border-radius: 12px 12px 0 0;
+    align-self: flex-end;
+    margin: 0;
+  }
+  .cast-active-pill { display: none; }  /* save toolbar space on mobile */
+}
+
+/* Light theme tweaks ─────────────────────────────────────────────────── */
+[data-theme="light"] #cast-panel {
+  background: #fff;
+  border-color: rgba(0, 0, 0, 0.12);
+}
+[data-theme="light"] .service-row {
+  background: rgba(0, 0, 0, 0.025);
+  border-color: rgba(0, 0, 0, 0.08);
+}
+[data-theme="light"] .service-toggle .slider {
+  background: rgba(0, 0, 0, 0.2);
+}
+/* UX-3 P1 light-mode contrast fixes — the previous gradient + colour
+   combo dropped below WCAG 1.4.3 4.5:1 on white surface.  Lift the
+   contrast by darkening the band tint. */
+[data-theme="light"] .cast-active {
+  background: linear-gradient(135deg,
+                              color-mix(in srgb, var(--accent) 18%, transparent),
+                              color-mix(in srgb, var(--accent)  9%, transparent));
+}
+[data-theme="light"] .cast-stop-btn {
+  color: #b03830;
+  background: rgba(220, 80, 70, 0.10);
+  border-color: rgba(220, 80, 70, 0.45);
+}
+
+/* Reduced motion override ───────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  #cast-panel,
+  #btn-cast.is-casting::after {
+    animation: none;
+  }
+  /* UX-1 P2: don't let the spinner become an invisible incomplete
+     circle.  Replace the animation with a static accent-coloured ring
+     (still communicates "loading" by visual presence). */
+  .cast-spinner {
+    animation: none;
+    border-top-color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+    opacity: 0.7;
+  }
+}
+
+/* ── ffmpeg incomplete-binary banner ─────────────────────────────────
+   Shown under the Renderer Status grid when the running ffmpeg is
+   missing required encoders/demuxers.  Offers a one-click refetch. */
+.ffmpeg-banner {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: rgba(240, 184, 64, 0.10);
+  border: 1px solid rgba(240, 184, 64, 0.35);
+  border-left: 4px solid #f0b840;
+  border-radius: 6px;
+  color: var(--text1);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.ffmpeg-banner.hidden { display: none; }
+.ffmpeg-banner-text { flex: 1; min-width: 240px; }
+.ffmpeg-banner-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  min-height: 36px;
+}
+.ffmpeg-banner-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.ffmpeg-banner-btn:disabled { opacity: 0.6; cursor: progress; }
+.ffmpeg-banner-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.ffmpeg-banner-error {
+  flex-basis: 100%;
+  margin-top: 6px;
+  color: #ff9c8d;
+  font-size: 12px;
 }
