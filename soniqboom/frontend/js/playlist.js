@@ -355,7 +355,10 @@ function _renderTracks() {
     // would happily extract on-demand, so we ask for that endpoint
     // unconditionally and let the img stay transparent (placeholder
     // shows through) when the request 404s.
-    const artSrc = track.id ? `/api/art/${track.id}?size=sm` : '';
+    // ``fallback=404`` so an art-less track 404s (→ <img> onerror removes it)
+    // and the format-emoji placeholder shows, instead of the endpoint's
+    // generic ♪ placeholder JPEG painting over it.
+    const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
       ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" alt="">` : ''}

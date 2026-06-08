@@ -500,38 +500,21 @@ async def cast_stream(
 
 
 # ── Rendered-source cache-key inference ──────────────────────────────────
-# cast_render uses different format_types depending on the source.  This
-# mirror lets cast_stream pin the right key without importing cast_render's
-# internals.  Audio-2 P0 noted that without pinning, an N+1 prewarm's
-# _maybe_evict can unlink the rendered WAV mid-stream.
-
-_SID_EXTS = {".sid"}
-_MIDI_EXTS = {".mid", ".midi", ".kar"}
-_TRACKER_EXTS = {".mod", ".s3m", ".xm", ".it", ".mptm", ".669", ".far", ".mtm"}
-_GME_EXTS = {".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz", ".ay", ".kss", ".sap", ".gym", ".hes"}
+# cast_stream must PIN the exact conversion-cache key cast_render populated,
+# else the N+1 prewarm's evictor can unlink the rendered WAV mid-stream
+# (Audio-2 P0).  Delegated to cast_render.rendered_cache_key — the SINGLE
+# source of truth — so the ext sets + per-format key params (SID duration,
+# MIDI soundfont, subsong) can never drift from what cast_render renders.
+# A divergent inline copy previously omitted .psid, most tracker extensions,
+# the SID duration, and the live MIDI soundfont, so those keys never matched
+# and the pins silently no-op'd.
 
 
 def _guess_rendered_ck(track_id: str, src_ext: str, subsong: int) -> str | None:
-    """Build the conversion-cache key cast_render would have populated.
-
-    Returns ``None`` for ffmpeg-native sources (no rendered cache entry
-    to pin) or unknown extensions."""
-    e = (src_ext or "").lower()
+    """Build the conversion-cache key cast_render would have populated, or
+    ``None`` for ffmpeg-native / unknown sources."""
     try:
-        if e in _SID_EXTS:
-            return _ck(track_id=track_id, format_type="sid", subsong=subsong)
-        if e in _MIDI_EXTS:
-            # Soundfont path defaults to the configured one; cast_render
-            # uses settings.midi_soundfont_path at render time.
-            from soniqboom.config import settings as _s
-            return _ck(
-                track_id=track_id, format_type="midi",
-                soundfont_path=getattr(_s, "midi_soundfont_path", None),
-            )
-        if e in _TRACKER_EXTS:
-            return _ck(track_id=track_id, format_type="tracker", subsong=subsong)
-        if e in _GME_EXTS:
-            return _ck(track_id=track_id, format_type="gme", subsong=subsong)
+        from soniqboom.core.cast_render import rendered_cache_key
+        return rendered_cache_key(track_id, src_ext, subsong)
     except Exception:
         return None
-    return None

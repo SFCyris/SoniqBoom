@@ -1298,6 +1298,21 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                         except Exception:
                             pass
 
+        elif ext in (".hvl", ".ahx") and len(raw) >= 6:
+            # AHX / HivelyTracker store the song name as a NUL-terminated
+            # string at the big-endian offset in bytes 4-5 — per the
+            # HivelyTracker replay (hvl2wav/replay.c):
+            #   strncpy(ht_Name, &buf[(buf[4]<<8)|buf[5]], 128)
+            # Offset 0 (the generic heuristic below) is the format MAGIC
+            # ("HVL\0" / "THX\0"), so every module would get title "HVL"/"THX"
+            # and distinct files collapse under duplicate-filtering.
+            name_off = (raw[4] << 8) | raw[5]
+            if 0 < name_off < len(raw):
+                end = raw.find(b"\x00", name_off)
+                if end == -1:
+                    end = min(name_off + 128, len(raw))
+                title = _decode_tracker_str(raw[name_off:end])
+
         else:
             # Other tracker formats — try reading first 20 bytes as title
             if len(raw) >= 20:
@@ -1334,11 +1349,15 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     except Exception:
         pass  # openmpt123 not available or failed — duration stays 0
 
+    # Fallback title from the INNER filename for zip-virtual paths
+    # ("a.zip::b.zip::song.hvl" → "song"); plain path.stem would otherwise
+    # yield the mangled "a.zip::b.zip::song" string as the title.
+    fallback = Path(str(path).split("::")[-1]).stem
     d: dict = {
         "id": track_id,
         "path": str(path),
         "format": fmt,
-        "title": title or path.stem,
+        "title": title or fallback,
         "duration": duration,
         "genre": ["Tracker", "Module"],
     }

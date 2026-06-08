@@ -309,6 +309,21 @@ let _vuChannelCount = 0;
 // Re-use the shared tracker format set (plus SID for VU meters)
 const _TRACKER_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID']);
 
+// Read the opt-in VU render style ('bars' | 'circuit') from the shared viz
+// settings.  Read directly from localStorage to avoid an import cycle with
+// the viz engine module — the key/shape is the engine's ``sb_viz_settings``.
+function _readVuStyle() {
+  try {
+    const s = JSON.parse(localStorage.getItem('sb_viz_settings') || '{}');
+    // Circuit only when the master + now-playing groups are on AND the user
+    // picked the circuit style.  Otherwise fall back to bars.
+    if (s.enabled === false || s.nowPlaying === false) return 'bars';
+    return s.vuStyle === 'circuit' ? 'circuit' : 'bars';
+  } catch {
+    return 'bars';
+  }
+}
+
 // VU draw cadence — pinned to 15 Hz instead of the browser's
 // requestAnimationFrame default (60 Hz).  The earlier 60 Hz draw was
 // what triggered Firefox audio underruns: the main thread spending
@@ -319,33 +334,106 @@ const _VU_INTERVAL_MS = 66;
 let _vuDrawTimer = null;
 let _vuBuffer = null;
 let _vuRunning = false;
+// prefers-reduced-motion gate for the VU meter.  The bars are driven by a JS
+// setTimeout loop writing the `--vu-level` custom property as an inline style;
+// the global CSS animation-neutralizer only catches @keyframes, NOT inline
+// custom-property mutations, so reduced-motion must be enforced here in JS.
+const _vuRM = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
 
-function _initVU(channelCount) {
+function _initVU(channelCount, opts) {
   if (!vuContainer) return;
   _stopVU();
 
+  const useVUMR = !!(opts && opts.useVUMR);
+  // Restore the parsed VUMR sidecar AFTER _stopVU cleared it — see
+  // _handleVU for the reasoning.  When useVUMR is false (FFT path),
+  // ``_vumr`` stays null and the FFT branch in _drawVU drives the bars.
+  if (useVUMR && opts.vumr) {
+    _vumr = opts.vumr;
+  }
   _vuChannelCount = channelCount || 4;
   vuContainer.innerHTML = '';
   vuContainer.hidden = false;
   _vuBars = [];
 
+  // Responsive preset: pick a layout based on bar width at the
+  // container's current width.  Re-evaluated on every track change;
+  // not on resize (cheap to re-init by triggering _handleVU again
+  // from a resize handler if needed).
+  // Decide whether this init is happening in (or destined for) the
+  // track-info modal vs the player bar — affects the density tiers.
+  // We read it from the actual parent at init time; _placeVUContainer
+  // will trigger a rebuild if the destination changes mid-life.
+  const _tiArtNow      = document.getElementById('ti-art');
+  const isInModalNow   = vuContainer.parentNode === _tiArtNow;
+  const hostWidth      = vuContainer.clientWidth
+                         || (isInModalNow ? 260 : window.innerWidth || 800);
+  const preset = _layoutPreset(_vuChannelCount, hostWidth, isInModalNow);
+  vuContainer.dataset.preset = preset;
+  vuContainer.dataset.source = useVUMR ? 'vumr' : 'fft';
+  // VU render style — opt-in "circuit board" (PCB) skin driven by the same
+  // ``--vu-level`` per-channel data as the bars.  Only applied for real
+  // VUMR sidecars (tracker formats); the FFT-fallback path always stays on
+  // honest bars.  Read from the viz settings (localStorage); default bars.
+  vuContainer.dataset.style = (useVUMR && _readVuStyle() === 'circuit')
+    ? 'circuit' : 'bars';
+
   for (let i = 0; i < _vuChannelCount; i++) {
+    const col = document.createElement('div');
+    col.className = 'vu-col';
+
     const bar = document.createElement('div');
     bar.className = 'vu-bar';
     bar.style.setProperty('--vu-hue', `${(i * 360 / _vuChannelCount) + 15}`);
-    vuContainer.appendChild(bar);
+    col.appendChild(bar);
+
+    // Per-channel label visibility:
+    //   roomy    → "CH:N" + pan circles    (≤4 ch in modal, wide in bar)
+    //   compact  → "N"    + pan circles    (5-8 ch)
+    //   numeric  → "N"    no pan           (>8 ch — keeps density manageable)
+    //   mini     → no label, no pan         (truly narrow bars)
+    if (preset !== 'mini') {
+      const label = document.createElement('div');
+      label.className = 'vu-col-label';
+      label.textContent = preset === 'roomy' ? `CH:${i + 1}` : `${i + 1}`;
+      col.appendChild(label);
+
+      // Pan circles only meaningful with real VUMR data and only
+      // legible when there's room (i.e. roomy / compact).  Numeric &
+      // mini omit them.
+      if (preset !== 'numeric') {
+        const panRow = document.createElement('div');
+        panRow.className = 'vu-col-pan';
+        const panVal = useVUMR && _vumr ? (_vumr.pan[i] || 0) : 0;
+        panRow.textContent = _buildPanCircle(panVal);
+        col.appendChild(panRow);
+      }
+    }
+
+    vuContainer.appendChild(col);
     _vuBars.push(bar);
   }
 
-  // Prefer the dedicated zero-smoothing tap (Player.vuAnalyser) — its
-  // ``smoothingTimeConstant`` is 0 so the bars react frame-by-frame
-  // with no decay tail.  Fall back to the shared analyser if for some
-  // reason the dedicated tap wasn't created.
+  // If the track-info modal is already open when a new tracker/SID
+  // track starts playing, the meters need to be re-parented onto the
+  // cover-art box right now — the dedicated open/close listeners
+  // (defined further down) only fire on overlay open/close.  Calling
+  // unconditionally keeps the container in the player bar otherwise.
+  if (typeof _placeVUContainer === 'function') _placeVUContainer();
+
+  if (useVUMR) {
+    // No AnalyserNode needed — VUMR path indexes by audio.currentTime.
+    _vuAnalyser = null;
+    _vuBuffer = null;
+    _vuRunning = true;
+    _scheduleNextVU();
+    return;
+  }
+
+  // FFT-spectrum fallback path.
   try {
     _vuAnalyser = Player.vuAnalyser || Player.analyser || null;
     if (!_vuAnalyser) {
-      // No audio context yet (e.g. autoplay-blocked) — fall back to
-      // pure CSS animation so the row still feels alive.
       _vuBars.forEach(bar => bar.classList.add('vu-animated'));
       return;
     }
@@ -354,16 +442,9 @@ function _initVU(channelCount) {
     return;
   }
 
-  // Pre-allocate the buffer once per analyser.  The size never changes
-  // for a given analyser node — only re-alloc if the analyser itself
-  // changed (e.g. Player rebuilt its graph between tracks).
   if (!_vuBuffer || _vuBuffer.length !== _vuAnalyser.frequencyBinCount) {
     _vuBuffer = new Uint8Array(_vuAnalyser.frequencyBinCount);
   }
-  // Self-rescheduling setTimeout chain — exits when document.hidden
-  // becomes true (no setInterval ticking pointlessly in a hidden tab,
-  // chewing CPU + draining battery).  ``visibilitychange`` re-arms the
-  // chain so it resumes naturally when the tab comes back.
   _vuRunning = true;
   _scheduleNextVU();
 }
@@ -375,15 +456,51 @@ function _scheduleNextVU() {
     _vuDrawTimer = null;
     return;
   }
+  if (_vuRM && _vuRM.matches) {
+    // Reduced motion: paint one representative static frame and stop the
+    // chain.  The bars stay visibly present but do not dance.
+    _freezeVU();
+    _vuDrawTimer = null;
+    return;
+  }
   _vuDrawTimer = setTimeout(() => {
     _drawVU();
     _scheduleNextVU();
   }, _VU_INTERVAL_MS);
 }
 
+/** Pin every VU bar to a fixed representative level (reduced-motion). */
+function _freezeVU() {
+  for (let ch = 0; ch < _vuChannelCount; ch++) {
+    if (_vuBars[ch]) _vuBars[ch].style.setProperty('--vu-level', '0.4');
+  }
+}
+
 function _drawVU() {
-  if (!_vuAnalyser || !_vuBars.length || !_vuBuffer) return;
-  if (document.hidden) return;   // tab not visible — skip the work entirely
+  if (!_vuBars.length) return;
+  if (document.hidden) return;
+
+  // VUMR (real per-channel) path — index by audio.currentTime.
+  if (_vumr) {
+    const t = (Player && typeof Player.currentTime === 'number')
+              ? Player.currentTime : 0;
+    const frameIdx = Math.min(
+      _vumr.frames - 1,
+      Math.max(0, Math.floor(t * _vumr.rateHz)),
+    );
+    const base = frameIdx * _vumr.channels;
+    for (let ch = 0; ch < _vuChannelCount; ch++) {
+      const raw = _vumr.samples[base + ch] / 255;
+      // Mild gamma so quiet hits register visually without compressing
+      // the loud end.  0.7 matches the FFT path for visual consistency.
+      const level = Math.pow(raw, 0.7);
+      _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
+    }
+    return;
+  }
+
+  // FFT-spectrum fallback path.
+  if (!_vuAnalyser || !_vuBuffer) return;
   _vuAnalyser.getByteFrequencyData(_vuBuffer);
   const bufLen = _vuBuffer.length;
   const binsPerChannel = Math.floor(bufLen / _vuChannelCount);
@@ -394,10 +511,6 @@ function _drawVU() {
     for (let i = start; i < end && i < bufLen; i++) sum += _vuBuffer[i];
     const avg = sum / binsPerChannel / 255;
     const level = Math.pow(avg, 0.7);
-    // No smoothing — bars snap to the current frame's value in both
-    // directions.  Some baseline smoothing still comes from the
-    // upstream AnalyserNode's smoothingTimeConstant; if you want the
-    // bars even more raw, drop that to 0 in the player.
     _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
   }
 }
@@ -409,6 +522,18 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && _vuRunning && !_vuDrawTimer) _scheduleNextVU();
 });
 
+// Re-evaluate when the reduced-motion preference flips at runtime: freeze the
+// bars if it turns on, re-arm the draw chain if it turns off mid-playback.
+if (_vuRM) {
+  const _onVuRM = () => {
+    if (!_vuRunning || document.hidden) return;
+    if (_vuRM.matches) _freezeVU();
+    else if (!_vuDrawTimer) _scheduleNextVU();
+  };
+  if (_vuRM.addEventListener) _vuRM.addEventListener('change', _onVuRM);
+  else if (_vuRM.addListener) _vuRM.addListener(_onVuRM);   // Safari < 14
+}
+
 function _stopVU() {
   _vuRunning = false;
   if (_vuDrawTimer) {
@@ -419,9 +544,6 @@ function _stopVU() {
     cancelAnimationFrame(_vuAnimFrame);
     _vuAnimFrame = null;
   }
-  // We no longer create a private analyser, so nothing to disconnect.
-  // Keep the cleanup defensive in case an older code path still owned
-  // a node (e.g. saved session, hot-reload during dev).
   if (_vuAnalyser && typeof _vuAnalyser.disconnect === 'function'
       && _vuAnalyser !== Player.analyser) {
     try { _vuAnalyser.disconnect(); } catch (_) {}
@@ -433,22 +555,290 @@ function _stopVU() {
   _vuBars = [];
   _vuAnalyser = null;
   _vuBuffer = null;
+  _vumr = null;   // clear the cached sidecar so the next track gets a fresh fetch
+}
+
+// ── Per-channel VU sidecar (VUMR v1) ─────────────────────────────────
+//
+// When the backend has a ``.vu`` sidecar for the current track (real
+// per-channel data from libopenmpt), we fetch it and drive the bars
+// from it directly — indexed by ``audio.currentTime``.  When no
+// sidecar is available, we fall back to the existing FFT-spectrum
+// visualiser and label it honestly so the user knows what they're
+// looking at.
+//
+// VUMR binary layout (see docs/vu-cache-format.md):
+//   0..4   "VUMR"
+//   4      version (0x01)
+//   5      channels N (1..32)
+//   6      flags  (reserved)
+//   7      reserved
+//   8..12  sample_rate_hz (uint32 LE)
+//   12..16 frame_count    (uint32 LE)
+//   16..16+N        pan per channel (uint8: 0=center, 1=left, 2=right)
+//   16+N..end       mono amplitude (frames * channels * uint8)
+
+let _vumr = null;   // { channels, rateHz, frames, samples (Uint8Array), pan (Uint8Array) }
+let _vuFallbackLabel = null;   // <div> appended below bars when in FFT mode
+
+const _VUMR_MAGIC_STR = 'VUMR';
+
+// FFT fallback bar count.  Fixed regardless of track.channels — the
+// fallback is an honest spectrum analyzer, not a faux per-voice
+// meter.  32 bars hit the sweet spot: visually rich, fits even narrow
+// player widths at ~25 px per bar on a 800-px-wide player.
+const _FFT_FALLBACK_BARS = 32;
+
+function _parseVUMR(arrayBuf) {
+  const dv = new DataView(arrayBuf);
+  if (arrayBuf.byteLength < 16) return null;
+  const magic = String.fromCharCode(
+    dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3),
+  );
+  if (magic !== _VUMR_MAGIC_STR) return null;
+  const version = dv.getUint8(4);
+  if (version !== 1) return null;
+  const channels = dv.getUint8(5);
+  const rateHz   = dv.getUint32(8, true);
+  const frames   = dv.getUint32(12, true);
+  if (channels < 1 || channels > 32) return null;
+  if (rateHz < 1 || rateHz > 240) return null;
+  const headerSize = 16 + channels;
+  const expectedTotal = headerSize + frames * channels;
+  if (arrayBuf.byteLength < expectedTotal) return null;
+  const pan     = new Uint8Array(arrayBuf, 16, channels);
+  const samples = new Uint8Array(arrayBuf, headerSize, frames * channels);
+  return { channels, rateHz, frames, pan, samples };
+}
+
+async function _fetchVUMR(trackId) {
+  if (!trackId) return null;
+  try {
+    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu`,
+                            { credentials: 'include' });
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    return _parseVUMR(buf);
+  } catch {
+    return null;
+  }
+}
+
+function _buildPanCircle(panValue) {
+  // panValue: 0=center, 1=left, 2=right
+  const left   = panValue === 1 ? '●' : '○';
+  const center = panValue === 0 ? '●' : '○';
+  const right  = panValue === 2 ? '●' : '○';
+  return left + center + right;
+}
+
+function _layoutPreset(channels, hostWidth, inModal) {
+  // Density tiers — user-requested for the modal cover-art box where
+  // 16ch FastTracker / ScreamTracker bars were too dense at 260px:
+  //   ≤4 ch  → roomy   (CH:N + pan)
+  //   5-8 ch → compact (N    + pan)
+  //   >8 ch  → numeric (N    no pan)
+  //
+  // In the player bar (wider canvas, often 800-1200 px) the channel-
+  // count rule still applies as a CEILING, but width can demote
+  // further (e.g. a narrow mobile bar → ``mini`` with no labels).
+  if (inModal) {
+    if (channels <= 4) return 'roomy';
+    if (channels <= 8) return 'compact';
+    return 'numeric';
+  }
+  const barW = hostWidth / Math.max(1, channels);
+  if (barW < 15) return 'mini';
+  if (channels <= 4 && barW >= 60) return 'roomy';
+  if (channels <= 8) return 'compact';
+  return 'numeric';
+}
+
+function _addFallbackLabel(format) {
+  // The label lives inside ``.player-progress`` and is positioned
+  // ABSOLUTELY below the seek-bar / waveform row.  ``.player-progress``
+  // is already ``position: relative`` (see ``css/app.css`` "Seek bar
+  // sits above the waveform"), so ``top: 100%`` lands the label just
+  // under the waveform without taking flex-flow space — the seek bar
+  // and waveform keep their original geometry, only the label rides
+  // below.  Earlier revisions parented this to ``.player-meta`` (next
+  // to the title), which the user reported as visually disconnected
+  // from the spectrum it describes.  Visual flow now:
+  //
+  //   ┌─────────┐  Title
+  //   │  cover  │  meta tags
+  //   │   art   │  path crumb     [ ▒▒▒▒ waveform/seek bar ▒▒▒▒ ]
+  //   └─────────┘                 Spectrum — per-voice meters not yet…
+  //
+  const host = document.querySelector('.player-progress');
+  if (!host) return;
+  const msg = `Spectrum — per-voice meters not yet available for ${format}`;
+  if (_vuFallbackLabel && _vuFallbackLabel.parentNode === host) {
+    _vuFallbackLabel.textContent = msg;
+    return;
+  }
+  _vuFallbackLabel = document.createElement('div');
+  _vuFallbackLabel.className = 'vu-fallback-label';
+  _vuFallbackLabel.textContent = msg;
+  // Absolute positioning keeps the label out of the flex row so the
+  // seek-bar + waveform layout is unchanged.  ``top: 100%`` anchors
+  // at the bottom of ``.player-progress`` (which is the seek-bar
+  // row); the waveform canvas is centred on the seek-bar and extends
+  // ~(WAVE_H/2 - seek_h/2) ≈ 20 px BELOW that bottom.  Margin-top
+  // pushes the label past the waveform's bottom edge so the spectrum
+  // and label never collide.  ``pointer-events: none`` so the label
+  // never intercepts seek-bar clicks.
+  _vuFallbackLabel.style.cssText = (
+    'position:absolute;top:100%;left:0;right:0;'
+    + `margin-top:${Math.round(WAVE_H / 2 - 1)}px;text-align:center;`
+    + 'font-size:10px;line-height:1.2;color:var(--text2,#888);'
+    + 'opacity:0.65;font-style:italic;'
+    + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
+    + 'pointer-events:none;'
+  );
+  host.appendChild(_vuFallbackLabel);
+}
+
+function _removeFallbackLabel() {
+  if (_vuFallbackLabel) {
+    _vuFallbackLabel.remove();
+    _vuFallbackLabel = null;
+  }
+}
+
+// ── VU container placement (player bar vs track-info modal) ──────────
+//
+// When the track-info modal opens, the FFT/VU bars are dramatically
+// more useful as an overlay on the 260×260 cover-art box than buried
+// behind the modal in the player bar (the modal occludes the player
+// bar at typical desktop sizes).  We move the SAME ``#vu-meters``
+// element between the two parents — the ``_vuBars`` references inside
+// it survive the reparent, so the draw loop keeps animating without
+// re-init.  On close we put it back in front of ``.player-art-info``
+// to match the original DOM order.
+const _tiOverlayEl  = document.getElementById('ti-overlay');
+const _tiArtEl      = document.getElementById('ti-art');
+const _playerBarEl  = document.getElementById('player-bar');
+
+// The track currently DISPLAYED in the track-info modal.  The modal
+// has prev/next navigation, so the displayed track may differ from
+// the playing track.  We park the VU overlay on the modal's cover
+// art ONLY when these match — otherwise an XM file's info card
+// would carry the playing SID's FFT spectrum, which is a visual lie
+// (user-reported D12).
+let _modalDisplayedTrackId = null;
+
+function _placeVUContainer() {
+  if (!vuContainer) return;
+  const modalOpen = _tiOverlayEl && !_tiOverlayEl.classList.contains('hidden');
+  const playingId = (typeof Player !== 'undefined' && Player.currentTrack)
+    ? Player.currentTrack.id
+    : null;
+  const modalShowsPlaying = modalOpen
+    && _modalDisplayedTrackId
+    && playingId
+    && _modalDisplayedTrackId === playingId;
+
+  const oldParent = vuContainer.parentNode;
+  let parentChanged = false;
+
+  if (modalShowsPlaying && _tiArtEl) {
+    if (vuContainer.parentNode !== _tiArtEl) {
+      _tiArtEl.appendChild(vuContainer);
+      parentChanged = true;
+    }
+    // ALWAYS sync the class with the modal state — even if the
+    // container is already parented correctly.  Without this, an
+    // earlier reparent that crashed mid-way could leave the class
+    // out of sync with the parentNode (QA-flagged P0 — the close
+    // event dispatch could in principle land mid-throw on the
+    // listener and skip the previous unconditional remove).
+    vuContainer.classList.add('in-modal');
+  } else {
+    // Modal closed, no #ti-art element, OR modal showing a DIFFERENT
+    // track than the one playing — VU lives in the player bar.
+    // Removing the class FIRST so even if the reparent below short-
+    // circuits, the class is in a consistent state with the
+    // container's actual position.
+    vuContainer.classList.remove('in-modal');
+    if (_playerBarEl && vuContainer.parentNode !== _playerBarEl) {
+      const artInfo = _playerBarEl.querySelector('.player-art-info');
+      if (artInfo) _playerBarEl.insertBefore(vuContainer, artInfo);
+      else         _playerBarEl.appendChild(vuContainer);
+      parentChanged = true;
+    }
+  }
+
+  // When the container crossed from one parent to the other AND we
+  // have an active VU display, rebuild the bars so the density tier
+  // (roomy / compact / numeric / mini) matches the new container's
+  // width.  Without this, a 16-channel tracker that initialised in
+  // the wide player bar (preset=numeric) carries those columns into
+  // the 260 px modal box unchanged (still legible because they share
+  // the same preset), but more importantly a 4-channel ProTracker
+  // that started in the player bar (preset=numeric due to width)
+  // shows up in the modal without the CH:N labels the user expects
+  // for ≤4 channels.
+  if (parentChanged && oldParent && !vuContainer.hidden && _vuChannelCount > 0) {
+    const useVUMR = !!_vumr;
+    _initVU(_vuChannelCount, { useVUMR, vumr: _vumr });
+  }
+}
+
+// Listen for modal open / close / render — dispatched from
+// trackinfo.js.  ``trackinfo:render`` carries ``{trackId}`` for the
+// currently-displayed track; ``trackinfo:close`` resets the tracked
+// id so a re-open without an immediate render doesn't see stale
+// state.
+if (_tiOverlayEl) {
+  _tiOverlayEl.addEventListener('trackinfo:open', _placeVUContainer);
+  _tiOverlayEl.addEventListener('trackinfo:close', () => {
+    _modalDisplayedTrackId = null;
+    _placeVUContainer();
+  });
+  _tiOverlayEl.addEventListener('trackinfo:render', (e) => {
+    _modalDisplayedTrackId = e?.detail?.trackId || null;
+    _placeVUContainer();
+  });
 }
 
 /** Init the VU meters for tracker / SID formats; tear down otherwise. */
-function _handleVU(track) {
-  if (!track) { _stopVU(); return; }
-  // ``_TRACKER_FORMATS`` stores mixed-case names ("ProTracker",
-  // "ScreamTracker 3", "SID"…) so we match the raw format string, not
-  // an upper-cased version.  Strip the "AAC/M4A"-style slash labels
-  // first by taking the primary token.
+async function _handleVU(track) {
+  if (!track) { _stopVU(); _removeFallbackLabel(); return; }
   const primary = String(track.format || '').split('/')[0].trim();
-  if (!_TRACKER_FORMATS.has(primary)) { _stopVU(); return; }
-  // Channel count: track.channels is the file's channel count for
-  // trackers (set by openmpt123 metadata extract); fall back to 4 for
-  // SID + classic ProTracker.
-  const ch = Math.max(1, Math.min(32, Number(track.channels) || 4));
-  _initVU(ch);
+  if (!_TRACKER_FORMATS.has(primary)) {
+    _stopVU();
+    _removeFallbackLabel();
+    return;
+  }
+  const fmtLabel = primary || 'this format';
+  const trackChannels = Math.max(1, Math.min(32, Number(track.channels) || 4));
+
+  // Try the real per-channel sidecar first.  Tracker formats:
+  // ``/api/tracks/<id>/vu`` runs a lazy backfill against the source
+  // file on cache miss (see _try_backfill_vu_sidecar in api/tracks.py),
+  // so a 200 here means real per-channel data on the very first play.
+  // Chip formats (SID, NSF, SPC, …): no Python binding exists yet for
+  // libsidplay/libgme, so the server returns 404 and we render the
+  // honest fallback below.
+  const fetched = await _fetchVUMR(track.id);
+  if (fetched) {
+    // Pass the parsed sidecar through opts — _initVU() unconditionally
+    // calls _stopVU() which would otherwise clear ``_vumr`` to null
+    // before the per-column pan render reads it.  Assigning after
+    // _stopVU runs preserves the pan data.
+    _initVU(fetched.channels, { useVUMR: true, vumr: fetched });
+    _removeFallbackLabel();
+  } else {
+    // Honest 32-bin FFT spectrum analyzer.  Channel count is fixed at
+    // _FFT_FALLBACK_BARS irrespective of track.channels — the bars
+    // are frequency bins, not voices.  Showing 3 bars for SID would
+    // imply "voice 1 / 2 / 3 meters" while in fact each bar is a
+    // slice of the post-mix stereo FFT spectrum (low / mid / high) —
+    // visually plausible, factually misleading.
+    _initVU(_FFT_FALLBACK_BARS, { useVUMR: false });
+    _addFallbackLabel(fmtLabel);
+  }
 }
 
 // Optimistic Play: flip the button icon the moment the user clicks,
@@ -666,25 +1056,26 @@ function _buildMetaTags(track) {
   playerMetaTags.replaceChildren(...children);
 }
 
-// ── Build "Playing Now: /path/ > folder > folder" breadcrumb ─────────────────
+// ── Build "Playing Now: <filename>" crumb ───────────────────────────────────
+//
+// Earlier revisions rendered the full breadcrumb chain
+// (``Volumes › Music › Tracker_SID › … › <file>.sid``) here so users
+// could click a parent folder to jump there.  That made the player bar
+// noisy for deeply-nested paths — a SID three folders deep into HVSC
+// would push the title off-screen on narrow viewports.  The full path
+// is available in the track-info modal (#ti-path), so the player bar
+// now shows just the filename and lets the modal carry the navigation
+// affordance.
 function _buildPathCrumb(track) {
   const raw = track.path || '';
-  // Strip ZIP virtual path (outer.zip::member → show the zip's directory)
-  const fsPath = raw.includes('::') ? raw.split('::')[0] : raw;
+  // Strip ZIP virtual path (outer.zip::member → show the inner file)
+  const fsPath = raw.includes('::')
+    ? raw.split('::').pop()      // member path inside the zip
+    : raw;
   const parts = fsPath.split('/').filter(Boolean);
-
   if (!parts.length) { playerPathCrumb.replaceChildren(); return; }
 
-  // Build cumulative paths for each segment
-  let cumulative = '';
-  const segments = [];
-  for (const part of parts) {
-    cumulative += '/' + part;
-    segments.push({ label: part, path: cumulative });
-  }
-
-  // Last segment is the filename — show without a link
-  const fileSegment = segments.pop();
+  const filename = parts[parts.length - 1];
 
   const children = [];
   const label = document.createElement('span');
@@ -693,35 +1084,15 @@ function _buildPathCrumb(track) {
   children.push(label);
   children.push(document.createTextNode(' '));
 
-  segments.forEach((seg, idx) => {
-    if (idx > 0) {
-      const sep = document.createElement('span');
-      sep.className = 'crumb-sep';
-      sep.textContent = '›';
-      children.push(sep);
-    }
-    const a = document.createElement('a');
-    a.className = 'crumb-link';
-    a.href = '#';
-    a.dataset.path = seg.path;
-    a.title = seg.path;
-    a.textContent = seg.label;
-    a.addEventListener('click', (e) => {
-      e.preventDefault();
-      Library.showFolder(seg.path);
-    });
-    children.push(a);
-  });
-
-  if (segments.length) {
-    const sep = document.createElement('span');
-    sep.className = 'crumb-sep';
-    sep.textContent = '›';
-    children.push(sep);
-  }
   const fileEl = document.createElement('span');
   fileEl.className = 'crumb-file';
-  fileEl.textContent = fileSegment.label;
+  fileEl.textContent = filename;
+  // Hover shows the full ORIGINAL path (including the ZIP parent for
+  // archive members, e.g. ``/.../archive.zip::inner.mod``) so power
+  // users still have one-glance access without opening the info
+  // modal.  Using ``raw`` rather than ``fsPath`` preserves the
+  // ``::`` separator on archive paths.
+  fileEl.title = raw;
   children.push(fileEl);
 
   playerPathCrumb.replaceChildren(...children);
@@ -756,49 +1127,54 @@ Player.on('trackchange', (track) => {
   });
 
   // Always try the art API — it extracts embedded + folder art lazily.
-  // Only fall back to the placeholder emoji if the API returns 404.
-  // ``decoding="async"`` + ``img.decode()`` ensures the image is fully
-  // decoded *off* the main thread before we commit to display — no
-  // half-painted flash on track change, GPU-paint only at insert time.
+  // ``fallback=404`` tells the server to return a cacheable 404 (no
+  // body) instead of the generic grey placeholder JPEG when the track
+  // has no real art.  The browser's IMG.onerror then fires, and we
+  // render the format-specific emoji (🕹️ SID, 💾 tracker, 🎼 MIDI…).
+  // This restores the browser's image pipeline — bitmap-cache, image-
+  // priority queue, lazy-loading — which the earlier fetch+blob+
+  // ObjectURL "read the X-SoniqBoom-Art header" approach destroyed
+  // (regression D14: folder-open latency went from ~50 ms to several
+  // seconds for big SID/MOD directories).
   {
-    const artSrc = track.cover_art || `/api/art/${track.id}?size=sm`;
-    // Preload + decode the cover image off the main thread.  The decoded
-    // resource enters the browser's HTTP cache, so the subsequent
-    // ``background-image: url(...)`` assignments on the ambient-glow
-    // elements pick up the same bytes without re-fetching.  We can't
-    // hand a decoded image to a background-image directly — that's a
-    // limitation of CSS background images — but the cache hit avoids
-    // the duplicate network round-trip and the background-image paint
-    // can use the already-decoded pixels.
-    const img = new Image();
-    img.decoding = 'async';
-    img.onload = async () => {
-      try {
-        if (typeof img.decode === 'function') await img.decode();
-      } catch (_) { /* decode unsupported in older browsers — fine, onload already done */ }
-      playerArt.innerHTML = '';
-      playerArt.appendChild(img);
-      img.alt = 'cover';
-      // Ambient art background glow in player bar — uses the now-cached
-      // resource so this is a paint-only operation, not a fresh fetch.
-      const bg = document.getElementById('player-art-bg');
-      bg.style.backgroundImage = `url("${artSrc}")`;
-      bg.classList.add('active');
-      // Sidebar ambient glow
-      const sg = document.getElementById('sidebar-glow');
-      if (sg) { sg.style.backgroundImage = `url("${artSrc}")`; sg.classList.add('active'); }
-      // Header ambient glow
-      const hg = document.getElementById('header-glow');
-      if (hg) { hg.style.backgroundImage = `url("${artSrc}")`; hg.classList.add('active'); }
-    };
-    img.onerror = () => {
+    const artSrc = track.cover_art || `/api/art/${track.id}?size=sm&fallback=404`;
+    // Glows use the placeholder branch (no &fallback=404) so the
+    // background-image URL the browser stores at cache key
+    // ``/api/art/X?size=sm`` is the visible-grey JPEG.  If the IMG
+    // path 404s we strip the glow classes; if it 200s we paint them.
+    const glowSrc = track.cover_art || `/api/art/${track.id}?size=sm`;
+    const reqTrackId = track.id;
+    const _renderEmojiFallback = () => {
       playerArt.innerHTML = `<span class="art-placeholder">${artPlaceholderEmoji(track)}</span>`;
       const bg = document.getElementById('player-art-bg');
-      bg.classList.remove('active');
+      if (bg) bg.classList.remove('active');
       const sg = document.getElementById('sidebar-glow');
       if (sg) sg.classList.remove('active');
       const hg = document.getElementById('header-glow');
       if (hg) hg.classList.remove('active');
+    };
+    const img = new Image();
+    img.decoding = 'async';
+    img.alt = 'cover';
+    img.onload = async () => {
+      try {
+        if (typeof img.decode === 'function') await img.decode();
+      } catch (_) { /* decode unsupported in older browsers — fine */ }
+      // Re-check the staleness after the await — another track
+      // change may have landed while we were decoding.
+      if (Player.currentTrack && Player.currentTrack.id !== reqTrackId) return;
+      playerArt.innerHTML = '';
+      playerArt.appendChild(img);
+      const bg = document.getElementById('player-art-bg');
+      if (bg) { bg.style.backgroundImage = `url("${glowSrc}")`; bg.classList.add('active'); }
+      const sg = document.getElementById('sidebar-glow');
+      if (sg) { sg.style.backgroundImage = `url("${glowSrc}")`; sg.classList.add('active'); }
+      const hg = document.getElementById('header-glow');
+      if (hg) { hg.style.backgroundImage = `url("${glowSrc}")`; hg.classList.add('active'); }
+    };
+    img.onerror = () => {
+      if (Player.currentTrack && Player.currentTrack.id !== reqTrackId) return;
+      _renderEmojiFallback();
     };
     img.src = artSrc;
   }
@@ -941,6 +1317,7 @@ const views = {
   albums:        () => Library.showAlbums(),
   genres:        () => Library.showGenres(),
   years:         () => Library.showYears(),
+  galaxy:        () => Library.showGalaxy(),
 };
 
 // Smart playlist views (fetched from /api/smart/* endpoints)
@@ -1455,10 +1832,19 @@ function _armStuckBadgeWatchdog() {
         setTimeout(() => { scanBadge.hidden = true; }, 4000);
         _disarmStuckBadgeWatchdog();
         try {
-          Library.showAll();
           Library.refreshBadges();
-          FolderTree.refresh();
           FolderTree.setScanActive(false);
+          // Same in-place rule as the WS completion handler: don't reset a
+          // folder viewer to root (the HTTP status carries last_dirs too).
+          const finished = Array.isArray(st.last_dirs) ? st.last_dirs : [];
+          if (Library.isInFolderView && Library.isInFolderView()) {
+            if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
+              Library.refreshCurrentFolderInPlace();
+            }
+          } else {
+            Library.showAll();
+          }
+          FolderTree.refresh();
         } catch (_) { /* defensive — module may not be ready */ }
       }
     } catch (_) {
@@ -1486,26 +1872,26 @@ function connectWS() {
         // ``pct:0, total:0`` payload while it walks the FS to *count*
         // files — at that point "0% (0/0)" reads as broken to users.
         // Show a friendlier "counting" label until totals are known.
-        scanBadge.hidden = false;
-        if (!msg.total) {
-          scanBadge.textContent = 'Scanning… (counting files)';
-        } else {
-          scanBadge.textContent = `Scanning ${msg.pct}% (${msg.processed}/${msg.total})`;
-        }
-        FolderTree.setScanActive(true);
-        // Safety net for the badge-stuck-at-99% bug: if processed has
-        // caught up to total (or close to it) but ``running`` is still
-        // true, the server is doing post-scan work (dedup, aggregation
-        // cache, sort-index rebuild) — that can take 5–20 s on big
-        // libraries.  Schedule a poll that asks the HTTP status
-        // endpoint for the real state every 3 s; the moment the
-        // backend says ``running:false`` we flip the badge to "Done"
-        // ourselves without waiting for a (potentially missed) WS
-        // broadcast.  Cleared by any non-running scan_progress event.
-        if (msg.total && msg.processed >= msg.total) {
-          _armStuckBadgeWatchdog();
-        } else {
-          _disarmStuckBadgeWatchdog();
+        // Silent freshness scans (drill-down refresh) never show the badge or
+        // the tree spinner — they update the open folder in place on
+        // completion, so navigation stays quiet until new files appear.
+        if (!msg.silent) {
+          scanBadge.hidden = false;
+          if (!msg.total) {
+            scanBadge.textContent = 'Scanning… (counting files)';
+          } else {
+            scanBadge.textContent = `Scanning ${msg.pct}% (${msg.processed}/${msg.total})`;
+          }
+          FolderTree.setScanActive(true);
+          // Safety net for the badge-stuck-at-99% bug: post-scan work (dedup,
+          // aggregation cache, sort-index rebuild) can keep running:true for
+          // 5–20 s.  Poll the HTTP status so we flip to "Done" even if the
+          // final WS frame is missed.  Cleared by any non-running event.
+          if (msg.total && msg.processed >= msg.total) {
+            _armStuckBadgeWatchdog();
+          } else {
+            _disarmStuckBadgeWatchdog();
+          }
         }
       } else if (msg.embedding) {
         // Phase 1 done, phase 2 embedding in background.  Distinct label
@@ -1513,19 +1899,40 @@ function connectWS() {
         scanBadge.hidden = false;
         scanBadge.textContent = 'Computing embeddings…';
         _disarmStuckBadgeWatchdog();
-        // Library is already usable — refresh now
-        Library.showAll();
+        // Library is already usable — refresh, but don't yank a folder viewer
+        // back to root just because phase-2 embeddings started.
+        if (!(Library.isInFolderView && Library.isInFolderView())) {
+          Library.showAll();
+        }
         FolderTree.refresh();
         FolderTree.setScanActive(true);
       } else {
-        // Both phases complete
-        scanBadge.textContent = `Done \u2014 ${msg.processed} tracks`;
-        setTimeout(() => { scanBadge.hidden = true; }, 4000);
+        // Both phases complete.  Silent freshness scans skip the "Done" badge
+        // but still update the open folder in place.
+        if (!msg.silent) {
+          scanBadge.textContent = `Done \u2014 ${msg.processed} tracks`;
+          setTimeout(() => { scanBadge.hidden = true; }, 4000);
+        }
         _disarmStuckBadgeWatchdog();
-        Library.showAll();
         Library.refreshBadges();
-        FolderTree.refresh();
         FolderTree.setScanActive(false);
+        // Refresh the MAIN panel by what the user is actually looking at.
+        // The old unconditional Library.showAll() reset the view to root on
+        // EVERY scan completion \u2014 the "re-index finishes and I lose my place"
+        // bug.  Now: a folder viewer whose folder the scan touched gets an
+        // in-place refresh (scroll kept); an untouched folder is left alone;
+        // only a NON-silent (explicit re-index) completion with no open folder
+        // falls back to showAll().  The in-place refresh runs for silent +
+        // visible scans alike, so drill-down freshness updates quietly.
+        const finished = Array.isArray(msg.last_dirs) ? msg.last_dirs : [];
+        if (Library.isInFolderView && Library.isInFolderView()) {
+          if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
+            Library.refreshCurrentFolderInPlace();
+          }
+        } else if (!msg.silent) {
+          Library.showAll();
+        }
+        FolderTree.refresh();   // sidebar tree only \u2014 surfaces new subfolders
       }
     } else if (msg.event === 'repair_progress') {
       // The metadata repair task (admin > Library > Repair Garbled
@@ -1580,6 +1987,18 @@ const _shortcutsOverlay = document.getElementById('shortcuts-overlay');
 document.getElementById('shortcuts-close').addEventListener('click', () => _shortcutsOverlay.classList.add('hidden'));
 _shortcutsOverlay.addEventListener('click', (e) => { if (e.target === _shortcutsOverlay) _shortcutsOverlay.classList.add('hidden'); });
 
+// ── Find-music (archives & demoscene) overlay ────────────────────────────────
+// Top-bar globe button → a focused popup of external archive links, available
+// to every user (not buried in the admin-only Settings panel).
+const _linksOverlay = document.getElementById('links-overlay');
+const _btnLinks     = document.getElementById('btn-links');
+if (_btnLinks && _linksOverlay) {
+  const _linksClose = document.getElementById('links-close');
+  _btnLinks.addEventListener('click', () => _linksOverlay.classList.remove('hidden'));
+  if (_linksClose) _linksClose.addEventListener('click', () => _linksOverlay.classList.add('hidden'));
+  _linksOverlay.addEventListener('click', (e) => { if (e.target === _linksOverlay) _linksOverlay.classList.add('hidden'); });
+}
+
 // ``_prevVolume`` is declared earlier (near the volume bar init) so the
 // glyph mute toggle and this keyboard handler share the same restore
 // value across the lifetime of the page.
@@ -1625,6 +2044,10 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Escape') {
     if (!_shortcutsOverlay.classList.contains('hidden')) {
       _shortcutsOverlay.classList.add('hidden');
+      return;
+    }
+    if (_linksOverlay && !_linksOverlay.classList.contains('hidden')) {
+      _linksOverlay.classList.add('hidden');
       return;
     }
     return; // let other handlers handle their own Escape

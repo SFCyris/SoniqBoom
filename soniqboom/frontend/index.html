@@ -119,6 +119,7 @@
                   title="Sign out" aria-label="Sign out"
                   style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:13px;padding:0 0 0 4px">⎋</button>
         </span>
+        <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
         <button id="btn-admin" title="Admin settings" aria-label="Admin settings">&#9881;</button>
       </div>
     </header>
@@ -139,6 +140,7 @@
             <li data-view="albums"       tabindex="0" role="button">Albums</li>
             <li data-view="genres"       tabindex="0" role="button">Genres</li>
             <li data-view="years"        tabindex="0" role="button">Years</li>
+            <li data-view="galaxy"       tabindex="0" role="button">Galaxy</li>
           </ul>
           <div id="browse-filter-wrap" hidden>
             <input id="browse-filter" type="search" placeholder="Filter…" autocomplete="off">
@@ -234,6 +236,10 @@
         </div>
 
         <div id="album-grid" hidden></div>
+
+        <!-- Library Galaxy view (viz #6) — mounted by library.js on first
+             entry; every format a constellation. -->
+        <div id="galaxy-view" class="viz-host" hidden></div>
 
         <canvas id="visualizer-canvas" aria-hidden="true"></canvas>
         <div id="now-playing-art" class="now-playing-art" hidden>
@@ -551,6 +557,9 @@
               still feels instant.  If the server allows fewer than your
               configured total, we automatically clamp to its limit.
             </p>
+            <!-- FTP lanes viz (#3) — mounted by admin.js; polls
+                 /api/admin/ftp-pool/status. -->
+            <div id="viz-ftp-lanes" class="viz-host" style="height:150px;margin-bottom:12px" hidden></div>
             <div class="admin-ftp-pool-list" id="admin-ftp-pool-list"></div>
             <div id="admin-ftp-pool-msg" class="admin-msg" style="display:none"></div>
           </div>
@@ -582,6 +591,9 @@
                 Pause
               </button>
             </h3>
+            <!-- Scan flow viz (#1) — mounted by admin.js; fed real files/sec
+                 from the scan_progress WS event. -->
+            <div id="viz-scan-flow" class="viz-host" style="height:170px;margin-bottom:12px" hidden></div>
             <div class="scan-progress-wrap">
               <div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill"></div></div>
               <div class="scan-progress-text" id="scan-progress-text"></div>
@@ -727,6 +739,9 @@
               <li><span class="cache-type">Chiptune (GME)</span> <span class="cache-bytes" id="cache-bytes-gme">—</span></li>
               <li><span class="cache-type">Transcoded</span> <span class="cache-bytes" id="cache-bytes-transcoded">—</span></li>
             </ul>
+            <!-- Cache cascade viz (#2) — live hit/miss flow across the cache
+                 tiers; mounted by admin.js, polls /api/admin/cache-stats. -->
+            <div id="viz-cache-cascade" class="viz-host" style="height:230px;margin:6px 0 14px" hidden></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button id="btn-cache-clear-transcoded" class="btn-secondary" type="button">
                 Clear transcoded only
@@ -773,124 +788,6 @@
               </button>
             </div>
             <div id="admin-hvsc-msg" class="admin-msg" style="display:none"></div>
-          </div>
-
-          <!-- Chiptune & tracker archives — external catalogs the user
-               can browse for source files.  We don't ingest them
-               automatically; the operator downloads what they want,
-               drops it in a scan dir, and SoniqBoom indexes it. -->
-          <div class="admin-section">
-            <h3>&#127760; Chiptune &amp; tracker archives</h3>
-            <p class="admin-hint" style="margin-bottom:12px">
-              <strong>External links</strong> — each card opens an archive
-              in a new tab.  SoniqBoom does <em>not</em> auto-ingest from
-              these.  Download what you want, drop it in a scan directory,
-              and the renderers (sidplayfp / libgme / openmpt) handle
-              playback.  HVSC metadata + Songlengths wire in via the HVSC
-              panel above.
-            </p>
-            <ul class="archive-grid" id="archive-grid">
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="https://www.hvsc.de/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">HVSC</span>
-                    <span class="archive-desc">
-                      High Voltage SID Collection &mdash; the canonical
-                      Commodore 64 .sid archive (~60k tunes).  Pair with
-                      Songlengths.md5 for per-tune durations.
-                    </span>
-                    <span class="archive-fmt">.sid / .psid</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="https://modarchive.org/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">The Mod Archive</span>
-                    <span class="archive-desc">
-                      Largest tracker module collection on the web
-                      (~280k modules).  Curated genres and Amiga/PC
-                      tracker scene compilations.
-                    </span>
-                    <span class="archive-fmt">.mod / .xm / .it / .s3m / &hellip;</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="http://sndh.atari.org/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">SNDH archive</span>
-                    <span class="archive-desc">
-                      Atari ST / STe / Falcon YM2149 chiptunes.  Use the
-                      libgme renderer (covers SNDH via .sndh / .ym).
-                    </span>
-                    <span class="archive-fmt">.sndh / .ym</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="https://zxart.ee/eng/music/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">ZXAART (ZX-Art)</span>
-                    <span class="archive-desc">
-                      ZX Spectrum AY-3-8910 chiptunes plus demoscene
-                      classics.  AY files render via libgme; raw
-                      Spectrum modules via openmpt.
-                    </span>
-                    <span class="archive-fmt">.ay / .pt3</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="https://amp.dascene.net/list.php?fcat=AHX"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">AMP / AHX</span>
-                    <span class="archive-desc">
-                      Amiga Music Preservation's AHX section.  AHX is
-                      Amiga's 4-channel chiptune format; rendered via
-                      openmpt's AHX support.
-                    </span>
-                    <span class="archive-fmt">.ahx / .hvl</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
-                   href="https://amp.dascene.net/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">Amiga Music Preservation</span>
-                    <span class="archive-desc">
-                      Top-level AMP catalog: ProTracker / OctaMED /
-                      FastTracker / Composer modules from the Amiga
-                      demoscene.  Browse by author or by year.
-                    </span>
-                    <span class="archive-fmt">.mod / .med / &hellip;</span>
-                  </span>
-                </a>
-              </li>
-            </ul>
-            <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
-              Want a real remote-source ingest of one of these?  Open an
-              issue with the FTP / HTTP listing format and we'll plumb it
-              through the FileSource backend.
-            </p>
           </div>
 
           <!-- Soundfonts -->
@@ -994,8 +891,20 @@
                 <input id="setting-scan-zips" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>Filter Duplicates <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Hide lower-quality copies of the same track">&#9432;</span></label>
+                <label>Scan ZIPs on remote shares <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Also crack open .zip files on FTP/SMB sources and index the songs inside. Each archive is downloaded once to the cache, so this is heavier than local zip scanning.">&#9432;</span></label>
+                <input id="setting-scan-remote-zips" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label>Hide duplicates in search <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="In search and library views, hide lower-quality copies of the same track (keeps the best encoding). Does not affect folder browsing.">&#9432;</span></label>
                 <input id="setting-filter-duplicates" type="checkbox">
+              </div>
+              <div class="admin-setting">
+                <label>Hide duplicates when browsing folders <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When browsing the folder tree, collapse duplicate alternate encodings of a track. Off by default — folder views show every audio file actually on disk.">&#9432;</span></label>
+                <input id="setting-dedup-folders" type="checkbox">
+              </div>
+              <div class="admin-setting">
+                <label>Do not display empty folders <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Hide subfolders that contain no playable audio anywhere — photo dumps, video-only directories, build outputs sharing a scan root with the music library.">&#9432;</span></label>
+                <input id="setting-hide-empty-folders" type="checkbox">
               </div>
               <div class="admin-setting">
                 <label>Use Folder Art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
@@ -1025,6 +934,40 @@
                 <select id="setting-theme">
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- ── Visualizations (client-side preference, applies instantly) ── -->
+            <h3 style="margin:28px 0 4px">&#10024; Visualizations</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              Animated overlays in the player, library and admin panels. These
+              are a per-device preference and apply immediately.  If your system
+              requests reduced motion, all animations stay frozen regardless of
+              these switches.
+            </p>
+            <div class="admin-settings-grid">
+              <div class="admin-setting">
+                <label for="setting-viz-enabled">Enable visualizations <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Master switch for every animated visualization.">&#9432;</span></label>
+                <input id="setting-viz-enabled" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-viz-nowplaying">Now-playing <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Decode signal-chain, CRT oscilloscope mode and the VU meter skin on the player screen.">&#9432;</span></label>
+                <input id="setting-viz-nowplaying" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-viz-library">Library <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="The Galaxy view — every format a drifting constellation.">&#9432;</span></label>
+                <input id="setting-viz-library" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-viz-admin">Admin diagnostics <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Scan-pipeline flow, cache-hit cascade and FTP-pool lanes in the admin panels.">&#9432;</span></label>
+                <input id="setting-viz-admin" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-viz-vustyle">VU meter style <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Bars: classic level meters. Circuit board: glowing PCB pads on copper traces.">&#9432;</span></label>
+                <select id="setting-viz-vustyle">
+                  <option value="bars">Bars</option>
+                  <option value="circuit">Circuit board</option>
                 </select>
               </div>
             </div>
@@ -1529,6 +1472,13 @@
                  the file has MP4 chpl atoms or ID3 CHAP frames. -->
             <div id="ti-chapters" class="ti-chapters" hidden></div>
 
+            <!-- Signal path (viz #4) — per-format decode pipeline, mounted
+                 by trackinfo.js when the viz "now-playing" group is on. -->
+            <div class="ti-section" id="ti-section-signal" hidden>
+              <div class="ti-section-hdr">Signal path</div>
+              <div id="ti-signal-chain" class="viz-host"></div>
+            </div>
+
           </div>
 
           <!-- Lyrics pane -->
@@ -1588,6 +1538,201 @@
     </div>
   </div>
 
+  <!-- ── Find music (archives & demoscene links) overlay ──────────── -->
+  <div id="links-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="links-title">
+    <div id="links-panel">
+      <div class="shortcuts-header">
+        <span class="shortcuts-title" id="links-title">&#127760; Find music &mdash; archives &amp; demoscene</span>
+        <button id="links-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="links-body">
+          <!-- Chiptune & tracker archives — external catalogs the user
+               can browse for source files.  We don't ingest them
+               automatically; the operator downloads what they want,
+               drops it in a scan dir, and SoniqBoom indexes it. -->
+          <div class="admin-section">
+            <h3>&#127760; Chiptune &amp; tracker archives</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              <strong>External links</strong> — each card opens an archive
+              in a new tab.  SoniqBoom does <em>not</em> auto-ingest from
+              these.  Download what you want, drop it in a scan directory,
+              and the renderers (sidplayfp / libgme / openmpt) handle
+              playback.  HVSC metadata + Songlengths wire in via the HVSC
+              panel in Settings.
+            </p>
+            <ul class="archive-grid" id="archive-grid">
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://www.hvsc.de/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">HVSC</span>
+                    <span class="archive-desc">
+                      High Voltage SID Collection &mdash; the canonical
+                      Commodore 64 .sid archive (~60k tunes).  Pair with
+                      Songlengths.md5 for per-tune durations.
+                    </span>
+                    <span class="archive-fmt">.sid / .psid</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://modarchive.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">The Mod Archive</span>
+                    <span class="archive-desc">
+                      Largest tracker module collection on the web
+                      (~280k modules).  Curated genres and Amiga/PC
+                      tracker scene compilations.
+                    </span>
+                    <span class="archive-fmt">.mod / .xm / .it / .s3m / &hellip;</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="http://sndh.atari.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">SNDH archive</span>
+                    <span class="archive-desc">
+                      Atari ST / STe / Falcon YM2149 chiptunes.  Use the
+                      libgme renderer (covers SNDH via .sndh / .ym).
+                    </span>
+                    <span class="archive-fmt">.sndh / .ym</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://zxart.ee/eng/music/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">ZXAART (ZX-Art)</span>
+                    <span class="archive-desc">
+                      ZX Spectrum AY-3-8910 chiptunes plus demoscene
+                      classics.  AY files render via libgme; raw
+                      Spectrum modules via openmpt.
+                    </span>
+                    <span class="archive-fmt">.ay / .pt3</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://amp.dascene.net/list.php?fcat=AHX"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">AMP / AHX</span>
+                    <span class="archive-desc">
+                      Amiga Music Preservation's AHX section.  AHX is
+                      Amiga's 4-channel chiptune format; rendered via
+                      openmpt's AHX support.
+                    </span>
+                    <span class="archive-fmt">.ahx / .hvl</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://amp.dascene.net/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">Amiga Music Preservation</span>
+                    <span class="archive-desc">
+                      Top-level AMP catalog: ProTracker / OctaMED /
+                      FastTracker / Composer modules from the Amiga
+                      demoscene.  Browse by author or by year.
+                    </span>
+                    <span class="archive-fmt">.mod / .med / &hellip;</span>
+                  </span>
+                </a>
+              </li>
+            </ul>
+            <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
+              Want a real remote-source ingest of one of these?  Open an
+              issue with the FTP / HTTP listing format and we'll plumb it
+              through the FileSource backend.
+            </p>
+          </div>
+
+          <!-- Demoscene — latest releases.  Distinct from the format-specific
+               archives above: these are the scene's *release* hubs where the
+               newest tracked/chip music shows up first (party music-compos +
+               fresh uploads).  Links verified live 2026-06. -->
+          <div class="admin-section">
+            <h3>&#10024; Demoscene &mdash; latest releases</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Where the <strong>newest</strong> scene music lands &mdash; party
+              music-compo entries and fresh uploads.  Same flow as above:
+              download into a scan directory (scene.org also exposes FTP, so a
+              remote FileSource can point straight at it).
+            </p>
+            <ul class="archive-grid">
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://files.scene.org/browse/parties/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">scene.org &mdash; parties</span>
+                    <span class="archive-desc">
+                      The demoscene file archive.  Each party folder (Revision,
+                      Assembly, The Gathering &hellip;) holds that event's
+                      music-compo entries &mdash; the freshest tracked &amp; chip
+                      music, right after the show.  FTP / open-directory access
+                      for bulk grabs.
+                    </span>
+                    <span class="archive-fmt">.mod / .xm / .it / .sid / &hellip;</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://demozoo.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">Demozoo</span>
+                    <span class="archive-desc">
+                      The scene's release database.  Filter to <em>Music</em>
+                      productions and sort by newest for direct downloads with
+                      proper composer / group credits.
+                    </span>
+                    <span class="archive-fmt">tracked &amp; streamed music</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="https://www.pouet.net/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">Pou&euml;t</span>
+                    <span class="archive-desc">
+                      The scene's prod board &mdash; &ldquo;latest released
+                      prods&rdquo; including musicdisks, with votes &amp;
+                      comments to surface the standouts.
+                    </span>
+                    <span class="archive-fmt">demoscene prods / musicdisks</span>
+                  </span>
+                </a>
+              </li>
+            </ul>
+          </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Keyboard shortcuts overlay ─────────────────────────────────────── -->
   <div id="shortcuts-overlay" class="hidden">
     <div id="shortcuts-panel">
@@ -1637,7 +1782,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=80"></script>
+  <script type="module" src="/assets/js/app.js?v=84"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

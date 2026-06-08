@@ -2,6 +2,7 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0       # pulls websockets, uvloop, watchfiles
 mutagen>=1.47.0
+lhafile>=0.3.1                  # Amiga LHA/LZH archive reading (scan inside .lha)
 aiofiles>=23.2.1
 pydantic>=2.6.0
 pydantic-settings>=2.2.0

@@ -43,6 +43,8 @@ from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable
 
 from soniqboom.core.metadata import SUPPORTED_EXTENSIONS, extract
+from soniqboom.core import diskimage
+from soniqboom.core import archive
 from soniqboom.core.art_cache import store_full_art_batch, store_thumbs_batch
 from soniqboom.core.data import (
     delete_track_ids,
@@ -101,6 +103,12 @@ class ScanProgress:
     # so this reflects the most recent scan.  Empty dict pre-first-
     # scan.
     last_plan:    dict = field(default_factory=dict)
+    # Resolved absolute paths covered by the most-recent scan.  Unlike
+    # ``current_dirs`` (cleared the instant a scan finishes), this SURVIVES
+    # completion so the ``running:false`` broadcast tells the frontend which
+    # folder(s) just finished — letting it refresh the open folder IN PLACE
+    # instead of resetting the whole tree.  Set at scan start.
+    last_dirs:    list = field(default_factory=list)
 
     def pct(self) -> int:
         return min(100, int(self.processed / self.total * 100)) if self.total else 0
@@ -116,6 +124,7 @@ class ScanProgress:
             "current_file": self.current_file,
             "paused":       is_scan_paused(),
             "last_plan":    dict(self.last_plan),
+            "last_dirs":    list(self.last_dirs),
         }
         # Append queue info (combine local + remote active dirs)
         all_active = set(_current_scan_dirs) | _current_remote_dirs
@@ -349,6 +358,22 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                     except (zipfile.BadZipFile, OSError) as exc:
                         log.warning("Cannot read ZIP %s: %s", full, exc)
 
+                elif scan_zips and diskimage.is_disk_image(lower):
+                    # Crack open vintage disk images (C64 .d64/.d71/.d81,
+                    # Amiga .adf) and surface embedded SID / tracker tunes as
+                    # ``::``-members — exactly like ZIP entries.
+                    try:
+                        for member in diskimage.list_members(full):
+                            files.append(Path(f"{full}::{member}"))
+                    except OSError as exc:
+                        log.warning("Cannot read disk image %s: %s", full, exc)
+
+                elif scan_zips and lower.endswith((".lha", ".lzh")):
+                    # Amiga LHA/LZH archives — surface the modules inside
+                    # (handles the ``MOD.title`` Amiga prefix naming).
+                    for member in archive.list_members(full):
+                        files.append(Path(f"{full}::{member}"))
+
         result[str(p)] = sorted(set(files))
         if skipped_junk:
             log.info("Discovered %d audio files in %s (skipped %d OS junk file(s))",
@@ -496,9 +521,23 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
     Supports paths like:
       /path/archive.zip::track.sid
       /path/outer.zip::inner.zip::track.mod
+      /path/disk.d64::THE RUNNER.sid          (C64/Amiga disk images)
 
     Returns (file_bytes, final_member_name).
     """
+    # Vintage disk images (C64 .d64/.d71/.d81, Amiga .adf) are read by the
+    # diskimage module.  They don't nest, so the member is everything after
+    # the first ``::``.
+    outer = virtual_path.split("::", 1)[0]
+    if diskimage.is_disk_image(outer) and "::" in virtual_path:
+        member = virtual_path.split("::", 1)[1]
+        return diskimage.read_member(outer, member), member
+    # Amiga LHA/LZH (and the same generic path works for a local cached zip):
+    # no nesting, so the member is everything after the first ``::``.
+    if archive.is_lha_name(outer) and "::" in virtual_path:
+        member = virtual_path.split("::", 1)[1]
+        return archive.read_member(outer, member), member
+
     import io
     import zipfile
 
@@ -516,8 +555,10 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
     # For 1-deep nesting (common case) stay with the in-memory read —
     # avoids the disk syscall when the member is small.
     if len(parts) == 2:
-        with zipfile.ZipFile(parts[0], 'r') as zf:
-            return zf.read(parts[1]), parts[-1]
+        # Route the common single-level case through the cached archive reader
+        # so a huge LOCAL zip doesn't re-open per member (the same O(n^2) the
+        # FTP path hit on a 4491-member archive).
+        return archive.read_member(parts[0], parts[1]), parts[-1]
 
     # Deeper nesting: pass through tempfiles.
     current_zip_path = parts[0]
@@ -881,19 +922,34 @@ async def _run_duplicate_detection_async() -> None:
     finally:
         dup_executor.shutdown(wait=False)
 
-    # Apply annotations in small batches with yield points
+    # Apply annotations in batches with yield points.  Two anti-bloat
+    # measures, both load-bearing on a 170K-track library:
+    #   1. SKIP tracks whose annotation is UNCHANGED.  This pass runs at
+    #      scan-end AND at shutdown; the shutdown run almost always finds the
+    #      annotations already current (the last scan set them), so without
+    #      this guard it rewrites all ~170K tracks for nothing — a 170K-entry
+    #      AOF that the merger (SIGKILLed at shutdown) never truncates, which
+    #      then makes the *next* startup's AOF replay pathological.
+    #   2. Use the BATCHED writer (one AOF record per batch, not one per
+    #      track) for the tracks that genuinely changed.
     items = list(annotations.items())
     APPLY_BATCH = 200
     updated = 0
     for i in range(0, len(items), APPLY_BATCH):
         batch = items[i : i + APPLY_BATCH]
+        changed: list[tuple[str, dict]] = []
         for tid, ann in batch:
-            store.update_track_fields(tid, {
+            new_fields = {
                 "duplicate_group_id": ann["duplicate_group_id"],
                 "format_score": ann["format_score"],
                 "is_duplicate_primary": ann["is_duplicate_primary"],
-            })
-            updated += 1
+            }
+            cur = store.get_track(tid)
+            if cur is not None and all(cur.get(k) == v for k, v in new_fields.items()):
+                continue  # unchanged → no store mutation, no AOF entry
+            changed.append((tid, new_fields))
+        if changed:
+            updated += store.update_track_fields_batch(changed)
         await asyncio.sleep(0)
 
     dup_count = sum(1 for a in annotations.values() if a["duplicate_group_id"] is not None)
@@ -928,6 +984,17 @@ async def _run_scan(
     else:
         _progress = ScanProgress(total=total, running=True)
     _scan_count += 1
+    # Remember the resolved dirs this scan covers — survives completion (unlike
+    # ``current_dirs``, cleared the instant the scan ends) so the scan-complete
+    # WS event lets the frontend refresh the OPEN folder in place rather than
+    # resetting the whole tree to root.
+    for _d in directories:
+        try:
+            _rd = str(Path(_d).resolve())
+        except OSError:
+            _rd = str(_d)
+        if _rd not in _progress.last_dirs:
+            _progress.last_dirs.append(_rd)
     log.info("Scan started: %d files across %d root(s)", total, len(dir_files))
 
     dir_counts:    dict[str, int] = defaultdict(int)
@@ -1349,10 +1416,43 @@ async def start_scan(
 
 # ── Remote scan (SMB / FTP) ─────────────────────────────────────────────────
 
+def _list_remote_zip_members(root_path: str, zip_fe, source) -> list:
+    """Download a remote ``.zip`` (once, via the local remote-cache) and return
+    a ``DirEntry`` per audio member.
+
+    Each member carries the OUTER archive's ``size``+``mtime`` so the
+    incremental-skip logic re-extracts a zip's members iff the archive itself
+    changed.  Member ``path`` is ``<zip_rel>::<member>``; the caller prepends
+    the ``ftp://host/share:`` prefix exactly as it does for a loose file.
+    Best-effort: a broken/oversized archive logs + yields ``[]``.
+    """
+    from soniqboom.core.filesource import DirEntry
+    from soniqboom.core.remote_cache import get_cache
+
+    out: list = []
+    try:
+        local_archive = get_cache().fetch(root_path, zip_fe.path, source)
+    except Exception as exc:
+        log.warning("Cannot fetch remote archive %s: %s", zip_fe.path, exc)
+        return out
+    # ``archive.list_members`` dispatches ZIP vs LHA, handles the Amiga
+    # ``MOD.title`` prefix naming, and already filters to playable members.
+    for member in archive.list_members(local_archive):
+        out.append(DirEntry(
+            name=_basename_of(member),
+            path=f"{zip_fe.path}::{member}",
+            is_dir=False,
+            size=zip_fe.size,
+            mtime=zip_fe.mtime,
+        ))
+    return out
+
+
 def _find_remote_audio_entries(
     root_path: str, source: "FileSource",
     *,
     dir_mtime_cap: float | None = None,
+    scan_zips: bool = True,
 ) -> tuple[list, int]:
     """Discover audio files via ``walk_with_stat`` — yields DirEntry
     objects preserving ``size`` and ``mtime`` from the underlying
@@ -1409,6 +1509,10 @@ def _find_remote_audio_entries(
                     continue
                 if os.path.splitext(fe.name.lower())[1] in ext_set:
                     entries.append(fe)
+                elif scan_zips and fe.name.lower().endswith((".zip", ".lha", ".lzh")):
+                    # Crack open the remote archive (ZIP or Amiga LHA/LZH) and
+                    # surface its audio members as ``<archive_rel>::<member>``.
+                    entries.extend(_list_remote_zip_members(root_path, fe, source))
     except Exception as exc:
         log.error("Remote walk_with_stat failed for %s: %s", root_path, exc)
     if skipped_junk:
@@ -1660,7 +1764,12 @@ async def start_remote_scan(
     # runs unchanged.  Wrapped in ``functools.partial`` because
     # ``run_in_executor`` doesn't forward kwargs.
     import functools as _ft
-    _walk_fn = _ft.partial(_find_remote_audio_entries, dir_mtime_cap=dir_mtime_cap)
+    from soniqboom.config import settings as _settings   # local bind — not a module global
+    _walk_fn = _ft.partial(
+        _find_remote_audio_entries,
+        dir_mtime_cap=dir_mtime_cap,
+        scan_zips=_settings.scan_remote_zips,
+    )
     entries, _pruned = await loop.run_in_executor(
         None, _walk_fn, scan_root, source,
     )
@@ -1928,11 +2037,26 @@ async def start_remote_scan(
     # certainly multi-MB art for which the full fetch wins anyway.
     _GROWING_BUDGET_MULTIPLIERS = (1, 4)
 
+    async def _fetch_zip_member(remote_path: str) -> bytes:
+        """Fetch one member of a remote archive (.zip/.lha/.lzh): download the
+        outer archive via the local remote-cache (once per archive), then
+        extract the member.  ``remote_path`` is ``<archive_rel>::<member>``."""
+        arc_rel, member = remote_path.split("::", 1)
+
+        def _read() -> bytes:
+            from soniqboom.core.remote_cache import get_cache
+            local_archive = get_cache().fetch(scan_root, arc_rel, source)
+            return archive.read_member(local_archive, member)
+
+        return await loop.run_in_executor(None, _read)
+
     async def _fetch_partial(remote_path: str, budget: int) -> bytes:
         """One stage of partial fetch.  Logs the actual bytes returned
         so the operator can see whether the file was smaller than the
         budget (early-EOF) or the server delivered the full request.
         """
+        if "::" in remote_path:        # ZIP member — fetch the whole member
+            return await _fetch_zip_member(remote_path)
         return await loop.run_in_executor(
             None, lambda: source.read_partial(
                 remote_path, budget, lane="scan",
@@ -1940,6 +2064,8 @@ async def start_remote_scan(
         )
 
     async def _fetch_full(remote_path: str) -> bytes:
+        if "::" in remote_path:
+            return await _fetch_zip_member(remote_path)
         return await loop.run_in_executor(
             None, lambda: source.read_file(remote_path, lane="scan"),
         )

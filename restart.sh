@@ -12,7 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARGS=("$@")
 
 # ── Stop (if running) ───────────────────────────────────────────────────────
-"$SCRIPT_DIR/shutdown.sh" 2>/dev/null || true
+# Forward args (e.g. --port) so shutdown targets the same port's listener.
+"$SCRIPT_DIR/shutdown.sh" "${ARGS[@]}" 2>/dev/null || true
 
 # Brief pause to release the port
 sleep 1

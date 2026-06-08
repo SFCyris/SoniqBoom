@@ -461,7 +461,19 @@ async def _render_midi(path: Path) -> Path:
 # ── Tracker module rendering ─────────────────────────────────────────────────
 
 async def _render_tracker(path: Path, subsong: int = 0) -> Path:
-    """Render tracker module to a temp WAV via openmpt123 and return the path."""
+    """Render tracker module to a temp WAV via openmpt123 and return the path.
+
+    Side effect: in parallel with the audio render, we kick off a VU
+    extraction pass that produces a ``.vu`` sidecar via the in-process
+    libopenmpt ctypes binding.  The sidecar lands next to the cached
+    WAV (the conversion cache moves the WAV from temp to its final
+    home; the VU writer follows the same path).  See
+    ``soniqboom/core/openmpt_vu.py`` and ``docs/vu-cache-format.md``.
+
+    The VU pass is best-effort: failures (lib not loaded, malformed
+    module, unsupported format) are swallowed and the frontend falls
+    back to its FFT-spectrum visualiser.
+    """
     binary = _find_renderer(settings.openmpt123_path, "openmpt123")
     if not binary:
         raise HTTPException(501, "openmpt123 not installed")
@@ -474,8 +486,72 @@ async def _render_tracker(path: Path, subsong: int = 0) -> Path:
         cmd.extend(["--subsong", str(subsong)])
     cmd.extend(["--", str(path)])
 
-    await _await_renderer(cmd, Path(tmp_wav.name), timeout=600, kind="tracker")
+    # Kick off the VU extraction concurrently — it runs against the
+    # source module file via libopenmpt directly and doesn't share I/O
+    # with the openmpt123 subprocess.  Reads the file ONCE in this
+    # coroutine to avoid two readers of a flaky network share / ZIP
+    # virtual path.
+    vu_task: asyncio.Task | None = None
+    try:
+        vu_task = asyncio.create_task(
+            _extract_vu_sidecar(path, subsong, Path(tmp_wav.name)),
+            name=f"vu_extract[{path.name}]",
+        )
+    except Exception:
+        log.debug("VU extract task scheduling failed", exc_info=True)
+
+    try:
+        await _await_renderer(cmd, Path(tmp_wav.name), timeout=600, kind="tracker")
+    finally:
+        # Let the VU pass finish (bounded), but don't block scan-complete
+        # forever if libopenmpt hangs on a malformed file.
+        if vu_task is not None:
+            try:
+                await asyncio.wait_for(vu_task, timeout=30)
+            except (asyncio.TimeoutError, Exception):
+                vu_task.cancel()
+
     return Path(tmp_wav.name)
+
+
+async def _extract_vu_sidecar(
+    src_path: Path, subsong: int, wav_path: Path,
+) -> None:
+    """Background helper: run the VU extraction pass and write the
+    ``.vu`` sidecar next to *wav_path*.  Best-effort; logs on failure
+    but never raises.
+
+    Runs the libopenmpt call in a thread (the ctypes calls release the
+    GIL, but the whole pass is bounded and short) to avoid stalling
+    the event loop on a very long module.
+    """
+    try:
+        from soniqboom.core import openmpt_vu
+        if not openmpt_vu.is_available():
+            return
+        loop = asyncio.get_event_loop()
+        file_bytes = await loop.run_in_executor(None, src_path.read_bytes)
+        result = await loop.run_in_executor(
+            None,
+            lambda: openmpt_vu.extract_vu(
+                file_bytes,
+                subsong=subsong if subsong > 0 else -1,
+            ),
+        )
+        if result is None or result.frames == 0:
+            log.debug("VU extract for %s: no result", src_path)
+            return
+        # Sidecar path: same stem as the WAV with .vu extension.
+        vu_path = wav_path.with_suffix(".vu")
+        await loop.run_in_executor(
+            None, openmpt_vu.write_sidecar, vu_path, result,
+        )
+        log.info(
+            "VU sidecar written for %s: %d channels × %d frames @ %d Hz",
+            src_path.name, result.channels, result.frames, result.sample_rate,
+        )
+    except Exception:
+        log.warning("VU extract failed for %s", src_path, exc_info=True)
 
 
 # ── UADE renderer (AHX / Hively / ~200 other Amiga formats) ───────────────
@@ -486,7 +562,13 @@ async def _render_tracker(path: Path, subsong: int = 0) -> Path:
 # on Debian/Ubuntu); fall back to a clear 501 when missing so the UI
 # can surface an install hint instead of swallowing the silence.
 
-_UADE_EXTS = {".ahx", ".hvl"}
+# AHX stays on uade123 (its AbyssHighestExperience replay works).  HVL
+# (HivelyTracker, AHX's multi-channel successor) is NOT in the Homebrew uade
+# player set and libopenmpt can't load it either, so it has its own renderer
+# below (bundled HivelyTracker replay → hvl2wav).
+_UADE_EXTS = {".ahx"}
+_HVL_EXTS = {".hvl"}
+_hvl2wav_bin: "Path | None" = None
 
 # uade123 has no native "render exactly N seconds" mode — it relies on
 # the player binary's end-detection.  Most AHX tunes are < 5 minutes;
@@ -542,6 +624,87 @@ async def _render_uade(path: Path, subsong: int = 0) -> Path:
         cmd, Path(tmp_wav.name),
         timeout=_UADE_DEFAULT_TIMEOUT_S, kind="uade",
     )
+    return Path(tmp_wav.name)
+
+
+# ── Hively (HVL) renderer ─────────────────────────────────────────────────
+# HivelyTracker (.hvl) is AHX's multi-channel successor.  The Homebrew uade123
+# build ships no Hively replay and libopenmpt can't load HVL either, so we
+# bundle the HivelyTracker project's self-contained replay (BSD, vendored under
+# ``soniqboom/native/hvl``) and compile a tiny ``hvl2wav`` converter once, on
+# first use, into the writable data dir (so it works from a read-only app too).
+async def _ensure_hvl2wav() -> "Path | None":
+    """Return a built ``hvl2wav`` path, compiling it once if needed.
+
+    Returns None when no C compiler is available — the caller raises a clear
+    501 rather than the cryptic generic render failure.
+    """
+    global _hvl2wav_bin
+    if _hvl2wav_bin and _hvl2wav_bin.exists():
+        return _hvl2wav_bin
+    src_dir = Path(__file__).resolve().parent.parent / "native" / "hvl"
+    csrc = [src_dir / "hvl2wav.c", src_dir / "replay.c"]
+    if not all(p.exists() for p in csrc):
+        log.warning("HVL: bundled replay source missing under %s", src_dir)
+        return None
+    from soniqboom.config import get_data_dir
+    out_dir = get_data_dir() / "native"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    binp = out_dir / "hvl2wav"
+    newest_src = max(p.stat().st_mtime for p in csrc)
+    if binp.exists() and binp.stat().st_mtime >= newest_src:
+        _hvl2wav_bin = binp
+        return binp
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        log.warning("HVL: no C compiler (cc/clang/gcc) — cannot build hvl2wav")
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cc, "-O2", "-w", str(csrc[0]), str(csrc[1]), "-o", str(binp), "-lm",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except (OSError, asyncio.TimeoutError) as exc:
+        log.warning("HVL: hvl2wav build failed to launch: %s", exc)
+        return None
+    if proc.returncode != 0 or not binp.exists():
+        log.warning("HVL: hvl2wav build failed: %s", (err or b"").decode("utf-8", "replace")[:300])
+        return None
+    try:
+        binp.chmod(0o755)
+    except OSError:
+        pass
+    log.info("HVL: built hvl2wav at %s", binp)
+    _hvl2wav_bin = binp
+    return binp
+
+
+async def _render_hvl(path: Path, subsong: int = 0) -> Path:
+    """Render a HivelyTracker (.hvl) module to WAV via the bundled hvl2wav.
+
+    44.1 kHz / stereo / 16-bit signed LE — matches the other renderers so the
+    cache + cast pipeline treats every rendered format uniformly.
+    """
+    binary = await _ensure_hvl2wav()
+    if not binary:
+        raise HTTPException(
+            501,
+            "HivelyTracker (HVL) decoder unavailable — a C compiler (cc / clang / "
+            "gcc) is required to build the bundled replay.",
+        )
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    # hvl2wav takes ATTACHED args: -f<freq>, -o<out>, -s<subsong>.  It writes
+    # ``<out>.tmp`` then copies to ``<out>`` (overwriting our 0-byte temp).
+    cmd = [str(binary), "-f44100", f"-o{tmp_wav.name}"]
+    if subsong > 0:
+        cmd.append(f"-s{subsong}")
+    cmd.append(str(path))
+    await _await_renderer(cmd, Path(tmp_wav.name), timeout=300, kind="HVL")
     return Path(tmp_wav.name)
 
 
@@ -2488,6 +2651,16 @@ async def _do_prewarm(
                 soundfont_path=str(sf) if sf else "",
                 render_fn=lambda: _render_midi(file_path),
             )
+        elif ext in _HVL_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="hvl", subsong=subsong,
+                render_fn=lambda: _render_hvl(file_path, subsong=subsong),
+            )
+        elif ext in _UADE_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="uade", subsong=subsong,
+                render_fn=lambda: _render_uade(file_path, subsong=subsong),
+            )
         elif ext in _TRACKER_EXTS:
             await get_or_render(
                 track_id=track_id, format_type="tracker", subsong=subsong,
@@ -2890,7 +3063,37 @@ async def stream_track(
     # track 500'd on first byte (validation finding 2026-05-21).
     _zip_track_id_for_unpin: str | None = None
 
-    if path_str.startswith(("smb://", "ftp://")):
+    if path_str.startswith(("smb://", "ftp://")) and "::" in path_str:
+        # Remote ZIP member — ``ftp://host/share:/path/x.zip::member``.  Fetch
+        # the OUTER archive to the local remote-cache, then extract the member
+        # with the same machinery a local zip uses.  Handled before the generic
+        # remote branch so the ``::member`` suffix isn't fetched as a literal
+        # file name.
+        from soniqboom.core.filesource import get_source, parse_remote_path
+        from soniqboom.core.remote_cache import get_cache
+        scan_root, remote_path = parse_remote_path(path_str)
+        if not remote_path or "::" not in remote_path:
+            raise HTTPException(400, "Remote archive path is malformed")
+        source = get_source(scan_root)
+        if source is None:
+            raise HTTPException(503, "Network share unavailable — reconnect in Settings")
+        zip_rel, _member = remote_path.split("::", 1)
+        loop = asyncio.get_running_loop()
+        try:
+            _local_zip = await loop.run_in_executor(
+                None, get_cache().fetch, scan_root, zip_rel, source,
+            )
+        except Exception as exc:
+            if _is_file_not_found(exc):
+                raise HTTPException(404, "Archive missing on source (rescan to refresh)")
+            log.warning("Remote archive fetch failed for %s: %s", path_str, exc)
+            raise HTTPException(502, "Could not fetch archive from network share")
+        path = await _get_or_extract_zip_member(f"{_local_zip}::{_member}", track_id)
+        if path is None:
+            raise HTTPException(404, "Track missing inside the archive")
+        _zip_pin(track_id)
+        _zip_track_id_for_unpin = track_id
+    elif path_str.startswith(("smb://", "ftp://")):
         from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
@@ -3024,13 +3227,19 @@ async def stream_track(
             try: _zip_unpin(_zip_track_id_for_unpin)
             except Exception: pass
 
+    # Single cleanup task for EVERY return branch below.  It unlinks any temp
+    # AND — crucially — runs _zip_unpin so a zip-member extraction's pin is
+    # released once the response finishes.  All branches (native AND the
+    # rendered SID/MIDI/tracker/GME/HVL/UADE paths) pass background=_bg.  The
+    # rendered paths previously used a _zip_bg that was always None, so every
+    # play of a zip-contained rendered tune leaked its pin and the extraction
+    # could never evict.
     _bg = BackgroundTask(_cleanup_tmp) if (_zip_tmp or _zip_track_id_for_unpin) else None
 
     # ── Rendered formats: SID / MIDI / Tracker ───────────────────────────────
     # These are cached as WAV files so repeat playback is instant.
     # On cache miss, the renderer runs and the result is stored for next time.
     from soniqboom.core.conversion_cache import get_or_render
-    _zip_bg = BackgroundTask(_cleanup_paths, _zip_tmp) if _zip_tmp else None
 
     if ext in _SID_EXTS:
         from soniqboom.core.conversion_cache import (
@@ -3061,7 +3270,7 @@ async def stream_track(
                 request, exact, media_type="audio/wav",
                 headers={"X-Rendered": "sidplayfp", "X-Cache": "hit",
                          "X-SID-Target-Seconds": str(target_dur)},
-                background=_zip_bg,
+                background=_bg,
             )
 
         # 2) Shorter version available — serve it now, render full in background
@@ -3077,7 +3286,7 @@ async def stream_track(
                 headers={"X-Rendered": "sidplayfp", "X-Cache": "partial",
                          "X-SID-Cached-Seconds": str(short_dur),
                          "X-SID-Target-Seconds": str(target_dur)},
-                background=_zip_bg,
+                background=_bg,
             )
 
         # 3) No cache at all — render synchronously
@@ -3090,7 +3299,7 @@ async def stream_track(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "sidplayfp", "X-Cache": "hit" if hit else "miss",
                      "X-SID-Target-Seconds": str(target_dur)},
-            background=_zip_bg,
+            background=_bg,
         )
     if ext in _MIDI_EXTS:
         from soniqboom.config import get_active_soundfont
@@ -3103,12 +3312,22 @@ async def stream_track(
         return await _range_file_response(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "fluidsynth", "X-Cache": "hit" if hit else "miss"},
-            background=_zip_bg,
+            background=_bg,
         )
     # UADE goes BEFORE the tracker branch — both .ahx and .hvl are
     # technically listed in _TRACKER_EXTS for scanner-side detection,
     # but openmpt123 silently doesn't decode them.  Without this
     # priority, every .ahx play would 501 from inside _render_tracker.
+    if ext in _HVL_EXTS:
+        cached_path, hit = await get_or_render(
+            track_id=track_id, format_type="hvl", subsong=subsong,
+            render_fn=lambda: _render_hvl(path, subsong=subsong),
+        )
+        return await _range_file_response(
+            request, cached_path, media_type="audio/wav",
+            headers={"X-Rendered": "hvl2wav", "X-Cache": "hit" if hit else "miss"},
+            background=_bg,
+        )
     if ext in _UADE_EXTS:
         cached_path, hit = await get_or_render(
             track_id=track_id, format_type="uade", subsong=subsong,
@@ -3117,7 +3336,7 @@ async def stream_track(
         return await _range_file_response(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
-            background=_zip_bg,
+            background=_bg,
         )
     if ext in _TRACKER_EXTS:
         cached_path, hit = await get_or_render(
@@ -3127,7 +3346,7 @@ async def stream_track(
         return await _range_file_response(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "openmpt123", "X-Cache": "hit" if hit else "miss"},
-            background=_zip_bg,
+            background=_bg,
         )
     if ext in _GME_EXTS_STREAM:
         cached_path, hit = await get_or_render(
@@ -3137,7 +3356,7 @@ async def stream_track(
         return await _range_file_response(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "gme", "X-Cache": "hit" if hit else "miss"},
-            background=_zip_bg,
+            background=_bg,
         )
 
     # ── Native: serve directly with Range support ─────────────────────────────

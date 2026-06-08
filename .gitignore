@@ -73,3 +73,7 @@ plugins/*
 
 # ─── Logs ──────────────────────────────────────────────────────────────────
 *.log
+
+# vendored HVL decoder build artifacts
+soniqboom/native/hvl/hvl2wav
+soniqboom/native/hvl/*.o

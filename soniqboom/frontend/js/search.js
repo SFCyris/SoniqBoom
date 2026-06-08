@@ -99,7 +99,7 @@ function _showPreview(tracks) {
     // ``fetchpriority=low`` keeps these preview thumbnails from competing
     // with the actual /api/search request that produced the dropdown, and
     // we stash a ref so the next keystroke can cancel by clearing ``src``.
-    const _previewSrc = t.cover_art || (t.id ? `/api/art/${t.id}?size=sm` : '');
+    const _previewSrc = t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : '');
     if (_previewSrc) {
       const artBox = row.querySelector('.sp-art');
       const img = new Image();

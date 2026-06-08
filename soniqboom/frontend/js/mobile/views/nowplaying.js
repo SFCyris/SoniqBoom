@@ -68,7 +68,7 @@ export function mountNowPlaying(root, ctx) {
     const span = document.createElement('span');
     span.textContent = artPlaceholderEmoji(t);
     art.appendChild(span);
-    const artSrc = t.id ? `/api/art/${t.id}?size=lg` : t.cover_art;
+    const artSrc = t.id ? `/api/art/${t.id}?size=lg&fallback=404` : t.cover_art;
     if (artSrc) {
       const img = new Image();
       img.alt = '';

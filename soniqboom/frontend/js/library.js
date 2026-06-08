@@ -16,6 +16,120 @@ const API = (path, q = {}) => {
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const tbody            = document.getElementById('track-tbody');
 const emptyEl          = document.getElementById('track-empty');
+// Capture the default empty-state markup at module load.  Per-call
+// customisations (``_renderBranchEmpty`` for branch-folder clicks,
+// ``showDuplicates`` for the dedicated dupe view) overwrite
+// ``emptyEl.innerHTML``; ``renderTracks`` restores this snapshot
+// whenever it gets a fresh, non-empty result set so the customised
+// markup doesn't leak into unrelated views.
+const _EMPTY_DEFAULT_HTML = emptyEl.innerHTML;
+
+// ── Background freshness-refresh per folder navigation ────────────────
+//
+// Schedule POST /api/fstree/refresh for ``path`` so the backend walks
+// that subtree and indexes newly-added files in parallel with the
+// user's browsing.  We debounce per-path: rapid nav (prev/next, quick
+// drill-in-then-out) batches into the most recent path only.  Each
+// in-flight request is also tracked so we never have two outstanding
+// refreshes for the same path; the scanner's own queue dedups
+// concurrent requests across paths.
+const _bgRefreshState = {
+  pendingTimer: null,
+  pendingPath: null,
+  recentlyScanned: new Map(), // path → timestamp; suppresses duplicates within window
+};
+const _BG_REFRESH_DEBOUNCE_MS = 400;
+const _BG_REFRESH_TTL_MS      = 30_000;
+// Don't auto-refresh huge archive subtrees (e.g. modarchive's ~100K ZIPs) on
+// drill-down — re-walking them over SMB is expensive and they're static.  The
+// folders the user actually edits (albums) are far below this.  Re-index from
+// Settings still covers everything.
+const FRESHNESS_MAX_TRACKS    = 5000;
+
+// TEMPORARILY DISABLED.  The drill-down auto-refresh routed through
+// POST /api/fstree/refresh → start_scan([folder]), but start_scan treats its
+// argument as a SCAN ROOT: it calls upsert_scan_dir() on the folder (so every
+// visited folder wrongly appeared as a top-level root in the FOLDERS tree) and
+// re-associates that subtree's tracks to the folder as a new root.  Drill-down
+// freshness needs a dedicated "refresh subtree under its existing root"
+// endpoint that does neither; until that exists, do not auto-scan on browse.
+const FRESHNESS_DRILLDOWN_ENABLED = false;
+
+function _scheduleBackgroundRefresh(path) {
+  if (!FRESHNESS_DRILLDOWN_ENABLED) return;
+  if (!path) return;
+  // Local-paths only (remote shares are auto-polled by remote_freshness).
+  if (/^(smb|ftp|webdav|webdavs|https?):\/\//.test(path)) return;
+  // Skip if we just refreshed this path — keeps the load light while
+  // the user clicks back-and-forth between siblings.
+  const now = performance.now();
+  const last = _bgRefreshState.recentlyScanned.get(path);
+  if (last && (now - last) < _BG_REFRESH_TTL_MS) return;
+
+  _bgRefreshState.pendingPath = path;
+  if (_bgRefreshState.pendingTimer) clearTimeout(_bgRefreshState.pendingTimer);
+  _bgRefreshState.pendingTimer = setTimeout(() => {
+    _bgRefreshState.pendingTimer = null;
+    const target = _bgRefreshState.pendingPath;
+    _bgRefreshState.pendingPath = null;
+    if (!target) return;
+    _bgRefreshState.recentlyScanned.set(target, performance.now());
+    fetch('/api/fstree/refresh', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: target }),
+    }).catch(() => { /* fire-and-forget — silent on error */ });
+  }, _BG_REFRESH_DEBOUNCE_MS);
+}
+
+// ── Current browse-folder state (drives in-place freshness refresh) ───────────
+// When the user is viewing a folder we remember which one (+ whether it's the
+// recursive/windowed view).  A scan that finishes touching this folder can then
+// refresh it IN PLACE — preserving scroll — instead of the old behaviour of
+// resetting the whole tree to root on every scan completion.
+let _currentBrowsePath = null;
+let _currentBrowseRecursive = false;
+
+function isInFolderView() { return _currentBrowsePath != null; }
+
+// True if any of the just-scanned resolved dirs overlaps the open folder
+// (scan-root is a parent of the folder → re-index case; or the folder is a
+// parent of a scanned subfolder → drill-down case; or they're equal).
+function currentFolderAffectedBy(dirs) {
+  if (!_currentBrowsePath || !Array.isArray(dirs)) return false;
+  const cur = _currentBrowsePath.replace(/\/+$/, '');
+  for (const d of dirs) {
+    if (!d) continue;
+    const dd = String(d).replace(/\/+$/, '');
+    if (cur === dd || cur.startsWith(dd + '/') || dd.startsWith(cur + '/')) return true;
+  }
+  return false;
+}
+
+// Cheap "did the folder change?" check for the in-place refresh: same length
+// and same track ids in the same order ⇒ nothing to re-render.
+function _sameTrackList(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if ((a[i] && a[i].id) !== (b[i] && b[i].id)) return false;
+  }
+  return true;
+}
+
+async function refreshCurrentFolderInPlace() {
+  if (!_currentBrowsePath) return;
+  const wrap = document.getElementById('track-list-wrap');
+  const scrollY = wrap ? wrap.scrollTop : 0;
+  const path = _currentBrowsePath, rec = _currentBrowseRecursive;
+  try {
+    await showFolder(path, rec, { quiet: true });   // no skeleton flash, no re-schedule
+  } catch (_) { return; }
+  // Restore scroll after the new rows paint (best-effort; the windowed
+  // recursive view manages its own scroll and may land at top — acceptable).
+  if (wrap) requestAnimationFrame(() => { try { wrap.scrollTop = scrollY; } catch (_) {} });
+}
+
 const loadingEl        = document.getElementById('track-loading');
 const browseHdr        = document.getElementById('browse-header');
 const browseCrumb      = document.getElementById('browse-crumb');
@@ -33,6 +147,11 @@ const groupFilterInput  = document.getElementById('group-filter-input');
 let currentTracks = [];
 let sortKey = null;
 let sortAsc = true;
+// Extra query params for the windowed track view (the chunked /tracks fetcher
+// merges these in).  null = the plain All-Tracks view; {format:'MIDI'} = the
+// Galaxy per-format browse.  Preserved across sort-clicks so re-sorting a
+// format view keeps filtering by that format.
+let _windowedFilter = null;
 let activeRow = null;
 
 // ── Windowed track store (large-library viewing) ──────────────────────────────
@@ -348,6 +467,14 @@ function _renderStars(rating) {
 function _showSkeletonRows(count = 18) {
   const albumGrid = document.getElementById('album-grid');
   if (albumGrid) albumGrid.hidden = true;
+  // Restore the track-list scroll container in case we're arriving from the
+  // Galaxy view (which sets it display:none).  Without this the skeleton —
+  // and then the loaded rows — would paint into a hidden wrapper, so clicking
+  // a galaxy cluster chip showed a blank screen for the whole fetch.
+  const galaxyView = document.getElementById('galaxy-view');
+  if (galaxyView && !galaxyView.hidden) galaxyView.hidden = true;
+  const wrap = document.getElementById('track-list-wrap');
+  if (wrap) wrap.style.display = '';
   document.getElementById('track-table').style.display = '';
   // The skeleton view replaces the entire tbody contents, so the pool
   // detaches.  Clearing it here makes the next _vsRender treat the pool as
@@ -506,13 +633,21 @@ function _fillTrackRow(tr, t, i) {
   const coverImg   = coverFrame?.lastElementChild;
   if (coverPh) coverPh.textContent = artPlaceholderEmoji(t);
   if (coverImg) {
-    const wantedSrc = t.id ? `/api/art/${t.id}?size=sm` : '';
+    // ``fallback=404`` is the cheap way to ask "is there real art?"
+    // — when there isn't, the server returns a cacheable 404 (no
+    // body) and IMG.onerror fires, leaving the format emoji visible.
+    // Earlier revisions tried to read the X-SoniqBoom-Art header via
+    // fetch+blob+ObjectURL, which lost the browser image pipeline's
+    // bitmap-cache coalescing, image-priority queue, and
+    // loading="lazy" deferral — folder-open went from ~50 ms to
+    // multiple seconds on big SID/MOD folders (regression D14).
+    const wantedSrc = t.id ? `/api/art/${t.id}?size=sm&fallback=404` : '';
     if (coverImg.dataset.src !== wantedSrc) {
       coverImg.dataset.src = wantedSrc;
       coverImg.removeAttribute('src');
       coverImg.classList.remove('loaded');
       if (wantedSrc) {
-        coverImg.onload = () => coverImg.classList.add('loaded');
+        coverImg.onload  = () => coverImg.classList.add('loaded');
         coverImg.onerror = () => coverImg.classList.remove('loaded');
         coverImg.src = wantedSrc;
       }
@@ -732,6 +867,7 @@ document.addEventListener('themechange', () => {
 });
 
 async function renderTracks(tracks) {
+  _leaveGalaxy();          // switching to a table view exits the galaxy
   currentTracks = tracks;
   _selected.clear();
   _lastClickIdx = -1;
@@ -740,11 +876,22 @@ async function renderTracks(tracks) {
   _vsEnd   = 0;
   _rowHMeasured = false;     // re-measure for the next dataset
 
-  // Reset the empty-state heading every time — ``showDuplicates`` mutates
-  // it to "No duplicate tracks found." for its specific empty case, and
-  // we don't want that copy leaking into every subsequent empty view.
-  const _emptyHeading = emptyEl.querySelector('h4');
-  if (_emptyHeading) _emptyHeading.textContent = 'No tracks found';
+  // Reset the empty-state markup every time — both ``showDuplicates``
+  // ("No duplicate tracks found.") and ``_renderBranchEmpty`` (branch-
+  // folder copy + opt-in recursive button) replace the heading and
+  // body for their specific cases.  Restoring the default snapshot
+  // captured at module load keeps the empty state consistent across
+  // view switches.
+  if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML && tracks.length > 0) {
+    // Only restore when we have real tracks to render — keeps the
+    // customised state visible while the empty case persists.
+    emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
+  } else if (tracks.length > 0) {
+    // No-op: default markup is already in place.
+  } else {
+    const _emptyHeading = emptyEl.querySelector('h4');
+    if (_emptyHeading) _emptyHeading.textContent = 'No tracks found';
+  }
 
   emptyEl.hidden  = tracks.length > 0;
   loadingEl.hidden = true;
@@ -1330,6 +1477,7 @@ async function showAll() {
   _hideGridToggle();
   restoreFullHeader();
   _showSkeletonRows();
+  _windowedFilter = null;          // plain All-Tracks view (no format filter)
   const limit = 5000;
   // Probe the real total first.  Cheap (one count() in the store) and
   // tells us whether to use the simple-array path (small libraries) or
@@ -1379,6 +1527,7 @@ function _rebuildWindowedStore(total, sortBy, sortOrder) {
       const params = { limit: lim, offset };
       if (sortBy)    params.sort  = sortBy;
       if (sortOrder) params.order = sortOrder;
+      if (_windowedFilter) Object.assign(params, _windowedFilter);  // e.g. {format}
       return API('/tracks', params);
     },
     { sortBy, sortOrder },
@@ -1527,6 +1676,66 @@ async function showYears() {
   renderGroupList(years, 'year', 'count', 'Tracks', (item) => showYearTracks(item.year));
 }
 
+// ── Library Galaxy view (viz #6) ──────────────────────────────────────────
+let _galaxy = null;
+function _leaveGalaxy() {
+  const view = document.getElementById('galaxy-view');
+  const wrap = document.getElementById('track-list-wrap');
+  if (view && !view.hidden) view.hidden = true;
+  if (wrap) wrap.style.display = '';
+}
+async function showGalaxy() {
+  hideBrowseHeader();
+  _hideGroupFilter();
+  _hideGridToggle();
+  setGroupHeader('Galaxy');
+  // Hide the table surfaces, reveal the galaxy canvas host.
+  const wrap = document.getElementById('track-list-wrap');
+  const grid = document.getElementById('album-grid');
+  const view = document.getElementById('galaxy-view');
+  if (wrap) wrap.style.display = 'none';
+  if (grid) grid.hidden = true;
+  if (view) view.hidden = false;
+  // Lazy-mount; clicking a cluster filters the library to that format.
+  if (!_galaxy && view) {
+    const { mountGalaxy } = await import('./viz/galaxy.js');
+    _galaxy = mountGalaxy(view, {
+      onPickFormat: (fmt, count) => showFormatTracks(fmt, count),
+    });
+  } else if (_galaxy) {
+    _galaxy.reload();
+  }
+}
+async function showFormatTracks(format, count = 0) {
+  restoreFullHeader();
+  setBrowseHeader(`Format: ${format}`, () => showGalaxy());
+  _hideGridToggle();
+  _showSkeletonRows();
+  // Same windowed virtual-scroll path as All Tracks, just filtered by format —
+  // so even the giant formats (ProTracker 62K, SID 57K, …) are fully
+  // browsable, not capped.  The chunked fetcher reads _windowedFilter.
+  _windowedFilter = { format };
+  const WINDOW_THRESHOLD = 5000;
+  // Prefer the count the Galaxy chip already showed; probe once if absent.
+  let total = Number(count) || 0;
+  if (!total) {
+    try {
+      const fmts = await API('/library/formats');
+      const hit = Array.isArray(fmts) ? fmts.find(f => f.format === format) : null;
+      total = hit ? Number(hit.count) || 0 : 0;
+    } catch { /* fall through to single-fetch */ }
+  }
+  if (total > WINDOW_THRESHOLD) {
+    const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
+    const sortOrder = sortBy ? (sortAsc ? 'asc' : 'desc') : null;
+    _rebuildWindowedStore(total, sortBy, sortOrder);   // renders the windowed store
+    return;
+  }
+  // Small format: a single format-filtered fetch (no chunking overhead).
+  const tracks = await API('/tracks', { format, limit: WINDOW_THRESHOLD });
+  renderTracks(tracks);
+}
+
 async function showYearTracks(year) {
   _hideGroupFilter();
   _hideGridToggle();
@@ -1603,7 +1812,9 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
             if (initialsEl) initialsEl.style.display = 'none';
             card.classList.add('album-card-art-loaded');
           };
-          img.src = `/api/art/${track.id}?size=sm`;
+          // fallback=404 so art-less albums keep their letter initials instead
+          // of the generic ♪ placeholder JPEG overwriting them as a background.
+          img.src = `/api/art/${track.id}?size=sm&fallback=404`;
         })
         .catch(() => {});
 
@@ -1665,6 +1876,7 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
 
 // Renders a grouped list (artists/albums/genres/years) into the table
 function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilter = true) {
+  _leaveGalaxy();          // switching to a group/list view exits the galaxy
   // Save state for live filtering
   _groupItems    = items;
   _groupNameKey  = nameKey;
@@ -1798,7 +2010,7 @@ function setBrowseHeader(label, backFn) {
   browseBack.onclick = backFn;
   _hideExportBtn();
 }
-function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); }
+function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); _currentBrowsePath = null; }
 
 // Export CSV button — injected into browse-header when a view supports it
 function _showExportBtn(onClick) {
@@ -2134,14 +2346,38 @@ Player.on('trackchange', (track) => {
   }
 });
 
-async function showFolder(path, recursive = false) {
+async function showFolder(path, recursive = false, opts = {}) {
+  _currentBrowsePath = path;
+  _currentBrowseRecursive = recursive;
   _hideGridToggle();
-  _showSkeletonRows();
+  // ``opts.quiet`` = an in-place freshness refresh (not a user navigation):
+  // skip the skeleton flash and don't re-schedule another background scan.
+  if (!opts.quiet) _showSkeletonRows();
 
   setBrowseHeader(path.split('/').filter(Boolean).pop() || path, () => {
     hideBrowseHeader();
     document.querySelectorAll('#nav-library li')[0]?.click();
   });
+
+  // Drill-down freshness: kick a debounced background scan of THIS folder
+  // (POST /api/fstree/refresh).  The view still renders instantly from the
+  // store first; when the scan finds new/removed files it broadcasts a
+  // scan_progress completion carrying ``last_dirs``, and the WS handler then
+  // refreshes THIS folder in place (see app.js + refreshCurrentFolderInPlace).
+  //
+  // This was previously removed (VU-D19) because the per-click scans wrote to
+  // the store, bumped the global ``_mutation_seq``, and flushed the metadata
+  // cache for EVERY folder — queue depth + cache thrash.  That root cause is
+  // GONE: the folder-browse caches now key on the directory's own mtime /
+  // scan-root bucket size, not ``_mutation_seq``.  Re-enabling is also
+  // necessary, not just nice: on SMB/NFS network mounts the FS watcher is
+  // silently deaf (FSEvents doesn't fire for network volumes), so a folder
+  // browse is the only signal that a subtree may have changed.  The helper
+  // debounces 400 ms and skips a path it scanned in the last 30 s, and
+  // ``start_scan`` dedups overlapping queued subtrees, so rapid nav is cheap.
+  // The actual call is made BELOW, once we know the folder's size — so we skip
+  // huge archive subtrees (FRESHNESS_MAX_TRACKS) and never re-fire from an
+  // in-place refresh (opts.quiet).
 
   const fetchTracks = async (rec) => {
     const res = await fetch(
@@ -2152,12 +2388,26 @@ async function showFolder(path, recursive = false) {
   };
 
   try {
-    let tracks = await fetchTracks(recursive);
-    // Folders that contain only sub-albums (no direct audio files) would
-    // otherwise show "No tracks found" — fall back to a recursive listing
-    // so clicking e.g. an artist or top-level share shows everything below.
-    if (!recursive && tracks.length === 0) {
-      tracks = await fetchTracks(true);
+    // Recursive request: skip the shallow round-trip and go straight to
+    // the windowed-fetch path.  Used both by branch-folder auto-flatten
+    // (fallthrough below) and by any caller that explicitly wants the
+    // full subtree.
+    if (recursive) {
+      await _showFolderRecursiveWindowed(path, opts);
+      return;
+    }
+    let tracks = await fetchTracks(false);
+    // Branch-folder case: the clicked directory has no DIRECT audio
+    // (e.g. ``modarchive_2007`` root contains only zip subfolders).
+    // Auto-flatten via the windowed store — the backend's store-side
+    // recursive fast path returns 56K SID tracks in ~1.2 s cold and
+    // sub-ms warm, then the windowed virtual scroll pulls additional
+    // 2K chunks on demand as the user scrolls.  Restores the historical
+    // "click and see everything" UX without the 7–8 s warm-cache hang
+    // that the old ``_discover_audio`` FS walk imposed.
+    if (tracks.length === 0) {
+      await _showFolderRecursiveWindowed(path, opts);
+      return;
     }
     // Collapse duplicate-groups to their primary track.  SACDs that ship
     // both a stereo and a multichannel (``Multi/``) fold tend to scan into
@@ -2167,14 +2417,151 @@ async function showFolder(path, recursive = false) {
     // the regular folder listing should show one row per song.  Tracks
     // not part of any group (``duplicate_group_id`` falsy) are always
     // kept.  Unscanned stubs (``_scanned === false``) carry neither flag
-    // and are kept too.
+    // and are kept too.  (Recursive path filters on the backend so the
+    // windowed ``total`` matches what's actually delivered across chunks.)
     tracks = tracks.filter(t =>
       !t.duplicate_group_id || t.is_duplicate_primary !== false
     );
+    // On a silent in-place refresh, bail BEFORE re-rendering if the folder is
+    // unchanged — avoids a needless DOM rebuild when a freshness scan found
+    // nothing new.
+    if (opts.quiet && _sameTrackList(tracks, currentTracks)) return;
     renderTracks(tracks);
+    // Silent drill-down freshness for this leaf folder.  Skip on in-place
+    // refreshes (opts.quiet) so we don't loop.  Direct-audio leaves are small
+    // albums (no size gate needed); the recursive/branch path gates by total.
+    if (!opts.quiet) _scheduleBackgroundRefresh(path);
   } catch {
     loadingEl.hidden = true;
     emptyEl.hidden = false;
+  }
+}
+
+
+/**
+ * Fetch the first chunk of the recursive flatten + the total count,
+ * then build a windowed store sized to ``total`` and install it as
+ * ``currentTracks``.  Subsequent chunks pull lazily as the virtual
+ * scroll moves — each chunk hits the server-side
+ * ``_STORE_RECURSIVE_CACHE`` so the first chunk pays the ~1.2 s
+ * (C64Music) / ~2.6 s (modarchive) helper-build cost and every later
+ * chunk is sub-millisecond.
+ *
+ * The first fetch goes via the same ``/api/fstree/tracks-with-meta``
+ * endpoint with ``offset=0`` and ``limit=CHUNK_SIZE`` so we get both
+ * ``{total, tracks}`` back in one round trip — no separate count
+ * probe.  We then preload chunk index 0 from that response so the
+ * store never re-fetches it.
+ *
+ * Folder duplicate-collapsing is OWNED BY THE SERVER: we pass no
+ * ``filter_duplicates`` param, so the endpoint resolves the
+ * ``dedup_folders`` config toggle (Settings → "Hide duplicates when
+ * browsing folders"; default off → folder views show every audio file on
+ * disk).  Resolving it server-side means ``total`` and every chunk read
+ * the same setting, so the windowed scroll stays consistent.  (Empty
+ * folders are hidden separately via ``hide_empty_folders`` +
+ * ``_has_audio`` — directory-level, not track-level dedup.)
+ */
+async function _showFolderRecursiveWindowed(path, opts = {}) {
+  const enc = encodeURIComponent(path);
+  const firstUrl =
+    `/api/fstree/tracks-with-meta?path=${enc}&recursive=true` +
+    `&offset=0&limit=${CHUNK_SIZE}`;
+  let firstRes;
+  try {
+    firstRes = await fetch(firstUrl).then(r => r.json());
+  } catch {
+    loadingEl.hidden = true;
+    emptyEl.hidden = false;
+    return;
+  }
+  const total      = Number(firstRes?.total || 0);
+  const firstChunk = Array.isArray(firstRes?.tracks) ? firstRes.tracks : [];
+
+  // Silent, size-gated drill-down freshness: skip in-place refreshes
+  // (opts.quiet) and huge static archive subtrees (modarchive) whose recursive
+  // re-walk over SMB would be expensive and pointless.
+  if (!opts.quiet && total > 0 && total <= FRESHNESS_MAX_TRACKS) {
+    _scheduleBackgroundRefresh(path);
+  }
+
+  // On a silent in-place refresh, skip the windowed rebuild (and its scroll
+  // reset) when the subtree's total is unchanged — the common "nothing new"
+  // case.  A same-count add+remove is rare and caught by the next real scan.
+  if (opts.quiet && currentTracks && currentTracks._total === total) return;
+
+  if (total === 0) {
+    // Truly nothing under this subtree — render standard empty state.
+    renderTracks([]);
+    return;
+  }
+
+  const fetcher = async (offset, lim) => {
+    const url =
+      `/api/fstree/tracks-with-meta?path=${enc}&recursive=true` +
+      `&offset=${offset}&limit=${lim}`;
+    try {
+      const r = await fetch(url).then(r => r.json());
+      return Array.isArray(r?.tracks) ? r.tracks : [];
+    } catch {
+      return [];
+    }
+  };
+  const store = createWindowedStore(total, fetcher);
+  // Preload chunk 0 from the first response so ``fetchChunk(0)``
+  // short-circuits the moment ``_vsRender`` reaches into the store.
+  store._chunks.set(0, firstChunk);
+  store.setOnChunkLoad(() => _vsRender(true));
+  // Reset scroll + selection — the indexes the user was looking at no
+  // longer point at the same tracks.
+  _selected.clear();
+  _lastClickIdx = -1;
+  _focusedIdx = -1;
+  const wrap = document.getElementById('track-list-wrap');
+  if (wrap) wrap.scrollTop = 0;
+  renderTracks(store);
+}
+
+/**
+ * Render the "branch folder" empty state in the main panel:
+ * the clicked folder has no direct audio, only subfolders.  We tell
+ * the user how to navigate (sidebar tree) AND give them an opt-in
+ * "Show all tracks recursively" button.  Matches user mental model
+ * (folder click = show what's in it = subfolders for branch nodes),
+ * and avoids the 117 MB recursive-flatten that the old code did
+ * silently on every branch-folder click.
+ */
+function _renderBranchEmpty(path) {
+  // Tear down anything currently in the tbody (skeleton rows from
+  // _showSkeletonRows, or stale data).  renderTracks([]) does the
+  // tbody cleanup, sets emptyEl.hidden=false, and resets the heading
+  // to "No tracks found" — we then customise the empty state below.
+  renderTracks([]);
+
+  const folderName = path.split('/').filter(Boolean).pop() || path;
+  const safeName   = String(folderName).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  emptyEl.innerHTML = `
+    <span class="empty-icon" aria-hidden="true">&#128193;</span>
+    <h4>${safeName} has no direct music files</h4>
+    <p>This folder only contains subfolders.  Pick one in the sidebar tree
+       on the left to drill in — that's where the music is.</p>
+    <p style="margin-top:18px">
+      <button id="show-recursively" class="btn-secondary"
+              title="Flatten every track under ${safeName} into one list (this may take several seconds for large libraries)">
+        Show all tracks recursively
+      </button>
+    </p>
+  `;
+  const btn = document.getElementById('show-recursively');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      // User explicitly opted in to the heavy flatten — reset the
+      // empty state heading immediately so the recursive call's
+      // ``_showSkeletonRows`` shimmer reads as "loading" rather than
+      // "still on the branch-folder screen".
+      emptyEl.hidden = true;
+      showFolder(path, true);
+    });
   }
 }
 
@@ -2396,7 +2783,8 @@ _refreshTrackCount();
 
 export const Library = {
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
-  showGenres, showYears, showFolder, renderTracks,
+  showGenres, showYears, showGalaxy, showFolder, renderTracks,
+  isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace,
   setBrowseHeader, hideBrowseHeader, onInfo,
   getSelectedTracks, clearSelection, refreshBadges: _refreshTrackCount,
   // Smart & duplicates views

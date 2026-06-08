@@ -120,39 +120,129 @@ def aof_quarantine_count() -> int:
     return _aof_quarantine_count
 
 
+# Sentinel: "this key did not exist before the op" in an undo record.
+_MISSING = object()
+
+
+def _entry_undo(state: dict, entry: dict):
+    """Capture the MINIMAL pre-state needed to roll one AOF entry back.
+
+    Returns a list of undo records covering only the sub-dict keys (or list
+    slot) the op can actually touch — O(touched), not O(whole store).  This
+    deliberately mirrors the op set in
+    :func:`soniqboom.core.merger._apply_entry`; **keep the two in sync**.
+    Returns ``None`` for an unrecognised op so the caller falls back to a
+    full (slow) snapshot — correct, just slow, and only for ops we don't know.
+
+    WHY THIS EXISTS: the previous implementation shallow-copied EVERY
+    top-level slot — including the 170K-entry ``tracks`` dict — on EVERY
+    replayed entry, making AOF replay O(entries × tracks).  A clean shutdown
+    annotates every track (the duplicate-detection pass → ~one
+    ``update_track_fields`` per track), so a 172K-track library produced a
+    172K-entry AOF and replay became 172K × 172K ≈ 3e10 dict copies — startup
+    spun at 100% CPU for many minutes and never became ready.
+    """
+    op = entry.get("op")
+
+    def kv(slot: str, keys):
+        # Undo specific KEYS of a dict slot.  copy.copy the pre-value because
+        # some ops (update_track_fields, record_play) mutate it in place — a
+        # bare reference would already reflect the mutation by rollback time.
+        d = state.get(slot)
+        d = d if isinstance(d, dict) else {}
+        return ("kv", slot, {
+            k: (copy.copy(d[k]) if k in d else _MISSING)
+            for k in keys if k is not None
+        })
+
+    def whole(slot: str):
+        # Undo the ENTIRE slot value (for the list-typed ``history`` slot,
+        # which push_history may wholesale-replace on truncation).
+        v = state.get(slot, _MISSING)
+        if isinstance(v, list):
+            v = list(v)
+        return ("whole", slot, v)
+
+    if op in ("upsert_track", "update_track_fields"):
+        return [kv("tracks", [entry.get("id")])]
+    if op == "batch_upsert_tracks":
+        return [kv("tracks", [t.get("id") for t in entry.get("data", [])
+                              if isinstance(t, dict)])]
+    if op == "update_track_fields_batch":
+        return [kv("tracks", [r.get("id") for r in entry.get("data", [])
+                              if isinstance(r, dict)])]
+    if op == "delete_tracks":
+        ids = list(entry.get("ids", []))
+        return [kv("tracks", ids), kv("waveforms", ids)]   # touches BOTH
+    if op == "set_rating":
+        return [kv("ratings", [entry.get("id")])]
+    if op == "record_play":
+        return [kv("play_stats", [entry.get("id")])]
+    if op in ("upsert_playlist", "delete_playlist"):
+        return [kv("playlists", [entry.get("id")])]
+    if op in ("upsert_scan_dir", "delete_scan_dir"):
+        return [kv("scan_dirs", [entry.get("path")])]
+    if op == "set_config":
+        return [kv("config", [entry.get("key")])]
+    if op == "push_history":
+        return [whole("history")]
+    return None
+
+
+def _entry_restore(state: dict, undo) -> None:
+    """Undo a partially-applied entry from a :func:`_entry_undo` record."""
+    for rec in undo:
+        kind = rec[0]
+        if kind == "kv":
+            _, slot, saved = rec
+            d = state.setdefault(slot, {})
+            for k, v in saved.items():
+                if v is _MISSING:
+                    d.pop(k, None)
+                else:
+                    d[k] = v
+        else:  # "whole"
+            _, slot, v = rec
+            if v is _MISSING:
+                state.pop(slot, None)
+            else:
+                state[slot] = v
+
+
 def _apply_entry_transactional(state: dict, entry: dict) -> bool:
     """Apply ``entry`` to ``state`` atomically.
 
-    The underlying ``_apply_entry`` mutates ``state`` in place, so a
-    half-applied batch upsert (e.g. AttributeError mid-loop) would leave
-    the store in a torn state.  We snapshot the touched top-level
-    sub-dicts before the call and restore them on failure so a corrupt
-    batch can't taint the rest of the replay.
+    ``_apply_entry`` mutates ``state`` in place, so a half-applied batch (e.g.
+    an AttributeError mid-loop) would leave the store torn.  We capture the
+    minimal pre-state for the keys this op touches (:func:`_entry_undo`) and
+    restore them on failure — O(touched), so AOF replay is O(entries), not
+    O(entries × tracks).
 
     Returns ``True`` on success, ``False`` if the entry was rolled back.
     """
     from soniqboom.core.merger import _apply_entry
 
-    # Shallow-snapshot the top-level state slots this op might touch.
-    # Deep-copying the entire 170K-track ``tracks`` dict per replayed
-    # entry would dominate startup, so we copy lazily — only the keys
-    # actually present in ``state``.
-    snapshot = {k: copy.copy(v) for k, v in state.items()}
+    undo = _entry_undo(state, entry)
+    if undo is None:
+        # Unrecognised op — fall back to a full shallow-snapshot.  Correct for
+        # ops _entry_undo doesn't know about; rare, so the O(n) cost is fine.
+        snapshot = {k: copy.copy(v) for k, v in state.items()}
+        try:
+            _apply_entry(state, entry)
+            return True
+        except Exception:
+            for k, v in snapshot.items():
+                state[k] = v
+            for k in list(state.keys()):
+                if k not in snapshot:
+                    state.pop(k, None)
+            return False
+
     try:
         _apply_entry(state, entry)
         return True
     except Exception:
-        # Restore the pre-call references so partial mutations don't
-        # leak.  Note: any nested dicts that ``_apply_entry`` mutated
-        # in place are restored via the snapshot's reference if it was
-        # a fresh container we copied; for atomic restoration we
-        # additionally copy each sub-dict on the way in.
-        for k, v in snapshot.items():
-            state[k] = v
-        # Drop keys created during the failed call.
-        for k in list(state.keys()):
-            if k not in snapshot:
-                state.pop(k, None)
+        _entry_restore(state, undo)
         return False
 
 

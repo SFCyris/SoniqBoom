@@ -124,7 +124,7 @@ function _renderCard(track) {
   $('mr-slave-title').textContent = track.title || '(Untitled)';
   $('mr-slave-artist').textContent = track.artist || track.album_artist || '';
   // Same format-aware fallback as master.js — see comment there.
-  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg` : '');
+  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg&fallback=404` : '');
   artEl.innerHTML = `<span class="mr-art-ph">${artPlaceholderEmoji(track)}</span>` +
     (src ? `<img class="mr-art-img" src="${_esc(src)}" alt="">` : '');
   const _mrImg = artEl.querySelector('.mr-art-img');

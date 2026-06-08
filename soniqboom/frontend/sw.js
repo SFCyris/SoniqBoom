@@ -292,7 +292,7 @@
 // retry when 1× under-shoots but 4× covers the cover art.
 // (b) FTP pool can auto-grow connections when a per-server
 // "Auto-grow scan workers" toggle is enabled (default OFF).
-const SHELL_VERSION = 'v39';
+const SHELL_VERSION = 'v72';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 
 // Precache: entry-point HTML + the four critical-path JS modules and the

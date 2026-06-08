@@ -98,6 +98,15 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "openmpt123: $(command -v openmpt123 || echo 'not found')"
 
+  # lhasa provides the reference ``lha`` CLI — it decodes every LHA method,
+  # including ``-lh1-`` (common in older Amiga archives) that the in-process
+  # ``lhafile`` reader rejects.  Optional: LHA scanning degrades without it.
+  if ! command -v lha &>/dev/null; then
+    info "Installing lhasa (LHA/LZH archive decoder)…"
+    brew install lhasa || warn "lhasa install failed — LHA -lh1- archives won't be scanned"
+  fi
+  info "lha (lhasa): $(command -v lha || echo 'not found — LHA -lh1- archives skipped')"
+
   section "Optional dependencies (informational)"
   for pkg in cmus cava; do
     if brew list "$pkg" &>/dev/null 2>&1; then
@@ -178,6 +187,19 @@ elif [ "$PLATFORM" = "linux" ]; then
       curl ca-certificates xz || true
   fi
 
+  # LHA archive support: the reference ``lha`` CLI (from lhasa) decodes Amiga
+  # ``-lh1-`` archives the in-process ``lhafile`` reader can't.  Best-effort and
+  # isolated (its own command per manager) so a distro that doesn't package it
+  # never blocks the core deps.
+  if [ "$PKG" != "none" ] && ! command -v lha &>/dev/null; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends lhasa || true ;;
+      dnf)    run_pkg dnf install -y lhasa || true ;;
+      zypper) run_pkg zypper --non-interactive install lhasa || true ;;
+      pacman) warn "lhasa is in the AUR — install it with an AUR helper for LHA -lh1- support" ;;
+    esac
+  fi
+
   PYTHON="$(command -v python3 || true)"
   [ -z "$PYTHON" ] && die "python3 not found after install.  Aborting."
   info "Python: $($PYTHON --version)"
@@ -185,6 +207,7 @@ elif [ "$PLATFORM" = "linux" ]; then
   info "sidplayfp:        $(command -v sidplayfp  || echo 'not found — SID rendering disabled')"
   info "fluidsynth:       $(command -v fluidsynth || echo 'not found — MIDI rendering disabled')"
   info "openmpt123:       $(command -v openmpt123 || echo 'not found — tracker rendering disabled')"
+  info "lha (lhasa):      $(command -v lha        || echo 'not found — LHA -lh1- archives skipped')"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

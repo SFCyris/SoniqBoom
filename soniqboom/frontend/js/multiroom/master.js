@@ -550,7 +550,7 @@ function _renderNow(track) {
   // layer the same format-emoji + ``/api/art/{id}`` fallback the
   // desktop player uses, so the multiroom controller shows real album
   // art consistently with the bottom-left bar.
-  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg` : '');
+  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg&fallback=404` : '');
   artEl.innerHTML = `<span class="mr-art-ph">${artPlaceholderEmoji(track)}</span>` +
     (src ? `<img class="mr-art-img" src="${_esc(src)}" alt="">` : '');
   const _mrImg = artEl.querySelector('.mr-art-img');

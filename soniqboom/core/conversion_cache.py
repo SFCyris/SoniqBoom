@@ -32,6 +32,11 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from soniqboom.config import get_conversion_cache_dir, settings
+# Aliased: this module already defines a public ``async def cache_stats()``
+# (imported by main.py / admin.py).  Without the alias that function shadows
+# this telemetry module at module scope, so ``cache_stats.miss`` resolves to
+# the function → AttributeError on every cold render (MIDI/SID/MOD/GME).
+from soniqboom.core import cache_stats as _cstats
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +98,9 @@ _pending_purge: dict[str, str] = {}
 
 # ── In-memory LRU state ────────────────────────────────────────────────────
 _meta: dict[str, dict] = {}      # key → {path, size_bytes, format_type, created_at}
+
+# Expose live entry count to the cache-stats telemetry (cascade viz).
+_cstats.register_size("conversion", lambda: len(_meta))
 # OrderedDict gives us O(1) eviction (popitem from the front) and O(1)
 # touch-on-access (move_to_end) instead of the previous ``min(_lru, key=...)``
 # which scanned every entry per eviction.
@@ -136,7 +144,10 @@ def _cache_key(
     elif format_type == "midi":
         sf_hash = hashlib.sha256((soundfont_path or "").encode()).hexdigest()[:8]
         parts.append(f"sf{sf_hash}")
-    elif format_type == "tracker":
+    elif format_type in ("tracker", "uade", "hvl"):
+        # All carry sub-songs (HVL/AHX especially) — without ``sub{N}`` in the
+        # key, different subsongs of the same module collide and the first
+        # render wins.
         parts.append(f"sub{subsong}")
     elif format_type == "gme":
         # libgme containers (NSF/SPC/GBS/VGM/AY/KSS/SAP/GYM/HES) carry
@@ -156,6 +167,34 @@ def _cache_path(cache_key: str, format_type: str) -> Path:
     base = get_conversion_cache_dir() / format_type
     shard = cache_key[:2]
     return base / shard / f"{cache_key}.wav"
+
+
+def get_vu_sidecar_path(track_id: str) -> Path | None:
+    """Return the on-disk path to the VU sidecar for *track_id*, or
+    None if no tracker render has produced one yet.
+
+    Walks the in-memory ``_meta`` looking for any cached tracker entry
+    whose key starts with *track_id*.  The cache key format is
+    ``"<track_id>__sub<N>"`` so a startswith match is unambiguous —
+    different subsongs would be different VU sidecars, but the
+    frontend currently only requests the default subsong's VU.
+
+    Returns the FIRST matching sidecar (lowest subsong) so the
+    frontend's default-subsong playback gets the right meters.  If we
+    later add per-subsong selection in the UI, the endpoint can grow a
+    ``?subsong=`` query param.
+    """
+    with _state_lock:
+        for cache_key, entry in _meta.items():
+            if not cache_key.startswith(f"{track_id}__"):
+                continue
+            if entry.get("format_type") != "tracker":
+                continue
+            wav_path = Path(entry["path"])
+            sidecar  = wav_path.with_suffix(".vu")
+            if sidecar.exists():
+                return sidecar
+    return None
 
 
 # ── Core cache operations ───────────────────────────────────────────────────
@@ -197,10 +236,21 @@ async def store_cached(
 
     Uses os.replace() for atomic placement when possible, falling back to
     shutil.move() across filesystems.  Triggers LRU eviction if over quota.
+
+    Sidecar handling
+    ----------------
+    Tracker renders may produce a ``<source>.vu`` per-channel VU sidecar
+    next to the WAV (see ``soniqboom/core/openmpt_vu.py``).  If present,
+    we move it alongside so the cached WAV always has its matching VU
+    sidecar — the frontend looks for ``<wav>.vu`` to drive per-channel
+    meters.  Sidecar bytes don't count towards the cache LRU budget
+    because they're trivially small (~10–100 KB) compared to the WAV.
     """
     global _total_bytes
 
     dest = _cache_path(cache_key, format_type)
+    src_sidecar  = source_path.with_suffix(".vu")
+    dest_sidecar = dest.with_suffix(".vu")
 
     def _place_and_size() -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +258,15 @@ async def store_cached(
             os.replace(str(source_path), str(dest))
         except OSError:
             shutil.move(str(source_path), str(dest))
+        # Move the sidecar too if it exists — non-fatal if it doesn't.
+        if src_sidecar.exists():
+            try:
+                os.replace(str(src_sidecar), str(dest_sidecar))
+            except OSError:
+                try:
+                    shutil.move(str(src_sidecar), str(dest_sidecar))
+                except Exception:
+                    pass
         return dest.stat().st_size
 
     size_bytes = await asyncio.to_thread(_place_and_size)
@@ -450,6 +509,7 @@ async def get_or_render(
     # Fast path: cache hit without acquiring the per-key lock.
     cached = await get_cached(key)
     if cached:
+        _cstats.hit("conversion")
         return cached, True
 
     # Slow path: serialise cold callers for this key.  Inside the lock the
@@ -463,12 +523,17 @@ async def get_or_render(
         # we awaited acquisition.
         cached = await get_cached(key)
         if cached:
+            _cstats.hit("conversion")
             return cached, True
         event = _inflight.get(key)
         if event is None:
             event = asyncio.Event()
             _inflight[key] = event
             is_renderer = True
+            # Cold path — this caller will actually render.  Count one miss
+            # per logical render (the waiters below served from cache are
+            # separate requests counted as hits when they wake).
+            _cstats.miss("conversion")
 
     if not is_renderer:
         # Another coroutine is already rendering — wait for its event and
@@ -476,6 +541,7 @@ async def get_or_render(
         await event.wait()
         cached = await get_cached(key)
         if cached:
+            _cstats.hit("conversion")
             return cached, True
         # The renderer failed (event set without storing).  We don't retry
         # — surface the error to the caller so the original render's
@@ -591,7 +657,7 @@ async def is_cache_ready(cache_key: str) -> bool:
 
 async def cache_stats() -> dict:
     with _state_lock:
-        by_type: dict[str, int] = {"sid": 0, "midi": 0, "tracker": 0, "gme": 0, "transcoded": 0}
+        by_type: dict[str, int] = {"sid": 0, "midi": 0, "tracker": 0, "uade": 0, "hvl": 0, "gme": 0, "transcoded": 0}
         by_type_bytes: dict[str, int] = dict.fromkeys(by_type, 0)
         for entry in _meta.values():
             ft = entry.get("format_type", "")
@@ -622,7 +688,7 @@ def warmup_from_disk() -> int:
         return 0
     adopted = 0
     with _state_lock:
-        for fmt in ("sid", "midi", "tracker", "gme", "transcoded"):
+        for fmt in ("sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"):
             sub = base / fmt
             if not sub.exists():
                 continue
@@ -721,7 +787,7 @@ async def clear_cache(types: list[str] | None = None) -> dict:
     regenerate from scratch)."""
     global _total_bytes
 
-    all_types = {"sid", "midi", "tracker", "gme", "transcoded"}
+    all_types = {"sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"}
     selected = set(types) if types else all_types
     selected &= all_types
     if not selected:

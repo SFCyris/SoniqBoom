@@ -32,7 +32,7 @@ export function buildTrackRow(track, opts = {}) {
   const ph = document.createElement('span');
   ph.textContent = artPlaceholderEmoji(track);
   art.appendChild(ph);
-  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm` : null);
+  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm&fallback=404` : null);
   if (artSrc) {
     const img = new Image();
     img.alt = '';

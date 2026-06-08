@@ -63,6 +63,25 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
+# Guard: refuse to start if something is already LISTENing on the port but our
+# pidfile didn't catch it (orphaned server, stale pidfile, or an unrelated
+# process).  Without this, we'd launch a second process that fails to bind and
+# dies — and the readiness check below would then falsely succeed against the
+# incumbent, reporting "ready" while the new code never ran.  ``shutdown.sh``'s
+# port fallback can clear an orphan.  Degrades to no-op if lsof is unavailable.
+if command -v lsof &>/dev/null; then
+  PORT_HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+  if [ -n "$PORT_HOLDER" ]; then
+    echo ""
+    echo -e "${BOLD}── SoniqBoom ──${RESET}"
+    echo ""
+    echo -e "  ${RED}Port ${PORT} is already in use (pid ${PORT_HOLDER}).${NC}"
+    echo -e "  Run ${BOLD}./shutdown.sh${RESET} first, or start with ${BOLD}--port <number>${RESET}."
+    echo ""
+    exit 1
+  fi
+fi
+
 # ── Start server ─────────────────────────────────────────────────────────────
 mkdir -p "$LOG_DIR"
 

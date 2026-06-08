@@ -346,10 +346,10 @@ class CastSession:
         # take down the cast session — prewarm is best-effort.
         try:
             from soniqboom.api.stream import (
-                _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS,
+                _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
                 _GME_EXTS_STREAM, _DSD_EXTS, NATIVE,
                 _render_sid, _render_midi, _render_tracker, _render_uade,
-                _render_gme, _render_to_transcoded_flac,
+                _render_hvl, _render_gme, _render_to_transcoded_flac,
             )
             from soniqboom.core.conversion_cache import (
                 _cache_key as _ck,
@@ -413,10 +413,25 @@ class CastSession:
                         ck, "midi",
                         lambda p=path: _render_midi(p),
                     )
+                elif src_ext in _HVL_EXTS:
+                    # HivelyTracker — bundled hvl2wav (uade/openmpt can't
+                    # decode HVL).  Checked before the uade + tracker branches.
+                    ck = _ck(
+                        track_id=item.track_id, format_type="hvl",
+                        subsong=int(item.subsong or 0),
+                    )
+                    if await is_cache_ready(ck):
+                        continue
+                    path = Path(track.path)
+                    await start_background_render(
+                        ck, "hvl",
+                        lambda p=path, ss=int(item.subsong or 0):
+                            _render_hvl(p, subsong=ss),
+                    )
                 elif src_ext in _UADE_EXTS:
-                    # AHX / Hively — uade123, not openmpt123.  Checked
-                    # before the tracker branch (same priority as the
-                    # foreground path in stream.py).
+                    # AHX — uade123, not openmpt123.  Checked before the
+                    # tracker branch (same priority as the foreground path
+                    # in stream.py).
                     ck = _ck(
                         track_id=item.track_id, format_type="uade",
                         subsong=int(item.subsong or 0),

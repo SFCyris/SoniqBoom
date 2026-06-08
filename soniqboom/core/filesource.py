@@ -664,12 +664,16 @@ class _PooledFTP:
     exception, so most call sites don't need to think about it.
     """
 
-    __slots__ = ("conn", "xfer_count", "_broken")
+    __slots__ = ("conn", "xfer_count", "_broken", "lane")
 
     def __init__(self, conn: ftplib.FTP):
         self.conn = conn
         self.xfer_count = 0
         self._broken = False
+        # Lane this handle is currently borrowed under ("stream"|"scan").
+        # Set by the pool on each borrow; used so _release decrements the
+        # right per-lane in-use counter (drives the admin FTP-lanes viz).
+        self.lane = "scan"
 
     def note_transfer(self) -> None:
         """Bump the transfer counter.  Pool will recycle when the count
@@ -723,6 +727,11 @@ class _FTPConnectionPool:
         self._cond        = threading.Condition(self._lock)
         self._idle: list[_PooledFTP] = []
         self._in_use_count = 0
+        # Per-lane in-use breakdown (sum == _in_use_count).  Lets the admin
+        # FTP-lanes viz show scan vs stream activity accurately — without it
+        # a scan-heavy reindex was mis-rendered on the stream lane.
+        self._in_use_stream = 0
+        self._in_use_scan = 0
         self._closed = False
         # Stream-priority bookkeeping.  Each waiting borrow registers
         # in one of these counters BEFORE entering ``cond.wait()``; on
@@ -810,6 +819,9 @@ class _FTPConnectionPool:
                         try:
                             handle.conn.voidcmd("NOOP")
                             self._in_use_count += 1
+                            handle.lane = lane
+                            if lane == "stream": self._in_use_stream += 1
+                            else:                self._in_use_scan += 1
                             if registered:
                                 if lane == "stream": self._waiting_stream -= 1
                                 else:                self._waiting_scan -= 1
@@ -829,6 +841,8 @@ class _FTPConnectionPool:
                 total = self._in_use_count + len(self._idle)
                 if total < self._max_size and not stream_ahead_of_me:
                     self._in_use_count += 1
+                    if lane == "stream": self._in_use_stream += 1
+                    else:                self._in_use_scan += 1
                     if registered:
                         if lane == "stream": self._waiting_stream -= 1
                         else:                self._waiting_scan -= 1
@@ -856,7 +870,9 @@ class _FTPConnectionPool:
         # back the reserved slot or the pool counter drifts upward forever.
         try:
             conn = self._factory()
-            return _PooledFTP(conn)
+            handle = _PooledFTP(conn)
+            handle.lane = lane
+            return handle
         except BaseException as exc:
             # Capture the current in-use count BEFORE giving the slot back
             # so cap-detection records the true peak we hit.  If this
@@ -867,6 +883,9 @@ class _FTPConnectionPool:
             with self._cond:
                 observed = self._in_use_count
                 self._in_use_count -= 1
+                # Roll back the per-lane counter too (we reserved it above).
+                if lane == "stream": self._in_use_stream = max(0, self._in_use_stream - 1)
+                else:                self._in_use_scan = max(0, self._in_use_scan - 1)
                 # Wake one waiter so the cap reservation doesn't strand
                 # the next person in line.
                 self._cond.notify()
@@ -892,6 +911,12 @@ class _FTPConnectionPool:
         need_topup = False
         with self._cond:
             self._in_use_count -= 1
+            # Decrement the per-lane counter matching how this handle was
+            # borrowed (clamped — defensive against any bookkeeping drift).
+            if handle.lane == "stream":
+                self._in_use_stream = max(0, self._in_use_stream - 1)
+            else:
+                self._in_use_scan = max(0, self._in_use_scan - 1)
             recycle = (
                 self._closed
                 or handle._broken
@@ -989,6 +1014,8 @@ class _FTPConnectionPool:
                 "max_size":       self._max_size,
                 "min_size":       self._min_size,
                 "in_use":         self._in_use_count,
+                "in_use_stream":  self._in_use_stream,
+                "in_use_scan":    self._in_use_scan,
                 "idle":           len(self._idle),
                 "waiting_stream": self._waiting_stream,
                 "waiting_scan":   self._waiting_scan,
@@ -1589,17 +1616,23 @@ class FTPFileSource(FileSource):
                      self._host)
             self._encoding = "latin-1"
 
-    def _list_entries(self, path: str) -> list[DirEntry]:
+    def _list_entries(self, path: str, lane: str = "scan") -> list[DirEntry]:
+        # ``lane`` selects the pool bucket: ``"scan"`` (default) for bulk
+        # scanner walks; ``"stream"`` for INTERACTIVE folder browsing so a
+        # running scan (which saturates the scan lane) can't starve the file
+        # browser.  The symptom was a remote folder rendering EMPTY mid-scan:
+        # the listing borrow timed out on the contended scan lane and
+        # fstree's _remote_list_children swallowed the exception → [].
         abs_path = self._abs(path)
 
         # Prefer MLSD (structured output, RFC 3659)
         if self._use_mlsd:
             try:
-                return self._list_via_mlsd(abs_path)
+                return self._list_via_mlsd(abs_path, lane)
             except UnicodeDecodeError:
                 self._switch_encoding_latin1()
                 try:
-                    return self._list_via_mlsd(abs_path)
+                    return self._list_via_mlsd(abs_path, lane)
                 except Exception as exc:
                     log.info("MLSD failed on %s (%s), using LIST fallback",
                              self._host, exc)
@@ -1613,11 +1646,11 @@ class FTPFileSource(FileSource):
 
         # Fallback: LIST (universally supported)
         try:
-            return self._list_via_list(abs_path)
+            return self._list_via_list(abs_path, lane)
         except UnicodeDecodeError:
             self._switch_encoding_latin1()
             try:
-                return self._list_via_list(abs_path)
+                return self._list_via_list(abs_path, lane)
             except Exception as exc:
                 log.warning("FTP LIST failed for %s: %s", abs_path, exc)
                 self._reset()
@@ -1627,11 +1660,10 @@ class FTPFileSource(FileSource):
             self._reset()
             return []
 
-    def _list_via_mlsd(self, abs_path: str) -> list[DirEntry]:
+    def _list_via_mlsd(self, abs_path: str, lane: str = "scan") -> list[DirEntry]:
         """List a directory via MLSD (RFC 3659 — structured output)."""
         entries: list[DirEntry] = []
-        # ``scan`` lane — directory listings are part of scanner work.
-        with self._pool.borrow(lane="scan") as handle:
+        with self._pool.borrow(lane=lane) as handle:
             ftp = handle.conn
             for name, facts in ftp.mlsd(abs_path):
                 if name in (".", ".."):
@@ -1644,10 +1676,9 @@ class FTPFileSource(FileSource):
                                         is_dir=is_d, size=sz, mtime=mtime))
         return entries
 
-    def _list_via_list(self, abs_path: str) -> list[DirEntry]:
+    def _list_via_list(self, abs_path: str, lane: str = "scan") -> list[DirEntry]:
         """List a directory via LIST (universal fallback)."""
-        # ``scan`` lane — directory listings are part of scanner work.
-        with self._pool.borrow(lane="scan") as handle:
+        with self._pool.borrow(lane=lane) as handle:
             ftp = handle.conn
             ftp.cwd(abs_path)
             lines: list[str] = []
@@ -1809,7 +1840,11 @@ class FTPFileSource(FileSource):
                 stack.append(self._abs(d.path))
 
     def list_dir(self, path: str) -> list[DirEntry]:
-        return self._list_entries(path)
+        # Interactive file-browser listing → "stream" lane, NOT "scan".  A
+        # running scan saturates the scan lane; sharing it made remote folders
+        # render empty in the browser.  The scanner's own walk_with_stat still
+        # calls _list_entries() with the default "scan" lane.
+        return self._list_entries(path, lane="stream")
 
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         # ``lane`` is forwarded to ``_pool.borrow`` so the caller can

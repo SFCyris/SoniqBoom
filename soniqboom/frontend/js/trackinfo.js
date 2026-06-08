@@ -13,6 +13,8 @@
  */
 import { Player }              from './player.js';
 import { artPlaceholderEmoji, trapFocus } from './utils.js';
+import { mountSignalChain }    from './viz/signalchain.js';
+import { vizGroupEnabled }     from './viz/engine.js';
 
 // ── Chapters (E-18) ────────────────────────────────────────────────────────
 
@@ -65,6 +67,32 @@ async function _loadChapters(track) {
     host.append(header, list);
     host.hidden = false;
   } catch { /* silent — chapters are best-effort */ }
+}
+
+// ── Signal-path viz (#4) ──────────────────────────────────────────────────
+let _signalChain = null;     // handle from mountSignalChain
+let _sigTrack = null;        // the track the chain is currently rendering
+
+function _mountSignalChainFor(track) {
+  _sigTrack = track;
+  const section = document.getElementById('ti-section-signal');
+  const host = document.getElementById('ti-signal-chain');
+  if (!section || !host) return;
+  if (!vizGroupEnabled('nowPlaying')) {
+    // Group off (or reduced-motion handled inside the engine) — hide section.
+    section.hidden = true;
+    if (_signalChain) { _signalChain.unregister(); _signalChain = null; host.textContent = ''; }
+    return;
+  }
+  section.hidden = false;
+  if (!_signalChain) {
+    _signalChain = mountSignalChain(host, () => ({
+      format: _sigTrack?.format || '',
+      playing: !!(Player && Player.playing),
+    }));
+  } else {
+    _signalChain.rebuild();
+  }
 }
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -148,23 +176,35 @@ function _render(track) {
   // Set format-appropriate placeholder emoji while art loads (or if no art)
   if (artPhEl) artPhEl.textContent = artPlaceholderEmoji(track);
 
+  // Request the ``lg`` thumbnail rather than the raw embedded JPEG —
+  // tracks with high-res cover art (1400×1248+) would otherwise download
+  // several MB into a ~260×260 dialog box.  The ``lg`` cache is shared
+  // with the now-playing overlay so the bytes are typically already on
+  // disk by the time the dialog opens.
+  //
+  // ``fallback=404`` tells the server to return a cacheable 404 (no
+  // body) when there's no real art, so the IMG.onerror fires and we
+  // keep the format-specific emoji visible.  We previously tried to
+  // read the ``X-SoniqBoom-Art`` header via fetch+blob, which forced
+  // a full body download per modal open and silently regressed
+  // perceived modal latency (D14).
   const img = new Image();
+  img.decoding = 'async';
+  const reqTrackId = track.id;
   img.onload = () => {
+    if (_queue[_idx]?.id !== reqTrackId) return;
     artImg.src = img.src;
     artImg.style.display = 'block';
     artEl.classList.remove('ti-art-loading');
     artEl.classList.add('ti-has-art');
   };
   img.onerror = () => {
+    if (_queue[_idx]?.id !== reqTrackId) return;
     artEl.classList.remove('ti-art-loading');
-    // Placeholder emoji (above) is shown automatically when ti-has-art is absent
+    // Placeholder emoji (above) shows automatically when
+    // ``ti-has-art`` is absent.
   };
-  // Request the ``lg`` thumbnail rather than the raw embedded JPEG —
-  // tracks with high-res cover art (1400×1248+) would otherwise download
-  // several MB into a ~260×260 dialog box.  The ``lg`` cache is shared
-  // with the now-playing overlay so the bytes are typically already on
-  // disk by the time the dialog opens.
-  img.src = `/api/art/${track.id}?size=lg`;
+  img.src = `/api/art/${track.id}?size=lg&fallback=404`;
 
   // ── Navigation label ──
   const title = track.title || track.path?.split('/').pop() || '—';
@@ -225,6 +265,26 @@ function _render(track) {
 
   // Load extended module/SID/MIDI info
   _loadExtendedInfo(track);
+
+  // Signal-path viz (#4): per-format decode pipeline.  Mounted lazily and
+  // gated on the now-playing viz group.  ``getState`` reads the DISPLAYED
+  // track's format (illustrative of how that format decodes) and the global
+  // play state (the signal flows while audio plays, freezes when paused).
+  _mountSignalChainFor(track);
+
+  // Notify app.js which track this modal is currently DISPLAYING
+  // (which may not be the track currently PLAYING — the user can
+  // browse with the ◀ ▶ navigation buttons).  app.js uses this to
+  // decide whether to park the VU/FFT overlay on the modal's cover
+  // art: only when displayed == playing, otherwise the overlay
+  // shows the wrong track's analysis (e.g. a SID's FFT spectrum
+  // sitting on an XM's info card, which the user pointed out as a
+  // visual lie).
+  try {
+    overlay.dispatchEvent(new CustomEvent('trackinfo:render', {
+      detail: { trackId: track?.id || null }
+    }));
+  } catch (_) {}
 }
 
 // ── Module / SID / MIDI extended info ─────────────────────────────────────────
@@ -503,6 +563,11 @@ function open(queue, idx) {
   _switchTab('info');
   overlay.classList.remove('hidden');
   document.body.classList.add('ti-open');
+  // Notify app.js so it can reparent the VU/FFT meters onto the
+  // cover-art box as a spectrum overlay (app.js _placeVUContainer).
+  // The event is fired AFTER the ``hidden`` class is removed so the
+  // listener sees the open state.
+  try { overlay.dispatchEvent(new CustomEvent('trackinfo:open')); } catch (_) {}
 
   // Windowed store: nudge the chunk containing this index in case the
   // LRU has evicted it.  ``ensureRange`` is async fire-and-forget; the
@@ -562,6 +627,12 @@ function close() {
   }
   overlay.classList.add('hidden');
   document.body.classList.remove('ti-open');
+  // Dispatch AFTER the ``hidden`` class lands so app.js's
+  // _placeVUContainer reads ``modalOpen=false`` and returns the
+  // VU meters to the player bar.  If we dispatched first the
+  // listener would still see ``modalOpen=true`` and skip the
+  // reparent — verified in preview.
+  try { overlay.dispatchEvent(new CustomEvent('trackinfo:close')); } catch (_) {}
   // Restore focus to the element that opened the panel.  Guarded against
   // the element being removed from the DOM in the meantime (defensive —
   // ``focus`` is a no-op on detached nodes but we don't want to throw if

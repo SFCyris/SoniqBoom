@@ -307,6 +307,18 @@ class UserStore:
     def get(self, user_id: str) -> User | None:
         return self._users.get(user_id)
 
+    def get_by_id(self, user_id: str) -> User | None:
+        """Alias for :meth:`get` — look up a user by their immutable id.
+
+        ``cast_stream``'s token re-auth check probes for a ``get_by_id``
+        method (the cast token's ``uid`` claim is the user *id*, via
+        ``cast._user_field``).  Without this method that probe silently
+        no-ops and the fallback ``get_by_username(uid)`` can't resolve a
+        UUID, so the re-auth check rejected EVERY cast token with a 404
+        ("Stream link no longer valid") — i.e. no cast ever streamed.
+        """
+        return self._users.get(user_id)
+
     def get_by_username(self, username: str) -> User | None:
         uid = self._by_username.get((username or "").lower())
         return self._users.get(uid) if uid else None

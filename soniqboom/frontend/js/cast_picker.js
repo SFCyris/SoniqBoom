@@ -407,6 +407,12 @@
         target_id: target.id,
         track_id:  currentTrackId,
       });
+      // Cast confirmed → the server now streams to the device, so silence
+      // the local <audio>.  Without this the browser keeps playing too
+      // (double audio) and the OS Now-Playing widget credits the browser,
+      // not the cast target.  Only after a confirmed start, so a failed
+      // cast never leaves the user with silence.
+      try { if (player && player.audio && !player.audio.paused) player.audio.pause(); } catch (_) {}
       _activeTargetId   = target.id;
       _activeTargetName = target.name;
       _lastFailedTarget = null;
@@ -466,6 +472,7 @@
               target_id: target.id,
               track_id:  currentTrackId,
             });
+            try { if (player && player.audio && !player.audio.paused) player.audio.pause(); } catch (_) {}
             _activeTargetId   = target.id;
             _activeTargetName = target.name;
             _lastFailedTarget = null;
@@ -570,10 +577,15 @@
       overlay.setAttribute('role', 'dialog');
       overlay.setAttribute('aria-modal', 'true');
       overlay.setAttribute('aria-labelledby', 'cast-pair-title');
+      // NO ``backdrop-filter:blur`` here: this overlay sits over the live
+      // now-playing visualizations (VU circuit / oscilloscope / galaxy), and
+      // re-blurring those animating layers every frame starves the compositor
+      // so badly that the PIN <input> only registered ~1 keystroke/second.  A
+      // more opaque solid backdrop reads the same without the per-frame cost.
       overlay.style.cssText =
-        'position:fixed;inset:0;background:rgba(0,0,0,.55);' +
+        'position:fixed;inset:0;background:rgba(0,0,0,.78);' +
         'display:flex;align-items:center;justify-content:center;' +
-        'z-index:10000;backdrop-filter:blur(4px)';
+        'z-index:10000';
       overlay.innerHTML = `
         <div class="cast-pair-card" style="
           background:var(--bg2,#1a1c20);color:var(--text1,#e8eaed);

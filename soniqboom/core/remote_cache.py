@@ -153,10 +153,12 @@ class RemoteCache:
         return self._root / f"{key}{ext}"
 
     def get_cached(self, share_id: str, remote_path: str) -> Path | None:
+        from soniqboom.core import cache_stats
         key = self._cache_key(share_id, remote_path)
         with self._mutex:
             entry = self._index.get(key)
             if entry is None:
+                cache_stats.miss("remote")
                 return None
             local = Path(entry["local"])
         if not local.exists():
@@ -166,6 +168,7 @@ class RemoteCache:
                     self._total_bytes = max(
                         0, self._total_bytes - stale.get("size", 0),
                     )
+            cache_stats.miss("remote")
             return None
         # Update access time in memory only.  The previous code wrote the
         # entire JSON index to disk on every cache *hit*, hammering the
@@ -173,6 +176,7 @@ class RemoteCache:
         # LRU bookkeeping, not durable data.
         with self._mutex:
             entry["last_access"] = time.time()
+        cache_stats.hit("remote")
         return local
 
     def _lock_for_key(self, key: str) -> threading.Lock:

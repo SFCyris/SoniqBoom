@@ -61,7 +61,22 @@ TRACKER_LIKE_EXTS: frozenset[str] = frozenset({
     ".sap", ".gym", ".hes",
     # Tracker formats
     ".mod", ".s3m", ".it", ".xm", ".mtm", ".669", ".med",
+    # AHX / HivelyTracker — header parsed by _extract_tracker; .hvl/.ahx
+    # were previously mis-titled with the offset-0 format magic.
+    ".ahx", ".hvl",
 })
+
+# Tracker formats whose offset-0 magic was mis-read as the title by the
+# pre-fix ``_extract_tracker`` (it read the first bytes, which are the format
+# MAGIC, not the song name).  A file with one of these exact titles is the
+# magic-as-title artifact; re-extracting with the corrected parser yields the
+# real embedded name.  Without this the four xeron/syphus .hvl modules all kept
+# title "HVL", looked identical, and collapsed to one row under duplicate
+# filtering.
+_MAGIC_TITLE_BUG: dict[str, frozenset[str]] = {
+    ".hvl": frozenset({"HVL"}),
+    ".ahx": frozenset({"THX", "AHX"}),
+}
 
 
 # ── Progress state ───────────────────────────────────────────────────────────
@@ -156,6 +171,38 @@ def _has_replacement_char(track: dict) -> bool:
     return False
 
 
+def _has_bad_tracker_title(track: dict) -> bool:
+    """True for an AHX/HVL track whose stored title is a known mis-extraction
+    artifact from the pre-fix ``_extract_tracker``:
+
+      * the bare format MAGIC ("HVL" / "THX" / "AHX") — offset-0 read,
+      * a mangled zip-virtual path ("a.zip::b.zip::song") — empty embedded
+        name fell back to ``Path(virtual).stem``,
+      * empty — nothing was extracted.
+
+    Re-extracting with the corrected parser yields the real embedded name.
+    """
+    ext = os.path.splitext((track.get("path") or "").lower())[1]
+    if ext not in (".hvl", ".ahx"):
+        return False
+    title = (track.get("title") or "").strip()
+    if not title:
+        return True
+    if title in _MAGIC_TITLE_BUG.get(ext, frozenset()):
+        return True
+    # Mangled zip-virtual path leaked into the title.
+    low = title.lower()
+    if "::" in title or ".zip" in low:
+        return True
+    return False
+
+
+def _needs_repair(track: dict) -> bool:
+    """A track is a repair candidate if its text was U+FFFD-garbled OR it is an
+    AHX/HVL track with a mis-extracted title (magic / mangled-path / empty)."""
+    return _has_replacement_char(track) or _has_bad_tracker_title(track)
+
+
 def find_corrupt_tracks(*, tracker_only: bool = False) -> list[dict]:
     """Walk the in-memory store and return candidate track dicts.
 
@@ -168,7 +215,7 @@ def find_corrupt_tracks(*, tracker_only: bool = False) -> list[dict]:
     store = get_store()
     out: list[dict] = []
     for t in store.all_tracks():
-        if not _has_replacement_char(t):
+        if not _needs_repair(t):
             continue
         if tracker_only:
             ext = os.path.splitext((t.get("path") or "").lower())[1]
@@ -477,6 +524,54 @@ async def _run_repair(
             _progress.total, _progress.processed, _progress.repaired,
             _progress.errors, _progress.cancelled,
         )
+        # A changed title/artist alters the duplicate-group signature
+        # (``_group_key(title, artist, duration)``).  Without recomputing,
+        # the stale ``is_duplicate_primary`` flags keep collapsing
+        # now-distinct tracks under duplicate-filtering — e.g. four .hvl
+        # modules that were all titled "HVL" stay merged into one row even
+        # after they get their real names.  Re-run detection so the flags
+        # match the repaired metadata.
+        if _progress.repaired > 0:
+            try:
+                n = await recompute_duplicate_groups_now()
+                log.info("Repair: recomputed duplicate groups (%d tracks) after %d re-titles",
+                         n, _progress.repaired)
+            except Exception:
+                log.warning("Repair: duplicate-group recompute failed", exc_info=True)
+
+
+async def recompute_duplicate_groups_now() -> int:
+    """Recompute every track's duplicate-group annotation in-process and apply
+    it to the store.  Used after a repair (changed titles alter the group key)
+    and exposed via ``POST /admin/metadata/recompute-duplicates``.
+
+    Deliberately runs ``compute_duplicate_groups`` IN-PROCESS rather than via
+    the scanner's ProcessPoolExecutor path — that subprocess hop silently
+    no-op'd when invoked from the repair task's ``finally``.  The algorithm is
+    O(N log N) over track metadata (no I/O), so a single in-process pass with
+    periodic event-loop yields is fine for a manual, infrequent operation.
+    Returns the number of tracks annotated.
+    """
+    from soniqboom.core.store import get_store
+    from soniqboom.core.duplicates import compute_duplicate_groups
+
+    store = get_store()
+    all_tracks = store.all_track_metas()
+    if not all_tracks:
+        return 0
+    annotations = compute_duplicate_groups(all_tracks)
+    n = 0
+    for tid, ann in annotations.items():
+        store.update_track_fields(tid, {
+            "duplicate_group_id": ann["duplicate_group_id"],
+            "format_score": ann["format_score"],
+            "is_duplicate_primary": ann["is_duplicate_primary"],
+        })
+        n += 1
+        if n % 1000 == 0:
+            await asyncio.sleep(0)
+    log.info("Duplicate-group recompute: annotated %d tracks", n)
+    return n
 
 
 async def start_repair(candidates: list[dict]) -> bool:
