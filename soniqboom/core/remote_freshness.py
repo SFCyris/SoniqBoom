@@ -453,6 +453,19 @@ async def start(
     except Exception:
         log.exception("freshness: initial share discovery failed")
 
+    # Prune stale non-mountpoint states left over from a previous run.  One-shot
+    # triggers (folder-open / stream-404 / app-focus) persist a ShareState for
+    # whatever SUBFOLDER they ran on; those are not configured shares.  Now that
+    # every real share is armed, any loaded state without a matching poll-loop
+    # task is such an orphan — drop it so the freshness file + admin UI only
+    # ever reflect real share mountpoints (and the file stops growing).
+    orphans = [sr for sr in list(_reg.states) if sr not in _reg.tasks]
+    for sr in orphans:
+        _reg.states.pop(sr, None)
+    if orphans:
+        _save_state()
+        log.info("freshness: pruned %d stale non-mountpoint state(s)", len(orphans))
+
     log.info("freshness: started (%d share(s) armed)", len(_reg.tasks))
 
 
@@ -532,6 +545,13 @@ def get_status() -> list[dict]:
     now = time.time()
     out = []
     for scan_root, st in _reg.states.items():
+        # Only surface configured share mountpoints — those with a live poll
+        # loop armed via add_share().  One-shot triggers (folder-open /
+        # stream-404 / app-focus) call check_now() on a SUBFOLDER, which
+        # setdefault()s a ShareState to run the poll; those are internal and
+        # must NOT appear in the admin list as if they were shares.
+        if scan_root not in _reg.tasks:
+            continue
         out.append({
             "scan_root":         scan_root,
             "last_check_ts":     st.last_check_ts,

@@ -178,7 +178,10 @@ function refresh() {
     // unconditionally — and dropping the <img> when it 404s — keeps the
     // queue/playlist row visually consistent with the bottom-left
     // player, which uses the same endpoint.
-    const artSrc = track.id ? `/api/art/${track.id}?size=sm` : '';
+    // ``fallback=404`` so an art-less track 404s (→ <img> onerror removes it)
+    // and the format-emoji placeholder shows — without it the endpoint returns
+    // the generic ♪ placeholder JPEG, which paints over the emoji.
+    const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
       ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" alt="">` : ''}

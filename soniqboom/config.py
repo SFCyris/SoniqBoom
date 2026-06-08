@@ -123,6 +123,7 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "merger_interval": 120,
     "aof_flush_interval": 0.1,
     "scan_zips": True,
+    "scan_remote_zips": True,   # also crack open .zip on remote (FTP/SMB) sources
     "expose_local_files": True,
     "display_startup_logo": True,
     "folder_aliases": {},          # { "/abs/path": "alias", ... }
@@ -232,6 +233,7 @@ _CONF_TEMPLATE = """\
   "aof_flush_interval": 0.1,
 
   "scan_zips": true,
+  "scan_remote_zips": true,
   "expose_local_files": true,
   "display_startup_logo": true,
 
@@ -526,6 +528,9 @@ class Settings(BaseSettings):
 
     # ZIP scanning — treat ZIP files as virtual directories
     scan_zips: bool = _local_conf.get("scan_zips", True)
+    # Remote ZIP traversal — also crack open .zip on FTP/SMB sources (each
+    # archive is downloaded once to the remote cache, then enumerated).
+    scan_remote_zips: bool = _local_conf.get("scan_remote_zips", True)
 
     # UI — startup logo animation
     display_startup_logo: bool = _local_conf.get("display_startup_logo", True)
@@ -639,6 +644,8 @@ def get_conversion_cache_dir() -> Path:
         p = Path(settings.conversion_cache_dir)
     else:
         p = APP_DIR / "cache" / "conversion"
-    for sub in ("sid", "midi", "tracker"):
+    # All rendered format_types (``_cache_path`` also mkdirs on demand, but
+    # pre-creating keeps the layout predictable and warmup_from_disk happy).
+    for sub in ("sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"):
         (p / sub).mkdir(parents=True, exist_ok=True)
     return p

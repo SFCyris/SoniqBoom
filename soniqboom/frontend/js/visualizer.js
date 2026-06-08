@@ -10,6 +10,8 @@
  *
  * Modes (cycled via the V key):
  *   - 'oscilloscope' — time-domain waveform
+ *   - 'crt'          — retro phosphor-green CRT scope (persistence trail,
+ *                      graticule grid, travelling scanline, bloom)
  *   - 'spectrogram'  — scrolling frequency spectrogram (waterfall)
  *   - 'hyperspace'   — neon vortex tunnel with rotating geometric objects flying past
  *   - 'synthwave'    — neon Tron grid + reactive sun + beat lightning + spectrum spires
@@ -28,7 +30,7 @@ let rafId    = null;
 
 // ── Mode management ─────────────────────────────────────────────────────────
 const MODES = [
-  'oscilloscope', 'spectrogram',
+  'oscilloscope', 'crt', 'spectrogram',
   'hyperspace', 'synthwave', 'globe', 'cosmic', 'lavalamp', 'raccoon',
 ];
 let _mode = localStorage.getItem('sb_vis_mode') || 'oscilloscope';
@@ -315,6 +317,7 @@ function draw() {
   if (!analyser) { clear(); return; }
 
   switch (_mode) {
+    case 'crt':         _drawCrt(analyser);         break;
     case 'spectrogram': _drawSpectrogram(analyser); break;
     case 'hyperspace':  _drawHyperspace(analyser);  break;
     case 'synthwave':   _drawSynthwave(analyser);   break;
@@ -370,6 +373,60 @@ function _drawOscilloscope(analyser) {
     i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
   }
   ctx2d.stroke();
+}
+
+// ── CRT / phosphor oscilloscope ────────────────────────────────────────────
+// Retro lab-scope skin: green P1-phosphor trace with persistence (trail
+// fade instead of clear), a faint graticule grid, a travelling scanline,
+// and a soft bloom.  Same time-domain data as ``_drawOscilloscope`` — this
+// is purely a stylistic mode, no extra analyser reads.
+let _crtScan = 0;
+function _drawCrt(analyser) {
+  const W = canvas.width;
+  const H = canvas.height;
+
+  if (!_timeBuf || _timeBuf.length !== analyser.fftSize) {
+    _timeBuf = new Uint8Array(analyser.fftSize);
+  }
+  analyser.getByteTimeDomainData(_timeBuf);
+  const buf = _timeBuf;
+
+  // Phosphor persistence: fade the previous frame toward black instead of
+  // clearing.  The faint green tint in the fade gives the classic glow
+  // afterimage.  (We do NOT clearRect — that's what makes it a CRT.)
+  ctx2d.fillStyle = 'rgba(1,8,3,0.22)';
+  ctx2d.fillRect(0, 0, W, H);
+
+  // Graticule grid (cheap: a handful of 1px lines).
+  ctx2d.strokeStyle = 'rgba(80,255,140,0.05)';
+  ctx2d.lineWidth = 1;
+  const cols = 12, rows = 8;
+  ctx2d.beginPath();
+  for (let c = 1; c < cols; c++) { const x = (c / cols) * W; ctx2d.moveTo(x, 0); ctx2d.lineTo(x, H); }
+  for (let r = 1; r < rows; r++) { const y = (r / rows) * H; ctx2d.moveTo(0, y); ctx2d.lineTo(W, y); }
+  ctx2d.stroke();
+
+  // Trace — single bright phosphor line with bloom.
+  const sliceW = W / buf.length;
+  const midY = H / 2;
+  ctx2d.beginPath();
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] / 128.0 - 1.0);
+    const x = i * sliceW;
+    const y = midY - v * midY * 0.82;
+    i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
+  }
+  ctx2d.lineWidth = 2;
+  ctx2d.strokeStyle = 'rgba(90,255,150,0.95)';
+  ctx2d.shadowBlur = 12;
+  ctx2d.shadowColor = 'rgba(80,255,140,0.85)';
+  ctx2d.stroke();
+  ctx2d.shadowBlur = 0;
+
+  // Travelling scanline.
+  _crtScan = (_crtScan + H * 0.012) % H;
+  ctx2d.fillStyle = 'rgba(120,255,170,0.045)';
+  ctx2d.fillRect(0, _crtScan, W, 2);
 }
 
 function _drawSpectrogram(analyser) {

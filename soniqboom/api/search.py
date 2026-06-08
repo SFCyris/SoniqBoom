@@ -110,6 +110,7 @@ async def filter_tracks(
     album_artist: str | None = None,
     album: str | None = None,
     genre: str | None = None,
+    format: str | None = None,
     year_min: int | None = None,
     year_max: int | None = None,
     limit: int = Query(200, ge=1, le=2000),
@@ -130,6 +131,12 @@ async def filter_tracks(
         parts.append(f"@album_tag:{{{_esc_tag(album)}}}")
     if genre:
         parts.append(f"@genre:{{{_esc_tag(genre)}}}")
+    if format:
+        # ft_search parses @format:{value} → store.filter_tracks(format_=value),
+        # which matches case-insensitively via _tag_format[value.lower()] — the
+        # same index the library Galaxy chips are built from, so the value the
+        # chip sends ("MIDI", "ProTracker", …) always resolves.
+        parts.append(f"@format:{{{_esc_tag(format)}}}")
     if year_min is not None and year_max is not None:
         parts.append(f"@year:[{year_min} {year_max}]")
     elif year_min is not None:

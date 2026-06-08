@@ -53,12 +53,17 @@ async def store_art(track_id: str, data: bytes, size: str) -> None:
 
 def _read_art_sync(track_id: str, size: str) -> bytes | None:
     """Synchronous art read — runs in a thread to avoid blocking the event loop."""
+    from soniqboom.core import cache_stats
     p = _art_path(track_id, size)
     if not p.exists():
+        cache_stats.miss("art")
         return None
     try:
-        return p.read_bytes()
+        data = p.read_bytes()
+        cache_stats.hit("art")
+        return data
     except OSError:
+        cache_stats.miss("art")
         return None
 
 

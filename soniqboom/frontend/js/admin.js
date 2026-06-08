@@ -8,6 +8,59 @@
 import { runRestartFlow } from './restart.js';
 import { Auth }           from './auth.js';
 import { Toast }          from './utils.js';
+import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
+import { mountScanFlow }   from './viz/scanflow.js';
+import { mountCacheCascade } from './viz/cachecascade.js';
+import { mountFtpLanes }   from './viz/ftplanes.js';
+
+// ── Admin visualizations (#1 scan flow, #2 cache cascade, #3 FTP lanes) ──
+// Lazily mounted into their admin sections.  Each is gated on the "admin"
+// viz group; the shared engine pauses them when off-screen / hidden tab.
+let _vizScan = null, _vizCascade = null, _vizFtp = null;
+function _ensureAdminViz() {
+  if (!vizGroupEnabled('admin')) return;
+  const scanHost = document.getElementById('viz-scan-flow');
+  if (scanHost && !_vizScan) { scanHost.hidden = false; try { _vizScan = mountScanFlow(scanHost); } catch (e) { console.warn('scanflow', e); } }
+  const cascadeHost = document.getElementById('viz-cache-cascade');
+  if (cascadeHost && !_vizCascade) { cascadeHost.hidden = false; try { _vizCascade = mountCacheCascade(cascadeHost); } catch (e) { console.warn('cascade', e); } }
+  const ftpHost = document.getElementById('viz-ftp-lanes');
+  if (ftpHost && !_vizFtp) { ftpHost.hidden = false; try { _vizFtp = mountFtpLanes(ftpHost); } catch (e) { console.warn('ftplanes', e); } }
+}
+
+// ── Visualization settings UI (client-side preference, applies instantly) ──
+// The viz settings live in localStorage (sb_viz_settings), read by the viz
+// engine.  These controls are NOT part of the server-persisted Save Settings
+// flow — each change is applied live via setVizSettings().
+let _vizSettingsWired = false;
+function _initVizSettingsUI() {
+  const s = getVizSettings();
+  const en   = document.getElementById('setting-viz-enabled');
+  const np   = document.getElementById('setting-viz-nowplaying');
+  const lib  = document.getElementById('setting-viz-library');
+  const adm  = document.getElementById('setting-viz-admin');
+  const vu   = document.getElementById('setting-viz-vustyle');
+  if (en)  en.checked  = s.enabled    !== false;
+  if (np)  np.checked  = s.nowPlaying !== false;
+  if (lib) lib.checked = s.library    !== false;
+  if (adm) adm.checked = s.admin      !== false;
+  if (vu)  vu.value    = s.vuStyle === 'circuit' ? 'circuit' : 'bars';
+  if (_vizSettingsWired) return;     // bind change handlers exactly once
+  _vizSettingsWired = true;
+  if (en)  en.addEventListener('change',  () => setVizSettings({ enabled:    en.checked }));
+  if (np)  np.addEventListener('change',  () => setVizSettings({ nowPlaying: np.checked }));
+  if (lib) lib.addEventListener('change', () => setVizSettings({ library:    lib.checked }));
+  if (adm) adm.addEventListener('change', () => { setVizSettings({ admin: adm.checked }); if (adm.checked) _ensureAdminViz(); });
+  if (vu)  vu.addEventListener('change',  () => {
+    setVizSettings({ vuStyle: vu.value });
+    // Live-apply to a currently-playing VUMR meter so the change is visible
+    // immediately rather than only on the next track.  The circuit skin is
+    // VUMR-only and gated on the now-playing group, mirroring app.js.
+    const vc = document.getElementById('vu-meters');
+    if (vc && vc.dataset.source === 'vumr') {
+      vc.dataset.style = (vu.value === 'circuit' && vizGroupEnabled('nowPlaying')) ? 'circuit' : 'bars';
+    }
+  });
+}
 
 const overlay        = document.getElementById('admin-overlay');
 const authDialog     = document.getElementById('admin-auth-dialog');
@@ -434,6 +487,7 @@ async function loadFtpPools() {
     return;
   }
   section.style.display = '';
+  _ensureAdminViz();
   list.innerHTML = '';
   servers.forEach(srv => list.appendChild(_renderFtpPoolCard(srv)));
 }
@@ -906,6 +960,10 @@ async function pollScanStatus() {
     if (active) {
       // Show progress section
       if (section) section.style.display = '';
+
+      // Drive the scan-flow viz from the live progress numbers.
+      _ensureAdminViz();
+      if (_vizScan) _vizScan.onProgress(s);
 
       // While a Rebuild Index is in progress, also push live numbers
       // into the Index section's status line so the user gets feedback
@@ -1654,6 +1712,8 @@ function _fmtBytes(n) {
 }
 
 async function loadConvCacheStats() {
+  // Mount the cache-cascade viz once the Renderers cache section is in play.
+  _ensureAdminViz();
   try {
     const r = await api('/admin/cache/conversion');
     if (!r.ok) return;
@@ -2561,6 +2621,8 @@ async function loadSettings() {
   if (delayEl)   delayEl.value   = localStorage.getItem('sb_convert_delay')  || '300';
   if (skipEl)    skipEl.checked  = localStorage.getItem('sb_skip_auth') === '1';
   if (themeEl)   themeEl.value   = localStorage.getItem('sb_theme') || 'dark';
+  // Visualization preference controls (client-side, applies live).
+  _initVizSettingsUI();
   // Populate the About panel each time settings load (cheap, idempotent)
   loadAbout();
   try {
@@ -2568,6 +2630,8 @@ async function loadSettings() {
     const s = await res.json();
     const zipEl = document.getElementById('setting-scan-zips');
     if (zipEl) zipEl.checked = s.scan_zips !== false;
+    const remoteZipEl = document.getElementById('setting-scan-remote-zips');
+    if (remoteZipEl) remoteZipEl.checked = s.scan_remote_zips !== false;
     // Keep the add-dir form checkbox in sync with the global setting
     const addZipEl = document.getElementById('admin-scan-zips');
     if (addZipEl) addZipEl.checked = s.scan_zips !== false;
@@ -2575,6 +2639,10 @@ async function loadSettings() {
     if (sidEl) sidEl.value = s.renderers?.sid_default_duration || 180;
     const dupEl = document.getElementById('setting-filter-duplicates');
     if (dupEl) dupEl.checked = !!s.filter_duplicates;
+    const dedupFoldersEl = document.getElementById('setting-dedup-folders');
+    if (dedupFoldersEl) dedupFoldersEl.checked = !!s.dedup_folders;
+    const hideEmptyEl = document.getElementById('setting-hide-empty-folders');
+    if (hideEmptyEl) hideEmptyEl.checked = !!s.hide_empty_folders;
     const folderArtEl = document.getElementById('setting-use-folder-art');
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
     const folderArtNamesEl = document.getElementById('setting-folder-art-names');
@@ -2626,8 +2694,11 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   else                   document.documentElement.removeAttribute('data-theme');
   try {
     const scanZips = document.getElementById('setting-scan-zips')?.checked ?? true;
+    const scanRemoteZips = document.getElementById('setting-scan-remote-zips')?.checked ?? true;
     const sidDur = parseInt(document.getElementById('setting-sid-duration')?.value || '180');
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
+    const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
+    const hideEmpty = document.getElementById('setting-hide-empty-folders')?.checked ?? false;
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
@@ -2640,8 +2711,11 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       method: 'PUT',
       body: JSON.stringify({
         scan_zips: scanZips,
+        scan_remote_zips: scanRemoteZips,
         renderers: { sid_default_duration: sidDur },
         filter_duplicates: filterDups,
+        dedup_folders: dedupFolders,
+        hide_empty_folders: hideEmpty,
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
@@ -2653,6 +2727,16 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ disabled: skipAuth }),
     });
+    // Rebuild the sidebar tree so the hide-empty toggle takes effect
+    // immediately.  ``FolderTree.refresh()`` rewinds every expanded node
+    // — without this the user has to collapse + re-expand to see the
+    // filter applied to nodes whose children are already cached
+    // client-side.  Imported dynamically because admin.js may load
+    // before the foldertree module attaches its scan-root list.
+    try {
+      const mod = await import('./foldertree.js');
+      mod.FolderTree?.refresh?.();
+    } catch { /* non-fatal — next page reload picks it up anyway */ }
     showMsg('admin-settings-msg', 'Settings saved.', 'ok');
   } catch {
     showMsg('admin-settings-msg', 'Error saving server settings.', 'err');

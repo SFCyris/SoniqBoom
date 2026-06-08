@@ -1,12 +1,16 @@
 <p align="center">
   <img src="images/logo-banner.png" alt="SoniqBoom" width="600">
 </p>
-<p align="center"><strong>Self-hosted music server for your personal library</strong></p>
+
+<p align="center"><strong>The self-hosted music server that actually plays the formats every other server forgot.</strong></p>
+
 <p align="center">
-  Streams FLAC, ALAC, MP3, Opus, plus SID, MIDI, and 20+ tracker formats &mdash; from any device on your network.
+  SID &bull; MOD &bull; XM &bull; IT &bull; AHX &bull; HivelyTracker &bull; NSF &bull; SPC &bull; VGM &bull; MIDI<br>
+  &mdash; plus FLAC, DSD, and every modern codec, rendered with the same obsessive care.
 </p>
+
 <p align="center">
-  Self-hosted &bull; Browser-based &bull; AGPL-3.0 &bull; Zero cloud dependencies
+  Self-hosted &bull; Browser-based &bull; Zero cloud &bull; Zero telemetry &bull; AGPL-3.0
 </p>
 
 <p align="center">
@@ -17,48 +21,110 @@
 
 ---
 
-## What it is
-
-SoniqBoom is a single-binary music server you run on your own machine. Point it
-at your music folders, open `http://localhost:8080` in any browser, and your
-library is ready &mdash; no cloud account, no database server, no app per
-device.
-
-The whole catalog lives in RAM with pre-computed indexes, so browsing a
-170,000-track library is as fast as browsing 100. Retro formats (SID, MOD, XM,
-S3M, IT, MIDI, etc.) are rendered on the fly via optional helper tools.
-
-<img src="images/ui-main.png" alt="Main library view" width="700">
+> Your 50,000 `.mod` files. Your mirror of the High Voltage SID Collection. That folder of `.nsf` rips you have carried across four hard drives since 2009.
+>
+> **Plex can't see them. Jellyfin skips them. Navidrome pretends they don't exist.**
+>
+> SoniqBoom was built for *exactly* those files — and it treats them like the art they are.
 
 ---
 
-## Highlights
+## The pitch (it's short)
 
-- **In-memory library** &mdash; instant browse and search at any scale.
-- **Native retro format support** &mdash; SID, tracker modules, MIDI with SoundFonts.
-- **Multi-room sync** &mdash; play the same track in lockstep across every browser on your LAN.
-- **Cast / AirPlay / DLNA** &mdash; send audio to Chromecast, Apple TV, HomePod, or any UPnP receiver.
-- **OpenSubsonic API** &mdash; compatible with Subsonic / OpenSubsonic apps (Amperfy, Symfonium, DSub, etc.).
-- **Direct network shares** &mdash; FTP, SMB, and WebDAV connected from the admin UI, no OS mount required.
-- **Privacy first** &mdash; 100% local, zero telemetry.
+Every "modern" music server is a polite wrapper around the same five codecs. The moment your library contains a tracker module, a SID tune, or a Game Boy rip, those servers go quiet: no metadata, no playback, no respect.
+
+SoniqBoom is the opposite. As far as we can tell, it is **the only self-hosted music server that treats demoscene, chiptune, and tracker formats as first-class citizens** — rendered on the fly, tagged with *real* scene metadata, visualized channel by channel, and streamed to any device you own.
+
+Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-featured modern music server. That part was easy. The hard part — the part nobody else bothered to do — is the retro. We did the hard part.
+
+<p align="center">
+  <img src="images/ui-main.png" alt="SoniqBoom main library view" width="800">
+</p>
+
+---
+
+## Every format the others gave up on
+
+**🎮 Chiptune & console** — SID (C64), NSF / NSFe (NES), SPC (SNES), GBS (Game Boy), VGM / VGZ (Sega & arcade), AY (ZX Spectrum / Amstrad), KSS (MSX), SAP (Atari), GYM, HES.
+
+**🎹 Tracker / module** — ProTracker (MOD), FastTracker 2 (XM), Impulse Tracker (IT), ScreamTracker 2 & 3 (STM / S3M), OctaMED, MultiTracker, DigiBooster Pro, Composer 669, UltraTracker, Oktalyzer, Imago Orpheus, Farandole, General DigiMusic, SoundFX, Grave Composer, DSIK… roughly twenty module formats in all.
+
+**🕹️ Amiga heritage** — AHX *and* HivelyTracker (`.hvl`) — the latter via a **HivelyTracker engine we vendor and compile on first run**, because neither UADE nor libopenmpt will touch HVL. We render the unrenderable.
+
+**🎼 MIDI** — synthesized with swappable SoundFonts, plus a one-click SoundFont marketplace.
+
+**…and the everyday stuff, of course** — FLAC, ALAC, MP3, AAC, Ogg Vorbis, Opus, WavPack, Musepack, WAV, AIFF, and 1-bit **DSD** (DSF / DFF / WSD). ZIP archives are scanned *inside the archive*, so your `modarchive_2007.zip` hoard simply works — no unpacking.
+
+> Thirty-plus retro formats. One unified render pipeline. Zero "unsupported file" dead ends.
+
+---
+
+## We don't just play them. We understand them.
+
+Anyone can shell out to a decoder. SoniqBoom speaks the culture:
+
+- **🎚️ Per-channel VU meters for tracker modules.** Watch every Paula voice and sample slot dance in real time, right in the browser. Your `.it` files have never looked like this.
+- **🧬 Real SID metadata from HVSC.** Per-tune song lengths straight from `Songlengths.md5` — so your SID tunes show *correct* durations instead of a flat three-minute guess — plus full **STIL** credits and trivia for every subtune.
+- **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own.
+- **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
+- **🗂️ Multi-subtune aware.** SID, NSF, and HVL tunes with multiple subsongs are addressed individually, not flattened into one.
+- **📼 That bundled HivelyTracker decoder.** Mentioned twice, because we're genuinely proud of it.
+
+<p align="center">
+  <img src="images/ui-tracker-overview.jpg" alt="Tracker module info — per-channel VU, module metadata, live signal chain" width="40%">
+  <img src="images/ui-tracker2.jpg" alt="A 64-channel Impulse Tracker module with per-channel VU" width="40%">
+</p>
+<p align="center"><sub>Open any module and you get per-channel VU meters, real module metadata — channels, patterns, instrument names — and a live decode-chain readout. Here a 16-channel ScreamTracker 3 and a 64-channel Impulse Tracker.</sub></p>
+
+<p align="center">
+  <img src="images/ui-galaxy.jpg" alt="The Library Galaxy — every format its own constellation" width="800">
+</p>
+<p align="center"><sub>The Library Galaxy — your whole collection as a drifting star field, every format its own glowing constellation, sized by how much of it you own.</sub></p>
+
+---
+
+## Oh — and it happens to be a complete modern music server
+
+Here's the twist that turns a niche curiosity into your *only* server: because every retro format is rendered to standard audio on the fly, a 1987 SID tune streams to your phone, your HomePod, or the speakers in the next room *exactly* like a FLAC does. The chiptune obsession and the everyday conveniences run through the same pipeline — so the same tool that finally sees your `.mod` hoard is also the one you reach for every single day.
+
+- **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist — pre-computed indexes, no SQL round-trips.
+- **📡 Cast / AirPlay / DLNA.** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or any UPnP receiver.
+- **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN.
+- **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem.
+- **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required.
+- **👥 Multi-user with roles**, **last.fm + ListenBrainz scrobbling**, **time-synced lyrics**, **podcast & audiobook chapters**, **dark mode**, **installable PWA**, and **absolutely zero telemetry**.
+
+<p align="center">
+  <img src="images/ui-folders.png" alt="Folder browser" width="49%">
+  <img src="images/ui-search.png" alt="Instant search" width="49%">
+</p>
+<p align="center">
+  <img src="images/ui-artists.png" alt="Artists view" width="49%">
+  <img src="images/ui-admin.png" alt="Admin panel" width="49%">
+</p>
+<p align="center">
+  <img src="images/ui-lyrics.jpg" alt="Time-synced lyrics scroll with the track" width="800">
+</p>
+<p align="center"><sub>Time-synced lyrics scroll line-by-line with playback — fetched from LRCLib when the file has none embedded.</sub></p>
 
 ---
 
 ## Install
+
+Point it at your HVSC mirror. Point it at your Modland archive. Point it at the FLAC rips you actually paid for. Hit scan — about two minutes per 50,000 tracks — and all of it plays.
 
 **macOS** (one-shot install + start):
 
 ```bash
 git clone https://github.com/SFCyris/SoniqBoom.git
 cd SoniqBoom
-bash install.sh        # installs Python, ffmpeg, optional renderers
+bash install.sh        # installs Python, ffmpeg, and the optional retro renderers
 bash run.sh            # starts the server on port 8080
 ```
 
 Then open `http://localhost:8080` in any browser.
 
-**Linux** &mdash; install the prerequisites with your package manager, then run
-the same `run.sh`:
+**Linux** — install the prerequisites with your package manager, then run the same `run.sh`:
 
 ```bash
 sudo apt install -y python3 python3-venv ffmpeg \
@@ -70,32 +136,26 @@ pip install -e .
 bash run.sh
 ```
 
-`bash shutdown.sh` stops it; `bash restart.sh` restarts it. To change the
-default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
+`bash shutdown.sh` stops it; `bash restart.sh` restarts it. To change the default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
+
+> **Retro renderers are optional and modular.** Install only the ones you need — `sidplayfp` for SID, `fluidsynth` for MIDI, `libopenmpt` for trackers, `uade` for AHX, `libgme` for console chiptunes. Miss one and SoniqBoom tells you exactly which package to install; everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
 
 ---
 
 ## First-time setup
 
-1. **Create the first admin account.** A fresh install has no users, and
-   registration via the UI is locked until at least one admin exists, so the
-   first one is bootstrapped from the CLI on the server host:
+1. **Create the first admin account.** A fresh install has no users, and UI registration is locked until at least one admin exists, so the first one is bootstrapped from the CLI on the server host:
 
    ```bash
    .venv/bin/soniqboom-setadm -user alice -passwd 'changeme123'
    ```
 
-   Username is 2&ndash;64 chars (letters, digits, `.`, `_`, `-`); password is
-   at least 8 chars. New users default to the `admin` role. To rotate the
-   password later, re-run the same command with a new `-passwd`; to add other
-   users, use `-role admin|edit|readonly`, or invite them from the admin UI
-   once you&rsquo;re signed in.
+   Username is 2–64 chars (letters, digits, `.`, `_`, `-`); password is at least 8 chars. New users default to the `admin` role. To rotate the password later, re-run with a new `-passwd`; to add others, use `-role admin|edit|readonly` or invite them from the admin UI once signed in.
 
-2. **Sign in.** Open `http://localhost:8080`, enter the credentials you just
-   set, and you&rsquo;ll land in the library view.
+2. **Sign in.** Open `http://localhost:8080`, enter the credentials you just set, and you'll land in the library.
 
-3. Click the **gear icon** in the top-right to open the admin panel.
-4. **Add music folders** &mdash; enter the path to your library and click **Add**.
+3. Click the **gear icon** (top-right) to open the admin panel.
+4. **Add music folders** — enter a path (local, FTP, SMB, or WebDAV) and click **Add**.
 5. Wait for the initial scan (about 2 minutes per 50,000 tracks).
 6. Close the admin panel. Your library is ready.
 
@@ -103,12 +163,18 @@ default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
 
 ## Supported formats
 
-**Standard audio**: MP3, FLAC, AAC/M4A, ALAC, OGG Vorbis, Opus, WAV, AIFF, WMA,
-APE, WavPack, DSF/DFF.
+| Family | Formats | Rendered by |
+|--------|---------|-------------|
+| **Lossless / PCM** | FLAC, ALAC (M4A), WAV, AIFF, WavPack, Musepack | native / ffmpeg |
+| **Lossy** | MP3, AAC, Ogg Vorbis, Opus | native / ffmpeg |
+| **DSD (1-bit)** | DSF, DFF, WSD | ffmpeg |
+| **SID** (C64) | `.sid`, `.psid` | sidplayfp + HVSC Songlengths & STIL |
+| **MIDI** | `.mid`, `.midi` | FluidSynth + SoundFonts |
+| **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF, OKT, SFX, WOW, DSM | libopenmpt |
+| **Amiga** | AHX, HivelyTracker (HVL) | uade123 / bundled HivelyTracker engine |
+| **Console chiptune** | NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES | libgme |
 
-**Retro / niche** *(via optional renderers)*: SID (sidplayfp), MOD/XM/S3M/IT/MPTM
-and other tracker modules (libopenmpt), MIDI/MID/KAR (FluidSynth), NSF/SPC/GBS/VGM
-(libgme). ZIP archives are scanned inline.
+ZIP archives are scanned and played **inline** — tracks inside `.zip` files appear in your library without unpacking.
 
 ---
 
@@ -119,28 +185,32 @@ and other tracker modules (libopenmpt), MIDI/MID/KAR (FluidSynth), NSF/SPC/GBS/V
 | macOS | `~/Library/Application Support/SoniqBoom/SoniqBoom.conf` |
 | Linux | `~/.local/share/soniqboom/SoniqBoom.conf` |
 
-Most settings can be changed from the admin UI. Environment variables
-(`SONIQBOOM_HOST`, `SONIQBOOM_PORT`, etc.) override config file values.
+Most settings are changeable from the admin UI. Environment variables (`SONIQBOOM_HOST`, `SONIQBOOM_PORT`, …) override config-file values.
+
+---
+
+## Who this is for
+
+- **Demosceners & chiptune collectors** whose libraries are invisible to every other server.
+- **HVSC / Modland / Modarchive hoarders** who want correct song lengths, STIL credits, and channel-level VU meters — not a generic file list.
+- **Hi-fi self-hosters** who *also* keep FLAC and DSD and refuse to run a cloud account to hear them.
+- **Anyone** who believes a 40-year-old `.mod` deserves a real player, not a "format not supported" toast.
+
+If your music collection has a weird corner, SoniqBoom is the server that finally lights it up.
+
+**Got a format we don't render yet?** That's the most interesting kind of bug report. Open an [issue](https://github.com/SFCyris/SoniqBoom/issues) with a sample file, [star the repo](https://github.com/SFCyris/SoniqBoom) if it earned it, and send PRs — chasing down obscure formats is the entire point of this project.
 
 ---
 
 ## License
 
-SoniqBoom is licensed under the **GNU Affero General Public License v3.0 or
-later (AGPL-3.0-or-later)**. See [LICENSE](LICENSE) for the full text.
+SoniqBoom is licensed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See [LICENSE](LICENSE) for the full text.
 
-In short: you may run, study, modify, and redistribute SoniqBoom freely. If you
-distribute a modified version &mdash; including running it as a network service
-that others interact with &mdash; you must make the corresponding source of your
-modifications available under the same license.
+In short: run, study, modify, and redistribute freely. If you distribute a modified version — including running it as a network service others interact with — you must make the corresponding source of your modifications available under the same license.
 
-Commercial licensing (for use cases that cannot comply with AGPL-3.0&rsquo;s
-network-use copyleft) is available from the copyright holder on request
-&mdash; contact <scyris@outlook.com>.
+Commercial licensing (for use cases that cannot comply with AGPL-3.0's network-use copyleft) is available from the copyright holder on request — contact <scyris@outlook.com>.
 
-SoniqBoom is intended for streaming music you already own or have the right to
-use. Users are solely responsible for ensuring their use complies with
-applicable copyright law.
+SoniqBoom is intended for streaming music you already own or have the right to use. Users are solely responsible for ensuring their use complies with applicable copyright law.
 
 ---
 
@@ -171,29 +241,30 @@ SoniqBoom stands on the shoulders of these excellent open-source projects.
 - [rumps](https://github.com/jaredks/rumps) by [Jared Suttles](https://github.com/jaredks) is licensed under [BSD-3-Clause](https://github.com/jaredks/rumps/blob/master/LICENSE)
 - [pyobjc](https://github.com/ronaldoussoren/pyobjc) by [Ronald Oussoren](https://github.com/ronaldoussoren) is licensed under [MIT License](https://github.com/ronaldoussoren/pyobjc/blob/master/License.txt)
 
-External tools (invoked via subprocess &mdash; not linked into SoniqBoom):
+External tools (invoked via subprocess — not linked into SoniqBoom):
 
 - [FFmpeg](https://ffmpeg.org/) is licensed under [LGPL-2.1 / GPL-2.0](https://ffmpeg.org/legal.html) (depending on build configuration)
 - [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp) is licensed under [GPL-2.0](https://github.com/libsidplayfp/libsidplayfp/blob/master/COPYING)
 - [FluidSynth](https://github.com/FluidSynth/fluidsynth) is licensed under [LGPL-2.1](https://github.com/FluidSynth/fluidsynth/blob/master/LICENSE)
 - [libopenmpt](https://lib.openmpt.org/libopenmpt/) by [OpenMPT](https://openmpt.org/) is licensed under [BSD-3-Clause](https://lib.openmpt.org/libopenmpt/license/)
+- [UADE](https://zakalwe.fi/uade/) (Unix Amiga Delitracker Emulator) — used to render AHX and other Amiga formats
+- [HivelyTracker replayer](https://github.com/pete-gordon/hivelytracker) by Pete Gordon et al. is licensed under [BSD-3-Clause](https://github.com/pete-gordon/hivelytracker) — vendored to decode `.hvl` modules
 - [Game_Music_Emu (libgme)](https://github.com/libgme/game-music-emu) is licensed under [LGPL-2.1](https://github.com/libgme/game-music-emu/blob/master/license.txt)
 
 Data / assets:
 
-- [GeneralUser GS SoundFont](https://schristiancollins.com/generaluser.php) by S. Christian Collins (Free, attribution required) &mdash; default SoundFont for MIDI synthesis
-- [HVSC (High Voltage SID Collection)](https://www.hvsc.c64.org/) (Free, archive of SID music) &mdash; Songlengths.md5 and STIL metadata used for SID playback
+- [GeneralUser GS SoundFont](https://schristiancollins.com/generaluser.php) by S. Christian Collins (Free, attribution required) — default SoundFont for MIDI synthesis
+- [HVSC (High Voltage SID Collection)](https://www.hvsc.c64.org/) (Free archive of SID music) — Songlengths.md5 and STIL metadata used for SID playback
 
-The full per-component license texts are recorded in
-[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+The full per-component license texts are recorded in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 
 **SoniqBoom license:** [AGPL-3.0-or-later](LICENSE)
 
 ---
 
-**Project home:** <https://github.com/SFCyris/SoniqBoom>
-&middot; **Issues:** <https://github.com/SFCyris/SoniqBoom/issues>
+<p align="center">
+  <strong>Point it at the weird corner of your collection. Watch it light up.</strong><br>
+  <a href="https://github.com/SFCyris/SoniqBoom">github.com/SFCyris/SoniqBoom</a> &middot; <a href="https://github.com/SFCyris/SoniqBoom/issues">Issues</a>
+</p>
 
-Copyright &copy; 2026 S.F. Cyris.
-
-<p align="center"><em>Built by S.F. Cyris</em></p>
+<p align="center"><sub>Copyright &copy; 2026 S.F. Cyris &middot; Built by S.F. Cyris</sub></p>

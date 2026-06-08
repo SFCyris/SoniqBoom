@@ -1057,6 +1057,28 @@ class TrackStore:
         results.sort(key=lambda x: x["genre"].lower())
         return self._agg_cache_set("genres", results)
 
+    def aggregate_formats(self) -> list[dict]:
+        """Return ``[{format, count}]`` from the format tag index.
+
+        Drives the library "Galaxy" visualization (per-format star
+        clusters).  Counts come straight from ``_tag_format`` bucket
+        sizes — O(number of distinct formats), no track scan.
+        """
+        cached = self._agg_cache_get("formats")
+        if cached is not None:
+            return cached
+        results: list[dict] = []
+        for key, tids in self._tag_format.items():
+            if not key or not tids:
+                continue
+            # Resolve a display-cased name from one member track.
+            tid = next(iter(tids))
+            t = self._tracks.get(tid)
+            name = (t.get("format") if t else None) or key
+            results.append({"format": name, "count": len(tids)})
+        results.sort(key=lambda x: -x["count"])
+        return self._agg_cache_set("formats", results)
+
     def aggregate_years(self) -> list[dict]:
         cached = self._agg_cache_get("years")
         if cached is not None:

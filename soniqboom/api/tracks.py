@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +66,14 @@ _ALLOWED_SORT_KEYS = {
 async def list_tracks(
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
+    format: str | None = Query(
+        None,
+        description=(
+            "Optional format filter (e.g. 'MIDI', 'ProTracker').  Drives the "
+            "library Galaxy view's windowed per-format browse.  Matched "
+            "case-insensitively against the store's format index."
+        ),
+    ),
     sort: str | None = Query(
         None,
         description=(
@@ -91,8 +100,16 @@ async def list_tracks(
     # frontend can't 400 the page; we fall back to the default sort instead.
     sort_by = sort if sort in _ALLOWED_SORT_KEYS else None
     sort_order = order if order in ("asc", "desc") else None
+    if format:
+        # ft_search parses @format:{value} → store.filter_tracks(format_=value),
+        # matched case-insensitively.  _esc_tag keeps odd format names (spaces,
+        # slashes) from breaking the tag-query parse.
+        from soniqboom.api.search import _esc_tag
+        query = f"@format:{{{_esc_tag(format)}}}"
+    else:
+        query = "*"
     return await ft_search(
-        "*", limit=limit, offset=offset,
+        query, limit=limit, offset=offset,
         sort_by=sort_by, sort_order=sort_order,
     )
 
@@ -184,11 +201,23 @@ async def get_patterns(track_id: str):
                 "order": [], "patterns": []}
     path_str = track.path
     if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
-        from soniqboom.core.filesource import parse_remote_path
+        # Fetch the remote module to the local cache so the pattern parser has
+        # a real file.  A cache-only lookup returned None for anything not
+        # already mirrored (e.g. a remote tracker the user hasn't played yet),
+        # leaving the pattern grid empty.  Guarded — a fetch failure degrades
+        # to "not available", never a 500.
+        from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
-        cached = get_cache().get_cached(scan_root, remote_path) if remote_path else None
-        path = cached if cached and cached.exists() else None
+        source = get_source(scan_root) if remote_path else None
+        path = None
+        if source is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                path = await loop.run_in_executor(
+                    None, get_cache().fetch, scan_root, remote_path, source)
+            except Exception:
+                path = None
     else:
         path = Path(path_str)
     if not path or not path.exists():
@@ -199,6 +228,186 @@ async def get_patterns(track_id: str):
     payload = await loop.run_in_executor(None, extract_patterns, path)
     payload["id"] = track_id
     return payload
+
+
+@router.get("/{track_id}/vu")
+async def get_vu_sidecar(track_id: str):
+    """Return the binary VUMR sidecar for a rendered tracker module.
+
+    Tracker / chip-format renders produce a per-channel VU sidecar
+    alongside the audio cache (see ``docs/vu-cache-format.md``).  The
+    frontend fetches this once on track-load and drives the per-channel
+    VU bars from it — random-access by frame index against
+    ``audio.currentTime``.
+
+    Lazy backfill
+    -------------
+    When the sidecar doesn't exist yet but the track IS a tracker
+    format AND the source file is reachable, we run an in-process VU
+    extraction pass on the source file directly.  Result is cached
+    alongside the existing audio WAV.  This covers the "v1.3.0 just
+    shipped, my 60 K-file library has audio caches but no .vu yet"
+    case without forcing the user to wait for natural cache eviction.
+
+    First-call latency: typically < 0.5 s for a sub-5-minute module
+    (libopenmpt advances the mixer state at ~1500× real-time per the
+    bench in core/openmpt_vu.py).  Cached on disk forever after — a
+    given track's sidecar is generated once per (track, subsong)
+    pair.
+
+    Returns:
+      * 200 ``application/octet-stream`` with the VUMR binary +
+        immutable cache headers, when a sidecar exists or was
+        just generated.
+      * 404 when the track isn't a tracker format, the source file
+        can't be reached, or libopenmpt isn't available on this
+        host.  The frontend falls back to its FFT-spectrum
+        visualiser with the honest label.
+    """
+    from fastapi.responses import Response
+    from soniqboom.core.conversion_cache import (
+        get_vu_sidecar_path, _cache_path,
+    )
+
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+
+    sidecar = get_vu_sidecar_path(track_id)
+    if sidecar is None:
+        # Lazy-backfill path.  Only attempt for known tracker formats
+        # (we don't want to spin up libopenmpt against a 10 GB FLAC).
+        sidecar = await _try_backfill_vu_sidecar(track, track_id)
+
+    if sidecar is None:
+        raise HTTPException(404, "No VU sidecar (not a tracker render or libopenmpt unavailable)")
+    try:
+        data = sidecar.read_bytes()
+    except OSError:
+        raise HTTPException(404, "VU sidecar unreadable")
+    import hashlib
+    etag = f'"{hashlib.sha256(data).hexdigest()[:16]}"'
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag":          etag,
+            "X-VU-Version":  "1",
+        },
+    )
+
+
+# Tracker-only formats — gating the lazy backfill so we don't try to
+# open a FLAC with libopenmpt.  Matches stream.py's _TRACKER_EXTS but
+# imported lazily to avoid a cycle.
+_VU_BACKFILL_EXTS = {
+    ".mod", ".s3m", ".xm", ".it", ".mptm", ".med", ".oct",
+    ".669", ".dbm", ".dsm", ".far", ".gdm", ".imf", ".mtm",
+    ".okt", ".sfx", ".stm", ".ult", ".wow",
+}
+
+
+async def _try_backfill_vu_sidecar(track, track_id: str):
+    """One-shot VU extraction against a track's source file.
+
+    Returns the path to the freshly-written sidecar, or None if any
+    step fails.  Side effect: writes the sidecar next to the cached
+    audio WAV when one exists, else next to the source file under a
+    pre-determined conversion-cache path.
+    """
+    import os
+    from pathlib import Path
+    from soniqboom.core import openmpt_vu
+    from soniqboom.core.conversion_cache import _cache_path
+
+    log = logging.getLogger(__name__)
+    if not openmpt_vu.is_available():
+        log.debug("VU backfill skipped — libopenmpt unavailable")
+        return None
+    # Tracker path can be a ZIP-virtual like ``foo.zip::inner.xm``
+    # where ``Path().suffix`` walks the LAST component (".xm" — good).
+    # For raw nested virtuals like ``a.zip::b.zip::c.xm`` it's the
+    # same — Path() ignores the ``::`` separator and treats the whole
+    # thing as one name; suffix is still ``.xm``.
+    ext = (Path(track.path).suffix or "").lower()
+    if ext not in _VU_BACKFILL_EXTS:
+        log.debug("VU backfill skipped — ext %r not in tracker set", ext)
+        return None
+    # Resolve the source bytes — local file, remote-cache mirror, or
+    # ZIP virtual path.  Reuses the same logic the pattern endpoint
+    # already does.
+    path_str = track.path
+    src_bytes: bytes | None = None
+    try:
+        if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+            # Fetch remote → local (cache-only previously missed never-played
+            # tracks).  The whole function is wrapped in try/except below, so a
+            # fetch failure just means no backfill → 404 → FFT fallback.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(path_str)
+            source = get_source(scan_root) if remote_path else None
+            if source is not None:
+                local = await asyncio.get_event_loop().run_in_executor(
+                    None, get_cache().fetch, scan_root, remote_path, source)
+                if local and local.exists():
+                    src_bytes = local.read_bytes()
+        elif "::" in path_str:
+            # ZIP-virtual path — _read_from_zip_path returns bytes.
+            from soniqboom.core.scanner import _read_from_zip_path
+            data, _name = _read_from_zip_path(path_str)
+            src_bytes = data
+        else:
+            p = Path(path_str)
+            if p.exists():
+                src_bytes = p.read_bytes()
+    except Exception:
+        log.warning("VU backfill source-read failed for %s", path_str, exc_info=True)
+        return None
+    if not src_bytes:
+        log.debug("VU backfill found no bytes for %s", path_str)
+        return None
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: openmpt_vu.extract_vu(src_bytes),
+    )
+    if result is None:
+        log.warning("VU backfill: extract_vu returned None for %s", path_str)
+        return None
+    if result.frames == 0:
+        log.warning("VU backfill: 0 frames for %s", path_str)
+        return None
+
+    # Pick a destination path.  Prefer next to the existing cached
+    # WAV (so eviction is uniform); fall back to a freshly-keyed
+    # cache slot if no audio cache exists for this track yet.
+    try:
+        from soniqboom.core.conversion_cache import _meta, _state_lock
+        candidate: Path | None = None
+        with _state_lock:
+            for cache_key, entry in _meta.items():
+                if cache_key.startswith(f"{track_id}__") and entry.get("format_type") == "tracker":
+                    candidate = Path(entry["path"]).with_suffix(".vu")
+                    break
+        if candidate is None:
+            # No tracker entry yet — synthesize a sidecar-only slot
+            # keyed by track_id alone.  Lives in the same cache dir
+            # so it gets evicted alongside other tracker assets.
+            base = _cache_path(f"{track_id}__novubackfill", "tracker")
+            candidate = base.with_suffix(".vu")
+        await loop.run_in_executor(
+            None, openmpt_vu.write_sidecar, candidate, result,
+        )
+        log.info(
+            "VU sidecar backfilled for %s: %d ch × %d frames @ %d Hz → %s",
+            track_id, result.channels, result.frames, result.sample_rate, candidate,
+        )
+        return candidate
+    except Exception:
+        log.warning("VU backfill write failed for %s", track_id, exc_info=True)
+        return None
 
 
 @router.get("/{track_id}/chapters")
@@ -304,15 +513,35 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     import tempfile
     from pathlib import Path as _Path
     from soniqboom.api.stream import (
-        _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS,
-        _render_sid, _render_midi, _render_tracker, _render_uade,
+        _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
+        _render_sid, _render_midi, _render_tracker, _render_uade, _render_hvl,
     )
     from soniqboom.core.conversion_cache import get_or_render
 
     _zip_tmp = None
     try:
         # Resolve actual file path (extract from ZIP if needed)
-        if '::' in path_str:
+        if '::' in path_str and path_str.startswith(("ftp://", "smb://")):
+            # Remote ZIP member — ``_read_from_zip_path`` can't open an
+            # ``ftp://…zip`` outer, so fetch the archive to the local cache
+            # first, then extract the member (same as the stream path).
+            from soniqboom.core import archive as _archive
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(path_str)
+            source = get_source(scan_root)
+            if source is None or "::" not in remote_path:
+                return None                    # degrade — no waveform, no 500
+            arc_rel, member_name = remote_path.split("::", 1)
+            local_archive = get_cache().fetch(scan_root, arc_rel, source)
+            data = _archive.read_member(local_archive, member_name)
+            suffix = _Path(member_name).suffix
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            tmp.write(data)
+            tmp.close()
+            path = _Path(tmp.name)
+            _zip_tmp = path
+        elif '::' in path_str:
             from soniqboom.core.scanner import _read_from_zip_path
             data, member_name = _read_from_zip_path(path_str)
             suffix = _Path(member_name).suffix
@@ -321,6 +550,26 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             tmp.close()
             path = _Path(tmp.name)
             _zip_tmp = path
+        elif path_str.startswith(("ftp://", "smb://")):
+            # Plain remote file (no ``::``).  The renderers need a REAL local
+            # path — ``Path("ftp://…")`` collapses to ``ftp:/…`` and
+            # openmpt123 / libopenmpt / sidplayfp can't open it.  This was the
+            # bug behind "remote MOD → SRC_NOT_SUPPORTED": the waveform render
+            # shares the audio render through ``get_or_render``'s thundering-
+            # herd dedup, so a failed render here also failed the audio.  Fetch
+            # to the local cache first, exactly like the stream endpoint does.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(path_str)
+            source = get_source(scan_root) if remote_path else None
+            if source is None:
+                return None                    # degrade — no waveform, no 500
+            try:
+                loop = asyncio.get_event_loop()
+                path = _Path(await loop.run_in_executor(
+                    None, get_cache().fetch, scan_root, remote_path, source))
+            except Exception:
+                return None                    # FTP hiccup — degrade, no 500
         else:
             path = _Path(path_str)
 
@@ -333,10 +582,14 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             sf = get_active_soundfont()
             fmt, sf_path = "midi", (str(sf) if sf else "")
             render_fn = lambda: _render_midi(path)
+        elif ext in _HVL_EXTS:
+            # HivelyTracker — bundled hvl2wav (uade/openmpt can't decode HVL).
+            fmt, sf_path = "hvl", None
+            render_fn = lambda: _render_hvl(path, subsong=0)
         elif ext in _UADE_EXTS:
-            # AHX / Hively — uade123, distinct cache namespace so an
-            # accidental tracker-render of the same file (if we ever
-            # mis-route) doesn't poison the right output.
+            # AHX — uade123, distinct cache namespace so an accidental
+            # tracker-render of the same file (if we ever mis-route)
+            # doesn't poison the right output.
             fmt, sf_path = "uade", None
             render_fn = lambda: _render_uade(path, subsong=0)
         else:  # tracker
@@ -410,7 +663,7 @@ async def get_track_waveform(track_id: str, response: Response):
     from pathlib import Path as _Path
     from soniqboom.core.data import get_waveform, get_track, store_waveform
     from soniqboom.core.scanner import _compute_waveform
-    from soniqboom.api.stream import _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS
+    from soniqboom.api.stream import _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS
 
     # ``no-store`` on every response so the browser never serves a stale
     # body when the frontend re-fetches after ``transcode-ready``.  The
@@ -449,7 +702,7 @@ async def get_track_waveform(track_id: str, response: Response):
     loop = asyncio.get_event_loop()
 
     # ── Converted formats: compute waveform from conversion-cache WAV ────
-    if ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS or ext in _UADE_EXTS:
+    if ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS or ext in _UADE_EXTS or ext in _HVL_EXTS:
         wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
         result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(wav_path))
         stored, response = _normalise_waveform(result)

@@ -24,6 +24,15 @@
   --accent-dim: #a84d1a;
   --accent-glow: rgba(240,114,42,0.18);
   --danger: #e55;
+  /* Embedded-visualization palette (scan flow, cache cascade, FTP lanes,
+     signal chain, transcode packets …).  Shared so every viz reads from
+     one cohesive set; flow colours match docs/architecture.html. */
+  --viz-req:    #6bc8f0;   /* request / downstream */
+  --viz-res:    #74e09a;   /* response / cache hit */
+  --viz-evt:    #f0a23a;   /* async event */
+  --viz-err:    #ef6b8d;   /* cold miss / error */
+  --viz-phosphor: #50ff8c; /* retro CRT green */
+  --viz-copper:   #1f6b42; /* PCB trace */
   /* Canonical "cool blue" used for art-placeholder glow, keyboard-focus
      ring, and now-playing tints.  Replaces 14+ raw rgba(107,200,240,…)
      spellings — change here once to restyle the whole language. */
@@ -1809,6 +1818,26 @@ a.crumb-link:hover { color: var(--accent); }
      reduced-motion user has explicitly opted out of even subtle
      transition curves. */
   .converting-badge.has-progress .progress-fill { transition: none; }
+  .converting-badge.has-progress .progress-bar.viz-packets .progress-fill { animation: none; }
+}
+
+/* Transcode "packet assembly" skin (viz #8) — render the determinate fill
+   as discrete blocks that accrue as the WAV is assembled, with a shimmer
+   sweep reading as "writing".  Pure CSS over the existing fill; the
+   progressbar a11y attributes are untouched.  Gated on the now-playing
+   viz group (player.js adds .viz-packets). */
+.converting-badge.has-progress .progress-bar.viz-packets .progress-fill {
+  background:
+    linear-gradient(90deg, rgba(255,255,255,0.55), rgba(255,255,255,0.0) 60%) 0 0 / 22px 100% no-repeat,
+    repeating-linear-gradient(90deg,
+      #ffe6db 0, #ffe6db 8px,
+      rgba(255,255,255,0.35) 8px, rgba(255,255,255,0.35) 10px);
+  background-color: #ffd1c2;
+  animation: viz-packet-shimmer 1.1s linear infinite;
+}
+@keyframes viz-packet-shimmer {
+  from { background-position: -22px 0, 0 0; }
+  to   { background-position: 60px 0, 0 0; }
 }
 
 /* Buffering badge — smaller, less alarming than the converting badge.
@@ -4348,13 +4377,58 @@ tr.dragging { opacity: 0.4; }
 }
 .vu-meters[hidden] { display: none; }
 
+/* When the track-info modal is open, the same ``#vu-meters`` element
+   is reparented onto the 260×260 cover-art box (``#ti-art``).  The
+   base rule's ``position: absolute; inset: 0`` already fills the
+   parent; here we only bump opacity for legibility over cover art
+   and raise z-index so the bars sit above the art image but below
+   the loading shimmer overlay. */
+.vu-meters.in-modal {
+  opacity: 0.75;
+  z-index: 5;
+  /* Slight inset so the bars don't touch the cover-art edge — the
+     cover art has a 12px border-radius which would clip the
+     bar bottoms otherwise. */
+  padding: 0 10px 8px;
+}
+
+/* ``.vu-col`` is the new per-channel container — wraps the bar with
+   its label and pan indicator stack.  Each column grows to share the
+   container width equally; vertically, the column reserves a fixed
+   strip at the bottom for the label + pan glyph, and the bar fills
+   the remaining height. */
+.vu-col {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-end;
+  min-width: 0;
+  /* Column itself stretches to the container's full height so the
+     percentage in the .vu-bar height calc resolves against a real
+     pixel value.  Without this, ``height: calc(var(--vu-level) * 100%)``
+     was anchored to an undefined parent height and the bar collapsed
+     to its ``min-height`` floor (6px). */
+  height: 100%;
+}
+
 .vu-bar {
-  flex: 1;
+  /* Do NOT flex-grow — the explicit ``height`` below drives the bar
+     size based on the per-channel VU level.  ``flex: 1`` would
+     override the height and stretch the bar to fill all remaining
+     space in the column, making every bar identical-height
+     regardless of input level (the bug the user observed in
+     v1.3.0 first cut: 30 channels at 0 px of motion despite valid
+     --vu-level values in the 0.0–0.77 range). */
+  flex: 0 0 auto;
   background: linear-gradient(
     to top,
     hsla(var(--vu-hue, 30), 80%, 55%, 0.85),
     hsla(var(--vu-hue, 30), 80%, 70%, 0.35)
   );
+  /* ``--vu-level`` is the 0..1 quantised level set per frame by
+     _drawVU (VUMR mode) or the FFT spectrum slicer (fallback mode).
+     Percentage anchors to ``.vu-col``'s explicit height above. */
   height: calc(var(--vu-level, 0) * 100%);
   /* A 6 px floor so the bars are visible at idle / silent passages
      too — gives the user feedback that the meter is alive, not just
@@ -4367,6 +4441,49 @@ tr.dragging { opacity: 0.4; }
   transition: none;
 }
 
+.vu-col-label {
+  font-size: 9px;
+  text-align: center;
+  color: var(--text2, #aaa);
+  line-height: 1.1;
+  margin-top: 1px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: clip;
+}
+.vu-meters[data-preset="roomy"] .vu-col-label { font-size: 10px; }
+
+.vu-col-pan {
+  font-size: 8px;
+  text-align: center;
+  color: var(--text2, #888);
+  letter-spacing: 1px;
+  line-height: 1;
+  opacity: 0.6;
+}
+.vu-meters[data-preset="roomy"] .vu-col-pan { font-size: 10px; }
+
+/* The ``mini`` preset hides labels entirely — _initVU never adds the
+   label/pan divs in that mode, but if the preset switches at runtime
+   the rule below provides a defensive fallback. */
+.vu-meters[data-preset="mini"] .vu-col-label,
+.vu-meters[data-preset="mini"] .vu-col-pan { display: none; }
+
+/* The ``numeric`` preset is for >8 channel layouts (16-ch FastTracker /
+   ScreamTracker in the modal box).  Number labels stay visible but
+   pan circles are dropped — at the column widths this tier hits the
+   ●○○/○●○/○○● glyph triplet becomes unreadable and just adds noise.
+   _initVU stops emitting the .vu-col-pan node in this mode; the rule
+   below is a defensive fallback if a stale preset is rendered. */
+.vu-meters[data-preset="numeric"] .vu-col-pan { display: none; }
+.vu-meters[data-preset="numeric"] .vu-col-label { font-size: 9px; }
+
+/* FFT fallback mode — the bars are a 32-bin spectrum analyzer, NOT
+   per-channel meters.  Per-voice labels (CH:N) and pan circles are
+   meaningless here and would actively mislead, so hide them. */
+.vu-meters[data-source="fft"] .vu-col-label,
+.vu-meters[data-source="fft"] .vu-col-pan { display: none; }
+
 /* Fallback animation when AudioContext is not available */
 .vu-bar.vu-animated {
   animation: vu-pulse 0.5s ease-in-out infinite alternate;
@@ -4375,6 +4492,160 @@ tr.dragging { opacity: 0.4; }
 @keyframes vu-pulse {
   from { height: 10%; }
   to   { height: 60%; }
+}
+
+/* ── VU "circuit board" skin (opt-in, tracker/VUMR only) ──────────────────
+   Retro PCB rendering of the SAME per-channel ``--vu-level`` data as the
+   bars (no new data path — app.js ``_readVuStyle`` just flips
+   ``data-style="circuit"``).  Each column is a copper trace rising to a
+   round solder pad that glows green with the channel's amplitude.  The
+   glow/blur are driven by ``--vu-level`` via ``calc()`` so the existing
+   15 Hz ``--vu-level`` writes animate it with zero extra JS.  Custom
+   props inherit DOWN, so the trace must hang off ``.vu-bar::before``
+   (which carries ``--vu-level``), not ``.vu-col``. */
+.vu-meters[data-style="circuit"] {
+  background:
+    repeating-linear-gradient(0deg, rgba(63,224,137,0.045) 0 1px, transparent 1px 13px),
+    radial-gradient(130% 100% at 50% 100%, #0a2417, #06120b);
+  border-radius: 8px;
+  padding: 8px 4px 4px;
+}
+.vu-meters[data-style="circuit"] .vu-col { justify-content: flex-end; }
+.vu-meters[data-style="circuit"] .vu-bar {
+  position: relative;
+  height: 11px !important;
+  width: 11px;
+  align-self: center;
+  margin-top: auto;            /* pad sits at the bottom of the column */
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    hsla(145, 90%, 66%, calc(0.40 + var(--vu-level, 0) * 0.60)),
+    hsla(145, 70%, 28%, 0.55));
+  box-shadow:
+    0 0 calc(2px + var(--vu-level, 0) * 13px) hsla(145, 90%, 60%, calc(0.30 + var(--vu-level, 0) * 0.70)),
+    inset 0 0 2px rgba(0, 0, 0, 0.55);
+  border: 1px solid hsla(145, 50%, 42%, 0.6);
+  transition: box-shadow 60ms linear, background 60ms linear;
+}
+/* The dim copper "track" — the full-height PCB trace the signal rides up. */
+.vu-meters[data-style="circuit"] .vu-bar::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 100%;                /* trace runs UP from the pad */
+  transform: translateX(-50%);
+  width: 2px;
+  height: 42px;
+  background: linear-gradient(to top,
+    hsla(145, 60%, 40%, 0.32),
+    hsla(145, 60%, 30%, 0.08));
+}
+/* The bright "signal" — fills the trace up to the current level so amplitude
+   reads as HEIGHT (a position cue), not glow alone.  Quiet channels are then
+   legible at a glance instead of just dim. */
+.vu-meters[data-style="circuit"] .vu-bar::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  transform: translateX(-50%);
+  width: 2px;
+  height: calc(var(--vu-level, 0) * 42px);
+  background: linear-gradient(to top,
+    hsla(145, 88%, 62%, 0.95),
+    hsla(145, 82%, 50%, 0.45));
+  box-shadow: 0 0 calc(2px + var(--vu-level, 0) * 6px)
+              hsla(145, 88%, 58%, calc(0.40 + var(--vu-level, 0) * 0.60));
+  transition: height 60ms linear, box-shadow 60ms linear;
+}
+.vu-meters[data-style="circuit"] .vu-col-label {
+  color: hsla(145, 45%, 62%, 0.78);
+  font-family: ui-monospace, monospace;
+}
+/* Reduced-motion: freeze pad glow + trace fill (no easing). */
+@media (prefers-reduced-motion: reduce) {
+  .vu-meters[data-style="circuit"] .vu-bar,
+  .vu-meters[data-style="circuit"] .vu-bar::before,
+  .vu-meters[data-style="circuit"] .vu-bar::after { transition: none; }
+}
+
+/* ── Embedded visualization shared chrome ─────────────────────────────────── */
+.viz-host {
+  position: relative;
+  border-radius: 10px;
+  background:
+    radial-gradient(120% 120% at 50% 0%, rgba(255,255,255,0.02), transparent 70%),
+    #070a0f;
+  border: 1px solid #1b2433;
+  overflow: hidden;
+}
+.viz-host svg, .viz-host canvas { display: block; width: 100%; height: 100%; }
+/* SR-only mirror so canvas/SVG viz expose meaning to assistive tech. */
+.viz-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* Signal chain (Track Info modal) */
+.viz-signal-chain { width: 100%; height: 96px; }
+.viz-signal-chain .viz-node { fill: var(--bg3); stroke: var(--line, #243043); }
+.viz-signal-chain .viz-node.active {
+  stroke: var(--viz-req);
+  filter: drop-shadow(0 0 7px var(--viz-req));
+}
+.viz-signal-chain .viz-node-label { fill: var(--text, #e6edf3); font: 600 10px sans-serif; }
+:root[data-theme="light"] .viz-host { background: #eef1f5; border-color: #d4d9e0; }
+/* The four canvas visualizations paint a dark scene (dark-on-dark by
+   design); on a light host they'd read as a black slab.  Pin their hosts to
+   a dark "instrument screen" in BOTH themes so the panel frames the canvas
+   deliberately instead of clashing.  ID specificity (1,0,0) outranks the
+   light .viz-host rule above.  The SVG signal-chain host is theme-adaptive
+   and is intentionally NOT included here. */
+#viz-scan-flow, #viz-cache-cascade, #viz-ftp-lanes, #galaxy-view {
+  background:
+    radial-gradient(120% 120% at 50% 0%, rgba(255,255,255,0.02), transparent 70%),
+    #070a0f;
+  border-color: #1b2433;
+}
+:root[data-theme="light"] .viz-signal-chain .viz-node { fill: #fff; stroke: #c4ccd6; }
+:root[data-theme="light"] .viz-signal-chain .viz-node-label { fill: #1a1d22; }
+
+/* Library Galaxy view (#6) — fills the content pane; legend chips float
+   over the canvas at the bottom and double as format filters. */
+#galaxy-view {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  border: none;
+  border-radius: 0;
+  background: #070a0f;
+}
+#galaxy-view canvas { position: absolute; inset: 0; }
+.galaxy-legend {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 12px 16px;
+  max-height: 33%;
+  overflow-y: auto;
+  background: linear-gradient(0deg, rgba(7,10,15,0.92), rgba(7,10,15,0.6) 60%, transparent);
+}
+.galaxy-empty { color: var(--text2, #93a1b3); font: 500 13px/1.4 system-ui, sans-serif; }
+.galaxy-chip {
+  font: 600 12px/1 system-ui, sans-serif;
+  color: hsl(var(--gx-hue, 200), 70%, 78%);
+  background: hsla(var(--gx-hue, 200), 60%, 22%, 0.55);
+  border: 1px solid hsla(var(--gx-hue, 200), 60%, 50%, 0.5);
+  border-radius: 999px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: transform .12s, box-shadow .12s;
+}
+.galaxy-chip:hover, .galaxy-chip:focus-visible {
+  transform: translateY(-1px);
+  box-shadow: 0 0 14px hsla(var(--gx-hue, 200), 70%, 55%, 0.5);
+  outline: none;
 }
 
 /* ── Keyboard shortcuts overlay ────────────────────────────────────────── */
@@ -4427,6 +4698,35 @@ tr.dragging { opacity: 0.4; }
   border-radius: 4px;
 }
 .shortcuts-header button:hover { color: var(--text0); background: rgba(255,255,255,0.08); }
+
+/* ── Find-music (archives & demoscene) overlay ──────────────────────────
+   Reuses the shortcuts-overlay shell; wider panel for the archive cards. */
+#links-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  background: rgba(0,0,0,0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+#links-overlay.hidden { display: none; }
+#links-panel {
+  background: var(--bg2);
+  border: 1px solid var(--border-bright);
+  border-radius: 16px;
+  box-shadow: var(--glass-shadow);
+  max-width: 780px;
+  width: 92vw;
+  max-height: 84vh;
+  overflow-y: auto;
+}
+.links-body { padding: 4px 18px 16px; }
+/* The moved settings sections shouldn't carry tab-specific spacing in the modal */
+.links-body .admin-section { margin: 0; padding: 14px 0 4px; border: none; background: none; }
+.links-body .admin-section + .admin-section { border-top: 1px solid var(--border); }
 
 .shortcuts-body {
   display: grid;

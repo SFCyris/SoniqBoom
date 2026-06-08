@@ -406,3 +406,13 @@ async def list_years(request: Request):
         cached = get_store().aggregate_years()
         _cache_set("years", cached)
     return _etag_response(request, "years", cached)
+
+
+@router.get("/formats")
+async def list_formats(request: Request):
+    """Per-format track counts — drives the library Galaxy visualization."""
+    cached = _cache_get("formats")
+    if cached is None:
+        cached = get_store().aggregate_formats()
+        _cache_set("formats", cached)
+    return _etag_response(request, "formats", cached)

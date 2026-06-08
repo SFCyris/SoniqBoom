@@ -668,6 +668,18 @@ async def metadata_repair_cancel(_tok: str = Depends(_require_token)):
     return {"cancelled": True, "flipped": flipped}
 
 
+@router.post("/metadata/recompute-duplicates")
+async def metadata_recompute_duplicates(_tok: str = Depends(_require_token)):
+    """Recompute every track's duplicate-group annotation against current
+    metadata.  Repair runs this automatically after re-titling, but it's
+    exposed standalone so a stale ``is_duplicate_primary`` (e.g. tracks that
+    were re-titled by an earlier repair before this hook existed) can be
+    corrected without a full reindex.  Returns ``{annotated: int}``."""
+    from soniqboom.core.repair import recompute_duplicate_groups_now
+    n = await recompute_duplicate_groups_now()
+    return {"annotated": n}
+
+
 # ── Diagnostics ─────────────────────────────────────────────────────────────
 
 @router.get("/inflight")
@@ -1233,6 +1245,20 @@ async def reconnect_share(body: dict, _tok: str = Depends(_require_token)):
 #      ("I bumped MaxClientsPerHost to 30, stop throttling me").
 #
 # All endpoints share the same admin-token guard as the rest of /admin.
+
+@router.get("/cache-stats")
+async def cache_stats_endpoint(_tok: str = Depends(_require_token)):
+    """Per-tier cache hit/miss telemetry for the cache-cascade visualization.
+
+    Process-lifetime counters (reset on restart, not persisted).  See
+    ``soniqboom/core/cache_stats.py``.  Returns ``{uptime_sec, tiers:{...}}``
+    where each tier carries ``hits, misses, hit_rate, rate_1s, size``.
+    The cascade viz uses ``hit_rate`` as each tier's real resolve
+    probability and ``rate_1s`` to pace the particle drop cadence.
+    """
+    from soniqboom.core import cache_stats
+    return cache_stats.snapshot()
+
 
 @router.get("/ftp-pool/status")
 async def ftp_pool_status(_tok: str = Depends(_require_token)):
@@ -1841,6 +1867,29 @@ async def download_known_soundfont(body: dict, _tok: str = Depends(_require_toke
                 async for chunk in resp.aiter_bytes(65536):
                     await f.write(chunk)
 
+    # Many well-known soundfonts (e.g. GeneralUser GS) are distributed as a
+    # ZIP.  A ZIP saved verbatim as ``.sf2`` is unreadable by FluidSynth — the
+    # MIDI render fails with "renderer exited with status 255".  Detect the
+    # archive and extract the largest ``.sf2`` member in its place so the
+    # downloaded soundfont is immediately usable.
+    import shutil
+    import zipfile
+    if zipfile.is_zipfile(dest):
+        try:
+            with zipfile.ZipFile(dest) as zf:
+                members = [m for m in zf.namelist() if m.lower().endswith(".sf2")]
+                if not members:
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(422, "Downloaded archive contains no .sf2 soundfont.")
+                member = max(members, key=lambda m: zf.getinfo(m).file_size)
+                tmp = dest.with_name(dest.name + ".tmp")
+                with zf.open(member) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out)
+            os.replace(tmp, dest)
+        except zipfile.BadZipFile:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(422, "Downloaded soundfont archive is corrupt.")
+
     return {"name": safe_name, "size": dest.stat().st_size}
 
 
@@ -2399,11 +2448,22 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "hvsc_docs_path": settings.hvsc_docs_path,
         },
         "scan_zips": settings.scan_zips,
+        "scan_remote_zips": settings.scan_remote_zips,
         "art_cache_dir": settings.art_cache_dir,
         "expose_local_files": settings.expose_local_files,
         "folder_aliases": conf.get("folder_aliases", {}),
         "filter_duplicates": await get_config("filter_duplicates", False),
+        # Folder-tree duplicate filter — independent of the search/library
+        # ``filter_duplicates`` above.  When True, ``/api/fstree/tracks-with-meta``
+        # collapses duplicate alternate encodings while browsing folders;
+        # default off so folder views mirror what's on disk.
+        "dedup_folders": await get_config("dedup_folders", False),
         "use_folder_art": await get_config("use_folder_art", True),
+        # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
+        # drops subdirectories whose subtree contains zero indexed audio
+        # tracks (e.g. photo dumps, build dirs, video-only folders
+        # sharing a scan root with the music library).
+        "hide_empty_folders": await get_config("hide_empty_folders", False),
         # Comma-separated, case-insensitive, ordered list of filenames the
         # folder-art fallback walks (first match wins).  Empty string =
         # ship the historical default (cover.jpg, folder.jpg, front.jpg,
@@ -2447,6 +2507,9 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 log.exception("HVSC reconfigure failed")
     if "scan_zips" in body:
         conf["scan_zips"] = bool(body["scan_zips"])
+    if "scan_remote_zips" in body:
+        conf["scan_remote_zips"] = bool(body["scan_remote_zips"])
+        settings.scan_remote_zips = conf["scan_remote_zips"]   # runtime effect, no restart
     if "art_cache_dir" in body:
         conf["art_cache_dir"] = body["art_cache_dir"]
     if "expose_local_files" in body:
@@ -2499,12 +2562,18 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
 
     if (
         "filter_duplicates" in body
+        or "dedup_folders" in body
         or "use_folder_art" in body
         or "folder_art_names" in body
+        or "hide_empty_folders" in body
     ):
         from soniqboom.core.data import set_config
+        if "hide_empty_folders" in body:
+            await set_config("hide_empty_folders", bool(body["hide_empty_folders"]))
         if "filter_duplicates" in body:
             await set_config("filter_duplicates", bool(body["filter_duplicates"]))
+        if "dedup_folders" in body:
+            await set_config("dedup_folders", bool(body["dedup_folders"]))
         if "use_folder_art" in body:
             new_val = bool(body["use_folder_art"])
             await set_config("use_folder_art", new_val)

@@ -161,6 +161,15 @@ export const Player = (() => {
     } catch (_) { /* network blip — try again next tick */ }
   }
 
+  // Read the now-playing viz toggle straight from localStorage (avoids an
+  // import cycle with the viz engine from this core module).
+  function _vizPacketsOn() {
+    try {
+      const s = JSON.parse(localStorage.getItem('sb_viz_settings') || '{}');
+      return s.enabled !== false && s.nowPlaying !== false;
+    } catch { return true; }
+  }
+
   function _updateConvertBadgeProgress(percent, etaSec) {
     if (!_convertBadge) return;
     let bar = _convertBadge.querySelector('.progress-bar');
@@ -173,6 +182,11 @@ export const Player = (() => {
       label.textContent = 'Converting…';
       bar = document.createElement('div');
       bar.className = 'progress-bar';
+      // Transcode "packet assembly" skin (viz #8): render the fill as
+      // discrete blocks growing block-by-block as the WAV is assembled.
+      // Pure CSS on the existing fill — preserves the progressbar a11y
+      // contract below.  Gated on the now-playing viz group + reduced-motion.
+      if (_vizPacketsOn()) bar.classList.add('viz-packets');
       bar.setAttribute('role', 'progressbar');
       bar.setAttribute('aria-valuemin', '0');
       bar.setAttribute('aria-valuemax', '100');
@@ -970,8 +984,22 @@ export const Player = (() => {
 
     // Media Session API — enables system media keys + lock screen widget
     if ('mediaSession' in navigator) {
+      // The OS Now-Playing widget (macOS Control Center, Android, lock
+      // screen) fetches these URLs itself, so they must be ABSOLUTE.
+      // ``track.cover_art`` is usually null (art is extracted on demand),
+      // so point at the ``/api/art`` endpoint — it returns the real cover
+      // or the format placeholder, never nothing.  Without this the widget
+      // falls back to the browser's own icon (the "Firefox" logo).
       const artwork = [];
-      if (track.cover_art) artwork.push({ src: track.cover_art, sizes: '192x192', type: 'image/jpeg' });
+      if (track.id) {
+        const base = `${location.origin}/api/art/${encodeURIComponent(track.id)}`;
+        artwork.push(
+          { src: `${base}?size=sm`, sizes: '256x256', type: 'image/jpeg' },
+          { src: `${base}?size=lg`, sizes: '512x512', type: 'image/jpeg' },
+        );
+      } else if (track.cover_art) {
+        artwork.push({ src: track.cover_art, sizes: '512x512', type: 'image/jpeg' });
+      }
       navigator.mediaSession.metadata = new MediaMetadata({
         title:  track.title  || '',
         artist: track.artist || track.album_artist || '',

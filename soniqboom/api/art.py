@@ -696,11 +696,27 @@ async def cover_art(
     track_id: str,
     request: Request,
     size: str = Query("sm", pattern="^(sm|lg|full)$"),
+    fallback: str = Query("placeholder", pattern="^(placeholder|404)$"),
 ):
     """Serve cover art with optional thumbnail sizing and ETag caching.
 
     Query params:
         size — ``sm`` (200px, default), ``lg`` (550px), or ``full`` (original).
+        fallback — what to return when no real art exists:
+            * ``placeholder`` (default) — a tiny grey JPEG with the
+              ``X-SoniqBoom-Art: placeholder`` header.  Cheaply cacheable
+              by ETag so every tagless track in a library shares one
+              download.  This is what e.g. Subsonic clients expect.
+            * ``404`` — a plain 404 with cache headers.  The frontend
+              track-list and player-bar IMG loaders pass this so the
+              browser's image pipeline reports ``onerror`` and the
+              format-specific emoji stays visible behind the IMG.
+              Crucially, the IMG path keeps lazy-loading, image-priority
+              queueing, and bitmap-level cache coalescing — all of which
+              the alternative (fetch + blob + ObjectURL to read the
+              X-SoniqBoom-Art header) silently loses, regressing
+              folder-open latency from ~50 ms to several seconds on
+              large directories of tagless tracks (regression D14).
 
     The ETag now mixes in the underlying art file's mtime so a re-extracted
     cover busts the client's cached 304 — previously the client kept serving
@@ -745,11 +761,14 @@ async def cover_art(
             thumbs = await _generate_and_cache_thumbs(track_id, full_data)
             return _etag_response(thumbs[size], "image/jpeg", etag)
 
-        # Nothing resolved — serve the placeholder.  Strong ETag means
-        # the browser caches it once and never asks again for any
-        # other tagless track.  Previous behaviour returned 404, which
-        # forced the UI to handle the failure per-track AND meant
-        # every scroll past a tagless track re-fired the request.
+        # Nothing resolved.  Default: serve the cached placeholder
+        # (strong ETag → one download covers every tagless track).
+        # When fallback=404, return a 404 with cache headers so the
+        # browser's IMG.onerror fires and the UI's format emoji stays
+        # visible — without paying the bitmap-decode + blob-alloc cost
+        # of fetching the placeholder body just to inspect a header.
+        if fallback == "404":
+            return _no_art_404()
         return _placeholder_response()
 
     # --- Full size ----------------------------------------------------------
@@ -760,6 +779,8 @@ async def cover_art(
         asyncio.create_task(_generate_and_cache_thumbs(track_id, full_data))
         return _etag_response(full_data, mime or "image/jpeg", etag)
 
+    if fallback == "404":
+        return _no_art_404()
     return _placeholder_response()
 
 
@@ -781,5 +802,26 @@ def _placeholder_response() -> Response:
             # treat tracks served this header as art-less and avoid
             # showing a "View full size" affordance, etc.
             "X-SoniqBoom-Art": "placeholder",
+        },
+    )
+
+
+def _no_art_404() -> Response:
+    """Return a 404 with strong cache headers for the ``fallback=404`` path.
+
+    The frontend track-list IMG loader uses this so the browser's
+    ``onerror`` handler fires for tagless tracks while the format-
+    appropriate emoji stays visible behind the IMG.  Crucially the
+    404 is cacheable — Chrome / Safari / Firefox all honour a
+    ``Cache-Control`` header on negative responses, so subsequent
+    scroll past the same track-id re-uses the cached 404 with no
+    network round trip.  Without the cache headers, every row repaint
+    would re-hit the server, defeating the purpose.
+    """
+    return Response(
+        status_code=404,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-SoniqBoom-Art": "none",
         },
     )

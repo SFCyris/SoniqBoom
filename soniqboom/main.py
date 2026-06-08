@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import socket
 import sys
 import time
@@ -696,6 +697,32 @@ async def startup():
     _ss_phase("loading_library", "Loading library snapshot")
     from soniqboom.core.persistence import init_persistence
     init_persistence(data_dir)
+
+    # Pre-warm the per-scan-root sorted cache for every LOCAL scan root.
+    # Pays the one-time O(bucket-size) iterate + TrackMeta shape cost
+    # NOW — while the splash is already displayed — so the first user
+    # click on any subfolder under any local scan root lands warm
+    # instead of paying ~1.2 s (SID, 56K) / ~3 s (modarchive, 111K) on
+    # interaction.  Remote (smb://, ftp://) roots are skipped — they
+    # use ``store.filter_tracks`` directly via ``_remote_tracks_with_meta``
+    # and don't benefit from this index.
+    _ss_phase("warmup_browse", "Pre-warming folder browse cache")
+    t_warm = time.monotonic()
+    try:
+        from soniqboom.api.fstree import warmup_scan_root_caches
+        # Pass data_dir so the cache is restored from
+        # ``{data_dir}/browse_cache.pickle`` on warm boots (and re-saved
+        # whenever a scan-root bucket size changes).  Cold boot still
+        # pays the full ~5 s build, but every subsequent boot — until a
+        # scan adds/removes tracks — comes up in ~300 ms for that phase.
+        warm_counts = warmup_scan_root_caches(data_dir)
+        warm_total = sum(warm_counts.values())
+        log.info(
+            "Folder browse cache warmed: %d local root(s), %d total tracks indexed in %.0fms",
+            len(warm_counts), warm_total, (time.monotonic() - t_warm) * 1000,
+        )
+    except Exception as exc:
+        log.warning("Folder browse cache warmup failed (will lazy-build on first click): %s", exc)
 
     # Initialise user store (users.json).  Safe even on fresh installs —
     # ``has_any()`` returns False until the first ``soniqboom-setadm`` run.

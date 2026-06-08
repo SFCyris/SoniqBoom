@@ -101,7 +101,7 @@ function renderMini(track) {
   span.className = 'm-mp-art-ph';
   span.textContent = artPlaceholderEmoji(track);
   miniArt.appendChild(span);
-  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm` : null);
+  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm&fallback=404` : null);
   if (artSrc) {
     const img = new Image();
     img.alt = '';

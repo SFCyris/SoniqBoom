@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<!-- Throwaway harness to verify embedded-viz modules in isolation (no auth).
+     Not linked from the app; safe to delete. -->
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>viz harness</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  body { background:#0d0f12; color:#e6edf3; font-family:system-ui; padding:24px; }
+  .panel { margin-bottom:28px; }
+  .host-wrap { width:440px; }
+  #vu-host { position:relative; height:120px; width:300px; background:#070a0f; border:1px solid #1b2433; border-radius:10px; }
+  /* give the harness VU container the flex layout the real app gives #vu-meters */
+  .vu-meters { display:flex; gap:6px; align-items:flex-end; justify-content:center; height:100%; padding:8px; }
+  .vu-col { display:flex; flex-direction:column; justify-content:flex-end; align-items:center; height:100%; }
+  .vu-bar { width:14px; background:linear-gradient(to top, hsla(var(--vu-hue,30),80%,55%,0.85), hsla(var(--vu-hue,30),80%,70%,0.35)); height:calc(var(--vu-level,0)*100%); border-radius:3px 3px 0 0; }
+  .vu-col-label { font-size:10px; color:#93a1b3; margin-top:3px; }
+</style>
+</head><body>
+  <div class="panel">
+    <h3>Signal chain (#4)</h3>
+    <div class="host-wrap"><div id="sc-host" class="viz-host"></div></div>
+  </div>
+  <div class="panel">
+    <h3>VU circuit (#7) — data-style="circuit"</h3>
+    <div id="vu-host"><div id="vu-meters" class="vu-meters" data-source="vumr" data-style="circuit"></div></div>
+  </div>
+  <div class="panel">
+    <h3>Scan flow (#1)</h3>
+    <div class="host-wrap"><div id="scan-host" class="viz-host" style="height:180px"></div></div>
+  </div>
+  <div class="panel">
+    <h3>Cache cascade (#2) — mocked /api/admin/cache-stats</h3>
+    <div class="host-wrap"><div id="cascade-host" class="viz-host" style="height:240px"></div></div>
+  </div>
+  <div class="panel">
+    <h3>FTP lanes (#3) — mocked /api/admin/ftp-pool/status</h3>
+    <div class="host-wrap"><div id="ftp-host" class="viz-host" style="height:160px"></div></div>
+  </div>
+  <div class="panel">
+    <h3>Galaxy (#6) — mocked /api/library/formats</h3>
+    <div style="width:560px"><div id="galaxy-host" class="viz-host" style="position:relative;height:340px"></div></div>
+  </div>
+  <div class="panel">
+    <h3>Transcode packets (#8) — CSS skin</h3>
+    <div class="converting-badge has-progress" style="position:relative;min-width:320px">
+      <span class="progress-label">Converting…</span>
+      <div class="progress-bar viz-packets" id="pkt-bar" role="progressbar" style="position:relative;height:22px;width:300px;background:#3a1f2a;border-radius:999px;overflow:hidden">
+        <div class="progress-fill" id="pkt-fill" style="width:62%"></div>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+import { mountSignalChain } from './js/viz/signalchain.js';
+
+// Force the viz settings on so registerViz doesn't gate everything off.
+localStorage.setItem('sb_viz_settings', JSON.stringify({ enabled:true, nowPlaying:true, library:true, admin:true, vuStyle:'circuit' }));
+
+// ── signal chain ──
+let _fmt = 'SID', _playing = true;
+const sc = mountSignalChain(document.getElementById('sc-host'), () => ({ format:_fmt, playing:_playing }));
+window.__setFmt = f => { _fmt = f; sc.rebuild(); };
+
+// ── VU circuit: build 8 mock bars + animate --vu-level ──
+const vu = document.getElementById('vu-meters');
+const bars = [];
+for (let i=0;i<8;i++){
+  const col=document.createElement('div'); col.className='vu-col';
+  const bar=document.createElement('div'); bar.className='vu-bar'; bar.style.setProperty('--vu-hue', (i*45+15));
+  const lab=document.createElement('div'); lab.className='vu-col-label'; lab.textContent='CH'+(i+1);
+  col.append(bar,lab); vu.appendChild(col); bars.push(bar);
+}
+let t=0;
+setInterval(()=>{
+  t+=0.066;
+  bars.forEach((b,i)=>{
+    const lvl = Math.max(0, Math.sin(t*1.3 + i*0.8)) * Math.max(0.2, Math.sin(t*0.5+i));
+    b.style.setProperty('--vu-level', lvl.toFixed(3));
+  });
+}, 66);
+window.__vuBars = bars;
+
+// ── admin viz: mock the two admin endpoints, then mount all three ──
+const _realFetch = window.fetch.bind(window);
+window.fetch = (url, opts) => {
+  const u = String(url);
+  if (u.includes('/api/admin/cache-stats')) {
+    return Promise.resolve(new Response(JSON.stringify({
+      uptime_sec: 120,
+      tiers: {
+        browse:     { hits: 800, misses: 200, hit_rate: 0.80, rate_1s: 3.0, size: 40 },
+        scan_root:  { hits: 60,  misses: 40,  hit_rate: 0.60, rate_1s: 1.0, size: 3 },
+        per_path:   { hits: 30,  misses: 70,  hit_rate: 0.30, rate_1s: 1.2, size: 12 },
+        conversion: { hits: 12,  misses: 18,  hit_rate: 0.40, rate_1s: 0.4, size: 77 },
+        art:        { hits: 200, misses: 90,  hit_rate: 0.69, rate_1s: 2.0, size: null },
+        remote:     { hits: 5,   misses: 25,  hit_rate: 0.17, rate_1s: 0.3, size: null },
+        zip:        { hits: 0,   misses: 0,   hit_rate: 0.0,  rate_1s: 0.0, size: null },
+      }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }
+  if (u.includes('/api/admin/ftp-pool/status')) {
+    // REAL shape: { servers:[{ label, host, port, scan_budget, stream_budget,
+    //   configured_total, live:{ in_use, idle, waiting_stream, waiting_scan } }] }
+    return Promise.resolve(new Response(JSON.stringify({ servers: [
+      // Reindex in progress on server 1: 6 borrows on the SCAN lane, 0 stream.
+      { label: '10.0.0.88:21', host: '10.0.0.88', port: 21, scan_budget: 6, stream_budget: 2,
+        configured_total: 8, live: { in_use: 6, in_use_stream: 0, in_use_scan: 6, idle: 0, waiting_stream: 0, waiting_scan: 0 } },
+      // A playback borrow on server 2: 1 stream, 0 scan.
+      { label: '10.0.0.5:21',  host: '10.0.0.5',  port: 21, scan_budget: 4, stream_budget: 2,
+        configured_total: 6, live: { in_use: 1, in_use_stream: 1, in_use_scan: 0, idle: 3, waiting_stream: 0, waiting_scan: 0 } },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }
+  if (u.includes('/api/library/formats')) {
+    return Promise.resolve(new Response(JSON.stringify([
+      { format: 'ProTracker', count: 62352 }, { format: 'SID', count: 56907 },
+      { format: 'FLAC', count: 49774 }, { format: 'MP3', count: 33167 },
+      { format: 'FastTracker 2', count: 32547 }, { format: 'Impulse Tracker', count: 18000 },
+      { format: 'Ogg Vorbis', count: 4200 }, { format: 'DSF', count: 1165 },
+    ]), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }
+  return _realFetch(url, opts);
+};
+
+import('./js/viz/galaxy.js').then(({ mountGalaxy }) => {
+  window.__galaxy = mountGalaxy(document.getElementById('galaxy-host'), { onPickFormat: f => console.log('pick', f) });
+});
+
+import('./js/viz/scanflow.js').then(({ mountScanFlow }) => {
+  const sf = mountScanFlow(document.getElementById('scan-host'));
+  // drive scan progress: ~900 files/s
+  let processed = 0;
+  setInterval(() => { processed += 60; sf.onProgress({ processed, total: 200000 }); }, 66);
+  window.__scanFlow = sf;
+});
+import('./js/viz/cachecascade.js').then(({ mountCacheCascade }) => {
+  window.__cascade = mountCacheCascade(document.getElementById('cascade-host'), { pollMs: 1000 });
+});
+import('./js/viz/ftplanes.js').then(({ mountFtpLanes }) => {
+  window.__ftp = mountFtpLanes(document.getElementById('ftp-host'), { pollMs: 1000 });
+});
+</script>
+</body></html>

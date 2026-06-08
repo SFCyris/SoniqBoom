@@ -47,10 +47,11 @@ log = logging.getLogger(__name__)
 
 _SID_EXTS = {".sid", ".psid"}
 _MIDI_EXTS = {".mid", ".midi"}
-# AHX / Hively need uade123, NOT openmpt123 — keep them separate from
-# the openmpt-handled tracker set so the cast dispatcher picks the
-# right renderer.
-_UADE_EXTS = {".ahx", ".hvl"}
+# AHX needs uade123, NOT openmpt123.  HVL (HivelyTracker) needs the bundled
+# hvl2wav (neither uade nor openmpt decodes it).  Both kept separate from the
+# openmpt-handled tracker set so the cast dispatcher picks the right renderer.
+_UADE_EXTS = {".ahx"}
+_HVL_EXTS = {".hvl"}
 _TRACKER_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ult", ".stm", ".far",
@@ -72,8 +73,42 @@ def is_rendered_format(source_ext: str) -> bool:
     return (e in _SID_EXTS
             or e in _MIDI_EXTS
             or e in _UADE_EXTS
+            or e in _HVL_EXTS
             or e in _TRACKER_EXTS
             or e in _GME_EXTS)
+
+
+def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str | None:
+    """The conversion-cache key ``prepare_source_for_stream`` will populate for
+    this source, or ``None`` for ffmpeg-native sources.
+
+    SINGLE SOURCE OF TRUTH for "what key does cast_render produce" — cast_stream
+    calls this to PIN the rendered WAV so the N+1 prewarm's evictor can't unlink
+    it mid-stream.  The format_type + key-relevant params below MUST stay in
+    lockstep with the ``get_or_render(...)`` calls in ``prepare_source_for_stream``
+    (same ext sets, same SID duration, same MIDI soundfont, same subsong).
+    """
+    e = (source_ext or "").lower()
+    if not e.startswith("."):
+        e = "." + e
+    from soniqboom.core.conversion_cache import _cache_key
+    if e in _SID_EXTS:
+        from soniqboom.config import settings
+        dur = int(getattr(settings, "sid_default_duration", 180))
+        return _cache_key(track_id, "sid", subsong=subsong, duration=dur)
+    if e in _MIDI_EXTS:
+        from soniqboom.config import get_active_soundfont
+        sf = get_active_soundfont()
+        return _cache_key(track_id, "midi", soundfont_path=str(sf) if sf else "")
+    if e in _HVL_EXTS:
+        return _cache_key(track_id, "hvl", subsong=subsong)
+    if e in _UADE_EXTS:
+        return _cache_key(track_id, "uade", subsong=subsong)
+    if e in _TRACKER_EXTS:
+        return _cache_key(track_id, "tracker", subsong=subsong)
+    if e in _GME_EXTS:
+        return _cache_key(track_id, "gme", subsong=subsong)
+    return None
 
 
 async def prepare_source_for_stream(
@@ -107,6 +142,19 @@ async def prepare_source_for_stream(
     src_ext = Path(visible_path).suffix.lower()
     path_obj = Path(track_path)
 
+    # ZIP-contained rendered sources: resolve to the real extracted file via
+    # the SAME stable extraction cache the foreground stream uses.  The
+    # renderers (sidplayfp / fluidsynth / openmpt123 / uade123 / hvl2wav) take
+    # a filesystem path and can't read a ``zip::member`` virtual path — without
+    # this, a COLD cast render of any zip-contained tracker/SID/HVL fails (it
+    # only worked when the foreground play had already warmed the cache).
+    # Shared cache ⇒ no temp churn and no double-extraction.
+    if "::" in track_path and is_rendered_format(src_ext):
+        from soniqboom.api.stream import _get_or_extract_zip_member
+        extracted = await _get_or_extract_zip_member(track_path, track_id)
+        if extracted is not None:
+            path_obj = extracted
+
     if src_ext in _SID_EXTS:
         # Late import — keeps the cast modules independently loadable
         # even if the SID renderer fails to import for any reason
@@ -134,11 +182,21 @@ async def prepare_source_for_stream(
         )
         return cached_path, "wav"
 
+    if src_ext in _HVL_EXTS:
+        # HivelyTracker → bundled hvl2wav (neither uade123 nor openmpt123
+        # decodes HVL).  Checked BEFORE uade + tracker (the ext also appears
+        # in the broader scanner tracker set).
+        from soniqboom.api.stream import _render_hvl
+        cached_path, _hit = await get_or_render(
+            track_id=track_id, format_type="hvl", subsong=subsong,
+            render_fn=lambda: _render_hvl(path_obj, subsong=subsong),
+        )
+        return cached_path, "wav"
+
     if src_ext in _UADE_EXTS:
-        # AHX / Hively → uade123.  Must be checked BEFORE the tracker
-        # branch — both extensions also appear in the broader tracker
-        # set used by the library scanner, but openmpt123 can't decode
-        # them.
+        # AHX → uade123.  Must be checked BEFORE the tracker branch — the
+        # extension also appears in the broader tracker set used by the
+        # library scanner, but openmpt123 can't decode it.
         from soniqboom.api.stream import _render_uade
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="uade", subsong=subsong,

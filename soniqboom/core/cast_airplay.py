@@ -44,11 +44,12 @@ from typing import Any
 
 try:
     import pyatv
-    from pyatv.const import Protocol
+    from pyatv.const import Protocol, PairingRequirement
     _PYATV_AVAILABLE = True
 except ImportError:                                              # pragma: no cover
     pyatv = None                                                 # type: ignore[assignment]
     Protocol = None                                              # type: ignore[assignment]
+    PairingRequirement = None                                    # type: ignore[assignment]
     _PYATV_AVAILABLE = False
 
 # pyatv exceptions used to recognise pairing-required vs generic failures.
@@ -123,6 +124,32 @@ _OP_TIMEOUT_S: float = 10.0
 # replies) and we still want connect() to finish inside the outer
 # wait_for budget.
 _SCAN_TIMEOUT_S: float = 5.0
+
+# The name AirPlay receivers show in their "Allow … to play music?" prompt
+# and in the OS Now-Playing "from" line.  pyatv announces ``settings.info.name``
+# (default "pyatv", and empty on some receivers) — we override it so the user
+# sees the program that's actually casting.
+_CAST_SENDER_NAME = "SoniqBoom"
+
+
+async def _named_storage(config: "Any"):
+    """A pyatv ``MemoryStorage`` whose advertised sender name is SoniqBoom.
+
+    Passed to both ``pyatv.connect`` and ``pyatv.pair`` so the AirPlay
+    pairing PIN dialog and the streaming "Allow … to play music" prompt
+    identify the sender as ``SoniqBoom`` instead of "" / "pyatv".  Best
+    effort — any failure degrades to the default (unnamed) storage rather
+    than blocking the connection.
+    """
+    from pyatv.storage.memory_storage import MemoryStorage
+    storage = MemoryStorage()
+    try:
+        settings = await storage.get_settings(config)
+        settings.info.name = _CAST_SENDER_NAME
+        settings.info.os_name = _CAST_SENDER_NAME
+    except Exception:
+        log.debug("AirPlay: could not set sender name on storage", exc_info=True)
+    return storage
 
 
 class AirPlayController:
@@ -235,8 +262,30 @@ class AirPlayController:
                         # finish_pair will overwrite once the user re-pairs.
                         log.warning("Stored AirPlay credentials rejected for %s — "
                                     "will need re-pairing", self.identifier)
+                else:
+                    # No stored credentials.  Some AirPlay-2 receivers (macOS
+                    # AirPlay Receiver, Apple TV) connect fine unauthenticated
+                    # but only DEMAND the PIN at stream-setup time — pyatv then
+                    # blocks on ``/pair-pin-start`` until our op-timeout fires,
+                    # which we'd surface as a confusing "could not reach the
+                    # cast target".  If the device advertises mandatory
+                    # pairing, route to the PIN-entry modal up front instead of
+                    # letting the stream time out.
+                    svc = config.get_service(Protocol.AirPlay)
+                    if (PairingRequirement is not None and svc is not None
+                            and getattr(svc, "pairing", None) == PairingRequirement.Mandatory):
+                        log.info("AirPlay %s requires pairing and we have no "
+                                 "credentials — prompting for PIN", self.identifier)
+                        raise PairingRequiredError(
+                            self.identifier,
+                            "AirPlay device requires PIN pairing — enter the "
+                            "code shown on the device.",
+                        )
 
-                self._atv = await pyatv.connect(config, loop)
+                # Named storage → the receiver's "Allow … to play music"
+                # prompt + OS Now-Playing source read "SoniqBoom".
+                storage = await _named_storage(config)
+                self._atv = await pyatv.connect(config, loop, storage=storage)
                 self._config = config
 
             try:
@@ -301,6 +350,22 @@ class AirPlayController:
         async with self._lock:
             loop = asyncio.get_running_loop()
 
+            # Tear down any live play/connect session FIRST.  The failed play
+            # that routed us into pairing left ``self._atv`` connected; if we
+            # leave it open, the pairing handler below opens a SECOND
+            # connection and the receiver shows two "accept"/PIN prompts,
+            # confusing both sender and receiver.  Close it directly (not via
+            # the locked disconnect(), which would re-enter self._lock).
+            if self._atv is not None:
+                try:
+                    self._atv.close()
+                except Exception:
+                    log.debug("AirPlay: closing stale session before pair raised",
+                              exc_info=True)
+                self._atv = None
+                self._config = None
+                self._is_airplay2 = False
+
             # Always do a fresh scan — pairing requires the same
             # config + identifier the live connect() would use, and a
             # cached self._config could be stale (device IP moved,
@@ -318,7 +383,14 @@ class AirPlayController:
             # Close any stale handler from a previous abandoned attempt.
             await self._close_pair_handler()
 
-            handler = await pyatv.pair(config, Protocol.AirPlay, loop)
+            # Pass the sender name both ways: ``name=`` is what the pairing
+            # handler reads directly, and the named storage covers the
+            # streaming SETUP — so the PIN dialog says "SoniqBoom", not "".
+            storage = await _named_storage(config)
+            handler = await pyatv.pair(
+                config, Protocol.AirPlay, loop,
+                storage=storage, name=_CAST_SENDER_NAME,
+            )
             try:
                 await asyncio.wait_for(handler.begin(), timeout=_OP_TIMEOUT_S)
             except Exception:
@@ -425,16 +497,6 @@ class AirPlayController:
             # the operator's INFO stream with non-events.
             log.debug("Pair-handler close raised for %s", self.identifier, exc_info=True)
 
-
-class PairingError(Exception):
-    """User-visible pairing failure — wrong PIN, expired session, etc.
-
-    Distinct from :class:`PairingRequiredError` (which signals that
-    *pairing is needed*); this one signals *pairing failed* after the
-    user tried.  The API layer maps this to HTTP 400 with the original
-    message so the UI can show "Wrong PIN — try again."
-    """
-    pass
 
     # ── Capabilities ───────────────────────────────────────────────────────
 
@@ -565,6 +627,23 @@ class PairingError(Exception):
                     "AirPlay play() timed out after %.1fs target=%s",
                     _OP_TIMEOUT_S, self.target_id,
                 )
+                # A play timeout with NO stored credentials is almost always
+                # the receiver demanding a PIN at stream-setup time (pyatv
+                # blocks on ``/pair-pin-start``).  Route to the PIN-entry modal
+                # instead of a dead-end "could not reach" error — belt-and-
+                # suspenders for receivers whose advertised pairing requirement
+                # didn't trip the proactive check in connect().
+                try:
+                    from soniqboom.core import airplay_credentials
+                    _have_creds = airplay_credentials.get(self.identifier) is not None
+                except Exception:
+                    _have_creds = False
+                if not _have_creds:
+                    raise PairingRequiredError(
+                        self.identifier,
+                        "AirPlay device requires PIN pairing — enter the code "
+                        "shown on the device.",
+                    )
                 raise
             except Exception:
                 log.warning(
@@ -798,3 +877,14 @@ def _detect_airplay2(config: Any) -> bool:
         return False
 
     return False
+
+
+class PairingError(Exception):
+    """User-visible pairing failure — wrong PIN, expired session, etc.
+
+    Distinct from :class:`PairingRequiredError` (which signals that
+    *pairing is needed*); this one signals *pairing failed* after the
+    user tried.  The API layer maps this to HTTP 400 with the original
+    message so the UI can show "Wrong PIN — try again."
+    """
+    pass
