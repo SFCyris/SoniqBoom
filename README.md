@@ -29,7 +29,7 @@
 
 ---
 
-## The pitch (it's short)
+## Retro Music Player... what gives?
 
 Every "modern" music server is a polite wrapper around the same five codecs. The moment your library contains a tracker module, a SID tune, or a Game Boy rip, those servers go quiet: no metadata, no playback, no respect.
 
@@ -51,11 +51,13 @@ Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-fea
 
 **🕹️ Amiga heritage** — AHX *and* HivelyTracker (`.hvl`) — the latter via a **HivelyTracker engine we vendor and compile on first run**, because neither UADE nor libopenmpt will touch HVL. We render the unrenderable.
 
+**🟥 AdLib / OPL2 FM** — the sound of DOS gaming: id Software / Apogee **IMF** (Wolfenstein 3D, Commander Keen, Duke Nukem), plus ROL, CMF, D00, RAD, LucasArts LAA, Sierra SCI, DOSBox DRO, HSC, RIX… rendered through **AdPlug**. (`.imf` is *two* unrelated formats — we sniff the file and route Imago Orpheus to the tracker engine, id IMF to the OPL synth.)
+
 **🎼 MIDI** — synthesized with swappable SoundFonts, plus a one-click SoundFont marketplace.
 
 **…and the everyday stuff, of course** — FLAC, ALAC, MP3, AAC, Ogg Vorbis, Opus, WavPack, Musepack, WAV, AIFF, and 1-bit **DSD** (DSF / DFF / WSD). ZIP archives are scanned *inside the archive*, so your `modarchive_2007.zip` hoard simply works — no unpacking.
 
-> Thirty-plus retro formats. One unified render pipeline. Zero "unsupported file" dead ends.
+> Forty-plus retro formats. One unified render pipeline. Zero "unsupported file" dead ends.
 
 ---
 
@@ -138,7 +140,7 @@ bash run.sh
 
 `bash shutdown.sh` stops it; `bash restart.sh` restarts it. To change the default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
 
-> **Retro renderers are optional and modular.** Install only the ones you need — `sidplayfp` for SID, `fluidsynth` for MIDI, `libopenmpt` for trackers, `uade` for AHX, `libgme` for console chiptunes. Miss one and SoniqBoom tells you exactly which package to install; everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
+> **Retro renderers are optional and modular.** Install only the ones you need — `sidplayfp` for SID, `fluidsynth` for MIDI, `libopenmpt` for trackers, `uade` for AHX, `libgme` for console chiptunes, `adplay` (AdPlug) for AdLib/OPL. Miss one and SoniqBoom tells you exactly which package to install; everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
 
 ---
 
@@ -170,9 +172,10 @@ bash run.sh
 | **DSD (1-bit)** | DSF, DFF, WSD | ffmpeg |
 | **SID** (C64) | `.sid`, `.psid` | sidplayfp + HVSC Songlengths & STIL |
 | **MIDI** | `.mid`, `.midi` | FluidSynth + SoundFonts |
-| **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF, OKT, SFX, WOW, DSM | libopenmpt |
+| **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF *(Imago Orpheus)*, OKT, SFX, WOW, DSM | libopenmpt |
 | **Amiga** | AHX, HivelyTracker (HVL) | uade123 / bundled HivelyTracker engine |
 | **Console chiptune** | NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES | libgme |
+| **AdLib / OPL2 FM** | id IMF *(Wolfenstein 3D, Keen…)*, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM | AdPlug (`adplay`) |
 
 ZIP archives are scanned and played **inline** — tracks inside `.zip` files appear in your library without unpacking.
 

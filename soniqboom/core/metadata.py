@@ -50,6 +50,10 @@ SUPPORTED_EXTENSIONS = {
     # absent from some ffmpeg builds (notably Homebrew 8.x) — startup probe
     # warns if the user has DFF files but the demuxer isn't available.
     ".dsf", ".dff", ".wsd",
+    # AdLib / OPL2 FM (AdPlug): id/Apogee IMF rides the ``.imf`` entry above
+    # (disambiguated from Imago Orpheus by content), plus the wider family.
+    ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
 }
 
 FORMAT_NAMES = {
@@ -80,6 +84,12 @@ FORMAT_NAMES = {
     # DSD — actual quality tier (DSD64/128/256/...) is filled in at
     # extract time once the source sample rate is known.
     ".dsf":  "DSD",  ".dff":  "DSD",  ".wsd": "DSD",
+    # AdLib / OPL2 FM (AdPlug)
+    ".rol": "AdLib ROL", ".cmf": "Creative Music", ".d00": "EdLib",
+    ".rad": "Reality AdLib", ".laa": "LucasArts AdLib", ".sci": "Sierra AdLib",
+    ".dro": "DOSBox OPL", ".hsc": "HSC AdLib", ".rix": "RIX OPL",
+    ".a2m": "AdLib Tracker 2", ".adl": "AdLib", ".bam": "Bob's AdLib",
+    ".ksm": "Ken's AdLib",
 }
 
 _DSD_EXTS = {".dsf", ".dff", ".wsd"}
@@ -98,6 +108,15 @@ _GME_EXTS = {
     ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
     ".ay", ".kss", ".sap", ".gym", ".hes",
 }
+
+# AdLib / OPL2 FM formats decoded by AdPlug (adplay).  ``.imf`` is NOT here —
+# it's shared with the Imago Orpheus tracker and disambiguated by content (see
+# ``_extract_imf`` / ``stream._render_imf``).
+_ADLIB_EXTS = {
+    ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+}
+_ADLIB_DEFAULT_DURATION = 180   # seconds; the rendered WAV carries the real length
 
 # ── General MIDI program names ────────────────────────────────────────────────
 
@@ -1426,6 +1445,42 @@ def extract_lyrics(path: Path) -> str | None:
     return None
 
 
+def _extract_adlib(path: Path, track_id: str) -> dict:
+    """Minimal metadata for an AdLib / OPL2 FM tune (id IMF, ROL, CMF, …).
+
+    AdPlug renders these at play time; we don't bind libadplug at scan time, so
+    the title is the filename and the duration is a sensible default — the
+    rendered WAV carries the real length once the track is played.
+    """
+    ext = path.suffix.lower()
+    return {
+        "id": track_id, "path": str(path),
+        "format": FORMAT_NAMES.get(ext, "AdLib"),
+        "title": path.stem, "artist": "", "album": "", "album_artist": "",
+        "duration": float(_ADLIB_DEFAULT_DURATION),
+    }
+
+
+def _extract_imf(path: Path, track_id: str) -> dict:
+    """Disambiguate the overloaded ``.imf`` extension.
+
+    Imago Orpheus modules carry an ``IM10`` signature at offset 0x3C (60) and
+    are decoded by openmpt123; id Software / Apogee AdLib IMF files do not and
+    are decoded by AdPlug.  Route extraction (and the displayed format label)
+    accordingly.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        head = b""
+    if len(head) >= 64 and head[60:64] == b"IM10":
+        return _extract_tracker(path, track_id)       # Imago Orpheus
+    d = _extract_adlib(path, track_id)
+    d["format"] = "AdLib IMF"                          # id / Apogee
+    return d
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def extract(path: Path, track_id: str) -> TrackMeta:
@@ -1438,6 +1493,10 @@ def extract(path: Path, track_id: str) -> TrackMeta:
             d = _extract_sid(path, track_id)
         elif ext in _MIDI_EXTS:
             d = _extract_midi(path, track_id)
+        elif ext == ".imf":
+            d = _extract_imf(path, track_id)       # Imago Orpheus vs AdLib IMF
+        elif ext in _ADLIB_EXTS:
+            d = _extract_adlib(path, track_id)
         elif ext in _TRACKER_EXTS:
             d = _extract_tracker(path, track_id)
         elif ext in _GME_EXTS:

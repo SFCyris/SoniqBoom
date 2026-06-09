@@ -137,6 +137,9 @@ _CONF_DEFAULTS: dict[str, Any] = {
         # and ~200 other Amiga formats that openmpt123 doesn't decode.
         # Optional; degrades to "renderer not installed" on missing.
         "uade123_path": "",
+        # adplay (AdPlug) renders AdLib/OPL2 FM formats — id/Apogee IMF, ROL,
+        # CMF, D00, RAD, …  Optional; degrades to a clear 501 when missing.
+        "adplay_path": "",
         "soundfont_path": "",
         "soundfonts_dir": "",
         "sid_default_duration": 180,
@@ -493,6 +496,9 @@ class Settings(BaseSettings):
     fluidsynth_path:    str = _local_conf.get("renderers", {}).get("fluidsynth_path", "")
     openmpt123_path:    str = _local_conf.get("renderers", {}).get("openmpt123_path", "")
     uade123_path:       str = _local_conf.get("renderers", {}).get("uade123_path", "")
+    # adplay (AdPlug) — AdLib/OPL2 FM formats: id/Apogee IMF, ROL, CMF, D00,
+    # RAD, LucasArts LAA, Sierra SCI, DOSBox DRO, …  Optional; clear 501 if absent.
+    adplay_path:        str = _local_conf.get("renderers", {}).get("adplay_path", "")
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
