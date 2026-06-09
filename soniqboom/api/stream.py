@@ -407,6 +407,22 @@ async def _render_gme(path: Path, subsong: int = 0) -> Path:
     tmp_wav.close()
     out = Path(tmp_wav.name)
 
+    # Preferred path: in-process libgme via ctypes.  Homebrew ffmpeg ships
+    # without --enable-libgme and there is no standalone gme CLI, so on a stock
+    # macOS/Linux box this is the ONLY working renderer for NSF/SPC/GBS/... —
+    # the CLI / ffmpeg branches below stay as fallbacks for hosts that have them.
+    from soniqboom.core import gme_render
+    if gme_render.is_available():
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, path.read_bytes)
+        wav = await loop.run_in_executor(
+            None, gme_render.render_wav, data, subsong, int(duration),
+        )
+        if wav:
+            out.write_bytes(wav)
+            return out
+        log.info("libgme produced no audio for %s — trying gme CLI / ffmpeg", path.name)
+
     gme_bin = _find_renderer(settings.gme_path, "gme")
     if gme_bin:
         # gme CLI signature: ``gme <input> <output.wav> [track=N] [length=Nms]``
