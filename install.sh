@@ -107,6 +107,14 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "game-music-emu: $(brew list game-music-emu &>/dev/null 2>&1 && echo installed || echo 'not found — NSF/SPC/etc. disabled')"
 
+  # uade (uade123) — renders AHX and other Amiga formats (Unix Amiga Delitracker
+  # Emulator).  Neither openmpt123 nor ffmpeg decode AHX.
+  if ! command -v uade123 &>/dev/null; then
+    info "Installing uade (Amiga AHX renderer)…"
+    brew install uade || warn "uade install failed — AHX (.ahx) won't play"
+  fi
+  info "uade123: $(command -v uade123 || echo 'not found — AHX disabled')"
+
   # lhasa provides the reference ``lha`` CLI — it decodes every LHA method,
   # including ``-lh1-`` (common in older Amiga archives) that the in-process
   # ``lhafile`` reader rejects.  Optional: LHA scanning degrades without it.
@@ -217,6 +225,17 @@ elif [ "$PLATFORM" = "linux" ]; then
       dnf)    run_pkg dnf install -y game-music-emu || true ;;
       pacman) run_pkg pacman -S --noconfirm --needed libgme || true ;;
       zypper) run_pkg zypper --non-interactive install libgme || true ;;
+    esac
+  fi
+
+  # uade123 — AHX / Amiga formats.  Niche; not packaged on every distro.
+  # Best-effort; the app surfaces a clear install hint if it's still missing.
+  if [ "$PKG" != "none" ] && ! command -v uade123 &>/dev/null; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends uade123 || true ;;
+      dnf)    run_pkg dnf install -y uade || true ;;
+      pacman) run_pkg pacman -S --noconfirm --needed uade || true ;;
+      zypper) run_pkg zypper --non-interactive install uade || true ;;
     esac
   fi
 
