@@ -98,6 +98,15 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "openmpt123: $(command -v openmpt123 || echo 'not found')"
 
+  # game-music-emu (libgme) — renders console chiptunes (NSF/SPC/GBS/VGM/AY/
+  # KSS/SAP/…).  SoniqBoom binds the shared library directly via ctypes
+  # (Homebrew ffmpeg has no libgme demuxer), so the library just needs to exist.
+  if ! brew list game-music-emu &>/dev/null 2>&1; then
+    info "Installing game-music-emu (console chiptune renderer)…"
+    brew install game-music-emu || warn "game-music-emu install failed — NSF/SPC/etc. won't play"
+  fi
+  info "game-music-emu: $(brew list game-music-emu &>/dev/null 2>&1 && echo installed || echo 'not found — NSF/SPC/etc. disabled')"
+
   # lhasa provides the reference ``lha`` CLI — it decodes every LHA method,
   # including ``-lh1-`` (common in older Amiga archives) that the in-process
   # ``lhafile`` reader rejects.  Optional: LHA scanning degrades without it.
@@ -197,6 +206,17 @@ elif [ "$PLATFORM" = "linux" ]; then
       dnf)    run_pkg dnf install -y lhasa || true ;;
       zypper) run_pkg zypper --non-interactive install lhasa || true ;;
       pacman) warn "lhasa is in the AUR — install it with an AUR helper for LHA -lh1- support" ;;
+    esac
+  fi
+
+  # libgme (console-chiptune renderer; SoniqBoom binds it via ctypes — see
+  # soniqboom/core/gme_render.py).  Best-effort: package name varies per distro.
+  if [ "$PKG" != "none" ]; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends libgme0 || true ;;
+      dnf)    run_pkg dnf install -y game-music-emu || true ;;
+      pacman) run_pkg pacman -S --noconfirm --needed libgme || true ;;
+      zypper) run_pkg zypper --non-interactive install libgme || true ;;
     esac
   fi
 
