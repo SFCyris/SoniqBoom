@@ -1634,14 +1634,20 @@ class FTPFileSource(FileSource):
                 try:
                     return self._list_via_mlsd(abs_path, lane)
                 except Exception as exc:
+                    if isinstance(exc, ftplib.error_perm):
+                        self._use_mlsd = False   # genuine "MLSD unsupported"
                     log.info("MLSD failed on %s (%s), using LIST fallback",
                              self._host, exc)
-                    self._use_mlsd = False
                     self._reset()
             except Exception as exc:
+                # Only a genuine 5xx "command not understood" (error_perm) means
+                # the server lacks MLSD.  A transient borrow-timeout / socket
+                # error must NOT disable MLSD for the whole source — that would
+                # degrade every later listing (incl. the scanner) to slower LIST.
+                if isinstance(exc, ftplib.error_perm):
+                    self._use_mlsd = False
                 log.info("MLSD not supported on %s (%s), using LIST fallback",
                          self._host, exc)
-                self._use_mlsd = False
                 self._reset()
 
         # Fallback: LIST (universally supported)
