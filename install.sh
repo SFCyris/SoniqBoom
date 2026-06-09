@@ -115,6 +115,15 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "uade123: $(command -v uade123 || echo 'not found — AHX disabled')"
 
+  # adplay (AdPlug) — renders AdLib/OPL2 FM music: id/Apogee IMF (Wolfenstein
+  # 3D, Commander Keen, …), ROL, CMF, D00, RAD, LucasArts LAA, Sierra SCI,
+  # DOSBox DRO, …  Neither openmpt123 nor ffmpeg decode these.
+  if ! command -v adplay &>/dev/null; then
+    info "Installing adplay (AdPlug — AdLib/OPL renderer)…"
+    brew install adplay || warn "adplay install failed — AdLib/OPL formats won't play"
+  fi
+  info "adplay: $(command -v adplay || echo 'not found — AdLib/OPL disabled')"
+
   # lhasa provides the reference ``lha`` CLI — it decodes every LHA method,
   # including ``-lh1-`` (common in older Amiga archives) that the in-process
   # ``lhafile`` reader rejects.  Optional: LHA scanning degrades without it.
@@ -236,6 +245,17 @@ elif [ "$PLATFORM" = "linux" ]; then
       dnf)    run_pkg dnf install -y uade || true ;;
       pacman) run_pkg pacman -S --noconfirm --needed uade || true ;;
       zypper) run_pkg zypper --non-interactive install uade || true ;;
+    esac
+  fi
+
+  # adplay (AdPlug) — AdLib/OPL2 FM: id/Apogee IMF, ROL, CMF, D00, RAD, …
+  # Debian/Ubuntu ship the player in ``adplug-utils``; other distros vary.
+  if [ "$PKG" != "none" ] && ! command -v adplay &>/dev/null; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends adplug-utils || true ;;
+      dnf)    run_pkg dnf install -y adplay || true ;;
+      pacman) run_pkg pacman -S --noconfirm --needed adplay || true ;;
+      zypper) run_pkg zypper --non-interactive install adplay || true ;;
     esac
   fi
 

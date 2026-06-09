@@ -444,6 +444,72 @@ async def _render_gme(path: Path, subsong: int = 0) -> Path:
     return out
 
 
+# ── AdLib / OPL2 FM rendering (AdPlug) ────────────────────────────────────────
+# AdPlug decodes id Software / Apogee IMF (Wolfenstein 3D, Commander Keen, …)
+# plus the wider AdLib/OPL family — ROL, CMF, D00, RAD, LucasArts LAA, Sierra
+# SCI, DOSBox DRO, HSC, RIX, …  Rendered to WAV via its ``adplay`` disk writer,
+# the same subprocess pattern as sidplayfp / openmpt123 / uade123.
+#
+# ``.imf`` is deliberately NOT in this set: the extension is shared with the
+# Imago Orpheus *tracker* format (decoded by openmpt123).  ``_render_imf``
+# disambiguates the two by content signature.
+_ADLIB_EXTS = {
+    ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+}
+_ADLIB_DEFAULT_TIMEOUT_S = 8 * 60
+
+
+async def _render_adlib(path: Path, subsong: int = 0) -> Path:
+    """Render an AdLib / OPL2 FM tune to WAV via AdPlug's ``adplay`` disk writer.
+
+    Output: 44.1 kHz / stereo / 16-bit signed LE — matches the other rendered
+    formats so the cache + cast pipeline treat them uniformly.  adplay renders
+    the tune once (AdPlug reports the song's end) then exits; the timeout bounds
+    any endless / looping tune.
+    """
+    binary = _find_renderer(settings.adplay_path, "adplay")
+    if not binary:
+        raise HTTPException(
+            501,
+            "adplay (AdPlug) not installed — AdLib/OPL formats (id IMF, ROL, "
+            "CMF, D00, RAD, …) require it.  Install via 'brew install adplay' "
+            "(macOS) or 'apt install adplug-utils' (Debian/Ubuntu).",
+        )
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    cmd = [binary, "-O", "disk", "-d", tmp_wav.name, "-f", "44100", "--stereo"]
+    if subsong > 0:
+        cmd += ["-s", str(subsong)]      # multi-song AdLib formats (RAD, …)
+    cmd.append(str(path))
+    await _await_renderer(
+        cmd, Path(tmp_wav.name),
+        timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
+    )
+    return Path(tmp_wav.name)
+
+
+async def _render_imf(path: Path, subsong: int = 0) -> Path:
+    """Render a ``.imf`` file, disambiguating the overloaded extension.
+
+    Two unrelated formats share ``.imf``:
+      * **Imago Orpheus** — a PC tracker module (decoded by openmpt123).
+      * **id Software / Apogee IMF** — an OPL2 FM register dump (Wolfenstein 3D,
+        Commander Keen, Duke Nukem …) decoded by AdPlug.
+
+    Imago Orpheus carries an ``IM10`` signature at offset 0x3C (60); id IMF does
+    not — so we read that signature and route to the right renderer.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        head = b""
+    if len(head) >= 64 and head[60:64] == b"IM10":
+        return await _render_tracker(path, subsong=subsong)   # Imago Orpheus
+    return await _render_adlib(path, subsong=subsong)          # id/Apogee AdLib IMF
+
+
 # ── MIDI rendering ────────────────────────────────────────────────────────────
 
 async def _render_midi(path: Path) -> Path:
@@ -2677,6 +2743,16 @@ async def _do_prewarm(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(file_path, subsong=subsong),
             )
+        elif ext == ".imf":
+            await get_or_render(
+                track_id=track_id, format_type="imf", subsong=subsong,
+                render_fn=lambda: _render_imf(file_path, subsong=subsong),
+            )
+        elif ext in _ADLIB_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="adlib", subsong=subsong,
+                render_fn=lambda: _render_adlib(file_path, subsong=subsong),
+            )
         elif ext in _TRACKER_EXTS:
             await get_or_render(
                 track_id=track_id, format_type="tracker", subsong=subsong,
@@ -3352,6 +3428,29 @@ async def stream_track(
         return await _range_file_response(
             request, cached_path, media_type="audio/wav",
             headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
+            background=_bg,
+        )
+    # .imf is overloaded (Imago Orpheus tracker vs id/Apogee AdLib IMF) —
+    # _render_imf disambiguates by content.  MUST come before _TRACKER_EXTS,
+    # which still lists .imf for scanner-side detection.
+    if ext == ".imf":
+        cached_path, hit = await get_or_render(
+            track_id=track_id, format_type="imf", subsong=subsong,
+            render_fn=lambda: _render_imf(path, subsong=subsong),
+        )
+        return await _range_file_response(
+            request, cached_path, media_type="audio/wav",
+            headers={"X-Rendered": "adplug/openmpt123", "X-Cache": "hit" if hit else "miss"},
+            background=_bg,
+        )
+    if ext in _ADLIB_EXTS:
+        cached_path, hit = await get_or_render(
+            track_id=track_id, format_type="adlib", subsong=subsong,
+            render_fn=lambda: _render_adlib(path, subsong=subsong),
+        )
+        return await _range_file_response(
+            request, cached_path, media_type="audio/wav",
+            headers={"X-Rendered": "adplug", "X-Cache": "hit" if hit else "miss"},
             background=_bg,
         )
     if ext in _TRACKER_EXTS:
