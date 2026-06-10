@@ -124,6 +124,21 @@ export const TRACKER_FORMAT_NAMES = new Set([
   'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
 ]);
 
+/**
+ * Chip / FM formats rendered server-side (libgme console chiptunes + AdPlug
+ * AdLib/OPL).  No per-voice VUMR sidecar exists for them, so they fall back to
+ * the FFT spectrum — but they still must pass the VU gate to show it at all.
+ * Names mirror metadata.py FORMAT_NAMES.
+ */
+export const CHIP_FORMAT_NAMES = new Set([
+  // libgme console chiptunes
+  'NSF', 'NSFe', 'SPC', 'GBS', 'VGM', 'VGZ', 'AY', 'KSS', 'SAP', 'GYM', 'HES',
+  // AdPlug AdLib / OPL2 FM
+  'AdLib IMF', 'AdLib ROL', 'Creative Music', 'EdLib', 'Reality AdLib',
+  'LucasArts AdLib', 'Sierra AdLib', 'DOSBox OPL', 'HSC AdLib', 'RIX OPL',
+  'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib",
+]);
+
 /** File extension fallback list (lower-case, no dot). */
 const TRACKER_EXTS = new Set([
   'mod', 's3m', 'xm', 'it', 'mtm', 'med', 'oct', '669',

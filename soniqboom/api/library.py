@@ -326,6 +326,27 @@ async def library_ws(ws: WebSocket):
             pass
     try:
         await ws.send_json({"event": "scan_progress", **get_progress().to_dict()})
+        # Initial snapshot of any in-flight transcodes so a client that
+        # connects mid-render learns the current determinate progress
+        # immediately (otherwise its badge would spin until the next ~1 Hz
+        # push).  Imported lazily to avoid a stream↔library load-order
+        # cycle; skip entries already marked ready (nothing useful to push
+        # and they're pruned server-side after a TTL anyway).
+        try:
+            from soniqboom.api.stream import _TRANSCODE_PROGRESS
+            for track_id, entry in list(_TRANSCODE_PROGRESS.items()):
+                if entry.get("ready"):
+                    continue
+                await ws.send_json({
+                    "event": "transcode_progress",
+                    "track_id": track_id,
+                    "percent": float(entry.get("percent") or 0.0),
+                    "eta_seconds": entry.get("eta_seconds"),
+                    "ready": False,
+                })
+        except Exception:
+            # Snapshot is best-effort — never let it abort the WS accept.
+            pass
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:

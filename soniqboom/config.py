@@ -247,6 +247,8 @@ _CONF_TEMPLATE = """\
   "network_shares": {},
   "remote_cache_max_mb": 2048,
 
+  "_comment_ftp_pools": "Optional per-server FTP connection-pool tuning, keyed by 'host:port'. Each entry may set 'scan' (bulk re-index, default 6), 'stream' (playback, default 2), and 'browse' (interactive folder listing, default 1) connection budgets, plus 'auto_grow' (bool) to let the pool probe one extra connection under demand. Managed via the admin UI; env overrides: SONIQBOOM_FTP_SCAN_CONN_PER_HOST / SONIQBOOM_FTP_STREAM_CONN_PER_HOST / SONIQBOOM_FTP_BROWSE_CONN_PER_HOST. Example: {\"192.168.1.100:21\": {\"scan\": 6, \"stream\": 2, \"browse\": 1, \"auto_grow\": true}}.",
+
   "renderers": {
     "_comment": "Leave empty to auto-detect from PATH. Set absolute paths to override.",
     "sidplayfp_path": "",

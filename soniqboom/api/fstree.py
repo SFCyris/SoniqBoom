@@ -198,6 +198,12 @@ def _remote_list_children(scan_root: str, remote_path: str, source) -> list[dict
     """List subdirectories of a remote path via FileSource."""
     try:
         entries = source.list_dir(remote_path)
+    except TimeoutError:
+        # Browse-lane borrow timed out — surfaces FTP pool exhaustion (e.g. the
+        # browse budget too small under heavy concurrent listing) rather than
+        # silently rendering an empty folder.
+        log.warning("Remote folder listing timed out (FTP browse lane busy): %s", remote_path)
+        return []
     except Exception:
         return []
     dirs = sorted(

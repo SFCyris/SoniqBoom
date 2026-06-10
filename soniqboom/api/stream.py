@@ -500,11 +500,18 @@ async def _render_imf(path: Path, subsong: int = 0) -> Path:
     Imago Orpheus carries an ``IM10`` signature at offset 0x3C (60); id IMF does
     not — so we read that signature and route to the right renderer.
     """
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(64)
-    except OSError:
-        head = b""
+    # Sniff the 64-byte header off the event-loop thread.  _render_imf is
+    # awaited inline by the conversion-cache render path (conversion_cache
+    # does ``await render_fn()`` on the loop), so even a sub-millisecond
+    # synchronous file read belongs in an executor — blocking the loop is
+    # exactly the failure class hardened against elsewhere this release.
+    def _sniff() -> bytes:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(64)
+        except OSError:
+            return b""
+    head = await asyncio.get_running_loop().run_in_executor(None, _sniff)
     if len(head) >= 64 and head[60:64] == b"IM10":
         return await _render_tracker(path, subsong=subsong)   # Imago Orpheus
     return await _render_adlib(path, subsong=subsong)          # id/Apogee AdLib IMF
@@ -1269,6 +1276,7 @@ async def _pump_pcm_to_wav(
 
         async def _consume_progress() -> None:
             assert proc.stderr is not None
+            last_broadcast_sec = -1
             try:
                 while True:
                     raw = await proc.stderr.readline()
@@ -1294,6 +1302,22 @@ async def _pump_pcm_to_wav(
                         if entry is not None and not entry.get("ready"):
                             entry["percent"] = pct
                             entry["eta_seconds"] = eta
+                            # WS push (throttled ~1 Hz) so the determinate bar
+                            # updates without the old per-tick HTTP poll; the
+                            # poll endpoint still reads the entry every tick.
+                            cur_sec = int(elapsed)
+                            if cur_sec != last_broadcast_sec:
+                                last_broadcast_sec = cur_sec
+                                try:
+                                    await _broadcast_transcode_progress({
+                                        "event": "transcode_progress",
+                                        "track_id": track_id,
+                                        "percent": pct,
+                                        "eta_seconds": eta,
+                                        "ready": False,
+                                    })
+                                except Exception:
+                                    pass
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1465,6 +1489,25 @@ async def _pump_pcm_to_wav(
                     entry["finished_at"] = time.time()
                 else:
                     _TRANSCODE_PROGRESS.pop(track_id, None)
+                # Terminal WS push — the client no longer continuously polls,
+                # so it must learn ready/error over the socket: ready → 100% +
+                # transcode-ready (PERC-9 waveform refresh); failure → badge
+                # torn down.  The fallback watchdog only fires when NO push
+                # arrives, so this terminal is required for the pump path.
+                try:
+                    if clean_exit:
+                        await _broadcast_transcode_progress({
+                            "event": "transcode_progress", "track_id": track_id,
+                            "percent": 100.0, "eta_seconds": 0.0, "ready": True,
+                        })
+                    else:
+                        await _broadcast_transcode_progress({
+                            "event": "transcode_progress", "track_id": track_id,
+                            "percent": 0.0, "eta_seconds": None,
+                            "ready": False, "error": True,
+                        })
+                except Exception:
+                    pass
     finally:
         _render_sem.release()
 
@@ -2196,6 +2239,29 @@ def _prune_transcode_progress(now: float | None = None) -> None:
         _TRANSCODE_PROGRESS.pop(k, None)
 
 
+async def _broadcast_transcode_progress(payload: dict) -> None:
+    """Push a ``transcode_progress`` event to the library WebSocket fan-out.
+
+    The WS connection manager and its ``_broadcast`` coroutine live in
+    :mod:`soniqboom.api.library`.  We import it **lazily, inside this
+    function body** rather than at module top so the two modules can keep
+    importing each other without a load-order cycle (library.py imports
+    stream-side state on connect; stream.py emits via library here).
+
+    Best-effort: a failure to reach the WS layer (e.g. library not yet
+    imported, no clients) must never break or stall the transcode itself.
+    """
+    try:
+        from soniqboom.api.library import _broadcast
+    except Exception as exc:  # pragma: no cover — import wiring only
+        log.debug("transcode_progress broadcast import failed: %s", exc)
+        return
+    try:
+        await _broadcast(payload)
+    except Exception as exc:  # pragma: no cover — WS fan-out is best-effort
+        log.debug("transcode_progress broadcast failed: %s", exc)
+
+
 async def _probe_source_duration(path: Path) -> float | None:
     """Cheap ffprobe call for source duration (seconds), or None on failure.
 
@@ -2441,7 +2507,15 @@ async def _render_to_transcoded_flac(
             stderr=asyncio.subprocess.DEVNULL,
         )
 
+        # Throttle WS pushes to ~1 Hz: ffmpeg emits ``out_time_*`` every
+        # frame (tens of ticks/sec), but the badge only needs ~1 update/sec
+        # to read as continuous motion.  We broadcast only when the whole
+        # second of *elapsed wall-clock* changes; the in-memory entry is
+        # still updated every tick so the back-compat HTTP poll stays fresh.
+        last_broadcast_sec = -1
+
         async def _consume_progress() -> None:
+            nonlocal last_broadcast_sec
             assert proc.stdout is not None
             try:
                 while True:
@@ -2471,6 +2545,16 @@ async def _render_to_transcoded_flac(
                         if entry is not None and not entry.get("ready"):
                             entry["percent"] = pct
                             entry["eta_seconds"] = eta
+                            cur_sec = int(elapsed)
+                            if cur_sec != last_broadcast_sec:
+                                last_broadcast_sec = cur_sec
+                                await _broadcast_transcode_progress({
+                                    "event": "transcode_progress",
+                                    "track_id": progress_key,
+                                    "percent": pct,
+                                    "eta_seconds": eta,
+                                    "ready": False,
+                                })
                     elif k == "progress" and v == "end":
                         return
             except asyncio.CancelledError:
@@ -2517,11 +2601,30 @@ async def _render_to_transcoded_flac(
                     entry["eta_seconds"] = 0.0
                     entry["ready"] = True
                     entry["finished_at"] = time.time()
+                    # Terminal event — always pushed (not throttled) so the
+                    # badge flips to "ready" the instant the render lands.
+                    await _broadcast_transcode_progress({
+                        "event": "transcode_progress",
+                        "track_id": progress_key,
+                        "percent": 100.0,
+                        "eta_seconds": 0.0,
+                        "ready": True,
+                    })
                 else:
                     # Drop failed entries straight away so the frontend
                     # falls back to the indeterminate badge instead of
                     # spinning on a "stuck at 47 %" reading.
                     _TRANSCODE_PROGRESS.pop(progress_key, None)
+                    # Terminal failure — tell clients to stop showing a
+                    # determinate bar and fall back gracefully.
+                    await _broadcast_transcode_progress({
+                        "event": "transcode_progress",
+                        "track_id": progress_key,
+                        "percent": float(entry.get("percent") or 0.0),
+                        "eta_seconds": None,
+                        "ready": False,
+                        "error": True,
+                    })
     return out
 
 

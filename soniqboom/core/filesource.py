@@ -599,26 +599,36 @@ class SMBFileSource(FileSource):
 # Environment overrides (also exposed as legacy):
 #   SONIQBOOM_FTP_SCAN_CONN_PER_HOST   – scan budget (default 6)
 #   SONIQBOOM_FTP_STREAM_CONN_PER_HOST – stream budget (default 2)
+#   SONIQBOOM_FTP_BROWSE_CONN_PER_HOST – browse budget (default 1)
 #   SONIQBOOM_FTP_MAX_CONN_PER_HOST    – legacy total, splits 75/25 if set
 _FTP_POOL_SCAN_DEFAULT   = max(1, int(os.environ.get("SONIQBOOM_FTP_SCAN_CONN_PER_HOST",   "6")))
 _FTP_POOL_STREAM_DEFAULT = max(1, int(os.environ.get("SONIQBOOM_FTP_STREAM_CONN_PER_HOST", "2")))
+_FTP_POOL_BROWSE_DEFAULT = max(1, int(os.environ.get("SONIQBOOM_FTP_BROWSE_CONN_PER_HOST", "1")))
 
 # Legacy single-knob compatibility — if the operator set the OLD env var
-# we honour it by splitting 75% scan / 25% stream (rounded).  Allows
-# existing deployments (e.g. the user's prior _FTP_POOL_MAX=4 setup) to
-# work unchanged on upgrade.
+# we honour it as an ABSOLUTE total cap.  Allows existing deployments
+# (e.g. the user's prior _FTP_POOL_MAX=4 setup) to work unchanged on
+# upgrade.  Browse is carved OUT of the legacy total first (the lane
+# didn't exist when the knob was set); the remainder splits 75% scan /
+# 25% stream.  Folding browse on TOP — as an earlier version did — would
+# silently exceed the operator's cap by 1 and trip a "too many clients"
+# rejection on a server pinned to exactly _lm.  Browse can still be tuned
+# independently via SONIQBOOM_FTP_BROWSE_CONN_PER_HOST, but is clamped so
+# scan+stream always keep at least one slot between them.
 _legacy_max = os.environ.get("SONIQBOOM_FTP_MAX_CONN_PER_HOST")
 if _legacy_max:
     try:
         _lm = max(2, int(_legacy_max))
-        _FTP_POOL_STREAM_DEFAULT = max(1, _lm // 4)
-        _FTP_POOL_SCAN_DEFAULT   = max(1, _lm - _FTP_POOL_STREAM_DEFAULT)
+        _FTP_POOL_BROWSE_DEFAULT = max(1, min(_FTP_POOL_BROWSE_DEFAULT, _lm - 1))
+        _usable = max(1, _lm - _FTP_POOL_BROWSE_DEFAULT)
+        _FTP_POOL_STREAM_DEFAULT = max(1, _usable // 4)
+        _FTP_POOL_SCAN_DEFAULT   = max(1, _usable - _FTP_POOL_STREAM_DEFAULT)
     except ValueError:
         pass
 
 # Aggregate default — the actual pool's max_size.  Per-share UI / config
 # can override at pool-creation time (or via _resize() once running).
-_FTP_POOL_MAX = _FTP_POOL_SCAN_DEFAULT + _FTP_POOL_STREAM_DEFAULT
+_FTP_POOL_MAX = _FTP_POOL_SCAN_DEFAULT + _FTP_POOL_STREAM_DEFAULT + _FTP_POOL_BROWSE_DEFAULT
 
 # Per-host warm-pool floor — how many connections to KEEP established and
 # alive at all times so the next operation skips the TCP handshake + LOGIN
@@ -670,7 +680,7 @@ class _PooledFTP:
         self.conn = conn
         self.xfer_count = 0
         self._broken = False
-        # Lane this handle is currently borrowed under ("stream"|"scan").
+        # Lane this handle is currently borrowed under ("stream"|"scan"|"browse").
         # Set by the pool on each borrow; used so _release decrements the
         # right per-lane in-use counter (drives the admin FTP-lanes viz).
         self.lane = "scan"
@@ -727,20 +737,24 @@ class _FTPConnectionPool:
         self._cond        = threading.Condition(self._lock)
         self._idle: list[_PooledFTP] = []
         self._in_use_count = 0
-        # Per-lane in-use breakdown (sum == _in_use_count).  Lets the admin
-        # FTP-lanes viz show scan vs stream activity accurately — without it
-        # a scan-heavy reindex was mis-rendered on the stream lane.
+        # Per-lane in-use breakdown (sum == _in_use_count, except transiently
+        # during _refresh_idle's NOOP validation, which reserves idle handles
+        # against the total without assigning them a lane).  Lets the admin
+        # FTP-lanes viz show scan vs stream vs browse activity accurately —
+        # without it a scan-heavy reindex was mis-rendered on the stream lane.
         self._in_use_stream = 0
         self._in_use_scan = 0
+        self._in_use_browse = 0
         self._closed = False
-        # Stream-priority bookkeeping.  Each waiting borrow registers
+        # Per-lane waiting bookkeeping.  Each waiting borrow registers
         # in one of these counters BEFORE entering ``cond.wait()``; on
-        # release we notify only if a stream borrow is pending OR no
-        # stream borrows are pending and there's a scan borrow waiting.
+        # release we notify only if a stream borrow is pending OR
+        # (no stream, no browse) and there's a scan borrow waiting.
         # The Condition is shared so wakes are correctly delivered; the
         # counters just steer who we *want* to wake.
         self._waiting_stream = 0
         self._waiting_scan   = 0
+        self._waiting_browse = 0
 
         # Background warm + keep-alive thread.  Skipped when min_size is 0
         # because there's nothing to maintain — the pool is purely on-
@@ -769,15 +783,18 @@ class _FTPConnectionPool:
         * ``"stream"`` — high priority.  Jumps the queue when the pool
           is saturated, so a play attempt during a heavy scan returns
           within milliseconds of the next release.
+        * ``"browse"`` — medium priority.  Interactive folder listing;
+          jumps ahead of scan so a file-browser click stays responsive
+          during a heavy reindex, but yields to stream playback.
         * ``"scan"`` — normal priority (the default).  Yields to any
-          pending stream borrow on release.
+          pending stream or browse borrow on release.
 
-        The same single physical pool serves both lanes.  When no
-        stream borrows are in flight, scan can use the full ``max_size``
-        budget (this is the "dynamic allocation" property the operator
-        asked for).
+        The same single physical pool serves all three lanes.  When no
+        higher-priority borrows are in flight, scan can use the full
+        ``max_size`` budget (this is the "dynamic allocation" property
+        the operator asked for).
         """
-        if lane not in ("stream", "scan"):
+        if lane not in ("stream", "scan", "browse"):
             lane = "scan"
         handle = self._acquire(_FTP_BORROW_TIMEOUT_S, lane=lane)
         try:
@@ -799,21 +816,20 @@ class _FTPConnectionPool:
                 if self._closed:
                     if registered:
                         if lane == "stream": self._waiting_stream -= 1
+                        elif lane == "browse": self._waiting_browse -= 1
                         else:                self._waiting_scan -= 1
                     raise RuntimeError("FTP pool is closed")
 
-                # Stream-priority fairness: when there are stream
-                # borrows waiting AND I'm a scan borrow, yield to them.
-                # This is what makes stream "jump the queue" — even if
-                # a free slot opens up first, scan waits while a stream
-                # waiter is pending.
-                stream_ahead_of_me = (
-                    lane == "scan" and self._waiting_stream > 0
+                # Priority fairness: stream > browse > scan. When higher-
+                # priority borrows are waiting, yield to them.
+                higher_priority_ahead = (
+                    (lane == "scan" and (self._waiting_stream > 0 or self._waiting_browse > 0))
+                    or (lane == "browse" and self._waiting_stream > 0)
                 )
 
                 # 1. Reuse an idle connection if one validates cleanly,
-                # provided no stream borrow is queued ahead of us.
-                if not stream_ahead_of_me:
+                # provided no higher-priority borrow is queued ahead of us.
+                if not higher_priority_ahead:
                     while self._idle:
                         handle = self._idle.pop()
                         try:
@@ -821,9 +837,11 @@ class _FTPConnectionPool:
                             self._in_use_count += 1
                             handle.lane = lane
                             if lane == "stream": self._in_use_stream += 1
+                            elif lane == "browse": self._in_use_browse += 1
                             else:                self._in_use_scan += 1
                             if registered:
                                 if lane == "stream": self._waiting_stream -= 1
+                                elif lane == "browse": self._waiting_browse -= 1
                                 else:                self._waiting_scan -= 1
                             return handle
                         except Exception:
@@ -839,12 +857,14 @@ class _FTPConnectionPool:
                 # OUTSIDE the lock so other threads can still acquire
                 # idle connections while we're connecting.
                 total = self._in_use_count + len(self._idle)
-                if total < self._max_size and not stream_ahead_of_me:
+                if total < self._max_size and not higher_priority_ahead:
                     self._in_use_count += 1
                     if lane == "stream": self._in_use_stream += 1
+                    elif lane == "browse": self._in_use_browse += 1
                     else:                self._in_use_scan += 1
                     if registered:
                         if lane == "stream": self._waiting_stream -= 1
+                        elif lane == "browse": self._waiting_browse -= 1
                         else:                self._waiting_scan -= 1
                     break  # leave the ``with`` block to do the connect
 
@@ -852,12 +872,14 @@ class _FTPConnectionPool:
                 # — register as a waiter and wait for a return.
                 if not registered:
                     if lane == "stream": self._waiting_stream += 1
+                    elif lane == "browse": self._waiting_browse += 1
                     else:                self._waiting_scan   += 1
                     registered = True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     # Clean up waiter bookkeeping before raising.
                     if lane == "stream": self._waiting_stream -= 1
+                    elif lane == "browse": self._waiting_browse -= 1
                     else:                self._waiting_scan -= 1
                     raise TimeoutError(
                         f"FTP pool {self._label!r} acquire timed out after "
@@ -885,6 +907,7 @@ class _FTPConnectionPool:
                 self._in_use_count -= 1
                 # Roll back the per-lane counter too (we reserved it above).
                 if lane == "stream": self._in_use_stream = max(0, self._in_use_stream - 1)
+                elif lane == "browse": self._in_use_browse = max(0, self._in_use_browse - 1)
                 else:                self._in_use_scan = max(0, self._in_use_scan - 1)
                 # Wake one waiter so the cap reservation doesn't strand
                 # the next person in line.
@@ -915,6 +938,8 @@ class _FTPConnectionPool:
             # borrowed (clamped — defensive against any bookkeeping drift).
             if handle.lane == "stream":
                 self._in_use_stream = max(0, self._in_use_stream - 1)
+            elif handle.lane == "browse":
+                self._in_use_browse = max(0, self._in_use_browse - 1)
             else:
                 self._in_use_scan = max(0, self._in_use_scan - 1)
             recycle = (
@@ -945,12 +970,16 @@ class _FTPConnectionPool:
                     need_topup = True
             else:
                 self._idle.append(handle)
-            # Notify ALL waiters when a stream borrow is pending — they
-            # have to re-check whether the head of the priority queue
-            # owns the freed slot.  When only scan borrows are waiting,
-            # one notify() is enough.  This is the cheap version of a
-            # priority queue: counters + notify_all-when-priority-pending.
-            if self._waiting_stream > 0:
+            # Notify ALL waiters when a higher-priority borrow (stream or
+            # browse) is pending — they have to re-check whether the head
+            # of the priority queue owns the freed slot.  A single notify()
+            # could wake a lower-priority waiter who then yields and re-
+            # waits, stranding the higher-priority waiter until timeout;
+            # notify_all() lets the priority waiter re-contend immediately.
+            # When only scan borrows are waiting, one notify() is enough.
+            # This is the cheap version of a priority queue: counters +
+            # notify_all-when-priority-pending.
+            if self._waiting_stream > 0 or self._waiting_browse > 0:
                 self._cond.notify_all()
             else:
                 self._cond.notify()
@@ -1016,9 +1045,11 @@ class _FTPConnectionPool:
                 "in_use":         self._in_use_count,
                 "in_use_stream":  self._in_use_stream,
                 "in_use_scan":    self._in_use_scan,
+                "in_use_browse":  self._in_use_browse,
                 "idle":           len(self._idle),
                 "waiting_stream": self._waiting_stream,
                 "waiting_scan":   self._waiting_scan,
+                "waiting_browse": self._waiting_browse,
                 "closed":         self._closed,
             }
 
@@ -1113,7 +1144,11 @@ class _FTPConnectionPool:
         # drop later.  Demand = waiters OR fully-saturated borrows.
         with self._cond:
             saturated = self._in_use_count >= self._max_size
-            waiting = self._waiting_scan > 0 or self._waiting_stream > 0
+            waiting = (
+                self._waiting_scan > 0
+                or self._waiting_stream > 0
+                or self._waiting_browse > 0
+            )
             current_max = self._max_size
         if not (saturated or waiting):
             return False
@@ -1173,6 +1208,7 @@ class _FTPConnectionPool:
             entry = pools.setdefault(server_key, {})
             entry["scan"] = int(entry.get("scan", _FTP_POOL_SCAN_DEFAULT)) + 1
             entry.setdefault("stream", _FTP_POOL_STREAM_DEFAULT)
+            entry.setdefault("browse", _FTP_POOL_BROWSE_DEFAULT)
             entry["auto_grow"] = True  # preserve
             save_local_conf(conf)
         except Exception:
@@ -1401,6 +1437,7 @@ def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]
         conf = {}
     scan_budget = _FTP_POOL_SCAN_DEFAULT
     stream_budget = _FTP_POOL_STREAM_DEFAULT
+    browse_budget = _FTP_POOL_BROWSE_DEFAULT
     # 1. Canonical per-server override.
     server_key = f"{host}:{int(port)}"
     pools_map = conf.get("ftp_pools") or {}
@@ -1410,6 +1447,7 @@ def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]
             try:
                 scan_budget   = max(1, int(pool_cfg.get("scan",   scan_budget)))
                 stream_budget = max(1, int(pool_cfg.get("stream", stream_budget)))
+                browse_budget = max(1, int(pool_cfg.get("browse", browse_budget)))
             except (TypeError, ValueError):
                 pass
             # Stop here — explicit per-server override wins over any
@@ -1436,11 +1474,12 @@ def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]
                 try:
                     scan_budget   = max(1, int(legacy.get("scan",   scan_budget)))
                     stream_budget = max(1, int(legacy.get("stream", stream_budget)))
+                    browse_budget = max(1, int(legacy.get("browse", browse_budget)))
                 except (TypeError, ValueError):
                     pass
             break
 
-    configured_total = scan_budget + stream_budget
+    configured_total = scan_budget + stream_budget + browse_budget
 
     # Detected cap (auto-learned).  Clamp configured total to (cap - 1)
     # so we leave a slot of headroom for any out-of-band probes / health
@@ -1846,11 +1885,12 @@ class FTPFileSource(FileSource):
                 stack.append(self._abs(d.path))
 
     def list_dir(self, path: str) -> list[DirEntry]:
-        # Interactive file-browser listing → "stream" lane, NOT "scan".  A
-        # running scan saturates the scan lane; sharing it made remote folders
-        # render empty in the browser.  The scanner's own walk_with_stat still
-        # calls _list_entries() with the default "scan" lane.
-        return self._list_entries(path, lane="stream")
+        # Interactive file-browser listing → "browse" lane, NOT "scan" or "stream".
+        # A running scan saturates the scan lane; a cold remote render holds the
+        # stream lane for the entire file RETR. The dedicated browse lane keeps
+        # folder listing responsive without waiting behind bulk work or playback.
+        # The scanner's own walk_with_stat still calls _list_entries() with "scan".
+        return self._list_entries(path, lane="browse")
 
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         # ``lane`` is forwarded to ``_pool.borrow`` so the caller can
