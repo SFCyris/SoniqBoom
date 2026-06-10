@@ -514,7 +514,9 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     from pathlib import Path as _Path
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
+        _ADLIB_EXTS, _GME_EXTS_STREAM,
         _render_sid, _render_midi, _render_tracker, _render_uade, _render_hvl,
+        _render_adlib, _render_imf, _render_gme,
     )
     from soniqboom.core.conversion_cache import get_or_render
 
@@ -592,6 +594,22 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             # doesn't poison the right output.
             fmt, sf_path = "uade", None
             render_fn = lambda: _render_uade(path, subsong=0)
+        elif ext == ".imf":
+            # .imf is overloaded: Imago Orpheus (openmpt) vs id/Apogee AdLib
+            # (AdPlug).  _render_imf sniffs the content and routes; cache key
+            # matches the stream path's format_type="imf".  Must precede the
+            # tracker fallback (.imf is also in _TRACKER_EXTS for scanning).
+            fmt, sf_path = "imf", None
+            render_fn = lambda: _render_imf(path, subsong=0)
+        elif ext in _ADLIB_EXTS:
+            # AdLib / OPL2 FM (ROL/CMF/D00/RAD/…) via AdPlug — openmpt can't
+            # decode these, so the tracker fallback below would just fail.
+            fmt, sf_path = "adlib", None
+            render_fn = lambda: _render_adlib(path, subsong=0)
+        elif ext in _GME_EXTS_STREAM:
+            # Console chiptunes (NSF/SPC/GBS/VGM/AY/KSS/…) via libgme.
+            fmt, sf_path = "gme", None
+            render_fn = lambda: _render_gme(path, subsong=0)
         else:  # tracker
             fmt, sf_path = "tracker", None
             render_fn = lambda: _render_tracker(path, subsong=0)
@@ -663,7 +681,10 @@ async def get_track_waveform(track_id: str, response: Response):
     from pathlib import Path as _Path
     from soniqboom.core.data import get_waveform, get_track, store_waveform
     from soniqboom.core.scanner import _compute_waveform
-    from soniqboom.api.stream import _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS
+    from soniqboom.api.stream import (
+        _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
+        _ADLIB_EXTS, _GME_EXTS_STREAM,
+    )
 
     # ``no-store`` on every response so the browser never serves a stale
     # body when the frontend re-fetches after ``transcode-ready``.  The
@@ -702,7 +723,9 @@ async def get_track_waveform(track_id: str, response: Response):
     loop = asyncio.get_event_loop()
 
     # ── Converted formats: compute waveform from conversion-cache WAV ────
-    if ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS or ext in _UADE_EXTS or ext in _HVL_EXTS:
+    if (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS
+            or ext in _UADE_EXTS or ext in _HVL_EXTS
+            or ext in _ADLIB_EXTS or ext in _GME_EXTS_STREAM):
         wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
         result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(wav_path))
         stored, response = _normalise_waveform(result)

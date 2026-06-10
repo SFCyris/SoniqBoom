@@ -52,6 +52,14 @@ export const Player = (() => {
   function _showConvertBadge() {
     if (!_convertBadge) return;
     _convertBadge.hidden = false;
+    // Resilience watchdog: progress now arrives via the library WebSocket
+    // (app.js ``transcode_progress`` branch → _onTranscodeProgress).  If no
+    // WS sample for the playing track lands within ~2 s of the badge
+    // appearing, fall back to ONE guarded HTTP poll so a dropped WS never
+    // leaves the badge stuck on the indeterminate spinner.  Re-enable the
+    // poll guard so that fallback fetch is accepted, then arm the watchdog.
+    _transcodePollTrackId = trackId;
+    _armTranscodeWatchdog(trackId);
     // Promote to cancellable: shows the inline × button declared in
     // index.html.  Wire its click on first show only (idempotent —
     // dataset flag guards against re-wiring on every show).
@@ -102,19 +110,47 @@ export const Player = (() => {
   // actual wall-clock wait is identical.
   let _transcodePollTimer = null;
   let _transcodePollTrackId = null;
+  // AbortController for an in-flight transcode-status fetch (the single
+  // WS-fallback poll, below).  Held at module scope so a track switch /
+  // folder nav can cancel the late response — same pattern as
+  // ``_sidPartialAbort``.
+  let _transcodePollAbort = null;
+  // WS-push is now the primary progress channel (see app.js onmessage
+  // ``transcode_progress`` branch).  These drive the resilience watchdog:
+  // when the convert badge first shows we arm a short timer; if no WS
+  // message for the playing track has arrived by then we fire ONE poll so
+  // progress is never lost to a WS blip.  Cleared on WS message / track
+  // change.
+  let _transcodeWatchdogTimer = null;
+  let _transcodeWatchdogTrackId = null;
+  const _TRANSCODE_WATCHDOG_MS = 2000;
 
-  function _startTranscodePolling(trackId) {
-    _stopTranscodePolling();
-    _transcodePollTrackId = trackId;
-    // 600 ms cadence: fast enough to feel live (>1 Hz updates read as
-    // continuous motion to the eye), slow enough to keep server load
-    // negligible — at most one HEAD-sized GET per transcode-second.
-    _transcodePollTimer = setInterval(
-      () => _pollTranscodeStatusOnce(trackId), 600,
-    );
-    // Fire once immediately so the badge can flip to determinate as soon
-    // as the first progress sample lands — no 600 ms blank gap.
-    _pollTranscodeStatusOnce(trackId);
+  // Arm a one-shot fallback: if no WS transcode_progress message for
+  // ``trackId`` lands within ~2 s of the badge showing, do a single
+  // guarded poll of /api/stream/{id}/transcode-status so a dropped WS
+  // connection never leaves the badge stuck on the indeterminate spinner.
+  function _armTranscodeWatchdog(watchTrackId) {
+    _clearTranscodeWatchdog();
+    if (!watchTrackId) return;
+    _transcodeWatchdogTrackId = watchTrackId;
+    _transcodeWatchdogTimer = setTimeout(() => {
+      _transcodeWatchdogTimer = null;
+      // Only poll if the track is still current — a switch between arming
+      // and firing makes the fallback moot.
+      if (trackId === watchTrackId) {
+        _transcodePollTrackId = watchTrackId;   // re-enable the guard
+        _pollTranscodeStatusOnce(watchTrackId);
+      }
+      _transcodeWatchdogTrackId = null;
+    }, _TRANSCODE_WATCHDOG_MS);
+  }
+
+  function _clearTranscodeWatchdog() {
+    if (_transcodeWatchdogTimer) {
+      clearTimeout(_transcodeWatchdogTimer);
+      _transcodeWatchdogTimer = null;
+    }
+    _transcodeWatchdogTrackId = null;
   }
 
   function _stopTranscodePolling() {
@@ -122,43 +158,102 @@ export const Player = (() => {
       clearInterval(_transcodePollTimer);
       _transcodePollTimer = null;
     }
+    // Abort any in-flight WS-fallback fetch so its connection slot frees
+    // immediately and a late response can't flash into the badge.
+    if (_transcodePollAbort) {
+      try { _transcodePollAbort.abort(); } catch (_) {}
+    }
+    _clearTranscodeWatchdog();
     _transcodePollTrackId = null;
+    _transcodePollAbort = null;
   }
 
-  async function _pollTranscodeStatusOnce(trackId) {
+  // WS-fallback poll: fired ONCE by the watchdog if no transcode_progress
+  // message arrived in time.  Determinate transcode progress is normally
+  // pushed over the library WebSocket (app.js → _onTranscodeProgress); this
+  // single guarded GET is the resilience net against a WS blip.  Aborted
+  // on track change / folder nav via ``_transcodePollAbort``.
+  async function _pollTranscodeStatusOnce(reqTrackId) {
     // Discard responses after the user has switched tracks — a slow
     // backend can return progress for the *previous* track and we don't
     // want that flashing into the badge mid-switch.
-    if (_transcodePollTrackId !== trackId) return;
+    if (_transcodePollTrackId !== reqTrackId) return;
+    const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    const prevAbort = _transcodePollAbort;
+    _transcodePollAbort = ctrl;
+    if (prevAbort && prevAbort !== ctrl) {
+      try { prevAbort.abort(); } catch (_) {}
+    }
     try {
-      const res = await fetch(`/api/stream/${trackId}/transcode-status`,
-                              { credentials: 'same-origin' });
+      const res = await fetch(`/api/stream/${reqTrackId}/transcode-status`,
+                              ctrl ? { credentials: 'same-origin', signal: ctrl.signal }
+                                   : { credentials: 'same-origin' });
       if (!res.ok) return;
       const j = await res.json();
-      if (_transcodePollTrackId !== trackId) return;
-      if (j.ready) {
-        // Render finished — the audio element's own load lifecycle will
-        // take over from here.  Snap the bar to 100 % for one beat
-        // before letting _hideConvertBadge clear it; without this the
-        // bar can vanish mid-fill which reads as a glitch.
-        _updateConvertBadgeProgress(100, 0);
-        _stopTranscodePolling();
-        // PERC-9: the waveform served at track-load was computed off
-        // the partial in-flight WAV (only a few seconds of audio were
-        // on disk).  Now that the full file is cached, re-fetch so the
-        // overlay reflects the complete track instead of the silent
-        // padding the partial read produced.  app.js's trackchange
-        // listener owns the canvas — we fire this event there too.
-        try { emit('transcode-ready', { trackId }); }
-        catch (_) { /* listener exceptions logged in emit() */ }
-        return;
-      }
-      if (typeof j.percent === 'number' && j.percent > 0) {
-        // Only flip to determinate once we actually have a sample —
-        // showing "0 %" with no movement is worse than "Converting…".
-        _updateConvertBadgeProgress(j.percent, j.eta_seconds);
-      }
-    } catch (_) { /* network blip — try again next tick */ }
+      if (_transcodePollTrackId !== reqTrackId) return;
+      // Route the sample through the same bridge the WS path uses so the
+      // dual-purpose (badge progress AND transcode-ready emit) stays in
+      // one place.
+      _onTranscodeProgress(
+        reqTrackId,
+        (typeof j.percent === 'number') ? j.percent : 0,
+        j.eta_seconds,
+        j.ready === true,
+        j.error === true,   // tear down the badge if the fallback poll sees a failure
+      );
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;  // intentional — stay quiet
+    } finally {
+      if (_transcodePollAbort === ctrl) _transcodePollAbort = null;
+    }
+  }
+
+  // Single source of truth for applying a transcode-progress sample to the
+  // UI, driven by BOTH the WebSocket push (app.js) and the WS-fallback poll
+  // above.  Preserves the dual duty the old 600 ms poll performed:
+  //   (a) in-progress → flip the badge to a determinate bar + ETA;
+  //   (b) ready       → snap to 100 %, tear down poll/watchdog + hide the
+  //       badge, AND emit ``transcode-ready`` so app.js re-fetches the
+  //       waveform off the now-complete file (PERC-9).
+  //   (c) error       → tear down poll/watchdog + hide the badge (no emit).
+  // ``msgTrackId`` is matched against the live ``trackId`` so a late sample
+  // for a track the user already moved past can't flash into the new badge.
+  function _onTranscodeProgress(msgTrackId, percent, etaSec, ready, isError) {
+    if (msgTrackId !== trackId) return;   // not the playing track — ignore
+    // A real sample arrived → the WS (or fallback) channel is alive; the
+    // resilience watchdog has done its job.
+    _clearTranscodeWatchdog();
+    if (isError) {
+      // Server reported the transcode failed.  Abandon the poll + badge so
+      // the user isn't left staring at a spinner that will never advance.
+      // No ``transcode-ready`` emit — the file never completed.
+      _stopTranscodePolling();
+      _hideConvertBadge();
+      return;
+    }
+    if (ready) {
+      // Render finished — the audio element's own load lifecycle will
+      // take over from here.  Snap the bar to 100 % for one beat
+      // before letting _hideConvertBadge clear it; without this the
+      // bar can vanish mid-fill which reads as a glitch.
+      _updateConvertBadgeProgress(100, 0);
+      _stopTranscodePolling();
+      _hideConvertBadge();
+      // PERC-9: the waveform served at track-load was computed off
+      // the partial in-flight WAV (only a few seconds of audio were
+      // on disk).  Now that the full file is cached, re-fetch so the
+      // overlay reflects the complete track instead of the silent
+      // padding the partial read produced.  app.js's transcode-ready
+      // listener owns the canvas re-fetch.
+      try { emit('transcode-ready', { trackId: msgTrackId }); }
+      catch (_) { /* listener exceptions logged in emit() */ }
+      return;
+    }
+    if (typeof percent === 'number' && percent > 0) {
+      // Only flip to determinate once we actually have a sample —
+      // showing "0 %" with no movement is worse than "Converting…".
+      _updateConvertBadgeProgress(percent, etaSec);
+    }
   }
 
   // Read the now-playing viz toggle straight from localStorage (avoids an
@@ -969,17 +1064,22 @@ export const Player = (() => {
     audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
 
     emit('trackchange', track);
+    // Abort any in-flight transcode-status fetch + watchdog from the prior
+    // track so a late response can't flash into the new track's badge and
+    // its connection slot frees immediately.  NEVER touches the audio
+    // element's own stream — only this ancillary metadata fetch.
+    _stopTranscodePolling();
 
     // Start "Converting…" timer for any format requiring server-side processing
     _hideConvertBadge();
     if (_needsConvert) {
       _convertTimer = setTimeout(_showConvertBadge, _getConvertDelay());
-      // Poll the determinate-progress endpoint in parallel so the badge
-      // flips from text "Converting…" to a live bar + ETA as soon as
-      // ffmpeg reports its first progress chunk (~500 ms in).  Costs one
-      // tiny GET every 600 ms while the wait lasts; pruned on track
-      // change / canplay / error via _hideConvertBadge.
-      _startTranscodePolling(track.id);
+      // Determinate progress (bar + ETA) is pushed over the library
+      // WebSocket: app.js's ``transcode_progress`` handler filters by the
+      // playing track id and calls Player.onTranscodeProgress(...), which
+      // drives _updateConvertBadgeProgress and — on ready — the
+      // ``transcode-ready`` waveform-refresh emit.  No 600 ms HTTP poll;
+      // _showConvertBadge arms a one-shot WS-fallback watchdog instead.
     }
 
     // Media Session API — enables system media keys + lock screen widget
@@ -1959,6 +2059,19 @@ export const Player = (() => {
     playTrack, playPause, seek, setVolume, next, prev, setQueue,
     addToQueue, removeFromQueue, moveInQueue,
     toggleShuffle, toggleRepeat,
+    // Stop the transcode-status poll + WS-fallback watchdog and abort any
+    // in-flight transcode-status fetch.  Called by app.js's
+    // _cancelAncillaryFetches() on folder navigation to free a browser
+    // connection slot.  Never touches the playing audio stream.
+    cancelAncillaryFetches() { _stopTranscodePolling(); },
+    // WS bridge: app.js's library-WebSocket ``transcode_progress`` handler
+    // feeds samples here.  Drives the convert badge AND, on ready, the
+    // ``transcode-ready`` waveform-refresh emit; on error, tears the badge
+    // down.  Filters internally by the playing trackId so stale per-track
+    // messages are ignored.
+    onTranscodeProgress(trackId, percent, etaSeconds, ready, error) {
+      _onTranscodeProgress(trackId, percent, etaSeconds, ready, error);
+    },
     get convertDelay()       { return _getConvertDelay(); },
     setConvertDelay(ms)      { localStorage.setItem(CONVERT_DELAY_KEY, String(ms)); },
     get crossfade()          { return _getCrossfade(); },

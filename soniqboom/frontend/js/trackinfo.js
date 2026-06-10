@@ -18,15 +18,28 @@ import { vizGroupEnabled }     from './viz/engine.js';
 
 // ── Chapters (E-18) ────────────────────────────────────────────────────────
 
+// AbortControllers for the three track-info panel fetches.  Switching the
+// panel's track (open / prev / next / re-open) aborts the previous track's
+// in-flight loads so they release their browser connection slot instead of
+// racing the new track's data in.  (Folder navigation does NOT abort these —
+// the panel may still be showing this track and legitimately wants its data.)
+let _chaptersAbort = null;
+let _extendedAbort = null;
+let _lyricsAbort   = null;
+
 async function _loadChapters(track) {
   const host = document.getElementById('ti-chapters');
   if (!host) return;
   host.innerHTML = '';
   host.hidden = true;
   if (!track || !track.id) return;
+  if (_chaptersAbort) { try { _chaptersAbort.abort(); } catch (_) {} }
+  const _c = (typeof AbortController === 'function') ? new AbortController() : null;
+  _chaptersAbort = _c;
   try {
     const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/chapters`,
-                            { credentials: 'same-origin' });
+                            _c ? { credentials: 'same-origin', signal: _c.signal }
+                               : { credentials: 'same-origin' });
     if (!res.ok) return;
     const { chapters } = await res.json();
     if (!Array.isArray(chapters) || chapters.length === 0) return;
@@ -66,7 +79,8 @@ async function _loadChapters(track) {
     });
     host.append(header, list);
     host.hidden = false;
-  } catch { /* silent — chapters are best-effort */ }
+  } catch { /* silent — best-effort (incl. AbortError on track switch) */ }
+  finally { if (_chaptersAbort === _c) _chaptersAbort = null; }
 }
 
 // ── Signal-path viz (#4) ──────────────────────────────────────────────────
@@ -312,8 +326,12 @@ async function _loadExtendedInfo(track) {
     else if (track.format === 'MIDI') hdr.textContent = 'MIDI Details';
     else hdr.textContent = 'Module Details';
 
+    if (_extendedAbort) { try { _extendedAbort.abort(); } catch (_) {} }
+    const _c = (typeof AbortController === 'function') ? new AbortController() : null;
+    _extendedAbort = _c;
     try {
-        const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`);
+        const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`,
+                                _c ? { signal: _c.signal } : undefined);
         const data = await res.json();
 
         // Channels
@@ -357,8 +375,11 @@ async function _loadExtendedInfo(track) {
         } else {
             instField.style.display = 'none';
         }
-    } catch {
+    } catch (e) {
+        if (e && e.name === 'AbortError') return;   // track switched; new load owns the UI
         section.style.display = 'none';
+    } finally {
+        if (_extendedAbort === _c) _extendedAbort = null;
     }
 }
 
@@ -456,9 +477,13 @@ async function _loadLyrics(track) {
 
   _lyricsCache[id] = 'loading';
   _setLyricsState('<div class="ti-lyrics-spinner"></div>Fetching lyrics…');
+  if (_lyricsAbort) { try { _lyricsAbort.abort(); } catch (_) {} }
+  const _lc = (typeof AbortController === 'function') ? new AbortController() : null;
+  _lyricsAbort = _lc;
 
   try {
-    const res  = await fetch(`/api/tracks/${encodeURIComponent(id)}/lyrics`);
+    const res  = await fetch(`/api/tracks/${encodeURIComponent(id)}/lyrics`,
+                             _lc ? { signal: _lc.signal } : undefined);
     const data = await res.json();
     if (data.lyrics) {
       _lyricsCache[id] = data;
@@ -471,11 +496,19 @@ async function _loadLyrics(track) {
         _setLyricsState('No lyrics found for this track.');
       }
     }
-  } catch {
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      // Track switched mid-fetch — drop the 'loading' marker so a later
+      // revisit re-fetches instead of sticking on the spinner forever.
+      delete _lyricsCache[id];
+      return;
+    }
     _lyricsCache[id] = 'error';
     if (_queue[_idx]?.id === id && _activeTab === 'lyrics') {
       _setLyricsState('Could not load lyrics.');
     }
+  } finally {
+    if (_lyricsAbort === _lc) _lyricsAbort = null;
   }
 }
 

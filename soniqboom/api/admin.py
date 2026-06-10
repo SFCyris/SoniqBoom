@@ -1409,9 +1409,14 @@ async def set_ftp_pool(body: dict, _tok: str = Depends(_require_token)):
     pools_map = conf.get("ftp_pools")
     if not isinstance(pools_map, dict):
         pools_map = {}
+    # Preserve (or accept) the per-server "browse" lane budget introduced with
+    # the dedicated interactive-listing lane.  The UI may not send it yet, so
+    # fall back to any existing value, then the default of 1 — never drop it.
+    _prev = pools_map.get(label) if isinstance(pools_map.get(label), dict) else {}
     pools_map[label] = {
         "scan":      scan,
         "stream":    stream,
+        "browse":    max(1, int(body.get("browse", _prev.get("browse", 1)))),
         "auto_grow": auto_grow,
     }
     conf["ftp_pools"] = pools_map

@@ -43,7 +43,7 @@ import { Equalizer }  from './equalizer.js';
 import { TrackInfo }  from './trackinfo.js';
 import { Queue }      from './queue.js';
 import { Playlist }   from './playlist.js';
-import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, Toast } from './utils.js';
+import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -51,6 +51,31 @@ import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, Toast } from './utils.js';
 // "stopped casting" confirmation.  Same global-escape-hatch pattern as
 // ``window.SoniqBoom.player`` above; documented at that comment.
 window.Toast = Toast;
+
+// Abort all playback-ancillary fetches (waveform, VUMR, transcode-status
+// poll) when the user navigates folders, so a slow remote response can't
+// keep holding one of the browser's ~6 per-host connection slots while the
+// user is waiting on the folder listing.  NEVER touches the playing audio
+// element's stream — only metadata/preparation fetches.  Invoked at the
+// top of the FolderTree.onSelect callback.  ``_waveformFetchAbort`` and
+// ``_vuFetchAbort`` are module-scope ``let``s declared elsewhere in this
+// file; this function only runs at user-navigation time, well after module
+// init, so their bindings are always live by then.
+function _cancelAncillaryFetches() {
+  if (_waveformFetchAbort) {
+    try { _waveformFetchAbort.abort(); } catch (_) {}
+    _waveformFetchAbort = null;
+  }
+  if (_vuFetchAbort) {
+    try { _vuFetchAbort.abort(); } catch (_) {}
+    _vuFetchAbort = null;
+  }
+  try {
+    if (Player && typeof Player.cancelAncillaryFetches === 'function') {
+      Player.cancelAncillaryFetches();
+    }
+  } catch (_) { /* player not ready / no-op — non-critical */ }
+}
 
 // ── Service Worker — offline-instant shell (PERC-6) ─────────────────────
 // Registered at top-level so the SW takes control on the first
@@ -91,6 +116,10 @@ const playerArt      = document.getElementById('player-art');
 const waveformCanvas = document.getElementById('waveform-canvas');
 const waveformCtx    = waveformCanvas ? waveformCanvas.getContext('2d') : null;
 let _waveformData    = null;   // Float array [0..1], 200 values
+// AbortController for the in-flight waveform fetch.  Aborted on track
+// change (a fresh _fetchWaveform supersedes it) and on folder navigation
+// (_cancelAncillaryFetches) so the connection slot frees immediately.
+let _waveformFetchAbort = null;
 
 const WAVE_H = 44; // visual height of waveform — much taller than the 3px seek-bar track
 
@@ -189,6 +218,14 @@ async function _fetchWaveform(trackId) {
   }
   progressEl?.classList.remove('has-waveform');
 
+  // Abort any waveform fetch still in flight from the prior track / call
+  // so its connection slot frees immediately and its late response can't
+  // race the fresh one below.  (The isStillCurrent() guard already drops
+  // stale data, but aborting also frees the HTTP slot.)
+  if (_waveformFetchAbort) {
+    try { _waveformFetchAbort.abort(); } catch (_) {}
+  }
+
   // Stash this fetch's trackId so that, if the user advances tracks
   // while we're awaiting the response, the LATE arrival of the prior
   // track's waveform doesn't overwrite the now-current track's data.
@@ -199,6 +236,9 @@ async function _fetchWaveform(trackId) {
       || (Player.queue && Player.queue[Player.queueIdx] && Player.queue[Player.queueIdx].id);
     return cur === fetchedFor;
   };
+
+  const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+  _waveformFetchAbort = ctrl;
 
   try {
     // ``cache: 'no-cache'`` is intentional — without it the browser's
@@ -216,7 +256,8 @@ async function _fetchWaveform(trackId) {
     // revalidation hit; combined with the backend's ``Cache-Control:
     // no-store`` header on this endpoint the body is always fresh.
     const res  = await fetch(`/api/tracks/${trackId}/waveform`,
-                             { cache: 'no-cache' });
+                             ctrl ? { cache: 'no-cache', signal: ctrl.signal }
+                                  : { cache: 'no-cache' });
     if (!isStillCurrent()) return;  // user advanced; discard late response
     if (!res.ok) { _waveformData = null; progressEl?.classList.remove('has-waveform'); return; }
     const data = await res.json();
@@ -277,9 +318,17 @@ async function _fetchWaveform(trackId) {
     } else {
       progressEl?.classList.remove('has-waveform');
     }
-  } catch {
-    _waveformData = null;
-    progressEl?.classList.remove('has-waveform');
+  } catch (err) {
+    // Swallow AbortError: an intentional cancel (track change / folder
+    // nav) must NOT clear the canvas — the superseding fetch (or the
+    // track-change canvas-clear above) owns the display now.  Only real
+    // fetch failures blank the waveform.
+    if (!(err && err.name === 'AbortError')) {
+      _waveformData = null;
+      progressEl?.classList.remove('has-waveform');
+    }
+  } finally {
+    if (_waveformFetchAbort === ctrl) _waveformFetchAbort = null;
   }
 }
 
@@ -307,7 +356,11 @@ let _vuAnimFrame = null;
 let _vuChannelCount = 0;
 
 // Re-use the shared tracker format set (plus SID for VU meters)
-const _TRACKER_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID']);
+// Formats that get a player-bar VU/spectrum visualization.  Trackers get
+// per-voice VUMR; SID + libgme console chiptunes + AdPlug AdLib/OPL render
+// fine but have no VUMR sidecar, so they fall back to the FFT spectrum (their
+// /vu 404s).  Without listing them here the gate hid the visual entirely.
+const _TRACKER_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID', ...CHIP_FORMAT_NAMES]);
 
 // Read the opt-in VU render style ('bars' | 'circuit') from the shared viz
 // settings.  Read directly from localStorage to avoid an import cycle with
@@ -611,16 +664,35 @@ function _parseVUMR(arrayBuf) {
   return { channels, rateHz, frames, pan, samples };
 }
 
+// AbortController for the in-flight VUMR (tracker channel-VU sidecar)
+// fetch.  Aborted on track change (a fresh _fetchVUMR supersedes it) and on
+// folder navigation (_cancelAncillaryFetches) to free the connection slot.
+let _vuFetchAbort = null;
+
 async function _fetchVUMR(trackId) {
   if (!trackId) return null;
+  // Abort any prior VUMR fetch still in flight so its slot frees and its
+  // late response can't return into a track the user already left.
+  if (_vuFetchAbort) {
+    try { _vuFetchAbort.abort(); } catch (_) {}
+  }
+  const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+  _vuFetchAbort = ctrl;
   try {
     const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu`,
-                            { credentials: 'include' });
+                            ctrl ? { credentials: 'include', signal: ctrl.signal }
+                                 : { credentials: 'include' });
     if (!res.ok) return null;
     const buf = await res.arrayBuffer();
     return _parseVUMR(buf);
-  } catch {
+  } catch (err) {
+    // AbortError and real failures both fall back to the FFT visualiser
+    // (null contract), so a single null return covers both — but keep the
+    // branch explicit for parity with the other two fetches.
+    if (err && err.name === 'AbortError') return null;
     return null;
+  } finally {
+    if (_vuFetchAbort === ctrl) _vuFetchAbort = null;
   }
 }
 
@@ -1496,6 +1568,12 @@ document.addEventListener('visibilitychange', () => {
 // so the share-tracking + folder-open freshness trigger has to live in
 // the SAME callback that drives Library.showFolder.
 FolderTree.onSelect(async (path) => {
+  // Free browser connection slots before the (potentially blocking) folder
+  // listing fetch: abort the waveform + VUMR fetches and stop the
+  // transcode-status poll/watchdog.  User-initiated navigation takes
+  // priority over background metadata refreshes.  Never touches the
+  // playing audio stream.
+  _cancelAncillaryFetches();
   _deactivateAllNav();
   const share = _resolveRemoteShareFromPath(path);
   if (share && /^(ftp|smb|webdav):/i.test(share)) {
@@ -1940,6 +2018,32 @@ function connectWS() {
       // anything in the main shell — admin.js binds its own handler
       // via a custom DOM event so the badge UI stays self-contained.
       window.dispatchEvent(new CustomEvent('soniqboom:repair-progress', { detail: msg }));
+    } else if (msg.event === 'transcode_progress') {
+      // Push-based transcode progress over the shared library WebSocket —
+      // replaces the old 600 ms HTTP poll on /api/stream/{id}/transcode-status
+      // (which consumed a browser connection slot per poll per tab and
+      // starved folder navigation).  Schema:
+      //   {event:"transcode_progress", track_id, percent, eta_seconds, ready, error}
+      // Filter by the currently-playing track so a message for one track
+      // can't drive another track's badge (multi-track / multi-tab safe).
+      // player.js owns the badge + the PERC-9 ``transcode-ready`` emit; we
+      // just forward the sample so that dual duty stays in one place.
+      try {
+        const tid = msg.track_id;
+        if (tid !== undefined && tid !== null && tid === Player.currentTrackId) {
+          const isError = msg.error === true;
+          const percent = (typeof msg.percent === 'number') ? msg.percent : 0;
+          const eta     = (msg.eta_seconds !== undefined) ? msg.eta_seconds : null;
+          const ready   = msg.ready === true;
+          // player.js applies the dual duty: in-progress drives
+          // _updateConvertBadgeProgress; ready snaps to 100%, hides the
+          // badge AND emits ``transcode-ready`` (waveform re-fetch off the
+          // now-complete file); error tears the badge down (no emit).
+          Player.onTranscodeProgress(tid, percent, eta, ready, isError);
+        }
+      } catch (err) {
+        console.warn('[WS] transcode_progress handler failed:', err);
+      }
     } else if (msg.event === 'remote_new_tracks') {
       // Adaptive remote-freshness scanner discovered new tracks in a
       // remote share.  Show ONE toast per share per coalesce window
