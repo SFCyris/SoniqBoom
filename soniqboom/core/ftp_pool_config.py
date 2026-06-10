@@ -45,7 +45,17 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 _FILE_NAME = "ftp_server_caps.json"
-_LOCK = threading.Lock()
+# REENTRANT ON PURPOSE — do NOT downgrade to threading.Lock().
+# record_too_many_clients() / set_detected_cap() / reset_detected_cap()
+# acquire this lock and then call _load(), which re-acquires it.  With a
+# plain (non-reentrant) Lock the calling thread self-deadlocks at the inner
+# acquire and, because the lock is then held forever, every other FTP-pool
+# caller AND the asyncio event loop (admin ftp_pool_status → get_all →
+# _load) freeze behind it — a whole-server hang.  Surfaced 2026-06 when the
+# browse lane tripped the NAS "too many clients" path; root cause was this
+# re-entrancy.  An RLock lets the same thread re-enter while still
+# serialising different threads.
+_LOCK = threading.RLock()
 _data_dir: Path | None = None
 _cache: dict | None = None  # in-memory copy of the JSON file, lazily loaded
 
