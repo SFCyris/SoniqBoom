@@ -52,6 +52,10 @@ coverage.xml
 # ─── Claude / agent config ─────────────────────────────────────────────────
 .claude/
 
+# ─── Internal working notes — not part of the public source tree ───────────
+internal/
+Internal/
+
 # ─── SoniqBoom build artefacts ─────────────────────────────────────────────
 # The macOS packaging tooling is local only — not part of the public source
 # tree. Build outputs likewise stay out.
