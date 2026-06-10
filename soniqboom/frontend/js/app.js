@@ -744,7 +744,7 @@ function _addFallbackLabel(format) {
   //
   const host = document.querySelector('.player-progress');
   if (!host) return;
-  const msg = `Spectrum — per-voice meters not yet available for ${format}`;
+  const msg = `Spectrum — per-voice meters not available for ${format}`;
   if (_vuFallbackLabel && _vuFallbackLabel.parentNode === host) {
     _vuFallbackLabel.textContent = msg;
     return;
