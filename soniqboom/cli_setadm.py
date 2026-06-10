@@ -114,8 +114,88 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ensure_admin_interactive() -> int:
+    """First-run bootstrap: if no admin account exists yet, prompt for a
+    username + password (hidden via getpass) and create one.
+
+    No-op (exit 0) when an admin already exists, or when stdin/stdout isn't a
+    TTY — so a backgrounded or CI start never hangs waiting on input.  Invoked
+    by ``run.sh`` before the server is launched.  Always returns 0: a failed
+    bootstrap must never block the server from starting.
+    """
+    import getpass
+
+    data_dir = get_data_dir()
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        store = UserStore(data_dir)
+    except (OSError, RuntimeError) as e:
+        print(f"setadm: couldn't open user store at {data_dir}: {e}", file=sys.stderr)
+        return 0
+
+    if store.has_any_admin():
+        return 0   # already bootstrapped — nothing to do
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "SoniqBoom has no admin account yet and this start is "
+            "non-interactive.\n"
+            "Create one with:  soniqboom-setadm -user <name> -passwd <password>",
+            file=sys.stderr,
+        )
+        return 0
+
+    print("")
+    print("  ──────────────────────────────────────────────────────")
+    print("  First-run setup — create the SoniqBoom admin account")
+    print("  ──────────────────────────────────────────────────────")
+    print("  Web-UI registration stays locked until one admin exists,")
+    print("  so let's create it now.")
+    print("")
+    try:
+        while True:
+            username = input("  Admin username: ").strip()
+            try:
+                validate_username(username)
+                break
+            except ValueError as e:
+                print(f"    {e}")
+        while True:
+            pw1 = getpass.getpass("  Admin password (min 8 chars): ")
+            try:
+                validate_password(pw1)
+            except ValueError as e:
+                print(f"    {e}")
+                continue
+            if getpass.getpass("  Confirm password: ") != pw1:
+                print("    Passwords don't match — try again.")
+                continue
+            break
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Setup cancelled — no admin created.  The server will start,")
+        print("  but the web UI stays locked until you run soniqboom-setadm.")
+        return 0
+
+    try:
+        user = store.create(username=username, password=pw1, role="admin")
+    except (ValueError, OSError) as e:
+        print(f"  setadm: couldn't create admin: {e}", file=sys.stderr)
+        return 0
+
+    print("")
+    print(f"  ✓ Admin '{user.username}' created — sign in with it once the")
+    print("    server is ready.")
+    print("")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = argv if argv is not None else sys.argv[1:]
+    # First-run bootstrap mode (used by run.sh): create an admin interactively
+    # when none exists.  Handled before the parser because the normal path
+    # requires -user, whereas this mode takes no other flags.
+    if "--ensure-admin" in raw or "-ensure-admin" in raw:
+        return _ensure_admin_interactive()
     _reject_prefix_matches(raw)
     args = _build_parser().parse_args(raw)
 
