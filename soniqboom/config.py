@@ -176,8 +176,8 @@ SERVICE_NAMES: tuple[str, ...] = ("subsonic", "multiroom", "cast", "dlna_server"
 SERVICE_LABELS: dict[str, str] = {
     "subsonic":    "OpenSubsonic REST API",
     "multiroom":   "Multiroom controller",
-    "cast":        "Cast / AirPlay / DLNA (outgoing)",
-    "dlna_server": "DLNA Media Server (incoming)",
+    "cast":        "Cast / AirPlay / DLNA (outgoing) — Beta",
+    "dlna_server": "DLNA Media Server (incoming) — Beta",
 }
 
 

@@ -169,10 +169,7 @@ Expected:
   flaky LAN)
 - `p95_first_ms` reported per (protocol, target_codec) bucket
 - Per-bucket p95 < 500 ms for any codec the budget gate covers
-  (cold-cache rendered formats — SID / MIDI / tracker — are
-  exempt; their cold-start is bounded by the renderer's realtime
-  decode speed, not ffmpeg)
+  (cold-cache rendered formats — SID / MIDI / tracker — are exempt)
 
 If `p95_first_ms` for a (protocol, codec) bucket exceeds the budget
-gate's threshold, investigate the controller / renderer pair before
-shipping.
+gate's threshold, investigate the controller / renderer pair.

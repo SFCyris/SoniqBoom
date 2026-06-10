@@ -60,7 +60,7 @@
            is a synonym so cast_picker.js wires both transparently).
            Hidden on viewports the picker doesn't fit gracefully (the
            bottom-sheet pattern handles ≤600 px). -->
-      <button id="btn-cast" class="m-mp-cast" aria-label="Cast to device" aria-haspopup="dialog" aria-expanded="false">
+      <button id="btn-cast" class="m-mp-cast" aria-label="Cast to device (Beta)" aria-haspopup="dialog" aria-expanded="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
           <line x1="2" y1="20" x2="2.01" y2="20"/>
@@ -76,7 +76,7 @@
          aria-labelledby="cast-title" aria-modal="true">
       <div id="cast-panel">
         <div class="cast-header">
-          <h3 id="cast-title">Cast to device</h3>
+          <h3 id="cast-title">Cast to device (Beta)</h3>
           <button id="cast-refresh" class="cast-icon-btn" aria-label="Refresh device list">&#8635;</button>
           <button id="cast-close" class="cast-icon-btn" aria-label="Close cast picker">&times;</button>
         </div>
@@ -111,7 +111,7 @@
             <label><input type="radio" name="cast-pref" value="auto" checked>
               <span>Auto</span><span class="cast-pref-hint">Lossless when supported</span></label>
             <label><input type="radio" name="cast-pref" value="force-mp3">
-              <span>MP3 320</span><span class="cast-pref-hint">Universal compatibility</span></label>
+              <span>MP3 320</span><span class="cast-pref-hint">Works with most devices</span></label>
           </div>
         </details>
       </div>

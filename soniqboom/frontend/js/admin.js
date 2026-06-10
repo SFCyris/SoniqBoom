@@ -2395,11 +2395,11 @@ document.getElementById('btn-clear-remote-cache')?.addEventListener('click', asy
 const _SERVICE_HINTS = {
   subsonic:    'Lets Subsonic-compatible clients (Amperfy, DSub, Symfonium, play:Sub) connect over /rest/*. Turning off blocks every such client.',
   multiroom:   'Synchronises playback across multiple SoniqBoom instances on the LAN. Turning off leaves only single-machine playback.',
-  cast:        'Outgoing Cast / DLNA / AirPlay sender — picks a TV, speaker, or receiver from the player toolbar. Turning off hides the toolbar cast button.',
+  cast:        'Beta — outgoing Cast / DLNA / AirPlay sender; picks a TV, speaker, or receiver from the player toolbar. Turning off hides the toolbar cast button.',
   // UX-2 P0: dlna_server was missing from the hint dict.  Also flag the
   // privacy implication of turning it ON so the user can make an informed
   // decision (Nielsen H5: error prevention).
-  dlna_server: 'Incoming DLNA Media Server — exposes your library to every DLNA/UPnP client on this network. Off by default for privacy; turning on lets phones, TVs, and speakers browse and play tracks anonymously.',
+  dlna_server: 'Beta — incoming DLNA Media Server; exposes your library to every DLNA/UPnP client on this network. Off by default; turning on lets phones, TVs, and speakers browse and play tracks anonymously.',
 };
 
 // Helper: HTML-escape any text we interpolate into innerHTML attributes

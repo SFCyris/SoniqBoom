@@ -23,19 +23,15 @@
 
 > Your 50,000 `.mod` files. Your mirror of the High Voltage SID Collection. That folder of `.nsf` rips you have carried across four hard drives since 2009.
 >
-> **Plex can't see them. Jellyfin skips them. Navidrome pretends they don't exist.**
->
-> SoniqBoom was built for *exactly* those files — and it treats them like the art they are.
+> **SoniqBoom plays *exactly* those files — and treats them like the art they are.**
 
 ---
 
-## Retro Music Player... what gives?
+## Retro formats, first-class
 
-Every "modern" music server is a polite wrapper around the same five codecs. The moment your library contains a tracker module, a SID tune, or a Game Boy rip, those servers go quiet: no metadata, no playback, no respect.
+SoniqBoom treats **demoscene, chiptune, and tracker formats as first-class citizens** — rendered on the fly, tagged with *real* scene metadata, visualized channel by channel, and streamed to any browser — with casting to Chromecast, AirPlay, and DLNA receivers in Beta.
 
-SoniqBoom is the opposite. As far as we can tell, it is **the only self-hosted music server that treats demoscene, chiptune, and tracker formats as first-class citizens** — rendered on the fly, tagged with *real* scene metadata, visualized channel by channel, and streamed to any device you own.
-
-Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-featured modern music server. That part was easy. The hard part — the part nobody else bothered to do — is the retro. We did the hard part.
+Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-featured modern music server.
 
 <p align="center">
   <img src="images/ui-main.png" alt="SoniqBoom main library view" width="800">
@@ -49,9 +45,9 @@ Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-fea
 
 **🎹 Tracker / module** — ProTracker (MOD), FastTracker 2 (XM), Impulse Tracker (IT), ScreamTracker 2 & 3 (STM / S3M), OctaMED, MultiTracker, DigiBooster Pro, Composer 669, UltraTracker, Oktalyzer, Imago Orpheus, Farandole, General DigiMusic, SoundFX, Grave Composer, DSIK… roughly twenty module formats in all.
 
-**🕹️ Amiga heritage** — AHX *and* HivelyTracker (`.hvl`) — the latter via a **HivelyTracker engine we vendor and compile on first run**, because neither UADE nor libopenmpt will touch HVL. We render the unrenderable.
+**🕹️ Amiga heritage** — AHX *and* HivelyTracker (`.hvl`), the latter via a **bundled HivelyTracker engine compiled on first run**. We render the unrenderable.
 
-**🟥 AdLib / OPL2 FM** — the sound of DOS gaming: id Software / Apogee **IMF** (Wolfenstein 3D, Commander Keen, Duke Nukem), plus ROL, CMF, D00, RAD, LucasArts LAA, Sierra SCI, DOSBox DRO, HSC, RIX… rendered through **AdPlug**. (`.imf` is *two* unrelated formats — we sniff the file and route Imago Orpheus to the tracker engine, id IMF to the OPL synth.)
+**🟥 AdLib / OPL2 FM** — the sound of DOS gaming: id Software / Apogee **IMF** (Wolfenstein 3D, Commander Keen, Duke Nukem), plus ROL, CMF, D00, RAD, LucasArts LAA, Sierra SCI, DOSBox DRO, HSC, RIX… rendered through **AdPlug**. (`.imf` files are detected automatically: Imago Orpheus modules play via the tracker engine, id Software IMF via the OPL synth.)
 
 **🎼 MIDI** — synthesized with swappable SoundFonts, plus a one-click SoundFont marketplace.
 
@@ -63,14 +59,14 @@ Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-fea
 
 ## We don't just play them. We understand them.
 
-Anyone can shell out to a decoder. SoniqBoom speaks the culture:
+SoniqBoom speaks the culture:
 
 - **🎚️ Per-channel VU meters for tracker modules.** Watch every Paula voice and sample slot dance in real time, right in the browser. Your `.it` files have never looked like this.
 - **🧬 Real SID metadata from HVSC.** Per-tune song lengths straight from `Songlengths.md5` — so your SID tunes show *correct* durations instead of a flat three-minute guess — plus full **STIL** credits and trivia for every subtune.
 - **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own.
 - **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
 - **🗂️ Multi-subtune aware.** SID, NSF, and HVL tunes with multiple subsongs are addressed individually, not flattened into one.
-- **📼 That bundled HivelyTracker decoder.** Mentioned twice, because we're genuinely proud of it.
+- **📼 Bundled HivelyTracker decoder.** `.hvl` modules play out of the box — nothing extra to install.
 
 <p align="center">
   <img src="images/ui-tracker-overview.jpg" alt="Tracker module info — per-channel VU, module metadata, live signal chain" width="40%">
@@ -87,10 +83,10 @@ Anyone can shell out to a decoder. SoniqBoom speaks the culture:
 
 ## Oh — and it happens to be a complete modern music server
 
-Here's the twist that turns a niche curiosity into your *only* server: because every retro format is rendered to standard audio on the fly, a 1987 SID tune streams to your phone, your HomePod, or the speakers in the next room *exactly* like a FLAC does. The chiptune obsession and the everyday conveniences run through the same pipeline — so the same tool that finally sees your `.mod` hoard is also the one you reach for every single day.
+Every retro format is rendered to standard audio on the fly — a 1987 SID tune streams to your phone *exactly* like a FLAC does (casting it to a HomePod or the speakers in the next room is in Beta). The same server that sees your `.mod` hoard handles your everyday listening.
 
-- **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist — pre-computed indexes, no SQL round-trips.
-- **📡 Cast / AirPlay / DLNA.** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or any UPnP receiver.
+- **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
+- **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
 - **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN.
 - **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem.
 - **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required.
@@ -201,7 +197,7 @@ Most settings are changeable from the admin UI. Environment variables (`SONIQBOO
 
 If your music collection has a weird corner, SoniqBoom is the server that finally lights it up.
 
-**Got a format we don't render yet?** That's the most interesting kind of bug report. Open an [issue](https://github.com/SFCyris/SoniqBoom/issues) with a sample file, [star the repo](https://github.com/SFCyris/SoniqBoom) if it earned it, and send PRs — chasing down obscure formats is the entire point of this project.
+**Got a format we don't render?** That's the most interesting kind of bug report. Open an [issue](https://github.com/SFCyris/SoniqBoom/issues) with a sample file, [star the repo](https://github.com/SFCyris/SoniqBoom) if it earned it, and send PRs.
 
 ---
 

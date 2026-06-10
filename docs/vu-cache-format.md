@@ -5,9 +5,8 @@
 
 The VUMR (**VU MeteR**) file is a small binary sidecar stored next to a
 rendered tracker-module audio cache.  It carries pre-computed
-per-channel volume samples so the frontend can render true per-channel
-VU bars indexed by playback time, without running an FFT or maintaining
-a live libopenmpt instance during playback.
+per-channel volume samples that the frontend indexes by playback time
+to render true per-channel VU bars.
 
 A VUMR file is produced by ``soniqboom/core/openmpt_vu.py`` during the
 same transcode pass that produces the audio WAV / MP3, using
@@ -46,9 +45,7 @@ For a typical 4-minute, 8-channel ProTracker at 30 Hz:
 | 2     | Right             | `○○●`          |
 
 Stored once in the header.  Pan automation within the song is not
-captured in v1 — most tracker songs use fixed per-channel pan, and the
-3-bin discrete representation can't render fine-grained pan automation
-anyway.  Pan is **derived** during VU extraction by summing each
+captured in v1.  Pan is **derived** during VU extraction by summing each
 channel's L/R contribution over the entire song and classifying:
 
 ```
@@ -61,8 +58,7 @@ else              -> 0 (centre)
 This captures the effective pan distribution as the song actually
 plays, including any default-pan settings from the song header.  Songs
 with pan automation that swings hard are classified by where the
-channel spent most of its energy — a reasonable approximation for a
-3-state visual indicator.
+channel spent most of its energy.
 
 ---
 
@@ -101,13 +97,7 @@ const frame = new Uint8Array(buf, base, channels);
 
 ## Sample rate
 
-The default is **30 Hz**:
-
-* 15 Hz is visibly choppy on fast snare attacks (~50 ms envelopes).
-* 30 Hz matches the perceptual sweet spot for bar-meter motion.
-* 60 Hz doesn't improve the visual experience and doubles file size.
-
-Custom sample rates 1–240 Hz are valid in the format.  The frontend
+The default is **30 Hz**.  Custom sample rates 1–240 Hz are valid in the format.  The frontend
 honours whatever rate the file declares.
 
 ---
@@ -121,14 +111,12 @@ to the final `.vu` path.  Readers never see a partial file.
 
 ## Fallback behaviour
 
-If a VUMR sidecar is absent (legacy cache, format not yet rendered,
+If a VUMR sidecar is absent (legacy cache, no transcode on record,
 libopenmpt unavailable on this host, non-tracker format), the
 `/api/tracks/<id>/vu` endpoint returns HTTP 404.  The frontend
 gracefully falls back to its FFT-spectrum visualiser and labels itself:
 
 > `FFT Spectrum Analyzer Fallback — Individual Channel Meter not available for <format>`
-
-so the user always knows what they're looking at.
 
 ---
 
@@ -136,16 +124,4 @@ so the user always knows what they're looking at.
 
 * Version byte at offset 4 will be incremented on any breaking change.
 * Readers MUST check the version byte before parsing.
-* The flags byte at offset 6 is reserved for additive features
-  (per-frame pan tracking, stereo-sample detection, etc.) without a
-  major version bump.
-
----
-
-## Why not JSON / MessagePack
-
-* JSON: ~5× larger; no random access without a full parse pass.
-* MessagePack / CBOR: smaller than JSON but still no `O(1)` indexing.
-* Binary packed: smallest payload, `O(1)` frame access, trivial to
-  parse in any language.  Right call for a sidecar that the frontend
-  re-indexes on every animation tick.
+* The flags byte at offset 6 is reserved and must be 0 in v1.

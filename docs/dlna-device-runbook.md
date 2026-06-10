@@ -9,8 +9,7 @@ device manual checks.
 
 ## Prereqs
 
-1. Enable the service (off by default since DLNA broadcasts the
-   library to anyone on the LAN):
+1. Enable the service (off by default):
 
    ```
    .venv/bin/soniqboom services enable dlna_server
@@ -41,9 +40,6 @@ device manual checks.
 
 ## A — LG WebOS TV (smart TV)
 
-This was the easiest target on my dev box because the LG TV was
-already running its built-in DLNA controller.
-
 1. On the TV, open the "Photo & Video" or "Music" app (LG renames
    this every firmware).  The DLNA browser is one of the source
    options.
@@ -55,9 +51,8 @@ already running its built-in DLNA controller.
    - "Device not found" on the TV → multicast may not be routing
      between SoniqBoom's interface and the TV's.  See diagnostic
      below.
-   - Plays for 1 s then stops → check the cast token's TTL is
-     compatible with the TV's HTTP timing.  TTL is 15 minutes;
-     should never trip.
+   - Plays for 1 s then stops → check the cast token's TTL (15
+     minutes) against the TV's HTTP timing.
 
 ## B — Sonos (S2 firmware)
 
@@ -95,12 +90,13 @@ separately and bridges them.
    metadata + time bar.
 6. FAIL modes:
    - "Empty library" — BubbleUPnP requires `Browse(0)` to return a
-     specific container; we return Music.  Should work.
+     specific container; we return Music.  DLNA support is Beta; if
+     the library shows as empty, capture the `Browse(0)` response
+     and report it.
 
 ## D — VLC ("Network Streams")
 
-Useful as a sanity check because VLC's UPnP-AV browser is well-tested
-and works on every platform.
+A cross-platform sanity check.
 
 1. VLC → View → Playlist → "Local Network" → "Universal Plug 'n' Play"
 2. SoniqBoom should appear in the device list.
@@ -135,8 +131,7 @@ your SoniqBoom is bound to an interface on the same subnet.
 
 ## Privacy posture
 
-The DLNA Media Server is **OFF by default** because it advertises
-the user's entire music library on the LAN.  Anyone on the same
+The DLNA Media Server is **OFF by default**.  Anyone on the same
 network can browse the track list and stream audio without
 authentication — DLNA is intrinsically anonymous.
 
@@ -145,9 +140,8 @@ When the service is ON:
 - Track URLs (`/cast/{token}/...`) are signed but anonymous
   (no `user_id` claim).
 - Tokens expire 15 minutes after minting.
-- A leaked URL from a Browse response remains valid for that
-  window — not enough for a long-term archive theft, but enough
-  for one play.
+- A leaked URL from a Browse response remains valid until the
+  token expires.
 
 When the service is OFF:
 
