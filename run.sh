@@ -82,6 +82,16 @@ if command -v lsof &>/dev/null; then
   fi
 fi
 
+# ── First-run admin bootstrap ────────────────────────────────────────────────
+# If no admin account exists yet, prompt for one BEFORE launching the server —
+# the prompt needs this terminal, whereas the server runs detached.  Skipped
+# automatically when stdin isn't a TTY (backgrounded / CI starts) so it never
+# hangs, and ``--ensure-admin`` is a fast no-op once an admin exists.
+SETADM="$VENV/bin/soniqboom-setadm"
+if [ -x "$SETADM" ] && [ -t 0 ]; then
+  "$SETADM" --ensure-admin || true
+fi
+
 # ── Start server ─────────────────────────────────────────────────────────────
 mkdir -p "$LOG_DIR"
 
