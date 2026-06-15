@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<!-- SPDX-FileCopyrightText: 2026 S.F. Cyris · SPDX-License-Identifier: AGPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SoniqBoom — User Guide</title>
+<meta name="description" content="The SoniqBoom user guide: install, build your library, play chiptune, tracker, lossless and DSD music, and stream it across your devices.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg-field"></div>
+<div class="bg-grid"></div>
+<canvas id="electrons"></canvas>
+<div class="crt-overlay"></div>
+
+<header class="topnav">
+  <a class="brand" href="index.html">
+    <img src="img/logo.png" alt="SoniqBoom" class="brand-logo" width="112" height="38">
+    <span class="ver">User Guide</span>
+  </a>
+  <div class="nav-right">
+    <!-- In-page section links: shown only when the right-hand "On this page" rail
+         is hidden (narrower than 1481px); the rail covers these on wide screens. -->
+    <nav class="sec-nav" aria-label="Sections">
+      <a href="#start">Get started</a>
+      <a href="#library">Library</a>
+      <a href="#find">Search</a>
+      <a href="#playing">Playback</a>
+      <a href="#make">Shortcuts</a>
+      <a href="#formats">Formats</a>
+      <a href="#cast">Casting</a>
+      <a href="#multiroom">Multi-room</a>
+      <a href="#manage">Manage</a>
+      <a href="#settings">Settings</a>
+      <a href="#faq">Help</a>
+    </nav>
+    <nav class="guide-nav" aria-label="More guides">
+      <a href="format-history.html" class="cta">Format guide ▸</a>
+      <a href="tracker-history.html" class="cta">Trackers ▸</a>
+      <a href="retro-gaming.html" class="cta">Retro gaming ▸</a>
+    </nav>
+  </div>
+</header>
+
+<aside class="page-toc" aria-label="On this page">
+  <p class="toc-head">On this page</p>
+  <a href="#features"><span class="n">01</span>What's inside</a>
+  <a href="#start"><span class="n">02</span>Install</a>
+  <a href="#library"><span class="n">03</span>Library</a>
+  <a href="#find"><span class="n">04</span>Find anything</a>
+  <a href="#playing"><span class="n">05</span>Now playing</a>
+  <a href="#make"><span class="n">06</span>Make it yours</a>
+  <a href="#formats"><span class="n">07</span>Formats</a>
+  <a href="#cast"><span class="n">08</span>Casting</a>
+  <a href="#multiroom"><span class="n">09</span>Multi-room</a>
+  <a href="#apps"><span class="n">10</span>Listen anywhere</a>
+  <a href="#manage"><span class="n">11</span>Manage</a>
+  <a href="#settings"><span class="n">12</span>Settings</a>
+  <a href="#faq"><span class="n">13</span>Help</a>
+  <a href="#reference"><span class="n">14</span>Reference</a>
+</aside>
+
+<main>
+<div class="wrap">
+
+  <!-- ── HERO ─────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="eyebrow">Self-hosted · Browser-based · Zero cloud</div>
+    <h1>Your whole collection,<br>from <span class="glow">SID</span> to <span class="glow">FLAC</span>.</h1>
+    <p class="lede">SoniqBoom is a self-hosted music server that plays the formats other servers forget —
+      chiptune, tracker modules, SID, MIDI, console rips — alongside FLAC, DSD and every modern codec,
+      streamed to any browser on your network.</p>
+    <div class="cta-row">
+      <a href="#start" class="btn primary">▶ Get started</a>
+      <a href="#reference" class="btn">Reference library</a>
+    </div>
+    <figure>
+      <div class="frame">
+        <div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/01-library.png" alt="The SoniqBoom library view showing a large mixed collection with format badges">
+      </div>
+      <figcaption>The <b>library</b> — a six-figure collection, every track tagged with its true format.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ── WHAT YOU GET ─────────────────────────────────────────────── -->
+  <section id="features">
+    <h2 class="sec"><span class="num">01</span>What's inside</h2>
+    <p class="sec-sub">One server for the everyday lossless library <em>and</em> the weird corners of music history.</p>
+    <div class="grid cols-3">
+      <div class="card"><span class="ico">🎮</span><h4>Chiptune &amp; console</h4><p>SID, NSF, SPC, GBS, VGM, AY, KSS, SAP, GYM, HES — rendered on the fly and played in the browser.</p></div>
+      <div class="card"><span class="ico">🎹</span><h4>Tracker modules</h4><p>MOD, XM, IT, S3M, MED, AHX, HivelyTracker and ~20 module formats, with per-channel VU meters.</p></div>
+      <div class="card"><span class="ico">🟥</span><h4>AdLib / OPL FM</h4><p>The sound of DOS gaming — id Software IMF, ROL, CMF and more, through an OPL2 synthesiser.</p></div>
+      <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD) and every common lossy codec.</p></div>
+      <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Channel-level VU meters, a live decode signal-chain, and the Library Galaxy star-field of your formats.</p></div>
+      <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares straight from the admin panel — no operating-system mount required.</p></div>
+      <div class="card"><span class="ico">📱</span><h4>OpenSubsonic API</h4><p>Connect Amperfy, Symfonium, DSub, Feishin and the wider Subsonic app ecosystem to your server.</p></div>
+      <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide Radio Browser directory, with live now-playing titles.</p></div>
+      <div class="card"><span class="ico">📡</span><h4>Casting <span class="badge beta">Beta</span></h4><p>Send playback to Chromecast, AirPlay and DLNA receivers — even rendered SID and tracker tunes.</p></div>
+      <div class="card"><span class="ico">👥</span><h4>Multi-user &amp; PWA</h4><p>Accounts with roles, instant-mix radio, smart playlists, offline downloads, time-synced lyrics, scrobbling, and an installable progressive web app.</p></div>
+    </div>
+  </section>
+
+  <!-- ── INSTALL ──────────────────────────────────────────────────── -->
+  <section id="start">
+    <h2 class="sec"><span class="num">02</span>Install &amp; first run</h2>
+    <p class="sec-sub">SoniqBoom runs on macOS and Linux. Point it at your music, hit scan, and open it in any browser.</p>
+
+    <div class="note"><b>Before you start.</b> You'll need <strong>macOS or Linux</strong>, <strong>Python 3.11 or
+      newer</strong>, and <strong>git</strong> (macOS: <code>brew install git</code>; Linux:
+      <code>apt install git</code> or your distro's equivalent). The installer fetches everything else — ffmpeg and
+      all the renderers. Any modern desktop or mobile browser can play the library; plan for memory that grows with
+      your collection, since the whole index lives in RAM (see <a href="#manage">System notes</a>).</div>
+
+    <h3>macOS &amp; Linux — one-shot install</h3>
+    <pre><span class="c"># clone, install everything, and start the server</span>
+git clone https://github.com/SFCyris/SoniqBoom.git
+cd SoniqBoom
+bash <span class="k">install.sh</span>        <span class="c"># Python, ffmpeg, and ALL retro renderers</span>
+bash <span class="k">run.sh</span>            <span class="c"># starts the server on port 8080</span></pre>
+
+    <div class="note"><b>The installer sets up every renderer for you.</b> One run of
+      <code>install.sh</code> installs <code>sidplayfp</code> (SID), <code>fluidsynth</code> (MIDI),
+      <code>libopenmpt</code> (trackers), <code>uade</code> (AHX), <code>libgme</code> (console
+      chiptunes) and <code>adplay</code> (AdLib/OPL) — on macOS via Homebrew, on Linux via your
+      distribution's package manager (apt, dnf, pacman or zypper). The HivelyTracker decoder is
+      bundled with SoniqBoom itself. Nothing to pick, nothing to add later — every format in this
+      guide plays out of the box.</div>
+
+    <h3>Or run it in Docker</h3>
+    <p>One container ships ffmpeg and all the renderers. Your music mounts read-only at
+       <code>/music</code>; everything the server writes lives in one named volume.</p>
+    <pre><span class="c"># clone, build, and start — then create the first admin</span>
+git clone https://github.com/SFCyris/SoniqBoom.git
+cd SoniqBoom
+docker compose <span class="k">up -d</span>
+docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alice -passwd 'a-strong-password'</pre>
+    <p>Open <code>http://&lt;host&gt;:8080</code>, sign in, and add <code>/music</code> as a library folder.
+       For automatic HTTPS on your own domain, the repo includes a Caddy stack —
+       <code>docker compose -f deploy/docker-compose.https.yml up -d</code>. Full details, updating,
+       and backup notes live in <code>DEPLOY.md</code>.</p>
+
+    <h3>Then, the first time you start it</h3>
+    <ol class="steps">
+      <li><b>Create the first admin account.</b> A fresh install has no users; the first run prompts you for
+        a username and password on the terminal, or set it manually:
+        <pre>.venv/bin/soniqboom-setadm -user alice -passwd 'changeme123'</pre></li>
+      <li><b>Sign in.</b> Open <code>http://localhost:8080</code> and enter those credentials.</li>
+      <li><b>Open the admin panel</b> with the gear icon (top-right).</li>
+      <li><b>Add a music folder</b> — a local path, or an <code>FTP</code> / <code>SMB</code> / <code>WebDAV</code> share.</li>
+      <li><b>Wait for the scan</b> — roughly two minutes per 50,000 tracks. Your library is ready when it finishes.</li>
+    </ol>
+  </section>
+
+  <!-- ── LIBRARY ──────────────────────────────────────────────────── -->
+  <section id="library">
+    <h2 class="sec"><span class="num">03</span>Browse your library</h2>
+    <p class="sec-sub">All Tracks, Artists, Albums, Genres, Years — plus folder trees that mirror your shares, and instant search.</p>
+
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/04-folders.png" alt="Folder tree with FTP, SMB, and local sources expanded"></div>
+      <figcaption>The <b>folder tree</b> mirrors every source — local disks and FTP / SMB / WebDAV shares alike.</figcaption>
+    </figure>
+
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/02-artists.png" alt="Artists browser"></div>
+        <figcaption>The <b>Artists</b> view.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/03-search.png" alt="Instant search results"></div>
+        <figcaption><b>Search</b> spans the whole library instantly.</figcaption>
+      </figure>
+    </div>
+
+    <h3>The Library Galaxy</h3>
+    <p>Every track in your collection rendered as a drifting star-field — each format its own glowing
+       constellation, sized by how much of it you own. The legend doubles as a census of your library.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/05-galaxy.png" alt="The Library Galaxy — formats shown as constellations with a count legend"></div>
+      <figcaption>The <b>Library Galaxy</b> — formats as constellations, with live per-format counts.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ── FIND ─────────────────────────────────────────────────────── -->
+  <section id="find">
+    <h2 class="sec"><span class="num">04</span>Find anything</h2>
+    <p class="sec-sub">A search bar that understands field operators, and smart views that surface your library by listening habit.</p>
+
+    <h3>Search with field operators</h3>
+    <p>Type anything to search titles, artists and albums at once. Narrow it with field operators —
+       stack as many as you like:</p>
+    <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC</pre>
+    <table>
+      <thead><tr><th>Operator</th><th>Matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>artist:</code> <code>album:</code> <code>albumartist:</code></td><td>That field only.</td></tr>
+        <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;1990</code></td><td>Exact year, or after / before a year.</td></tr>
+        <tr><td><code>format:FLAC</code> · <code>format:SID</code></td><td>Restrict to one format.</td></tr>
+        <tr><td><code>genre:</code> <code>composer:</code> <code>title:</code></td><td>Match those fields.</td></tr>
+        <tr><td><code>artist:"The Ghost Inside"</code></td><td>Quote any value containing spaces.</td></tr>
+      </tbody>
+    </table>
+    <div class="note">Press <span class="kbd">/</span> anywhere to jump to the search box. A mistyped operator (an unknown <code>field:</code>) is flagged in the preview instead of silently returning nothing.</div>
+
+    <h3>Smart views</h3>
+    <p>The sidebar's <strong>Smart</strong> section builds these on the fly from your play history and ratings:</p>
+    <div class="grid cols-3">
+      <div class="card"><span class="ico">🕒</span><h4>Listening History</h4><p>Everything you've played, most recent first.</p></div>
+      <div class="card"><span class="ico">🔂</span><h4>Most Played</h4><p>Your highest play-counts, ranked.</p></div>
+      <div class="card"><span class="ico">✨</span><h4>Recently Added</h4><p>The newest tracks the scanner found.</p></div>
+      <div class="card"><span class="ico">⭐</span><h4>Top Rated</h4><p>The tracks you've starred highest.</p></div>
+      <div class="card"><span class="ico">🆕</span><h4>Unplayed</h4><p>Everything you haven't heard yet.</p></div>
+      <div class="card"><span class="ico">♊</span><h4>Duplicates</h4><p>Likely duplicate tracks, grouped for cleanup.</p></div>
+    </div>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/12-mostplayed.png" alt="The Most Played smart view listing top tracks, with the search bar showing field operators above it"></div>
+      <figcaption>A <b>smart view</b> in action — <i>Most Played</i>, with the field-operator search bar above the list.</figcaption>
+    </figure>
+
+    <h3>Instant Mix radio</h3>
+    <p>Press the <b>📻 radio button</b> in the player toolbar while anything is playing and SoniqBoom
+       builds an endless queue around it — tracks picked by genre, artist, era, tempo and format, spread
+       across artists. A SID radio stays chiptune, a FLAC radio follows the genre. The queue refills itself
+       as you listen, seeded from whatever is playing now.</p>
+    <p><strong>Radio view.</strong> Starting a radio opens a full radio view: the cover art large with a
+       live oscilloscope playing across it, the track that's on, and the upcoming tracks with their covers —
+       the list fades out at the bottom because more is always coming; click any entry to jump to it.
+       <b>Save as playlist</b> keeps the mix. Leaving the view — <b>Stop radio</b>,
+       <span class="kbd">Esc</span> or the <b>×</b> — ends the radio; the tracks already queued keep
+       playing.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/23-radiomode.png" alt="The radio view: large album art overlaid with a live green oscilloscope, the current track title, transport controls, an up-next list, and Save-as-playlist and Stop-radio buttons"></div>
+      <figcaption><b>Radio view</b> — the cover with a live oscilloscope, what's playing, and what's next.</figcaption>
+    </figure>
+
+    <h3>Internet radio stations</h3>
+    <p>The sidebar's <strong>Stations</strong> section plays live internet radio. It has three lists:</p>
+    <ul>
+      <li><b>Favorites</b> — the stations you've starred. <i>Nectarine Demoscene Radio</i> is there to start.</li>
+      <li><b>Scene</b> — a curated pack of demoscene, chiptune, SID and game-music stations
+        (SceneSat, Nectarine, SLAY Radio, Kohina, Radio PARALAX, CVGM, Rainwave and more).</li>
+      <li><b>World</b> — the worldwide <a href="https://www.radio-browser.info/" target="_blank" rel="noopener">Radio
+        Browser</a> directory, browsed by <b>continent → country</b>, then split into
+        <b>Top 10</b>, <b>Top 11–50</b> and <b>Remaining</b> by listener votes.</li>
+    </ul>
+    <p>Click a station to play it. SoniqBoom relays the stream through your server and starts at the
+       highest quality your browser supports, stepping down automatically if the stream can't keep up.
+       Stations that offer several qualities appear once, under one name. The player shows the station and
+       the track that's on air; the <b>★ button</b> adds or removes it from Favorites.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/24-stations.png" alt="The Stations view: the Scene list of demoscene and chiptune stations with codec and stream counts, a now-playing card at the top showing SceneSat Radio with its current track, and a station search box in the header"></div>
+      <figcaption>The <b>Stations</b> view — the Scene pack playing, each station listed once with its qualities.</figcaption>
+    </figure>
+    <p><strong>Station details.</strong> While a station plays, the <b>ⓘ button</b> in the player toolbar
+       opens its details — tags, website, the live now-playing title, and every available stream with the
+       one you're hearing marked.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/25-stationinfo.png" alt="The station details panel for SceneSat Radio showing tags, a website link, the current track title, and a list of streams from MP3 320 kbps down to AAC+ 48 kbps with the playing one marked"></div>
+      <figcaption><b>Station details</b> — tags, website, the live track, and the full quality ladder.</figcaption>
+    </figure>
+    <div class="note"><b>Search stations.</b> Open any Stations list and the search box becomes a station
+      search. Station matches also appear under a <b>Stations</b> heading in the main search results, so you
+      can find one without leaving your library.</div>
+
+    <h3>More like this</h3>
+    <p>Select any track in the list and press the <b>◆ button</b> in the player toolbar — a panel lists the
+       closest matches with a relative similarity score. Tracks that have been played before are also
+       compared by their <em>loudness contour</em> — songs that move the same way rank higher.
+       Click a result to play it.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/18-similar.png" alt="The More-like-this panel open over the track list, showing ten similar tracks with percentage scores"></div>
+      <figcaption><b>More like this</b> — the closest matches to the selected track, scored.</figcaption>
+    </figure>
+
+    <h3>Smart playlists — save a search</h3>
+    <p>Any search can become a playlist that keeps itself up to date. Type a query — say
+       <code>format:SID year:&gt;1988</code> — and press <b>⚡ Save search</b> next to the search box.
+       Name it, and it appears under <strong>Playlists</strong> with a ⚡ marker. Opening it re-runs the
+       saved search, so new tracks that match are included automatically. Smart playlists work in
+       Subsonic apps too.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/20-savesearch.png" alt="The search bar with the query format:SID year:>1988 typed and the Save search button visible in the header"></div>
+      <figcaption>Type a query, press <b>⚡ Save search</b> — it becomes a self-updating playlist.</figcaption>
+    </figure>
+
+    <div class="note"><b>🌐 Find more music.</b> The globe button in the top bar opens curated links to
+      chiptune and demoscene archives — <a href="https://www.hvsc.de/" target="_blank" rel="noopener">HVSC</a>,
+      <a href="https://modarchive.org/" target="_blank" rel="noopener">The Mod Archive</a>, the
+      <a href="http://sndh.atari.org/" target="_blank" rel="noopener">SNDH</a> Atari archive and more.
+      Download what you like, drop it in a scan folder, and SoniqBoom indexes it.</div>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/13-findmusic.png" alt="The Find more music panel listing archive cards: HVSC, The Mod Archive, SNDH, ZXART, AMP and demoscene sites"></div>
+      <figcaption>The <b>Find more music</b> panel — one-click links to HVSC, The Mod Archive, SNDH, ZXART and the demoscene.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ── PLAYING ──────────────────────────────────────────────────── -->
+  <section id="playing">
+    <h2 class="sec"><span class="num">05</span>Now playing</h2>
+    <p class="sec-sub">Click any track and it plays — even a 1987 SID tune or a 64-channel tracker module, rendered to audio on the fly.</p>
+
+    <h3>Per-channel VU meters for tracker modules</h3>
+    <p>Open any module and SoniqBoom shows a meter for <em>every</em> voice in the song — Paula channels,
+       sample slots, OPL operators — dancing in real time, alongside the module's real metadata: channel
+       and pattern counts, instrument names, and the embedded text messages trackers are famous for.
+       A live <strong>signal path</strong> traces the exact decode chain for the playing track.</p>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/07-trackinfo.jpg" alt="Track info modal for a 16-channel ScreamTracker 3 module with per-channel VU meters"></div>
+        <figcaption>A 16-channel <b>ScreamTracker 3</b> module — VU per channel, module details, signal path.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/08-tracker64.jpg" alt="A 64-channel Impulse Tracker module with per-channel VU meters"></div>
+        <figcaption>A <b>64-channel</b> Impulse Tracker module — every voice metered at once.</figcaption>
+      </figure>
+    </div>
+    <div class="note">For SID and other formats without per-voice data, the meter falls back to a live
+      32-bin <b>FFT spectrum analyser</b>, labelled so you always know which view you're seeing.</div>
+
+    <h3>Equalizer &amp; visualizer</h3>
+    <p>A built-in graphic <strong>equalizer</strong> shapes the sound band by band — toggle it with
+       <span class="kbd">E</span>, and choose from a row of presets or drag the bands by hand. The full-screen
+       <strong>visualizer</strong> cycles through several modes — oscilloscope, CRT, a scrolling spectrogram,
+       and a neon synthwave grid — with <span class="kbd">V</span>.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/11-equalizer.png" alt="The graphic equalizer open over the player, with frequency-band sliders and preset buttons"></div>
+      <figcaption>The graphic <b>equalizer</b> — shape the sound band by band, or pick a preset.</figcaption>
+    </figure>
+    <div class="note"><b>Gapless playback.</b> Near the end of a track, the next one in the queue is
+       fetched ahead of time, so playback rolls straight into it without a network pause at the seam.
+       Prefer a blend instead? Set a <em>Crossfade</em> length in Settings and tracks fade into each
+       other.</div>
+
+    <h3>Time-synced lyrics</h3>
+    <p>Lyrics scroll line-by-line with playback — read from the file's own tags, or fetched from LRCLib
+       when the file has none embedded.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/09-lyrics.jpg" alt="Time-synced lyrics scrolling with the track"></div>
+      <figcaption><b>Time-synced lyrics</b> follow the music.</figcaption>
+    </figure>
+
+    <h3>Podcast &amp; audiobook chapters</h3>
+    <p>For files that carry chapter marks — MP3 podcasts and <code>.m4a</code> / <code>.m4b</code> / <code>.mp4</code>
+       audiobooks — open the <strong>Track Info</strong> panel (the circled-<span class="kbd">i</span> button) to see a
+       numbered <em>Chapters</em> list. Tap any chapter to jump straight to it.</p>
+
+    <h3>About the artist &amp; tag editing</h3>
+    <p>The <strong>Track Info</strong> panel also shows an <em>About the artist</em> card — a short bio and
+       portrait, with a link to the full article — whenever the artist has one. The artist is matched
+       through MusicBrainz using the album and track you're viewing, and the bio comes from the matched
+       artist's Wikipedia page: "Ghost" on an Impera track is the Swedish band, not the apparition.
+       Below it, <b>✏️ Edit tags</b> opens an inline form for title, artist, album, album artist, genre and
+       year: <b>Save tags</b> writes the changes into the audio file itself and updates the library at the
+       same time. Editing works on local files; tracks on network shares show the button disabled.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/22-tagedit.png" alt="The Track Info panel showing the About-the-artist card with a Wikipedia bio and portrait, and the open tag-editing form with Save tags and Cancel buttons"></div>
+      <figcaption><b>Track Info</b> — the artist's story from Wikipedia, and tags you can fix in place.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ── MAKE IT YOURS ────────────────────────────────────────────── -->
+  <section id="make">
+    <h2 class="sec"><span class="num">06</span>Make it yours</h2>
+    <p class="sec-sub">Rate, queue and build playlists — and drive the whole player from the keyboard.</p>
+    <div class="grid cols-3">
+      <div class="card"><span class="ico">⭐</span><h4>Ratings</h4><p>Star tracks to score them; your ratings feed the <em>Top Rated</em> smart view.</p></div>
+      <div class="card"><span class="ico">📜</span><h4>Play queue</h4><p>Toggle the queue with <span class="kbd">Q</span>, reorder what's coming up, and queue tracks from any list.</p></div>
+      <div class="card"><span class="ico">🎶</span><h4>Playlists</h4><p>Build and edit your own playlists from the sidebar — add single tracks, whole folders, or search results.</p></div>
+    </div>
+
+    <h3>Keyboard shortcuts</h3>
+    <p>Press <span class="kbd">?</span> at any time to see this list inside the app. <span class="kbd">⌘</span> is
+       Command on macOS (the Super / Windows key elsewhere); <span class="kbd">⌥</span> is Option / Alt.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/10-shortcuts.png" alt="The in-app Keyboard Shortcuts overlay, grouped into Playback, Navigation and Library sections"></div>
+      <figcaption>The in-app <b>shortcut sheet</b> — press <span class="kbd">?</span> to open it.</figcaption>
+    </figure>
+
+    <p class="muted" style="margin:16px 0 2px"><strong>Playback</strong></p>
+    <table><tbody>
+      <tr><td><span class="kbd">Space</span></td><td>Play / pause</td><td><span class="kbd">M</span></td><td>Mute / unmute</td></tr>
+      <tr><td><span class="kbd">⌘</span> <span class="kbd">→</span> / <span class="kbd">←</span></td><td>Next / previous</td><td><span class="kbd">S</span></td><td>Shuffle</td></tr>
+      <tr><td><span class="kbd">↑</span> / <span class="kbd">↓</span></td><td>Volume up / down</td><td><span class="kbd">R</span></td><td>Repeat (cycle)</td></tr>
+      <tr><td><span class="kbd">Q</span></td><td>Toggle the queue</td><td><span class="kbd">E</span></td><td>Equalizer</td></tr>
+      <tr><td><span class="kbd">V</span></td><td>Cycle the visualizer</td><td><span class="kbd">I</span></td><td>Track info</td></tr>
+    </tbody></table>
+
+    <p class="muted" style="margin:16px 0 2px"><strong>Browse &amp; select</strong></p>
+    <table><tbody>
+      <tr><td><span class="kbd">J</span> / <span class="kbd">K</span></td><td>Move down / up the track list</td><td><span class="kbd">Enter</span></td><td>Play the focused track</td></tr>
+      <tr><td><span class="kbd">A</span></td><td>Add the focused track to the queue</td><td><span class="kbd">/</span></td><td>Focus the search box</td></tr>
+      <tr><td><span class="kbd">?</span></td><td>Show this shortcut list</td><td></td><td></td></tr>
+    </tbody></table>
+
+    <p class="muted" style="margin:16px 0 2px"><strong>Jump to a view</strong></p>
+    <table><tbody>
+      <tr><td><span class="kbd">1</span>–<span class="kbd">6</span></td><td>Library views — All Tracks, Artists, Album Artists, Albums, Genres, Years</td></tr>
+      <tr><td><span class="kbd">⌥</span><span class="kbd">1</span>–<span class="kbd">6</span></td><td>Smart views — History, Most Played, Recently Added, Top Rated, Unplayed, Duplicates</td></tr>
+      <tr><td><span class="kbd">H</span> · <span class="kbd">D</span></td><td>Quick keys for History · Duplicates</td></tr>
+    </tbody></table>
+  </section>
+
+  <!-- ── FORMATS ──────────────────────────────────────────────────── -->
+  <section id="formats">
+    <h2 class="sec"><span class="num">07</span>Every format, at a glance</h2>
+    <p class="sec-sub">Forty-plus formats through one render pipeline. The reference addenda below tell each one's story.</p>
+    <table>
+      <thead><tr><th>Family</th><th>Formats</th><th>Rendered by</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack, Musepack</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>DSD (1-bit)</strong></td><td>DSF, DFF, WSD</td><td>ffmpeg</td></tr>
+        <tr><td><strong>SID</strong> (C64)</td><td><code>.sid</code>, <code>.psid</code></td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
+        <tr><td><strong>MIDI</strong></td><td><code>.mid</code>, <code>.midi</code></td><td>FluidSynth + SoundFonts</td></tr>
+        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, DSM …</td><td>libopenmpt</td></tr>
+        <tr><td><strong>Amiga</strong></td><td>AHX, HivelyTracker (HVL)</td><td>uade123 / bundled HivelyTracker engine</td></tr>
+        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES</td><td>libgme</td></tr>
+        <tr><td><strong>AdLib / OPL2 FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX …</td><td>AdPlug (<code>adplay</code>)</td></tr>
+      </tbody>
+    </table>
+    <p>ZIP archives are scanned and played <strong>inline</strong> — tracks inside <code>.zip</code> files
+       appear in your library without unpacking.</p>
+    <div class="note"><b>DSD &amp; hi-res.</b> One-bit DSD files (<code>.dsf</code>, <code>.dff</code>, <code>.wsd</code>)
+       play in any browser — SoniqBoom converts them to high-resolution PCM on the fly, and the library tags each
+       one by rate (<code>DSD64</code>, <code>DSD128</code>, <code>DSD256</code>, <code>DSD512</code>). High-resolution
+       PCM — 24-bit FLAC, WAV and the like — streams to the browser without re-encoding.</div>
+  </section>
+
+  <!-- ── CAST ─────────────────────────────────────────────────────── -->
+  <section id="cast">
+    <h2 class="sec"><span class="num">08</span>Casting <span class="badge beta">Beta</span></h2>
+    <p class="sec-sub">Send what you're playing to a TV, speaker or receiver on your network.</p>
+    <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported and
+      under active testing; behaviour can vary by device.</div>
+    <ol class="steps">
+      <li>Press the <b>cast button</b> in the player toolbar.</li>
+      <li>Pick a device from the list — discovered Chromecast, Apple TV / HomePod (AirPlay), and DLNA receivers appear together.</li>
+      <li>Playback moves to that device. Even SID, MIDI and tracker tunes are rendered to standard audio first, so they cast like any FLAC.</li>
+      <li>Some AirPlay devices show a <b>PIN</b> the first time you connect — type it into the pairing dialog to authorise SoniqBoom.</li>
+      <li>Open <b>Audio quality</b> in the picker to choose: <b>Auto</b> (lossless when the device supports it, otherwise MP3 320), <b>Original</b> (no transcoding), <b>FLAC</b> (lossless transcode for every track), or <b>MP3 320</b> (smallest bandwidth, widest compatibility).</li>
+    </ol>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/06-cast.png" alt="The cast picker overlay, headed 'Cast to device (Beta)', listing discovered Chromecast, AirPlay and DLNA devices"></div>
+      <figcaption>The <b>cast picker</b> — Chromecast, AirPlay and DLNA devices discovered on the LAN.</figcaption>
+    </figure>
+    <div class="note beta"><b>SoniqBoom as a DLNA server <span class="badge beta">Beta</span> — off by default.</b>
+      Besides sending audio out, SoniqBoom can announce itself as a <strong>DLNA Media Server</strong> so UPnP
+      controllers on your network (some smart TVs and receivers) can browse and play your library. Turn it on in
+      <a href="#settings">Settings → Services</a>; while it is on, any controller on the same network can browse your
+      whole library.</div>
+  </section>
+
+  <!-- ── MULTI-ROOM ───────────────────────────────────────────────── -->
+  <section id="multiroom">
+    <h2 class="sec"><span class="num">09</span>Multi-room sync</h2>
+    <p class="sec-sub">Play the same music in step across the devices on your network — one device leads, the rest follow in lockstep.</p>
+
+    <p>SoniqBoom has a dedicated multi-room controller. Open it at <code>/multiroom</code> on your server — for
+      example <code>http://localhost:8080/multiroom</code>, or your server's own address. One device becomes the
+      <strong>master</strong> and drives playback; every other device joins as a <strong>listener</strong> and stays
+      in sync.</p>
+
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/15-multiroom-landing.png" alt="The multi-room landing screen at /multiroom — a device-label field, a '+ Create new room' button, and an Active rooms list"></div>
+      <figcaption>The <b>multi-room</b> entry screen at <code>/multiroom</code> — name your device, then create or join a room.</figcaption>
+    </figure>
+
+    <h3>Start a room — the master</h3>
+    <ol class="steps">
+      <li>Open <code>/multiroom</code> in a browser on the device that will lead.</li>
+      <li>Type a <b>device label</b> (for example <em>Kitchen speaker</em>).</li>
+      <li>Click <b>+ Create new room</b>, give the room a name, then <b>Create &amp; become master</b>.</li>
+      <li>As master you browse <b>Tracks</b>, <b>Playlists</b> and <b>Albums</b>, search, and control playback —
+        play/pause, next/previous, shuffle and repeat. The <b>Listeners</b> panel shows every device that has joined.</li>
+    </ol>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/16-multiroom-master.png" alt="The multi-room master view — now playing with transport controls, a Tracks / Playlists / Albums library, a Listeners panel showing the master and one listener, and an Up Next queue"></div>
+      <figcaption>The <b>master</b> view — pick and control the music; the <b>Listeners</b> panel shows every connected device.</figcaption>
+    </figure>
+
+    <h3>Join a room — a listener</h3>
+    <ol class="steps">
+      <li>Open <code>/multiroom</code> on another device and type a device label.</li>
+      <li>Pick the room under <b>Active rooms</b> — you join as a listener and follow the master in sync, with a live
+        sync-drift meter on screen.</li>
+      <li>Press <b>Leave</b> to drop out. If a room has no master (the leader left), the next device to open that room
+        becomes the master.</li>
+    </ol>
+    <figure style="max-width:380px;margin:24px auto">
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/17-multiroom-listener.png" alt="The multi-room listener view — the current track, a progress bar, and a live Sync drift meter reading -2 ms"></div>
+      <figcaption>A <b>listener</b> follows the master — the <b>Sync</b> meter shows the drift in milliseconds.</figcaption>
+    </figure>
+
+    <div class="note">Every device must be able to reach the same SoniqBoom server. Multi-room is one of SoniqBoom's
+      optional services and is on by default — it can be turned off in <a href="#settings">Settings → Services</a>.</div>
+  </section>
+
+  <!-- ── LISTEN ANYWHERE ──────────────────────────────────────────── -->
+  <section id="apps">
+    <h2 class="sec"><span class="num">10</span>Listen anywhere</h2>
+    <div class="grid cols-3">
+      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>SoniqBoom speaks the OpenSubsonic API. Point Amperfy, Symfonium, DSub or Feishin at your server's address and sign in with your SoniqBoom username and password.</p></div>
+      <div class="card"><span class="ico">🔁</span><h4>Multi-room</h4><p>Play the same track in lockstep across your devices — see <a href="#multiroom">Multi-room sync</a>.</p></div>
+      <div class="card"><span class="ico">⬇️</span><h4>Installable PWA</h4><p>Add SoniqBoom to your home screen or dock for a full-screen, app-like experience, online or off.</p></div>
+    </div>
+
+    <h3>On your phone</h3>
+    <p>Open SoniqBoom on a phone and it adapts automatically — the full player works at phone width, and on phones
+       the site also serves a dedicated <strong>touch-first shell</strong> with Library, Search, Queue, Now Playing
+       and Settings tabs plus a tap-to-expand mini-player. A <em>Desktop site</em> link switches to the full desktop
+       UI whenever you want it. <a href="#cast">Casting</a> is reachable from the mobile mini-player too
+       (<span class="badge beta">Beta</span>).</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/14-mobile.png" alt="SoniqBoom running in a narrow phone-width browser, showing the track list and the player transport"></div>
+      <figcaption>SoniqBoom on a <b>phone-sized screen</b>.</figcaption>
+    </figure>
+    <h3>Take it offline</h3>
+    <p>Press the <b>⤓ download button</b> in the player toolbar to keep the current track on the device
+       you're using — it plays even with no connection to the server. The button lights up on tracks you've
+       downloaded; press it again to remove the copy. Everything else streams exactly as before.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/21-transport.png" alt="The player toolbar with the new controls: radio, download for offline, equalizer, more-like-this, lyrics, cast, playlists and queue"></div>
+      <figcaption>The <b>player toolbar</b> — radio 📻, offline download ⤓ and more-like-this ◆ sit beside shuffle, repeat and EQ.</figcaption>
+    </figure>
+
+    <p>Multi-user accounts and roles, last.fm and ListenBrainz scrobbling, and a light/dark theme are all built
+       in — see <a href="#manage">Manage your library &amp; users</a> and <a href="#settings">Settings</a>.</p>
+  </section>
+
+  <!-- ── MANAGE LIBRARY & USERS ───────────────────────────────────── -->
+  <section id="manage">
+    <h2 class="sec"><span class="num">11</span>Manage your library &amp; users</h2>
+    <p class="sec-sub">Add network shares, keep the index fresh, back up your data, and decide who can do what — all from the admin panel (gear icon, top-right).</p>
+
+    <h3>Add a network share — FTP, SMB or WebDAV</h3>
+    <p>In the admin panel's <strong>Music Folders</strong> section, switch from <em>Local Path</em> to the
+       <strong>Network Share</strong> tab and pick a protocol:</p>
+    <table>
+      <thead><tr><th>Protocol</th><th>You enter</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SMB</strong></td><td>Host, share name and path — with a username and password, or tick <em>Guest access</em>.</td></tr>
+        <tr><td><strong>FTP</strong></td><td>Host and remote path — with a username and password, or tick <em>Anonymous</em>.</td></tr>
+        <tr><td><strong>WebDAV</strong> (http / https)</td><td>A base URL — with a username and password, or tick <em>Public (no auth)</em>.</td></tr>
+      </tbody>
+    </table>
+    <p>Add an optional alias, click <strong>Test</strong> to check the connection, then <strong>+ Connect</strong> —
+       SoniqBoom attaches the share with no operating-system mount required and scans it straight away.</p>
+
+    <h3>Keep your library fresh</h3>
+    <p>Local folders are <strong>watched automatically</strong> — files you add, change or remove are picked up within
+       a couple of seconds. Network shares are re-checked on a periodic background poll, and you can force one with the
+       <strong>Check now</strong> button on a remote folder. To rebuild everything by hand, use
+       <strong>↻ Rebuild Index</strong>; to re-scan a single folder, use its <strong>Re-Index</strong> button.
+       While a scan is running you can <strong>Pause</strong> it and later <strong>Resume</strong> from where it left
+       off — handy for easing server load during busy listening.</p>
+
+    <h3>Back up &amp; restore</h3>
+    <p>The admin panel's <strong>Backup</strong> tab exports your whole database to a single date-stamped file
+       (<code>soniqboom-YYYY-MM-DD.sbz</code>) — a compressed snapshot of your track index and metadata, waveforms,
+       star ratings, play counts, playlists, listening history, your scan-folder list and library settings.
+       <strong>Import .sbz</strong> restores it; it replaces the current library data and asks you to confirm first.</p>
+    <div class="note">The backup holds your <em>library database</em>, not the audio files themselves, and it does not
+       include user accounts — keep those, and your music, backed up separately.</div>
+
+    <h3>User accounts &amp; roles</h3>
+    <p>Manage people in the admin panel's <strong>Users</strong> tab — add a user, set their role, enable or disable
+       them, set a password, or remove them. Three roles decide what each person can do:</p>
+    <table>
+      <thead><tr><th>Capability</th><th>Read-only</th><th>Edit</th><th>Admin</th></tr></thead>
+      <tbody>
+        <tr><td>Browse &amp; play the whole library</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Rate tracks &amp; build play history</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Create &amp; manage playlists</td><td>—</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Manage users, folders, settings &amp; backups</td><td>—</td><td>—</td><td>✓</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">New accounts come from two places: an admin adds them in the <strong>Users</strong> tab with a
+       role, or a visitor signs themselves up from the login screen — self-registered accounts are always
+       <strong>Read-only</strong> until an admin promotes them.</p>
+
+    <h3>Reset a password or recover access</h3>
+    <p>Run this on the server host to set any user's password — it's also how you create the very first admin on a
+       fresh install:</p>
+    <pre>.venv/bin/soniqboom-setadm -user alice -passwd 'a-new-password'
+.venv/bin/soniqboom-setadm -user alice -passwd 'a-new-password' -role admin   <span class="c"># also make them an admin</span></pre>
+
+    <h3>System notes</h3>
+    <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory, so browsing and search
+       stay instant even at six-figure track counts — plan for RAM that grows with the size of your collection. The
+       initial scan runs at roughly two minutes per 50,000 tracks. On disk, SoniqBoom keeps a snapshot of the library
+       plus a render / transcode cache for instant replay — 4 GB by default, adjustable from 256 MB to 100 GB in
+       <a href="#settings">Settings → Renderers</a>.</div>
+  </section>
+
+  <!-- ── SETTINGS & INTEGRATIONS ──────────────────────────────────── -->
+  <section id="settings">
+    <h2 class="sec"><span class="num">12</span>Settings &amp; integrations</h2>
+    <p class="sec-sub">Open the admin panel with the gear icon (top-right) to connect outside services and tune the extras.</p>
+    <div class="grid cols-2">
+      <div class="card"><span class="ico">🎹</span><h4>SoundFonts for MIDI</h4><p>Open <strong>gear → Renderers → Soundfonts</strong>. Click <strong>↑ Upload .sf2/.sf3</strong> to add your own bank, or pick one from <strong>Download Known Soundfonts</strong> for a one-click install. Select an installed bank to make it the active MIDI voice.</p></div>
+      <div class="card"><span class="ico">🧬</span><h4>HVSC for SID</h4><p>Download the <a href="https://www.hvsc.de/" target="_blank" rel="noopener">High Voltage SID Collection</a>, then in <strong>gear → Renderers → HVSC SID database</strong> paste the path to its <code>DOCUMENTS</code> folder and click <strong>Save &amp; reload</strong> — every SID gains its exact per-tune length and STIL credits.</p></div>
+      <div class="card"><span class="ico">📈</span><h4>Scrobbling</h4><p>In <strong>gear → System → My Account</strong>, paste your <strong>ListenBrainz user token</strong> (from <a href="https://listenbrainz.org/profile" target="_blank" rel="noopener">listenbrainz.org/profile</a>) and/or your <strong>last.fm session key</strong>. Plays are logged automatically once a token is saved.</p></div>
+      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Subsonic apps sign in with your <strong>SoniqBoom username and password</strong> — there's no separate Subsonic password. Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong>, then see <a href="#apps">Listen anywhere</a>.</p></div>
+      <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart.</p></div>
+      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), hide empty folders, choose which filenames count as folder art, and toggle ZIP-archive scanning.</p></div>
+      <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Switch between dark and light under <strong>gear → System → Settings → Theme</strong>; your choice is saved in the browser and applies instantly. (You can also change your own password here.)</p></div>
+      <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. Adjust the size from 256 MB to 100 GB in <strong>gear → Renderers → Transcode &amp; render cache</strong>.</p></div>
+    </div>
+  </section>
+
+  <!-- ── TROUBLESHOOTING ──────────────────────────────────────────── -->
+  <section id="faq">
+    <h2 class="sec"><span class="num">13</span>Troubleshooting</h2>
+    <p class="sec-sub">The handful of things people ask about first.</p>
+    <h3>A track is listed but won't play</h3>
+    <p>Its renderer isn't installed. Re-run <code>bash install.sh</code> (it installs them all), or install the one
+       package SoniqBoom names in the error — <code>sidplayfp</code>, <code>fluidsynth</code>, <code>libopenmpt</code>,
+       <code>uade</code>, <code>libgme</code> or <code>adplay</code>. Everything else keeps working in the meantime.</p>
+    <h3>A SID tune shows the wrong length</h3>
+    <p>Configure HVSC in <a href="#settings">Settings</a> — without it, SID durations fall back to an estimate.</p>
+    <h3>MIDI sounds thin or silent</h3>
+    <p>Install or select a SoundFont in <a href="#settings">Settings</a>; MIDI is synthesised from the active <code>.sf2</code> bank.</p>
+    <h3>I'm locked out / forgot the admin password</h3>
+    <p>On the server host, reset any account from the command line:
+       <code>.venv/bin/soniqboom-setadm -user &lt;name&gt; -passwd '&lt;new password&gt;'</code>
+       (add <code>-role admin</code> to restore admin rights). See <a href="#manage">Manage your library &amp; users</a>.</p>
+    <h3>A network share won't connect</h3>
+    <p>In the admin panel's <strong>Music Folders → Network Share</strong> form, use <strong>Test</strong> before
+       connecting — it reports the exact connection error. Check the host, share name / path and credentials, and that
+       the server can reach the share on your network.</p>
+    <h3>A cast device doesn't appear</h3>
+    <p>It must be on the same Wi-Fi / LAN as the server, and casting is in <span class="badge beta">Beta</span> —
+       behaviour varies by device. Wake the device, then use the picker's <em>Search again</em> button.</p>
+    <h3>The app didn't change after an upgrade</h3>
+    <p>SoniqBoom is an installable PWA, so the browser may still be serving a cached shell — reload the page
+       (or remove and re-add the installed app) to fetch the new version.</p>
+  </section>
+
+  <!-- ── REFERENCE ────────────────────────────────────────────────── -->
+  <section id="reference">
+    <h2 class="sec"><span class="num">14</span>Reference library</h2>
+    <p class="sec-sub">Three illustrated histories of the music SoniqBoom plays — where every format came from, and why it sounds the way it does.</p>
+    <div class="grid cols-3">
+      <a class="card" href="format-history.html" style="text-decoration:none;color:inherit">
+        <span class="ico">💿</span><h4>A Field Guide to Music Formats ▸</h4>
+        <p>From FLAC and DSD to SID, MIDI and OPL FM — the origin, hardware and codec behind every format, with reference links.</p></a>
+      <a class="card" href="tracker-history.html" style="text-decoration:none;color:inherit">
+        <span class="ico">🎛️</span><h4>The Tracker Lineage ▸</h4>
+        <p>Soundtracker to Impulse Tracker — the Amiga birth of module music, the PC tracker explosion, and the demoscene.</p></a>
+      <a class="card" href="retro-gaming.html" style="text-decoration:none;color:inherit">
+        <span class="ico">🕹️</span><h4>Music in Retro Gaming ▸</h4>
+        <p>How game soundtracks were made, chip by chip — NES, C64, Genesis, Game Boy, SNES, MSX and DOS.</p></a>
+    </div>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>SoniqBoom · Self-hosted music server · <a href="https://github.com/SFCyris/SoniqBoom">github.com/SFCyris/SoniqBoom</a></span>
+    <span class="muted">© 2026 S.F. Cyris · AGPL-3.0-or-later</span>
+  </div>
+</footer>
+
+<script>
+/* Sticky-TOC scroll-spy: highlight whichever section's top has last crossed
+   the trigger line near the top of the viewport. */
+(function () {
+  var links = Array.prototype.slice.call(document.querySelectorAll('.page-toc a'));
+  if (!links.length) return;
+  var items = links.map(function (a) {
+    return { a: a, sec: document.getElementById(a.getAttribute('href').slice(1)) };
+  }).filter(function (x) { return x.sec; });
+  if (!items.length) return;
+  var ticking = false;
+  function update() {
+    ticking = false;
+    var line = 130, current = items[0].a;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].sec.getBoundingClientRect().top <= line) current = items[i].a;
+    }
+    links.forEach(function (a) { a.classList.toggle('active', a === current); });
+  }
+  function onScroll() {
+    if (!ticking) { ticking = true; requestAnimationFrame(update); }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  update();
+})();
+</script>
+<script src="electrons.js"></script>
+</body>
+</html>

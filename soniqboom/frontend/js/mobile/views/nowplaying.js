@@ -72,6 +72,7 @@ export function mountNowPlaying(root, ctx) {
     if (artSrc) {
       const img = new Image();
       img.alt = '';
+      img.decoding = 'async';   // lg art decode off the main thread
       img.onload  = () => img.classList.add('loaded');
       img.onerror = () => img.remove();
       art.appendChild(img);

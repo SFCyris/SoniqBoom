@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from soniqboom import __version__
-from soniqboom.api import art, cast, fstree, library, multiroom, playlist, search, smart, stream, subsonic, tracks, users as users_api
+from soniqboom.api import art, artist, cast, fstree, library, multiroom, playlist, search, smart, stream, subsonic, tracks, users as users_api
 from soniqboom.config import settings, get_data_dir, _CONF_PATH
 from soniqboom.plugins import load_all
 from soniqboom.plugins.base import registry
@@ -90,6 +90,9 @@ _GZIP_SKIP_PREFIXES = (
     "/api/rest/download",
     "/api/rest/getCoverArt",
     "/api/art",
+    # Live radio relay — an infinite audio stream; gzip buffering would
+    # stall it and the bytes are already compressed audio.
+    "/api/stations/relay",
 )
 
 
@@ -293,7 +296,11 @@ app.include_router(stream.router,  prefix="/api")
 app.include_router(library.router, prefix="/api")
 app.include_router(fstree.router,  prefix="/api")
 app.include_router(smart.router,   prefix="/api")
+app.include_router(artist.router,  prefix="/api")
 app.include_router(users_api.router, prefix="/api")
+
+from soniqboom.api import stations as _stations_api  # noqa: E402
+app.include_router(_stations_api.router, prefix="/api")
 
 # ── Optional access services ────────────────────────────────────────────
 # Each gated by ``services.<name>`` in SoniqBoom.conf (default ON).  Toggle
@@ -1068,6 +1075,12 @@ async def startup():
     global _cast_reaper_task
     _cast_reaper_task = asyncio.create_task(_cast_session_reaper())
 
+    # Stations (internet radio): seed favorites and warm the Radio Browser
+    # country metadata in the background — startup never blocks on the
+    # public directory being reachable; a cache on disk serves either way.
+    from soniqboom.core import radiodir as _radiodir
+    asyncio.create_task(_radiodir.ensure_ready())
+
     # Arm the deadlock watchdog last — once everything else has loaded,
     # so a slow startup step (e.g. HVSC reindex) doesn't trip the
     # watchdog while it isn't even servicing requests yet.
@@ -1538,12 +1551,15 @@ if FRONTEND_DIR.exists():
     @app.get("/m", include_in_schema=False)
     @app.get("/m/{rest:path}", include_in_schema=False)
     async def mobile_shell(rest: str = ""):
-        # Pin sb_ui=mobile so the next visit to / doesn't have to UA-sniff
-        # again (and so bookmarked /m is consistent with the cookie flow).
-        resp = FileResponse(FRONTEND_DIR / "mobile.html")
-        resp.set_cookie("sb_ui", "mobile", max_age=60 * 60 * 24 * 365,
-                        samesite="lax")
-        return resp
+        # Plain serve — deliberately does NOT pin sb_ui=mobile.  Setting a
+        # sticky cookie here had a nasty side effect: the service worker
+        # precaches ``/m`` (and any link/prefetch hits it too), so a desktop
+        # browser would silently acquire sb_ui=mobile just from the SW
+        # install and then bounce ``/`` to ``/m`` forever.  Deliberate
+        # mobile pinning still happens via the explicit ``?ui=mobile``
+        # override on ``/``; real phones get ``/m`` via UA sniffing each
+        # visit (cheap), so losing the optimization costs nothing.
+        return FileResponse(FRONTEND_DIR / "mobile.html")
 
     # ``/multiroom`` HTML shell is gated on the multiroom service toggle —
     # disable in Settings → Services to hide the page entirely (404 from

@@ -1,0 +1,535 @@
+// SPDX-FileCopyrightText: 2026 S.F. Cyris
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+/**
+ * stations.js — internet-radio Stations view (Beta).  Lazy module: app.js
+ * imports it on the first Stations sidebar click.
+ *
+ * Views: Favorites (server-side list, seeded with Nectarine), Scene (the
+ * curated demoscene/chiptune pack) and World (Radio Browser directory:
+ * continent → country → Top 10 / 11–50 / Remaining).
+ *
+ * Playback goes through ``Player.playStation`` against the server relay.
+ * A station's quality ladder is reordered for THIS browser (canPlayType),
+ * starts at the best supported stream and steps down when the stream
+ * errors or keeps rebuffering.  When every stream fails the station is
+ * reported as a temporary outage (no blacklisting — it stays listed so
+ * the listener can retry).  Now-playing titles arrive over the library
+ * WebSocket as ``radio_meta`` events (re-dispatched by app.js as
+ * ``sb:radio-meta``).
+ */
+import { Player } from './player.js';
+import { Toast } from './utils.js';
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// Station favicon/homepage URLs come from a stranger-editable directory.
+// esc() stops attribute breakout, but a ``javascript:`` href still executes
+// on click (entities decode before URI evaluation), so the scheme must be
+// whitelisted to http(s) before any URL reaches an href/src.
+const _safeUrl = (u) => {
+  const s = String(u == null ? '' : u).trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+};
+
+const view = () => $('stations-view');
+
+// ── Playback state ────────────────────────────────────────────────────────────
+let _current = null;     // { station, cands, i } while a station is selected
+let _nowTitle = '';      // last ICY StreamTitle for the current station
+let _stallTimes = [];    // timestamps of recent 'waiting' events
+
+// ── Codec support → candidate order ──────────────────────────────────────────
+const _probe = document.createElement('audio');
+
+function _mimeFor(codec) {
+  switch ((codec || '').toUpperCase()) {
+    case 'MP3':  return 'audio/mpeg';
+    case 'AAC': case 'AAC+': case 'AACP': return 'audio/aac';
+    case 'OGG': case 'VORBIS': return 'audio/ogg; codecs="vorbis"';
+    case 'OPUS': return 'audio/ogg; codecs="opus"';
+    case 'FLAC': return 'audio/flac';
+    default:     return '';
+  }
+}
+
+// Streams reordered for this browser: supported codecs first (highest
+// bitrate first within a tier), unknown codecs as a middle hail-mary,
+// definitely-unsupported last.  ``v`` keeps the server-side index so the
+// relay picks the same stream we chose.
+function _candidates(station) {
+  const scored = (station.streams || []).map((s, v) => {
+    const mime = _mimeFor(s.codec);
+    const support = !mime ? 1 : (_probe.canPlayType(mime) ? 2 : 0);
+    return { v, s, support };
+  });
+  scored.sort((a, b) => (b.support - a.support) || ((b.s.bitrate || 0) - (a.s.bitrate || 0)));
+  return scored;
+}
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+
+function play(station) {
+  const cands = _candidates(station);
+  if (!cands.length) {
+    // No stream this browser can play — surface it as a temporary outage
+    // (the directory entry may gain a playable mount later).
+    _unavailable(station);
+    return;
+  }
+  _wireAudioHealth();   // play() can be reached from global search, not just show()
+  _current = { station, cands, i: 0 };
+  _nowTitle = '';
+  _stallTimes = [];
+  _tryPlay();
+}
+
+async function _tryPlay() {
+  if (!_current) return;
+  const { station, cands, i } = _current;
+  const c = cands[i];
+  const url = `/api/stations/relay/${encodeURIComponent(station.sid)}?v=${c.v}`;
+  _renderNowPlaying(true);
+  try {
+    await Player.playStation(station, url, c.s.codec);
+    _renderNowPlaying();
+  } catch (_) {
+    _stepDown();
+  }
+}
+
+function _qualityLabel(c) {
+  if (!c) return '';
+  return `${c.s.codec || '?'}${c.s.bitrate ? ` ${c.s.bitrate}k` : ''}`;
+}
+
+function _stepDown() {
+  if (!_current) return;
+  if (_current.i + 1 < _current.cands.length) {
+    _current.i++;
+    Toast?.info?.(`Stream trouble — switching to ${_qualityLabel(_current.cands[_current.i])}.`);
+    _tryPlay();
+  } else {
+    _unavailable(_current.station);
+  }
+}
+
+// A station that won't play right now is treated as a TEMPORARY outage —
+// the listener can try again later.  We don't blacklist it or remove it
+// from the list, so it reappears and stays playable next time the relay
+// or the station itself recovers.
+function _unavailable(station) {
+  Toast?.error?.(`${station.name} is unavailable right now — it may be temporary. Try again later.`);
+  Player.stopStation();
+  _current = null;
+  _renderNowPlaying();
+}
+
+function stop() {
+  Player.stopStation();
+  _current = null;
+  _nowTitle = '';
+  _renderNowPlaying();
+}
+
+// Stream health: hard errors step down immediately; repeated rebuffering
+// (4+ 'waiting' events inside 30 s) steps down too, but only while a
+// lower-quality candidate exists — better a 64k stream that plays than a
+// 320k one that gaps.
+function _wireAudioHealth() {
+  const audio = Player.audio;
+  if (!audio || audio.__sbStationsWired) return;
+  audio.__sbStationsWired = true;
+  audio.addEventListener('error', () => {
+    if (Player.stationMode && _current) _stepDown();
+  });
+  audio.addEventListener('waiting', () => {
+    if (!Player.stationMode || !_current) return;
+    const now = Date.now();
+    _stallTimes = _stallTimes.filter((t) => now - t < 30000);
+    _stallTimes.push(now);
+    if (_stallTimes.length >= 4 && _current.i + 1 < _current.cands.length) {
+      _stallTimes = [];
+      _stepDown();
+    }
+  });
+}
+
+// ── Favorites ─────────────────────────────────────────────────────────────────
+
+async function _toggleFavorite(station, btn) {
+  const makeFav = !station.favorite;
+  try {
+    if (makeFav) {
+      await fetch('/api/stations/favorites', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(station),
+      });
+    } else {
+      await fetch(`/api/stations/favorites/${encodeURIComponent(station.sid)}`, { method: 'DELETE' });
+    }
+    station.favorite = makeFav;
+    btn?.classList.toggle('on', makeFav);
+    if (btn) btn.title = makeFav ? 'Remove from favorites' : 'Add to favorites';
+    (Toast?.ok || Toast?.info)?.(makeFav
+      ? `${station.name} added to favorites.`
+      : `${station.name} removed from favorites.`);
+    if (_sview === 'favorites') _renderFavorites();   // list reflects the change
+  } catch (_) {
+    Toast?.error?.('Could not update favorites.');
+  }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+let _sview = null;       // 'favorites' | 'scene' | 'world'
+
+function _shell() {
+  const v = view();
+  if (!v.__sbShell) {
+    v.innerHTML = '<div id="st-now"></div><div id="st-crumbs"></div><div id="st-body"></div>';
+    v.__sbShell = true;
+  }
+  return { now: $('st-now'), crumbs: $('st-crumbs'), body: $('st-body') };
+}
+
+function _renderNowPlaying(connecting = false) {
+  const el = $('st-now');
+  if (!el) return;
+  if (!_current) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  const { station, cands, i } = _current;
+  el.classList.remove('hidden');
+  const favUrl = _safeUrl(station.favicon);
+  const art = favUrl
+    ? `<img class="st-now-art" src="${esc(favUrl)}" alt="" decoding="async">`
+    : '<span class="st-now-art st-now-glyph">📻</span>';
+  el.innerHTML = `
+    ${art}
+    <div class="st-now-info">
+      <div class="st-now-name">${esc(station.name)}</div>
+      <div class="st-now-title">${connecting ? 'Connecting…' : esc(_nowTitle || 'Live')}</div>
+      <div class="st-now-quality">${esc(_qualityLabel(cands[i]))}${_safeUrl(station.homepage)
+        ? ` · <a href="${esc(_safeUrl(station.homepage))}" target="_blank" rel="noopener">site</a>` : ''}</div>
+    </div>
+    <button id="st-fav-btn" class="st-btn ${station.favorite ? 'on' : ''}"
+            title="${station.favorite ? 'Remove from favorites' : 'Add to favorites'}">★</button>
+    <button id="st-stop-btn" class="st-btn" title="Stop station">⏹</button>`;
+  const img = el.querySelector('img.st-now-art');
+  if (img) img.onerror = () => { img.outerHTML = '<span class="st-now-art st-now-glyph">📻</span>'; };
+  $('st-fav-btn')?.addEventListener('click', () => _toggleFavorite(station, $('st-fav-btn')));
+  $('st-stop-btn')?.addEventListener('click', stop);
+}
+
+function _updateNowTitle() {
+  const t = view()?.querySelector('.st-now-title');
+  if (t) t.textContent = _nowTitle || 'Live';
+}
+
+function _crumbsHtml(parts) {
+  // parts: [{label, fn}] — last one is the current page (no link)
+  return parts.map((p, i) => i === parts.length - 1
+    ? `<span class="st-crumb-here">${esc(p.label)}</span>`
+    : `<a class="st-crumb" data-i="${i}">${esc(p.label)}</a>`,
+  ).join(' <span class="st-crumb-sep">›</span> ');
+}
+
+function _setCrumbs(parts) {
+  const el = $('st-crumbs');
+  el.innerHTML = _crumbsHtml(parts);
+  el.querySelectorAll('a.st-crumb').forEach((a) => {
+    a.addEventListener('click', () => parts[+a.dataset.i].fn());
+  });
+}
+
+function _loading(msg = 'Loading…') {
+  $('st-body').innerHTML = `<div class="st-empty">${esc(msg)}</div>`;
+}
+
+function _stationRows(body, stations, { showCountry = false } = {}) {
+  if (!stations.length) {
+    body.innerHTML = '<div class="st-empty">Nothing here yet.</div>';
+    return;
+  }
+  body.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  stations.forEach((st) => {
+    const row = document.createElement('div');
+    row.className = 'st-row';
+    row.dataset.sid = st.sid;
+    row.tabIndex = 0;
+    row.setAttribute('role', 'button');
+    const best = (st.streams || [])[0];
+    const nQual = (st.streams || []).length;
+    row.innerHTML = `
+      <span class="st-row-art">${_safeUrl(st.favicon)
+        ? `<img src="${esc(_safeUrl(st.favicon))}" alt="" loading="lazy" decoding="async">` : '📻'}</span>
+      <span class="st-row-name">${st.favorite ? '<span class="st-row-fav">★</span> ' : ''}${esc(st.name)}</span>
+      <span class="st-row-meta">${esc(best ? `${best.codec || ''}${best.bitrate ? ` ${best.bitrate}k` : ''}` : '')}${
+        nQual > 1 ? ` · ${nQual} streams` : ''}${
+        showCountry && st.country ? ` · ${esc(st.country)}` : ''}${
+        st.votes ? ` · ▲${st.votes}` : ''}</span>`;
+    const img = row.querySelector('.st-row-art img');
+    if (img) img.onerror = () => { img.remove(); };
+    const go = () => play(st);
+    row.addEventListener('click', go);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+    frag.appendChild(row);
+  });
+  body.appendChild(frag);
+}
+
+async function _fetchJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`;
+    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+async function _renderFavorites() {
+  _setCrumbs([{ label: 'Favorites' }]);
+  _loading();
+  try {
+    const favs = await _fetchJson('/api/stations/favorites');
+    if (!favs.length) {
+      $('st-body').innerHTML =
+        '<div class="st-empty">No favorite stations yet — play one and hit ★.</div>';
+      return;
+    }
+    _stationRows($('st-body'), favs);
+  } catch (e) { _loading(`Could not load favorites: ${e.message}`); }
+}
+
+async function _renderScene() {
+  _setCrumbs([{ label: 'Scene' }]);
+  _loading();
+  try {
+    _stationRows($('st-body'), await _fetchJson('/api/stations/scene'));
+  } catch (e) { _loading(`Could not load scene stations: ${e.message}`); }
+}
+
+async function _renderWorld() {
+  _setCrumbs([{ label: 'World' }]);
+  _loading();
+  let continents;
+  try {
+    continents = await _fetchJson('/api/stations/world');
+  } catch (e) { _loading(`Radio directory unavailable: ${e.message}`); return; }
+  const body = $('st-body');
+  body.innerHTML = '';
+  continents.forEach((c) => {
+    const row = document.createElement('div');
+    row.className = 'st-row st-row-group';
+    row.tabIndex = 0;
+    row.innerHTML = `<span class="st-row-art">🌍</span>
+      <span class="st-row-name">${esc(c.continent)}</span>
+      <span class="st-row-meta">${c.countries.length} countries</span>`;
+    row.addEventListener('click', () => _renderContinent(c));
+    body.appendChild(row);
+  });
+}
+
+function _renderContinent(cont) {
+  _setCrumbs([{ label: 'World', fn: _renderWorld }, { label: cont.continent }]);
+  const body = $('st-body');
+  body.innerHTML = '';
+  cont.countries.forEach((c) => {
+    const row = document.createElement('div');
+    row.className = 'st-row st-row-group';
+    row.tabIndex = 0;
+    row.innerHTML = `<span class="st-row-art">${esc(_flag(c.code))}</span>
+      <span class="st-row-name">${esc(c.name)}</span>
+      <span class="st-row-meta">${c.count} stations</span>`;
+    row.addEventListener('click', () => _renderCountry(cont, c));
+    body.appendChild(row);
+  });
+}
+
+function _flag(code) {
+  // Regional-indicator emoji from the ISO code; falls back to a globe.
+  try {
+    const cc = (code || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(cc)) return '🌐';
+    return String.fromCodePoint(...[...cc].map((ch) => 0x1F1E6 + ch.charCodeAt(0) - 65));
+  } catch (_) { return '🌐'; }
+}
+
+const _BUCKETS = [
+  ['top10', 'Top 10'],
+  ['top50', 'Top 11–50'],
+  ['rest', 'Remaining'],
+];
+
+async function _renderCountry(cont, country, bucket = 'top10') {
+  _setCrumbs([
+    { label: 'World', fn: _renderWorld },
+    { label: cont.continent, fn: () => _renderContinent(cont) },
+    { label: country.name },
+  ]);
+  const body = $('st-body');
+  body.innerHTML = `<div class="st-tabs">${_BUCKETS.map(([k, lbl]) =>
+    `<button class="st-tab ${k === bucket ? 'on' : ''}" data-b="${k}">${lbl}</button>`).join('')}
+    </div><div class="st-tab-body"><div class="st-empty">Loading…</div></div>`;
+  body.querySelectorAll('.st-tab').forEach((b) => {
+    b.addEventListener('click', () => _renderCountry(cont, country, b.dataset.b));
+  });
+  try {
+    const stations = await _fetchJson(
+      `/api/stations/country/${encodeURIComponent(country.code)}?bucket=${bucket}`);
+    _stationRows(body.querySelector('.st-tab-body'), stations);
+  } catch (e) {
+    const tb = body.querySelector('.st-tab-body');
+    if (tb) tb.innerHTML = `<div class="st-empty">Could not load: ${esc(e.message)}</div>`;
+  }
+}
+
+// ── View switching ────────────────────────────────────────────────────────────
+
+// ── Station info modal (the player (i) button while a station plays) ──────────
+
+function showInfo(station) {
+  station = station || (_current && _current.station);
+  if (!station) return;
+  let ov = $('st-info-overlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'st-info-overlay';
+    ov.addEventListener('click', (e) => { if (e.target === ov) _closeInfo(); });
+    document.body.appendChild(ov);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && $('st-info-overlay')?.classList.contains('open')) _closeInfo();
+    });
+  }
+  const isCurrent = !!(_current && _current.station.sid === station.sid);
+  const cands = isCurrent ? _current.cands : _candidates(station);
+  const playingIdx = isCurrent ? _current.i : -1;
+  const favUrl = _safeUrl(station.favicon);
+  const art = favUrl
+    ? `<img class="st-info-art" src="${esc(favUrl)}" alt="" decoding="async">`
+    : '<span class="st-info-art st-info-glyph">📻</span>';
+  const streams = (station.streams || []).map((s, i) => {
+    const v = cands.find((c) => c.v === i);   // map back to candidate for the playing mark
+    const mark = (isCurrent && cands[playingIdx] && cands[playingIdx].v === i)
+      ? '<span class="st-info-playing">▶ playing</span>' : '';
+    const sup = v && v.support === 0 ? ' <span class="st-info-nosup">(unsupported)</span>' : '';
+    return `<li>${esc(s.codec || '?')}${s.bitrate ? ` · ${s.bitrate} kbps` : ''}${mark}${sup}</li>`;
+  }).join('');
+  ov.innerHTML = `
+    <div id="st-info-panel" role="dialog" aria-label="Station details">
+      <button id="st-info-close" class="st-btn" title="Close">×</button>
+      <div class="st-info-head">
+        ${art}
+        <div class="st-info-headtext">
+          <div class="st-info-name">${esc(station.name)}</div>
+          <div class="st-info-now">${isCurrent
+            ? `🎵 ${esc(_nowTitle || 'Live — fetching track…')}` : 'Not currently playing'}</div>
+        </div>
+      </div>
+      <dl class="st-info-meta">
+        ${station.tags ? `<dt>Tags</dt><dd>${esc(station.tags)}</dd>` : ''}
+        ${station.country ? `<dt>Country</dt><dd>${esc(station.country)}</dd>` : ''}
+        ${station.votes ? `<dt>Votes</dt><dd>▲ ${esc(station.votes)}</dd>` : ''}
+        ${_safeUrl(station.homepage) ? `<dt>Website</dt><dd><a href="${esc(_safeUrl(station.homepage))}" target="_blank" rel="noopener">${esc(station.homepage)}</a></dd>` : ''}
+        <dt>Streams</dt><dd><ul class="st-info-streams">${streams || '<li>—</li>'}</ul></dd>
+      </dl>
+      <div class="st-info-actions">
+        <button id="st-info-fav" class="st-btn ${station.favorite ? 'on' : ''}">${station.favorite ? '★ Favorited' : '☆ Add to favorites'}</button>
+        ${isCurrent ? '<button id="st-info-stop" class="st-btn">⏹ Stop</button>' : '<button id="st-info-play" class="st-btn">▶ Play</button>'}
+      </div>
+    </div>`;
+  ov.classList.add('open');
+  $('st-info-close').addEventListener('click', _closeInfo);
+  const imgEl = ov.querySelector('img.st-info-art');
+  if (imgEl) imgEl.onerror = () => { imgEl.outerHTML = '<span class="st-info-art st-info-glyph">📻</span>'; };
+  $('st-info-fav')?.addEventListener('click', async () => {
+    await _toggleFavorite(station, null);
+    showInfo(station);   // re-render with the new favorite state
+  });
+  $('st-info-stop')?.addEventListener('click', () => { stop(); _closeInfo(); });
+  $('st-info-play')?.addEventListener('click', () => { play(station); _closeInfo(); });
+}
+
+function _closeInfo() {
+  $('st-info-overlay')?.classList.remove('open');
+}
+
+function _updateInfoNow() {
+  const el = $('st-info-overlay');
+  if (!el || !el.classList.contains('open')) return;
+  const now = el.querySelector('.st-info-now');
+  if (now && _current) now.textContent = `🎵 ${_nowTitle || 'Live — fetching track…'}`;
+}
+
+// ── Header search placeholder: while Stations is open, the global search
+// box reads (and behaves) as a station search.  search.js checks the same
+// view-visibility to decide whether to prioritise station results. ────────────
+let _origSearchPlaceholder = null;
+
+function _stationsSearchMode(on) {
+  const inp = $('search-input');
+  if (!inp) return;
+  if (on) {
+    if (_origSearchPlaceholder === null) _origSearchPlaceholder = inp.getAttribute('placeholder') || '';
+    inp.setAttribute('placeholder', 'Search stations…');
+  } else if (_origSearchPlaceholder !== null) {
+    inp.setAttribute('placeholder', _origSearchPlaceholder);
+  }
+}
+
+function show(sview) {
+  _sview = sview;
+  _shell();
+  _wireAudioHealth();
+  _stationsSearchMode(true);
+  const v = view();
+  v.hidden = false;
+  // Take the content pane: hide the library surfaces (their own show
+  // functions restore visibility when a library view is opened).
+  const tt = $('track-table'); if (tt) tt.style.display = 'none';
+  const ag = $('album-grid'); if (ag) ag.hidden = true;
+  const gx = $('galaxy-view'); if (gx) gx.hidden = true;
+  document.querySelectorAll('#nav-library li.active, #nav-smart li.active')
+    .forEach((li) => li.classList.remove('active'));
+  document.querySelectorAll('#nav-stations li').forEach((li) =>
+    li.classList.toggle('active', li.dataset.sview === sview));
+  _renderNowPlaying();
+  if (sview === 'favorites') _renderFavorites();
+  else if (sview === 'scene') _renderScene();
+  else _renderWorld();
+}
+
+function hide() {
+  const v = view();
+  if (!v || v.hidden) return;
+  v.hidden = true;
+  _stationsSearchMode(false);
+  const tt = $('track-table'); if (tt) tt.style.display = '';
+  document.querySelectorAll('#nav-stations li.active')
+    .forEach((li) => li.classList.remove('active'));
+}
+
+// Leaving Stations: any click on the other sidebar sections hides the view.
+document.addEventListener('click', (e) => {
+  if (view()?.hidden !== false) return;
+  if (e.target.closest('#nav-library li, #nav-smart li, #folder-tree li, .sidebar-playlist-list li')) {
+    hide();
+  }
+}, true);
+
+// Now-playing titles pushed from the relay over the library WebSocket.
+window.addEventListener('sb:radio-meta', (e) => {
+  const d = e.detail || {};
+  if (_current && d.sid === _current.station.sid) {
+    _nowTitle = d.title || '';
+    _updateNowTitle();
+    _updateInfoNow();
+  }
+});
+
+export const Stations = { show, hide, play, stop, showInfo };
+window.Stations = Stations;   // test/debug escape hatch — same pattern as RadioMode

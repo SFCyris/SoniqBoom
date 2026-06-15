@@ -35,6 +35,58 @@ from soniqboom.models.track import TrackMeta
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
 
+
+# ── Tag editing ───────────────────────────────────────────────────────────────
+
+from fastapi import Depends as _Depends
+from pydantic import BaseModel as _BaseModel
+
+
+class _TagUpdate(_BaseModel):
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    album_artist: str | None = None
+    genre: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+
+
+from soniqboom.api.users import require_user as _require_user
+
+
+@router.put("/{track_id}/tags")
+async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_user)):
+    """Write tags into the local audio file AND mirror them into the library.
+
+    Local files only — remote-share tracks (smb/ftp/webdav) and zip members
+    are refused.  Requires a signed-in non-read-only account.
+    """
+    if user.role == "readonly":
+        raise HTTPException(403, "Your account is read-only — tag editing needs an 'edit' or admin account.")
+
+    from soniqboom.core.store import get_store
+    t = get_store().get_track(track_id)
+    if not t:
+        raise HTTPException(404, "Track not found")
+    path = t.get("path") or ""
+    if path.startswith(("smb://", "ftp://", "http://", "https://")):
+        raise HTTPException(422, "Tags can only be edited on local files (this track lives on a network share).")
+
+    from soniqboom.core.tagwriter import write_tags
+    try:
+        applied = await asyncio.to_thread(write_tags, path, body.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception:
+        raise HTTPException(500, "Could not write tags to the file.")
+
+    store_updates: dict = dict(applied)
+    if "genre" in store_updates:
+        store_updates["genre"] = [store_updates["genre"]]
+    get_store().update_track_fields(track_id, store_updates)
+    return {"id": track_id, "applied": applied}
+
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
 
 _lrclib_client: httpx.AsyncClient | None = None

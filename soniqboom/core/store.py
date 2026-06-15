@@ -1031,7 +1031,10 @@ class TrackStore:
             tid = next(iter(tids))
             t = self._tracks.get(tid)
             name = (t.get("album") or "").strip() if t else key
-            results.append({"album": name or key, "count": count})
+            # ``track_id`` is a representative track for the album so the
+            # frontend can build its cover-art URL directly instead of
+            # round-tripping a /search/filter lookup per grid card.
+            results.append({"album": name or key, "count": count, "track_id": tid})
         results.sort(key=lambda x: x["album"].lower())
         return self._agg_cache_set(cache_key, results)
 
@@ -1126,6 +1129,11 @@ class TrackStore:
     def get_waveform(self, track_id: str) -> list[float] | None:
         return self._waveforms.get(track_id)
 
+    def waveforms_view(self) -> dict[str, list[float]]:
+        """Snapshot of all stored waveforms (shallow copy — safe to read
+        off-thread while a scan stores new waveforms concurrently)."""
+        return dict(self._waveforms)
+
     def store_waveform(self, track_id: str, amplitudes: list[float]) -> None:
         self._waveforms[track_id] = amplitudes
 
@@ -1193,6 +1201,7 @@ class TrackStore:
         name: str,
         track_ids: list[str] | None = None,
         owner_user_id: str | None = None,
+        query: str | None = None,
     ) -> dict:
         now = int(time.time())
         # The API layer reads/writes ``track_ids`` consistently — historically
@@ -1203,6 +1212,7 @@ class TrackStore:
             "name": name,
             "track_ids": list(track_ids or []),
             "owner_user_id": owner_user_id,  # None ⇒ legacy/shared
+            "query": query,                  # non-None ⇒ smart (auto-updating) playlist
             "created_at": now,
             "updated_at": now,
         }

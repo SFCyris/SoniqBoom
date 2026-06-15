@@ -36,13 +36,28 @@ window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 import { Library }    from './library.js';
 import { Search }     from './search.js';
-import { Visualizer } from './visualizer.js';
 import { FolderTree } from './foldertree.js';
-import { Admin }      from './admin.js';
+// Equalizer stays a static import on purpose: its module body restores the
+// saved EQ gains from localStorage into Player.eqFilters at load — deferring
+// it would play everything flat until the user first presses E.
 import { Equalizer }  from './equalizer.js';
-import { TrackInfo }  from './trackinfo.js';
 import { Queue }      from './queue.js';
 import { Playlist }   from './playlist.js';
+import { RadioMode }  from './radio.js';
+
+// ── Lazily-loaded modules ─────────────────────────────────────────────────────
+// admin.js (~150 KB), visualizer.js (~108 KB) and trackinfo.js (+ its viz
+// deps) together are ~45% of the eager JS bundle but none are needed for
+// first paint.  Admin and TrackInfo load on the interaction that opens
+// them.  Visualizer is different: its module body attaches the Player
+// hooks that auto-start the canvas with playback, so it loads on first
+// idle (not first keypress) and reconciles if playback already started.
+let _adminP = null;
+const loadAdmin = () => (_adminP ||= import('./admin.js').then(m => m.Admin));
+let _trackInfoP = null;
+const loadTrackInfo = () => (_trackInfoP ||= import('./trackinfo.js').then(m => m.TrackInfo));
+let _vizP = null;
+const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
 import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
@@ -103,6 +118,7 @@ const btnPrev    = document.getElementById('btn-prev');
 const btnNext    = document.getElementById('btn-next');
 const btnShuffle = document.getElementById('btn-shuffle');
 const btnRepeat  = document.getElementById('btn-repeat');
+const btnRadio   = document.getElementById('btn-radio');
 const seekBar    = document.getElementById('seek-bar');
 const volBar     = document.getElementById('volume-bar');
 const timeCur    = document.getElementById('time-cur');
@@ -1030,6 +1046,135 @@ Promise.resolve().then(() => {
   try { _renderRepeatBtn(Player.repeatMode || 'none'); } catch {}
 });
 
+// ── Instant Mix radio ─────────────────────────────────────────────────────────
+// Build an endless, varied queue around the current track. Perceived-perf play:
+// the seed plays instantly (it's already the one in hand), then the mix streams
+// into "up next" the moment the response lands — the user never waits on it.
+let _radioBusy = false;
+async function startRadio(seed) {
+  if (!seed || !seed.id) { window.Toast?.info?.('Play a track first, then start radio.'); return; }
+  if (_radioBusy) return;
+  _radioBusy = true;
+  btnRadio?.classList.add('on');
+  const label = seed.title || seed.artist || 'this track';
+  // Keep/seed playback instantly; only (re)start if a different track is current.
+  try { if (Player.currentTrackId !== seed.id) Player.setQueue([seed], 0); } catch {}
+  window.Toast?.info?.(`Starting radio from “${label}”…`);
+  try {
+    const r = await fetch(`/api/smart/radio?seed=${encodeURIComponent(seed.id)}&limit=60`, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const mix = await r.json();                  // [seed, ...rest]
+    const rest = Array.isArray(mix) ? mix.slice(1) : [];
+    rest.forEach(t => { if (t && t.id) Player.addToQueue(t); });
+    RadioMode.start(seed);                       // session bar + radio-mode overlay
+  } catch (e) {
+    window.Toast?.error?.('Could not start radio. Try again.');
+    btnRadio?.classList.remove('on');
+  } finally {
+    _radioBusy = false;
+  }
+}
+if (btnRadio) btnRadio.addEventListener('click', () => {
+  // Active session → the button re-opens the radio view; otherwise it starts
+  // a new radio from the current track.
+  if (RadioMode.active) RadioMode.openOverlay();
+  else startRadio(Player.currentTrack);
+});
+
+// ── Smart playlists — save the current search as an auto-updating playlist ─────
+const _searchInputEl = document.getElementById('search-input');
+const btnSaveSmart   = document.getElementById('search-save-smart');
+function _syncSaveSmart() {
+  if (btnSaveSmart && _searchInputEl) btnSaveSmart.hidden = !_searchInputEl.value.trim();
+}
+if (_searchInputEl) _searchInputEl.addEventListener('input', _syncSaveSmart);
+_syncSaveSmart();
+if (btnSaveSmart) btnSaveSmart.addEventListener('click', async () => {
+  const q = (_searchInputEl?.value || '').trim();
+  if (!q) return;
+  const name = window.prompt('Name this smart playlist', q);
+  if (!name) return;
+  try {
+    const r = await fetch('/api/playlists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim(), query: q }),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    (window.Toast?.ok || window.Toast?.info)?.(`Smart playlist “${name.trim()}” saved — it updates itself.`);
+    try { Playlist.refresh(); } catch {}
+  } catch (e) {
+    window.Toast?.error?.('Could not save smart playlist.');
+  }
+});
+
+// ── Offline downloads ─────────────────────────────────────────────────────────
+// Save the playable stream into a stable Cache Storage bucket; the service
+// worker then serves /api/stream/<id> from there — instant when online, and the
+// only source when the network is gone. A localStorage index tracks what's kept.
+const OFFLINE_AUDIO_CACHE = 'soniqboom-offline-audio';
+const OFFLINE_IDX_KEY = 'sb_offline_index';
+const btnDownload = document.getElementById('btn-download');
+function _offlineIndex() { try { return JSON.parse(localStorage.getItem(OFFLINE_IDX_KEY) || '{}'); } catch { return {}; } }
+function _saveOfflineIndex(ix) { try { localStorage.setItem(OFFLINE_IDX_KEY, JSON.stringify(ix)); } catch {} }
+function isDownloaded(id) { return !!(id && _offlineIndex()[id]); }
+async function downloadTrack(track) {
+  const id = track && track.id;
+  if (!id) return false;
+  const url = `/api/stream/${id}`;
+  const resp = await fetch(url, { cache: 'no-store' });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const cache = await caches.open(OFFLINE_AUDIO_CACHE);
+  await cache.put(url, resp.clone());
+  const ix = _offlineIndex();
+  ix[id] = { id, title: track.title || '', artist: track.artist || '', format: track.format || '', ts: Date.now() };
+  _saveOfflineIndex(ix);
+  return true;
+}
+async function removeDownload(id) {
+  try {
+    const cache = await caches.open(OFFLINE_AUDIO_CACHE);
+    await cache.delete(`/api/stream/${id}`, { ignoreSearch: true });
+  } catch {}
+  const ix = _offlineIndex();
+  delete ix[id];
+  _saveOfflineIndex(ix);
+}
+function _renderDownloadBtn() {
+  if (!btnDownload) return;
+  const t = Player.currentTrack;
+  const dl = !!(t && isDownloaded(t.id));
+  btnDownload.classList.toggle('on', dl);
+  const lbl = !t ? 'Download for offline'
+            : dl ? 'Downloaded — click to remove from offline'
+                 : 'Download this track for offline';
+  btnDownload.title = lbl;
+  btnDownload.setAttribute('aria-label', lbl);
+}
+if (btnDownload) btnDownload.addEventListener('click', async () => {
+  const t = Player.currentTrack;
+  if (!t || !t.id) { window.Toast?.info?.('Play a track first to download it.'); return; }
+  if (!('caches' in window)) { window.Toast?.error?.('Offline storage isn’t available in this browser.'); return; }
+  if (isDownloaded(t.id)) {
+    await removeDownload(t.id);
+    window.Toast?.info?.('Removed from offline downloads.');
+  } else {
+    btnDownload.classList.add('busy');
+    window.Toast?.info?.(`Downloading “${t.title || 'track'}” for offline…`);
+    try {
+      await downloadTrack(t);
+      (window.Toast?.ok || window.Toast?.info)?.('Available offline.');
+    } catch (e) {
+      window.Toast?.error?.('Download failed — try again.');
+    } finally {
+      btnDownload.classList.remove('busy');
+    }
+  }
+  _renderDownloadBtn();
+});
+Player.on('trackchange', () => _renderDownloadBtn());
+_renderDownloadBtn();
+
 // ── Player callbacks ──────────────────────────────────────────────────────────
 // timeupdate fires ~4Hz. We coalesce all DOM writes into a single rAF pass
 // per tick and skip the write entirely when the tab is hidden (nothing to
@@ -1288,13 +1433,25 @@ playerArt.title = 'Song overview';
 playerArt.setAttribute('role', 'button');
 playerArt.setAttribute('tabindex', '0');
 playerArt.setAttribute('aria-label', 'Open song overview');
-function _openSongOverview() {
+// Open details for whatever is playing now.  A live radio station shows
+// STATION details (name, streams, now-playing ICY title) — not a track,
+// and crucially not the stale queue track underneath it: station mode
+// leaves the music queue intact so ``queue[queueIdx]`` is still the last
+// song, which is what used to show.  Everything else opens Track Info.
+function _openNowPlayingInfo() {
+  if (Player.stationMode) {
+    loadStations().then(S => S.showInfo(Player.station));
+    return;
+  }
   if (!Player.currentTrack) return;
   const q   = Player.queue;
   const idx = Player.queueIdx;
-  if (q.length > 0 && idx >= 0) TrackInfo.open(q, idx);
-  else                          TrackInfo.openSingle(Player.currentTrack);
+  loadTrackInfo().then(TrackInfo => {
+    if (q.length > 0 && idx >= 0) TrackInfo.open(q, idx);
+    else                          TrackInfo.openSingle(Player.currentTrack);
+  });
 }
+function _openSongOverview() { _openNowPlayingInfo(); }
 playerArt.addEventListener('click', _openSongOverview);
 playerArt.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _openSongOverview(); }
@@ -1599,8 +1756,10 @@ if (scanBadge) {
   scanBadge.setAttribute('tabindex', '0');
   scanBadge.setAttribute('title', 'Open admin → library');
   const _openAdminLibrary = () => {
-    Admin.open();
-    document.querySelector('.admin-tab[data-tab="tab-library"]')?.click();
+    loadAdmin().then(Admin => {
+      Admin.open();
+      document.querySelector('.admin-tab[data-tab="tab-library"]')?.click();
+    });
   };
   scanBadge.addEventListener('click', _openAdminLibrary);
   scanBadge.addEventListener('keydown', (e) => {
@@ -1659,7 +1818,7 @@ if (scanBadge) {
 })();
 
 // ── Admin button ──────────────────────────────────────────────────────────────
-document.getElementById('btn-admin').addEventListener('click', () => Admin.open());
+document.getElementById('btn-admin').addEventListener('click', () => loadAdmin().then(A => A.open()));
 
 // ── EQ button ─────────────────────────────────────────────────────────────────
 document.getElementById('btn-eq').addEventListener('click', () => Equalizer.toggle());
@@ -1706,19 +1865,21 @@ if (selAddPlaylist) {
 Player.on('queuechange', () => Queue.refresh());
 
 // ── Track Info button (player bar) ────────────────────────────────────────────
-document.getElementById('btn-track-info').addEventListener('click', () => {
-  const q   = Player.queue;
-  const idx = Player.queueIdx;
-  if (q.length > 0 && idx >= 0) {
-    TrackInfo.open(q, idx);
-  } else if (Player.currentTrack) {
-    // Fallback: open for current track even if queue idx is stale
-    TrackInfo.openSingle(Player.currentTrack);
-  }
-});
+document.getElementById('btn-track-info').addEventListener('click', _openNowPlayingInfo);
 
 // ── Track Info via right-click on library rows ────────────────────────────────
-Library.onInfo((tracks, idx) => TrackInfo.open(tracks, idx));
+Library.onInfo((tracks, idx) => loadTrackInfo().then(TI => TI.open(tracks, idx)));
+
+// ── Stations (internet radio, Beta) — lazy module on first sidebar click ─────
+let _stationsP = null;
+const loadStations = () => (_stationsP ||= import('./stations.js').then(m => m.Stations));
+document.querySelectorAll('#nav-stations li').forEach(li => {
+  const go = () => loadStations().then(S => S.show(li.dataset.sview));
+  li.addEventListener('click', go);
+  li.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+  });
+});
 
 // ── Admin → main page sync ────────────────────────────────────────────────────
 // Fired by admin.js after adding/removing/scanning folders so the tree and alias state stay in sync
@@ -1982,7 +2143,8 @@ function connectWS() {
         if (!(Library.isInFolderView && Library.isInFolderView())) {
           Library.showAll();
         }
-        FolderTree.refresh();
+        // Don't rebuild the sidebar tree here — embeddings add no folders, and
+        // FolderTree.refresh() collapses every expanded node back to root.
         FolderTree.setScanActive(true);
       } else {
         // Both phases complete.  Silent freshness scans skip the "Done" badge
@@ -2010,7 +2172,12 @@ function connectWS() {
         } else if (!msg.silent) {
           Library.showAll();
         }
-        FolderTree.refresh();   // sidebar tree only \u2014 surfaces new subfolders
+        // Only rebuild the sidebar tree on an EXPLICIT re-index (which may add
+        // or remove roots).  A silent drill-down / freshness completion must
+        // NOT \u2014 FolderTree.refresh() rebuilds from root and would collapse the
+        // tree the user is browsing (the "tree jumps back to root randomly"
+        // bug).  refresh() itself now preserves expansion as a backstop.
+        if (!msg.silent) FolderTree.refresh();
       }
     } else if (msg.event === 'repair_progress') {
       // The metadata repair task (admin > Library > Repair Garbled
@@ -2060,6 +2227,11 @@ function connectWS() {
       } catch (err) {
         console.warn('remote_new_tracks toast failed', err);
       }
+    } else if (msg.event === 'radio_meta') {
+      // Live-radio now-playing title pushed by the station relay.  The
+      // stations module is lazy, so hand it off via a DOM event instead
+      // of a direct import.
+      window.dispatchEvent(new CustomEvent('sb:radio-meta', { detail: msg }));
     }
   };
 
@@ -2215,7 +2387,7 @@ document.addEventListener('keydown', (e) => {
   }
 
   // V — toggle visualizer mode (oscilloscope / spectrogram)
-  if (e.code === 'KeyV') { Visualizer.toggleMode(); return; }
+  if (e.code === 'KeyV') { loadVisualizer().then(V => V.toggleMode()); return; }
 
   // E — toggle EQ
   if (e.code === 'KeyE') { Equalizer.toggle(); return; }
@@ -2225,9 +2397,7 @@ document.addEventListener('keydown', (e) => {
 
   // I — track info
   if (e.code === 'KeyI') {
-    const q = Player.queue;
-    const idx = Player.queueIdx;
-    if (q.length > 0 && idx >= 0) TrackInfo.open(q, idx);
+    _openNowPlayingInfo();
     return;
   }
 
@@ -2455,3 +2625,21 @@ connectWS();
 fetch('/api/library/scan/status').then(r => r.json()).then(s => {
   if (s.running || s.embedding) FolderTree.setScanActive(true);
 }).catch(() => {});
+
+// Warm the visualizer module off the critical path.  Its module body owns
+// the Player hooks that auto-start the canvas with playback, so it must be
+// resident before (or shortly after) the first play — the reconcile call
+// covers the race where playback began while the import was in flight.
+_ric(() => {
+  loadVisualizer().then(V => { if (Player.playing) V.start(); }).catch(() => {});
+});
+
+// Warm the browser HTTP cache for the aggregation lists the sidebar views
+// fetch on first click.  The endpoints reply with ETags, so the later
+// view-open revalidates (304) instead of re-pulling the body — first click
+// on Artists/Albums/Genres lands without the payload wait.
+_ric(() => {
+  for (const p of ['artists', 'album-artists', 'albums', 'genres', 'years', 'formats']) {
+    fetch(`/api/library/${p}`, { priority: 'low' }).catch(() => {});
+  }
+});

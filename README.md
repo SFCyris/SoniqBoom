@@ -86,6 +86,7 @@ SoniqBoom speaks the culture:
 Every retro format is rendered to standard audio on the fly — a 1987 SID tune streams to your phone *exactly* like a FLAC does (casting it to a HomePod or the speakers in the next room is in Beta). The same server that sees your `.mod` hoard handles your everyday listening.
 
 - **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
+- **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
 - **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN.
 - **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem.
@@ -136,7 +137,7 @@ bash run.sh
 
 `bash shutdown.sh` stops it; `bash restart.sh` restarts it. To change the default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
 
-> **Retro renderers are optional and modular.** Install only the ones you need — `sidplayfp` for SID, `fluidsynth` for MIDI, `libopenmpt` for trackers, `uade` for AHX, `libgme` for console chiptunes, `adplay` (AdPlug) for AdLib/OPL. Miss one and SoniqBoom tells you exactly which package to install; everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
+> **`install.sh` installs every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdPlug, AdLib/OPL) — on macOS via Homebrew and on Linux via apt / dnf / pacman / zypper. On a manual install, add the same packages with your package manager; if one is missing, SoniqBoom names the exact package and everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
 
 ---
 

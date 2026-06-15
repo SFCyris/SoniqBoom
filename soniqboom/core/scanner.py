@@ -2324,3 +2324,102 @@ async def start_remote_scan(
 
     executor.shutdown(wait=False)
     log.info("Remote scan complete: %d tracks from %s", track_count, scan_root)
+
+
+# ── Drill-down freshness ──────────────────────────────────────────────────────
+
+async def refresh_subtree_under_root(
+    root: str, subdir: str, max_files: int = 5000,
+) -> dict:
+    """Freshness pass for ONE folder subtree under an EXISTING scan root.
+
+    The redesign the disabled drill-down refresh was waiting for: unlike
+    ``start_scan([subdir])`` this never calls ``upsert_scan_dir`` (so browsed
+    folders don't appear as top-level roots) and every track keeps its
+    attribution to *root*.  New and changed files are extracted and upserted;
+    index entries whose files vanished are removed.
+
+    Safety rails:
+      * subtrees above ``max_files`` are skipped (use Re-Index for those);
+      * removals only happen when ``subdir`` still exists as a directory
+        (an unmounted share must never mass-orphan its tracks), and are
+        capped per pass — a partial walk on a flaky mount can't wipe a
+        folder's index.
+    """
+    from soniqboom.config import settings as _settings
+
+    loop = asyncio.get_event_loop()
+    store = get_store()
+    sub = str(Path(subdir).resolve())
+
+    dir_files = await loop.run_in_executor(
+        None, _find_audio_files, [sub], _settings.scan_zips,
+    )
+    files_strs = [str(p) for fl in dir_files.values() for p in fl]
+    if len(files_strs) > max_files:
+        return {"skipped": True, "checked": len(files_strs),
+                "added": 0, "updated": 0, "removed": 0, "errors": 0}
+    found = set(files_strs)
+
+    # Existing index entries under this subtree (scoped to the parent root).
+    prefix = sub.rstrip("/") + "/"
+    existing: dict[str, dict] = {}
+    for tid in await get_track_ids_for_scan_root(root):
+        t = store._tracks.get(tid)
+        if t:
+            p_str = t.get("path") or ""
+            if p_str.startswith(prefix):
+                existing[p_str] = t
+
+    mtime_size_map = {
+        t["id"]: (t.get("mtime"), t.get("file_size")) for t in existing.values()
+    }
+    fresh, _tid_map = await loop.run_in_executor(
+        None, _compute_incremental, files_strs, mtime_size_map,
+    )
+    to_scan = [s for s in files_strs if s not in fresh]
+
+    added = updated = errors = 0
+    if to_scan:
+        def _pdir(s: str) -> str:
+            return str(Path(s.split("::")[0]).parent) if "::" in s else str(Path(s).parent)
+
+        unique_dirs = list({_pdir(s) for s in to_scan} | {root})
+        hash_map = await store_hash_lookups_batch(unique_dirs)
+        buf: list = []
+        for s in to_scan:
+            _p, result, _sm, _lg = await loop.run_in_executor(None, _extract_one, Path(s))
+            if isinstance(result, str):
+                errors += 1
+                continue
+            track, _art = _build_track(result, root, _pdir(s), hash_map)
+            if not track:
+                errors += 1
+                continue
+            if store.get_track(track.id) is None:
+                added += 1
+            else:
+                updated += 1
+            buf.append(track)
+            if len(buf) >= 200:
+                await upsert_tracks_batch(buf)
+                buf = []
+        if buf:
+            await upsert_tracks_batch(buf)
+
+    removed = 0
+    gone = [t["id"] for p_str, t in existing.items() if p_str not in found]
+    if gone and Path(sub).is_dir():
+        cap = max(20, len(existing) // 3)
+        if len(gone) <= cap:
+            from soniqboom.core.data import delete_track_ids
+            removed = await delete_track_ids(gone)
+        else:
+            log.warning(
+                "Drill-down refresh %s: %d of %d tracks vanished — over the "
+                "safety cap (%d), leaving the index untouched (full Re-Index "
+                "will reconcile).", sub, len(gone), len(existing), cap,
+            )
+
+    return {"added": added, "updated": updated, "removed": removed,
+            "checked": len(files_strs), "errors": errors, "skipped": False}

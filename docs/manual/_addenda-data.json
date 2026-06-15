@@ -1,0 +1,1803 @@
+{
+ "formats": {
+  "intro": "<p>SoniqBoom plays an unusually wide span of audio: from bit-perfect lossless masters down to one-bit DSD streams, and across to the \"non-audio\" formats that store a program or a log of chip commands rather than recorded sound. A FLAC file holds a compressed copy of a waveform; a SID file holds 6502 machine code that, when run, makes a Commodore 64's sound chip sing. Both end up as music in your speakers, but they reach that point by completely different routes \u2014 one is decoded, the other is emulated or synthesized in real time.</p><p>This field guide walks through every family of format the server understands, grouped by how they make sound: lossless and uncompressed PCM, lossy perceptual codecs, the one-bit DSD lineage from Super Audio CD, the chip-music formats tied to specific 1980s and 1990s silicon, and the synthesis formats (MIDI, SoundFonts, FM) that describe music as instructions. Each entry covers who created it, when and why, the hardware or codec underneath, and links to authoritative references and archives.</p>",
+  "sections": [
+   {
+    "id": "flac",
+    "title": "FLAC \u2014 Free Lossless Audio Codec",
+    "era": "Xiph.Org, 2001",
+    "body_html": "<p>FLAC is the most widely used open lossless codec, and the workhorse of serious music collections. It compresses PCM audio to roughly 50\u201370% of its original size while guaranteeing that decoding reproduces the source bit-for-bit \u2014 no information is discarded, unlike MP3 or AAC. That makes it ideal for archival rips and for serving high-resolution masters.</p><p>Development began with <strong>Josh Coalson</strong> in 2000; version 1.0 was released on 20 July 2001. The project came under the umbrella of the <strong>Xiph.Org Foundation</strong> in January 2003, the same non-profit behind Vorbis and Opus. FLAC uses linear prediction plus Rice coding of the residual, and supports streaming, seeking, embedded cue sheets and rich metadata via Vorbis comments.</p><p>FLAC's standing as a preservation format is formal: it is a recommended format for digital-audio archiving, and in late 2024 the format was published by the IETF as RFC 9639, giving the long-stable bitstream an official specification.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "2001 (v1.0)"
+     },
+     {
+      "label": "Origin",
+      "value": "Josh Coalson / Xiph.Org"
+     },
+     {
+      "label": "Type",
+      "value": "Lossless, ~50\u201370% size"
+     },
+     {
+      "label": "Spec",
+      "value": "RFC 9639 (2024)"
+     }
+    ],
+    "links": [
+     {
+      "label": "FLAC",
+      "url": "https://en.wikipedia.org/wiki/FLAC",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "FLAC project home",
+      "url": "https://xiph.org/flac/",
+      "source": "Xiph.Org"
+     }
+    ]
+   },
+   {
+    "id": "alac",
+    "title": "ALAC \u2014 Apple Lossless Audio Codec",
+    "era": "Apple, 2004",
+    "body_html": "<p>ALAC is Apple's answer to FLAC: a lossless codec that perfectly reconstructs the original PCM while typically halving the file size. It was introduced in 2004 for use with iTunes and iPod, and ALAC data is normally carried in an MP4 container with the <strong>.m4a</strong> extension \u2014 the same wrapper used for AAC, which is why both share that extension.</p><p>For its first seven years ALAC was proprietary. In October 2011 Apple released the encoder and decoder as open source under the Apache License 2.0, which let third-party tools and players adopt it freely. The codec supports up to 8 channels at 16, 20, 24 and 32-bit depths and high sample rates, and it is the format behind Apple Music's lossless tier.</p><p>Because the algorithm and container differ from FLAC, ALAC and FLAC are not interchangeable byte-for-byte, but both are lossless \u2014 converting between them does not degrade audio.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "2004"
+     },
+     {
+      "label": "Origin",
+      "value": "Apple Inc."
+     },
+     {
+      "label": "Container",
+      "value": "MP4 / .m4a, .caf"
+     },
+     {
+      "label": "Open-sourced",
+      "value": "2011 (Apache 2.0)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Apple Lossless Audio Codec",
+      "url": "https://en.wikipedia.org/wiki/Apple_Lossless_Audio_Codec",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "wav-aiff",
+    "title": "WAV & AIFF \u2014 Uncompressed PCM Containers",
+    "era": "1988\u20131991",
+    "body_html": "<p>WAV and AIFF are the two classic uncompressed containers \u2014 the raw, un-encoded PCM that lossless codecs compress and that lossy codecs throw data away from. They store sound as linear pulse-code modulation samples, exactly the representation on a Compact Disc (44.1 kHz, 16-bit, stereo), with no compression and therefore no quality loss and no decoding cost.</p><p><strong>AIFF</strong> (Audio Interchange File Format) was developed by <strong>Apple</strong> in 1988, derived from Electronic Arts' Interchange File Format (IFF) chunk structure; it became the native uncompressed format on the Macintosh. <strong>WAV</strong> (Waveform Audio File Format) followed in 1991 from <strong>Microsoft and IBM</strong>, built on the closely related RIFF (Resource Interchange File Format) container, and became the standard uncompressed format on Windows.</p><p>Both are chunk-based and broadly equivalent in audio terms \u2014 the difference is mainly byte order and ecosystem. A practical limit is that the classic 32-bit size field caps a file at 4 GiB (about 6.8 hours of CD-quality stereo); professional variants like RF64 and BWF extend this for broadcast use.</p>",
+    "facts": [
+     {
+      "label": "AIFF",
+      "value": "Apple, 1988"
+     },
+     {
+      "label": "WAV",
+      "value": "Microsoft/IBM, 1991"
+     },
+     {
+      "label": "Encoding",
+      "value": "Uncompressed LPCM"
+     },
+     {
+      "label": "Containers",
+      "value": "IFF / RIFF chunks"
+     }
+    ],
+    "links": [
+     {
+      "label": "WAV",
+      "url": "https://en.wikipedia.org/wiki/WAV",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Audio Interchange File Format",
+      "url": "https://en.wikipedia.org/wiki/Audio_Interchange_File_Format",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "wavpack",
+    "title": "WavPack \u2014 Hybrid Lossless",
+    "era": "David Bryant, 1998",
+    "body_html": "<p>WavPack is a free, open-source lossless codec notable for a feature few others offer: a <strong>hybrid mode</strong>. In hybrid mode it splits the encode into a small, relatively low-bitrate lossy file plus a separate \"correction\" file; the lossy part plays on its own, and adding the correction file restores perfect lossless quality. This lets one master serve both a compact everyday copy and a bit-perfect archive.</p><p>Development was started by <strong>David Bryant</strong> in mid-1998, with version 1.0 released on 15 August 1998. The format is maintained under a BSD license and continues to see active releases. Alongside hybrid mode it supports standard pure-lossless compression, high bit depths and sample rates, and multichannel audio.</p><p>WavPack is less ubiquitous than FLAC but is valued by archivists and tinkerers precisely for that hybrid split, which no mainstream lossless format replicates.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1998"
+     },
+     {
+      "label": "Origin",
+      "value": "David Bryant"
+     },
+     {
+      "label": "Modes",
+      "value": "Lossless + hybrid"
+     },
+     {
+      "label": "License",
+      "value": "BSD"
+     }
+    ],
+    "links": [
+     {
+      "label": "WavPack",
+      "url": "https://en.wikipedia.org/wiki/WavPack",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "WavPack project home",
+      "url": "https://www.wavpack.com/",
+      "source": "WavPack.com"
+     }
+    ]
+   },
+   {
+    "id": "mp3",
+    "title": "MP3 \u2014 MPEG-1/2 Audio Layer III",
+    "era": "Fraunhofer, 1993",
+    "body_html": "<p>MP3 is the format that made digital music portable. It is a <strong>lossy perceptual codec</strong>: it uses a psychoacoustic model to discard sound the human ear is unlikely to notice (masked frequencies, quiet detail behind loud passages), achieving roughly 10:1 compression over CD audio. The trade-off is that the discarded information is gone for good \u2014 unlike FLAC, an MP3 cannot be decoded back to the original waveform.</p><p>It was developed largely at the <strong>Fraunhofer Society</strong> in Germany under <strong>Karlheinz Brandenburg</strong>, with the underlying standard approved in 1991, finalized in 1992 and published in 1993 as ISO/IEC 11172-3 \u2014 MPEG-1 Audio Layer III. Layer III was the most complex and most efficient of the three MPEG-1 audio layers.</p><p>Through the late 1990s and 2000s MP3 became synonymous with digital music, file sharing and the first portable players. Its core patents have since expired, and while newer codecs are more efficient, MP3 remains universally compatible.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1993 (ISO/IEC 11172-3)"
+     },
+     {
+      "label": "Origin",
+      "value": "Fraunhofer / Brandenburg"
+     },
+     {
+      "label": "Type",
+      "value": "Lossy, perceptual"
+     },
+     {
+      "label": "Standard",
+      "value": "MPEG-1 Audio Layer III"
+     }
+    ],
+    "links": [
+     {
+      "label": "MP3",
+      "url": "https://en.wikipedia.org/wiki/MP3",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "aac",
+    "title": "AAC \u2014 Advanced Audio Coding",
+    "era": "MPEG, 1997",
+    "body_html": "<p>AAC was designed as the successor to MP3, delivering better sound quality at the same bitrate (and acceptable quality at lower bitrates). Like MP3 it is lossy and perceptual, but it uses larger transform blocks, more sample frequencies, and more sophisticated coding tools, which is why a 256 kbps AAC generally sounds better than a 256 kbps MP3.</p><p>It was standardized by the Moving Picture Experts Group, first as part of MPEG-2 in 1997 and later extended under MPEG-4. Development was a collaboration among <strong>Fraunhofer IIS, Dolby, AT&T and Sony</strong> \u2014 Fraunhofer again, the same lab behind MP3. AAC reached mass adoption as the default format of Apple's iTunes Store and iPod, and it is the audio in most MP4 video and streaming today.</p><p>AAC streams are usually stored in MP4/.m4a or .aac files. SoniqBoom treats .m4a containers as either AAC (lossy) or ALAC (lossless) depending on the codec inside.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1997 (MPEG-2)"
+     },
+     {
+      "label": "Origin",
+      "value": "Fraunhofer, Dolby, AT&T, Sony"
+     },
+     {
+      "label": "Type",
+      "value": "Lossy, perceptual"
+     },
+     {
+      "label": "Container",
+      "value": "MP4 / .m4a, .aac"
+     }
+    ],
+    "links": [
+     {
+      "label": "Advanced Audio Coding",
+      "url": "https://en.wikipedia.org/wiki/Advanced_Audio_Coding",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "vorbis",
+    "title": "Ogg Vorbis \u2014 Open Lossy Audio",
+    "era": "Xiph.Org, 2000\u20132002",
+    "body_html": "<p>Vorbis is a free, open, patent-unencumbered lossy codec created as an alternative to the then patent-encumbered MP3 and AAC. It typically matches or beats MP3 at a given bitrate and was an early favorite for open-source software, games and streaming where licensing fees were unwelcome. The codec is properly called <strong>Vorbis</strong>; \"Ogg Vorbis\" refers to Vorbis audio inside the <strong>Ogg</strong> container, which is its usual home (.ogg / .oga).</p><p>It is a project of the <strong>Xiph.Org Foundation</strong> \u2014 the same group behind FLAC and later Opus. The first packaged release came in 2000 and version 1.0 stabilized in July 2002. Vorbis introduced the Vorbis comment metadata scheme that FLAC also adopted.</p><p>Xiph now recommends Opus for new lossy encoding, but Vorbis remains widely supported and is still common in game audio and older streaming catalogs.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "2000 (v1.0 in 2002)"
+     },
+     {
+      "label": "Origin",
+      "value": "Xiph.Org Foundation"
+     },
+     {
+      "label": "Type",
+      "value": "Lossy, open, royalty-free"
+     },
+     {
+      "label": "Container",
+      "value": "Ogg (.ogg/.oga)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Vorbis",
+      "url": "https://en.wikipedia.org/wiki/Vorbis",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Vorbis project home",
+      "url": "https://xiph.org/vorbis/",
+      "source": "Xiph.Org"
+     }
+    ]
+   },
+   {
+    "id": "opus",
+    "title": "Opus \u2014 Low-Latency Modern Codec",
+    "era": "IETF, 2012",
+    "body_html": "<p>Opus is the current state of the art in open lossy audio: it handles everything from low-bitrate speech to full-quality music in a single codec, with very low latency, and is royalty-free. It works well across an enormous bitrate range and is the default audio codec for WebRTC, Discord-style voice, and much of YouTube and modern streaming.</p><p>It was developed by the <strong>Xiph.Org Foundation</strong> with contributors from <strong>Skype</strong> and Mozilla, combining two technologies \u2014 <strong>SILK</strong> (from Skype, strong on speech) and <strong>CELT</strong> (low-latency music). Key developers included Jean-Marc Valin, Koen Vos and Timothy B. Terriberry. The final specification was published as <strong>RFC 6716 on 10 September 2012</strong>, making Opus an IETF standard.</p><p>For music delivery Opus generally outperforms Vorbis and AAC at equal bitrates, and like its Xiph siblings it carries no licensing burden.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "2012 (RFC 6716)"
+     },
+     {
+      "label": "Origin",
+      "value": "Xiph.Org + Skype/Mozilla"
+     },
+     {
+      "label": "Built from",
+      "value": "SILK + CELT"
+     },
+     {
+      "label": "Type",
+      "value": "Lossy, low-latency, royalty-free"
+     }
+    ],
+    "links": [
+     {
+      "label": "Opus (audio format)",
+      "url": "https://en.wikipedia.org/wiki/Opus_(audio_format)",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Opus codec home",
+      "url": "https://opus-codec.org/",
+      "source": "Opus-codec.org"
+     }
+    ]
+   },
+   {
+    "id": "dsd",
+    "title": "DSD (DSF / DFF) \u2014 One-Bit Audio & the SACD Origin",
+    "era": "Sony & Philips, 1999",
+    "body_html": "<p>DSD (Direct Stream Digital) is a fundamentally different way of representing sound from everything above. Instead of multi-bit PCM samples taken tens of thousands of times per second, DSD uses a stream of <strong>single-bit</strong> values via pulse-density modulation \u2014 the proportion of 1s to 0s, sampled at <strong>2.8224 MHz</strong> (64\u00d7 the CD rate, \"DSD64\"), encodes the waveform. Higher rates like DSD128 and DSD256 push that further.</p><p>Direct Stream Digital is a trademark of <strong>Sony and Philips</strong>, created for the <strong>Super Audio CD (SACD)</strong>, introduced in 1999 as a high-resolution successor to the CD. SoniqBoom handles DSD in two file forms: <strong>.dsf</strong> (DSD Stream File, Sony's format, which carries tags) and <strong>.dff</strong> (DSDIFF / DSD Interchange File Format, Philips', common in raw SACD rips).</p><p>Because most playback chains and cast targets are PCM, the server transcodes DSD to high-resolution PCM for delivery while preserving the source files untouched.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1999 (SACD)"
+     },
+     {
+      "label": "Origin",
+      "value": "Sony & Philips"
+     },
+     {
+      "label": "Encoding",
+      "value": "1-bit PDM @ 2.8224 MHz (DSD64)"
+     },
+     {
+      "label": "Files",
+      "value": ".dsf (Sony), .dff (Philips)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Direct Stream Digital",
+      "url": "https://en.wikipedia.org/wiki/Direct_Stream_Digital",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Super Audio CD",
+      "url": "https://en.wikipedia.org/wiki/Super_Audio_CD",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "sid",
+    "title": "SID \u2014 Commodore 64 (MOS 6581 / 8580) & the HVSC",
+    "era": "Commodore 64, 1982",
+    "body_html": "<p>A SID file is not recorded audio \u2014 it is 6502 machine code plus a small player routine that, when executed, drives the Commodore 64's sound chip. To play one, SoniqBoom emulates the chip and the CPU in real time, which is why the same file sounds slightly different on different emulation cores.</p><p>The chip is the <strong>MOS Technology 6581</strong>, universally known as the <strong>SID</strong> (Sound Interface Device), designed by <strong>Bob Yannes</strong> and shipped in the Commodore 64 in 1982. It was a genuine single-chip synthesizer: three oscillators with multiple waveforms, ADSR envelopes, ring modulation and a famously characterful analog multimode filter. A later revision, the <strong>8580</strong> (around 1986), used a different process and had subtly different, cleaner filter behavior \u2014 so collectors distinguish 6581 vs 8580 recordings.</p><p>The definitive archive is the <strong>High Voltage SID Collection (HVSC)</strong> at hvsc.c64.org, holding tens of thousands of tunes. Two companion datasets matter for playback: <strong>Songlengths</strong> (an MD5-keyed list giving the correct duration of each subtune, since the code itself never \"ends\") and <strong>STIL</strong>, the SID Tune Information List, which adds composer credits, cover-song notes and trivia.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1982"
+     },
+     {
+      "label": "Chip",
+      "value": "MOS 6581 / 8580 (SID)"
+     },
+     {
+      "label": "Designer",
+      "value": "Bob Yannes"
+     },
+     {
+      "label": "Archive",
+      "value": "HVSC + Songlengths + STIL"
+     }
+    ],
+    "links": [
+     {
+      "label": "MOS Technology 6581 (SID)",
+      "url": "https://en.wikipedia.org/wiki/MOS_Technology_6581",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "High Voltage SID Collection",
+      "url": "https://www.hvsc.c64.org/",
+      "source": "HVSC"
+     }
+    ]
+   },
+   {
+    "id": "midi-soundfont",
+    "title": "MIDI & SoundFonts \u2014 General MIDI and SF2",
+    "era": "MIDI 1983 \u00b7 GM 1991 \u00b7 SoundFont 1994",
+    "body_html": "<p>A MIDI file contains no sound at all \u2014 it is a score: a timed list of note-on / note-off events, instrument selections and controllers. The actual audio depends entirely on the synthesizer rendering it. <strong>MIDI</strong> (Musical Instrument Digital Interface) was standardized in 1983 by a panel of synth makers, famously demoed by Dave Smith at NAMM, to let instruments from different companies talk to each other.</p><p>Because a raw MIDI file could sound wildly different per device, <strong>General MIDI (GM)</strong> was published in 1991 by the MIDI Manufacturers Association and the Japan MIDI Standards Committee. It fixes a standard 128-instrument patch map (program 1 is always Acoustic Grand Piano, etc.) and minimum polyphony, so a file plays recognizably everywhere.</p><p>To render GM consistently, SoniqBoom uses a <strong>SoundFont</strong>. The <strong>.sf2</strong> format stores banks of recorded instrument samples plus instructions for pitching and looping them \u2014 sample-based synthesis driven by the MIDI score. SoundFont was developed by <strong>E-mu Systems and Creative Labs</strong>, first used on the <strong>Sound Blaster AWE32</strong> in 1994, and is now an open standard, so any GM-compliant .sf2 can be swapped in to change the sound.</p>",
+    "facts": [
+     {
+      "label": "MIDI",
+      "value": "1983 standard"
+     },
+     {
+      "label": "General MIDI",
+      "value": "1991 (MMA/JMSC)"
+     },
+     {
+      "label": "SoundFont",
+      "value": "E-mu/Creative, 1994 (AWE32)"
+     },
+     {
+      "label": "File",
+      "value": ".mid score + .sf2 bank"
+     }
+    ],
+    "links": [
+     {
+      "label": "MIDI",
+      "url": "https://en.wikipedia.org/wiki/MIDI",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "General MIDI",
+      "url": "https://en.wikipedia.org/wiki/General_MIDI",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "SoundFont",
+      "url": "https://en.wikipedia.org/wiki/SoundFont",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "nsf",
+    "title": "NSF \u2014 NES Sound Format (Ricoh 2A03)",
+    "era": "Nintendo Entertainment System, 1983",
+    "body_html": "<p>NSF (NES Sound Format) packages the music engine and data extracted from a Nintendo Entertainment System game, along with the 6502 code that plays it. Like SID, it is executable music: the player emulates the NES CPU and its audio hardware to reproduce the tune, and exposes the game's separate tracks as selectable subtunes.</p><p>The sound comes from the audio unit inside the <strong>Ricoh 2A03</strong> (the 2A07 in PAL regions), the NES's CPU, which integrates the APU (Audio Processing Unit) alongside a 6502-derived processor. The APU provides five channels: two pulse/square waves, a triangle wave, a noise channel and a DPCM sample channel \u2014 the unmistakable palette of NES music. Some games added expansion sound chips on the cartridge (Konami VRC6, Nintendo's FDS, Namco 163, Sunsoft 5B), which NSF can also represent.</p><p>SoniqBoom renders NSF through its game-music engine, which emulates the 2A03 APU and the common expansion chips.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "NES, 1983 (JP) / 1985 (US)"
+     },
+     {
+      "label": "Chip",
+      "value": "Ricoh 2A03 APU"
+     },
+     {
+      "label": "Channels",
+      "value": "2 pulse, triangle, noise, DPCM"
+     },
+     {
+      "label": "Expansions",
+      "value": "VRC6, FDS, N163, 5B"
+     }
+    ],
+    "links": [
+     {
+      "label": "Ricoh 2A03 (NES CPU/APU)",
+      "url": "https://en.wikipedia.org/wiki/Ricoh_2A03",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Nintendo Entertainment System",
+      "url": "https://en.wikipedia.org/wiki/Nintendo_Entertainment_System",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "spc",
+    "title": "SPC \u2014 Super Nintendo (SPC700 / S-DSP)",
+    "era": "Super NES, 1990",
+    "body_html": "<p>An SPC file is a snapshot of the Super Nintendo's entire sound subsystem at the moment a tune is playing: the 64 KB of audio RAM, plus the registers of the sound CPU and DSP. To play it, SoniqBoom loads that memory image into an emulation of the SNES audio hardware and lets it run \u2014 so an SPC is closer to a frozen machine state than to a sequence of notes.</p><p>The SNES audio system was designed by <strong>Ken Kutaragi</strong> and built by <strong>Sony</strong>, running independently of the main console. It pairs an 8-bit <strong>SPC700</strong> CPU with a 16-bit <strong>S-DSP</strong> that mixes eight channels of <strong>compressed PCM samples</strong> (BRR format) with hardware ADSR envelopes and, distinctively, a built-in echo/reverb unit \u2014 which is why SNES soundtracks have that lush, ambient character.</p><p>Because the SNES used real recorded samples rather than pure tone generators, SPC music can sound surprisingly rich for 1990 hardware.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1990 (SFC) / 1991 (SNES)"
+     },
+     {
+      "label": "Audio CPU",
+      "value": "Sony SPC700 + S-DSP"
+     },
+     {
+      "label": "Voices",
+      "value": "8 BRR-sample channels + echo"
+     },
+     {
+      "label": "Designer",
+      "value": "Ken Kutaragi / Sony"
+     }
+    ],
+    "links": [
+     {
+      "label": "Super Nintendo Entertainment System",
+      "url": "https://en.wikipedia.org/wiki/Super_Nintendo_Entertainment_System",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "gbs",
+    "title": "GBS \u2014 Game Boy Sound",
+    "era": "Game Boy, 1989",
+    "body_html": "<p>GBS (Game Boy Sound) captures the music driver and data from a Game Boy title, played back by emulating the handheld's audio hardware. As with NSF and SID, the file holds code and data rather than a recording, and exposes a game's tracks as subtunes.</p><p>The original <strong>Game Boy</strong> launched from Nintendo in 1989 (developed under Gunpei Yokoi's Nintendo R&D1). Its sound hardware, integrated into the system's Sharp LR35902 core, offers <strong>four channels</strong>: two pulse/square-wave channels (one with a frequency sweep), a 4-bit programmable <strong>wavetable</strong> channel, and a noise channel. That wavetable voice \u2014 a user-definable 32-step waveform \u2014 gives Game Boy music its signature buzzy, hollow timbres beloved by chiptune artists.</p><p>The Game Boy's sound chip remains a living instrument: trackers like LSDj run on real hardware, and GBS preserves the original game scores in the same idiom.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1989"
+     },
+     {
+      "label": "Origin",
+      "value": "Nintendo (Gunpei Yokoi / R&D1)"
+     },
+     {
+      "label": "Channels",
+      "value": "2 pulse, wavetable, noise"
+     },
+     {
+      "label": "Note",
+      "value": "User-defined 4-bit wave voice"
+     }
+    ],
+    "links": [
+     {
+      "label": "Game Boy",
+      "url": "https://en.wikipedia.org/wiki/Game_Boy",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "vgm",
+    "title": "VGM \u2014 Video Game Music (Sega & Arcade)",
+    "era": "Sega / arcade, format c. 2002",
+    "body_html": "<p>VGM takes a different approach from the executable formats above: rather than storing CPU code, it is a <strong>log of the exact register writes sent to the sound chips</strong>, timestamped sample-by-sample. Playback re-issues those writes to emulated chips, so a VGM is essentially a recording of chip commands \u2014 accurate to the original hardware regardless of the game's CPU.</p><p>This makes VGM a near-universal container for chip music. A single file can target many systems and their sound chips: the <strong>Sega Master System, Game Gear and Mega Drive/Genesis</strong> (Texas Instruments SN76489 PSG and Yamaha YM2612 FM), the <strong>MSX</strong>, <strong>Neo Geo</strong>, and a long list of arcade boards. Files use the <strong>.vgm</strong> extension, or <strong>.vgz</strong> when gzip-compressed.</p><p>Because it logs every write at hardware resolution, VGM is prized for fidelity: it reproduces the precise timing quirks of FM and PSG chips that higher-level formats might smooth over.</p>",
+    "facts": [
+     {
+      "label": "Approach",
+      "value": "Logged chip register writes"
+     },
+     {
+      "label": "Systems",
+      "value": "SMS, Mega Drive, MSX, arcade"
+     },
+     {
+      "label": "Key chips",
+      "value": "SN76489 PSG, YM2612 FM"
+     },
+     {
+      "label": "Files",
+      "value": ".vgm / .vgz"
+     }
+    ],
+    "links": [
+     {
+      "label": "VGM (file format)",
+      "url": "https://en.wikipedia.org/wiki/VGM_(file_format)",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "ay",
+    "title": "AY \u2014 ZX Spectrum & Amstrad (AY-3-8910)",
+    "era": "PSG from 1978; AY music 1980s",
+    "body_html": "<p>AY files hold music for the <strong>General Instrument AY-3-8910</strong> programmable sound generator (and its compatible Yamaha YM2149 variant), the chip that gave 8-bit European home computers their voice. They are most associated with the <strong>ZX Spectrum 128</strong> and the <strong>Amstrad CPC</strong>, and the format also accommodates the Z80 code that drives the tunes.</p><p>The AY-3-8910 was designed by <strong>General Instrument in 1978</strong> as a 3-voice PSG: three square-wave tone channels plus a shared noise generator and a single envelope generator, covering nearly the full range of a piano. It was enormously popular, also appearing in the Intellivision, Vectrex, Atari ST, MSX machines and countless arcade cabinets, which is why its bright, buzzy three-channel sound is instantly recognizable.</p><p>SoniqBoom renders AY tunes by emulating the PSG (and the host CPU where needed), reproducing the chip's distinctive envelope-driven timbres.</p>",
+    "facts": [
+     {
+      "label": "Chip",
+      "value": "GI AY-3-8910 (1978)"
+     },
+     {
+      "label": "Variant",
+      "value": "Yamaha YM2149"
+     },
+     {
+      "label": "Channels",
+      "value": "3 tone + noise + envelope"
+     },
+     {
+      "label": "Hosts",
+      "value": "ZX Spectrum 128, Amstrad CPC"
+     }
+    ],
+    "links": [
+     {
+      "label": "General Instrument AY-3-8910",
+      "url": "https://en.wikipedia.org/wiki/General_Instrument_AY-3-8910",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "ZX Spectrum",
+      "url": "https://en.wikipedia.org/wiki/ZX_Spectrum",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "kss",
+    "title": "KSS \u2014 MSX Sound",
+    "era": "MSX, 1983 onward",
+    "body_html": "<p>KSS files store music ripped from <strong>MSX</strong> computer software, bundled with the Z80 code that plays it. The MSX was a standardized home-computer architecture launched in 1983, hugely popular in Japan, the Netherlands, Brazil, Korea and parts of the Middle East, and home to early work by composers who later shaped console game music.</p><p>What makes KSS interesting is the breadth of MSX sound hardware it can drive. The base machines used the <strong>AY-3-8910 PSG</strong> (here called the PSG). MSX-MUSIC added the <strong>Yamaha YM2413 (OPLL)</strong> FM chip, MSX-AUDIO used the <strong>Y8950</strong>, and Konami cartridges shipped their own <strong>SCC</strong> wavetable chip \u2014 famous from games like Gradius and Nemesis. A KSS file can call on these in combination.</p><p>SoniqBoom's game-music engine emulates the MSX CPU and these sound chips so KSS tunes play with the right mix of PSG, FM and SCC voices.</p>",
+    "facts": [
+     {
+      "label": "Platform",
+      "value": "MSX (from 1983)"
+     },
+     {
+      "label": "Base chip",
+      "value": "AY-3-8910 PSG"
+     },
+     {
+      "label": "FM add-ons",
+      "value": "YM2413 OPLL, Y8950"
+     },
+     {
+      "label": "Konami",
+      "value": "SCC wavetable"
+     }
+    ],
+    "links": [
+     {
+      "label": "MSX",
+      "url": "https://en.wikipedia.org/wiki/MSX",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Yamaha YM2413 (OPLL)",
+      "url": "https://en.wikipedia.org/wiki/Yamaha_YM2413",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "sap",
+    "title": "SAP \u2014 Atari 8-bit (POKEY)",
+    "era": "Atari 400/800, 1979",
+    "body_html": "<p>SAP (Slight Atari Player) is the standard format for music from the <strong>Atari 8-bit computers</strong> (400/800 and the XL/XE line). It carries the 6502 player code and song data, played back by emulating the Atari CPU and its sound chip.</p><p>That chip is the <strong>POKEY</strong> (Pot Keyboard Integrated Circuit), designed by <strong>Doug Neubauer</strong> at Atari and first released with the Atari 400 and 800 in 1979. POKEY is a multi-purpose part \u2014 it scanned the keyboard, read paddle controllers and handled serial I/O \u2014 but for music it provides <strong>four audio channels</strong> with a flexible set of polynomial-counter \"distortion\" modes that yield everything from clean tones to gritty noise. Channels can be paired for higher-resolution pitch, and the same chip later powered Atari arcade games.</p><p>Some SAP tunes assume a machine with two POKEYs (stereo); SoniqBoom's emulation supports the dual-POKEY case where the file calls for it.</p>",
+    "facts": [
+     {
+      "label": "Chip",
+      "value": "Atari POKEY (1979)"
+     },
+     {
+      "label": "Designer",
+      "value": "Doug Neubauer"
+     },
+     {
+      "label": "Channels",
+      "value": "4, polynomial distortion modes"
+     },
+     {
+      "label": "Format",
+      "value": "SAP (Slight Atari Player)"
+     }
+    ],
+    "links": [
+     {
+      "label": "POKEY (Atari chip)",
+      "url": "https://en.wikipedia.org/wiki/POKEY",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Atari 8-bit computers",
+      "url": "https://en.wikipedia.org/wiki/Atari_8-bit_computers",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "adlib-opl",
+    "title": "AdLib / OPL2 FM (Yamaha YM3812) & id Software IMF",
+    "era": "AdLib 1987 \u00b7 OPL2 1985",
+    "body_html": "<p>This family is the sound of early-1990s PC gaming: <strong>FM synthesis</strong> on the <strong>Yamaha YM3812</strong>, better known as the <strong>OPL2</strong>. Rather than playing samples, FM synthesis generates timbres mathematically by having operators modulate each other's frequency \u2014 a technique Yamaha popularized with the DX7 synthesizer and miniaturized into cheap sound-card chips.</p><p>The OPL2 (YM3812) was released by Yamaha in <strong>1985</strong> as part of the OPL series (the later OPL3/YMF262 of 1990 doubled the channels and added 4-operator voices). It offers 9 channels of 2-operator FM with four waveform shapes. The chip became the de-facto PC audio standard inside the <strong>Ad Lib</strong> card (from Ad Lib, Inc., founded by Martin Prevel, 1987) and then the Creative <strong>Sound Blaster</strong>, which kept OPL compatibility.</p><p>SoniqBoom plays this music two ways. Raw register logs and tunes are rendered through an OPL emulator. It also supports <strong>IMF</strong> (id Music Format), the timestamped OPL2 command stream <strong>id Software</strong> used for the music in Commander Keen, Wolfenstein 3D and the early Doom-era tools \u2014 a format that, like VGM, simply logs the writes to feed the FM chip.</p>",
+    "facts": [
+     {
+      "label": "Chip",
+      "value": "Yamaha YM3812 (OPL2), 1985"
+     },
+     {
+      "label": "Synthesis",
+      "value": "9-ch, 2-operator FM"
+     },
+     {
+      "label": "Card",
+      "value": "Ad Lib (1987), Sound Blaster"
+     },
+     {
+      "label": "id format",
+      "value": "IMF (OPL2 command log)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Yamaha OPL (OPL2 / YM3812)",
+      "url": "https://en.wikipedia.org/wiki/Yamaha_OPL",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Ad Lib, Inc.",
+      "url": "https://en.wikipedia.org/wiki/Ad_Lib,_Inc.",
+      "source": "Wikipedia"
+     }
+    ]
+   }
+  ]
+ },
+ "trackers": {
+  "intro": "<p>Long before the digital audio workstation, a generation of musicians composed entire scores by typing hexadecimal numbers into a grid. This was <strong>tracker music</strong>: a way of sequencing sampled sounds that emerged on the Commodore Amiga in 1987 and went on to power the soundtracks of countless games, the audio of the demoscene, and an enduring underground culture of self-taught composers. A tracker song was not a recording but a recipe \u2014 a compact file bundling the instrument samples together with the instructions for playing them, small enough to fit on a floppy disk yet capable of producing minutes of music.</p><p>This addendum traces the lineage of the tracker and its <strong>module formats</strong> \u2014 the family of files (.mod, .s3m, .xm, .it and their many cousins) that SoniqBoom recognizes as a distinct branch of recorded music. It follows the format from Karsten Obarski's original Ultimate Soundtracker through the PC tracker wars of the 1990s, the rise of FastTracker 2 and Impulse Tracker, and the specialized formats that pushed the idea in new directions. Throughout, the through-line is a community of hobbyists who treated music software as something to be shared, cracked open, reverse-engineered, and improved.</p>",
+  "sections": [
+   {
+    "id": "what-is-tracker-music",
+    "title": "What Is Tracker Music? Patterns, Channels, and Samples",
+    "era": "Concept, 1987-present",
+    "body_html": "<p>A tracker is a music sequencer with a distinctive vertical, text-based interface. Instead of a horizontal piano-roll or staff notation, a tracker displays a <strong>pattern</strong>: a grid read from top to bottom, where each row is a moment in time and each column is a <strong>channel</strong> (a voice that can play one note at a time). As playback scrolls down the rows, the tracker triggers whatever notes, instruments, and effect commands are written in each cell.</p><p>The sounds themselves are <strong>samples</strong> \u2014 short digital recordings of an instrument, a drum hit, a voice, or any noise at all, stored inside the file. This is what made trackers revolutionary on home computers: a composer could record or borrow a real piano sample and play it chromatically across the keyboard, rather than being limited to a synthesizer chip's fixed waveforms. A complete tracker file \u2014 a <strong>module</strong> \u2014 packages the patterns, the order in which patterns play, and all the samples into a single self-contained document.</p><p>Each cell in a pattern can hold a note, an instrument number, a volume, and an <strong>effect command</strong> \u2014 a one- or two-digit code that bends pitch, slides volume, sets tempo, retriggers a sample, or produces vibrato and arpeggio. Mastering these hexadecimal effect codes was the craft of tracking. Because everything was sample-based and the playback routine was deterministic, a module sounded identical on any machine that could run the player, while occupying only a few dozen kilobytes.</p>",
+    "facts": [
+     {
+      "label": "Interface",
+      "value": "Vertical pattern grid (rows = time)"
+     },
+     {
+      "label": "Voice unit",
+      "value": "Channel (one note each)"
+     },
+     {
+      "label": "Sound source",
+      "value": "Digital samples stored in-file"
+     },
+     {
+      "label": "File type",
+      "value": "Module (patterns + order + samples)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Music tracker",
+      "url": "https://en.wikipedia.org/wiki/Music_tracker",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Module file",
+      "url": "https://en.wikipedia.org/wiki/Module_file",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "demoscene-culture",
+    "title": "The Demoscene and Module Culture",
+    "era": "Late 1980s onward",
+    "body_html": "<p>Tracker music grew up alongside the <strong>demoscene</strong> \u2014 a subculture of programmers, artists, and musicians who created <strong>demos</strong>: real-time audiovisual productions that showed off coding and artistic skill, often released competitively at gatherings called <strong>demoparties</strong>. The demoscene emerged from the software cracking groups of the 1980s, where crackers attached small animated 'intros' with music to the games they distributed. Those intros evolved into an art form of their own.</p><p>Because demos ran in real time and had to fit in tight memory, the compact tracker module was the perfect audio format. A skilled <strong>tracker musician</strong> (often credited by a scene handle) was a prized member of any demo group. Demoparties such as <strong>The Party</strong>, <strong>Assembly</strong>, and later <strong>Revision</strong> ran music competitions where tracked tunes were judged by the assembled crowd.</p><p>This culture of sharing meant modules circulated freely. Because the format stored samples uncompressed and unencrypted, anyone could open a .mod in a tracker, study how it was built, and learn by taking it apart \u2014 a built-in education system that made the scene largely self-taught.</p>",
+    "facts": [
+     {
+      "label": "Origin",
+      "value": "Cracker intros, mid-1980s"
+     },
+     {
+      "label": "Events",
+      "value": "Demoparties (Assembly, Revision, The Party)"
+     },
+     {
+      "label": "Role of music",
+      "value": "Real-time soundtrack for demos"
+     },
+     {
+      "label": "Ethos",
+      "value": "Open samples, learn by disassembly"
+     }
+    ],
+    "links": [
+     {
+      "label": "Demoscene",
+      "url": "https://en.wikipedia.org/wiki/Demoscene",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Demo (computer programming)",
+      "url": "https://en.wikipedia.org/wiki/Demo_(computer_programming)",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Assembly (demoparty)",
+      "url": "https://en.wikipedia.org/wiki/Assembly_(demoparty)",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "ultimate-soundtracker",
+    "title": "Ultimate Soundtracker and the Birth of MOD",
+    "era": "Amiga, 1987",
+    "body_html": "<p>The tracker as we know it begins with <strong>Karsten Obarski</strong>, a German programmer and musician who, while working at the games studio EAS (Electronic Arts Germany / Rainbow Arts circles), wrote <strong>Ultimate Soundtracker</strong> for the Commodore Amiga in <strong>1987</strong>. The Amiga's custom <strong>Paula</strong> chip could play four independent channels of 8-bit PCM samples in hardware, and Obarski's program gave composers a pattern-based interface to drive them. It was sold commercially, but cracked copies and clones spread it across the Amiga world within months.</p><p>The file format it produced became known simply as <strong>MOD</strong> (extension .mod). A classic MOD has <strong>four channels</strong>, holds 15 (later 31) samples, and arranges 64-row patterns into a playback order. Because the Amiga panned channels hard left and right, the iconic 'Amiga stereo' of early MODs has voices 1 and 4 on one side and 2 and 3 on the other.</p><p>A wave of clones followed Obarski's original \u2014 <strong>SoundTracker</strong>, NoiseTracker, and many variants \u2014 each adding samples, effects, or stability. This rapid, collaborative iteration set the template for tracker development for the next decade.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1987"
+     },
+     {
+      "label": "Author",
+      "value": "Karsten Obarski"
+     },
+     {
+      "label": "Platform",
+      "value": "Commodore Amiga (Paula chip)"
+     },
+     {
+      "label": "Channels",
+      "value": "4 (MOD format)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Ultimate Soundtracker",
+      "url": "https://en.wikipedia.org/wiki/Ultimate_Soundtracker",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MOD (file format)",
+      "url": "https://en.wikipedia.org/wiki/MOD_(file_format)",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Karsten Obarski",
+      "url": "https://en.wikipedia.org/wiki/Karsten_Obarski",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "protracker",
+    "title": "ProTracker: The Definitive MOD Tracker",
+    "era": "Amiga, 1990-1994",
+    "body_html": "<p>Among the many Soundtracker descendants, <strong>ProTracker</strong> became the de facto standard on the Amiga. First released around <strong>1990</strong> and developed by a succession of Amiga coders (including Lars 'Lallapallooza' Hamre and others), ProTracker refined the four-channel MOD into a stable, expressive tool. Its effect command set \u2014 the hexadecimal codes for portamento, vibrato, sample offset, pattern loops, and tempo changes \u2014 became the reference that later formats had to remain compatible with.</p><p>ProTracker's 31-sample, 4-channel MOD is the format most people mean by 'a mod file.' Its conventions were so influential that the playback quirks of ProTracker (and of the Amiga hardware itself) are emulated faithfully by modern players to keep thousands of archived tunes sounding correct.</p><p>The program remained in active use for years, and a community of enthusiasts has continued to maintain and clone it long after the Amiga's commercial decline, including faithful modern recreations that reproduce its behavior cycle-for-cycle.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "~1990"
+     },
+     {
+      "label": "Lineage",
+      "value": "Soundtracker / NoiseTracker descendant"
+     },
+     {
+      "label": "Platform",
+      "value": "Commodore Amiga"
+     },
+     {
+      "label": "Channels",
+      "value": "4 (31 samples)"
+     }
+    ],
+    "links": [
+     {
+      "label": "ProTracker",
+      "url": "https://en.wikipedia.org/wiki/ProTracker",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MOD (file format)",
+      "url": "https://en.wikipedia.org/wiki/MOD_(file_format)",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MOD files at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     }
+    ]
+   },
+   {
+    "id": "the-pc-migration",
+    "title": "The Move to the PC: From Amiga to Sound Blaster",
+    "era": "Early 1990s",
+    "body_html": "<p>As the IBM PC clone overtook the Amiga, tracking migrated to DOS. The catalyst was the <strong>sound card</strong>: cards like the Creative <strong>Sound Blaster</strong> and especially the <strong>Gravis UltraSound (GUS)</strong> of 1992 gave PCs sample-playback capability the original PC speaker never had. The Gravis UltraSound was particularly beloved by trackers because it had on-board RAM and could mix many channels in hardware, freeing the CPU.</p><p>PC trackers were no longer bound to the Amiga's four-channel Paula chip. They could mix 8, 16, 32, or more channels in software, support 16-bit samples, and add stereo panning per channel. This freedom drove a rapid format evolution through the 1990s \u2014 the <strong>.mod &rarr; .s3m &rarr; .xm &rarr; .it</strong> progression \u2014 each step adding channels, sample fidelity, and instrument features.</p><p>The result was a friendly rivalry between competing trackers and their formats, much of it driven by demoscene groups who wrote both the music software and the demos that used it.</p>",
+    "facts": [
+     {
+      "label": "Platform shift",
+      "value": "Amiga \u2192 IBM PC (DOS)"
+     },
+     {
+      "label": "Key hardware",
+      "value": "Gravis UltraSound (1992), Sound Blaster"
+     },
+     {
+      "label": "New capabilities",
+      "value": "Many channels, 16-bit, per-channel pan"
+     },
+     {
+      "label": "Format arc",
+      "value": ".mod \u2192 .s3m \u2192 .xm \u2192 .it"
+     }
+    ],
+    "links": [
+     {
+      "label": "Gravis UltraSound",
+      "url": "https://en.wikipedia.org/wiki/Gravis_UltraSound",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Sound Blaster",
+      "url": "https://en.wikipedia.org/wiki/Sound_Blaster",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Music tracker",
+      "url": "https://en.wikipedia.org/wiki/Music_tracker",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "screamtracker-3",
+    "title": "ScreamTracker 3 and the S3M Format (Future Crew)",
+    "era": "MS-DOS, 1994",
+    "body_html": "<p>The first PC tracker to achieve broad popularity was <strong>ScreamTracker</strong>, written by <strong>Sami 'PSI' Tammilehto</strong> of the legendary Finnish demo group <strong>Future Crew</strong>. <strong>ScreamTracker 3</strong>, released in <strong>1994</strong>, and its <strong>S3M</strong> format (.s3m) became a PC tracking standard. S3M supported up to <strong>32 channels</strong>, per-channel panning, and could mix both digital samples and Adlib/OPL2 FM synthesis instruments.</p><p>Future Crew's fame was amplified by their 1992 demo <strong>Second Reality</strong>, one of the most celebrated demoscene productions of all time, whose soundtrack showcased what PC tracked music could do. ScreamTracker's effect command syntax \u2014 adapted from the Amiga but extended \u2014 influenced the formats that followed, and FastTracker 2 in particular built directly on S3M conventions.</p><p>ScreamTracker 3 is often cited as the bridge between the Amiga MOD tradition and the mature PC tracker era, carrying the four-channel grammar forward while embracing the PC's expanded hardware.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1994 (v3)"
+     },
+     {
+      "label": "Author",
+      "value": "Sami 'PSI' Tammilehto (Future Crew)"
+     },
+     {
+      "label": "Platform",
+      "value": "MS-DOS"
+     },
+     {
+      "label": "Channels",
+      "value": "Up to 32 (S3M)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Scream Tracker",
+      "url": "https://en.wikipedia.org/wiki/Scream_Tracker",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Future Crew",
+      "url": "https://en.wikipedia.org/wiki/Future_Crew",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "S3M modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     }
+    ]
+   },
+   {
+    "id": "fasttracker-2",
+    "title": "FastTracker 2 and the XM Format (Triton)",
+    "era": "MS-DOS, 1994",
+    "body_html": "<p><strong>FastTracker 2</strong> (often written FT2), released in <strong>1994</strong> by the Swedish group <strong>Triton</strong> \u2014 principally <strong>Fredrik 'Mr.H' Huss</strong> and <strong>Magnus 'Vogue' Hogdahl</strong> \u2014 was for many the high-water mark of DOS tracking. Its <strong>XM</strong> format (Extended Module, .xm) introduced <strong>multi-sample instruments</strong> with volume and panning <strong>envelopes</strong>, 16-bit samples, and up to <strong>32 channels</strong>, while remaining easy to learn.</p><p>FT2 was beloved for its responsive, keyboard-driven interface and clean mouse-driven UI, and it became the tracker of choice for a huge swath of the 1990s scene. The XM format's combination of accessibility and capability made it one of the most widely used module formats ever, and it remains extremely common in module archives.</p><p>The instrument concept XM introduced \u2014 mapping different samples to different note ranges under a single playable instrument, with envelopes shaping volume and pan over time \u2014 was a major step toward the modern sampler workflow, and Impulse Tracker would push the idea further still.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1994"
+     },
+     {
+      "label": "Author",
+      "value": "Fredrik Huss & Magnus Hogdahl (Triton)"
+     },
+     {
+      "label": "Platform",
+      "value": "MS-DOS"
+     },
+     {
+      "label": "Channels",
+      "value": "Up to 32 (XM, 16-bit samples)"
+     }
+    ],
+    "links": [
+     {
+      "label": "FastTracker 2",
+      "url": "https://en.wikipedia.org/wiki/FastTracker_2",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "XM (file format)",
+      "url": "https://en.wikipedia.org/wiki/XM_(file_format)",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "impulse-tracker",
+    "title": "Impulse Tracker and the IT Format (Jeffrey Lim)",
+    "era": "MS-DOS, 1995-1999",
+    "body_html": "<p><strong>Impulse Tracker</strong> (IT), written by <strong>Jeffrey Lim</strong> and first released in <strong>1995</strong>, is widely regarded as the most advanced of the classic DOS trackers. Its <strong>IT</strong> format (.it) supported up to <strong>64 channels</strong> (with mixing of many virtual voices via 'New Note Actions'), 16-bit samples, a resonant <strong>low-pass filter</strong>, and a high-quality software mixer that gave it a noticeably cleaner, fuller sound than its rivals.</p><p>Impulse Tracker's signature feature was <strong>New Note Actions (NNA)</strong>, which allowed a single channel to overlap and sustain multiple notes \u2014 enabling natural reverb tails and polyphonic instruments that earlier trackers could not produce. Combined with its filter envelopes, IT could approach the richness of dedicated samplers.</p><p>The IT format and FastTracker's XM together defined the end-state of the DOS tracker era. When tracking moved to Windows, IT remained a target format, and the modern open-source tracker <strong>Schism Tracker</strong> was created specifically to reproduce Impulse Tracker's behavior and feel on contemporary systems.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "1995"
+     },
+     {
+      "label": "Author",
+      "value": "Jeffrey Lim"
+     },
+     {
+      "label": "Platform",
+      "value": "MS-DOS"
+     },
+     {
+      "label": "Channels",
+      "value": "Up to 64 + NNA virtual voices"
+     }
+    ],
+    "links": [
+     {
+      "label": "Impulse Tracker",
+      "url": "https://en.wikipedia.org/wiki/Impulse_Tracker",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Schism Tracker",
+      "url": "https://schismtracker.org/",
+      "source": "schismtracker.org"
+     },
+     {
+      "label": "IT modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     }
+    ]
+   },
+   {
+    "id": "octamed-med",
+    "title": "OctaMED and the MED Format",
+    "era": "Amiga, 1989-1990s",
+    "body_html": "<p>While the Soundtracker family dominated one branch of the Amiga, a parallel lineage grew around <strong>MED</strong> (Music EDitor) and its commercial successor <strong>OctaMED</strong>, developed by <strong>Teijo Kinnunen</strong> (RBF Software / later distributed by Amiganuts and others). MED files use the .med extension; OctaMED songs commonly use .med as well.</p><p>OctaMED's headline trick was suggested by its name: by software-mixing pairs of the Amiga's four hardware channels, it could play <strong>eight channels</strong> ('Octa') on hardware that natively offered only four. It also supported MIDI, multiple time signatures, and more flexible note entry than the rigid Soundtracker grid, which made it popular with musicians who wanted more than four voices on a stock Amiga.</p><p>Later versions, sold as <strong>OctaMED SoundStudio</strong>, extended the format further with more channels and 16-bit support, keeping the MED lineage alive into the late Amiga era.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "MED late 1980s; OctaMED early 1990s"
+     },
+     {
+      "label": "Author",
+      "value": "Teijo Kinnunen (RBF Software)"
+     },
+     {
+      "label": "Platform",
+      "value": "Commodore Amiga"
+     },
+     {
+      "label": "Channels",
+      "value": "8 via software mixing (later more)"
+     }
+    ],
+    "links": [
+     {
+      "label": "OctaMED",
+      "url": "https://en.wikipedia.org/wiki/OctaMED",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MED modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "multitracker-mtm",
+    "title": "MultiTracker and the MTM Format",
+    "era": "MS-DOS, early 1990s",
+    "body_html": "<p><strong>MultiTracker</strong>, whose format carries the .mtm extension (<strong>MTM</strong>, MultiTracker Module), was written by <strong>Daniel 'Starscream' Goldstein</strong>, a prolific scene musician associated with the group <strong>Renaissance</strong> and later known professionally as a game and film composer. MultiTracker appeared in the early 1990s as one of the first PC trackers to break the four-channel Amiga limit, supporting up to <strong>32 channels</strong>.</p><p>MTM occupied a transitional spot in the PC timeline: more capable than a straight MOD, but soon overshadowed by ScreamTracker 3, FastTracker 2, and Impulse Tracker. Even so, a body of MTM modules survives in the archives, and the format is supported by general-purpose module players for completeness.</p><p>Goldstein's career arc \u2014 from demoscene tracker to mainstream composer \u2014 is itself emblematic of how many scene musicians carried their tracker-honed skills into professional game audio.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "Early 1990s"
+     },
+     {
+      "label": "Author",
+      "value": "Daniel 'Starscream' Goldstein"
+     },
+     {
+      "label": "Platform",
+      "value": "MS-DOS"
+     },
+     {
+      "label": "Channels",
+      "value": "Up to 32 (MTM)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Module file (formats overview)",
+      "url": "https://en.wikipedia.org/wiki/Module_file",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MTM modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "composer-669",
+    "title": "Composer 669 and the 669 Format",
+    "era": "MS-DOS, early 1990s",
+    "body_html": "<p>One of the earliest dedicated PC trackers was <strong>Composer 669</strong>, written by <strong>Tran of Renaissance</strong> (the handle of Tomasz Pytel). Its format takes the unusual extension <strong>.669</strong> \u2014 reportedly a nod to the author's BBS culture and handle. Released in the early 1990s, Composer 669 targeted the Sound Blaster and supported up to <strong>8 channels</strong>.</p><p>The 669 format is primitive by later standards \u2014 it lacks the rich effect set of ScreamTracker and its successors \u2014 but it holds a place of honor as one of the first formats to bring sample-based tracking to the PC independent of the Amiga lineage. An 'Extended 669' variant later added a few features.</p><p>Like MTM, the 669 format was quickly superseded, but its modules are preserved in archives and supported by playback libraries, making it part of the complete picture of early PC tracking.</p>",
+    "facts": [
+     {
+      "label": "Year",
+      "value": "Early 1990s"
+     },
+     {
+      "label": "Author",
+      "value": "Tran of Renaissance (Tomasz Pytel)"
+     },
+     {
+      "label": "Platform",
+      "value": "MS-DOS (Sound Blaster)"
+     },
+     {
+      "label": "Channels",
+      "value": "Up to 8 (.669)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Module file (formats overview)",
+      "url": "https://en.wikipedia.org/wiki/Module_file",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "669 modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "digibooster-pro",
+    "title": "DigiBooster Pro and the DBM Format",
+    "era": "Amiga, late 1990s",
+    "body_html": "<p>As the PC pulled ahead, the Amiga scene continued to innovate. <strong>DigiBooster Pro</strong>, developed by the Polish team around <strong>Tomasz Piasta</strong> (with later work by the Czech firm <strong>Animationsfabrik</strong> / Polish coders), pushed Amiga tracking far beyond the four-channel Paula limit through software mixing. Its <strong>DBM</strong> format (DigiBooster Module, .dbm) supported many channels, 16-bit samples, and an effects set rivaling the PC trackers.</p><p>DigiBooster Pro showed that the Amiga, even late in its commercial life, remained a serious music platform in the hands of skilled coders. The DBM format is one of the more advanced Amiga module formats and is supported by modern cross-platform players that aim for full archive coverage.</p><p>The project saw continued development in later years, reflecting the unusually persistent loyalty of the Amiga music community well past the platform's mainstream era.</p>",
+    "facts": [
+     {
+      "label": "Era",
+      "value": "Late 1990s onward"
+     },
+     {
+      "label": "Author",
+      "value": "Tomasz Piasta & team"
+     },
+     {
+      "label": "Platform",
+      "value": "Commodore Amiga"
+     },
+     {
+      "label": "Channels",
+      "value": "Many (software-mixed, 16-bit)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Module file (formats overview)",
+      "url": "https://en.wikipedia.org/wiki/Module_file",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "DBM modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "ahx-hively",
+    "title": "AHX and HivelyTracker: Synthetic Chiptunes",
+    "era": "Amiga 1990s / cross-platform 2000s",
+    "body_html": "<p>Not every tracker relied on stored samples. <strong>AHX</strong> (Abyss' Highest eXperience), created in the 1990s by <strong>Dexter</strong> and <strong>Pink</strong> of the Amiga group <strong>Abyss</strong>, generated its sound from tiny synthesized waveforms rather than recorded samples. This made AHX modules extraordinarily small and gave them a distinctive buzzy, C64-like 'chiptune' character \u2014 perfect for size-limited intros.</p><p>The AHX idea was carried forward and modernized by <strong>HivelyTracker</strong>, an open-source, cross-platform tracker created by <strong>Pete 'IRIS' Gordon</strong> and <strong>Xeron</strong> in the mid-2000s. HivelyTracker's <strong>HVL</strong> format (.hvl) extends AHX with stereo, more channels, and additional waveform features while remaining true to the synthetic chiptune aesthetic.</p><p>Together, AHX and HivelyTracker represent the synthesis branch of the tracker family \u2014 proof that the pattern-and-channel paradigm works just as well driving generated waveforms as it does triggering recorded samples.</p>",
+    "facts": [
+     {
+      "label": "AHX",
+      "value": "1990s, Dexter & Pink (Abyss)"
+     },
+     {
+      "label": "HivelyTracker",
+      "value": "Mid-2000s, Pete Gordon & Xeron"
+     },
+     {
+      "label": "Platform",
+      "value": "Amiga (AHX); cross-platform (HVL)"
+     },
+     {
+      "label": "Sound",
+      "value": "Synthesized waveforms (chiptune)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Chiptune",
+      "url": "https://en.wikipedia.org/wiki/Chiptune",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "AHX / HVL modules at Modland",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     }
+    ]
+   },
+   {
+    "id": "wider-family",
+    "title": "The Wider Family: Imago Orpheus, Oktalyzer, and Others",
+    "era": "1990s",
+    "body_html": "<p>Beyond the headline formats, the tracker world produced dozens of specialized programs and module types. <strong>Imago Orpheus</strong>, written by <strong>Lutz Roeder</strong>, was an ambitious DOS tracker whose <strong>IMF</strong> format (.imf) supported up to 32 channels and mixed both digital and FM (OPL) instruments; some game soundtracks of the era shipped in IMF. <strong>Oktalyzer</strong>, an early Amiga tracker, gave its name to the <strong>OKT</strong> format (.okt), an eight-channel Amiga module type from the format's experimental early years.</p><p>Other entries in the family include <strong>UltraTracker</strong> (.ult), <strong>PolyTracker</strong> (.ptm), <strong>Velvet Studio</strong> (.ams), <strong>Galaxy/MikMod</strong>-era variants, <strong>Disorder Tracker / PSM</strong>, <strong>Liquid Tracker</strong> (.liq), and many more. Each addressed a particular niche \u2014 more channels, FM synthesis, a specific sound card, or a particular composer's workflow.</p><p>This sprawling diversity is why a modern player relies on broad-coverage libraries such as <strong>libopenmpt</strong> (from the OpenMPT project) and the older <strong>MikMod</strong>, which together recognize the long tail of historical formats so that no archived module is left unplayable.</p>",
+    "facts": [
+     {
+      "label": "Imago Orpheus",
+      "value": "IMF, Lutz Roeder"
+     },
+     {
+      "label": "Oktalyzer",
+      "value": "OKT, 8-channel Amiga"
+     },
+     {
+      "label": "Others",
+      "value": "ULT, PTM, AMS, PSM, LIQ, and more"
+     },
+     {
+      "label": "Modern playback",
+      "value": "libopenmpt / OpenMPT, MikMod"
+     }
+    ],
+    "links": [
+     {
+      "label": "OpenMPT",
+      "url": "https://en.wikipedia.org/wiki/OpenMPT",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "MikMod",
+      "url": "https://en.wikipedia.org/wiki/MikMod",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Module file (formats overview)",
+      "url": "https://en.wikipedia.org/wiki/Module_file",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "archives-and-legacy",
+    "title": "The Archives and the Living Legacy",
+    "era": "1996-present",
+    "body_html": "<p>The tracker community's open culture produced some of the most enduring music archives on the internet. <strong>The Mod Archive</strong>, online since the mid-1990s, hosts an enormous, searchable, freely downloadable collection of modules across every major format, complete with ratings and artist pages. <strong>Modland</strong>, an FTP-based archive organized meticulously by format and composer, preserves the deep catalog of scene musicians' work, including obscure formats and complete artist discographies.</p><p>On the software side, the tradition continues through actively maintained open-source trackers: <strong>OpenMPT</strong> (Open ModPlug Tracker) on Windows, descended from the 1990s ModPlug Tracker; <strong>Schism Tracker</strong>, a faithful Impulse Tracker recreation; <strong>MilkyTracker</strong>, a cross-platform FastTracker 2 successor; and <strong>HivelyTracker</strong> for the synthetic branch. Their shared playback engine, <strong>libopenmpt</strong>, has become the reference for accurate module rendering.</p><p>For collectors, the lasting appeal of the module is its transparency: a single small file contains the composer's instruments, arrangement, and every performance instruction, openly inspectable. Decades after Karsten Obarski first typed notes into a pattern on an Amiga, those files still play exactly as written \u2014 a self-contained, self-documenting form of recorded music with few parallels.</p>",
+    "facts": [
+     {
+      "label": "The Mod Archive",
+      "value": "Online since mid-1990s"
+     },
+     {
+      "label": "Modland",
+      "value": "FTP archive by format & artist"
+     },
+     {
+      "label": "Living trackers",
+      "value": "OpenMPT, Schism, MilkyTracker, Hively"
+     },
+     {
+      "label": "Reference engine",
+      "value": "libopenmpt"
+     }
+    ],
+    "links": [
+     {
+      "label": "The Mod Archive",
+      "url": "https://modarchive.org",
+      "source": "The Mod Archive"
+     },
+     {
+      "label": "Modland FTP archive",
+      "url": "https://ftp.modland.com/",
+      "source": "Modland"
+     },
+     {
+      "label": "OpenMPT",
+      "url": "https://en.wikipedia.org/wiki/OpenMPT",
+      "source": "Wikipedia"
+     }
+    ]
+   }
+  ]
+ },
+ "retro-gaming": {
+  "intro": "<p>Before recorded soundtracks and streamed scores, game music was <em>generated</em> \u2014 synthesized in real time by tiny dedicated sound chips, each with its own voice, quirks, and hard limits. A composer working on the Commodore 64 had three oscillators and a few kilobytes; one on the Sega Genesis had six FM channels and a sample voice; one on the Super Nintendo had a miniature digital sampler with 64 KB of audio RAM. The music wasn't played back from a file so much as performed by the silicon, note by note, every time you switched the machine on.</p><p>Because that music lived as register writes and sequence data rather than as audio waveforms, the preservation community built a family of small \"music rip\" formats \u2014 NSF, SID, VGM, GBS, SPC, KSS, SAP and others \u2014 that each bundle a chip's program code (or its register log) so the original hardware can be re-synthesized by an emulator decades later. SoniqBoom plays these formats by emulating the source chips, which is why a 1985 C64 tune can sound exactly as it did on period hardware. This addendum walks through the major console and computer sound architectures, the formats that grew out of them, and the composers who made the chips sing.</p>",
+  "sections": [
+   {
+    "id": "what-is-game-music",
+    "title": "How Game Music Was Made: Chips, Not Recordings",
+    "era": "1977\u2013mid 1990s",
+    "body_html": "<p>For most of the classic era, a game console or home computer could not store or stream recorded audio \u2014 there was nowhere to put it and no spare processing power to decode it. Instead, machines shipped with a dedicated <strong>sound chip</strong> that synthesized audio on the fly. Music was data: a sequence of instructions telling the chip which notes to play, on which voices, with what envelope, updated dozens of times per second by the game's code.</p><p>Two broad approaches dominated. <strong>PSGs (Programmable Sound Generators)</strong> produced simple waveforms \u2014 square/pulse tones, triangle waves, and pseudo-random noise \u2014 giving the bright, buzzy 'chiptune' sound. <strong>FM synthesis</strong>, commercialized by Yamaha in chips derived from John Chowning's frequency-modulation research at Stanford, layered operators to build richer, more organic timbres and defined the sound of the 16-bit arcade and console era. Later machines added <strong>PCM sample playback</strong>, where short recordings of real instruments were pitched and looped.</p><p>Because the music existed as chip programs and register data rather than as audio waveforms, it can be preserved by storing that data and re-running it on an emulated chip \u2014 the basis of every format below.</p>",
+    "facts": [
+     {
+      "label": "Core idea",
+      "value": "Synthesized live, not recorded"
+     },
+     {
+      "label": "PSG voices",
+      "value": "Square / triangle / noise"
+     },
+     {
+      "label": "FM origin",
+      "value": "Yamaha (Chowning FM patent)"
+     },
+     {
+      "label": "Later addition",
+      "value": "PCM sample playback"
+     }
+    ],
+    "links": [
+     {
+      "label": "Video game music (overview)",
+      "url": "https://en.wikipedia.org/wiki/Video_game_music",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Programmable sound generator",
+      "url": "https://en.wikipedia.org/wiki/Programmable_sound_generator",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Chiptune",
+      "url": "https://en.wikipedia.org/wiki/Chiptune",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "psg-chiptune-era",
+    "title": "The PSG / Chiptune Era: Atari 2600 TIA and the Arcade PSGs",
+    "era": "1977\u20131985",
+    "body_html": "<p>The earliest console sound was austere. The Atari 2600's <strong>TIA (Television Interface Adaptor)</strong>, the chip at the heart of the 1977 Atari Video Computer System, offered just <strong>two channels of one-bit sound</strong>, each with 32 pitch values and a 4-bit volume control. Its pitch divisions didn't map cleanly to a musical scale, so 2600 composers famously had to choose between melodies that were in tune and melodies that fit the available notes \u2014 a constraint that gives early Atari music its distinctive, slightly detuned character.</p><p>Arcade and home-computer audio quickly grew more capable through dedicated PSGs. Texas Instruments' <strong>SN76489</strong> provided three square-wave tone generators plus one noise channel, and spread across the BBC Micro, ColecoVision, IBM PCjr, and Sega's consoles. General Instrument's <strong>AY-3-8910</strong> (designed in 1978) likewise offered three tone channels plus noise and an envelope generator, powering the ZX Spectrum 128, Amstrad CPC, MSX, Intellivision, the Atari ST (via Yamaha's YM2149F variant), and dozens of arcade boards including Frogger and Gyruss.</p><p>These chips defined the vocabulary of 'chiptune': pulse-wave leads, noise-channel percussion, and clever tricks like rapid arpeggios to fake chords on a monophonic voice.</p>",
+    "facts": [
+     {
+      "label": "Atari 2600",
+      "value": "TIA, 1977, 2 ch (1-bit)"
+     },
+     {
+      "label": "TI PSG",
+      "value": "SN76489, 3 tone + 1 noise"
+     },
+     {
+      "label": "GI PSG",
+      "value": "AY-3-8910, 1978, 3 ch + noise"
+     },
+     {
+      "label": "Sound",
+      "value": "Square/pulse + noise 'chiptune'"
+     }
+    ],
+    "links": [
+     {
+      "label": "Television Interface Adaptor (TIA)",
+      "url": "https://en.wikipedia.org/wiki/Television_Interface_Adaptor",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Texas Instruments SN76489",
+      "url": "https://en.wikipedia.org/wiki/Texas_Instruments_SN76489",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "General Instrument AY-3-8910",
+      "url": "https://en.wikipedia.org/wiki/General_Instrument_AY-3-8910",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Atari 2600 (VGMPF)",
+      "url": "https://www.vgmpf.com/Wiki/index.php/Atari_2600",
+      "source": "VGMPF"
+     }
+    ]
+   },
+   {
+    "id": "nes-2a03-nsf",
+    "title": "The NES: Ricoh 2A03 and the NSF Format",
+    "era": "Famicom 1983 / NES 1985",
+    "body_html": "<p>Nintendo's Famicom (1983 in Japan; released in the West as the NES in 1985) ran on Ricoh's <strong>2A03</strong>, a single chip combining a modified MOS 6502 CPU with an integrated <strong>APU (Audio Processing Unit)</strong>. The 6502 core had its binary-coded-decimal mode disabled, and the audio side delivered <strong>five channels</strong>: two pulse/square-wave channels for melody and harmony, one triangle-wave channel typically used for bass, one noise channel for percussion, and a DPCM sample channel for short drum hits and voice clips.</p><p>That five-voice palette shaped a generation of game scores. Some cartridges went further with extra sound chips on the cartridge itself \u2014 Konami's VRC6, Nintendo's FDS, Sunsoft's 5B and others \u2014 expanding the voice count beyond the console's built-in capabilities.</p><p>NES music is preserved in the <strong>NSF (NES Sound Format)</strong>, which packages the 6502 audio driver code and music data so an emulator can re-run the original playback routine on a virtual 2A03 \u2014 including support for the cartridge expansion chips. SoniqBoom plays NSF by emulating that chip and its driver, reproducing the authentic console output rather than a re-recording.</p>",
+    "facts": [
+     {
+      "label": "Console",
+      "value": "NES / Famicom"
+     },
+     {
+      "label": "Year",
+      "value": "1983 (JP) / 1985 (NA)"
+     },
+     {
+      "label": "Sound chip",
+      "value": "Ricoh 2A03 (6502 + APU), 5 ch"
+     },
+     {
+      "label": "Format",
+      "value": "NSF (NES Sound Format)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Ricoh 2A03",
+      "url": "https://en.wikipedia.org/wiki/Ricoh_2A03",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Nintendo Entertainment System",
+      "url": "https://en.wikipedia.org/wiki/Nintendo_Entertainment_System",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "NES (VGMPF)",
+      "url": "https://www.vgmpf.com/Wiki/index.php/Nintendo_Entertainment_System",
+      "source": "VGMPF"
+     }
+    ]
+   },
+   {
+    "id": "c64-sid-demoscene",
+    "title": "The Commodore 64: The SID Chip, the Demoscene, and Game Soundtracks",
+    "era": "Commodore 64, 1982",
+    "body_html": "<p>No chip is more beloved by enthusiasts than the MOS Technology <strong>6581 SID (Sound Interface Device)</strong>, introduced with the Commodore 64 in 1982. Designed by Bob Yannes, the SID was practically a synthesizer on a chip: <strong>three independent voices</strong>, each with selectable waveforms (sawtooth, triangle, pulse with variable width, and noise), ADSR envelopes, ring modulation, oscillator sync, and \u2014 crucially \u2014 a programmable analog <strong>multi-mode filter</strong> (low-pass, high-pass, band-pass). That filter, plus the SID's willingness to be pushed in undocumented ways, gave C64 music a warmth and expressiveness far beyond a plain PSG. A later revision, the 8580, refined the design.</p><p>The C64's musical legacy runs in two parallel streams. Game composers like Rob Hubbard and Martin Galway turned the three-voice chip into something that sounded orchestral; and the <strong>demoscene</strong> \u2014 communities competing to push the hardware to its limits \u2014 kept SID music as a living art form long after the machine's commercial life, through ongoing 'SID tune' composition and competitions.</p><p>SID music is preserved in the <strong>PSID/RSID</strong> format (the <strong>.sid</strong> file), curated en masse by the <strong>High Voltage SID Collection (HVSC)</strong>, which holds tens of thousands of tunes. SoniqBoom emulates the SID chip to play these files, and supports HVSC song-length metadata for accurate track durations.</p>",
+    "facts": [
+     {
+      "label": "Computer",
+      "value": "Commodore 64, 1982"
+     },
+     {
+      "label": "Sound chip",
+      "value": "MOS 6581 SID (later 8580), 3 voices"
+     },
+     {
+      "label": "Format",
+      "value": "SID (.sid, PSID/RSID)"
+     },
+     {
+      "label": "Archive",
+      "value": "High Voltage SID Collection"
+     }
+    ],
+    "links": [
+     {
+      "label": "MOS Technology 6581 (SID)",
+      "url": "https://en.wikipedia.org/wiki/MOS_Technology_6581",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Commodore 64",
+      "url": "https://en.wikipedia.org/wiki/Commodore_64",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Demoscene",
+      "url": "https://en.wikipedia.org/wiki/Demoscene",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "High Voltage SID Collection",
+      "url": "https://www.hvsc.c64.org/",
+      "source": "HVSC"
+     }
+    ]
+   },
+   {
+    "id": "sega-sms-genesis-vgm",
+    "title": "Sega: Master System (SN76489) to Genesis (YM2612) and the VGM Format",
+    "era": "Master System 1985 / Genesis 1988",
+    "body_html": "<p>Sega's 8-bit <strong>Master System</strong> (1985 in Japan as the Mark III) used a clone of the TI <strong>SN76489</strong> PSG \u2014 three square tones plus noise \u2014 integrated into its video display processor. Bright and punchy, it was firmly in the PSG tradition.</p><p>The 16-bit <strong>Mega Drive / Genesis</strong> (1988) made the leap to FM. It paired a Z80-driven <strong>SN76489</strong> PSG with Yamaha's <strong>YM2612</strong>, a six-channel, four-operator FM synthesis chip (a cost-reduced derivative of the YM2608). One of those six FM channels could be switched into a PCM mode to play digital samples. The combination \u2014 gritty FM brass and bass, noisy PSG accents, and sampled drums \u2014 became one of the most recognizable sounds of the era, heard across Sega's catalog.</p><p>Sega's chips are preserved in the <strong>VGM (Video Game Music)</strong> format, which is fundamentally different from program-based formats like NSF or SID: rather than storing driver code, a VGM file is a <strong>timestamped log of the exact register writes</strong> sent to the sound chips. On playback, an emulator replays those writes to emulated YM2612/SN76489 chips with sample-accurate timing. The format covers a wide range of FM and PSG hardware beyond Sega. SoniqBoom plays VGM via chip emulation.</p>",
+    "facts": [
+     {
+      "label": "Master System",
+      "value": "1985, SN76489 PSG"
+     },
+     {
+      "label": "Genesis / Mega Drive",
+      "value": "1988"
+     },
+     {
+      "label": "Genesis FM chip",
+      "value": "Yamaha YM2612, 6 FM ch + PCM"
+     },
+     {
+      "label": "Format",
+      "value": "VGM (register-log)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Yamaha YM2612",
+      "url": "https://en.wikipedia.org/wiki/Yamaha_YM2612",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Sega Genesis",
+      "url": "https://en.wikipedia.org/wiki/Sega_Genesis",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Master System",
+      "url": "https://en.wikipedia.org/wiki/Master_System",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Sega Genesis (VGMPF)",
+      "url": "https://www.vgmpf.com/Wiki/index.php/Sega_Genesis",
+      "source": "VGMPF"
+     }
+    ]
+   },
+   {
+    "id": "game-boy-gbs",
+    "title": "The Game Boy: LR35902 APU and the GBS Format",
+    "era": "Game Boy, 1989",
+    "body_html": "<p>Nintendo's <strong>Game Boy</strong> (1989) carried a custom Sharp <strong>LR35902</strong> CPU \u2014 the <strong>SM83</strong> core, a hybrid drawing from the Intel 8080 and Zilog Z80 \u2014 with an integrated sound unit. Its APU offered <strong>four channels</strong>: two pulse-wave channels (one with a frequency sweep), one programmable <strong>wave channel</strong> that played back a 32-sample waveform stored in RAM, and one noise channel. The wave channel in particular let composers craft custom timbres beyond plain square waves.</p><p>Constrained but characterful, the Game Boy's sound became iconic \u2014 and, decades later, a foundation of the LSDj/'chip music' live-performance scene, where the handheld is used as a hardware synthesizer.</p><p>Game Boy music is preserved in the <strong>GBS (Game Boy Sound)</strong> format, which packages the LR35902 audio driver and song data for re-execution on an emulated APU. SoniqBoom plays GBS through chip emulation, reproducing the handheld's four-channel output.</p>",
+    "facts": [
+     {
+      "label": "Console",
+      "value": "Game Boy, 1989"
+     },
+     {
+      "label": "CPU",
+      "value": "Sharp LR35902 (SM83 core)"
+     },
+     {
+      "label": "Audio",
+      "value": "4 ch: 2 pulse + wave + noise"
+     },
+     {
+      "label": "Format",
+      "value": "GBS (Game Boy Sound)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Game Boy",
+      "url": "https://en.wikipedia.org/wiki/Game_Boy",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Game Boy (VGMPF)",
+      "url": "https://www.vgmpf.com/Wiki/index.php/Game_Boy",
+      "source": "VGMPF"
+     }
+    ]
+   },
+   {
+    "id": "snes-spc700-spc",
+    "title": "The SNES: Sony SPC700, Sample-Based Sound, and the SPC Format",
+    "era": "Super Famicom 1990 / SNES 1991",
+    "body_html": "<p>The Super Nintendo (Super Famicom, 1990 in Japan; SNES, 1991 in North America) took a different path from its FM-driven rivals: a fully <strong>sample-based</strong> audio subsystem co-developed with Sony. At its core sat an 8-bit <strong>SPC700</strong> CPU (part of the S-SMP module) driving a 16-bit <strong>DSP</strong>, with <strong>64 KB of dedicated audio RAM</strong>. The DSP mixed <strong>eight voices</strong> built from 16-bit samples compressed in the BRR format, and could apply hardware effects including an echo/reverb unit and ADSR envelopes.</p><p>Because every instrument was a (tiny, compressed) recording, SNES music could evoke real strings, choirs, guitars, and percussion \u2014 within the strict 64 KB budget that forced composers into a constant art of compression and clever looping. The results defined the lush sound of early-1990s console RPGs and platformers.</p><p>SNES music is preserved in the <strong>SPC</strong> format, which is essentially a <strong>complete snapshot of the 64 KB audio RAM plus the SPC700/DSP register state</strong> at the moment a track starts. An emulator loads that snapshot and runs the audio CPU to play the song \u2014 no main-CPU code required. SoniqBoom plays SPC by emulating the SPC700 and DSP.</p>",
+    "facts": [
+     {
+      "label": "Console",
+      "value": "SNES / Super Famicom"
+     },
+     {
+      "label": "Year",
+      "value": "1990 (JP) / 1991 (NA)"
+     },
+     {
+      "label": "Sound chip",
+      "value": "Sony SPC700 + 16-bit DSP, 8 voices"
+     },
+     {
+      "label": "Format",
+      "value": "SPC (audio-RAM snapshot)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Super Nintendo Entertainment System",
+      "url": "https://en.wikipedia.org/wiki/Super_Nintendo_Entertainment_System",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "SNES (VGMPF)",
+      "url": "https://www.vgmpf.com/Wiki/index.php/Super_Nintendo_Entertainment_System",
+      "source": "VGMPF"
+     }
+    ]
+   },
+   {
+    "id": "msx-scc-kss",
+    "title": "MSX: AY-3-8910, the Konami SCC, and the KSS Format",
+    "era": "MSX standard, 1983",
+    "body_html": "<p>The <strong>MSX</strong> standard (launched 1983, championed by Microsoft Japan and ASCII) put a common architecture in machines from many manufacturers, especially in Japan and parts of Europe. Every MSX shipped with a General Instrument <strong>AY-3-8910</strong> PSG (three tone channels plus noise) as its baseline sound hardware.</p><p>What set the platform apart musically were the <strong>cartridge-based sound chips</strong> Konami built into its later games. The <strong>SCC (Sound Creative Chip)</strong>, introduced around 1986, was a <strong>wavetable</strong> chip: it added five channels, each playing a 32-byte user-defined waveform looped to produce a pitch. Riding on top of the MSX's built-in three PSG voices, the SCC let games like <em>Gradius 2</em>, <em>Salamander</em>, and <em>Snatcher</em> sound dramatically richer than the bare standard allowed. Other cartridges added Yamaha FM sound (the MSX-MUSIC/MSX-AUDIO OPLL and OPL chips).</p><p>MSX music is preserved in the <strong>KSS</strong> format, which packages the Z80 driver code and music data so an emulator can re-run it against the appropriate emulated chips \u2014 PSG, SCC, and FM. SoniqBoom plays KSS through chip emulation.</p>",
+    "facts": [
+     {
+      "label": "Platform",
+      "value": "MSX standard, 1983"
+     },
+     {
+      "label": "Base sound",
+      "value": "AY-3-8910 PSG (3 ch + noise)"
+     },
+     {
+      "label": "Konami add-on",
+      "value": "SCC wavetable (5 ch), ~1986"
+     },
+     {
+      "label": "Format",
+      "value": "KSS"
+     }
+    ],
+    "links": [
+     {
+      "label": "MSX",
+      "url": "https://en.wikipedia.org/wiki/MSX",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "General Instrument AY-3-8910",
+      "url": "https://en.wikipedia.org/wiki/General_Instrument_AY-3-8910",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Konami 051649 (SCC) \u2014 MSX Wiki",
+      "url": "https://www.msx.org/wiki/Konami_051649",
+      "source": "MSX Wiki"
+     }
+    ]
+   },
+   {
+    "id": "dos-adlib-opl2-imf",
+    "title": "DOS PC Gaming: AdLib, OPL2 FM, and id Software's IMF Format",
+    "era": "1987\u2013early 1990s",
+    "body_html": "<p>Early IBM PCs had only the tinny internal <strong>PC speaker</strong> for sound, until add-on cards changed everything. The <strong>AdLib Music Synthesizer Card</strong> (1987) was the first sound card for IBM compatibles to win wide acceptance, becoming an early de facto standard. It was built around Yamaha's <strong>YM3812 (OPL2)</strong>, a two-operator FM synthesizer offering nine channels of melodic voices (or six melodic plus a percussion mode). FM gave DOS games a far richer sound than the PC speaker's single square wave.</p><p>id Software's games leaned on this hardware directly. <em>Commander Keen</em> (1990) and <em>Wolfenstein 3D</em> (1992), with music by Bobby Prince, drove the OPL2 through id's own <strong>IMF (id Music Format)</strong> \u2014 a stream of timestamped OPL register writes, conceptually similar to VGM but specific to the OPL2/AdLib hardware and id's audio engine. Playing an IMF means replaying those FM register writes to an emulated OPL2 chip, reproducing the exact synthesized output PC gamers heard in the early 1990s. SoniqBoom plays IMF via OPL2 emulation.</p>",
+    "facts": [
+     {
+      "label": "Card",
+      "value": "AdLib, 1987"
+     },
+     {
+      "label": "Chip",
+      "value": "Yamaha YM3812 (OPL2), 9 FM ch"
+     },
+     {
+      "label": "Format",
+      "value": "IMF (id Music Format)"
+     },
+     {
+      "label": "Used by",
+      "value": "Commander Keen, Wolfenstein 3D"
+     }
+    ],
+    "links": [
+     {
+      "label": "Ad Lib, Inc.",
+      "url": "https://en.wikipedia.org/wiki/Ad_Lib,_Inc.",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Yamaha YM3812 (OPL2)",
+      "url": "https://en.wikipedia.org/wiki/Yamaha_YM3812",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Wolfenstein 3D",
+      "url": "https://en.wikipedia.org/wiki/Wolfenstein_3D",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Wolfenstein 3D (MobyGames)",
+      "url": "https://en.wikipedia.org/wiki/Wolfenstein_3D",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "sound-blaster",
+    "title": "Sound Blaster: FM Plus Digital Audio Becomes the PC Standard",
+    "era": "1989 onward",
+    "body_html": "<p>Creative Technology's <strong>Sound Blaster</strong> (1989) extended the AdLib formula and seized the PC market. The original Sound Blaster 1.0 paired an AdLib-compatible <strong>YM3812 (OPL2)</strong> FM synthesizer with something AdLib lacked: an 8-bit <strong>digital sample channel</strong> (DAC/ADC) for playing and recording PCM audio at up to roughly 23 kHz, plus a game/MIDI port. Being AdLib-compatible meant it ran the entire existing FM music library, while the digital channel let games add sampled sound effects and speech.</p><p>Later models raised the bar \u2014 the Sound Blaster Pro added stereo and dual OPL2 (then OPL3), and the Sound Blaster 16 brought 16-bit CD-quality digital audio and the OPL3 (YM262) FM chip with up to 18 channels. 'Sound Blaster compatible' became the baseline every DOS game targeted through the 1990s.</p><p>This split \u2014 FM-synthesized music alongside digitally sampled effects \u2014 bridged the chiptune era and the later world of fully recorded, streamed game soundtracks. SoniqBoom's support for OPL-based formats reproduces the FM side of that history through chip emulation.</p>",
+    "facts": [
+     {
+      "label": "Maker",
+      "value": "Creative Technology"
+     },
+     {
+      "label": "First model",
+      "value": "Sound Blaster 1.0, 1989"
+     },
+     {
+      "label": "FM chip",
+      "value": "YM3812 OPL2 (SB16 \u2192 OPL3)"
+     },
+     {
+      "label": "Added",
+      "value": "8-bit PCM digital audio"
+     }
+    ],
+    "links": [
+     {
+      "label": "Sound Blaster",
+      "url": "https://en.wikipedia.org/wiki/Sound_Blaster",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Yamaha YMF262 (OPL3)",
+      "url": "https://en.wikipedia.org/wiki/Yamaha_YMF262",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Creative Technology",
+      "url": "https://en.wikipedia.org/wiki/Creative_Technology",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "atari-pokey-sap",
+    "title": "Atari 8-bit and ST: POKEY, the YM2149, and the SAP Format",
+    "era": "Atari 400/800 1979 / Atari ST 1985",
+    "body_html": "<p>While the 2600 used the TIA, Atari's 8-bit home computers \u2014 the Atari 400 and 800 (1979) and their successors \u2014 used the far more capable <strong>POKEY (Pot Keyboard Integrated Circuit)</strong>. POKEY provided <strong>four semi-independent audio channels</strong>, each 8-bit, with options to pair channels for 16-bit precision, plus distortion/polynomial-counter settings that produced a range of buzzy and noisy timbres. It also handled keyboard scanning and serial I/O. POKEY turned up in many arcade machines too \u2014 Centipede, Missile Command, Asteroids Deluxe, and Gauntlet among them \u2014 and even appeared on a few Atari 7800 cartridges for enhanced sound.</p><p>Atari 8-bit music is preserved in the <strong>SAP (Slight Atari Player)</strong> format, which packages the 6502 driver code and music data for re-execution on an emulated POKEY. The later 16-bit <strong>Atari ST</strong> (1985) used the Yamaha <strong>YM2149F</strong> \u2014 a variant of the AY-3-8910 PSG \u2014 and that machine became a hub of tracker-based music and the European demoscene. SoniqBoom plays SAP through POKEY emulation.</p>",
+    "facts": [
+     {
+      "label": "Atari 8-bit",
+      "value": "1979, POKEY, 4 ch (8-bit)"
+     },
+     {
+      "label": "Atari ST",
+      "value": "1985, Yamaha YM2149F PSG"
+     },
+     {
+      "label": "Format",
+      "value": "SAP (Slight Atari Player)"
+     },
+     {
+      "label": "Arcade use",
+      "value": "Centipede, Missile Command, Gauntlet"
+     }
+    ],
+    "links": [
+     {
+      "label": "POKEY",
+      "url": "https://en.wikipedia.org/wiki/POKEY",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Atari 8-bit computers",
+      "url": "https://en.wikipedia.org/wiki/Atari_8-bit_computers",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Atari ST",
+      "url": "https://en.wikipedia.org/wiki/Atari_ST",
+      "source": "Wikipedia"
+     }
+    ]
+   },
+   {
+    "id": "composers",
+    "title": "The Composers: Making Chips Sing",
+    "era": "1980s\u20131990s",
+    "body_html": "<p>The chips set the limits; composers found the music inside them. On the Commodore 64, British composer <strong>Rob Hubbard</strong> (b. 1955) wrote scores for over 75 games between roughly 1985 and 1989 \u2014 including <em>Monty on the Run</em>, <em>International Karate</em>, <em>Sanxion</em>, and <em>Commando</em> \u2014 coaxing pseudo-polyphony and arpeggiated 'chords' out of the SID's three voices. His countryman <strong>Martin Galway</strong> (b. 1966) brought a melodic, sample-augmented style to titles like <em>Wizball</em>, <em>Rambo: First Blood Part II</em>, <em>Arkanoid</em>, and <em>Times of Lore</em>, and was an early pioneer of sampled sound on the C64.</p><p>In Japan, <strong>Koji Kondo</strong> (b. 1961) joined Nintendo in 1984 as its first dedicated composer and wrote the instantly recognizable themes for <em>Super Mario Bros.</em> (1985) and <em>The Legend of Zelda</em> \u2014 the Mario theme later became the first video-game music inducted into the U.S. National Recording Registry. <strong>Nobuo Uematsu</strong> (b. 1959) joined Square in 1986 and scored the <em>Final Fantasy</em> series across the NES, SNES, and beyond, earning a reputation as one of the form's most celebrated melodists.</p><p><strong>Yuzo Koshiro</strong> (b. 1967) pushed game audio toward club and dance idioms, composing for <em>The Revenge of Shinobi</em> (1989), <em>ActRaiser</em> (1990, with a clever SNES sample-loading scheme), and the <em>Streets of Rage</em> / <em>Bare Knuckle</em> series (1991\u20131994), whose house- and techno-infused Genesis soundtracks were ahead of their time. These composers \u2014 and many peers \u2014 are why the formats in this addendum are worth preserving: the constraints were severe, and the artistry within them endures.</p>",
+    "facts": [
+     {
+      "label": "C64 / SID",
+      "value": "Rob Hubbard, Martin Galway"
+     },
+     {
+      "label": "Nintendo",
+      "value": "Koji Kondo (Mario, Zelda)"
+     },
+     {
+      "label": "Square",
+      "value": "Nobuo Uematsu (Final Fantasy)"
+     },
+     {
+      "label": "Sega / SNES",
+      "value": "Yuzo Koshiro (Streets of Rage)"
+     }
+    ],
+    "links": [
+     {
+      "label": "Rob Hubbard",
+      "url": "https://en.wikipedia.org/wiki/Rob_Hubbard",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Martin Galway",
+      "url": "https://en.wikipedia.org/wiki/Martin_Galway",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Koji Kondo",
+      "url": "https://en.wikipedia.org/wiki/Koji_Kondo",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Nobuo Uematsu",
+      "url": "https://en.wikipedia.org/wiki/Nobuo_Uematsu",
+      "source": "Wikipedia"
+     },
+     {
+      "label": "Yuzo Koshiro",
+      "url": "https://en.wikipedia.org/wiki/Yuzo_Koshiro",
+      "source": "Wikipedia"
+     }
+    ]
+   }
+  ]
+ }
+}

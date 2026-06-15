@@ -1,0 +1,27 @@
+# SoniqBoom — simplest self-host. `docker compose up -d`, then open :8080.
+#
+#   1. Put (or symlink) your music under ./music — or edit the bind below.
+#   2. docker compose up -d
+#   3. Open http://<host>:8080, create the first admin (see DEPLOY.md),
+#      then in Settings → Music Folders add  /music  as a library folder.
+#
+# For automatic HTTPS over the internet, see deploy/docker-compose.https.yml.
+
+services:
+  soniqboom:
+    build: .
+    # Once a published image exists you can skip the build and just pull:
+    # image: ghcr.io/sfcyris/soniqboom:latest
+    container_name: soniqboom
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./music:/music:ro       # your library — read-only; the server never writes here
+      - soniqboom-data:/data    # index, conversion cache, config, logs (back this up)
+    environment:
+      - SONIQBOOM_DATA_DIR=/data
+      # - TZ=Europe/Berlin
+    restart: unless-stopped
+
+volumes:
+  soniqboom-data:

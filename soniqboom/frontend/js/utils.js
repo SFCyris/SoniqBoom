@@ -74,7 +74,10 @@ function _emitToast(kind, msg) {
   }
   const el = document.createElement('div');
   el.textContent = msg;
-  const bg = kind === 'error' ? '#7a1f1f' : kind === 'warn' ? '#6b5310' : '#1f3f7a';
+  const bg = kind === 'error' ? '#7a1f1f'
+    : kind === 'warn' ? '#6b5310'
+    : kind === 'ok'   ? '#1f5c34'   // success green — matches the info/warn/error dark palette
+    : '#1f3f7a';
   el.style.cssText = (
     `background:${bg};color:#fff;padding:10px 16px;border-radius:6px;`
     + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);font:13px/1.4 system-ui,sans-serif;'
@@ -109,6 +112,11 @@ export const Toast = {
   info:  (msg) => _emitToast('info',  msg),
   warn:  (msg) => _emitToast('warn',  msg),
   error: (msg) => _emitToast('error', msg),
+  // Success confirmations (green).  Several call sites already prefer
+  // ``Toast.ok`` — trackinfo's tag-save used ``?.ok`` (silently no-op'd
+  // without this) and auth's password-update called ``Toast.ok`` directly
+  // (a hard TypeError without this).
+  ok:    (msg) => _emitToast('ok',    msg),
 };
 
 

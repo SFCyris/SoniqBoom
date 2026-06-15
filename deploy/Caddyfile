@@ -1,0 +1,6 @@
+# Replace music.example.com with your domain (its DNS A/AAAA record must point
+# at this host, and ports 80 + 443 must be reachable). Caddy then fetches and
+# renews a Let's Encrypt certificate automatically — nothing else to configure.
+music.example.com {
+	reverse_proxy soniqboom:8080
+}

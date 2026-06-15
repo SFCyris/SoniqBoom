@@ -145,6 +145,10 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
     row.setAttribute('aria-expanded', 'true');
   }
 
+  // Expose expand() so a tree rebuild can restore the user's open folders.
+  row.__expand = expand;
+  row.__isOpen = () => children.classList.contains('open');
+
   chev.addEventListener('click', (e) => { e.stopPropagation(); expand(); });
 
   // Click label → show tracks in this directory
@@ -198,6 +202,10 @@ function checkEmpty() {
 
 // Debounce multiple rapid refresh() calls (WS + dirs-changed fire together)
 let _refreshTimer = null;
+// Generation token: a refresh that starts while an earlier one is still
+// awaiting (dirs fetch / re-expand) supersedes it, so the older run bails out
+// instead of wiping nodes the newer run is populating.
+let _refreshGen = 0;
 
 function refresh() {
   clearTimeout(_refreshTimer);
@@ -205,9 +213,23 @@ function refresh() {
 }
 
 async function _doRefresh() {
+  const gen = ++_refreshGen;
+  // Snapshot what the user has open + selected so a rebuild doesn't collapse
+  // the tree they're browsing.  We restore by re-expanding the same paths
+  // (parents first) after the roots render.
+  const expanded = [];
+  treeEl.querySelectorAll('li[data-path]').forEach(li => {
+    const ul = li.querySelector(':scope > .tree-children');
+    if (ul && ul.classList.contains('open')) expanded.push(li.dataset.path);
+  });
+  const activePath = treeEl.querySelector('.tree-node.active')
+    ?.closest('li[data-path]')?.dataset.path || null;
+  const wasScanning = treeEl.querySelector('.tree-root-scanning') !== null;
+
   treeEl.innerHTML = '';
   try {
     const { dirs } = await API('/library/dirs');
+    if (gen !== _refreshGen) return;       // superseded by a newer refresh
     // Clear again after the async wait — a concurrent call may have rendered already
     treeEl.innerHTML = '';
     const aliases = (window.__sbConfig && window.__sbConfig.folder_aliases) || {};
@@ -220,8 +242,40 @@ async function _doRefresh() {
     });
   } catch {
     // Store not ready yet — silently skip
+    return;
   }
   checkEmpty();
+  if (wasScanning) _setScanningClass(true);
+  if (expanded.length || activePath) _restoreExpansion(expanded, activePath, gen);
+}
+
+// Re-open the previously-expanded paths after a rebuild.  Sorted shallow→deep
+// so each parent is expanded (and its children lazy-loaded into the DOM)
+// before its descendants are looked up.  Best-effort: a path that no longer
+// exists is simply skipped.
+async function _restoreExpansion(expandedPaths, activePath, gen) {
+  const ordered = [...expandedPaths].sort(
+    (a, b) => a.split('/').length - b.split('/').length,
+  );
+  for (const p of ordered) {
+    if (gen !== undefined && gen !== _refreshGen) return;   // a newer refresh won
+    let li;
+    try { li = treeEl.querySelector(`li[data-path="${CSS.escape(p)}"]`); } catch { li = null; }
+    if (!li) continue;
+    const row = li.querySelector(':scope > .tree-node');
+    if (row && row.__expand && !row.__isOpen()) {
+      try { await row.__expand(); } catch { /* share offline etc. — skip */ }
+    }
+  }
+  if (activePath) {
+    let li;
+    try { li = treeEl.querySelector(`li[data-path="${CSS.escape(activePath)}"]`); } catch { li = null; }
+    const row = li && li.querySelector(':scope > .tree-node');
+    if (row) {
+      document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
+      row.classList.add('active');
+    }
+  }
 }
 
 function addRoot(path, alias = '') {

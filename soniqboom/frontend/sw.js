@@ -292,8 +292,34 @@
 // retry when 1× under-shoots but 4× covers the cover art.
 // (b) FTP pool can auto-grow connections when a per-server
 // "Auto-grow scan workers" toggle is enabled (default OFF).
-const SHELL_VERSION = 'v74';
+// v87: perf pass — lazy admin/visualizer/trackinfo modules, album-grid art
+// via aggregation track_id, queue spot-updates, group-filter debounce.
+// v88: Stations (internet radio, Beta) — sidebar section, stations.js,
+// relay-based playback with ICY now-playing.
+// v89: Stations QA fixes — SSRF guard on relay/favorites, moveInQueue
+// persistence, empty-streams retire.
+// v90: utils.js — Toast.ok() success variant (green); fixes silent tag-save
+// confirmation + a hard TypeError on the password-update toast.
+// v91: Stations — station search (header + global preview), station-info
+// modal on the (i) button, and /m no longer precached/pinned (fixes desktop
+// being bounced to the mobile shell).
+// v92: stations.js — scheme-whitelist favicon/homepage URLs (block
+// javascript:/data: from a stranger-editable directory).
+// v93: Stations out of Beta; unavailable stations are no longer blacklisted
+// (temporary-outage handling).
+// v94: folder browsing — local children served store-first (no per-click
+// os.scandir on SMB mounts); sidebar tree no longer collapses to root on
+// background scan completions (preserves expansion).
+// v95: QA follow-ups — astral-plane folder-name infinite-loop fix in the
+// children bisect; tree-refresh re-entrancy guard.
+// v96: non-recursive folder listing served store-first + windowed (a leaf
+// folder with thousands of direct tracks, e.g. modarchive/E, no longer pays
+// a live SMB walk + unwindowed payload).
+const SHELL_VERSION = 'v96';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
+// Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
+// survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.
+const OFFLINE_AUDIO_CACHE = 'soniqboom-offline-audio';
 
 // Precache: entry-point HTML + the four critical-path JS modules and the
 // main CSS.  This way a cold first visit warms the cache for the next
@@ -303,7 +329,11 @@ const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // paths here just seed Module-Cache priming.
 const SHELL_PRECACHE = [
   '/',
-  '/m',
+  // NOTE: ``/m`` is deliberately NOT precached.  Fetching it during SW
+  // install would pin desktop browsers to the mobile shell (the route used
+  // to set a sticky sb_ui=mobile cookie; even without that, precaching the
+  // mobile shell on a desktop install is wasted work).  The mobile shell is
+  // cached on first real visit by the network-first navigation handler.
   '/assets/css/app.css',
   '/assets/js/player.js',
   '/assets/js/library.js',
@@ -345,6 +375,20 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== self.location.origin) return;
 
   const path = url.pathname;
+
+  // Offline audio: serve a downloaded track from the offline cache (works both
+  // online and off). Only the exact /api/stream/<id> audio URL is considered —
+  // status/cancel sub-endpoints fall through. A cache MISS goes straight to the
+  // network, so tracks that aren't downloaded stream exactly as before.
+  if (/^\/api\/stream\/[^/]+$/.test(path)) {
+    e.respondWith(
+      caches.open(OFFLINE_AUDIO_CACHE)
+        .then(c => c.match(req, { ignoreSearch: true }))
+        .then(hit => hit || fetch(req))
+        .catch(() => fetch(req)),
+    );
+    return;
+  }
 
   // Never cache data / streams / live admin endpoints.
   if (path.startsWith('/api/') ||
