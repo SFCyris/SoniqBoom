@@ -145,7 +145,32 @@ function esc(s) {
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
+// Spot-updates: remove/reorder initiated from inside this panel mutate the
+// existing DOM (drop a node / move a node + renumber) instead of rebuilding
+// every row.  The full rebuild re-creates all rows, re-attaches ~10 listeners
+// each and re-fires every cover-art <img> — visible as a flicker and a
+// scroll-position wobble on big queues.  ``_suppressRefresh`` swallows the
+// ``queuechange``-driven refresh for those self-initiated mutations; every
+// other queue change (adds from the library, clear, undo) still rebuilds.
+let _suppressRefresh = false;
+
+// Re-sync row indices + playing highlight after a spot-update.  Handlers
+// read ``row.dataset.idx`` at event time, so this sweep is all that's
+// needed to keep them correct.
+function _renumber() {
+  const q   = Player.queue;
+  const idx = Player.queueIdx;
+  countEl.textContent = q.length ? `(${q.length})` : '';
+  listEl.querySelectorAll('.queue-row').forEach((row, i) => {
+    row.dataset.idx = i;
+    row.classList.toggle('playing', i === idx);
+    const icon = row.querySelector('.queue-playing-icon');
+    if (icon) icon.innerHTML = i === idx ? '&#9654;' : '';
+  });
+}
+
 function refresh() {
+  if (_suppressRefresh) return;   // self-initiated spot-update already applied
   const q   = Player.queue;
   const idx = Player.queueIdx;
 
@@ -184,7 +209,7 @@ function refresh() {
     const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
-      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" alt="">` : ''}
+      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" decoding="async" alt="">` : ''}
     </div>`;
 
     row.innerHTML = `
@@ -207,17 +232,29 @@ function refresh() {
       _qArtImg.onerror = () => _qArtImg.remove();
     }
 
-    // Click to play this row (but not if user clicked the remove button)
+    // Click to play this row (but not if user clicked the remove button).
+    // Index is read from the row at event time — spot-updates renumber
+    // ``dataset.idx`` without re-binding handlers.
     row.addEventListener('click', (e) => {
       if (e.target.closest('.queue-remove-btn')) return;
-      Player.setQueue(Player.queue, i);
+      Player.setQueue(Player.queue, +row.dataset.idx);
     });
 
-    // Remove button
+    // Remove button — spot-update: drop this row and renumber the rest.
+    // Removing the playing row (or the last row) changes playback state,
+    // so those fall through to the normal full refresh.
     row.querySelector('.queue-remove-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      Player.removeFromQueue(i);
-      refresh();
+      const ri = +row.dataset.idx;
+      if (ri === Player.queueIdx || Player.queue.length <= 1) {
+        Player.removeFromQueue(ri);   // queuechange listener does the rebuild
+        return;
+      }
+      _suppressRefresh = true;
+      Player.removeFromQueue(ri);     // emits queuechange synchronously
+      _suppressRefresh = false;
+      row.remove();
+      _renumber();
     });
 
     // ── Drag-to-reorder within queue ──────────────────────────────────────
@@ -228,9 +265,9 @@ function refresh() {
     const handle = row.querySelector('.queue-drag-handle');
 
     row.addEventListener('dragstart', (e) => {
-      _dragFromIdx = i;
+      _dragFromIdx = +row.dataset.idx;
       e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('application/x-soniqboom-queue-idx', String(i));
+      e.dataTransfer.setData('application/x-soniqboom-queue-idx', String(_dragFromIdx));
       row.classList.add('dragging');
     });
 
@@ -304,9 +341,23 @@ function refresh() {
       e.preventDefault();
       row.classList.remove('dragging-over');
       const fromIdx = parseInt(e.dataTransfer.getData('application/x-soniqboom-queue-idx'), 10);
-      if (isNaN(fromIdx) || fromIdx === i) return;
-      Player.moveInQueue(fromIdx, i);
-      refresh();
+      const toIdx   = +row.dataset.idx;
+      if (isNaN(fromIdx) || fromIdx === toIdx) return;
+      // Spot-update: move the dragged node into place and renumber instead
+      // of rebuilding every row (keeps scroll position, no art re-fetch).
+      _suppressRefresh = true;
+      Player.moveInQueue(fromIdx, toIdx);   // emits queuechange synchronously
+      _suppressRefresh = false;
+      const rows = listEl.querySelectorAll('.queue-row');
+      const dragged = rows[fromIdx];
+      const target  = rows[toIdx];
+      if (dragged && target) {
+        if (fromIdx < toIdx) target.after(dragged);
+        else                 target.before(dragged);
+        _renumber();
+      } else {
+        refresh();   // DOM out of sync with the queue — rebuild
+      }
     });
 
     listEl.appendChild(row);

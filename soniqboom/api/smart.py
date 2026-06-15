@@ -20,6 +20,7 @@ Duplicate management (format-variant deduplication):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -100,6 +101,65 @@ async def top_rated(limit: int = Query(100, ge=1, le=500)):
     )[:limit]
 
     return await _enrich_tracks(rated_ids, ratings=all_ratings)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INSTANT MIX  (heuristic "song radio")
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _as_dict(t) -> dict | None:
+    if t is None:
+        return None
+    if hasattr(t, "model_dump"):
+        return t.model_dump()
+    return dict(t)
+
+
+@router.get("/smart/radio")
+async def instant_mix(
+    seed: str = Query(..., description="Seed track id to build the mix around"),
+    limit: int = Query(60, ge=5, le=200),
+):
+    """Build an endless, varied queue around a seed track.
+
+    Returns the seed first, followed by up to ``limit`` tracks chosen by genre /
+    artist / era / tempo / rating / format affinity, artist-diversified. Pure
+    in-memory; scoring runs off the event loop.
+    """
+    seed_track = await get_track(seed)
+    seed_dict = _as_dict(seed_track)
+    if seed_dict is None:
+        raise HTTPException(404, "Seed track not found")
+
+    # Score over the store's raw in-RAM dicts directly. Converting all ~170K
+    # tracks to TrackMeta and back (``_all_tracks_meta``) cost ~6.7 s/request;
+    # the radio only reads a handful of fields, so we read the live dicts and
+    # copy just the selected ~60 on the way out (never mutating the store).
+    store = get_store()
+    candidates = store.all_tracks()
+    ratings = await get_all_ratings()
+    try:
+        history = store.get_history(40) or []
+    except Exception:
+        history = []
+    recent_ids = [h.get("track_id") for h in history if isinstance(h, dict) and h.get("track_id")]
+
+    from soniqboom.core.radio import build_instant_mix
+    mix = await asyncio.to_thread(
+        build_instant_mix,
+        seed_dict,
+        candidates,
+        ratings=ratings or {},
+        recent_ids=recent_ids,
+        limit=limit,
+    )
+
+    def _clean(t: dict) -> dict:
+        d = dict(t)              # copy — candidates are live store references
+        d.pop("embedding", None)
+        return d
+
+    return [_clean(seed_dict), *(_clean(t) for t in mix)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

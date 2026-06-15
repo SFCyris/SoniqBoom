@@ -28,11 +28,13 @@ router = APIRouter(prefix="/playlists", tags=["playlists"])
 class PlaylistCreate(BaseModel):
     name: str
     track_ids: list[str] = []
+    query: str | None = None        # non-empty ⇒ smart (auto-updating) playlist
 
 
 class PlaylistUpdate(BaseModel):
     name: str | None = None
     track_ids: list[str] | None = None
+    query: str | None = None        # smart playlists: update the saved search
 
 
 class TrackIds(BaseModel):
@@ -79,6 +81,8 @@ async def list_all_playlists(user = Depends(current_user)):
             "id": p["id"],
             "name": p["name"],
             "track_count": len(p.get("track_ids", [])),
+            "query": p.get("query"),
+            "smart": bool(p.get("query")),
             "owner_user_id": p.get("owner_user_id"),
             "created_at": p.get("created_at"),
             "updated_at": p.get("updated_at"),
@@ -102,6 +106,7 @@ async def create_new_playlist(body: PlaylistCreate, user = Depends(require_user)
         playlist_id=playlist_id,
         track_ids=body.track_ids,
         owner_user_id=user.id,
+        query=(body.query or None),
     )
     return playlist
 
@@ -113,6 +118,15 @@ async def read_playlist(playlist_id: str, user = Depends(current_user)):
     playlist = await get_playlist(playlist_id)
     if not playlist or not _can_read(playlist, user):
         raise HTTPException(404, "Playlist not found")
+
+    q = playlist.get("query")
+    if q:
+        # Smart playlist — tracks are computed live from the saved search, so it
+        # auto-updates as the library grows. Same query engine as /api/search.
+        from soniqboom.api.search import run_search
+        results = await run_search(q, limit=500)
+        tracks = [t.model_dump() if hasattr(t, "model_dump") else t for t in results]
+        return {**playlist, "smart": True, "tracks": tracks}
 
     track_ids = playlist.get("track_ids", [])
     tracks = await get_tracks_batch(track_ids) if track_ids else []

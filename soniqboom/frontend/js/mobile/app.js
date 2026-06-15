@@ -105,6 +105,7 @@ function renderMini(track) {
   if (artSrc) {
     const img = new Image();
     img.alt = '';
+    img.decoding = 'async';   // decode off the main thread on track change
     img.onload  = () => img.classList.add('loaded');
     img.onerror = () => img.remove();
     miniArt.appendChild(img);

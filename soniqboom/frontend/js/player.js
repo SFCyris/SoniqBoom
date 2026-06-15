@@ -416,6 +416,60 @@ export const Player = (() => {
   let _crossfadeTimer = null;
   let _crossfading = false;
 
+  // ── Gapless next-track preload ─────────────────────────────────────────
+  // Near the end of a track (and only when crossfade is off) the next queue
+  // track's stream is fetched into a blob; playTrack then swaps to the blob
+  // URL, so the seam pays no network/transcode latency — just the element's
+  // own decode start.  Not sample-accurate gapless (one <audio> element),
+  // but it removes the audible network gap.  ``sb_gapless`` = '0' disables.
+  const GAPLESS_KEY = 'sb_gapless';
+  const GAPLESS_WINDOW_S = 20;          // start preloading in the last N seconds
+  const GAPLESS_MAX_BYTES = 220 * 1024 * 1024;  // skip preload for huge streams
+  function _gaplessEnabled() { return localStorage.getItem(GAPLESS_KEY) !== '0'; }
+  let _nextPreload = null;              // { id, url, abort } | null
+  let _activeBlobUrl = null;            // blob URL currently used as audio.src
+  function _dropNextPreload() {
+    if (!_nextPreload) return;
+    try { _nextPreload.abort?.abort(); } catch (_) {}
+    if (_nextPreload.url) { try { URL.revokeObjectURL(_nextPreload.url); } catch (_) {} }
+    _nextPreload = null;
+  }
+  function _maybeGaplessPreload(dur, current) {
+    if (!_gaplessEnabled() || _getCrossfade() > 0) return;
+    if (!(dur > 0) || queue.length === 0) return;
+    const hasNext = repeatMode === 'all' || queueIdx < queue.length - 1;
+    if (!hasNext) return;
+    const next = queue[(queueIdx + 1) % queue.length];
+    if (!next || !next.id) return;
+    const remaining = dur - current;
+    if (remaining > GAPLESS_WINDOW_S || remaining <= 1) return;
+    if (_nextPreload && _nextPreload.id === next.id) return;   // already on it
+    _dropNextPreload();
+    const abort = new AbortController();
+    _nextPreload = { id: next.id, url: null, abort };
+    fetch(`/api/stream/${next.id}`, { signal: abort.signal })
+      .then(res => {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const len = parseInt(res.headers.get('content-length') || '0', 10);
+        if (len > GAPLESS_MAX_BYTES) throw new Error('too large to preload');
+        return res.blob();
+      })
+      .then(blob => {
+        // Guard on !url too: if a drop+re-preload of the same id raced this
+        // resolution, overwriting would orphan the fresher blob URL.
+        if (_nextPreload && _nextPreload.id === next.id && !_nextPreload.url) {
+          _nextPreload.url = URL.createObjectURL(blob);
+        }
+      })
+      .catch(() => {
+        // Preload is best-effort: on any failure the seam simply falls back
+        // to the normal network fetch.
+        if (_nextPreload && _nextPreload.id === next.id && !_nextPreload.url) {
+          _nextPreload = null;
+        }
+      });
+  }
+
   // ── Preload buffer ─────────────────────────────────────────────────────
   // Optional anti-stutter cushion: wait until N seconds of audio are
   // buffered ahead of the play head before starting playback.  Default
@@ -1032,8 +1086,65 @@ export const Player = (() => {
     replayGain.gain.value = linear;
   }
 
+  // ── Internet-radio station mode (Beta) ─────────────────────────────────────
+  // A station is NOT a queue track: it streams the server relay endpoint,
+  // has no duration/seek, and never advances the queue.  The queue and its
+  // index are left untouched so next/prev (or picking any track) drops the
+  // user straight back into their music.
+  let _stationMode = false;
+  let _station = null;
+
+  async function playStation(station, relayUrl, codec = '') {
+    _stationMode  = true;
+    _station      = station;
+    trackId       = null;
+    _metaDuration = 0;
+    _seekOffset   = 0;
+    _pendingSeekSec = null;
+    _isTranscoded = false;
+    _needsConvert = false;
+    _playRecorded = true;        // never record a play-stat against a station
+    _resetSidPartial();
+    _stopTranscodePolling();
+    _hideConvertBadge();
+    if (_crossfadeTimer) { clearInterval(_crossfadeTimer); _crossfadeTimer = null; }
+    _crossfading = false;
+    const savedVol = localStorage.getItem('sb_volume');
+    audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
+
+    // Synthetic "track" so the player bar renders the station like any
+    // other now-playing item.  Empty id → art/waveform fetchers fall back
+    // to their placeholder paths.
+    _track = {
+      id: '', title: station.name, artist: 'Internet radio',
+      album: station.tags || '', duration: 0,
+      format: codec || 'RADIO', station: true, sid: station.sid,
+    };
+    emit('trackchange', _track);
+    audio.src = relayUrl;
+    audio.load();
+    try {
+      await audio.play();
+      emit('statechange', { playing: true });
+    } catch (err) {
+      emit('error', { track: _track, error: err });
+      throw err;
+    }
+  }
+
+  function stopStation() {
+    if (!_stationMode) return;
+    _stationMode = false;
+    _station = null;
+    try { audio.pause(); } catch (_) {}
+    audio.removeAttribute('src');
+    emit('statechange', { playing: false });
+  }
+
   // ── Core playback ─────────────────────────────────────────────────────────
   async function playTrack(track) {
+    _stationMode   = false;      // any real track ends station mode
+    _station       = null;
     _track         = track;
     _metaDuration  = track.duration || 0;
     _seekOffset    = 0;
@@ -1120,7 +1231,19 @@ export const Player = (() => {
     }
 
     audio.pause();
-    audio.src = _streamUrlFor(track.id);
+    // Gapless seam: if the previous track's tail preloaded THIS track into a
+    // blob, play from the blob — no network fetch at the seam.  The blob URL
+    // is revoked on the NEXT track change (revoking while it's the active
+    // src would kill playback).
+    if (_activeBlobUrl) { try { URL.revokeObjectURL(_activeBlobUrl); } catch (_) {} _activeBlobUrl = null; }
+    if (_nextPreload && _nextPreload.id === track.id && _nextPreload.url) {
+      _activeBlobUrl = _nextPreload.url;
+      _nextPreload = null;
+      audio.src = _activeBlobUrl;
+    } else {
+      _dropNextPreload();                 // stale preload for some other track
+      audio.src = _streamUrlFor(track.id);
+    }
     // Force fetch even though the element has preload="none" — without this
     // the browser would otherwise wait until play() is called to start
     // loading, defeating _waitForBuffer below.
@@ -1261,6 +1384,7 @@ export const Player = (() => {
 
   // ── Seeking ────────────────────────────────────────────────────────────────
   function seek(pct) {
+    if (_stationMode) return;    // live stream — nothing to seek into
     const dur = _duration();
     if (!dur) return;
     const targetSec = (pct / 100) * dur;
@@ -1498,6 +1622,7 @@ export const Player = (() => {
     }
     queue = newQueue;
     emit('queuechange', { queue, queueIdx });
+    _saveQueueSoon();   // persist reorders like every other queue mutation
   }
 
   function toggleShuffle() { shuffle = !shuffle; return shuffle; }
@@ -1524,6 +1649,7 @@ export const Player = (() => {
       pct: dur ? Math.min(100, (current / dur) * 100) : 0,
     });
     _maybeCrossfade(dur, current);
+    _maybeGaplessPreload(dur, current);
     _checkPlayRecording();
     _maybePrefetchNext();
   }
@@ -1867,6 +1993,9 @@ export const Player = (() => {
   });
 
   audio.addEventListener('ended', async () => {
+    // A live station stream "ending" is an upstream drop, not a queue
+    // advance — stations.js owns reconnect/downgrade; never auto-next.
+    if (_stationMode) return;
     // Natural ended → user listened the whole way through → CONTINUE
     // signal for the P(skip) model.  Guarded by !_sidPartial because
     // SID partials also fire 'ended' at the cached boundary, and that's
@@ -2058,6 +2187,9 @@ export const Player = (() => {
     fmt,
     playTrack, playPause, seek, setVolume, next, prev, setQueue,
     addToQueue, removeFromQueue, moveInQueue,
+    playStation, stopStation,
+    get stationMode() { return _stationMode; },
+    get station()     { return _station; },
     toggleShuffle, toggleRepeat,
     // Stop the transcode-status poll + WS-fallback watchdog and abort any
     // in-flight transcode-status fetch.  Called by app.js's

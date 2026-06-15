@@ -1,0 +1,42 @@
+# SoniqBoom behind Caddy with automatic HTTPS (Let's Encrypt).
+#
+#   1. Point your domain's DNS at this host; open ports 80 and 443.
+#   2. Edit deploy/Caddyfile — replace music.example.com with your domain.
+#   3. From the repo root:  docker compose -f deploy/docker-compose.https.yml up -d
+#   4. Open https://your-domain — Caddy fetches the certificate on first request.
+#
+# SoniqBoom itself is NOT published on the host here; only Caddy is exposed, so
+# the only way in is through TLS.
+
+services:
+  soniqboom:
+    build: ..
+    # image: ghcr.io/sfcyris/soniqboom:latest
+    container_name: soniqboom
+    volumes:
+      - ../music:/music:ro
+      - soniqboom-data:/data
+    environment:
+      - SONIQBOOM_DATA_DIR=/data
+    restart: unless-stopped
+    expose:
+      - "8080"            # reachable only on the internal compose network
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: soniqboom-caddy
+    depends_on:
+      - soniqboom
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  soniqboom-data:
+  caddy-data:
+  caddy-config:

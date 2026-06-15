@@ -53,7 +53,42 @@ function _cancelInflightArt() {
   _previewArtImgs = [];
 }
 
-function _showPreview(tracks) {
+function _renderStationGroup(dd, stations) {
+  if (!stations || !stations.length) return;
+  const hdr = document.createElement('div');
+  hdr.className = 'sp-group-hdr';
+  hdr.textContent = 'Stations';
+  dd.appendChild(hdr);
+  stations.slice(0, 4).forEach((st) => {
+    const row = document.createElement('div');
+    row.className = 'sp-row sp-station-row';
+    const best = (st.streams || [])[0];
+    row.innerHTML = `
+      <div class="sp-art"><span class="sp-art-ph">${st.favorite ? '★' : '📻'}</span></div>
+      <div class="sp-info">
+        <div class="sp-title">${_esc(st.name || '—')}</div>
+        <div class="sp-sub">${_esc(st.tags || 'Internet radio')}${
+          best ? ` — ${_esc(best.codec || '')}${best.bitrate ? ' ' + best.bitrate + 'k' : ''}` : ''}</div>
+      </div>
+      <div class="sp-dur">▶</div>`;
+    if (st.favicon) {
+      const artBox = row.querySelector('.sp-art');
+      const img = new Image();
+      img.alt = '';
+      if ('fetchPriority' in img) img.fetchPriority = 'low';
+      img.onload = () => { if (img.src) { artBox.innerHTML = ''; artBox.appendChild(img); } };
+      _previewArtImgs.push(img);
+      img.src = st.favicon;
+    }
+    row.addEventListener('click', () => {
+      _hidePreview();
+      import('./stations.js').then(m => m.Stations.play(st)).catch(() => {});
+    });
+    dd.appendChild(row);
+  });
+}
+
+function _showPreview(tracks, stations = []) {
   const dd = _ensureDropdown();
   // Drop refs to art images from the prior preview before we rebuild — any
   // loads still in flight no longer have a target row.
@@ -66,14 +101,29 @@ function _showPreview(tracks) {
   const badOps = _detectBadOperators(input.value);
   _renderBadOpsWarning(dd, badOps);
 
+  // While the Stations view is open the header IS a station search, so put
+  // stations first; otherwise tracks lead and stations follow as a group.
+  const stationsFirst = !document.getElementById('stations-view')?.hidden;
+  if (stationsFirst) _renderStationGroup(dd, stations);
+
   if (!tracks.length) {
-    const empty = document.createElement('div');
-    empty.className = 'sp-empty';
-    empty.textContent = 'No matches';
-    dd.appendChild(empty);
+    if (!stationsFirst && stations.length) _renderStationGroup(dd, stations);
+    if (!tracks.length && !stations.length) {
+      const empty = document.createElement('div');
+      empty.className = 'sp-empty';
+      empty.textContent = 'No matches';
+      dd.appendChild(empty);
+    }
     dd.classList.add('visible');
     _previewVisible = true;
     return;
+  }
+
+  if (tracks.length && stations.length && stationsFirst) {
+    const hdr = document.createElement('div');
+    hdr.className = 'sp-group-hdr';
+    hdr.textContent = 'Music';
+    dd.appendChild(hdr);
   }
 
   tracks.slice(0, 8).forEach((t, i) => {
@@ -126,6 +176,9 @@ function _showPreview(tracks) {
     dd.appendChild(row);
   });
 
+  // In library mode, stations follow the tracks as a labelled group.
+  if (!stationsFirst) _renderStationGroup(dd, stations);
+
   // Always show "press Enter" hint so behaviour is discoverable
   const hint = document.createElement('div');
   hint.className = tracks.length > 8 ? 'sp-more' : 'sp-hint';
@@ -160,7 +213,10 @@ function _navigatePreview(delta) {
 
 function _playHighlighted() {
   if (_selectedPreview < 0 || !_previewDropdown) return false;
-  const row = _previewDropdown.querySelector(`.sp-row[data-idx="${_selectedPreview}"]`);
+  // Click by NodeList position (not data-idx): station rows are interleaved
+  // with track rows and carry no data-idx, so position is the stable key.
+  const rows = _previewDropdown.querySelectorAll('.sp-row');
+  const row = rows[_selectedPreview];
   if (row) { row.click(); return true; }
   return false;
 }
@@ -255,13 +311,32 @@ async function query(text) {
 // #2 caught a race where stale responses from earlier keystrokes could
 // arrive after newer ones, briefly showing the wrong preview.
 let _quickAbort = null;
+let _searchGen = 0;        // monotonic — guards two independent async sources
+let _lastTracks = [];
+let _curStations = [];
 async function _quickSearch(text) {
   if (!text.trim()) { _hidePreview(); return; }
+  const gen = ++_searchGen;
   if (_quickAbort) {
     try { _quickAbort.abort(); } catch {}
   }
   const ctl = new AbortController();
   _quickAbort = ctl;
+  _curStations = [];
+  _lastTracks = [];   // avoid an early station injection pairing with stale tracks
+  // Stations search hits Radio Browser (can be slow), so it runs INDEPENDENTLY
+  // of the fast local track preview and injects when it lands — never blocking
+  // the track results.  Gated at ≥2 chars to avoid hammering the directory.
+  if (text.trim().length >= 2) {
+    fetch(`/api/stations/search?q=${encodeURIComponent(text)}&limit=4`, { signal: ctl.signal })
+      .then(r => (r.ok ? r.json() : []))
+      .then(st => {
+        if (gen !== _searchGen) return;            // a newer keystroke won
+        _curStations = Array.isArray(st) ? st : [];
+        _showPreview(_lastTracks, _curStations);
+      })
+      .catch(() => {});
+  }
   try {
     const res = await fetch(
       `/api/search/quick?q=${encodeURIComponent(text)}&limit=8`,
@@ -269,11 +344,14 @@ async function _quickSearch(text) {
     );
     const tracks = await res.json();
     // Only render if we're still the latest request (another keystroke
-    // could have replaced _quickAbort while we were awaiting json).
-    if (_quickAbort === ctl) _showPreview(tracks);
+    // could have replaced the generation while we were awaiting json).
+    if (gen === _searchGen) {
+      _lastTracks = Array.isArray(tracks) ? tracks : [];
+      _showPreview(_lastTracks, _curStations);
+    }
   } catch (err) {
     if (err && err.name === 'AbortError') return;
-    _hidePreview();
+    if (gen === _searchGen) _hidePreview();
   } finally {
     if (_quickAbort === ctl) _quickAbort = null;
   }

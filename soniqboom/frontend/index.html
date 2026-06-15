@@ -54,7 +54,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=60">
+  <link rel="stylesheet" href="/assets/css/app.css?v=62">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -111,6 +111,10 @@
                 aria-label="Clear search">&times;</button>
       </div>
       <div class="header-actions">
+        <button id="search-save-smart" type="button" hidden
+                title="Save this search as a smart playlist (it updates itself)"
+                aria-label="Save current search as a smart playlist"
+                style="font-size:12px;padding:4px 10px">&#9889; Save search</button>
         <span id="scan-badge" class="scan-badge" hidden></span>
         <span id="user-chip" class="user-chip" hidden>
           <span aria-hidden="true">&#128100;</span>
@@ -166,6 +170,15 @@
         </section>
 
         <div class="sidebar-h-splitter" id="splitter-folders-smart" title="Drag to resize"></div>
+
+        <section id="section-stations">
+          <h3>Stations</h3>
+          <ul id="nav-stations">
+            <li data-sview="favorites" tabindex="0" role="button">Favorites</li>
+            <li data-sview="scene"     tabindex="0" role="button">Scene</li>
+            <li data-sview="world"     tabindex="0" role="button">World</li>
+          </ul>
+        </section>
 
         <section id="section-smart">
           <h3>Smart</h3>
@@ -236,6 +249,10 @@
         </div>
 
         <div id="album-grid" hidden></div>
+
+        <!-- Internet-radio Stations view — mounted by stations.js
+             (lazy module) on first Stations sidebar click. -->
+        <div id="stations-view" hidden></div>
 
         <!-- Library Galaxy view (viz #6) — mounted by library.js on first
              entry; every format a constellation. -->
@@ -355,6 +372,8 @@
         <div class="player-extra-controls">
           <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle" aria-label="Toggle shuffle">&#8652;</button>
           <button id="btn-repeat"  class="ctrl-toggle" title="Repeat"  aria-label="Toggle repeat mode">&#8635;</button>
+          <button id="btn-radio"   class="ctrl-toggle" title="Start radio from this track" aria-label="Start an endless radio mix from the current track">&#128251;</button>
+          <button id="btn-download" class="ctrl-toggle" title="Download for offline" aria-label="Download the current track for offline">&#10515;</button>
           <button id="btn-eq"      class="ctrl-toggle" title="Equalizer" aria-label="Equalizer">EQ</button>
           <button id="btn-similar" class="ctrl-toggle" title="More like this" aria-label="More like this" hidden>&#9670;</button>
           <button id="btn-lyrics"  class="ctrl-toggle" title="Lyrics" aria-label="Lyrics"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M4 1h8c.6 0 1 .4 1 1v12c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1V2c0-.6.4-1 1-1z"/><line x1="5.5" y1="4.5" x2="10.5" y2="4.5"/><line x1="5.5" y1="7" x2="10.5" y2="7"/><line x1="5.5" y1="9.5" x2="8.5" y2="9.5"/></svg></button>
@@ -1298,6 +1317,36 @@
     </div>
   </div>
 
+  <!-- ── Radio mode overlay ────────────────────────────────────────────────── -->
+  <div id="radio-overlay" class="hidden" role="dialog" aria-modal="true" aria-label="Radio mode">
+    <div id="radio-panel">
+      <button id="radio-close" class="radio-close" aria-label="Close radio view (Esc)">&times;</button>
+      <div id="radio-art-wrap">
+        <img id="radio-art" alt="" decoding="async">
+        <canvas id="radio-scope" aria-hidden="true"></canvas>
+      </div>
+      <div id="radio-side">
+        <div class="radio-eyebrow"><span aria-hidden="true">📻</span> RADIO · seeded from
+          <span id="radio-seed-label"></span></div>
+        <div id="radio-title"></div>
+        <div id="radio-artist"></div>
+        <div class="radio-controls">
+          <button id="radio-prev" aria-label="Previous track">⏮</button>
+          <button id="radio-play" aria-label="Play or pause">▶</button>
+          <button id="radio-next" aria-label="Next track">⏭</button>
+        </div>
+        <div class="radio-upnext">
+          <div class="radio-upnext-head">Up next</div>
+          <ul id="radio-upnext-list" role="list"></ul>
+        </div>
+        <div class="radio-actions">
+          <button id="radio-save">Save as playlist</button>
+          <button id="radio-stop">Stop radio</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Equalizer overlay ─────────────────────────────────────────────────── -->
   <div id="eq-overlay" class="hidden">
     <div id="eq-panel">
@@ -1471,6 +1520,8 @@
             <!-- Chapters (E-18) — populated by trackinfo._loadChapters when
                  the file has MP4 chpl atoms or ID3 CHAP frames. -->
             <div id="ti-chapters" class="ti-chapters" hidden></div>
+            <div id="ti-artist-about" hidden style="margin-top:14px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px"></div>
+            <div id="ti-tagedit-wrap" style="margin:12px 0 22px"></div>
 
             <!-- Signal path (viz #4) — per-format decode pipeline, mounted
                  by trackinfo.js when the viz "now-playing" group is on. -->
@@ -1782,7 +1833,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=84"></script>
+  <script type="module" src="/assets/js/app.js?v=94"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

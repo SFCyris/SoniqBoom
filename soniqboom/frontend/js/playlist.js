@@ -206,8 +206,9 @@ function _renderSidebar() {
     const li = document.createElement('li');
     li.className = 'sidebar-playlist-item' + (pl.id === _activeId ? ' active' : '');
     li.dataset.id = pl.id;
-    const cnt = pl.track_count ?? pl.tracks?.length ?? 0;
-    li.innerHTML = `<span class="pl-name">${esc(pl.name)}</span><span class="pl-count">${cnt}</span>`;
+    const cnt = pl.smart ? '⚡' : (pl.track_count ?? pl.tracks?.length ?? 0);
+    const cntTitle = pl.smart ? 'Smart playlist — updates itself from a saved search' : '';
+    li.innerHTML = `<span class="pl-name">${esc(pl.name)}</span><span class="pl-count" title="${cntTitle}">${cnt}</span>`;
     li.addEventListener('click', () => { open(); _openPlaylist(pl.id, pl.name); });
     sidebarList.appendChild(li);
   });
@@ -361,7 +362,7 @@ function _renderTracks() {
     const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
-      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" alt="">` : ''}
+      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" decoding="async" alt="">` : ''}
     </div>`;
 
     row.innerHTML = `
