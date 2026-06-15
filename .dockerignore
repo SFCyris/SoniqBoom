@@ -1,0 +1,20 @@
+# Keep the build context (and image) lean — exclude everything the server
+# doesn't need at runtime. The bundled frontend (soniqboom/frontend) IS needed.
+.git
+.gitignore
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+node_modules
+installer/dist
+installer/build
+*.log
+.DS_Store
+docs/manual/img
+internal
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.sbz

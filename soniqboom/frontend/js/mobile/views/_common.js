@@ -37,6 +37,7 @@ export function buildTrackRow(track, opts = {}) {
     const img = new Image();
     img.alt = '';
     img.loading = 'lazy';
+    img.decoding = 'async';   // decode off the main thread — keeps scroll smooth
     // Append the img alongside the placeholder span (no innerHTML wipe)
     // so a 404 / decode failure leaves the format glyph visible.  The
     // .loaded class triggers the CSS opacity fade-in defined in

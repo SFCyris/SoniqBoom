@@ -74,6 +74,19 @@ def _parse_advanced_query(q: str) -> str | None:
     return " ".join(parts) if parts else None
 
 
+async def run_search(q: str, limit: int = 50) -> list[TrackMeta]:
+    """Evaluate a query (advanced field-operators or plain text) → tracks.
+
+    Shared by the ``/search`` endpoint and smart-playlist evaluation so the two
+    can never drift in how they interpret ``artist:…  year:>2020  format:SID``.
+    """
+    advanced = _parse_advanced_query(q)
+    if advanced:
+        return await ft_search(advanced, limit=limit)
+    safe = q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
+    return await ft_search(safe, limit=limit)
+
+
 @router.get("", response_model=list[TrackMeta])
 async def search(
     q: str = Query(..., min_length=1),
@@ -82,13 +95,7 @@ async def search(
     """Full-text search across artist, album, and title.
     Also supports advanced syntax: artist:Ghost album:Impera year:>2020
     """
-    # Try advanced query first
-    advanced = _parse_advanced_query(q)
-    if advanced:
-        return await ft_search(advanced, limit=limit)
-    # Escape special characters in query
-    safe = q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
-    return await ft_search(safe, limit=limit)
+    return await run_search(q, limit=limit)
 
 
 @router.get("/quick", response_model=list[TrackMeta])
@@ -149,8 +156,38 @@ async def filter_tracks(
 
 @router.get("/similar/{track_id}")
 async def similar_tracks(track_id: str, k: int = Query(10, ge=1, le=50)):
-    """Similarity search — not available in Python-only mode."""
-    raise HTTPException(501, "Similarity search not available — Python-only mode has no vector index")
+    """"Sounds-like" tracks for a seed.
+
+    Heuristic affinity (genre / artist / era / tempo / format) blended with a
+    loudness-contour cosine where waveform data exists for both tracks (it is
+    captured whenever a track plays, so audio-aware coverage grows with use).
+
+    Response: ``[{track, score}]`` where ``score`` is a 0–1 float RELATIVE to
+    the top hit of this result set (the UI renders it as a percentage).
+    """
+    import asyncio as _asyncio
+
+    from soniqboom.core.data import get_all_ratings
+    from soniqboom.core.similar import find_similar
+    from soniqboom.core.store import get_store
+
+    store = get_store()
+    seed = store.get_track(track_id)
+    if not seed:
+        raise HTTPException(404, "Track not found")
+
+    ratings = await get_all_ratings()
+    result = await _asyncio.to_thread(
+        find_similar, seed, store.all_tracks(), store.waveforms_view(),
+        ratings=ratings or {}, k=k,
+    )
+
+    def _clean(t: dict) -> dict:
+        d = dict(t)
+        d.pop("embedding", None)
+        return d
+
+    return [{"track": _clean(r["track"]), "score": r["score"]} for r in result]
 
 
 @router.get("/query/semantic")

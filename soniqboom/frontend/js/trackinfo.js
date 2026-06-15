@@ -177,6 +177,132 @@ function _show(id, val, formatter) {
   el.classList.toggle('ti-empty', !text);
 }
 
+async function _loadArtistAbout(track) {
+  const host = document.getElementById('ti-artist-about');
+  if (!host) return;
+  host.hidden = true; host.innerHTML = '';
+  const artist = ((track && track.artist) || '').trim();
+  if (!artist) return;
+  try {
+    // Album/track context lets the server pin the right artist for ambiguous
+    // names ("Ghost" the band on this record, not anything else).
+    let q = '/api/artist/info?name=' + encodeURIComponent(artist);
+    if (track.album) q += '&album=' + encodeURIComponent(track.album);
+    if (track.title) q += '&track=' + encodeURIComponent(track.title);
+    const r = await fetch(q);
+    if (!r.ok) return;
+    const info = await r.json();
+    if (!info || !info.found || !info.bio) return;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+      c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    const full = info.bio;
+    const bio = full.length > 420 ? full.slice(0, 420).replace(/\s+\S*$/, '') + '…' : full;
+    const img = info.image
+      ? `<img src="${esc(info.image)}" alt="${esc(info.title || artist)}" loading="lazy" decoding="async" style="float:left;width:72px;height:72px;object-fit:cover;border-radius:8px;margin:0 12px 8px 0">`
+      : '';
+    const link = info.url
+      ? ` <a href="${esc(info.url)}" target="_blank" rel="noopener" style="white-space:nowrap">Read on ${esc(info.source || 'Wikipedia')} ▸</a>`
+      : '';
+    host.innerHTML =
+      `<h4 style="margin:0 0 6px;font-size:13px;opacity:.85">About ${esc(info.title || artist)}</h4>` +
+      `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>`;
+    host.hidden = false;
+  } catch (e) { /* network/parse issue — leave hidden */ }
+}
+
+// ── Tag editing ────────────────────────────────────────────────────────────────
+const _TAG_FIELDS = [
+  ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
+  ['album_artist', 'Album artist'], ['genre', 'Genre'], ['year', 'Year'],
+];
+function _renderTagEdit(track) {
+  const wrap = document.getElementById('ti-tagedit-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!track || !track.id) return;
+  const remote = /^(smb|ftp|https?):\/\//.test(track.path || '');
+  const btn = document.createElement('button');
+  btn.id = 'ti-edit-tags';
+  btn.textContent = '✏️ Edit tags';
+  btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+  if (remote) {
+    btn.disabled = true;
+    btn.title = 'Tags can only be edited on local files — this track lives on a network share.';
+  }
+  btn.addEventListener('click', () => _showTagForm(track, wrap));
+  wrap.appendChild(btn);
+}
+function _showTagForm(track, wrap) {
+  wrap.innerHTML = '';
+  const form = document.createElement('div');
+  form.style.cssText = 'display:grid;grid-template-columns:90px 1fr;gap:6px 10px;align-items:center;font-size:12.5px';
+  const inputs = {};
+  for (const [key, label] of _TAG_FIELDS) {
+    const lab = document.createElement('label');
+    lab.textContent = label;
+    lab.style.opacity = '.7';
+    const inp = document.createElement('input');
+    inp.type = key === 'year' ? 'number' : 'text';
+    inp.value = key === 'genre'
+      ? (Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || ''))
+      : (track[key] ?? '');
+    inp.style.cssText = 'font-size:12.5px;padding:4px 8px;min-width:0';
+    inputs[key] = inp;
+    form.appendChild(lab); form.appendChild(inp);
+  }
+  const row = document.createElement('div');
+  row.style.cssText = 'grid-column:1/-1;display:flex;gap:8px;margin-top:4px';
+  const save = document.createElement('button');
+  save.textContent = 'Save tags';
+  save.style.cssText = 'font-size:12px;padding:4px 12px';
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  cancel.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.7';
+  cancel.addEventListener('click', () => _renderTagEdit(track));
+  save.addEventListener('click', async () => {
+    const body = {};
+    for (const [key] of _TAG_FIELDS) {
+      let v = inputs[key].value.trim();
+      if (key === 'genre') {
+        const cur = Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || '');
+        // Send the full string — "Rock, Pop" round-trips as one tag value
+        // rather than silently dropping everything after the first comma.
+        if (v !== cur && v) body.genre = v;
+      } else if (key === 'year') {
+        const n = parseInt(v, 10);
+        if (v && n && n !== track.year) body.year = n;
+      } else if (v && v !== (track[key] || '')) {
+        body[key] = v;
+      }
+    }
+    if (!Object.keys(body).length) { _renderTagEdit(track); return; }
+    save.disabled = true; save.textContent = 'Saving…';
+    try {
+      const r = await fetch(`/api/tracks/${track.id}/tags`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        let msg = 'Could not save tags.';
+        try { msg = (await r.json()).detail || msg; } catch (_) {}
+        throw new Error(msg);
+      }
+      const res = await r.json();
+      Object.assign(track, res.applied || {});
+      if (res.applied && res.applied.genre) track.genre = [res.applied.genre];
+      window.Toast?.ok?.('Tags saved — file and library updated.');
+      _render(track);
+    } catch (e) {
+      window.Toast?.error?.(e.message || 'Could not save tags.');
+      save.disabled = false; save.textContent = 'Save tags';
+    }
+  });
+  row.appendChild(save); row.appendChild(cancel);
+  form.appendChild(row);
+  wrap.appendChild(form);
+  inputs.title?.focus();
+}
+
 // ── Render one track ──────────────────────────────────────────────────────────
 function _render(track) {
   if (!track) return;
@@ -268,6 +394,8 @@ function _render(track) {
   // ── Chapters (podcast/audiobook) — appended after the regular tags
   // when the file has them.  Click jumps the player.
   _loadChapters(track);
+  _loadArtistAbout(track);
+  _renderTagEdit(track);
 
   // Reset lyrics pane if navigating away from current lyrics
   if (_activeTab === 'lyrics') {

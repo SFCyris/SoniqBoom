@@ -16,11 +16,17 @@ import io
 import logging
 import os
 import pickle
+import time
 import uuid
 import zipfile
 from pathlib import Path
 
 import asyncio
+
+# Drill-down refresh debounce: path → monotonic timestamp of the last
+# accepted refresh.  Bounded by the number of distinct folders browsed
+# per server lifetime.
+_REFRESH_RECENT: dict[str, float] = {}
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -183,7 +189,17 @@ def _dir_node(path: Path, root: Path) -> dict:
 
 
 def _children(path: Path, root: Path) -> list[dict]:
-    """Return immediate subdirectories of path, sorted alphabetically."""
+    """Return immediate subdirectories of path, sorted alphabetically.
+
+    ``has_audio`` comes from the in-RAM index (one bisect per child) instead
+    of reading every child directory off disk.  The old per-child ``scandir``
+    made a folder click cost 1 + N directory reads — on scan roots that live
+    on a network mount (smbfs/NFS), N extra round-trips per click, seconds
+    when the attribute cache is cold.  The index answer is also deeper: a
+    folder whose music sits in sub-subfolders now reports audio correctly.
+    Not-yet-indexed folders read as no-audio until the next scan touches
+    them — display-only, and self-heals.
+    """
     try:
         dirs = sorted(
             (p for p in path.iterdir() if p.is_dir() and not p.name.startswith(".")),
@@ -191,7 +207,138 @@ def _children(path: Path, root: Path) -> list[dict]:
         )
     except PermissionError:
         return []
-    return [_dir_node(d, root) for d in dirs]
+    from soniqboom.core.store import get_store
+    store = get_store()
+    return [
+        {
+            "name": d.name,
+            "path": str(d),
+            "rel": str(d.relative_to(root)),
+            "has_audio": _subtree_has_indexed_audio(store, d),
+            "children": [],
+        }
+        for d in dirs
+    ]
+
+
+def _local_children_from_store(store, path: str, root: str) -> list[dict] | None:
+    """Immediate subdirectories of a LOCAL path, derived from the in-RAM index.
+
+    The local counterpart of :func:`_remote_children_from_store`.  Bisect-skips
+    the scan root's sorted-path cache to list child folders that contain indexed
+    audio anywhere underneath — with ZERO filesystem I/O.  That matters because
+    an SMB/NFS share mounted as a local path (``/Volumes/...``) otherwise costs a
+    network ``os.scandir`` (plus a ``stat`` for ``exists``/``is_dir``) on every
+    chevron click, which is the random "folder browsing is slow" stall.
+
+    Returns ``None`` when nothing under ``path`` is indexed, so the caller falls
+    back to a live ``os.scandir`` — covering not-yet-scanned corners and folders
+    whose only contents are non-audio.  Path-safe by construction: it only ever
+    returns children whose paths sit under the passed-in scan ``root``.
+    """
+    from bisect import bisect_left
+    from soniqboom.core.data import path_hash
+
+    if _is_remote(path) or _is_remote(root):
+        return None
+    sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, path_hash(root))
+    if not sorted_paths:
+        return None
+    p_clean = path.rstrip("/")
+    root_clean = root.rstrip("/")
+    if not (p_clean == root_clean or p_clean.startswith(root_clean + "/")):
+        return None
+    prefix = p_clean + "/"
+    i = bisect_left(sorted_paths, prefix)
+    if not (i < len(sorted_paths) and sorted_paths[i].startswith(prefix)):
+        return None                       # nothing indexed here → caller goes live
+    names: list[str] = []
+    seen: set[str] = set()
+    plen = len(prefix)
+    n = len(sorted_paths)
+    while i < n and sorted_paths[i].startswith(prefix):
+        rest = sorted_paths[i][plen:]
+        slash = rest.find("/")
+        if slash > 0:
+            child = rest[:slash]
+            if child not in seen:
+                seen.add(child)
+                names.append(child)
+            # Skip the whole child subtree in one bisect.  Sentinel is the
+            # MAX code point (U+10FFFF): a plain U+FFFF would sort *before* a
+            # grandchild dir whose name starts in the astral plane (emoji,
+            # CJK-Ext), leaving the bisect pinned at ``i`` → infinite loop.
+            # The ``max(i+1, …)`` guard makes progress unconditional regardless.
+            nxt = bisect_left(sorted_paths, f"{prefix}{child}/\U0010FFFF", i)
+            i = nxt if nxt > i else i + 1
+        else:
+            i += 1                        # a file directly inside this folder
+    names.sort(key=str.lower)
+    rel_base = "" if p_clean == root_clean else p_clean[len(root_clean) + 1:] + "/"
+    return [
+        {
+            "name": nm,
+            "path": f"{prefix}{nm}",
+            "rel": f"{rel_base}{nm}",
+            "has_audio": True,            # derived from indexed tracks, by construction
+            "children": [],
+        }
+        for nm in names
+    ]
+
+
+def _remote_children_from_store(store, scan_root: str, remote_path: str) -> list[dict] | None:
+    """Derive a remote folder's immediate subdirectories from the in-RAM index.
+
+    Remote tracks are stored as ``{scan_root}:/{rel}``; bisect-skipping over
+    the root's sorted-path cache yields the child folder names in
+    O(children x log n) with zero network I/O — the live ``list_dir`` walk
+    goes through the FTP browse lane (budget: 1 connection) and stalls behind
+    scans.  Returns ``None`` when nothing under ``remote_path`` is indexed,
+    so the caller can fall back to a live listing for unindexed corners.
+    """
+    from bisect import bisect_left
+    from soniqboom.core.data import path_hash
+
+    sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, path_hash(scan_root))
+    if not sorted_paths:
+        return None
+    rel = remote_path.strip("/")
+    prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
+    i = bisect_left(sorted_paths, prefix)
+    if not (i < len(sorted_paths) and sorted_paths[i].startswith(prefix)):
+        return None                       # nothing indexed here → caller goes live
+    names: list[str] = []
+    plen = len(prefix)
+    n = len(sorted_paths)
+    while i < n and sorted_paths[i].startswith(prefix):
+        rest = sorted_paths[i][plen:]
+        slash = rest.find("/")
+        if slash > 0:
+            child = rest[:slash]
+            names.append(child)
+            # Skip the whole child subtree in one bisect.  Sentinel is the
+            # MAX code point (U+10FFFF): a plain U+FFFF would sort *before* a
+            # grandchild dir whose name starts in the astral plane (emoji,
+            # CJK-Ext), leaving the bisect pinned at ``i`` → infinite loop.
+            # The ``max(i+1, …)`` guard makes progress unconditional regardless.
+            nxt = bisect_left(sorted_paths, f"{prefix}{child}/\U0010FFFF", i)
+            i = nxt if nxt > i else i + 1
+        else:
+            i += 1                        # a file directly inside this folder
+    names.sort(key=str.lower)
+    base = scan_root.rstrip("/") + ("" if remote_path == "/" else remote_path)
+    rel_base = f"{rel}/" if rel else ""
+    return [
+        {
+            "name": nm,
+            "path": f"{base}/{nm}",
+            "rel": f"{rel_base}{nm}",
+            "has_audio": True,            # derived from indexed tracks, by construction
+            "children": [],
+        }
+        for nm in names
+    ]
 
 
 def _remote_list_children(scan_root: str, remote_path: str, source) -> list[dict]:
@@ -243,6 +390,14 @@ async def get_children(
             raise HTTPException(503, "Network share not connected")
         scan_root, remote_path, source = result
         loop = asyncio.get_running_loop()
+        # Store-first: indexed shares answer from RAM instantly. Only paths
+        # with nothing indexed underneath fall back to a live network walk.
+        from soniqboom.core.store import get_store
+        children = await loop.run_in_executor(
+            None, _remote_children_from_store, get_store(), scan_root, remote_path,
+        )
+        if children is not None:
+            return {"path": path, "children": children}
         children = await loop.run_in_executor(
             None, _remote_list_children, scan_root, remote_path, source,
         )
@@ -257,6 +412,22 @@ async def get_children(
             )
         return {"path": path, "children": children}
 
+    # Store-first: derive children straight from the RAM index — no filesystem
+    # touch at all, so a folder on an SMB/NFS mount (presented as /Volumes/...)
+    # expands instantly instead of paying a network os.scandir + stat per click.
+    # The helper only returns paths under the registered scan root, so it's
+    # path-safe; it returns None for unindexed corners, which fall through to a
+    # live listing.  hide_empty is a no-op on store children (all contain audio).
+    loop = asyncio.get_running_loop()
+    from soniqboom.core.store import get_store
+    store = get_store()
+    children = _local_children_from_store(store, path, root)
+    if children is not None:
+        return {"path": path, "children": children}
+
+    # Nothing indexed under this path — fall back to a live listing.  Only now
+    # do we touch the filesystem (exists/is_dir + iterdir), which is the slow
+    # part on a cold network mount; it covers brand-new and non-audio folders.
     p = Path(path).resolve()
     r = Path(root).resolve()
 
@@ -269,8 +440,6 @@ async def get_children(
     except ValueError:
         raise HTTPException(403, "Path is outside scan root")
 
-    # iterdir + per-dir _has_audio scans are blocking FS calls
-    loop = asyncio.get_running_loop()
     children = await loop.run_in_executor(None, _children, p, r)
 
     # Optional filter: drop subfolders with no indexed audio anywhere
@@ -281,8 +450,6 @@ async def get_children(
     from soniqboom.core.data import get_config as _get_config
     hide_empty = bool(await _get_config("hide_empty_folders", False))
     if hide_empty and children:
-        from soniqboom.core.store import get_store
-        store = get_store()
         children = [
             c for c in children
             if _subtree_has_indexed_audio(store, Path(c["path"]))
@@ -336,26 +503,49 @@ async def refresh_subtree(body: dict):
     scan_dirs = [Path(sd["path"]).resolve()
                  for sd in store.list_scan_dirs()
                  if not _is_remote(sd["path"])]
-    inside_root = False
+    matched_root: Path | None = None
     for root in scan_dirs:
         try:
             p.relative_to(root)
-            inside_root = True
+            matched_root = root
             break
         except ValueError:
             continue
-    if not inside_root:
+    if matched_root is None:
         raise HTTPException(403, "Path is not under any registered scan root")
 
-    # DISABLED pending redesign.  This routed freshness through
-    # ``start_scan([folder])``, but ``_run_scan`` treats its argument as a scan
-    # ROOT: it calls ``upsert_scan_dir(folder)`` (so every browsed folder wrongly
-    # appeared as a top-level entry in the FOLDERS tree) and re-associates that
-    # subtree's tracks to the folder as a new root — polluting the tree and
-    # churning the store on every navigation.  Drill-down freshness needs a
-    # dedicated "rescan a subtree, keep it under its EXISTING root, register
-    # nothing" path; until that exists this endpoint is a safe no-op.
-    return {"queued": False, "reason": "drill-down refresh disabled pending redesign"}
+    # One refresh per path per 30 s — back-and-forth clicking between
+    # siblings must not stack walks on a network mount.
+    now = time.monotonic()
+    if now - _REFRESH_RECENT.get(str(p), 0.0) < 30.0:
+        return {"queued": False, "reason": "recently refreshed"}
+    _REFRESH_RECENT[str(p)] = now
+
+    root_str, sub_str = str(matched_root), str(p)
+
+    async def _job() -> None:
+        try:
+            from soniqboom.core.scanner import refresh_subtree_under_root
+            res = await refresh_subtree_under_root(root_str, sub_str)
+            if res.get("added") or res.get("updated") or res.get("removed"):
+                # Same silent scan_progress completion the full scanner emits —
+                # the frontend's in-place folder refresh keys off last_dirs.
+                from soniqboom.api.library import _broadcast
+                await _broadcast({
+                    "event": "scan_progress", "running": False, "silent": True,
+                    "total": res.get("checked", 0), "processed": res.get("checked", 0),
+                    "errors": res.get("errors", 0), "pct": 100.0,
+                    "current_file": "", "paused": False,
+                    "last_plan": {}, "last_dirs": [sub_str],
+                    "current_dirs": [], "queued": [],
+                })
+                log.info("Drill-down refresh %s: +%d added, %d updated, -%d removed",
+                         sub_str, res["added"], res["updated"], res["removed"])
+        except Exception:
+            log.exception("Drill-down refresh failed for %s", sub_str)
+
+    asyncio.create_task(_job())
+    return {"queued": True}
 
 
 @router.get("/tracks")
@@ -1099,6 +1289,30 @@ async def tracks_with_meta(
         # Empty store-side result: either the subtree truly has no tracks
         # (and the FS walk will agree, fast) or it's un-indexed.  Either
         # way we fall through to ``_discover_audio`` below for correctness.
+    else:
+        # Non-recursive store-first: the tracks DIRECTLY inside ``p`` (no
+        # subfolder), straight from the RAM index.  A folder can hold thousands
+        # of direct files — an archive bucket flattens ~4K module tracks into
+        # one directory — and the old path did a live ``_discover_audio`` FS
+        # walk (slow on an SMB mount) and returned the whole lot unwindowed.
+        # ``_store_recursive_tracks_under`` returns everything under ``p``;
+        # keep only rows whose path has no further ``/`` after the directory
+        # prefix (``::`` archive separators are NOT subfolders, so an archive's
+        # tracks count as direct).  Only when there are genuinely no indexed
+        # direct tracks do we fall through to the FS walk (covers a pure
+        # branch folder — the frontend then auto-flattens — and unindexed
+        # corners with on-disk-only files).
+        store_results = _store_recursive_tracks_under(store, p)
+        if store_results is not None and len(store_results) > 0:
+            prefix_len = len(str(p).rstrip("/")) + 1
+            direct = [
+                t for t in store_results
+                if "/" not in t.get("path", "")[prefix_len:]
+            ]
+            if direct:
+                if filter_duplicates:
+                    direct = _drop_duplicate_alternates(direct)
+                return _maybe_paginate(direct, offset, limit, recursive)
     # NOTE: invalidation key is the directory's OWN mtime — not the
     # store's global ``_mutation_seq``.  The cache's job is to skip
     # re-walking THIS directory when its file set hasn't changed; the
@@ -1154,7 +1368,11 @@ async def tracks_with_meta(
                     "id_map": id_map,
                     "results": [],
                 }
-                return []
+                # Route the empty result through _maybe_paginate so a
+                # ``limit > 0`` caller gets the windowed ``{total:0}`` shape
+                # consistently — the warm-cache path already does, and the
+                # frontend's branch-folder auto-flatten keys on total === 0.
+                return _maybe_paginate([], offset, limit, recursive)
             _TRACKS_META_CACHE[cache_key] = {
                 "mtime": mtime_now,
                 "files": files,
@@ -1208,19 +1426,19 @@ def _maybe_paginate(results: list[dict], offset: int, limit: int, recursive: boo
     """Apply ``offset``/``limit`` to a results list for the windowed-fetch path.
 
     Returns the plain array (legacy shape) when pagination isn't requested
-    — ``limit == 0`` — OR when ``recursive`` is false (shallow listings are
-    small by construction and don't benefit from windowing; keeping the
-    response shape stable for those callers avoids churning every
-    non-windowed code path).
+    (``limit == 0``).  This is what keeps every non-windowed caller working —
+    they pass no ``limit`` and get the bare array.
 
-    For paginated requests returns ``{"total": N, "tracks": [...]}`` so the
-    frontend can size its windowed store from ``total`` and then pull
-    additional chunks at higher offsets without re-fetching the count.  The
-    ``recursive`` gate makes the response shape predictable per query:
-    callers that pass ``limit > 0`` ALWAYS get the windowed shape when
-    ``recursive`` is true.
+    A caller that DOES pass ``limit > 0`` gets the windowed
+    ``{"total": N, "tracks": [...]}`` shape so it can size its windowed store
+    from ``total`` and pull further chunks by ``offset`` without re-counting.
+    This now applies to non-recursive listings too: a single folder can still
+    hold thousands of tracks directly (e.g. an archive bucket that flattens
+    ~4K module files into one directory), so shallow ≠ small.  The ``recursive``
+    parameter is retained for call-site compatibility but no longer gates the
+    shape — ``limit`` alone decides it.
     """
-    if not recursive or limit <= 0:
+    if limit <= 0:
         return results
     total = len(results)
     end = min(offset + limit, total)

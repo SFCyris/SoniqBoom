@@ -46,14 +46,12 @@ const _BG_REFRESH_TTL_MS      = 30_000;
 // Settings still covers everything.
 const FRESHNESS_MAX_TRACKS    = 5000;
 
-// TEMPORARILY DISABLED.  The drill-down auto-refresh routed through
-// POST /api/fstree/refresh → start_scan([folder]), but start_scan treats its
-// argument as a SCAN ROOT: it calls upsert_scan_dir() on the folder (so every
-// visited folder wrongly appeared as a top-level root in the FOLDERS tree) and
-// re-associates that subtree's tracks to the folder as a new root.  Drill-down
-// freshness needs a dedicated "refresh subtree under its existing root"
-// endpoint that does neither; until that exists, do not auto-scan on browse.
-const FRESHNESS_DRILLDOWN_ENABLED = false;
+// RE-ENABLED: POST /api/fstree/refresh now runs the dedicated
+// refresh_subtree_under_root() pass — it scans the clicked folder under its
+// EXISTING scan root (no upsert_scan_dir, no re-rooting), upserts new/changed
+// files, prunes vanished ones (capped, never on a missing mount), and emits a
+// silent scan_progress completion so the open folder refreshes in place.
+const FRESHNESS_DRILLDOWN_ENABLED = true;
 
 function _scheduleBackgroundRefresh(path) {
   if (!FRESHNESS_DRILLDOWN_ENABLED) return;
@@ -1173,14 +1171,11 @@ function selectRow(tr, idx) {
   activeRow?.classList.remove('selected');
   tr.classList.add('selected');
   activeRow = tr;
-  // "More like this" is gated on the backend ``/search/similar`` endpoint,
-  // which currently returns 501.  Keep the button hidden until the
-  // backend ships a vector / embedding index — otherwise the UI advertises
-  // a feature that errors when clicked.
-  if (window.__sbFeatures?.similar) {
-    simBtn.hidden = false;
-    simBtn.dataset.id = currentTracks[idx]?.id;
-  }
+  // "More like this" — backed by /search/similar (metadata affinity blended
+  // with a loudness-contour cosine where waveform data exists for both
+  // tracks, i.e. tracks that have been played at least once).
+  simBtn.hidden = false;
+  simBtn.dataset.id = currentTracks[idx]?.id;
 }
 
 function markPlayingRow() {
@@ -1764,6 +1759,31 @@ function _hideGridToggle() {
 // ── Album grid rendering ───────────────────────────────────────────────────────
 let _albumArtObserver = null;
 
+function _loadAlbumCardArt(card, trackId) {
+  const artEl = card.querySelector('.album-card-art');
+  if (!artEl) return;
+  const img = new Image();
+  img.decoding = 'async';
+  img.onload = async () => {
+    // Decode off the main thread when the API is available —
+    // ``backgroundImage`` commits paint atomically once the
+    // decode promise resolves, so we never paint a half-decoded
+    // bitmap during the card's scroll-in.
+    try {
+      if (typeof img.decode === 'function') await img.decode();
+    } catch (_) { /* fallback to onload-only timing */ }
+    artEl.style.backgroundImage = `url("${img.src}")`;
+    artEl.style.backgroundSize = 'cover';
+    artEl.style.backgroundPosition = 'center';
+    const initialsEl = artEl.querySelector('.album-card-initials');
+    if (initialsEl) initialsEl.style.display = 'none';
+    card.classList.add('album-card-art-loaded');
+  };
+  // fallback=404 so art-less albums keep their letter initials instead
+  // of the generic ♪ placeholder JPEG overwriting them as a background.
+  img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404`;
+}
+
 function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
   const albumGrid = document.getElementById('album-grid');
   if (!albumGrid) return;
@@ -1782,41 +1802,23 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
       const card = entry.target;
       if (card.classList.contains('album-card-art-loaded')) return;
       const album  = card.dataset.album;
-      const artist = card.dataset.artist;
       if (!album) return;
 
-      // Fetch a track for this album to get its art
-      const params = new URLSearchParams({ album, limit: '1' });
-      if (artist) params.set('artist', artist);
-      fetch(`/api/search/filter?${params}`)
-        .then(r => r.json())
-        .then(tracks => {
-          if (!tracks.length) return;
-          const track = tracks[0];
-          const artEl = card.querySelector('.album-card-art');
-          if (!artEl) return;
-          const img = new Image();
-          img.decoding = 'async';
-          img.onload = async () => {
-            // Decode off the main thread when the API is available —
-            // ``backgroundImage`` commits paint atomically once the
-            // decode promise resolves, so we never paint a half-decoded
-            // bitmap during the card's scroll-in.
-            try {
-              if (typeof img.decode === 'function') await img.decode();
-            } catch (_) { /* fallback to onload-only timing */ }
-            artEl.style.backgroundImage = `url("${img.src}")`;
-            artEl.style.backgroundSize = 'cover';
-            artEl.style.backgroundPosition = 'center';
-            const initialsEl = artEl.querySelector('.album-card-initials');
-            if (initialsEl) initialsEl.style.display = 'none';
-            card.classList.add('album-card-art-loaded');
-          };
-          // fallback=404 so art-less albums keep their letter initials instead
-          // of the generic ♪ placeholder JPEG overwriting them as a background.
-          img.src = `/api/art/${track.id}?size=sm&fallback=404`;
-        })
-        .catch(() => {});
+      // Aggregation rows carry a representative ``track_id``, so the art
+      // URL is known without a per-card /search/filter round-trip.  Cards
+      // built from rows without one (group views that aren't albums) fall
+      // back to the lookup.
+      if (card.dataset.trackId) {
+        _loadAlbumCardArt(card, card.dataset.trackId);
+      } else {
+        const artist = card.dataset.artist;
+        const params = new URLSearchParams({ album, limit: '1' });
+        if (artist) params.set('artist', artist);
+        fetch(`/api/search/filter?${params}`)
+          .then(r => r.json())
+          .then(tracks => { if (tracks.length) _loadAlbumCardArt(card, tracks[0].id); })
+          .catch(() => {});
+      }
 
       _albumArtObserver.unobserve(card);
     });
@@ -1837,6 +1839,7 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
     card.dataset.name = name;
     card.dataset.album = name;
     card.dataset.artist = artist;
+    if (item.track_id) card.dataset.trackId = item.track_id;
     // Keyboard activation — cards behave like buttons (Enter/Space activates).
     // The `keyboard-focus` class is added on keyboard-induced focus so CSS
     // can render a focus-visible ring without lighting up on every click.
@@ -1940,12 +1943,20 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
   }
 }
 
+let _groupRenderGen = 0;
+
 function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
   // Group rows replace the tbody — drop any pool nodes that were here.
   _vsResetPool();
   tbody.innerHTML = '';
   emptyEl.hidden = items.length > 0;
-  items.forEach(item => {
+  // Chunked render: the first screenful paints synchronously (instant
+  // perceived response on any library size), the rest streams in between
+  // frames. A generation token cancels stale batches when the user
+  // navigates away mid-stream.
+  const gen = ++_groupRenderGen;
+  const FIRST = 150, BATCH = 800;
+  const build = (item) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="col-num"></td>
@@ -1955,8 +1966,21 @@ function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
       <td class="col-rating"></td>`;
     tr.style.cursor = 'pointer';
     tr.addEventListener('click', () => onClick(item));
-    tbody.appendChild(tr);
-  });
+    return tr;
+  };
+  const frag = document.createDocumentFragment();
+  items.slice(0, FIRST).forEach(item => frag.appendChild(build(item)));
+  tbody.appendChild(frag);
+  let pos = Math.min(FIRST, items.length);
+  const more = () => {
+    if (gen !== _groupRenderGen || pos >= items.length) return;
+    const f = document.createDocumentFragment();
+    items.slice(pos, pos + BATCH).forEach(item => f.appendChild(build(item)));
+    tbody.appendChild(f);
+    pos += BATCH;
+    if (pos < items.length) requestAnimationFrame(more);
+  };
+  if (pos < items.length) requestAnimationFrame(more);
 }
 
 // ── Grid toggle button handler ─────────────────────────────────────────────────
@@ -1983,17 +2007,25 @@ if (_gridToggleBtn) {
 }
 
 // ── Browse filter (live filtering of group lists) ──────────────────────────────
+// Debounced: each render is a full teardown+rebuild of the visible rows, so
+// firing it per keystroke makes fast typing jank on big group lists (~6k
+// artists).  150 ms matches the quick-search debounce — under the threshold
+// where the pause itself reads as lag.
+let _browseFilterTimer = null;
 browseFilter.addEventListener('input', () => {
-  const q = browseFilter.value.trim().toLowerCase();
-  if (!_groupItems.length || !_groupOnClick) return;
-  const filtered = q
-    ? _groupItems.filter(item => String(item.label || item[_groupNameKey] || '').toLowerCase().includes(q))
-    : _groupItems;
-  if (_gridView && _groupNameKey === 'album') {
-    _renderAlbumGrid(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
-  } else {
-    _renderGroupRows(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
-  }
+  clearTimeout(_browseFilterTimer);
+  _browseFilterTimer = setTimeout(() => {
+    const q = browseFilter.value.trim().toLowerCase();
+    if (!_groupItems.length || !_groupOnClick) return;
+    const filtered = q
+      ? _groupItems.filter(item => String(item.label || item[_groupNameKey] || '').toLowerCase().includes(q))
+      : _groupItems;
+    if (_gridView && _groupNameKey === 'album') {
+      _renderAlbumGrid(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
+    } else {
+      _renderGroupRows(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
+    }
+  }, 150);
 });
 
 browseFilter.addEventListener('keydown', (e) => {
@@ -2379,14 +2411,6 @@ async function showFolder(path, recursive = false, opts = {}) {
   // huge archive subtrees (FRESHNESS_MAX_TRACKS) and never re-fire from an
   // in-place refresh (opts.quiet).
 
-  const fetchTracks = async (rec) => {
-    const res = await fetch(
-      `/api/fstree/tracks-with-meta?path=${encodeURIComponent(path)}&recursive=${rec}`
-    );
-    const tracks = await res.json();
-    return Array.isArray(tracks) ? tracks : [];
-  };
-
   try {
     // Recursive request: skip the shallow round-trip and go straight to
     // the windowed-fetch path.  Used both by branch-folder auto-flatten
@@ -2396,41 +2420,49 @@ async function showFolder(path, recursive = false, opts = {}) {
       await _showFolderRecursiveWindowed(path, opts);
       return;
     }
-    let tracks = await fetchTracks(false);
+    // Non-recursive: probe with a WINDOWED first chunk.  The backend serves
+    // this store-first (no per-click SMB ``os.scandir``) and paginates it, so
+    // a folder that flattens thousands of archive tracks straight into it
+    // (e.g. ``modarchive_2007/E``) no longer ships its whole listing as one
+    // un-windowed array — it lands the first 2 000 instantly and streams the
+    // rest as the user scrolls.
+    const enc = encodeURIComponent(path);
+    let first;
+    try {
+      first = await fetch(
+        `/api/fstree/tracks-with-meta?path=${enc}&recursive=false` +
+        `&offset=0&limit=${CHUNK_SIZE}&filter_duplicates=true`,
+      ).then(r => r.json());
+    } catch {
+      loadingEl.hidden = true;
+      emptyEl.hidden = false;
+      return;
+    }
+    const windowed   = first && !Array.isArray(first) && typeof first.total === 'number';
+    const total      = windowed ? Number(first.total) : (Array.isArray(first) ? first.length : 0);
+    const firstChunk = windowed
+      ? (Array.isArray(first.tracks) ? first.tracks : [])
+      : (Array.isArray(first) ? first : []);
+
     // Branch-folder case: the clicked directory has no DIRECT audio
-    // (e.g. ``modarchive_2007`` root contains only zip subfolders).
-    // Auto-flatten via the windowed store — the backend's store-side
-    // recursive fast path returns 56K SID tracks in ~1.2 s cold and
-    // sub-ms warm, then the windowed virtual scroll pulls additional
-    // 2K chunks on demand as the user scrolls.  Restores the historical
-    // "click and see everything" UX without the 7–8 s warm-cache hang
-    // that the old ``_discover_audio`` FS walk imposed.
-    if (tracks.length === 0) {
+    // (e.g. ``modarchive_2007`` root holds only zip subfolders).  Auto-flatten
+    // recursively — the backend's store-side recursive path returns the whole
+    // subtree windowed, restoring "click and see everything".
+    if (total === 0) {
       await _showFolderRecursiveWindowed(path, opts);
       return;
     }
-    // Collapse duplicate-groups to their primary track.  SACDs that ship
-    // both a stereo and a multichannel (``Multi/``) fold tend to scan into
-    // two near-identical tracks per song; the scanner's duplicate detector
-    // groups them and marks one ``is_duplicate_primary: true``.  The
-    // dedicated Duplicates view still surfaces both for management, but
-    // the regular folder listing should show one row per song.  Tracks
-    // not part of any group (``duplicate_group_id`` falsy) are always
-    // kept.  Unscanned stubs (``_scanned === false``) carry neither flag
-    // and are kept too.  (Recursive path filters on the backend so the
-    // windowed ``total`` matches what's actually delivered across chunks.)
-    tracks = tracks.filter(t =>
-      !t.duplicate_group_id || t.is_duplicate_primary !== false
-    );
-    // On a silent in-place refresh, bail BEFORE re-rendering if the folder is
-    // unchanged — avoids a needless DOM rebuild when a freshness scan found
-    // nothing new.
-    if (opts.quiet && _sameTrackList(tracks, currentTracks)) return;
-    renderTracks(tracks);
-    // Silent drill-down freshness for this leaf folder.  Skip on in-place
-    // refreshes (opts.quiet) so we don't loop.  Direct-audio leaves are small
-    // albums (no size gate needed); the recursive/branch path gates by total.
-    if (!opts.quiet) _scheduleBackgroundRefresh(path);
+    // Whole folder fit in the first chunk → render it directly (the common
+    // album-sized case; no windowed store needed).
+    if (total <= firstChunk.length) {
+      if (opts.quiet && _sameTrackList(firstChunk, currentTracks)) return;
+      renderTracks(firstChunk);
+      if (!opts.quiet) _scheduleBackgroundRefresh(path);
+      return;
+    }
+    // Large leaf folder — hand the prefetched first chunk + total to the
+    // windowed store (non-recursive), which pulls more on scroll.
+    await _showFolderRecursiveWindowed(path, opts, false, { total, tracks: firstChunk });
   } catch {
     loadingEl.hidden = true;
     emptyEl.hidden = false;
@@ -2462,18 +2494,24 @@ async function showFolder(path, recursive = false, opts = {}) {
  * folders are hidden separately via ``hide_empty_folders`` +
  * ``_has_audio`` — directory-level, not track-level dedup.)
  */
-async function _showFolderRecursiveWindowed(path, opts = {}) {
+async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, prefetched = null) {
   const enc = encodeURIComponent(path);
-  const firstUrl =
-    `/api/fstree/tracks-with-meta?path=${enc}&recursive=true` +
-    `&offset=0&limit=${CHUNK_SIZE}`;
-  let firstRes;
-  try {
-    firstRes = await fetch(firstUrl).then(r => r.json());
-  } catch {
-    loadingEl.hidden = true;
-    emptyEl.hidden = false;
-    return;
+  // Non-recursive (a single leaf folder with thousands of direct tracks, e.g.
+  // an archive bucket) collapses duplicate groups server-side, matching the
+  // old shallow-listing behaviour; recursive flattens uses the config default.
+  const extra = recursive ? '' : '&filter_duplicates=true';
+  const urlFor = (off, lim) =>
+    `/api/fstree/tracks-with-meta?path=${enc}&recursive=${recursive}` +
+    `&offset=${off}&limit=${lim}${extra}`;
+  let firstRes = prefetched;
+  if (!firstRes) {
+    try {
+      firstRes = await fetch(urlFor(0, CHUNK_SIZE)).then(r => r.json());
+    } catch {
+      loadingEl.hidden = true;
+      emptyEl.hidden = false;
+      return;
+    }
   }
   const total      = Number(firstRes?.total || 0);
   const firstChunk = Array.isArray(firstRes?.tracks) ? firstRes.tracks : [];
@@ -2497,11 +2535,8 @@ async function _showFolderRecursiveWindowed(path, opts = {}) {
   }
 
   const fetcher = async (offset, lim) => {
-    const url =
-      `/api/fstree/tracks-with-meta?path=${enc}&recursive=true` +
-      `&offset=${offset}&limit=${lim}`;
     try {
-      const r = await fetch(url).then(r => r.json());
+      const r = await fetch(urlFor(offset, lim)).then(r => r.json());
       return Array.isArray(r?.tracks) ? r.tracks : [];
     } catch {
       return [];

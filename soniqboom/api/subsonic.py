@@ -1671,7 +1671,14 @@ async def get_playlist(
     owner_id = pl.get("owner_user_id")
     if owner_id is not None and owner_id != user.id:
         raise _SubsonicError(70, "Playlist not found.")
-    entry_tracks = store.get_tracks_batch(pl.get("track_ids") or [])
+    if pl.get("query"):
+        # Smart playlist — evaluate the saved search live (same engine as the
+        # native API) so Subsonic clients see the computed tracks too.
+        from soniqboom.api.search import run_search
+        _results = await run_search(pl["query"], limit=500)
+        entry_tracks = [r.model_dump() if hasattr(r, "model_dump") else r for r in _results]
+    else:
+        entry_tracks = store.get_tracks_batch(pl.get("track_ids") or [])
     entries = [_track_to_song(t_) for t_ in entry_tracks if t_]
     return _ok({
         "playlist": {

@@ -120,6 +120,7 @@ async def create_playlist(
     playlist_id: str | None = None,
     track_ids: list[str] | None = None,
     owner_user_id: str | None = None,
+    query: str | None = None,
     # Back-compat shim: older callers used positional ``playlist_id, name``.
     _legacy_first_positional: str | None = None,
     _legacy_second_positional: str | None = None,
@@ -133,7 +134,7 @@ async def create_playlist(
         playlist_id = str(uuid.uuid4())
     return get_store().create_playlist(
         playlist_id, name or "New playlist",
-        track_ids=track_ids, owner_user_id=owner_user_id,
+        track_ids=track_ids, owner_user_id=owner_user_id, query=query,
     )
 
 
