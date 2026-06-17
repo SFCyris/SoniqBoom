@@ -315,7 +315,16 @@
 // v96: non-recursive folder listing served store-first + windowed (a leaf
 // folder with thousands of direct tracks, e.g. modarchive/E, no longer pays
 // a live SMB walk + unwindowed payload).
-const SHELL_VERSION = 'v96';
+// v97: radio underrun — downgrade quality or pause-and-rebuffer instead of
+// the browser skipping to the live edge; never advance the queue under a
+// station; reconnect on relay EOF.
+// v98: station-switch crash fix — free the previous live-stream decoder before
+// attaching the next (renderer OOM / Edge "Error code 5"); ignore
+// MEDIA_ERR_ABORTED so a src swap can't self-trigger a downgrade storm;
+// backoff + single-flight + sustained-play budget on reconnect.
+// v99: Instant-Mix radio advances in its curated order regardless of the
+// shuffle toggle (next no longer random-jumps to an unrelated artist/station).
+const SHELL_VERSION = 'v99';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

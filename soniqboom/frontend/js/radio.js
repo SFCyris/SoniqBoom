@@ -140,6 +140,9 @@ function start(seedTrack) {
   _seedLabel = seedTrack?.artist || seedTrack?.title || 'this track';
   $('radio-seed-label') && ($('radio-seed-label').textContent = _seedLabel);
   $('btn-radio')?.classList.add('on');
+  // The radio's curated order replaces shuffle while the session runs, so
+  // "next" follows the mix instead of random-jumping to an unrelated artist.
+  try { Player.setRadioActive(true); } catch (_) {}
   openOverlay();
 }
 
@@ -148,6 +151,8 @@ function stop() {
   _active = false;
   _refillBusy = false;
   $('btn-radio')?.classList.remove('on');
+  // Radio over — the queue keeps playing, and the shuffle toggle resumes effect.
+  try { Player.setRadioActive(false); } catch (_) {}
   closeOverlay();
   Toast?.info?.('Radio stopped — the queue keeps playing.');
 }

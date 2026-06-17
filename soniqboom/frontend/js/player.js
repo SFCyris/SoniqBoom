@@ -406,6 +406,12 @@ export const Player = (() => {
   let queueIdx      = -1;
   let shuffle       = false;
   let repeatMode    = 'none'; // 'none' | 'one' | 'all'
+  // Instant-Mix radio supplies its own curated, ever-refilling order, so while
+  // a radio session is active we advance the queue sequentially and ignore the
+  // shuffle toggle — otherwise "next" random-jumps to an unrelated track and
+  // the refill re-seeds the radio from it (jumping artist AND station).  Set by
+  // RadioMode.start/stop via setRadioActive(); shuffle resumes once radio ends.
+  let _radioActive  = false;
 
   // ── Crossfade / gapless ────────────────────────────────────────────────
   const CROSSFADE_KEY = 'sb_crossfade';
@@ -435,6 +441,7 @@ export const Player = (() => {
     _nextPreload = null;
   }
   function _maybeGaplessPreload(dur, current) {
+    if (_stationMode) return;   // never seam-swap the queue track sitting under a station
     if (!_gaplessEnabled() || _getCrossfade() > 0) return;
     if (!(dur > 0) || queue.length === 0) return;
     const hasNext = repeatMode === 'all' || queueIdx < queue.length - 1;
@@ -1121,6 +1128,16 @@ export const Player = (() => {
       format: codec || 'RADIO', station: true, sid: station.sid,
     };
     emit('trackchange', _track);
+    // Free the PREVIOUS stream's decoder + close its relay socket before
+    // attaching the new one.  Overwriting ``audio.src`` alone leaves the old
+    // live-stream media resource alive until GC; with continuous radio streams
+    // a couple of un-freed decoders is enough to OOM the renderer (the Edge
+    // "Error code: 5" crash on switching stations).  removeAttribute+load()
+    // forces the element to abort and release the old resource immediately,
+    // which also propagates the disconnect so the server relay closes upstream.
+    try { audio.pause(); } catch (_) {}
+    audio.removeAttribute('src');
+    audio.load();
     audio.src = relayUrl;
     audio.load();
     try {
@@ -1486,7 +1503,7 @@ export const Player = (() => {
     // below — that's CONTINUE.
     _recordAdvance(true);
     _invalidatePContinue();   // history changed; recompute on next read
-    queueIdx = shuffle
+    queueIdx = (shuffle && !_radioActive)
       ? Math.floor(Math.random() * queue.length)
       : (queueIdx + 1) % queue.length;
     playTrack(queue[queueIdx]);
@@ -1626,6 +1643,9 @@ export const Player = (() => {
   }
 
   function toggleShuffle() { shuffle = !shuffle; return shuffle; }
+  // RadioMode tells the player a curated-radio session is (in)active so queue
+  // advance follows the radio's order regardless of the shuffle toggle.
+  function setRadioActive(v) { _radioActive = !!v; }
 
   function toggleRepeat() {
     const modes = ['none', 'all', 'one'];
@@ -1655,6 +1675,7 @@ export const Player = (() => {
   }
 
   function _maybeCrossfade(dur, current) {
+    if (_stationMode) return;   // a live station has no track end to cross-fade into
     // Crossfade: when approaching end of track, trigger crossfade to next
     const xfade = _getCrossfade();
     if (xfade > 0 && !_crossfading && dur > 0 && queue.length > 0) {
@@ -1854,7 +1875,7 @@ export const Player = (() => {
   }
 
   function _maybePrefetchNext() {
-    if (shuffle) return;
+    if (shuffle && !_radioActive) return;   // radio advances in order — prefetch is valid
     if (!trackId || _prefetchDoneForId === trackId) return;
     const dur = _duration();
     const cur = _currentTime();
@@ -2190,7 +2211,7 @@ export const Player = (() => {
     playStation, stopStation,
     get stationMode() { return _stationMode; },
     get station()     { return _station; },
-    toggleShuffle, toggleRepeat,
+    toggleShuffle, toggleRepeat, setRadioActive,
     // Stop the transcode-status poll + WS-fallback watchdog and abort any
     // in-flight transcode-status fetch.  Called by app.js's
     // _cancelAncillaryFetches() on folder navigation to free a browser

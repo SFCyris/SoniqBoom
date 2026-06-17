@@ -38,7 +38,39 @@ const view = () => $('stations-view');
 // ── Playback state ────────────────────────────────────────────────────────────
 let _current = null;     // { station, cands, i } while a station is selected
 let _nowTitle = '';      // last ICY StreamTitle for the current station
-let _stallTimes = [];    // timestamps of recent 'waiting' events
+
+// ── Buffering / underrun tuning ────────────────────────────────────────────────
+// A brief buffer dip recovers on its own; a SUSTAINED stall is handled.  With a
+// lower-quality stream available we drop to it; with none we pause and rebuffer
+// ourselves (a longer 2x buffer) so the browser can't skip to the live edge —
+// which sounds like jumping to the next song.
+const STALL_SUSTAINED_MS = 1200;   // a 'waiting' lasting this long = a real underrun
+const REBUFFER_TARGET_S  = 6;      // "longer buffer (2x)": seconds buffered ahead before resuming
+const REBUFFER_QUARTER_S = REBUFFER_TARGET_S / 4;   // worst-case floor — a quarter of the target
+const REBUFFER_GIVEUP_MS = 8000;   // after this long without the full buffer, accept the quarter
+const MAX_RECONNECTS     = 3;      // relay/upstream EOF: reconnect the same stream up to N times
+const RECONNECT_BASE_MS  = 600;    // first 'ended' reconnect waits this long (then backs off)
+const RECONNECT_MAX_MS   = 4000;   // backoff ceiling
+const GOOD_PLAY_RESET_MS = 10000;  // sustained playback before the reconnect budget is forgiven
+let _stallTimer     = null;
+let _rebufferTimer  = null;        // the in-flight rebuffer poll (must be cancellable)
+let _reconnectTimer = null;        // pending 'ended' reconnect (backoff; cancel on switch/stop)
+let _goodPlayTimer  = null;        // fires after sustained play to forgive the reconnect budget
+let _rebuffering    = false;
+let _reconnects     = 0;
+let _playGen        = 0;           // single-flight token: bumped on each (re)connect
+
+function _resetBuffering() {
+  clearTimeout(_stallTimer);
+  clearInterval(_rebufferTimer);   // a station change must abort an in-flight rebuffer
+  clearTimeout(_reconnectTimer);   // ...and any pending backoff reconnect
+  clearTimeout(_goodPlayTimer);
+  _stallTimer = null;
+  _rebufferTimer = null;
+  _reconnectTimer = null;
+  _goodPlayTimer = null;
+  _rebuffering = false;
+}
 
 // ── Codec support → candidate order ──────────────────────────────────────────
 const _probe = document.createElement('audio');
@@ -81,20 +113,25 @@ function play(station) {
   _wireAudioHealth();   // play() can be reached from global search, not just show()
   _current = { station, cands, i: 0 };
   _nowTitle = '';
-  _stallTimes = [];
+  _resetBuffering();
+  _reconnects = 0;
   _tryPlay();
 }
 
 async function _tryPlay() {
   if (!_current) return;
+  _resetBuffering();   // (re)starting a stream — drop any pending stall/rebuffer
+  const gen = ++_playGen;   // single-flight: a newer (re)connect invalidates this one
   const { station, cands, i } = _current;
   const c = cands[i];
   const url = `/api/stations/relay/${encodeURIComponent(station.sid)}?v=${c.v}`;
   _renderNowPlaying(true);
   try {
     await Player.playStation(station, url, c.s.codec);
+    if (gen !== _playGen) return;   // superseded mid-load (user switched / reconnected)
     _renderNowPlaying();
   } catch (_) {
+    if (gen !== _playGen) return;   // superseded — don't ladder-walk a stale stream
     _stepDown();
   }
 }
@@ -121,38 +158,140 @@ function _stepDown() {
 // or the station itself recovers.
 function _unavailable(station) {
   Toast?.error?.(`${station.name} is unavailable right now — it may be temporary. Try again later.`);
+  _resetBuffering();
   Player.stopStation();
   _current = null;
   _renderNowPlaying();
 }
 
 function stop() {
+  _resetBuffering();
   Player.stopStation();
   _current = null;
   _nowTitle = '';
   _renderNowPlaying();
 }
 
-// Stream health: hard errors step down immediately; repeated rebuffering
-// (4+ 'waiting' events inside 30 s) steps down too, but only while a
-// lower-quality candidate exists — better a 64k stream that plays than a
-// 320k one that gaps.
+// Seconds of CONTIGUOUS audio buffered ahead of the playhead (0 when nothing is
+// buffered there).  We measure the range that actually covers currentTime, not
+// the end of the last range — a gap ahead must not count as "buffered" or we'd
+// resume into silence.
+function _bufferedAhead(audio) {
+  try {
+    const b = audio.buffered;
+    if (!b || !b.length) return 0;
+    const t = audio.currentTime || 0;
+    for (let i = 0; i < b.length; i++) {
+      if (b.start(i) <= t + 0.25 && b.end(i) > t) return Math.max(0, b.end(i) - t);
+    }
+    return 0;
+  } catch (_) { return 0; }
+}
+
+// Show a transient status in the now-playing card's title (e.g. "Buffering…"),
+// or restore the live ICY title when ``msg`` is null.
+function _setRebufferStatus(msg) {
+  const t = view()?.querySelector('.st-now-title');
+  if (t) t.textContent = msg || (_nowTitle || 'Live');
+}
+
+// A sustained underrun on a station with NO lower-quality fallback: pause and
+// fill a longer buffer ourselves, then resume from where we stalled.  This
+// keeps the browser from skipping forward to the live edge (which sounds like
+// jumping to the next song).  The buffer target is 2x a nominal dip; if even a
+// long wait can't fill it, we resume on a quarter of it so the listener isn't
+// stranded on silence (they'll switch stations if it stays bad).
+function _rebuffer() {
+  const audio = Player.audio;
+  if (!audio || _rebuffering) return;
+  _rebuffering = true;
+  try { audio.pause(); } catch (_) {}
+  _setRebufferStatus('Buffering…');
+  const started = performance.now();
+  clearInterval(_rebufferTimer);   // never run two rebuffer polls at once
+  _rebufferTimer = setInterval(() => {
+    // Station stopped or swapped out from under us — abort, don't touch the new audio.
+    if (!Player.stationMode || !_current) { clearInterval(_rebufferTimer); _rebufferTimer = null; _rebuffering = false; return; }
+    const ahead   = _bufferedAhead(audio);
+    const waited   = performance.now() - started;
+    const full    = ahead >= REBUFFER_TARGET_S || audio.readyState >= 4;   // HAVE_ENOUGH_DATA
+    const quarter = waited >= REBUFFER_GIVEUP_MS && ahead >= REBUFFER_QUARTER_S;
+    if (full || quarter) {
+      clearInterval(_rebufferTimer);
+      _rebufferTimer = null;
+      _rebuffering = false;
+      _setRebufferStatus(null);
+      audio.play().catch(() => {});
+    }
+  }, 250);
+}
+
+// A real underrun fired (sustained 'waiting', or a hard media error).  Prefer a
+// lower-quality stream — a 64k that plays beats a 320k that gaps — otherwise
+// rebuffer in place.
+function _onUnderrun() {
+  if (!Player.stationMode || !_current || _rebuffering) return;
+  if (_current.i + 1 < _current.cands.length) {
+    _stepDown();
+  } else {
+    _rebuffer();
+  }
+}
+
+// Stream health for stations.  A brief buffer dip recovers on its own
+// ('playing' clears the stall timer); only a sustained stall is acted on.
 function _wireAudioHealth() {
   const audio = Player.audio;
   if (!audio || audio.__sbStationsWired) return;
   audio.__sbStationsWired = true;
+
+  // Hard media error: the stream/relay died — step down or surface an outage.
+  // MEDIA_ERR_ABORTED (code 1) is what the element reports when WE swap src to
+  // switch/stop a station — it is NOT an underrun.  Treating it as one made
+  // every station switch self-trigger _onUnderrun → _stepDown → a fresh relay
+  // fetch, cascading down the candidate ladder and storming the relay.
   audio.addEventListener('error', () => {
-    if (Player.stationMode && _current) _stepDown();
+    const e = audio.error;
+    if (!e || e.code === e.MEDIA_ERR_ABORTED /* 1 */) return;
+    if (Player.stationMode && _current) _onUnderrun();
   });
-  audio.addEventListener('waiting', () => {
+
+  // EOF: the relay/upstream dropped the connection.  Reconnect the SAME stream
+  // a few times (with backoff) before downgrading / giving up — never advance
+  // the queue.  The reconnect is deferred + cancellable so a station switch or
+  // stop aborts it (no runaway, no stale reconnect onto the new station).
+  audio.addEventListener('ended', () => {
     if (!Player.stationMode || !_current) return;
-    const now = Date.now();
-    _stallTimes = _stallTimes.filter((t) => now - t < 30000);
-    _stallTimes.push(now);
-    if (_stallTimes.length >= 4 && _current.i + 1 < _current.cands.length) {
-      _stallTimes = [];
-      _stepDown();
+    if (_reconnects >= MAX_RECONNECTS) {
+      _reconnects = 0;
+      if (_current.i + 1 < _current.cands.length) _stepDown();
+      else _unavailable(_current.station);
+      return;
     }
+    _reconnects++;
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (_reconnects - 1), RECONNECT_MAX_MS);
+    clearTimeout(_reconnectTimer);
+    _reconnectTimer = setTimeout(() => {
+      if (Player.stationMode && _current) _tryPlay();
+    }, delay);
+  });
+
+  // Buffer underrun: only act if still stalled after a beat (brief dips recover).
+  audio.addEventListener('waiting', () => {
+    if (!Player.stationMode || !_current || _rebuffering) return;
+    clearTimeout(_stallTimer);
+    _stallTimer = setTimeout(_onUnderrun, STALL_SUSTAINED_MS);
+  });
+
+  // Recovered (on its own or after a rebuffer): cancel any pending stall action.
+  // Forgive the reconnect budget ONLY after sustained healthy playback — a
+  // stream that plays a fraction of a second before dropping must NOT keep
+  // zeroing the counter, or it would reconnect forever and never give up.
+  audio.addEventListener('playing', () => {
+    clearTimeout(_stallTimer);
+    _stallTimer = null;
+    clearTimeout(_goodPlayTimer);
+    _goodPlayTimer = setTimeout(() => { _reconnects = 0; }, GOOD_PLAY_RESET_MS);
   });
 }
 

@@ -26,6 +26,7 @@ import re
 import socket
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -36,6 +37,11 @@ from soniqboom.core import radiodir
 log = logging.getLogger("soniqboom.stations")
 
 router = APIRouter(prefix="/stations", tags=["stations"])
+
+# Strong refs to fire-and-forget background tasks (e.g. play-click reports).
+# asyncio only weak-references tasks, so an unreferenced one can be GC'd —
+# and silently cancelled — before it finishes.
+_bg_tasks: set[asyncio.Task] = set()
 
 _TITLE_RE = re.compile(rb"StreamTitle='(.*?)';")
 
@@ -191,7 +197,9 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
     # Radio Browser etiquette: report the play click (dedup'd server-side
     # per IP per day) so community popularity rankings stay meaningful.
     if stream.get("uuid"):
-        asyncio.get_running_loop().create_task(radiodir.report_click(stream["uuid"]))
+        _t = asyncio.get_running_loop().create_task(radiodir.report_click(stream["uuid"]))
+        _bg_tasks.add(_t)
+        _t.add_done_callback(_bg_tasks.discard)
 
     client = httpx.AsyncClient(
         # ``read=30`` doubles as upstream-stall detection: a live Icecast
@@ -273,8 +281,17 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
                             buf = buf[1 + meta_len:]
                             audio_left = metaint
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            # When the listener switches/stops a station, the browser drops the
+            # connection; Starlette handles that http.disconnect by CANCELLING
+            # the streaming task.  The cancellation is injected at the suspended
+            # ``yield`` above, so this finally runs inside an already-cancelled
+            # scope — an unshielded ``await upstream.aclose()`` would re-raise
+            # CancelledError immediately and ``client.aclose()`` would never run,
+            # leaking the upstream socket + httpx client until GC.  Shield the
+            # teardown so both actually close on abort (same idiom as cast_pipe).
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+                await client.aclose()
 
     return StreamingResponse(gen(), media_type=media_type, headers={
         "Cache-Control": "no-store",
