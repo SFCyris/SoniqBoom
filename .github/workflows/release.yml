@@ -1,0 +1,45 @@
+# Build a downloadable source zip and publish it as a GitHub release asset
+# whenever a version tag is pushed.  Cutting a release is then one command:
+#
+#     git tag v1.3.4 && git push origin v1.3.4
+#
+# The zip is built from tracked files at the tag (git archive), so it never
+# includes gitignored content such as internal/.  The published asset shows up
+# on the Releases page and is reachable forever at:
+#
+#     https://github.com/SFCyris/SoniqBoom/releases/latest
+#
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write          # create the release and upload its assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build source zip and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="soniqboom-${VERSION}.zip"
+          git archive --format=zip --prefix="soniqboom-${VERSION}/" -o "$ZIP" HEAD
+          # A constant-named copy so the one-click permalink stays stable:
+          #   https://github.com/SFCyris/SoniqBoom/releases/latest/download/soniqboom-latest.zip
+          cp "$ZIP" soniqboom-latest.zip
+          echo "Built $ZIP ($(du -h "$ZIP" | cut -f1))"
+          # Create the release (with auto-generated notes); if it already
+          # exists (e.g. a re-run), just (re)upload the assets instead.
+          gh release create "${GITHUB_REF_NAME}" "$ZIP" soniqboom-latest.zip \
+              --title "SoniqBoom ${GITHUB_REF_NAME}" \
+              --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" "$ZIP" soniqboom-latest.zip --clobber

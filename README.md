@@ -15,8 +15,13 @@
 
 <p align="center">
   <a href="https://github.com/SFCyris/SoniqBoom/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg" alt="License: AGPL-3.0-or-later"></a>
-  <a href="https://github.com/SFCyris/SoniqBoom/releases"><img src="https://img.shields.io/github/v/release/SFCyris/SoniqBoom?include_prereleases&sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/SFCyris/SoniqBoom/releases/latest"><img src="https://img.shields.io/github/v/release/SFCyris/SoniqBoom?include_prereleases&sort=semver" alt="Latest release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+"></a>
+</p>
+
+<p align="center">
+  <strong><a href="https://github.com/SFCyris/SoniqBoom/releases/latest/download/soniqboom-latest.zip">⬇&nbsp; Download the latest release</a></strong>
+  &nbsp;·&nbsp; <a href="https://github.com/SFCyris/SoniqBoom/releases/latest">release notes</a>
 </p>
 
 ---
