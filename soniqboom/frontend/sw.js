@@ -324,7 +324,11 @@
 // backoff + single-flight + sustained-play budget on reconnect.
 // v99: Instant-Mix radio advances in its curated order regardless of the
 // shuffle toggle (next no longer random-jumps to an unrelated artist/station).
-const SHELL_VERSION = 'v99';
+// v100: stations no longer downgrade during startup buffering — a 'waiting'
+// before the first 'playing' is startup connect, not an underrun (9s grace).
+// Fixes eager quality-drop at start AND the switch-storm renderer crash (the
+// cascade was opening 4 connections per station start).
+const SHELL_VERSION = 'v100';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

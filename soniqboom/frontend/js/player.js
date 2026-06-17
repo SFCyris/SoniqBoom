@@ -1155,6 +1155,11 @@ export const Player = (() => {
     _station = null;
     try { audio.pause(); } catch (_) {}
     audio.removeAttribute('src');
+    // load() is required to make the element abort + release the live decoder
+    // and propagate the disconnect that closes the relay socket — same contract
+    // as playStation's teardown.  Without it the last station's decoder/socket
+    // leaks until GC.
+    audio.load();
     emit('statechange', { playing: false });
   }
 
@@ -1970,6 +1975,7 @@ export const Player = (() => {
   // Replaces the start-of-track preload wait that the user reported as a
   // multi-second "conversion" delay before audio began.
   audio.addEventListener('waiting', () => {
+    if (_stationMode) return;   // stations show their own Connecting/Buffering status in the station card
     _showBufferingBadge();
   });
   audio.addEventListener('playing', () => {

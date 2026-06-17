@@ -44,7 +44,8 @@ let _nowTitle = '';      // last ICY StreamTitle for the current station
 // lower-quality stream available we drop to it; with none we pause and rebuffer
 // ourselves (a longer 2x buffer) so the browser can't skip to the live edge —
 // which sounds like jumping to the next song.
-const STALL_SUSTAINED_MS = 1200;   // a 'waiting' lasting this long = a real underrun
+const STALL_SUSTAINED_MS = 1200;   // a MID-STREAM 'waiting' lasting this long = a real underrun
+const STARTUP_GRACE_MS   = 9000;   // a fresh stream gets this long to CONNECT before we downgrade
 const REBUFFER_TARGET_S  = 6;      // "longer buffer (2x)": seconds buffered ahead before resuming
 const REBUFFER_QUARTER_S = REBUFFER_TARGET_S / 4;   // worst-case floor — a quarter of the target
 const REBUFFER_GIVEUP_MS = 8000;   // after this long without the full buffer, accept the quarter
@@ -56,6 +57,9 @@ let _stallTimer     = null;
 let _rebufferTimer  = null;        // the in-flight rebuffer poll (must be cancellable)
 let _reconnectTimer = null;        // pending 'ended' reconnect (backoff; cancel on switch/stop)
 let _goodPlayTimer  = null;        // fires after sustained play to forgive the reconnect budget
+let _startupTimer   = null;        // fires if a fresh stream never starts within the grace window
+let _hasPlayed      = false;       // has the CURRENT stream actually started playing yet?
+let _activeUrl      = '';          // relay URL of the stream we're currently loading/playing
 let _rebuffering    = false;
 let _reconnects     = 0;
 let _playGen        = 0;           // single-flight token: bumped on each (re)connect
@@ -65,11 +69,14 @@ function _resetBuffering() {
   clearInterval(_rebufferTimer);   // a station change must abort an in-flight rebuffer
   clearTimeout(_reconnectTimer);   // ...and any pending backoff reconnect
   clearTimeout(_goodPlayTimer);
+  clearTimeout(_startupTimer);
   _stallTimer = null;
   _rebufferTimer = null;
   _reconnectTimer = null;
   _goodPlayTimer = null;
+  _startupTimer = null;
   _rebuffering = false;
+  _hasPlayed = false;   // a (re)connect resets "has it played?"; set true on 'playing'
 }
 
 // ── Codec support → candidate order ──────────────────────────────────────────
@@ -120,11 +127,23 @@ function play(station) {
 
 async function _tryPlay() {
   if (!_current) return;
-  _resetBuffering();   // (re)starting a stream — drop any pending stall/rebuffer
+  _resetBuffering();   // (re)starting a stream — drop any pending stall/rebuffer (resets _hasPlayed)
   const gen = ++_playGen;   // single-flight: a newer (re)connect invalidates this one
+  _activeUrl = '';
+  // Give the fresh stream time to actually CONNECT before we consider a
+  // downgrade.  Connecting to an upstream relay routinely fires 'waiting' for a
+  // second or two before the first audio arrives — that is NOT an underrun, and
+  // treating it as one made stations cascade down the whole quality ladder at
+  // startup.  Only if the stream never starts within the grace window do we act.
+  _startupTimer = setTimeout(() => {
+    if (gen === _playGen && Player.stationMode && _current && !_hasPlayed && !_rebuffering) {
+      _onUnderrun();
+    }
+  }, STARTUP_GRACE_MS);
   const { station, cands, i } = _current;
   const c = cands[i];
   const url = `/api/stations/relay/${encodeURIComponent(station.sid)}?v=${c.v}`;
+  _activeUrl = url;   // so the 'error' handler can ignore late errors from a superseded stream
   _renderNowPlaying(true);
   try {
     await Player.playStation(station, url, c.s.codec);
@@ -132,7 +151,12 @@ async function _tryPlay() {
     _renderNowPlaying();
   } catch (_) {
     if (gen !== _playGen) return;   // superseded — don't ladder-walk a stale stream
-    _stepDown();
+    // play() rejected.  A genuine load failure ALSO fires the media 'error'
+    // event (handled there → _onUnderrun); a transient AbortError from swapping
+    // src does not, and the stream often still comes up.  So do NOT downgrade
+    // here — the 'error' handler covers real failures and the startup-grace
+    // timer is the backstop if the stream never starts.
+    _renderNowPlaying();
   }
 }
 
@@ -226,15 +250,19 @@ function _rebuffer() {
   }, 250);
 }
 
-// A real underrun fired (sustained 'waiting', or a hard media error).  Prefer a
-// lower-quality stream — a 64k that plays beats a 320k that gaps — otherwise
-// rebuffer in place.
+// A real underrun fired (sustained 'waiting', a hard media error, or a stream
+// that never started within the startup grace).  Prefer a lower-quality stream
+// — a 64k that plays beats a 320k that gaps.  With no lower quality: if we WERE
+// playing, rebuffer in place; if we never started at all, the stream is dead —
+// surface it as unavailable rather than spinning on "Buffering…" forever.
 function _onUnderrun() {
   if (!Player.stationMode || !_current || _rebuffering) return;
   if (_current.i + 1 < _current.cands.length) {
     _stepDown();
-  } else {
+  } else if (_hasPlayed) {
     _rebuffer();
+  } else {
+    _unavailable(_current.station);
   }
 }
 
@@ -253,6 +281,10 @@ function _wireAudioHealth() {
   audio.addEventListener('error', () => {
     const e = audio.error;
     if (!e || e.code === e.MEDIA_ERR_ABORTED /* 1 */) return;
+    // Ignore a late error from a stream we already swapped away from — acting on
+    // it would fire _onUnderrun against the NEW candidate.  currentSrc still
+    // names the resource that errored; only act if it's the one we're on.
+    if (_activeUrl && audio.currentSrc && !audio.currentSrc.endsWith(_activeUrl)) return;
     if (Player.stationMode && _current) _onUnderrun();
   });
 
@@ -276,18 +308,25 @@ function _wireAudioHealth() {
     }, delay);
   });
 
-  // Buffer underrun: only act if still stalled after a beat (brief dips recover).
+  // MID-STREAM buffer underrun: only act if still stalled after a beat (brief
+  // dips recover).  Ignored until the stream has actually played — a 'waiting'
+  // before the first 'playing' is just startup buffering, handled by the
+  // startup-grace timer, NOT a reason to downgrade.
   audio.addEventListener('waiting', () => {
-    if (!Player.stationMode || !_current || _rebuffering) return;
+    if (!Player.stationMode || !_current || _rebuffering || !_hasPlayed) return;
     clearTimeout(_stallTimer);
     _stallTimer = setTimeout(_onUnderrun, STALL_SUSTAINED_MS);
   });
 
-  // Recovered (on its own or after a rebuffer): cancel any pending stall action.
-  // Forgive the reconnect budget ONLY after sustained healthy playback — a
-  // stream that plays a fraction of a second before dropping must NOT keep
-  // zeroing the counter, or it would reconnect forever and never give up.
+  // Playback actually started (or recovered).  Mark the stream as live, cancel
+  // the startup-grace + stall timers, and forgive the reconnect budget ONLY
+  // after sustained healthy playback (a stream that plays a fraction of a
+  // second before dropping must NOT keep zeroing the counter, or it would
+  // reconnect forever and never give up).
   audio.addEventListener('playing', () => {
+    _hasPlayed = true;
+    clearTimeout(_startupTimer);
+    _startupTimer = null;
     clearTimeout(_stallTimer);
     _stallTimer = null;
     clearTimeout(_goodPlayTimer);
