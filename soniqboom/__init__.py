@@ -9,7 +9,7 @@ streamed from your network to any device with a browser.
 Source:  https://github.com/SFCyris/SoniqBoom
 License: AGPL-3.0-or-later
 """
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 __author__  = "S.F. Cyris"
 __license__ = "AGPL-3.0-or-later"
 __url__     = "https://github.com/SFCyris/SoniqBoom"
