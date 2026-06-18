@@ -24,6 +24,80 @@ _WAVEFORM_POOL = ThreadPoolExecutor(
     thread_name_prefix="sb-waveform",
 )
 
+
+async def _compute_waveform_safe(path: str, points: int = 200):
+    """Compute a track's waveform WITHOUT forking ffmpeg from a worker thread.
+
+    ``scanner._compute_waveform`` decodes via a blocking ``subprocess.run``;
+    offloaded to ``_WAVEFORM_POOL`` that fork runs on a non-main thread, which
+    SEGFAULTS on macOS once the process has initialised Core Foundation (e.g.
+    after the stations relay's outbound networking) — the worker dies and every
+    waveform comes back all-zero (blank).  Decode ffmpeg on the EVENT LOOP via
+    ``create_subprocess_exec`` instead — the same fork-safe pattern the whole
+    streaming path uses — then crunch the PCM in the pool (numpy doesn't fork).
+    """
+    from soniqboom.config import settings
+    from soniqboom.core.scanner import _pcm_to_waveform
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            settings.ffmpeg_path, "-i", path,
+            "-ac", "1", "-ar", "22050", "-f", "f32le", "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:               # noqa: BLE001 — ffmpeg missing / spawn failure
+        return [0.0] * points
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except Exception:               # noqa: BLE001 — timeout / transport error
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return [0.0] * points
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_WAVEFORM_POOL, _pcm_to_waveform, raw, points)
+
+
+async def _resolve_zip_member_to_local(path_str: str):
+    """Extract a ZIP member to a local temp file ffmpeg can read.
+
+    Handles both a local archive (``/path/a.zip::member``) and a remote one
+    (``ftp://host/scanroot:/a.zip::member`` — fetch the archive to the cache
+    first, then read the member).  Returns a ``Path`` the CALLER must unlink,
+    or ``None`` if it can't be resolved (the caller then degrades to 404).
+    Mirrors the extraction already used for converted formats in
+    ``_waveform_from_conversion_cache``.
+    """
+    from pathlib import Path as _Path
+    import tempfile
+    loop = asyncio.get_event_loop()
+    try:
+        if path_str.startswith(("ftp://", "smb://")):
+            from soniqboom.core import archive as _archive
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(path_str)
+            source = get_source(scan_root)
+            if source is None or "::" not in remote_path:
+                return None
+            arc_rel, member_name = remote_path.split("::", 1)
+            local_archive = await loop.run_in_executor(
+                None, get_cache().fetch, scan_root, arc_rel, source)
+            data = await loop.run_in_executor(
+                None, _archive.read_member, local_archive, member_name)
+        else:
+            from soniqboom.core.scanner import _read_from_zip_path
+            data, member_name = await loop.run_in_executor(
+                None, _read_from_zip_path, path_str)
+        tmp = tempfile.NamedTemporaryFile(suffix=_Path(member_name).suffix, delete=False)
+        tmp.write(data)
+        tmp.close()
+        return _Path(tmp.name)
+    except Exception:                       # noqa: BLE001 — degrade, never 500
+        return None
+
 from soniqboom.core.data import (
     delete_track, get_track, track_count,
     set_rating, get_rating, get_ratings_batch, get_all_ratings,
@@ -732,7 +806,6 @@ async def get_track_waveform(track_id: str, response: Response):
     import asyncio
     from pathlib import Path as _Path
     from soniqboom.core.data import get_waveform, get_track, store_waveform
-    from soniqboom.core.scanner import _compute_waveform
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
         _ADLIB_EXTS, _GME_EXTS_STREAM,
@@ -778,8 +851,20 @@ async def get_track_waveform(track_id: str, response: Response):
     if (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS
             or ext in _UADE_EXTS or ext in _HVL_EXTS
             or ext in _ADLIB_EXTS or ext in _GME_EXTS_STREAM):
-        wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
-        result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(wav_path))
+        try:
+            wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
+        except HTTPException as exc:
+            # A render that EXITED nonzero (502 — e.g. fluidsynth can't parse
+            # this .mid, an AdLib tune with no resolvable instruments) means the
+            # file is unrenderable; degrade to a blank waveform like every other
+            # branch instead of throwing a 502 error toast.  Re-raise genuine
+            # transient/availability errors (501 renderer-missing, 503/504
+            # timeout) so a real misconfiguration stays visible.
+            if exc.status_code == 502:
+                wav_path = None
+            else:
+                raise
+        result = await _compute_waveform_safe(str(wav_path) if wav_path else "")
         stored, response = _normalise_waveform(result)
         if not _waveform_is_blank(stored):
             await store_waveform(track_id, stored)
@@ -941,10 +1026,27 @@ async def get_track_waveform(track_id: str, response: Response):
         # appears in ~3 s on a typical 5-min DSD instead of waiting the full
         # transcode (~30–50 s) — the single biggest perception polish
         # remaining after the cold-start fix.
-        src_for_waveform = str(cached_path) if cached_path else path_str
-        result = await loop.run_in_executor(
-            _WAVEFORM_POOL, _compute_waveform, src_for_waveform,
-        )
+        if cached_path:
+            src_for_waveform = str(cached_path)
+        elif path_str.startswith(("smb://", "ftp://")):
+            # Remote transcoded source (e.g. a .m4a/.aac on an FTP/SMB share)
+            # with no cached transcode yet: ffmpeg can't open our internal
+            # ``ftp://host/scanroot:/rel`` pseudo-URL — it returns all-zeros and
+            # the waveform shows blank.  Fetch a local copy first (same as the
+            # remote branch below) instead of handing ffmpeg the pseudo-URL.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(path_str)
+            source = get_source(scan_root) if remote_path else None
+            if source is None:
+                raise HTTPException(503, "Network share unavailable")
+            try:
+                src_for_waveform = str(get_cache().fetch(scan_root, remote_path, source))
+            except Exception as exc:        # noqa: BLE001 — surface fetch failure
+                raise HTTPException(502, f"Could not fetch remote file: {exc}")
+        else:
+            src_for_waveform = path_str
+        result = await _compute_waveform_safe(src_for_waveform)
         stored, response = _normalise_waveform(result)
         # Cache-poisoning guard: when ``cached_path`` is None (the
         # in-flight pump hasn't promoted .partial yet) and ``path_str``
@@ -964,9 +1066,25 @@ async def get_track_waveform(track_id: str, response: Response):
         )
         return {"waveform": response}
 
-    # ── Non-converted ZIP files: skip (ffmpeg can't read ZIP directly) ───
+    # ── Plain audio inside a ZIP: extract the member, then compute ───────
+    # ffmpeg can't read the ``archive.zip::member`` virtual path directly, so
+    # pull the member out to a local temp file first (works for local and
+    # remote archives), exactly like the converted-format path already does.
     if '::' in path_str:
-        raise HTTPException(404, "Waveform not available for this format")
+        local = await _resolve_zip_member_to_local(path_str)
+        if local is None:
+            raise HTTPException(404, "Waveform not available for this format")
+        try:
+            result = await _compute_waveform_safe(str(local))
+            stored, response = _normalise_waveform(result)
+            if not _waveform_is_blank(stored):
+                await store_waveform(track_id, stored)
+            return {"waveform": response}
+        finally:
+            try:
+                local.unlink()
+            except Exception:
+                pass
 
     # ── Remote files: compute from cached local copy ─────────────────────
     if path_str.startswith(("smb://", "ftp://")):
@@ -982,14 +1100,14 @@ async def get_track_waveform(track_id: str, response: Response):
             local_path = get_cache().fetch(scan_root, remote_path, source)
         except Exception as exc:
             raise HTTPException(502, f"Could not fetch remote file: {exc}")
-        result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, str(local_path))
+        result = await _compute_waveform_safe(str(local_path))
         stored, response = _normalise_waveform(result)
         if not _waveform_is_blank(stored):
             await store_waveform(track_id, stored)
         return {"waveform": response}
 
     # ── Standard local files: compute directly from source ───────────────
-    result = await loop.run_in_executor(_WAVEFORM_POOL, _compute_waveform, track.path)
+    result = await _compute_waveform_safe(track.path)
     stored, response = _normalise_waveform(result)
     if not _waveform_is_blank(stored):
         await store_waveform(track_id, stored)

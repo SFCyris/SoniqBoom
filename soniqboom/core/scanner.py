@@ -766,7 +766,20 @@ def _compute_waveform(path: str, points: int = 200):
     proc = subprocess.run(
         cmd, capture_output=True, timeout=60,
     )
-    raw = proc.stdout
+    return _pcm_to_waveform(proc.stdout, points)
+
+
+def _pcm_to_waveform(raw: bytes, points: int = 200):
+    """Crunch raw mono 22.05 kHz f32le PCM into a compact waveform.
+
+    Split out from ``_compute_waveform`` so the ffmpeg DECODE can be driven by
+    ``asyncio.create_subprocess_exec`` on the event loop (fork-safe on macOS —
+    ``subprocess.run`` fork from a worker thread segfaults once the process has
+    initialised Core Foundation, e.g. after the stations relay's outbound
+    networking), while this CPU-bound crunch still runs in a worker thread.
+    Return shape mirrors ``_compute_waveform``: ``{"peaks", "rms"}`` on the
+    numpy path, a flat RMS list on the pure-Python fallback.
+    """
     if not raw:
         return [0.0] * points
 

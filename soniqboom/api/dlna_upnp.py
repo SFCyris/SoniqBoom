@@ -509,6 +509,25 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
             "TotalMatches":   "1",
             "UpdateID":       "0",
         }
+    # Album / artist container metadata — some controllers fetch this before
+    # BrowseDirectChildren, and return it as the container itself.
+    if obj_id.startswith("al:") or obj_id.startswith("ar:"):
+        is_album = obj_id.startswith("al:")
+        name = _dec_name(obj_id[3:])
+        parent = "music/albums" if is_album else "music/artists"
+        title = name or ("[Unknown Album]" if is_album else "[No Album Artist]")
+        result = (
+            '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '>'
+            + _container(obj_id, parent, title, 0)
+            + '</DIDL-Lite>'
+        )
+        return {
+            "Result":         result,
+            "NumberReturned": "1",
+            "TotalMatches":   "1",
+            "UpdateID":       "0",
+        }
+
     # Unknown object → empty result
     return {
         "Result":         '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '></DIDL-Lite>',
@@ -516,6 +535,23 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
         "TotalMatches":   "0",
         "UpdateID":       "0",
     }
+
+
+def _enc_name(name: str) -> str:
+    """URL-safe base64 of an album/artist NAME → an opaque, REVERSIBLE ObjectID
+    token (no server-side hash→name map needed, unlike the old sha1 plan)."""
+    import base64
+    return base64.urlsafe_b64encode((name or "").encode("utf-8")).decode("ascii")
+
+
+def _dec_name(token: str) -> str:
+    """Reverse of _enc_name; returns '' on a malformed token."""
+    import base64
+    try:
+        pad = "=" * (-len(token) % 4)
+        return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
+    except Exception:                       # noqa: BLE001 — garbage token → empty
+        return ""
 
 
 async def _browse_children(
@@ -539,11 +575,15 @@ async def _browse_children(
         if returned == 0:
             didl_parts = ["<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">"]
     elif obj_id == "music":
-        # Music → All / Albums / Artists
+        # Music → All / Albums / Artists.  Real child counts so a controller
+        # doesn't render Albums/Artists as "0 items" and refuse to descend.
+        store = get_store()
+        n_albums  = len(await asyncio.to_thread(store.aggregate_albums))
+        n_artists = len(await asyncio.to_thread(store.aggregate_album_artists))
         children = [
-            ("music/all",     "All Tracks", get_store().track_count()),
-            ("music/albums",  "Albums",     0),  # child count unknown w/o scan
-            ("music/artists", "Artists",    0),
+            ("music/all",     "All Tracks", store.track_count()),
+            ("music/albums",  "Albums",     n_albums),
+            ("music/artists", "Artists",    n_artists),
         ]
         total = len(children)
         for i, (cid, ctitle, ccount) in enumerate(children):
@@ -579,15 +619,58 @@ async def _browse_children(
         for row in rendered:
             didl_parts.append(row)
             returned += 1
-    elif obj_id == "music/albums" or obj_id == "music/artists":
-        # TODO(future): build album / artist container index.  For v1
-        # we expose only the flat list under "music/all" — DLNA
-        # controllers can still walk it.
-        total = 0
+    elif obj_id == "music/albums":
+        # One container per album → ``al:<base64(album)>``.
+        store = get_store()
+        rows = await asyncio.to_thread(store.aggregate_albums)
+        total = len(rows)
+        for d in rows[start:start + count]:
+            name = d.get("album") or ""
+            didl_parts.append(_container(
+                "al:" + _enc_name(name), "music/albums",
+                name or "[Unknown Album]", int(d.get("count", 0) or 0)))
+            returned += 1
+    elif obj_id == "music/artists":
+        # One container per album-artist → ``ar:<base64(album_artist)>``.
+        store = get_store()
+        rows = await asyncio.to_thread(store.aggregate_album_artists)
+        total = len(rows)
+        for d in rows[start:start + count]:
+            name = d.get("album_artist") or ""
+            didl_parts.append(_container(
+                "ar:" + _enc_name(name), "music/artists",
+                name or "[No Album Artist]", int(d.get("count", 0) or 0)))
+            returned += 1
     elif obj_id.startswith("al:") or obj_id.startswith("ar:"):
-        # Same TODO — not implemented in v1; returns empty so the
-        # controller shows "no items" instead of erroring out.
-        total = 0
+        # Tracks of one album / album-artist.  The name is base64 in the id,
+        # so no server-side hash map is needed — decode and filter.
+        store = get_store()
+        is_album = obj_id.startswith("al:")
+        name = _dec_name(obj_id[3:])
+        filt = {"album": name} if is_album else {"album_artist": name}
+
+        # Accurate TotalMatches from the (cached) aggregate count.
+        agg = await asyncio.to_thread(
+            store.aggregate_albums if is_album else store.aggregate_album_artists)
+        akey = "album" if is_album else "album_artist"
+        total = next((int(d.get("count", 0) or 0)
+                      for d in agg if (d.get(akey) or "") == name), 0)
+
+        def _fetch_page() -> list[dict]:
+            try:
+                return store.filter_tracks(limit=count, offset=start, **filt)
+            except TypeError:               # older store: no ``offset`` kwarg
+                allt = store.filter_tracks(limit=start + count, **filt)
+                return allt[start:start + count]
+        tracks = await asyncio.to_thread(_fetch_page)
+
+        def _render_rows() -> list[str]:
+            return [_track_to_didl_item(t, base_url) for t in tracks]
+        for row in await asyncio.to_thread(_render_rows):
+            didl_parts.append(row)
+            returned += 1
+        if total == 0:                      # name not in aggregate — fall back
+            total = start + returned
     else:
         # Unknown obj_id — empty
         total = 0

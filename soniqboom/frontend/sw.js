@@ -328,7 +328,10 @@
 // before the first 'playing' is startup connect, not an underrun (9s grace).
 // Fixes eager quality-drop at start AND the switch-storm renderer crash (the
 // cascade was opening 4 connections per station start).
-const SHELL_VERSION = 'v100';
+// v101: app.css v63 — #stations-view sits above the visualizer canvas
+// (position:relative; z-index:1) so screen-filling visualizers no longer
+// wash out the station text (it was painting under the z-index:0 canvas).
+const SHELL_VERSION = 'v101';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

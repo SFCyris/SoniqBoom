@@ -2093,6 +2093,23 @@ input[type="range"]:hover::-moz-range-thumb {
   transition: opacity 0.6s ease;
 }
 
+/* The visualizer canvas (z-index:0, above #content's background) must sit BEHIND
+   the content panels.  Only #track-list-wrap was positioned, so it alone painted
+   above the canvas; these static panels painted UNDER it, letting a screen-
+   filling visualizer (synthwave/lavalamp/…) wash their text out.  Lift them above
+   the canvas — they're transparent, so the visualizer still shows through behind.
+   (Listed explicitly rather than ``#content > *`` so we don't clobber the
+   #now-playing-art overlay's own z-index:10.) */
+#stations-view,
+#album-grid,
+#browse-header,
+#group-filter-bar,
+#selection-bar,
+#browse-toolbar {
+  position: relative;
+  z-index: 1;
+}
+
 /* ── Equalizer overlay ───────────────────────────────────────────────────── */
 #eq-overlay {
   position: fixed;
