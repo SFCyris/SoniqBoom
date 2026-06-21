@@ -12,9 +12,10 @@ endpoints:
   GET  /dlna/device.xml     - root device description (UPnP DDD)
   GET  /dlna/cds.xml        - ContentDirectory:1 service description
   GET  /dlna/cm.xml         - ConnectionManager:1 service description
-  POST /dlna/cds/control    - ContentDirectory:1 SOAP control (Browse)
+  POST /dlna/cds/control    - ContentDirectory:1 SOAP control (Browse + Search)
   POST /dlna/cm/control     - ConnectionManager:1 SOAP control (minimal)
-  GET  /dlna/cds/event      - eventing endpoint stub (no GENA subscriptions)
+  SUB  /dlna/cds/event      - GENA eventing (SUBSCRIBE/UNSUBSCRIBE; NOTIFY on
+                              library change, carrying SystemUpdateID)
 
 The router mounts at the app root (NOT under /api/) so the URLs
 exactly match what the SSDP LOCATION header advertises, and so the
@@ -25,13 +26,17 @@ credentials.
 
 Browse hierarchy:
 
-    0                           (root container)
-    └── music                   (audio container)
-        ├── all                 (every track in flat list)
-        ├── albums              (one container per album)
-        │   └── al:<sha1>       (tracks of one album)
-        └── artists             (one container per album_artist)
-            └── ar:<sha1>       (tracks of one artist)
+    0                                   (root container)
+    └── music                           (audio container)
+        ├── all                         (every track in flat list)
+        ├── albums                      (one container per album)
+        │   └── al:<b64(album)>         (tracks of one album)
+        └── artists                     (one container per album_artist)
+            └── ar:<b64(album_artist)>  (that artist's albums)
+                └── aa:<b64(artist)>:<b64(album)>  (tracks of one album)
+
+    ObjectID name tokens are URL-safe base64 of the album / artist NAME
+    (reversible, so no server-side hash→name map is needed).
 
 Each track returns a DIDL-Lite ``<item>`` whose ``<res>`` URL points
 at the existing ``/cast/{token}/<filename>.<ext>`` anonymous byte
@@ -189,6 +194,20 @@ async def cds_description():
         <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <action><name>Search</name>
+      <argumentList>
+        <argument><name>ContainerID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>
+        <argument><name>SearchCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SearchCriteria</relatedStateVariable></argument>
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
   </actionList>
   <serviceStateTable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>
@@ -197,11 +216,13 @@ async def cds_description():
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SearchCriteria</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>ContainerUpdateIDs</name><dataType>string</dataType></stateVariable>
   </serviceStateTable>
 </scpd>
 """
@@ -338,7 +359,7 @@ _DIDL_NS_BOILERPLATE = (
 )
 
 
-def _track_to_didl_item(track: dict, base_url: str) -> str:
+def _track_to_didl_item(track: dict, base_url: str, parent_id: str = "music") -> str:
     """Render a single track row as a DIDL-Lite ``<item>``.
 
     The ``<res>`` URL points at the existing anonymous cast byte server
@@ -346,6 +367,12 @@ def _track_to_didl_item(track: dict, base_url: str) -> str:
     so DLNA controllers — which never authenticate to us — get exactly
     the access scope the operator agreed to when they enabled the
     Media Server.
+
+    ``parent_id`` is the ObjectID of the container this item is being
+    returned under (``music/all``, ``al:<b64>``, ``aa:<b64>:<b64>`` …).
+    ContentDirectory:1 §2.7.1 requires an item's ``parentID`` to match
+    the container that lists it; strict controllers use it to anchor the
+    item back into the tree, so a constant ``"music"`` breaks descent.
     """
     from soniqboom.core import cast_tokens
     from soniqboom.core.cast_codecs import CODECS
@@ -385,7 +412,7 @@ def _track_to_didl_item(track: dict, base_url: str) -> str:
     dur_str = f"{h:d}:{m:02d}:{s:06.3f}"
 
     return (
-        f'<item id="{_xescape(track_id)}" parentID="music" restricted="1">'
+        f'<item id="{_xescape(track_id)}" parentID="{_xescape(parent_id)}" restricted="1">'
         f'<dc:title>{_xescape(title)}</dc:title>'
         f'<dc:creator>{_xescape(artist)}</dc:creator>'
         f'<upnp:artist>{_xescape(artist)}</upnp:artist>'
@@ -419,27 +446,99 @@ async def cds_control(request: Request):
     action, args = _parse_soap_body(raw)
 
     if action == "GetSearchCapabilities":
-        # We don't support Search; controllers fall back to client-side filter.
-        return _soap_response(_UPNP_CDS_NS, action, {"SearchCaps": ""})
+        # Fields the Search action can match on.
+        return _soap_response(_UPNP_CDS_NS, action,
+                              {"SearchCaps": "dc:title,upnp:artist,upnp:album,dc:creator"})
 
     if action == "GetSortCapabilities":
         # Also empty — we return tracks in library/insertion order.
         return _soap_response(_UPNP_CDS_NS, action, {"SortCaps": ""})
 
     if action == "GetSystemUpdateID":
-        # Bumps when the library changes; we just use a monotonic counter
-        # derived from store.track_count() so a rescan flips it visibly.
-        try:
-            from soniqboom.core.store import get_store
-            updid = get_store().track_count()
-        except Exception:
-            updid = 0
-        return _soap_response(_UPNP_CDS_NS, action, {"Id": str(updid)})
+        # Monotonic counter bumped by notify_library_changed() on every
+        # library change (the same value carried in the GENA SystemUpdateID
+        # event), so a controller can tell its cached tree is stale.
+        return _soap_response(_UPNP_CDS_NS, action, {"Id": str(_system_update_id)})
 
     if action == "Browse":
         return await _do_browse(args, request)
 
+    if action == "Search":
+        return await _do_search(args, request)
+
     return _soap_fault(401, f"Invalid Action: {action!r}")
+
+
+def _parse_search_criteria(crit: str):
+    """Map a UPnP SearchCriteria string to ``filter_tracks`` kwargs.
+
+    Returns the kwargs dict, or ``None`` for "match everything" (``*`` or a
+    criteria that only constrains upnp:class).  Pragmatic — real controllers
+    send simple ``<field> contains "term"`` clauses; we pull the term out per
+    known field and otherwise fall back to a full-text query.
+    """
+    import re
+    c = (crit or "").strip()
+    if not c or c == "*":
+        return None
+    # Exact-match clauses (operator ``=``) → precise field filter.
+    filt: dict[str, str] = {}
+    for field, key in (("artist", "artist"), ("author", "artist"),
+                       ("album", "album"), ("creator", "artist")):
+        m = re.search(r'(?:upnp|dc):%s\s*=\s*["\']([^"\']+)["\']' % field, c, re.I)
+        if m and key not in filt:
+            filt[key] = m.group(1)
+    if filt:
+        return filt
+    # ``contains`` (and anything else) → full-text query, which does substring
+    # matching across title/artist/album.  Mapping ``contains`` to an exact
+    # field filter would miss partial terms (e.g. artist contains "Beethoven").
+    # Use the first quoted term that isn't a UPnP class path.
+    for m in re.finditer(r'["\']([^"\']+)["\']', c):
+        term = m.group(1)
+        if not term.lower().startswith("object."):
+            return {"query": term}
+    return None
+
+
+async def _do_search(args: dict[str, str], request: Request) -> FResponse:
+    """ContentDirectory:1 Search — returns matching track items as DIDL-Lite."""
+    from soniqboom.core.store import get_store
+    try:
+        start = max(0, int(args.get("StartingIndex", "0") or 0))
+        req_cnt = int(args.get("RequestedCount", "0") or 0)
+    except ValueError:
+        return _soap_fault(402, "StartingIndex / RequestedCount must be integers")
+    if req_cnt <= 0 or req_cnt > 500:
+        req_cnt = 500
+    base_url = str(request.base_url).rstrip("/")
+    container = args.get("ContainerID", "music") or "music"
+    store = get_store()
+
+    filt = _parse_search_criteria(args.get("SearchCriteria", ""))
+    if filt is None:
+        # Match everything — same as browsing music/all.
+        total = await asyncio.to_thread(store.track_count)
+        rows = await _list_track_items(store, {}, start, req_cnt, base_url, container)
+    else:
+        # Search result sets are small in practice; fetch a bounded match set,
+        # then page in memory (cap guards a 1-char query on a huge library).
+        def _all() -> list[dict]:
+            return store.filter_tracks(limit=5000, **filt)
+        matches = await asyncio.to_thread(_all)
+        total = len(matches)
+        page = matches[start:start + req_cnt]
+        rows = await asyncio.to_thread(
+            lambda: [_track_to_didl_item(t, base_url, container) for t in page])
+
+    result = ("<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">"
+              + "".join(rows) + "</DIDL-Lite>")
+    return _soap_response(_UPNP_CDS_NS, "Search", {
+        "Result":         result,
+        "NumberReturned": str(len(rows)),
+        "TotalMatches":   str(total),
+        "UpdateID":       str(_system_update_id),
+    })
 
 
 async def _do_browse(args: dict[str, str], request: Request) -> FResponse:
@@ -448,11 +547,12 @@ async def _do_browse(args: dict[str, str], request: Request) -> FResponse:
     Object-ID hierarchy:
       "0"       → root (single child: music)
       "music"   → music container (all / albums / artists)
-      "music/all"     → flat list of every track
-      "music/albums"  → list of album containers
-      "music/artists" → list of artist containers
-      "al:<sha1>"     → tracks of one album
-      "ar:<sha1>"     → tracks of one artist
+      "music/all"          → flat list of every track
+      "music/albums"       → list of album containers
+      "music/artists"      → list of artist containers
+      "al:<b64>"           → tracks of one album (by album name)
+      "ar:<b64>"           → that album-artist's albums (aa: containers)
+      "aa:<b64>:<b64>"     → tracks of one (album_artist, album)
 
     BrowseFlag = "BrowseMetadata" returns just the object itself;
     "BrowseDirectChildren" returns its children paginated by
@@ -507,15 +607,24 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
             "Result":         result,
             "NumberReturned": "1",
             "TotalMatches":   "1",
-            "UpdateID":       "0",
+            "UpdateID":       str(_system_update_id),
         }
-    # Album / artist container metadata — some controllers fetch this before
-    # BrowseDirectChildren, and return it as the container itself.
-    if obj_id.startswith("al:") or obj_id.startswith("ar:"):
-        is_album = obj_id.startswith("al:")
-        name = _dec_name(obj_id[3:])
-        parent = "music/albums" if is_album else "music/artists"
-        title = name or ("[Unknown Album]" if is_album else "[No Album Artist]")
+    # Album / artist / artist-album container metadata — some controllers fetch
+    # this before BrowseDirectChildren; return it as the container itself.
+    if obj_id.startswith(("al:", "ar:", "aa:")):
+        if obj_id.startswith("aa:"):
+            try:
+                _, b_artist, b_album = obj_id.split(":", 2)
+            except ValueError:
+                b_artist = b_album = ""
+            title = _dec_name(b_album) or "[Unknown Album]"
+            parent = "ar:" + b_artist
+        elif obj_id.startswith("al:"):
+            title = _dec_name(obj_id[3:]) or "[Unknown Album]"
+            parent = "music/albums"
+        else:  # ar:
+            title = _dec_name(obj_id[3:]) or "[No Album Artist]"
+            parent = "music/artists"
         result = (
             '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '>'
             + _container(obj_id, parent, title, 0)
@@ -525,7 +634,7 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
             "Result":         result,
             "NumberReturned": "1",
             "TotalMatches":   "1",
-            "UpdateID":       "0",
+            "UpdateID":       str(_system_update_id),
         }
 
     # Unknown object → empty result
@@ -533,7 +642,7 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
         "Result":         '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '></DIDL-Lite>',
         "NumberReturned": "0",
         "TotalMatches":   "0",
-        "UpdateID":       "0",
+        "UpdateID":       str(_system_update_id),
     }
 
 
@@ -552,6 +661,22 @@ def _dec_name(token: str) -> str:
         return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
     except Exception:                       # noqa: BLE001 — garbage token → empty
         return ""
+
+
+async def _list_track_items(store, filt: dict, start: int, count: int, base_url: str,
+                            parent_id: str = "music") -> list[str]:
+    """Paginated DIDL-Lite ``<item>`` rows for tracks matching ``filt``."""
+    def _fetch() -> list[dict]:
+        try:
+            return store.filter_tracks(limit=count, offset=start, **filt)
+        except TypeError:                   # older store: no ``offset`` kwarg
+            allt = store.filter_tracks(limit=start + count, **filt)
+            return allt[start:start + count]
+    tracks = await asyncio.to_thread(_fetch)
+
+    def _render() -> list[str]:
+        return [_track_to_didl_item(t, base_url, parent_id) for t in tracks]
+    return await asyncio.to_thread(_render)
 
 
 async def _browse_children(
@@ -614,7 +739,7 @@ async def _browse_children(
         # 500 rows is ~30 ms; off-loop it as well so concurrent requests
         # aren't held while we render Browse.
         def _render_rows() -> list[str]:
-            return [_track_to_didl_item(t, base_url) for t in tracks]
+            return [_track_to_didl_item(t, base_url, "music/all") for t in tracks]
         rendered = await asyncio.to_thread(_render_rows)
         for row in rendered:
             didl_parts.append(row)
@@ -641,35 +766,49 @@ async def _browse_children(
                 "ar:" + _enc_name(name), "music/artists",
                 name or "[No Album Artist]", int(d.get("count", 0) or 0)))
             returned += 1
-    elif obj_id.startswith("al:") or obj_id.startswith("ar:"):
-        # Tracks of one album / album-artist.  The name is base64 in the id,
-        # so no server-side hash map is needed — decode and filter.
+    elif obj_id.startswith("ar:"):
+        # Artist → that album-artist's ALBUMS (containers ``aa:<artist>:<album>``).
         store = get_store()
-        is_album = obj_id.startswith("al:")
-        name = _dec_name(obj_id[3:])
-        filt = {"album": name} if is_album else {"album_artist": name}
-
-        # Accurate TotalMatches from the (cached) aggregate count.
-        agg = await asyncio.to_thread(
-            store.aggregate_albums if is_album else store.aggregate_album_artists)
-        akey = "album" if is_album else "album_artist"
+        artist = _dec_name(obj_id[3:])
+        rows = await asyncio.to_thread(store.aggregate_albums, None, artist)
+        total = len(rows)
+        for d in rows[start:start + count]:
+            album = d.get("album") or ""
+            didl_parts.append(_container(
+                "aa:" + _enc_name(artist) + ":" + _enc_name(album), obj_id,
+                album or "[Unknown Album]", int(d.get("count", 0) or 0)))
+            returned += 1
+    elif obj_id.startswith("aa:"):
+        # Artist + album → tracks (disambiguated, so same-named albums by
+        # different artists don't bleed together).
+        store = get_store()
+        try:
+            _, b_artist, b_album = obj_id.split(":", 2)
+        except ValueError:
+            b_artist = b_album = ""
+        artist, album = _dec_name(b_artist), _dec_name(b_album)
+        agg = await asyncio.to_thread(store.aggregate_albums, None, artist)
         total = next((int(d.get("count", 0) or 0)
-                      for d in agg if (d.get(akey) or "") == name), 0)
-
-        def _fetch_page() -> list[dict]:
-            try:
-                return store.filter_tracks(limit=count, offset=start, **filt)
-            except TypeError:               # older store: no ``offset`` kwarg
-                allt = store.filter_tracks(limit=start + count, **filt)
-                return allt[start:start + count]
-        tracks = await asyncio.to_thread(_fetch_page)
-
-        def _render_rows() -> list[str]:
-            return [_track_to_didl_item(t, base_url) for t in tracks]
-        for row in await asyncio.to_thread(_render_rows):
+                      for d in agg if (d.get("album") or "") == album), 0)
+        for row in await _list_track_items(
+                store, {"album_artist": artist, "album": album},
+                start, count, base_url, obj_id):
             didl_parts.append(row)
             returned += 1
-        if total == 0:                      # name not in aggregate — fall back
+        if total == 0:
+            total = start + returned
+    elif obj_id.startswith("al:"):
+        # Album (top level) → tracks, by album name only.
+        store = get_store()
+        album = _dec_name(obj_id[3:])
+        agg = await asyncio.to_thread(store.aggregate_albums)
+        total = next((int(d.get("count", 0) or 0)
+                      for d in agg if (d.get("album") or "") == album), 0)
+        for row in await _list_track_items(
+                store, {"album": album}, start, count, base_url, obj_id):
+            didl_parts.append(row)
+            returned += 1
+        if total == 0:
             total = start + returned
     else:
         # Unknown obj_id — empty
@@ -682,7 +821,7 @@ async def _browse_children(
         "Result":         result,
         "NumberReturned": str(returned),
         "TotalMatches":   str(total),
-        "UpdateID":       "0",
+        "UpdateID":       str(_system_update_id),
     }
 
 
@@ -734,36 +873,189 @@ async def cm_control(request: Request):
     return _soap_fault(401, f"Invalid Action: {action!r}")
 
 
-# ── GENA event subscription stubs ──────────────────────────────────────────
-# Many DLNA controllers send a SUBSCRIBE request to the event URLs at
-# startup.  We don't actually emit events (no library-change push), but
-# returning a successful subscription response avoids "device half-broken"
-# warnings on strict controllers.
+# ── GENA eventing (ContentDirectory) ───────────────────────────────────────
+# Real subscriptions: on SUBSCRIBE we register the controller's callback and
+# send the initial event; when the library changes we bump SystemUpdateID and
+# NOTIFY every live subscriber so it re-browses.  ConnectionManager eventing
+# stays a stub — its evented state never changes.
+
+import threading as _threading
+import time as _gtime
+import uuid as _guuid
+
+_SUB_LOCK = asyncio.Lock()
+_cds_subs: dict[str, dict] = {}        # sid -> {callback, host, expires, seq}
+_system_update_id: int = 1
+_MAX_SUBS = 64                          # cap registry growth (cheap DoS guard)
+
+# ``_system_update_id`` is mutated both from the event loop (on_library_changed)
+# and, on the no-loop fallback, from a library-scan worker thread.  ``+= 1`` is
+# read-modify-write and not atomic across threads, so guard it with a plain
+# threading.Lock (held only for the increment — never across an await).
+_UPDATE_ID_LOCK = _threading.Lock()
+
+
+def _bump_update_id() -> int:
+    """Atomically increment the SystemUpdateID and return the new value."""
+    global _system_update_id
+    with _UPDATE_ID_LOCK:
+        _system_update_id += 1
+        return _system_update_id
+
+
+def _parse_timeout(raw: str | None) -> int:
+    """``Second-1800`` / ``infinite`` → seconds, clamped to [60, 3600]."""
+    import re
+    if not raw:
+        return 1800
+    raw = raw.strip().lower()
+    if "infinite" in raw:
+        return 3600
+    m = re.match(r"second-(\d+)", raw)
+    return max(60, min(3600, int(m.group(1)) if m else 1800))
+
+
+def _parse_callback(raw: str | None) -> str | None:
+    """``CALLBACK: <http://host/path> [<...>]`` → first URL."""
+    import re
+    if not raw:
+        return None
+    m = re.search(r"<([^>]+)>", raw)
+    return m.group(1) if m else None
+
+
+def _propertyset() -> str:
+    return (
+        '<?xml version="1.0"?>'
+        '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+        f'<e:property><SystemUpdateID>{_system_update_id}</SystemUpdateID></e:property>'
+        '<e:property><ContainerUpdateIDs></ContainerUpdateIDs></e:property>'
+        '</e:propertyset>'
+    )
+
+
+async def _send_gena_notify(sid: str, sub: dict) -> bool:
+    """POST a GENA NOTIFY to a subscriber's callback.  False on failure."""
+    import httpx
+    # Allocate this NOTIFY's SEQ *synchronously* — read and bump with no await
+    # in between, so the event loop can't interleave two concurrent notifies to
+    # the same subscriber onto the same sequence number.  GENA (UPnP Device
+    # Architecture §4.1.4) requires SEQ to start at 0 and increment by exactly
+    # one per event; reading SEQ before the await and bumping after would let
+    # two overlapping sends both ship SEQ=0 and leave a gap.
+    seq = sub["seq"]
+    sub["seq"] = seq + 1
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "NT":  "upnp:event",
+        "NTS": "upnp:propchange",
+        "SID": sid,
+        "SEQ": str(seq),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.request(
+                "NOTIFY", sub["callback"], content=_propertyset(), headers=headers)
+        return r.status_code < 400
+    except Exception:                       # noqa: BLE001 — controller offline
+        return False
+
+
+async def _send_initial_notify(sid: str, sub: dict) -> None:
+    """Initial GENA event, fired just after a SUBSCRIBE.  A short delay lets the
+    SUBSCRIBE 200 (carrying the SID) reach the controller before the first
+    NOTIFY, so the controller has the subscription registered when it lands."""
+    await asyncio.sleep(0.1)
+    await _send_gena_notify(sid, sub)
+
+
+def _prune_subs(now: float) -> None:
+    for k in [k for k, v in _cds_subs.items() if v["expires"] <= now]:
+        _cds_subs.pop(k, None)
+
+
+async def on_library_changed() -> None:
+    """Bump SystemUpdateID and NOTIFY all live CDS subscribers."""
+    _bump_update_id()
+    now = _gtime.monotonic()
+    async with _SUB_LOCK:
+        _prune_subs(now)
+        subs = list(_cds_subs.items())
+    for sid, sub in subs:
+        await _send_gena_notify(sid, sub)
+
+
+def notify_library_changed() -> None:
+    """Sync entry point (called from the library-change path).  Schedules the
+    async NOTIFY when a loop is running; otherwise just bumps the counter."""
+    try:
+        asyncio.get_running_loop().create_task(on_library_changed())
+    except RuntimeError:                    # no running loop (worker thread)
+        _bump_update_id()
+
 
 @router.api_route(
     "/dlna/cds/event", methods=["SUBSCRIBE", "UNSUBSCRIBE"], include_in_schema=False,
 )
 async def cds_event(request: Request):
-    return _event_response()
+    sid_hdr = request.headers.get("SID")
+    if request.method == "UNSUBSCRIBE":
+        if sid_hdr:
+            async with _SUB_LOCK:
+                _cds_subs.pop(sid_hdr, None)
+        return PlainTextResponse("", status_code=200)
+
+    # SUBSCRIBE
+    now = _gtime.monotonic()
+    timeout_s = _parse_timeout(request.headers.get("TIMEOUT"))
+    callback = _parse_callback(request.headers.get("CALLBACK"))
+
+    if sid_hdr and not callback:            # renewal
+        async with _SUB_LOCK:
+            sub = _cds_subs.get(sid_hdr)
+            if sub is None:
+                return PlainTextResponse("", status_code=412)
+            sub["expires"] = now + timeout_s
+        return PlainTextResponse("", status_code=200, headers={
+            "SID": sid_hdr, "TIMEOUT": f"Second-{timeout_s}",
+            "Server": "UPnP/1.0 SoniqBoom-DLNA/1.0"})
+
+    if not callback:
+        return PlainTextResponse("", status_code=412)
+
+    # SSRF guard: a subscriber may only register a callback on its OWN address,
+    # so we can't be coerced into NOTIFYing an arbitrary internal host.
+    from urllib.parse import urlparse
+    cb_host = urlparse(callback).hostname or ""
+    client_host = request.client.host if request.client else ""
+    if cb_host != client_host:
+        return PlainTextResponse("Callback host must match subscriber",
+                                 status_code=412)
+
+    sid = "uuid:" + str(_guuid.uuid4())
+    sub = {"callback": callback, "host": cb_host, "expires": now + timeout_s, "seq": 0}
+    async with _SUB_LOCK:
+        _prune_subs(now)
+        if len(_cds_subs) >= _MAX_SUBS:
+            # Registry full of live subscriptions — refuse rather than grow
+            # unbounded.  503 tells the controller to retry later.
+            return PlainTextResponse("Too many subscriptions", status_code=503)
+        _cds_subs[sid] = sub
+    # GENA requires the initial event right after SUBSCRIBE (seq 0); fire it
+    # slightly deferred so the SUBSCRIBE 200 reaches the controller first.
+    asyncio.create_task(_send_initial_notify(sid, sub))
+    return PlainTextResponse("", status_code=200, headers={
+        "SID": sid, "TIMEOUT": f"Second-{timeout_s}",
+        "Server": "UPnP/1.0 SoniqBoom-DLNA/1.0"})
 
 
 @router.api_route(
     "/dlna/cm/event", methods=["SUBSCRIBE", "UNSUBSCRIBE"], include_in_schema=False,
 )
 async def cm_event(request: Request):
-    return _event_response()
-
-
-def _event_response() -> PlainTextResponse:
-    """Minimal GENA SUBSCRIBE response — accepts the subscription
-    but never sends NOTIFYs.  Sufficient for controllers that bail
-    when the device 405s on SUBSCRIBE."""
-    return PlainTextResponse(
-        content="",
-        status_code=200,
-        headers={
-            "Server":  "UPnP/1.0 SoniqBoom-DLNA/1.0",
-            "SID":     "uuid:00000000-0000-0000-0000-000000000000",
-            "TIMEOUT": "Second-1800",
-        },
-    )
+    # ConnectionManager evented state never changes — accept and no-op.
+    return PlainTextResponse("", status_code=200, headers={
+        "Server":  "UPnP/1.0 SoniqBoom-DLNA/1.0",
+        "SID":     "uuid:00000000-0000-0000-0000-0000000000cm",
+        "TIMEOUT": "Second-1800",
+    })

@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid as _uuid
 import zipfile
@@ -915,22 +916,35 @@ async def _zip_lock_for(track_id: str) -> asyncio.Lock:
 _zip_pin_refs: dict[str, int] = {}
 _zip_pending_purge: dict[str, str] = {}  # tid -> path-to-unlink-on-zero-refs
 
+# Guards every mutation of the four shared structures above + below
+# (_ZIP_EXTRACT_CACHE / _ZIP_EXTRACT_TOTAL_BYTES / _zip_pin_refs /
+# _zip_pending_purge).  Must be a *threading* lock, not asyncio: eviction runs
+# in a worker thread (``to_thread(_zip_evict_until_under_budget)``) concurrently
+# with the event-loop mutators (extract / pin / unpin / clear).  CRITICAL: never
+# hold it across an ``await`` — that would block the whole loop thread on any
+# other coroutine's acquire.  Every critical section here is a tiny synchronous
+# block; file I/O (unlink) is always done AFTER releasing the lock.
+_zip_state_lock = threading.Lock()
+
 
 def _zip_pin(track_id: str) -> None:
-    _zip_pin_refs[track_id] = _zip_pin_refs.get(track_id, 0) + 1
+    with _zip_state_lock:
+        _zip_pin_refs[track_id] = _zip_pin_refs.get(track_id, 0) + 1
 
 
 def _zip_unpin(track_id: str) -> None:
-    cur = _zip_pin_refs.get(track_id, 0)
-    if cur <= 1:
-        _zip_pin_refs.pop(track_id, None)
-        # If eviction queued an unlink while pinned, execute it now.
-        pending = _zip_pending_purge.pop(track_id, None)
-        if pending:
-            try: Path(pending).unlink(missing_ok=True)
-            except OSError: pass
-    else:
-        _zip_pin_refs[track_id] = cur - 1
+    pending = None
+    with _zip_state_lock:
+        cur = _zip_pin_refs.get(track_id, 0)
+        if cur <= 1:
+            _zip_pin_refs.pop(track_id, None)
+            # If eviction queued an unlink while pinned, take it to run below.
+            pending = _zip_pending_purge.pop(track_id, None)
+        else:
+            _zip_pin_refs[track_id] = cur - 1
+    if pending:                              # unlink outside the lock
+        try: Path(pending).unlink(missing_ok=True)
+        except OSError: pass
 
 
 def _zip_evict_until_under_budget() -> None:
@@ -940,28 +954,111 @@ def _zip_evict_until_under_budget() -> None:
     the last reader unpins — the file is removed from the in-memory
     cache immediately so a new extraction takes over the cache slot,
     but its on-disk bytes survive until the active stream finishes.
+
+    Runs in a worker thread.  The index/counter walk happens under
+    ``_zip_state_lock``; the actual unlinks are collected and performed
+    after the lock is released so file I/O never blocks other mutators.
     """
     global _ZIP_EXTRACT_TOTAL_BYTES
     max_bytes = _zip_extract_max_bytes()
-    while _ZIP_EXTRACT_TOTAL_BYTES > max_bytes and _ZIP_EXTRACT_CACHE:
-        oldest_tid = min(
-            _ZIP_EXTRACT_CACHE,
-            key=lambda k: _ZIP_EXTRACT_CACHE[k].get("extracted_at", 0),
-        )
-        entry = _ZIP_EXTRACT_CACHE.pop(oldest_tid, None)
-        if not entry:
-            break
-        size = entry.get("size", 0)
-        _ZIP_EXTRACT_TOTAL_BYTES = max(0, _ZIP_EXTRACT_TOTAL_BYTES - size)
-        path_to_drop = entry.get("path")
-        if oldest_tid in _zip_pin_refs:
-            # Defer — last reader will unlink in _zip_unpin.
+    to_unlink: list[str] = []
+    with _zip_state_lock:
+        while _ZIP_EXTRACT_TOTAL_BYTES > max_bytes and _ZIP_EXTRACT_CACHE:
+            oldest_tid = min(
+                _ZIP_EXTRACT_CACHE,
+                key=lambda k: _ZIP_EXTRACT_CACHE[k].get("extracted_at", 0),
+            )
+            entry = _ZIP_EXTRACT_CACHE.pop(oldest_tid, None)
+            if not entry:
+                break
+            size = entry.get("size", 0)
+            _ZIP_EXTRACT_TOTAL_BYTES = max(0, _ZIP_EXTRACT_TOTAL_BYTES - size)
+            path_to_drop = entry.get("path")
+            if oldest_tid in _zip_pin_refs:
+                # Defer — last reader will unlink in _zip_unpin.
+                if path_to_drop:
+                    _zip_pending_purge[oldest_tid] = path_to_drop
+                continue
             if path_to_drop:
-                _zip_pending_purge[oldest_tid] = path_to_drop
-            continue
-        if path_to_drop:
-            try: Path(path_to_drop).unlink(missing_ok=True)
-            except OSError: pass
+                to_unlink.append(path_to_drop)
+    for p in to_unlink:                      # unlink outside the lock
+        try: Path(p).unlink(missing_ok=True)
+        except OSError: pass
+
+
+async def clear_zip_extract_cache() -> dict:
+    """Clear the extracted-from-ZIP audio cache wholesale.
+
+    Owns both halves of the cache: the in-memory index (``_ZIP_EXTRACT_CACHE``
+    + ``_ZIP_EXTRACT_TOTAL_BYTES``) and the on-disk files under
+    ``data_dir/zip-extracts/``.  Honours read pins exactly like LRU eviction —
+    a member currently being streamed has its on-disk bytes deferred until the
+    last reader unpins (tracked in ``_zip_pending_purge``), so clearing the
+    cache never yanks an in-flight Range read out from under a player.
+
+    Returns ``{"cleared", "deferred", "path"}`` (+ ``"failed"`` /
+    ``"failed_samples"`` when some files resisted removal).
+    """
+    global _ZIP_EXTRACT_TOTAL_BYTES
+    cleared = 0
+    deferred = 0
+    errors: list[str] = []
+    to_unlink: list[str] = []
+
+    # 1. Drain the in-memory index under _zip_state_lock (atomic vs the
+    #    worker-thread evictor).  Collect non-pinned files to unlink after the
+    #    lock drops; pinned tracks defer their unlink to _zip_unpin.  No await
+    #    runs anywhere in this function, so no other coroutine (extract / unpin)
+    #    can interleave between the drain and the unlinks — the clear is atomic
+    #    against the event loop too.
+    with _zip_state_lock:
+        for tid in list(_ZIP_EXTRACT_CACHE.keys()):
+            entry = _ZIP_EXTRACT_CACHE.pop(tid, None)
+            if not entry:
+                continue
+            path_to_drop = entry.get("path")
+            if tid in _zip_pin_refs:
+                if path_to_drop:
+                    _zip_pending_purge[tid] = path_to_drop
+                deferred += 1
+                continue
+            if path_to_drop:
+                to_unlink.append(path_to_drop)
+        _ZIP_EXTRACT_TOTAL_BYTES = 0
+        protected = set(_zip_pending_purge.values())
+
+    for p in to_unlink:
+        try:
+            Path(p).unlink(missing_ok=True)
+            cleared += 1
+        except OSError as exc:
+            errors.append(f"{Path(p).name}: {exc.strerror or 'error'}")
+
+    # 2. Sweep any orphan files left on disk (entries already evicted from the
+    #    index, partial extracts, …) — but never touch a file an active stream
+    #    still owns (pinned → in `protected`).
+    extract_dir = _zip_extract_dir()
+    try:
+        for de in os.scandir(extract_dir):
+            if not de.is_file(follow_symlinks=False) or de.path in protected:
+                continue
+            try:
+                os.unlink(de.path)
+                cleared += 1
+            except OSError as exc:
+                errors.append(f"{de.name}: {exc.strerror or 'error'}")
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+
+    out: dict = {"cleared": cleared, "deferred": deferred, "path": str(extract_dir)}
+    if errors:
+        out["failed"] = len(errors)
+        out["failed_samples"] = errors[:5]
+        log.warning(
+            "clear-zip-extract: %d files could not be removed (e.g. %s)",
+            len(errors), "; ".join(errors[:5]),
+        )
+    return out
 
 
 async def reap_orphan_zip_extracts() -> int:
@@ -1022,11 +1119,12 @@ async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | Non
                 entry["extracted_at"] = time.time()
                 return cached_path
             # Stale or missing — drop and re-extract.
-            _ZIP_EXTRACT_TOTAL_BYTES = max(
-                0, _ZIP_EXTRACT_TOTAL_BYTES - entry.get("size", 0),
-            )
-            _ZIP_EXTRACT_CACHE.pop(track_id, None)
-            try: cached_path.unlink()
+            with _zip_state_lock:
+                _ZIP_EXTRACT_TOTAL_BYTES = max(
+                    0, _ZIP_EXTRACT_TOTAL_BYTES - entry.get("size", 0),
+                )
+                _ZIP_EXTRACT_CACHE.pop(track_id, None)
+            try: cached_path.unlink()        # I/O outside the lock
             except OSError: pass
 
         member_name = parts[-1]
@@ -1055,14 +1153,15 @@ async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | Non
             size = path.stat().st_size
         except OSError:
             size = 0
-        _ZIP_EXTRACT_CACHE[track_id] = {
-            "path": str(path),
-            "zip_path": str(outer_zip),
-            "zip_mtime": zip_mtime,
-            "extracted_at": time.time(),
-            "size": size,
-        }
-        _ZIP_EXTRACT_TOTAL_BYTES += size
+        with _zip_state_lock:
+            _ZIP_EXTRACT_CACHE[track_id] = {
+                "path": str(path),
+                "zip_path": str(outer_zip),
+                "zip_mtime": zip_mtime,
+                "extracted_at": time.time(),
+                "size": size,
+            }
+            _ZIP_EXTRACT_TOTAL_BYTES += size
         # Run eviction off the lock so a slow disk on the unlink doesn't
         # block the next extraction in the queue.
         try:

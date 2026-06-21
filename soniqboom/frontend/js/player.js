@@ -809,14 +809,25 @@ export const Player = (() => {
   function _initAudioContext() {
     if (ctx) return;
     try {
-      // TODO: probe the served file's actual sample rate (read
-      //   X-DSD-Output-Rate from the previous stream response and pass
-      //   { sampleRate } here on subsequent contexts).  Requires server
-      //   to emit the header consistently and a teardown-then-rebuild on
-      //   first track since AudioContext sampleRate is fixed at creation.
-      //   Until then the browser picks the device's preferred rate, which
-      //   is usually fine but does cost a sample-rate convert step for
-      //   non-44.1 / 48 kHz sources.
+      // We deliberately let the browser pick the AudioContext sample rate
+      // (the output device's preferred rate) rather than matching it to the
+      // served file (e.g. a DSD track's X-DSD-Output-Rate).  Matching would
+      // require tearing the context down and rebuilding it whenever the rate
+      // changes — AudioContext.sampleRate is immutable after creation — and
+      // that is unsafe here for three compounding reasons:
+      //   1. createMediaElementSource(audio) is single-use per element; once
+      //      this element is routed through a context it cannot be re-routed
+      //      through a new one without throwing, so a rebuild would break the
+      //      element's audio path permanently.
+      //   2. The context must be created inside a user gesture (Safari/iOS),
+      //      so it cannot be deferred until after a stream response reveals
+      //      the rate.
+      //   3. The entire output chain — EQ, ReplayGain, analyser/VU meter —
+      //      hangs off this one source node; a teardown/rebuild would risk
+      //      all of it.
+      // The only cost of not matching is a transparent, high-quality browser
+      // resample of non-device-rate sources (inaudible; negligible CPU), so
+      // the rebuild is not worth the regression surface.
       ctx = new (window.AudioContext || window.webkitAudioContext)();
       analyser = ctx.createAnalyser();
       analyser.fftSize = 256;

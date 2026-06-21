@@ -1001,6 +1001,41 @@ class TrackStore:
         results.sort(key=lambda x: x["album_artist"].lower())
         return self._agg_cache_set("album_artists", results)
 
+    def album_sample_index(self) -> dict[tuple[str, str], dict]:
+        """Map ``(album_artist, album) → newest sample-track meta`` for every
+        album in the library.
+
+        Picks one representative track per ``(album_artist, album)`` — the
+        most-recently-added — so a caller (e.g. the Subsonic ``getAlbumList2``
+        view) can surface cover-art ids / sample metadata per album without a
+        per-request full scan.  The ``album_artist`` falls back to ``artist``
+        when absent, and tracks with no album are skipped, matching the album
+        grouping used elsewhere.
+
+        Memoised on ``_mutation_seq`` via ``_agg_cache`` — recomputed from the
+        authoritative ``_tracks`` map on any upsert / update / delete, so it
+        can never drift the way a hand-maintained incremental index could.
+
+        Like the other ``aggregate_*`` views, the returned dict is a shared
+        memoised object — callers must treat it (and the sample-track dicts
+        inside) as READ-ONLY; mutating it would corrupt the cached copy until
+        the next library change.
+        """
+        cached = self._agg_cache_get("album_sample_index")
+        if cached is not None:
+            return cached
+        seen: dict[tuple[str, str], dict] = {}
+        for tid, t in self._tracks.items():
+            al = t.get("album") or ""
+            if not al:
+                continue
+            aa = t.get("album_artist") or t.get("artist") or ""
+            key = (aa, al)
+            existing = seen.get(key)
+            if not existing or (t.get("added_at") or 0) > (existing.get("added_at") or 0):
+                seen[key] = self._meta_dict(tid)
+        return self._agg_cache_set("album_sample_index", seen)
+
     def aggregate_albums(
         self, artist: str | None = None, album_artist: str | None = None,
     ) -> list[dict]:

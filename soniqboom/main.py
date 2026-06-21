@@ -455,8 +455,9 @@ async def admin_metrics(_admin=Depends(_require_admin_session)):
     # add them as the modules grow them.
     metrics: dict = {
         "version": __version__,
-        # Cache hit/miss counters — TODO(observability): conversion_cache,
-        # art_cache, and zip-extract cache should each export a counter dict.
+        # Cache hit/miss totals are aggregated across every tier that
+        # publishes counters via cache_stats (conversion, art, zip-extract,
+        # …); the per-tier breakdown lands under "cache_stats" below.
         "cache_hit": None,
         "cache_miss": None,
         "render_failure": None,
@@ -464,6 +465,16 @@ async def admin_metrics(_admin=Depends(_require_admin_session)):
         "growing_file_timeouts": None,
         "aof_flock_contention": None,
     }
+    # Cross-tier cache counters (cache_stats keeps hit/miss per tier).
+    try:
+        from soniqboom.core import cache_stats as _cstats
+        snap = _cstats.snapshot()
+        tiers = snap.get("tiers", {})
+        metrics["cache_hit"] = sum(int(t.get("hits", 0) or 0) for t in tiers.values())
+        metrics["cache_miss"] = sum(int(t.get("misses", 0) or 0) for t in tiers.values())
+        metrics["cache_stats"] = snap
+    except Exception:
+        metrics["cache_stats"] = None
     # Available now: track count + art-absent count.
     try:
         from soniqboom.core.store import get_store

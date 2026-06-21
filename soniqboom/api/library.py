@@ -117,6 +117,13 @@ def invalidate_agg_cache() -> None:
     """Call after a scan completes to force fresh aggregations."""
     _AGG_CACHE.clear()
     _AGG_ETAGS.clear()
+    # Tell DLNA controllers the tree changed (bumps SystemUpdateID + NOTIFYs
+    # any GENA subscribers).  Lazy import to avoid an import cycle.
+    try:
+        from soniqboom.api.dlna_upnp import notify_library_changed
+        notify_library_changed()
+    except Exception:                       # noqa: BLE001 — never break a scan
+        pass
 
 
 def _etag_response(request: Request, cache_key: str, result: list) -> Response:

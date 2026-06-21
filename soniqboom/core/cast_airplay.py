@@ -538,7 +538,7 @@ class AirPlayController:
         title: str = "",
         artist: str = "",
         album: str = "",
-        album_art_url: str = "",
+        album_art: bytes | None = None,
     ) -> None:
         """Start playback of ``stream_url`` on the receiver.
 
@@ -552,11 +552,11 @@ class AirPlayController:
         * **AirPlay 2** — title/artist/album are wrapped in a
           ``pyatv.interface.MediaMetadata`` dataclass and forwarded
           to the receiver as MRP/HAP "Now Playing" frames (Apple TV,
-          HomePod, lock-screen).  ``album_art_url`` is currently
-          *not* forwarded because MediaMetadata.artwork expects raw
-          bytes, not a URL — sending the URL would silently drop the
-          art frame.  TODO: fetch the URL into a small bytes cache
-          and pass it through.
+          HomePod, lock-screen).  ``album_art`` is the raw cover-art
+          *bytes* (JPEG/PNG) — ``MediaMetadata.artwork`` expects bytes,
+          not a URL — and is passed straight through; the orchestrator
+          (cast_session) resolves + caps + caches them.  ``None`` means
+          "no artwork frame", which pyatv handles without crashing.
         * **AirPlay 1** — the RAOP protocol has *no* metadata frames.
           Anything we pass here is silently dropped.  HomePod 1st gen
           and other RAOP-only receivers will display "Unknown Track"
@@ -583,23 +583,22 @@ class AirPlayController:
                     # attribute 'stream_url'`` on every play attempt,
                     # which surfaced in the UI as "can't find device".
                     #
-                    # Artwork in MediaMetadata is *bytes*, not a URL —
-                    # we'd have to fetch ``album_art_url`` and hand the
-                    # bytes over.  Skip for now (TODO: fetch + cache);
-                    # title/artist/album still appear on the receiver,
-                    # which is the 80 % of the metadata UX.
+                    # Artwork in MediaMetadata is raw *bytes* — the
+                    # orchestrator resolved + size-capped them for us, so
+                    # we hand them straight to pyatv.  ``None`` is fine:
+                    # pyatv emits no artwork frame rather than crashing.
                     if _MEDIA_METADATA_AVAILABLE:
                         md = _MediaMetadata(
                             title=title or None,
                             artist=artist or None,
                             album=album or None,
-                            # artwork left as None until we wire the
-                            # URL→bytes fetcher; pyatv treats None as
-                            # "no artwork frame" rather than crashing.
+                            artwork=album_art or None,
                         )
                         log.debug(
-                            "AirPlay2 stream_file target=%s url=%s title=%r artist=%r album=%r",
+                            "AirPlay2 stream_file target=%s url=%s title=%r artist=%r "
+                            "album=%r artwork=%s",
                             self.target_id, stream_url, title, artist, album,
+                            f"{len(album_art)}B" if album_art else "none",
                         )
                         await stream.stream_file(stream_url, metadata=md)
                     else:

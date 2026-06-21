@@ -34,6 +34,7 @@ import asyncio
 import logging
 import socket
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,96 @@ _IDLE_TIMEOUT_S = 10 * 60
 
 # Time-to-live for the local LAN URL cache (see _server_base_url).
 _BASE_URL_TTL_S = 60
+
+
+# ── AirPlay artwork cache ───────────────────────────────────────────────────
+# AirPlay 2 receivers (Apple TV / HomePod / macOS) show cover art on the
+# now-playing screen, but pyatv's MediaMetadata.artwork wants raw *bytes*, not
+# a URL — the receiver never fetches it itself.  So we resolve the art through
+# the canonical pipeline (api.art._resolve_full_art, which already caches +
+# falls back embedded→folder), size-cap it so a pathological multi-MB embedded
+# cover doesn't get pushed on every track, and keep the last few in a bounded
+# LRU so advancing through an album doesn't re-extract.  Negative results
+# (no art) are cached as None too, so a tagless track isn't re-probed per skip.
+_ART_CACHE_MAX = 24                       # most-recently-used track arts
+_ART_MAX_BYTES = 2 * 1024 * 1024          # cap before downscaling (2 MiB)
+_ART_DOWNSCALE_PX = 640                   # longest edge when downscaling
+_ART_RESOLVE_TIMEOUT_S = 2.0              # hard bound — art must not stall play
+_art_cache: "OrderedDict[str, bytes | None]" = OrderedDict()
+_art_cache_lock = asyncio.Lock()
+
+
+def _downscale_art(raw: bytes) -> bytes | None:
+    """Downscale an oversized cover to ``_ART_DOWNSCALE_PX`` as JPEG.
+
+    CPU-bound (PIL decode/encode) — call via ``asyncio.to_thread``.  Returns
+    ``None`` if Pillow can't process the bytes: the caller only reaches here
+    for images already over ``_ART_MAX_BYTES``, so forwarding them un-shrunk
+    would violate the cap — dropping the art frame is the safe choice (Pillow
+    is a hard dependency, so this path is effectively unreachable in prod).
+    """
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw))
+        im.thumbnail((_ART_DOWNSCALE_PX, _ART_DOWNSCALE_PX))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=82)
+        data = out.getvalue()
+        if data:
+            return data
+    except Exception:                     # noqa: BLE001 — Pillow missing / decode failed
+        log.debug("artwork downscale failed (%d bytes)", len(raw), exc_info=True)
+    return None
+
+
+async def _resolve_and_cap_art(track_id: str) -> bytes | None:
+    """Resolve cover bytes via the canonical art pipeline and size-cap them."""
+    from soniqboom.api.art import _resolve_full_art
+    raw, _mime = await _resolve_full_art(track_id)
+    if not raw:
+        return None
+    if len(raw) <= _ART_MAX_BYTES:
+        return raw
+    return await asyncio.to_thread(_downscale_art, raw)
+
+
+async def _airplay_artwork_bytes(track_id: str) -> bytes | None:
+    """Cover-art bytes for an AirPlay now-playing frame, or ``None``.
+
+    Bounded LRU over recent tracks; oversized images are downscaled so the
+    pushed frame never exceeds ``_ART_MAX_BYTES``.  Art is best-effort and now
+    sits in the playback-start critical path (awaited under the session lock),
+    so resolution is hard-bounded by ``_ART_RESOLVE_TIMEOUT_S`` — a slow or
+    hung art source (stalled SMB/FTP mount, mutagen on a huge file) can never
+    stall playback.  A timeout / transient error returns ``None`` WITHOUT
+    caching, so a later play retries; only a definitive result (bytes, or a
+    genuine "no art") is cached (negative cache suppresses re-probing tagless
+    tracks on every skip).
+    """
+    async with _art_cache_lock:
+        if track_id in _art_cache:
+            _art_cache.move_to_end(track_id)
+            return _art_cache[track_id]
+
+    try:
+        art = await asyncio.wait_for(
+            _resolve_and_cap_art(track_id), timeout=_ART_RESOLVE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log.debug("airplay artwork resolve timed out track=%s — skipping", track_id)
+        return None
+    except Exception:                     # noqa: BLE001 — art is best-effort
+        log.debug("airplay artwork resolve failed track=%s", track_id, exc_info=True)
+        return None
+
+    async with _art_cache_lock:
+        _art_cache[track_id] = art
+        _art_cache.move_to_end(track_id)
+        while len(_art_cache) > _ART_CACHE_MAX:
+            _art_cache.popitem(last=False)
+    return art
 
 
 # ── Public types ───────────────────────────────────────────────────────────
@@ -286,6 +377,7 @@ class CastSession:
                 title         = getattr(track, "title", "") or "",
                 artist        = getattr(track, "artist", "") or "",
                 album         = getattr(track, "album", "") or "",
+                album_art     = await _airplay_artwork_bytes(track_id),
             )
 
         self.state.delivered_codec = target_codec
@@ -630,6 +722,7 @@ class CastSession:
                         title        = first["title"],
                         artist       = first["artist"],
                         album        = first["album"],
+                        album_art    = await _airplay_artwork_bytes(items[0].track_id),
                     )
 
             self.state.touch()
@@ -661,6 +754,39 @@ class CastSession:
             self.state.queue_index += 1
             if self.state.queue_index >= len(self.state.queue):
                 return None
+            item = self.state.queue[self.state.queue_index]
+            return await self._play_track_locked(
+                track_id=item.track_id, user_id=user_id, base_url=base_url,
+                subsong=int(item.subsong or 0),
+            )
+
+    async def queue_prev(
+        self,
+        *,
+        user_id: str | int | None = None,
+        base_url: str | None = None,
+    ) -> dict | None:
+        """Go back to the previous queued track manually (for renderers
+        without native queue support).  Cast handles this itself via the
+        receiver's QUEUE_UPDATE ``jump: -1`` message, so we delegate there.
+
+        Mirror of :meth:`queue_next`.  Held under ``self._lock`` for the
+        duration and uses ``_play_track_locked`` (the lock is not
+        reentrant).  Going ``prev`` at the head of the queue clamps at
+        index 0 and restarts the first track — the conventional media
+        behaviour and harmless if the queue is a single item.
+        """
+        async with self._lock:
+            ctrl = await self._ensure_controller()
+            self.state.touch()
+            if self.target.protocol == "cast":
+                await ctrl.queue_prev()
+                return None
+            if not self.state.queue:
+                return None
+            self.state.queue_index -= 1
+            if self.state.queue_index < 0:
+                self.state.queue_index = 0
             item = self.state.queue[self.state.queue_index]
             return await self._play_track_locked(
                 track_id=item.track_id, user_id=user_id, base_url=base_url,

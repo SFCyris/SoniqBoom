@@ -247,16 +247,17 @@ def _refresh_reverse_cache(store) -> None:
 
 
 def _refresh_album_list_cache(store) -> dict[tuple[str, str], dict]:
-    """Return the (album_artist, album) → sample-track map, rebuilding
-    on store mutation with the same debounce strategy as the reverse
-    cache.  ``getAlbumList2`` calls this on every poll.
+    """Return the ``(album_artist, album) → sample-track`` map for
+    ``getAlbumList2``.
 
-    TODO(perf): the rebuild walks every track meta in the library on
-    cache miss.  Once the store gains an incremental ``(aa, al) →
-    sample-track`` map (mutated alongside upsert_track / delete_track),
-    this function should just return that view directly and drop the
-    debounced full-scan.  Until then, the debounce keeps the worst case
-    to one rebuild per ``_CACHE_DEBOUNCE_SEC`` even during active scans.
+    The map itself is built + memoised by ``store.album_sample_index()`` (the
+    same ``_mutation_seq``-keyed cache that backs ``aggregate_albums`` etc.),
+    so it's recomputed only on real mutation and can never drift from the track
+    table — replacing the old inline ``all_track_metas()`` re-walk.  This
+    wrapper keeps the short debounce: a watcher-driven rescan bumps the seq
+    every ~25 tracks, and the debounce caps the O(n) rebuild to at most once
+    per ``_CACHE_DEBOUNCE_SEC`` even if a Subsonic client polls throughout the
+    scan (the store's per-seq memo alone wouldn't rate-limit across seq bumps).
     """
     seq = store._mutation_seq
     now = time.time()
@@ -264,16 +265,7 @@ def _refresh_album_list_cache(store) -> dict[tuple[str, str], dict]:
         return _ALBUM_LIST_CACHE["seen"]
     if (now - _ALBUM_LIST_CACHE["built_at"]) < _CACHE_DEBOUNCE_SEC and _ALBUM_LIST_CACHE["seq"] is not None:
         return _ALBUM_LIST_CACHE["seen"]
-    seen: dict[tuple[str, str], dict] = {}
-    for t_ in store.all_track_metas():
-        aa = t_.get("album_artist") or t_.get("artist") or ""
-        al = t_.get("album") or ""
-        if not al:
-            continue
-        key = (aa, al)
-        existing = seen.get(key)
-        if not existing or (t_.get("added_at") or 0) > (existing.get("added_at") or 0):
-            seen[key] = t_
+    seen = store.album_sample_index()
     _ALBUM_LIST_CACHE["seq"] = seq
     _ALBUM_LIST_CACHE["seen"] = seen
     _ALBUM_LIST_CACHE["built_at"] = now

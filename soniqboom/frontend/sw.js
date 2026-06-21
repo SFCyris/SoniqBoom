@@ -331,7 +331,11 @@
 // v101: app.css v63 — #stations-view sits above the visualizer canvas
 // (position:relative; z-index:1) so screen-filling visualizers no longer
 // wash out the station text (it was painting under the z-index:0 canvas).
-const SHELL_VERSION = 'v101';
+// v102: player.js — documented why the AudioContext sample rate is left to
+// the browser (no DSD teardown/rebuild); admin.js — FTP probe-cap button now
+// posts {host,port} instead of {share_id}.  Bump so the cache-first shell
+// serves the edited player.js / admin.js to returning users.
+const SHELL_VERSION = 'v102';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

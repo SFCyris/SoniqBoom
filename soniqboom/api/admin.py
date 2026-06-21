@@ -1511,8 +1511,11 @@ async def ftp_pool_probe_cap(body: dict, _tok: str = Depends(_require_token)):
     one below the highest successful count; resizes the live pool to
     match.
 
-    Body: ``{"share_id": "..."}`` (host/port resolved from the share),
-    optional ``"max_probe": int`` (default 16; capped at 32).
+    Body: either ``{"share_id": "..."}`` or ``{"host": "...", "port": 21}``
+    (host+port resolves to a matching configured FTP share to borrow its
+    credentials — the probe must authenticate, and shares to the same
+    host:port share a credential pool).  Optional ``"max_probe": int``
+    (default 16; capped at 32).
 
     SECURITY: only run this when no scan or stream is active — the
     probe will eat scan slots while it works.
@@ -1524,14 +1527,14 @@ async def ftp_pool_probe_cap(body: dict, _tok: str = Depends(_require_token)):
         _build_ftp_factory, reload_ftp_pool_sizes,
     )
 
-    share_id = (body.get("share_id") or "").strip()
-    if not share_id:
-        raise HTTPException(400, "share_id is required")
-
     conf = load_local_conf()
-    share = conf.get("network_shares", {}).get(share_id)
+    share = _resolve_ftp_share_from_body(body, conf)
     if not share:
-        raise HTTPException(404, f"Share '{share_id}' not found")
+        raise HTTPException(
+            404,
+            "No matching FTP share found — provide share_id, or the host"
+            " (and port) of a configured FTP share.",
+        )
     if share.get("protocol", "").lower() != "ftp":
         raise HTTPException(400, "Probe only applies to FTP shares")
 
@@ -1597,6 +1600,35 @@ def _resolve_host_port_from_body(body: dict) -> tuple[str, int]:
         if share:
             return share.get("host", ""), int(share.get("port", 21))
     return (body.get("host") or "").strip(), int(body.get("port", 21))
+
+
+def _resolve_ftp_share_from_body(body: dict, conf: dict) -> dict | None:
+    """Resolve the FTP share to operate on from a body that is either
+    ``{share_id}`` or ``{host[, port]}``.
+
+    With an explicit ``share_id`` the share is looked up directly.  With
+    ``host`` (and optional ``port``, default 21) we return the first
+    configured FTP share matching that host:port — the probe needs a share to
+    borrow credentials from, and shares to the same endpoint share a pool.
+    Returns ``None`` when nothing matches.
+    """
+    shares = conf.get("network_shares", {})
+    sid = (body.get("share_id") or "").strip()
+    if sid:
+        return shares.get(sid)
+    host = (body.get("host") or "").strip()
+    if not host:
+        return None
+    try:
+        port = int(body.get("port", 21) or 21)
+    except (TypeError, ValueError):
+        port = 21
+    for s in shares.values():
+        if (s.get("protocol", "").lower() == "ftp"
+                and s.get("host", "") == host
+                and int(s.get("port", 21) or 21) == port):
+            return s
+    return None
 
 
 # ── Renderers ────────────────────────────────────────────────────────────────
@@ -2119,52 +2151,18 @@ async def clear_conversion_cache(
 async def clear_zip_extract_cache(_tok: str = Depends(_require_token)):
     """Clear the per-track extracted-from-ZIP audio cache.
 
-    The cache lives under ``<data_dir>/cache/zip-extract`` and is populated
-    by ``stream.py`` whenever a file inside a ZIP is played — extracting the
-    member is expensive (especially for nested ZIPs), so we keep the
-    extracted bytes on disk until eviction.
+    The cache is owned by ``stream.py`` — it has both an in-memory index and
+    on-disk files under ``<data_dir>/zip-extracts/``, populated whenever a file
+    inside a ZIP is played (extracting the member is expensive, especially for
+    nested ZIPs, so the extracted bytes are kept on disk until eviction).
 
-    TODO(stream-owner): expose ``soniqboom.api.stream.clear_zip_extract_cache``
-    so this endpoint can call into it directly.  Until that exists, we walk
-    the on-disk directory ourselves so the operator at least has a button.
+    Delegates to :func:`soniqboom.api.stream.clear_zip_extract_cache`, which
+    drops the in-memory index, resets the byte counter, and unlinks the on-disk
+    files while honouring read-pins (an actively-streamed member is deferred,
+    not yanked mid-Range).
     """
-    from soniqboom.config import get_data_dir
-    zip_dir = get_data_dir() / "cache" / "zip-extract"
-
-    count = 0
-    errors: list[str] = []
-
-    def _walk(d: str) -> None:
-        nonlocal count
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    try:
-                        if entry.is_file(follow_symlinks=False):
-                            try:
-                                os.unlink(entry.path)
-                                count += 1
-                            except OSError as exc:
-                                errors.append(f"{entry.name}: {exc.strerror or 'error'}")
-                        elif entry.is_dir(follow_symlinks=False):
-                            _walk(entry.path)
-                    except OSError:
-                        continue
-        except (PermissionError, FileNotFoundError, OSError):
-            return
-
-    if zip_dir.exists():
-        _walk(str(zip_dir))
-
-    out: dict = {"cleared": count, "path": str(zip_dir)}
-    if errors:
-        out["failed"] = len(errors)
-        out["failed_samples"] = errors[:5]
-        log.warning(
-            "clear-zip-extract: %d files could not be removed (e.g. %s)",
-            len(errors), "; ".join(errors[:5]),
-        )
-    return out
+    from soniqboom.api.stream import clear_zip_extract_cache as _clear
+    return await _clear()
 
 
 # ── Log viewer ───────────────────────────────────────────────────────────────

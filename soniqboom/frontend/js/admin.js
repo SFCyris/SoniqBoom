@@ -740,17 +740,11 @@ function _renderFtpPoolCard(srv) {
     btn.disabled = true;
     btn.textContent = 'Probing…';
     try {
-      // probe-cap endpoint currently requires share_id; pick any share
-      // on this server (they share creds, so any will resolve to the
-      // same pool).  TODO: extend the endpoint to accept host+port.
-      const anyShare = (srv.shares || [])[0];
-      if (!anyShare) {
-        showMsg('admin-ftp-pool-msg', 'No share to probe with.', 'err');
-        return;
-      }
+      // probe-cap accepts host+port directly now; the backend resolves a
+      // matching configured FTP share on this endpoint to borrow creds.
       const res = await api('/admin/ftp-pool/probe-cap', {
         method: 'POST',
-        body: JSON.stringify({ share_id: anyShare.share_id }),
+        body: JSON.stringify({ host: srv.host, port: srv.port }),
       });
       const d = await res.json();
       if (res.ok) {
@@ -2377,6 +2371,23 @@ document.getElementById('btn-clear-remote-cache')?.addEventListener('click', asy
     showMsg('admin-cache-msg', `Cleared ${d.cleared} cached files.`, 'ok');
     loadDiskUsage();
   } catch { showMsg('admin-cache-msg', 'Error clearing remote cache.', 'err'); }
+});
+
+document.getElementById('btn-clear-zip-extract')?.addEventListener('click', async () => {
+  const ok = await styledConfirm(
+    'Clear extracted-from-ZIP audio files? Tracks inside archives will be re-extracted on next play. Files currently streaming are kept until playback ends.',
+    { title: 'Clear ZIP Extract Cache', okLabel: 'Clear' }
+  );
+  if (!ok) return;
+  showMsg('admin-cache-msg', 'Clearing ZIP extract cache...', 'ok');
+  try {
+    const res = await api('/admin/cache/clear-zip-extract', { method: 'POST' });
+    const d = await res.json();
+    const deferred = d.deferred ? `, ${d.deferred} deferred (in use)` : '';
+    const failed = d.failed ? `, ${d.failed} failed` : '';
+    showMsg('admin-cache-msg', `Cleared ${d.cleared} extracted files${deferred}${failed}.`, 'ok');
+    loadDiskUsage();
+  } catch { showMsg('admin-cache-msg', 'Error clearing ZIP extract cache.', 'err'); }
 });
 
 // ── Services panel ──────────────────────────────────────────────────────────

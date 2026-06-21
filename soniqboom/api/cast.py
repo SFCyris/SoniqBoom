@@ -370,11 +370,9 @@ async def cast_control(body: ControlBody, user = Depends(require_user)):
         elif action == "next":
             await session.queue_next(user_id=_user_field(user))
         elif action == "prev":
-            # No native prev across protocols; surface a clear error
-            # for now — the UI can branch on this.  422 (not 501) —
-            # the action is recognised, just not implemented on this
-            # protocol class right now.
-            raise HTTPException(422, "Previous-track not yet supported on this cast target.")
+            # Cast delegates to the receiver's native QUEUE_UPDATE jump:-1;
+            # other protocols step the server-side queue index back one.
+            await session.queue_prev(user_id=_user_field(user))
         # No "else" branch needed — Pydantic Literal already rejects
         # unknown actions before reaching here.
     except HTTPException:
