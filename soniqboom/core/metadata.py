@@ -9,6 +9,7 @@ Supported: MP3, FLAC, ALAC/M4A, AAC, Ogg Vorbis, Opus, AIFF, WAV, WavPack, Musep
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 import struct
@@ -236,9 +237,12 @@ HEADER_BUDGET: dict[str, int | None] = {
     ".med":  64 * 1024,
     ".669":  64 * 1024,
     # Chiptune containers — tiny headers
-    ".sid":  8 * 1024,
-    ".psid": 8 * 1024,
-    ".rsid": 8 * 1024,
+    # SID files are 2–64 KB total; a full fetch is trivial AND required so the
+    # whole-file MD5 (the HVSC Songlengths key) is computed over the real file,
+    # not a truncated header.  See _extract_sid / hvsc.lookup_durations_by_md5.
+    ".sid":  None,
+    ".psid": None,
+    ".rsid": None,
     ".nsf":  8 * 1024,
     ".nsfe": 64 * 1024,    # NSFe has chunks throughout — generous
     ".spc":  None,         # SPC files are 64-256 KB total; full fetch trivial
@@ -759,26 +763,32 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
 
 # ── SID (C64) ────────────────────────────────────────────────────────────────
 
+# Real SID files top out well under 64 KB; cap the whole-file read used for
+# the HVSC MD5 so a mislabelled huge ``.sid`` can't exhaust memory.
+_SID_MAX_BYTES = 1024 * 1024
+
+
 def _extract_sid(path: Path, track_id: str) -> dict:
     """Parse PSID/RSID binary header to extract SID metadata."""
     from soniqboom.config import settings
 
+    # Read the whole file once: the header drives metadata, and the MD5 of the
+    # ENTIRE file is the key HVSC's Songlengths database is indexed by.  SID
+    # files are tiny (2–64 KB), so this is cheap — and for remote tracks the
+    # ``path`` here is a temp file holding the full download (HEADER_BUDGET is
+    # None for .sid), so the MD5 matches the real file.  Cap the read so a
+    # mislabelled giant ``.sid`` can't be slurped into RAM — anything over the
+    # cap isn't a real SID and won't match HVSC anyway.
     with open(path, "rb") as f:
-        header = f.read(124)
+        data = f.read(_SID_MAX_BYTES)
+    header = data[:124]
+    sid_md5 = hashlib.md5(data).hexdigest()
 
-    if len(header) < 118:
+    if len(header) < 118 or header[0:4] not in (b"PSID", b"RSID"):
         return {
             "id": track_id, "path": str(path), "title": path.stem,
             "format": "SID", "duration": float(settings.sid_default_duration),
-            "genre": ["Chiptune", "C64"],
-        }
-
-    magic = header[0:4]
-    if magic not in (b"PSID", b"RSID"):
-        return {
-            "id": track_id, "path": str(path), "title": path.stem,
-            "format": "SID", "duration": float(settings.sid_default_duration),
-            "genre": ["Chiptune", "C64"],
+            "genre": ["Chiptune", "C64"], "sid_md5": sid_md5,
         }
 
     version = struct.unpack(">H", header[4:6])[0]
@@ -826,6 +836,7 @@ def _extract_sid(path: Path, track_id: str) -> dict:
         "genre": ["Chiptune", "C64"],
         "subsongs": subsongs if subsongs and subsongs > 1 else None,
         "channels": channels,
+        "sid_md5": sid_md5,
     }
     if sid_model:
         d["sid_model"] = sid_model
@@ -833,12 +844,16 @@ def _extract_sid(path: Path, track_id: str) -> dict:
     # ── HVSC enrichment ──────────────────────────────────────────────
     # When the user has pointed at the High Voltage SID Collection
     # documents folder, swap our default-duration estimate for the real
-    # per-subsong durations and attach the STIL commentary blob.
+    # per-subsong durations and attach the STIL commentary blob.  Durations
+    # match by the cached whole-file MD5 (works local OR remote); STIL is
+    # path-keyed, so it resolves here only for LOCAL files at their canonical
+    # HVSC paths — remote tracks pick up STIL in the re-apply pass, which has
+    # the real remote path (this ``path`` is a temp file for remote scans).
     try:
         from soniqboom.core.hvsc import get_hvsc
         hvsc = get_hvsc()
         if hvsc.is_configured():
-            durations = hvsc.lookup_durations(path)
+            durations = hvsc.lookup_durations_by_md5(sid_md5)
             if durations:
                 d["duration"]    = durations[0]
                 d["hvsc_lengths"] = durations

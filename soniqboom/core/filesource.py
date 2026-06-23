@@ -275,6 +275,23 @@ class FileSource(ABC):
         """
         return self.read_file(path, lane=lane)[:max_bytes]
 
+    def read_at(
+        self, path: str, offset: int, length: int, *, lane: str = "scan",
+    ) -> bytes:
+        """Read ``length`` bytes starting at byte ``offset``.
+
+        Used by the remote album-art backfill to fetch just an MP4 ``moov``
+        atom (which can live at either end of the file) or a tag header,
+        without pulling the whole multi-MB audio payload.  The default reads
+        the whole file and slices — correct for every backend; backends with
+        byte-range support (FTP ``REST``) override it to actually save the
+        bandwidth.
+        """
+        if length <= 0:
+            return b""
+        off = max(0, int(offset))
+        return self.read_file(path, lane=lane)[off:off + length]
+
     @abstractmethod
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         """Read entire file contents.
@@ -508,6 +525,29 @@ class SMBFileSource(FileSource):
         self._ensure_registered()
         with smbclient.open_file(self._smb_path(path), mode="rb") as f:
             return f.read()
+
+    def read_at(self, path: str, offset: int, length: int, *, lane: str = "scan") -> bytes:
+        """SMB2 ranged read — open, seek, read ``length`` bytes.
+
+        Without this override the base class would read the WHOLE file just to
+        slice out a few bytes; the MP4 art backfill issues several small ranged
+        reads per file, so a 50 MB share file would otherwise be transferred
+        many times over.  smbclient's file handle supports seek + bounded read,
+        so we transfer only what's asked.
+        """
+        if length <= 0:
+            return b""
+        import smbclient
+        self._ensure_registered()
+        with smbclient.open_file(self._smb_path(path), mode="rb") as f:
+            off = max(0, int(offset))
+            if off:
+                f.seek(off)
+            return f.read(length)
+
+    def read_partial(self, path: str, max_bytes: int, *, lane: str = "scan") -> bytes:
+        # Front-only ranged read — same one-shot transfer as read_at(0, n).
+        return self.read_at(path, 0, max_bytes, lane=lane)
 
     def stat(self, path: str) -> FileStat:
         import smbclient
@@ -2017,6 +2057,64 @@ class FTPFileSource(FileSource):
                         except Exception:
                             handle.mark_broken()
 
+                    handle.note_transfer()
+                return bytes(buf)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.3)
+        raise last_exc  # type: ignore[misc]
+
+    def read_at(
+        self, path: str, offset: int, length: int, *, lane: str = "scan",
+    ) -> bytes:
+        """Read ``length`` bytes from byte ``offset`` via FTP ``REST``.
+
+        Seeks with ``transfercmd(..., rest=offset)`` (a ``REST`` command before
+        ``RETR``), then reads exactly ``length`` bytes — so the art backfill
+        can grab an MP4 ``moov`` atom from the END of a 50 MB file without
+        transferring the audio in between.  Mirrors ``read_partial``'s
+        control-channel discipline (early ``ABOR``, handle recycling on
+        desync).
+        """
+        if length <= 0:
+            return b""
+        offset = max(0, int(offset))
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            handle = None
+            try:
+                with self._pool.borrow(lane=lane) as handle:
+                    ftp = handle.conn
+                    ftp.voidcmd("TYPE I")
+                    abs_path = self._abs(path)
+                    data_sock = ftp.transfercmd(f"RETR {abs_path}", rest=offset)
+                    try:
+                        buf = bytearray()
+                        chunk_size = 64 * 1024
+                        eof = False
+                        while len(buf) < length:
+                            want = min(chunk_size, length - len(buf))
+                            chunk = data_sock.recv(want)
+                            if not chunk:
+                                eof = True
+                                break
+                            buf.extend(chunk)
+                    finally:
+                        try:
+                            data_sock.close()
+                        except Exception:
+                            pass
+                    if eof:
+                        try:
+                            ftp.voidresp()
+                        except Exception:
+                            handle.mark_broken()
+                    else:
+                        try:
+                            ftp.abort()
+                        except Exception:
+                            handle.mark_broken()
                     handle.note_transfer()
                 return bytes(buf)
             except Exception as exc:

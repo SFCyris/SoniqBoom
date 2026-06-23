@@ -298,6 +298,103 @@ def _basename_of(path_str: str) -> str:
     return path_str
 
 
+# ── HVSC auto-detection ──────────────────────────────────────────────────────
+# When a scan turns up SID files and the user hasn't configured an HVSC
+# DOCUMENTS folder yet, look for one up the directory tree (DOCUMENTS sits at
+# the HVSC root, a sibling of MUSICIANS/DEMOS/GAMES — so walking UP from where
+# SID files live always passes through it).  Works for local and remote roots.
+
+_SID_DETECT_EXTS = (".sid", ".psid")
+
+# Scan roots we've already probed for an HVSC DOCUMENTS folder this process —
+# so a root that has SID files but NO HVSC tree isn't re-probed (which, on a
+# remote share, would mean dozens of slow stat() round-trips) on every scan.
+# Cleared on process restart, and by the admin "Re-extract SID metadata" path
+# (which calls reset_hvsc_probe_cache()), so a freshly-dropped DOCUMENTS folder
+# is re-detected on the next scan without a restart.
+_hvsc_probed_roots: set[str] = set()
+
+
+def reset_hvsc_probe_cache() -> None:
+    """Forget which scan roots were probed for HVSC, so the next scan re-detects
+    (e.g. after the user dropped a DOCUMENTS folder onto an already-scanned root)."""
+    _hvsc_probed_roots.clear()
+
+
+def _detect_hvsc_docs_local(sid_dirs: set[str]) -> str | None:
+    """Walk up from each SID directory looking for ``DOCUMENTS/Songlengths*``.
+    Returns the DOCUMENTS path (str) or None.  ``seen`` dedupes the shared
+    ancestor chains so we probe each directory at most once."""
+    from soniqboom.core.hvsc import SONGLENGTHS_NAMES, DOCS_DIR_NAME
+    seen: set[str] = set()
+    for d in sorted(sid_dirs, key=len):           # shallowest first → fewer hops
+        p = Path(d)
+        for _ in range(16):
+            sp = str(p)
+            if sp in seen:
+                break
+            seen.add(sp)
+            docs = p / DOCS_DIR_NAME
+            for nm in SONGLENGTHS_NAMES:
+                try:
+                    if (docs / nm).is_file():
+                        return str(docs)
+                except OSError:
+                    pass
+            if p.parent == p:
+                break
+            p = p.parent
+    return None
+
+
+def _remote_file_exists(source, path: str) -> bool:
+    try:
+        st = source.stat(path)
+        return not getattr(st, "is_dir", False)
+    except Exception:
+        return False
+
+
+def _detect_hvsc_docs_remote(source, scan_root: str, sid_rel_dirs: set[str]) -> str | None:
+    """Remote analogue of :func:`_detect_hvsc_docs_local`, walking up the
+    root-relative tree with ``source.stat`` probes.  Returns a
+    ``scan_root:/DOCUMENTS`` path (same addressing as track paths) or None."""
+    from soniqboom.core.hvsc import SONGLENGTHS_NAMES, DOCS_DIR_NAME
+    seen: set[str] = set()
+    # All HVSC SIDs share one root, so a handful of representative chains is
+    # plenty — cap the network probing.
+    for d in sorted(sid_rel_dirs, key=len)[:8]:
+        p = d or "/"
+        for _ in range(16):
+            if p in seen:
+                break
+            seen.add(p)
+            docs_rel = str(PurePosixPath(p) / DOCS_DIR_NAME)
+            for nm in SONGLENGTHS_NAMES:
+                if _remote_file_exists(source, str(PurePosixPath(docs_rel) / nm)):
+                    return f"{scan_root}:{docs_rel}"
+            parent = str(PurePosixPath(p).parent)
+            if parent == p:
+                break
+            p = parent
+    return None
+
+
+async def _apply_hvsc_autoconfig(docs_path: str) -> None:
+    """Auto-configure HVSC from a detected DOCUMENTS path (no-op if a path is
+    already set) and tell connected clients so the admin UI updates live."""
+    from soniqboom.core.hvsc import auto_configure
+    loop = asyncio.get_event_loop()
+    applied = await loop.run_in_executor(None, auto_configure, docs_path)
+    if applied:
+        log.info("HVSC auto-configured from scan → %s", docs_path)
+        try:
+            from soniqboom.api.library import _broadcast
+            await _broadcast({"event": "hvsc_configured", "docs_path": docs_path})
+        except Exception:
+            pass
+
+
 def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[str, list[Path]]:
     import io
     import os
@@ -679,8 +776,17 @@ def _build_track(
 
         # Don't store a huge zero embedding — leave empty, Phase 2 fills it
         track = Track(**meta_dict, embedding=[])
-        # Art data is no longer stored during scan — on-access cache handles it
-        return track, None
+
+        # Persist embedded art during the scan ONLY for remote (FTP/SMB) tracks.
+        # On-access extraction (api/art._resolve_full_art) can re-read a LOCAL
+        # file at any time, so for local tracks we skip storing here to save
+        # scan time + disk.  But a remote file is NOT on local disk unless it's
+        # been played, so on-access extraction can't recover its embedded cover
+        # — we must persist it now, while we still hold the bytes the scan just
+        # fetched.  Without this, embedded-art-only remote tracks (e.g. iTunes
+        # ``.m4a``, which carry no folder.jpg) show the placeholder forever.
+        is_remote = (meta.path or "").startswith(("ftp://", "smb://"))
+        return track, (raw_art if is_remote else None)
     except Exception as exc:
         log.error("Failed to build track %s: %s", meta.path, exc)
         return None, None
@@ -1020,6 +1126,33 @@ async def _run_scan(
     for scan_root, files in dir_files.items():
         await upsert_scan_dir(scan_root)
 
+        # HVSC auto-detect: if this root has SID files and no HVSC DOCUMENTS
+        # path is configured yet, look for one up the tree and auto-configure
+        # (self-guards against overriding a user-set path).  Probe at most once
+        # per scan_root per process, and never let detection break the scan.
+        if (getattr(_settings, "hvsc_autodetect", True)
+                and scan_root not in _hvsc_probed_roots):
+            from soniqboom.core.hvsc import get_hvsc as _get_hvsc
+            if not _get_hvsc().is_configured():
+                try:
+                    sid_dirs = {
+                        str(Path(str(p).split("::")[0]).parent)
+                        for p in files
+                        if str(p).split("::")[0].lower().endswith(_SID_DETECT_EXTS)
+                    }
+                    if sid_dirs:
+                        docs = await loop.run_in_executor(
+                            None, _detect_hvsc_docs_local, sid_dirs,
+                        )
+                        # Mark probed only AFTER detection actually ran — a
+                        # transient failure (raises) is caught below and leaves
+                        # the root un-probed so the next scan retries.
+                        _hvsc_probed_roots.add(scan_root)
+                        if docs:
+                            await _apply_hvsc_autoconfig(docs)
+                except Exception:
+                    log.debug("HVSC local auto-detect failed", exc_info=True)
+
         def _parent_dir(fp: Path) -> str:
             s = str(fp)
             if '::' in s:
@@ -1335,6 +1468,23 @@ async def _run_scan(
     _progress.current_file = "Refreshing aggregations…"
     if on_progress:
         await on_progress(_progress)
+
+    # HVSC: apply per-tune durations + STIL to SID tracks now that they're
+    # indexed.  SID extraction runs in worker processes whose HVSC singleton is
+    # unconfigured (spawn), so this main-process join — keyed on the cached
+    # ``sid_md5`` — is what actually updates the tracks.  Covers both a
+    # pre-configured HVSC and one auto-detected during THIS scan.  Idempotent.
+    try:
+        from soniqboom.core.hvsc import get_hvsc
+        if get_hvsc().is_configured() and any(
+            str(p).split("::")[0].lower().endswith(_SID_DETECT_EXTS)
+            for fl in dir_files.values() for p in fl
+        ):
+            from soniqboom.core.hvsc_apply import apply_hvsc_to_library
+            await apply_hvsc_to_library(reload=False)
+    except Exception:
+        log.debug("HVSC post-scan apply failed", exc_info=True)
+
     from soniqboom.api.library import invalidate_agg_cache
     invalidate_agg_cache()
 
@@ -1786,6 +1936,33 @@ async def start_remote_scan(
     entries, _pruned = await loop.run_in_executor(
         None, _walk_fn, scan_root, source,
     )
+
+    # HVSC auto-detect (remote): SID files on this share + no DOCUMENTS path
+    # configured → probe up the tree for DOCUMENTS/Songlengths.* and
+    # auto-configure (reads the DB through the FileSource).  Once per scan_root
+    # per process (remote stat() probes are slow), and never breaks the scan.
+    if (getattr(_settings, "hvsc_autodetect", True)
+            and scan_root not in _hvsc_probed_roots):
+        from soniqboom.core.hvsc import get_hvsc as _get_hvsc
+        if not _get_hvsc().is_configured():
+            try:
+                sid_rel_dirs = {
+                    str(PurePosixPath("/" + str(fe.path).lstrip("/")).parent)
+                    for fe in entries
+                    if str(fe.path).lower().endswith(_SID_DETECT_EXTS)
+                }
+                if sid_rel_dirs:
+                    docs = await loop.run_in_executor(
+                        None, _detect_hvsc_docs_remote, source, scan_root, sid_rel_dirs,
+                    )
+                    # Mark probed only AFTER the (slow, network) detection ran —
+                    # a transient failure is caught below and leaves the root
+                    # un-probed so the next scan retries.
+                    _hvsc_probed_roots.add(scan_root)
+                    if docs:
+                        await _apply_hvsc_autoconfig(docs)
+            except Exception:
+                log.debug("HVSC remote auto-detect failed", exc_info=True)
 
     # ── Classify against the store ────────────────────────────────────────
     #
@@ -2283,6 +2460,19 @@ async def start_remote_scan(
 
     await _flush()
     await _async_exit_batch_mode(store)
+
+    # HVSC: apply per-tune durations + STIL to SID tracks now they're indexed —
+    # a main-process join keyed on the cached ``sid_md5`` (worker processes run
+    # an unconfigured HVSC singleton).  Covers pre-configured + auto-detected.
+    try:
+        from soniqboom.core.hvsc import get_hvsc
+        if get_hvsc().is_configured() and any(
+            str(fe.path).lower().endswith(_SID_DETECT_EXTS) for fe in entries
+        ):
+            from soniqboom.core.hvsc_apply import apply_hvsc_to_library
+            await apply_hvsc_to_library(reload=False)
+    except Exception:
+        log.debug("HVSC post-scan apply failed (remote)", exc_info=True)
 
     # Ghost-track cleanup: any track in the store under this scan_root
     # whose path didn't appear in the live walk is a file that was

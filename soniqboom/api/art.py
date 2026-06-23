@@ -601,6 +601,19 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     if not path_str.startswith(("ftp://", "smb://")):
         get_store().mark_art_absent(track_id)
         _mark_art_absent_persisted(track_id)
+    else:
+        # Remote track with no art resolvable from local state.  If the scan
+        # recorded an embedded cover (``cover_art`` URL set) but the bytes
+        # aren't cached, recover them surgically in the BACKGROUND (fetch just
+        # the moov/tag-header, not the whole file) and push ``art_ready`` when
+        # done — so this request never blocks on a remote read.  The backfill
+        # coalesces + bounds itself.
+        try:
+            if getattr(track, "cover_art", None):
+                from soniqboom.core.art_backfill import request_backfill
+                request_backfill(track)
+        except Exception:
+            pass
     return None, None
 
 

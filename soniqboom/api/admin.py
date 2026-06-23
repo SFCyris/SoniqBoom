@@ -2350,118 +2350,20 @@ async def hvsc_cleanup_orphans(_tok: str = Depends(_require_token)):
 
 @router.post("/hvsc/rescan-sids")
 async def hvsc_rescan_sids(_tok: str = Depends(_require_token)):
-    """Apply HVSC lookups to every existing SID/PSID track in the library.
+    """Re-apply HVSC durations + STIL to every SID track in the library.
 
-    Earlier this routed through ``start_scan(parent_dirs)``, but the
-    scanner is *incremental* — it skips files whose mtime + size haven't
-    changed, so a HVSC-config change never propagated to existing tracks
-    (the file content is identical; only the lookup table is new).
-
-    Instead, walk the store directly: for each SID, compute the MD5,
-    query HVSC, and patch ``duration`` / ``hvsc_lengths`` / ``subsongs``
-    / ``stil`` in place.  Remote tracks are skipped because we'd have to
-    pull the bytes through the FileSource to MD5 them — that's a
-    follow-up.
+    The scanner is incremental (skips unchanged files), and SID extraction runs
+    in spawn worker processes whose HVSC singleton is unconfigured — so this
+    MAIN-process pass is where HVSC data actually gets applied.  It joins the
+    cached whole-file MD5 (``sid_md5``) against the HVSC index, reloading the
+    databases first so an updated release is reflected.  We also clear the
+    scanner's HVSC probe cache so a freshly-dropped DOCUMENTS folder is
+    re-detected on the next scan.
     """
-    from soniqboom.core.store import get_store
-    from soniqboom.core.hvsc import get_hvsc
-    hvsc = get_hvsc()
-    if not hvsc.is_configured():
-        return {"updated": 0, "message": "HVSC is not configured — set the DOCUMENTS path first."}
-    store = get_store()
-    updates: list[tuple[str, dict]] = []
-    skipped_remote = 0
-    skipped_missing = 0
-    scanned = 0
-    # Track the post-rescan correct duration set for every SID we touched, so
-    # we can reconcile the conversion cache against it after the update
-    # batch — this catches entries that were rendered at the global
-    # default before HVSC was configured.  Multi-subsong tracks contribute
-    # one valid duration per subsong so per-tune renders are preserved too.
-    correct_durations: dict[str, set[int]] = {}
-    sid_track_ids: list[str] = []
-
-    def _ints(seq) -> set[int]:
-        out: set[int] = set()
-        for v in seq or []:
-            try:
-                out.add(int(round(float(v))))
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    for t in store.all_track_metas():
-        fmt = str(t.get("format", "")).upper()
-        if fmt != "SID":
-            continue
-        scanned += 1
-        sid_track_ids.append(t["id"])
-        path_str = t.get("path") or ""
-        if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
-            skipped_remote += 1
-            continue
-        path = Path(path_str)
-        if not path.is_file():
-            skipped_missing += 1
-            continue
-        try:
-            durations = hvsc.lookup_durations(path)
-            stil = hvsc.lookup_stil(path)
-        except Exception:
-            continue
-        patch: dict = {}
-        if durations:
-            patch["duration"] = durations[0]
-            patch["hvsc_lengths"] = durations
-            if len(durations) > 1:
-                patch["subsongs"] = len(durations)
-            correct_durations[t["id"]] = _ints(durations)
-        else:
-            # No HVSC entry — keep whatever durations the track already had so
-            # its cache survives.  This covers single-subsong tracks (duration
-            # field) and multi-subsong tracks (hvsc_lengths field) alike.
-            valid = _ints(t.get("hvsc_lengths") or [])
-            if t.get("duration"):
-                valid |= _ints([t["duration"]])
-            if valid:
-                correct_durations[t["id"]] = valid
-        if stil and stil.get("text"):
-            patch["stil"] = stil["text"]
-        if patch:
-            updates.append((t["id"], patch))
-
-    if updates:
-        # Run on the executor — both update_track_fields_batch and the
-        # AOF append cost are CPU-bound and synchronous.
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, store.update_track_fields_batch, updates,
-        )
-
-    # Reconcile the SID conversion cache against the post-rescan track
-    # durations.  This also evicts entries from BEFORE HVSC was configured
-    # (where the track already had a non-default duration but the cache key
-    # still references the old global default), which the user perceives
-    # as a flaky "renders twice before sticking" cache.
-    from soniqboom.core.conversion_cache import purge_sid_entries_for
-    purged = await purge_sid_entries_for(
-        sid_track_ids, keep_duration=correct_durations,
-    )
-
-    msg_parts = [f"Updated {len(updates)} of {scanned} SID track(s)."]
-    if purged:
-        msg_parts.append(f"Purged {purged} stale render(s).")
-    if skipped_remote:
-        msg_parts.append(f"Skipped {skipped_remote} on remote shares.")
-    if skipped_missing:
-        msg_parts.append(f"Skipped {skipped_missing} missing files.")
-    return {
-        "updated": len(updates),
-        "scanned": scanned,
-        "skipped_remote":  skipped_remote,
-        "skipped_missing": skipped_missing,
-        "message": " ".join(msg_parts),
-    }
+    from soniqboom.core.hvsc_apply import apply_hvsc_to_library
+    from soniqboom.core.scanner import reset_hvsc_probe_cache
+    reset_hvsc_probe_cache()
+    return await apply_hvsc_to_library(reload=True)
 
 
 # ── Settings panel ───────────────────────────────────────────────────────────
@@ -2482,6 +2384,7 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "soundfonts_dir": settings.soundfonts_dir,
             "sid_default_duration": settings.sid_default_duration,
             "hvsc_docs_path": settings.hvsc_docs_path,
+            "hvsc_autodetect": settings.hvsc_autodetect,
         },
         "scan_zips": settings.scan_zips,
         "scan_remote_zips": settings.scan_remote_zips,
@@ -2526,13 +2429,16 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             conf["renderers"] = {}
         for k in ("sidplayfp_path", "fluidsynth_path", "openmpt123_path",
                    "soundfont_path", "soundfonts_dir", "sid_default_duration",
-                   "hvsc_docs_path"):
+                   "hvsc_docs_path", "hvsc_autodetect"):
             if k in body["renderers"]:
-                conf["renderers"][k] = body["renderers"][k]
+                val = body["renderers"][k]
+                if k == "hvsc_autodetect":
+                    val = bool(val)            # coerce — keep the schema honest
+                conf["renderers"][k] = val
                 # Live-update settings so the change takes effect without
                 # restart; HVSC re-indexes on the next SID extract.
                 if hasattr(settings, k):
-                    setattr(settings, k, body["renderers"][k])
+                    setattr(settings, k, val)
         # If hvsc_docs_path changed, reconfigure the HVSC singleton so the
         # next SID extract (or "Re-extract SID metadata" click) picks it up.
         if "hvsc_docs_path" in body["renderers"]:

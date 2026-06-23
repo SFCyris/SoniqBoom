@@ -143,6 +143,7 @@ _CONF_DEFAULTS: dict[str, Any] = {
         "soundfont_path": "",
         "soundfonts_dir": "",
         "sid_default_duration": 180,
+        "hvsc_autodetect": True,
     },
     # ── Optional access services ────────────────────────────────────────────
     # Each toggle gates whether the corresponding router + frontend page is
@@ -256,7 +257,8 @@ _CONF_TEMPLATE = """\
     "openmpt123_path": "",
     "soundfont_path": "",
     "soundfonts_dir": "",
-    "sid_default_duration": 180
+    "sid_default_duration": 180,
+    "hvsc_autodetect": true
   },
 
   "_comment_services": "Optional access services. Disable a flag to remove the corresponding router from the FastAPI app — clients then get 404. Toggle live from Settings → Services or `soniqboom services enable|disable <name>`.",
@@ -508,6 +510,10 @@ class Settings(BaseSettings):
     # ``DOCUMENTS/`` folder (containing Songlengths.md5 + STIL.txt) to
     # get per-tune accurate durations and STIL commentary.  Empty = off.
     hvsc_docs_path:    str = _local_conf.get("renderers", {}).get("hvsc_docs_path", "")
+    # When true (default), a scan that turns up SID files but has no HVSC path
+    # configured will look for a ``DOCUMENTS/`` folder up the tree and auto-set
+    # it.  Never overrides a path the user set.  Turn off to disable detection.
+    hvsc_autodetect:   bool = bool(_local_conf.get("renderers", {}).get("hvsc_autodetect", True))
     # libgme renderer (E-14) — covers NSF/SPC/GBS/VGM/AY/KSS/SAP/HES/GYM.
     # Path to the ``gme`` CLI (from gme-tools or similar) that writes WAV
     # to stdout from a chiptune file.  Empty disables — falls back to

@@ -53,6 +53,16 @@ class TrackMeta(BaseModel):
     patterns: int | None = None
     subsongs: int | None = None
 
+    # SID (C64) / HVSC enrichment.  ``sid_md5`` is the MD5 of the whole .sid
+    # file — the key HVSC's Songlengths database is indexed by — cached at scan
+    # time so the re-apply join needs no file I/O (and works for remote tracks,
+    # whose bytes aren't on local disk).  ``hvsc_lengths`` is the per-subsong
+    # duration list; ``stil`` the STIL commentary blob; ``sid_model`` the chip.
+    sid_md5: str | None = None
+    sid_model: str | None = None
+    hvsc_lengths: list[float] | None = None
+    stil: str | None = None
+
     # Art
     cover_art: str | None = None  # data-URI thumbnail
 

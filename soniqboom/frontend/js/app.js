@@ -2105,6 +2105,25 @@ function connectWS() {
 
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
+    if (msg.event === 'art_ready' && msg.track_id) {
+      // The server recovered a remote track's embedded cover in the background
+      // (it wasn't cached when the page first requested it).  Swap the
+      // placeholder <img> for the real art without a reload.  Match the track
+      // id EXACTLY against the URL path — not a substring CSS selector, which
+      // could mis-match a different id or break on odd characters — and
+      // cache-bust so the browser refetches, keeping any ?size= param intact.
+      try {
+        const want = `/api/art/${msg.track_id}`;
+        document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
+          let u;
+          try { u = new URL(img.src, location.href); } catch (_) { return; }
+          if (u.pathname !== want) return;
+          u.searchParams.set('_t', Date.now());
+          img.src = u.pathname + u.search;
+        });
+      } catch (_) { /* ignore */ }
+      return;
+    }
     if (msg.event === 'scan_progress') {
       if (msg.running) {
         // Phase 1: metadata scan in progress.  Server can emit a
@@ -2232,6 +2251,16 @@ function connectWS() {
       // stations module is lazy, so hand it off via a DOM event instead
       // of a direct import.
       window.dispatchEvent(new CustomEvent('sb:radio-meta', { detail: msg }));
+    } else if (msg.event === 'hvsc_configured') {
+      // A scan auto-detected the HVSC DOCUMENTS folder and enabled it.  SID
+      // tracks pick up accurate per-tune durations + STIL on their next play
+      // (or via Admin → Renderers → Re-extract SID metadata for the whole
+      // library at once).  Coalesce so a multi-root scan can't double-toast.
+      const _now = Date.now();
+      if (_now - (window.__sbHvscToastTs || 0) > 3000) {
+        window.__sbHvscToastTs = _now;
+        try { Toast.info('🎼 HVSC database detected — SID song lengths enabled'); } catch {}
+      }
     }
   };
 
