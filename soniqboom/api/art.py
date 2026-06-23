@@ -348,7 +348,15 @@ def _is_art_absent_persisted(track_id: str, source_mtime: float | None = None) -
         if not sentinel.exists():
             return False
         if source_mtime is None:
-            return True
+            # Unknown source mtime → we CANNOT prove the sentinel is still
+            # valid, so don't honour it: re-attempt instead.  This is the
+            # common case for remote (FTP/SMB) tracks not currently in the
+            # local cache, where the old ``return True`` permanently locked out
+            # folder art that arrived after the sentinel was first written.
+            # The re-attempt is cheap — embedded extraction only reads an
+            # existing local cache copy (never downloads), and folder art comes
+            # from the warm per-directory cache.
+            return False
         try:
             sentinel_mtime = sentinel.stat().st_mtime
         except OSError:
@@ -581,10 +589,18 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
             asyncio.create_task(_update_track_cover_ref(track_id))
             return folder_data, folder_mime or "image/jpeg"
 
-    # No art found — remember this to avoid repeated extraction attempts
-    # (both in-memory for this process and on-disk for future restarts).
-    get_store().mark_art_absent(track_id)
-    _mark_art_absent_persisted(track_id)
+    # No art found.  Remember it to skip repeated extraction — BUT only for
+    # local / zip sources.  For remote (FTP/SMB) tracks the folder-art lookup
+    # can come up empty for transient reasons (the shared folder cache wasn't
+    # warm yet, an FTP listing hiccupped), and persisting a sentinel against an
+    # unknowable source mtime would lock the art out forever (the Linux FTP
+    # "no art" bug).  Re-attempts for remote are cheap — a track that DOES have
+    # art is served from the positive art cache after the first resolve, and
+    # the folder lookup is O(1) on the warm dir cache — so we never poison a
+    # remote track with a negative sentinel.
+    if not path_str.startswith(("ftp://", "smb://")):
+        get_store().mark_art_absent(track_id)
+        _mark_art_absent_persisted(track_id)
     return None, None
 
 

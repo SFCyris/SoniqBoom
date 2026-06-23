@@ -1658,28 +1658,61 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         import subprocess as _sub
         bin_ = settings.ffmpeg_path or "ffmpeg"
         if ff_check.get("installed"):
-            r = _sub.run([bin_, "-hide_banner", "-formats"],
-                         capture_output=True, text=True, timeout=10, check=False)
-            fmts = (r.stdout or "").lower()
-            demuxers_ok = all(
-                f" d   {d} " in fmts or f" d   {d}\n" in fmts
-                for d in ("dsf", "iff", "wsd")
-            )
-            r2 = _sub.run([bin_, "-hide_banner", "-encoders"],
-                          capture_output=True, text=True, timeout=10, check=False)
-            enc_out = (r2.stdout or "") + (r2.stderr or "")
-            encoders_present = {
-                name: name in enc_out
-                for name in ("libmp3lame", "libvorbis", "libopus",
-                             "flac", "aac")
-            }
-            missing = [k for k, v in encoders_present.items() if not v]
-            if not demuxers_ok:
-                missing.insert(0, "dsd-demuxers")
-            ff_check["demuxers_ok"]   = demuxers_ok
-            ff_check["encoders"]      = encoders_present
-            ff_check["missing"]       = missing
-            ff_check["fully_capable"] = (not missing)
+            def _probe(arg: str):
+                # Retry once: a single ffmpeg spawn can transiently time out or
+                # be killed under heavy scan load (many concurrent ffmpeg
+                # processes + FTP I/O).  A flaked probe must NOT be read as
+                # "the binary lacks codecs" — that produced a scary, WRONG
+                # "bundled ffmpeg is missing everything" banner + a needless
+                # re-download prompt for a perfectly healthy binary.
+                for _ in range(2):
+                    try:
+                        rr = _sub.run([bin_, "-hide_banner", arg],
+                                      capture_output=True, text=True,
+                                      timeout=20, check=False)
+                        if rr.returncode == 0:
+                            return rr
+                    except (FileNotFoundError, _sub.SubprocessError):
+                        pass
+                return None
+
+            r  = _probe("-formats")
+            r2 = _probe("-encoders")
+            fmts    = (r.stdout or "").lower() if r else ""
+            enc_out = ((r2.stdout or "") + (r2.stderr or "")) if r2 else ""
+            # A successful probe always emits a large table (hundreds of rows);
+            # empty / short output or a non-zero exit means we couldn't really
+            # run the binary, NOT that it lacks features.  Distinguish the two.
+            probe_ok = len(fmts) > 2000 and len(enc_out) > 500
+            if probe_ok:
+                demuxers_ok = all(
+                    f" d   {d} " in fmts or f" d   {d}\n" in fmts
+                    for d in ("dsf", "iff", "wsd")
+                )
+                encoders_present = {
+                    name: name in enc_out
+                    for name in ("libmp3lame", "libvorbis", "libopus",
+                                 "flac", "aac")
+                }
+                missing = [k for k, v in encoders_present.items() if not v]
+                if not demuxers_ok:
+                    missing.insert(0, "dsd-demuxers")
+                ff_check["demuxers_ok"]   = demuxers_ok
+                ff_check["encoders"]      = encoders_present
+                ff_check["missing"]       = missing
+                ff_check["fully_capable"] = (not missing)
+            else:
+                # Couldn't probe — report UNVERIFIED (fully_capable = None) so
+                # the UI shows no scary "missing" banner.  The startup resolver
+                # already trusts a bundled binary that executes, so a flaked
+                # probe here doesn't change which binary is in use.
+                ff_check["probe_failed"]  = True
+                ff_check["fully_capable"] = None
+                ff_check["missing"]       = []
+                log.warning(
+                    "ffmpeg feature probe could not run %s (transient under "
+                    "load) — reporting unverified, not missing.", bin_,
+                )
             # Whether a bundled copy exists alongside — informs the UI
             # whether to offer "Use bundled" vs "Download bundled".
             bundled_path = Path(get_data_dir()) / "bin" / "ffmpeg"
@@ -1729,12 +1762,12 @@ async def admin_fetch_ffmpeg(_tok: str = Depends(_require_token)):
         # ``force=True`` so a stale (older version) bundled binary gets
         # overwritten — operators expect the button to actually refresh,
         # not no-op when a binary already exists.
+        log.info("admin/ffmpeg/fetch: re-downloading bundled ffmpeg into %s (force=True)…",
+                 dest_dir)
         result = _ff_install(dest_dir=dest_dir, force=True)
-        return {
-            "ok":   True,
-            "path": str(result.get("path") if isinstance(result, dict) else result),
-            "dest": str(dest_dir),
-        }
+        path = str(result.get("path") if isinstance(result, dict) else result)
+        log.info("admin/ffmpeg/fetch: bundled ffmpeg installed at %s", path)
+        return {"ok": True, "path": path, "dest": str(dest_dir)}
 
     try:
         res = await loop.run_in_executor(None, _do_install)

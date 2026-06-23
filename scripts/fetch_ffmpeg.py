@@ -387,21 +387,38 @@ def install(
             )
         version = _ffmpeg_version(str(extracted))
 
-        # Atomic swap: rename .staging/ffmpeg → bin/ffmpeg
-        if binary.exists():
-            binary.unlink()
-        extracted.rename(binary)
+        # Atomic swap: os.replace overwrites bin/ffmpeg in a single rename(2),
+        # so the old binary stays fully intact until the instant the new one
+        # lands — there is never a window with no/partial binary.  The old
+        # ``unlink``-then-``rename`` left exactly such a hole; an interruption
+        # there (crash, kill, disk-full) produced the "bundled ffmpeg corrupted,
+        # must reinstall" reports.  Staging is under dest_dir → same filesystem,
+        # so os.replace is atomic.
+        os.replace(str(extracted), str(binary))
         shutil.rmtree(staging, ignore_errors=True)
 
+        # Re-verify on the FINAL path.  The staging probes already confirmed the
+        # binary runs, but a move + macOS codesign edge could in principle leave
+        # it non-executable — refuse to report success unless the installed
+        # binary actually runs where it now lives.
+        if _ffmpeg_version(str(binary)) is None:
+            raise RuntimeError(
+                f"ffmpeg installed at {binary} but does not execute "
+                "(codesign / quarantine?) — install not marked successful."
+            )
+
     # Manifest — recorded so future runs know what we have and the operator
-    # can audit it.
-    manifest_path.write_text(json.dumps({
+    # can audit it.  Written atomically (tmp + os.replace) so a crash mid-write
+    # can't leave a truncated/garbage manifest.json.
+    _manifest_tmp = manifest_path.with_suffix(".json.tmp")
+    _manifest_tmp.write_text(json.dumps({
         "platform":    f"{target[0]}/{target[1]}",
         "source_url":  source["archive_url"],
         "sha256":      sha,
         "version":     version,
         "demuxers":    sorted(new_demuxers),
     }, indent=2))
+    os.replace(str(_manifest_tmp), str(manifest_path))
 
     print(f"installed:      {binary}", file=sys.stderr)
     print(f"version:        {version}",  file=sys.stderr)

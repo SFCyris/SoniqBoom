@@ -831,6 +831,26 @@ async def startup():
                     have.add(name)
             return have
 
+        def _ffmpeg_runs(binary: str) -> bool:
+            """Liveness check — True if ``binary -version`` exits 0.
+
+            Kept SEPARATE from the feature probes: this is what decides whether
+            to trust a bundled binary, and it must not be fooled by a probe
+            that merely timed out under heavy scan load (the old code abandoned
+            a perfectly good bundled ffmpeg whenever the feature probe came back
+            empty, which forced a needless reinstall).  Retried for exactly
+            that reason, with a generous timeout.
+            """
+            for _ in range(2):
+                try:
+                    r = _sub.run([binary, "-version"], capture_output=True,
+                                 text=True, timeout=20, check=False)
+                    if r.returncode == 0 and "ffmpeg version" in (r.stdout or "").lower():
+                        return True
+                except (FileNotFoundError, _sub.SubprocessError):
+                    pass
+            return False
+
         # Demuxers we need to read DSD / general containers.
         required_demuxers = {"dsf", "iff", "wsd"}
         # Encoders we need to deliver to clients (esp. Subsonic
@@ -848,65 +868,56 @@ async def startup():
 
             sys_demux = _probe_dsd(system) if system else set()
             sys_enc   = _probe_encoders(system) if system else set()
-            sys_ok = system and required_demuxers.issubset(sys_demux) \
+            sys_ok = bool(system) and required_demuxers.issubset(sys_demux) \
                             and required_encoders.issubset(sys_enc)
 
-            bundle_demux: set[str] = set()
-            bundle_enc:   set[str] = set()
-            bundle_ok = False
-            if bundled.is_file():
-                bundle_demux = _probe_dsd(str(bundled))
-                bundle_enc   = _probe_encoders(str(bundled))
-                bundle_ok = required_demuxers.issubset(bundle_demux) \
-                          and required_encoders.issubset(bundle_enc)
+            # A bundled binary is ONLY ever written by fetch_ffmpeg AFTER it
+            # passed the full feature check, and a binary doesn't lose codecs
+            # over time — so a present, real-sized, *executable* bundled copy
+            # is trusted.  We gate on "does it run" (a liveness check), NOT on
+            # the feature probe: that probe spawns ffmpeg with a short timeout
+            # and returned empty under heavy scan load, which falsely condemned
+            # a perfectly good binary and forced a reinstall.  The size gate
+            # rejects a truncated/zero-byte file from a previously-interrupted
+            # install.  Feature probes stay diagnostic-only for the bundled one.
+            try:
+                bundled_present = bundled.is_file() and bundled.stat().st_size > 1_000_000
+            except OSError:
+                bundled_present = False
+            bundled_runs = bundled_present and _ffmpeg_runs(str(bundled))
 
-            # Preference order (UX-3 / user's report 2026-05-23):
-            #   1. bundled (if fully capable) — we KNOW it has the
-            #      libmp3lame / libvorbis / DSD demuxers because
-            #      fetch_ffmpeg.py only blesses a download with all
-            #      required features.
-            #   2. system (if fully capable) — operator's choice, full
-            #      featureset present.
-            #   3. system (incomplete) with a loud warning + fix hint.
-            #   4. nothing — fatal log.
-            if bundle_ok:
+            # Preference order:
+            #   1. bundled, if it EXISTS and EXECUTES (complete-by-installation)
+            #   2. system, if fully capable
+            #   3. system (incomplete) with a loud, actionable warning
+            #   4. nothing — fatal log
+            if bundled_runs:
                 settings.ffmpeg_path = str(bundled)
                 log.info("ffmpeg: using bundled binary at %s "
-                         "(full DSD + lossy-encoder support).", bundled)
+                         "(installed complete; verified it executes).", bundled)
                 if system and not sys_ok:
-                    missing_sys = sorted(
-                        (required_demuxers - sys_demux) |
-                        (required_encoders - sys_enc),
-                    )
                     log.info(
                         "ffmpeg: system binary at %s is missing %s — "
                         "the bundled copy is preferred.",
-                        system, missing_sys,
+                        system,
+                        sorted((required_demuxers - sys_demux) | (required_encoders - sys_enc)),
                     )
             elif sys_ok:
                 settings.ffmpeg_path = system
                 log.info("ffmpeg: using system binary at %s "
                          "(full feature set).", system)
             elif system:
-                # System present but incomplete; surface the actionable
-                # hint and continue with whatever we have.  Bundled would
-                # be preferred but isn't installed (or is also incomplete).
                 settings.ffmpeg_path = system
                 missing_sys = sorted(
-                    (required_demuxers - sys_demux) |
-                    (required_encoders - sys_enc),
+                    (required_demuxers - sys_demux) | (required_encoders - sys_enc),
                 )
-                if bundled.is_file():
-                    missing_bun = sorted(
-                        (required_demuxers - bundle_demux) |
-                        (required_encoders - bundle_enc),
-                    )
+                if bundled_present:
                     log.warning(
-                        "ffmpeg: both system (%s missing %s) and bundled "
-                        "(%s missing %s) lack required features.  Falling "
-                        "back to system; some plays will fail.  Run "
-                        "`soniqboom fetch-ffmpeg --force` to refresh.",
-                        system, missing_sys, bundled, missing_bun,
+                        "ffmpeg: bundled binary at %s EXISTS but failed to execute — "
+                        "falling back to system ffmpeg (%s, missing %s).  Re-download the "
+                        "bundled ffmpeg from Admin → Renderers, or run "
+                        "`soniqboom fetch-ffmpeg --force`.",
+                        bundled, system, missing_sys,
                     )
                 else:
                     log.warning(
@@ -917,11 +928,19 @@ async def startup():
                         system, missing_sys,
                     )
             else:
-                log.error(
-                    "ffmpeg: no binary found.  Install ffmpeg via your package "
-                    "manager or run `soniqboom fetch-ffmpeg` to download a "
-                    "bundled copy.  Transcoded playback will fail until this is fixed."
-                )
+                if bundled_present:
+                    log.error(
+                        "ffmpeg: bundled binary at %s exists but failed to execute and no "
+                        "system ffmpeg was found.  Re-download the bundled ffmpeg or install "
+                        "ffmpeg via your package manager.  Transcoded playback will fail.",
+                        bundled,
+                    )
+                else:
+                    log.error(
+                        "ffmpeg: no binary found.  Install ffmpeg via your package "
+                        "manager or run `soniqboom fetch-ffmpeg` to download a "
+                        "bundled copy.  Transcoded playback will fail until this is fixed."
+                    )
     except Exception:
         log.exception("ffmpeg path resolution failed (non-fatal — falling back to config)")
 

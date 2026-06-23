@@ -114,14 +114,22 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _ensure_admin_interactive() -> int:
+def _ensure_admin_interactive(verbose: bool = False) -> int:
     """First-run bootstrap: if no admin account exists yet, prompt for a
     username + password (hidden via getpass) and create one.
 
     No-op (exit 0) when an admin already exists, or when stdin/stdout isn't a
-    TTY — so a backgrounded or CI start never hangs waiting on input.  Invoked
-    by ``run.sh`` before the server is launched.  Always returns 0: a failed
-    bootstrap must never block the server from starting.
+    TTY — so a backgrounded or CI start never hangs waiting on input.  Always
+    returns 0: a failed bootstrap must never block the server from starting.
+
+    Two entry points:
+      * ``--ensure-admin`` (``verbose=False``) — the *silent* auto-bootstrap
+        used by ``run.sh`` / ``install.sh``: once an admin exists it prints
+        nothing, so it never nags on every start.
+      * ``--setup-admin``  (``verbose=True``)  — the *explicit* entry used by
+        ``setup-admin.sh``: when an admin already exists it PRINTS what's there
+        and how to add / reset one, so the operator never sees a silent
+        "nothing happened".
     """
     import getpass
 
@@ -134,6 +142,17 @@ def _ensure_admin_interactive() -> int:
         return 0
 
     if store.has_any_admin():
+        if verbose:
+            admins = [u.username for u in store.list_users()
+                      if u.role == "admin" and u.enabled]
+            print("")
+            print(f"  An admin account already exists: {', '.join(admins) or '(unnamed)'}")
+            print("  The web UI is unlocked — sign in with it.")
+            print("")
+            print("  To add another admin or reset a password, run:")
+            print("    bash setup-admin.sh -user <name> -passwd '<password>' -role admin")
+            print(f"  (user store: {data_dir / 'users.json'})")
+            print("")
         return 0   # already bootstrapped — nothing to do
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -195,7 +214,12 @@ def main(argv: list[str] | None = None) -> int:
     # when none exists.  Handled before the parser because the normal path
     # requires -user, whereas this mode takes no other flags.
     if "--ensure-admin" in raw or "-ensure-admin" in raw:
-        return _ensure_admin_interactive()
+        return _ensure_admin_interactive(verbose=False)
+    # ``--setup-admin`` is the explicit, *verbose* variant used by
+    # setup-admin.sh: same prompt when no admin exists, but it reports the
+    # existing admin (instead of a silent no-op) when one already does.
+    if "--setup-admin" in raw or "-setup-admin" in raw:
+        return _ensure_admin_interactive(verbose=True)
     _reject_prefix_matches(raw)
     args = _build_parser().parse_args(raw)
 

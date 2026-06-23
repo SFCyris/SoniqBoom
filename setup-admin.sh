@@ -33,11 +33,12 @@ if [ ! -x "$SETADM" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  # No arguments → first-run bootstrap: prompt for a username + password and
-  # create an admin, but ONLY if none exists yet.  Already have an admin?  This
-  # is a silent no-op — pass -user/-passwd (see usage above) to add or reset a
-  # specific account.
-  exec "$SETADM" --ensure-admin
+  # No arguments → interactive setup.  Prompts for a username + password and
+  # creates an admin when none exists yet.  If an admin ALREADY exists, it
+  # tells you so (the account name + where the user store lives) and how to add
+  # or reset one — never a silent no-op.  Pass -user/-passwd (see usage above)
+  # to create or reset a specific account directly.
+  exec "$SETADM" --setup-admin
 fi
 
 # Otherwise forward all arguments straight through to soniqboom-setadm
