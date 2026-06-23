@@ -213,6 +213,23 @@ elif [ "$PLATFORM" = "linux" ]; then
       curl ca-certificates xz || true
   fi
 
+  # openmpt123 CLI (tracker renderer — SoniqBoom shells out to the *binary*,
+  # not the libopenmpt library).  Several distros split the CLI out of the
+  # library package (Fedora: ``openmpt123`` vs ``libopenmpt``; openSUSE:
+  # ``openmpt123`` vs ``libopenmpt0``), so installing only the library leaves
+  # tracker rendering disabled.  Ensure the binary itself is present —
+  # best-effort and isolated (its own command per manager) so a distro that
+  # names it differently never blocks the core deps.  apt installs it in the
+  # main list above; Arch's ``libopenmpt`` package bundles the binary.
+  if [ "$PKG" != "none" ] && ! command -v openmpt123 &>/dev/null; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends openmpt123 || true ;;
+      dnf)    run_pkg dnf install -y openmpt123 || true ;;
+      zypper) run_pkg zypper --non-interactive install openmpt123 || true ;;
+      pacman) run_pkg pacman -S --noconfirm --needed libopenmpt || true ;;
+    esac
+  fi
+
   # LHA archive support: the reference ``lha`` CLI (from lhasa) decodes Amiga
   # ``-lh1-`` archives the in-process ``lhafile`` reader can't.  Best-effort and
   # isolated (its own command per manager) so a distro that doesn't package it
@@ -314,6 +331,25 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# First-run admin account
+# ─────────────────────────────────────────────────────────────────────────────
+# The web UI keeps registration LOCKED until at least one admin exists (so an
+# anonymous LAN visitor can't make themselves admin), which means a fresh
+# install needs the admin bootstrapped from the trusted local terminal.  Do it
+# now, while we still own this TTY.  ``--ensure-admin`` prompts for a username +
+# password only when NO admin exists yet, and is a silent no-op once one does —
+# so re-running install.sh never re-prompts.  The CLI self-detects a
+# non-interactive install (piped / CI: no TTY) and prints a hint instead of
+# hanging.  You can re-run this any time with:  bash setup-admin.sh
+section "Admin account"
+SETADM="$VENV/bin/soniqboom-setadm"
+if [ -x "$SETADM" ]; then
+  "$SETADM" --ensure-admin || true
+else
+  warn "soniqboom-setadm not found — create an admin later with:  bash setup-admin.sh"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Done
 # ─────────────────────────────────────────────────────────────────────────────
 section "Installation complete"
@@ -323,6 +359,7 @@ echo ""
 echo "  Start SoniqBoom:  bash run.sh"
 echo "  Or directly:      $VENV/bin/soniqboom"
 echo "  Browser UI:       http://127.0.0.1:8080"
+echo "  Manage admin:     bash setup-admin.sh   (create / reset the admin account)"
 echo ""
 if [ "$PLATFORM" = "macos" ]; then
   echo "  Config:           ~/Library/Application Support/SoniqBoom/SoniqBoom.conf"
