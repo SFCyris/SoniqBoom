@@ -178,8 +178,14 @@ elif [ "$PLATFORM" = "linux" ]; then
     run_pkg apt-get update -qq
     # python3-venv is the bit Debian splits out; libopenmpt0 ships openmpt123
     # in the openmpt-tools package on bookworm+.
+    # python3-dev + build-essential: some pinned deps (e.g. lhafile) ship no
+    # prebuilt aarch64/musl wheel and compile a C extension at install time,
+    # which needs Python.h (python3-dev) and a C toolchain (build-essential).
+    # Debian/Ubuntu split these out of the base python3, so without them the
+    # ``pip install`` fails with ``fatal error: Python.h: No such file`` — the
+    # Fedora (python3-devel) and macOS (framework Python) paths ship them already.
     run_pkg apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-pip ffmpeg \
+      python3 python3-venv python3-pip python3-dev build-essential ffmpeg \
       fluidsynth libfluidsynth3 \
       openmpt123 \
       curl ca-certificates xz-utils
@@ -193,21 +199,21 @@ elif [ "$PLATFORM" = "linux" ]; then
   elif [ "$PKG" = "dnf" ]; then
     section "Installing system dependencies (dnf)"
     run_pkg dnf install -y \
-      python3 python3-virtualenv python3-pip ffmpeg \
+      python3 python3-virtualenv python3-pip python3-devel gcc ffmpeg \
       fluidsynth libopenmpt \
       sidplayfp \
       curl ca-certificates xz || true
   elif [ "$PKG" = "pacman" ]; then
     section "Installing system dependencies (pacman)"
     run_pkg pacman -S --noconfirm --needed \
-      python python-virtualenv python-pip ffmpeg \
+      python python-virtualenv python-pip gcc ffmpeg \
       fluidsynth libopenmpt \
       sidplayfp \
       curl ca-certificates xz || true
   elif [ "$PKG" = "zypper" ]; then
     section "Installing system dependencies (zypper)"
     run_pkg zypper --non-interactive install \
-      python3 python3-virtualenv python3-pip ffmpeg \
+      python3 python3-virtualenv python3-pip python3-devel gcc ffmpeg \
       fluidsynth libopenmpt0 \
       sidplayfp \
       curl ca-certificates xz || true
