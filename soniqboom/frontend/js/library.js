@@ -539,7 +539,7 @@ async function _refreshTrackCount() {
 // on every scroll frame.
 const _CANONICAL_ROW_HTML = `
     <td class="col-num"><span class="row-play-glyph" aria-hidden="true" title="Double-click to play">▶</span><span class="row-num"></span></td>
-    <td class="col-cover"><div class="col-cover-frame"><span class="art-placeholder row-art-placeholder"></span><img class="row-cover-img" loading="lazy" decoding="async" alt=""></div></td>
+    <td class="col-cover"><div class="col-cover-frame"><span class="art-placeholder row-art-placeholder"></span><img class="row-cover-img" decoding="async" alt=""></div></td>
     <td class="col-title"></td>
     <td class="col-album-artist"></td>
     <td class="col-artist"></td>
@@ -636,18 +636,37 @@ function _fillTrackRow(tr, t, i) {
     // body) and IMG.onerror fires, leaving the format emoji visible.
     // Earlier revisions tried to read the X-SoniqBoom-Art header via
     // fetch+blob+ObjectURL, which lost the browser image pipeline's
-    // bitmap-cache coalescing, image-priority queue, and
-    // loading="lazy" deferral — folder-open went from ~50 ms to
-    // multiple seconds on big SID/MOD folders (regression D14).
+    // bitmap-cache coalescing and image-priority queue — folder-open
+    // went from ~50 ms to multiple seconds on big SID/MOD folders
+    // (regression D14).  NOTE: the request bound is the virtual-scroll
+    // WINDOWING (only visible rows + buffer are ever filled), NOT a
+    // ``loading="lazy"`` attribute — that attribute was REMOVED from the
+    // row <img> because, set after the row was built inside the scroll
+    // subtree, the browser deferred the load past the visible window and
+    // never re-fired it, so covers silently never requested.  The grid
+    // (_loadAlbumCardArt) sidesteps the same trap with a detached Image().
     const wantedSrc = t.id ? `/api/art/${t.id}?size=sm&fallback=404` : '';
-    if (coverImg.dataset.src !== wantedSrc) {
-      coverImg.dataset.src = wantedSrc;
+    // If a background art-fill (play / on-demand extract / backfill) landed for
+    // this track while its row was scrolled out of view, the bare URL would
+    // reuse the browser-cached placeholder.  ``__sbArtPending`` (set by the
+    // art_ready WS handler in app.js) flags those ids so we bust them once on
+    // the render that brings the row back into view.
+    const pendingBust = !!(t.id && window.__sbArtPending && window.__sbArtPending.has(t.id));
+    // Guard on the TRACK id, not the exact URL: a recycled row (new track) or a
+    // pending bust re-fetches; a re-render of the SAME track keeps whatever it
+    // already loaded (so we never revert a just-busted cover back to the bare,
+    // still-cached placeholder URL).
+    if (coverImg.dataset.tid !== (t.id || '') || pendingBust) {
+      if (pendingBust) window.__sbArtPending.delete(t.id);
+      coverImg.dataset.tid = t.id || '';
+      const src = wantedSrc && pendingBust ? `${wantedSrc}&_t=${Date.now()}` : wantedSrc;
+      coverImg.dataset.src = src;
       coverImg.removeAttribute('src');
       coverImg.classList.remove('loaded');
-      if (wantedSrc) {
+      if (src) {
         coverImg.onload  = () => coverImg.classList.add('loaded');
         coverImg.onerror = () => coverImg.classList.remove('loaded');
-        coverImg.src = wantedSrc;
+        coverImg.src = src;
       }
     }
   }

@@ -362,7 +362,7 @@ function _renderTracks() {
     const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
-      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" decoding="async" alt="">` : ''}
+      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" decoding="async" alt="">` : ''}
     </div>`;
 
     row.innerHTML = `
@@ -380,13 +380,19 @@ function _renderTracks() {
       <button class="queue-remove-btn" title="Remove from playlist">&times;</button>
     `;
 
-    // Wire the cover thumbnail: fade in on successful decode, drop the
-    // <img> on error so the placeholder stays put.  No broken-image
-    // glyph ever ends up rendered in the row.
+    // Wire the cover thumbnail: fade in on successful decode; on error KEEP the
+    // <img> (it's opacity:0, so the placeholder shows through and no broken
+    // glyph renders) and just drop ``loaded``.  Keeping it in the DOM is what
+    // lets remote (FTP/SMB) covers recover: the first request 404s and fires a
+    // background art-backfill, which broadcasts ``art_ready`` → app.js's
+    // _bustArtImg re-busts every in-DOM /api/art/ <img> for that track.  The
+    // old ``.remove()`` deleted the <img>, so there was nothing left to
+    // refresh and the row stayed on the placeholder forever (it only filled in
+    // once the track was actually played).  Mirrors the library-row pattern.
     const _artImg = row.querySelector('.qr-art-img');
     if (_artImg) {
       _artImg.onload  = () => _artImg.classList.add('loaded');
-      _artImg.onerror = () => _artImg.remove();
+      _artImg.onerror = () => _artImg.classList.remove('loaded');
     }
 
     // ── Touch long-press to begin drag ────────────────────────────────────

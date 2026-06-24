@@ -1111,6 +1111,30 @@ export const Player = (() => {
   // user straight back into their music.
   let _stationMode = false;
   let _station = null;
+  let _stationLogo = '';   // the current station's logo URL — the art fallback
+
+  // Swap the player-bar art for a station: ``coverUrl`` when a now-playing song
+  // cover was identified, else fall back to the station logo.  Re-renders via
+  // the normal trackchange path so the art + ambient glow update together.
+  function updateStationArt(coverUrl) {
+    if (!_stationMode || !_track) return;
+    _track.cover_art = coverUrl || _stationLogo || '';
+    emit('trackchange', _track);
+  }
+
+  // Update the player bar with the now-playing SONG for a station: title shows
+  // the song, the subtitle shows the artist (the renderer's normal title/artist
+  // path).  Falls back to the station name / "Internet radio" between songs.
+  // ``stationName`` and ``song``/``artist`` are also stashed on _track so the
+  // radio-mode UI (ticker, station label) can read the structured values.
+  function setStationNowPlaying(song, artist) {
+    if (!_stationMode || !_track) return;
+    _track.song = song || '';
+    _track.songArtist = artist || '';
+    _track.title  = song   || _track.stationName || (_station && _station.name) || 'Live';
+    _track.artist = artist || 'Internet radio';
+    emit('trackchange', _track);
+  }
 
   async function playStation(station, relayUrl, codec = '') {
     _stationMode  = true;
@@ -1130,6 +1154,17 @@ export const Player = (() => {
     const savedVol = localStorage.getItem('sb_volume');
     audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
 
+    // Route the station through the Web Audio graph (EQ / ReplayGain / VU /
+    // analyser) — playTrack does this, playStation used to skip it.  Without it
+    // a radio-only session (no library track played first) leaves
+    // createMediaElementSource unbuilt, so the stream bypasses the EQ entirely.
+    // Guarded by ``if (ctx) return`` so it's a no-op once built; must run inside
+    // the click gesture (Safari/iOS), which playStation is.
+    _initAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      try { await ctx.resume(); } catch (_) {}
+    }
+
     // Synthetic "track" so the player bar renders the station like any
     // other now-playing item.  Empty id → art/waveform fetchers fall back
     // to their placeholder paths.
@@ -1137,7 +1172,12 @@ export const Player = (() => {
       id: '', title: station.name, artist: 'Internet radio',
       album: station.tags || '', duration: 0,
       format: codec || 'RADIO', station: true, sid: station.sid,
+      stationName: station.name, song: '', songArtist: '',
+      // Station logo as the default player-bar art; swapped for the
+      // now-playing song cover when one is identified (see updateStationArt).
+      cover_art: (station.favicon && /^https?:\/\//.test(station.favicon)) ? station.favicon : '',
     };
+    _stationLogo = _track.cover_art;
     emit('trackchange', _track);
     // Free the PREVIOUS stream's decoder + close its relay socket before
     // attaching the new one.  Overwriting ``audio.src`` alone leaves the old
@@ -2225,7 +2265,7 @@ export const Player = (() => {
     fmt,
     playTrack, playPause, seek, setVolume, next, prev, setQueue,
     addToQueue, removeFromQueue, moveInQueue,
-    playStation, stopStation,
+    playStation, stopStation, updateStationArt, setStationNowPlaying,
     get stationMode() { return _stationMode; },
     get station()     { return _station; },
     toggleShuffle, toggleRepeat, setRadioActive,

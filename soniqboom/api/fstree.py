@@ -803,6 +803,29 @@ _STORE_RECURSIVE_CACHE: dict[str, dict] = {}
 _SCAN_ROOT_FULL_CACHE: dict[str, dict] = {}
 
 
+def invalidate_browse_cache(*, drop_disk: bool = True) -> None:
+    """Clear the folder-browse caches so the next request re-reads track
+    metadata from the store.
+
+    The three caches above bake ``duration`` (and other TrackMeta fields) into
+    their entries and are validated ONLY by scan-root bucket size + dir mtime
+    — by design, so rating/play-count writes don't invalidate them.  But a
+    BULK FIELD update that changes a cached field WITHOUT changing the track
+    count (e.g. applying HVSC song lengths to existing SID tracks) leaves them
+    serving stale values.  Callers doing such an update must invalidate here,
+    and drop the on-disk pickle so a restart doesn't reload the stale copy
+    (its validity check is bucket-size only, which is unchanged)."""
+    _TRACKS_META_CACHE.clear()
+    _STORE_RECURSIVE_CACHE.clear()
+    _SCAN_ROOT_FULL_CACHE.clear()
+    if drop_disk:
+        try:
+            from soniqboom.config import get_data_dir
+            (get_data_dir() / _BROWSE_CACHE_FILENAME).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _dir_mtime(p: Path) -> float:
     try:
         return p.stat().st_mtime

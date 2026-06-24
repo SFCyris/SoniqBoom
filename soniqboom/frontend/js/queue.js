@@ -209,7 +209,7 @@ function refresh() {
     const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
-      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" loading="lazy" decoding="async" alt="">` : ''}
+      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" decoding="async" alt="">` : ''}
     </div>`;
 
     row.innerHTML = `

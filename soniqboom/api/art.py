@@ -568,9 +568,10 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
         # Clear any prior absent-sentinel — the source must have been
         # updated since we last gave up on it.
         _clear_art_absent_persisted(track_id)
-        asyncio.create_task(art_cache.store_art(track_id, data, "full"))
-        asyncio.create_task(_generate_and_cache_thumbs(track_id, data))
-        asyncio.create_task(_update_track_cover_ref(track_id))
+        # Cache (full + thumbs) and BROADCAST art_ready so the list refreshes —
+        # the player owns this response's bytes, but the list <img> for the same
+        # track only learns the art exists via the broadcast.
+        _persist_and_notify(track_id, data)
         return data, mime or "image/jpeg"
 
     # ── Step 2: try folder art (folder.jpg / cover.jpg) ───────────────────
@@ -584,9 +585,7 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
         )
         if folder_data:
             _clear_art_absent_persisted(track_id)
-            asyncio.create_task(art_cache.store_art(track_id, folder_data, "full"))
-            asyncio.create_task(_generate_and_cache_thumbs(track_id, folder_data))
-            asyncio.create_task(_update_track_cover_ref(track_id))
+            _persist_and_notify(track_id, folder_data)
             return folder_data, folder_mime or "image/jpeg"
 
     # No art found.  Remember it to skip repeated extraction — BUT only for
@@ -714,10 +713,46 @@ async def _generate_and_cache_thumbs(track_id: str, full_data: bytes) -> dict[st
     sm_bytes, lg_bytes = await loop.run_in_executor(
         None, lambda: (resize_cover(full_data, 200), resize_cover(full_data, 550))
     )
-    asyncio.create_task(
-        art_cache.store_thumbs_batch({track_id: sm_bytes}, {track_id: lg_bytes})
-    )
+    # AWAIT the disk write (was fire-and-forget) so callers — especially the
+    # backfill, which broadcasts ``art_ready`` right after — can rely on the
+    # thumbnails actually being on disk before a client re-requests them.
+    await art_cache.store_thumbs_batch({track_id: sm_bytes}, {track_id: lg_bytes})
     return {"sm": sm_bytes, "lg": lg_bytes}
+
+
+# Strong refs to in-flight persist/notify tasks — without this, asyncio only
+# holds a weak ref and the GC can cancel the write/broadcast mid-flight.
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _persist_and_notify(track_id: str, data: bytes) -> None:
+    """Cache freshly-extracted art (full + thumbs), update the DB cover ref, and
+    THEN broadcast ``art_ready`` so list/grid ``<img>`` elements refresh.
+
+    Fire-and-forget but GC-safe (held in ``_bg_tasks``).  The broadcast was the
+    missing link: ``_resolve_full_art`` cached art on demand but never told
+    clients, so a track resolved by the player never refreshed its list row.
+    Broadcasting only AFTER the thumbs are on disk means the client's refetch
+    hits the cache instead of re-extracting (or getting a placeholder).
+    """
+    async def _job():
+        try:
+            await art_cache.store_art(track_id, data, "full")
+            await _generate_and_cache_thumbs(track_id, data)
+            await _update_track_cover_ref(track_id)
+        except Exception:
+            log.debug("art persist failed for %s", track_id, exc_info=True)
+        try:
+            from soniqboom.api.library import _broadcast
+            await _broadcast({"event": "art_ready", "track_id": track_id})
+        except Exception:
+            pass
+    try:
+        t = asyncio.get_running_loop().create_task(_job())
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
+    except RuntimeError:
+        pass
 
 
 @router.get("/{track_id}")
@@ -797,19 +832,19 @@ async def cover_art(
         # visible — without paying the bitmap-decode + blob-alloc cost
         # of fetching the placeholder body just to inspect a header.
         if fallback == "404":
-            return _no_art_404()
+            return _no_art_404(etag)
         return _placeholder_response()
 
     # --- Full size ----------------------------------------------------------
+    # ``_resolve_full_art`` already caches full + thumbs and broadcasts
+    # art_ready on a fresh extraction (see _persist_and_notify), so no extra
+    # thumb task is needed here.
     full_data, mime = await _resolve_full_art(track_id)
     if full_data:
-        # Also generate thumbs on first full-size hit so future thumb
-        # requests are fast.
-        asyncio.create_task(_generate_and_cache_thumbs(track_id, full_data))
         return _etag_response(full_data, mime or "image/jpeg", etag)
 
     if fallback == "404":
-        return _no_art_404()
+        return _no_art_404(etag)
     return _placeholder_response()
 
 
@@ -835,22 +870,25 @@ def _placeholder_response() -> Response:
     )
 
 
-def _no_art_404() -> Response:
-    """Return a 404 with strong cache headers for the ``fallback=404`` path.
+def _no_art_404(etag: str = "") -> Response:
+    """Return a 404 with cache headers for the ``fallback=404`` path.
 
     The frontend track-list IMG loader uses this so the browser's
     ``onerror`` handler fires for tagless tracks while the format-
-    appropriate emoji stays visible behind the IMG.  Crucially the
-    404 is cacheable — Chrome / Safari / Firefox all honour a
-    ``Cache-Control`` header on negative responses, so subsequent
-    scroll past the same track-id re-uses the cached 404 with no
-    network round trip.  Without the cache headers, every row repaint
-    would re-hit the server, defeating the purpose.
+    appropriate emoji stays visible behind the IMG.  The 404 is cacheable
+    so scrolling past the same track-id re-uses it without a round trip —
+    BUT it must be REVALIDATABLE, not ``immutable``: for remote tracks the
+    cover is filled in later (on play, or by the background backfill), and
+    an ``immutable`` 404 would pin the empty result for a year so the list
+    could never recover without a hard reload.  A short TTL plus the
+    per-track ETag means a re-request after the art lands picks it up (the
+    cached-art mtime changes the ETag, so the 304 short-circuit no longer
+    fires and the real cover is served).
     """
-    return Response(
-        status_code=404,
-        headers={
-            "Cache-Control": "public, max-age=31536000, immutable",
-            "X-SoniqBoom-Art": "none",
-        },
-    )
+    headers = {
+        "Cache-Control": "public, max-age=60, must-revalidate",
+        "X-SoniqBoom-Art": "none",
+    }
+    if etag:
+        headers["ETag"] = etag
+    return Response(status_code=404, headers=headers)

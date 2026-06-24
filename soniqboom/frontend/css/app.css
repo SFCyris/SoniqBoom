@@ -2021,8 +2021,17 @@ input[type="range"]:hover::-moz-range-thumb {
   align-items: flex-end;
   gap: 12px;
   flex-shrink: 0;
+  /* Mirror .player-art-info's sizing (width:32%, max 420px) so the two flanks
+     are SYMMETRIC and the flex:1 .player-center is truly centred in the bar.
+     Previously this was content-width (260–320px) while the left flank was 32%,
+     so the centre column — and the radio-mode transport pill in it — sat ~80px
+     right of centre.  Worse, content-width varies by engine (control glyph
+     metrics differ), so Chromium looked roughly centred while Gecko/WebKit
+     drifted further — the cross-browser misalignment the user saw.  Controls
+     stay flex-end (right-aligned); the extra width is just empty space. */
+  width: 32%;
   min-width: 260px;
-  max-width: 320px;
+  max-width: 420px;
   position: relative;
   z-index: 1;
 }
@@ -3955,6 +3964,93 @@ tr.dragging { opacity: 0.4; }
 .player-progress.has-waveform #seek-bar {
   background: transparent !important;
 }
+
+/* ── Radio mode ──────────────────────────────────────────────────────────────
+   A live stream has no seekable position and no next/prev *track*, so the
+   player bar (a) replaces the seek row with a "● LIVE" badge + now-playing
+   ticker, and (b) repurposes ◄◄ / ►► to surf the current station list, with
+   the target station name shown inline beside each button.  Everything here
+   is gated on #player-bar.radio-mode, set by the renderer when a station is
+   the now-playing item — the normal track layout is untouched otherwise. */
+
+/* Hide the seek widgets; the waveform canvas stays behind the ticker. */
+#player-bar.radio-mode .player-progress > #time-cur,
+#player-bar.radio-mode .player-progress > #time-dur,
+#player-bar.radio-mode .player-progress > #seek-bar { visibility: hidden; }
+
+.radio-nowplaying { display: none; }
+#player-bar.radio-mode .radio-nowplaying {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;  /* centre the LIVE + ticker group under the transport */
+  gap: 10px;
+  z-index: 2;            /* above the waveform canvas + hidden seek bar */
+  pointer-events: none;  /* nothing here is clickable — let clicks fall through */
+}
+.radio-live {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #ff5252;
+  text-transform: uppercase;
+  animation: radio-live-pulse 2s ease-in-out infinite;
+}
+@keyframes radio-live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* flex:0 1 auto → the wrapper sizes to the ticker so a short now-playing line
+   centres; a long one shrinks to the available width and marquees (clipped). */
+.radio-ticker-wrap { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.radio-ticker {
+  display: inline-block;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text1);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);   /* readable over the waveform */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* JS adds .scroll (and sets --ticker-shift / --ticker-dur) only when the text
+   actually overflows its wrapper — a measured marquee, no magic numbers. */
+.radio-ticker.scroll {
+  max-width: none;
+  text-overflow: clip;
+  animation: radio-ticker-scroll var(--ticker-dur, 12s) linear infinite;
+}
+@keyframes radio-ticker-scroll {
+  0%, 12%   { transform: translateX(0); }
+  88%, 100% { transform: translateX(var(--ticker-shift, 0)); }
+}
+
+/* Surf-target station names, inline beside ◄◄ / ►►.  Both sides are a FIXED
+   equal width (flex:0 0) so unequal station-name lengths can't shift the play
+   button off-centre.  An empty target (a list end) keeps its width as blank
+   space — invisible (no box) but symmetric — so the cluster stays centred. */
+.radio-target { display: none; }
+#player-bar.radio-mode .radio-target {
+  display: inline-block;
+  /* Hard-clamp to exactly 120px.  flex:0 0 120px alone is honoured by Chromium
+     but NOT by WebKit/Gecko during the pill's intrinsic-size pass — there the
+     LAST target collapsed to ~16px (flex-shrink:0 ignored), making the pill
+     left-heavy and pushing the play button ~53px off-centre.  min/max-width are
+     fundamental box constraints every engine obeys, so both flanks stay 120px
+     and the transport is centred cross-browser. */
+  flex: 0 0 120px;
+  min-width: 120px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 1.15;
+  color: var(--text2);
+  opacity: 0.85;
+}
+#player-bar.radio-mode .radio-target-prev { text-align: right; }
+#player-bar.radio-mode .radio-target-next { text-align: left; }
 
 /* ── Playlist panel ──────────────────────────────────────────────────────────── */
 #playlist-panel {

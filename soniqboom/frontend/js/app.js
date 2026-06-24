@@ -101,8 +101,71 @@ function _cancelAncillaryFetches() {
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then((reg) => {
+        // Surface a "new version — refresh" prompt when an UPDATE installs.
+        // Only prompt when there's already a controller (an actual update,
+        // not the first-ever install, which activates silently).  The new SW
+        // sits in ``waiting`` until the user accepts — see sw.js.
+        const consider = (worker) => {
+          if (worker && navigator.serviceWorker.controller) _showUpdatePrompt(worker);
+        };
+        if (reg.waiting) consider(reg.waiting);        // already waiting on load
+        reg.addEventListener('updatefound', () => {
+          const nw = reg.installing;
+          if (!nw) return;
+          nw.addEventListener('statechange', () => {
+            if (nw.state === 'installed') consider(nw);
+          });
+        });
+      })
       .catch(() => { /* SW disabled in this browser — no fallback needed */ });
   });
+}
+
+// A small, dismissible banner shown when a newer build's SW is waiting.
+// Clicking Refresh tells the waiting SW to activate (SKIP_WAITING); once it
+// takes control we reload ONCE so the page picks up the new JS/CSS — turning
+// the old "needs a second reload" dance into a single click.
+let _updatePromptShown = false;
+function _showUpdatePrompt(worker) {
+  if (_updatePromptShown || !worker) return;
+  _updatePromptShown = true;
+  const bar = document.createElement('div');
+  bar.setAttribute('role', 'status');
+  bar.style.cssText = (
+    'position:fixed;left:50%;transform:translateX(-50%);'
+    + 'bottom:calc(var(--player-h, 88px) + 16px);z-index:9999;'
+    + 'background:#1f3f7a;color:#fff;padding:10px 14px;border-radius:8px;'
+    + 'box-shadow:0 6px 24px rgba(0,0,0,0.45);font:13px/1.4 system-ui,sans-serif;'
+    + 'display:flex;align-items:center;gap:12px;max-width:90vw;pointer-events:auto;'
+  );
+  const msg = document.createElement('span');
+  msg.textContent = 'A new version of SoniqBoom is available.';
+  const refresh = document.createElement('button');
+  refresh.textContent = 'Refresh';
+  refresh.style.cssText = (
+    'background:#fff;color:#1f3f7a;border:none;border-radius:5px;'
+    + 'padding:5px 12px;font:600 13px system-ui,sans-serif;cursor:pointer;'
+  );
+  const dismiss = document.createElement('button');
+  dismiss.textContent = '×';
+  dismiss.setAttribute('aria-label', 'Dismiss');
+  dismiss.style.cssText = (
+    'background:none;color:#fff;border:none;font-size:18px;line-height:1;'
+    + 'cursor:pointer;opacity:0.8;'
+  );
+  refresh.addEventListener('click', () => {
+    refresh.disabled = true;
+    refresh.textContent = 'Updating…';
+    // Reload as soon as the freshly-activated SW takes control of the page.
+    navigator.serviceWorker.addEventListener(
+      'controllerchange', () => window.location.reload(), { once: true },
+    );
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  });
+  dismiss.addEventListener('click', () => { bar.remove(); _updatePromptShown = false; });
+  bar.append(msg, refresh, dismiss);
+  document.body.appendChild(bar);
 }
 
 // Gate the rest of app boot on the auth overlay: if there's no valid
@@ -997,8 +1060,16 @@ btnPlay.addEventListener('click', () => {
   }
   Player.playPause();
 });
-btnPrev.addEventListener('click',  () => Player.prev());
-btnNext.addEventListener('click',  () => Player.next());
+// In radio mode ◄◄/►► surf the current station list instead of seeking tracks;
+// works from any view, so the radio stays controllable after navigating away.
+btnPrev.addEventListener('click',  () => {
+  if (Player.stationMode && window.Stations) { window.Stations.surf(-1); return; }
+  Player.prev();
+});
+btnNext.addEventListener('click',  () => {
+  if (Player.stationMode && window.Stations) { window.Stations.surf(1); return; }
+  Player.next();
+});
 volBar.addEventListener('input',   () => Player.setVolume(parseFloat(volBar.value)));
 
 // 'change' fires on mouse-up after dragging — and also on plain clicks
@@ -1333,9 +1404,21 @@ function _escAttr(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
 }
 
+// Monotonic render token for the player-bar cover.  Stations all share the
+// synthetic id ``''`` so the old ``currentTrack.id !== reqTrackId`` staleness
+// guard couldn't tell two rapid radio renders apart — when the external station
+// logo (slow) finished loading AFTER the song cover (fast, same-origin) it
+// clobbered the cover.  Each render bumps this; an <img> only paints if its
+// token is still the latest.  Works for real tracks too.
+let _artRenderGen = 0;
+
 Player.on('trackchange', (track) => {
   playerTitle.textContent  = track.title || '—';
   document.title = `${track.title || 'SoniqBoom'} — SoniqBoom`;
+  // Radio mode: a station swaps the seek row for a LIVE badge + ticker and
+  // repurposes ◄◄/►► to surf the station list (see app.css .radio-mode +
+  // stations.js _updateRadioBar).  Toggled here off the synthetic station track.
+  if (_playerBarEl) _playerBarEl.classList.toggle('radio-mode', !!track.station);
   // Defer non-audible meta/crumb updates to idle time so they don't
   // compete with audio-pipeline work on the main thread.
   _ric(() => {
@@ -1360,7 +1443,7 @@ Player.on('trackchange', (track) => {
     // ``/api/art/X?size=sm`` is the visible-grey JPEG.  If the IMG
     // path 404s we strip the glow classes; if it 200s we paint them.
     const glowSrc = track.cover_art || `/api/art/${track.id}?size=sm`;
-    const reqTrackId = track.id;
+    const reqGen = ++_artRenderGen;
     const _renderEmojiFallback = () => {
       playerArt.innerHTML = `<span class="art-placeholder">${artPlaceholderEmoji(track)}</span>`;
       const bg = document.getElementById('player-art-bg');
@@ -1371,15 +1454,14 @@ Player.on('trackchange', (track) => {
       if (hg) hg.classList.remove('active');
     };
     const img = new Image();
-    img.decoding = 'async';
+    img.decoding = 'async';   // declarative async decode — no blocking img.decode()
     img.alt = 'cover';
-    img.onload = async () => {
-      try {
-        if (typeof img.decode === 'function') await img.decode();
-      } catch (_) { /* decode unsupported in older browsers — fine */ }
-      // Re-check the staleness after the await — another track
-      // change may have landed while we were decoding.
-      if (Player.currentTrack && Player.currentTrack.id !== reqTrackId) return;
+    // Paint as soon as the bitmap loads.  We do NOT ``await img.decode()`` first:
+    // for a cross-origin station logo that promise can reject or stall in some
+    // engines (Firefox), and stalling here left the placeholder showing.
+    // ``decoding="async"`` already keeps the decode off the paint path.
+    img.onload = () => {
+      if (reqGen !== _artRenderGen) return;   // a newer render superseded this one
       playerArt.innerHTML = '';
       playerArt.appendChild(img);
       const bg = document.getElementById('player-art-bg');
@@ -1390,7 +1472,7 @@ Player.on('trackchange', (track) => {
       if (hg) { hg.style.backgroundImage = `url("${glowSrc}")`; hg.classList.add('active'); }
     };
     img.onerror = () => {
-      if (Player.currentTrack && Player.currentTrack.id !== reqTrackId) return;
+      if (reqGen !== _artRenderGen) return;
       _renderEmojiFallback();
     };
     img.src = artSrc;
@@ -2099,6 +2181,38 @@ function _disarmStuckBadgeWatchdog() {
 }
 
 // ── WebSocket — scan progress ─────────────────────────────────────────────────
+// Cache-bust every in-DOM <img> for one track so it refetches the now-cached
+// cover (defeats a cached placeholder/404 by giving the URL a fresh _t).
+function _bustArtImg(trackId) {
+  try {
+    const want = `/api/art/${trackId}`;
+    document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
+      let u;
+      try { u = new URL(img.src, location.href); } catch (_) { return; }
+      if (u.pathname !== want) return;
+      u.searchParams.set('_t', Date.now());
+      img.src = u.pathname + u.search;
+    });
+  } catch (_) { /* ignore */ }
+}
+
+// On WS re-connect we may have missed art_ready events while the socket was
+// down (e.g. a 403 after a server restart) — re-fetch covers still showing the
+// placeholder so the list recovers without a manual reload.  Only touches
+// images that aren't already showing real art (no ``.loaded``), to avoid
+// re-fetching/flickering covers that are fine.
+function _rebustMissingArt() {
+  try {
+    document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
+      if (img.classList.contains('loaded')) return;
+      let u;
+      try { u = new URL(img.src, location.href); } catch (_) { return; }
+      u.searchParams.set('_t', Date.now());
+      img.src = u.pathname + u.search;
+    });
+  } catch (_) { /* ignore */ }
+}
+
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/library/ws`);
@@ -2106,22 +2220,16 @@ function connectWS() {
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.event === 'art_ready' && msg.track_id) {
-      // The server recovered a remote track's embedded cover in the background
-      // (it wasn't cached when the page first requested it).  Swap the
-      // placeholder <img> for the real art without a reload.  Match the track
-      // id EXACTLY against the URL path — not a substring CSS selector, which
-      // could mis-match a different id or break on odd characters — and
-      // cache-bust so the browser refetches, keeping any ?size= param intact.
-      try {
-        const want = `/api/art/${msg.track_id}`;
-        document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
-          let u;
-          try { u = new URL(img.src, location.href); } catch (_) { return; }
-          if (u.pathname !== want) return;
-          u.searchParams.set('_t', Date.now());
-          img.src = u.pathname + u.search;
-        });
-      } catch (_) { /* ignore */ }
+      // The server cached a track's cover after the page first requested it
+      // (on play, on-demand extract, or background backfill).  Refresh any
+      // in-DOM <img> for that track now, AND remember the id so a virtual-
+      // scroll row that recycles back into view later (library.js
+      // _fillTrackRow) also busts its cached placeholder URL instead of
+      // reusing it forever.
+      const pending = (window.__sbArtPending ||= new Set());
+      pending.add(msg.track_id);
+      if (pending.size > 8000) pending.clear();   // bound it
+      _bustArtImg(msg.track_id);
       return;
     }
     if (msg.event === 'scan_progress') {
@@ -2251,6 +2359,9 @@ function connectWS() {
       // stations module is lazy, so hand it off via a DOM event instead
       // of a direct import.
       window.dispatchEvent(new CustomEvent('sb:radio-meta', { detail: msg }));
+    } else if (msg.event === 'radio_art') {
+      // Now-playing cover + metadata resolved (library/Discogs/MusicBrainz).
+      window.dispatchEvent(new CustomEvent('sb:radio-art', { detail: msg }));
     } else if (msg.event === 'hvsc_configured') {
       // A scan auto-detected the HVSC DOCUMENTS folder and enabled it.  SID
       // tracks pick up accurate per-tune durations + STIL on their next play
@@ -2284,7 +2395,13 @@ function connectWS() {
     const jitter = next * (0.75 + Math.random() * 0.5);
     setTimeout(connectWS, Math.round(jitter));
   };
-  ws.onopen = () => { window.__sbWsBackoff = 1000; };
+  ws.onopen = () => {
+    window.__sbWsBackoff = 1000;
+    // On RE-connect (not the first connect) recover any covers whose art_ready
+    // we missed while disconnected.
+    if (window.__sbWsConnectedBefore) _rebustMissingArt();
+    window.__sbWsConnectedBefore = true;
+  };
 }
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
@@ -2361,9 +2478,15 @@ document.addEventListener('keydown', (e) => {
   // Space — play/pause
   if (e.code === 'Space') { e.preventDefault(); Player.playPause(); return; }
 
-  // Meta+Right / Meta+Left — next / prev
-  if (e.code === 'ArrowRight' && e.metaKey) { Player.next(); return; }
-  if (e.code === 'ArrowLeft'  && e.metaKey) { Player.prev(); return; }
+  // Meta+Right / Meta+Left — next / prev (surf stations in radio mode)
+  if (e.code === 'ArrowRight' && e.metaKey) {
+    if (Player.stationMode && window.Stations) window.Stations.surf(1); else Player.next();
+    return;
+  }
+  if (e.code === 'ArrowLeft'  && e.metaKey) {
+    if (Player.stationMode && window.Stations) window.Stations.surf(-1); else Player.prev();
+    return;
+  }
 
   // ArrowUp / ArrowDown — volume
   if (e.code === 'ArrowUp' && !e.metaKey) {

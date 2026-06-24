@@ -126,6 +126,9 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "scan_remote_zips": True,   # also crack open .zip on remote (FTP/SMB) sources
     "expose_local_files": True,
     "display_startup_logo": True,
+    # Internet-radio now-playing cover lookup (library → Discogs → MusicBrainz).
+    "radio_art_lookup": True,
+    "discogs_token": "",        # optional Discogs personal access token
     "folder_aliases": {},          # { "/abs/path": "alias", ... }
     "network_shares": {},          # { "share_id": { protocol, host, ... }, ... }
     "remote_cache_max_mb": 2048,   # LRU cache limit for remote audio files
@@ -240,6 +243,8 @@ _CONF_TEMPLATE = """\
   "scan_remote_zips": true,
   "expose_local_files": true,
   "display_startup_logo": true,
+  "radio_art_lookup": true,
+  "discogs_token": "",
 
   "_comment_aliases": "Map absolute directory paths to short display names in the UI.",
   "folder_aliases": {},
@@ -548,6 +553,14 @@ class Settings(BaseSettings):
 
     # UI — startup logo animation
     display_startup_logo: bool = _local_conf.get("display_startup_logo", True)
+
+    # Internet-radio now-playing cover lookup.  ``radio_art_lookup`` gates
+    # sending the ICY artist/title to MusicBrainz/Discogs to find a cover (on
+    # by default; turn off for strict privacy).  ``discogs_token`` (optional
+    # personal access token) enables the Discogs source, tried before
+    # MusicBrainz when present.
+    radio_art_lookup: bool = bool(_local_conf.get("radio_art_lookup", True))
+    discogs_token: str = _local_conf.get("discogs_token", "")
 
     # Location / alias display
     expose_local_files: bool = _local_conf.get("expose_local_files", True)

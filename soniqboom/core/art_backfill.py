@@ -163,6 +163,13 @@ async def _run(track) -> None:
                       tid, len(data))
         else:
             _record_failure(tid)
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        # Transient network / FTP-pool-contention failure — do NOT poison the
+        # 5-minute cooldown, or a single slow moment locks a track's art out
+        # for the whole browse session.  Let the next request retry.  (A file
+        # that genuinely has no cover returns data=None above and DOES cool
+        # down, so we don't hammer coverless files.)
+        log.debug("art-backfill transient error for %s: %s", tid, exc)
     except Exception:
         _record_failure(tid)
         log.debug("art-backfill failed for %s", tid, exc_info=True)

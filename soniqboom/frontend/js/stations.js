@@ -38,6 +38,87 @@ const view = () => $('stations-view');
 // ── Playback state ────────────────────────────────────────────────────────────
 let _current = null;     // { station, cands, i } while a station is selected
 let _nowTitle = '';      // last ICY StreamTitle for the current station
+let _artMeta = null;     // last radio_art result (cover + album/year/source) for _nowTitle
+// Surf context: the station list (+ index) the playing station was launched
+// from, so the player-bar ◄◄ / ►► can move through it.  Set by _stationRows
+// when a row is clicked; realigned by _syncPlayCtx for non-list plays.
+let _playCtx = { list: null, idx: -1 };
+
+function _syncPlayCtx(station) {
+  // Keep the surf index pointing at the now-playing station.  If it isn't in
+  // the current list (played from Info/search), collapse to a single-item
+  // context so surfing becomes a no-op rather than jumping to a wrong station.
+  if (_playCtx.list && _playCtx.list[_playCtx.idx]?.sid === station.sid) return;
+  const i = _playCtx.list ? _playCtx.list.findIndex((s) => s.sid === station.sid) : -1;
+  if (i >= 0) _playCtx.idx = i;
+  else _playCtx = { list: [station], idx: 0 };
+}
+
+// Station the ◄◄ (dir -1) / ►► (dir +1) button would surf to, or null at an end.
+function _peekStation(dir) {
+  if (!_playCtx.list) return null;
+  return _playCtx.list[_playCtx.idx + dir] || null;
+}
+
+// Surf to the adjacent station in the current list.  No-op at the list ends.
+function _surfStation(dir) {
+  const next = _peekStation(dir);
+  if (!next) return;
+  _playCtx.idx += dir;
+  play(next);
+}
+
+// Populate the radio-mode pieces of the player bar: the now-playing ticker,
+// and the names of the stations ◄◄ / ►► will surf to (inline + as tooltips).
+// The .radio-mode class itself is toggled by the player-bar renderer (app.js)
+// off track.station, so this only fills content while a station is on air.
+function _updateRadioBar() {
+  const ticker = document.getElementById('radio-ticker');
+  if (!ticker) return;
+  const onAir = !!(_current && Player.stationMode);
+  // Keep the radio-mode class in sync here too: stopStation() emits only
+  // 'statechange' (no trackchange), so app.js's trackchange toggle never fires
+  // on stop — without this the seek row would stay hidden after stopping.
+  document.getElementById('player-bar')?.classList.toggle('radio-mode', onAir);
+  const prevT = document.getElementById('radio-prev-target');
+  const nextT = document.getElementById('radio-next-target');
+  const btnPrev = document.getElementById('btn-prev');
+  const btnNext = document.getElementById('btn-next');
+  if (!onAir) {
+    ticker.textContent = '';
+    if (prevT) prevT.textContent = '';
+    if (nextT) nextT.textContent = '';
+    return;
+  }
+  // Ticker shows the raw "Artist - Song" StreamTitle, falling back to the
+  // station name between songs / when no metadata is shared.
+  ticker.textContent = _nowTitle || _current.station.name || 'Live';
+  _fitTicker(ticker);
+  const prev = _peekStation(-1);
+  const next = _peekStation(1);
+  if (prevT) prevT.textContent = prev ? prev.name : '';
+  if (nextT) nextT.textContent = next ? next.name : '';
+  if (btnPrev) btnPrev.title = prev ? `Previous station: ${prev.name}` : 'Start of list';
+  if (btnNext) btnNext.title = next ? `Next station: ${next.name}` : 'End of list';
+}
+
+// Marquee the ticker only when its text actually overflows the wrapper — a
+// measured shift (no magic numbers), recomputed each song.
+function _fitTicker(el) {
+  el.classList.remove('scroll');
+  el.style.removeProperty('--ticker-shift');
+  el.style.removeProperty('--ticker-dur');
+  requestAnimationFrame(() => {
+    const wrap = el.parentElement;
+    if (!wrap || !el.isConnected) return;
+    const overflow = el.scrollWidth - wrap.clientWidth;
+    if (overflow > 8) {
+      el.style.setProperty('--ticker-shift', `-${overflow + 12}px`);
+      el.style.setProperty('--ticker-dur', `${Math.max(8, Math.round((overflow + 12) / 22))}s`);
+      el.classList.add('scroll');
+    }
+  });
+}
 
 // ── Buffering / underrun tuning ────────────────────────────────────────────────
 // A brief buffer dip recovers on its own; a SUSTAINED stall is handled.  With a
@@ -118,11 +199,13 @@ function play(station) {
     return;
   }
   _wireAudioHealth();   // play() can be reached from global search, not just show()
+  _syncPlayCtx(station);   // keep the ◄◄/►► surf context aligned to this station
   _current = { station, cands, i: 0 };
   _nowTitle = '';
   _resetBuffering();
   _reconnects = 0;
   _tryPlay();
+  _updateRadioBar();    // enter / refresh the radio-mode player bar
 }
 
 async function _tryPlay() {
@@ -193,7 +276,9 @@ function stop() {
   Player.stopStation();
   _current = null;
   _nowTitle = '';
+  _playCtx = { list: null, idx: -1 };
   _renderNowPlaying();
+  _updateRadioBar();    // clear the radio-mode ticker + surf targets
 }
 
 // Seconds of CONTIGUOUS audio buffered ahead of the playhead (0 when nothing is
@@ -431,7 +516,7 @@ function _stationRows(body, stations, { showCountry = false } = {}) {
   }
   body.innerHTML = '';
   const frag = document.createDocumentFragment();
-  stations.forEach((st) => {
+  stations.forEach((st, i) => {
     const row = document.createElement('div');
     row.className = 'st-row';
     row.dataset.sid = st.sid;
@@ -449,7 +534,7 @@ function _stationRows(body, stations, { showCountry = false } = {}) {
         st.votes ? ` · ▲${st.votes}` : ''}</span>`;
     const img = row.querySelector('.st-row-art img');
     if (img) img.onerror = () => { img.remove(); };
-    const go = () => play(st);
+    const go = () => { _playCtx = { list: stations, idx: i }; play(st); };
     row.addEventListener('click', go);
     row.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
@@ -640,7 +725,17 @@ function _updateInfoNow() {
   const el = $('st-info-overlay');
   if (!el || !el.classList.contains('open')) return;
   const now = el.querySelector('.st-info-now');
-  if (now && _current) now.textContent = `🎵 ${_nowTitle || 'Live — fetching track…'}`;
+  if (now && _current) {
+    let txt = `🎵 ${_nowTitle || 'Live — fetching track…'}`;
+    if (_artMeta) {
+      // Append the cover-lookup metadata when we have it (Discogs/MusicBrainz/library).
+      const album = [_artMeta.album, _artMeta.year].filter(Boolean).join(' · ');
+      const src = _artMeta.source ? `via ${_artMeta.source}` : '';
+      const extra = [album, _artMeta.label, src].filter(Boolean).join(' — ');
+      if (extra) txt += `  ·  ${extra}`;
+    }
+    now.textContent = txt;
+  }
 }
 
 // ── Header search placeholder: while Stations is open, the global search
@@ -704,10 +799,29 @@ window.addEventListener('sb:radio-meta', (e) => {
   const d = e.detail || {};
   if (_current && d.sid === _current.station.sid) {
     _nowTitle = d.title || '';
+    _artMeta = null;                  // new song — drop the previous cover/metadata
+    // Bottom-left player bar: show the now-playing Song (title) + Artist
+    // (subtitle), falling back to the station name between songs.
+    Player.setStationNowPlaying(d.song, d.artist);
+    Player.updateStationArt(null);    // back to the station logo until a cover lands
     _updateNowTitle();
     _updateInfoNow();
+    _updateRadioBar();                // ticker + LIVE + prev/next targets
   }
 });
 
-export const Stations = { show, hide, play, stop, showInfo };
+// Now-playing cover + metadata resolved by the relay (library/Discogs/MusicBrainz).
+// Swap the bottom-left art to the song cover; show the gathered album/year/source.
+window.addEventListener('sb:radio-art', (e) => {
+  const d = e.detail || {};
+  // Ignore a stale result (the song already changed) or a different station.
+  if (!_current || d.sid !== _current.station.sid || d.title !== _nowTitle) {
+    return;   // _artMeta was already cleared by the radio_meta song-change reset
+  }
+  _artMeta = d;
+  if (d.cover_url) Player.updateStationArt(d.cover_url);
+  _updateInfoNow();
+});
+
+export const Stations = { show, hide, play, stop, showInfo, surf: _surfStation };
 window.Stations = Stations;   // test/debug escape hatch — same pattern as RadioMode

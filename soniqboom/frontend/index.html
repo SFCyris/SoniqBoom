@@ -54,7 +54,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=63">
+  <link rel="stylesheet" href="/assets/css/app.css?v=68">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -355,9 +355,13 @@
 
       <div class="player-center">
         <div class="player-controls">
+          <!-- Radio mode only: the station ◄◄ will surf to (previous in list). -->
+          <span id="radio-prev-target" class="radio-target radio-target-prev" aria-hidden="true"></span>
           <button id="btn-prev" title="Previous" aria-label="Previous track">&#9664;&#9664;</button>
           <button id="btn-play" class="btn-play-pause" title="Play/Pause" aria-label="Play or pause">&#9654;</button>
           <button id="btn-next" title="Next" aria-label="Next track">&#9654;&#9654;</button>
+          <!-- Radio mode only: the station ►► will surf to (next in list). -->
+          <span id="radio-next-target" class="radio-target radio-target-next" aria-hidden="true"></span>
         </div>
         <div class="player-progress">
           <span id="time-cur">0:00</span>
@@ -365,6 +369,12 @@
           <input id="seek-bar" type="range" min="0" max="100" value="0" step="0.1"
                  aria-label="Seek position">
           <span id="time-dur">0:00</span>
+          <!-- Radio mode only: a live stream has no seekable position, so the
+               seek row is replaced by a LIVE badge + a now-playing ticker. -->
+          <div id="radio-nowplaying" class="radio-nowplaying" aria-hidden="true">
+            <span id="radio-live" class="radio-live">&#9679; LIVE</span>
+            <span class="radio-ticker-wrap"><span id="radio-ticker" class="radio-ticker"></span></span>
+          </div>
         </div>
       </div>
 
@@ -1834,7 +1844,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=96"></script>
+  <script type="module" src="/assets/js/app.js?v=101"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

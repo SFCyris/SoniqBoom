@@ -182,6 +182,48 @@ async def _broadcast_meta(payload: dict) -> None:
         pass
 
 
+async def _lookup_and_push_art(sid: str, raw_title: str) -> None:
+    """Resolve a cover for the now-playing ``StreamTitle`` and push a
+    ``radio_art`` event.  Carries ``title`` so a client can ignore a result
+    that lands after the song already changed."""
+    try:
+        from soniqboom.core.nowplaying_art import parse_stream_title, lookup
+        artist, song = parse_stream_title(raw_title)
+        if not artist or not song:
+            return
+        res = await lookup(artist, song)
+        if not res:
+            return                          # no confident cover → keep station logo
+        await _broadcast_meta({
+            "event": "radio_art",
+            "sid": sid,
+            "title": raw_title,
+            "artist": artist,
+            "song": song,
+            "cover_url": res.get("cover_url"),
+            "album": res.get("album") or "",
+            "year": res.get("year"),
+            "label": res.get("label") or "",
+            "source": res.get("source") or "",
+        })
+    except Exception:
+        log.debug("radio art lookup failed for %r", raw_title, exc_info=True)
+
+
+@router.get("/nowplaying-art/{slug}")
+async def nowplaying_art(slug: str):
+    """Serve a now-playing cover that was fetched from Discogs/MusicBrainz and
+    cached locally (so the browser never hotlinks the third party)."""
+    from fastapi.responses import Response
+    from soniqboom.core.nowplaying_art import read_cover
+    data = read_cover(slug)
+    if not data:
+        raise HTTPException(404, "No cached cover")
+    mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+    return Response(content=data, media_type=mime,
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 @router.get("/relay/{sid:path}")
 async def relay(sid: str, v: int = Query(0, ge=0)):
     """Stream a station through the server, de-interleaving ICY metadata."""
@@ -241,12 +283,28 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
             title = title.strip()
             if title and title != last_title:
                 last_title = title
+                # Parse "Artist - Song" so the player bar can show them split
+                # (falls back to the raw title when there's no clean split).
+                from soniqboom.core.nowplaying_art import parse_stream_title
+                _artist, _song = parse_stream_title(title)
                 await _broadcast_meta({
                     "event": "radio_meta",
                     "sid": st["sid"],
                     "station": station_name,
                     "title": title,
+                    "artist": _artist or "",
+                    "song": _song or "",
                 })
+                # Background now-playing cover lookup (library → Discogs →
+                # MusicBrainz); pushes a ``radio_art`` event when it finds one.
+                # Never blocks the audio stream.  Gated by the privacy setting.
+                from soniqboom.config import settings as _settings
+                if _settings.radio_art_lookup:
+                    _at = asyncio.get_running_loop().create_task(
+                        _lookup_and_push_art(st["sid"], title),
+                    )
+                    _bg_tasks.add(_at)
+                    _at.add_done_callback(_bg_tasks.discard)
 
         try:
             if metaint <= 0:

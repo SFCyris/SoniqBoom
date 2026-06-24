@@ -335,7 +335,43 @@
 // the browser (no DSD teardown/rebuild); admin.js — FTP probe-cap button now
 // posts {host,port} instead of {share_id}.  Bump so the cache-first shell
 // serves the edited player.js / admin.js to returning users.
-const SHELL_VERSION = 'v102';
+// v103 (2026-06-23): art pipeline — library.js _fillTrackRow cache-busts a
+// just-filled cover on row re-entry; app.js art_ready/reconnect re-bust so the
+// list recovers backfilled art without a reload.
+// v105 (2026-06-24): radio mode — player bar shows now-playing Song/Artist for
+// stations (player.js setStationNowPlaying, stations.js), and a live stream now
+// swaps the seek row for a LIVE badge + ticker with ◄◄/►► surfing the station
+// list (app.js radio-mode toggle + transport branch, app.css .radio-mode).
+// Bump forces fresh player.js (precached) + stations.js (lazy) for returning users.
+// v106 (2026-06-24): radio mode follow-ups — centre the LIVE/ticker group under
+// the transport (app.css), and route stations through the Web Audio graph so the
+// EQ/ReplayGain/VU apply to radio (player.js playStation now calls
+// _initAudioContext, which it previously skipped — a radio-only session bypassed EQ).
+// v107 (2026-06-24): radio surf-target labels are now a fixed equal width
+// (app.css .radio-target flex:0 0 120px) so unequal station names keep the
+// play button + ticker centred (verified: play/ticker centres coincide).
+// v108 (2026-06-24): playlist panel covers — on art 404 the row <img> is now
+// KEPT (opacity:0) instead of removed, so the remote-art backfill's art_ready
+// → _bustArtImg can recover it (playlist.js).  Previously remote covers only
+// appeared after the track was played; now they fill in like the library list.
+// v109 (2026-06-24): FIX covers never loading in track lists / playlist / queue.
+// Root cause: the row <img> had loading="lazy" but its src was set by JS AFTER
+// the row was built inside a scroll subtree, so the browser deferred the load
+// past the visible window and never re-fired it — the cover URL was never
+// requested (server access log showed 0 hits for those rows).  The album grid
+// avoided this with a detached Image().  Removed loading="lazy" from the
+// row-cover-img (library.js) and qr-art-img (playlist.js, queue.js) so the
+// eagerly-set src fetches immediately; virtual scroll still bounds the table.
+// v110 (2026-06-24): SW updates no longer auto-skipWaiting — app.js shows a
+// "new version — refresh" prompt and posts SKIP_WAITING on accept, so a code
+// change applies on ONE reload (the prompt) instead of needing a second one.
+// v111 (2026-06-24): cross-browser radio fixes — (a) player-right now mirrors
+// player-art-info's width so the centre column (and the radio transport pill)
+// is symmetric/centred in Gecko/WebKit, not just Chromium (app.css); (b) the
+// player-bar cover uses a render-generation token instead of the station's
+// empty id and no longer blocks the paint on img.decode(), so a slow/rejecting
+// cross-origin station logo can't strand the cover on the placeholder (app.js).
+const SHELL_VERSION = 'v112';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.
@@ -368,8 +404,20 @@ self.addEventListener('install', (e) => {
     await Promise.allSettled(
       SHELL_PRECACHE.map(url => cache.add(new Request(url, { cache: 'reload' }))),
     );
-    self.skipWaiting();
+    // NOTE: we deliberately do NOT self.skipWaiting() here.  An UPDATE (a new
+    // SW found while an old one still controls open tabs) now goes to the
+    // "waiting" state, and app.js surfaces a "new version — refresh" prompt;
+    // the new SW activates only once the user accepts (via the SKIP_WAITING
+    // message below).  The first-ever install still activates immediately
+    // (nothing is controlling the clients yet), so cold visits are unaffected.
+    // This makes an update apply on ONE reload (the prompt's Refresh) instead
+    // of the old skipWaiting flow that needed a second manual reload.
   })());
+});
+
+// app.js posts this when the user clicks "Refresh" on the update prompt.
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', (e) => {

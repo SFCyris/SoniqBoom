@@ -220,15 +220,15 @@ function _renderTagEdit(track) {
   if (!wrap) return;
   wrap.innerHTML = '';
   if (!track || !track.id) return;
-  const remote = /^(smb|ftp|https?):\/\//.test(track.path || '');
+  // Tags can only be written to LOCAL files (tagwriter can't write to a network
+  // share), so hide the edit affordance entirely for any non-local track rather
+  // than showing a disabled button.
+  const remote = /^(smb|ftp|webdav|webdavs|https?):\/\//.test(track.path || '');
+  if (remote) return;
   const btn = document.createElement('button');
   btn.id = 'ti-edit-tags';
   btn.textContent = '✏️ Edit tags';
   btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
-  if (remote) {
-    btn.disabled = true;
-    btn.title = 'Tags can only be edited on local files — this track lives on a network share.';
-  }
   btn.addEventListener('click', () => _showTagForm(track, wrap));
   wrap.appendChild(btn);
 }

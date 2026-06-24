@@ -144,6 +144,21 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
         await loop.run_in_executor(
             None, store.update_track_fields_batch, updates,
         )
+        # Durations are baked into the folder-browse + aggregation caches,
+        # which are validated by track COUNT — a field-only update like this
+        # won't invalidate them, so the UI would keep showing the old (default)
+        # lengths.  Invalidate both explicitly (works for the scan auto-fire
+        # AND the admin re-extract endpoint).
+        try:
+            from soniqboom.api.library import invalidate_agg_cache
+            invalidate_agg_cache()
+        except Exception:
+            pass
+        try:
+            from soniqboom.api.fstree import invalidate_browse_cache
+            invalidate_browse_cache()
+        except Exception:
+            pass
 
     # Reconcile the SID conversion cache against the post-apply durations.
     from soniqboom.core.conversion_cache import purge_sid_entries_for
