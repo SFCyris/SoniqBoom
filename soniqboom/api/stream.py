@@ -26,7 +26,7 @@ import uuid as _uuid
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Cookie, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Cookie, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -308,6 +308,29 @@ import os as _os_for_render
 _RENDER_SLOTS = max(2, (_os_for_render.cpu_count() or 4) // 2)
 _render_sem = asyncio.Semaphore(_RENDER_SLOTS)
 
+# ALL speculative/background renders — web N+1/N+2 prewarm AND the AdLib
+# duration-probe batch — share this single low-priority gate so their COMBINED
+# concurrency can never occupy the render slot a live play needs.  Capped one
+# below the total: a background render holds this WHILE it waits for and holds
+# ``_render_sem``, so at most ``_RENDER_SLOTS - 1`` render slots are ever held
+# by background work in aggregate, leaving ≥1 permit free for the foreground
+# stream path (which never touches ``_bg_render_sem``).  No deadlock: foreground
+# never acquires ``_bg_render_sem``, so there is no circular wait.  ONE shared
+# gate, not one-per-pool: two independent ``Semaphore(N-1)`` pools could each
+# "leave 1 free" yet together take every slot, so the reservation must be global.
+#
+# KNOWN GAP: the Cast lookahead prewarm (core/cast_session.py) renders via
+# ``conversion_cache.start_background_render`` and is NOT yet routed through this
+# gate (gating it cleanly needs a conversion_cache change); those renders still
+# acquire ``_render_sem`` so they're bounded by total slots, just not
+# subordinated to foreground.  Cast is Beta.
+#
+# NOTE: an in-flight (DSD/transcode) prewarm that is FIFO-cap-cancelled releases
+# this gate immediately, but its detached pump task keeps holding ``_render_sem``
+# until the render completes (which populates the cache — the prewarm's goal),
+# so the slot frees on natural completion; a benign transient, not a leak.
+_bg_render_sem = asyncio.Semaphore(max(1, _RENDER_SLOTS - 1))
+
 
 async def _await_renderer(
     cmd: list[str], tmp_path: Path, *, timeout: float, kind: str,
@@ -487,7 +510,28 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
         cmd, Path(tmp_wav.name),
         timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
     )
-    return Path(tmp_wav.name)
+    # adplay exits 0 even when AdPlug can't decode the tune (e.g. a Sierra .sci
+    # whose <prefix>patch.003 instrument bank is missing) — it just writes a
+    # header-only (~44-byte) WAV.  Streaming that makes the browser fail with
+    # SRC_NOT_SUPPORTED; surface a clear error instead.
+    out = Path(tmp_wav.name)
+    try:
+        size = out.stat().st_size
+    except OSError:
+        size = 0
+    if size < 1024:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+        raise HTTPException(
+            422,
+            "AdLib render produced no audio. For formats that need a companion "
+            "instrument bank — Sierra .sci (patch.003), AdLib Visual Composer "
+            ".rol (standard.bnk), Ken Silverman .ksm (insts.dat) — this usually "
+            "means that bank could not be found beside the tune in the archive.",
+        )
+    return out
 
 
 async def _render_imf(path: Path, subsong: int = 0) -> Path:
@@ -516,6 +560,196 @@ async def _render_imf(path: Path, subsong: int = 0) -> Path:
     if len(head) >= 64 and head[60:64] == b"IM10":
         return await _render_tracker(path, subsong=subsong)   # Imago Orpheus
     return await _render_adlib(path, subsong=subsong)          # id/Apogee AdLib IMF
+
+
+async def _backfill_adlib_duration(track_id: str, track, wav_path) -> float | None:
+    """Persist an AdLib tune's REAL length once we've rendered it; return it.
+
+    The scanner can't know an AdLib tune's length without rendering, so it
+    stores a placeholder (``metadata._ADLIB_DEFAULT_DURATION`` = 180s) and the
+    library list shows "3:00".  But adplay renders to the song's natural end, so
+    the served WAV carries the true length — read it from the WAV header (cheap,
+    header-only) and write it back via the store (AOF-journalled, so it survives
+    restart; a rescan that resets the placeholder simply re-triggers this).
+
+    Gated on the placeholder, so the WRITE is a no-op once a real duration is
+    stored.  Returns the real length in seconds (for the duration-probe to hand
+    back to the client) or None if it couldn't be determined.  Best-effort — a
+    duration cosmetic must never break playback.
+    """
+    try:
+        if track is None:
+            return None
+        from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+        meta = track.__dict__ if hasattr(track, "__dict__") else {}
+        stored = float(meta.get("duration") or 0)
+        placeholder = float(_ADLIB_DEFAULT_DURATION)
+        if stored > 0 and abs(stored - placeholder) > 0.01:
+            return stored  # already carries a real, non-placeholder duration
+        import wave
+        with wave.open(str(wav_path), "rb") as w:
+            frames, rate = w.getnframes(), w.getframerate()
+        if not rate or frames <= 0:
+            return None
+        real = round(frames / float(rate), 2)
+        if real <= 0:
+            return None
+        if abs(real - stored) >= 0.5:
+            from soniqboom.core.store import get_store
+            get_store().update_track_fields(track_id, {"duration": real})
+            log.debug("AdLib duration backfilled: %s -> %.2fs", track_id, real)
+        return real
+    except Exception:
+        return None
+
+
+async def _resolve_adlib_local_path(track_id: str, path_str: str) -> Path | None:
+    """Resolve a (possibly remote, possibly zip-member) AdLib track to a local
+    renderable file path — the subset of ``stream_track``'s resolution that
+    AdLib tunes need.  AdLib files are tiny, so fetching a remote one purely to
+    probe its length is cheap (unlike big media, which prewarm deliberately
+    skips).  Returns the local Path, or None if it couldn't be resolved.
+    """
+    loop = asyncio.get_running_loop()
+    is_remote = path_str.startswith(("smb://", "ftp://", "http://", "https://"))
+    if is_remote and "::" in path_str:
+        from soniqboom.core.filesource import get_source, parse_remote_path
+        from soniqboom.core.remote_cache import get_cache
+        scan_root, remote_path = parse_remote_path(path_str)
+        zip_rel, member = remote_path.split("::", 1)
+        local_zip = await loop.run_in_executor(
+            None, get_cache().fetch, scan_root, zip_rel, get_source(scan_root),
+        )
+        return await _get_or_extract_zip_member(f"{local_zip}::{member}", track_id)
+    if is_remote:
+        from soniqboom.core.filesource import get_source, parse_remote_path
+        from soniqboom.core.remote_cache import get_cache
+        scan_root, remote_path = parse_remote_path(path_str)
+        source = get_source(scan_root)
+        globs = _ADLIB_COMPANION_GLOBS.get(Path(remote_path).suffix.lower())
+        if globs and source is not None:
+            mat = await _materialize_loose_remote_adlib(
+                track_id, scan_root, remote_path, source, globs,
+            )
+            if mat is not None:
+                return mat
+        local = await loop.run_in_executor(
+            None, get_cache().fetch, scan_root, remote_path, source,
+        )
+        return Path(local) if local else None
+    if "::" in path_str:
+        return await _get_or_extract_zip_member(path_str, track_id)
+    return Path(path_str)
+
+
+async def _materialize_loose_remote_adlib(
+    track_id: str, scan_root: str, remote_path: str, source, globs,
+) -> Path | None:
+    """A loose (non-zip) AdLib tune on a remote share needs its companion bank in
+    the SAME directory (Sierra .sci → patch.003, ROL .bnk, KSM insts.dat), but
+    the per-file remote cache pulls siblings to separate hash-keyed paths, so
+    adplay can't find the bank.  Fetch the tune + every matching sibling bank
+    from the remote directory into one local ``{track_id}.adlib`` dir and return
+    the tune's path there.  Returns None (caller falls back to a plain fetch) if
+    no matching companion sibling is present.
+    """
+    import fnmatch
+    import posixpath
+    loop = asyncio.get_running_loop()
+    out_dir = _zip_extract_dir() / f"{track_id}.adlib"
+    rp = remote_path.replace("\\", "/")
+    tune_base = posixpath.basename(rp)
+    rdir = posixpath.dirname(rp)
+    tune_out = out_dir / tune_base
+    try:
+        st = await loop.run_in_executor(None, source.stat, remote_path)
+        marker_val = f"{getattr(st, 'size', '')}:{getattr(st, 'mtime', '')}"
+    except Exception:
+        marker_val = ""
+    lock = await _zip_lock_for(track_id)
+    async with lock:
+        marker = out_dir / ".loose_marker"
+        if tune_out.exists() and marker.exists() and marker.read_text() == marker_val:
+            # Cache hit — re-account (post-restart the in-memory budget is empty
+            # though the dir persists) + bump LRU recency, mirroring the flat path.
+            _register_adlib_extract(track_id, out_dir)
+            return tune_out
+
+        def _work() -> Path | None:
+            import shutil
+            try:
+                entries = source.list_dir(rdir)
+            except Exception:
+                entries = []
+            sibs = []
+            for e in entries:
+                if getattr(e, "is_dir", False):
+                    continue
+                base = posixpath.basename((getattr(e, "name", "") or "").replace("\\", "/"))
+                if base and base != tune_base and any(
+                    fnmatch.fnmatch(base.lower(), g.lower()) for g in globs
+                ):
+                    sibs.append((base, getattr(e, "path", None) or posixpath.join(rdir, base)))
+            if not sibs:
+                return None
+            if out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tune_out.write_bytes(source.read_file(remote_path))
+            for base, sib_remote in sibs:
+                try:
+                    (out_dir / base).write_bytes(source.read_file(sib_remote))
+                except Exception:
+                    continue
+            marker.write_text(marker_val)
+            return tune_out
+
+        tune = await loop.run_in_executor(None, _work)
+        if tune is not None:
+            _register_adlib_extract(track_id, out_dir)
+            try:
+                await asyncio.to_thread(_zip_evict_until_under_budget)
+            except Exception:
+                log.exception("AdLib loose-extract eviction failed")
+        return tune
+
+
+async def _probe_one_adlib_duration(track_id: str) -> float | None:
+    """Render an AdLib/id-IMF tune once, JUST to learn its length, persist it,
+    and return it — the WAV is thrown away (a probe, not a play, so it never
+    pollutes the conversion cache with multi-MB renders).  Returns None for
+    non-AdLib tracks, already-known durations, or render failures (e.g. a
+    missing companion bank → 422, which just leaves the placeholder in place).
+    """
+    track = await get_track(track_id)
+    if track is None:
+        return None
+    path_str = getattr(track, "path", "") or ""
+    ext = Path(path_str.split("::")[-1]).suffix.lower()
+    if ext not in _ADLIB_EXTS and ext != ".imf":
+        return None
+    from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+    meta = track.__dict__ if hasattr(track, "__dict__") else {}
+    stored = float(meta.get("duration") or 0)
+    if stored > 0 and abs(stored - float(_ADLIB_DEFAULT_DURATION)) > 0.01:
+        return stored  # already a real duration — nothing to probe
+    local = await _resolve_adlib_local_path(track_id, path_str)
+    if local is None:
+        return None
+    wav = None
+    try:
+        wav = await (_render_imf(local) if ext == ".imf" else _render_adlib(local))
+        return await _backfill_adlib_duration(track_id, track, wav)
+    except HTTPException:
+        return None      # undecodable / missing bank — leave the placeholder
+    except Exception:
+        return None
+    finally:
+        if wav is not None:
+            try:
+                Path(wav).unlink()
+            except OSError:
+                pass
 
 
 # ── MIDI rendering ────────────────────────────────────────────────────────────
@@ -942,9 +1176,8 @@ def _zip_unpin(track_id: str) -> None:
             pending = _zip_pending_purge.pop(track_id, None)
         else:
             _zip_pin_refs[track_id] = cur - 1
-    if pending:                              # unlink outside the lock
-        try: Path(pending).unlink(missing_ok=True)
-        except OSError: pass
+    if pending:                              # remove outside the lock (file or dir)
+        _zip_drop_path(pending)
 
 
 def _zip_evict_until_under_budget() -> None:
@@ -981,9 +1214,46 @@ def _zip_evict_until_under_budget() -> None:
                 continue
             if path_to_drop:
                 to_unlink.append(path_to_drop)
-    for p in to_unlink:                      # unlink outside the lock
-        try: Path(p).unlink(missing_ok=True)
-        except OSError: pass
+    for p in to_unlink:                      # remove outside the lock (file or dir)
+        _zip_drop_path(p)
+
+
+def _zip_drop_path(p: str) -> None:
+    """Remove a cache entry's on-disk artifact — a flat extracted FILE or an
+    AdLib ``.adlib`` companion DIRECTORY (tune + bank).  Silent, best-effort;
+    the plain ``unlink`` the budget paths used before would raise on a dir."""
+    import shutil
+    try:
+        path = Path(p)
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _register_adlib_extract(track_id: str, out_dir: Path) -> None:
+    """Account a materialized ``.adlib`` directory (tune + companion bank) in the
+    SAME LRU byte budget as flat extracts, so it's bounded + LRU-evictable
+    instead of accumulating until restart.  Idempotent: replaces any prior entry
+    for this track_id (the dir is rewritten in place on a fresh materialization).
+    """
+    global _ZIP_EXTRACT_TOTAL_BYTES
+    try:
+        size = sum(f.stat().st_size for f in out_dir.iterdir() if f.is_file())
+    except OSError:
+        size = 0
+    with _zip_state_lock:
+        prev = _ZIP_EXTRACT_CACHE.get(track_id)
+        if prev:
+            _ZIP_EXTRACT_TOTAL_BYTES = max(0, _ZIP_EXTRACT_TOTAL_BYTES - prev.get("size", 0))
+        _ZIP_EXTRACT_CACHE[track_id] = {
+            "path": str(out_dir),
+            "extracted_at": time.time(),
+            "size": size,
+        }
+        _ZIP_EXTRACT_TOTAL_BYTES += size
 
 
 async def clear_zip_extract_cache() -> dict:
@@ -999,11 +1269,13 @@ async def clear_zip_extract_cache() -> dict:
     Returns ``{"cleared", "deferred", "path"}`` (+ ``"failed"`` /
     ``"failed_samples"`` when some files resisted removal).
     """
+    import shutil
     global _ZIP_EXTRACT_TOTAL_BYTES
     cleared = 0
     deferred = 0
     errors: list[str] = []
     to_unlink: list[str] = []
+    extract_dir = _zip_extract_dir()
 
     # 1. Drain the in-memory index under _zip_state_lock (atomic vs the
     #    worker-thread evictor).  Collect non-pinned files to unlink after the
@@ -1026,10 +1298,19 @@ async def clear_zip_extract_cache() -> dict:
                 to_unlink.append(path_to_drop)
         _ZIP_EXTRACT_TOTAL_BYTES = 0
         protected = set(_zip_pending_purge.values())
+        # Also protect the .adlib dir of any track currently pinned (mid-render),
+        # even if it isn't a registered/deferred cache entry — so a clear can't
+        # rmtree a companion bank out from under an in-flight adplay render.
+        for tid in list(_zip_pin_refs):
+            protected.add(str(extract_dir / f"{tid}.adlib"))
 
     for p in to_unlink:
         try:
-            Path(p).unlink(missing_ok=True)
+            pp = Path(p)
+            if pp.is_dir():                  # an AdLib .adlib companion dir
+                shutil.rmtree(pp)
+            else:
+                pp.unlink(missing_ok=True)
             cleared += 1
         except OSError as exc:
             errors.append(f"{Path(p).name}: {exc.strerror or 'error'}")
@@ -1037,13 +1318,19 @@ async def clear_zip_extract_cache() -> dict:
     # 2. Sweep any orphan files left on disk (entries already evicted from the
     #    index, partial extracts, …) — but never touch a file an active stream
     #    still owns (pinned → in `protected`).
-    extract_dir = _zip_extract_dir()
     try:
         for de in os.scandir(extract_dir):
-            if not de.is_file(follow_symlinks=False) or de.path in protected:
+            if de.path in protected:
                 continue
             try:
-                os.unlink(de.path)
+                # AdLib companion materialization makes a "<track_id>.adlib" DIRECTORY (the
+                # tune + its bank/patch); everything else is a flat file.
+                if de.is_dir(follow_symlinks=False):
+                    shutil.rmtree(de.path, ignore_errors=True)
+                elif de.is_file(follow_symlinks=False):
+                    os.unlink(de.path)
+                else:
+                    continue
                 cleared += 1
             except OSError as exc:
                 errors.append(f"{de.name}: {exc.strerror or 'error'}")
@@ -1083,11 +1370,144 @@ async def reap_orphan_zip_extracts() -> int:
             track = None
         if track is None:
             try:
-                child.unlink()
+                if child.is_dir():           # AdLib "<track_id>.adlib" extract dir
+                    import shutil
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
                 removed += 1
             except OSError:
                 pass
     return removed
+
+
+# AdLib / OPL2 formats whose AdPlug player needs companion instrument-bank /
+# patch files in the SAME directory as the tune.  Map: extension -> filename
+# globs (case-insensitive) to materialize alongside it.  Confirmed empirically
+# against adplay (AdPlug) 1.9 — without these, adplay exits 0 but writes a
+# silent, header-only WAV.  Every other AdLib format AdPlug handles is
+# self-contained (.laa/.d00/.cmf/.rad/.hsc/.a2m/.bam/.dro/.rix/...).
+_ADLIB_COMPANION_GLOBS = {
+    ".sci": ("*patch.003",),   # Sierra On-Line  (kq1patch.003, icepatch.003, ...)
+    ".rol": ("*.bnk",),        # AdLib Visual Composer  (standard.bnk)
+    ".ksm": ("insts.dat",),    # Ken Silverman's Music Format
+}
+
+
+def _adlib_companion_names(path_str: str, member_dir: str, globs) -> list[str]:
+    """Member names (as stored, ready to read back) in ``member_dir`` of the
+    INNERMOST archive on ``path_str`` matching any of ``globs`` — the bank/patch
+    siblings an AdLib tune needs beside it.
+
+    Names are pulled from the SAME reader the extractor reads them back with —
+    ``archive.list_members`` for a single-level local archive (handles ZIP *and*
+    LHA/LZH), the inner zip's own namelist when nested — so the returned name
+    always resolves via ``_read_from_zip_path``, even for DOS backslash
+    separators or an LHA container.  Matching is on a slash-normalised copy; the
+    ORIGINAL stored name is returned.
+    """
+    import fnmatch
+    import io
+    import os as _os
+    import zipfile
+    found: list[str] = []
+    parts = path_str.split("::")
+    if len(parts) < 2:
+        return found
+    try:
+        if len(parts) == 2:
+            # Single-level local archive — format-aware (ZIP + LHA/LZH).  Use the
+            # UNFILTERED namelist (list_members drops non-playable banks); the
+            # names it yields round-trip back through archive.read_member.
+            from soniqboom.core import archive as _archive
+            names = _archive.raw_namelist(parts[0])
+        else:
+            # Nested: read the innermost archive's bytes with the same walker the
+            # extractor uses, then list it (inner archives are zips in practice).
+            from soniqboom.core.scanner import _read_from_zip_path
+            inner_bytes, _ = _read_from_zip_path("::".join(parts[:-1]))
+            with zipfile.ZipFile(io.BytesIO(inner_bytes)) as zf:
+                names = zf.namelist()
+        for n in names:
+            norm = n.replace("\\", "/")        # match on a normalised copy …
+            if _os.path.dirname(norm) != member_dir:
+                continue
+            base = _os.path.basename(norm)
+            if any(fnmatch.fnmatch(base.lower(), g.lower()) for g in globs):
+                if n not in found:
+                    found.append(n)            # … but return the ORIGINAL name
+    except Exception:
+        pass
+    return found
+
+
+async def _extract_adlib_with_companions(
+    path_str: str, track_id: str, outer_zip: Path, globs,
+) -> Path | None:
+    """Materialize an AdLib tune that needs companion bank/patch files so adplay
+    can decode it (Sierra ``.sci`` -> ``patch.003``, ROL ``.bnk``, KSM
+    ``insts.dat``).  The generic extractor pulls the tune out alone under a
+    track-id name, so AdPlug can't find its bank and silently writes a
+    header-only WAV.  Here we drop the tune (under its ORIGINAL name) plus every
+    matching companion into a per-track directory.  Idempotent; re-extracts if
+    the archive changed.
+    """
+    import os as _os
+    from soniqboom.core.scanner import _read_from_zip_path
+    parts = path_str.split("::")
+    member = parts[-1].replace("\\", "/")          # DOS-era zips can use backslashes
+    music_base = _os.path.basename(member)
+    member_dir = _os.path.dirname(member)
+    out_dir = _zip_extract_dir() / f"{track_id}.adlib"
+    music_out = out_dir / music_base
+    try:
+        zip_mtime = str(outer_zip.stat().st_mtime)
+    except OSError:
+        return None
+    lock = await _zip_lock_for(track_id)
+    async with lock:
+        marker = out_dir / ".zip_mtime"
+        if music_out.exists() and marker.exists() and marker.read_text() == zip_mtime:
+            # Cache hit — re-account (post-restart the in-memory budget is empty
+            # though the dir persists) + bump LRU recency, mirroring the flat path.
+            _register_adlib_extract(track_id, out_dir)
+            return music_out
+
+        def _extract() -> Path | None:
+            import shutil
+            if out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                music_bytes, _ = _read_from_zip_path(path_str)
+            except Exception:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None
+            music_out.write_bytes(music_bytes)
+            # Drop EVERY matching companion beside the tune so adplay finds the
+            # exact bank/patch name AdPlug derives (names vary per format/title).
+            # ``comp_member`` is the FULL stored name (incl. dir + native
+            # separators), so it reads back across DOS-backslash / LHA archives;
+            # the on-disk filename is its clean basename.
+            for comp_member in _adlib_companion_names(path_str, member_dir, globs):
+                comp_vpath = "::".join(parts[:-1] + [comp_member])
+                try:
+                    comp_bytes, _ = _read_from_zip_path(comp_vpath)
+                except Exception:
+                    continue
+                out_name = _os.path.basename(comp_member.replace("\\", "/"))
+                (out_dir / out_name).write_bytes(comp_bytes)
+            marker.write_text(zip_mtime)
+            return music_out
+
+        music = await asyncio.get_running_loop().run_in_executor(None, _extract)
+        if music is not None:
+            _register_adlib_extract(track_id, out_dir)
+            try:
+                await asyncio.to_thread(_zip_evict_until_under_budget)
+            except Exception:
+                log.exception("AdLib companion-extract eviction failed")
+        return music
 
 
 async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | None:
@@ -1102,6 +1522,14 @@ async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | Non
     outer_zip = Path(parts[0])
     if not outer_zip.exists():
         return None
+    # Some AdLib formats (Sierra .sci, ROL .bnk, KSM insts.dat) need a companion
+    # instrument-bank/patch file in the same dir, which the flat per-track
+    # extraction below can't provide — route them to the dedicated materializer.
+    _adlib_ext = Path(parts[-1]).suffix.lower()
+    if _adlib_ext in _ADLIB_COMPANION_GLOBS:
+        return await _extract_adlib_with_companions(
+            path_str, track_id, outer_zip, _ADLIB_COMPANION_GLOBS[_adlib_ext],
+        )
     try:
         zip_mtime = outer_zip.stat().st_mtime
     except OSError:
@@ -1841,6 +2269,36 @@ async def _get_or_start_inflight_wav(
         raise
 
 
+def _compose_backgrounds(*tasks) -> BackgroundTask | None:
+    """Combine several Starlette ``BackgroundTask`` objects (None-safe) into one
+    runnable that AWAITS each.
+
+    Needed because ``BackgroundTask.__call__`` is a coroutine — calling it
+    synchronously (e.g. the old ``prior_task()``) only creates an un-awaited
+    coroutine, so the wrapped func never runs.  Returns the single task when
+    there's only one, a wrapper ``BackgroundTask`` that awaits each (isolated, so
+    one failing doesn't strand the rest) for several, or ``None`` when empty.
+    """
+    present = [t for t in tasks if t is not None]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+
+    # Run each task isolated: starlette's BackgroundTasks has NO per-task
+    # try/except, so a raise in one would strand the rest (e.g. the inflight
+    # unpin failing would skip the zip-pin cleanup).  Awaiting each under its own
+    # guard makes exactly-once cleanup independent of order or raise-safety.
+    async def _run_all():
+        for t in present:
+            try:
+                await t()
+            except Exception:
+                log.debug("composed background task failed", exc_info=True)
+
+    return BackgroundTask(_run_all)
+
+
 async def _serve_inflight_wav(
     request: Request,
     track,
@@ -1879,12 +2337,11 @@ async def _serve_inflight_wav(
                 _unpin(cache_key)
             except Exception:
                 pass
-            if prior_task is not None:
-                try:
-                    prior_task()
-                except Exception:
-                    pass
-        return BackgroundTask(_do_unpin)
+        # Compose the inflight-cache unpin AND the caller's zip-extract cleanup
+        # (``prior_task``, e.g. the zip-pin _bg) so BOTH run, awaited, on response
+        # close.  The old ``prior_task()`` ran a BackgroundTask synchronously,
+        # which only made an un-awaited coroutine — so the zip pin leaked.
+        return _compose_backgrounds(BackgroundTask(_do_unpin), prior_task)
 
     cached_path = await get_cached(cache_key)
     if cached_path is not None:
@@ -1961,6 +2418,7 @@ async def _serve_inflight_wav(
             data_event=inflight.get("data_event"),
             inflight=inflight,
             unpin_key=cache_key,
+            background_task=background_task,
         )
     return await _growing_file_range_response(
         request,
@@ -1972,6 +2430,7 @@ async def _serve_inflight_wav(
         data_event=inflight.get("data_event"),
         inflight=inflight,
         unpin_key=cache_key,
+        background_task=background_task,
     )
 
 
@@ -1985,6 +2444,7 @@ async def _chunked_growing_file_response(
     data_event: asyncio.Event | None = None,
     inflight: dict | None = None,
     unpin_key: str | None = None,
+    background_task=None,
 ) -> Response:
     """Serve a growing inflight WAV via chunked transfer-encoding.
 
@@ -2122,6 +2582,9 @@ async def _chunked_growing_file_response(
         status_code=200,
         media_type=media_type,
         headers=extra,
+        # The inflight-cache unpin runs in _stream_pcm's finally (_release_pin_once);
+        # this releases the caller's zip-extract pin when the response closes.
+        background=background_task,
     )
 
 
@@ -2135,6 +2598,7 @@ async def _growing_file_range_response(
     data_event: asyncio.Event | None = None,
     inflight: dict | None = None,
     unpin_key: str | None = None,
+    background_task=None,
 ) -> Response:
     """Serve a file that's still being written.
 
@@ -2308,7 +2772,9 @@ async def _growing_file_range_response(
         status_code=status_code,
         media_type=media_type,
         headers=extra,
-        background=bg,
+        # Run BOTH the inflight-cache unpin and the caller's zip-extract cleanup
+        # (background_task) when the response closes — each awaited + isolated.
+        background=_compose_backgrounds(bg, background_task),
     )
 
 
@@ -2904,6 +3370,22 @@ def _prewarm_key(track_id: str, fmt: str, subsong: int = 0) -> str:
 async def _do_prewarm(
     track_id: str, file_path: Path, ext: str, subsong: int,
 ) -> None:
+    """Background-render one track under the low-priority prewarm gate.
+
+    ``_bg_render_sem`` caps ALL background renders (this prewarm + the AdLib
+    probe batch) at ``_RENDER_SLOTS - 1`` in aggregate and is held across the
+    inner render (which itself acquires ``_render_sem``), so a speculative
+    render never starves the foreground stream path of its reserved slot.  A
+    FIFO-cap cancellation that fires while we're still waiting on the gate
+    raises ``CancelledError`` straight out of the ``async with`` — the inner
+    render never starts."""
+    async with _bg_render_sem:
+        await _do_prewarm_render(track_id, file_path, ext, subsong)
+
+
+async def _do_prewarm_render(
+    track_id: str, file_path: Path, ext: str, subsong: int,
+) -> None:
     """Run the format-appropriate cached render for one track in the
     background.  Mirrors the routing in ``stream_track`` so the cache key
     matches exactly what playback will request later."""
@@ -3095,6 +3577,41 @@ async def prewarm(
             log.debug("Prewarm cap reached — cancelled %s", evict_key)
 
     return {"status": "queued", "key": key, "in_flight": len(_prewarm_tasks)}
+
+
+@router.post("/probe-durations")
+async def probe_durations(
+    payload: dict = Body(...),
+    sb_session: str | None = Cookie(default=None),
+    request: Request = None,
+):
+    """Fill in real lengths for AdLib/id-IMF tracks shown in the UI that still
+    carry the 180s placeholder, WITHOUT the user having to play them.
+
+    The library calls this in the background for the AdLib rows currently on
+    screen (any view — folder, search, smart, galaxy).  Each tune is rendered
+    once (throwaway) to learn its length, which is persisted; the real seconds
+    are returned as ``{track_id: seconds}`` so the client patches the rows in
+    place.  Concurrency-limited so a big result set can't spike CPU, and naturally
+    one-time (a probed/played track is no longer a placeholder, so it's skipped).
+    """
+    _require_stream_auth(request, sb_session, None, None)
+    ids = payload.get("track_ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list):
+        return {}
+    ids = [str(x) for x in ids][:200]          # cap the batch
+    # Share the single low-priority background gate with web prewarm so probes
+    # + prewarms in AGGREGATE never occupy the render slot reserved for a live
+    # play (``_bg_render_sem`` = _RENDER_SLOTS-1; foreground never acquires it).
+    async def _one(tid: str):
+        async with _bg_render_sem:
+            try:
+                return tid, await _probe_one_adlib_duration(tid)
+            except Exception:
+                return tid, None
+
+    out = await asyncio.gather(*[_one(t) for t in ids])
+    return {tid: dur for tid, dur in out if dur and dur > 0}
 
 
 async def _ingest_on_demand(track_id: str, file_path: str):
@@ -3514,6 +4031,28 @@ async def stream_track(
 
     ext = Path(path_str.split('::')[-1] if '::' in path_str else path_str).suffix.lower()
 
+    # Loose (non-zip) AdLib tunes on a remote share need their companion bank
+    # materialized in the same dir; the per-file fetch above split them apart.
+    # Re-point ``path`` to a dir holding tune + bank (no-op if no bank sibling).
+    if (path_str.startswith(("smb://", "ftp://")) and "::" not in path_str
+            and ext in _ADLIB_COMPANION_GLOBS):
+        try:
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            _sr, _rp = parse_remote_path(path_str)
+            _src = get_source(_sr)
+            if _src is not None:
+                _mat = await _materialize_loose_remote_adlib(
+                    track_id, _sr, _rp, _src, _ADLIB_COMPANION_GLOBS[ext],
+                )
+                if _mat is not None:
+                    path = _mat
+                    # Pin so a concurrent clear/eviction can't rmtree the bank
+                    # mid-render (mirrors the zip-member play paths).
+                    _zip_pin(track_id)
+                    _zip_track_id_for_unpin = track_id
+        except Exception as exc:
+            log.info("Loose AdLib companion materialize failed for %s: %s", path_str, exc)
+
     def _cleanup_tmp():
         if _zip_tmp is not None:
             _zip_tmp.unlink(missing_ok=True)
@@ -3530,295 +4069,315 @@ async def stream_track(
     # could never evict.
     _bg = BackgroundTask(_cleanup_tmp) if (_zip_tmp or _zip_track_id_for_unpin) else None
 
-    # ── Rendered formats: SID / MIDI / Tracker ───────────────────────────────
-    # These are cached as WAV files so repeat playback is instant.
-    # On cache miss, the renderer runs and the result is stored for next time.
-    from soniqboom.core.conversion_cache import get_or_render
+    # Release the pin/temp on ANY failure path: if a renderer raises
+    # (422 missing-bank, 501/502/504, or asyncio.CancelledError) before a
+    # response carrying background=_bg is built, _bg never runs — so without
+    # this the zip-member / .adlib extract pin would leak permanently and the
+    # extract could never evict or be cleared.  The success path is untouched:
+    # each branch returns a response with background=_bg, so the pin is held
+    # for the whole stream and unpinned by _bg AFTER it finishes (never early).
+    try:
 
-    if ext in _SID_EXTS:
-        from soniqboom.core.conversion_cache import (
-            _cache_key, find_shorter_sid_entry,
-            start_background_render, get_cached,
-        )
-        # Prefer per-track HVSC duration over the global default.  The
-        # track record may carry ``hvsc_lengths`` (a list of per-subsong
-        # durations) and/or a ``duration`` value already patched by the
-        # HVSC rescan endpoint.  Fall back to the safety-cap default.
-        target_dur = settings.sid_default_duration
-        meta = track.__dict__ if hasattr(track, "__dict__") else {}
-        hvsc_lengths = meta.get("hvsc_lengths") or []
-        if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
-            target_dur = int(round(float(hvsc_lengths[subsong])))
-        elif meta.get("duration") and float(meta["duration"]) > 0:
-            target_dur = int(round(float(meta["duration"])))
-        # Clamp: extremely short or zero durations would produce empty
-        # WAVs; cap to a minimum of 5s so we never feed sidplayfp -t0.
-        target_dur = max(5, target_dur)
+        # ── Rendered formats: SID / MIDI / Tracker ───────────────────────────────
+        # These are cached as WAV files so repeat playback is instant.
+        # On cache miss, the renderer runs and the result is stored for next time.
+        from soniqboom.core.conversion_cache import get_or_render
 
-        full_key = _cache_key(track_id, "sid", subsong, duration=target_dur)
+        if ext in _SID_EXTS:
+            from soniqboom.core.conversion_cache import (
+                _cache_key, find_shorter_sid_entry,
+                start_background_render, get_cached,
+            )
+            # Prefer per-track HVSC duration over the global default.  The
+            # track record may carry ``hvsc_lengths`` (a list of per-subsong
+            # durations) and/or a ``duration`` value already patched by the
+            # HVSC rescan endpoint.  Fall back to the safety-cap default.
+            target_dur = settings.sid_default_duration
+            meta = track.__dict__ if hasattr(track, "__dict__") else {}
+            hvsc_lengths = meta.get("hvsc_lengths") or []
+            if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
+                target_dur = int(round(float(hvsc_lengths[subsong])))
+            elif meta.get("duration") and float(meta["duration"]) > 0:
+                target_dur = int(round(float(meta["duration"])))
+            # Clamp: extremely short or zero durations would produce empty
+            # WAVs; cap to a minimum of 5s so we never feed sidplayfp -t0.
+            target_dur = max(5, target_dur)
 
-        # 1) Exact cache hit (correct duration)
-        exact = await get_cached(full_key)
-        if exact:
+            full_key = _cache_key(track_id, "sid", subsong, duration=target_dur)
+
+            # 1) Exact cache hit (correct duration)
+            exact = await get_cached(full_key)
+            if exact:
+                return await _range_file_response(
+                    request, exact, media_type="audio/wav",
+                    headers={"X-Rendered": "sidplayfp", "X-Cache": "hit",
+                             "X-SID-Target-Seconds": str(target_dur)},
+                    background=_bg,
+                )
+
+            # 2) Shorter version available — serve it now, render full in background
+            shorter = await find_shorter_sid_entry(track_id, subsong, target_dur)
+            if shorter:
+                short_path, short_dur = shorter
+                await start_background_render(
+                    full_key, "sid",
+                    lambda: _render_sid(path, subsong=subsong, duration=target_dur),
+                )
+                return await _range_file_response(
+                    request, short_path, media_type="audio/wav",
+                    headers={"X-Rendered": "sidplayfp", "X-Cache": "partial",
+                             "X-SID-Cached-Seconds": str(short_dur),
+                             "X-SID-Target-Seconds": str(target_dur)},
+                    background=_bg,
+                )
+
+            # 3) No cache at all — render synchronously
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="sid", subsong=subsong,
+                duration=target_dur,
+                render_fn=lambda: _render_sid(path, subsong=subsong, duration=target_dur),
+            )
             return await _range_file_response(
-                request, exact, media_type="audio/wav",
-                headers={"X-Rendered": "sidplayfp", "X-Cache": "hit",
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "sidplayfp", "X-Cache": "hit" if hit else "miss",
                          "X-SID-Target-Seconds": str(target_dur)},
                 background=_bg,
             )
-
-        # 2) Shorter version available — serve it now, render full in background
-        shorter = await find_shorter_sid_entry(track_id, subsong, target_dur)
-        if shorter:
-            short_path, short_dur = shorter
-            await start_background_render(
-                full_key, "sid",
-                lambda: _render_sid(path, subsong=subsong, duration=target_dur),
+        if ext in _MIDI_EXTS:
+            from soniqboom.config import get_active_soundfont
+            sf = get_active_soundfont()
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="midi", subsong=0,
+                render_fn=lambda: _render_midi(path),
+                soundfont_path=str(sf) if sf else "",
             )
             return await _range_file_response(
-                request, short_path, media_type="audio/wav",
-                headers={"X-Rendered": "sidplayfp", "X-Cache": "partial",
-                         "X-SID-Cached-Seconds": str(short_dur),
-                         "X-SID-Target-Seconds": str(target_dur)},
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "fluidsynth", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        # UADE goes BEFORE the tracker branch — both .ahx and .hvl are
+        # technically listed in _TRACKER_EXTS for scanner-side detection,
+        # but openmpt123 silently doesn't decode them.  Without this
+        # priority, every .ahx play would 501 from inside _render_tracker.
+        if ext in _HVL_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="hvl", subsong=subsong,
+                render_fn=lambda: _render_hvl(path, subsong=subsong),
+            )
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "hvl2wav", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _UADE_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="uade", subsong=subsong,
+                render_fn=lambda: _render_uade(path, subsong=subsong),
+            )
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        # .imf is overloaded (Imago Orpheus tracker vs id/Apogee AdLib IMF) —
+        # _render_imf disambiguates by content.  MUST come before _TRACKER_EXTS,
+        # which still lists .imf for scanner-side detection.
+        if ext == ".imf":
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="imf", subsong=subsong,
+                render_fn=lambda: _render_imf(path, subsong=subsong),
+            )
+            # id/Apogee AdLib IMF stores the same 180s placeholder and renders to
+            # natural end via _render_adlib, so backfill its real length too.  The
+            # placeholder gate no-ops for IM10 (Imago Orpheus) .imf, which already
+            # carries a real tracker duration.
+            await _backfill_adlib_duration(track_id, track, cached_path)
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "adplug/openmpt123", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _ADLIB_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="adlib", subsong=subsong,
+                render_fn=lambda: _render_adlib(path, subsong=subsong),
+            )
+            # The scanner stored a 180s placeholder; the WAV we just made/cached
+            # carries the real length — persist it so the list stops showing "3:00".
+            await _backfill_adlib_duration(track_id, track, cached_path)
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "adplug", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _TRACKER_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="tracker", subsong=subsong,
+                render_fn=lambda: _render_tracker(path, subsong=subsong),
+            )
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "openmpt123", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _GME_EXTS_STREAM:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="gme", subsong=subsong,
+                render_fn=lambda: _render_gme(path, subsong=subsong),
+            )
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "gme", "X-Cache": "hit" if hit else "miss"},
                 background=_bg,
             )
 
-        # 3) No cache at all — render synchronously
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="sid", subsong=subsong,
-            duration=target_dur,
-            render_fn=lambda: _render_sid(path, subsong=subsong, duration=target_dur),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "sidplayfp", "X-Cache": "hit" if hit else "miss",
-                     "X-SID-Target-Seconds": str(target_dur)},
-            background=_bg,
-        )
-    if ext in _MIDI_EXTS:
-        from soniqboom.config import get_active_soundfont
-        sf = get_active_soundfont()
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="midi", subsong=0,
-            render_fn=lambda: _render_midi(path),
-            soundfont_path=str(sf) if sf else "",
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "fluidsynth", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    # UADE goes BEFORE the tracker branch — both .ahx and .hvl are
-    # technically listed in _TRACKER_EXTS for scanner-side detection,
-    # but openmpt123 silently doesn't decode them.  Without this
-    # priority, every .ahx play would 501 from inside _render_tracker.
-    if ext in _HVL_EXTS:
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="hvl", subsong=subsong,
-            render_fn=lambda: _render_hvl(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "hvl2wav", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    if ext in _UADE_EXTS:
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="uade", subsong=subsong,
-            render_fn=lambda: _render_uade(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    # .imf is overloaded (Imago Orpheus tracker vs id/Apogee AdLib IMF) —
-    # _render_imf disambiguates by content.  MUST come before _TRACKER_EXTS,
-    # which still lists .imf for scanner-side detection.
-    if ext == ".imf":
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="imf", subsong=subsong,
-            render_fn=lambda: _render_imf(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "adplug/openmpt123", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    if ext in _ADLIB_EXTS:
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="adlib", subsong=subsong,
-            render_fn=lambda: _render_adlib(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "adplug", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    if ext in _TRACKER_EXTS:
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="tracker", subsong=subsong,
-            render_fn=lambda: _render_tracker(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "openmpt123", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-    if ext in _GME_EXTS_STREAM:
-        cached_path, hit = await get_or_render(
-            track_id=track_id, format_type="gme", subsong=subsong,
-            render_fn=lambda: _render_gme(path, subsong=subsong),
-        )
-        return await _range_file_response(
-            request, cached_path, media_type="audio/wav",
-            headers={"X-Rendered": "gme", "X-Cache": "hit" if hit else "miss"},
-            background=_bg,
-        )
-
-    # ── Native: serve directly with Range support ─────────────────────────────
-    # Skipped when:
-    #   • ``force_transcode=1`` is on the URL — the client's ``audio.error``
-    #     retry uses that to route the next attempt through ffmpeg, which
-    #     tolerates corrupt-frame LOST_SYNC and produces a cleanly-demuxable
-    #     WAV.  Healthy files still hit the fast path on the first attempt;
-    #     only failing playbacks pay the transcode cost.
-    #   • The client asked for a different codec via Subsonic's ``?format=``
-    #     param (Amperfy/iOS always asks for ``format=mp3``, because iOS
-    #     can decode MP3 from any AVPlayer URL; FLAC requires the file to
-    #     either be served via the proper extension or routed through a
-    #     framework component that's not always available on background
-    #     threads).  Before this fan-out we'd hand Amperfy raw FLAC bytes
-    #     labelled ``audio/flac`` regardless of its ``format=mp3`` request
-    #     — Amperfy treated the resulting unintelligible stream as a
-    #     zero-duration track and auto-advanced through the entire queue.
-    #     Honour the explicit format hint and re-route through the
-    #     transcoder for files whose source extension doesn't match.
-    _src_codec = ext.lstrip(".")  # 'flac' / 'mp3' / 'wav' / 'ogg' / 'opus'
-    _format_mismatch = bool(
-        target_format
-        and target_format.lower() in TRANSCODE_MIME
-        and target_format.lower() != _src_codec
-    )
-    if ext in NATIVE and not force_transcode and not _format_mismatch:
-        return await _range_file_response(
-            request, path, media_type=NATIVE[ext],
-            background=_bg,
-        )
-
-    # ── .m4a / .aac / .mp4 / .m4b / .m4r / .3gp: probe codec first ───────────
-    # AAC in any MP4-family container → browsers can play it natively (serve
-    # directly).  ALAC in .m4a/.mp4 → must transcode (Chrome/Firefox cannot
-    # decode ALAC).  Probe result is reused in the transcode header to avoid
-    # a second call.
-    #
-    # The container list was historically just (.m4a, .aac).  Real-world
-    # libraries include .mp4 (Apple Books / podcasts), .m4b (audiobooks
-    # specifically), .m4r (ringtones — surprisingly common in scraped
-    # archives) and .3gp (mobile-origin recordings).  Treating these the
-    # same as .m4a means an AAC-encoded audiobook plays without the
-    # cold-start transcode penalty.
-    detected_codec: str | None = None
-    if ext in (".m4a", ".aac", ".mp4", ".m4b", ".m4r", ".3gp"):
-        detected_codec = await _probe_codec(path)
-        # Same format-mismatch guard as the NATIVE branch above — when a
-        # Subsonic client (Amperfy, DSub, Symfonium) asks for ``format=mp3``
-        # we must transcode, not serve raw AAC labelled as audio/mp4.
-        _aac_mismatch = bool(
+        # ── Native: serve directly with Range support ─────────────────────────────
+        # Skipped when:
+        #   • ``force_transcode=1`` is on the URL — the client's ``audio.error``
+        #     retry uses that to route the next attempt through ffmpeg, which
+        #     tolerates corrupt-frame LOST_SYNC and produces a cleanly-demuxable
+        #     WAV.  Healthy files still hit the fast path on the first attempt;
+        #     only failing playbacks pay the transcode cost.
+        #   • The client asked for a different codec via Subsonic's ``?format=``
+        #     param (Amperfy/iOS always asks for ``format=mp3``, because iOS
+        #     can decode MP3 from any AVPlayer URL; FLAC requires the file to
+        #     either be served via the proper extension or routed through a
+        #     framework component that's not always available on background
+        #     threads).  Before this fan-out we'd hand Amperfy raw FLAC bytes
+        #     labelled ``audio/flac`` regardless of its ``format=mp3`` request
+        #     — Amperfy treated the resulting unintelligible stream as a
+        #     zero-duration track and auto-advanced through the entire queue.
+        #     Honour the explicit format hint and re-route through the
+        #     transcoder for files whose source extension doesn't match.
+        _src_codec = ext.lstrip(".")  # 'flac' / 'mp3' / 'wav' / 'ogg' / 'opus'
+        _format_mismatch = bool(
             target_format
             and target_format.lower() in TRANSCODE_MIME
-            and target_format.lower() not in ("aac", "m4a")
+            and target_format.lower() != _src_codec
         )
-        if detected_codec == "aac" and not _aac_mismatch:
+        if ext in NATIVE and not force_transcode and not _format_mismatch:
             return await _range_file_response(
-                request, path, media_type="audio/mp4",
+                request, path, media_type=NATIVE[ext],
                 background=_bg,
             )
-        # Safari decodes ALAC natively; transcoding to FLAC would break it,
-        # since Safari doesn't support raw audio/flac in <audio>.  Also
-        # honour an explicit ``format=`` mismatch here so a client asking
-        # for FLAC/MP3 from ALAC actually gets the requested codec.
-        if detected_codec == "alac" and _is_safari(request) and not _aac_mismatch:
-            return await _range_file_response(
-                request, path, media_type="audio/mp4",
-                background=_bg,
+
+        # ── .m4a / .aac / .mp4 / .m4b / .m4r / .3gp: probe codec first ───────────
+        # AAC in any MP4-family container → browsers can play it natively (serve
+        # directly).  ALAC in .m4a/.mp4 → must transcode (Chrome/Firefox cannot
+        # decode ALAC).  Probe result is reused in the transcode header to avoid
+        # a second call.
+        #
+        # The container list was historically just (.m4a, .aac).  Real-world
+        # libraries include .mp4 (Apple Books / podcasts), .m4b (audiobooks
+        # specifically), .m4r (ringtones — surprisingly common in scraped
+        # archives) and .3gp (mobile-origin recordings).  Treating these the
+        # same as .m4a means an AAC-encoded audiobook plays without the
+        # cold-start transcode penalty.
+        detected_codec: str | None = None
+        if ext in (".m4a", ".aac", ".mp4", ".m4b", ".m4r", ".3gp"):
+            detected_codec = await _probe_codec(path)
+            # Same format-mismatch guard as the NATIVE branch above — when a
+            # Subsonic client (Amperfy, DSub, Symfonium) asks for ``format=mp3``
+            # we must transcode, not serve raw AAC labelled as audio/mp4.
+            _aac_mismatch = bool(
+                target_format
+                and target_format.lower() in TRANSCODE_MIME
+                and target_format.lower() not in ("aac", "m4a")
             )
-        # ALAC on non-Safari, or unknown → fall through to transcode
+            if detected_codec == "aac" and not _aac_mismatch:
+                return await _range_file_response(
+                    request, path, media_type="audio/mp4",
+                    background=_bg,
+                )
+            # Safari decodes ALAC natively; transcoding to FLAC would break it,
+            # since Safari doesn't support raw audio/flac in <audio>.  Also
+            # honour an explicit ``format=`` mismatch here so a client asking
+            # for FLAC/MP3 from ALAC actually gets the requested codec.
+            if detected_codec == "alac" and _is_safari(request) and not _aac_mismatch:
+                return await _range_file_response(
+                    request, path, media_type="audio/mp4",
+                    background=_bg,
+                )
+            # ALAC on non-Safari, or unknown → fall through to transcode
 
-    # Honour per-request transcode overrides from the OpenSubsonic transcoding
-    # extension (or any caller appending ?format=&maxBitRate=&sampleRate=).
-    # Empty / 0 falls back to the server-configured defaults, preserving
-    # backward compatibility with old clients that never sent these.
-    eff_codec = (target_format or settings.transcode_format).lower()
-    if eff_codec not in TRANSCODE_MIME:
-        eff_codec = settings.transcode_format
-    eff_mime = TRANSCODE_MIME.get(eff_codec, "audio/flac")
+        # Honour per-request transcode overrides from the OpenSubsonic transcoding
+        # extension (or any caller appending ?format=&maxBitRate=&sampleRate=).
+        # Empty / 0 falls back to the server-configured defaults, preserving
+        # backward compatibility with old clients that never sent these.
+        eff_codec = (target_format or settings.transcode_format).lower()
+        if eff_codec not in TRANSCODE_MIME:
+            eff_codec = settings.transcode_format
+        eff_mime = TRANSCODE_MIME.get(eff_codec, "audio/flac")
 
-    # ── Adaptive cold start (PERC-8) ─────────────────────────────────────────
-    # Three states, in priority order:
-    #
-    #   1. Final cache hit  → serve the WAV from disk with Range.  ZERO
-    #                          penalty, sub-50 ms first byte.
-    #   2. In-flight render → attach to the growing WAV file already being
-    #                          written by an earlier subscriber.  Headers
-    #                          carry the FINAL Content-Length so the audio
-    #                          element computes the correct duration and
-    #                          seeks against any byte ≤ rendered-position.
-    #                          Seeks beyond block briefly until ffmpeg
-    #                          catches up — typical wait is < 1 s because
-    #                          the render runs ~5–10× realtime.
-    #   3. Cold start       → pre-write a 44-byte WAV header to the cache
-    #                          file, spawn ffmpeg writing raw PCM, then
-    #                          serve as state 2.  Audio starts as soon as
-    #                          the first ~64 KB of PCM is on disk
-    #                          (typically < 300 ms).
-    #
-    # Net effect: from the user's perspective the track plays "instantly"
-    # whether it's cached or not.  The ~30 s wait that used to gate
-    # cold DSD plays is gone.
+        # ── Adaptive cold start (PERC-8) ─────────────────────────────────────────
+        # Three states, in priority order:
+        #
+        #   1. Final cache hit  → serve the WAV from disk with Range.  ZERO
+        #                          penalty, sub-50 ms first byte.
+        #   2. In-flight render → attach to the growing WAV file already being
+        #                          written by an earlier subscriber.  Headers
+        #                          carry the FINAL Content-Length so the audio
+        #                          element computes the correct duration and
+        #                          seeks against any byte ≤ rendered-position.
+        #                          Seeks beyond block briefly until ffmpeg
+        #                          catches up — typical wait is < 1 s because
+        #                          the render runs ~5–10× realtime.
+        #   3. Cold start       → pre-write a 44-byte WAV header to the cache
+        #                          file, spawn ffmpeg writing raw PCM, then
+        #                          serve as state 2.  Audio starts as soon as
+        #                          the first ~64 KB of PCM is on disk
+        #                          (typically < 300 ms).
+        #
+        # Net effect: from the user's perspective the track plays "instantly"
+        # whether it's cached or not.  The ~30 s wait that used to gate
+        # cold DSD plays is gone.
 
-    # Subsonic-style transcode hints can ask for a non-WAV codec.  When
-    # they do, fall back to the legacy block-then-serve path because the
-    # in-flight protocol only knows how to serve WAV (the only format
-    # whose total byte count is computable up front without encoding).
-    # In practice this branch fires only for Subsonic clients with the
-    # transcodeOffload extension, ~5 % of plays.
-    use_inflight = (target_format is None or target_format.lower() == "wav")
+        # Subsonic-style transcode hints can ask for a non-WAV codec.  When
+        # they do, fall back to the legacy block-then-serve path because the
+        # in-flight protocol only knows how to serve WAV (the only format
+        # whose total byte count is computable up front without encoding).
+        # In practice this branch fires only for Subsonic clients with the
+        # transcodeOffload extension, ~5 % of plays.
+        use_inflight = (target_format is None or target_format.lower() == "wav")
 
-    if ext in _DSD_EXTS:
-        # Client may downshift the DSD output rate (e.g. mobile asking
-        # for 48 kHz).  Clamp to the DSD ceiling so we never *upsample*
-        # past the native 96 kHz default.
-        eff_rate = min(target_sample_rate or _DSD_OUTPUT_RATE, _DSD_OUTPUT_RATE)
-        target_channels_hint = 2
-        original_codec = "dsd"
-    else:
-        eff_rate = target_sample_rate or None
-        target_channels_hint = None
-        original_codec = detected_codec or ext.lstrip(".") or "unknown"
+        if ext in _DSD_EXTS:
+            # Client may downshift the DSD output rate (e.g. mobile asking
+            # for 48 kHz).  Clamp to the DSD ceiling so we never *upsample*
+            # past the native 96 kHz default.
+            eff_rate = min(target_sample_rate or _DSD_OUTPUT_RATE, _DSD_OUTPUT_RATE)
+            target_channels_hint = 2
+            original_codec = "dsd"
+        else:
+            eff_rate = target_sample_rate or None
+            target_channels_hint = None
+            original_codec = detected_codec or ext.lstrip(".") or "unknown"
 
-    if use_inflight:
-        return await _serve_inflight_wav(
-            request, track, path, track_id, eff_rate,
-            target_channels_hint, original_codec, _bg,
+        if use_inflight:
+            return await _serve_inflight_wav(
+                request, track, path, track_id, eff_rate,
+                target_channels_hint, original_codec, _bg,
+            )
+
+        # Subsonic transcodeOffload path — keep the legacy block-then-serve
+        # for non-WAV codecs.  Old behaviour, no in-flight handling.
+        cached_path, hit = await get_or_render(
+            track_id=track_id, format_type="transcoded", subsong=0,
+            codec=eff_codec, target_rate=eff_rate,
+            render_fn=lambda: _render_to_transcoded_flac(
+                path, target_rate=eff_rate, codec=eff_codec,
+                bitrate_kbps=max_bitrate_kbps or None,
+                progress_key=track_id,
+                source_duration=float(getattr(track, "duration", 0) or 0) or None,
+            ),
         )
-
-    # Subsonic transcodeOffload path — keep the legacy block-then-serve
-    # for non-WAV codecs.  Old behaviour, no in-flight handling.
-    cached_path, hit = await get_or_render(
-        track_id=track_id, format_type="transcoded", subsong=0,
-        codec=eff_codec, target_rate=eff_rate,
-        render_fn=lambda: _render_to_transcoded_flac(
-            path, target_rate=eff_rate, codec=eff_codec,
-            bitrate_kbps=max_bitrate_kbps or None,
-            progress_key=track_id,
-            source_duration=float(getattr(track, "duration", 0) or 0) or None,
-        ),
-    )
-    return await _range_file_response(
-        request, cached_path, media_type=eff_mime,
-        headers={"X-Transcoded": "1", "X-Original-Codec": original_codec,
-                 "X-Target-Codec": eff_codec,
-                 "X-Cache": "hit" if hit else "miss"},
-        background=_bg,
-    )
+        return await _range_file_response(
+            request, cached_path, media_type=eff_mime,
+            headers={"X-Transcoded": "1", "X-Original-Codec": original_codec,
+                     "X-Target-Codec": eff_codec,
+                     "X-Cache": "hit" if hit else "miss"},
+            background=_bg,
+        )
+    except BaseException:
+        _cleanup_tmp()
+        raise

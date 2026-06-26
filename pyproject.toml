@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soniqboom"
-version = "1.3.11"
+version = "1.3.12"
 description = "Self-hosted music server for personal libraries — FLAC, MP3, Opus, SID, MIDI, plus 20+ tracker formats"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }

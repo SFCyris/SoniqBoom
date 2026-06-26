@@ -133,6 +133,19 @@ export const TRACKER_FORMAT_NAMES = new Set([
 ]);
 
 /**
+ * AdPlug AdLib / OPL2 FM formats.  adplay renders these to the tune's NATURAL
+ * end, so the served WAV carries the real length while the scanner only stores
+ * a 180s placeholder — the library's duration backfill + live row-patch are
+ * scoped to exactly this set (mirrors backend _ADLIB_EXTS + id IMF).
+ * Names mirror metadata.py FORMAT_NAMES.
+ */
+export const ADLIB_FORMAT_NAMES = new Set([
+  'AdLib IMF', 'AdLib ROL', 'Creative Music', 'EdLib', 'Reality AdLib',
+  'LucasArts AdLib', 'Sierra AdLib', 'DOSBox OPL', 'HSC AdLib', 'RIX OPL',
+  'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib",
+]);
+
+/**
  * Chip / FM formats rendered server-side (libgme console chiptunes + AdPlug
  * AdLib/OPL).  No per-voice VUMR sidecar exists for them, so they fall back to
  * the FFT spectrum — but they still must pass the VU gate to show it at all.
@@ -142,10 +155,57 @@ export const CHIP_FORMAT_NAMES = new Set([
   // libgme console chiptunes
   'NSF', 'NSFe', 'SPC', 'GBS', 'VGM', 'VGZ', 'AY', 'KSS', 'SAP', 'GYM', 'HES',
   // AdPlug AdLib / OPL2 FM
-  'AdLib IMF', 'AdLib ROL', 'Creative Music', 'EdLib', 'Reality AdLib',
-  'LucasArts AdLib', 'Sierra AdLib', 'DOSBox OPL', 'HSC AdLib', 'RIX OPL',
-  'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib",
+  ...ADLIB_FORMAT_NAMES,
 ]);
+
+/**
+ * Background duration probe — ask the server to compute the real length of any
+ * AdLib/IMF tracks in *tracks* that still carry the 180s placeholder, so any
+ * view can show it without the user playing each tune.  The server renders once
+ * (throwaway) and persists the result, so it's a one-time cost; each track id is
+ * requested at most once per session (shared across the desktop library, the
+ * playlist editor and mobile).  Resolves to ``{track_id: seconds}``; the caller
+ * patches its own rows + cached track objects.
+ */
+const _durProbed = new Set();      // attempted (success OR fail) — don't re-fetch
+const _durKnown = new Map();       // id -> real seconds (successful), shared across views
+export async function probeAdlibDurations(tracks) {
+  const result = {};
+  const ids = [];
+  const seen = new Set();
+  for (const t of (tracks || [])) {
+    if (!t || !t.id || seen.has(t.id)) continue;
+    seen.add(t.id);
+    if (!ADLIB_FORMAT_NAMES.has(t.format)) continue;
+    const cur = (+t.duration) || 0;
+    if (!(cur === 0 || Math.abs(cur - 180) < 0.5)) continue;   // not a placeholder
+    if (_durKnown.has(t.id)) { result[t.id] = _durKnown.get(t.id); continue; }  // another view already probed it
+    if (_durProbed.has(t.id)) continue;                        // attempted (maybe undecodable) — don't hammer
+    _durProbed.add(t.id);
+    ids.push(t.id);
+  }
+  if (ids.length) {
+    try {
+      const res = await fetch('/api/stream/probe-durations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track_ids: ids }),
+      });
+      if (res.ok) {
+        const map = await res.json();
+        for (const id in map) {
+          const sec = map[id];
+          if (sec > 0) { _durKnown.set(id, sec); result[id] = sec; }
+        }
+      } else {
+        ids.forEach(id => _durProbed.delete(id));              // allow retry
+      }
+    } catch (_) {
+      ids.forEach(id => _durProbed.delete(id));                // network error
+    }
+  }
+  return result;
+}
 
 /** File extension fallback list (lower-case, no dot). */
 const TRACKER_EXTS = new Set([
@@ -167,6 +227,25 @@ const TRACKER_EXTS = new Set([
  *   🔊  Everything else    (MP3, OGG, Opus, AAC …)
  */
 export function artPlaceholderEmoji(track) {
+  // Memoize on the track object — a track's format/path are immutable per id,
+  // so the emoji never changes once computed.  This kills the ~9-branch +
+  // ``.split('.')`` recompute that otherwise ran for every visible row on
+  // every virtual-scroll frame.  Stored non-enumerable so it never leaks into
+  // ``JSON.stringify`` / ``{...track}`` clones (a clone is a cache miss → it
+  // simply recomputes, which is correct).
+  if (track && track._phEmoji) return track._phEmoji;
+  const emoji = _computeArtPlaceholderEmoji(track);
+  if (track) {
+    try {
+      Object.defineProperty(track, '_phEmoji', {
+        value: emoji, enumerable: false, configurable: true, writable: true,
+      });
+    } catch (_) { /* frozen/sealed track object — skip caching */ }
+  }
+  return emoji;
+}
+
+function _computeArtPlaceholderEmoji(track) {
   const fmt   = track?.format || '';     // raw mutagen format name — see metadata.py FORMAT_NAMES
   const fmtUp = fmt.toUpperCase();
 

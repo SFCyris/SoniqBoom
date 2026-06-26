@@ -58,7 +58,7 @@ let _trackInfoP = null;
 const loadTrackInfo = () => (_trackInfoP ||= import('./trackinfo.js').then(m => m.TrackInfo));
 let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
-import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast } from './utils.js';
+import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast, trapFocus } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -1245,6 +1245,9 @@ if (btnDownload) btnDownload.addEventListener('click', async () => {
 });
 Player.on('trackchange', () => _renderDownloadBtn());
 _renderDownloadBtn();
+// When the decoded WAV reveals a tune's true length, correct the AdLib/IMF
+// "3:00" placeholder row in place (server persists the same value via backfill).
+Player.on('durationknown', ({ id, seconds }) => Library.patchTrackDuration(id, seconds));
 
 // ── Player callbacks ──────────────────────────────────────────────────────────
 // timeupdate fires ~4Hz. We coalesce all DOM writes into a single rAF pass
@@ -2421,6 +2424,90 @@ if (_btnLinks && _linksOverlay) {
   _linksOverlay.addEventListener('click', (e) => { if (e.target === _linksOverlay) _linksOverlay.classList.add('hidden'); });
 }
 
+// ── Welcome / onboarding overlay ─────────────────────────────────────────────
+// One-time first-run guide (gated on localStorage ``sb_onboarded_v1``), and
+// re-openable any time via the header "?" button.  Mirrors the links/shortcuts
+// overlay idiom plus the auth modal's focus-trap + restore (WCAG 2.4.3).  The
+// first-run trigger lives in the startup-intro IIFE so the guide appears AFTER
+// the splash (or immediately when the splash is disabled / config fetch fails).
+const ONBOARDED_KEY   = 'sb_onboarded_v1';
+const _welcomeOverlay = document.getElementById('welcome-overlay');
+let _welcomeRelease   = null;   // trapFocus release callback
+let _welcomePrevFocus = null;   // element to restore focus to on close
+
+function _openWelcome() {
+  // Idempotent — never stack a second instance (the splash IIFE and the header
+  // "?" button can both ask).
+  if (!_welcomeOverlay || !_welcomeOverlay.classList.contains('hidden')) return;
+  _welcomePrevFocus = document.activeElement;
+  // Hide the app from AT and the tab order while the modal is up — matches the
+  // auth/cast-picker pattern.  The overlay is a sibling of #app, so inert on
+  // #app doesn't disable the dialog; the Tab-trap blocks tabbing out and inert
+  // also removes the background from the AT virtual cursor.
+  const _app = document.getElementById('app');
+  if (_app) { _app.setAttribute('inert', ''); _app.setAttribute('aria-hidden', 'true'); }
+  _welcomeOverlay.classList.remove('hidden');
+  document.getElementById('btn-welcome')?.setAttribute('aria-expanded', 'true');
+  _welcomeRelease = trapFocus(_welcomeOverlay);
+  // Focus the panel (tabindex=-1), NOT the destructive "Add your music" CTA, so
+  // the dialog title + description are announced on entry and the first
+  // Enter/Space can't accidentally dismiss onboarding + open admin.
+  document.getElementById('welcome-panel')?.focus();
+}
+function _closeWelcome() {
+  if (!_welcomeOverlay || _welcomeOverlay.classList.contains('hidden')) return;
+  _welcomeOverlay.classList.add('hidden');
+  const _app = document.getElementById('app');
+  if (_app) { _app.removeAttribute('inert'); _app.removeAttribute('aria-hidden'); }
+  document.getElementById('btn-welcome')?.setAttribute('aria-expanded', 'false');
+  // Once seen, never auto-show again — manual re-open via "?" still works.
+  try { localStorage.setItem(ONBOARDED_KEY, '1'); } catch (_) {}
+  if (_welcomeRelease) { try { _welcomeRelease(); } catch (_) {} _welcomeRelease = null; }
+  if (_welcomePrevFocus && typeof _welcomePrevFocus.focus === 'function') {
+    try { _welcomePrevFocus.focus(); } catch (_) {}
+  }
+  _welcomePrevFocus = null;
+}
+// Called from the startup-intro IIFE (after the splash, or immediately when the
+// splash is disabled) so first-run users see the guide exactly once.
+function _maybeShowFirstRunWelcome() {
+  let seen = true;
+  try { seen = !!localStorage.getItem(ONBOARDED_KEY); } catch (_) { /* storage blocked */ }
+  if (!seen) _openWelcome();
+}
+if (_welcomeOverlay) {
+  document.getElementById('welcome-close')?.addEventListener('click', _closeWelcome);
+  document.getElementById('welcome-dismiss')?.addEventListener('click', _closeWelcome);
+  document.getElementById('welcome-add-music')?.addEventListener('click', () => {
+    _closeWelcome();
+    loadAdmin().then(A => A.open()).catch(() => {});
+  });
+  // Connect the two "help" surfaces: this guide links to the keyboard-shortcuts
+  // overlay (keyboard "?" opens shortcuts; header "?" opens this guide — the
+  // link makes the relationship discoverable instead of two colliding "?"s).
+  document.getElementById('welcome-shortcuts-link')?.addEventListener('click', () => {
+    _closeWelcome();
+    _shortcutsOverlay?.classList.remove('hidden');
+  });
+  // Backdrop click (not the panel) closes.
+  _welcomeOverlay.addEventListener('click', (e) => { if (e.target === _welcomeOverlay) _closeWelcome(); });
+  // Escape closes while the dialog is open.
+  _welcomeOverlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); _closeWelcome(); }
+  });
+}
+// Header "?" re-opens the guide any time — a persistent discoverability entry.
+document.getElementById('btn-welcome')?.addEventListener('click', _openWelcome);
+// Empty-state CTA → jump straight to Library settings to add a folder.  Delegate
+// on the stable #track-empty container, NOT the button directly: renderTracks
+// rebuilds the empty state via ``emptyEl.innerHTML = …``, which would recreate a
+// listener-less button.  Delegation survives every rebuild.
+document.getElementById('track-empty')?.addEventListener('click', (e) => {
+  if (e.target.closest('#empty-open-library')) {
+    loadAdmin().then(A => A.open()).catch(() => {});
+  }
+});
+
 // ``_prevVolume`` is declared earlier (near the volume bar init) so the
 // glyph mute toggle and this keyboard handler share the same restore
 // value across the lifetime of the page.
@@ -2631,8 +2718,8 @@ document.addEventListener('keydown', (e) => {
 (async () => {
   try {
     const cfg = window.__sbConfig || await fetch('/api/ui-config').then(r => r.json());
-    if (!cfg.display_startup_logo) return;
-  } catch (_) { return; }
+    if (!cfg.display_startup_logo) { _maybeShowFirstRunWelcome(); return; }
+  } catch (_) { _maybeShowFirstRunWelcome(); return; }
 
   const overlay = document.createElement('div');
   overlay.id = 'sb-intro-overlay';
@@ -2762,6 +2849,7 @@ document.addEventListener('keydown', (e) => {
 
   cancelAnimationFrame(_elecRaf);
   overlay.remove();
+  _maybeShowFirstRunWelcome();
 })();
 
 // ── Init ──────────────────────────────────────────────────────────────────────

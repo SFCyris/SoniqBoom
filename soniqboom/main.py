@@ -716,6 +716,15 @@ async def startup():
     from soniqboom.core.persistence import init_persistence
     init_persistence(data_dir)
 
+    # Reclaim on-disk zip-extracts / AdLib .adlib companion dirs whose track is
+    # no longer in the store (dir-aware).  Fire-and-forget — it walks the extract
+    # dir + does store lookups, so never block the splash on it.
+    try:
+        from soniqboom.api.stream import reap_orphan_zip_extracts
+        asyncio.create_task(reap_orphan_zip_extracts(), name="reap_zip_extracts")
+    except Exception:
+        log.debug("zip-extract reap scheduling failed", exc_info=True)
+
     # Pre-warm the per-scan-root sorted cache for every LOCAL scan root.
     # Pays the one-time O(bucket-size) iterate + TrackMeta shape cost
     # NOW — while the splash is already displayed — so the first user

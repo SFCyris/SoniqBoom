@@ -11,6 +11,7 @@
 import { Player } from '../../player.js';
 import { attachRowGestures } from '../gestures.js';
 import { buildTrackRow, fmtDur, esc, trackActions } from './_common.js';
+import { probeAdlibDurations } from '../../utils.js';
 
 const PAGE_SIZE = 100;
 
@@ -125,6 +126,7 @@ export function mountLibrary(root, ctx) {
   }
 
   function appendTracks(page) {
+    const durEls = new Map();          // track id -> its duration <span>, for backfill
     page.forEach((t, i) => {
       const idx = tracks.length + i;
       const dur = document.createElement('span');
@@ -133,6 +135,7 @@ export function mountLibrary(root, ctx) {
       dur.style.fontSize = '12px';
       dur.style.marginRight = '4px';
       dur.textContent = fmtDur(t.duration);
+      if (t && t.id) durEls.set(t.id, dur);
 
       const row = buildTrackRow(t, { trailing: dur });
       const cleanup = attachRowGestures(row, {
@@ -154,6 +157,17 @@ export function mountLibrary(root, ctx) {
       listEl.appendChild(row);
     });
     tracks.push(...page);
+    // Background-fill real AdLib/IMF lengths for this page's placeholder rows.
+    probeAdlibDurations(page).then(map => {
+      for (const id in map) {
+        const sec = map[id];
+        if (!(sec > 0)) continue;
+        const el = durEls.get(id);
+        if (el) el.textContent = fmtDur(sec);
+        const t = page.find(x => x && x.id === id);
+        if (t) t.duration = sec;
+      }
+    });
   }
 
   // Infinite scroll

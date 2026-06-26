@@ -23,7 +23,7 @@
  */
 import { Player } from './player.js';
 import { Library } from './library.js';
-import { artPlaceholderEmoji, Toast } from './utils.js';
+import { artPlaceholderEmoji, Toast, probeAdlibDurations } from './utils.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -545,6 +545,24 @@ function _renderTracks() {
 
     tracksEl.appendChild(row);
   });
+
+  // Fill real AdLib/IMF lengths for rows still showing the 180s placeholder.
+  _probePlaylistDurations();
+}
+
+// Background-fill AdLib/IMF durations for the rendered rows (one-time per track;
+// shared dedup with the library + mobile via probeAdlibDurations).
+async function _probePlaylistDurations() {
+  const map = await probeAdlibDurations(_activeTracks);
+  for (const id in map) {
+    const sec = map[id];
+    if (!(sec > 0)) continue;
+    const idx = _activeTracks.findIndex(t => t && t.id === id);
+    if (idx < 0) continue;
+    _activeTracks[idx].duration = sec;
+    const span = tracksEl.querySelector(`.queue-row[data-idx="${idx}"] .queue-track-dur`);
+    if (span) span.textContent = fmtDur(sec);
+  }
 }
 
 // ── Mutations ─────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
  * Exports: Player singleton
  */
 // version bump needed in index.html for player.js (queue/race/EQ chain fixes)
-import { TRACKER_FORMAT_NAMES, Toast } from './utils.js';
+import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast } from './utils.js';
 
 export const Player = (() => {
   const audio = document.getElementById('audio-el');
@@ -336,12 +336,39 @@ export const Player = (() => {
     }
   }
 
+  // Build (or rebuild) the canonical TEXT-ONLY badge: a ``.badge-label`` span
+  // plus the hidden inline cancel button that _showConvertBadge wires.  Used
+  // (a) to set the label — "Rendering…" for blocking renders vs "Converting…"
+  // for transcodes — and (b) to restore the structure after a determinate-
+  // progress teardown flattened it to a bare text node (which would otherwise
+  // lose both the label span AND the cancel button for the next text-only
+  // badge).  Idempotent; safe to call while the badge is hidden.
+  function _renderTextOnlyConvertBadge(text) {
+    if (!_convertBadge) return;
+    _convertBadge.classList.remove('has-progress');
+    _convertBadge.textContent = '';
+    const lbl = document.createElement('span');
+    lbl.className = 'badge-label';
+    lbl.textContent = text;
+    _convertBadge.appendChild(lbl);
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'badge-cancel';
+    cancel.id = 'converting-badge-cancel';
+    cancel.setAttribute('aria-label', 'Cancel conversion');
+    cancel.title = 'Cancel conversion';
+    cancel.hidden = true;
+    cancel.textContent = '×';   // × — multiplication sign
+    _convertBadge.appendChild(cancel);
+  }
+
   function _resetConvertBadgeProgress() {
     if (!_convertBadge) return;
     if (!_convertBadge.classList.contains('has-progress')) return;
-    while (_convertBadge.firstChild) _convertBadge.removeChild(_convertBadge.firstChild);
-    _convertBadge.classList.remove('has-progress');
-    _convertBadge.textContent = 'Converting…';
+    // Restore the canonical text-only structure (label + cancel button) rather
+    // than a bare "Converting…" text node, so a later label set / cancel wire
+    // still finds the elements it expects.
+    _renderTextOnlyConvertBadge('Converting…');
   }
 
   // Formats served as FileResponse with Accept-Ranges (browser can seek
@@ -402,6 +429,25 @@ export const Player = (() => {
     'SID', 'PSID', 'MIDI', 'MID',
     ...TRACKER_FORMAT_NAMES,   // ProTracker, ScreamTracker 3, FastTracker 2, etc.
   ]);
+
+  // Formats that BLOCK until the server finishes rendering the whole tune
+  // (sidplayfp / fluidsynth / openmpt123 / adplay write a complete cached WAV
+  // before the first byte is served), so a cold-cache play has a guaranteed
+  // multi-second silent gap.  These get the "Rendering…" badge — unlike
+  // DSD/ALAC/generic transcodes, which stream an in-flight WAV whose audio
+  // starts in <100 ms and so keep the delayed "Converting…" badge.  Uppercased
+  // so the lookup matches playTrack's ``_fmtUp``.  CHIP_FORMAT_NAMES already
+  // includes the AdLib/OPL (ADLIB_FORMAT_NAMES) plus libgme chiptune names.
+  const SERVER_RENDERED_FORMATS = new Set(
+    ['SID', 'PSID', 'MIDI', 'MID',
+     ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES,
+    ].map(s => s.toUpperCase())
+  );
+  // Show the "Rendering…" badge after this delay (ms).  Long enough that a
+  // warm-cache hit — whose audio starts well under it — clears the timer
+  // before it fires (no flash on replays), short enough that a cold render
+  // reads as near-immediate feedback instead of the old 6 s of dead air.
+  const RENDER_BADGE_DELAY = 1000;
   let queue         = [];
   let queueIdx      = -1;
   let shuffle       = false;
@@ -503,6 +549,11 @@ export const Player = (() => {
   // without flashing for the ~50 ms it takes to start a cached file.
   // (Card et al. 1983, Nielsen "Response Times: 3 Important Limits".)
   let _bufferingTimer = null;
+  // True while a blocking-renderer track is loading — suppresses the (centered)
+  // buffering badge so it never stacks on the top-right "Rendering…" badge (the
+  // early render badge IS the feedback).  The module-scope `waiting` handler
+  // can't see playTrack's block-local _serverRendered, so it reads this instead.
+  let _suppressBufferingBadge = false;
   // Hofman et al. ("Tolerable Waiting Time for Interactive Web Tasks",
   // 2009): an indeterminate "loading" indicator shown for 1–3 s
   // *increases* perceived wait vs no indicator at all.  Push to 5 s so
@@ -600,7 +651,7 @@ export const Player = (() => {
   ];
 
   // ── Observers ─────────────────────────────────────────────────────────────
-  const _handlers = { timeupdate: [], trackchange: [], ended: [], statechange: [], error: [], queuechange: [], seeked: [] };
+  const _handlers = { timeupdate: [], trackchange: [], ended: [], statechange: [], error: [], queuechange: [], seeked: [], durationknown: [] };
   // Isolate listener failures.  The earlier ``forEach(fn => fn(data))`` form
   // had a sharp edge: a single listener throwing — e.g. visualizer.start()
   // hitting an uninitialised canvas, or a lyrics handler choking on an
@@ -1138,6 +1189,7 @@ export const Player = (() => {
 
   async function playStation(station, relayUrl, codec = '') {
     _stationMode  = true;
+    _suppressBufferingBadge = false;   // stations surface their own status
     _station      = station;
     trackId       = null;
     _metaDuration = 0;
@@ -1236,6 +1288,15 @@ export const Player = (() => {
     // (DSD/ALAC/AIFF) and rendered (SID/MIDI/tracker).  Used only to gate
     // the "Converting…" badge timer, not the seek path.
     _needsConvert  = !_native;
+    // Renderer formats (SID/MIDI/tracker/AdLib/GME) block until the full WAV
+    // is cached — a guaranteed multi-second silent gap on a cold cache — so
+    // they get an early "Rendering…" badge and skip the redundant buffering
+    // badge.  In-flight transcodes (DSD/ALAC/generic) stream audio in <100 ms
+    // and keep the delayed "Converting…" badge.
+    const _serverRendered = _needsConvert && SERVER_RENDERED_FORMATS.has(_fmtUp);
+    // Mirror to the module flag so the 'waiting' event handler (which can't see
+    // this block-local const) also suppresses the buffering badge for renderers.
+    _suppressBufferingBadge = _serverRendered;
     trackId        = track.id;
     _playRecorded  = false;
     _resetSidPartial();
@@ -1254,16 +1315,25 @@ export const Player = (() => {
     // element's own stream — only this ancillary metadata fetch.
     _stopTranscodePolling();
 
-    // Start "Converting…" timer for any format requiring server-side processing
+    // Feedback for any format requiring server-side processing.  Renderer
+    // formats block with a guaranteed silent gap, so arm a short
+    // RENDER_BADGE_DELAY and label the badge "Rendering…"; in-flight
+    // transcodes keep the 6 s convert delay that only surfaces for genuinely
+    // slow waits.  Either way the badge is hidden the instant audio is audible
+    // (the ``playing`` handler + the audio.play() success path).
     _hideConvertBadge();
     if (_needsConvert) {
-      _convertTimer = setTimeout(_showConvertBadge, _getConvertDelay());
+      _renderTextOnlyConvertBadge(_serverRendered ? 'Rendering…' : 'Converting…');
+      _convertTimer = setTimeout(
+        _showConvertBadge,
+        _serverRendered ? RENDER_BADGE_DELAY : _getConvertDelay(),
+      );
       // Determinate progress (bar + ETA) is pushed over the library
       // WebSocket: app.js's ``transcode_progress`` handler filters by the
       // playing track id and calls Player.onTranscodeProgress(...), which
       // drives _updateConvertBadgeProgress and — on ready — the
-      // ``transcode-ready`` waveform-refresh emit.  No 600 ms HTTP poll;
-      // _showConvertBadge arms a one-shot WS-fallback watchdog instead.
+      // ``transcode-ready`` waveform-refresh emit.  Renderer formats emit no
+      // ffmpeg progress, so they stay on the indeterminate "Rendering…" label.
     }
 
     // Media Session API — enables system media keys + lock screen widget
@@ -1327,7 +1397,9 @@ export const Player = (() => {
     // resolves so the UI stays responsive on slow / transcoding sources.
     const _bufSec = _getPreloadBuffer();
     if (_bufSec > 0) {
-      _showBufferingBadge();
+      // Renderer formats already show the "Rendering…" badge — don't stack the
+      // buffering badge on top of it.
+      if (!_serverRendered) _showBufferingBadge();
       try { await _waitForBuffer(audio, _bufSec, 8000); }
       finally { _hideBufferingBadge(); }
     }
@@ -1803,6 +1875,13 @@ export const Player = (() => {
     // `replaygain_*` fields have been read from the library response and
     // the Web Audio chain (built in _initAudioContext) is connected.
     try { _applyReplayGain(_track); } catch (_) { /* never fatal */ }
+    // The decoded WAV's true length is now known — tell the library so it can
+    // correct an AdLib/IMF "3:00" placeholder row in place (the server also
+    // persists it via backfill).  Use raw audio.duration, not _duration()'s
+    // metadata fallback.
+    if (trackId && isFinite(audio.duration) && audio.duration > 0) {
+      emit('durationknown', { id: trackId, seconds: audio.duration });
+    }
     const dur     = _duration();
     const current = _currentTime();
     emit('timeupdate', {
@@ -2026,7 +2105,9 @@ export const Player = (() => {
   // Replaces the start-of-track preload wait that the user reported as a
   // multi-second "conversion" delay before audio began.
   audio.addEventListener('waiting', () => {
-    if (_stationMode) return;   // stations show their own Connecting/Buffering status in the station card
+    // Stations show their own status; blocking-renderer tracks show the early
+    // "Rendering…" badge — don't stack the buffering badge on top of either.
+    if (_stationMode || _suppressBufferingBadge) return;
     _showBufferingBadge();
   });
   audio.addEventListener('playing', () => {
@@ -2040,6 +2121,10 @@ export const Player = (() => {
     // had already begun, leaving a confusing post-start "Converting…"
     // overlay.
     _hideConvertBadge();
+    // Audio is audible now — scope the renderer buffering-badge suppression to
+    // the load window only, so a genuine mid-track underrun can still surface
+    // the buffering badge.
+    _suppressBufferingBadge = false;
   });
   audio.addEventListener('canplay', () => {
     // ``canplay`` fires before ``playing``; if the browser is now ready

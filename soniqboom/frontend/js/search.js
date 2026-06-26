@@ -19,6 +19,7 @@ let previewTimer     = null;
 let _previewDropdown = null;
 let _previewVisible  = false;
 let _selectedPreview = -1;   // keyboard-navigated preview index
+let _renderedTracks  = null; // track array last rendered (identity check for selection preservation)
 
 // Preview art elements have no AbortController — once an Image src is set
 // the browser queues the GET and we can't cancel it.  Track every image we
@@ -93,6 +94,20 @@ function _showPreview(tracks, stations = []) {
   // Drop refs to art images from the prior preview before we rebuild — any
   // loads still in flight no longer have a target row.
   _cancelInflightArt();
+  // Preserve an active keyboard selection across a re-render of the SAME track
+  // list (a late Stations injection re-calls _showPreview with the same array)
+  // — otherwise the user's ↓ selection is silently discarded and the highlight
+  // snaps back to row 0.  A genuinely new keystroke passes a different `tracks`
+  // array, so the selection correctly resets there.  Capture the selected TRACK
+  // row's stable ``data-idx`` (NOT its raw NodeList position): a Stations-view
+  // injection prepends station rows, which would shift a raw index onto the
+  // wrong (station) row — and Enter would then play a station, not the track.
+  let _priorIdx = null;
+  if (tracks === _renderedTracks && _previewVisible && _selectedPreview >= 0) {
+    const _sel = _previewDropdown?.querySelectorAll('.sp-row')[_selectedPreview];
+    _priorIdx = (_sel && _sel.dataset.idx != null) ? _sel.dataset.idx : null;  // track rows only; stations carry none
+  }
+  _renderedTracks = tracks;
   dd.innerHTML = '';
   _selectedPreview = -1;
 
@@ -183,9 +198,22 @@ function _showPreview(tracks, stations = []) {
   const hint = document.createElement('div');
   hint.className = tracks.length > 8 ? 'sp-more' : 'sp-hint';
   hint.textContent = tracks.length > 8
-    ? `${tracks.length - 8} more — press ↵ for full results`
-    : 'Press ↵ for full results';
+    ? `${tracks.length - 8} more — ↵ full results · ↓ to play a row`
+    : '↵ full results · ↓ to play a row';
   dd.appendChild(hint);
+
+  // Restore a preserved keyboard selection (same-list re-render), else anchor
+  // the top result as a passive visual cue.  Either way Enter opens full
+  // results until the user has actually arrowed into the list (_selectedPreview
+  // >= 0); the anchor uses a distinct, subtler class so it never reads as an
+  // actionable selection.
+  const _restore = (_priorIdx != null) ? dd.querySelector(`.sp-row[data-idx="${_priorIdx}"]`) : null;
+  if (_restore) {
+    _selectedPreview = Array.from(dd.querySelectorAll('.sp-row')).indexOf(_restore);
+    _restore.classList.add('sp-highlighted');
+  } else {
+    _anchorFirstRow();
+  }
 
   dd.classList.add('visible');
   _previewVisible = true;
@@ -202,13 +230,26 @@ function _hidePreview() {
   _cancelInflightArt();
 }
 
+// Passive "top result" anchor.  _selectedPreview stays -1, so Enter still opens
+// full results (the chosen "Enter = full results" model); the anchor uses a
+// distinct, subtler class than the active keyboard selection so it reads as
+// "top hit" rather than "selected".  The first ↓ clears it (see _navigatePreview)
+// and formally selects a row.
+function _anchorFirstRow() {
+  const first = _previewDropdown?.querySelector('.sp-row');
+  if (first) first.classList.add('sp-anchored');
+}
+
 function _navigatePreview(delta) {
   if (!_previewVisible || !_previewDropdown) return;
   const rows = _previewDropdown.querySelectorAll('.sp-row');
   if (!rows.length) return;
-  rows.forEach(r => r.classList.remove('sp-highlighted'));
+  // Strip both the active selection AND the passive anchor before re-applying —
+  // navigating supersedes the anchor.
+  rows.forEach(r => r.classList.remove('sp-highlighted', 'sp-anchored'));
   _selectedPreview = Math.max(-1, Math.min(rows.length - 1, _selectedPreview + delta));
   if (_selectedPreview >= 0) rows[_selectedPreview].classList.add('sp-highlighted');
+  else _anchorFirstRow();   // arrowed back above the top → restore the passive top-result cue
 }
 
 function _playHighlighted() {
@@ -371,7 +412,7 @@ input.addEventListener('input', () => {
   // Full search only fires on Enter (keydown handler) or dropdown item click.
   clearTimeout(previewTimer);
   if (val.trim()) {
-    previewTimer = setTimeout(() => _quickSearch(val), 150);
+    previewTimer = setTimeout(() => _quickSearch(val), 100);
   } else {
     _hidePreview();
     Library.showAll();

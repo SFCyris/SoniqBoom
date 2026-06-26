@@ -17,7 +17,7 @@
   <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
   <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
   <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
-  <link rel="stylesheet" href="/assets/css/mobile.css?v=1">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=2">
 </head>
 <body>
   <div id="m-app">
@@ -68,6 +68,17 @@
       </button>
       <div id="m-mp-progress" class="m-mp-progress"><div id="m-mp-progress-fill"></div></div>
     </div>
+
+    <!-- Render/transcode feedback.  The shared player.js looks these up by id
+         (converting-badge / buffering-badge), so without them the early
+         "Rendering…" hint for SID/MIDI/tracker/AdLib/GME silently no-ops on
+         mobile.  Sit them just above the mini-player as a small pill. -->
+    <div id="converting-badge" class="m-badge converting-badge" hidden role="status" aria-live="polite">
+      <span class="badge-label">Converting…</span>
+      <button type="button" class="badge-cancel" id="converting-badge-cancel"
+              aria-label="Cancel conversion" title="Cancel conversion" hidden>&times;</button>
+    </div>
+    <div id="buffering-badge" class="m-badge buffering-badge" hidden>Buffering…</div>
 
     <!-- Cast picker overlay — same markup the desktop shell exposes,
          so cast_picker.js can run unchanged on the mobile route.

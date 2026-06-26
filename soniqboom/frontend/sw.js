@@ -371,7 +371,32 @@
 // player-bar cover uses a render-generation token instead of the station's
 // empty id and no longer blocks the paint on img.decode(), so a slow/rejecting
 // cross-origin station logo can't strand the cover on the placeholder (app.js).
-const SHELL_VERSION = 'v112';
+// v114 (2026-06-25): perceived-perf polish + onboarding — search debounce
+// 150→100 ms and an auto-highlighted top preview row (search.js); art-
+// placeholder emoji memoized per track (utils.js); skeleton shimmer cells get
+// will-change (app.css); an early "Rendering…" badge for blocking SID/MIDI/
+// tracker/AdLib/GME renders + redundant buffering-badge suppression (player.js);
+// first-run welcome overlay + header "?" re-open + empty-state CTA + sidebar
+// discoverability tooltips (index.html, app.css, app.js).  Bump re-fetches the
+// precached shell (app.css/player.js/utils.js) and the versioned app.js.
+// v115 (2026-06-25): adversarial-review fixes on v114 — removed the
+// will-change anti-pattern from skeleton cells (app.css); buffering badge no
+// longer stacks on "Rendering…" (player.js 'waiting' gate); consolidated web
+// prewarm + AdLib-probe into one shared background-render gate (stream.py);
+// search anchor uses a distinct passive class + preserves keyboard selection
+// across Stations re-render (search.js/app.css); welcome dialog focuses the
+// panel (not the destructive CTA), marks #app inert, adds aria-describedby +
+// aria-expanded + a shortcuts link (app.js/index.html); empty-state "add a
+// folder" CTA gated to a genuinely-empty library (library.js/index.html);
+// Rendering/buffering badges added to the mobile shell (mobile.html/mobile.css).
+// v116 (2026-06-25): fix-review follow-ups — empty-state CTA uses event
+// delegation so it survives innerHTML rebuilds (app.js); search selection
+// restore matches the track row's data-idx (not raw index) so a Stations
+// injection can't shift it onto a station row, and ArrowUp past the top
+// re-anchors (search.js); renderer buffering-badge suppression now ends once
+// audio is audible (player.js); #btn-welcome ships aria-expanded="false"
+// (index.html).
+const SHELL_VERSION = 'v116';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

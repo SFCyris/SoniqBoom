@@ -513,6 +513,63 @@ input, select, textarea { touch-action: manipulation; }
 }
 .m-toast.hidden { display: none; }
 
+/* ── Render / transcode badges ─────────────────────────────────────────────
+   The shared player.js looks up #converting-badge / #buffering-badge by id and
+   drives the early "Rendering…" hint for blocking SID/MIDI/tracker/AdLib/GME
+   renders.  mobile.html doesn't load app.css, so style them here.  Float just
+   above the mini-player as a pill. */
+.m-badge {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--mini-h) + var(--tabbar-h) + var(--safe-bottom) + 56px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 84vw;
+  background: rgba(0, 0, 0, 0.88);
+  color: #fff;
+  padding: 9px 16px;
+  border-radius: 18px;
+  font-size: 13px;
+  line-height: 1.2;
+  z-index: 190;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  animation: m-fade-in 0.15s ease;
+}
+.m-badge[hidden] { display: none; }
+.m-badge .badge-cancel,
+.m-badge .progress-cancel {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 17px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.m-badge .badge-cancel[hidden] { display: none; }
+/* Determinate transcode progress (DSD/ALAC on mobile) — minimal so it reads as
+   a labelled bar, not raw text. */
+.m-badge .progress-label { white-space: nowrap; }
+.m-badge .progress-bar {
+  position: relative;
+  width: 90px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
+  overflow: hidden;
+}
+.m-badge .progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent, #f0722a);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.m-badge .progress-eta { font-size: 11px; opacity: 0.75; white-space: nowrap; }
+
 /* ── Settings ──────────────────────────────────────────────────────────── */
 
 .m-settings { padding: 16px; }

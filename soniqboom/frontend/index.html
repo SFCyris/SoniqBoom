@@ -54,7 +54,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=68">
+  <link rel="stylesheet" href="/assets/css/app.css?v=70">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -123,6 +123,7 @@
                   title="Sign out" aria-label="Sign out"
                   style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:13px;padding:0 0 0 4px">⎋</button>
         </span>
+        <button id="btn-welcome" class="btn-help" title="Welcome &amp; tips" aria-label="Show the welcome guide and tips" aria-haspopup="dialog" aria-expanded="false">?</button>
         <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
         <button id="btn-admin" title="Admin settings" aria-label="Admin settings">&#9881;</button>
       </div>
@@ -144,7 +145,7 @@
             <li data-view="albums"       tabindex="0" role="button">Albums</li>
             <li data-view="genres"       tabindex="0" role="button">Genres</li>
             <li data-view="years"        tabindex="0" role="button">Years</li>
-            <li data-view="galaxy"       tabindex="0" role="button">Galaxy</li>
+            <li data-view="galaxy"       tabindex="0" role="button" title="Explore your library as a galaxy of format clusters — click one to filter to that format">Galaxy</li>
           </ul>
           <div id="browse-filter-wrap" hidden>
             <input id="browse-filter" type="search" placeholder="Filter…" autocomplete="off">
@@ -174,21 +175,21 @@
         <section id="section-stations">
           <h3>Stations</h3>
           <ul id="nav-stations">
-            <li data-sview="favorites" tabindex="0" role="button">Favorites</li>
-            <li data-sview="scene"     tabindex="0" role="button">Scene</li>
-            <li data-sview="world"     tabindex="0" role="button">World</li>
+            <li data-sview="favorites" tabindex="0" role="button" title="Your saved internet-radio stations (Beta)">Favorites</li>
+            <li data-sview="scene"     tabindex="0" role="button" title="Curated demoscene &amp; chiptune internet radio (Beta)">Scene</li>
+            <li data-sview="world"     tabindex="0" role="button" title="Worldwide internet radio — the Radio Browser directory (Beta)">World</li>
           </ul>
         </section>
 
         <section id="section-smart">
           <h3>Smart</h3>
           <ul id="nav-smart">
-            <li data-view="history"        tabindex="0" role="button">History</li>
-            <li data-view="most-played"    tabindex="0" role="button">Most Played</li>
-            <li data-view="recently-added" tabindex="0" role="button">Recently Added</li>
-            <li data-view="top-rated"      tabindex="0" role="button">Top Rated</li>
-            <li data-view="unplayed"       tabindex="0" role="button">Unplayed</li>
-            <li data-view="duplicates"     tabindex="0" role="button">Duplicates</li>
+            <li data-view="history"        tabindex="0" role="button" title="Tracks you've played recently">History</li>
+            <li data-view="most-played"    tabindex="0" role="button" title="Your most-played tracks">Most Played</li>
+            <li data-view="recently-added" tabindex="0" role="button" title="Tracks added to your library recently">Recently Added</li>
+            <li data-view="top-rated"      tabindex="0" role="button" title="Your highest-rated tracks">Top Rated</li>
+            <li data-view="unplayed"       tabindex="0" role="button" title="Tracks you haven't played yet">Unplayed</li>
+            <li data-view="duplicates"     tabindex="0" role="button" title="Find and resolve duplicate tracks in your library">Duplicates</li>
           </ul>
         </section>
 
@@ -297,7 +298,14 @@
           <div id="track-empty" class="empty-state" hidden role="status" aria-live="polite">
             <span class="empty-icon" aria-hidden="true">♫</span>
             <h4>No tracks found</h4>
-            <p>Try adjusting your filter, or add a folder via <strong>Settings → Library</strong>.</p>
+            <p>Try adjusting your filter or search.</p>
+            <!-- Shown only when the whole library is empty (renderTracks gates
+                 this on the track count), so a merely-filtered-empty view never
+                 gets the misdirected "add a folder" CTA. -->
+            <div id="empty-add-folder" hidden>
+              <p class="empty-sub">Your library is empty — add a music folder to get started.</p>
+              <button id="empty-open-library" type="button" class="empty-cta">Open Library settings</button>
+            </div>
           </div>
           <!-- Skeleton screen: shown while a track list is loading.  Rows
                are pure CSS shimmer; no JS needed once the markup is in
@@ -426,6 +434,58 @@
       </div>
 
     </footer>
+  </div>
+
+  <!-- ── Welcome / onboarding overlay ───────────────────────────────────── -->
+  <!-- Shown once on first run (gated on localStorage ``sb_onboarded_v1``) and
+       re-openable any time via the header "?" button.  Same ``.hidden`` +
+       click-outside idiom as the links / shortcuts overlays. -->
+  <div id="welcome-overlay" class="hidden" role="dialog" aria-modal="true"
+       aria-labelledby="welcome-title" aria-describedby="welcome-sub">
+    <div id="welcome-panel" tabindex="-1">
+      <button id="welcome-close" class="welcome-close" type="button"
+              aria-label="Close welcome">&times;</button>
+      <div class="welcome-hero">
+        <span class="welcome-logo" aria-hidden="true">&#128266;</span>
+        <h2 id="welcome-title">Welcome to SoniqBoom</h2>
+        <p id="welcome-sub" class="welcome-sub">Your self-hosted music library — from FLAC to forgotten formats.</p>
+      </div>
+      <ul class="welcome-features">
+        <li>
+          <span class="wf-icon" aria-hidden="true">&#128269;</span>
+          <div><strong>Search anything</strong><br>
+            Try <code>artist:Ghost year:&gt;2020 format:FLAC</code> in the top bar.</div>
+        </li>
+        <li>
+          <span class="wf-icon" aria-hidden="true">&#128377;&#65039;</span>
+          <div><strong>Plays exotic formats</strong><br>
+            SID, MOD, MIDI, AdLib &amp; dozens more — rendered on the fly.</div>
+        </li>
+        <li>
+          <span class="wf-icon" aria-hidden="true">&#129680;</span>
+          <div><strong>Galaxy view</strong><br>
+            Explore your collection as clusters of formats — in the Library menu.</div>
+        </li>
+        <li>
+          <span class="wf-icon" aria-hidden="true">&#127899;&#65039;</span>
+          <div><strong>Equalizer &amp; effects</strong><br>
+            10-band EQ with presets — the <strong>EQ</strong> button, bottom-right.</div>
+        </li>
+        <li>
+          <span class="wf-icon" aria-hidden="true">&#128251;</span>
+          <div><strong>Stations &amp; Cast <span class="welcome-beta">Beta</span></strong><br>
+            Internet radio, and cast to AirPlay / Chromecast / DLNA.</div>
+        </li>
+      </ul>
+      <div class="welcome-actions">
+        <button id="welcome-add-music" class="btn-primary" type="button">Add your music</button>
+        <button id="welcome-dismiss" class="btn-secondary" type="button">Explore on my own</button>
+      </div>
+      <p class="welcome-foot">
+        Tip: press <kbd>?</kbd> any time for
+        <button id="welcome-shortcuts-link" type="button" class="welcome-link">keyboard shortcuts</button>.
+      </p>
+    </div>
   </div>
 
   <!-- ── Admin overlay ──────────────────────────────────────────────────── -->
@@ -1844,7 +1904,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=101"></script>
+  <script type="module" src="/assets/js/app.js?v=105"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

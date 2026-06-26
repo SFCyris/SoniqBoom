@@ -247,6 +247,30 @@ def list_members(local_path) -> list[str]:
         return []
 
 
+def raw_namelist(local_path) -> list[str]:
+    """ALL stored member names in *local_path* (.zip/.lha/.lzh), UNFILTERED —
+    including non-playable companion files (AdLib instrument banks / patches)
+    that ``list_members`` deliberately drops.  Names are returned exactly as
+    stored, so each one round-trips back through ``read_member`` (which falls
+    through to the raw name for members not in the playable map).  Returns
+    ``[]`` on a broken/unsupported archive so one bad file never aborts a scan.
+    """
+    arc = None
+    try:
+        arc = _open(local_path)
+        return list(arc.namelist())
+    except Exception as exc:
+        log.warning("Cannot list archive %s: %s", local_path, exc)
+        return []
+    finally:
+        close = getattr(arc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 def read_member(local_path, display_name: str) -> bytes:
     """Raw bytes of *display_name* inside the archive at *local_path*.
 

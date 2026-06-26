@@ -6,7 +6,7 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji } from './utils.js';
+import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, probeAdlibDurations } from './utils.js';
 
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
@@ -23,6 +23,11 @@ const emptyEl          = document.getElementById('track-empty');
 // whenever it gets a fresh, non-empty result set so the customised
 // markup doesn't leak into unrelated views.
 const _EMPTY_DEFAULT_HTML = emptyEl.innerHTML;
+// Set by showAll() when the WHOLE library is empty (total === 0); consumed once
+// by renderTracks() to decide whether the empty state shows the "add a folder"
+// CTA (genuinely-empty library) vs neutral "no matches" copy (a filter/search
+// that merely returned nothing).  Reset to false after each render.
+let _showAddFolderCta = false;
 
 // ── Background freshness-refresh per folder navigation ────────────────
 //
@@ -842,6 +847,9 @@ function _vsRender(force = false) {
   if (currentTracks && typeof currentTracks.ensureRange === 'function') {
     currentTracks.ensureRange(_vsStart, _vsEnd);
   }
+  // Background-fill real lengths for any AdLib/IMF rows now on screen that still
+  // show the 180s placeholder (debounced; one-time per track; any view).
+  _scheduleDurationProbe();
 
   markPlayingRow();
   _applyColVisibility();
@@ -906,9 +914,20 @@ async function renderTracks(tracks) {
   } else if (tracks.length > 0) {
     // No-op: default markup is already in place.
   } else {
+    // Empty result.  Show the "add a folder" CTA + matching heading ONLY when
+    // the whole library is empty (showAll set _showAddFolderCta); a merely
+    // filtered/searched-empty view gets neutral copy and no misdirected CTA.
     const _emptyHeading = emptyEl.querySelector('h4');
-    if (_emptyHeading) _emptyHeading.textContent = 'No tracks found';
+    const _addFolder    = emptyEl.querySelector('#empty-add-folder');
+    if (_showAddFolderCta) {
+      if (_emptyHeading) _emptyHeading.textContent = 'Your library is empty';
+      if (_addFolder) _addFolder.hidden = false;
+    } else {
+      if (_emptyHeading) _emptyHeading.textContent = 'No tracks found';
+      if (_addFolder) _addFolder.hidden = true;
+    }
   }
+  _showAddFolderCta = false;   // consume once — defaults off for the next render
 
   emptyEl.hidden  = tracks.length > 0;
   loadingEl.hidden = true;
@@ -1521,6 +1540,7 @@ async function showAll() {
   // Small-library path (≤ 5000): legacy single-fetch array — simpler,
   // no chunking overhead, no skeleton rows for unloaded slots.
   const tracks = await API('/tracks', { limit });
+  _showAddFolderCta = (total === 0);   // genuinely-empty library → offer the add-folder CTA
   renderTracks(tracks);
   const truncated = tracks.length >= limit;
   _updateNavBadge('all', tracks.length, truncated);
@@ -2835,7 +2855,70 @@ _restoreSortState();
 // Fetch initial sidebar badge counts
 _refreshTrackCount();
 
+// Background duration probe — for AdLib/IMF rows shown in ANY view that still
+// carry the 180s placeholder, ask the server (via the shared probeAdlibDurations
+// util) to compute the real length so the overview shows it without the user
+// playing the track.  Debounced against scroll; the util dedups across views.
+let _durProbeTimer = null;
+
+function _scheduleDurationProbe() {
+  if (_durProbeTimer) return;
+  _durProbeTimer = setTimeout(() => {
+    _durProbeTimer = null;
+    _probeVisibleAdlibDurations();
+  }, 300);
+}
+
+async function _probeVisibleAdlibDurations() {
+  const arr = [];
+  const refs = new Map();          // id -> track object, to patch a scrolled-away row
+  for (let i = _vsStart; i < _vsEnd && i < currentTracks.length; i++) {
+    const t = currentTracks[i];
+    if (t && t.id) { arr.push(t); refs.set(t.id, t); }
+  }
+  const map = await probeAdlibDurations(arr);
+  for (const id in map) {
+    const sec = map[id];
+    if (!(sec > 0)) continue;
+    patchTrackDuration(id, sec);          // updates the visible cell + currentTracks[idx]
+    const t = refs.get(id);               // also catch a row scrolled away before the reply
+    if (t) {
+      const cur = (+t.duration) || 0;
+      if (cur === 0 || Math.abs(cur - 180) < 0.5) t.duration = sec;
+    }
+  }
+}
+
+// Live-correct the AdLib/IMF "3:00" placeholder once the player learns the real
+// decoded length (audio.duration).  Updates the visible row's duration cell AND
+// the cached track object in place; the server persists the same value via
+// backfill, so a later folder re-fetch stays consistent.  Gated on the 180s
+// placeholder, so it never overwrites a real or duration-capped (SID/GME) value.
+function patchTrackDuration(id, seconds) {
+  if (!id || !isFinite(seconds) || seconds <= 0 || !tbody) return;
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+  const row = tbody.querySelector(`tr[data-id="${sel}"]`);
+  if (!row) return;                       // only a currently-visible row
+  const idx = parseInt(row.dataset.idx, 10);
+  const t = (idx >= 0 && idx < currentTracks.length) ? currentTracks[idx] : null;
+  // Scope to AdLib/IMF only — the formats the server actually backfills.  GME
+  // (NSF/SPC/…) also stores 180 but isn't persisted, so patching it would
+  // flicker back to "3:00" on reload; SID's render is duration-capped so its
+  // audio.duration already equals the stored value.
+  if (!t || t.id !== id || !ADLIB_FORMAT_NAMES.has(t.format)) return;
+  const cur = (+t.duration) || 0;
+  const isPlaceholder = (cur === 0) || (Math.abs(cur - 180) < 0.5);
+  if (!isPlaceholder || Math.abs(seconds - cur) < 0.5) return;
+  t.duration = seconds;
+  const durTd = row.cells[8];             // col-dur
+  if (durTd) {
+    durTd.classList.remove('col-empty');
+    durTd.textContent = fmtDur(seconds);
+  }
+}
+
 export const Library = {
+  patchTrackDuration,
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
   showGenres, showYears, showGalaxy, showFolder, renderTracks,
   isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace,
