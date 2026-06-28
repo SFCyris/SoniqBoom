@@ -482,6 +482,228 @@ _ADLIB_EXTS = {
     ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
 }
 _ADLIB_DEFAULT_TIMEOUT_S = 8 * 60
+# AdPlug OPL emulator core.  adplay defaults to "woody" (DOSBox WoodyOPL — fast
+# but approximate); we pin "nuked" (Nuked OPL3, reverse-engineered from the
+# YMF262 die) so the render is cycle-accurate to real OPL3 hardware.  ~3x slower
+# than woody, but renders are cached so it's a one-time per-tune cost.  adplay's
+# other cores: satoh, ken, woody, nuked.  See internal/OPL-ENHANCEMENT-OPTIONS.md.
+_ADLIB_OPL_EMULATOR = "nuked"
+# A rendered subsong shorter than this is treated as empty (an empty Westwood
+# .adl subsong renders as ~0.01 s).  Kept LOW so a legitimately short tune / SFX
+# still passes; the amplitude test below is what catches long-but-silent subsongs.
+_ADLIB_MIN_AUDIO_S = 0.1
+# Peak 16-bit sample at/below this (~ -60 dBFS) ⇒ the subsong is effectively
+# silent.  Duration alone isn't enough: Westwood .adl files have subsongs that
+# render LONG but silent (Dune II song 1 is 2.3 s at -91 dB) while the real
+# theme is a later subsong — we must check actual amplitude.
+_ADLIB_SILENCE_PEAK = 32
+# Multi-song AdLib files can put the music well past subsong 0 (Dune II's theme
+# is subsong 6); probe up to this many for the first that is AUDIBLE.
+_ADLIB_MAX_SUBSONG_PROBE = 16
+# When a loose AdLib tune's own directory has no companion bank, walk up this
+# many parent dirs looking for one.  Collections keep a single standard.bnk at a
+# root with the ROLs in subfolders (…/Visual Composer/standard.bnk with tunes
+# under …/Visual Composer/OPLx/LARIX/).  Without the bank AdPlug can't even
+# DETECT a ROL — it reports "unknown filetype", not a missing-bank error.
+_ADLIB_BANK_PARENT_LEVELS = 4
+
+
+async def _render_adlib_one(binary: str, path: Path, subsong: int) -> Path:
+    """Render a single AdLib/OPL subsong to a fresh temp WAV (no audio check)."""
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    cmd = [binary, "-O", "disk", "-d", tmp_wav.name,
+           "-e", _ADLIB_OPL_EMULATOR, "-f", "44100", "--stereo"]
+    if subsong > 0:
+        cmd += ["-s", str(subsong)]      # multi-song AdLib formats (RAD, .adl, …)
+    cmd.append(str(path))
+    await _await_renderer(
+        cmd, Path(tmp_wav.name),
+        timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
+    )
+    return Path(tmp_wav.name)
+
+
+def _wav_audio_seconds(wav_path: Path) -> float:
+    """Real audio length of a WAV from its header (cheap); 0.0 if unreadable.
+
+    Parses the RIFF chunks by hand rather than via the stdlib ``wave`` module:
+    uade123 writes WAVE_FORMAT_EXTENSIBLE (format tag 0xFFFE / 65534), which
+    ``wave.open`` rejects with "unknown format" — that would silently break the
+    AHX/HVL duration backfill.  Duration = data-chunk bytes / average-bytes-per-
+    second, which is format-tag-agnostic and works for plain PCM (adplay /
+    sidplayfp / openmpt123) too.
+    """
+    import struct
+    try:
+        with open(wav_path, "rb") as f:
+            riff = f.read(12)
+            if len(riff) < 12 or riff[:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                return 0.0
+            avg_bps = rate = channels = bits = data_bytes = 0
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                cid, size = hdr[:4], struct.unpack("<I", hdr[4:8])[0]
+                if cid == b"fmt ":
+                    fmt = f.read(size)
+                    if len(fmt) >= 16:
+                        channels = struct.unpack("<H", fmt[2:4])[0]
+                        rate = struct.unpack("<I", fmt[4:8])[0]
+                        avg_bps = struct.unpack("<I", fmt[8:12])[0]
+                        bits = struct.unpack("<H", fmt[14:16])[0]
+                    if size % 2:
+                        f.seek(1, 1)             # chunks are word-aligned
+                elif cid == b"data":
+                    pos = f.tell()
+                    f.seek(0, 2)
+                    avail = f.tell() - pos        # bytes actually on disk
+                    data_bytes = size if 0 < size <= avail else avail
+                    break
+                else:
+                    f.seek(size + (size & 1), 1)
+            if data_bytes <= 0:
+                return 0.0
+            if avg_bps <= 0:                       # derive it if the writer left it 0
+                if rate and channels and bits:
+                    avg_bps = rate * channels * (bits // 8)
+                else:
+                    return 0.0
+            return data_bytes / float(avg_bps)
+    except Exception:
+        return 0.0
+
+
+def _wav_peak_amplitude(wav_path: Path) -> int:
+    """Peak |sample| sampled across several ~1 s windows of a 16-bit WAV.
+
+    Sampling 5 windows (not just start+middle) avoids a false "silent" verdict on
+    a tune with a quiet intro AND a quiet midpoint but audio elsewhere.  Stops as
+    soon as audibility is proven.  Returns 32767 (treat as audible) if the file
+    isn't readable as 16-bit PCM — a probe heuristic must never suppress a tune we
+    could otherwise play.
+    """
+    import wave, array, sys
+    try:
+        with wave.open(str(wav_path), "rb") as w:
+            if w.getsampwidth() != 2:
+                return 32767
+            rate = w.getframerate() or 44100
+            total = w.getnframes()
+            if total <= 0:
+                return 0
+            win = min(total, rate)                 # ~1 s per window
+            peak = 0
+            for frac in (0.0, 0.2, 0.4, 0.6, 0.8):
+                pos = min(max(0, int(total * frac)), max(0, total - win))
+                w.setpos(pos)
+                raw = w.readframes(win)
+                if not raw:
+                    continue
+                a = array.array("h")
+                a.frombytes(raw[: (len(raw) // 2) * 2])
+                if sys.byteorder == "big":         # WAV PCM is little-endian; array uses host order
+                    a.byteswap()
+                if len(a):
+                    peak = max(peak, max(a), -min(a))
+                    if peak > _ADLIB_SILENCE_PEAK:  # proven audible — no need to scan further
+                        break
+            return peak
+    except Exception:
+        return 32767
+
+
+def _wav_is_audible(wav_path: Path) -> bool:
+    """True if a render has real, non-silent audio of meaningful length."""
+    if _wav_audio_seconds(wav_path) < _ADLIB_MIN_AUDIO_S:
+        return False
+    return _wav_peak_amplitude(wav_path) > _ADLIB_SILENCE_PEAK
+
+
+def _dro_is_v2(data: bytes) -> bool:
+    """True if *data* is a DRO v2 capture (which adplay decodes natively)."""
+    return len(data) >= 12 and data[:8] == b"DBRAWOPL" and data[8:12] == b"\x02\x00\x00\x00"
+
+
+def _dro_v1_to_v2(data: bytes) -> bytes:
+    """Rewrite a DRO v1 (DOSBox Raw OPL) capture as DRO v2.
+
+    adplay/AdPlug auto-detect only recognises DRO **v2**; older v1 captures are
+    rejected as "unknown filetype".  We re-encode the SAME OPL register-write
+    stream into the v2 container (codemap + short/long delay codes), so this is a
+    lossless transcode — the rendered audio is identical to the original capture.
+
+    DRO v1 has two header variants: the early "no version field" layout
+    (``DBRAWOPL`` + lengthMs + lengthBytes + hwType, data @17 — what melcom's
+    captures use) and a later versioned layout (version + lengthMs + lengthBytes
+    + hwType[+pad], data @21 or @24).  We pick whichever places
+    ``data_start + lengthBytes`` exactly on EOF.
+    """
+    import struct
+    if len(data) < 17 or data[:8] != b"DBRAWOPL":
+        raise ValueError("not a DRO file")
+    n = len(data)
+    data_start = 17
+    for lb_off, d_off in ((12, 17), (16, 21), (16, 24)):
+        if lb_off + 4 <= n and d_off + struct.unpack_from("<I", data, lb_off)[0] == n:
+            data_start = d_off
+            break
+    pos, end, bank = data_start, n, 0
+    events: "list[tuple]" = []
+    while pos < end:
+        cmd = data[pos]; pos += 1
+        if cmd == 0x00:                       # 1-byte delay
+            if pos >= end: break
+            events.append(("d", data[pos] + 1)); pos += 1
+        elif cmd == 0x01:                     # 2-byte delay
+            if pos + 1 >= end: break
+            events.append(("d", struct.unpack_from("<H", data, pos)[0] + 1)); pos += 2
+        elif cmd == 0x02:                     # low register bank
+            bank = 0
+        elif cmd == 0x03:                     # high register bank (OPL3)
+            bank = 1
+        elif cmd == 0x04:                     # escape: write to register 0x00-0x04
+            if pos + 1 >= end: break
+            events.append(("w", bank, data[pos], data[pos + 1])); pos += 2
+        else:                                 # cmd is the register, next byte the value
+            if pos >= end: break
+            events.append(("w", bank, cmd, data[pos])); pos += 1
+
+    regs: "list[int]" = []
+    seen: "set[int]" = set()
+    for e in events:
+        if e[0] == "w" and e[2] not in seen:
+            seen.add(e[2]); regs.append(e[2])
+    if len(regs) > 126:                       # codes are 7-bit; leave room for 2 delay codes
+        raise ValueError(f"too many distinct OPL registers ({len(regs)}) for a DRO v2 codemap")
+    code = {r: i for i, r in enumerate(regs)}
+    short_code, long_code = len(regs), len(regs) + 1
+
+    body = bytearray(); pairs = 0; total_ms = 0
+    for e in events:
+        if e[0] == "d":
+            d = e[1]; total_ms += d
+            full = d // 256
+            while full > 0:                   # long delay encodes (val+1)*256 ms
+                chunk = min(256, full)
+                body += bytes([long_code, chunk - 1]); pairs += 1; full -= chunk
+            rem = d % 256
+            if rem:                           # short delay encodes (val+1) ms
+                body += bytes([short_code, rem - 1]); pairs += 1
+        else:
+            _, b, reg, val = e
+            body += bytes([code[reg] | (0x80 if b else 0), val]); pairs += 1
+
+    hdr = bytearray(b"DBRAWOPL")
+    hdr += struct.pack("<HH", 2, 0)                       # version 2.0
+    hdr += struct.pack("<I", pairs)                       # iLengthPairs
+    hdr += struct.pack("<I", total_ms)                    # iLengthMS
+    # hwType / format / compression / shortDelayCode / longDelayCode / codemapLen.
+    # adplay derives OPL2-vs-OPL3 from the register stream, so hwType is moot.
+    hdr += bytes([0, 0, 0, short_code, long_code, len(regs)])
+    hdr += bytes(regs)                                    # codemap
+    return bytes(hdr) + bytes(body)
 
 
 async def _render_adlib(path: Path, subsong: int = 0) -> Path:
@@ -491,6 +713,12 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
     formats so the cache + cast pipeline treat them uniformly.  adplay renders
     the tune once (AdPlug reports the song's end) then exits; the timeout bounds
     any endless / looping tune.
+
+    Multi-song AdLib formats (notably Westwood ``.adl`` — Dune II, Kyrandia)
+    have an EMPTY subsong 0, with the music in a later subsong.  When the caller
+    doesn't pin a subsong we render subsong 0 and, if it's silent, probe the next
+    few subsongs for the first that actually produces audio — otherwise the
+    server would stream a ~0.01 s silent clip that "plays" but is useless.
     """
     binary = _find_renderer(settings.adplay_path, "adplay")
     if not binary:
@@ -500,38 +728,73 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
             "CMF, D00, RAD, …) require it.  Install via 'brew install adplay' "
             "(macOS) or 'apt install adplug-utils' (Debian/Ubuntu).",
         )
-    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_wav.close()
-    cmd = [binary, "-O", "disk", "-d", tmp_wav.name, "-f", "44100", "--stereo"]
-    if subsong > 0:
-        cmd += ["-s", str(subsong)]      # multi-song AdLib formats (RAD, …)
-    cmd.append(str(path))
-    await _await_renderer(
-        cmd, Path(tmp_wav.name),
-        timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
-    )
-    # adplay exits 0 even when AdPlug can't decode the tune (e.g. a Sierra .sci
-    # whose <prefix>patch.003 instrument bank is missing) — it just writes a
-    # header-only (~44-byte) WAV.  Streaming that makes the browser fail with
-    # SRC_NOT_SUPPORTED; surface a clear error instead.
-    out = Path(tmp_wav.name)
+
+    # DOSBox Raw OPL: adplay's auto-detect only handles DRO v2; the older DRO v1
+    # (no version field) it rejects as "unknown filetype".  Losslessly rewrite a
+    # v1 capture as v2 (OPL register stream preserved verbatim) and render that.
+    render_path, dro_tmp = path, None
     try:
-        size = out.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(12)
     except OSError:
-        size = 0
-    if size < 1024:
+        head = b""
+    if head[:8] == b"DBRAWOPL" and not _dro_is_v2(head):
         try:
-            out.unlink()
+            v2 = _dro_v1_to_v2(path.read_bytes())   # may raise — no temp file created yet
+            with tempfile.NamedTemporaryFile(suffix=".dro", delete=False) as t:
+                dro_tmp = Path(t.name)              # register NOW so the finally always cleans up
+                t.write(v2)
+            render_path = dro_tmp
+        except Exception as exc:        # noqa: BLE001 — fall back to raw file
+            log.warning("DRO v1→v2 transcode failed for %s: %s", path, exc)
+
+    try:
+        # adplay exits 0 even when AdPlug can't decode the tune (e.g. a Sierra
+        # .sci whose <prefix>patch.003 bank is missing → header-only ~44-byte WAV)
+        # or when the requested subsong is empty (~2 KB / 0.01 s).  Both used to
+        # slip past the old ``size < 1024`` guard or stream as silence; gate on
+        # real audio LENGTH + amplitude instead.
+        out = await _render_adlib_one(binary, render_path, subsong)
+        if _wav_is_audible(out):
+            return out
+
+        size0 = 0
+        try:
+            size0 = out.stat().st_size
         except OSError:
             pass
-        raise HTTPException(
-            422,
-            "AdLib render produced no audio. For formats that need a companion "
-            "instrument bank — Sierra .sci (patch.003), AdLib Visual Composer "
-            ".rol (standard.bnk), Ken Silverman .ksm (insts.dat) — this usually "
-            "means that bank could not be found beside the tune in the archive.",
-        )
-    return out
+        out.unlink(missing_ok=True)
+
+        # Header-only (< 1 KB) ⇒ AdPlug decoded nothing at all (missing bank /
+        # unsupported) — probing other subsongs won't help.  A tiny non-header
+        # clip ⇒ an empty subsong of a multi-song file — probe the next few.
+        if subsong == 0 and size0 >= 1024:
+            for ss in range(1, _ADLIB_MAX_SUBSONG_PROBE + 1):
+                cand = await _render_adlib_one(binary, render_path, ss)
+                if _wav_is_audible(cand):
+                    return cand
+                cand.unlink(missing_ok=True)
+
+        # Human-readable reason, distinguished by what adplay produced:
+        #   size0 < 1 KB  → adplay decoded NOTHING (header-only WAV): a missing
+        #                   companion bank (for bank formats) or an undecodable
+        #                   / corrupt file (for the rest).
+        #   size0 ≥ 1 KB  → adplay decoded the tune but it's silent/near-empty:
+        #                   an empty or corrupt tune (or an all-empty multi-song).
+        if size0 < 1024:
+            if path.suffix.lower() in _ADLIB_COMPANION_GLOBS:
+                detail = ("This file needs a companion instrument bank (e.g. "
+                          "standard.bnk / patch.003 / insts.dat) that wasn't "
+                          "found next to it in the archive or folder.")
+            else:
+                detail = ("This file couldn't be decoded — it looks corrupt or "
+                          "is an unsupported AdLib variant.")
+        else:
+            detail = "This file is empty or corrupt — it contains no audio."
+        raise HTTPException(422, detail)
+    finally:
+        if dro_tmp is not None:
+            dro_tmp.unlink(missing_ok=True)
 
 
 async def _render_imf(path: Path, subsong: int = 0) -> Path:
@@ -562,36 +825,36 @@ async def _render_imf(path: Path, subsong: int = 0) -> Path:
     return await _render_adlib(path, subsong=subsong)          # id/Apogee AdLib IMF
 
 
-async def _backfill_adlib_duration(track_id: str, track, wav_path) -> float | None:
-    """Persist an AdLib tune's REAL length once we've rendered it; return it.
+async def _backfill_rendered_duration(track_id: str, track, wav_path,
+                                      placeholder: float | None = None) -> float | None:
+    """Persist a render-only tune's REAL length once we've rendered it; return it.
 
-    The scanner can't know an AdLib tune's length without rendering, so it
-    stores a placeholder (``metadata._ADLIB_DEFAULT_DURATION`` = 180s) and the
-    library list shows "3:00".  But adplay renders to the song's natural end, so
-    the served WAV carries the true length — read it from the WAV header (cheap,
-    header-only) and write it back via the store (AOF-journalled, so it survives
-    restart; a rescan that resets the placeholder simply re-triggers this).
+    The scanner can't know a render-only format's length without rendering, so it
+    stores a per-format placeholder and the library list shows e.g. "3:00"/"5:00".
+    But the renderer runs to the song's natural end, so the served/probed WAV
+    carries the true length — read it from the WAV header (cheap, header-only) and
+    write it back via the store (AOF-journalled, so it survives restart; a rescan
+    that resets the placeholder simply re-triggers this).
 
-    Gated on the placeholder, so the WRITE is a no-op once a real duration is
-    stored.  Returns the real length in seconds (for the duration-probe to hand
-    back to the client) or None if it couldn't be determined.  Best-effort — a
-    duration cosmetic must never break playback.
+    Covers AdLib (180s placeholder), GME/chiptune — NSF/SPC/GBS/VGM/… —
+    (``settings.sid_default_duration``), and tracker (pass ``placeholder=0`` so it
+    only backfills when the scan's openmpt123 probe returned nothing).
+    ``placeholder`` defaults to the AdLib 180s.  Gated on it, so the WRITE is a
+    no-op once a real duration is stored (``stored<=0`` always backfills).
+    Returns the real length in seconds, or None.  Best-effort — a duration
+    cosmetic must never break playback.
     """
     try:
         if track is None:
             return None
-        from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+        if placeholder is None:
+            from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+            placeholder = float(_ADLIB_DEFAULT_DURATION)
         meta = track.__dict__ if hasattr(track, "__dict__") else {}
         stored = float(meta.get("duration") or 0)
-        placeholder = float(_ADLIB_DEFAULT_DURATION)
-        if stored > 0 and abs(stored - placeholder) > 0.01:
+        if stored > 0 and abs(stored - float(placeholder)) > 0.01:
             return stored  # already carries a real, non-placeholder duration
-        import wave
-        with wave.open(str(wav_path), "rb") as w:
-            frames, rate = w.getnframes(), w.getframerate()
-        if not rate or frames <= 0:
-            return None
-        real = round(frames / float(rate), 2)
+        real = round(_wav_audio_seconds(wav_path), 2)
         if real <= 0:
             return None
         if abs(real - stored) >= 0.5:
@@ -620,7 +883,10 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str) -> Path | None
         local_zip = await loop.run_in_executor(
             None, get_cache().fetch, scan_root, zip_rel, get_source(scan_root),
         )
-        return await _get_or_extract_zip_member(f"{local_zip}::{member}", track_id)
+        return await _get_or_extract_zip_member(
+            f"{local_zip}::{member}", track_id,
+            bank_fallback=_make_zip_bank_fallback(remote=(zip_rel, get_source(scan_root))),
+        )
     if is_remote:
         from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
@@ -638,7 +904,10 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str) -> Path | None
         )
         return Path(local) if local else None
     if "::" in path_str:
-        return await _get_or_extract_zip_member(path_str, track_id)
+        return await _get_or_extract_zip_member(
+            path_str, track_id,
+            bank_fallback=_make_zip_bank_fallback(local_zip=path_str.split("::")[0]),
+        )
     return Path(path_str)
 
 
@@ -675,21 +944,37 @@ async def _materialize_loose_remote_adlib(
             _register_adlib_extract(track_id, out_dir)
             return tune_out
 
-        def _work() -> Path | None:
-            import shutil
+        def _scan_companions(d: str, exclude_base: "str | None") -> list:
             try:
-                entries = source.list_dir(rdir)
+                entries = source.list_dir(d)
             except Exception:
-                entries = []
-            sibs = []
+                return []
+            found = []
             for e in entries:
                 if getattr(e, "is_dir", False):
                     continue
                 base = posixpath.basename((getattr(e, "name", "") or "").replace("\\", "/"))
-                if base and base != tune_base and any(
+                if base and base != exclude_base and any(
                     fnmatch.fnmatch(base.lower(), g.lower()) for g in globs
                 ):
-                    sibs.append((base, getattr(e, "path", None) or posixpath.join(rdir, base)))
+                    found.append((base, getattr(e, "path", None) or posixpath.join(d, base)))
+            return found
+
+        def _work() -> Path | None:
+            import shutil
+            sibs = _scan_companions(rdir, tune_base)
+            # If the tune's own dir has no companion bank, walk up a few parents
+            # and use the closest one found — collections keep one standard.bnk at
+            # a root with the ROLs in subfolders (see _ADLIB_BANK_PARENT_LEVELS).
+            if not sibs:
+                parent = rdir
+                for _ in range(_ADLIB_BANK_PARENT_LEVELS):
+                    parent = posixpath.dirname(parent)
+                    if not parent or parent in ("/", "."):
+                        break
+                    sibs = _scan_companions(parent, None)
+                    if sibs:
+                        break
             if not sibs:
                 return None
             if out_dir.exists():
@@ -714,32 +999,52 @@ async def _materialize_loose_remote_adlib(
         return tune
 
 
-async def _probe_one_adlib_duration(track_id: str) -> float | None:
-    """Render an AdLib/id-IMF tune once, JUST to learn its length, persist it,
-    and return it — the WAV is thrown away (a probe, not a play, so it never
-    pollutes the conversion cache with multi-MB renders).  Returns None for
-    non-AdLib tracks, already-known durations, or render failures (e.g. a
-    missing companion bank → 422, which just leaves the placeholder in place).
+async def _probe_one_rendered_duration(track_id: str) -> float | None:
+    """Render a render-only tune once, JUST to learn its length, persist it, and
+    return it — the WAV is thrown away (a probe, not a play, so it never pollutes
+    the conversion cache with multi-MB renders).  Covers AdLib/id-IMF and GME
+    chiptunes (NSF/SPC/GBS/VGM/AY/KSS/…).  Returns None for other formats,
+    already-known durations, or render failures (e.g. a missing companion bank →
+    422, which just leaves the placeholder in place).
     """
     track = await get_track(track_id)
     if track is None:
         return None
     path_str = getattr(track, "path", "") or ""
     ext = Path(path_str.split("::")[-1]).suffix.lower()
-    if ext not in _ADLIB_EXTS and ext != ".imf":
+    is_adlib = ext in _ADLIB_EXTS or ext == ".imf"
+    is_gme = ext in _GME_EXTS_STREAM
+    is_uade = ext in _UADE_EXTS
+    is_hvl = ext in _HVL_EXTS
+    if not (is_adlib or is_gme or is_uade or is_hvl):
         return None
-    from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+    if is_gme:
+        placeholder = float(settings.sid_default_duration)
+    elif is_uade or is_hvl:
+        placeholder = 0.0   # .ahx/.hvl carry no scan-time duration
+    else:
+        from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
+        placeholder = float(_ADLIB_DEFAULT_DURATION)
     meta = track.__dict__ if hasattr(track, "__dict__") else {}
     stored = float(meta.get("duration") or 0)
-    if stored > 0 and abs(stored - float(_ADLIB_DEFAULT_DURATION)) > 0.01:
+    if stored > 0 and abs(stored - placeholder) > 0.01:
         return stored  # already a real duration — nothing to probe
     local = await _resolve_adlib_local_path(track_id, path_str)
     if local is None:
         return None
     wav = None
     try:
-        wav = await (_render_imf(local) if ext == ".imf" else _render_adlib(local))
-        return await _backfill_adlib_duration(track_id, track, wav)
+        if is_gme:
+            wav = await _render_gme(local)
+        elif ext == ".imf":
+            wav = await _render_imf(local)
+        elif is_hvl:
+            wav = await _render_hvl(local)
+        elif is_uade:
+            wav = await _render_uade(local)
+        else:
+            wav = await _render_adlib(local)
+        return await _backfill_rendered_duration(track_id, track, wav, placeholder)
     except HTTPException:
         return None      # undecodable / missing bank — leave the placeholder
     except Exception:
@@ -1428,21 +1733,114 @@ def _adlib_companion_names(path_str: str, member_dir: str, globs) -> list[str]:
             inner_bytes, _ = _read_from_zip_path("::".join(parts[:-1]))
             with zipfile.ZipFile(io.BytesIO(inner_bytes)) as zf:
                 names = zf.namelist()
+        # Group matching banks by their dir inside the archive, then take the
+        # member's own dir — else the CLOSEST ancestor dir that holds one (a
+        # zipped collection may keep a single standard.bnk at a root with the
+        # tunes in subfolders, mirroring the loose-file parent-walk).
+        by_dir: "dict[str, list[str]]" = {}
         for n in names:
             norm = n.replace("\\", "/")        # match on a normalised copy …
-            if _os.path.dirname(norm) != member_dir:
-                continue
             base = _os.path.basename(norm)
             if any(fnmatch.fnmatch(base.lower(), g.lower()) for g in globs):
-                if n not in found:
-                    found.append(n)            # … but return the ORIGINAL name
+                by_dir.setdefault(_os.path.dirname(norm), []).append(n)  # keep ORIGINAL
+        d = member_dir
+        seen: "set[str]" = set()
+        while d not in seen:
+            seen.add(d)
+            if d in by_dir:
+                for n in by_dir[d]:
+                    if n not in found:
+                        found.append(n)
+                break
+            nd = _os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
     except Exception:
         pass
     return found
 
 
+def _dir_has_companion(d: Path, globs) -> bool:
+    """True if directory *d* already holds a file matching any of *globs*."""
+    import fnmatch
+    try:
+        return any(f.is_file() and any(fnmatch.fnmatch(f.name.lower(), g.lower()) for g in globs)
+                   for f in d.iterdir())
+    except OSError:
+        return False
+
+
+def _make_zip_bank_fallback(*, remote=None, local_zip=None):
+    """Build a sync ``fn(out_dir, globs)`` for a bank-dependent AdLib tune zipped
+    WITHOUT its bank: if *out_dir* has no companion bank, walk the .zip's
+    container dir + a few parents on the share/FS for a loose one and drop it in.
+    ``remote`` is ``(zip_rel, source)``; ``local_zip`` is the on-disk .zip path.
+    Returns None if neither is supplied (nowhere to look)."""
+    import fnmatch, os as _os, posixpath
+    if remote is not None:
+        zip_rel, source = remote
+        start = posixpath.dirname(str(zip_rel).replace("\\", "/"))
+        def _list(d):
+            try:
+                entries = source.list_dir(d)
+            except Exception:
+                return []
+            out = []
+            for e in entries:
+                if getattr(e, "is_dir", False):
+                    continue
+                b = posixpath.basename((getattr(e, "name", "") or "").replace("\\", "/"))
+                if b:
+                    out.append((b, getattr(e, "path", None) or posixpath.join(d, b)))
+            return out
+        def _read(ref):
+            return source.read_file(ref)
+        _up = posixpath.dirname
+    elif local_zip is not None:
+        start = _os.path.dirname(str(local_zip))
+        def _list(d):
+            try:
+                names = _os.listdir(d)
+            except OSError:
+                return []
+            return [(n, _os.path.join(d, n)) for n in names
+                    if _os.path.isfile(_os.path.join(d, n))]
+        def _read(ref):
+            with open(ref, "rb") as fh:        # explicit close, not GC-dependent
+                return fh.read()
+        _up = _os.path.dirname
+    else:
+        return None
+
+    def _fb(out_dir: Path, globs) -> None:
+        if _dir_has_companion(out_dir, globs):
+            return                             # the zip already supplied a bank
+        # Walk the .zip's container dir + a few parents; materialize EVERY bank in
+        # the FIRST dir that has one (AdPlug needs the exact bank NAME it derives,
+        # so drop them all and let it pick the right one), then stop.  Never lists
+        # the share root — the upward walk halts before "" / "/" / ".".
+        d, seen = start, set()
+        for _ in range(_ADLIB_BANK_PARENT_LEVELS + 1):
+            if not d or d in seen or d in ("/", "."):
+                break
+            seen.add(d)
+            wrote = False
+            for base, ref in _list(d):
+                if any(fnmatch.fnmatch(base.lower(), g.lower()) for g in globs):
+                    try:
+                        (out_dir / base).write_bytes(_read(ref))
+                        wrote = True
+                    except Exception:
+                        continue
+            if wrote:
+                return
+            d = _up(d)
+    return _fb
+
+
 async def _extract_adlib_with_companions(
-    path_str: str, track_id: str, outer_zip: Path, globs,
+    path_str: str, track_id: str, outer_zip: Path, globs, bank_fallback=None,
 ) -> Path | None:
     """Materialize an AdLib tune that needs companion bank/patch files so adplay
     can decode it (Sierra ``.sci`` -> ``patch.003``, ROL ``.bnk``, KSM
@@ -1467,9 +1865,13 @@ async def _extract_adlib_with_companions(
     lock = await _zip_lock_for(track_id)
     async with lock:
         marker = out_dir / ".zip_mtime"
-        if music_out.exists() and marker.exists() and marker.read_text() == zip_mtime:
-            # Cache hit — re-account (post-restart the in-memory budget is empty
-            # though the dir persists) + bump LRU recency, mirroring the flat path.
+        if (music_out.exists() and marker.exists() and marker.read_text() == zip_mtime
+                and _dir_has_companion(out_dir, globs)):
+            # Cache hit WITH the bank present — re-account (post-restart the
+            # in-memory budget is empty though the dir persists) + bump LRU recency.
+            # If a prior extraction cached the tune BANKLESS (the bank was
+            # unreachable then), fall through and re-extract so the in-zip walk /
+            # cross-zip fallback gets another chance instead of latching broken.
             _register_adlib_extract(track_id, out_dir)
             return music_out
 
@@ -1497,6 +1899,12 @@ async def _extract_adlib_with_companions(
                     continue
                 out_name = _os.path.basename(comp_member.replace("\\", "/"))
                 (out_dir / out_name).write_bytes(comp_bytes)
+            # Tune zipped WITHOUT its bank → pull a loose one from the share/FS.
+            if bank_fallback is not None:
+                try:
+                    bank_fallback(out_dir, globs)
+                except Exception:
+                    log.debug("AdLib zip bank fallback failed", exc_info=True)
             marker.write_text(zip_mtime)
             return music_out
 
@@ -1510,7 +1918,7 @@ async def _extract_adlib_with_companions(
         return music
 
 
-async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | None:
+async def _get_or_extract_zip_member(path_str: str, track_id: str, bank_fallback=None) -> Path | None:
     """Return a stable on-disk path for a ZIP-contained track.
 
     Extracts on first request, caches on disk, reuses on every subsequent
@@ -1529,6 +1937,7 @@ async def _get_or_extract_zip_member(path_str: str, track_id: str) -> Path | Non
     if _adlib_ext in _ADLIB_COMPANION_GLOBS:
         return await _extract_adlib_with_companions(
             path_str, track_id, outer_zip, _ADLIB_COMPANION_GLOBS[_adlib_ext],
+            bank_fallback=bank_fallback,
         )
     try:
         zip_mtime = outer_zip.stat().st_mtime
@@ -3585,11 +3994,13 @@ async def probe_durations(
     sb_session: str | None = Cookie(default=None),
     request: Request = None,
 ):
-    """Fill in real lengths for AdLib/id-IMF tracks shown in the UI that still
-    carry the 180s placeholder, WITHOUT the user having to play them.
+    """Fill in real lengths for render-only tracks shown in the UI that still
+    carry their default-duration placeholder — AdLib/id-IMF (180s) and GME
+    chiptunes (NSF/SPC/GBS/VGM/… at sid_default_duration) — WITHOUT the user
+    having to play them.
 
-    The library calls this in the background for the AdLib rows currently on
-    screen (any view — folder, search, smart, galaxy).  Each tune is rendered
+    The library calls this in the background for the placeholder rows currently
+    on screen (any view — folder, search, smart, galaxy).  Each tune is rendered
     once (throwaway) to learn its length, which is persisted; the real seconds
     are returned as ``{track_id: seconds}`` so the client patches the rows in
     place.  Concurrency-limited so a big result set can't spike CPU, and naturally
@@ -3606,7 +4017,7 @@ async def probe_durations(
     async def _one(tid: str):
         async with _bg_render_sem:
             try:
-                return tid, await _probe_one_adlib_duration(tid)
+                return tid, await _probe_one_rendered_duration(tid)
             except Exception:
                 return tid, None
 
@@ -3899,7 +4310,10 @@ async def stream_track(
                 raise HTTPException(404, "Archive missing on source (rescan to refresh)")
             log.warning("Remote archive fetch failed for %s: %s", path_str, exc)
             raise HTTPException(502, "Could not fetch archive from network share")
-        path = await _get_or_extract_zip_member(f"{_local_zip}::{_member}", track_id)
+        path = await _get_or_extract_zip_member(
+            f"{_local_zip}::{_member}", track_id,
+            bank_fallback=_make_zip_bank_fallback(remote=(zip_rel, source)),
+        )
         if path is None:
             raise HTTPException(404, "Track missing inside the archive")
         _zip_pin(track_id)
@@ -4016,7 +4430,10 @@ async def stream_track(
         # invalidate via the outer-zip mtime so a ZIP rebuild forces a
         # fresh extract.  Reused across every Range request for the
         # lifetime of the on-disk archive.
-        path = await _get_or_extract_zip_member(path_str, track_id)
+        path = await _get_or_extract_zip_member(
+            path_str, track_id,
+            bank_fallback=_make_zip_bank_fallback(local_zip=path_str.split("::")[0]),
+        )
         if path is None:
             raise HTTPException(410, "ZIP archive not found or unreadable")
         # Pin the extract for the duration of the response so eviction
@@ -4165,6 +4582,11 @@ async def stream_track(
                 track_id=track_id, format_type="hvl", subsong=subsong,
                 render_fn=lambda: _render_hvl(path, subsong=subsong),
             )
+            # .hvl is listed in _TRACKER_EXTS for scanner detection, but openmpt123
+            # can't decode it, so the scan stored duration 0 — hvl2wav renders to the
+            # tune's natural end, so persist the WAV's real length (placeholder=0
+            # no-ops if a real duration was somehow already stored).
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "hvl2wav", "X-Cache": "hit" if hit else "miss"},
@@ -4175,6 +4597,11 @@ async def stream_track(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(path, subsong=subsong),
             )
+            # .ahx is listed in _TRACKER_EXTS for scanner detection, but openmpt123
+            # can't decode it, so the scan stored duration 0 — uade123 renders to the
+            # tune's natural end, so persist the WAV's real length (placeholder=0
+            # no-ops if a real duration was somehow already stored).
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
@@ -4192,7 +4619,7 @@ async def stream_track(
             # natural end via _render_adlib, so backfill its real length too.  The
             # placeholder gate no-ops for IM10 (Imago Orpheus) .imf, which already
             # carries a real tracker duration.
-            await _backfill_adlib_duration(track_id, track, cached_path)
+            await _backfill_rendered_duration(track_id, track, cached_path)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "adplug/openmpt123", "X-Cache": "hit" if hit else "miss"},
@@ -4205,7 +4632,7 @@ async def stream_track(
             )
             # The scanner stored a 180s placeholder; the WAV we just made/cached
             # carries the real length — persist it so the list stops showing "3:00".
-            await _backfill_adlib_duration(track_id, track, cached_path)
+            await _backfill_rendered_duration(track_id, track, cached_path)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "adplug", "X-Cache": "hit" if hit else "miss"},
@@ -4216,6 +4643,11 @@ async def stream_track(
                 track_id=track_id, format_type="tracker", subsong=subsong,
                 render_fn=lambda: _render_tracker(path, subsong=subsong),
             )
+            # Tracker length normally comes from openmpt123 --info at scan, but
+            # that falls back to 0 when the binary is unavailable — backfill from
+            # the rendered WAV in that case (placeholder=0 no-ops when scan already
+            # stored a real duration).
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "openmpt123", "X-Cache": "hit" if hit else "miss"},
@@ -4226,6 +4658,12 @@ async def stream_track(
                 track_id=track_id, format_type="gme", subsong=subsong,
                 render_fn=lambda: _render_gme(path, subsong=subsong),
             )
+            # GME chiptunes (NSF/SPC/GBS/…) store the sid_default_duration
+            # placeholder; libgme renders to the track's natural end so the WAV
+            # carries the real length — persist it so the list/modal stop showing
+            # the default (e.g. "5:00").
+            await _backfill_rendered_duration(
+                track_id, track, cached_path, float(settings.sid_default_duration))
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "gme", "X-Cache": "hit" if hit else "miss"},

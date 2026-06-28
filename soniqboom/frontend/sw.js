@@ -396,7 +396,50 @@
 // re-anchors (search.js); renderer buffering-badge suppression now ends once
 // audio is audible (player.js); #btn-welcome ships aria-expanded="false"
 // (index.html).
-const SHELL_VERSION = 'v116';
+// v117 (2026-06-26): review fixes — defined the missing ``.sr-only`` clip so
+// the skeleton's "Loading tracks…" label stops painting on screen (app.css);
+// the Cast picker now marks the real ``#content`` / ``#m-content`` inert (it
+// targeted a non-existent ``#main-content``, so its aria-modal isolation never
+// applied — cast_picker.js).  Backend (not SW-cached): /smart/duplicates now
+// gates the 270k-track rebuild behind the mutation-seq cache and runs the cold
+// build off the event loop (smart.py).
+// v118 (2026-06-26): app.css — the Library Galaxy view (#galaxy-view) was missing
+// from the z-index lift list, so a playing music visualizer (z-index:0, opacity
+// 0.9) painted over the constellation and washed it out.  Lifted #galaxy-view to
+// z-index:1 like the other content views; its opaque scene now fully covers the
+// ambient visualizer.  Bump re-fetches the precached app.css.
+// v119 (2026-06-27): utils.js — the background duration probe (probeAdlibDurations)
+// now covers GME chiptunes (NSF/SPC/GBS/…), not just AdLib, so their real lengths
+// replace the sid_default_duration placeholder ("5:00") in the list/modal without
+// playing.  Backend persists the rendered length on play + via /probe-durations.
+// v120 (2026-06-27): library.js — patchTrackDuration was scoped to AdLib only and
+// gated on the 180s placeholder, so it silently DROPPED the backend's GME (NSF/…)
+// duration corrections (their placeholder is sid_default_duration, e.g. 300, not
+// 180) — the list/now-playing row stayed at "5:00" even though the store had the
+// real length.  Widened to render-only formats (CHIP_FORMAT_NAMES), removed the
+// 180-only gate.
+// v121 (2026-06-27): player.js — the play-failure probe aborted the response body
+// and only ever showed "Server returned HTTP <code>".  It now reads the error
+// body's human-readable ``detail`` (backend returns specific reasons, e.g. "This
+// file is empty or corrupt", "needs a companion instrument bank", "couldn't be
+// decoded") and surfaces THAT in the toast.  Bump re-fetches the precached player.js.
+// v122 (2026-06-27): app.js — two visualizer fixes for radio.  (1) The global
+// keydown guard returned for ANY key when a role=button/tab/radio was focused,
+// so "v" (cycle visualizer) did nothing right after clicking a station to play
+// it (the focused row swallowed the key) — now it only defers Space/Enter/arrow
+// keys to the widget, letter shortcuts pass through.  (2) The visualizer's
+// auto-start hooks live in the lazy module; a radio-only session never loaded it
+// (no library track play, deferred warm may not have run), so radio didn't
+// render the canvas until a song was played first.  Added a statechange listener
+// that load+starts the visualizer on the first play of any kind.
+// v123 (2026-06-27): utils.js + library.js — AHX/HVL (UADE) duration display.
+// .ahx/.hvl are render-only (uade123/hvl2wav) so the scan stores duration 0 and
+// the list/modal showed "—" even though playback knew the length.  The duration
+// probe + live row-patch were gated on CHIP_FORMAT_NAMES (AdLib+GME only); added
+// RENDER_DURATION_FORMAT_NAMES = CHIP ∪ {AHX, HivelyTracker} and switched both
+// gates to it.  (Backend also now backfills the UADE/HVL branches and parses
+// WAVE_FORMAT_EXTENSIBLE, which stdlib wave.open rejected — server restart.)
+const SHELL_VERSION = 'v123';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

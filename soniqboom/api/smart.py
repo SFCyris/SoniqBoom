@@ -39,33 +39,34 @@ router = APIRouter(tags=["smart"])
 HISTORY_MAX = 500                       # cap to avoid unbounded growth
 
 
-# ── Helper: fetch all tracks as dicts ────────────────────────────────────────
-
-async def _all_tracks_meta() -> list[dict]:
-    """Return every track in the library as a list of dicts."""
-    from soniqboom.core.data import scan_all_tracks_meta
-    metas = await scan_all_tracks_meta()
-    return [t.model_dump() for t in metas]
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  SMART PLAYLIST VIEWS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Ranked-list memos for /smart/most-played + /smart/top-rated.  The full sorted
+# id list is reused across requests until a play / rating actually changes — keyed
+# on the store's _play_seq / _rating_seq (which record_play / set_rating bump; they
+# do NOT touch _mutation_seq).  Sized by the played/rated subset, not the library.
+_MOST_PLAYED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
+_TOP_RATED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
+
+
 @router.get("/smart/most-played")
 async def most_played(limit: int = Query(100, ge=1, le=500)):
     """Return tracks sorted by play count (most → least)."""
+    seq = get_store()._play_seq
     all_stats = await get_all_play_stats()
     if not all_stats:
         return []
-
-    # Sort by count descending, then by last_played descending
-    ranked_ids = sorted(
-        all_stats.keys(),
-        key=lambda tid: (-all_stats[tid].get("count", 0),
-                         -all_stats[tid].get("last_played", 0)),
-    )[:limit]
-
+    if _MOST_PLAYED_MEMO["seq"] != seq:
+        # Sort by count descending, then by last_played descending.
+        _MOST_PLAYED_MEMO["ranked"] = sorted(
+            all_stats.keys(),
+            key=lambda tid: (-all_stats[tid].get("count", 0),
+                             -all_stats[tid].get("last_played", 0)),
+        )
+        _MOST_PLAYED_MEMO["seq"] = seq
+    ranked_ids = _MOST_PLAYED_MEMO["ranked"][:limit]
     return await _enrich_tracks(ranked_ids, stats=all_stats)
 
 
@@ -90,16 +91,18 @@ async def unplayed(limit: int = Query(100, ge=1, le=500)):
 @router.get("/smart/top-rated")
 async def top_rated(limit: int = Query(100, ge=1, le=500)):
     """Return tracks sorted by star rating (highest first)."""
+    seq = get_store()._rating_seq
     all_ratings = await get_all_ratings()
     if not all_ratings:
         return []
-
-    # Only include tracks with rating >= 1
-    rated_ids = sorted(
-        (tid for tid, r in all_ratings.items() if r >= 1),
-        key=lambda tid: -all_ratings[tid],
-    )[:limit]
-
+    if _TOP_RATED_MEMO["seq"] != seq:
+        # Only include tracks with rating >= 1, highest first.
+        _TOP_RATED_MEMO["ranked"] = sorted(
+            (tid for tid, r in all_ratings.items() if r >= 1),
+            key=lambda tid: -all_ratings[tid],
+        )
+        _TOP_RATED_MEMO["seq"] = seq
+    rated_ids = _TOP_RATED_MEMO["ranked"][:limit]
     return await _enrich_tracks(rated_ids, ratings=all_ratings)
 
 
@@ -189,206 +192,212 @@ async def listening_history(limit: int = Query(50, ge=1, le=200)):
 #  DUPLICATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Cache the (tracks, annotations) pair so back-to-back ``/smart/duplicates``
-# requests (the UI hits the list, then group-detail, then sometimes again on
-# pagination) don't re-scan every track each time.
+# Duplicate-group views are served from the store's maintained ``_tag_dup_group``
+# index ({group_id -> member track_ids}) plus the PERSISTED per-track annotation
+# fields (``duplicate_group_id`` / ``is_duplicate_primary`` / ``format_score``).
+# That index is reconstructed from the AOF on boot, so these views never recompute
+# groups over the whole library on a request — they read the saved index.
 #
-# The cache is keyed on the store's mutation sequence number — bumped on
-# every track upsert / update / delete — so a rescan or retag that doesn't
-# change the *count* still invalidates the cache.  Callers always receive
-# a deep copy of the cached tracks so they can't mutate the cached pair
-# in-place (``format_score`` / ``is_duplicate_primary`` injection used to
-# leak across calls).
-import copy as _copy
+# Freshness: a single-flight background recompute fires whenever the library has
+# mutated since the last one (``_dup_seq`` tracks the ``_mutation_seq`` at that
+# point).  The persisted index is served instantly meanwhile (eventually
+# consistent); only a never-computed library blocks for one build.  The recompute
+# diffs against the current annotations and persists just the changed tracks in a
+# single batched AOF record, off the event loop.
 
-_DUP_CACHE: dict[str, object] = {"seq": -1, "count": -1, "tracks": None, "annotations": None}
-
-
-def _store_seq() -> int:
-    """Mutation sequence number from the store; ``-1`` if not exposed yet."""
-    try:
-        from soniqboom.core.store import get_store
-        return int(getattr(get_store(), "_mutation_seq", -1))
-    except Exception:
-        return -1
+_dup_seq: int = -1                          # _mutation_seq as of the last completed recompute
+_dup_task: "asyncio.Task | None" = None     # single-flight recompute task
+_PUBLIC_META_FIELDS = set(TrackMeta.model_fields)
 
 
-async def _dup_snapshot():
-    """Return ``(all_tracks, annotations)`` reusing a cached pair when valid.
-
-    Always returns *fresh copies* — the cache stores reference originals,
-    the caller gets a deep clone so per-request annotation injection can't
-    leak into subsequent calls.
-    """
+def _compute_dup_changes(raw_tracks: list[dict]) -> list[tuple[str, dict]]:
+    """Off-loop: recompute duplicate groups over a snapshot of raw store dicts and
+    return ONLY the ``(track_id, fields)`` whose annotation changed, so the persist
+    step writes a minimal batch (and re-indexes only what moved).
+    ``compute_duplicate_groups`` reads title/artist/duration/format/bitrate — all
+    present on the raw dicts — so no Pydantic construction is needed."""
     from soniqboom.core.duplicates import compute_duplicate_groups
-
-    all_tracks = await _all_tracks_meta()
-    count = len(all_tracks)
-    seq = _store_seq()
-    cached_seq = _DUP_CACHE.get("seq", -1)
-    cached_count = _DUP_CACHE.get("count", -1)
-    cached_tracks = _DUP_CACHE.get("tracks")
-    cached_anno = _DUP_CACHE.get("annotations")
-    if (
-        cached_seq == seq
-        and cached_count == count
-        and cached_tracks is not None
-        and cached_anno is not None
-    ):
-        # Shallow-copy the *list* of track dicts but reuse the dict
-        # references; the caller's per-track ``format_score`` /
-        # ``is_duplicate_primary`` injection still leaks across calls —
-        # so we also restore the original keys on a tracked copy of each
-        # mutated dict.  Full ``deepcopy`` of a 170K-track list was
-        # ~150–300 ms blocking on the event loop (Perf #1).
-        track_copies = [dict(t) for t in cached_tracks]
-        anno_copies = {k: dict(v) for k, v in cached_anno.items()}
-        return track_copies, anno_copies
-
-    annotations = compute_duplicate_groups(all_tracks)
-    # Stash the originals; future callers get their own per-dict copies.
-    _DUP_CACHE["seq"] = seq
-    _DUP_CACHE["count"] = count
-    _DUP_CACHE["tracks"] = all_tracks
-    _DUP_CACHE["annotations"] = annotations
-    track_copies = [dict(t) for t in all_tracks]
-    anno_copies = {k: dict(v) for k, v in annotations.items()}
-    return track_copies, anno_copies
+    annotations = compute_duplicate_groups(raw_tracks)
+    cur = {t["id"]: t for t in raw_tracks if t.get("id")}
+    changes: list[tuple[str, dict]] = []
+    for tid, a in annotations.items():
+        c = cur.get(tid)
+        if c is None:
+            continue
+        if (c.get("duplicate_group_id") != a["duplicate_group_id"]
+                or bool(c.get("is_duplicate_primary", True)) != bool(a["is_duplicate_primary"])
+                or int(c.get("format_score") or 0) != int(a["format_score"])):
+            changes.append((tid, {
+                "duplicate_group_id": a["duplicate_group_id"],
+                "format_score": a["format_score"],
+                "is_duplicate_primary": a["is_duplicate_primary"],
+            }))
+    return changes
 
 
-def _invalidate_dup_cache() -> None:
-    _DUP_CACHE["seq"] = -1
-    _DUP_CACHE["count"] = -1
-    _DUP_CACHE["tracks"] = None
-    _DUP_CACHE["annotations"] = None
+async def _do_dup_recompute() -> int:
+    """Recompute + persist duplicate annotations.  Snapshot on the loop, compute +
+    diff OFF the loop, then persist the (minimal) changed set in ONE batched AOF
+    record — which also updates the store's ``_tag_dup_group`` index.  Returns the
+    number of tracks whose annotation changed."""
+    global _dup_seq
+    store = get_store()
+    snap_seq = store._mutation_seq
+    try:
+        # Snapshot only the fields the grouping + diff + primary tiebreak need
+        # (incl. ``added_at`` — _pick_primary's final tiebreaker), not the full
+        # ~30-field dicts, so the loop-side copy of 270k tracks is as small as
+        # possible before threading.
+        raw_snapshot = [{
+            "id": d.get("id"), "title": d.get("title"),
+            "artist": d.get("artist"), "album_artist": d.get("album_artist"),
+            "duration": d.get("duration"), "format": d.get("format"),
+            "bitrate": d.get("bitrate"), "added_at": d.get("added_at"),
+            "duplicate_group_id": d.get("duplicate_group_id"),
+            "is_duplicate_primary": d.get("is_duplicate_primary"),
+            "format_score": d.get("format_score"),
+        } for d in store.all_tracks()]
+        changes = await asyncio.to_thread(_compute_dup_changes, raw_snapshot)
+        # Did a REAL mutation interleave during the off-loop compute?  (Our own
+        # batch write below is synchronous, so it's excluded from this check.)
+        interleaved = store._mutation_seq != snap_seq
+        if changes:
+            store.update_track_fields_batch(changes)
+        # Mark fresh as of the snapshot.  If a real change interleaved during the
+        # compute, leave _dup_seq at snap_seq so the next request recomputes once
+        # and converges — never silently dropping that change.
+        _dup_seq = snap_seq if interleaved else store._mutation_seq
+        return len(changes)
+    except Exception:
+        # Never let a failed recompute storm every request: mark fresh-as-of-now
+        # so it doesn't re-fire until the next real mutation.  Handling it here
+        # also avoids an unretrieved-exception warning on the detached task.
+        log.warning("duplicate-group recompute failed; retrying on next mutation",
+                    exc_info=True)
+        _dup_seq = store._mutation_seq
+        return 0
+
+
+async def _ensure_dup_fresh(*, await_if_empty: bool = True) -> None:
+    """Trigger a single-flight background recompute when the library has mutated
+    since the last one.  Serves the persisted index immediately (eventually
+    consistent); only blocks when there's nothing to show yet."""
+    global _dup_task
+    store = get_store()
+    if _dup_seq == store._mutation_seq:
+        return
+    if _dup_task is None or _dup_task.done():
+        _dup_task = asyncio.create_task(_do_dup_recompute())
+    if await_if_empty and store.duplicate_group_count() == 0:
+        try:
+            await _dup_task
+        except Exception:
+            log.warning("duplicate-group recompute failed", exc_info=True)
+
+
+def _public_meta(store, tid: str) -> dict | None:
+    """TrackMeta-shaped dict (every public field present + defaults coerced, incl.
+    the persisted dup annotations) for a track id.  Shaped through ``TrackMeta`` so
+    the response matches the old ``model_dump()`` contract even for tracks
+    persisted before a newer field was added — only the few-hundred members of the
+    returned groups are shaped, so the per-track cost is negligible.  ``embedding``
+    is excluded from the input so it round-trips as the model default (not the
+    stored vector), exactly as the old path did."""
+    t = store.get_track(tid)
+    if not t:
+        return None
+    try:
+        return TrackMeta(**{
+            k: v for k, v in t.items()
+            if k in _PUBLIC_META_FIELDS and k != "embedding"
+        }).model_dump()
+    except Exception:
+        return None
+
+
+def _shape_group(store, gid: str, tids: list[str]) -> dict | None:
+    """Assemble one response group from member ids — primary first, then by
+    format quality.  Returns ``None`` for groups that no longer have ≥2 members
+    (e.g. after a delete dropped one)."""
+    members = [m for m in (_public_meta(store, tid) for tid in tids) if m]
+    if len(members) < 2:
+        return None
+    members.sort(key=lambda t: (not t.get("is_duplicate_primary", False),
+                                -(t.get("format_score") or 0)))
+    return {
+        "group_id": gid,
+        "primary_id": members[0]["id"],
+        "count": len(members),
+        "tracks": members,
+    }
 
 
 @router.get("/smart/duplicates")
 async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
-    """Return all duplicate groups with their member tracks.
+    """Return duplicate groups (largest first) with their member tracks.
 
-    Response format: [
-        {
-            "group_id": "abc123...",
-            "primary_id": "track-uuid",
-            "count": 3,
-            "tracks": [ { TrackMeta fields + format_score }, ... ]
-        },
-        ...
-    ]
+    Response: ``[{group_id, primary_id, count, tracks: [TrackMeta + dup fields]}]``.
+    Served from the maintained ``_tag_dup_group`` index — no per-request recompute.
     """
-    from soniqboom.core.duplicates import format_quality_score  # noqa: F401
-
-    all_tracks, annotations = await _dup_snapshot()
-
-    # Build groups dict
-    groups: dict[str, list[dict]] = {}
-    for t in all_tracks:
-        tid = t["id"]
-        ann = annotations.get(tid, {})
-        gid = ann.get("duplicate_group_id")
-        if gid:
-            t["format_score"] = ann.get("format_score", 0)
-            t["is_duplicate_primary"] = ann.get("is_duplicate_primary", False)
-            groups.setdefault(gid, []).append(t)
-
-    # Convert to response list, sorted by group size descending
+    store = get_store()
+    await _ensure_dup_fresh()
+    index = store.duplicate_group_index()                 # {gid: [tids]}, grouped tracks only
+    sized = [(gid, tids) for gid, tids in index.items() if len(tids) >= 2]
+    sized.sort(key=lambda gt: -len(gt[1]))                # rank by size before shaping
     result = []
-    for gid, tracks in sorted(groups.items(), key=lambda x: -len(x[1])):
-        primary = next((t for t in tracks if t.get("is_duplicate_primary")), tracks[0])
-        # Sort within group: primary first, then by format_score descending
-        tracks.sort(key=lambda t: (-t.get("is_duplicate_primary", False),
-                                   -t.get("format_score", 0)))
-        result.append({
-            "group_id": gid,
-            "primary_id": primary["id"],
-            "count": len(tracks),
-            "tracks": tracks,
-        })
-
-    return result[:limit]
+    for gid, tids in sized[:limit]:
+        g = _shape_group(store, gid, tids)
+        if g:
+            result.append(g)
+    return result
 
 
 @router.get("/smart/duplicates/{group_id}")
 async def get_duplicate_group(group_id: str):
     """Return all tracks in a specific duplicate group."""
-    all_tracks, annotations = await _dup_snapshot()
-
-    tracks_in_group = []
-    for t in all_tracks:
-        ann = annotations.get(t["id"], {})
-        if ann.get("duplicate_group_id") == group_id:
-            t["format_score"] = ann.get("format_score", 0)
-            t["is_duplicate_primary"] = ann.get("is_duplicate_primary", False)
-            tracks_in_group.append(t)
-
-    if not tracks_in_group:
+    store = get_store()
+    await _ensure_dup_fresh()
+    tids = store.duplicate_group_index().get(group_id)
+    g = _shape_group(store, group_id, tids) if tids else None
+    if not g:
         raise HTTPException(404, "Duplicate group not found")
-
-    return tracks_in_group
+    return g["tracks"]
 
 
 @router.post("/smart/duplicates/recompute")
 async def recompute_duplicates():
-    """Force recomputation of duplicate groups and store annotations."""
-    from soniqboom.core.duplicates import compute_duplicate_groups
-
-    all_tracks = await _all_tracks_meta()
-    annotations = compute_duplicate_groups(all_tracks)
-
-    store = get_store()
-    # Bulk-apply via a single AOF record instead of 170K individual ones —
-    # Perf #1 caught the journal blow-up that starved play/rating writes
-    # for the duration of a recompute.
-    items = [
-        (tid, {
-            "duplicate_group_id": ann["duplicate_group_id"],
-            "format_score": ann["format_score"],
-            "is_duplicate_primary": ann["is_duplicate_primary"],
-        })
-        for tid, ann in annotations.items()
-    ]
-    updated = store.update_track_fields_batch(items)
-
-    log.info("Duplicate recompute: annotated %d tracks", updated)
-    # Recompute invalidates the cached snapshot so the next
-    # ``/smart/duplicates`` hit reflects the fresh annotations.
-    _invalidate_dup_cache()
-    # Count distinct group ids — the previous ``// 2`` assumed pairs and
-    # under-counted (or over-counted) any group with ≥3 members.
-    distinct_groups = {
-        a["duplicate_group_id"] for a in annotations.values()
-        if a["duplicate_group_id"] is not None
-    }
-    return {"updated": updated, "groups": len(distinct_groups)}
+    """Force a recompute of duplicate-group annotations and persist them."""
+    changed = await _do_dup_recompute()
+    # Count only real groups (≥2 members) — a delete can decay a group to a lone
+    # member that still carries a stale group_id until the next recompute.
+    index = get_store().duplicate_group_index()
+    groups = sum(1 for tids in index.values() if len(tids) >= 2)
+    log.info("Duplicate recompute: %d annotation change(s), %d groups", changed, groups)
+    return {"updated": changed, "groups": groups}
 
 
 @router.post("/smart/duplicates/{group_id}/primary")
 async def set_group_primary(group_id: str, track_id: str):
-    """Override which track is the primary in a duplicate group."""
-    from soniqboom.core.duplicates import compute_duplicate_groups
+    """Override which track is the primary in a duplicate group.
 
-    all_tracks = await _all_tracks_meta()
-    annotations = compute_duplicate_groups(all_tracks)
-
-    group_tids = [
-        tid for tid, ann in annotations.items()
-        if ann.get("duplicate_group_id") == group_id
-    ]
-    if not group_tids:
-        raise HTTPException(404, "Group not found")
-    if track_id not in group_tids:
-        raise HTTPException(400, "Track is not in this duplicate group")
-
+    Reads the group's members straight from the maintained index (no full
+    recompute) and flips ``is_duplicate_primary`` on them in one batched write.
+    The override stands until the next recompute re-derives the primary by
+    format quality.
+    """
+    global _dup_seq
     store = get_store()
-    for tid in group_tids:
-        store.update_track_fields(tid, {"is_duplicate_primary": tid == track_id})
-
-    # Annotations changed but the track count didn't — invalidate the cache
-    # explicitly so the next ``/smart/duplicates`` hit reflects the new
-    # primary instead of serving the previous snapshot.
-    _invalidate_dup_cache()
-
+    tids = store.duplicate_group_index().get(group_id)
+    if not tids:
+        raise HTTPException(404, "Group not found")
+    if track_id not in tids:
+        raise HTTPException(400, "Track is not in this duplicate group")
+    store.update_track_fields_batch(
+        [(tid, {"is_duplicate_primary": tid == track_id}) for tid in tids]
+    )
+    # Keep _dup_seq in lock-step with the write we just made so the staleness
+    # check doesn't immediately recompute the manual override away.
+    _dup_seq = store._mutation_seq
     return {"group_id": group_id, "primary_id": track_id}
 
 

@@ -1126,6 +1126,15 @@ async def startup():
     from soniqboom.core import deadlock_watchdog
     deadlock_watchdog.start()
 
+    # Background index-integrity sweep: periodically (default 30 min, and only
+    # when the library has changed) rebuild the derived indexes via the atomic
+    # shadow-swap, which DETECTS and AUTO-HEALS any incremental-maintenance
+    # drift and keeps GET /admin/stats' ``index_ok`` honest.  The boot rebuild
+    # above is authoritative, so indexes start healthy; this catches drift that
+    # creeps in between restarts.  Disable with SONIQBOOM_INDEX_SWEEP_SECONDS<=0.
+    from soniqboom.core import index_health
+    index_health.start()
+
     # All startup work done — mark ready so the menubar can switch its
     # title from "starting…" to running and any status-file pollers can
     # stop spinning.  Message includes the track count so the final
@@ -1427,6 +1436,13 @@ async def shutdown():
         deadlock_watchdog.stop()
     except Exception:
         log.debug("deadlock_watchdog.stop() failed (non-fatal)", exc_info=True)
+
+    # Stop the background index-integrity sweep.  Idempotent.
+    try:
+        from soniqboom.core import index_health
+        index_health.stop()
+    except Exception:
+        log.debug("index_health.stop() failed (non-fatal)", exc_info=True)
 
     # Stop the remote-freshness loops — each share has its own asyncio
     # task that sleeps for the adaptive interval.  Without explicit

@@ -6,7 +6,7 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, probeAdlibDurations } from './utils.js';
+import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, RENDER_DURATION_FORMAT_NAMES, probeAdlibDurations } from './utils.js';
 
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
@@ -2882,10 +2882,7 @@ async function _probeVisibleAdlibDurations() {
     if (!(sec > 0)) continue;
     patchTrackDuration(id, sec);          // updates the visible cell + currentTracks[idx]
     const t = refs.get(id);               // also catch a row scrolled away before the reply
-    if (t) {
-      const cur = (+t.duration) || 0;
-      if (cur === 0 || Math.abs(cur - 180) < 0.5) t.duration = sec;
-    }
+    if (t && Math.abs((+t.duration || 0) - sec) >= 0.5) t.duration = sec;  // probe result is authoritative
   }
 }
 
@@ -2901,14 +2898,16 @@ function patchTrackDuration(id, seconds) {
   if (!row) return;                       // only a currently-visible row
   const idx = parseInt(row.dataset.idx, 10);
   const t = (idx >= 0 && idx < currentTracks.length) ? currentTracks[idx] : null;
-  // Scope to AdLib/IMF only — the formats the server actually backfills.  GME
-  // (NSF/SPC/…) also stores 180 but isn't persisted, so patching it would
-  // flicker back to "3:00" on reload; SID's render is duration-capped so its
-  // audio.duration already equals the stored value.
-  if (!t || t.id !== id || !ADLIB_FORMAT_NAMES.has(t.format)) return;
+  // Render-only formats (AdLib/IMF + GME chiptunes: NSF/SPC/GBS/… + UADE/HVL
+  // .ahx/.hvl) carry a scanner placeholder (or 0) until rendered; the server now
+  // backfills + PERSISTS the real length, and the player's audio.duration equals
+  // that rendered length — so for these formats the incoming value is
+  // AUTHORITATIVE.  (Other formats already have a real scan duration and aren't
+  // routed here.)  No placeholder gate is needed — the GME placeholder is the
+  // configurable sid_default_duration (not always 180), and AHX/HVL are 0.
+  if (!t || t.id !== id || !RENDER_DURATION_FORMAT_NAMES.has(t.format)) return;
   const cur = (+t.duration) || 0;
-  const isPlaceholder = (cur === 0) || (Math.abs(cur - 180) < 0.5);
-  if (!isPlaceholder || Math.abs(seconds - cur) < 0.5) return;
+  if (Math.abs(seconds - cur) < 0.5) return;   // already the right value — no-op
   t.duration = seconds;
   const durTd = row.cells[8];             // col-dur
   if (durTd) {

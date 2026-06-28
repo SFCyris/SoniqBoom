@@ -1491,25 +1491,34 @@ export const Player = (() => {
           headers: { 'Range': 'bytes=0-0' },
           signal: ctrl.signal,
           credentials: 'same-origin',
-        }).then(res => {
-          // Abort the body read; we only needed the status.  Safari
-          // throws on .body access for some opaque responses — guard.
-          try { ctrl.abort(); } catch (_) {}
+        }).then(async res => {
           if (res.ok || res.status === 206) {
-            // 200 or 206 Partial Content → the source is fine; play
-            // failed for browser-side reasons (codec, corrupt frame).
+            // 200 or 206 Partial Content → the source is fine; play failed for
+            // browser-side reasons (codec, corrupt frame).  Abort the (large)
+            // audio body; we only needed the status.  Safari throws on .body
+            // access for some opaque responses — guard.
+            try { ctrl.abort(); } catch (_) {}
             showOnce(genericReason);
             return;
           }
           const code = res.status;
-          const httpReason =
-            code === 502 ? `Source unavailable (share unreachable or ffmpeg failed)` :
-            code === 503 ? `Server busy — try again in a moment` :
-            code === 504 ? `Source timed out — share may be unreachable` :
-            code === 404 ? `Track or file missing on disk (rescan to refresh)` :
-            code === 403 ? `Sign in required to play this track` :
-            code === 401 ? `Sign in required` :
-                           `Server returned HTTP ${code}`;
+          // Error responses carry a SMALL JSON body with a human-readable
+          // ``detail`` (e.g. "This file is empty or corrupt") — read it and
+          // prefer it over the bare status code so the listener understands WHY.
+          let detail = '';
+          try {
+            const body = await res.json();
+            if (body && typeof body.detail === 'string') detail = body.detail.trim().slice(0, 200);
+          } catch (_) {}
+          try { ctrl.abort(); } catch (_) {}
+          const httpReason = detail ||
+            (code === 502 ? `Source unavailable (share unreachable or ffmpeg failed)` :
+             code === 503 ? `Server busy — try again in a moment` :
+             code === 504 ? `Source timed out — share may be unreachable` :
+             code === 404 ? `Track or file missing on disk (rescan to refresh)` :
+             code === 403 ? `Sign in required to play this track` :
+             code === 401 ? `Sign in required` :
+                            `Server returned HTTP ${code}`);
           showOnce(`Couldn't play "${title}"${fmtHint}: ${httpReason}`);
         }).catch((err) => {
           if (err && err.name === 'AbortError') return;

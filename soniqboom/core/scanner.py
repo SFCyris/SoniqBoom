@@ -262,8 +262,12 @@ def get_progress() -> ScanProgress:
     return _progress
 
 
-def is_scanning() -> bool:
-    return _progress.running
+# NOTE: ``is_scanning`` is defined once, later in this module
+# (``is_scanning(path=None)`` — running OR queued).  A second, earlier
+# ``def is_scanning() -> bool: return _progress.running`` used to live here but
+# was DEAD CODE: module-scope re-definition meant the later one always won and
+# this one was unreachable.  Removed so the name has a single, unambiguous
+# meaning and the integrity sweep's scan-gate can't silently change behaviour.
 
 
 # ── File discovery ─────────────────────────────────────────────────────────────
@@ -969,8 +973,17 @@ async def _async_exit_batch_mode(store) -> None:
     # in-line _rebuild_sorted_indexes path.
     from soniqboom.core.store import normalise_year
 
-    # Single pass to build the 4 lists (fast — just dict lookups)
-    year, added, dur, bpm = [], [], [], []
+    # Single pass to build ALL 11 sorted lists (numeric + lexical), mirroring
+    # TrackStore._index_track / TrackStore._rebuild_sorted_indexes exactly so
+    # this async post-scan rebuild produces byte-identical indexes.  Building
+    # only the 4 numeric lists here left the lexical/format lists and the
+    # ``_sorted_added_at_primary`` subset STALE after every scan — so sort-by-
+    # format/title/artist/album was wrong and the duplicates-hidden default
+    # view (which walks ``_sorted_added_at_primary``) missed newly-scanned
+    # tracks until the next full restart.
+    EMPTY_SORT_KEY = "￿"
+    year, added, added_primary, dur, bpm = [], [], [], [], []
+    title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
     for tid, t in store._tracks.items():
         y = normalise_year(t.get("year"))
         if y is not None:
@@ -978,21 +991,28 @@ async def _async_exit_batch_mode(store) -> None:
         a = t.get("added_at", 0)
         if a:
             added.append((a, tid))
+            if t.get("is_duplicate_primary", True):
+                added_primary.append((a, tid))
         d = t.get("duration", 0.0)
         if d:
             dur.append((d, tid))
         b = t.get("bpm")
         if b is not None:
             bpm.append((b, tid))
+        title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+        artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+        album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
+        album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+        fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
 
     await asyncio.sleep(0)
 
     # Sort each list separately, yielding between them.  CPython's
-    # list.sort() for tuples of (number, str) runs in C and partially
+    # list.sort() for tuples of (key, str) runs in C and partially
     # releases the GIL during comparisons.
-    # Guard against mixed types (e.g. year as str vs int) which would
-    # raise TypeError during sort.
-    for lst in (year, added, dur, bpm):
+    # Numeric lists guard against mixed types (e.g. year as str vs int)
+    # which would raise TypeError during sort; lexical keys are all str.
+    for lst in (year, added, added_primary, dur, bpm):
         try:
             lst.sort()
         except TypeError:
@@ -1004,18 +1024,31 @@ async def _async_exit_batch_mode(store) -> None:
                     lst[i] = (0.0, tid)
             lst.sort()
         await asyncio.sleep(0)
+    for lst in (title, artist_s, album_artist_s, album_s, fmt):
+        lst.sort()
+        await asyncio.sleep(0)
 
     store._sorted_year = year
     store._sorted_added_at = added
+    store._sorted_added_at_primary = added_primary
     store._sorted_duration = dur
     store._sorted_bpm = bpm
+    store._sorted_title = title
+    store._sorted_artist = artist_s
+    store._sorted_album_artist = album_artist_s
+    store._sorted_album = album_s
+    store._sorted_format = fmt
     store._sorted_dirty = False
     # Only now is it safe to drop out of batch mode — any in-flight
     # _index_track that happened during the yields ran in batch mode and
     # set _sorted_dirty (handled on the next rebuild).
     store._batch_mode = False
-    log.info("Sorted indexes rebuilt: %d year, %d added, %d dur, %d bpm",
-             len(year), len(added), len(dur), len(bpm))
+    log.info(
+        "Sorted indexes rebuilt: %d year, %d added (%d primary), %d dur, %d bpm, "
+        "%d title, %d artist, %d album_artist, %d album, %d fmt",
+        len(year), len(added), len(added_primary), len(dur), len(bpm),
+        len(title), len(artist_s), len(album_artist_s), len(album_s), len(fmt),
+    )
 
 
 def _compute_duplicates_in_process(all_tracks: list[dict]) -> dict:

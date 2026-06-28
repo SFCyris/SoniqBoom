@@ -272,6 +272,38 @@ def _refresh_album_list_cache(store) -> dict[tuple[str, str], dict]:
     return seen
 
 
+# Per-type SORTED album list, memoised on the same seq as the (aa,al)->sample map.
+# getAlbumList[2] used to re-materialise ``list(seen.items())`` and re-sort it
+# (O(A log A) over 20-50k albums) ON THE EVENT LOOP on every poll; the
+# deterministic sorts only change when the album set does, so cache one list per
+# type.  Returns the cached list REFERENCE — callers must slice / comprehend it
+# (never mutate it in place).
+_ALBUM_SORT_CACHE: dict = {"seq": None, "lists": {}}
+
+
+def _sorted_album_items(store, sort_type: str) -> list:
+    seen = _refresh_album_list_cache(store)          # debounced (aa,al)->sample map
+    seq = _ALBUM_LIST_CACHE["seq"]
+    if _ALBUM_SORT_CACHE["seq"] != seq:
+        _ALBUM_SORT_CACHE["seq"] = seq
+        _ALBUM_SORT_CACHE["lists"] = {}              # invalidate every per-type list at once
+    cached = _ALBUM_SORT_CACHE["lists"].get(sort_type)
+    if cached is not None:
+        return cached
+    items = list(seen.items())
+    if sort_type == "newest":
+        items.sort(key=lambda a: a[1].get("added_at") or 0, reverse=True)
+    elif sort_type == "alphabeticalByName":
+        items.sort(key=lambda a: a[0][1].lower())
+    elif sort_type == "alphabeticalByArtist":
+        items.sort(key=lambda a: (a[0][0].lower(), a[0][1].lower()))
+    elif sort_type == "byYear":
+        items.sort(key=lambda a: _normalise_year(a[1].get("year")))   # ascending; reverse handled by the caller
+    # "__unsorted__" (recent/frequent/highest/starred/byGenre) keeps seen.items() order
+    _ALBUM_SORT_CACHE["lists"][sort_type] = items
+    return items
+
+
 def _decode_artist_id(raw: str, store) -> str | None:
     """Reverse ``ar:<hash>`` → artist name.  O(1) after first lookup
     in a stable library."""
@@ -750,12 +782,18 @@ async def get_artist(
     if not albums_raw:
         albums_raw = store.aggregate_albums(artist=name)
     albums = []
+    seen = _refresh_album_list_cache(store)   # memoised (album_artist|artist, album) -> newest sample
     for a in albums_raw:
-        # One sample track gives us cover art, year, genre.
-        tracks = store.filter_tracks(album_artist=name, album=a["album"], limit=1)
-        if not tracks:
-            tracks = store.filter_tracks(artist=name, album=a["album"], limit=1)
-        sample = tracks[0] if tracks else {}
+        # Cover/year/genre come from one sample track.  Use the memoised index (a
+        # dict lookup) instead of a per-album filter_tracks scan that walks the
+        # global added-at index until it hits a member — O(library) for an old
+        # album.  Fall back to the case-insensitive tag lookup ONLY on a
+        # key-normalization miss (the index keys on raw-case album names).
+        sample = seen.get((name, a["album"]))
+        if sample is None:
+            ts = (store.filter_tracks(album_artist=name, album=a["album"], limit=1)
+                  or store.filter_tracks(artist=name, album=a["album"], limit=1))
+            sample = ts[0] if ts else {}
         albums.append({
             "id":         _album_id(name, a["album"]),
             "name":       a["album"],
@@ -859,50 +897,61 @@ async def get_album_list(
 ):
     _require_user(request, sb_session, u, p, s, t)
     store = get_store()
-    # Cached (album_artist, album) → sample-track — rebuilt at most once
-    # per 5s during a scan, instantly otherwise.  Was a full
-    # ``all_track_metas()`` walk per request (load-test #1 P1-3).
-    seen = _refresh_album_list_cache(store)
-    albums = list(seen.items())
+    # The (album_artist, album) → sample map is memoised on _mutation_seq (5s
+    # debounce during a scan); the per-TYPE SORT on top of it is now memoised too
+    # (_sorted_album_items), so the common unfiltered carousel poll is an O(size)
+    # slice instead of an O(A) materialise + O(A log A) sort on the event loop.
 
-    # Apply filters
-    if genre:
-        albums = [a for a in albums
-                  if genre.lower() in [g.lower() for g in (a[1].get("genre") or [])]]
-    if fromYear is not None or toYear is not None:
-        lo = fromYear or -9999
-        hi = toYear or 9999
-        albums = [a for a in albums
-                  if lo <= _normalise_year(a[1].get("year")) <= hi]
+    def _apply_filters(items: list) -> list:
+        out = items
+        if genre:
+            out = [a for a in out
+                   if genre.lower() in [g.lower() for g in (a[1].get("genre") or [])]]
+        if fromYear is not None or toYear is not None:
+            lo = fromYear or -9999
+            hi = toYear or 9999
+            out = [a for a in out
+                   if lo <= _normalise_year(a[1].get("year")) <= hi]
+        return out
 
-    # Sort
-    if type == "newest":
-        albums.sort(key=lambda a: a[1].get("added_at") or 0, reverse=True)
-    elif type == "alphabeticalByName":
-        albums.sort(key=lambda a: a[0][1].lower())
-    elif type == "alphabeticalByArtist":
-        albums.sort(key=lambda a: (a[0][0].lower(), a[0][1].lower()))
-    elif type == "byYear":
-        albums.sort(key=lambda a: _normalise_year(a[1].get("year")),
-                    reverse=fromYear is not None and toYear is not None and toYear < fromYear)
-    elif type == "random":
+    has_filter = bool(genre) or fromYear is not None or toYear is not None
+
+    if type == "random":
+        # Random can't reuse a cached order — materialise + shuffle per request.
         import random
+        albums = _apply_filters(list(_refresh_album_list_cache(store).items()))
         random.shuffle(albums)
-    # ``recent`` / ``frequent`` / ``highest`` / ``starred`` are advisory —
-    # we ship the same newest-first list until per-user state lands.
-
-    sliced = albums[offset: offset + size]
+        sliced = albums[offset: offset + size]
+    else:
+        # ``recent`` / ``frequent`` / ``highest`` / ``starred`` / ``byGenre`` are
+        # advisory — they ship the unsorted seen.items() order, exactly as before.
+        base = type if type in ("newest", "alphabeticalByName",
+                                 "alphabeticalByArtist", "byYear") else "__unsorted__"
+        sorted_items = _sorted_album_items(store, base)        # cached, pre-sorted
+        if has_filter:
+            albums = _apply_filters(sorted_items)              # comprehension → new list; cache untouched
+            # byYear descending only ever applies here (it needs both years set).
+            if base == "byYear" and fromYear is not None and toYear is not None and toYear < fromYear:
+                albums.reverse()
+            sliced = albums[offset: offset + size]
+        else:
+            sliced = sorted_items[offset: offset + size]       # O(size); no materialise, no sort
     out = []
     # Per-album-artist counter is precomputed in the store — read it once
     # per row instead of calling aggregate_albums() (which sorts) twice per
     # row (load-test #1 P1-3).
     aa_counter = store._agg_albums_by_album_artist
     for (aa, al), sample in sliced:
-        song_count = aa_counter.get((aa or "").lower(), {}).get(al, 0)
+        # The album sub-counters are keyed on ``album.lower()`` (see
+        # store._index_track) but ``al`` here is the raw-case album name from
+        # album_sample_index() — lowercase it to match, else mixed/upper-case
+        # titles miss the counter and report songCount: 0.
+        al_key = (al or "").lower()
+        song_count = aa_counter.get((aa or "").lower(), {}).get(al_key, 0)
         if not song_count:
             # Fallback for tracks whose album_artist is empty — fall back
             # to the bare artist counter.
-            song_count = store._agg_albums_by_artist.get((aa or "").lower(), {}).get(al, 0)
+            song_count = store._agg_albums_by_artist.get((aa or "").lower(), {}).get(al_key, 0)
         out.append({
             "id":        _album_id(aa, al),
             "name":      al,
@@ -957,18 +1006,17 @@ async def search3(
         "name":       a,
         "albumCount": len(store.aggregate_albums(album_artist=a)) or len(store.aggregate_albums(artist=a)),
     } for a in artists_match]
-    albums_all_pairs: set[tuple[str, str]] = set()
-    for t_ in store.all_track_metas():
-        aa = t_.get("album_artist") or t_.get("artist") or ""
-        al = t_.get("album") or ""
-        if al and q in al.lower():
-            albums_all_pairs.add((aa, al))
-    pairs_sorted = sorted(albums_all_pairs, key=lambda x: x[1].lower())
-    pairs_sliced = pairs_sorted[albumOffset:albumOffset + albumCount]
+    # Album matches: scan the memoised (album_artist|artist, album) -> sample map
+    # (O(albums)) instead of materialising + walking all 270k track metas, and read
+    # each match's sample straight from it instead of a per-pair filter_tracks scan.
+    # The map keys derive identically to the old walk (raw album_artist-or-artist /
+    # album), so no normalization fallback is needed here.
+    seen = _refresh_album_list_cache(store)
+    matches = [(aa, al) for (aa, al) in seen.keys() if al and q in al.lower()]
+    matches.sort(key=lambda x: x[1].lower())
     albums_out = []
-    for aa, al in pairs_sliced:
-        sample = (store.filter_tracks(album_artist=aa, album=al, limit=1)
-                  or store.filter_tracks(artist=aa, album=al, limit=1) or [{}])[0]
+    for aa, al in matches[albumOffset:albumOffset + albumCount]:
+        sample = seen.get((aa, al), {})
         albums_out.append({
             "id":       _album_id(aa, al),
             "name":     al,
@@ -1024,28 +1072,18 @@ async def get_random_songs(
     _require_user(request, sb_session, u, p, s, t)
     import random
     store = get_store()
-    # Filtered path — genre / year filters need the full meta list to
-    # decide eligibility, so fall back to the legacy O(N) walk.  Most
-    # clients call without filters (just pure random shuffle), and
-    # that path now scales independently of library size.
+    # Filtered path — resolve eligibility via the maintained _tag_genre ∩
+    # _sorted_year indexes (filter_track_ids), then random.sample over just the
+    # candidate IDs and materialise only the picks.  Was a full all_track_metas()
+    # walk + filter over 270k on the event loop.
     if genre or fromYear is not None or toYear is not None:
-        all_t = store.all_track_metas()
-        if genre:
-            g_ = genre.lower()
-            all_t = [t_ for t_ in all_t
-                     if g_ in [g.lower() for g in (t_.get("genre") or [])]]
-        if fromYear is not None or toYear is not None:
-            lo = fromYear or -9999
-            hi = toYear or 9999
-            all_t = [t_ for t_ in all_t
-                     if lo <= _normalise_year(t_.get("year")) <= hi]
-        # On the filtered branch, ``random.sample`` over the (already
-        # smaller) result set avoids the full shuffle cost too.
-        if len(all_t) > size:
-            picks = random.sample(all_t, size)
+        ids = store.filter_track_ids(genre=genre, year_min=fromYear, year_max=toYear)
+        if len(ids) > size:
+            pick_ids = random.sample(ids, size)
         else:
-            random.shuffle(all_t)
-            picks = all_t
+            random.shuffle(ids)
+            pick_ids = ids
+        picks = [m for m in (store.get_track(i) for i in pick_ids) if m]
         songs = [_track_to_song(t_) for t_ in picks]
         return _ok({"randomSongs": {"song": songs}}, fmt=f)
 

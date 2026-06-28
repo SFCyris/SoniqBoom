@@ -159,9 +159,31 @@ export const CHIP_FORMAT_NAMES = new Set([
 ]);
 
 /**
+ * UADE/HVL Amiga formats (.ahx / .hvl).  They're listed in TRACKER_FORMAT_NAMES,
+ * but openmpt123 can't decode them, so the scanner stores duration 0 and the
+ * real length only exists in the server-rendered WAV (uade123 / hvl2wav play to
+ * natural end).  Kept SEPARATE from CHIP_FORMAT_NAMES — that set also gates
+ * VU/spectrum behaviour these tracker formats must NOT inherit — and used only
+ * for the duration backfill/probe below.
+ */
+export const UADE_FORMAT_NAMES = new Set(['AHX', 'HivelyTracker']);
+
+/**
+ * Every render-only format whose real duration is learned at render time and
+ * backfilled because there's no reliable scan-time length: the chip formats plus
+ * UADE/HVL.  Gates both the background duration probe and the live row-patch.
+ */
+export const RENDER_DURATION_FORMAT_NAMES = new Set([
+  ...CHIP_FORMAT_NAMES, ...UADE_FORMAT_NAMES,
+]);
+
+/**
  * Background duration probe — ask the server to compute the real length of any
- * AdLib/IMF tracks in *tracks* that still carry the 180s placeholder, so any
- * view can show it without the user playing each tune.  The server renders once
+ * render-only tracks in *tracks* that still carry a default-duration placeholder
+ * (AdLib/IMF at 180s, and GME chiptunes — NSF/SPC/GBS/… — at the server's
+ * sid_default_duration), so any view can show it without the user playing each
+ * tune.  AdLib placeholders are recognised client-side; GME rows are handed to
+ * the server which renders only genuine placeholders.  The server renders once
  * (throwaway) and persists the result, so it's a one-time cost; each track id is
  * requested at most once per session (shared across the desktop library, the
  * playlist editor and mobile).  Resolves to ``{track_id: seconds}``; the caller
@@ -176,9 +198,16 @@ export async function probeAdlibDurations(tracks) {
   for (const t of (tracks || [])) {
     if (!t || !t.id || seen.has(t.id)) continue;
     seen.add(t.id);
-    if (!ADLIB_FORMAT_NAMES.has(t.format)) continue;
+    if (!RENDER_DURATION_FORMAT_NAMES.has(t.format)) continue; // AdLib + GME chiptunes + UADE/HVL
     const cur = (+t.duration) || 0;
-    if (!(cur === 0 || Math.abs(cur - 180) < 0.5)) continue;   // not a placeholder
+    // AdLib stores a 180s placeholder we can recognise client-side, so skip AdLib
+    // rows that already carry a real length.  GME chiptunes store the server's
+    // sid_default_duration (unknown to the client), so we let the SERVER gate them:
+    // it renders only true placeholders and returns already-real lengths cheaply.
+    if (ADLIB_FORMAT_NAMES.has(t.format) && !(cur === 0 || Math.abs(cur - 180) < 0.5)) continue;
+    // UADE/HVL (.ahx/.hvl) carry no scan-time duration — placeholder is 0, so any
+    // row with a real length is already done; only probe the still-0 ones.
+    if (UADE_FORMAT_NAMES.has(t.format) && cur > 0) continue;
     if (_durKnown.has(t.id)) { result[t.id] = _durKnown.get(t.id); continue; }  // another view already probed it
     if (_durProbed.has(t.id)) continue;                        // attempted (maybe undecodable) — don't hammer
     _durProbed.add(t.id);

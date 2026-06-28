@@ -205,16 +205,48 @@ async def admin_auth_skip(
 
 @router.get("/stats")
 async def admin_stats(_tok: str = Depends(_require_token)):
-    """Return library and index health stats."""
+    """Return library + index health stats.
+
+    The ``index_*`` fields come from the last REAL integrity check (boot
+    rebuild, background sweep, an /admin/reindex, or an explicit
+    /admin/verify-indexes) — see core/index_health.  They are NOT recomputed
+    per request (a full verify is O(library)); the background sweep keeps them
+    fresh.  ``index_ok`` was previously a hardcoded ``True`` that could never
+    reflect drift — it is now real.
+    """
+    from soniqboom.core import index_health
     dirs = await list_scan_dirs()
     store = get_store()
     count = store.track_count()
+    health = index_health.snapshot()
     return {
         "track_count": count,
         "dir_count": len(dirs),
-        "index_ok": True,
-        "index_docs": count,
+        "index_ok": health["index_ok"],
+        "index_docs": count,  # retained for backward-compat (== track_count)
+        "index_checked_at": health["checked_at"],
+        "index_check_kind": health["last_check_kind"],
+        "index_drift_detected_total": health["drift_detected_total"],
+        "index_auto_heal_total": health["auto_heal_total"],
+        "index_mismatches": health["last_mismatches"],
     }
+
+
+@router.post("/verify-indexes")
+async def admin_verify_indexes(_tok: str = Depends(_require_token)):
+    """Run a full index-integrity check NOW and return the drift report.
+
+    Authoritative deep check: rebuilds a shadow from ``_tracks`` and diffs every
+    derived index against the live one.  Synchronous and O(library) — it briefly
+    pauses the event loop on a large library, so it is an explicit operator
+    action, not something to poll.  Does NOT heal; use POST /admin/reindex to
+    rebuild.  Updates the cached health that GET /admin/stats reports.
+    """
+    from soniqboom.core import index_health
+    store = get_store()
+    report = store.verify_indexes()
+    index_health.record(report, kind="manual", healed=False)
+    return report
 
 
 @router.get("/dirs")
@@ -455,7 +487,16 @@ async def admin_reindex(_tok: str = Depends(_require_token)):
     made it look like a re-index "jumped to Done" because no scan task
     actually ran for those shares.
     """
-    await rebuild_indexes()
+    report = await rebuild_indexes()   # diagnoses drift + heals it (atomic swap)
+    from soniqboom.core import index_health
+    index_health.record(report, kind="reindex", healed=True)
+    if not report.get("index_ok", True):
+        log.warning("admin_reindex corrected index drift: %s", report.get("mismatches"))
+    # Invalidate the HTTP aggregation cache immediately after the rebuild — not
+    # only via scan completion (scanner.py) — so a long, skipped, or crashed
+    # trailing scan can't leave /library/formats serving pre-reindex counts.
+    from soniqboom.api.library import invalidate_agg_cache
+    invalidate_agg_cache()
     scan_dir_docs = await list_scan_dirs()
     dirs = [d["path"] for d in scan_dir_docs]
 
@@ -469,6 +510,8 @@ async def admin_reindex(_tok: str = Depends(_require_token)):
         result = await _scan_dirs_split(dirs, _progress_cb)
     return {
         "reindexed": True,
+        "drift_detected": not report.get("index_ok", True),
+        "drift": report.get("mismatches", []),
         "scanning":  bool(result["started"]),
         "dirs":      dirs,
         "started":   result["started"],
@@ -1658,26 +1701,52 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         import subprocess as _sub
         bin_ = settings.ffmpeg_path or "ffmpeg"
         if ff_check.get("installed"):
-            def _probe(arg: str):
+            import types
+            async def _probe(arg: str):
                 # Retry once: a single ffmpeg spawn can transiently time out or
                 # be killed under heavy scan load (many concurrent ffmpeg
                 # processes + FTP I/O).  A flaked probe must NOT be read as
                 # "the binary lacks codecs" — that produced a scary, WRONG
                 # "bundled ffmpeg is missing everything" banner + a needless
                 # re-download prompt for a perfectly healthy binary.
+                #
+                # MUST use create_subprocess_exec, NOT subprocess.run: on macOS a
+                # fork() from a Core-Foundation-initialised process segfaults in
+                # subprocess._execute_child — both on the main thread (which also
+                # STARVED the event loop, stalling an in-flight /admin/reindex
+                # index refill so ``_tag_format`` stayed cleared-but-empty and
+                # format filters returned 0) AND from a worker thread (so
+                # ``asyncio.to_thread`` does not help — see scanner.py:882).
+                # create_subprocess_exec spawns fork-safely on the loop and never
+                # blocks it; it's the same pattern used everywhere else here.
                 for _ in range(2):
                     try:
-                        rr = _sub.run([bin_, "-hide_banner", arg],
-                                      capture_output=True, text=True,
-                                      timeout=20, check=False)
-                        if rr.returncode == 0:
-                            return rr
-                    except (FileNotFoundError, _sub.SubprocessError):
-                        pass
+                        proc = await asyncio.create_subprocess_exec(
+                            bin_, "-hide_banner", arg,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                    except (FileNotFoundError, OSError):
+                        return None
+                    try:
+                        out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except ProcessLookupError:
+                            pass
+                        continue
+                    if proc.returncode == 0:
+                        return types.SimpleNamespace(
+                            stdout=out.decode("utf-8", "replace"),
+                            stderr=err.decode("utf-8", "replace"),
+                            returncode=0,
+                        )
                 return None
 
-            r  = _probe("-formats")
-            r2 = _probe("-encoders")
+            r  = await _probe("-formats")
+            r2 = await _probe("-encoders")
             fmts    = (r.stdout or "").lower() if r else ""
             enc_out = ((r2.stdout or "") + (r2.stderr or "")) if r2 else ""
             # A successful probe always emits a large table (hundreds of rows);

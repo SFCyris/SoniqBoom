@@ -2111,13 +2111,19 @@ input[type="range"]:hover::-moz-range-thumb {
    filling visualizer (synthwave/lavalamp/…) wash their text out.  Lift them above
    the canvas — they're transparent, so the visualizer still shows through behind.
    (Listed explicitly rather than ``#content > *`` so we don't clobber the
-   #now-playing-art overlay's own z-index:10.) */
+   #now-playing-art overlay's own z-index:10.)
+   #galaxy-view is itself a content visualization with an OPAQUE dark scene
+   (#070a0f), so once lifted it fully COVERS the ambient visualizer rather than
+   letting it bleed through — that's intended: the Galaxy owns the screen, two
+   visualizations must not fight.  It was missing from this list, so a playing
+   visualizer washed the constellation out. */
 #stations-view,
 #album-grid,
 #browse-header,
 #group-filter-bar,
 #selection-bar,
-#browse-toolbar {
+#browse-toolbar,
+#galaxy-view {
   position: relative;
   z-index: 1;
 }
@@ -4697,6 +4703,11 @@ tr.dragging { opacity: 0.4; }
 }
 .viz-host svg, .viz-host canvas { display: block; width: 100%; height: 100%; }
 /* SR-only mirror so canvas/SVG viz expose meaning to assistive tech. */
+/* Visually-hidden, screen-reader-only.  ``.sr-only`` is the conventional name
+   used in the markup (e.g. the skeleton's "Loading tracks…" label); it was
+   never defined, so that text painted on screen.  Share one rule with the
+   visualizer's ``.viz-sr-only``. */
+.sr-only,
 .viz-sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;

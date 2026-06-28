@@ -62,8 +62,9 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
     store = get_store()
     loop = asyncio.get_event_loop()
 
-    sids = [t for t in store.all_track_metas()
-            if str(t.get("format", "")).upper() == "SID"]
+    # Reuse the maintained _tag_format index (keyed lowercase) instead of
+    # materializing + scanning all 270k metas — O(|SID bucket|).
+    sids = store.tracks_for_format("SID")
     scanned = len(sids)
     sid_track_ids = [t["id"] for t in sids]
 

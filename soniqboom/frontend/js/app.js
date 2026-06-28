@@ -2525,8 +2525,15 @@ document.addEventListener('keydown', (e) => {
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
   if (t && t.isContentEditable) return;
+  // …but only for the keys the composite widget actually owns (Space/Enter
+  // activate, arrows move selection).  Letter shortcuts (V=visualizer, E=EQ, …)
+  // must still reach the global handler even when a station row / button is
+  // focused — otherwise pressing "v" right after clicking a station to play it
+  // does nothing (the focused role=button row swallowed every key).
   if (t && typeof t.matches === 'function'
-      && t.matches('[role="button"], [role="tab"], [role="radio"]')) return;
+      && t.matches('[role="button"], [role="tab"], [role="radio"]')
+      && [' ', 'Spacebar', 'Enter', 'ArrowUp', 'ArrowDown', 'ArrowLeft',
+          'ArrowRight', 'Home', 'End'].includes(e.key)) return;
   // If any visible dialog has focus inside it, let the dialog own the keys.
   if (document.querySelector(
     '.dialog.visible:focus-within, .modal.visible:focus-within, '
@@ -2872,6 +2879,18 @@ fetch('/api/library/scan/status').then(r => r.json()).then(s => {
 // covers the race where playback began while the import was in flight.
 _ric(() => {
   loadVisualizer().then(V => { if (Player.playing) V.start(); }).catch(() => {});
+});
+
+// Belt-and-suspenders for a RADIO-ONLY session: the visualizer's own
+// statechange/trackchange auto-start hooks live INSIDE the lazy module, so they
+// only fire once it has loaded.  The deferred warm above may not have run yet
+// (idle starvation under a big library) and — unlike the library views — the
+// stations view has no local-track play to trigger the import.  So load + start
+// on the FIRST play of any kind; the lazy import is cached, and V.start() is
+// idempotent with the module's own hook.  This makes a station rendered the
+// visualizer without a library track having been played first.
+Player.on('statechange', ({ playing }) => {
+  if (playing) loadVisualizer().then(V => V.start()).catch(() => {});
 });
 
 // Warm the browser HTTP cache for the aggregation lists the sidebar views

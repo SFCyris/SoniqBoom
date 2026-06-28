@@ -23,42 +23,88 @@ UPSERT_BATCH = 1_000
 
 # ── Index management ───────────────────────────────────────────────────────
 
-async def rebuild_indexes() -> None:
-    """Rebuild all indexes, yielding to the event loop every 500 tracks
-    so HTTP requests are not blocked during large libraries.
+# Serialize index rebuilds (the background integrity sweep + both /reindex
+# endpoints) so two atomic shadow-swaps can't interleave — the call that
+# snapshotted earlier would otherwise swap last and regress the live indexes to
+# a stale snapshot.  Created lazily per running event loop (one in the server;
+# tests may spin up several).
+_rebuild_lock = None
+_rebuild_lock_loop = None
 
-    Wraps the work in ``enter_batch_mode`` / ``exit_batch_mode`` so
-    the 9 sorted indexes (year, added_at, duration, bpm, title,
-    artist, album_artist, album, format) are built by a single
-    O(N log N) ``list.sort()`` at the end instead of N ×
-    ``bisect.insort`` per track — which is O(N) per call (memmove
-    on a contiguous list) and produces O(N²) wall-clock for the
-    full rebuild.
 
-    For a 270K-track library that's the difference between ~3 s
-    and ~70 s — the "Rebuilding schema and scanning all folders…"
-    stage that felt frozen before each ``/admin/reindex`` scan
-    actually started.  ``store.rebuild_indexes`` (the sync version
-    used at startup) already had this wrap; this brings the async
-    path called by ``/admin/reindex`` in line.
+def _rebuild_lock_for_loop():
+    import asyncio
+    global _rebuild_lock, _rebuild_lock_loop
+    loop = asyncio.get_running_loop()
+    if _rebuild_lock is None or _rebuild_lock_loop is not loop:
+        _rebuild_lock = asyncio.Lock()
+        _rebuild_lock_loop = loop
+    return _rebuild_lock
+
+
+async def rebuild_indexes() -> dict:
+    """Rebuild all indexes atomically, yielding to the event loop every 500
+    tracks so HTTP requests are not blocked during large libraries AND so a
+    concurrent query never sees a half-built index.
+
+    Builds the new indexes on a SHADOW ``TrackStore`` that owns a consistent
+    snapshot of ``_tracks``; the live store keeps serving its old, COMPLETE
+    indexes for the entire rebuild.  The 11 sorted indexes are built by a
+    single O(N log N) ``sort()`` at the shadow's ``exit_batch_mode`` (~3 s for
+    270K, not ~70 s of per-track ``bisect.insort``).  The final swap is one
+    synchronous block (NO ``await`` between assignments), so a reader only ever
+    observes the old-complete or the new-complete index — never empty.
+
+    This replaces the previous clear-then-refill approach, which called
+    ``store.clear_indexes()`` (emptying ``_tag_format`` etc.) and refilled
+    across ~540 ``await`` yields: any filter query landing in that window
+    returned 0 (e.g. ``GET /tracks?format=Ken's AdLib`` right after a reindex,
+    while the Galaxy legend still showed the cached "41").
+
+    Cost: peak memory roughly doubles the index footprint transiently (shadow
+    + live held together until the swap + GC).  Concurrent ``_tracks`` mutation
+    during the build is excluded by the snapshot (rare — reindex starts scans
+    only AFTER this returns; ``record_play``/``set_rating`` don't touch these
+    indexes) and self-corrects on the next rebuild.
+
+    Returns the pre-heal drift report from ``store._diff_indexes``
+    (``{index_ok, mismatches, indexes, ...}``) so reindex endpoints and the
+    background integrity sweep can detect-and-report, not just blindly cure.
     """
     import asyncio
+    from soniqboom.core.store import TrackStore, INDEX_ATTRS
     store = get_store()
-    store.clear_indexes()
-    store.enter_batch_mode()
-    try:
-        items = store.track_items_list()
+
+    async with _rebuild_lock_for_loop():
+        shadow = TrackStore()
+        shadow._tracks = dict(store._tracks)        # consistent snapshot for the build
+        # _index_track derives _unplayed_ids from membership in _play_stats, so the
+        # shadow MUST see the real play stats or it would mark every track unplayed.
+        shadow._play_stats = dict(store._play_stats)
+        shadow.enter_batch_mode()
+        items = shadow.track_items_list()
         BATCH = 500
         for i in range(0, len(items), BATCH):
-            store.index_tracks_batch(items[i : i + BATCH])
+            shadow.index_tracks_batch(items[i : i + BATCH])
             await asyncio.sleep(0)
-    finally:
-        # exit_batch_mode triggers the single sort() of every sorted
-        # index — this is where the win lands.  In a finally so a
-        # task cancel mid-rebuild can't leave the store in batch mode
-        # forever (which would silently break subsequent inserts).
-        store.exit_batch_mode()
-    store.finish_rebuild()
+        shadow.exit_batch_mode()   # one sort() per sorted index, on the shadow
+        shadow.finish_rebuild()    # builds the shadow's _word_list
+
+        # Diagnose BEFORE healing: diff the live (possibly drifted) indexes
+        # against the freshly-built shadow.  This is the drift report the reindex
+        # endpoints and the background integrity sweep surface.
+        report = store._diff_indexes(shadow)
+
+        # Atomic swap (the heal) — single synchronous block, no await, so a
+        # concurrent reader can never observe a partially-built index.
+        for attr in INDEX_ATTRS:
+            setattr(store, attr, getattr(shadow, attr))
+        store._word_list_dirty = shadow._word_list_dirty
+        store._sorted_dirty = False
+        store._batch_mode = False
+        store._mutation_seq += 1   # invalidate seq-keyed memos (store agg cache,
+                                   # subsonic _ALBUM_*_CACHE, smart.py dup memos)
+        return report
 
 
 # ── Hash helpers ─────────────────────────────────────────────────────────────

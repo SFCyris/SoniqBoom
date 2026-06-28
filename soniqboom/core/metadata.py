@@ -375,9 +375,16 @@ def _total(v) -> int | None:
 
 def _float(v, default=None) -> float | None:
     try:
-        return float(str(v).strip())
+        f = float(str(v).strip())
     except Exception:
         return default
+    # Reject NaN/inf: a tag literally "nan"/"inf" parses as a float but is not a
+    # valid bpm/gain, and NaN poisons sorted indexes (NaN != NaN makes
+    # ``_sorted_bpm`` compare unequal to a rebuild forever — the integrity sweep
+    # would flap and "auto-heal" endlessly).
+    if f != f or f in (float("inf"), float("-inf")):
+        return default
+    return f
 
 
 def _cover_b64(data: bytes, mime: str = "image/jpeg") -> str:
@@ -1502,6 +1509,26 @@ def extract(path: Path, track_id: str) -> TrackMeta:
     """Extract full metadata from any supported audio file."""
     ext = path.suffix.lower()
     file_size = path.stat().st_size if path.exists() else None
+
+    # PC AdLib/OPL formats (incl. id/Apogee .imf) are never Amiga executables, so
+    # a file with one of these extensions whose first bytes are the AmigaDOS HUNK
+    # magic (0x000003F3) is an EXTENSION-ONLY misdetection — e.g. demoscene ".SCI"
+    # members of Amiga demo archives that are HUNK binaries, not Sierra AdLib tunes
+    # (AdPlug reports "unknown filetype", UADE too).  Reject so the scanner records
+    # an error instead of indexing an unplayable binary as music.  The raise is
+    # BEFORE the catch-all below, so it propagates to _extract_one → skip.
+    if ext in _ADLIB_EXTS or ext == ".imf":
+        try:
+            with open(path, "rb") as _fh:
+                _magic = _fh.read(4)
+        except OSError:
+            _magic = b""
+        if _magic == b"\x00\x00\x03\xf3":
+            raise ValueError(
+                f"Amiga HUNK executable misdetected as "
+                f"{FORMAT_NAMES.get(ext, 'AdLib')} by extension; not a playable "
+                f"tune: {path.name}"
+            )
 
     try:
         if ext in _SID_EXTS:

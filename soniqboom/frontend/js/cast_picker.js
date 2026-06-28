@@ -133,7 +133,7 @@
     // Make the rest of the page inert while the picker is open — UX-3 P2
     // flagged that the lyrics-resize handle / other overlays remained
     // clickable beneath our scrim.
-    const main = document.getElementById('main-content');
+    const main = document.getElementById('content') || document.getElementById('m-content');
     if (main && 'inert' in main) main.inert = true;
     // Focus management — UX-1 P0: initial focus should NOT land on the
     // destructive-feeling Refresh icon at the top.  Land on the first
@@ -159,7 +159,7 @@
     _overlay.classList.add('hidden');
     _btn.setAttribute('aria-expanded', 'false');
     // Restore page interactivity (matches the inert toggle in open()).
-    const main = document.getElementById('main-content');
+    const main = document.getElementById('content') || document.getElementById('m-content');
     if (main && 'inert' in main) main.inert = false;
     // Restore focus to the trigger so keyboard users don't get dumped
     // at the document start.

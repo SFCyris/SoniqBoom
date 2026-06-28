@@ -205,8 +205,19 @@ async def reindex():
     """Rebuild the in-memory indexes (use after schema changes).
     Existing track documents are preserved; the index is rebuilt automatically.
     """
-    await rebuild_indexes()
-    return {"reindexed": True}
+    report = await rebuild_indexes()   # diagnoses drift + heals it (atomic swap)
+    from soniqboom.core import index_health
+    index_health.record(report, kind="reindex", healed=True)
+    # The HTTP aggregation cache (/library/formats etc.) is NOT keyed on the
+    # store mutation seq, so a rebuild alone would leave it serving pre-reindex
+    # counts — e.g. the Galaxy legend showing "Ken's AdLib · 41" while the
+    # freshly-rebuilt live index is queried by the filter.  Invalidate it here.
+    invalidate_agg_cache()
+    return {
+        "reindexed": True,
+        "drift_detected": not report.get("index_ok", True),
+        "drift": report.get("mismatches", []),
+    }
 
 
 @router.get("/dirs")

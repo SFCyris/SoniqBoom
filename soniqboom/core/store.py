@@ -83,6 +83,40 @@ def _sorted_tail(lst: list[tuple], n: int) -> list[str]:
 
 # ── TrackStore ───────────────────────────────────────────────────────────────
 
+# Every per-track DERIVED index attribute on TrackStore — exactly what
+# ``clear_indexes`` empties, plus the lazily-built ``_word_list``.  Shared by
+# the integrity check (``verify_indexes``) and the atomic async rebuild
+# (``data.rebuild_indexes``).  KEEP IN SYNC with ``clear_indexes``.
+INDEX_ATTRS = (
+    "_word_index", "_word_list",
+    "_tag_artist", "_tag_album_artist", "_tag_album", "_tag_genre",
+    "_tag_format", "_tag_dir_hash", "_tag_scan_root_hash", "_tag_dup_group",
+    "_sorted_year", "_sorted_added_at", "_sorted_added_at_primary",
+    "_sorted_duration", "_sorted_bpm",
+    "_sorted_title", "_sorted_artist", "_sorted_album_artist",
+    "_sorted_album", "_sorted_format",
+    "_agg_artists", "_agg_album_artists", "_agg_albums", "_agg_genres",
+    "_agg_years", "_agg_albums_by_artist", "_agg_albums_by_album_artist",
+    "_agg_cache", "_unplayed_ids",
+)
+
+
+def _index_sample_diff(live, exp, limit: int = 5) -> list:
+    """Up to ``limit`` keys/elements that differ between two index structures —
+    so a drift report can show WHAT diverged, not merely that it did."""
+    try:
+        if isinstance(live, dict) and isinstance(exp, dict):
+            diff = list(set(live) ^ set(exp))[:limit]
+            if len(diff) < limit:
+                diff += [k for k in live if k in exp and live[k] != exp[k]][: limit - len(diff)]
+            return [str(k) for k in diff[:limit]]
+        if isinstance(live, set) and isinstance(exp, set):
+            return [str(x) for x in list(live ^ exp)[:limit]]
+    except Exception:
+        pass
+    return []
+
+
 class TrackStore:
     """Central in-memory data store with indexed search."""
 
@@ -92,6 +126,12 @@ class TrackStore:
         self._waveforms: dict[str, list[float]] = {}
         self._ratings: dict[str, int] = {}
         self._play_stats: dict[str, dict] = {}
+        # Bumped on every rating / play change so the /smart/top-rated and
+        # /smart/most-played ranked-list memos invalidate WITHOUT touching the
+        # library-wide _mutation_seq (which play/rating writes deliberately
+        # don't bump — they're far hotter than structural mutations).
+        self._rating_seq: int = 0
+        self._play_seq: int = 0
         self._playlists: dict[str, dict] = {}
         self._history: list[dict] = []
         self._scan_dirs: dict[str, dict] = {}
@@ -434,6 +474,68 @@ class TrackStore:
         # snapshot-loaded play stats correctly suppress those tids.
         log.info("Indexes rebuilt for %d tracks", len(self._tracks))
 
+    def verify_indexes(self) -> dict:
+        """Check the live derived indexes against a fresh rebuild from _tracks.
+
+        Builds a throwaway shadow store from the SAME _tracks/_play_stats and
+        diffs every index in ``INDEX_ATTRS`` against the live one.  Returns
+        ``{index_ok, track_count, mutation_seq, indexes:{attr:{actual,expected,
+        ok}}, mismatches:[...]}``.  Authoritative (uses the same _index_track
+        derivation) and non-destructive to the live store.
+
+        Synchronous, ~3-5 s for a 270K library, and NON-DESTRUCTIVE (does not
+        touch the live store).  MUST run on the event loop (or with _tracks
+        otherwise quiescent): it shares _tracks by reference, so a concurrent
+        mutation mid-build would be a data race.
+        """
+        # ``_word_list`` is a lazy derivative of ``_word_index`` and is skipped
+        # by ``_diff_indexes``, so a dirty word list is irrelevant here — no
+        # need to refresh it (which would mutate self).  ``_word_index`` itself
+        # IS compared.
+        shadow = TrackStore()
+        shadow._tracks = self._tracks          # shared, read-only during build
+        shadow._play_stats = self._play_stats  # _index_track derives _unplayed_ids from this
+        shadow.rebuild_indexes()
+        return self._diff_indexes(shadow)
+
+    # Derived/cache layers EXCLUDED from drift detection — they legitimately
+    # differ between the live store and a fresh rebuild, so comparing them
+    # yields FALSE positives.  Both are still SWAPPED by a rebuild (so it resets
+    # them); they're just not drift signals:
+    #   _word_list  — lazy derivative of _word_index (which IS compared).
+    #   _agg_cache  — per-query aggregation MEMO (key -> (mutation_seq, value)):
+    #     empty after a rebuild but populated by serving aggregate_* requests,
+    #     so its contents track query traffic, not _tracks.  The structural
+    #     _agg_* COUNTERS it memoizes from ARE compared, so coverage is intact.
+    _DIFF_SKIP = frozenset({"_word_list", "_agg_cache"})
+
+    def _diff_indexes(self, expected: "TrackStore") -> dict:
+        """Diff this store's live indexes against a freshly-built ``expected``
+        shadow.  Pure comparison, no mutation."""
+        indexes: dict[str, dict] = {}
+        mismatches: list[dict] = []
+        for attr in INDEX_ATTRS:
+            if attr in self._DIFF_SKIP:
+                continue
+            live = getattr(self, attr)
+            exp = getattr(expected, attr)
+            ok = live == exp
+            indexes[attr] = {"actual": len(live), "expected": len(exp), "ok": ok}
+            if not ok:
+                mismatches.append({
+                    "index": attr,
+                    "actual": len(live),
+                    "expected": len(exp),
+                    "sample": _index_sample_diff(live, exp),
+                })
+        return {
+            "index_ok": not mismatches,
+            "track_count": len(self._tracks),
+            "mutation_seq": self._mutation_seq,
+            "indexes": indexes,
+            "mismatches": mismatches,
+        }
+
     def clear_indexes(self) -> None:
         """Clear all indexes (first phase of rebuild, can be followed by
         batched ``index_tracks_batch`` calls)."""
@@ -622,6 +724,27 @@ class TrackStore:
     def get_track_ids_for_scan_root(self, root_hash: str) -> set[str]:
         return set(self._tag_scan_root_hash.get(root_hash, set()))
 
+    def duplicate_group_index(self) -> dict[str, list[str]]:
+        """Snapshot of the maintained ``{duplicate_group_id -> member track_ids}``
+        index (``_tag_dup_group``).  It's reconstructed from the persisted
+        ``duplicate_group_id`` track fields during AOF replay, so it survives
+        restart — duplicate views can read it directly instead of recomputing
+        groups over the whole library.  Returns copies (the live sets are never
+        exposed) so callers can't mutate the index."""
+        return {gid: list(tids) for gid, tids in self._tag_dup_group.items() if tids}
+
+    def duplicate_group_count(self) -> int:
+        """Cheap O(1)-ish count of maintained duplicate groups (no snapshot)."""
+        return sum(1 for tids in self._tag_dup_group.values() if tids)
+
+    def tracks_for_format(self, fmt: str) -> list[dict]:
+        """All track meta-dicts (no embedding) for one format, via the maintained
+        ``_tag_format`` index — O(|format bucket|), not a full-library scan.  The
+        index is keyed on the lowercased format string (same as ``_index_track`` /
+        ``filter_tracks``)."""
+        tids = self._tag_format.get(str(fmt).strip().lower(), set())
+        return [self._meta_dict(tid) for tid in tids if tid in self._tracks]
+
     def update_track_fields(self, track_id: str, updates: dict) -> bool:
         """Update specific fields on an existing track."""
         t = self._tracks.get(track_id)
@@ -806,6 +929,33 @@ class TrackStore:
                     break
         page = collected[offset : offset + limit]
         return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+
+    def filter_track_ids(self, *, genre: str | None = None,
+                         year_min: int | None = None,
+                         year_max: int | None = None,
+                         format_: str | None = None) -> list[str]:
+        """Eligible track ids for the given filters via the maintained indexes
+        (``_tag_genre`` / ``_tag_format`` ∩ the ``_sorted_year`` range) — without
+        sorting or paginating.  For callers that need the candidate SET to sample
+        over (e.g. ``getRandomSongs``) rather than a sorted page.  Same predicate
+        semantics as ``filter_tracks``; returns all ids when no filter is given."""
+        sets: list[set[str]] = []
+        if genre:
+            sets.append(self._tag_genre.get(genre.lower(), set()))
+        if format_:
+            sets.append(self._tag_format.get(str(format_).strip().lower(), set()))
+        if year_min is not None or year_max is not None:
+            lo = year_min if year_min is not None else -999999
+            hi = year_max if year_max is not None else 999999
+            sets.append(set(_sorted_range(self._sorted_year, lo, hi)))
+        if not sets:
+            return list(self._tracks.keys())
+        result = sets[0]
+        for s in sets[1:]:
+            result = result & s
+            if not result:
+                return []
+        return list(result)
 
     @staticmethod
     def _is_descending(sort_by: str | None, sort_order: str | None) -> bool:
@@ -1193,6 +1343,7 @@ class TrackStore:
             self._ratings.pop(track_id, None)
         else:
             self._ratings[track_id] = rating
+        self._rating_seq += 1
         self._aof("set_rating", id=track_id, rating=rating)
 
     def get_ratings_batch(self, track_ids: list[str]) -> dict[str, int]:
@@ -1216,6 +1367,7 @@ class TrackStore:
             # remove() so the set stays consistent if a play event arrives
             # before the corresponding track upsert (rare AOF replay reorder).
             self._unplayed_ids.discard(track_id)
+        self._play_seq += 1
         self._aof("record_play", id=track_id, ts=now)
         return dict(stats)
 
