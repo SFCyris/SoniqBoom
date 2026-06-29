@@ -26,9 +26,74 @@
 
 ---
 
-> Your 50,000 `.mod` files. Your mirror of the High Voltage SID Collection. That folder of `.nsf` rips you have carried across four hard drives since 2009.
->
-> **SoniqBoom plays *exactly* those files — and treats them like the art they are.**
+## What is SoniqBoom?
+
+**SoniqBoom is a free music server you run on your own computer.**
+
+Install it on a **Mac or Linux** machine, point it at your music folders, and listen from any web browser on your network — phone, laptop, tablet, anything.
+
+It plays your everyday files (FLAC, MP3, ALAC, and the rest) **and** the retro formats most servers can't: SID, MOD, chiptunes, AdLib, dozens more. No cloud, no account, no tracking — it all stays on your machine.
+
+---
+
+## Install &amp; run it
+
+The steps are **identical on macOS and Linux**. Three commands: download, install, run.
+
+> **Before you start:** open the **Terminal** app. Copy the block below, paste it in, and press Enter. That's the whole install.
+
+```bash
+# 1 — Download and unpack
+curl -LO https://github.com/SFCyris/SoniqBoom/releases/latest/download/soniqboom-latest.zip
+unzip soniqboom-latest.zip
+cd soniqboom-*/        # opens the folder you just unzipped
+
+# 2 — Install everything (same command on macOS and Linux)
+bash install.sh
+
+# 3 — Start it
+bash run.sh
+```
+
+Then open **<http://localhost:8080>** in any browser. That's it. 🎉
+
+> Macs and most Linux desktops already include `curl` and `unzip`. On a bare-bones Linux box that's missing them, install them once first — e.g. `sudo apt install -y curl unzip` (or `dnf` / `pacman` / `zypper`).
+
+**What each step does:**
+
+1. **Download** — grabs the latest release and unzips it.
+2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. It then **asks you to create your admin login** — pick a username and a password (at least 8 characters). This is the account you'll sign in with.
+3. **`bash run.sh`** — starts the server in the background and prints the address to open. (If port 8080 is already in use, run `bash run.sh --port 9090` to pick another.)
+
+> *Prefer git?* `git clone https://github.com/SFCyris/SoniqBoom.git && cd SoniqBoom`, then run steps 2 and 3.
+
+If anything looks missing afterwards, just **re-run `bash install.sh`** — it's safe to run as many times as you like and only fills in what's absent.
+
+---
+
+## First-time setup
+
+1. **Sign in.** Open <http://localhost:8080> and log in with the admin username and password you created during install.
+2. **Add your music.** Click the **gear icon** (top-right) to open the admin panel, enter a folder path, and click **Add**. Local folders work, and so do **FTP, SMB, and WebDAV** shares — no mounting required.
+3. **Wait for the scan** (about 2 minutes per 50,000 tracks), then close the panel. Your library is ready.
+
+---
+
+## Handy commands
+
+Run these from inside the SoniqBoom folder:
+
+| You want to… | Command |
+|--------------|---------|
+| **Change the port** (default is 8080) | `bash run.sh --port 9090` |
+| **Stop the server** | `bash shutdown.sh` |
+| **Restart the server** | `bash restart.sh` |
+| **Create or reset your admin login** | `bash setup-admin.sh` |
+| Set an admin login non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
+
+> Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords are at least 8 characters. Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in.
+
+> **`install.sh` sets up every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdLib/OPL). If one ever fails to install, SoniqBoom names the exact missing package and everything else keeps working. (HivelyTracker `.hvl` needs nothing extra — it's bundled and compiled on first run.)
 
 ---
 
@@ -67,7 +132,7 @@ Then, once you're hooked, you'll notice it's *also* a ruthlessly fast, fully-fea
 SoniqBoom speaks the culture:
 
 - **🎚️ Per-channel VU meters for tracker modules.** Watch every Paula voice and sample slot dance in real time, right in the browser. Your `.it` files have never looked like this.
-- **🧬 Real SID metadata from HVSC.** Per-tune song lengths straight from `Songlengths.md5` — so your SID tunes show *correct* durations instead of a flat three-minute guess — plus full **STIL** credits and trivia for every subtune.
+- **🧬 Real SID metadata from HVSC.** Per-tune song lengths straight from `Songlengths.md5` — so your SID tunes show *correct* durations instead of a flat three-minute guess — plus full **STIL** credits for every subtune.
 - **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own.
 - **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
 - **🗂️ Multi-subtune aware.** SID, NSF, and HVL tunes with multiple subsongs are addressed individually, not flattened into one.
@@ -91,7 +156,7 @@ SoniqBoom speaks the culture:
 Every retro format is rendered to standard audio on the fly — a 1987 SID tune streams to your phone *exactly* like a FLAC does (casting it to a HomePod or the speakers in the next room is in Beta). The same server that sees your `.mod` hoard handles your everyday listening.
 
 - **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
-- **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
+- **📻 Internet radio (Beta) — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
 - **🎲 Instant Mix radio.** Press the radio button on any track and SoniqBoom builds an endless, self-refilling queue around it — picked by genre, artist, era, tempo and format — in a focused radio view with a live oscilloscope over the cover. A SID radio stays chiptune; a FLAC radio follows the genre.
 - **🔎 More like this & smart playlists.** Surface the closest-sounding tracks to any song (scored by audio similarity), and save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
@@ -116,65 +181,13 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 <p align="center">
   <img src="docs/manual/img/24-stations.png" alt="Internet radio Stations — the curated scene pack and the Radio Browser world directory" width="800">
 </p>
-<p align="center"><sub>Internet-radio <b>Stations</b> — a curated demoscene/chiptune pack plus the worldwide Radio Browser directory (continent → country), with the live now-playing track and one-click favourites.</sub></p>
+<p align="center"><sub>Internet-radio <b>Stations</b> (Beta) — a curated demoscene/chiptune pack plus the worldwide Radio Browser directory (continent → country), with the live now-playing track and one-click favourites.</sub></p>
 
 <p align="center">
   <img src="docs/manual/img/25-stationinfo.png" alt="A scene radio station up close — tags, website, the live now-playing track, and the full quality ladder" width="49%">
   <img src="docs/manual/img/16-multiroom-master.png" alt="Multi-room — the same track in lockstep across every browser on the LAN" width="49%">
 </p>
 <p align="center"><sub>Left: a <b>scene radio</b> station up close — tags, website, the live now-playing track, and every available stream quality. Right: <b>multi-room sync</b> — the same track, in lockstep, across every browser on your LAN.</sub></p>
-
----
-
-## Install
-
-Point it at your HVSC mirror. Point it at your Modland archive. Point it at the FLAC rips you actually paid for. Hit scan — about two minutes per 50,000 tracks — and all of it plays.
-
-**macOS** (one-shot install + start):
-
-```bash
-git clone https://github.com/SFCyris/SoniqBoom.git
-cd SoniqBoom
-bash install.sh        # installs Python, ffmpeg, and the optional retro renderers
-bash run.sh            # starts the server on port 8080
-```
-
-Then open `http://localhost:8080` in any browser.
-
-**Linux** — install the prerequisites with your package manager, then run the same `run.sh`:
-
-```bash
-sudo apt install -y python3 python3-venv ffmpeg \
-    fluid-synth libopenmpt0 libsidplayfp   # last 3 are optional renderers
-git clone https://github.com/SFCyris/SoniqBoom.git
-cd SoniqBoom
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-bash run.sh
-```
-
-`bash shutdown.sh` stops it; `bash restart.sh` restarts it. To change the default port: `bash run.sh --port 9090` (or set `SONIQBOOM_PORT=9090`).
-
-> **`install.sh` installs every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdPlug, AdLib/OPL) — on macOS via Homebrew and on Linux via apt / dnf / pacman / zypper. On a manual install, add the same packages with your package manager; if one is missing, SoniqBoom names the exact package and everything else keeps working. (HivelyTracker needs nothing extra — it's bundled.)
-
----
-
-## First-time setup
-
-1. **Create the first admin account.** A fresh install has no users, and UI registration is locked until at least one admin exists, so the first one is bootstrapped from the CLI on the server host:
-
-   ```bash
-   .venv/bin/soniqboom-setadm -user alice -passwd 'changeme123'
-   ```
-
-   Username is 2–64 chars (letters, digits, `.`, `_`, `-`); password is at least 8 chars. New users default to the `admin` role. To rotate the password later, re-run with a new `-passwd`; to add others, use `-role admin|edit|readonly` or invite them from the admin UI once signed in.
-
-2. **Sign in.** Open `http://localhost:8080`, enter the credentials you just set, and you'll land in the library.
-
-3. Click the **gear icon** (top-right) to open the admin panel.
-4. **Add music folders** — enter a path (local, FTP, SMB, or WebDAV) and click **Add**.
-5. Wait for the initial scan (about 2 minutes per 50,000 tracks).
-6. Close the admin panel. Your library is ready.
 
 ---
 
@@ -198,12 +211,14 @@ ZIP archives are scanned and played **inline** — tracks inside `.zip` files ap
 
 ## Configuration
 
+Most settings live in the admin UI. The config file is created for you on first run:
+
 | Platform | Path |
 |----------|------|
 | macOS | `~/Library/Application Support/SoniqBoom/SoniqBoom.conf` |
 | Linux | `~/.local/share/soniqboom/SoniqBoom.conf` |
 
-Most settings are changeable from the admin UI. Environment variables (`SONIQBOOM_HOST`, `SONIQBOOM_PORT`, …) override config-file values.
+Environment variables (`SONIQBOOM_HOST`, `SONIQBOOM_PORT`, …) override config-file values when you launch the `soniqboom` binary directly. (To just change the port, the easy way is `bash run.sh --port 9090`.)
 
 ---
 

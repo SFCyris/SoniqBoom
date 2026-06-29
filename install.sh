@@ -371,7 +371,7 @@ if [ "$PLATFORM" = "macos" ]; then
   echo "  Config:           ~/Library/Application Support/SoniqBoom/SoniqBoom.conf"
   echo "  Data:             ~/Library/Application Support/SoniqBoom/"
 else
-  echo "  Config:           \${XDG_CONFIG_HOME:-~/.config}/soniqboom/SoniqBoom.conf"
+  echo "  Config:           \${XDG_DATA_HOME:-~/.local/share}/soniqboom/SoniqBoom.conf"
   echo "  Data:             \${XDG_DATA_HOME:-~/.local/share}/soniqboom/"
 fi
 echo ""
