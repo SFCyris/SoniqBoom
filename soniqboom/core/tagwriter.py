@@ -68,6 +68,12 @@ def write_tags(path: str, updates: dict) -> dict:
             continue
 
     if not applied:
+        # Distinguish "you sent nothing" from "the container rejected every
+        # key": WAV/AIFF/DSD open in mutagen but their raw-ID3 tags reject
+        # the easy interface, so all assignments above fail — reporting
+        # that as 'no fields supplied' blamed the user for a format limit.
+        if any(updates.get(field) not in (None, "") for field in _EASY_KEYS):
+            raise ValueError("This file format does not support tag editing.")
         raise ValueError("No editable fields were supplied.")
 
     f.save()

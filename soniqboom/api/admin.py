@@ -36,6 +36,30 @@ from soniqboom.core.store import get_store
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+# Strong refs for fire-and-forget scan tasks.  asyncio holds only a WEAK
+# reference to tasks from create_task; without this set a running scan
+# task could be garbage-collected mid-flight, and an unhandled exception
+# surfaced only at GC time as "Task exception was never retrieved" —
+# hours after the fact (observed with the 2026-07-02 BrokenProcessPool).
+_bg_scan_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_scan_task(coro, label: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=label)
+    _bg_scan_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _bg_scan_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error("Background scan task %s died: %r", label, exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
 # ── Token store ───────────────────────────────────────────────────────────────
 # Maps token → expiry (Unix timestamp). Kept in-memory; lost on restart.
 _tokens: dict[str, float] = {}
@@ -230,6 +254,32 @@ async def admin_stats(_tok: str = Depends(_require_token)):
         "index_auto_heal_total": health["auto_heal_total"],
         "index_mismatches": health["last_mismatches"],
     }
+
+
+@router.get("/scene/status")
+async def admin_scene_status(_tok: str = Depends(_require_token)):
+    """Modland scene-metadata enrichment state (index rows, last apply)."""
+    from soniqboom.core import scene_metadata
+    return scene_metadata.status()
+
+
+@router.post("/scene/refresh-index")
+async def admin_scene_refresh(_tok: str = Depends(_require_token)):
+    """Download Modland's nightly allmods_md5 index (~21 MB) and rebuild the
+    local sqlite join table.  Runs in an executor; returns the new status."""
+    import asyncio as _asyncio
+    from soniqboom.core import scene_metadata
+    return await _asyncio.get_running_loop().run_in_executor(
+        None, scene_metadata.refresh_index)
+
+
+@router.post("/scene/apply")
+async def admin_scene_apply(_tok: str = Depends(_require_token)):
+    """Join every scanned module's ``file_md5`` against the Modland index and
+    fill in missing artists (exact-match only, never overwrites).  The sqlite
+    join runs in an executor; the store WRITE stays on the loop thread."""
+    from soniqboom.core import scene_metadata
+    return await scene_metadata.apply_to_library()
 
 
 @router.post("/verify-indexes")
@@ -461,9 +511,10 @@ async def _scan_dirs_split(dirs: list[str], progress_cb=None) -> dict:
                         share_id = sid
                         break
             if source and share_id:
-                asyncio.create_task(
+                _spawn_scan_task(
                     start_remote_scan(share_id, scan_root, source,
-                                      on_progress=progress_cb)
+                                      on_progress=progress_cb),
+                    label=f"scan.remote[{scan_root}]",
                 )
                 started.append(scan_root)
             else:
@@ -861,7 +912,13 @@ def _do_restart() -> None:
         # cleanly replaces the old process.  ``-n`` forces a new instance.
         log.info("Restart: relaunching bundle at %s", bundle)
         try:
-            subprocess.Popen(["/usr/bin/open", "-n", str(bundle)])
+            # close_fds=False → CPython takes the fork-free posix_spawn
+            # path (absolute executable, no cwd).  This runs in a WORKER
+            # THREAD of the CF-initialised server: the default fork path
+            # is the segfault hazard class from the 2026-07-02 incident —
+            # on the one endpoint that must not fail (restart).
+            subprocess.Popen(["/usr/bin/open", "-n", str(bundle)],
+                             close_fds=False)
         except Exception as exc:  # pragma: no cover — last-ditch
             log.exception("Restart: open -n failed: %s", exc)
         # Give LaunchServices a breath, then ask uvicorn to shut down
@@ -1131,8 +1188,9 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
     async def _progress_cb(p):
         await _broadcast({"event": "scan_progress", **p.to_dict()})
 
-    asyncio.create_task(
-        start_remote_scan(share_id, scan_root, source, on_progress=_progress_cb)
+    _spawn_scan_task(
+        start_remote_scan(share_id, scan_root, source, on_progress=_progress_cb),
+        label=f"scan.remote[{scan_root}]",
     )
 
     return {"id": share_id, "scan_root": scan_root, "dirs": await list_scan_dirs()}
@@ -1793,11 +1851,49 @@ async def check_renderers(_tok: str = Depends(_require_token)):
     except Exception:
         log.exception("ffmpeg feature probe failed")
 
+    def _check_gme() -> dict:
+        """GME status mirrors _render_gme's preference order: in-process
+        libgme first, then the (rare) CLI.  ffmpeg-with-libgme also works
+        as a render fallback but isn't probed here — by the time it
+        matters, one of the first two is virtually always present."""
+        from soniqboom.core import gme_render
+        if gme_render.is_available():
+            return {"installed": True,
+                    "path": f"in-process libgme ({gme_render.lib_name()})"}
+        return _check(settings.gme_path, "gme")
+
+    # Bundled compile-on-first-use engines (HivelyTracker, StSound) report
+    # whether their built binary exists yet OR a compiler is available.
+    def _bundled(binary_name: str) -> dict:
+        from soniqboom.config import get_data_dir
+        import shutil as _sh
+        built = get_data_dir() / "native" / binary_name
+        if built.exists():
+            return {"installed": True, "path": str(built)}
+        cxx = _sh.which("c++") or _sh.which("clang++") or _sh.which("g++")
+        return {"installed": bool(cxx),
+                "path": f"(builds on first use{'' if cxx else ' — NO C++ compiler found'})"}
+
     return {
         "ffmpeg": ff_check,
         "sidplayfp": _check(settings.sidplayfp_path, "sidplayfp"),
         "fluidsynth": _check(settings.fluidsynth_path, "fluidsynth"),
         "openmpt123": _check(settings.openmpt123_path, "openmpt123"),
+        # QA M5/MN1 2026-07-02: the panel showed green while these 501'd.
+        "uade123": _check(settings.uade123_path, "uade123"),
+        # gme: the render path PREFERS the in-process libgme ctypes binding
+        # (core/gme_render.py) — a standalone `gme` CLI almost never exists
+        # (Homebrew's game-music-emu ships only the library), so probing
+        # the CLI alone showed ✗ on hosts where chiptunes play fine.
+        "gme": _check_gme(),
+        "adplay": _check(settings.adplay_path, "adplay"),
+        "psgplay": _check(settings.psgplay_path, "psgplay"),
+        "sc68": _check(settings.sc68_path, "sc68"),
+        "zxtune123": _check(settings.zxtune123_path, "zxtune123"),
+        # Clean keys — they double as the frontend's element-id suffixes
+        # (renderer-icon-<key>); the "bundled" note lives in the label.
+        "ym2wav": _bundled("ym2wav"),
+        "hvl2wav": _bundled("hvl2wav"),
     }
 
 
@@ -2239,11 +2335,13 @@ async def clear_conversion_cache(
 ):
     """Clear conversion-cache entries.
 
-    ``types`` is a comma-separated list of any of ``sid`` / ``midi`` /
-    ``tracker`` / ``transcoded``, or ``all``.  The Settings UI typically
-    sends ``transcoded`` only — that lets a user reclaim DSD/ALAC disk
-    without losing the (much more expensive to regenerate) SID, MIDI,
-    and tracker renders."""
+    ``types`` is a comma-separated list of any FORMAT_TYPES key
+    (``sid`` / ``midi`` / ``tracker`` / ``uade`` / ``hvl`` / ``gme`` /
+    ``adlib`` / ``imf`` / ``sndh`` / ``ym`` / ``sc68`` / ``psf`` /
+    ``transcoded``), or ``all``.  Unknown names are silently dropped by
+    ``clear_cache``.  The Settings UI typically sends ``transcoded``
+    only — that lets a user reclaim DSD/ALAC disk without losing the
+    (much more expensive to regenerate) chip-music renders."""
     from soniqboom.core.conversion_cache import clear_cache
     selected = None if types == "all" else [t.strip() for t in types.split(",") if t.strip()]
     return await clear_cache(selected)
@@ -2452,6 +2550,17 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "soundfont_path": settings.soundfont_path,
             "soundfonts_dir": settings.soundfonts_dir,
             "sid_default_duration": settings.sid_default_duration,
+            "psgplay_path": settings.psgplay_path,
+            "sc68_path": settings.sc68_path,
+            "zxtune123_path": settings.zxtune123_path,
+            "uade123_path": settings.uade123_path,
+            "gme_path": settings.gme_path,
+            "adplay_path": settings.adplay_path,
+            "sid_model": settings.sid_model,
+            "sid_model_force": settings.sid_model_force,
+            "sid_filter": settings.sid_filter,
+            "sid_filter_curve": settings.sid_filter_curve,
+            "sid_digiboost": settings.sid_digiboost,
             "hvsc_docs_path": settings.hvsc_docs_path,
             "hvsc_autodetect": settings.hvsc_autodetect,
         },
@@ -2498,11 +2607,37 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             conf["renderers"] = {}
         for k in ("sidplayfp_path", "fluidsynth_path", "openmpt123_path",
                    "soundfont_path", "soundfonts_dir", "sid_default_duration",
-                   "hvsc_docs_path", "hvsc_autodetect"):
+                   "hvsc_docs_path", "hvsc_autodetect",
+                   "sid_model", "sid_model_force", "sid_filter",
+                   "sid_filter_curve", "sid_digiboost",
+                   "psgplay_path", "sc68_path", "zxtune123_path",
+                   "uade123_path", "gme_path", "adplay_path"):
             if k in body["renderers"]:
                 val = body["renderers"][k]
-                if k == "hvsc_autodetect":
+                if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
+                         "sid_digiboost"):
                     val = bool(val)            # coerce — keep the schema honest
+                elif k == "sid_model":
+                    val = str(val).lower()
+                    if val not in ("auto", "6581", "8580"):
+                        val = "auto"
+                elif k == "sid_filter_curve":
+                    try:
+                        val = float(val)
+                    except (TypeError, ValueError):
+                        val = -1.0
+                    if not (0.0 <= val <= 1.0):
+                        val = -1.0             # -1 = sidplayfp default curve
+                elif k == "sid_default_duration":
+                    # QA M3: was written raw via setattr — a string 500'd the
+                    # renderer, a huge int parked a render slot for years.
+                    try:
+                        val = int(val)
+                    except (TypeError, ValueError):
+                        val = 180
+                    val = max(5, min(1800, val))
+                else:
+                    val = str(val)             # every remaining key is a path
                 conf["renderers"][k] = val
                 # Live-update settings so the change takes effect without
                 # restart; HVSC re-indexes on the next SID extract.

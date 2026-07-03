@@ -253,7 +253,7 @@ _CONF_TEMPLATE = """\
   "network_shares": {},
   "remote_cache_max_mb": 2048,
 
-  "_comment_ftp_pools": "Optional per-server FTP connection-pool tuning, keyed by 'host:port'. Each entry may set 'scan' (bulk re-index, default 6), 'stream' (playback, default 2), and 'browse' (interactive folder listing, default 1) connection budgets, plus 'auto_grow' (bool) to let the pool probe one extra connection under demand. Managed via the admin UI; env overrides: SONIQBOOM_FTP_SCAN_CONN_PER_HOST / SONIQBOOM_FTP_STREAM_CONN_PER_HOST / SONIQBOOM_FTP_BROWSE_CONN_PER_HOST. Example: {\"192.168.1.100:21\": {\"scan\": 6, \"stream\": 2, \"browse\": 1, \"auto_grow\": true}}.",
+  "_comment_ftp_pools": "Optional per-server FTP connection-pool tuning, keyed by 'host:port'. Each entry may set 'scan' (bulk re-index, default 6), 'stream' (playback, default 2), and 'browse' (interactive folder listing, default 1) connection budgets, plus 'auto_grow' (bool) to let the pool probe one extra connection under demand. Managed via the admin UI; env overrides: SONIQBOOM_FTP_SCAN_CONN_PER_HOST / SONIQBOOM_FTP_STREAM_CONN_PER_HOST / SONIQBOOM_FTP_BROWSE_CONN_PER_HOST. Example: {'192.168.1.100:21': {'scan': 6, 'stream': 2, 'browse': 1, 'auto_grow': true}}.",
 
   "renderers": {
     "_comment": "Leave empty to auto-detect from PATH. Set absolute paths to override.",
@@ -508,9 +508,30 @@ class Settings(BaseSettings):
     # adplay (AdPlug) — AdLib/OPL2 FM formats: id/Apogee IMF, ROL, CMF, D00,
     # RAD, LucasArts LAA, Sierra SCI, DOSBox DRO, …  Optional; clear 501 if absent.
     adplay_path:        str = _local_conf.get("renderers", {}).get("adplay_path", "")
+    # Atari ST renderers.  psgplay (SNDH) is built from source by install.sh;
+    # sc68 (.sc68 disks) comes from Homebrew/distro packages.  StSound (.ym)
+    # is vendored + compiled on first use — no path setting needed.
+    psgplay_path:       str = _local_conf.get("renderers", {}).get("psgplay_path", "")
+    sc68_path:          str = _local_conf.get("renderers", {}).get("sc68_path", "")
+    # zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF).
+    zxtune123_path:     str = _local_conf.get("renderers", {}).get("zxtune123_path", "")
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
+    # SID render fidelity (sidplayfp, ReSIDfp core).  Defaults leave sidplayfp
+    # honouring each tune's own PSID header — i.e. exactly the pre-setting
+    # behaviour, so existing conversion-cache keys stay valid until changed.
+    #   sid_model:        "auto" (tune decides) | "6581" (-mo) | "8580" (-mn)
+    #   sid_model_force:  append sidplayfp's 'f' — override even tunes that
+    #                     declare a specific chip (else the flag is a hint)
+    #   sid_filter:       False adds -nf (filter emulation off)
+    #   sid_filter_curve: 0.0-1.0 -> --fcurve=<num>; -1 = sidplayfp default
+    #   sid_digiboost:    8580 digiboost hack for louder sample playback
+    sid_model:          str   = _local_conf.get("renderers", {}).get("sid_model", "auto")
+    sid_model_force:    bool  = bool(_local_conf.get("renderers", {}).get("sid_model_force", False))
+    sid_filter:         bool  = bool(_local_conf.get("renderers", {}).get("sid_filter", True))
+    sid_filter_curve:   float = float(_local_conf.get("renderers", {}).get("sid_filter_curve", -1.0))
+    sid_digiboost:      bool  = bool(_local_conf.get("renderers", {}).get("sid_digiboost", False))
     # HVSC integration — point at the High Voltage SID Collection's
     # ``DOCUMENTS/`` folder (containing Songlengths.md5 + STIL.txt) to
     # get per-tune accurate durations and STIL commentary.  Empty = off.
@@ -673,6 +694,9 @@ def get_conversion_cache_dir() -> Path:
         p = APP_DIR / "cache" / "conversion"
     # All rendered format_types (``_cache_path`` also mkdirs on demand, but
     # pre-creating keeps the layout predictable and warmup_from_disk happy).
-    for sub in ("sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"):
+    # Keep in sync via conversion_cache.FORMAT_TYPES (imported lazily to
+    # avoid a config<->cache import cycle at boot).
+    for sub in ("sid", "midi", "tracker", "uade", "hvl", "gme",
+                "adlib", "imf", "sndh", "ym", "sc68", "psf", "transcoded"):
         (p / sub).mkdir(parents=True, exist_ok=True)
     return p

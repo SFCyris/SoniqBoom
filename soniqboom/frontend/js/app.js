@@ -58,7 +58,9 @@ let _trackInfoP = null;
 const loadTrackInfo = () => (_trackInfoP ||= import('./trackinfo.js').then(m => m.TrackInfo));
 let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
-import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast, trapFocus } from './utils.js';
+import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES,
+         ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, isUadeAmigaTrack,
+         Toast, trapFocus } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -957,7 +959,19 @@ if (_tiOverlayEl) {
 async function _handleVU(track) {
   if (!track) { _stopVU(); _removeFallbackLabel(); return; }
   const primary = String(track.format || '').split('/')[0].trim();
-  if (!_TRACKER_FORMATS.has(primary)) {
+  // Eligibility: static tracker/SID/chip names PLUS the families whose
+  // format names can't live in a static set — the ~175 exotic uade
+  // Amiga players carry dynamic names ('Sonic Arranger', 'TFMX Pro',
+  // …; the genre pair is the reliable signal), Atari ST (SNDH/YM/SC68)
+  // and the PSF consoles.  They either have real per-voice sidecars
+  // (uade) or get the honest FFT spectrum below — the old gate stopped
+  // them BEFORE the sidecar was even tried, so a Sonic Arranger track
+  // showed nothing even though its VUMR sidecar existed.
+  const vuEligible = _TRACKER_FORMATS.has(primary)
+      || isUadeAmigaTrack(track)
+      || ATARI_FORMAT_NAMES.has(primary)
+      || PSF_FORMAT_NAMES.has(primary);
+  if (!vuEligible) {
     _stopVU();
     _removeFallbackLabel();
     return;
@@ -1955,7 +1969,7 @@ document.getElementById('btn-track-info').addEventListener('click', _openNowPlay
 // ── Track Info via right-click on library rows ────────────────────────────────
 Library.onInfo((tracks, idx) => loadTrackInfo().then(TI => TI.open(tracks, idx)));
 
-// ── Stations (internet radio, Beta) — lazy module on first sidebar click ─────
+// ── Stations (internet radio) — lazy module on first sidebar click ───────────
 let _stationsP = null;
 const loadStations = () => (_stationsP ||= import('./stations.js').then(m => m.Stations));
 document.querySelectorAll('#nav-stations li').forEach(li => {

@@ -124,6 +124,9 @@
                   style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:13px;padding:0 0 0 4px">⎋</button>
         </span>
         <button id="btn-welcome" class="btn-help" title="Welcome &amp; tips" aria-label="Show the welcome guide and tips" aria-haspopup="dialog" aria-expanded="false">?</button>
+        <a id="btn-docs" class="header-link" href="/manual/" target="_blank" rel="noopener"
+           title="User guide &amp; documentation (opens a new tab)"
+           aria-label="Open the user guide and documentation in a new tab">&#128214;</a>
         <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
         <button id="btn-admin" title="Admin settings" aria-label="Admin settings">&#9881;</button>
       </div>
@@ -175,9 +178,9 @@
         <section id="section-stations">
           <h3>Stations</h3>
           <ul id="nav-stations">
-            <li data-sview="favorites" tabindex="0" role="button" title="Your saved internet-radio stations (Beta)">Favorites</li>
-            <li data-sview="scene"     tabindex="0" role="button" title="Curated demoscene &amp; chiptune internet radio (Beta)">Scene</li>
-            <li data-sview="world"     tabindex="0" role="button" title="Worldwide internet radio — the Radio Browser directory (Beta)">World</li>
+            <li data-sview="favorites" tabindex="0" role="button" title="Your saved internet-radio stations">Favorites</li>
+            <li data-sview="scene"     tabindex="0" role="button" title="Curated demoscene &amp; chiptune internet radio">Scene</li>
+            <li data-sview="world"     tabindex="0" role="button" title="Worldwide internet radio — the Radio Browser directory">World</li>
           </ul>
         </section>
 
@@ -473,8 +476,8 @@
         </li>
         <li>
           <span class="wf-icon" aria-hidden="true">&#128251;</span>
-          <div><strong>Stations &amp; Cast <span class="welcome-beta">Beta</span></strong><br>
-            Internet radio, and cast to AirPlay / Chromecast / DLNA.</div>
+          <div><strong>Stations &amp; Cast</strong><br>
+            Internet radio, and cast to AirPlay / Chromecast / DLNA <span class="welcome-beta">Beta</span>.</div>
         </li>
       </ul>
       <div class="welcome-actions">
@@ -770,6 +773,38 @@
                 <span class="renderer-icon" id="renderer-icon-openmpt123">&#8943;</span>
                 <span class="renderer-name">Tracker (openmpt123)</span>
               </div>
+              <div class="renderer-item" id="renderer-uade123">
+                <span class="renderer-icon" id="renderer-icon-uade123">&#8943;</span>
+                <span class="renderer-name">Amiga Exotica (uade123)</span>
+              </div>
+              <div class="renderer-item" id="renderer-hvl2wav">
+                <span class="renderer-icon" id="renderer-icon-hvl2wav">&#8943;</span>
+                <span class="renderer-name">AHX / Hively (bundled hvl2wav)</span>
+              </div>
+              <div class="renderer-item" id="renderer-gme">
+                <span class="renderer-icon" id="renderer-icon-gme">&#8943;</span>
+                <span class="renderer-name">Chiptune (gme)</span>
+              </div>
+              <div class="renderer-item" id="renderer-adplay">
+                <span class="renderer-icon" id="renderer-icon-adplay">&#8943;</span>
+                <span class="renderer-name">AdLib (adplay)</span>
+              </div>
+              <div class="renderer-item" id="renderer-psgplay">
+                <span class="renderer-icon" id="renderer-icon-psgplay">&#8943;</span>
+                <span class="renderer-name">Atari SNDH (psgplay)</span>
+              </div>
+              <div class="renderer-item" id="renderer-ym2wav">
+                <span class="renderer-icon" id="renderer-icon-ym2wav">&#8943;</span>
+                <span class="renderer-name">Atari YM (bundled ym2wav)</span>
+              </div>
+              <div class="renderer-item" id="renderer-sc68">
+                <span class="renderer-icon" id="renderer-icon-sc68">&#8943;</span>
+                <span class="renderer-name">Atari/Amiga SC68 (sc68)</span>
+              </div>
+              <div class="renderer-item" id="renderer-zxtune123">
+                <span class="renderer-icon" id="renderer-icon-zxtune123">&#8943;</span>
+                <span class="renderer-name">PSF Consoles (zxtune123)</span>
+              </div>
             </div>
             <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
                  in admin.js when the running ffmpeg is missing required
@@ -825,7 +860,15 @@
               <li><span class="cache-type">SID</span>      <span class="cache-bytes" id="cache-bytes-sid">—</span></li>
               <li><span class="cache-type">MIDI</span>     <span class="cache-bytes" id="cache-bytes-midi">—</span></li>
               <li><span class="cache-type">Tracker</span>  <span class="cache-bytes" id="cache-bytes-tracker">—</span></li>
+              <li><span class="cache-type">Amiga (UADE)</span> <span class="cache-bytes" id="cache-bytes-uade">—</span></li>
+              <li><span class="cache-type">AHX / Hively</span> <span class="cache-bytes" id="cache-bytes-hvl">—</span></li>
               <li><span class="cache-type">Chiptune (GME)</span> <span class="cache-bytes" id="cache-bytes-gme">—</span></li>
+              <li><span class="cache-type">AdLib</span>    <span class="cache-bytes" id="cache-bytes-adlib">—</span></li>
+              <li><span class="cache-type">IMF</span>      <span class="cache-bytes" id="cache-bytes-imf">—</span></li>
+              <li><span class="cache-type">Atari SNDH</span> <span class="cache-bytes" id="cache-bytes-sndh">—</span></li>
+              <li><span class="cache-type">Atari YM</span> <span class="cache-bytes" id="cache-bytes-ym">—</span></li>
+              <li><span class="cache-type">SC68</span>     <span class="cache-bytes" id="cache-bytes-sc68">—</span></li>
+              <li><span class="cache-type">PSF Consoles</span> <span class="cache-bytes" id="cache-bytes-psf">—</span></li>
               <li><span class="cache-type">Transcoded</span> <span class="cache-bytes" id="cache-bytes-transcoded">—</span></li>
             </ul>
             <!-- Cache cascade viz (#2) — live hit/miss flow across the cache
@@ -877,6 +920,127 @@
               </button>
             </div>
             <div id="admin-hvsc-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- SID fidelity (sidplayfp render options) -->
+          <div class="admin-section admin-sid-fidelity">
+            <h3>&#127911; SID fidelity</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Chip and filter options passed to sidplayfp.  Changes apply to
+              future renders immediately (no restart); tunes already in the
+              render cache keep their old sound until re-rendered.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-sid-model">SID chip model
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="Auto follows each tune's declared chip. 6581 = original gritty filter (C64 breadbin), 8580 = later cleaner revision.">&#9432;</span>
+              </label>
+              <select id="setting-sid-model">
+                <option value="auto">Auto (follow tune)</option>
+                <option value="6581">MOS 6581</option>
+                <option value="8580">MOS 8580</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-sid-model-force">Force model over tune's own choice</label>
+              <input id="setting-sid-model-force" type="checkbox">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-sid-filter">Filter emulation</label>
+              <input id="setting-sid-filter" type="checkbox" checked>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-sid-fcurve">Filter curve
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="0.0 (bright) to 1.0 (dark). Leave empty for sidplayfp's default curve.">&#9432;</span>
+              </label>
+              <input id="setting-sid-fcurve" type="number" min="0" max="1" step="0.05"
+                     placeholder="default">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-sid-digiboost">8580 digiboost (louder digi samples)</label>
+              <input id="setting-sid-digiboost" type="checkbox">
+            </div>
+            <div class="admin-io-row" style="margin-top:12px">
+              <button id="btn-save-sidfid">Save SID options</button>
+            </div>
+            <div id="admin-sidfid-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Renderer binary paths -->
+          <div class="admin-section">
+            <h3>&#128736;&#65039; Renderer binaries</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Optional absolute paths for the chip-music engines.  Leave a
+              field empty to auto-discover the binary on PATH.  Saving
+              applies immediately and re-checks Renderer Status above.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-path-uade123">uade123 (Amiga exotica)</label>
+              <input id="setting-path-uade123" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-gme">gme (chiptune)</label>
+              <input id="setting-path-gme" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-adplay">adplay (AdLib)</label>
+              <input id="setting-path-adplay" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-psgplay">psgplay (Atari SNDH)</label>
+              <input id="setting-path-psgplay" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-sc68">sc68 (Atari/Amiga SC68)</label>
+              <input id="setting-path-sc68" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-zxtune123">zxtune123 (PSF consoles)</label>
+              <input id="setting-path-zxtune123" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-io-row" style="margin-top:12px">
+              <button id="btn-save-renderer-paths">Save paths</button>
+            </div>
+            <div id="admin-rpaths-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Scene metadata (Modland MD5 index) -->
+          <div class="admin-section">
+            <h3>&#127760; Scene metadata (Modland)</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Match your modules against Modland's nightly MD5 index to fill
+              in scene authorship and provenance (the "Scene origin" row in
+              track info).  Exact checksum matches only — nothing is guessed.
+              Tracks indexed before v1.4.0 need a rescan to get checksums.
+            </p>
+            <div id="scene-status-line" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Index: &mdash;</div>
+            <div class="admin-io-row">
+              <button id="btn-scene-refresh" class="btn-secondary">
+                Download / refresh index (~21&nbsp;MB)
+              </button>
+              <button id="btn-scene-apply">Apply to library</button>
+            </div>
+            <div id="admin-scene-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- Soundfonts -->
@@ -1566,6 +1730,7 @@
               <div class="ti-field"><span class="ti-label">Duration</span><span class="ti-value" id="ti-duration">—</span></div>
               <div class="ti-field"><span class="ti-label">BPM</span><span class="ti-value" id="ti-bpm">—</span></div>
               <div class="ti-field"><span class="ti-label">Comment</span><span class="ti-value ti-value-wrap" id="ti-comment">—</span></div>
+              <div class="ti-field"><span class="ti-label">Scene origin</span><span class="ti-value ti-value-wrap" id="ti-scene-origin">—</span></div>
               <div class="ti-field"><span class="ti-label">ISRC</span><span class="ti-value" id="ti-isrc">—</span></div>
               <div class="ti-field"><span class="ti-label">Label</span><span class="ti-value" id="ti-label">—</span></div>
             </div>
@@ -1717,21 +1882,6 @@
               </li>
               <li class="archive-card">
                 <a class="archive-link"
-                   href="http://sndh.atari.org/"
-                   target="_blank" rel="noopener noreferrer">
-                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
-                  <span class="archive-text">
-                    <span class="archive-name">SNDH archive</span>
-                    <span class="archive-desc">
-                      Atari ST / STe / Falcon YM2149 chiptunes.  Use the
-                      libgme renderer (covers SNDH via .sndh / .ym).
-                    </span>
-                    <span class="archive-fmt">.sndh / .ym</span>
-                  </span>
-                </a>
-              </li>
-              <li class="archive-card">
-                <a class="archive-link"
                    href="https://zxart.ee/eng/music/"
                    target="_blank" rel="noopener noreferrer">
                   <span class="archive-globe" aria-hidden="true">&#127760;</span>
@@ -1739,10 +1889,25 @@
                     <span class="archive-name">ZXAART (ZX-Art)</span>
                     <span class="archive-desc">
                       ZX Spectrum AY-3-8910 chiptunes plus demoscene
-                      classics.  AY files render via libgme; raw
-                      Spectrum modules via openmpt.
+                      classics.  AY files render via libgme.
                     </span>
-                    <span class="archive-fmt">.ay / .pt3</span>
+                    <span class="archive-fmt">.ay</span>
+                  </span>
+                </a>
+              </li>
+              <li class="archive-card">
+                <a class="archive-link"
+                   href="http://sndh.atari.org/"
+                   target="_blank" rel="noopener noreferrer">
+                  <span class="archive-globe" aria-hidden="true">&#127760;</span>
+                  <span class="archive-text">
+                    <span class="archive-name">SNDH archive</span>
+                    <span class="archive-desc">
+                      Atari ST / STe YM2149 chiptunes.  Rendered via
+                      psgplay (built by install.sh); .ym register dumps
+                      play through the bundled ST-Sound engine.
+                    </span>
+                    <span class="archive-fmt">.sndh / .ym</span>
                   </span>
                 </a>
               </li>
@@ -1756,7 +1921,7 @@
                     <span class="archive-desc">
                       Amiga Music Preservation's AHX section.  AHX is
                       Amiga's 4-channel chiptune format; rendered via
-                      openmpt's AHX support.
+                      uade123 (.hvl via the bundled HivelyTracker engine).
                     </span>
                     <span class="archive-fmt">.ahx / .hvl</span>
                   </span>

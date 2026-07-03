@@ -403,6 +403,22 @@ async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None)
     cmd = [binary]
     if subsong > 0:
         cmd.append(f"-o{subsong}")      # sidplayfp flags: no space between flag and value
+    # SID chip-model / filter overrides (settings; defaults = no flags, i.e.
+    # sidplayfp honours the tune's own PSID header).  Flags verified against
+    # sidplayfp --help: -m<o|n>[f], -nf, --fcurve=<num>, --digiboost.
+    _model = (settings.sid_model or "auto").lower()
+    if _model in ("6581", "8580"):
+        _mflag = "-mo" if _model == "6581" else "-mn"
+        if settings.sid_model_force:
+            _mflag += "f"
+        cmd.append(_mflag)
+    if not settings.sid_filter:
+        cmd.append("-nf")
+    _curve = float(getattr(settings, "sid_filter_curve", -1.0))
+    if 0.0 <= _curve <= 1.0:
+        cmd.append(f"--fcurve={_curve:g}")
+    if settings.sid_digiboost:
+        cmd.append("--digiboost")
     cmd.extend([
         f"-t{dur}",
         f"-w{tmp_wav.name}",
@@ -892,6 +908,14 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str) -> Path | None
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
         source = get_source(scan_root)
+        # uade Amiga modules: fetch module + companion halves into one dir.
+        if (source is not None
+                and _uade_formats.classify(Path(remote_path).name) is not None):
+            mat = await _materialize_loose_remote_uade(
+                track_id, scan_root, remote_path, source,
+            )
+            if mat is not None:
+                return mat
         globs = _ADLIB_COMPANION_GLOBS.get(Path(remote_path).suffix.lower())
         if globs and source is not None:
             mat = await _materialize_loose_remote_adlib(
@@ -909,6 +933,80 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str) -> Path | None
             bank_fallback=_make_zip_bank_fallback(local_zip=path_str.split("::")[0]),
         )
     return Path(path_str)
+
+
+async def _materialize_loose_remote_uade(
+    track_id: str, scan_root: str, remote_path: str, source,
+) -> Path | None:
+    """A loose uade Amiga module on a remote share, materialized WITH its
+    companion halves (TFMX ``smpl.X`` etc.) in one local dir — the per-file
+    remote cache would otherwise split the pair apart.  Same-directory,
+    case-insensitive sibling matching (eagleplayers resolve companions
+    case-insensitively themselves).  Returns None → caller falls back to a
+    plain single-file fetch (fine for the many companion-less formats).
+    """
+    import posixpath
+    loop = asyncio.get_running_loop()
+    rp = remote_path.replace("\\", "/")
+    tune_base = posixpath.basename(rp)
+    rdir = posixpath.dirname(rp)
+    wanted = {s.lower() for s in _uade_formats.companion_sibling_names(tune_base)}
+    out_dir = _zip_extract_dir() / f"{track_id}.uade"
+    tune_out = out_dir / tune_base
+    try:
+        st = await loop.run_in_executor(None, source.stat, remote_path)
+        marker_val = f"{getattr(st, 'size', '')}:{getattr(st, 'mtime', '')}"
+    except Exception:
+        marker_val = ""
+    lock = await _zip_lock_for(track_id)
+    async with lock:
+        marker = out_dir / ".loose_marker"
+        if tune_out.exists() and marker.exists() and marker.read_text() == marker_val:
+            _register_adlib_extract(track_id, out_dir)   # same budget/LRU pool
+            return tune_out
+
+        def _work() -> Path | None:
+            import shutil
+            try:
+                entries = source.list_dir(rdir)
+            except Exception:
+                entries = []
+            sibs = []
+            for e in entries:
+                if getattr(e, "is_dir", False):
+                    continue
+                base = posixpath.basename(
+                    (getattr(e, "name", "") or "").replace("\\", "/"))
+                if base and base.lower() in wanted:
+                    sibs.append(
+                        (base, getattr(e, "path", None) or posixpath.join(rdir, base)))
+            if out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            from soniqboom.core.remote_cache import get_cache
+            try:
+                local = get_cache().fetch(scan_root, remote_path, source)
+                shutil.copyfile(local, tune_out)
+            except Exception:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None
+            for base, sib_path in sibs:
+                try:
+                    lp = get_cache().fetch(scan_root, sib_path, source)
+                    shutil.copyfile(lp, out_dir / base)
+                except Exception:
+                    continue
+            marker.write_text(marker_val)
+            return tune_out
+
+        tune = await loop.run_in_executor(None, _work)
+        if tune is not None:
+            _register_adlib_extract(track_id, out_dir)
+            try:
+                await asyncio.to_thread(_zip_evict_until_under_budget)
+            except Exception:
+                log.exception("UADE loose-remote eviction failed")
+        return tune
 
 
 async def _materialize_loose_remote_adlib(
@@ -1014,14 +1112,25 @@ async def _probe_one_rendered_duration(track_id: str) -> float | None:
     ext = Path(path_str.split("::")[-1]).suffix.lower()
     is_adlib = ext in _ADLIB_EXTS or ext == ".imf"
     is_gme = ext in _GME_EXTS_STREAM
-    is_uade = ext in _UADE_EXTS
+    is_uade = (ext in _UADE_EXTS
+               or _uade_formats.classify(Path(path_str.split("::")[-1]).name)
+               is not None)
     is_hvl = ext in _HVL_EXTS
-    if not (is_adlib or is_gme or is_uade or is_hvl):
+    is_sc68 = ext in _SC68_EXTS
+    # Bare .dsf might be a Dreamcast rip — decidable only once local.
+    is_psf = ext in _PSF_STREAM_EXTS
+    maybe_dreamcast = ext == ".dsf"
+    # A bare .sid may be Amiga SidMon (no PSID magic) — probe-eligible, but
+    # only decidable after the file is local; real C64 PSID bails below.
+    maybe_sidmon = ext in _SID_EXTS and not is_uade
+    if not (is_adlib or is_gme or is_uade or is_hvl or is_sc68 or is_psf
+            or maybe_sidmon or maybe_dreamcast):
         return None
     if is_gme:
         placeholder = float(settings.sid_default_duration)
-    elif is_uade or is_hvl:
-        placeholder = 0.0   # .ahx/.hvl carry no scan-time duration
+    elif (is_uade or is_hvl or is_sc68 or is_psf
+            or maybe_sidmon or maybe_dreamcast):
+        placeholder = 0.0   # render-only formats carry no scan-time duration
     else:
         from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
         placeholder = float(_ADLIB_DEFAULT_DURATION)
@@ -1032,6 +1141,14 @@ async def _probe_one_rendered_duration(track_id: str) -> float | None:
     local = await _resolve_adlib_local_path(track_id, path_str)
     if local is None:
         return None
+    if maybe_sidmon:
+        if _is_c64_sid(local):
+            return None       # real C64 — HVSC owns those durations
+        is_uade = True
+    if maybe_dreamcast and not is_psf:
+        if not _dsf_is_dreamcast(local):
+            return None       # Sony DSD stream — not render-only
+        is_psf = True
     wav = None
     try:
         if is_gme:
@@ -1040,8 +1157,12 @@ async def _probe_one_rendered_duration(track_id: str) -> float | None:
             wav = await _render_imf(local)
         elif is_hvl:
             wav = await _render_hvl(local)
+        elif is_psf:
+            wav = await _render_psf(local)
+        elif is_sc68:
+            wav = await _render_sc68(local)
         elif is_uade:
-            wav = await _render_uade(local)
+            wav = await _render_uade(local, with_vu=False)
         else:
             wav = await _render_adlib(local)
         return await _backfill_rendered_duration(track_id, track, wav, placeholder)
@@ -1195,9 +1316,40 @@ async def _extract_vu_sidecar(
 # (HivelyTracker, AHX's multi-channel successor) is NOT in the Homebrew uade
 # player set and libopenmpt can't load it either, so it has its own renderer
 # below (bundled HivelyTracker replay → hvl2wav).
-_UADE_EXTS = {".ahx"}
+from soniqboom.core import uade_formats as _uade_formats
+
+# .ahx plus every registered uade suffix token (song.fc13, tune.dm2, …) and
+# the archive layer's appended routing extensions (mdat.X → display X.mdat).
+# Amiga PREFIX-form loose files (mdat.song) don't have a token extension —
+# they're caught by ``_uade_formats.classify`` at the routing sites instead.
+_UADE_EXTS = {".ahx"} | {f".{_t}" for _t in _uade_formats.new_suffix_tokens()}
 _HVL_EXTS = {".hvl"}
+
+
+def _is_c64_sid(path: Path) -> bool:
+    """True if a ``.sid`` file is a real C64 tune (PSID/RSID magic).
+
+    Modland stores Amiga SidMon modules as ``*.sid`` too — those carry no
+    PSID header and must render via uade, not sidplayfp.  Unreadable files
+    return True so the legacy sidplayfp path keeps ownership of errors.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) in (b"PSID", b"RSID")
+    except OSError:
+        return True
 _hvl2wav_bin: "Path | None" = None
+# One lock per bundled build — two concurrent FIRST plays of different
+# tracks could otherwise compile to the same output path simultaneously
+# and exec a half-written binary (QA MN6).
+_native_build_locks: dict[str, asyncio.Lock] = {}
+
+
+def _native_build_lock(name: str) -> asyncio.Lock:
+    lock = _native_build_locks.get(name)
+    if lock is None:
+        lock = _native_build_locks.setdefault(name, asyncio.Lock())
+    return lock
 
 # uade123 has no native "render exactly N seconds" mode — it relies on
 # the player binary's end-detection.  Most AHX tunes are < 5 minutes;
@@ -1206,7 +1358,7 @@ _hvl2wav_bin: "Path | None" = None
 _UADE_DEFAULT_TIMEOUT_S = 8 * 60
 
 
-async def _render_uade(path: Path, subsong: int = 0) -> Path:
+async def _render_uade(path: Path, subsong: int = 0, with_vu: bool = True) -> Path:
     """Render an AHX / Hively / Amiga-tracker module to WAV via uade123.
 
     Returns the temp-file path; caller (``conversion_cache.get_or_render``)
@@ -1219,13 +1371,21 @@ async def _render_uade(path: Path, subsong: int = 0) -> Path:
     ``subsong`` is honoured for multi-tune containers (rare in AHX,
     common in HVL).  uade123 uses 0-indexed subsongs like the rest of
     SoniqBoom — no off-by-one translation needed.
+
+    ``with_vu``: also capture uade's per-voice ``--write-audio`` dump in the
+    SAME pass and convert it to a VUMR ``.vu`` sidecar next to the temp WAV —
+    ``conversion_cache`` moves the pair together and the frontend's
+    per-channel VU meters pick it up like a tracker module's.  Best-effort:
+    a VU failure never fails the render.  The duration-probe path passes
+    ``with_vu=False`` (its WAV is thrown away).
     """
     binary = _find_renderer(settings.uade123_path, "uade123")
     if not binary:
         raise HTTPException(
             501,
-            "uade123 not installed — Amiga formats (AHX / Hively) require it. "
-            "Install via 'brew install uade' (macOS) or 'apt install uade' (Debian/Ubuntu).",
+            "uade123 not installed — Amiga formats (AHX, TFMX, Future "
+            "Composer, SidMon, …) require it. Install via 'brew install "
+            "uade' (macOS) or 'apt install uade' (Debian/Ubuntu).",
         )
 
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -1235,9 +1395,12 @@ async def _render_uade(path: Path, subsong: int = 0) -> Path:
     # default A500 sounds muffled on modern listeners).  ``--headphones``
     # adds a tiny stereo-widening effect that mimics what AHX players
     # commonly did at the time.  ``-e wav`` plus ``-f`` forces output
-    # path (uade123 defaults to a temporary streaming sink).
+    # path (uade123 defaults to a temporary streaming sink).  ``-1``
+    # (--one) is ESSENTIAL: without it uade plays the start subsong and
+    # every FOLLOWING one concatenated into a single render (QA M1).
     cmd = [
         binary,
+        "-1",
         "--filter=A1200",
         "--headphones",
         "-e", "wav",
@@ -1253,7 +1416,80 @@ async def _render_uade(path: Path, subsong: int = 0) -> Path:
         cmd, Path(tmp_wav.name),
         timeout=_UADE_DEFAULT_TIMEOUT_S, kind="uade",
     )
+    if with_vu:
+        await _uade_vu_pass(binary, path, subsong, Path(tmp_wav.name))
     return Path(tmp_wav.name)
+
+
+# The Paula dump grows at ~2.5 MB per tune-second (measured); a runaway
+# looping tune capped only by the 8-min kill would write ~1.2 GB per render
+# slot (QA C3).  So the VU pass runs AFTER the main render, only when the
+# now-known duration is within this cap, and only with disk headroom.
+_UADE_VU_MAX_TUNE_S = 420
+_UADE_VU_MIN_FREE_BYTES = 4 * 1024**3
+
+
+async def _uade_vu_pass(
+    binary: str, path: Path, subsong: int, wav_path: Path,
+) -> None:
+    """Best-effort per-voice VU sidecar via a second, dump-only uade run.
+
+    Kept OUT of the main render so the dump size is bounded by the
+    already-known tune duration and a disk-space check — a VU failure or
+    skip never affects the audio render.
+    """
+    dump_tmp: Path | None = None
+    try:
+        duration = _wav_audio_seconds(wav_path)
+        if not (0 < duration <= _UADE_VU_MAX_TUNE_S):
+            log.debug("UADE VU skipped for %s: duration %.0fs out of range",
+                      path.name, duration)
+            return
+        import shutil as _sh
+        if _sh.disk_usage(tempfile.gettempdir()).free < (
+                _UADE_VU_MIN_FREE_BYTES + int(duration * 3 * 1024 * 1024)):
+            log.info("UADE VU skipped for %s: low disk", path.name)
+            return
+        _d = tempfile.NamedTemporaryFile(suffix=".uadedump", delete=False)
+        _d.close()
+        dump_tmp = Path(_d.name)
+        cmd = [binary, "-1", "--filter=A1200", "--headphones",
+               f"--write-audio={dump_tmp}", "-e", "wav", "-f", os.devnull]
+        if subsong > 0:
+            cmd += [f"--subsong={subsong}"]
+        cmd += ["--", str(path)]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=min(duration * 2 + 60, 600))
+        except asyncio.TimeoutError:
+            proc.kill()
+            return
+        from soniqboom.core import uade_vu
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: uade_vu.parse_dump(dump_tmp, duration),
+        )
+        if result is not None and result.frames > 0:
+            from soniqboom.core import openmpt_vu
+            vu_path = wav_path.with_suffix(".vu")
+            await loop.run_in_executor(
+                None, openmpt_vu.write_sidecar, vu_path, result,
+            )
+            log.info("UADE VU sidecar for %s: %d ch × %d frames @ %d Hz",
+                     path.name, result.channels, result.frames,
+                     result.sample_rate)
+    except Exception:
+        log.warning("UADE VU extraction failed for %s", path, exc_info=True)
+    finally:
+        if dump_tmp is not None:
+            try:
+                dump_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ── Hively (HVL) renderer ─────────────────────────────────────────────────
@@ -1271,6 +1507,14 @@ async def _ensure_hvl2wav() -> "Path | None":
     global _hvl2wav_bin
     if _hvl2wav_bin and _hvl2wav_bin.exists():
         return _hvl2wav_bin
+    async with _native_build_lock("hvl2wav"):
+        if _hvl2wav_bin and _hvl2wav_bin.exists():
+            return _hvl2wav_bin
+        return await _build_hvl2wav()
+
+
+async def _build_hvl2wav() -> "Path | None":
+    global _hvl2wav_bin
     src_dir = Path(__file__).resolve().parent.parent / "native" / "hvl"
     csrc = [src_dir / "hvl2wav.c", src_dir / "replay.c"]
     if not all(p.exists() for p in csrc):
@@ -1292,17 +1536,20 @@ async def _ensure_hvl2wav() -> "Path | None":
         log.warning("HVL: no C compiler (cc/clang/gcc) — cannot build hvl2wav")
         return None
     try:
+        _tmp_out = binp.with_suffix(".building")
         proc = await asyncio.create_subprocess_exec(
-            cc, "-O2", "-w", str(csrc[0]), str(csrc[1]), "-o", str(binp), "-lm",
+            cc, "-O2", "-w", str(csrc[0]), str(csrc[1]), "-o", str(_tmp_out), "-lm",
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
         _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
     except (OSError, asyncio.TimeoutError) as exc:
         log.warning("HVL: hvl2wav build failed to launch: %s", exc)
         return None
-    if proc.returncode != 0 or not binp.exists():
+    if proc.returncode != 0 or not _tmp_out.exists():
         log.warning("HVL: hvl2wav build failed: %s", (err or b"").decode("utf-8", "replace")[:300])
+        _tmp_out.unlink(missing_ok=True)
         return None
+    os.replace(_tmp_out, binp)     # atomic — no truncated binary on interrupt
     try:
         binp.chmod(0o755)
     except OSError:
@@ -1335,6 +1582,326 @@ async def _render_hvl(path: Path, subsong: int = 0) -> Path:
     cmd.append(str(path))
     await _await_renderer(cmd, Path(tmp_wav.name), timeout=300, kind="HVL")
     return Path(tmp_wav.name)
+
+
+# ── PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF) ──────────
+# Rendered via zxtune123 — the only cross-format CLI that bundles the
+# reference cores (Highly Experimental, Highly Theoretical, lazyusf2, mGBA,
+# vio2sf).  Linux: prebuilt from storage.zxtune.ru; macOS: built from source
+# (see install.sh).  Absent binary → clear 501.
+
+_PSF_STREAM_EXTS = {
+    ".psf", ".minipsf", ".psf2", ".minipsf2", ".usf", ".miniusf",
+    ".gsf", ".minigsf", ".2sf", ".mini2sf", ".ssf", ".minissf",
+    ".minidsf", ".ncsf", ".minincsf",
+}
+
+
+def _dsf_is_dreamcast(path: Path) -> bool:
+    """Content sniff for the ``.dsf`` extension collision: 'PSF\\x12' =
+    Sega Dreamcast rip (sequenced); 'DSD ' = Sony DSD audio stream."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"PSF\x12"
+    except OSError:
+        return False
+
+
+async def _render_psf(path: Path, subsong: int = 0) -> Path:
+    """Render a PSF-family file to WAV via zxtune123.
+
+    PSF rips are one-track-per-file (minipsf per song, shared *lib beside
+    it) — ``subsong`` is accepted for signature parity but unused.  zxtune
+    honours the embedded length/fade tags for the stop point.
+    """
+    binary = _find_renderer(settings.zxtune123_path, "zxtune123")
+    if not binary:
+        raise HTTPException(
+            501,
+            "zxtune123 not installed — console music rips (PSF/USF/GSF/2SF/"
+            "SSF/DSF) require it. Re-run install.sh, or set "
+            "renderers.zxtune123_path.",
+        )
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    # zxtune REFUSES to overwrite an existing file yet still exits 0
+    # ("File already exists", rc=0 — verified), which cached the pre-created
+    # empty temp as a "successful" render.  Unlink the placeholder first.
+    Path(tmp_wav.name).unlink(missing_ok=True)
+    # File-based WAV backend: ``--wav filename=<out>``.  No display needed.
+    cmd = [binary, "--silent", "--wav", f"filename={tmp_wav.name}", str(path)]
+    await _await_renderer(
+        cmd, Path(tmp_wav.name), timeout=600, kind="PSF")
+    return Path(tmp_wav.name)
+
+
+# ── Atari ST renderers (SNDH / YM / SC68) ─────────────────────────────────
+# Three engines, chosen for accuracy (2026-07 research + head-to-head tests):
+#   .sndh → psgplay   (modern 68000+YM2149+MFP+STE-DMA emulation; rendered
+#                      10/10 test files incl. every one brew's sc68 2.2.1
+#                      rejects; built from source by install.sh)
+#   .ym   → StSound   (Arnaud Carré's reference engine — he CREATED the YM
+#                      format; BSD, vendored under soniqboom/native/stsound
+#                      and compiled on first use like hvl2wav; handles the
+#                      LHA wrapper + every YM variant; mono 44.1 kHz out)
+#   .sc68 → sc68      (only available player for native .sc68 disks; 2.2.1
+#                      CLI quirks handled: options AFTER the filename, raw
+#                      PCM on stdout, config via an isolated SC68_HOME)
+
+_SNDH_EXTS = {".sndh"}
+_YM_EXTS = {".ym"}
+_SC68_EXTS = {".sc68"}
+_ATARI_DEFAULT_S = 180        # SNDH TIME tag missing/0 → render this long
+_ym2wav_bin: "Path | None" = None
+
+
+async def _ensure_ym2wav() -> "Path | None":
+    """Return a built StSound ``ym2wav`` path, compiling once if needed."""
+    global _ym2wav_bin
+    if _ym2wav_bin and _ym2wav_bin.exists():
+        return _ym2wav_bin
+    async with _native_build_lock("ym2wav"):
+        if _ym2wav_bin and _ym2wav_bin.exists():
+            return _ym2wav_bin
+        return await _build_ym2wav()
+
+
+async def _build_ym2wav() -> "Path | None":
+    global _ym2wav_bin
+    src_dir = Path(__file__).resolve().parent.parent / "native" / "stsound"
+    main_cpp = src_dir / "Ym2Wav" / "Ym2Wav.cpp"
+    lib_dir = src_dir / "StSoundLibrary"
+    if not main_cpp.exists() or not lib_dir.is_dir():
+        log.warning("YM: vendored StSound source missing under %s", src_dir)
+        return None
+    srcs = [main_cpp] + sorted(lib_dir.glob("*.cpp")) + sorted(
+        (lib_dir / "LZH").glob("*.cpp"))
+    from soniqboom.config import get_data_dir
+    out_dir = get_data_dir() / "native"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    binp = out_dir / "ym2wav"
+    newest = max(p.stat().st_mtime for p in srcs)
+    if binp.exists() and binp.stat().st_mtime >= newest:
+        _ym2wav_bin = binp
+        return binp
+    cxx = shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
+    if not cxx:
+        log.warning("YM: no C++ compiler — cannot build StSound ym2wav")
+        return None
+    _tmp_out = binp.with_suffix(".building")
+    cmd = [cxx, "-O2", "-w", "-o", str(_tmp_out),
+           *[str(p) for p in srcs],
+           "-I", str(lib_dir), "-I", str(lib_dir / "LZH")]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except (OSError, asyncio.TimeoutError) as exc:
+        log.warning("YM: ym2wav build failed to launch: %s", exc)
+        return None
+    if proc.returncode != 0 or not _tmp_out.exists():
+        log.warning("YM: ym2wav build failed: %s",
+                    (err or b"").decode("utf-8", "replace")[:300])
+        _tmp_out.unlink(missing_ok=True)
+        return None
+    os.replace(_tmp_out, binp)     # atomic — no truncated binary on interrupt
+    try:
+        binp.chmod(0o755)
+    except OSError:
+        pass
+    log.info("YM: built StSound ym2wav at %s", binp)
+    _ym2wav_bin = binp
+    return binp
+
+
+async def _render_ym(path: Path, subsong: int = 0) -> Path:
+    """Render an Atari ST ``.ym`` register dump via StSound's Ym2Wav.
+
+    YM files are single-tune (no subsongs).  Output is mono 16-bit
+    44.1 kHz WAV — browsers and the transcode pipeline handle mono fine.
+    """
+    binary = await _ensure_ym2wav()
+    if not binary:
+        raise HTTPException(
+            501,
+            "YM decoder unavailable — a C++ compiler is required to build "
+            "the bundled StSound engine.",
+        )
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    cmd = [str(binary), str(path), tmp_wav.name]     # exactly two args
+    await _await_renderer(cmd, Path(tmp_wav.name), timeout=300, kind="YM")
+    return Path(tmp_wav.name)
+
+
+def _sndh_info(path: Path) -> tuple[int, dict[int, int]]:
+    """(default_track, {track: seconds}) from ``psgplay -i`` tags (``!#`` /
+    ``TIME``).  default_track falls back to 1."""
+    binary = _find_renderer(settings.psgplay_path, "psgplay")
+    default_track, times = 1, {}
+    if not binary:
+        return default_track, times
+    import subprocess as _sp
+    try:
+        r = _sp.run([binary, "-i", str(path)], capture_output=True,
+                    text=True, timeout=20)
+    except (_sp.TimeoutExpired, OSError):
+        return default_track, times
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if parts[:2] != ["tag", "field"] or len(parts) < 4:
+            continue
+        if parts[2] == "!#":
+            try:
+                default_track = max(1, int(parts[3]))
+            except ValueError:
+                pass
+        elif parts[2] == "TIME" and len(parts) >= 5:
+            try:
+                times[int(parts[3])] = max(0, int(parts[4]))
+            except ValueError:
+                continue
+    return default_track, times
+
+
+async def _render_sndh(path: Path, subsong: int = 0) -> Path:
+    """Render an Atari ST SNDH file via psgplay (stereo 16-bit 44.1 kHz).
+
+    Subsong semantics mirror SID: the param is the 1-BASED track number,
+    0 = the tune's own default track (SNDH ``!#`` tag).  psgplay
+    hard-errors on ``--stop=auto`` when a tune declares no TIME tag, so a
+    ``--length`` is ALWAYS passed: the tag's duration when present, else
+    the Atari default cap.
+    """
+    binary = _find_renderer(settings.psgplay_path, "psgplay")
+    if not binary:
+        raise HTTPException(
+            501,
+            "psgplay not installed — Atari ST SNDH requires it. Re-run "
+            "install.sh (it builds psgplay from source) or set "
+            "renderers.psgplay_path.",
+        )
+    loop = asyncio.get_running_loop()
+    default_track, times = await loop.run_in_executor(None, _sndh_info, path)
+    track = subsong if subsong > 0 else default_track
+    secs = times.get(track, 0)
+    # Hard-cap the length: an untrusted TIME tag ("TIME 1 999999999") would
+    # otherwise drive an unbounded render + timeout — filling the disk and
+    # pinning a render slot forever (QA C1, 2026-07-02).
+    length = min(secs if secs > 0 else _ATARI_DEFAULT_S, 3600)
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    cmd = [binary, "-t", str(track), "-f", "44100",
+           f"--length={length}", "-o", tmp_wav.name, str(path)]
+    await _await_renderer(
+        cmd, Path(tmp_wav.name), timeout=max(60, length + 60), kind="SNDH")
+    return Path(tmp_wav.name)
+
+
+def _sc68_home() -> Path:
+    """An isolated SC68_HOME with our config (44.1 kHz), created once.
+
+    sc68 2.2.1 has no sample-rate CLI flag — the rate lives in
+    ``config.txt``.  A private home keeps us off the user's ~/.sc68 and
+    pins the output format the WAV wrapper below assumes.
+    """
+    from soniqboom.config import get_data_dir
+    home = get_data_dir() / "sc68_home"
+    d = home / ".sc68"
+    d.mkdir(parents=True, exist_ok=True)
+    conf = d / "config.txt"
+    if not conf.exists():
+        conf.write_text(
+            "# SoniqBoom-managed sc68 config\n"
+            "sampling_rate=44100\n"
+            f"default_time={_ATARI_DEFAULT_S}\n"
+        )
+    return home
+
+
+async def _render_sc68(path: Path, subsong: int = 0) -> Path:
+    """Render a native ``.sc68`` disk via the sc68 CLI.
+
+    sc68 2.2.1 quirks (verified empirically): options must come AFTER the
+    filename; output is RAW stereo signed 16-bit machine-endian PCM on
+    stdout at the config-file sample rate — wrapped into a WAV here.
+    Embedded per-track durations are honoured by sc68 itself.
+    """
+    binary = _find_renderer(settings.sc68_path, "sc68")
+    if not binary:
+        raise HTTPException(
+            501,
+            "sc68 not installed — native .sc68 files require it. "
+            "Install via 'brew install sc68' (macOS) or from sc68.atari.org.",
+        )
+    # Subsong semantics mirror SID: param = 1-based track, 0 = default (sc68
+    # itself picks the disk's default when --track is omitted... but 2.2.1's
+    # "0 = all tracks" would concatenate, so resolve 0 → track 1 explicitly).
+    track = subsong if subsong > 0 else 1
+    tmp_raw = tempfile.NamedTemporaryFile(suffix=".raw", delete=False)
+    tmp_raw.close()
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    home = await asyncio.get_running_loop().run_in_executor(None, _sc68_home)
+    import os as _os
+    env = dict(_os.environ, SC68_HOME=str(home), HOME=str(home))
+    ok = False
+    try:
+        # NOTE: no --quiet — sc68 2.2.1's option parser rejects it (verified);
+        # info chatter goes to stderr anyway, PCM alone arrives on stdout.
+        with open(tmp_raw.name, "wb") as _raw_out:      # QA MN3: close the fd
+            proc = await asyncio.create_subprocess_exec(
+                binary, str(path), f"--track={track}",
+                stdout=_raw_out, stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)  # reap
+                except asyncio.TimeoutError:
+                    pass
+                raise HTTPException(504, "sc68 render timed out")
+        raw_size = Path(tmp_raw.name).stat().st_size
+        if proc.returncode != 0 or raw_size < 8820:   # <0.05 s → failed
+            raise HTTPException(
+                422,
+                "This .sc68 file couldn't be decoded — it may be corrupt or "
+                "use an unsupported variant.",
+            )
+        # RIFF sizes are uint32 — a runaway/looping disk that outrendered the
+        # timeout budget would overflow struct.pack into an unclean 500
+        # (QA C1).  2 GB ≈ 3.4 h of audio: nothing legitimate.
+        if raw_size > 2 * 1024**3:
+            raise HTTPException(
+                422, "This .sc68 file rendered implausibly long output — "
+                     "it looks like an endless loop.")
+        # Wrap raw stereo s16le PCM into a WAV container.  (sc68's output is
+        # machine-endian; every supported host is little-endian, matching
+        # the LE header written here.)
+        import struct as _struct
+        with open(tmp_wav.name, "wb") as w:
+            w.write(b"RIFF" + _struct.pack("<I", 36 + raw_size) + b"WAVE")
+            w.write(b"fmt " + _struct.pack("<IHHIIHH", 16, 1, 2, 44100,
+                                           44100 * 4, 4, 16))
+            w.write(b"data" + _struct.pack("<I", raw_size))
+            with open(tmp_raw.name, "rb") as r:
+                shutil.copyfileobj(r, w, 1024 * 1024)
+        ok = True
+        return Path(tmp_wav.name)
+    finally:
+        Path(tmp_raw.name).unlink(missing_ok=True)
+        if not ok:
+            # QA C2: every failure path (504/422/wrap error) previously
+            # orphaned the pre-created output temp file.
+            Path(tmp_wav.name).unlink(missing_ok=True)
 
 
 def _is_safari(request: Request) -> bool:
@@ -1696,6 +2263,21 @@ _ADLIB_COMPANION_GLOBS = {
     ".sci": ("*patch.003",),   # Sierra On-Line  (kq1patch.003, icepatch.003, ...)
     ".rol": ("*.bnk",),        # AdLib Visual Composer  (standard.bnk)
     ".ksm": ("insts.dat",),    # Ken Silverman's Music Format
+    # PSF family: mini files reference shared driver/sample libs via _lib
+    # tags; the near-universal rip convention keeps them in the same dir.
+    # Materializing every same-family lib is a safe superset (multi-_lib
+    # sets exist).  NOTE ``.dsf`` (Dreamcast minis) is deliberately absent —
+    # the extension collides with Sony DSD; its zip/remote lib fetch is
+    # handled by the ``.minidsf`` entry + local-loose sibling presence, and
+    # a big DSD .dsf must never be routed through companion extraction.
+    ".psf": ("*.psflib",), ".minipsf": ("*.psflib",),
+    ".psf2": ("*.psf2lib",), ".minipsf2": ("*.psf2lib",),
+    ".usf": ("*.usflib",), ".miniusf": ("*.usflib",),
+    ".gsf": ("*.gsflib",), ".minigsf": ("*.gsflib",),
+    ".2sf": ("*.2sflib",), ".mini2sf": ("*.2sflib",),
+    ".ssf": ("*.ssflib",), ".minissf": ("*.ssflib",),
+    ".minidsf": ("*.dsflib",),
+    ".ncsf": ("*.ncsflib",), ".minincsf": ("*.ncsflib",),
 }
 
 
@@ -1918,6 +2500,121 @@ async def _extract_adlib_with_companions(
         return music
 
 
+def _uade_member_real_name(member_base: str) -> str | None:
+    """The uade-detectable filename for an archive member, or None.
+
+    The archive layer appends a routing extension to prefix-named members
+    (``mdat.song`` is listed as ``mdat.song.mdat``) so the suffix-keyed
+    pipeline recognises them — strip it back off for uade itself, whose
+    detection needs the ORIGINAL Amiga name.
+
+    ORDER MATTERS (QA C2, 2026-07-02): the strip check must run FIRST.
+    ``classify("mdat.acieed1.mdat")`` matches via the *prefix* token, so a
+    classify-first implementation never stripped — uade then derived the
+    companion as ``smpl.acieed1.mdat`` (nonexistent) and every archived
+    prefix-form TFMX/RJP module failed to play.  Strip when the last
+    segment is itself a uade routing extension AND the stripped name still
+    classifies.
+    """
+    if "." in member_base:
+        stem, _, last = member_base.rpartition(".")
+        if (f".{last.lower()}" in _UADE_EXTS
+                and _uade_formats.classify(stem) is not None):
+            return stem
+    if _uade_formats.classify(member_base) is not None:
+        return member_base
+    return None
+
+
+async def _extract_uade_with_companions(
+    path_str: str, track_id: str, outer_zip: Path, uade_name: str,
+) -> Path | None:
+    """Materialize a uade Amiga module + its companion halves from an archive.
+
+    TFMX (``mdat.X`` + ``smpl.X``), Richard Joseph (``X.sng`` + ``X.ins``) and
+    friends resolve their sample file by NAME in the module's own directory —
+    so the flat per-track extraction (track-id filename, no siblings) can
+    never play them.  Drops the module under its REAL Amiga name plus any
+    same-body companion siblings into a per-track dir.  Companion matching is
+    case-insensitive against the archive's raw member list (Amiga rips mix
+    SMPL./smpl.).  Mirrors ``_extract_adlib_with_companions``.
+    """
+    import os as _os
+    from soniqboom.core import archive as _archive
+    from soniqboom.core.scanner import _read_from_zip_path
+    parts = path_str.split("::")
+    member = parts[-1].replace("\\", "/")
+    member_dir = _os.path.dirname(member)
+    out_dir = _zip_extract_dir() / f"{track_id}.uade"
+    music_out = out_dir / uade_name
+    try:
+        zip_mtime = str(outer_zip.stat().st_mtime)
+    except OSError:
+        return None
+    lock = await _zip_lock_for(track_id)
+    async with lock:
+        wanted = {s.lower() for s in
+                  _uade_formats.companion_sibling_names(uade_name)}
+        marker = out_dir / ".zip_mtime"
+        if (music_out.exists() and marker.exists()
+                and marker.read_text() == zip_mtime):
+            # QA m1: don't latch a companion-LESS extract forever.  If the
+            # archive holds a wanted sibling that the cached dir lacks
+            # (earlier partial read), fall through and re-extract.
+            try:
+                from soniqboom.core import archive as _arc
+                _in_zip = {
+                    _os.path.basename(r.replace("\\", "/")).lower()
+                    for r in _arc.raw_namelist(outer_zip)
+                    if _os.path.dirname(r.replace("\\", "/")) == member_dir
+                }
+                _have = {p.name.lower() for p in out_dir.glob("*")}
+                _missing = (wanted & _in_zip) - _have
+            except Exception:
+                _missing = set()
+            if not _missing:
+                _register_adlib_extract(track_id, out_dir)  # same budget/LRU pool
+                return music_out
+
+        def _extract() -> Path | None:
+            import shutil
+            if out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                music_bytes, _ = _read_from_zip_path(path_str)
+            except Exception:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None
+            music_out.write_bytes(music_bytes)
+            # Case-insensitive same-dir sibling match against RAW member names
+            # (companion halves are filtered out of the playable map, so the
+            # display-name map never lists them).
+            for raw in _archive.raw_namelist(outer_zip):
+                clean = raw.replace("\\", "/")
+                if _os.path.dirname(clean) != member_dir:
+                    continue
+                base = _os.path.basename(clean)
+                if base.lower() in wanted:
+                    comp_vpath = "::".join(parts[:-1] + [raw])
+                    try:
+                        comp_bytes, _ = _read_from_zip_path(comp_vpath)
+                        (out_dir / base).write_bytes(comp_bytes)
+                    except Exception:
+                        continue
+            marker.write_text(zip_mtime)
+            return music_out
+
+        music = await asyncio.get_running_loop().run_in_executor(None, _extract)
+        if music is not None:
+            _register_adlib_extract(track_id, out_dir)
+            try:
+                await asyncio.to_thread(_zip_evict_until_under_budget)
+            except Exception:
+                log.exception("UADE companion-extract eviction failed")
+        return music
+
+
 async def _get_or_extract_zip_member(path_str: str, track_id: str, bank_fallback=None) -> Path | None:
     """Return a stable on-disk path for a ZIP-contained track.
 
@@ -1930,6 +2627,14 @@ async def _get_or_extract_zip_member(path_str: str, track_id: str, bank_fallback
     outer_zip = Path(parts[0])
     if not outer_zip.exists():
         return None
+    # uade Amiga modules may need companion halves + their REAL name — route
+    # them to the dedicated materializer (before the flat path renames them).
+    _member_base = Path(parts[-1].replace("\\", "/")).name
+    _uade_real = _uade_member_real_name(_member_base)
+    if _uade_real is not None:
+        return await _extract_uade_with_companions(
+            path_str, track_id, outer_zip, _uade_real,
+        )
     # Some AdLib formats (Sierra .sci, ROL .bnk, KSM insts.dat) need a companion
     # instrument-bank/patch file in the same dir, which the flat per-track
     # extraction below can't provide — route them to the dedicated materializer.
@@ -3696,7 +4401,7 @@ async def render_status(
             target_dur = int(round(float(hvsc_lengths[subsong])))
         elif meta.get("duration") and float(meta["duration"]) > 0:
             target_dur = int(round(float(meta["duration"])))
-    target_dur = max(5, target_dur)
+    target_dur = max(5, min(int(target_dur), 3600))  # clamp: HVSC/meta values are semi-trusted (QA residual #1)
 
     full_key = _cache_key(track_id, "sid", subsong, duration=target_dur)
     full_ready = await is_cache_ready(full_key)
@@ -3800,7 +4505,7 @@ async def _do_prewarm_render(
     matches exactly what playback will request later."""
     from soniqboom.core.conversion_cache import get_or_render
     try:
-        if ext in _SID_EXTS:
+        if ext in _SID_EXTS and _is_c64_sid(file_path):
             # Honour HVSC per-tune duration so the prewarm caches under the
             # same key the streaming path uses.
             target_dur = settings.sid_default_duration
@@ -3812,7 +4517,7 @@ async def _do_prewarm_render(
                     target_dur = int(round(float(lengths[subsong])))
                 elif meta.get("duration") and float(meta["duration"]) > 0:
                     target_dur = int(round(float(meta["duration"])))
-            target_dur = max(5, target_dur)
+            target_dur = max(5, min(int(target_dur), 3600))  # clamp: HVSC/meta values are semi-trusted (QA residual #1)
             await get_or_render(
                 track_id=track_id, format_type="sid", subsong=subsong,
                 duration=target_dur,
@@ -3831,7 +4536,31 @@ async def _do_prewarm_render(
                 track_id=track_id, format_type="hvl", subsong=subsong,
                 render_fn=lambda: _render_hvl(file_path, subsong=subsong),
             )
-        elif ext in _UADE_EXTS:
+        elif ext in _PSF_STREAM_EXTS or (
+                ext == ".dsf" and _dsf_is_dreamcast(file_path)):
+            await get_or_render(
+                track_id=track_id, format_type="psf", subsong=0,
+                render_fn=lambda: _render_psf(file_path),
+            )
+        elif ext in _SNDH_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="sndh", subsong=subsong,
+                render_fn=lambda: _render_sndh(file_path, subsong=subsong),
+            )
+        elif ext in _YM_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="ym", subsong=0,
+                render_fn=lambda: _render_ym(file_path),
+            )
+        elif ext in _SC68_EXTS:
+            await get_or_render(
+                track_id=track_id, format_type="sc68", subsong=subsong,
+                render_fn=lambda: _render_sc68(file_path, subsong=subsong),
+            )
+        elif (ext in _UADE_EXTS or ext in _SID_EXTS
+                or _uade_formats.classify(file_path.name) is not None):
+            # uade family: suffix tokens, Amiga prefix-form names, and
+            # magic-less .sid (SidMon — real C64 PSID returned above).
             await get_or_render(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(file_path, subsong=subsong),
@@ -4447,6 +5176,27 @@ async def stream_track(
             raise HTTPException(410, f"File not found on disk: {track.path}")
 
     ext = Path(path_str.split('::')[-1] if '::' in path_str else path_str).suffix.lower()
+    # Amiga prefix-form names (mdat.song) carry no token extension — detect by
+    # name so they route to uade below.  (Suffix-form is covered by _UADE_EXTS.)
+    _uade_named = _uade_formats.classify(
+        Path(path_str.split('::')[-1]).name) is not None
+
+    # Loose (non-zip) uade modules on a remote share: materialize module +
+    # companion halves (TFMX smpl.X …) into one dir, mirroring AdLib below.
+    if (path_str.startswith(("smb://", "ftp://")) and "::" not in path_str
+            and (_uade_named or ext in _UADE_EXTS) and ext != ".ahx"):
+        try:
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            _sr, _rp = parse_remote_path(path_str)
+            _src = get_source(_sr)
+            if _src is not None:
+                _mat = await _materialize_loose_remote_uade(track_id, _sr, _rp, _src)
+                if _mat is not None:
+                    path = _mat
+                    _zip_pin(track_id)
+                    _zip_track_id_for_unpin = track_id
+        except Exception as exc:
+            log.info("Loose UADE companion materialize failed for %s: %s", path_str, exc)
 
     # Loose (non-zip) AdLib tunes on a remote share need their companion bank
     # materialized in the same dir; the per-file fetch above split them apart.
@@ -4500,7 +5250,7 @@ async def stream_track(
         # On cache miss, the renderer runs and the result is stored for next time.
         from soniqboom.core.conversion_cache import get_or_render
 
-        if ext in _SID_EXTS:
+        if ext in _SID_EXTS and _is_c64_sid(path):
             from soniqboom.core.conversion_cache import (
                 _cache_key, find_shorter_sid_entry,
                 start_background_render, get_cached,
@@ -4518,7 +5268,7 @@ async def stream_track(
                 target_dur = int(round(float(meta["duration"])))
             # Clamp: extremely short or zero durations would produce empty
             # WAVs; cap to a minimum of 5s so we never feed sidplayfp -t0.
-            target_dur = max(5, target_dur)
+            target_dur = max(5, min(int(target_dur), 3600))  # clamp: HVSC/meta values are semi-trusted (QA residual #1)
 
             full_key = _cache_key(track_id, "sid", subsong, duration=target_dur)
 
@@ -4592,15 +5342,66 @@ async def stream_track(
                 headers={"X-Rendered": "hvl2wav", "X-Cache": "hit" if hit else "miss"},
                 background=_bg,
             )
-        if ext in _UADE_EXTS:
+        if ext in _PSF_STREAM_EXTS or (ext == ".dsf" and _dsf_is_dreamcast(path)):
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="psf", subsong=0,
+                render_fn=lambda: _render_psf(path),
+            )
+            # Duration normally comes from the length/fade tags at scan; rips
+            # without tags stored 0 — persist the rendered WAV's real length.
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "zxtune", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _SNDH_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="sndh", subsong=subsong,
+                render_fn=lambda: _render_sndh(path, subsong=subsong),
+            )
+            # SNDH TIME tags are frequently absent; the scan stored the Atari
+            # default cap in that case — backfill only refines a 0 duration.
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "psgplay", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _YM_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="ym", subsong=0,
+                render_fn=lambda: _render_ym(path),
+            )
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "stsound", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _SC68_EXTS:
+            cached_path, hit = await get_or_render(
+                track_id=track_id, format_type="sc68", subsong=subsong,
+                render_fn=lambda: _render_sc68(path, subsong=subsong),
+            )
+            # sc68 durations are embedded and honoured by the renderer; the
+            # scan stored 0 — persist the WAV's real length.
+            await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
+            return await _range_file_response(
+                request, cached_path, media_type="audio/wav",
+                headers={"X-Rendered": "sc68", "X-Cache": "hit" if hit else "miss"},
+                background=_bg,
+            )
+        if ext in _UADE_EXTS or _uade_named or ext in _SID_EXTS:
+            # Everything uade renders: .ahx, ~350 suffix tokens (song.fc13),
+            # Amiga prefix-form names (mdat.song), and magic-less .sid files
+            # (Amiga SidMon — real C64 PSID/RSID returned above already).
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(path, subsong=subsong),
             )
-            # .ahx is listed in _TRACKER_EXTS for scanner detection, but openmpt123
-            # can't decode it, so the scan stored duration 0 — uade123 renders to the
-            # tune's natural end, so persist the WAV's real length (placeholder=0
-            # no-ops if a real duration was somehow already stored).
+            # uade formats are render-only: the scan stored duration 0 — uade123
+            # renders to the tune's natural end, so persist the WAV's real length
+            # (placeholder=0 no-ops if a real duration was somehow already stored).
             await _backfill_rendered_duration(track_id, track, cached_path, 0.0)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",

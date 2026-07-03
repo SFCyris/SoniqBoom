@@ -577,7 +577,10 @@ class CastSession:
                     # foreground play at "ar88200" — every DSD cold start
                     # re-renders despite the N+1 prewarm "completing".
                     _prewarm_forced_sr: int | None = None
-                    if src_ext in ("dsf", "dff", "wsd"):
+                    # src_ext is DOTTED (".dsf") — the old dotless tuple never
+                    # matched, so every DSD cast track cold-started despite a
+                    # "completed" prewarm (QA 2026-07-02, cache-key mismatch).
+                    if src_ext in (".dsf", ".dff", ".wsd"):
                         _prewarm_forced_sr = 88200
                     ck = _ck(
                         track_id=item.track_id, format_type="transcoded",

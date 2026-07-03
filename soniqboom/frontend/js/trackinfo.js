@@ -12,7 +12,7 @@
  *   TrackInfo.openSingle(track)        — open panel for a single track
  */
 import { Player }              from './player.js';
-import { artPlaceholderEmoji, trapFocus } from './utils.js';
+import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags } from './utils.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -177,12 +177,31 @@ function _show(id, val, formatter) {
   el.classList.toggle('ti-empty', !text);
 }
 
+// Placeholder / "unknown artist" tokens that must NOT trigger a bio lookup —
+// mirrors artistinfo._PLACEHOLDER_ARTISTS on the backend (defense in depth).
+// A fuzzy lookup on "<?>" (the SID header's unknown-author sentinel) returned
+// a confident-but-wrong bio ("Kenji Kawai").
+const _PLACEHOLDER_ARTISTS = new Set([
+  '<?>', '?', '??', '???', '<no artist>', '<unknown>', '<unknown artist>',
+  'unknown', 'unknown artist', 'various', 'various artists', 'va', 'n/a',
+  'none', 'no artist', 'untitled',
+]);
+function _isPlaceholderArtist(name) {
+  // Only the explicit sentinels — NOT "all-symbol" names: "!!!" (Chk Chk
+  // Chk), "☭" etc. are real acts, and pure-punctuation garbage resolves to
+  // found:False on the backend anyway (mirrors artistinfo._is_placeholder_artist).
+  return _PLACEHOLDER_ARTISTS.has(name.trim().toLowerCase());
+}
+
 async function _loadArtistAbout(track) {
   const host = document.getElementById('ti-artist-about');
   if (!host) return;
   host.hidden = true; host.innerHTML = '';
   const artist = ((track && track.artist) || '').trim();
-  if (!artist) return;
+  if (!artist || _isPlaceholderArtist(artist)) return;
+  // Guard against a slow response racing into a DIFFERENT track's modal on
+  // rapid prev/next (mirrors the artwork loader's reqTrackId check).
+  const reqTrackId = track.id;
   try {
     // Album/track context lets the server pin the right artist for ambiguous
     // names ("Ghost" the band on this record, not anything else).
@@ -190,8 +209,10 @@ async function _loadArtistAbout(track) {
     if (track.album) q += '&album=' + encodeURIComponent(track.album);
     if (track.title) q += '&track=' + encodeURIComponent(track.title);
     const r = await fetch(q);
+    if (_queue[_idx]?.id !== reqTrackId) return;   // user navigated away
     if (!r.ok) return;
     const info = await r.json();
+    if (_queue[_idx]?.id !== reqTrackId) return;
     if (!info || !info.found || !info.bio) return;
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -225,6 +246,11 @@ function _renderTagEdit(track) {
   // than showing a disabled button.
   const remote = /^(smb|ftp|webdav|webdavs|https?):\/\//.test(track.path || '');
   if (remote) return;
+  // …and only to containers mutagen can actually write (MP3/FLAC/M4A/
+  // OGG/Opus/WavPack/Musepack).  Modules, SID, uade exotica, SNDH/PSF,
+  // chiptunes, WAV/AIFF/DSD and archive members would only ever produce
+  // a 422 on save — hide the affordance, matching the remote pattern.
+  if (!canEditTags(track)) return;
   const btn = document.createElement('button');
   btn.id = 'ti-edit-tags';
   btn.textContent = '✏️ Edit tags';
@@ -378,6 +404,9 @@ function _render(track) {
   _show('ti-duration', track.duration, _fmt);
   _show('ti-bpm',      track.bpm);
   _show('ti-comment',  track.comment);
+  // Scene provenance from the Modland MD5 join (admin → Scene metadata) —
+  // "Format/Author/…/file", the module's home in the scene archive.
+  _show('ti-scene-origin', track.scene_path, v => `Modland: ${v}`);
   _show('ti-isrc',     track.isrc);
   _show('ti-label',    track.label);
 
@@ -442,7 +471,13 @@ async function _loadExtendedInfo(track) {
     const section = document.getElementById('ti-section-module');
     if (!section) return;
 
-    if (!_MODULE_FORMATS.has(track.format)) {
+    // Beyond the static tracker/SID/MIDI names: exotic-Amiga uade formats
+    // (dynamic names, genre-keyed), Atari ST, and PSF console rips all
+    // carry module-style extras (subsongs especially).
+    const _isScene = isUadeAmigaTrack(track)
+        || ATARI_FORMAT_NAMES.has(track.format)
+        || PSF_FORMAT_NAMES.has(track.format);
+    if (!_MODULE_FORMATS.has(track.format) && !_isScene) {
         section.style.display = 'none';
         return;
     }
@@ -482,11 +517,16 @@ async function _loadExtendedInfo(track) {
             patField.style.display = 'none';
         }
 
-        // Subsongs
+        // Subsongs — the extended endpoint knows tracker/SID counts; the
+        // new scene formats (uade/SNDH/SC68) carry theirs on the track
+        // metadata itself, so fall back to it.
         const subField = document.getElementById('ti-field-subsongs');
         const subEl = document.getElementById('ti-subsongs');
-        if (data.subsongs && data.subsongs > 1) {
-            subEl.textContent = data.subsongs;
+        const subCount = (data.subsongs && data.subsongs > 1)
+            ? data.subsongs
+            : (track.subsongs && track.subsongs > 1 ? track.subsongs : null);
+        if (subCount) {
+            subEl.textContent = subCount;
             subField.style.display = '';
         } else {
             subField.style.display = 'none';

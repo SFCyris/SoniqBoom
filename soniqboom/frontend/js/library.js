@@ -6,7 +6,7 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, RENDER_DURATION_FORMAT_NAMES, probeAdlibDurations } from './utils.js';
+import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations } from './utils.js';
 
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
@@ -2905,7 +2905,7 @@ function patchTrackDuration(id, seconds) {
   // AUTHORITATIVE.  (Other formats already have a real scan duration and aren't
   // routed here.)  No placeholder gate is needed — the GME placeholder is the
   // configurable sid_default_duration (not always 180), and AHX/HVL are 0.
-  if (!t || t.id !== id || !RENDER_DURATION_FORMAT_NAMES.has(t.format)) return;
+  if (!t || t.id !== id || !isRenderOnlyDuration(t)) return;
   const cur = (+t.duration) || 0;
   if (Math.abs(seconds - cur) < 0.5) return;   // already the right value — no-op
   t.duration = seconds;

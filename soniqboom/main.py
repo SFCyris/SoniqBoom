@@ -58,6 +58,28 @@ def _find_frontend_dir() -> Path:
 
 FRONTEND_DIR = _find_frontend_dir()
 
+
+def _find_docs_dir() -> Path:
+    """Locate the bundled HTML user manual (``docs/manual``).
+
+    Checked in order: the repo checkout (``<repo>/docs/manual``), next to the
+    executable in a packaged build, and next to the frontend.  Falls back to
+    the repo path so callers get a predictable ``.exists()`` false when the
+    manual wasn't shipped."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / "docs" / "manual",                 # dev checkout
+        Path(sys.executable).resolve().parent / "docs" / "manual",   # bundled
+        FRONTEND_DIR.parent / "docs" / "manual",         # alongside frontend
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return candidates[0]
+
+
+DOCS_DIR = _find_docs_dir()
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -1120,6 +1142,11 @@ async def startup():
     from soniqboom.core import radiodir as _radiodir
     asyncio.create_task(_radiodir.ensure_ready())
 
+    # SSRF-validating egress proxy for the radio relay (best-effort; the
+    # relay degrades to direct connections if it can't bind).
+    from soniqboom.core import ssrf_proxy as _ssrf_proxy
+    await _ssrf_proxy.start()
+
     # Arm the deadlock watchdog last — once everything else has loaded,
     # so a slow startup step (e.g. HVSC reindex) doesn't trip the
     # watchdog while it isn't even servicing requests yet.
@@ -1437,6 +1464,13 @@ async def shutdown():
     except Exception:
         log.debug("deadlock_watchdog.stop() failed (non-fatal)", exc_info=True)
 
+    # Close the SSRF relay proxy (idempotent, best-effort).
+    try:
+        from soniqboom.core import ssrf_proxy
+        await ssrf_proxy.stop()
+    except Exception:
+        log.debug("ssrf_proxy.stop() failed (non-fatal)", exc_info=True)
+
     # Stop the background index-integrity sweep.  Idempotent.
     try:
         from soniqboom.core import index_health
@@ -1582,6 +1616,13 @@ async def shutdown():
 if FRONTEND_DIR.exists():
     log.info("Serving frontend from %s", FRONTEND_DIR)
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR), name="frontend")
+
+# Bundled HTML user manual — served at /manual (html=True → /manual/ serves
+# index.html).  Best-effort: mounted only when the docs shipped.  The header's
+# docs button links here.
+if DOCS_DIR.is_dir():
+    log.info("Serving user manual from %s", DOCS_DIR)
+    app.mount("/manual", StaticFiles(directory=DOCS_DIR, html=True), name="manual")
 
     # Service Worker for the offline shell (PERC-6).  Must be served from
     # a top-level path AND carry ``Service-Worker-Allowed: /`` so the

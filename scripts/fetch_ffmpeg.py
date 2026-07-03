@@ -49,6 +49,27 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+def _run(cmd, **kw):
+    """``subprocess.run`` that avoids ``fork()`` on macOS (posix_spawn path).
+
+    Standalone twin of ``soniqboom.core.forksafe.run`` — this script must
+    stay runnable without the package importable.  When the admin
+    ``/ffmpeg/fetch`` endpoint imports this module, these probes execute
+    in a worker THREAD of the Core-Foundation-initialised server, where
+    CPython's default fork path segfaults the child (219 dumps in the
+    2026-07-02 incident).  ``close_fds=False`` + a resolved executable
+    path flips CPython to fork-free ``posix_spawn``.
+    """
+    if platform.system() == "Darwin" and kw.get("cwd") is None:
+        kw.setdefault("close_fds", False)
+        exe = cmd[0]
+        if not os.path.dirname(exe):
+            found = shutil.which(exe)
+            if found:
+                cmd = [found, *cmd[1:]]
+    return subprocess.run(cmd, **kw)
+
+
 # ── Source map ──────────────────────────────────────────────────────────────
 # Per (OS, arch), the URL of the ffmpeg archive and the URL of its sidecar
 # SHA256 file.  Stable, publisher-published URLs only — no GitHub asset names
@@ -104,7 +125,7 @@ def _detect_target() -> tuple[str, str]:
         # the native-arch ffmpeg.
         if machine == "x86_64":
             try:
-                r = subprocess.run(
+                r = _run(
                     ["sysctl", "-n", "hw.optional.arm64"],
                     capture_output=True, text=True, check=False, timeout=5,
                 )
@@ -191,7 +212,7 @@ def _probe_demuxers(ffmpeg: str) -> set[str]:
     """Return the subset of ``_REQUIRED_DEMUXERS`` that ``ffmpeg`` claims to
     support.  Empty set on probe failure."""
     try:
-        r = subprocess.run(
+        r = _run(
             [ffmpeg, "-hide_banner", "-formats"],
             capture_output=True, text=True, timeout=10, check=False,
         )
@@ -211,7 +232,7 @@ def _probe_demuxers(ffmpeg: str) -> set[str]:
 
 def _ffmpeg_version(ffmpeg: str) -> str | None:
     try:
-        r = subprocess.run(
+        r = _run(
             [ffmpeg, "-version"],
             capture_output=True, text=True, timeout=5, check=False,
         )
@@ -265,18 +286,18 @@ def _post_install_macos(binary: Path) -> None:
     Gatekeeper / hardened-runtime checks don't refuse it.  Both operations
     are best-effort — failures are warned about but not fatal."""
     try:
-        subprocess.run(
+        _run(
             ["xattr", "-d", "com.apple.quarantine", str(binary)],
-            check=False, capture_output=True,
+            check=False, capture_output=True, timeout=30,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.SubprocessError):
         pass
     try:
-        subprocess.run(
+        _run(
             ["codesign", "--force", "--sign", "-", str(binary)],
-            check=False, capture_output=True,
+            check=False, capture_output=True, timeout=60,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.SubprocessError):
         # codesign is part of the Xcode command-line tools — usually present
         # on any Mac with brew installed.  If it's missing the binary still
         # runs from Terminal; the warning is purely for Gatekeeper-aware UX.

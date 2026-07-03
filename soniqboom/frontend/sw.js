@@ -439,7 +439,60 @@
 // RENDER_DURATION_FORMAT_NAMES = CHIP ∪ {AHX, HivelyTracker} and switched both
 // gates to it.  (Backend also now backfills the UADE/HVL branches and parses
 // WAVE_FORMAT_EXTENSIBLE, which stdlib wave.open rejected — server restart.)
-const SHELL_VERSION = 'v123';
+// v124 (2026-07-01): index.html — archives panel honesty pass.  Removed the
+// SNDH archive card (claimed libgme renders .sndh/.ym — neither is routed
+// anywhere; an Atari user would get silence), dropped the unsupported .pt3
+// from the ZXArt card (.ay stays — libgme really does play it), and fixed the
+// AMP/AHX card's renderer attribution (openmpt cannot decode AHX; it renders
+// via uade123, .hvl via the bundled HivelyTracker engine).
+// v125 (2026-07-02): retro-format expansion — utils.js gains ATARI/PSF format
+// sets + genre-keyed isUadeAmigaTrack/isRenderOnlyDuration (the ~175 exotic
+// Amiga uade formats carry DYNAMIC names, so gates key on the
+// ["Amiga","Module"] genre pair); library.js probe/patch gates switch to the
+// helper; player.js "Rendering…" badge covers SNDH/YM/SC68/PSF-family +
+// uade-Amiga; new placeholder emoji for Atari (🕹) and console rips (🎮);
+// index.html re-adds the SNDH archive card (psgplay now renders it — the old
+// card was removed for claiming unsupported formats).
+// v126 (2026-07-02): track-info modal — new "Scene origin" row (Modland
+// provenance from the MD5 join), Module Details section now opens for the
+// exotic-Amiga/Atari/PSF families (genre-keyed), subsongs falls back to the
+// track metadata for formats the extended endpoint doesn't parse.
+// v127 (2026-07-02): admin Renderers tab — status chips for all 12 engines
+// (uade123/hvl2wav/gme/adplay/psgplay/ym2wav/sc68/zxtune123 join the original
+// four), cache breakdown covers all 13 conversion types, new SID-fidelity
+// section (chip model/filter/curve/digiboost), renderer binary-path inputs,
+// and a Scene metadata (Modland) card with index refresh + apply.
+// v128 (2026-07-02): QA pass on v127 — SSE cache stream now closed on ALL
+// admin-dismissal paths (Escape/Cancel leaked an auto-reconnecting
+// EventSource), SSE error frames no longer blank the fill bar, SID
+// filter-curve input validates 0..1 client-side, bundled-engine chips
+// surface their build diagnostics, save handlers report backend detail.
+// v129 (2026-07-02): VU eligibility widened — exotic uade Amiga (dynamic
+// format names, genre-detected), SNDH/YM/SC68 and PSF tracks now reach
+// the per-voice-sidecar-then-FFT-spectrum pipeline instead of showing no
+// visualization; tag editor hidden for formats whose files can't carry
+// mutagen-writable tags (modules/SID/chips/WAV/AIFF/DSD/archive members).
+// v130 (2026-07-02): track-info "About <artist>" no longer looks up
+// placeholder/unknown artist names ("<?>", "Unknown", "Various") — a fuzzy
+// match was inventing a wrong bio (e.g. "Kenji Kawai" for a SID's "<?>"
+// author); plus a request-token guard so a slow bio can't race into another
+// track's modal.
+// v131 (2026-07-02): admin Settings visual alignment — even 30px row rhythm
+// across checkbox/select/number rows (checkbox rows no longer collapse to
+// ~15px), 16px checkboxes (were ~13px), the bare OS <select> now shares the
+// input styling, and SID-fidelity select+number pinned to one width so their
+// edges line up.
+// v132 (2026-07-02): admin checkboxes are now CSS-drawn (appearance:none,
+// bordered box + drawn checkmark) instead of native accent-color boxes — the
+// native control measured 16px in Chromium but rendered inset from the
+// select/number right edge in Edge, so the SID-fidelity right rail looked
+// misaligned at the Filter-curve row. The drawn box aligns identically in
+// every engine.
+// v133 (2026-07-02): header "📖" docs button — opens the bundled HTML user
+// manual (served at /manual) in a new tab.
+// v134 (2026-07-02): Internet radio / Stations out of Beta — removed the Beta
+// labels from the Stations sidebar tooltips and the welcome card.
+const SHELL_VERSION = 'v134';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

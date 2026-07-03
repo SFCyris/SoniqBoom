@@ -31,6 +31,19 @@ or include their source code.
 | [libsidplayfp / sidplayfp](https://github.com/libsidplayfp/sidplayfp) | GPL-2.0 | Commodore 64 SID music emulation and playback. Invoked via subprocess to render SID files to audio. |
 | [FluidSynth](https://github.com/FluidSynth/fluidsynth) | LGPL-2.1 | Software MIDI synthesizer. Invoked via subprocess to render MIDI files to audio using SoundFont banks. |
 | [libopenmpt / openmpt123](https://lib.openmpt.org/libopenmpt/) | BSD-3-Clause | Tracker module file playback (MOD, XM, S3M, IT, etc.). Invoked via subprocess to render module files to audio. |
+| [UADE / uade123](https://zakalwe.fi/uade/) | GPL-2.0 | Exotic Amiga music formats (AHX, TFMX, Future Composer, SidMon, and ~150 others) via emulated original Amiga player code. Invoked via subprocess. |
+| [AdPlug / adplay](https://adplug.github.io/) | LGPL-2.1 | AdLib / OPL2 FM formats (IMF, ROL, CMF, D00, RAD, ...). Invoked via subprocess. |
+| [Game_Music_Emu (libgme)](https://github.com/libgme/game-music-emu) | LGPL-2.1 | Console chiptunes (NSF, SPC, GBS, VGM, AY, KSS, ...). Bound via ctypes as a shared library. |
+| [psgplay](https://github.com/frno7/psgplay) | GPL-2.0 | Atari ST SNDH playback (68000 + YM2149 + MFP + STE DMA emulation). Built from a pinned source revision by install.sh; invoked via subprocess. |
+| [sc68](https://sc68.atari.org/) | GPL-2.0-or-later | Native Atari ST .sc68 disk playback. Invoked via subprocess. |
+| [zxtune / zxtune123](https://github.com/vitamin-caig/zxtune) | GPL-3.0 | PSF console-music family (PSF/PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) via its bundled reference cores (Highly Experimental, Highly Theoretical, lazyusf2, mGBA, vio2sf). Invoked via subprocess. |
+
+## Vendored & Compiled-In Code
+
+| Component | License | Usage |
+|------|---------|-------|
+| [HivelyTracker replayer](https://github.com/pete-gordon/hivelytracker) | BSD-3-Clause | Vendored under `soniqboom/native/hvl/`; compiled on first use into the `hvl2wav` helper for `.hvl` playback. |
+| [ST-Sound (StSound) by Arnaud Carre](https://github.com/arnaud-carre/StSound) | BSD (per-file headers, (c) 1995-1999 Arnaud Carre) / MIT (repository license) | Vendored under `soniqboom/native/stsound/`; compiled on first use into the `ym2wav` helper for Atari ST `.ym` playback. |
 
 
 ## Data / Assets

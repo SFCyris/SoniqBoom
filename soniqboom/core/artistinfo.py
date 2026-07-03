@@ -58,6 +58,28 @@ class _Unreachable(Exception):
     """Network-level failure — don't negative-cache, just skip this time."""
 
 
+# Placeholder / "unknown artist" sentinels that must NEVER be resolved — a
+# fuzzy MusicBrainz search on them returns a confident-but-wrong match (the
+# SID header author "<?>" resolved to "Kenji Kawai").  Confidence-gated
+# enrichment rule: refuse over guess.
+_PLACEHOLDER_ARTISTS = frozenset({
+    "<?>", "?", "??", "???", "<no artist>", "<unknown>", "<unknown artist>",
+    "unknown", "unknown artist", "various", "various artists", "va", "n/a",
+    "none", "no artist", "untitled",
+})
+
+
+def _is_placeholder_artist(name: str) -> bool:
+    """True for the explicit unknown/placeholder sentinels.
+
+    Deliberately does NOT reject "all-symbol" names: "!!!" (Chk Chk Chk),
+    "☭", "△" are real acts, and pure-punctuation garbage ("---", "...")
+    is already safe — it folds to "" and can never match a real artist in
+    the resolver's fold-equal gate, so it resolves to found:False anyway.
+    """
+    return name.strip().casefold() in _PLACEHOLDER_ARTISTS
+
+
 def _slug(name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     return s[:120] or "_"
@@ -123,6 +145,20 @@ def _lucene(value: str) -> str:
     return value.replace('"', " ").strip()
 
 
+def _fold(value: str) -> str:
+    """Accent- and punctuation-insensitive key for name comparison.
+
+    Casefold + strip Unicode combining marks (é→e) + drop non-alphanumerics
+    + collapse whitespace.  Lets "Beyonce" match "Beyoncé" and "AC/DC" match
+    "AC-DC", while a garbage string like "<?>" folds to "" (never equal to a
+    real artist's fold)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", value)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
 def _pick_credit(entities: list[dict], name: str) -> dict | None:
     """From release/recording search results, find the artist credit whose
     name matches ``name`` (casefold)."""
@@ -153,15 +189,24 @@ async def _resolve_mbid(name: str, album: str | None, track: str | None) -> dict
     q = quote(f'artist:"{q_name}"', safe="")
     d = await _get_json(f"{_MB}/artist/?query={q}&fmt=json&limit=5", mb=True)
     want = name.casefold()
+    want_folded = _fold(name)
     best = None
     for art in (d or {}).get("artists", []):
         if (art.get("name") or "").casefold() == want:
             if best is None or int(art.get("score", 0)) > int(best.get("score", 0)):
                 best = art
     if best is None:
+        # Fallback for accent/punctuation near-misses: a "Beyonce" query
+        # returns "Beyoncé" (casefold-unequal, so the exact loop missed it).
+        # MusicBrainz's ``score`` is RELEVANCE-NORMALISED — the top hit is
+        # ~100 even for a garbage query — so a high score is NOT evidence of
+        # a real match (that is how "<?>" became "Kenji Kawai").  Require the
+        # top hit's ACCENT-FOLDED name to equal the folded query: tolerant of
+        # diacritics/punctuation, but garbage still has no real match.
         arts = (d or {}).get("artists", [])
-        if arts and int(arts[0].get("score", 0)) >= 95:
-            best = arts[0]
+        if arts and int(arts[0].get("score", 0)) >= 90:
+            if _fold(arts[0].get("name") or "") == want_folded and want_folded:
+                best = arts[0]
     return best
 
 
@@ -227,8 +272,10 @@ async def get_artist_info(name: str, album: str | None = None, track: str | None
     one artist share a single resolution.
     """
     name = (name or "").strip()
-    if not name:
-        return {"name": "", "found": False}
+    if not name or _is_placeholder_artist(name):
+        # Placeholder / unknown artist — refuse the lookup entirely rather
+        # than let a fuzzy MusicBrainz match invent a wrong bio.
+        return {"name": name, "found": False}
 
     cached = _read_cache(name)
     if cached is not None:

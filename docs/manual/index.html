@@ -26,6 +26,8 @@
       <a href="#start">Get started</a>
       <a href="#library">Library</a>
       <a href="#find">Search</a>
+      <a href="#playlists">Playlists</a>
+      <a href="#radio">Radio</a>
       <a href="#playing">Playback</a>
       <a href="#make">Shortcuts</a>
       <a href="#formats">Formats</a>
@@ -49,16 +51,18 @@
   <a href="#start"><span class="n">02</span>Install</a>
   <a href="#library"><span class="n">03</span>Library</a>
   <a href="#find"><span class="n">04</span>Find anything</a>
-  <a href="#playing"><span class="n">05</span>Now playing</a>
-  <a href="#make"><span class="n">06</span>Make it yours</a>
-  <a href="#formats"><span class="n">07</span>Formats</a>
-  <a href="#cast"><span class="n">08</span>Casting</a>
-  <a href="#multiroom"><span class="n">09</span>Multi-room</a>
-  <a href="#apps"><span class="n">10</span>Listen anywhere</a>
-  <a href="#manage"><span class="n">11</span>Manage</a>
-  <a href="#settings"><span class="n">12</span>Settings</a>
-  <a href="#faq"><span class="n">13</span>Help</a>
-  <a href="#reference"><span class="n">14</span>Reference</a>
+  <a href="#playlists"><span class="n">05</span>Playlists</a>
+  <a href="#radio"><span class="n">06</span>Internet radio</a>
+  <a href="#playing"><span class="n">07</span>Now playing</a>
+  <a href="#make"><span class="n">08</span>Make it yours</a>
+  <a href="#formats"><span class="n">09</span>Formats</a>
+  <a href="#cast"><span class="n">10</span>Casting</a>
+  <a href="#multiroom"><span class="n">11</span>Multi-room</a>
+  <a href="#apps"><span class="n">12</span>Listen anywhere</a>
+  <a href="#manage"><span class="n">13</span>Manage</a>
+  <a href="#settings"><span class="n">14</span>Settings</a>
+  <a href="#faq"><span class="n">15</span>Help</a>
+  <a href="#reference"><span class="n">16</span>Reference</a>
 </aside>
 
 <main>
@@ -89,16 +93,19 @@
     <h2 class="sec"><span class="num">01</span>What's inside</h2>
     <p class="sec-sub">One server for the everyday lossless library <em>and</em> the weird corners of music history.</p>
     <div class="grid cols-3">
-      <div class="card"><span class="ico">🎮</span><h4>Chiptune &amp; console</h4><p>SID, NSF, SPC, GBS, VGM, AY, KSS, SAP, GYM, HES — rendered on the fly and played in the browser.</p></div>
-      <div class="card"><span class="ico">🎹</span><h4>Tracker modules</h4><p>MOD, XM, IT, S3M, MED, AHX, HivelyTracker and ~20 module formats, with per-channel VU meters.</p></div>
+      <div class="card"><span class="ico">🎮</span><h4>Chiptune &amp; console</h4><p>SID, NSF, SPC, GBS, VGM, AY, KSS, SAP, GYM, HES — rendered on the fly, with tunable 6581 / 8580 SID fidelity.</p></div>
+      <div class="card"><span class="ico">🎹</span><h4>Tracker modules</h4><p>MOD, XM, IT, S3M, MED and the full libopenmpt family — every voice metered on its own channel.</p></div>
+      <div class="card"><span class="ico">💾</span><h4>Amiga &amp; Atari exotica</h4><p>Over 175 UADE formats — TFMX, Future Composer, Jochen Hippel, SidMon — plus AHX, HivelyTracker and Atari ST SNDH / YM / SC68.</p></div>
+      <div class="card"><span class="ico">🕹️</span><h4>Portable &amp; console rips</h4><p>The PSF family in full — PSF, PSF2, GSF, USF, 2SF, SSF, DSF and NCSF — straight from the reference emulation cores.</p></div>
       <div class="card"><span class="ico">🟥</span><h4>AdLib / OPL FM</h4><p>The sound of DOS gaming — id Software IMF, ROL, CMF and more, through an OPL2 synthesiser.</p></div>
       <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD) and every common lossy codec.</p></div>
-      <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Channel-level VU meters, a live decode signal-chain, and the Library Galaxy star-field of your formats.</p></div>
+      <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Per-channel VU meters, a live spectrum fallback, an animated decode signal-chain, and the Library Galaxy star-field.</p></div>
+      <div class="card"><span class="ico">🏷️</span><h4>Scene origins</h4><p>Retro modules matched by fingerprint against Modland fill in the original scene author and the tune's provenance path.</p></div>
       <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares straight from the admin panel — no operating-system mount required.</p></div>
       <div class="card"><span class="ico">📱</span><h4>OpenSubsonic API</h4><p>Connect Amperfy, Symfonium, DSub, Feishin and the wider Subsonic app ecosystem to your server.</p></div>
-      <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide Radio Browser directory, with live now-playing titles.</p></div>
+      <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide directory — HLS and classic streams alike, with live now-playing titles and cover art.</p></div>
       <div class="card"><span class="ico">📡</span><h4>Casting <span class="badge beta">Beta</span></h4><p>Send playback to Chromecast, AirPlay and DLNA receivers — even rendered SID and tracker tunes.</p></div>
-      <div class="card"><span class="ico">👥</span><h4>Multi-user &amp; PWA</h4><p>Accounts with roles, instant-mix radio, smart playlists, offline downloads, time-synced lyrics, scrobbling, and an installable progressive web app.</p></div>
+      <div class="card"><span class="ico">👥</span><h4>Multi-user &amp; PWA</h4><p>Accounts with roles, multi-room sync, instant mixes, smart playlists, offline downloads, time-synced lyrics, scrobbling, and an installable web app.</p></div>
     </div>
   </section>
 
@@ -122,9 +129,10 @@ bash <span class="k">run.sh</span>            <span class="c"># starts the serve
 
     <div class="note"><b>The installer sets up every renderer for you.</b> One run of
       <code>install.sh</code> installs <code>sidplayfp</code> (SID), <code>fluidsynth</code> (MIDI),
-      <code>libopenmpt</code> (trackers), <code>uade</code> (AHX), <code>libgme</code> (console
-      chiptunes) and <code>adplay</code> (AdLib/OPL) — on macOS via Homebrew, on Linux via your
-      distribution's package manager (apt, dnf, pacman or zypper). The HivelyTracker decoder is
+      <code>libopenmpt</code> (trackers), <code>uade</code> (AHX + Amiga exotica), <code>libgme</code> (console
+      chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>, with the
+      bundled StSound engine compiled on first play) and <code>zxtune123</code> (the PSF console-rip family) — on macOS via Homebrew, on
+      Linux via your distribution's package manager (apt, dnf, pacman or zypper). The HivelyTracker decoder is
       bundled with SoniqBoom itself. Nothing to pick, nothing to add later — every format in this
       guide plays out of the box.</div>
 
@@ -241,37 +249,6 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       <figcaption><b>Radio view</b> — the cover with a live oscilloscope, what's playing, and what's next.</figcaption>
     </figure>
 
-    <h3>Internet radio stations</h3>
-    <p>The sidebar's <strong>Stations</strong> section plays live internet radio. It has three lists:</p>
-    <ul>
-      <li><b>Favorites</b> — the stations you've starred. <i>Nectarine Demoscene Radio</i> is there to start.</li>
-      <li><b>Scene</b> — a curated pack of demoscene, chiptune, SID and game-music stations
-        (SceneSat, Nectarine, SLAY Radio, Kohina, Radio PARALAX, CVGM, Rainwave and more).</li>
-      <li><b>World</b> — the worldwide <a href="https://www.radio-browser.info/" target="_blank" rel="noopener">Radio
-        Browser</a> directory, browsed by <b>continent → country</b>, then split into
-        <b>Top 10</b>, <b>Top 11–50</b> and <b>Remaining</b> by listener votes.</li>
-    </ul>
-    <p>Click a station to play it. SoniqBoom relays the stream through your server and starts at the
-       highest quality your browser supports, stepping down automatically if the stream can't keep up.
-       Stations that offer several qualities appear once, under one name. The player shows the station and
-       the track that's on air; the <b>★ button</b> adds or removes it from Favorites.</p>
-    <figure>
-      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/24-stations.png" alt="The Stations view: the Scene list of demoscene and chiptune stations with codec and stream counts, a now-playing card at the top showing SceneSat Radio with its current track, and a station search box in the header"></div>
-      <figcaption>The <b>Stations</b> view — the Scene pack playing, each station listed once with its qualities.</figcaption>
-    </figure>
-    <p><strong>Station details.</strong> While a station plays, the <b>ⓘ button</b> in the player toolbar
-       opens its details — tags, website, the live now-playing title, and every available stream with the
-       one you're hearing marked.</p>
-    <figure>
-      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/25-stationinfo.png" alt="The station details panel for SceneSat Radio showing tags, a website link, the current track title, and a list of streams from MP3 320 kbps down to AAC+ 48 kbps with the playing one marked"></div>
-      <figcaption><b>Station details</b> — tags, website, the live track, and the full quality ladder.</figcaption>
-    </figure>
-    <div class="note"><b>Search stations.</b> Open any Stations list and the search box becomes a station
-      search. Station matches also appear under a <b>Stations</b> heading in the main search results, so you
-      can find one without leaving your library.</div>
-
     <h3>More like this</h3>
     <p>Select any track in the list and press the <b>◆ button</b> in the player toolbar — a panel lists the
        closest matches with a relative similarity score. Tracks that have been played before are also
@@ -281,18 +258,6 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/18-similar.png" alt="The More-like-this panel open over the track list, showing ten similar tracks with percentage scores"></div>
       <figcaption><b>More like this</b> — the closest matches to the selected track, scored.</figcaption>
-    </figure>
-
-    <h3>Smart playlists — save a search</h3>
-    <p>Any search can become a playlist that keeps itself up to date. Type a query — say
-       <code>format:SID year:&gt;1988</code> — and press <b>⚡ Save search</b> next to the search box.
-       Name it, and it appears under <strong>Playlists</strong> with a ⚡ marker. Opening it re-runs the
-       saved search, so new tracks that match are included automatically. Smart playlists work in
-       Subsonic apps too.</p>
-    <figure>
-      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/20-savesearch.png" alt="The search bar with the query format:SID year:>1988 typed and the Save search button visible in the header"></div>
-      <figcaption>Type a query, press <b>⚡ Save search</b> — it becomes a self-updating playlist.</figcaption>
     </figure>
 
     <div class="note"><b>🌐 Find more music.</b> The globe button in the top bar opens curated links to
@@ -307,9 +272,83 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     </figure>
   </section>
 
+  <!-- ── PLAYLISTS ────────────────────────────────────────────────── -->
+  <section id="playlists">
+    <h2 class="sec"><span class="num">05</span>Playlists</h2>
+    <p class="sec-sub">Hand-built collections that stick, and saved searches that keep themselves current.</p>
+
+    <h3>Build a playlist by hand</h3>
+    <p>Open the <strong>Playlists</strong> panel from the sidebar's <strong>Playlists</strong> section or the
+       Playlists button in the player toolbar, then press <b>+ New</b> to start one and name it. Add tracks two
+       ways: select any rows in the library and click <b>+ Playlist</b> to drop them into an existing list — or a
+       brand-new one — or drag them straight into the panel. Inside a playlist a <b>drag handle</b> reorders
+       tracks, and you can grab several at once to move them together. Delete a playlist whenever you're done
+       with it.</p>
+
+    <h3>Smart playlists — save a search</h3>
+    <p>Any search can become a playlist that keeps itself up to date. Type a query — say
+       <code>format:SID year:&gt;1988</code> — and press <b>⚡ Save search</b> next to the search box.
+       Name it, and it appears under <strong>Playlists</strong> with a ⚡ marker. Opening it re-runs the
+       saved search, so new tracks that match are included automatically. Smart playlists work in
+       Subsonic apps too.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/20-savesearch.png" alt="The search bar with the query format:SID year:>1988 typed and the Save search button visible in the header"></div>
+      <figcaption>Type a query, press <b>⚡ Save search</b> — it becomes a self-updating playlist.</figcaption>
+    </figure>
+
+    <div class="note"><b>Keep an Instant Mix.</b> Built an <a href="#find">Instant Mix radio</a> you love? Its
+      <b>Save as playlist</b> button freezes the current mix into a playlist you can return to any time.</div>
+  </section>
+
+  <!-- ── INTERNET RADIO ───────────────────────────────────────────── -->
+  <section id="radio">
+    <h2 class="sec"><span class="num">06</span>Internet radio</h2>
+    <p class="sec-sub">A hand-picked demoscene &amp; chiptune station pack, plus the worldwide directory — every stream relayed through your own server.</p>
+    <p>The sidebar's <strong>Stations</strong> section plays live internet radio. It has three lists:</p>
+    <ul>
+      <li><b>Favorites</b> — the stations you've starred. <i>Nectarine Demoscene Radio</i> is there to start.</li>
+      <li><b>Scene</b> — a curated pack of demoscene, chiptune, SID and game-music stations: SceneSat Radio,
+        Nectarine Demoscene Radio, SLAY Radio, Kohina, Radio PARALAX, CVGM.net, Rainwave Chiptunes,
+        Rainwave Game Music, OverClocked ReMix Radio, Keygen-FM and CGM UK DemoScene.</li>
+      <li><b>World</b> — the worldwide <a href="https://www.radio-browser.info/" target="_blank" rel="noopener">Radio
+        Browser</a> directory, browsed by <b>continent → country</b>, then split into
+        <b>Top 10</b>, <b>Top 11–50</b> and <b>Remaining</b> by listener votes.</li>
+    </ul>
+    <p>Click a station to play it. SoniqBoom relays the stream through your server, so stations play in the
+       browser whatever they're built on — classic Icecast / SHOUTcast, modern <b>HLS</b>, or a
+       <code>.pls</code> / <code>.m3u</code> / <code>.xspf</code> / <code>.asx</code> playlist that just points at
+       the real stream. Playback starts at the highest quality your browser supports and steps down
+       automatically if the stream can't keep up; stations that offer several qualities appear once, under one
+       name. The player shows the station and the track that's on air, and the <b>★ button</b> adds or removes it
+       from Favorites.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/24-stations.png" alt="The Stations view: the Scene list of demoscene and chiptune stations with codec and stream counts, a now-playing card at the top showing SceneSat Radio with its current track, and a station search box in the header"></div>
+      <figcaption>The <b>Stations</b> view — the Scene pack playing, each station listed once with its qualities.</figcaption>
+    </figure>
+    <p><strong>Live now-playing.</strong> As each song changes, the current track's title appears in the player —
+       split into artist and song when the station provides it — read from classic ICY stream metadata
+       <em>and</em> the in-band metadata modern HLS streams carry. When a track is announced, SoniqBoom looks up
+       matching cover art and shows it in place of the station logo; if there's no confident match, the station's
+       own logo stays. Community vote counts ride along, and playing a directory station reports the play back so
+       the popularity rankings stay accurate.</p>
+    <p><strong>Station details.</strong> While a station plays, the <b>ⓘ button</b> in the player toolbar
+       opens its details — tags, website, the live now-playing title, and every available stream with the
+       one you're hearing marked.</p>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/25-stationinfo.png" alt="The station details panel for SceneSat Radio showing tags, a website link, the current track title, and a list of streams from MP3 320 kbps down to AAC+ 48 kbps with the playing one marked"></div>
+      <figcaption><b>Station details</b> — tags, website, the live track, and the full quality ladder.</figcaption>
+    </figure>
+    <div class="note"><b>Search stations.</b> Open any Stations list and the search box becomes a station
+      search. Station matches also appear under a <b>Stations</b> heading in the main search results, so you
+      can find one without leaving your library.</div>
+  </section>
+
   <!-- ── PLAYING ──────────────────────────────────────────────────── -->
   <section id="playing">
-    <h2 class="sec"><span class="num">05</span>Now playing</h2>
+    <h2 class="sec"><span class="num">07</span>Now playing</h2>
     <p class="sec-sub">Click any track and it plays — even a 1987 SID tune or a 64-channel tracker module, rendered to audio on the fly.</p>
 
     <h3>Per-channel VU meters for tracker modules</h3>
@@ -329,14 +368,18 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <figcaption>A <b>64-channel</b> Impulse Tracker module — every voice metered at once.</figcaption>
       </figure>
     </div>
-    <div class="note">For SID and other formats without per-voice data, the meter falls back to a live
-      32-bin <b>FFT spectrum analyser</b>, labelled so you always know which view you're seeing.</div>
+    <div class="note">For formats without per-voice data — SID, console chiptunes, AdLib / OPL, Atari ST and the
+      PSF family — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled so you always know
+      which view you're seeing. Prefer a different look? A <b>circuit-board</b> VU skin, driven by the same live
+      per-channel levels, is selectable in Settings.</div>
 
     <h3>Equalizer &amp; visualizer</h3>
-    <p>A built-in graphic <strong>equalizer</strong> shapes the sound band by band — toggle it with
-       <span class="kbd">E</span>, and choose from a row of presets or drag the bands by hand. The full-screen
-       <strong>visualizer</strong> cycles through several modes — oscilloscope, CRT, a scrolling spectrogram,
-       and a neon synthwave grid — with <span class="kbd">V</span>.</p>
+    <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
+       toggle it with <span class="kbd">E</span>, and choose from genre presets or drag the bands by hand. A
+       full-width <strong>visualizer</strong> plays behind the track list and cycles through its modes with
+       <span class="kbd">V</span> — oscilloscope, retro CRT scope, scrolling spectrogram, hyperspace tunnel,
+       synthwave grid, wireframe globe, cosmic eye, lava lamp, and a singing raccoon. The visuals respect your
+       system's <em>reduce motion</em> setting and pause when the tab is hidden.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/11-equalizer.png" alt="The graphic equalizer open over the player, with frequency-band sliders and preset buttons"></div>
@@ -374,11 +417,18 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <img src="img/22-tagedit.png" alt="The Track Info panel showing the About-the-artist card with a Wikipedia bio and portrait, and the open tag-editing form with Save tags and Cancel buttons"></div>
       <figcaption><b>Track Info</b> — the artist's story from Wikipedia, and tags you can fix in place.</figcaption>
     </figure>
+
+    <h3>Scene origins</h3>
+    <p>Retro module files rarely carry proper tags — but the scene has spent decades cataloguing them. Turn on
+       <strong>gear → Scene metadata (Modland)</strong> and SoniqBoom fingerprints each module and matches it against
+       the <a href="https://modland.com/" target="_blank" rel="noopener">Modland</a> index, filling in the original
+       author and adding a <em>Scene origin</em> row to Track Info that shows exactly where the tune sits in the
+       archive — <code>Modland: &lt;format&gt;/&lt;author&gt;/…</code>. Refresh the index and apply it from the same panel.</p>
   </section>
 
   <!-- ── MAKE IT YOURS ────────────────────────────────────────────── -->
   <section id="make">
-    <h2 class="sec"><span class="num">06</span>Make it yours</h2>
+    <h2 class="sec"><span class="num">08</span>Make it yours</h2>
     <p class="sec-sub">Rate, queue and build playlists — and drive the whole player from the keyboard.</p>
     <div class="grid cols-3">
       <div class="card"><span class="ico">⭐</span><h4>Ratings</h4><p>Star tracks to score them; your ratings feed the <em>Top Rated</em> smart view.</p></div>
@@ -421,18 +471,22 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── FORMATS ──────────────────────────────────────────────────── -->
   <section id="formats">
-    <h2 class="sec"><span class="num">07</span>Every format, at a glance</h2>
-    <p class="sec-sub">Forty-plus formats through one render pipeline. The reference addenda below tell each one's story.</p>
+    <h2 class="sec"><span class="num">09</span>Every format, at a glance</h2>
+    <p class="sec-sub">Hundreds of formats through one render pipeline — from FLAC to the deepest corners of the
+       Amiga scene. The reference addenda below tell each one's story.</p>
     <table>
       <thead><tr><th>Family</th><th>Formats</th><th>Rendered by</th></tr></thead>
       <tbody>
-        <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack, Musepack</td><td>native / ffmpeg</td></tr>
-        <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus, Musepack</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>DSD (1-bit)</strong></td><td>DSF, DFF, WSD</td><td>ffmpeg</td></tr>
-        <tr><td><strong>SID</strong> (C64)</td><td><code>.sid</code>, <code>.psid</code></td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
-        <tr><td><strong>MIDI</strong></td><td><code>.mid</code>, <code>.midi</code></td><td>FluidSynth + SoundFonts</td></tr>
+        <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
+        <tr><td><strong>MIDI</strong></td><td>MID, MIDI</td><td>FluidSynth + SoundFonts</td></tr>
         <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, DSM …</td><td>libopenmpt</td></tr>
-        <tr><td><strong>Amiga</strong></td><td>AHX, HivelyTracker (HVL)</td><td>uade123 / bundled HivelyTracker engine</td></tr>
+        <tr><td><strong>Amiga</strong> (Hively / AHX)</td><td>AHX, HivelyTracker (HVL)</td><td>uade123 / bundled HivelyTracker engine</td></tr>
+        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>175+ custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
+        <tr><td><strong>Atari ST</strong></td><td>SNDH, YM, SC68</td><td>psgplay / StSound / sc68</td></tr>
+        <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF</td><td>zxtune123</td></tr>
         <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES</td><td>libgme</td></tr>
         <tr><td><strong>AdLib / OPL2 FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX …</td><td>AdPlug (<code>adplay</code>)</td></tr>
       </tbody>
@@ -447,7 +501,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── CAST ─────────────────────────────────────────────────────── -->
   <section id="cast">
-    <h2 class="sec"><span class="num">08</span>Casting <span class="badge beta">Beta</span></h2>
+    <h2 class="sec"><span class="num">10</span>Casting <span class="badge beta">Beta</span></h2>
     <p class="sec-sub">Send what you're playing to a TV, speaker or receiver on your network.</p>
     <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported and
       under active testing; behaviour can vary by device.</div>
@@ -472,7 +526,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── MULTI-ROOM ───────────────────────────────────────────────── -->
   <section id="multiroom">
-    <h2 class="sec"><span class="num">09</span>Multi-room sync</h2>
+    <h2 class="sec"><span class="num">11</span>Multi-room sync</h2>
     <p class="sec-sub">Play the same music in step across the devices on your network — one device leads, the rest follow in lockstep.</p>
 
     <p>SoniqBoom has a dedicated multi-room controller. Open it at <code>/multiroom</code> on your server — for
@@ -520,7 +574,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── LISTEN ANYWHERE ──────────────────────────────────────────── -->
   <section id="apps">
-    <h2 class="sec"><span class="num">10</span>Listen anywhere</h2>
+    <h2 class="sec"><span class="num">12</span>Listen anywhere</h2>
     <div class="grid cols-3">
       <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>SoniqBoom speaks the OpenSubsonic API. Point Amperfy, Symfonium, DSub or Feishin at your server's address and sign in with your SoniqBoom username and password.</p></div>
       <div class="card"><span class="ico">🔁</span><h4>Multi-room</h4><p>Play the same track in lockstep across your devices — see <a href="#multiroom">Multi-room sync</a>.</p></div>
@@ -554,7 +608,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── MANAGE LIBRARY & USERS ───────────────────────────────────── -->
   <section id="manage">
-    <h2 class="sec"><span class="num">11</span>Manage your library &amp; users</h2>
+    <h2 class="sec"><span class="num">13</span>Manage your library &amp; users</h2>
     <p class="sec-sub">Add network shares, keep the index fresh, back up your data, and decide who can do what — all from the admin panel (gear icon, top-right).</p>
 
     <h3>Add a network share — FTP, SMB or WebDAV</h3>
@@ -619,23 +673,26 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── SETTINGS & INTEGRATIONS ──────────────────────────────────── -->
   <section id="settings">
-    <h2 class="sec"><span class="num">12</span>Settings &amp; integrations</h2>
+    <h2 class="sec"><span class="num">14</span>Settings &amp; integrations</h2>
     <p class="sec-sub">Open the admin panel with the gear icon (top-right) to connect outside services and tune the extras.</p>
     <div class="grid cols-2">
       <div class="card"><span class="ico">🎹</span><h4>SoundFonts for MIDI</h4><p>Open <strong>gear → Renderers → Soundfonts</strong>. Click <strong>↑ Upload .sf2/.sf3</strong> to add your own bank, or pick one from <strong>Download Known Soundfonts</strong> for a one-click install. Select an installed bank to make it the active MIDI voice.</p></div>
       <div class="card"><span class="ico">🧬</span><h4>HVSC for SID</h4><p>Download the <a href="https://www.hvsc.de/" target="_blank" rel="noopener">High Voltage SID Collection</a>, then in <strong>gear → Renderers → HVSC SID database</strong> paste the path to its <code>DOCUMENTS</code> folder and click <strong>Save &amp; reload</strong> — every SID gains its exact per-tune length and STIL credits.</p></div>
+      <div class="card"><span class="ico">🎛️</span><h4>SID fidelity</h4><p>In <strong>gear → Renderers → SID fidelity</strong>, dial in how the C64 chip is voiced: pick the <strong>6581</strong> or <strong>8580</strong> model (or <em>Auto</em>), and toggle filter emulation, filter curve and digiboost. The fallback tune length for SIDs without an HVSC entry lives under <strong>System → Settings</strong> as <em>SID Duration</em>.</p></div>
       <div class="card"><span class="ico">📈</span><h4>Scrobbling</h4><p>In <strong>gear → System → My Account</strong>, paste your <strong>ListenBrainz user token</strong> (from <a href="https://listenbrainz.org/profile" target="_blank" rel="noopener">listenbrainz.org/profile</a>) and/or your <strong>last.fm session key</strong>. Plays are logged automatically once a token is saved.</p></div>
       <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Subsonic apps sign in with your <strong>SoniqBoom username and password</strong> — there's no separate Subsonic password. Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong>, then see <a href="#apps">Listen anywhere</a>.</p></div>
       <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart.</p></div>
       <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), hide empty folders, choose which filenames count as folder art, and toggle ZIP-archive scanning.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Switch between dark and light under <strong>gear → System → Settings → Theme</strong>; your choice is saved in the browser and applies instantly. (You can also change your own password here.)</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. Adjust the size from 256 MB to 100 GB in <strong>gear → Renderers → Transcode &amp; render cache</strong>.</p></div>
+      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing.</p></div>
+      <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — settings, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later by uploading the file.</p></div>
     </div>
   </section>
 
   <!-- ── TROUBLESHOOTING ──────────────────────────────────────────── -->
   <section id="faq">
-    <h2 class="sec"><span class="num">13</span>Troubleshooting</h2>
+    <h2 class="sec"><span class="num">15</span>Troubleshooting</h2>
     <p class="sec-sub">The handful of things people ask about first.</p>
     <h3>A track is listed but won't play</h3>
     <p>Its renderer isn't installed. Re-run <code>bash install.sh</code> (it installs them all), or install the one
@@ -663,7 +720,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
   <!-- ── REFERENCE ────────────────────────────────────────────────── -->
   <section id="reference">
-    <h2 class="sec"><span class="num">14</span>Reference library</h2>
+    <h2 class="sec"><span class="num">16</span>Reference library</h2>
     <p class="sec-sub">Three illustrated histories of the music SoniqBoom plays — where every format came from, and why it sounds the way it does.</p>
     <div class="grid cols-3">
       <a class="card" href="format-history.html" style="text-decoration:none;color:inherit">

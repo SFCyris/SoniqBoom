@@ -76,6 +76,11 @@ def is_available() -> bool:
     return _lib is not None
 
 
+def lib_name() -> str:
+    """The path/name libgme was loaded from — for the admin status panel."""
+    return getattr(_lib, "_name", "libgme") if _lib is not None else ""
+
+
 def render_wav(data: bytes, subsong: int = 0, duration_s: int = 180) -> bytes | None:
     """Render GME file *data* (raw NSF/SPC/… bytes) to a 44.1 kHz 16-bit
     stereo WAV and return the WAV bytes.

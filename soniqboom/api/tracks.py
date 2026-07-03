@@ -146,6 +146,8 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_us
     path = t.get("path") or ""
     if path.startswith(("smb://", "ftp://", "http://", "https://")):
         raise HTTPException(422, "Tags can only be edited on local files (this track lives on a network share).")
+    if "::" in path:
+        raise HTTPException(422, "Tags can't be edited on files inside archives.")
 
     from soniqboom.core.tagwriter import write_tags
     try:
@@ -629,20 +631,50 @@ async def get_lyrics(track_id: str):
     return {"lyrics": None, "synced": False, "source": None}
 
 
-async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str):
+def _sid_target_duration(track, subsong: int = 0) -> int:
+    """Per-tune SID render length, IDENTICAL to the stream path's logic
+    (stream.py ~5262).  Prefer HVSC per-subsong length, then the stored
+    duration, then the global default; clamp 5..3600.
+
+    The waveform MUST use this same value (and the same cache key) as the
+    audio render — otherwise it renders the SID at ``sid_default_duration``
+    (e.g. 300 s) while the tune is ~54 s, producing 54 s of audio + 246 s
+    of trailing silence.  The 200 waveform bars then spread across 300 s,
+    so the real signal lands in only the leftmost ~18 % of the seek bar.
+    """
+    from soniqboom.config import settings
+    meta = track.__dict__ if hasattr(track, "__dict__") else (track or {})
+    target = settings.sid_default_duration
+    hvsc_lengths = meta.get("hvsc_lengths") or []
+    if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
+        target = int(round(float(hvsc_lengths[subsong])))
+    elif meta.get("duration") and float(meta["duration"]) > 0:
+        target = int(round(float(meta["duration"])))
+    return max(5, min(int(target), 3600))
+
+
+async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str,
+                                          *, sid_duration: int | None = None):
     """Get WAV path for a converted format via the conversion cache.
 
     Uses get_or_render() which has thundering-herd prevention — if the
     stream endpoint is currently rendering the same track, this waits for it
     instead of starting a duplicate render.
+
+    ``sid_duration`` (SID only) MUST match the stream path's per-tune length
+    so the waveform reuses the already-rendered stream WAV instead of
+    rendering a separate default-duration one padded with silence.
     """
     import tempfile
     from pathlib import Path as _Path
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
         _ADLIB_EXTS, _GME_EXTS_STREAM,
+        _SNDH_EXTS, _YM_EXTS, _SC68_EXTS, _PSF_STREAM_EXTS,
         _render_sid, _render_midi, _render_tracker, _render_uade, _render_hvl,
         _render_adlib, _render_imf, _render_gme,
+        _render_sndh, _render_ym, _render_sc68, _render_psf,
+        _dsf_is_dreamcast, _is_c64_sid,
     )
     from soniqboom.core.conversion_cache import get_or_render
 
@@ -702,9 +734,18 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             path = _Path(path_str)
 
         # Determine format type and build render function
-        if ext in _SID_EXTS:
+        render_dur = None
+        if ext in _SID_EXTS and _is_c64_sid(path):
+            # C64 SID → sidplayfp.  Render (and cache-key) at the SAME
+            # per-tune duration the stream uses, so this reuses the stream's
+            # WAV instead of rendering a default-length one padded with
+            # silence (which squashed the waveform into the left ~18% of the
+            # seek bar).  A non-C64 ``.sid`` (Amiga SidMon) is NOT gated here
+            # and falls through to the uade branch below — matching the
+            # stream, which routes it to _render_uade (stream.py:5253).
             fmt, sf_path = "sid", None
-            render_fn = lambda: _render_sid(path, subsong=0)
+            render_dur = sid_duration
+            render_fn = lambda: _render_sid(path, subsong=0, duration=render_dur)
         elif ext in _MIDI_EXTS:
             from soniqboom.config import get_active_soundfont
             sf = get_active_soundfont()
@@ -736,6 +777,26 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
             # Console chiptunes (NSF/SPC/GBS/VGM/AY/KSS/…) via libgme.
             fmt, sf_path = "gme", None
             render_fn = lambda: _render_gme(path, subsong=0)
+        elif ext in _PSF_STREAM_EXTS or (
+                ext == ".dsf" and _dsf_is_dreamcast(path)):
+            # PSF console rips (+ Dreamcast .dsf) via zxtune123 — matches
+            # the stream path's format_type="psf".
+            fmt, sf_path = "psf", None
+            render_fn = lambda: _render_psf(path)
+        elif ext in _SNDH_EXTS:
+            fmt, sf_path = "sndh", None
+            render_fn = lambda: _render_sndh(path, subsong=0)
+        elif ext in _YM_EXTS:
+            fmt, sf_path = "ym", None
+            render_fn = lambda: _render_ym(path)
+        elif ext in _SC68_EXTS:
+            fmt, sf_path = "sc68", None
+            render_fn = lambda: _render_sc68(path, subsong=0)
+        elif ext not in _TRACKER_EXTS:
+            # Exotic-Amiga prefix/suffix names (mdat.song, song.fc13) reach
+            # here with an unknown ext — matches format_type="uade".
+            fmt, sf_path = "uade", None
+            render_fn = lambda: _render_uade(path, subsong=0)
         else:  # tracker
             fmt, sf_path = "tracker", None
             render_fn = lambda: _render_tracker(path, subsong=0)
@@ -743,6 +804,7 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
         wav_path, _ = await get_or_render(
             track_id=track_id, format_type=fmt, subsong=0,
             render_fn=render_fn, soundfont_path=sf_path,
+            duration=render_dur,
         )
         return wav_path
     finally:
@@ -848,11 +910,29 @@ async def get_track_waveform(track_id: str, response: Response):
     loop = asyncio.get_event_loop()
 
     # ── Converted formats: compute waveform from conversion-cache WAV ────
+    from soniqboom.api.stream import (
+        _SNDH_EXTS, _YM_EXTS, _SC68_EXTS, _PSF_STREAM_EXTS,
+    )
+    from soniqboom.core import uade_formats as _uadef
+    # ``.dsf`` is ambiguous (Sony DSD vs Dreamcast rip) — the scanner already
+    # content-sniffed it, so trust the STORE's format field here (no file
+    # access needed; works for remote paths too).
+    _dreamcast = ext == ".dsf" and (
+        getattr(track, "format", "") or "").startswith("DSF")
+    _base_name = path_str.split("::")[-1].rsplit("/", 1)[-1]
     if (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS
             or ext in _UADE_EXTS or ext in _HVL_EXTS
-            or ext in _ADLIB_EXTS or ext in _GME_EXTS_STREAM):
+            or ext in _ADLIB_EXTS or ext in _GME_EXTS_STREAM
+            or ext in _SNDH_EXTS or ext in _YM_EXTS or ext in _SC68_EXTS
+            or ext in _PSF_STREAM_EXTS or _dreamcast
+            or _uadef.classify(_base_name) is not None):
+        # SID: pass the per-tune duration so the waveform reuses the stream's
+        # render (see _sid_target_duration).  Other converted formats render
+        # full-length by nature and need no duration hint.
+        _sid_dur = _sid_target_duration(track) if ext in _SID_EXTS else None
         try:
-            wav_path = await _waveform_from_conversion_cache(track_id, path_str, ext)
+            wav_path = await _waveform_from_conversion_cache(
+                track_id, path_str, ext, sid_duration=_sid_dur)
         except HTTPException as exc:
             # A render that EXITED nonzero (502 — e.g. fluidsynth can't parse
             # this .mid, an AdLib tune with no resolvable instruments) means the

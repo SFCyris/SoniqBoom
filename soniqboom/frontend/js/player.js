@@ -440,9 +440,15 @@ export const Player = (() => {
   // includes the AdLib/OPL (ADLIB_FORMAT_NAMES) plus libgme chiptune names.
   const SERVER_RENDERED_FORMATS = new Set(
     ['SID', 'PSID', 'MIDI', 'MID',
+     'SNDH', 'YM', 'SC68',
+     'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (DREAMCAST)', 'NCSF',
      ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES,
     ].map(s => s.toUpperCase())
   );
+  // The ~175 exotic-Amiga uade formats carry dynamic names ("TFMX Pro", …);
+  // their ["Amiga","Module"] genre pair is the reliable render-badge signal.
+  const _isUadeAmiga = (t) => Array.isArray(t && t.genre)
+    && t.genre.includes('Amiga') && t.genre.includes('Module');
   // Show the "Rendering…" badge after this delay (ms).  Long enough that a
   // warm-cache hit — whose audio starts well under it — clears the timer
   // before it fires (no flash on replays), short enough that a cold render
@@ -1155,7 +1161,7 @@ export const Player = (() => {
     replayGain.gain.value = linear;
   }
 
-  // ── Internet-radio station mode (Beta) ─────────────────────────────────────
+  // ── Internet-radio station mode ────────────────────────────────────────────
   // A station is NOT a queue track: it streams the server relay endpoint,
   // has no duration/seek, and never advances the queue.  The queue and its
   // index are left untouched so next/prev (or picking any track) drops the
@@ -1293,7 +1299,8 @@ export const Player = (() => {
     // they get an early "Rendering…" badge and skip the redundant buffering
     // badge.  In-flight transcodes (DSD/ALAC/generic) stream audio in <100 ms
     // and keep the delayed "Converting…" badge.
-    const _serverRendered = _needsConvert && SERVER_RENDERED_FORMATS.has(_fmtUp);
+    const _serverRendered = _needsConvert
+      && (SERVER_RENDERED_FORMATS.has(_fmtUp) || _isUadeAmiga(track));
     // Mirror to the module flag so the 'waiting' event handler (which can't see
     // this block-local const) also suppresses the buffering badge for renderers.
     _suppressBufferingBadge = _serverRendered;

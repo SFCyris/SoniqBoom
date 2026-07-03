@@ -303,6 +303,10 @@ def _trim_station(s: dict) -> dict:
         "url": s.get("url_resolved") or s.get("url") or "",
         "codec": (s.get("codec") or "").upper(),
         "bitrate": s.get("bitrate") or 0,
+        # Radio Browser marks HLS streams (hls=1).  The relay needs to know:
+        # an HLS ``.m3u8`` playlist can't be handed to <audio> directly, it
+        # must be transcoded server-side (see stations._relay_hls).
+        "hls": 1 if s.get("hls") else 0,
         "favicon": s.get("favicon") or "",
         "homepage": s.get("homepage") or "",
         "country": s.get("countrycode") or "",
@@ -341,7 +345,8 @@ def _group_stations(trimmed: list[dict]) -> list[dict]:
         if not g["homepage"] and s["homepage"]:
             g["homepage"] = s["homepage"]
         g["streams"].append(
-            {"url": s["url"], "codec": s["codec"], "bitrate": s["bitrate"], "uuid": s["uuid"]}
+            {"url": s["url"], "codec": s["codec"], "bitrate": s["bitrate"],
+             "uuid": s["uuid"], "hls": s.get("hls", 0)}
         )
     out = []
     for key in order:

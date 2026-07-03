@@ -169,13 +169,65 @@ export const CHIP_FORMAT_NAMES = new Set([
 export const UADE_FORMAT_NAMES = new Set(['AHX', 'HivelyTracker']);
 
 /**
+ * Atari ST + PSF console-rip families (server-rendered; scan stores 0 for
+ * SC68 and for untagged PSF rips, so they join the duration probe).  YM and
+ * tagged PSF carry REAL scan durations; SNDH defaults to the server cap.
+ */
+export const ATARI_FORMAT_NAMES = new Set(['SNDH', 'YM', 'SC68']);
+export const PSF_FORMAT_NAMES = new Set([
+  'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (Dreamcast)', 'NCSF',
+]);
+
+/**
  * Every render-only format whose real duration is learned at render time and
  * backfilled because there's no reliable scan-time length: the chip formats plus
- * UADE/HVL.  Gates both the background duration probe and the live row-patch.
+ * UADE/HVL/SC68/PSF.  Gates both the background duration probe and the live
+ * row-patch.
  */
 export const RENDER_DURATION_FORMAT_NAMES = new Set([
-  ...CHIP_FORMAT_NAMES, ...UADE_FORMAT_NAMES,
+  ...CHIP_FORMAT_NAMES, ...UADE_FORMAT_NAMES, 'SC68', ...PSF_FORMAT_NAMES,
 ]);
+
+/**
+ * The ~175 exotic-Amiga uade formats carry DYNAMIC names from uade's own
+ * player list ("TFMX Pro", "SoundMon 2.0", "Jochen Hippel ST", …) — no
+ * static set can enumerate them.  Their extractor stamps genre
+ * ["Amiga", "Module"], so genre is the reliable signal.
+ */
+export function isUadeAmigaTrack(t) {
+  const g = t && t.genre;
+  if (!Array.isArray(g)) return false;
+  return g.includes('Amiga') && g.includes('Module');
+}
+
+/** Render-only duration semantics, name-based OR genre-based (uade). */
+export function isRenderOnlyDuration(t) {
+  return !!t && (RENDER_DURATION_FORMAT_NAMES.has(t.format) || isUadeAmigaTrack(t));
+}
+
+/**
+ * Containers whose tags core/tagwriter.py (mutagen, easy interface) can
+ * actually WRITE: ID3/EasyMP3, EasyMP4, VorbisComment, APEv2.  An
+ * ALLOWLIST by extension, not a format-name denylist, because (a) the
+ * deny side is unbounded — uade format names are dynamic (see
+ * isUadeAmigaTrack) — and (b) the 'AAC' format label is ambiguous:
+ * .m4a AAC is writable, raw ADTS .aac is not.  WAV/AIFF/DSD open in
+ * mutagen but reject easy keys; modules/SID/SNDH/PSF/GME/AdLib/MIDI
+ * aren't loadable by mutagen at all.
+ */
+export const TAG_WRITABLE_EXTS = new Set([
+  '.mp3', '.flac', '.m4a', '.mp4', '.ogg', '.opus', '.wv', '.mpc',
+]);
+
+/** True when the tag editor should be offered for *t* — extension the
+ *  backend can write, and not an archive member (never writable). The
+ *  local-vs-remote check stays with the caller. */
+export function canEditTags(t) {
+  const p = (t && t.path) || '';
+  if (p.includes('::')) return false;
+  const m = /\.[^./\\]+$/.exec(p);
+  return !!m && TAG_WRITABLE_EXTS.has(m[0].toLowerCase());
+}
 
 /**
  * Background duration probe — ask the server to compute the real length of any
@@ -198,16 +250,17 @@ export async function probeAdlibDurations(tracks) {
   for (const t of (tracks || [])) {
     if (!t || !t.id || seen.has(t.id)) continue;
     seen.add(t.id);
-    if (!RENDER_DURATION_FORMAT_NAMES.has(t.format)) continue; // AdLib + GME chiptunes + UADE/HVL
+    if (!isRenderOnlyDuration(t)) continue; // AdLib + GME + UADE/HVL + Amiga + SC68/PSF
     const cur = (+t.duration) || 0;
     // AdLib stores a 180s placeholder we can recognise client-side, so skip AdLib
     // rows that already carry a real length.  GME chiptunes store the server's
     // sid_default_duration (unknown to the client), so we let the SERVER gate them:
     // it renders only true placeholders and returns already-real lengths cheaply.
     if (ADLIB_FORMAT_NAMES.has(t.format) && !(cur === 0 || Math.abs(cur - 180) < 0.5)) continue;
-    // UADE/HVL (.ahx/.hvl) carry no scan-time duration — placeholder is 0, so any
-    // row with a real length is already done; only probe the still-0 ones.
-    if (UADE_FORMAT_NAMES.has(t.format) && cur > 0) continue;
+    // UADE/Amiga/SC68/PSF store 0 until rendered — any row with a real length
+    // is already done; only probe the still-0 ones.
+    if ((UADE_FORMAT_NAMES.has(t.format) || isUadeAmigaTrack(t)
+         || t.format === 'SC68' || PSF_FORMAT_NAMES.has(t.format)) && cur > 0) continue;
     if (_durKnown.has(t.id)) { result[t.id] = _durKnown.get(t.id); continue; }  // another view already probed it
     if (_durProbed.has(t.id)) continue;                        // attempted (maybe undecodable) — don't hammer
     _durProbed.add(t.id);
@@ -286,6 +339,14 @@ function _computeArtPlaceholderEmoji(track) {
 
   // Tracker — primary check via mutagen format name (exact, case-sensitive)
   if (TRACKER_FORMAT_NAMES.has(fmt)) return '\u{1F4BE}';              // 💾
+
+  // Exotic Amiga (uade: TFMX / Future Composer / SidMon / … — dynamic
+  // names, genre-keyed) share the tracker floppy.
+  if (isUadeAmigaTrack(track)) return '\u{1F4BE}';                    // 💾
+
+  // Atari ST + PSF console rips
+  if (ATARI_FORMAT_NAMES.has(fmt)) return '\u{1F579}\uFE0F';          // 🕹️
+  if (PSF_FORMAT_NAMES.has(fmt)) return '\u{1F3AE}';                  // 🎮
 
   // Tracker — fallback: check file extension
   const ext = ((track?.path || '').split('.').pop() || '').toLowerCase();

@@ -645,7 +645,8 @@ body::before {
   margin-left: auto;
 }
 
-.header-actions button {
+.header-actions button,
+.header-actions a.header-link {
   background: rgba(255,255,255,0.07);
   border: 1px solid var(--glass-border);
   border-radius: 6px;
@@ -656,7 +657,16 @@ body::before {
   transition: background 0.12s, color 0.12s;
   backdrop-filter: blur(8px);
 }
-.header-actions button:hover { background: rgba(255,255,255,0.13); color: var(--text0); }
+/* The docs link is an <a> (native new-tab / middle-click) styled to match its
+   button siblings. */
+.header-actions a.header-link {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.header-actions button:hover,
+.header-actions a.header-link:hover { background: rgba(255,255,255,0.13); color: var(--text0); }
 /* The "?" help button is text, not an emoji glyph — bump weight so it reads
    as a deliberate icon alongside its emoji siblings. */
 .btn-help { font-weight: 700; }
@@ -5259,6 +5269,9 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   align-items: center;
   gap: 8px;
   min-width: 0;          /* allow flex children to shrink inside the grid cell */
+  min-height: 30px;      /* even vertical rhythm across checkbox/select/number
+                            rows — checkbox rows used to collapse to ~15px while
+                            number rows were ~24px, reading as cramped/ragged */
 }
 .admin-setting label {
   font-size: 12px;
@@ -5269,9 +5282,13 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   word-break: normal;
   overflow-wrap: anywhere;
 }
-.admin-setting input[type="number"] {
+/* All right-rail box controls share one styled appearance so the column
+   reads as a single aligned unit (the bare OS <select> was the odd one out). */
+.admin-setting input[type="number"],
+.admin-setting select {
   flex: 0 0 auto;
   width: 72px;
+  box-sizing: border-box;
   background: rgba(255,255,255,0.06);
   border: 1px solid var(--glass-border);
   border-radius: 6px;
@@ -5279,8 +5296,62 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   color: var(--text0);
   font-size: 12px;
 }
+.admin-setting select {
+  width: auto;           /* selects size to their options unless a section pins a width */
+  min-width: 120px;
+  cursor: pointer;
+}
+/* Custom checkbox — fully CSS-drawn (appearance:none) so its box size and
+   position are identical across Chromium/WebKit/Gecko/Edge.  The native
+   ``accent-color`` checkbox measured 16px in Chromium but rendered with a
+   browser-specific intrinsic box + margin in Edge, leaving it visibly inset
+   from the select/number right edge in the SID panel.  A drawn box removes
+   that variance: exactly 16px, zero margin, right edge flush with the other
+   controls' right edge in every engine. */
 .admin-setting input[type="checkbox"] {
-  accent-color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--glass-border);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.06);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.admin-setting input[type="checkbox"]:hover {
+  border-color: var(--accent);
+}
+.admin-setting input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.admin-setting input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.admin-setting input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* SID fidelity: pin the select + number to one width so their left AND right
+   edges line up into a clean column (checkboxes stay right-aligned to the same
+   right edge). */
+.admin-sid-fidelity .admin-setting select,
+.admin-sid-fidelity .admin-setting input[type="number"] {
+  width: 150px;
+  min-width: 150px;
 }
 .setting-info {
   position: relative;
@@ -7621,16 +7692,10 @@ body.auth-blocked > #app {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
-   STATIONS — internet radio (Beta)
+   STATIONS — internet radio
    ══════════════════════════════════════════════════════════════════════════════ */
 
 #section-stations h3 { display: flex; align-items: center; gap: 8px; }
-.stations-beta {
-  font-size: 9px; font-weight: 600; letter-spacing: 0.08em;
-  text-transform: uppercase; padding: 1px 6px; border-radius: 8px;
-  color: var(--accent); border: 1px solid rgba(240,114,42,0.35);
-  background: var(--accent-glow);
-}
 
 #nav-stations li {
   display: flex; align-items: center; padding: 6px 14px; cursor: pointer;

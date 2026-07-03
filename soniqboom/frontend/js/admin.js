@@ -236,6 +236,10 @@ function close() {
   _hideAllDialogs();
   overlay.classList.add('hidden');
   stopScanPoller();
+  // Close the conversion-cache SSE stream on EVERY dismissal path —
+  // it used to be wired only to the ✕ button, so Escape / Cancel left
+  // an EventSource reconnecting forever in the background (QA).
+  try { _stopCacheStream(); } catch { /* defined later in this file */ }
   // Cancel any pending confirm dialog
   if (_confirmResolve) { _confirmResolve(false); _confirmResolve = null; }
   // WCAG 2.4.3: restore focus to the element that had it before open().
@@ -305,6 +309,9 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
       loadUsers();
     } else if (tab.dataset.tab === 'tab-renderers') {
       loadHvscStatus();
+      // Populates the SID fidelity + renderer-path fields (and the rest
+      // of the settings mirrors — cheap, idempotent).
+      loadSettings();
     }
   });
 });
@@ -1519,7 +1526,10 @@ async function loadRendererStatus() {
   // "user opened admin and the Renderers tab is already active" case
   // that MutationObserver-on-aria-selected misses (no transition fires).
   try { loadConvCacheStats(); } catch (_) { /* defined later */ }
-  const names = ['ffmpeg', 'sidplayfp', 'fluidsynth', 'openmpt123'];
+  try { loadSceneStatus(); } catch (_) { /* defined later */ }
+  const names = ['ffmpeg', 'sidplayfp', 'fluidsynth', 'openmpt123',
+                 'uade123', 'hvl2wav', 'gme', 'adplay',
+                 'psgplay', 'ym2wav', 'sc68', 'zxtune123'];
   // Set all to loading state \u2014 ``renderer-loading`` adds a subtle pulse
   // animation so the user sees the row is actively probing rather than
   // frozen at "\u2026".
@@ -1558,7 +1568,10 @@ async function loadRendererStatus() {
       } else {
         iconEl.textContent = '\u2717';
         iconEl.className = 'renderer-icon renderer-missing';
-        iconEl.title = 'Not found';
+        // Bundled engines (ym2wav/hvl2wav) report a diagnostic sentence
+        // in "path" even when not built yet (e.g. "builds on first use —
+        // NO C++ compiler found") — surface it instead of discarding it.
+        iconEl.title = (info && info.path) || 'Not found';
       }
     });
     // ffmpeg-specific banner: show a refetch CTA when the running binary
@@ -1742,12 +1755,20 @@ async function loadConvCacheStats() {
         `${s.entry_count} entries${pinSuffix}`;
     }
     const by = s.by_type_bytes || {};
-    for (const t of ['sid', 'midi', 'tracker', 'gme', 'transcoded']) {
+    for (const t of CONV_CACHE_TYPES) {
       const el = document.getElementById(`cache-bytes-${t}`);
       if (el) el.textContent = _fmtBytes(by[t] || 0);
     }
   } catch (_) { /* non-critical */ }
 }
+
+// Per-type rows in the cache breakdown — one entry per backend
+// FORMAT_TYPES key (conversion_cache.py); ids are cache-bytes-<key>.
+// Shared by loadConvCacheStats and the SSE _applyCacheStats path so the
+// two can never drift apart again.
+const CONV_CACHE_TYPES = ['sid', 'midi', 'tracker', 'uade', 'hvl', 'gme',
+                          'adlib', 'imf', 'sndh', 'ym', 'sc68', 'psf',
+                          'transcoded'];
 
 document.getElementById('btn-cache-refresh')?.addEventListener(
   'click', loadConvCacheStats,
@@ -1831,6 +1852,11 @@ document.getElementById('btn-cache-clear-all')?.addEventListener(
 let _cacheStream = null;
 
 function _applyCacheStats(s) {
+  // SSE error payloads ({"error": ...}) or malformed frames must not
+  // zero the fill bar and render "undefined entries" — ignore anything
+  // without real numbers and keep showing the last good stats.
+  if (!s || typeof s.total_bytes !== 'number'
+        || typeof s.entry_count !== 'number') return;
   const total = s.total_bytes || 0;
   const max   = s.max_bytes   || 0;
   const pct   = max ? Math.min(100, (total / max) * 100) : 0;
@@ -1856,7 +1882,7 @@ function _applyCacheStats(s) {
       `${s.entry_count} entries${pinSuffix}`;
   }
   const by = s.by_type_bytes || {};
-  for (const t of ['sid', 'midi', 'tracker', 'gme', 'transcoded']) {
+  for (const t of CONV_CACHE_TYPES) {
     const el = document.getElementById(`cache-bytes-${t}`);
     if (el) el.textContent = _fmtBytes(by[t] || 0);
   }
@@ -2667,6 +2693,28 @@ async function loadSettings() {
     if (rcMbEl) rcMbEl.value = s.remote_cache_max_mb || 2048;
     const ccMbEl = document.getElementById('setting-conv-cache-mb');
     if (ccMbEl) ccMbEl.value = s.conversion_cache_max_mb || 4096;
+    // SID fidelity controls (Renderers tab)
+    const r = s.renderers || {};
+    const sidModelEl = document.getElementById('setting-sid-model');
+    if (sidModelEl) sidModelEl.value = r.sid_model || 'auto';
+    const sidForceEl = document.getElementById('setting-sid-model-force');
+    if (sidForceEl) sidForceEl.checked = !!r.sid_model_force;
+    const sidFilterEl = document.getElementById('setting-sid-filter');
+    if (sidFilterEl) sidFilterEl.checked = r.sid_filter !== false;
+    const sidCurveEl = document.getElementById('setting-sid-fcurve');
+    // -1 is the backend's "engine default" sentinel — shown as empty.
+    if (sidCurveEl) {
+      const c = r.sid_filter_curve;
+      sidCurveEl.value = (typeof c === 'number' && c >= 0) ? String(c) : '';
+    }
+    const sidBoostEl = document.getElementById('setting-sid-digiboost');
+    if (sidBoostEl) sidBoostEl.checked = !!r.sid_digiboost;
+    // Renderer binary paths (Renderers tab)
+    for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
+                        'zxtune123']) {
+      const el = document.getElementById(`setting-path-${name}`);
+      if (el) el.value = r[`${name}_path`] || '';
+    }
   } catch { /* non-fatal */ }
   // Refresh the HVSC hint on the SID-duration field so opening the
   // System tab reflects whether HVSC is in charge of per-tune lengths.
@@ -3275,6 +3323,145 @@ document.getElementById('btn-hvsc-cleanup')?.addEventListener('click', async () 
     document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
   } catch (err) {
     showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
+  }
+});
+
+// ── SID fidelity (Renderers tab) ─────────────────────────────────────────────
+
+document.getElementById('btn-save-sidfid')?.addEventListener('click', async () => {
+  const modelEl = document.getElementById('setting-sid-model');
+  const forceEl = document.getElementById('setting-sid-model-force');
+  const filterEl = document.getElementById('setting-sid-filter');
+  const curveEl = document.getElementById('setting-sid-fcurve');
+  const boostEl = document.getElementById('setting-sid-digiboost');
+  // Empty curve field = "engine default" = the backend's -1 sentinel.
+  // Anything non-empty must be a real 0..1 number — the backend silently
+  // coerces out-of-range values to the default, which would show "Saved"
+  // while quietly discarding the user's input.
+  const rawCurve = (curveEl?.value || '').trim();
+  const curve = rawCurve === '' ? -1 : parseFloat(rawCurve);
+  if (rawCurve !== '' && (!Number.isFinite(curve) || curve < 0 || curve > 1)) {
+    showMsg('admin-sidfid-msg',
+            'Filter curve must be between 0.0 and 1.0 (or empty for the '
+            + 'engine default) — nothing was saved.', 'err');
+    return;
+  }
+  try {
+    // api() throws on non-2xx with the backend detail in err.message.
+    await api('/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ renderers: {
+        sid_model: modelEl?.value || 'auto',
+        sid_model_force: !!forceEl?.checked,
+        sid_filter: filterEl ? !!filterEl.checked : true,
+        sid_filter_curve: curve,
+        sid_digiboost: !!boostEl?.checked,
+      } }),
+    });
+    showMsg('admin-sidfid-msg',
+            'Saved. New renders use these options; cached tunes keep their '
+            + 'old sound until the SID cache is cleared.', 'ok');
+  } catch (err) {
+    showMsg('admin-sidfid-msg', `Save failed: ${err.message}`, 'err');
+  }
+});
+
+// ── Renderer binary paths (Renderers tab) ────────────────────────────────────
+
+document.getElementById('btn-save-renderer-paths')?.addEventListener('click', async () => {
+  const renderers = {};
+  for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
+                      'zxtune123']) {
+    const el = document.getElementById(`setting-path-${name}`);
+    if (el) renderers[`${name}_path`] = el.value.trim();
+  }
+  try {
+    // api() throws on non-2xx with the backend detail in err.message.
+    await api('/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ renderers }),
+    });
+    showMsg('admin-rpaths-msg', 'Saved — re-checking renderer status…', 'ok');
+    loadRendererStatus();   // reflect the new paths in the chips above
+  } catch (err) {
+    showMsg('admin-rpaths-msg', `Save failed: ${err.message}`, 'err');
+  }
+});
+
+// ── Scene metadata (Modland) ─────────────────────────────────────────────────
+
+function _renderSceneStatus(s) {
+  const line = document.getElementById('scene-status-line');
+  if (!line) return;
+  if (!s || typeof s !== 'object') { line.textContent = 'Index: —'; return; }
+  let txt;
+  if (s.refreshing) {
+    txt = 'Index: downloading…';
+  } else if (!s.index_rows) {
+    txt = 'Index: not downloaded yet';
+  } else {
+    const built = s.index_built_at
+      ? new Date(s.index_built_at * 1000).toLocaleDateString() : 'unknown date';
+    txt = `Index: ${s.index_rows.toLocaleString()} entries (built ${built})`;
+  }
+  if (s.applying) txt += ' · applying…';
+  else if (s.last_apply) {
+    txt += ` · last apply: ${s.last_apply.matched.toLocaleString()} matched, `
+         + `${s.last_apply.updated.toLocaleString()} updated`;
+  }
+  if (s.error) txt += ` · ${s.error}`;
+  line.textContent = txt;
+}
+
+async function loadSceneStatus() {
+  try {
+    const res = await api('/admin/scene/status');
+    if (res.ok) _renderSceneStatus(await res.json());
+  } catch (_) { /* non-critical */ }
+}
+
+document.getElementById('btn-scene-refresh')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  const line = document.getElementById('scene-status-line');
+  if (line) line.textContent = 'Index: downloading (~21 MB — can take a minute)…';
+  try {
+    const res = await api('/admin/scene/refresh-index', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderSceneStatus(s);
+    if (s && !s.error) showMsg('admin-scene-msg', 'Index refreshed.', 'ok');
+    else showMsg('admin-scene-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+  } catch (err) {
+    // api() throws on non-2xx too — err.message carries the backend detail.
+    showMsg('admin-scene-msg', `Refresh failed: ${err.message}`, 'err');
+    loadSceneStatus();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('btn-scene-apply')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const res = await api('/admin/scene/apply', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderSceneStatus(s);
+    if (s && !s.error) {
+      const la = s.last_apply || {};
+      showMsg('admin-scene-msg',
+              `Applied: ${(la.matched ?? 0).toLocaleString()} matched, `
+              + `${(la.updated ?? 0).toLocaleString()} tracks updated.`, 'ok');
+    } else {
+      showMsg('admin-scene-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    // api() throws on non-2xx too — err.message carries the backend detail.
+    showMsg('admin-scene-msg', `Apply failed: ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
   }
 });
 

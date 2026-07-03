@@ -141,18 +141,36 @@ def _cache_key(
         parts.append(f"sub{subsong}")
         dur = int(duration if duration is not None else settings.sid_default_duration)
         parts.append(f"dur{dur}")
+        # SID fidelity settings shape the rendered audio — key on any
+        # NON-default value so changing the chip model / filter doesn't
+        # serve stale WAVs.  At defaults NO parts are appended, keeping
+        # every pre-existing cache entry valid.
+        _model = (getattr(settings, "sid_model", "auto") or "auto").lower()
+        if _model in ("6581", "8580"):
+            parts.append(
+                f"m{_model}{'f' if getattr(settings, 'sid_model_force', False) else ''}")
+        if not getattr(settings, "sid_filter", True):
+            parts.append("nf")
+        _curve = float(getattr(settings, "sid_filter_curve", -1.0))
+        if 0.0 <= _curve <= 1.0:
+            parts.append(f"fc{_curve:g}")
+        if getattr(settings, "sid_digiboost", False):
+            parts.append("db")
     elif format_type == "midi":
         sf_hash = hashlib.sha256((soundfont_path or "").encode()).hexdigest()[:8]
         parts.append(f"sf{sf_hash}")
-    elif format_type in ("tracker", "uade", "hvl"):
-        # All carry sub-songs (HVL/AHX especially) — without ``sub{N}`` in the
-        # key, different subsongs of the same module collide and the first
-        # render wins.
-        parts.append(f"sub{subsong}")
-    elif format_type == "gme":
-        # libgme containers (NSF/SPC/GBS/VGM/AY/KSS/SAP/GYM/HES) carry
-        # multiple sub-songs — without ``sub{N}`` in the key, Mega Man 1
-        # subsong 0 and subsong 5 collide and the first render wins.
+    elif format_type in ("tracker", "uade", "hvl", "sndh", "sc68", "gme",
+                         "adlib", "imf", "ym"):
+        # All carry sub-songs (HVL/AHX/SNDH/SC68 especially) — without
+        # ``sub{N}`` in the key, different subsongs of the same module
+        # collide and the first render wins (QA 2026-07-02: sndh/sc68
+        # originally fell through to the bare-track_id key and served ONE
+        # cached render for every subsong).
+        # NOTE: "gme" already keyed sub{N} before (identical output — no
+        # invalidation); "adlib"/"imf" previously used the BARE track_id, so
+        # Westwood .adl / id-IMF subsongs collided the same way — including
+        # them here fixes that at the cost of a one-time lazy re-render of
+        # existing AdLib cache entries.
         parts.append(f"sub{subsong}")
     elif format_type == "transcoded":
         parts.append(f"c{codec or 'flac'}")
@@ -188,7 +206,9 @@ def get_vu_sidecar_path(track_id: str) -> Path | None:
         for cache_key, entry in _meta.items():
             if not cache_key.startswith(f"{track_id}__"):
                 continue
-            if entry.get("format_type") != "tracker":
+            if entry.get("format_type") not in ("tracker", "uade"):
+                # tracker renders get VU from libopenmpt; uade renders from
+                # the Paula --write-audio dump (uade_vu.py).  Same VUMR blob.
                 continue
             wav_path = Path(entry["path"])
             sidecar  = wav_path.with_suffix(".vu")
@@ -653,11 +673,20 @@ async def is_cache_ready(cache_key: str) -> bool:
     return cached is not None
 
 
+# Every render format-type the cache can hold — THE single list, used by
+# warmup adoption, clear_cache, cache_stats and the dir pre-create in
+# config.py (QA M2/M3/M4 2026-07-02: four divergent hand-kept lists meant
+# new formats couldn't be cleared, mis-reported in stats, and orphaned WAVs
+# on full clears).
+FORMAT_TYPES = ("sid", "midi", "tracker", "uade", "hvl", "gme",
+                "adlib", "imf", "sndh", "ym", "sc68", "psf", "transcoded")
+
+
 # ── Admin / stats ───────────────────────────────────────────────────────────
 
 async def cache_stats() -> dict:
     with _state_lock:
-        by_type: dict[str, int] = {"sid": 0, "midi": 0, "tracker": 0, "uade": 0, "hvl": 0, "gme": 0, "transcoded": 0}
+        by_type: dict[str, int] = dict.fromkeys(FORMAT_TYPES, 0)
         by_type_bytes: dict[str, int] = dict.fromkeys(by_type, 0)
         for entry in _meta.values():
             ft = entry.get("format_type", "")
@@ -688,7 +717,7 @@ def warmup_from_disk() -> int:
         return 0
     adopted = 0
     with _state_lock:
-        for fmt in ("sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"):
+        for fmt in FORMAT_TYPES:
             sub = base / fmt
             if not sub.exists():
                 continue
@@ -787,7 +816,7 @@ async def clear_cache(types: list[str] | None = None) -> dict:
     regenerate from scratch)."""
     global _total_bytes
 
-    all_types = {"sid", "midi", "tracker", "uade", "hvl", "gme", "transcoded"}
+    all_types = set(FORMAT_TYPES)
     selected = set(types) if types else all_types
     selected &= all_types
     if not selected:

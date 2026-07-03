@@ -27,10 +27,10 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import zipfile
 
+from soniqboom.core import forksafe
 from soniqboom.core.metadata import SUPPORTED_EXTENSIONS
 
 log = logging.getLogger(__name__)
@@ -58,8 +58,27 @@ _AMIGA_PREFIX_EXT: dict[str, str] = {
     "mod": ".mod", "med": ".med", "mmd": ".med", "ahx": ".ahx", "thx": ".ahx",
     "hvl": ".hvl", "xm": ".xm", "s3m": ".s3m", "it": ".it", "okt": ".okt",
     "dbm": ".dbm", "mtm": ".mtm", "stm": ".stm", "digi": ".mod", "dgi": ".mod",
-    "ptm": ".mod", "sid": ".sid", "psid": ".sid",
+    "ptm": ".mod", "psid": ".sid",
+    # ``sid.X`` is Amiga SidMon (uade), NOT C64 — the old ``"sid": ".sid"``
+    # entry silently fed SidMon modules to sidplayfp, which can't play them.
+    # ``.sid1`` is SidMon's own registered uade token.
+    "sid": ".sid1",
 }
+# Every other uade eagleplayer prefix token (mdat, fc13, dw, hip, rh, ...)
+# maps to its own registered extension so archived prefix-named exotica
+# surfaces as playable members.  ``setdefault`` keeps the hand-tuned openmpt
+# entries above authoritative; companion halves (smpl/smp) are never tokens.
+from soniqboom.core import uade_formats as _uade_formats
+
+
+def _extend_amiga_prefix_map() -> None:
+    # Function scope: a module-level ``del`` after a possibly-empty loop
+    # raised NameError on uade-less hosts (QA C1).
+    for tok in _uade_formats.new_suffix_tokens():
+        _AMIGA_PREFIX_EXT.setdefault(tok, f".{tok}")
+
+
+_extend_amiga_prefix_map()
 _EXT_SET = {e.lower() for e in SUPPORTED_EXTENSIONS}
 
 # Documentation/text suffixes that never hold music even under a music prefix
@@ -89,7 +108,10 @@ class _LhaCliArchive:
     def __init__(self, path: str):
         self._dir = tempfile.mkdtemp(prefix="sb_lha_")
         try:
-            subprocess.run(
+            # forksafe: this runs from scanner/stream worker THREADS of the
+            # CF-initialised server — a plain subprocess.run fork here
+            # segfaulted the child (8 dumps in the 2026-07-02 scan).
+            forksafe.run(
                 [_LHA_BIN, f"xw={self._dir}", path],
                 check=True, capture_output=True, timeout=120,
             )

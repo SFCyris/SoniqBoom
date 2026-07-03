@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * stations.js — internet-radio Stations view (Beta).  Lazy module: app.js
+ * stations.js — internet-radio Stations view.  Lazy module: app.js
  * imports it on the first Stations sidebar click.
  *
  * Views: Favorites (server-side list, seeded with Nectarine), Scene (the

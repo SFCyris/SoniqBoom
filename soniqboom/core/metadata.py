@@ -25,6 +25,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 from mutagen.aiff import AIFF
 
+from soniqboom.core import forksafe
 from soniqboom.models.track import TrackMeta
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,19 @@ SUPPORTED_EXTENSIONS = {
     # (disambiguated from Imago Orpheus by content), plus the wider family.
     ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
     ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+    # Atari ST: SNDH archive files (psgplay), YM register dumps (StSound),
+    # native sc68 disks (sc68).
+    ".sndh", ".ym", ".sc68",
+    # PSF console-music family (zxtune123 renders via the reference cores —
+    # Highly Experimental / Highly Theoretical / lazyusf2 / mGBA / vio2sf).
+    # ``.dsf`` is ALREADY listed under DSD above — Dreamcast Sound Format
+    # shares the extension and is disambiguated by magic ('PSF\x12' vs
+    # 'DSD ') in extract() and the stream router.  *lib companions
+    # (.psflib …) are fetched beside their mini file, never indexed.
+    ".psf", ".minipsf", ".psf2", ".minipsf2",
+    ".usf", ".miniusf", ".gsf", ".minigsf",
+    ".2sf", ".mini2sf", ".ssf", ".minissf",
+    ".minidsf", ".ncsf", ".minincsf",
 }
 
 FORMAT_NAMES = {
@@ -91,6 +105,28 @@ FORMAT_NAMES = {
     ".dro": "DOSBox OPL", ".hsc": "HSC AdLib", ".rix": "RIX OPL",
     ".a2m": "AdLib Tracker 2", ".adl": "AdLib", ".bam": "Bob's AdLib",
     ".ksm": "Ken's AdLib",
+    # Atari ST
+    ".sndh": "SNDH", ".ym": "YM", ".sc68": "SC68",
+    # PSF console-music family (.dsf stays "DSD" here — the Dreamcast case
+    # is rewritten by content in extract())
+    ".psf": "PSF", ".minipsf": "PSF", ".psf2": "PSF2", ".minipsf2": "PSF2",
+    ".usf": "USF", ".miniusf": "USF", ".gsf": "GSF", ".minigsf": "GSF",
+    ".2sf": "2SF", ".mini2sf": "2SF", ".ssf": "SSF", ".minissf": "SSF",
+    ".minidsf": "DSF (Dreamcast)", ".ncsf": "NCSF", ".minincsf": "NCSF",
+}
+
+_ATARI_EXTS = {".sndh", ".ym", ".sc68"}
+
+# PSF family: extension set + the platform-version byte after the 'PSF' magic
+# (spec v1.4 + per-format specs; verified against real files from each set).
+_PSF_EXTS = {
+    ".psf", ".minipsf", ".psf2", ".minipsf2", ".usf", ".miniusf",
+    ".gsf", ".minigsf", ".2sf", ".mini2sf", ".ssf", ".minissf",
+    ".minidsf", ".ncsf", ".minincsf",
+}
+_PSF_VERSION_NAMES = {
+    0x01: "PSF", 0x02: "PSF2", 0x11: "SSF", 0x12: "DSF (Dreamcast)",
+    0x21: "USF", 0x22: "GSF", 0x24: "2SF", 0x25: "NCSF",
 }
 
 _DSD_EXTS = {".dsf", ".dff", ".wsd"}
@@ -118,6 +154,58 @@ _ADLIB_EXTS = {
     ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
 }
 _ADLIB_DEFAULT_DURATION = 180   # seconds; the rendered WAV carries the real length
+
+# ── UADE — exotic Amiga formats (TFMX, Future Composer, SidMon, ...) ─────────
+# uade's own eagleplayer.conf is the source of truth for which name tokens it
+# claims (~350 tokens across ~175 players).  Modland-style SUFFIX naming
+# (``song.fc13``) is registered below as ordinary extensions so every
+# extension-keyed gate (scanner walk, zip/LHA members, remote walk, stream
+# routing) works unchanged; Amiga PREFIX naming (``mdat.song``) can't be an
+# extension and is handled by ``is_supported_music_name`` /
+# ``uade_formats.classify`` at the scanner gates and extract dispatch.
+# Ownership: tokens other engines already claim are excluded inside
+# ``new_suffix_tokens`` — .mod/.med/.okt stay libopenmpt, .sid stays
+# sidplayfp, .ahx/.hvl keep their dedicated routes.  No conf → empty set →
+# everything degrades to exactly the pre-UADE behaviour.
+from soniqboom.core import uade_formats as _uade
+
+def _register_uade_suffixes() -> set[str]:
+    # Function scope (not module-level loop vars): with no eagleplayer.conf
+    # the token dict is EMPTY, and a module-level ``del`` of never-bound loop
+    # variables raised NameError at import — bricking every uade-less host
+    # (QA C1, 2026-07-02).
+    exts: set[str] = set()
+    for tok, player in _uade.new_suffix_tokens().items():
+        ext = f".{tok}"
+        exts.add(ext)
+        SUPPORTED_EXTENSIONS.add(ext)
+        FORMAT_NAMES.setdefault(ext, _uade.display_name(player))
+    return exts
+
+
+_UADE_SUFFIX_EXTS: set[str] = _register_uade_suffixes()
+
+
+def is_supported_music_name(name: str) -> bool:
+    """Scanner gate: extension-supported OR a uade prefix-form candidate.
+
+    Companion halves (``smpl.*`` / ``*.ins`` / ...) are excluded by
+    ``classify`` — they are materialised next to their module at render
+    time, never indexed as tracks.
+    """
+    import os as _os
+    ext = _os.path.splitext(name)[1].lower()
+    # Core (non-uade) extensions win outright — a song someone named
+    # ``SMP.remix.mp3`` must never be swallowed by Amiga companion naming.
+    if ext in SUPPORTED_EXTENSIONS and ext not in _UADE_SUFFIX_EXTS:
+        return True
+    # Companion halves next: a sample half's arbitrary body may collide with
+    # a registered token (``smpl.fc13``) and sneak past the extension gate.
+    if _uade.is_companion_half(name):
+        return False
+    if ext in _UADE_SUFFIX_EXTS:
+        return True
+    return _uade.classify(name) is not None
 
 # ── General MIDI program names ────────────────────────────────────────────────
 
@@ -675,7 +763,7 @@ def _mp4(path: Path, track_id: str) -> dict:
     # we end up with the right format label even on those edge cases.
     fmt: str | None = None
     try:
-        probed = subprocess.run(
+        probed = forksafe.run(
             ["ffprobe", "-v", "quiet",
              "-select_streams", "a:0",
              "-show_entries", "stream=codec_name",
@@ -977,10 +1065,11 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         "path": str(path),
         "format": fmt,
         "title": title or path.stem,
-        "artist": artist or None,
         "duration": duration,
         "genre": ["Chiptune"],
     }
+    if artist:
+        d["artist"] = artist   # TrackMeta.artist is str — never None
     return d
 
 
@@ -1033,7 +1122,7 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
         "format": "DSD",
     }
     try:
-        out = subprocess.run(
+        out = forksafe.run(
             [probe, "-v", "error",
              "-show_entries",
              "stream=sample_rate,channels,duration:format=duration,size,bit_rate:format_tags",
@@ -1371,7 +1460,10 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         import shutil
         binary = settings.openmpt123_path or shutil.which("openmpt123")
         if binary:
-            result = subprocess.run(
+            # forksafe: this is THE hot fork site — it runs from scan and
+            # drill-down worker threads (206 of the 219 segfault dumps on
+            # 2026-07-02 crashed exactly here).
+            result = forksafe.run(
                 [binary, "--info", str(path)],
                 capture_output=True, text=True, timeout=10,
             )
@@ -1409,6 +1501,367 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     if patterns is not None:
         d["patterns"] = patterns
     return d
+
+
+# ── UADE (exotic Amiga) extraction ────────────────────────────────────────────
+
+_UADE123_INFO_TIMEOUT_S = 20
+
+
+def _find_uade123() -> str | None:
+    import shutil as _shutil
+    try:
+        from soniqboom.config import settings as _settings
+        cand = getattr(_settings, "uade123_path", "") or ""
+        if cand and Path(cand).exists():
+            return cand
+    except Exception:
+        pass
+    found = _shutil.which("uade123")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/uade123", "/usr/local/bin/uade123",
+                 "/usr/bin/uade123"):
+        if Path(cand).exists():
+            return cand
+    return None
+
+
+def uade_get_info(path: Path) -> dict:
+    """Probe *path* with ``uade123 -g`` (boots the emulator, ~110 ms).
+
+    Returns the parsed key/value lines (playername, modulename, subsongs, …)
+    plus ``_ok``: True iff uade accepted the file.  ``_ok`` False covers
+    unknown formats, corrupt modules, MISSING COMPANION halves (TFMX without
+    its ``smpl.``), and uade123 not being installed at all.
+    """
+    import subprocess as _sp
+    binary = _find_uade123()
+    if not binary:
+        return {"_ok": False, "_error": "uade123 not installed"}
+    try:
+        r = forksafe.run(
+            [binary, "-g", str(path)],
+            capture_output=True, text=True, timeout=_UADE123_INFO_TIMEOUT_S,
+        )
+    except (_sp.TimeoutExpired, OSError) as exc:
+        return {"_ok": False, "_error": str(exc)}
+    info: dict = {"_ok": r.returncode == 0}
+    for line in r.stdout.splitlines():
+        key, sep, val = line.partition(":")
+        if sep:
+            info[key.strip()] = val.strip()
+    return info
+
+
+_UADE_SUBSONGS_RE = re.compile(r"min\s+(-?\d+)\s+max\s+(-?\d+)")
+
+
+def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
+    """Metadata for a uade-rendered Amiga module, from a prior ``-g`` probe."""
+    name = Path(str(path).split("::")[-1]).name
+    cls = _uade.classify(name)
+    # Format: uade's own playername ("TFMX Pro", "SoundMon 2.0") is already
+    # human-friendly and runtime-authoritative; fall back to the conf name.
+    fmt = (info.get("playername") or "").strip()
+    if not fmt and cls:
+        fmt = _uade.display_name(cls[0])
+    fmt = fmt or "Amiga"
+    # Normalize playername variants that would split one format across two
+    # library groups (suffix-.ahx files are labelled "AHX" by the tracker
+    # extractor; uade's AbyssHighestExperience reports "AHX v1/v2").
+    if fmt.startswith("AHX"):
+        fmt = "AHX"
+    # Title: embedded modulename when the format stores one, else the name
+    # BODY (``mdat.acieed1`` → "acieed1"; ``legendcrack.fc`` → "legendcrack").
+    title = (info.get("modulename") or "").strip()
+    if not title:
+        first, _, rest = name.partition(".")
+        if cls and cls[1] == first.lower() and rest:
+            title = rest
+        else:
+            title = name.rsplit(".", 1)[0]
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "title": title or Path(name).stem,
+        "duration": 0.0,          # render-only — backfilled from the WAV
+        "genre": ["Amiga", "Module"],
+    }
+    m = _UADE_SUBSONGS_RE.search(info.get("subsongs", ""))
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if hi > lo:
+            d["subsongs"] = hi - lo + 1
+    return d
+
+
+# ── Atari ST extraction (SNDH / YM / SC68) ────────────────────────────────────
+
+_ATARI_DEFAULT_DURATION = 180.0   # SNDH without TIME tags renders this long
+
+
+def _find_atari_binary(setting_name: str, binary: str) -> str | None:
+    import shutil as _shutil
+    try:
+        from soniqboom.config import settings as _settings
+        cand = getattr(_settings, setting_name, "") or ""
+        if cand and Path(cand).exists():
+            return cand
+    except Exception:
+        pass
+    return _shutil.which(binary)
+
+
+def _extract_sndh(path: Path, track_id: str) -> dict:
+    """SNDH metadata via ``psgplay -i`` (TITL/COMM/YEAR/##/TIME tags).
+
+    Output format verified against psgplay (2026-07): lines like
+    ``tag field TITL Funfares``, ``tag field ## 11``, ``tag field TIME 2 95``.
+    Duration = default track's TIME tag; absent/0 → the Atari default cap
+    (that's exactly how long the renderer will play it).
+    """
+    import subprocess as _sp
+    name = Path(str(path).split("::")[-1]).stem
+    title, artist, year = "", "", None
+    subsongs, default_track = None, 1
+    times: dict[int, int] = {}
+    binary = _find_atari_binary("psgplay_path", "psgplay")
+    if binary:
+        try:
+            r = forksafe.run([binary, "-i", str(path)], capture_output=True,
+                             text=True, timeout=20)
+            for line in r.stdout.splitlines():
+                parts = line.split(None, 3)
+                if parts[:2] != ["tag", "field"] or len(parts) < 3:
+                    continue
+                tag = parts[2]
+                val = parts[3].strip() if len(parts) > 3 else ""
+                if tag == "TITL" and val:
+                    title = val
+                elif tag == "COMM" and val:
+                    artist = val
+                elif tag == "YEAR":
+                    try:
+                        year = int(val[:4])
+                    except ValueError:
+                        pass
+                elif tag == "##":
+                    try:
+                        subsongs = int(val)
+                    except ValueError:
+                        pass
+                elif tag == "!#":
+                    try:
+                        default_track = max(1, int(val))
+                    except ValueError:
+                        pass
+                elif tag == "TIME":
+                    tv = val.split()
+                    if len(tv) >= 2:
+                        try:
+                            times[int(tv[0])] = int(tv[1])
+                        except ValueError:
+                            pass
+        except (_sp.TimeoutExpired, OSError):
+            pass
+    dur = float(times.get(default_track, 0) or 0)
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "SNDH",
+        "title": title or name,
+        "duration": dur if dur > 0 else _ATARI_DEFAULT_DURATION,
+        "genre": ["Chiptune", "Atari ST"],
+    }
+    if artist:
+        d["artist"] = artist   # TrackMeta.artist is str — never None
+    if year:
+        d["year"] = year
+    if subsongs and subsongs > 1:
+        d["subsongs"] = subsongs
+    return d
+
+
+def _extract_ym(path: Path, track_id: str) -> dict:
+    """YM metadata parsed straight from the (usually LHA-wrapped) header.
+
+    YM5!/YM6! carry frame count + play rate (duration = frames/rate,
+    verified to 0.1 s against a StSound render) plus NT-terminated
+    title/author/comment strings.  Older YM2!/YM3! have no header —
+    duration ≈ (size-4)/14 frames at 50 Hz.
+    """
+    import struct as _struct
+    name = Path(str(path).split("::")[-1]).stem
+    raw = b""
+    try:
+        import lhafile as _lha
+        lf = _lha.Lhafile(str(path))
+        names = lf.namelist()
+        if names:
+            raw = lf.read(names[0])
+    except Exception:
+        try:
+            raw = path.read_bytes()       # uncompressed YM
+        except OSError:
+            raw = b""
+    title, artist, comment, dur = "", "", "", 0.0
+    magic = raw[:4]
+    try:
+        if magic in (b"YM5!", b"YM6!") and raw[4:12] == b"LeOnArD!":
+            nb = _struct.unpack(">I", raw[12:16])[0]
+            nd = _struct.unpack(">H", raw[20:22])[0]
+            rate = _struct.unpack(">H", raw[26:28])[0] or 50
+            extra = _struct.unpack(">H", raw[32:34])[0]
+            dur = min(nb / float(rate), 86400.0)   # untrusted header — clamp
+            off = 34 + extra
+            for _ in range(nd):
+                sz = _struct.unpack(">I", raw[off:off + 4])[0]
+                off += 4 + sz
+            def _nts(b: bytes, o: int) -> tuple[str, int]:
+                e = b.find(b"\x00", o)
+                if e == -1:
+                    return "", o
+                return b[o:e].decode("latin-1", "replace").strip(), e + 1
+            title, off = _nts(raw, off)
+            artist, off = _nts(raw, off)
+            comment, off = _nts(raw, off)
+        elif magic in (b"YM2!", b"YM3!", b"YM3b"):
+            dur = max(0.0, (len(raw) - 4) / 14.0 / 50.0)
+    except (_struct.error, IndexError):
+        pass
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "YM",
+        "title": title or name,
+        "duration": round(dur, 2),
+        "genre": ["Chiptune", "Atari ST"],
+    }
+    if artist:
+        d["artist"] = artist   # TrackMeta.artist is str — never None
+    if comment:
+        d["comment"] = comment
+    return d
+
+
+def _extract_sc68(path: Path, track_id: str) -> dict:
+    """SC68 metadata: track count via ``info68 -#``; durations are embedded
+    and honoured by the renderer (backfilled from the WAV on first play)."""
+    import subprocess as _sp
+    name = Path(str(path).split("::")[-1]).stem
+    subsongs = None
+    binary = _find_atari_binary("sc68_path", "sc68")
+    info68 = None
+    if binary:
+        sib = Path(binary).with_name("info68")
+        info68 = str(sib) if sib.exists() else _find_atari_binary("", "info68")
+    if info68:
+        try:
+            r = forksafe.run([info68, str(path), "-#"], capture_output=True,
+                             text=True, timeout=15)
+            n = int((r.stdout or "").strip().splitlines()[-1])
+            if n > 1:
+                subsongs = n
+        except (ValueError, IndexError, _sp.TimeoutExpired, OSError):
+            pass
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "SC68",
+        "title": name,
+        "duration": 0.0,          # render-only; backfilled from the WAV
+        "genre": ["Chiptune", "Atari ST"],
+    }
+    if subsongs:
+        d["subsongs"] = subsongs
+    return d
+
+
+# ── PSF console-music family extraction ──────────────────────────────────────
+
+def _psf_parse_length(val: str) -> float:
+    """PSF length/fade tag → seconds.  Formats: 'ss', 'ss.ddd', 'mm:ss',
+    'h:mm:ss.ddd' (spec v1.4)."""
+    try:
+        parts = val.strip().split(":")
+        secs = float(parts[-1])
+        if len(parts) >= 2:
+            secs += int(parts[-2]) * 60
+        if len(parts) >= 3:
+            secs += int(parts[-3]) * 3600
+        return max(0.0, secs)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _extract_psf(path: Path, track_id: str) -> dict:
+    """PSF-family metadata from the header version byte + the [TAG] block.
+
+    The tag block sits at EOF after the compressed program: ``[TAG]`` then
+    ``key=value`` lines (title/artist/game/year/length/fade/_lib...).
+    Duration = length + fade when tagged; else 0 (backfilled from the WAV).
+    """
+    name = Path(str(path).split("::")[-1]).stem
+    raw = b""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        pass
+    version = raw[3] if len(raw) >= 4 and raw[:3] == b"PSF" else None
+    fmt = _PSF_VERSION_NAMES.get(version or -1) or FORMAT_NAMES.get(
+        path.suffix.lower(), "PSF")
+    tags: dict[str, str] = {}
+    # Per the PSF v1.4 spec the tag block sits at EOF — search only the last
+    # 64 KB so '[TAG]' bytes occurring randomly inside the zlib-compressed
+    # program can't fake a tag block.
+    idx = raw.rfind(b"[TAG]", max(0, len(raw) - 65536))
+    if idx != -1:
+        for line in raw[idx + 5:].decode("utf-8", "replace").splitlines():
+            k, sep, v = line.partition("=")
+            if sep:
+                tags.setdefault(k.strip().lower(), v.strip())
+    dur = 0.0
+    if "length" in tags:
+        dur = _psf_parse_length(tags["length"])
+        if dur > 0 and "fade" in tags:
+            dur += _psf_parse_length(tags["fade"])
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "title": tags.get("title") or name,
+        "duration": round(dur, 2),
+        "genre": ["Chiptune", "Game Rip"],
+    }
+    # TrackMeta's artist/album are plain ``str`` — a None fails validation
+    # and DROPS the track (QA 2026-07-02: every untagged SSF/DSF vanished).
+    if tags.get("artist"):
+        d["artist"] = tags["artist"]
+    if tags.get("game"):
+        d["album"] = tags["game"]
+    year = tags.get("year", "")[:4]
+    if year.isdigit():
+        d["year"] = int(year)
+    if tags.get("comment"):
+        d["comment"] = tags["comment"]
+    return d
+
+
+def _wants_scene_md5(ext: str, name: str) -> bool:
+    """Should this file's MD5 be cached for the Modland scene join?
+
+    Chiptune/tracker-family formats Modland hosts.  C64 ``.sid`` is
+    excluded — it already carries ``sid_md5`` for the HVSC join.
+    """
+    if ext in _SID_EXTS:
+        return False
+    if (ext in _TRACKER_EXTS or ext in _UADE_SUFFIX_EXTS
+            or ext in _ATARI_EXTS or ext in _GME_EXTS
+            or ext in _ADLIB_EXTS or ext in _PSF_EXTS):
+        return True
+    return _uade.classify(name) is not None
 
 
 # ── Lyrics extraction ─────────────────────────────────────────────────────────
@@ -1530,8 +1983,66 @@ def extract(path: Path, track_id: str) -> TrackMeta:
                 f"tune: {path.name}"
             )
 
+    # ── UADE candidates: authoritative content probe BEFORE the permissive
+    # try below (mirrors the HUNK guard — the catch-all would otherwise index
+    # rejected files with junk fallback metadata).  Candidates are:
+    #   * suffix-form registered uade extensions  (song.fc13)
+    #   * Amiga prefix-form eagleplayer names     (mdat.song → classify)
+    #   * bare ``.sid`` WITHOUT PSID/RSID magic — Modland stores Amiga
+    #     SidMon modules as ``*.sid``; only C64 files carry the PSID header.
+    _uade_probe: dict | None = None
+    _uade_cls = _uade.classify(path.name)
+    _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None
+    if not _is_uade and ext in _SID_EXTS:
+        try:
+            with open(path, "rb") as _fh:
+                _sid_magic = _fh.read(4)
+        except OSError:
+            _sid_magic = b""
+        if _sid_magic not in (b"PSID", b"RSID"):
+            _is_uade = True
+    if _is_uade:
+        # Cheap binary sniff first (QA M1): Amiga modules are binary; a file
+        # whose head is pure printable text (README.md next to the music,
+        # docs named like tokens) is silently NOT music — no uade boot, no
+        # scan-error noise.
+        try:
+            with open(path, "rb") as _fh:
+                _head = _fh.read(256)
+        except OSError:
+            _head = b""
+        _texty = _head and all(
+            32 <= b < 127 or b in (9, 10, 13) for b in _head)
+        if _texty or not _head:
+            raise ValueError(
+                f"not an Amiga module (text or empty content): {path.name}")
+        _uade_probe = uade_get_info(path)
+        if not _uade_probe.get("_ok"):
+            # QA C1: remote loose modules are scanned from a LONE temp copy —
+            # a companion-needing format (TFMX mdat/smpl, RJP sng/ins) always
+            # fails -g here even though play-time materialization fetches the
+            # sibling and works.  When the NAME classifies and the file sits
+            # alone (no companion beside it), index leniently from the
+            # classification; genuinely corrupt files fail at play with a
+            # clear 422.  Local files WITH their companions present keep the
+            # strict content verdict.
+            _lenient = False
+            if _uade_cls is not None:
+                _sibs = _uade.companion_sibling_names(path.name)
+                _here = {p.name.lower() for p in path.parent.glob("*")}
+                if not any(s.lower() in _here for s in _sibs):
+                    _lenient = True
+            if not _lenient:
+                raise ValueError(
+                    f"uade123 rejected {path.name}: unknown/corrupt Amiga "
+                    f"module or missing companion sample file"
+                )
+            _uade_probe = {"_ok": False}   # classify-only metadata below
+
     try:
-        if ext in _SID_EXTS:
+        if _uade_probe is not None:
+            d = _extract_uade(path, track_id, _uade_probe)
+        elif ext in _SID_EXTS:
             d = _extract_sid(path, track_id)
         elif ext in _MIDI_EXTS:
             d = _extract_midi(path, track_id)
@@ -1543,8 +2054,30 @@ def extract(path: Path, track_id: str) -> TrackMeta:
             d = _extract_tracker(path, track_id)
         elif ext in _GME_EXTS:
             d = _extract_gme(path, track_id)
+        elif ext in _PSF_EXTS:
+            d = _extract_psf(path, track_id)
         elif ext in _DSD_EXTS:
-            d = _extract_dsd(path, track_id)
+            # ``.dsf`` collision: Sony DSD Stream File ('DSD ') vs Sega
+            # Dreamcast Sound Format ('PSF' + version 0x12) share the
+            # extension — content decides the pipeline.
+            if ext == ".dsf":
+                try:
+                    with open(path, "rb") as _fh:
+                        _m4 = _fh.read(4)
+                except OSError:
+                    _m4 = b""
+                if _m4[:3] == b"PSF":
+                    d = _extract_psf(path, track_id)
+                else:
+                    d = _extract_dsd(path, track_id)
+            else:
+                d = _extract_dsd(path, track_id)
+        elif ext == ".sndh":
+            d = _extract_sndh(path, track_id)
+        elif ext == ".ym":
+            d = _extract_ym(path, track_id)
+        elif ext == ".sc68":
+            d = _extract_sc68(path, track_id)
         elif ext == ".mp3":
             d = _mp3(path, track_id)
         elif ext == ".flac":
@@ -1606,6 +2139,17 @@ def extract(path: Path, track_id: str) -> TrackMeta:
     # Normalise title fallback
     if not d.get("title"):
         d["title"] = path.stem
+
+    # Scene-enrichment MD5 (Modland join key) — chiptune/tracker-family
+    # files only, capped so no big PCM file is ever hashed.  Mirrors the
+    # HVSC ``sid_md5`` pattern; costs one small read at scan time.
+    if "file_md5" not in d and _wants_scene_md5(ext, path.name):
+        try:
+            if path.stat().st_size <= 8 * 1024 * 1024:
+                import hashlib as _hashlib
+                d["file_md5"] = _hashlib.md5(path.read_bytes()).hexdigest()
+        except OSError:
+            pass
 
     valid = TrackMeta.model_fields.keys()
     return TrackMeta(**{k: v for k, v in d.items() if k in valid})

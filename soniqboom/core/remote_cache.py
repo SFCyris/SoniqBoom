@@ -22,12 +22,44 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from soniqboom.core import forksafe
+
 if TYPE_CHECKING:
     from soniqboom.core.filesource import FileSource
 
 log = logging.getLogger(__name__)
 
 _DEFAULT_MAX_MB = 2048
+
+# Entries younger than this are never evicted: fetch() hands out a path
+# and the caller opens it moments later — evicting inside that window
+# turns a cache hit into FileNotFoundError.  A scan that floods the
+# cache with fresh entries may transiently overshoot the byte budget by
+# the grace window's working set; that's disk headroom, not corruption.
+_EVICTION_GRACE_S = 60
+
+# Eviction telemetry — during a scan whose working set exceeds the cache
+# limit, EVERY insert evicts (1,489 per-batch INFO lines / 22 GB churn
+# observed 2026-07-02).  Per-batch detail goes to DEBUG; INFO gets one
+# aggregated line per minute.
+_evict_stats = {"bytes": 0, "entries": 0, "last_emit": 0.0}
+_evict_stats_lock = threading.Lock()
+
+
+def _note_eviction(nbytes: int, nentries: int, cache: "RemoteCache") -> None:
+    with _evict_stats_lock:
+        _evict_stats["bytes"] += nbytes
+        _evict_stats["entries"] += nentries
+        now = time.time()
+        if now - _evict_stats["last_emit"] < 60:
+            return
+        agg_b, agg_n = _evict_stats["bytes"], _evict_stats["entries"]
+        _evict_stats.update(bytes=0, entries=0, last_emit=now)
+    log.info(
+        "Cache evicted %.2f GB in %d entries over the last minute "
+        "(cache %d/%d MB)",
+        agg_b / 1e9, agg_n, cache.total_size() // (1024 * 1024), cache.max_mb,
+    )
 
 
 def _flac_has_seektable(path: Path) -> bool | None:
@@ -80,7 +112,10 @@ def _add_flac_seektable_best_effort(path: Path) -> None:
     try:
         # 10 s spacing → ~6 seekpoints per minute, ~360 for an hour-long
         # album track.  At ~18 bytes per point this is < 7 KB of metadata.
-        subprocess.run(
+        # forksafe: fetch() runs in executor threads of the CF-initialised
+        # server — a plain subprocess.run fork here is the macOS segfault
+        # hazard (see core/forksafe.py).
+        forksafe.run(
             [metaflac, "--add-seekpoint=10s", "--no-utf8-convert", str(path)],
             check=True, timeout=30, capture_output=True,
         )
@@ -124,6 +159,9 @@ class RemoteCache:
             weakref.WeakValueDictionary()
         )
         self._fetch_locks_guard = threading.Lock()
+        # Serialises index-file writes that happen OUTSIDE _mutex (the
+        # eviction hot path snapshots under _mutex, writes under this).
+        self._save_lock = threading.Lock()
         self._load_index()
         self._total_bytes = sum(e.get("size", 0) for e in self._index.values())
 
@@ -139,10 +177,16 @@ class RemoteCache:
             self._index = loaded if isinstance(loaded, dict) else {}
 
     def _save_index(self) -> None:
-        self._root.mkdir(parents=True, exist_ok=True)
-        tmp = self._index_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._index))
-        tmp.replace(self._index_path)
+        """Persist the index — best-effort, NEVER raises.
+
+        A raise here used to propagate out of eviction BEFORE the victim
+        unlink loop ran: entries already popped from the index stayed on
+        disk as permanently untracked orphans — and the most likely cause
+        (ENOSPC on the cache volume) is exactly the condition eviction
+        exists to relieve.  The index is advisory LRU bookkeeping; losing
+        one write is recoverable, skipping unlinks is not.
+        """
+        self._write_index_payload(json.dumps(self._index))
 
     @staticmethod
     def _cache_key(share_id: str, remote_path: str) -> str:
@@ -168,6 +212,10 @@ class RemoteCache:
                     self._total_bytes = max(
                         0, self._total_bytes - stale.get("size", 0),
                     )
+                    # Persist the pop — an unpersisted stale entry came
+                    # back after restart as phantom bytes in _total_bytes
+                    # and triggered spurious eviction of live entries.
+                    self._save_index()
             cache_stats.miss("remote")
             return None
         # Update access time in memory only.  The previous code wrote the
@@ -178,6 +226,39 @@ class RemoteCache:
             entry["last_access"] = time.time()
         cache_stats.hit("remote")
         return local
+
+    def validate_size(self, share_id: str, remote_path: str,
+                      expected_size: int) -> None:
+        """Drop the cached copy of *remote_path* when its size no longer
+        matches the live directory listing.
+
+        The cache is keyed on path alone with no mtime/size validation —
+        a remote file that CHANGED (e.g. a scene archive updated on the
+        share) would otherwise be served from the stale local copy
+        forever.  The scanner calls this with the listing size before
+        enumerating/extracting an archive; playback paths don't (a track
+        mid-stream keeps its bytes).  Size-only: cheap, catches the
+        overwhelmingly common case; a same-size content change slips
+        through until the entry is evicted naturally.
+        """
+        if expected_size <= 0:
+            return
+        key = self._cache_key(share_id, remote_path)
+        with self._mutex:
+            entry = self._index.get(key)
+            if entry is None or entry.get("size") == expected_size:
+                return
+            self._index.pop(key)
+            self._total_bytes = max(0, self._total_bytes - entry.get("size", 0))
+            local = entry.get("local")
+            self._save_index()
+        if local:
+            try:
+                Path(local).unlink(missing_ok=True)
+            except OSError:
+                pass
+        log.info("Remote cache: dropped stale copy of %s (size changed)",
+                 remote_path)
 
     def _lock_for_key(self, key: str) -> threading.Lock:
         """Get (or lazily create) the per-key fetch lock.
@@ -194,7 +275,17 @@ class RemoteCache:
                 self._fetch_locks[key] = lock
         return lock
 
-    def fetch(self, share_id: str, remote_path: str, source: FileSource) -> Path:
+    def fetch(self, share_id: str, remote_path: str, source: FileSource,
+              *, lane: str = "stream") -> Path:
+        """Download *remote_path* into the cache (or return the cached copy).
+
+        ``lane`` is forwarded to ``FileSource.read_file`` so pooled-FTP
+        backends can prioritise correctly: playback callers keep the
+        default ``"stream"`` priority lane; the scanner passes
+        ``lane="scan"`` so multi-hundred-MB archive pulls don't starve a
+        concurrent play request (observed: 22 GB of scan traffic riding
+        the stream lane of a 2-connection pool).
+        """
         cached = self.get_cached(share_id, remote_path)
         if cached is not None:
             return cached
@@ -219,8 +310,14 @@ class RemoteCache:
             # files used to race on ``+=`` against ``_total_bytes`` and
             # the ``_save_index`` write — the global mutex still covers
             # that, on top of the per-key serialisation we added here.
-            data = source.read_file(remote_path)
+            data = source.read_file(remote_path, lane=lane)
             local.write_bytes(data)
+            size = len(data)
+            # Drop the in-RAM copy before the (potentially slow) seektable
+            # step — archives ride through here at up to ~1.5 GB apiece,
+            # and two concurrent scan fetches holding whole-file buffers
+            # spike RSS by gigabytes.
+            del data
 
             # Post-fetch: FLAC files without a SEEKTABLE block can't be
             # seeked reliably by the browser's audio element — Chromium's
@@ -232,8 +329,13 @@ class RemoteCache:
             # the source on the FTP/SMB share is untouched.
             if remote_path.lower().endswith(".flac"):
                 _add_flac_seektable_best_effort(local)
+                # The SEEKTABLE injection grew the file — index the REAL
+                # on-disk size or the byte accounting undercounts.
+                try:
+                    size = local.stat().st_size
+                except OSError:
+                    pass
 
-            size = len(data)
             with self._mutex:
                 self._index[key] = {
                     "share_id": share_id,
@@ -244,40 +346,93 @@ class RemoteCache:
                     "last_access": time.time(),
                 }
                 self._total_bytes += size
-                self._save_index()
-        self._evict_if_needed()
+        # Evict + persist in one pass (a single index write per fetch —
+        # the old insert-save + evict-save double write hammered the disk
+        # at scan rates).  ``protect_key`` keeps the entry we are about to
+        # return: the previous code could evict the just-inserted file
+        # before the caller ever opened it — guaranteed when a single
+        # entry exceeded the cache limit (fetch returned an already-
+        # unlinked path → FileNotFoundError downstream).
+        self._evict_if_needed(protect_key=key)
         return local
 
-    def _evict_if_needed(self) -> None:
-        # Snapshot under lock so a parallel fetch can't mutate during the
-        # sort/scan, then drop the lock to do the actual file unlinks.
+    def _evict_if_needed(self, protect_key: str | None = None) -> None:
+        """Evict LRU entries over budget, then persist the index.
+
+        Claim-then-delete: victims are popped from ``_index`` and their
+        sizes subtracted from ``_total_bytes`` in ONE mutex hold, so two
+        concurrent evictions can never double-count the same entry (the
+        old snapshot-unlink-subtract dance let both threads count the
+        same file and corrupt the running total).  The slow unlinks and
+        the index write both happen outside the lock — the write used to
+        hold ``_mutex`` through a disk flush on EVERY fetch, stalling
+        playback ``get_cached`` calls behind it during scan floods.
+        """
+        now = time.time()
+        victims: list[dict] = []
         with self._mutex:
-            if self._total_bytes <= self._max_bytes:
-                return
-            by_access = sorted(
-                self._index.items(),
-                key=lambda kv: kv[1].get("last_access", 0),
-            )
-        removed = 0
-        evicted_keys: list[str] = []
-        for key, entry in by_access:
-            if self._total_bytes - removed <= self._max_bytes:
-                break
-            path = Path(entry["local"])
-            try:
-                sz = entry.get("size", 0)
-                path.unlink(missing_ok=True)
-                removed += sz
-                evicted_keys.append(key)
-            except OSError:
-                continue
-        if evicted_keys:
-            with self._mutex:
-                for k in evicted_keys:
-                    self._index.pop(k, None)
-                self._total_bytes = max(0, self._total_bytes - removed)
-                self._save_index()
-            log.info("Cache evicted %d bytes", removed)
+            if self._total_bytes > self._max_bytes:
+                by_access = sorted(
+                    self._index.items(),
+                    key=lambda kv: kv[1].get("last_access", 0),
+                )
+                claimed = 0
+                excess = self._total_bytes - self._max_bytes
+                # Grace protects both freshly-FETCHED entries and
+                # freshly-ACCESSED ones: get_cached hands out paths and
+                # bumps only last_access — keying grace on "fetched"
+                # alone let a just-served cache hit be unlinked before
+                # the caller opened it.  BUT grace is advisory: past the
+                # hard ceiling (2x budget) it is ignored, or a scan
+                # flooding >budget bytes per minute would grow the cache
+                # without bound (grace-skip 'continue' removed nothing).
+                hard_ceiling = self._total_bytes > 2 * self._max_bytes
+                for k, entry in by_access:
+                    if claimed >= excess:
+                        break
+                    if k == protect_key:
+                        continue
+                    last_touch = max(entry.get("fetched", 0),
+                                     entry.get("last_access", 0))
+                    if (not hard_ceiling
+                            and now - last_touch < _EVICTION_GRACE_S):
+                        continue
+                    self._index.pop(k)
+                    claimed += entry.get("size", 0)
+                    victims.append(entry)
+                self._total_bytes = max(0, self._total_bytes - claimed)
+            # Snapshot the payload under the mutex; write it outside.
+            payload = json.dumps(self._index)
+        self._write_index_payload(payload)
+        if victims:
+            removed = 0
+            for entry in victims:
+                try:
+                    Path(entry["local"]).unlink(missing_ok=True)
+                    removed += entry.get("size", 0)
+                except OSError as exc:
+                    # File stays on disk but left the index — surface it
+                    # so untracked orphans don't accumulate silently.
+                    log.warning("Cache eviction could not unlink %s: %s",
+                                entry.get("local"), exc)
+            log.debug("Cache evicted %d bytes in %d entries",
+                      removed, len(victims))
+            _note_eviction(removed, len(victims), self)
+
+    def _write_index_payload(self, payload: str) -> None:
+        """Write a pre-serialised index snapshot — best-effort, never
+        raises.  ``_save_lock`` serialises concurrent writers (two racing
+        ``tmp.replace`` calls on the same tmp path corrupt the file);
+        last writer wins, which is fine for advisory LRU bookkeeping."""
+        try:
+            with self._save_lock:
+                self._root.mkdir(parents=True, exist_ok=True)
+                tmp = self._index_path.with_suffix(".tmp")
+                tmp.write_text(payload)
+                tmp.replace(self._index_path)
+        except OSError as exc:
+            log.warning("Remote-cache index save failed (%s) — continuing; "
+                        "the index is best-effort", exc)
 
     def invalidate_share(self, share_id: str) -> int:
         with self._mutex:
@@ -355,9 +510,18 @@ _cache: RemoteCache | None = None
 def get_cache() -> RemoteCache:
     global _cache
     if _cache is None:
-        from soniqboom.config import get_data_dir
+        from soniqboom.config import get_data_dir, load_local_conf
         root = Path(get_data_dir()) / "cache" / "remote"
-        _cache = RemoteCache(root)
+        # Honour the configured limit even on the lazy-fallback path — a
+        # caller racing ahead of _init_network_shares used to freeze the
+        # singleton at the 2048 MB default, silently evicting most of a
+        # larger configured cache.  load_local_conf is mtime-cached.
+        try:
+            max_mb = int(load_local_conf().get("remote_cache_max_mb",
+                                               _DEFAULT_MAX_MB))
+        except Exception:
+            max_mb = _DEFAULT_MAX_MB
+        _cache = RemoteCache(root, max_mb if max_mb > 0 else _DEFAULT_MAX_MB)
     return _cache
 
 

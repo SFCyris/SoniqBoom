@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import itertools
+import json
 import logging
 import math
 import os
@@ -36,13 +37,17 @@ import subprocess
 import threading
 import time
 import uuid
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from collections import Counter, defaultdict
+from concurrent.futures import (
+    BrokenExecutor, ProcessPoolExecutor, ThreadPoolExecutor,
+)
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable
 
-from soniqboom.core.metadata import SUPPORTED_EXTENSIONS, extract
+from soniqboom.core.metadata import (
+    SUPPORTED_EXTENSIONS, extract, is_supported_music_name,
+)
 from soniqboom.core import diskimage
 from soniqboom.core import archive
 from soniqboom.core.art_cache import store_full_art_batch, store_thumbs_batch
@@ -404,10 +409,10 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
     import os
     import zipfile
 
-    ext_set = {e.lower() for e in SUPPORTED_EXTENSIONS}
-
     def _is_audio(name: str) -> bool:
-        return os.path.splitext(name)[1].lower() in ext_set
+        # Extension-supported OR a uade Amiga prefix-form name (mdat.song);
+        # companion sample halves are excluded inside the helper.
+        return is_supported_music_name(name)
 
     result: dict[str, list[Path]] = {}
     for d in directories:
@@ -428,7 +433,7 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                 full = os.path.join(dirpath, fn)
                 lower = fn.lower()
 
-                if os.path.splitext(lower)[1] in ext_set:
+                if _is_audio(fn):
                     files.append(Path(full))
 
                 elif scan_zips and lower.endswith(".zip"):
@@ -494,7 +499,6 @@ def _find_remote_audio_files(
     """
     from soniqboom.core.filesource import FileSource
 
-    ext_set = {e.lower() for e in SUPPORTED_EXTENSIONS}
     files: list[str] = []
     skipped_junk = 0
     try:
@@ -503,7 +507,7 @@ def _find_remote_audio_files(
                 if _is_junk_filename(fn):
                     skipped_junk += 1
                     continue
-                if os.path.splitext(fn.lower())[1] in ext_set:
+                if is_supported_music_name(fn):
                     fpath = f"{dirpath}/{fn}" if dirpath != "/" else f"/{fn}"
                     files.append(fpath)
     except Exception as exc:
@@ -590,12 +594,25 @@ def _extract_one_remote(
     Runs in a worker process like _extract_one.  Writes data to a temp file
     because mutagen requires a seekable file handle for most formats.
     """
+    import shutil
     import tempfile
     try:
-        ext = os.path.splitext(remote_path)[1]
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(file_data)
-            tmp_path = Path(tmp.name)
+        real_base = _basename_of(remote_path)
+        from soniqboom.core import uade_formats as _uade
+        if _uade.classify(real_base) is not None:
+            # Amiga prefix-form names (mdat.song) lose their identity in a
+            # random-stem temp file (QA M2: tmpXXXX.song classifies as
+            # nothing) — preserve the REAL basename in a private temp dir.
+            tdir = Path(tempfile.mkdtemp(prefix="sq_remscan_"))
+            tmp_path = tdir / real_base
+            tmp_path.write_bytes(file_data)
+            cleanup = lambda: shutil.rmtree(tdir, ignore_errors=True)  # noqa: E731
+        else:
+            ext = os.path.splitext(remote_path)[1]
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(file_data)
+                tmp_path = Path(tmp.name)
+            cleanup = lambda: tmp_path.unlink(missing_ok=True)  # noqa: E731
         try:
             meta = extract(tmp_path, track_id)
             meta.path = remote_path
@@ -604,12 +621,12 @@ def _extract_one_remote(
             # Title fallback inside extract() used the temp file's basename
             # (e.g. ``tmpXXXXXXXX``) when the source had no title tag.  Replace
             # it with the real remote basename so the UI doesn't show garbage.
-            real_stem = Path(_basename_of(remote_path)).stem
+            real_stem = Path(real_base).stem
             if real_stem and meta.title == tmp_path.stem:
                 meta.title = real_stem
             return remote_path, meta, None, None
         finally:
-            tmp_path.unlink(missing_ok=True)
+            cleanup()
     except Exception as exc:
         return remote_path, f"{type(exc).__name__}: {exc}", None, None
 
@@ -706,9 +723,51 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
 
 def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
     """Extract metadata from a file inside a (possibly nested) ZIP archive."""
+    import shutil
     import tempfile
 
     data, member_name = _read_from_zip_path(virtual_path)
+    real_base = _basename_of(member_name)
+
+    # UADE Amiga members need their REAL basename (detection is name-based:
+    # ``mdat.song``; the archive layer may have appended a routing extension
+    # → strip it back off) and their companion sample halves extracted
+    # alongside (TFMX ``smpl.X`` etc.), or ``uade123 -g`` rejects them.
+    # Strip check runs FIRST (QA C2): classify("mdat.X.mdat") matches via the
+    # prefix token, so a classify-first order never stripped and uade then
+    # derived a nonexistent ``smpl.X.mdat`` companion.
+    from soniqboom.core import uade_formats as _uade
+    uade_name = real_base
+    if "." in real_base:
+        _stem, _, _last = real_base.rpartition(".")
+        from soniqboom.core.metadata import _UADE_SUFFIX_EXTS
+        if (f".{_last.lower()}" in _UADE_SUFFIX_EXTS
+                and _uade.classify(_stem) is not None):
+            uade_name = _stem
+    is_uade_member = _uade.classify(uade_name) is not None
+
+    if is_uade_member:
+        tdir = Path(tempfile.mkdtemp(prefix="sq_uadescan_"))
+        tmp_path = tdir / uade_name
+        tmp_path.write_bytes(data)
+        # Pull companion halves from the SAME archive directory, best-effort.
+        # Amiga archives often use BACKSLASH separators (QA m2) — normalize.
+        _member_norm = member_name.replace("\\", "/")
+        member_dir = _member_norm.rsplit("/", 1)[0] if "/" in _member_norm else ""
+        outer = virtual_path.rsplit("::", 1)[0]
+        for sib in _uade.companion_sibling_names(uade_name):
+            sib_member = f"{member_dir}/{sib}" if member_dir else sib
+            try:
+                sib_data, _ = _read_from_zip_path(f"{outer}::{sib_member}")
+                (tdir / sib).write_bytes(sib_data)
+            except Exception:
+                continue                            # extras are optional
+        try:
+            meta = extract(tmp_path, track_id)
+            meta.path = virtual_path
+            return meta
+        finally:
+            shutil.rmtree(tdir, ignore_errors=True)
 
     suffix = Path(member_name).suffix
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -721,7 +780,7 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
         # Title fallback inside extract() used the temp file's basename when the
         # source had no title tag.  Substitute the real ZIP member name so the
         # UI doesn't show ``tmpXXXXXXXX``.
-        real_stem = Path(_basename_of(member_name)).stem
+        real_stem = Path(real_base).stem
         if real_stem and meta.title == tmp_path.stem:
             meta.title = real_stem
         return meta
@@ -873,7 +932,10 @@ def _compute_waveform(path: str, points: int = 200):
         settings.ffmpeg_path, "-i", path,
         "-ac", "1", "-ar", "22050", "-f", "f32le", "-",
     ]
-    proc = subprocess.run(
+    # forksafe: runs in the dedicated _WAVEFORM_POOL threads — plain
+    # subprocess.run forks the CF-initialised server from a worker thread.
+    from soniqboom.core import forksafe
+    proc = forksafe.run(
         cmd, capture_output=True, timeout=60,
     )
     return _pcm_to_waveform(proc.stdout, points)
@@ -1380,10 +1442,18 @@ async def _run_scan(
         file_iter = iter(files_to_scan)
         active: dict[asyncio.Future, Path] = {}
 
-        # Seed initial window
-        for path in itertools.islice(file_iter, INFLIGHT):
-            fut = loop.run_in_executor(executor, _extract_one, path)
-            active[fut] = path
+        # Seed initial window.  A BrokenExecutor here (worker processes
+        # killed) must not escape — it would bypass this root's flush +
+        # cleanup and leave the scan a zombie.  Stop submitting, drain
+        # whatever is in flight, and finish the root early.
+        try:
+            for path in itertools.islice(file_iter, INFLIGHT):
+                fut = loop.run_in_executor(executor, _extract_one, path)
+                active[fut] = path
+        except BrokenExecutor:
+            log.error("Extraction pool died while seeding %s — finishing "
+                      "this root early (Re-Index to retry)", scan_root)
+            file_iter = iter(())
         while active:
             done, _ = await asyncio.wait(
                 active.keys(), return_when=asyncio.FIRST_COMPLETED,
@@ -1435,9 +1505,15 @@ async def _run_scan(
             await _await_resume()
 
             # Refill the window with new tasks
-            for path in itertools.islice(file_iter, len(done)):
-                new_fut = loop.run_in_executor(executor, _extract_one, path)
-                active[new_fut] = path
+            try:
+                for path in itertools.islice(file_iter, len(done)):
+                    new_fut = loop.run_in_executor(executor, _extract_one, path)
+                    active[new_fut] = path
+            except BrokenExecutor:
+                log.error("Extraction pool died mid-scan of %s — draining "
+                          "in-flight files and finishing this root early "
+                          "(Re-Index to retry)", scan_root)
+                file_iter = iter(())
 
             await asyncio.sleep(0)  # yield to event loop every iteration
 
@@ -1612,7 +1688,92 @@ async def start_scan(
 
 # ── Remote scan (SMB / FTP) ─────────────────────────────────────────────────
 
-def _list_remote_zip_members(root_path: str, zip_fe, source) -> list:
+# Archive-enumeration sidecar.  Every walk used to download EVERY remote
+# archive in full just to list its members — 22 GB per rescan observed on
+# one share — even though the skip logic then discarded almost all of the
+# work.  Unchanged archives are now handled without a single byte:
+#   * archives with indexed members → member entries are SYNTHESIZED from
+#     the store (see _remote_scan_body's known_archives);
+#   * archives with NO indexed members ("barren": zips of text files,
+#     archives whose members all failed extraction) have nothing in the
+#     store to synthesize from, so this sidecar remembers them keyed on
+#     (scan_root, archive, mtime, size).
+# The per-scan_root "schema" stamp guards the whole mechanism: member
+# lists derived from the store are only valid while the supported-format
+# map that produced them is unchanged.  A version upgrade that registers
+# new formats changes the fingerprint, which disables the skip for ONE
+# full walk per share (deep enumeration surfaces the newly-supported
+# members), after which the stamp is refreshed.
+_enum_sidecar_lock = threading.Lock()
+
+
+class _PermanentMemberError(Exception):
+    """A member failed to read out of a LOCALLY-present archive (bad CRC,
+    unsupported compression method, name-vs-header mismatch).  Distinct
+    from network fetch errors so the barren bookkeeping can tell "this
+    archive's contents are genuinely unreadable" (eligible for the barren
+    sidecar) apart from "the FTP hiccuped" (must never be blacklisted)."""
+
+
+def _enum_sidecar_path() -> Path:
+    from soniqboom.config import get_data_dir
+    d = get_data_dir() / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "archive_enum.json"
+
+
+def _member_schema_fingerprint() -> str:
+    import hashlib as _h
+    from soniqboom.core.archive import _AMIGA_PREFIX_EXT
+    from soniqboom.core.metadata import SUPPORTED_EXTENSIONS
+    blob = (",".join(sorted(e.lower() for e in SUPPORTED_EXTENSIONS))
+            + "|" + ",".join(sorted(_AMIGA_PREFIX_EXT)))
+    return _h.sha1(blob.encode()).hexdigest()[:12]
+
+
+def _load_enum_sidecar() -> dict:
+    try:
+        d = json.loads(_enum_sidecar_path().read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _update_enum_sidecar(
+    scan_root: str,
+    *,
+    enum_report: dict,
+    indexed_arcs: set,
+    failed_fetch_arcs: set,
+    stamp_schema: bool,
+) -> None:
+    """Fold one finished scan's enumeration results into the sidecar.
+
+    ``enum_report`` holds every archive DOWNLOADED and enumerated this
+    scan (arc_rel → (mtime, size, member_count)).  An arc is barren iff
+    none of its members ended up indexed — but never mark one barren when
+    its fetches failed (transient FTP outage must not blacklist a real
+    archive until its mtime happens to change).
+    """
+    with _enum_sidecar_lock:
+        d = _load_enum_sidecar()
+        barren = d.setdefault("barren", {})
+        for arc, (m, s, _n) in enum_report.items():
+            key = f"{scan_root}|{arc}"
+            if arc in indexed_arcs:
+                barren.pop(key, None)
+            elif arc not in failed_fetch_arcs:
+                barren[key] = [m, s]
+        if stamp_schema:
+            d.setdefault("schemas", {})[scan_root] = _member_schema_fingerprint()
+        path = _enum_sidecar_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d))
+        tmp.replace(path)
+
+
+def _list_remote_zip_members(root_path: str, zip_fe, source,
+                             enum_report: dict | None = None) -> list:
     """Download a remote ``.zip`` (once, via the local remote-cache) and return
     a ``DirEntry`` per audio member.
 
@@ -1626,8 +1787,20 @@ def _list_remote_zip_members(root_path: str, zip_fe, source) -> list:
     from soniqboom.core.remote_cache import get_cache
 
     out: list = []
+    # Walk-phase feedback: archive enumeration is the most expensive part
+    # of a large scan (each un-skipped archive is a full download) and it
+    # runs BEFORE total/processed are known — surface the current archive
+    # name so /admin/scan/status shows life instead of a frozen counter.
+    # Plain attribute write from the walk thread; readers only display it.
+    _progress.current_file = (
+        f"Reading archive {PurePosixPath(zip_fe.path).name}…"
+    )
     try:
-        local_archive = get_cache().fetch(root_path, zip_fe.path, source)
+        # Changed-on-remote guard: drop a stale cached copy before
+        # enumerating, or the members of the OLD archive get indexed.
+        get_cache().validate_size(root_path, zip_fe.path, zip_fe.size)
+        local_archive = get_cache().fetch(root_path, zip_fe.path, source,
+                                          lane="scan")
     except Exception as exc:
         log.warning("Cannot fetch remote archive %s: %s", zip_fe.path, exc)
         return out
@@ -1641,6 +1814,11 @@ def _list_remote_zip_members(root_path: str, zip_fe, source) -> list:
             size=zip_fe.size,
             mtime=zip_fe.mtime,
         ))
+    if enum_report is not None:
+        # Record that this archive was actually downloaded + enumerated —
+        # the scan's tail folds this into the enumeration sidecar (barren
+        # archives get remembered; see _update_enum_sidecar).
+        enum_report[zip_fe.path] = (zip_fe.mtime, zip_fe.size, len(out))
     return out
 
 
@@ -1649,7 +1827,8 @@ def _find_remote_audio_entries(
     *,
     dir_mtime_cap: float | None = None,
     scan_zips: bool = True,
-) -> tuple[list, int]:
+    archive_skip: dict | None = None,
+) -> tuple[list, int, bool]:
     """Discover audio files via ``walk_with_stat`` — yields DirEntry
     objects preserving ``size`` and ``mtime`` from the underlying
     directory-listing response.
@@ -1666,20 +1845,22 @@ def _find_remote_audio_entries(
     walked normally — i.e. correctness is preserved even when the
     optimization is unsupported.
 
-    Returns ``(entries, pruned_subtree_count)`` so callers can log how
-    much the dir-mtime cap actually saved.
+    Returns ``(entries, pruned_subtree_count, walk_ok)``.  ``walk_ok`` is
+    False when the walk DIED midway (network error, listing failure) —
+    the entries list is then PARTIAL and must never be treated as ground
+    truth for ghost cleanup: everything not yet walked would look
+    deleted.
 
     Used by ``start_remote_scan`` to decide which files actually need
     re-extraction (mtime+size match → skip) vs. which need a fresh
     download.  Without this, every re-index re-downloads every byte.
     """
-    from soniqboom.core.filesource import FileSource  # noqa
-    from soniqboom.core.metadata import SUPPORTED_EXTENSIONS
-
-    ext_set = {e.lower() for e in SUPPORTED_EXTENSIONS}
+    from soniqboom.core.filesource import DirEntry, FileSource  # noqa
     entries = []
     skipped_junk = 0
     pruned = [0]  # mutable holder for closure
+    synth_arcs = 0        # archives satisfied from the store (no download)
+    barren_skips = 0      # archives skipped via the barren sidecar
 
     def _skip(dir_entry) -> bool:
         # Prune subtree iff dir.mtime exists AND is ≤ cap (i.e. hasn't
@@ -1703,14 +1884,52 @@ def _find_remote_audio_entries(
                 if _is_junk_filename(fe.name):
                     skipped_junk += 1
                     continue
-                if os.path.splitext(fe.name.lower())[1] in ext_set:
+                if is_supported_music_name(fe.name):
                     entries.append(fe)
                 elif scan_zips and fe.name.lower().endswith((".zip", ".lha", ".lzh")):
+                    if archive_skip is not None:
+                        ka = archive_skip["known"].get(fe.path)
+                        if (ka and fe.size == ka[1]
+                                and abs(fe.mtime - ka[0]) < 2.0):
+                            # Archive unchanged since its members were
+                            # indexed — synthesize the member entries from
+                            # the store instead of downloading the archive
+                            # just to re-list it (the old behaviour cost a
+                            # full download per archive per walk).
+                            for rel in ka[2]:
+                                entries.append(DirEntry(
+                                    name=_basename_of(rel.split("::", 1)[1]),
+                                    path=rel,
+                                    is_dir=False,
+                                    size=fe.size,
+                                    mtime=fe.mtime,
+                                ))
+                            synth_arcs += 1
+                            continue
+                        ba = archive_skip["barren"].get(fe.path)
+                        if (ba and fe.size == ba[1]
+                                and abs(fe.mtime - ba[0]) < 2.0):
+                            # Known to contain no playable members at this
+                            # (mtime, size) — nothing to download.
+                            barren_skips += 1
+                            continue
                     # Crack open the remote archive (ZIP or Amiga LHA/LZH) and
                     # surface its audio members as ``<archive_rel>::<member>``.
-                    entries.extend(_list_remote_zip_members(root_path, fe, source))
+                    entries.extend(_list_remote_zip_members(
+                        root_path, fe, source,
+                        enum_report=(archive_skip or {}).get("report"),
+                    ))
     except Exception as exc:
         log.error("Remote walk_with_stat failed for %s: %s", root_path, exc)
+        walk_ok = False
+    else:
+        walk_ok = True
+    if synth_arcs or barren_skips:
+        log.info(
+            "Archive skip for %s: %d archive(s) synthesized from the store, "
+            "%d barren archive(s) skipped — zero bytes downloaded for them",
+            root_path, synth_arcs, barren_skips,
+        )
     if skipped_junk:
         log.info(
             "Discovered %d remote audio entries in %s (skipped %d junk, pruned %d subtree(s))",
@@ -1721,7 +1940,7 @@ def _find_remote_audio_entries(
             "Discovered %d remote audio entries in %s (pruned %d subtree(s))",
             len(entries), root_path, pruned[0],
         )
-    return entries, pruned[0]
+    return entries, pruned[0], walk_ok
 
 
 async def _prefetch_folder_art_remote(
@@ -1790,6 +2009,12 @@ async def _prefetch_folder_art_remote(
         rel = fe.path or ""
         if not rel:
             continue
+        if "::" in rel:
+            # Archive members: ``…/x.zip::sub/track.mod``'s "parent" is a
+            # pseudo-path inside the zip — LISTing it costs a 550 round
+            # trip per archive.  The real on-disk folder that could hold
+            # a folder.jpg is the archive's own parent.
+            rel = rel.split("::", 1)[0]
         parents.add(str(PurePosixPath(rel).parent))
     stats["unique_dirs"] = len(parents)
     if not parents:
@@ -1928,9 +2153,6 @@ async def start_remote_scan(
          remote) and gets purged.
     """
     global _progress, _scan_count
-    from soniqboom.core.filesource import FileSource
-    from soniqboom.core.metadata import HEADER_BUDGET
-    from soniqboom.core.remote_cache import get_cache
 
     # Dedupe: drop if this scan_root is already being scanned.  The
     # in-flight task will broadcast its own completion event when
@@ -1948,61 +2170,106 @@ async def start_remote_scan(
             await on_progress(_progress)
         return
 
-    loop = asyncio.get_event_loop()
+    # Register BEFORE the walk.  The walk/enumeration phase — which
+    # downloads remote archives just to list their members — is the most
+    # expensive part of a large scan; registering only after it (the old
+    # order) meant (a) /admin/scan/status showed the PREVIOUS scan's
+    # final state for the entire phase ("not progressing"), and (b) the
+    # dedupe gate above couldn't see a walk-phase scan, so a double
+    # trigger started a parallel walk against the same share.
+    _scan_count += 1
+    _current_remote_dirs.add(scan_root)
+    if not _progress.running:
+        _progress = ScanProgress(total=0, running=True)
+    _progress.current_file = f"Discovering files in {scan_root}…"
+    if on_progress:
+        await on_progress(_progress)
+
     executor = ProcessPoolExecutor(max_workers=SCAN_WORKERS)
+    batch_state = {"entered": False}
+    try:
+        await _remote_scan_body(
+            share_id, scan_root, source, on_progress,
+            dir_mtime_cap=dir_mtime_cap, executor=executor,
+            batch_state=batch_state,
+        )
+    except Exception:
+        # A dead scan must NEVER leave zombie state.  Before this guard,
+        # one unhandled BrokenProcessPool left running=true forever,
+        # silently blocked every re-trigger of the share via the dedupe
+        # gate, and orphaned thousands of sibling download tasks (the
+        # 22 GB eviction storm of 2026-07-02).
+        log.exception("Remote scan for %s aborted", scan_root)
+    finally:
+        # SYNCHRONOUS state cleanup FIRST.  If this task was CANCELLED,
+        # the first ``await`` in this finally re-raises CancelledError at
+        # its suspension point and everything after it would be skipped —
+        # re-creating the exact zombie state this wrapper exists to
+        # prevent.  Only after the flags are safe do we attempt the
+        # (shielded) awaits, each swallowing BaseException so a
+        # cancellation can't abort the remaining cleanup steps.
+        executor.shutdown(wait=False)
+        _current_remote_dirs.discard(scan_root)
+        _scan_count = max(0, _scan_count - 1)
+        if _scan_count == 0:
+            _progress.running = False
+            _progress.embedding = False
+            _progress.current_file = ""
+            # Snap processed up to total ONLY when the last scan finishes
+            # (see the parallel-scan display bug note in _run_scan).
+            if _progress.processed < _progress.total:
+                _progress.processed = _progress.total
+        if batch_state["entered"]:
+            try:
+                # shield: on cancellation the await raises immediately but
+                # the exit itself still completes in the background.
+                await asyncio.shield(_async_exit_batch_mode(get_store()))
+            except BaseException:
+                log.exception(
+                    "exit_batch_mode failed after remote scan of %s", scan_root)
+        if on_progress:
+            try:
+                await on_progress(_progress)
+            except BaseException:
+                pass
+
+
+async def _remote_scan_body(
+    share_id: str,
+    scan_root: str,
+    source: "FileSource",
+    on_progress: Callable[[ScanProgress], Awaitable[None]] | None,
+    *,
+    dir_mtime_cap: float | None,
+    executor: ProcessPoolExecutor,
+    batch_state: dict,
+) -> None:
+    """The working half of :func:`start_remote_scan`.
+
+    Split out so the wrapper can guarantee scan-state cleanup (progress
+    flags, ``_current_remote_dirs``, ``_scan_count``, executor shutdown,
+    store batch mode) in ONE ``finally`` no matter where this body dies.
+    ``batch_state["entered"]`` tracks store batch mode across the split:
+    set True right after ``enter_batch_mode`` and back to False after the
+    body's own successful exit call, so the wrapper only force-exits it
+    when the body died in between.
+    """
+    global _progress
+    from soniqboom.core.filesource import FileSource
+    from soniqboom.core.metadata import HEADER_BUDGET
+    from soniqboom.core.remote_cache import get_cache
+
+    loop = asyncio.get_event_loop()
     cache = get_cache()
 
-    # Walk with stat — preserves mtime+size per file from MLSD.
-    #
-    # ``dir_mtime_cap`` (when supplied by the freshness loop) prunes
-    # subtrees whose dir.mtime is unchanged since the cap timestamp.
-    # On the first walk OR when caller passes None, the full walk
-    # runs unchanged.  Wrapped in ``functools.partial`` because
-    # ``run_in_executor`` doesn't forward kwargs.
-    import functools as _ft
-    from soniqboom.config import settings as _settings   # local bind — not a module global
-    _walk_fn = _ft.partial(
-        _find_remote_audio_entries,
-        dir_mtime_cap=dir_mtime_cap,
-        scan_zips=_settings.scan_remote_zips,
-    )
-    entries, _pruned = await loop.run_in_executor(
-        None, _walk_fn, scan_root, source,
-    )
-
-    # HVSC auto-detect (remote): SID files on this share + no DOCUMENTS path
-    # configured → probe up the tree for DOCUMENTS/Songlengths.* and
-    # auto-configure (reads the DB through the FileSource).  Once per scan_root
-    # per process (remote stat() probes are slow), and never breaks the scan.
-    if (getattr(_settings, "hvsc_autodetect", True)
-            and scan_root not in _hvsc_probed_roots):
-        from soniqboom.core.hvsc import get_hvsc as _get_hvsc
-        if not _get_hvsc().is_configured():
-            try:
-                sid_rel_dirs = {
-                    str(PurePosixPath("/" + str(fe.path).lstrip("/")).parent)
-                    for fe in entries
-                    if str(fe.path).lower().endswith(_SID_DETECT_EXTS)
-                }
-                if sid_rel_dirs:
-                    docs = await loop.run_in_executor(
-                        None, _detect_hvsc_docs_remote, source, scan_root, sid_rel_dirs,
-                    )
-                    # Mark probed only AFTER the (slow, network) detection ran —
-                    # a transient failure is caught below and leaves the root
-                    # un-probed so the next scan retries.
-                    _hvsc_probed_roots.add(scan_root)
-                    if docs:
-                        await _apply_hvsc_autoconfig(docs)
-            except Exception:
-                log.debug("HVSC remote auto-detect failed", exc_info=True)
-
-    # ── Classify against the store ────────────────────────────────────────
+    # ── Store map (BEFORE the walk — the walk needs it too) ─────────────
     #
     # Build the existing (path → (mtime, size, track_id)) map for this
     # scan_root so we can decide skip / refresh / extract in one in-
     # memory pass.  ``get_track_ids_for_scan_root`` is O(1) via the
     # scan_root_hash tag index, then we materialise the small subset.
+    # Built ahead of the walk so unchanged archives can have their member
+    # entries synthesized from the store instead of being re-downloaded.
     import hashlib
     from soniqboom.core.filesource import parse_remote_path
 
@@ -2038,6 +2305,114 @@ async def start_remote_scan(
                 r.get("id", ""),
             )
 
+    # ── Archive skip plumbing ────────────────────────────────────────────
+    # known: arc_rel → (mtime, size, [member rel paths]) from the store;
+    # members inherit the outer archive's stat at index time, so any one
+    # member's (mtime, size) is the archive's.
+    #
+    # An arc is only skippable when EVERY stored member carries the same
+    # valid stat.  Synthesizing a PARTIAL member list (e.g. dropping a
+    # legacy mtime==0 member) would leave the dropped member out of
+    # ``seen_rel_paths`` — the ghost cleanup below would then delete a
+    # perfectly healthy track (QA 2026-07-02).  Mixed/invalid stats →
+    # the arc simply enumerates like before.
+    _arc_members: dict[str, list[str]] = {}
+    _arc_stat: dict[str, tuple[float, int] | None] = {}
+    for rel, (m, s, _tid) in existing_map.items():
+        if "::" not in rel:
+            continue
+        arc = rel.split("::", 1)[0]
+        _arc_members.setdefault(arc, []).append(rel)
+        if m <= 0 or s <= 0:
+            _arc_stat[arc] = None                    # invalid → never skip
+        elif arc not in _arc_stat:
+            _arc_stat[arc] = (m, s)
+        else:
+            prev = _arc_stat[arc]
+            if prev is not None and (abs(prev[0] - m) >= 2.0 or prev[1] != s):
+                _arc_stat[arc] = None                # inconsistent → never skip
+    known_archives: dict[str, tuple[float, int, list[str]]] = {}
+    for arc, members in _arc_members.items():
+        st = _arc_stat.get(arc)
+        if st is not None:
+            known_archives[arc] = (st[0], st[1], members)
+
+    _sidecar = await loop.run_in_executor(None, _load_enum_sidecar)
+    _schema_now = _member_schema_fingerprint()
+    _schema_ok = _sidecar.get("schemas", {}).get(scan_root) == _schema_now
+    enum_report: dict[str, tuple[float, int, int]] = {}
+    if not _schema_ok and known_archives:
+        log.info(
+            "Archive skip disabled for %s this pass: supported-format map "
+            "changed — deep enumeration will surface newly-supported "
+            "members (one-time cost after an upgrade)", scan_root,
+        )
+    archive_skip = {
+        # Synthesis only while the format map that produced the stored
+        # member lists is still current — otherwise force enumeration.
+        "known": known_archives if _schema_ok else {},
+        "barren": {
+            k.split("|", 1)[1]: (float(v[0]), int(v[1]))
+            for k, v in _sidecar.get("barren", {}).items()
+            if k.startswith(scan_root + "|") and isinstance(v, list)
+        } if _schema_ok else {},
+        "report": enum_report,
+    }
+
+    # Walk with stat — preserves mtime+size per file from MLSD.
+    #
+    # ``dir_mtime_cap`` (when supplied by the freshness loop) prunes
+    # subtrees whose dir.mtime is unchanged since the cap timestamp.
+    # On the first walk OR when caller passes None, the full walk
+    # runs unchanged.  Wrapped in ``functools.partial`` because
+    # ``run_in_executor`` doesn't forward kwargs.
+    import functools as _ft
+    from soniqboom.config import settings as _settings   # local bind — not a module global
+    _walk_fn = _ft.partial(
+        _find_remote_audio_entries,
+        dir_mtime_cap=dir_mtime_cap,
+        scan_zips=_settings.scan_remote_zips,
+        archive_skip=archive_skip,
+    )
+    entries, _pruned, walk_ok = await loop.run_in_executor(
+        None, _walk_fn, scan_root, source,
+    )
+    if not walk_ok:
+        log.warning(
+            "Walk of %s died midway — the %d entries collected are "
+            "PARTIAL: ghost cleanup and sidecar updates are disabled "
+            "for this scan", scan_root, len(entries),
+        )
+
+    # HVSC auto-detect (remote): SID files on this share + no DOCUMENTS path
+    # configured → probe up the tree for DOCUMENTS/Songlengths.* and
+    # auto-configure (reads the DB through the FileSource).  Once per scan_root
+    # per process (remote stat() probes are slow), and never breaks the scan.
+    if (getattr(_settings, "hvsc_autodetect", True)
+            and scan_root not in _hvsc_probed_roots):
+        from soniqboom.core.hvsc import get_hvsc as _get_hvsc
+        if not _get_hvsc().is_configured():
+            try:
+                sid_rel_dirs = {
+                    str(PurePosixPath("/" + str(fe.path).lstrip("/")).parent)
+                    for fe in entries
+                    if str(fe.path).lower().endswith(_SID_DETECT_EXTS)
+                }
+                if sid_rel_dirs:
+                    docs = await loop.run_in_executor(
+                        None, _detect_hvsc_docs_remote, source, scan_root, sid_rel_dirs,
+                    )
+                    # Mark probed only AFTER the (slow, network) detection ran —
+                    # a transient failure is caught below and leaves the root
+                    # un-probed so the next scan retries.
+                    _hvsc_probed_roots.add(scan_root)
+                    if docs:
+                        await _apply_hvsc_autoconfig(docs)
+            except Exception:
+                log.debug("HVSC remote auto-detect failed", exc_info=True)
+
+    # ── Classify against the store ────────────────────────────────────────
+    # (existing_map was built before the walk — see above.)
     to_extract: list = []                          # full extract path
     to_refresh: list[tuple[str, float]] = []       # (track_id, new_mtime)
     seen_rel_paths: set[str] = set()
@@ -2049,8 +2424,13 @@ async def start_remote_scan(
             to_extract.append(fe)
             continue
         stored_mtime, stored_size, tid = existing
-        if stored_size == fe.size and stored_mtime > 0 and stored_mtime == fe.mtime:
-            # Genuine match — skip entirely.
+        if (stored_size == fe.size and stored_mtime > 0
+                and abs(stored_mtime - fe.mtime) < 2.0):
+            # Genuine match — skip entirely.  Tolerant compare, mirroring
+            # the local path's 1 s drift allowance: FTP listing mtimes can
+            # shift sub-second precision between MLSD and a LIST fallback,
+            # and the old EXACT float equality flipped an entire share
+            # (21,197 files) to full re-download when that happened.
             continue
         if stored_size == fe.size and stored_mtime == 0 and fe.mtime > 0:
             # Legacy entry: size matches, mtime never captured.  Bump
@@ -2081,6 +2461,24 @@ async def start_remote_scan(
         scan_root, scan_plan["walked"], scan_plan["extract"],
         scan_plan["mtime_refresh"], scan_plan["skip"], scan_plan["ghosts"],
     )
+    # Self-diagnosing anomaly check: a plan that wants to re-extract most
+    # of an ALREADY-INDEXED share almost always means the listing mtimes
+    # shifted en masse (MLSD→LIST precision change, server timezone jump)
+    # rather than 20k files genuinely changing.  Log the delta histogram
+    # so the operator can see the shift instead of a silent full re-download.
+    if len(existing_map) > 50 and total > 0.5 * max(1, len(entries)):
+        _deltas = Counter()
+        for fe in to_extract:
+            _ex = existing_map.get(fe.path)
+            if _ex and _ex[1] == fe.size and _ex[0] > 0:
+                _deltas[int(round(fe.mtime - _ex[0]))] += 1
+        if _deltas:
+            log.warning(
+                "Scan plan for %s wants %d/%d re-extracts of indexed files — "
+                "mtime delta histogram (s: count): %s",
+                scan_root, total, len(entries),
+                dict(_deltas.most_common(8)),
+            )
 
     # Apply mtime-refresh in a single batched store call (no network).
     if to_refresh:
@@ -2097,23 +2495,11 @@ async def start_remote_scan(
         fe.path: (fe.size, fe.mtime) for fe in to_extract
     }
 
-    # Additive progress: when a local scan is already running, add to the
-    # existing total instead of overwriting it.
-    if _scan_count > 0 and _progress.running:
-        _progress.total += total
-    else:
-        _progress = ScanProgress(total=total, running=True)
-
-    # Publish the plan via the shared ScanProgress object — MUST come
-    # AFTER the conditional reset above, otherwise the ``_scan_count == 0``
-    # branch replaces _progress with a fresh ScanProgress and wipes the
-    # plan we just set.  (Pre-existing bug: the freshness loop reads
-    # last_plan to count newly-extracted tracks; with the wipe in place
-    # it always saw an empty plan and never logged anything as "fresh".)
+    # Registration (running=True, _scan_count, _current_remote_dirs)
+    # happened in the wrapper BEFORE the walk — here we only add this
+    # scan's share of the work to the aggregate total.
+    _progress.total += total
     _progress.last_plan = scan_plan
-
-    _scan_count += 1
-    _current_remote_dirs.add(scan_root)
     log.info("Remote scan started: %d files to extract in %s", total, scan_root)
 
     await upsert_scan_dir(scan_root, network_share_id=share_id, status="ok")
@@ -2121,6 +2507,7 @@ async def start_remote_scan(
 
     store = get_store()
     store.enter_batch_mode()
+    batch_state["entered"] = True
 
     track_buffer: list[Track] = []
     art_buffer: dict[str, str] = {}
@@ -2268,8 +2655,19 @@ async def start_remote_scan(
 
         def _read() -> bytes:
             from soniqboom.core.remote_cache import get_cache
-            local_archive = get_cache().fetch(scan_root, arc_rel, source)
-            return archive.read_member(local_archive, member)
+            # Fetch errors (network) propagate as-is; a member that fails
+            # to read out of the LOCAL archive copy is a permanent defect
+            # of the archive and gets the distinctive wrapper type.
+            # Members inherit the OUTER archive's listing size — use it to
+            # drop a stale cached archive before extracting from it.
+            arc_size = entry_stat_map.get(remote_path, (0, 0.0))[0]
+            get_cache().validate_size(scan_root, arc_rel, arc_size)
+            local_archive = get_cache().fetch(scan_root, arc_rel, source,
+                                              lane="scan")
+            try:
+                return archive.read_member(local_archive, member)
+            except Exception as exc:
+                raise _PermanentMemberError(str(exc)) from exc
 
         return await loop.run_in_executor(None, _read)
 
@@ -2293,8 +2691,23 @@ async def start_remote_scan(
             None, lambda: source.read_file(remote_path, lane="scan"),
         )
 
+    # One-way latch flipped when the extraction pool dies: remaining
+    # queued tasks must not keep DOWNLOADING files nobody can extract
+    # (pre-fix, ~19K orphaned siblings pulled 22 GB of archives against
+    # a broken pool).  List-wrapped so the closure can assign it.
+    _pool_dead = [False]
+    # Sidecar bookkeeping: archives that produced at least one indexed
+    # track this scan, and archives whose member fetches failed (the
+    # latter must never be barren-marked off a transient outage).
+    _indexed_arcs: set[str] = set()
+    _failed_fetch_arcs: set[str] = set()
+
     async def _process_one(remote_path: str) -> None:
         nonlocal track_count
+        if _pool_dead[0]:
+            _progress.errors += 1
+            _progress.processed += 1
+            return
         # Honour the pause flag BEFORE acquiring the semaphore so a
         # paused scan doesn't tie up the in-flight window with workers
         # parked on the gate — let other slots stay free for any
@@ -2324,7 +2737,17 @@ async def start_remote_scan(
             # Build the budget ladder: a list of (label, budget_bytes
             # or None) to try in order.  ``None`` budget = full fetch.
             stages: list[tuple[str, int | None]] = []
-            if base_budget is None or (listing_size and listing_size <= base_budget * 2):
+            if "::" in remote_path:
+                # Archive members have NO partial path: _fetch_partial
+                # short-circuits to _fetch_zip_member, so every ladder
+                # stage performed the identical full member read — and a
+                # permanent zipfile error (bad CRC, unsupported
+                # compression method, name-vs-header mismatch) was
+                # "escalated" through three identical attempts, each able
+                # to re-trigger a full archive download under cache
+                # pressure.  One stage, one verdict.
+                stages.append(("full", None))
+            elif base_budget is None or (listing_size and listing_size <= base_budget * 2):
                 stages.append(("full", None))
             else:
                 for mult in _GROWING_BUDGET_MULTIPLIERS:
@@ -2360,6 +2783,13 @@ async def start_remote_scan(
                     # FULL fetch fails, we're out of options.
                     if stage_budget is None:
                         log.error("Download failed %s: %s", remote_path, exc)
+                        if ("::" in remote_path
+                                and not isinstance(exc, _PermanentMemberError)):
+                            # Network failure — shield this archive from
+                            # barren marking.  Permanent member defects
+                            # deliberately stay eligible: an archive whose
+                            # every member is unreadable IS barren.
+                            _failed_fetch_arcs.add(remote_path.split("::", 1)[0])
                         _progress.errors += 1
                         _progress.processed += 1
                         if on_progress and (
@@ -2381,6 +2811,22 @@ async def start_remote_scan(
                         executor, _extract_one_remote,
                         file_data, remote_path, track_id,
                     )
+                except BrokenExecutor:
+                    # Worker processes died (killed / crashed) — the pool
+                    # is unusable for the rest of this scan.  Flip the
+                    # latch so queued siblings stop downloading, count
+                    # this file as errored, and let the scan drain to a
+                    # clean, retriggerable completion.
+                    if not _pool_dead[0]:
+                        _pool_dead[0] = True
+                        log.error(
+                            "Extraction pool for %s died — aborting the "
+                            "remaining files of this scan (re-Index the "
+                            "share to retry)", scan_root,
+                        )
+                    _progress.errors += 1
+                    _progress.processed += 1
+                    return
                 finally:
                     with _phase_lock:
                         _phase_counts["extract"] -= 1
@@ -2409,6 +2855,13 @@ async def start_remote_scan(
             else:
                 meta: TrackMeta = result
                 meta.path = f"{scan_root}:{remote_path}"
+                if was_partial and meta.file_md5:
+                    # A partial fetch that parsed "complete enough" still
+                    # hashed TRUNCATED bytes — that md5 would be a
+                    # permanently wrong Modland join key.  Only full
+                    # fetches may carry one; the lazy scene-apply path
+                    # simply skips tracks without an md5.
+                    meta.file_md5 = None
                 # Stamp mtime + file_size from the directory listing.
                 # Without this, the NEXT scan would see ``stored mtime
                 # == 0`` and re-extract every file, defeating the
@@ -2427,6 +2880,8 @@ async def start_remote_scan(
                     hash_map.update(new_hashes)
                 track, raw_art = _build_track(meta, scan_root, parent_dir, hash_map)
                 if track:
+                    if "::" in remote_path:
+                        _indexed_arcs.add(remote_path.split("::", 1)[0])
                     # Serialise buffer growth + flush so two concurrent
                     # workers can't both observe ``len(track_buffer) ==
                     # WRITE_BATCH`` and double-flush the same chunk.
@@ -2483,7 +2938,22 @@ async def start_remote_scan(
         _art_prefetch_tasks.add(_art_task)
         _art_task.add_done_callback(_art_prefetch_done)
     try:
-        await asyncio.gather(*(_process_one(p) for p in remote_paths))
+        # return_exceptions so one dying task can't detach its ~20K
+        # siblings from the coroutine (the pre-fix failure mode: the
+        # first BrokenProcessPool killed the gather + this coroutine
+        # while every sibling kept downloading archives nobody could
+        # extract).  Individual failures are counted per-file inside
+        # _process_one; anything that still leaks out is summarised.
+        results = await asyncio.gather(
+            *(_process_one(p) for p in remote_paths),
+            return_exceptions=True,
+        )
+        leaked = [r for r in results if isinstance(r, BaseException)]
+        if leaked:
+            log.error(
+                "Remote scan %s: %d file task(s) raised unexpectedly; "
+                "first: %r", scan_root, len(leaked), leaked[0],
+            )
     finally:
         _phase_task.cancel()
         try:
@@ -2493,6 +2963,7 @@ async def start_remote_scan(
 
     await _flush()
     await _async_exit_batch_mode(store)
+    batch_state["entered"] = False
 
     # HVSC: apply per-tune durations + STIL to SID tracks now they're indexed —
     # a main-process join keyed on the cached ``sid_md5`` (worker processes run
@@ -2519,7 +2990,28 @@ async def start_remote_scan(
     # nuke the entire share's tracks.  ``len(entries) > 0`` is the
     # signal that we're looking at real ground truth, not a network
     # failure.
-    if ghost_ids and len(entries) > 0:
+    #
+    # SAFETY 2 (QA 2026-07-02): NEVER purge on a capped walk.  A
+    # ``dir_mtime_cap`` walk PRUNES unchanged subtrees — their files are
+    # absent from ``entries`` because they weren't visited, not because
+    # they were deleted.  The production log showed capped freshness
+    # polls planning ghosts_to_delete=44,792 on a healthy share; only
+    # the scan crashing first prevented a mass index wipe.  Ghost truth
+    # requires a FULL walk (manual re-index, cold start, drift sweep —
+    # the latter runs every 5th poll, so real ghosts still clear fast).
+    # SAFETY 3: a walk that died midway returned PARTIAL entries — the
+    # unwalked remainder would all look deleted.  ``walk_ok`` gates this
+    # the same way the cap does.
+    if ghost_ids and len(entries) > 0 and (dir_mtime_cap is not None
+                                           or not walk_ok):
+        log.info(
+            "Ghost cleanup for %s skipped (%s): %d absent path(s) are "
+            "unverified (next clean full walk decides)",
+            scan_root,
+            "capped walk" if dir_mtime_cap is not None else "partial walk",
+            len(ghost_ids),
+        )
+    if ghost_ids and len(entries) > 0 and dir_mtime_cap is None and walk_ok:
         try:
             removed = await delete_track_ids(ghost_ids)
             log.info(
@@ -2533,32 +3025,36 @@ async def start_remote_scan(
     await upsert_scan_dir(scan_root, track_count_val=track_count,
                           network_share_id=share_id, status="ok")
 
-    _current_remote_dirs.discard(scan_root)
-    _scan_count = max(0, _scan_count - 1)
-    is_last_scan = (_scan_count == 0)
-    if is_last_scan:
-        _progress.running = False
-        _progress.embedding = False
-        _progress.current_file = ""
-        # Snap processed up to total ONLY when this is the last scan
-        # finishing.  Earlier code did this unconditionally, which broke
-        # parallel scans: the first task to finish would snap processed
-        # to the aggregate total (since _progress.processed/total are
-        # globals shared across all in-flight scans), then the other
-        # tasks' continued increments pushed processed PAST total →
-        # the "100% — 137,034 / 76,952" display the user reported.
-        if _progress.processed < _progress.total:
-            _progress.processed = _progress.total
+    # Fold this scan's enumeration results into the archive sidecar:
+    # newly-confirmed barren archives get remembered, revived ones get
+    # unmarked, and a completed FULL walk stamps the schema fingerprint
+    # (re-enabling store-synthesis after an upgrade's deep pass).
+    # Skipped when the pool died mid-scan — members never got their
+    # extraction attempt, so a "barren" verdict would be wrong, and the
+    # deep pass must rerun.  ``known_archives`` counts as indexed: an
+    # unchanged archive re-enumerated by the deep pass has its members
+    # SKIPPED by classification, not re-indexed — it is not barren.
+    # walk_ok gate: a partial walk enumerated who-knows-what — neither
+    # barren verdicts nor the "deep pass done" schema stamp are valid.
+    # ``entries`` must also be non-empty for the stamp: a full walk that
+    # found nothing (share unreachable at connect) proved nothing.
+    if ((enum_report or dir_mtime_cap is None)
+            and walk_ok and not _pool_dead[0]):
+        try:
+            _upd = _ft.partial(
+                _update_enum_sidecar, scan_root,
+                enum_report=dict(enum_report),
+                indexed_arcs=_indexed_arcs | set(known_archives),
+                failed_fetch_arcs=set(_failed_fetch_arcs),
+                stamp_schema=(dir_mtime_cap is None and len(entries) > 0),
+            )
+            await loop.run_in_executor(None, _upd)
+        except Exception:
+            log.debug("archive-enum sidecar update failed", exc_info=True)
 
-    # Always broadcast the (possibly partial) state so the badge gets
-    # an updated count.  When this is the last scan we just guaranteed
-    # processed == total above; when it isn't, the per-scan share of
-    # the work is reflected in ``_progress.processed`` already from
-    # the per-file increments.
-    if on_progress:
-        await on_progress(_progress)
-
-    executor.shutdown(wait=False)
+    # De-registration, the final progress broadcast, and executor
+    # shutdown all live in start_remote_scan's ``finally`` — they must
+    # run on the abort path too, not just here on success.
     log.info("Remote scan complete: %d tracks from %s", track_count, scan_root)
 
 

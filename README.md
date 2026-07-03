@@ -156,7 +156,7 @@ SoniqBoom speaks the culture:
 Every retro format is rendered to standard audio on the fly — a 1987 SID tune streams to your phone *exactly* like a FLAC does (casting it to a HomePod or the speakers in the next room is in Beta). The same server that sees your `.mod` hoard handles your everyday listening.
 
 - **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
-- **📻 Internet radio (Beta) — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
+- **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
 - **🎲 Instant Mix radio.** Press the radio button on any track and SoniqBoom builds an endless, self-refilling queue around it — picked by genre, artist, era, tempo and format — in a focused radio view with a live oscilloscope over the cover. A SID radio stays chiptune; a FLAC radio follows the genre.
 - **🔎 More like this & smart playlists.** Surface the closest-sounding tracks to any song (scored by audio similarity), and save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
@@ -181,7 +181,7 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 <p align="center">
   <img src="docs/manual/img/24-stations.png" alt="Internet radio Stations — the curated scene pack and the Radio Browser world directory" width="800">
 </p>
-<p align="center"><sub>Internet-radio <b>Stations</b> (Beta) — a curated demoscene/chiptune pack plus the worldwide Radio Browser directory (continent → country), with the live now-playing track and one-click favourites.</sub></p>
+<p align="center"><sub>Internet-radio <b>Stations</b> — a curated demoscene/chiptune pack plus the worldwide Radio Browser directory (continent → country), with the live now-playing track and one-click favourites.</sub></p>
 
 <p align="center">
   <img src="docs/manual/img/25-stationinfo.png" alt="A scene radio station up close — tags, website, the live now-playing track, and the full quality ladder" width="49%">
@@ -202,10 +202,15 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 | **MIDI** | `.mid`, `.midi` | FluidSynth + SoundFonts |
 | **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF *(Imago Orpheus)*, OKT, SFX, WOW, DSM | libopenmpt |
 | **Amiga** | AHX, HivelyTracker (HVL) | uade123 / bundled HivelyTracker engine |
+| **Amiga exotics** | ~150 custom formats: TFMX *(Turrican)*, Future Composer, SidMon 1/2, David Whittaker, Rob Hubbard, Jochen Hippel (+COSO/ST), Delta Music, SoundMon, JamCracker, Sonic Arranger, ProWizard-packed MODs… — both Amiga prefix naming (`mdat.song`) and suffix naming, companion sample files resolved automatically | uade123 (runs the original Amiga player code) |
+| **Atari ST** | SNDH *(with per-track TIME/subsong tags)*, YM register dumps, SC68 | psgplay / bundled ST-Sound engine / sc68 |
+| **Console rips (PSF family)** | PSF, PSF2 *(PlayStation)*, USF *(N64)*, GSF *(GBA)*, 2SF + NCSF *(NDS)*, SSF *(Saturn)*, DSF *(Dreamcast)* — mini + shared-lib pairs kept together | zxtune123 (Highly Experimental / lazyusf2 / mGBA / vio2sf reference cores) |
 | **Console chiptune** | NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES | libgme |
 | **AdLib / OPL2 FM** | id IMF *(Wolfenstein 3D, Keen…)*, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM | AdPlug (`adplay`) |
 
 ZIP archives are scanned and played **inline** — tracks inside `.zip` files appear in your library without unpacking.
+
+> **Curious where these formats came from?** [docs/FORMATS.md](docs/FORMATS.md) has the lore — every family's origin, claim to fame, and the stories behind them (why TFMX travels as two files, which chip designer went on to build the PlayStation, what `M.K.` stands for…).
 
 ---
 
@@ -283,6 +288,11 @@ External tools (invoked via subprocess — not linked into SoniqBoom):
 - [UADE](https://zakalwe.fi/uade/) (Unix Amiga Delitracker Emulator) — used to render AHX and other Amiga formats
 - [HivelyTracker replayer](https://github.com/pete-gordon/hivelytracker) by Pete Gordon et al. is licensed under [BSD-3-Clause](https://github.com/pete-gordon/hivelytracker) — vendored to decode `.hvl` modules
 - [Game_Music_Emu (libgme)](https://github.com/libgme/game-music-emu) is licensed under [LGPL-2.1](https://github.com/libgme/game-music-emu/blob/master/license.txt)
+- [AdPlug / adplay](https://adplug.github.io/) is licensed under [LGPL-2.1](https://github.com/adplug/adplug/blob/master/COPYING)
+- [psgplay](https://github.com/frno7/psgplay) by Fredrik Noring is licensed under [GPL-2.0](https://github.com/frno7/psgplay/tree/main/COPYING) — renders Atari ST SNDH
+- [sc68](https://sc68.atari.org/) by Benjamin Gerard is licensed under GPL-2.0-or-later — renders native .sc68 disks
+- [zxtune](https://github.com/vitamin-caig/zxtune) by Vitamin/CAIG is licensed under [GPL-3.0](https://github.com/vitamin-caig/zxtune/blob/master/LICENSE) — renders the PSF console-music family
+- [ST-Sound](https://github.com/arnaud-carre/StSound) by Arnaud Carré is licensed under BSD/MIT — vendored to decode Atari ST `.ym` files
 
 Data / assets:
 

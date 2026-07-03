@@ -63,6 +63,15 @@ class TrackMeta(BaseModel):
     hvsc_lengths: list[float] | None = None
     stil: str | None = None
 
+    # Scene-metadata enrichment.  MD5 of the whole module file, cached at
+    # scan time for chiptune/tracker-family formats (mirrors ``sid_md5``) —
+    # the key Modland's nightly ``allmods_md5`` index is joined on, so
+    # author enrichment needs no file I/O and works for remote tracks.
+    file_md5: str | None = None
+    # The matched Modland tree path ("Future Composer 1.3/Pow/intro.smod") —
+    # the module's scene provenance, shown in the track-info modal.
+    scene_path: str | None = None
+
     # Art
     cover_art: str | None = None  # data-URI thumbnail
 

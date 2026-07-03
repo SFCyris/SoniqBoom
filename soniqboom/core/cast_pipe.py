@@ -72,7 +72,12 @@ def _has_libvorbis(ffmpeg_bin: str) -> bool:
         # ``ffmpeg -encoders`` prints one row per encoder; libvorbis only
         # shows up when ffmpeg was compiled --enable-libvorbis.  Limit
         # the wall budget so a missing/hung ffmpeg doesn't stall import.
-        proc = subprocess.run(
+        # forksafe: probed from cast worker threads of the CF-initialised
+        # server — plain subprocess.run forks and segfaults the child
+        # (see core/forksafe.py).  QA caught this site as a missed
+        # conversion on the first pass.
+        from soniqboom.core import forksafe
+        proc = forksafe.run(
             [ffmpeg_bin, "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=2.5,
         )

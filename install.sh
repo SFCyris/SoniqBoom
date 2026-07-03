@@ -133,6 +133,14 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "lha (lhasa): $(command -v lha || echo 'not found — LHA -lh1- archives skipped')"
 
+  # sc68 — native Atari ST .sc68 disks.  (SNDH uses psgplay, built from
+  # source below for both platforms; .ym uses the bundled StSound engine.)
+  if ! command -v sc68 &>/dev/null; then
+    info "Installing sc68 (Atari ST .sc68 renderer)…"
+    brew install sc68 || warn "sc68 install failed — .sc68 files won't play"
+  fi
+  info "sc68: $(command -v sc68 || echo 'not found — .sc68 disabled')"
+
   section "Optional dependencies (informational)"
   for pkg in cmus cava; do
     if brew list "$pkg" &>/dev/null 2>&1; then
@@ -290,6 +298,100 @@ elif [ "$PLATFORM" = "linux" ]; then
   info "fluidsynth:       $(command -v fluidsynth || echo 'not found — MIDI rendering disabled')"
   info "openmpt123:       $(command -v openmpt123 || echo 'not found — tracker rendering disabled')"
   info "lha (lhasa):      $(command -v lha        || echo 'not found — LHA -lh1- archives skipped')"
+
+  # sc68 — native Atari ST .sc68 disks (best-effort; not in every distro).
+  if ! command -v sc68 &>/dev/null; then
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends sc68 || true ;;
+      dnf)    run_pkg dnf install -y sc68 || true ;;
+      pacman) warn "sc68 is in the AUR — install with an AUR helper for .sc68 support" ;;
+      zypper) run_pkg zypper --non-interactive install sc68 || true ;;
+    esac
+  fi
+  info "sc68:             $(command -v sc68       || echo 'not found — .sc68 disabled')"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# psgplay (Atari ST SNDH renderer) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# No package manager ships psgplay.  Plain C, no dependencies, ~10 s build.
+# Pinned to a verified commit (rendered 10/10 SNDH test files, including
+# every file the 2003-era sc68 CLI rejects).  The .ym renderer needs no step
+# here — the BSD StSound engine is vendored and compiled on first use.
+section "psgplay (Atari ST SNDH)"
+PSGPLAY_COMMIT="869992cbbb8488b519149d8c0dd7afafb78aae5e"
+if command -v psgplay &>/dev/null; then
+  info "psgplay already installed: $(command -v psgplay)"
+else
+  if [ "$PLATFORM" = "macos" ]; then
+    PSG_DEST="$(brew --prefix)/bin"
+  else
+    PSG_DEST="/usr/local/bin"
+  fi
+  PSG_TMP="$(mktemp -d)"
+  if git clone -q https://github.com/frno7/psgplay.git "$PSG_TMP/psgplay" \
+      && git -C "$PSG_TMP/psgplay" checkout -q "$PSGPLAY_COMMIT" \
+      && make -C "$PSG_TMP/psgplay" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" psgplay >/dev/null 2>&1 \
+      && [ -x "$PSG_TMP/psgplay/psgplay" ]; then
+    if [ -w "$PSG_DEST" ]; then
+      cp "$PSG_TMP/psgplay/psgplay" "$PSG_DEST/psgplay"
+    elif command -v sudo &>/dev/null; then
+      sudo cp "$PSG_TMP/psgplay/psgplay" "$PSG_DEST/psgplay"
+    fi
+  fi
+  rm -rf "$PSG_TMP"
+  if command -v psgplay &>/dev/null || [ -x "$PSG_DEST/psgplay" ]; then
+    info "psgplay: $(command -v psgplay || echo "$PSG_DEST/psgplay")"
+  else
+    warn "psgplay build failed — Atari ST SNDH files won't play (re-run install.sh to retry)"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# zxtune123 (PSF console-music family: PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF)
+# ─────────────────────────────────────────────────────────────────────────────
+# The only cross-format CLI bundling the reference cores (Highly Experimental,
+# Highly Theoretical, lazyusf2, mGBA, vio2sf).  Linux: official prebuilt from
+# storage.zxtune.ru.  macOS: built from a pinned revision (verified build,
+# 2026-07-01, arm64) with two small compat patches for modern clang.
+# OPTIONAL — skips gracefully; SoniqBoom 501s PSF files with a clear hint.
+section "zxtune123 (console music rips — optional)"
+ZXTUNE_REV="be510430c54b78f230881ece66b6e2799f92748d"
+ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/x86_64/zxtune_r5100_linux_x86_64.tar.gz"
+if command -v zxtune123 &>/dev/null; then
+  info "zxtune123 already installed: $(command -v zxtune123)"
+elif [ "$PLATFORM" = "linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+  ZX_TMP="$(mktemp -d)"
+  if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \
+      && tar xzf "$ZX_TMP/zx.tar.gz" -C "$ZX_TMP" \
+      && ZXBIN="$(find "$ZX_TMP" -name zxtune123 -type f | head -1)" \
+      && [ -n "$ZXBIN" ]; then
+    if [ -w /usr/local/bin ]; then cp "$ZXBIN" /usr/local/bin/zxtune123
+    elif command -v sudo &>/dev/null; then sudo cp "$ZXBIN" /usr/local/bin/zxtune123; fi
+  fi
+  rm -rf "$ZX_TMP"
+  info "zxtune123: $(command -v zxtune123 || echo 'not installed — PSF/USF/GSF/… disabled')"
+elif [ "$PLATFORM" = "macos" ]; then
+  warn "Building zxtune123 from source (one-time, ~10-15 min; needs boost)…"
+  brew list boost &>/dev/null || brew install boost
+  ZX_TMP="$(mktemp -d)"
+  if git clone -q https://github.com/vitamin-caig/zxtune.git "$ZX_TMP/zxtune" \
+      && git -C "$ZX_TMP/zxtune" checkout -q "$ZXTUNE_REV"; then
+    ( cd "$ZX_TMP/zxtune" \
+      && sed -i '' 's/if (!subLocation\.unique())/if (subLocation.use_count() != 1)/; s/if (!Subdata\.unique())/if (Subdata.use_count() != 1)/' src/core/plugins/archives/raw_supp.cpp \
+      && sed -i '' 's/#    define FMT_CONSTEVAL consteval/#    define FMT_CONSTEVAL/' 3rdparty/fmt/include/fmt/core.h \
+      && env CPATH="$(brew --prefix boost)/include" LIBRARY_PATH="$(brew --prefix boost)/lib" \
+         make system.zlib=1 platform=darwin -C apps/zxtune123 -j"$(sysctl -n hw.ncpu)" ) \
+      >/dev/null 2>&1 || true
+    ZXBIN="$ZX_TMP/zxtune/bin/darwin/release/zxtune123"
+    if [ -x "$ZXBIN" ]; then
+      cp "$ZXBIN" "$(brew --prefix)/bin/zxtune123"
+    fi
+  fi
+  rm -rf "$ZX_TMP"
+  info "zxtune123: $(command -v zxtune123 || echo 'build failed — PSF/USF/GSF/… disabled (re-run install.sh to retry)')"
+else
+  warn "zxtune123: no prebuilt for this platform — PSF-family formats disabled"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
