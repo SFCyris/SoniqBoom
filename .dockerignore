@@ -33,7 +33,9 @@ soundfonts
 tests
 *.log
 .DS_Store
-docs/manual/img
+# NOTE: docs/manual/img is intentionally NOT excluded — the in-app manual
+# (served from docs/manual/) references those 25 screenshots (~12 MB); excluding
+# them 404s every image in the container's documentation.
 internal
 .pytest_cache
 .mypy_cache

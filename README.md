@@ -74,6 +74,34 @@ If anything looks missing afterwards, just **re-run `bash install.sh`** — it's
 
 ---
 
+## Run it with Docker
+
+Prefer a container — a Raspberry Pi, a home server, or Windows via Docker Desktop? A prebuilt multi-arch image (Intel/AMD **and** ARM) is published on GHCR, so there's nothing to build.
+
+```bash
+# 1 — Start it.  The named volume keeps your index, config, and logs across
+#     restarts; swap /path/to/your/music for your library (or drop that -v line
+#     to start empty and add folders later from the UI).
+docker run -d --name soniqboom -p 8080:8080 \
+  -v soniqboom-data:/data \
+  -v /path/to/your/music:/music:ro \
+  --restart unless-stopped \
+  ghcr.io/sfcyris/soniqboom:latest
+
+# 2 — Create your admin login (any username + a password of 8+ characters).
+#     New users are admins by default; the change goes live with no restart.
+docker exec soniqboom soniqboom-setadm -user me -passwd 'change-this-password'
+
+# 3 — Log in.
+#     Open  http://localhost:8080  and sign in with:  me  /  change-this-password
+```
+
+Once you're in, click the **gear icon** (top-right) and add a library folder — `/music` if you mounted it above, or any local / FTP / SMB / WebDAV path. Internet **Radio** plays right away with no library at all.
+
+Using **Docker Compose** instead, or want automatic HTTPS? See the full guide → **[DEPLOY.md](DEPLOY.md)**.
+
+---
+
 ## First-time setup
 
 1. **Sign in.** Open <http://localhost:8080> and log in with the admin username and password you created during install.
