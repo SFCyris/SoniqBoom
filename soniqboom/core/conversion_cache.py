@@ -187,24 +187,28 @@ def _cache_path(cache_key: str, format_type: str) -> Path:
     return base / shard / f"{cache_key}.wav"
 
 
-def get_vu_sidecar_path(track_id: str) -> Path | None:
-    """Return the on-disk path to the VU sidecar for *track_id*, or
-    None if no tracker render has produced one yet.
+def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
+    """Return the on-disk path to the VU sidecar for *track_id* at
+    *subsong* (0-based wire index), or None if that subsong hasn't been
+    rendered yet.
 
-    Walks the in-memory ``_meta`` looking for any cached tracker entry
-    whose key starts with *track_id*.  The cache key format is
-    ``"<track_id>__sub<N>"`` so a startswith match is unambiguous —
-    different subsongs would be different VU sidecars, but the
-    frontend currently only requests the default subsong's VU.
+    The tracker/uade cache key is exactly ``"<track_id>__sub<N>"`` (those
+    format types append no other key parts — see ``_cache_key``), so we
+    match by EQUALITY on ``sub<subsong>``.  Equality (not ``startswith``)
+    is deliberate: a prefix match on ``sub1`` would also catch ``sub10``,
+    ``sub12`` … and a subsong-agnostic match would serve tune 0's meters
+    while tune 3 plays.  Multi-subsong UADE files (AHX/HVL/TFMX) and the
+    rare multi-song tracker each get their own per-tune sidecar, written
+    during that subsong's render (stream.py ``_extract_vu_sidecar``).
 
-    Returns the FIRST matching sidecar (lowest subsong) so the
-    frontend's default-subsong playback gets the right meters.  If we
-    later add per-subsong selection in the UI, the endpoint can grow a
-    ``?subsong=`` query param.
+    A miss (subsong never rendered) returns None → the endpoint attempts a
+    lazy backfill for that subsong, else 404 → the frontend falls back to
+    its FFT-spectrum visualiser.
     """
+    want = f"{track_id}__sub{int(subsong)}"
     with _state_lock:
         for cache_key, entry in _meta.items():
-            if not cache_key.startswith(f"{track_id}__"):
+            if cache_key != want:
                 continue
             if entry.get("format_type") not in ("tracker", "uade"):
                 # tracker renders get VU from libopenmpt; uade renders from

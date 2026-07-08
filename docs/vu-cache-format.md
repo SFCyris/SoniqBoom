@@ -116,7 +116,7 @@ libopenmpt unavailable on this host, non-tracker format), the
 `/api/tracks/<id>/vu` endpoint returns HTTP 404.  The frontend
 gracefully falls back to its FFT-spectrum visualiser and labels itself:
 
-> `FFT Spectrum Analyzer Fallback — Individual Channel Meter not available for <format>`
+> `Spectrum — per-voice meters not available for <format>`
 
 ---
 

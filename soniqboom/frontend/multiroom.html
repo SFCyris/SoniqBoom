@@ -7,7 +7,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SoniqBoom — Multi-room</title>
-  <link rel="stylesheet" href="/assets/css/multiroom.css?v=1">
+  <link rel="stylesheet" href="/assets/css/multiroom.css?v=2">
 </head>
 <body data-view="landing">
   <div id="mr-app">
@@ -92,6 +92,7 @@
               <button class="mr-tab active" data-tab="tracks">Tracks</button>
               <button class="mr-tab" data-tab="playlists">Playlists</button>
               <button class="mr-tab" data-tab="albums">Albums</button>
+              <button class="mr-tab" data-tab="radio">📻 Radio</button>
             </div>
             <input id="mr-lib-search" type="search" placeholder="Search…">
           </div>
@@ -104,6 +105,11 @@
           </div>
           <div id="mr-pane-albums" class="mr-pane hidden">
             <ul id="mr-album-list" class="mr-lib-list"></ul>
+          </div>
+          <!-- Radio: favorite internet-radio stations → stream to the whole room
+               via one shared StationHub (POST /multiroom/{room}/play_station). -->
+          <div id="mr-pane-radio" class="mr-pane hidden">
+            <ul id="mr-radio-list" class="mr-lib-list"></ul>
           </div>
           <div id="mr-pane-detail" class="mr-pane hidden">
             <div class="mr-detail-head">
@@ -178,6 +184,6 @@
   <span id="buffering-badge" hidden></span>
   <span id="converting-badge" hidden></span>
 
-  <script type="module" src="/assets/js/multiroom/app.js?v=1"></script>
+  <script type="module" src="/assets/js/multiroom/app.js?v=4"></script>
 </body>
 </html>

@@ -276,6 +276,15 @@ input, select, textarea { touch-action: manipulation; }
 }
 .m-row.playing { background: linear-gradient(90deg, rgba(138,219,255,0.10), transparent); }
 .m-row:active { background: var(--surface); }
+/* Long library track lists (262k tracks accumulate as you infinite-scroll):
+   let the browser skip layout/paint for off-screen rows entirely.  Rows are a
+   fixed --row-h, so contain-intrinsic-size keeps the scroll height exact (no
+   jitter).  Scoped to track rows (data-track-id) — group / playlist-management
+   rows are untouched. */
+#lib-list .m-row[data-track-id] {
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--row-h);
+}
 
 .m-row-art {
   position: relative;
@@ -651,4 +660,154 @@ input, select, textarea { touch-action: manipulation; }
 }
 .m-crumb-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
 
+/* ── Top-bar settings gear (Settings moved off the bottom tab bar) ───────── */
+.m-settings-btn {
+  flex: 0 0 auto;
+  background: none; border: none; color: var(--text-dim);
+  font-size: 20px; line-height: 1; padding: 4px 8px; margin-left: 6px;
+  cursor: pointer;
+}
+.m-settings-btn:active { color: var(--accent); }
+
+/* ── Radio view ─────────────────────────────────────────────────────────── */
+.m-radio-search { padding: 8px 12px; background: var(--bg); }
+.m-radio-search input {
+  width: 100%; box-sizing: border-box;
+  padding: 10px 14px; border-radius: 12px;
+  background: var(--surface-2); border: none; color: var(--text);
+  font-size: 15px;
+}
+.m-radio-row .m-row-art img {
+  width: 100%; height: 100%; object-fit: cover; border-radius: 8px;
+}
+.m-radio-fav {
+  flex-shrink: 0; background: none; border: none;
+  color: var(--accent); font-size: 22px; line-height: 1;
+  padding: 6px 10px; cursor: pointer; align-self: center;
+}
+.m-radio-row.playing .m-row-title { color: var(--accent); }
+
+/* ── Playlists (in the Library view) ────────────────────────────────────── */
+.m-pl-new .m-row-title,
+.m-pl-new .m-row-art > span { color: var(--accent); }
+
 .hidden { display: none !important; }
+
+/* ── Auth overlay (login / register) ──────────────────────────────────────
+   The mobile shell reuses the shared auth.js overlay (identical markup + flow
+   to desktop), but desktop's overlay styles live in app.css — which the mobile
+   route never loads.  These rules restyle that overlay with the mobile palette
+   so an unauthenticated visitor gets a usable sign-in card instead of a bare,
+   unstyled form.  Class/id names mirror auth.js's _ensureOverlay() markup. */
+body.auth-blocked { overflow: hidden; }
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;                 /* above topbar, tabbar, mini-player, sheet */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(circle at 35% 25%, rgba(138,219,255,0.10) 0%, transparent 60%),
+    radial-gradient(circle at 70% 80%, rgba(255,137,92,0.08) 0%, transparent 55%),
+    var(--bg);
+  padding:
+    max(16px, var(--safe-top))  max(16px, var(--safe-right))
+    max(16px, var(--safe-bottom)) max(16px, var(--safe-left));
+  overflow-y: auto;               /* card + keyboard can exceed height in landscape */
+}
+.auth-overlay.hidden { display: none !important; }
+/* auth.js toggles fields (display-name, register/login links, error, bootstrap
+   hint) via the [hidden] attribute.  The UA ``[hidden]{display:none}`` rule is
+   weaker than our ``.auth-field{display:flex}`` class rule, so without this a
+   hidden field (e.g. Display name in login mode) would still show. */
+.auth-overlay [hidden] { display: none !important; }
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 24px 22px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+}
+.auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.auth-brand-icon { font-size: 28px; filter: drop-shadow(0 0 8px rgba(138,219,255,0.45)); }
+.auth-brand-name { font-size: 18px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; }
+.auth-title { font-size: 20px; color: var(--text); margin: 0 0 16px; font-weight: 600; }
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-field { display: flex; flex-direction: column; gap: 5px; }
+.auth-field > span { font-size: 12px; color: var(--text-dim); }
+.auth-field > span em { font-style: italic; opacity: 0.7; }
+.auth-field input {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px 14px;
+  font-size: 16px;                /* 16px minimum blocks iOS focus auto-zoom */
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.auth-field input:focus { border-color: var(--accent); }
+.auth-field-password { position: relative; }
+.auth-field-password input { padding-right: 48px; }
+.auth-pw-toggle {
+  position: absolute; right: 6px; bottom: 4px;
+  background: none; border: none;
+  font-size: 18px; line-height: 1; padding: 8px;
+  cursor: pointer; opacity: 0.7;
+}
+.auth-submit {
+  margin-top: 6px;
+  background: var(--accent);
+  color: var(--bg);               /* same accent-on-bg contrast as .m-group-chip.active */
+  border: none;
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-size: 16px; font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.1s, transform 0.05s;
+  position: relative;
+}
+.auth-submit:active { transform: translateY(1px); }
+.auth-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+.auth-submit.busy { color: transparent; }
+.auth-submit.busy::after {
+  content: ''; position: absolute; inset: 0; margin: auto;
+  width: 18px; height: 18px;
+  border: 2px solid rgba(128,128,128,0.4);
+  border-top-color: var(--bg);
+  border-radius: 50%;
+  animation: auth-spin 0.6s linear infinite;
+}
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+.auth-error {
+  margin-top: 4px;
+  padding: 10px 12px;
+  background: rgba(255,94,94,0.15);
+  color: var(--danger);
+  border: 1px solid rgba(255,94,94,0.32);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.auth-switch { margin-top: 14px; display: flex; justify-content: center; }
+.auth-link {
+  background: none; border: none;
+  color: var(--accent); font-size: 13px;
+  cursor: pointer; padding: 6px 8px;
+}
+.auth-bootstrap-hint {
+  margin-top: 14px;
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px; color: var(--text-dim); line-height: 1.55;
+}
+.auth-bootstrap-hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px; color: var(--text);
+  background: var(--bg); padding: 2px 6px; border-radius: 4px;
+  word-break: break-all;
+}

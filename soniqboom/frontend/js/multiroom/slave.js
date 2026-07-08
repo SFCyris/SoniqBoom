@@ -153,3 +153,14 @@ function _esc(s) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
 }
+
+// Station now-playing → slave card.  A station reaches the slave via
+// play_station (not the state-sync path that drives _onState), and its live
+// now-playing arrives as trackchange (setStationNowPlaying / updateStationArt).
+// Registered ONCE at module load and guarded by the active view + station mode,
+// so it's inert for library playback and can't accumulate across enter/leave.
+Player.on('trackchange', (t) => {
+  if (document.body.getAttribute('data-view') === 'slave' && Player.stationMode) {
+    _renderCard(t);
+  }
+});

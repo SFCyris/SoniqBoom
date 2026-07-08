@@ -40,6 +40,8 @@ It plays your everyday files (FLAC, MP3, ALAC, and the rest) **and** the retro f
 
 The steps are **identical on macOS and Linux**. Three commands: download, install, run.
 
+> **On Windows, or want to run it in a container** (Raspberry Pi, a home server)? This native installer is macOS/Linux only — use the Docker guide instead → **[DEPLOY.md](DEPLOY.md)**.
+
 > **Before you start:** open the **Terminal** app. Copy the block below, paste it in, and press Enter. That's the whole install.
 
 ```bash
@@ -62,7 +64,7 @@ Then open **<http://localhost:8080>** in any browser. That's it. 🎉
 **What each step does:**
 
 1. **Download** — grabs the latest release and unzips it.
-2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. It then **asks you to create your admin login** — pick a username and a password (at least 8 characters). This is the account you'll sign in with.
+2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. On an interactive terminal it then **asks you to create your admin login** — pick a username and a password (at least 8 characters); this is the account you'll sign in with. (If it doesn't prompt — for example you pasted all three commands at once — just create the login afterward with `bash setup-admin.sh`.)
 3. **`bash run.sh`** — starts the server in the background and prints the address to open. (If port 8080 is already in use, run `bash run.sh --port 9090` to pick another.)
 
 > *Prefer git?* `git clone https://github.com/SFCyris/SoniqBoom.git && cd SoniqBoom`, then run steps 2 and 3.
@@ -91,7 +93,7 @@ Run these from inside the SoniqBoom folder:
 | **Create or reset your admin login** | `bash setup-admin.sh` |
 | Set an admin login non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
 
-> Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords are at least 8 characters. Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in.
+> Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords are at least 8 characters. Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in. If the server is already running, the change takes effect right away (`setup-admin.sh` tells it to reload).
 
 > **`install.sh` sets up every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdLib/OPL). If one ever fails to install, SoniqBoom names the exact missing package and everything else keeps working. (HivelyTracker `.hvl` needs nothing extra — it's bundled and compiled on first run.)
 
@@ -156,11 +158,12 @@ SoniqBoom speaks the culture:
 Every retro format is rendered to standard audio on the fly — a 1987 SID tune streams to your phone *exactly* like a FLAC does (casting it to a HomePod or the speakers in the next room is in Beta). The same server that sees your `.mod` hoard handles your everyday listening.
 
 - **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
-- **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites.
+- **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites. Stations turn up in the main search too, with a **Show all** view for the full list.
 - **🎲 Instant Mix radio.** Press the radio button on any track and SoniqBoom builds an endless, self-refilling queue around it — picked by genre, artist, era, tempo and format — in a focused radio view with a live oscilloscope over the cover. A SID radio stays chiptune; a FLAC radio follows the genre.
 - **🔎 More like this & smart playlists.** Surface the closest-sounding tracks to any song (scored by audio similarity), and save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
-- **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN.
+- **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN — or send a favourite internet-radio station to a whole room, its live station, artist and cover art updating in place.
+- **📲 Touch-first mobile UI.** A dedicated phone shell — browse and play your library, tune in internet radio streamed straight to the phone, manage playlists, and a tap-to-expand mini-player.
 - **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem.
 - **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required.
 - **👥 Multi-user with roles**, **last.fm + ListenBrainz scrobbling**, **time-synced lyrics**, **podcast & audiobook chapters**, **in-browser tag editing**, **field-operator search** (`artist:Ghost year:>2020 format:FLAC`), **dark mode**, **installable PWA**, and **absolutely zero telemetry**.
@@ -195,8 +198,8 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 
 | Family | Formats | Rendered by |
 |--------|---------|-------------|
-| **Lossless / PCM** | FLAC, ALAC (M4A), WAV, AIFF, WavPack, Musepack | native / ffmpeg |
-| **Lossy** | MP3, AAC, Ogg Vorbis, Opus | native / ffmpeg |
+| **Lossless / PCM** | FLAC, ALAC (M4A), WAV, AIFF, WavPack | native / ffmpeg |
+| **Lossy** | MP3, AAC, Ogg Vorbis, Opus, Musepack | native / ffmpeg |
 | **DSD (1-bit)** | DSF, DFF, WSD | ffmpeg |
 | **SID** (C64) | `.sid`, `.psid` | sidplayfp + HVSC Songlengths & STIL |
 | **MIDI** | `.mid`, `.midi` | FluidSynth + SoundFonts |
@@ -221,9 +224,9 @@ Most settings live in the admin UI. The config file is created for you on first 
 | Platform | Path |
 |----------|------|
 | macOS | `~/Library/Application Support/SoniqBoom/SoniqBoom.conf` |
-| Linux | `~/.local/share/soniqboom/SoniqBoom.conf` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/soniqboom/SoniqBoom.conf` |
 
-Environment variables (`SONIQBOOM_HOST`, `SONIQBOOM_PORT`, …) override config-file values when you launch the `soniqboom` binary directly. (To just change the port, the easy way is `bash run.sh --port 9090`.)
+Environment variables like `SONIQBOOM_HOST` / `SONIQBOOM_PORT` apply when you launch the raw `soniqboom` binary directly. With the helper scripts, change the port with `bash run.sh --port 9090` instead — `run.sh` sets the port explicitly, so it won't read `SONIQBOOM_PORT`. (It does honour `SONIQBOOM_DATA_DIR`.)
 
 ---
 

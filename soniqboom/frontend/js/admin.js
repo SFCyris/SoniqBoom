@@ -7,7 +7,7 @@
 
 import { runRestartFlow } from './restart.js';
 import { Auth }           from './auth.js';
-import { Toast }          from './utils.js';
+import { Toast, trapFocus } from './utils.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
 import { mountScanFlow }   from './viz/scanflow.js';
 import { mountCacheCascade } from './viz/cachecascade.js';
@@ -86,6 +86,8 @@ const confirmOk     = document.getElementById('btn-confirm-ok');
 const confirmCancel = document.getElementById('btn-confirm-cancel');
 let _confirmResolve = null;
 let _confirmPreviousDialog = null; // which dialog was showing before confirm
+let _confirmTrapRelease = null;    // focus-trap release fn while the confirm is up
+let _confirmPrevFocus = null;      // element to restore focus to on close
 
 /**
  * Show an in-app styled confirm dialog. Returns a promise that resolves
@@ -94,6 +96,7 @@ let _confirmPreviousDialog = null; // which dialog was showing before confirm
 function styledConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor = true } = {}) {
   return new Promise((resolve) => {
     _confirmResolve = resolve;
+    _confirmPrevFocus = (document.activeElement instanceof HTMLElement) ? document.activeElement : null;
     confirmTitle.textContent = title;
     confirmMsg.textContent = message;
     confirmOk.textContent = okLabel;
@@ -120,10 +123,14 @@ function styledConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor
     confirmDialog.classList.remove('hidden');
     overlay.classList.remove('hidden');
     confirmOk.focus();
+    // Trap Tab within the confirm so focus can't wander to the (inert-looking)
+    // page behind a standalone confirm (bug 4.3); released on close.
+    _confirmTrapRelease = trapFocus(confirmDialog);
   });
 }
 
 function _closeConfirmDialog(result) {
+  if (_confirmTrapRelease) { _confirmTrapRelease(); _confirmTrapRelease = null; }
   confirmDialog.classList.add('hidden');
   // Restore the previous dialog, or hide overlay if confirm was standalone
   if (_confirmPreviousDialog === 'panel') adminPanel.classList.remove('hidden');
@@ -132,6 +139,8 @@ function _closeConfirmDialog(result) {
   else overlay.classList.add('hidden'); // no parent dialog — hide overlay entirely
   overlay.classList.remove('confirm-standalone');
   _confirmPreviousDialog = null;
+  if (_confirmPrevFocus && _confirmPrevFocus.isConnected) { try { _confirmPrevFocus.focus(); } catch (_) {} }
+  _confirmPrevFocus = null;
   if (_confirmResolve) { _confirmResolve(result); _confirmResolve = null; }
 }
 
@@ -257,15 +266,13 @@ document.getElementById('btn-admin-close').addEventListener('click', close);
 // breaking modal-dismissal muscle memory (UX/UI #1 #6).
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  // The confirm dialog is Escape-closable whether it was opened from INSIDE the
+  // admin overlay or STANDALONE (playlist delete, DLNA toggle, ffmpeg download).
+  // The old guard on ``_isOpen`` left the standalone confirm in an Escape
+  // dead-zone (bug 4.3) — check the confirm first, regardless of admin state.
+  if (!confirmDialog.classList.contains('hidden')) { _closeConfirmDialog(false); return; }
   if (_isOpen && !overlay.classList.contains('hidden')) {
-    // If a confirm dialog is up, let *its* Cancel button handle Esc
-    // (closing only the confirm).  Otherwise dismiss the overlay.
-    const confirmVisible = !confirmDialog.classList.contains('hidden');
-    if (confirmVisible) {
-      _closeConfirmDialog(false);
-    } else {
-      close();
-    }
+    close();
   }
 });
 overlay.addEventListener('click', (e) => {

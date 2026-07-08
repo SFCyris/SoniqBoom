@@ -8,8 +8,29 @@ venv
 **/*.pyc
 **/*.pyo
 node_modules
-installer/dist
-installer/build
+# Local runtime state / config — must NEVER be baked into the image. A shipped
+# SoniqBoom.conf overrides the container's SONIQBOOM_DATA_DIR (so state stops
+# persisting to the /data volume) and would leak the dev's paths/settings.
+SoniqBoom.conf
+.soniqboom.env
+prefs.json
+users.json
+library.json
+library.json.bak
+library.aof
+startup-status.json
+freshness_state.json
+/data
+/log
+/cache
+# Build/packaging tooling and release artifacts — never needed at runtime.
+installer
+dist
+*.sbz
+# Bundled SoundFonts (~260 MB): the image ships the apt fluid-soundfont-gm
+# instead and symlinks it in; add richer SoundFonts at runtime via Settings.
+soundfonts
+tests
 *.log
 .DS_Store
 docs/manual/img
@@ -17,4 +38,3 @@ internal
 .pytest_cache
 .mypy_cache
 .ruff_cache
-*.sbz

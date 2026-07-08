@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import urllib.parse
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -98,11 +99,13 @@ async def _resolve_zip_member_to_local(path_str: str):
     except Exception:                       # noqa: BLE001 — degrade, never 500
         return None
 
+import orjson
+
 from soniqboom.core.data import (
     delete_track, get_track, track_count,
     set_rating, get_rating, get_ratings_batch, get_all_ratings,
     record_play, get_play_stats, get_play_stats_batch, get_all_play_stats,
-    ft_search,
+    ft_search, ft_search_dicts,
 )
 from soniqboom.core.metadata import extract_lyrics
 from soniqboom.models.track import TrackMeta
@@ -190,7 +193,7 @@ _ALLOWED_SORT_KEYS = {
 }
 
 
-@router.get("", response_model=list[TrackMeta])
+@router.get("")
 async def list_tracks(
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
@@ -236,10 +239,17 @@ async def list_tracks(
         query = f"@format:{{{_esc_tag(format)}}}"
     else:
         query = "*"
-    return await ft_search(
+    # Hot path: return the store's dicts serialized straight to JSON bytes with
+    # orjson, skipping the per-row TrackMeta construction + Pydantic re-encode
+    # (~12 ms/page on a 2000-track page).  The dicts are already the TrackMeta
+    # field set (``_meta_dict`` strips ``embedding``), so the response bytes are
+    # identical to the response_model path — we just trade this endpoint's
+    # OpenAPI schema for the speed.  See data.ft_search_dicts.
+    dicts = await ft_search_dicts(
         query, limit=limit, offset=offset,
         sort_by=sort_by, sort_order=sort_order,
     )
+    return Response(content=orjson.dumps(dicts), media_type="application/json")
 
 
 @router.get("/count")
@@ -275,6 +285,27 @@ async def batch_play_stats(body: dict):
     return await get_play_stats_batch(ids)
 
 
+@router.post("/meta/batch")
+async def batch_tracks(body: dict):
+    """Return full track objects for a list of IDs in ONE request.
+
+    Hydrates client-side id lists (e.g. the History Smart view's play-log
+    entries) without an N+1 storm of ``GET /api/tracks/{id}`` round-trips —
+    ``get_track`` is an in-memory lookup, so N of them in a single request is
+    cheap.  Unknown ids are skipped; order follows the request.  Capped to
+    keep a pathological request bounded.
+    """
+    ids = body.get("ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(422, "ids must be a list")
+    out = []
+    for tid in ids[:5000]:
+        t = await get_track(tid)
+        if t:
+            out.append(t)
+    return out
+
+
 @router.get("/{track_id}", response_model=TrackMeta)
 async def read_track(track_id: str):
     track = await get_track(track_id)
@@ -304,63 +335,150 @@ async def get_track_extended(track_id: str):
         "channels": track.channels,
         "patterns": track.patterns,
         "subsongs": track.subsongs,
+        # The file's intended default tune (1-based, matching the PSID/SNDH
+        # header).  ``None`` when unknown — the client then treats the first
+        # tune (wire subsong 0) as the default.  Read the ?subsong= wire index
+        # as 0-based: display "Tune K" -> ?subsong=K-1.
+        "default_track": getattr(track, "default_track", None),
+        # Per-subsong lengths (seconds), indexed by 0-based wire subsong, when
+        # an HVSC Songlengths DB is configured; else None — the picker then
+        # shows tune numbers without times (graceful degrade).
+        "hvsc_lengths": getattr(track, "hvsc_lengths", None),
+        # HVSC STIL commentary blob (raw text) for SID files, when configured;
+        # else None.  The client parses the ``(#N)`` subtune markers into
+        # per-tune titles for the picker and shows the file-level comment as a
+        # "STIL" panel.  We ship the raw text (not a parsed structure) so the
+        # backend stays agnostic to STIL's freeform layout.
+        "stil": getattr(track, "stil", None),
+        # SID chip model ("6581" / "8580" / "6581/8580"), read from the PSID
+        # header at scan time; None when the header didn't specify one.  Drives
+        # a chip badge in the Track-Info header.
+        "sid_model": getattr(track, "sid_model", None),
     }
     return result
 
 
+# Format names (metadata.FORMAT_NAMES values) whose files libopenmpt can
+# parse into a pattern grid.  AHX/HivelyTracker are uade/hvl2wav territory
+# and SID/MIDI have no pattern grid — deliberately absent.
+_PATTERN_FORMAT_NAMES = frozenset({
+    "ProTracker", "ScreamTracker 3", "ScreamTracker 2", "FastTracker 2",
+    "Impulse Tracker", "MultiTracker", "OctaMED", "Composer 669",
+    "DigiBooster Pro", "UltraTracker", "Farandole", "ASYLUM/DMP",
+    "General DigiMusic", "Imago Orpheus", "Oktalyzer", "SoundFX",
+    "Grave Composer", "DSIK",
+})
+
+
+def _read_module_bytes(path_str: str) -> bytes | None:
+    """Raw module bytes for a local path, archive-virtual path, or remote
+    path (with optional archive tail).  Blocking — run in an executor.
+    Returns None when the file can't be reached; never raises."""
+    try:
+        outer, sep, rest = path_str.partition("::")
+        if outer.startswith(("smb://", "ftp://", "http://", "https://",
+                             "webdav://", "webdavs://")):
+            # Mirror the remote OUTER file (the module itself, or the
+            # archive containing it) into the local remote-cache first.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(outer)
+            source = get_source(scan_root) if remote_path else None
+            if source is None:
+                return None
+            local = get_cache().fetch(scan_root, remote_path, source)
+            if not local:
+                return None
+            outer = str(local)
+        if sep:
+            # Archive member (possibly nested zips) — the scanner's reader
+            # already handles zip/LHA/disk-image chains.
+            from soniqboom.core.scanner import _read_from_zip_path
+            data, _member = _read_from_zip_path(f"{outer}::{rest}")
+            return data
+        p = Path(outer)
+        return p.read_bytes() if p.exists() else None
+    except Exception:
+        return None
+
+
+# Extracted pattern payloads, LRU keyed by (track_id, mtime).  The row→time
+# map costs one libopenmpt seek per row, which grows with order count
+# (~3.7 s for an 82-order S3M) — re-opening the same track's info modal
+# shouldn't re-pay it.  The mtime is part of the key so an in-place edit +
+# rescan (same path → same track_id, new mtime) invalidates the entry
+# instead of serving a stale grid; nothing else clears this cache.  Tiny
+# (≤16 payloads).
+_PATTERNS_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_PATTERNS_CACHE_MAX = 16
+# Coalesce concurrent cache-misses for the SAME (track_id, mtime): the
+# extraction is a multi-second libopenmpt seek, so a second request that lands
+# mid-flight awaits the first computation instead of re-paying it.
+_PATTERNS_INFLIGHT: "dict[tuple, asyncio.Future]" = {}
+
+
 @router.get("/{track_id}/patterns")
 async def get_patterns(track_id: str):
-    """Return the tracker pattern grid + order list for the file, when
-    the operator has ``pyopenmpt`` installed.  Used by the Now-Playing
-    pattern viewer for tracker modules (E-15).  Returns
-    ``{"available": False}`` for non-tracker files or when the binding
-    isn't available."""
+    """Return the tracker pattern grid, order list, row→time map, song
+    message and initial tempo for a module — extracted in-process via
+    libopenmpt (see ``core/tracker_patterns.py`` for the payload
+    contract).  Drives the Track-Info "Patterns" and "Song message"
+    sections.  Returns ``{"available": False}`` for non-tracker files,
+    unreachable sources, or hosts without libopenmpt."""
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
-    fmt = str(track.format or "").upper()
-    # Cheap reject: skip anything that isn't a known tracker format.
-    if not any(fmt.startswith(prefix) for prefix in (
-        "PROTRACKER", "FASTTRACKER", "SCREAMTRACKER", "IMPULSE",
-        "MULTITRACKER", "OCTAMED", "COMPOSER", "DIGIBOOSTER",
-        "ULTRATRACKER", "FARANDOLE", "OKTALYZER", "AHX", "HIVELY",
-    )):
+    if (track.format or "") not in _PATTERN_FORMAT_NAMES:
         return {"id": track_id, "available": False, "channels": 0,
                 "order": [], "patterns": []}
-    path_str = track.path
-    if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
-        # Fetch the remote module to the local cache so the pattern parser has
-        # a real file.  A cache-only lookup returned None for anything not
-        # already mirrored (e.g. a remote tracker the user hasn't played yet),
-        # leaving the pattern grid empty.  Guarded — a fetch failure degrades
-        # to "not available", never a 500.
-        from soniqboom.core.filesource import get_source, parse_remote_path
-        from soniqboom.core.remote_cache import get_cache
-        scan_root, remote_path = parse_remote_path(path_str)
-        source = get_source(scan_root) if remote_path else None
-        path = None
-        if source is not None:
-            try:
-                loop = asyncio.get_event_loop()
-                path = await loop.run_in_executor(
-                    None, get_cache().fetch, scan_root, remote_path, source)
-            except Exception:
-                path = None
-    else:
-        path = Path(path_str)
-    if not path or not path.exists():
-        return {"id": track_id, "available": False, "channels": 0,
-                "order": [], "patterns": []}
-    from soniqboom.core.tracker_patterns import extract_patterns
+    cache_key = (track_id, getattr(track, "mtime", None))
+    cached = _PATTERNS_CACHE.get(cache_key)
+    if cached is not None:
+        _PATTERNS_CACHE.move_to_end(cache_key)
+        return cached
+    # No await between the cache-miss above and this in-flight check, so the two
+    # lookups are atomic under asyncio: a concurrent request either sees the
+    # cache populated (owner fully done) or joins this future (owner still in
+    # the executor) — never recomputes redundantly.
+    inflight = _PATTERNS_INFLIGHT.get(cache_key)
+    if inflight is not None:
+        return await inflight
     loop = asyncio.get_event_loop()
-    payload = await loop.run_in_executor(None, extract_patterns, path)
-    payload["id"] = track_id
-    return payload
+    fut = loop.create_future()
+    _PATTERNS_INFLIGHT[cache_key] = fut
+    try:
+        data = await loop.run_in_executor(None, _read_module_bytes, track.path)
+        if not data:
+            payload = {"id": track_id, "available": False, "channels": 0,
+                       "order": [], "patterns": []}
+        else:
+            from soniqboom.core.tracker_patterns import extract_patterns
+            payload = await loop.run_in_executor(None, extract_patterns, data)
+            payload["id"] = track_id
+            if payload.get("available"):
+                _PATTERNS_CACHE[cache_key] = payload
+                while len(_PATTERNS_CACHE) > _PATTERNS_CACHE_MAX:
+                    _PATTERNS_CACHE.popitem(last=False)
+        fut.set_result(payload)
+    except Exception as exc:  # propagate to the owner AND any joined waiters
+        fut.set_exception(exc)
+    finally:
+        # Pop and set_result happen with no await between them, so no coroutine
+        # can observe a populated cache with a stale in-flight entry.
+        _PATTERNS_INFLIGHT.pop(cache_key, None)
+    return await fut
 
 
 @router.get("/{track_id}/vu")
-async def get_vu_sidecar(track_id: str):
+async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024)):
     """Return the binary VUMR sidecar for a rendered tracker module.
+
+    ``subsong`` (0-based wire index, default 0) selects the tune: a
+    multi-subsong UADE/tracker file renders a distinct sidecar per tune,
+    so the meters match the tune actually playing rather than always
+    showing tune 0.  The frontend passes the current subsong when the
+    playing track carries one (mirroring the ``?subsong=`` it threads onto
+    the stream URL); plain playback omits it → the default tune 0.
 
     Tracker / chip-format renders produce a per-channel VU sidecar
     alongside the audio cache (see ``docs/vu-cache-format.md``).  The
@@ -401,11 +519,11 @@ async def get_vu_sidecar(track_id: str):
     if not track:
         raise HTTPException(404, "Track not found")
 
-    sidecar = get_vu_sidecar_path(track_id)
+    sidecar = get_vu_sidecar_path(track_id, subsong)
     if sidecar is None:
         # Lazy-backfill path.  Only attempt for known tracker formats
         # (we don't want to spin up libopenmpt against a 10 GB FLAC).
-        sidecar = await _try_backfill_vu_sidecar(track, track_id)
+        sidecar = await _try_backfill_vu_sidecar(track, track_id, subsong)
 
     if sidecar is None:
         raise HTTPException(404, "No VU sidecar (not a tracker render or libopenmpt unavailable)")
@@ -436,8 +554,13 @@ _VU_BACKFILL_EXTS = {
 }
 
 
-async def _try_backfill_vu_sidecar(track, track_id: str):
+async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     """One-shot VU extraction against a track's source file.
+
+    ``subsong`` (0-based wire index) selects the tune to render so a
+    multi-subsong module backfills the meters for the tune being played,
+    not always tune 0.  Written to a per-subsong slot so tune 0's and
+    tune 3's backfills never overwrite each other.
 
     Returns the path to the freshly-written sidecar, or None if any
     step fails.  Side effect: writes the sidecar next to the cached
@@ -498,8 +621,13 @@ async def _try_backfill_vu_sidecar(track, track_id: str):
         return None
 
     loop = asyncio.get_event_loop()
+    # extract_vu takes -1 = "libopenmpt default subsong" (what _render_tracker
+    # uses for subsong 0 — it only passes --subsong for N>0), and an explicit
+    # index for N>0.  Mirror that so the backfilled sidecar matches the streamed
+    # render's sidecar frame-for-frame.
+    vu_subsong = subsong if subsong > 0 else -1
     result = await loop.run_in_executor(
-        None, lambda: openmpt_vu.extract_vu(src_bytes),
+        None, lambda: openmpt_vu.extract_vu(src_bytes, subsong=vu_subsong),
     )
     if result is None:
         log.warning("VU backfill: extract_vu returned None for %s", path_str)
@@ -516,14 +644,18 @@ async def _try_backfill_vu_sidecar(track, track_id: str):
         candidate: Path | None = None
         with _state_lock:
             for cache_key, entry in _meta.items():
-                if cache_key.startswith(f"{track_id}__") and entry.get("format_type") == "tracker":
+                # This subsong's cached WAV specifically — write the .vu next to
+                # it so eviction stays uniform.  Exact match (not startswith) so
+                # subsong 3's backfill doesn't land on subsong 0's WAV.
+                if cache_key == f"{track_id}__sub{subsong}" and entry.get("format_type") == "tracker":
                     candidate = Path(entry["path"]).with_suffix(".vu")
                     break
         if candidate is None:
-            # No tracker entry yet — synthesize a sidecar-only slot
-            # keyed by track_id alone.  Lives in the same cache dir
-            # so it gets evicted alongside other tracker assets.
-            base = _cache_path(f"{track_id}__novubackfill", "tracker")
+            # No cached WAV for this subsong yet — synthesize a sidecar-only slot
+            # keyed per-subsong (the ``__novubackfill`` suffix keeps it from
+            # colliding with a real render slot).  Lives in the same cache dir so
+            # it gets evicted alongside other tracker assets.
+            base = _cache_path(f"{track_id}__sub{subsong}__novubackfill", "tracker")
             candidate = base.with_suffix(".vu")
         await loop.run_in_executor(
             None, openmpt_vu.write_sidecar, candidate, result,
@@ -902,10 +1034,13 @@ async def get_track_waveform(track_id: str, response: Response):
         raise HTTPException(404, "Track not found")
 
     path_str = track.path
-    # Extract extension from final path component (handles ZIP virtual paths)
-    ext = _Path(
-        path_str.split('::')[-1] if '::' in path_str else path_str
-    ).suffix.lower()
+    # Route the scrubber waveform render exactly like playback: an AdLib
+    # extension wins over a uade name-token collision, and an archive routing
+    # suffix (``STAR.AMD.star``) is stripped so AMUSIC ``.amd`` files get their
+    # AdLib waveform instead of a failed uade render — including library rows
+    # scanned before ``.amd`` was recognized (mirrors ``stream._render_ident``).
+    from soniqboom.api.stream import _render_ident
+    ext, _ = _render_ident(path_str)
 
     loop = asyncio.get_event_loop()
 

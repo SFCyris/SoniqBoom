@@ -41,5 +41,5 @@ Install the package into SoniqBoom's venv, then restart — the plugin appears a
 ## API endpoint
 
 ```
-GET /plugins          → list all loaded plugins
+GET /api/plugins      → list all loaded plugins
 ```

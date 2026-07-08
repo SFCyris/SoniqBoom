@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, HTTPException, Query
+import orjson
+from fastapi import APIRouter, HTTPException, Query, Response
 
-from soniqboom.core.data import ft_search, get_track
+from soniqboom.core.data import ft_search, ft_search_dicts, get_track
 from soniqboom.models.track import TrackMeta
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -87,7 +88,19 @@ async def run_search(q: str, limit: int = 50) -> list[TrackMeta]:
     return await ft_search(safe, limit=limit)
 
 
-@router.get("", response_model=list[TrackMeta])
+async def run_search_dicts(q: str, limit: int = 50) -> list[dict]:
+    """Dict-returning twin of :func:`run_search` for the ``/search`` endpoint —
+    serializes with orjson and skips the TrackMeta round-trip (see
+    ``data.ft_search_dicts``).  ``run_search`` (models) stays for smart-playlist
+    evaluation so the two never drift on query parsing."""
+    advanced = _parse_advanced_query(q)
+    if advanced:
+        return await ft_search_dicts(advanced, limit=limit)
+    safe = q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
+    return await ft_search_dicts(safe, limit=limit)
+
+
+@router.get("")
 async def search(
     q: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
@@ -95,7 +108,8 @@ async def search(
     """Full-text search across artist, album, and title.
     Also supports advanced syntax: artist:Ghost album:Impera year:>2020
     """
-    return await run_search(q, limit=limit)
+    dicts = await run_search_dicts(q, limit=limit)
+    return Response(content=orjson.dumps(dicts), media_type="application/json")
 
 
 @router.get("/quick", response_model=list[TrackMeta])

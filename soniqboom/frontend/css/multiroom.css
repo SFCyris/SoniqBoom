@@ -638,3 +638,120 @@ body[data-view="slave"]     #mr-view-slave { display: block; }
   box-shadow: 0 6px 24px rgba(0,0,0,0.4);
   z-index: 1000;
 }
+
+/* ── Sign-in overlay (shared auth.js) ─────────────────────────────────────────
+   /multiroom is a standalone SPA that loads multiroom.css, not app.css, so the
+   desktop overlay styles aren't present.  These rules restyle the shared auth.js
+   overlay with the multiroom palette (whose token names differ) so a signed-out
+   visitor gets a usable sign-in card instead of a bare, unstyled form.
+   Class/id names mirror auth.js's _ensureOverlay() markup. */
+body.auth-blocked { overflow: hidden; }
+.auth-overlay {
+  /* Alias the shared overlay's tokens onto multiroom's palette — custom
+     properties inherit, so the card + fields below resolve them. */
+  --bg: var(--bg0); --surface: var(--bg2); --surface-2: var(--bg3);
+  --text: var(--text0); --text-dim: var(--text2); --danger: var(--bad);
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(circle at 35% 25%, rgba(138,219,255,0.10) 0%, transparent 60%),
+    radial-gradient(circle at 70% 80%, rgba(255,137,92,0.08) 0%, transparent 55%),
+    var(--bg);
+  padding: 24px;
+  overflow-y: auto;
+}
+.auth-overlay.hidden { display: none !important; }
+.auth-overlay [hidden] { display: none !important; }
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 24px 22px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+}
+.auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.auth-brand-icon { font-size: 28px; filter: drop-shadow(0 0 8px rgba(138,219,255,0.45)); }
+.auth-brand-name { font-size: 18px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; }
+.auth-title { font-size: 20px; color: var(--text); margin: 0 0 16px; font-weight: 600; }
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-field { display: flex; flex-direction: column; gap: 5px; }
+.auth-field > span { font-size: 12px; color: var(--text-dim); }
+.auth-field > span em { font-style: italic; opacity: 0.7; }
+.auth-field input {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px 14px;
+  font-size: 16px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.auth-field input:focus { border-color: var(--accent); }
+.auth-field-password { position: relative; }
+.auth-field-password input { padding-right: 48px; }
+.auth-pw-toggle {
+  position: absolute; right: 6px; bottom: 4px;
+  background: none; border: none;
+  font-size: 18px; line-height: 1; padding: 8px;
+  cursor: pointer; opacity: 0.7;
+}
+.auth-submit {
+  margin-top: 6px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-size: 16px; font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.1s, transform 0.05s;
+  position: relative;
+}
+.auth-submit:active { transform: translateY(1px); }
+.auth-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+.auth-submit.busy { color: transparent; }
+.auth-submit.busy::after {
+  content: ''; position: absolute; inset: 0; margin: auto;
+  width: 18px; height: 18px;
+  border: 2px solid rgba(128,128,128,0.4);
+  border-top-color: var(--bg);
+  border-radius: 50%;
+  animation: auth-spin 0.6s linear infinite;
+}
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+.auth-error {
+  margin-top: 4px;
+  padding: 10px 12px;
+  background: rgba(255,94,94,0.15);
+  color: var(--danger);
+  border: 1px solid rgba(255,94,94,0.32);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.auth-switch { margin-top: 14px; display: flex; justify-content: center; }
+.auth-link {
+  background: none; border: none;
+  color: var(--accent); font-size: 13px;
+  cursor: pointer; padding: 6px 8px;
+}
+.auth-bootstrap-hint {
+  margin-top: 14px;
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px; color: var(--text-dim); line-height: 1.55;
+}
+.auth-bootstrap-hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px; color: var(--text);
+  background: var(--bg); padding: 2px 6px; border-radius: 4px;
+  word-break: break-all;
+}

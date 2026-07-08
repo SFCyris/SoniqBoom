@@ -26,6 +26,21 @@ case "$OS_KIND" in
 esac
 info "Detected platform: ${PLATFORM}"
 
+# ── Pre-flight: tools we assume are already present ──────────────────────────
+# On Linux we build a couple of players from source (git clone + make), and git
+# and curl are NOT pulled in by the package installs below — so check for them up
+# front and fail with one clear message instead of a cryptic error deep in the
+# run.  (On macOS these arrive with the Xcode Command Line Tools that Homebrew
+# triggers, so we don't pre-check there.)
+if [ "$PLATFORM" = "linux" ]; then
+  _missing=""
+  command -v curl >/dev/null 2>&1 || _missing="$_missing curl"
+  command -v git  >/dev/null 2>&1 || _missing="$_missing git"
+  if [ -n "$_missing" ]; then
+    die "Missing required tool(s):$_missing — install them first (e.g. 'sudo apt install -y$_missing', or the dnf/pacman/zypper equivalent), then re-run  bash install.sh"
+  fi
+fi
+
 PYTHON=""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,6 +196,106 @@ elif [ "$PLATFORM" = "linux" ]; then
     fi
   }
 
+  NPROC="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+
+  # Run a single command as root when we aren't already (used for `make install`
+  # into /usr/local).  Unlike run_pkg this never dies — the caller treats a
+  # failure as "renderer unavailable" and warns, matching the best-effort steps.
+  _root() {
+    if [ "$(id -u)" = "0" ]; then "$@"
+    elif command -v sudo &>/dev/null; then sudo "$@"
+    else "$@"; fi
+  }
+
+  # Install the toolchain a source build needs (best-effort; only pulled when we
+  # actually fall back to compiling uade/sc68 because the distro doesn't ship
+  # them).  Package names differ per manager; the set covers both builds.
+  _ensure_build_deps() {
+    case "$PKG" in
+      apt)    run_pkg apt-get install -y --no-install-recommends \
+                build-essential pkg-config libao-dev bzip2 automake zlib1g-dev || true ;;
+      dnf)    run_pkg dnf install -y \
+                gcc gcc-c++ make pkgconf-pkg-config libao-devel bzip2 automake zlib-devel || true ;;
+      pacman) run_pkg pacman -S --noconfirm --needed \
+                base-devel libao bzip2 automake zlib || true ;;
+      zypper) run_pkg zypper --non-interactive install \
+                gcc gcc-c++ make pkg-config libao-devel bzip2 automake zlib-devel || true ;;
+    esac
+  }
+
+  _have_cc() { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }
+
+  # uade123 — Amiga AHX + ~150 "exotica" formats (TFMX, Future Composer, David
+  # Whittaker, Rob Hubbard, Hippel, …).  Not in any mainstream Linux archive, so
+  # built from source exactly as the Docker image does: bencodetools + libzakalwe
+  # + uade 3.05, into /usr/local.  --without-write-audio skips uade's SDL2/GL
+  # scope tool (whose installer needs python-distutils, gone in 3.12) — WAV comes
+  # from libao inside uade123 itself.  Build as the calling user; only the three
+  # `make install` steps touch /usr/local, so they go through _root.
+  build_uade_from_source() {
+    section "uade (Amiga AHX / exotica) — building from source"
+    _ensure_build_deps
+    _have_cc || { warn "no C compiler found — uade skipped (install a toolchain, then re-run)"; return; }
+    local T; T="$(mktemp -d)"
+    if ( set -e
+         git clone -q https://gitlab.com/heikkiorsila/bencodetools.git "$T/bt"
+         cd "$T/bt"; git checkout -q v1.0.1 2>/dev/null || true
+         ./configure --prefix=/usr/local --without-python >/dev/null
+         { make -j"$NPROC" >/dev/null || make -j"$NPROC" >/dev/null || make -j1 >/dev/null; }
+         _root make install >/dev/null
+         git clone -q https://gitlab.com/hors/libzakalwe.git "$T/lz"
+         cd "$T/lz"; git checkout -q v1.0.0 2>/dev/null || true
+         ./configure >/dev/null
+         { make CC=cc >/dev/null || make CC=cc >/dev/null || make -j1 CC=cc >/dev/null; }
+         _root make install PREFIX=/usr/local >/dev/null
+         curl -sfL --max-time 300 https://zakalwe.fi/uade/uade3/uade-3.05.tar.bz2 -o "$T/uade.tar.bz2"
+         tar xjf "$T/uade.tar.bz2" -C "$T"
+         cd "$T"/uade-3.05
+         ./configure --prefix=/usr/local --libzakalwe-prefix=/usr/local \
+                     --bencode-tools-prefix=/usr/local --without-uadefs --without-write-audio >/dev/null
+         { make -j"$NPROC" >/dev/null || make -j"$NPROC" >/dev/null || make -j1 >/dev/null; }
+         _root make install >/dev/null
+       ); then :; fi
+    _root ldconfig 2>/dev/null || true
+    rm -rf "$T" 2>/dev/null || _root rm -rf "$T" 2>/dev/null || true
+    if command -v uade123 >/dev/null 2>&1; then info "uade123: $(command -v uade123)"
+    else warn "uade build failed — AHX/exotica disabled (re-run install.sh to retry)"; fi
+  }
+
+  # sc68 — native Atari ST .sc68 disks.  The 2.2.1 release predates modern
+  # autotools, so three fixes make it build on current Debian: fresh
+  # config.guess/config.sub (from the automake package) + explicit --build; the
+  # six unsubstituted `#if @HAVE_*@` knobs hardcoded; and -O3→-O1 (emu68 has -O3
+  # UB).  Built into /usr/local, incl. its share/sc68/Replay m68k drivers.
+  build_sc68_from_source() {
+    section "sc68 (Atari ST .sc68) — building from source"
+    _ensure_build_deps
+    _have_cc || { warn "no C compiler found — sc68 skipped (install a toolchain, then re-run)"; return; }
+    local T; T="$(mktemp -d)"
+    if ( set -e
+         curl -sfL --max-time 300 \
+           "https://downloads.sourceforge.net/project/sc68/sc68/2.2.1/sc68-2.2.1.tar.gz" \
+           -o "$T/sc68.tar.gz"
+         tar xzf "$T/sc68.tar.gz" -C "$T"
+         cd "$T"/sc68-2.2.1
+         cp /usr/share/automake-*/config.guess ./config.guess
+         cp /usr/share/automake-*/config.sub   ./config.sub
+         sed -i -e 's/#if @HAVE_VSPRINTF@/#if 1/'  -e 's/#if @HAVE_VSNPRINTF@/#if 1/' \
+                -e 's/#if @HAVE_GETENV@/#if 1/'     -e 's/#if @HAVE_ZLIB_H@/#if 1/' \
+                -e 's/#if @HAVE_READLINE_READLINE_H@/#if 0/' \
+                -e 's/#if @HAVE_READLINE_HISTORY_H@/#if 0/' config_platform68.h.in
+         CFLAGS="-fcommon -Wno-implicit-function-declaration" \
+           ./configure --prefix=/usr/local --build="$(gcc -dumpmachine)" >/dev/null
+         find . -name Makefile -exec sed -i 's/-O3/-O1/g' {} +
+         { make -j"$NPROC" >/dev/null 2>&1 || make -j"$NPROC" >/dev/null 2>&1 || make -j1 >/dev/null 2>&1; }
+         _root make install >/dev/null
+       ); then :; fi
+    _root ldconfig 2>/dev/null || true
+    rm -rf "$T" 2>/dev/null || _root rm -rf "$T" 2>/dev/null || true
+    if command -v sc68 >/dev/null 2>&1; then info "sc68: $(command -v sc68)"
+    else warn "sc68 build failed — .sc68 disabled (re-run install.sh to retry)"; fi
+  }
+
   if [ "$PKG" = "apt" ]; then
     section "Installing system dependencies (apt)"
     run_pkg apt-get update -qq
@@ -268,15 +383,16 @@ elif [ "$PLATFORM" = "linux" ]; then
     esac
   fi
 
-  # uade123 — AHX / Amiga formats.  Niche; not packaged on every distro.
-  # Best-effort; the app surfaces a clear install hint if it's still missing.
+  # uade123 — AHX + Amiga "exotica".  Not in Debian/Ubuntu's archive; a few
+  # distros do package it, so try that first (fast), then fall back to a source
+  # build so bare-metal Linux reaches the same renderer set as the Docker image.
   if [ "$PKG" != "none" ] && ! command -v uade123 &>/dev/null; then
     case "$PKG" in
-      apt)    run_pkg apt-get install -y --no-install-recommends uade123 || true ;;
       dnf)    run_pkg dnf install -y uade || true ;;
       pacman) run_pkg pacman -S --noconfirm --needed uade || true ;;
       zypper) run_pkg zypper --non-interactive install uade || true ;;
     esac
+    command -v uade123 &>/dev/null || build_uade_from_source
   fi
 
   # adplay (AdPlug) — AdLib/OPL2 FM: id/Apogee IMF, ROL, CMF, D00, RAD, …
@@ -299,14 +415,15 @@ elif [ "$PLATFORM" = "linux" ]; then
   info "openmpt123:       $(command -v openmpt123 || echo 'not found — tracker rendering disabled')"
   info "lha (lhasa):      $(command -v lha        || echo 'not found — LHA -lh1- archives skipped')"
 
-  # sc68 — native Atari ST .sc68 disks (best-effort; not in every distro).
-  if ! command -v sc68 &>/dev/null; then
+  # sc68 — native Atari ST .sc68 disks.  Try a distro package first (a few ship
+  # it), then fall back to a source build so .sc68 works on bare-metal Linux the
+  # same as in the Docker image.
+  if [ "$PKG" != "none" ] && ! command -v sc68 &>/dev/null; then
     case "$PKG" in
-      apt)    run_pkg apt-get install -y --no-install-recommends sc68 || true ;;
       dnf)    run_pkg dnf install -y sc68 || true ;;
-      pacman) warn "sc68 is in the AUR — install with an AUR helper for .sc68 support" ;;
       zypper) run_pkg zypper --non-interactive install sc68 || true ;;
     esac
+    command -v sc68 &>/dev/null || build_sc68_from_source
   fi
   info "sc68:             $(command -v sc68       || echo 'not found — .sc68 disabled')"
 fi
@@ -357,10 +474,16 @@ fi
 # OPTIONAL — skips gracefully; SoniqBoom 501s PSF files with a clear hint.
 section "zxtune123 (console music rips — optional)"
 ZXTUNE_REV="be510430c54b78f230881ece66b6e2799f92748d"
-ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/x86_64/zxtune_r5100_linux_x86_64.tar.gz"
+# Official Linux prebuilts (storage.zxtune.ru) ship for BOTH x86_64 and arm64.
+case "$(uname -m)" in
+  x86_64)        ZXARCH="x86_64" ;;
+  aarch64|arm64) ZXARCH="arm64"  ;;
+  *)             ZXARCH="" ;;
+esac
+ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/zxtune_r5100_linux_${ZXARCH}.tar.gz"
 if command -v zxtune123 &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
-elif [ "$PLATFORM" = "linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
   if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \
       && tar xzf "$ZX_TMP/zx.tar.gz" -C "$ZX_TMP" \
@@ -477,3 +600,12 @@ else
   echo "  Data:             \${XDG_DATA_HOME:-~/.local/share}/soniqboom/"
 fi
 echo ""
+
+# If no admin exists yet (e.g. the first-run prompt was skipped on a
+# non-interactive install), say so loudly — otherwise the user meets a locked
+# sign-in page with no hint how to proceed.
+if [ -x "$SETADM" ] && ! "$VENV/bin/python" -c "import sys; from soniqboom.config import get_data_dir; from soniqboom.core.users import UserStore; sys.exit(0 if UserStore(get_data_dir()).has_any_admin() else 1)" >/dev/null 2>&1; then
+  echo -e "  ${YELLOW}${BOLD}No admin account yet${RESET} — create one before you can sign in:"
+  echo -e "      ${BOLD}bash setup-admin.sh -user <name> -passwd '<password>'${RESET}"
+  echo ""
+fi

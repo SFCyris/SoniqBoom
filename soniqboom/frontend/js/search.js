@@ -57,8 +57,24 @@ function _cancelInflightArt() {
 function _renderStationGroup(dd, stations) {
   if (!stations || !stations.length) return;
   const hdr = document.createElement('div');
-  hdr.className = 'sp-group-hdr';
-  hdr.textContent = 'Stations';
+  hdr.className = 'sp-group-hdr sp-group-hdr-row';
+  const label = document.createElement('span');
+  label.textContent = 'Stations';
+  // "Show all →" opens the complete station list in the Stations view — the
+  // dropdown only previews 4, so this is how the rest are reached.
+  const all = document.createElement('button');
+  all.type = 'button';
+  all.className = 'sp-show-all';
+  all.textContent = 'Show all →';
+  all.addEventListener('click', (e) => {
+    e.stopPropagation();
+    _hidePreview();
+    import('./stations.js')
+      .then(m => m.Stations.showSearchResults(input.value))
+      .catch(() => Toast.error('Could not open station results.'));
+  });
+  hdr.appendChild(label);
+  hdr.appendChild(all);
   dd.appendChild(hdr);
   stations.slice(0, 4).forEach((st) => {
     const row = document.createElement('div');
@@ -194,12 +210,16 @@ function _showPreview(tracks, stations = []) {
   // In library mode, stations follow the tracks as a labelled group.
   if (!stationsFirst) _renderStationGroup(dd, stations);
 
-  // Always show "press Enter" hint so behaviour is discoverable
+  // Always show "press Enter" hint so behaviour is discoverable.  In the
+  // Stations view Enter opens the full station list, not the song search, so
+  // the hint reflects that (the footer's "more" count only applies to songs).
   const hint = document.createElement('div');
-  hint.className = tracks.length > 8 ? 'sp-more' : 'sp-hint';
-  hint.textContent = tracks.length > 8
-    ? `${tracks.length - 8} more — ↵ full results · ↓ to play a row`
-    : '↵ full results · ↓ to play a row';
+  hint.className = (!stationsFirst && tracks.length > 8) ? 'sp-more' : 'sp-hint';
+  hint.textContent = stationsFirst
+    ? '↵ all station results · ↓ to play a row'
+    : (tracks.length > 8
+        ? `${tracks.length - 8} more — ↵ full results · ↓ to play a row`
+        : '↵ full results · ↓ to play a row');
   dd.appendChild(hint);
 
   // Restore a preserved keyboard selection (same-list re-render), else anchor
@@ -430,7 +450,17 @@ input.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (!_playHighlighted()) {
       _hidePreview();
-      query(input.value);
+      // Full results for the ACTIVE category: while the Stations view is open,
+      // Enter opens the complete station list (the parallel to how Enter fills
+      // the Library with every song match); otherwise it runs the song search.
+      const stationsFirst = !document.getElementById('stations-view')?.hidden;
+      if (stationsFirst) {
+        import('./stations.js')
+          .then(m => m.Stations.showSearchResults(input.value))
+          .catch(() => Toast.error('Could not open station results.'));
+      } else {
+        query(input.value);
+      }
     }
   } else if (e.key === 'Escape') {
     if (_previewVisible) {

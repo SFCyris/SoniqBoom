@@ -5,6 +5,7 @@
  * app.js — Mobile shell entry: view router, tab bar, mini-player, action sheet.
  */
 import { Player } from '../player.js';
+import { Auth }   from '../auth.js';
 import { artPlaceholderEmoji, Toast } from '../utils.js';
 // UX-3 P0: mobile shell exposes the same globals desktop does so the
 // classic-script cast_picker.js can read currentTrackId + emit toasts.
@@ -12,8 +13,10 @@ window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 window.Toast = Toast;
 
+import { MobileRadio }     from './radio-player.js';
 import { mountLibrary }    from './views/library.js';
 import { mountSearch }     from './views/search.js';
+import { mountRadio }      from './views/radio.js';
 import { mountQueue }      from './views/queue.js';
 import { mountNowPlaying } from './views/nowplaying.js';
 import { mountSettings }   from './views/settings.js';
@@ -43,10 +46,15 @@ const toast       = document.getElementById('m-toast');
 const VIEWS = {
   library:    { title: 'Library',     mount: mountLibrary,    el: document.getElementById('m-view-library') },
   search:     { title: 'Search',      mount: mountSearch,     el: document.getElementById('m-view-search') },
+  radio:      { title: 'Radio',       mount: mountRadio,      el: document.getElementById('m-view-radio') },
   queue:      { title: 'Queue',       mount: mountQueue,      el: document.getElementById('m-view-queue') },
   nowplaying: { title: 'Now Playing', mount: mountNowPlaying, el: document.getElementById('m-view-nowplaying') },
   settings:   { title: 'Settings',    mount: mountSettings,   el: document.getElementById('m-view-settings') },
 };
+
+// Settings lives behind the top-bar gear rather than a bottom tab (5 tabs max).
+const settingsBtn = document.getElementById('m-settings-btn');
+if (settingsBtn) settingsBtn.addEventListener('click', () => activate('settings'));
 
 const _mounted = {};
 
@@ -85,7 +93,13 @@ function initialView() {
 
 // ── Mini-player wiring ────────────────────────────────────────────────────
 function renderMini(track) {
-  if (!track) {
+  // Radio takes precedence: while a station plays it's the active source.
+  if (MobileRadio.active) { renderMiniStation(MobileRadio.station); return; }
+  // Hide when there's nothing, OR when a radio takeover detached the shared
+  // element (src cleared) so ``track`` is no longer resumable — otherwise the
+  // mini would show a dead ▶ that playPause() ignores after radio stops.
+  const resumable = track && (Player.playing || (Player.audio && Player.audio.getAttribute('src')));
+  if (!resumable) {
     mini.classList.add('hidden');
     return;
   }
@@ -113,16 +127,51 @@ function renderMini(track) {
   }
 }
 
+function renderMiniStation(st) {
+  mini.classList.remove('hidden');
+  miniTitle.textContent  = (st && st.name) || 'Radio';
+  miniArtist.textContent = 'Internet radio';
+  miniArt.innerHTML = '';
+  const span = document.createElement('span');
+  span.className = 'm-mp-art-ph';
+  span.textContent = '📻';
+  miniArt.appendChild(span);
+  if (st && st.favicon) {
+    const img = new Image();
+    img.alt = ''; img.decoding = 'async';
+    img.onload  = () => img.classList.add('loaded');
+    img.onerror = () => img.remove();
+    miniArt.appendChild(img);
+    img.src = st.favicon;
+  }
+  miniProg.style.width = '0%';   // live stream — no meaningful progress
+}
+
 Player.on('trackchange', renderMini);
 Player.on('statechange', ({ playing }) => {
+  if (MobileRadio.active) return;         // radio owns the transport while active
   miniPlay.textContent = playing ? '⏸' : '▶';
 });
 Player.on('timeupdate', ({ pct }) => {
+  if (MobileRadio.active) return;
   miniProg.style.width = `${Math.min(100, Math.max(0, pct))}%`;
 });
 
-miniPlay.addEventListener('click', (e) => { e.stopPropagation(); Player.playPause(); });
-miniNext.addEventListener('click', (e) => { e.stopPropagation(); Player.next(); });
+// Radio drives the mini-player when a station is the active source.
+MobileRadio.on('change', () => renderMini(Player.currentTrack));
+MobileRadio.on('state',  () => {
+  if (MobileRadio.active) miniPlay.textContent = MobileRadio.playing ? '⏸' : '▶';
+});
+
+miniPlay.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (MobileRadio.active) MobileRadio.toggle(); else Player.playPause();
+});
+miniNext.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (MobileRadio.active) return;         // a single live station has no "next"
+  Player.next();
+});
 mini.addEventListener('click',     ()  => activate('nowplaying'));
 
 // ── Action sheet ──────────────────────────────────────────────────────────
@@ -167,6 +216,23 @@ window.addEventListener('hashchange', () => {
   const hash = (location.hash || '').replace(/^#/, '');
   if (VIEWS[hash]) activate(hash);
 });
+
+// Gate the app on a valid session.  Without this the mobile UI mounts over a
+// wall of 401s with no way to authenticate: Auth.boot() shows the login overlay
+// when there's no valid session cookie.  Importing auth.js also installs the
+// global 401 → re-login fetch interceptor, so a mid-session expiry re-prompts.
+//
+// We POLL ``Auth.user`` rather than ``await Auth.ready`` (which the desktop
+// shell does): on mobile a stray /api 401 during boot — cast_picker.js probes
+// /api/cast/sessions before the user signs in — trips auth.js's re-auth flow,
+// which REPLACES the ready promise.  A single ``await Auth.ready`` would then
+// wait on an orphaned promise and hang forever after a successful login (the
+// app never mounts).  ``Auth.user`` is set synchronously on sign-in, so polling
+// it is immune to that promise swap.
+await Auth.boot();
+while (!Auth.user) {
+  await new Promise(r => setTimeout(r, 120));
+}
 
 activate(initialView());
 renderMini(Player.currentTrack);

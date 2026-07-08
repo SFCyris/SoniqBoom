@@ -446,7 +446,12 @@ async function _toggleFavorite(station, btn) {
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
-let _sview = null;       // 'favorites' | 'scene' | 'world'
+let _sview = null;       // 'favorites' | 'scene' | 'world' | 'search'
+// Monotonic render token — bumped on every view switch (_enterView).  Each
+// async list renderer captures it and re-checks after its await, so a slow
+// response (Radio Browser can lag seconds) can't paint into a view the user
+// already navigated away from — content + crumb would otherwise disagree.
+let _renderGen = 0;
 
 function _shell() {
   const v = view();
@@ -460,9 +465,22 @@ function _shell() {
 function _renderNowPlaying(connecting = false) {
   const el = $('st-now');
   if (!el) return;
-  if (!_current) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  if (!_current) {
+    // Keep the card in the layout (don't collapse it) so starting a station
+    // doesn't shove the whole list down under the cursor — an easy way to
+    // double-click the wrong station.  Show a muted placeholder instead.
+    el.classList.remove('hidden');
+    el.classList.add('st-now-empty');
+    el.innerHTML = `
+      <span class="st-now-art st-now-glyph">📻</span>
+      <div class="st-now-info">
+        <div class="st-now-name">No station playing</div>
+        <div class="st-now-title">Pick a station below to start listening</div>
+      </div>`;
+    return;
+  }
   const { station, cands, i } = _current;
-  el.classList.remove('hidden');
+  el.classList.remove('hidden', 'st-now-empty');
   const favUrl = _safeUrl(station.favicon);
   const art = favUrl
     ? `<img class="st-now-art" src="${esc(favUrl)}" alt="" decoding="async">`
@@ -506,7 +524,39 @@ function _setCrumbs(parts) {
 }
 
 function _loading(msg = 'Loading…') {
+  // Default load → shimmer skeleton rows (perceived-perf 2.8); explicit
+  // error/status messages still render as plain text.
+  if (msg === 'Loading…') {
+    const row = '<div class="st-skel-row"><span class="st-skel-art skel-bar"></span>'
+              + '<span class="st-skel-line skel-bar"></span></div>';
+    $('st-body').innerHTML = `<div class="st-skel" aria-hidden="true">${row.repeat(8)}</div>`;
+    return;
+  }
   $('st-body').innerHTML = `<div class="st-empty">${esc(msg)}</div>`;
+}
+
+// Hover-intent station warm: after the pointer rests on a row briefly (or the
+// row takes keyboard focus), ask the server to pre-resolve the station + its
+// stream host DNS so a click starts the relay from a warm resolver.  Deduped
+// per session; the pointer delay keeps a fast scroll-past from firing.  The
+// server does only the cheap, side-effect-free half — no play-click report, no
+// relay spawn — see api/stations.py warm().
+const _warmed = new Set();
+const WARM_INTENT_MS = 140;
+function _warmStation(station) {
+  const sid = station && station.sid;
+  if (!sid || _warmed.has(sid)) return;
+  _warmed.add(sid);
+  // Warm the SAME stream the click will pick — _candidates() reorders by
+  // browser-playability then bitrate, and play() starts at index 0 (?v=cands[0].v).
+  // Warming streams[0] instead would DNS-prime a different host on multi-stream
+  // stations and waste the warm, so pass the chosen v.
+  const cands = _candidates(station);
+  const v = cands.length ? cands[0].v : 0;
+  try {
+    fetch(`/api/stations/warm/${encodeURIComponent(sid)}?v=${v}`, { priority: 'low' })
+      .catch(() => {});
+  } catch { /* ignore */ }
 }
 
 function _stationRows(body, stations, { showCountry = false } = {}) {
@@ -539,6 +589,17 @@ function _stationRows(body, stations, { showCountry = false } = {}) {
     row.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
     });
+    // Hover-intent + keyboard-focus warm.  Pointer waits out a short intent
+    // delay (cancelled on leave) so scrolling past a row doesn't warm it;
+    // focus fires immediately (a deliberate keyboard landing).
+    let _warmTimer = null;
+    row.addEventListener('pointerenter', () => {
+      _warmTimer = setTimeout(() => _warmStation(st), WARM_INTENT_MS);
+    });
+    row.addEventListener('pointerleave', () => {
+      if (_warmTimer) { clearTimeout(_warmTimer); _warmTimer = null; }
+    });
+    row.addEventListener('focus', () => _warmStation(st));
     frag.appendChild(row);
   });
   body.appendChild(frag);
@@ -555,10 +616,12 @@ async function _fetchJson(url) {
 }
 
 async function _renderFavorites() {
+  const gen = _renderGen;
   _setCrumbs([{ label: 'Favorites' }]);
   _loading();
   try {
     const favs = await _fetchJson('/api/stations/favorites');
+    if (gen !== _renderGen) return;
     if (!favs.length) {
       $('st-body').innerHTML =
         '<div class="st-empty">No favorite stations yet — play one and hit ★.</div>';
@@ -569,20 +632,25 @@ async function _renderFavorites() {
 }
 
 async function _renderScene() {
+  const gen = _renderGen;
   _setCrumbs([{ label: 'Scene' }]);
   _loading();
   try {
-    _stationRows($('st-body'), await _fetchJson('/api/stations/scene'));
+    const scene = await _fetchJson('/api/stations/scene');
+    if (gen !== _renderGen) return;
+    _stationRows($('st-body'), scene);
   } catch (e) { _loading(`Could not load scene stations: ${e.message}`); }
 }
 
 async function _renderWorld() {
+  const gen = _renderGen;
   _setCrumbs([{ label: 'World' }]);
   _loading();
   let continents;
   try {
     continents = await _fetchJson('/api/stations/world');
   } catch (e) { _loading(`Radio directory unavailable: ${e.message}`); return; }
+  if (gen !== _renderGen) return;
   const body = $('st-body');
   body.innerHTML = '';
   continents.forEach((c) => {
@@ -754,8 +822,12 @@ function _stationsSearchMode(on) {
   }
 }
 
-function show(sview) {
+// Switch the content pane into the Stations view (shared by the sidebar
+// sections AND the full-results station search).  ``sview`` highlights the
+// matching sidebar item; 'search' has no sidebar item, so all deactivate.
+function _enterView(sview) {
   _sview = sview;
+  _renderGen++;              // invalidate any in-flight list render for the old view
   _shell();
   _wireAudioHealth();
   _stationsSearchMode(true);
@@ -771,9 +843,44 @@ function show(sview) {
   document.querySelectorAll('#nav-stations li').forEach((li) =>
     li.classList.toggle('active', li.dataset.sview === sview));
   _renderNowPlaying();
+}
+
+function show(sview) {
+  _enterView(sview);
   if (sview === 'favorites') _renderFavorites();
   else if (sview === 'scene') _renderScene();
   else _renderWorld();
+}
+
+// Full station search results.  This is the stations parallel to the Library's
+// "Enter = all song results": the omnibox routes here (on Enter while the
+// Stations view is open, or via the dropdown's "Show all →") so stations get
+// their COMPLETE match list — up to the endpoint's cap of 100 — instead of the
+// 4-row dropdown preview.  Rendered through the shared ``_stationRows`` so play,
+// favorite ★, and warm-on-hover behave exactly like every other station list.
+async function _renderSearch(q) {
+  const gen = _renderGen;
+  _setCrumbs([{ label: `Search: “${q}”` }]);
+  _loading();
+  try {
+    const stations = await _fetchJson(
+      `/api/stations/search?q=${encodeURIComponent(q)}&limit=100`);
+    if (gen !== _renderGen) return;    // user switched views while we fetched
+    if (!Array.isArray(stations) || !stations.length) {
+      $('st-body').innerHTML =
+        `<div class="st-empty">No stations match “${esc(q)}”.</div>`;
+      return;
+    }
+    _setCrumbs([{ label: `Search: “${q}” · ${stations.length} station${
+      stations.length === 1 ? '' : 's'}` }]);
+    _stationRows($('st-body'), stations, { showCountry: true });
+  } catch (e) { _loading(`Station search failed: ${e.message}`); }
+}
+
+function showSearchResults(q) {
+  if (!q || !q.trim()) return;
+  _enterView('search');
+  _renderSearch(q.trim());
 }
 
 function hide() {
@@ -823,5 +930,5 @@ window.addEventListener('sb:radio-art', (e) => {
   _updateInfoNow();
 });
 
-export const Stations = { show, hide, play, stop, showInfo, surf: _surfStation };
+export const Stations = { show, hide, play, stop, showInfo, surf: _surfStation, showSearchResults };
 window.Stations = Stations;   // test/debug escape hatch — same pattern as RadioMode

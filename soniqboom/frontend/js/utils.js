@@ -142,7 +142,7 @@ export const TRACKER_FORMAT_NAMES = new Set([
 export const ADLIB_FORMAT_NAMES = new Set([
   'AdLib IMF', 'AdLib ROL', 'Creative Music', 'EdLib', 'Reality AdLib',
   'LucasArts AdLib', 'Sierra AdLib', 'DOSBox OPL', 'HSC AdLib', 'RIX OPL',
-  'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib",
+  'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib", 'AMUSIC AdLib',
 ]);
 
 /**

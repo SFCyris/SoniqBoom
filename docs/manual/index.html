@@ -150,10 +150,13 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        and backup notes live in <code>DEPLOY.md</code>.</p>
 
     <h3>Then, the first time you start it</h3>
+    <div class="note">Used <b>Docker</b> above? You already created your admin — skip to
+      step&nbsp;2 (<b>Sign in</b>). Steps below are for the <b>native</b> macOS/Linux install.</div>
     <ol class="steps">
-      <li><b>Create the first admin account.</b> A fresh install has no users; the first run prompts you for
-        a username and password on the terminal, or set it manually:
-        <pre>.venv/bin/soniqboom-setadm -user alice -passwd 'changeme123'</pre></li>
+      <li><b>Create the first admin account.</b> A fresh install has no users; the native install prompts you
+        for a username and password on the terminal. If it didn't prompt — or to add/reset one later — run this
+        from inside the SoniqBoom folder:
+        <pre>bash setup-admin.sh -user alice -passwd 'changeme123'</pre></li>
       <li><b>Sign in.</b> Open <code>http://localhost:8080</code> and enter those credentials.</li>
       <li><b>Open the admin panel</b> with the gear icon (top-right).</li>
       <li><b>Add a music folder</b> — a local path, or an <code>FTP</code> / <code>SMB</code> / <code>WebDAV</code> share.</li>
@@ -184,6 +187,16 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <figcaption><b>Search</b> spans the whole library instantly.</figcaption>
       </figure>
     </div>
+
+    <h3>Getting around a big library</h3>
+    <p>Any track list has <strong>Play all</strong> and <strong>Shuffle</strong> buttons in its header — browse
+       to a genre, artist or album and start it playing in one click, or press <span class="kbd">P</span> to
+       play and <span class="kbd">Shift</span>+<span class="kbd">P</span> to shuffle. Long track and group lists
+       show an <strong>A–Z rail</strong> down the left edge — click a letter to jump straight to that part of the
+       list. Right-click any track for <strong>Go to artist</strong> or <strong>Go to album</strong> to pivot to
+       everything by that artist or on that album. And the <strong>⌾ Locate</strong> button on the player bar —
+       or the <span class="kbd">G</span> key — scrolls the list back to whatever's playing, which is marked with
+       a small animated equalizer.</p>
 
     <h3>The Library Galaxy</h3>
     <p>Every track in your collection rendered as a drifting star-field — each format its own glowing
@@ -315,6 +328,9 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         Browser</a> directory, browsed by <b>continent → country</b>, then split into
         <b>Top 10</b>, <b>Top 11–50</b> and <b>Remaining</b> by listener votes.</li>
     </ul>
+    <p>Search the directory from the box in the <strong>Stations</strong> header, or straight from the main search bar
+       at the top — matching <strong>Stations</strong> are listed alongside your music, and <strong>Show all&nbsp;→</strong>
+       (or pressing <span class="kbd">Enter</span> while the Stations view is open) opens the full list of matches.</p>
     <p>Click a station to play it. SoniqBoom relays the stream through your server, so stations play in the
        browser whatever they're built on — classic Icecast / SHOUTcast, modern <b>HLS</b>, or a
        <code>.pls</code> / <code>.m3u</code> / <code>.xspf</code> / <code>.asx</code> playlist that just points at
@@ -372,6 +388,32 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       PSF family — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled so you always know
       which view you're seeing. Prefer a different look? A <b>circuit-board</b> VU skin, driven by the same live
       per-channel levels, is selectable in Settings.</div>
+
+    <h3>The pattern view — watch the module play</h3>
+    <p>Open <strong>Track Info</strong> (the circled-<span class="kbd">i</span> button, or right-click a row)
+       on a tracker module and the panel leads with the module itself: channels, patterns, instruments — and a
+       live <strong>pattern grid</strong>. Each pattern is laid out tracker-style — note · instrument ·
+       volume · effect — with the song's <em>pattern order</em> strip above it to jump anywhere. With
+       <b>Follow</b> on, the playhead row tracks playback and the grid scrolls with the music, and every
+       channel's column glows with its live level, in the same colour as its meter bar. Track Info is
+       tidier for every format now: each file shows only the fields it actually has.</p>
+    <p>Modules that carry a <strong>song message</strong> — greets, release notes, ASCII art — show it
+       exactly as written, spacing and all. A <em>Made with</em> row names the tracker software when the
+       file records it, and BPM comes straight from the module's own tempo.</p>
+    <div class="note"><b>Which formats?</b> The pattern grid covers the classic tracker family — MOD, S3M, XM,
+      IT, MED, 669, MTM, OKT and the rest of the libopenmpt set. AHX, HivelyTracker and the Amiga exotica keep
+      their per-voice meters and module details, and SID and MIDI keep their own detail panels.</div>
+
+    <h3>Multi-song files — the tune picker</h3>
+    <p>A single SID, SNDH, AHX or tracker file often holds many separate tunes — a game's whole soundtrack in
+       one file. Open <strong>Track Info</strong> on one and a <strong>tune picker</strong> lists every
+       subsong: <b>▶</b> play, <b>+</b> queue or <b>☰</b> add any one to a playlist, or <b>Play all</b>,
+       <b>Add all</b> and <b>shuffle</b> the whole set at once — and those single-tune picks live happily
+       inside playlists alongside ordinary tracks. When a SID is part of the
+       <a href="https://hvsc.c64.org/" target="_blank" rel="noopener">HVSC</a> collection, each tune shows its
+       real name and length from the <strong>Songlengths</strong> and <strong>STIL</strong> databases — so
+       <em>Tune&nbsp;3&nbsp;/&nbsp;6</em> reads <em>"Assembly"</em> rather than a bare number — with the full
+       STIL commentary below and the chip model shown as a <strong>6581 / 8580</strong> badge.</p>
 
     <h3>Equalizer &amp; visualizer</h3>
     <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
@@ -452,13 +494,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       <tr><td><span class="kbd">↑</span> / <span class="kbd">↓</span></td><td>Volume up / down</td><td><span class="kbd">R</span></td><td>Repeat (cycle)</td></tr>
       <tr><td><span class="kbd">Q</span></td><td>Toggle the queue</td><td><span class="kbd">E</span></td><td>Equalizer</td></tr>
       <tr><td><span class="kbd">V</span></td><td>Cycle the visualizer</td><td><span class="kbd">I</span></td><td>Track info</td></tr>
+      <tr><td><span class="kbd">P</span></td><td>Play all in the current list</td><td><span class="kbd">Shift</span><span class="kbd">P</span></td><td>Shuffle all in the current list</td></tr>
     </tbody></table>
 
     <p class="muted" style="margin:16px 0 2px"><strong>Browse &amp; select</strong></p>
     <table><tbody>
       <tr><td><span class="kbd">J</span> / <span class="kbd">K</span></td><td>Move down / up the track list</td><td><span class="kbd">Enter</span></td><td>Play the focused track</td></tr>
       <tr><td><span class="kbd">A</span></td><td>Add the focused track to the queue</td><td><span class="kbd">/</span></td><td>Focus the search box</td></tr>
-      <tr><td><span class="kbd">?</span></td><td>Show this shortcut list</td><td></td><td></td></tr>
+      <tr><td><span class="kbd">?</span></td><td>Show this shortcut list</td><td><span class="kbd">G</span></td><td>Locate the playing track</td></tr>
     </tbody></table>
 
     <p class="muted" style="margin:16px 0 2px"><strong>Jump to a view</strong></p>
@@ -568,6 +611,12 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       <figcaption>A <b>listener</b> follows the master — the <b>Sync</b> meter shows the drift in milliseconds.</figcaption>
     </figure>
 
+    <h3>Stream a station to a room</h3>
+    <p>A room isn't only for your own library. Open the master's <strong>📻 Radio</strong> tab, pick any of your
+      favourite <a href="#radio">internet-radio stations</a>, and it plays to <em>every</em> device in the room at
+      once. The now-playing card shows the station and its live <b>artist</b> and <b>track</b> as they change,
+      right alongside the room's transport and <b>Listeners</b> panel.</p>
+
     <div class="note">Every device must be able to reach the same SoniqBoom server. Multi-room is one of SoniqBoom's
       optional services and is on by default — it can be turned off in <a href="#settings">Settings → Services</a>.</div>
   </section>
@@ -583,10 +632,12 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
     <h3>On your phone</h3>
     <p>Open SoniqBoom on a phone and it adapts automatically — the full player works at phone width, and on phones
-       the site also serves a dedicated <strong>touch-first shell</strong> with Library, Search, Queue, Now Playing
-       and Settings tabs plus a tap-to-expand mini-player. A <em>Desktop site</em> link switches to the full desktop
-       UI whenever you want it. <a href="#cast">Casting</a> is reachable from the mobile mini-player too
-       (<span class="badge beta">Beta</span>).</p>
+       the site also serves a dedicated <strong>touch-first shell</strong> with Library, Search, <strong>Radio</strong>,
+       Queue and Now&nbsp;Playing tabs plus a tap-to-expand mini-player and Settings behind the gear. Browse and play
+       your library, tune in <a href="#radio">internet radio</a> streamed straight to your phone, build and edit
+       <a href="#playlists">playlists</a>, and <strong>sign in right on the phone</strong>. A <em>Desktop site</em>
+       link switches to the full desktop UI whenever you want it. <a href="#cast">Casting</a> is reachable from the
+       mobile mini-player too (<span class="badge beta">Beta</span>).</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/14-mobile.png" alt="SoniqBoom running in a narrow phone-width browser, showing the track list and the player transport"></div>
@@ -658,10 +709,12 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        <strong>Read-only</strong> until an admin promotes them.</p>
 
     <h3>Reset a password or recover access</h3>
-    <p>Run this on the server host to set any user's password — it's also how you create the very first admin on a
-       fresh install:</p>
-    <pre>.venv/bin/soniqboom-setadm -user alice -passwd 'a-new-password'
-.venv/bin/soniqboom-setadm -user alice -passwd 'a-new-password' -role admin   <span class="c"># also make them an admin</span></pre>
+    <p>Run this on the server host (from inside the SoniqBoom folder) to set any user's password — it's also how
+       you create the very first admin on a fresh install:</p>
+    <pre>bash setup-admin.sh -user alice -passwd 'a-new-password'
+bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span class="c"># also make them an admin</span></pre>
+    <div class="note">The change applies immediately — <code>setup-admin.sh</code> tells a running server to reload.
+       On Docker, do the same with <code>docker compose exec soniqboom soniqboom-setadm …</code>.</div>
 
     <h3>System notes</h3>
     <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory, so browsing and search
@@ -703,9 +756,10 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <h3>MIDI sounds thin or silent</h3>
     <p>Install or select a SoundFont in <a href="#settings">Settings</a>; MIDI is synthesised from the active <code>.sf2</code> bank.</p>
     <h3>I'm locked out / forgot the admin password</h3>
-    <p>On the server host, reset any account from the command line:
-       <code>.venv/bin/soniqboom-setadm -user &lt;name&gt; -passwd '&lt;new password&gt;'</code>
-       (add <code>-role admin</code> to restore admin rights). See <a href="#manage">Manage your library &amp; users</a>.</p>
+    <p>On the server host (inside the SoniqBoom folder), reset any account from the command line:
+       <code>bash setup-admin.sh -user &lt;name&gt; -passwd '&lt;new password&gt;'</code>
+       (add <code>-role admin</code> to restore admin rights) — it takes effect immediately.
+       See <a href="#manage">Manage your library &amp; users</a>.</p>
     <h3>A network share won't connect</h3>
     <p>In the admin panel's <strong>Music Folders → Network Share</strong> form, use <strong>Test</strong> before
        connecting — it reports the exact connection error. Check the host, share name / path and credentials, and that

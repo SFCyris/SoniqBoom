@@ -17,7 +17,7 @@
   <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
   <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
   <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
-  <link rel="stylesheet" href="/assets/css/mobile.css?v=2">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=6">
 </head>
 <body>
   <div id="m-app">
@@ -25,6 +25,7 @@
     <!-- ── Top bar (per-view title) ─────────────────────────────────────── -->
     <header id="m-topbar">
       <span id="m-topbar-title">Library</span>
+      <button id="m-settings-btn" class="m-settings-btn" aria-label="Settings">⚙</button>
       <!-- Escape hatch: the auto-redirect at / pins ``sb_ui=mobile`` so a
            phone that landed here once stays here.  This link lets the
            user opt back into the desktop UI (useful on iPads forced to
@@ -41,6 +42,7 @@
     <main id="m-content">
       <section id="m-view-library"    class="m-view active"></section>
       <section id="m-view-search"     class="m-view"></section>
+      <section id="m-view-radio"      class="m-view"></section>
       <section id="m-view-queue"      class="m-view"></section>
       <section id="m-view-nowplaying" class="m-view"></section>
       <section id="m-view-settings"   class="m-view"></section>
@@ -136,14 +138,14 @@
       <button class="m-tab" data-view="search"     aria-label="Search">
         <span class="m-tab-icon">🔍</span><span class="m-tab-label">Search</span>
       </button>
+      <button class="m-tab" data-view="radio"      aria-label="Radio">
+        <span class="m-tab-icon">📻</span><span class="m-tab-label">Radio</span>
+      </button>
       <button class="m-tab" data-view="queue"      aria-label="Queue">
         <span class="m-tab-icon">≡</span><span class="m-tab-label">Queue</span>
       </button>
       <button class="m-tab" data-view="nowplaying" aria-label="Now Playing">
         <span class="m-tab-icon">♪</span><span class="m-tab-label">Now</span>
-      </button>
-      <button class="m-tab" data-view="settings"   aria-label="Settings">
-        <span class="m-tab-icon">⚙</span><span class="m-tab-label">Settings</span>
       </button>
     </nav>
 
@@ -167,7 +169,7 @@
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
 
-  <script type="module" src="/assets/js/mobile/app.js?v=2"></script>
+  <script type="module" src="/assets/js/mobile/app.js?v=13"></script>
   <!-- Same cast picker the desktop shell loads.  Picker is a classic
        script that wires itself to #btn-cast on either route. -->
   <script src="/assets/js/cast_picker.js?v=2" defer></script>

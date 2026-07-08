@@ -54,7 +54,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=72">
+  <link rel="stylesheet" href="/assets/css/app.css?v=86">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -373,6 +373,7 @@
           <button id="btn-next" title="Next" aria-label="Next track">&#9654;&#9654;</button>
           <!-- Radio mode only: the station ►► will surf to (next in list). -->
           <span id="radio-next-target" class="radio-target radio-target-next" aria-hidden="true"></span>
+          <button id="btn-locate" title="Scroll to the playing track (G)" aria-label="Locate now playing">&#9678;</button>
         </div>
         <div class="player-progress">
           <span id="time-cur">0:00</span>
@@ -1708,7 +1709,7 @@
           <!-- Metadata pane -->
           <div id="ti-meta-pane" class="ti-meta-pane">
 
-            <div class="ti-section">
+            <div class="ti-section ti-autohide" id="ti-section-main">
               <div class="ti-section-hdr">Track Info</div>
               <div class="ti-field"><span class="ti-label">Title</span><span class="ti-value" id="ti-title">—</span></div>
               <div class="ti-field"><span class="ti-label">Artist</span><span class="ti-value" id="ti-artist">—</span></div>
@@ -1718,13 +1719,13 @@
               <div class="ti-field"><span class="ti-label">Year</span><span class="ti-value" id="ti-year">—</span></div>
             </div>
 
-            <div class="ti-section">
+            <div class="ti-section ti-autohide" id="ti-section-numbering">
               <div class="ti-section-hdr">Numbering</div>
               <div class="ti-field"><span class="ti-label">Track</span><span class="ti-value" id="ti-track">—</span></div>
               <div class="ti-field"><span class="ti-label">Disc</span><span class="ti-value" id="ti-disc">—</span></div>
             </div>
 
-            <div class="ti-section">
+            <div class="ti-section ti-autohide" id="ti-section-details">
               <div class="ti-section-hdr">Details</div>
               <div class="ti-field"><span class="ti-label">Genre</span><span class="ti-value" id="ti-genre">—</span></div>
               <div class="ti-field"><span class="ti-label">Duration</span><span class="ti-value" id="ti-duration">—</span></div>
@@ -1741,13 +1742,73 @@
               <div class="ti-field" id="ti-field-channels-ext"><span class="ti-label">Channels</span><span class="ti-value" id="ti-channels-ext">—</span></div>
               <div class="ti-field" id="ti-field-patterns"><span class="ti-label">Patterns</span><span class="ti-value" id="ti-patterns">—</span></div>
               <div class="ti-field" id="ti-field-subsongs"><span class="ti-label">Subsongs</span><span class="ti-value" id="ti-subsongs">—</span></div>
+              <div class="ti-field" id="ti-field-sidchip" style="display:none"><span class="ti-label">SID chip</span><span class="ti-value"><span class="ti-sid-chip" id="ti-sidchip">—</span></span></div>
+              <div class="ti-field" id="ti-field-madewith" style="display:none"><span class="ti-label">Made with</span><span class="ti-value" id="ti-madewith">—</span></div>
               <div class="ti-field ti-field-instruments" id="ti-field-instruments">
                 <span class="ti-label">Instruments</span>
                 <div class="ti-instrument-list" id="ti-instrument-list"></div>
               </div>
             </div>
 
-            <div class="ti-section">
+            <!-- Subsong picker (SID / SNDH / AHX / SC68 / UADE / GME multi-tune
+                 files) — populated by trackinfo._renderSubsongPicker.  Each tune
+                 streams via ?subsong=<0-based>; the picker plays/queues one tune
+                 or all.  Hidden unless the file has >1 subsong. -->
+            <div class="ti-section" id="ti-section-subsongs" hidden>
+              <div class="ti-section-hdr ti-sub-hdrrow">
+                <span>Subsongs <span id="ti-sub-count" class="ti-sub-count"></span></span>
+                <span class="ti-sub-actions">
+                  <button type="button" id="ti-sub-playall" class="ti-sub-abtn" title="Play all tunes in order">&#9654; Play all</button>
+                  <button type="button" id="ti-sub-addall" class="ti-sub-abtn" title="Add every tune to the play queue">&#65291; <span id="ti-sub-addall-lbl">Add all</span></button>
+                  <button type="button" id="ti-sub-addall-pl" class="ti-sub-abtn" title="Add every tune to a playlist">&#9776; Playlist</button>
+                  <button type="button" id="ti-sub-shuffle" class="ti-sub-abtn ti-sub-abtn-icon" title="Shuffle all tunes" aria-label="Shuffle all tunes">&#128256;</button>
+                </span>
+              </div>
+              <div id="ti-sub-list" class="ti-sub-list" role="list" aria-label="Subsong list"></div>
+              <div class="ti-sub-foot">
+                <span id="ti-sub-more" class="ti-sub-more"></span>
+                <label class="ti-sub-jump">Jump to <input type="text" id="ti-sub-jump-in" inputmode="numeric" maxlength="4" placeholder="#" aria-label="Jump to tune number"></label>
+              </div>
+            </div>
+
+            <!-- HVSC STIL commentary (SID files) — raw blob rendered as-is
+                 (human-authored trivia; per-tune titles are lifted into the
+                 subsong picker rows).  Hidden when the file has no STIL entry. -->
+            <div class="ti-section" id="ti-section-stil" hidden>
+              <div class="ti-section-hdr">STIL <span class="ti-stil-src">· HVSC</span></div>
+              <div class="ti-stil-wrap"><pre id="ti-stil-body" class="ti-stil-body"></pre></div>
+            </div>
+
+            <!-- Pattern grid (tracker modules) — populated by trackinfo._loadPatterns
+                 from GET /api/tracks/{id}/patterns; hidden for everything else. -->
+            <div class="ti-section" id="ti-section-patterns" hidden>
+              <div class="ti-section-hdr ti-pat-hdrrow"><span>Patterns</span>
+                <button id="ti-pat-follow" class="ti-pat-follow" type="button"
+                        aria-pressed="false" title="Follow playback — the grid tracks the playing row">Follow</button>
+              </div>
+              <div class="ti-pat-orderrow">
+                <div id="ti-pat-order" class="ti-pat-order" aria-label="Pattern order"></div>
+                <span id="ti-pat-pos" class="ti-pat-pos"></span>
+              </div>
+              <div id="ti-pat-gridwrap" class="ti-pat-gridwrap" tabindex="0" aria-label="Pattern grid">
+                <table id="ti-pat-grid" class="ti-pat-grid"></table>
+              </div>
+              <div class="ti-pat-caption">note&#8202;·&#8202;instrument&#8202;·&#8202;volume&#8202;·&#8202;effect — beat rows shaded, playhead follows playback</div>
+              <div id="ti-pat-note" class="ti-pat-note" hidden></div>
+            </div>
+
+            <!-- Song message (tracker modules) — greets/scrolltext, whitespace
+                 preserved for ASCII art; hidden when the module has none. -->
+            <div class="ti-section" id="ti-section-message" hidden>
+              <div class="ti-section-hdr ti-pat-hdrrow"><span>Song message</span>
+                <button id="ti-msg-scroll" class="ti-pat-follow" type="button"
+                        aria-pressed="false" title="Show the message as a demoscene scroller">&#9654; Scroller</button>
+              </div>
+              <div id="ti-msg-marquee" class="ti-msg-marquee" hidden><span id="ti-msg-marquee-text"></span></div>
+              <div class="ti-msg-wrap"><pre id="ti-message"></pre></div>
+            </div>
+
+            <div class="ti-section ti-autohide" id="ti-section-file">
               <div class="ti-section-hdr">File</div>
               <div class="ti-field"><span class="ti-label">Added</span><span class="ti-value" id="ti-added">—</span></div>
               <div class="ti-field ti-field-path"><span class="ti-label">Path</span><span class="ti-value ti-value-path" id="ti-path">—</span></div>
@@ -2069,7 +2130,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=105"></script>
+  <script type="module" src="/assets/js/app.js?v=120"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

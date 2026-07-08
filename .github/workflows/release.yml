@@ -1,14 +1,18 @@
-# Build a downloadable source zip and publish it as a GitHub release asset
-# whenever a version tag is pushed.  Cutting a release is then one command:
+# On every version tag (e.g. `git tag v1.5.1 && git push origin v1.5.1`) this:
+#   1. publishes a source zip as a GitHub release asset, and
+#   2. builds + pushes a multi-arch Docker image to GHCR:
+#        ghcr.io/sfcyris/soniqboom:{1.5.1, 1.5, latest}
 #
-#     git tag v1.3.4 && git push origin v1.3.4
+# The two architectures are built on their OWN native runners (x86 on
+# ubuntu-24.04, arm64 on ubuntu-24.04-arm) and stitched into one manifest — NOT
+# cross-built under qemu.  This matters: the retro-format players (sc68, uade)
+# compile from source, and qemu-user cross-emulation segfaults gcc mid-compile
+# on those, non-deterministically.  Native runners avoid it entirely, so the
+# Dockerfile's renderer gate always passes and every published image is complete.
 #
-# The zip is built from tracked files at the tag (git archive), so it never
-# includes gitignored content such as internal/.  The published asset shows up
-# on the Releases page and is reachable forever at:
-#
-#     https://github.com/SFCyris/SoniqBoom/releases/latest
-#
+# Native arm64 runners are free for PUBLIC repos.  If this repo is private,
+# switch the arm64 `runner` to a paid larger-runner label (or accept qemu with
+# the compile-retries already in the Dockerfile).
 name: Release
 
 on:
@@ -16,12 +20,15 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write          # create the release and upload its assets
+env:
+  IMAGE: ghcr.io/sfcyris/soniqboom      # GHCR requires an all-lowercase path
 
 jobs:
+  # ── 1. Source-zip release asset ────────────────────────────────────────────
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release and upload its assets
     steps:
       - uses: actions/checkout@v4
 
@@ -43,3 +50,103 @@ jobs:
               --title "SoniqBoom ${GITHUB_REF_NAME}" \
               --generate-notes \
             || gh release upload "${GITHUB_REF_NAME}" "$ZIP" soniqboom-latest.zip --clobber
+
+  # ── 2a. Build each architecture on its own NATIVE runner, push by digest ────
+  docker-build:
+    permissions:
+      contents: read
+      packages: write        # push to GHCR with the built-in GITHUB_TOKEN
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Platform slug (for artifact names)
+        run: echo "PSLUG=${{ matrix.platform }}" | sed 's#/#-#' >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Shared labels (OCI metadata)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false     # plain manifest — keeps the digest-merge below simple
+          cache-from: type=gha,scope=${{ env.PSLUG }}
+          cache-to: type=gha,mode=max,scope=${{ env.PSLUG }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ env.PSLUG }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── 2b. Combine the per-arch digests into one multi-arch tag set ────────────
+  docker-manifest:
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"

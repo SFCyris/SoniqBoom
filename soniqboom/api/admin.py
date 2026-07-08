@@ -1812,10 +1812,21 @@ async def check_renderers(_tok: str = Depends(_require_token)):
             # run the binary, NOT that it lacks features.  Distinguish the two.
             probe_ok = len(fmts) > 2000 and len(enc_out) > 500
             if probe_ok:
-                demuxers_ok = all(
-                    f" d   {d} " in fmts or f" d   {d}\n" in fmts
-                    for d in ("dsf", "iff", "wsd")
-                )
+                # ffmpeg -formats rows are "<flags> <name> <long name>", e.g.
+                # " D  dsf   DSD Stream File".  The flag field is 2 chars (D/E,
+                # blank when absent) and the whitespace width varies, so split
+                # on whitespace runs instead of matching a fixed column layout —
+                # the old " d   {d} " (3-space) check never matched ffmpeg's
+                # 2-space output and reported every DSD demuxer as missing.
+                def _has_demuxer(name: str) -> bool:
+                    for _ln in fmts.splitlines():
+                        _parts = _ln.split()
+                        # flag token is column 0 after whitespace-split; the demux
+                        # bit is its first char ("d", "de" → demux; "e" → mux-only).
+                        if len(_parts) >= 2 and _parts[1] == name and _parts[0][:1] == "d":
+                            return True
+                    return False
+                demuxers_ok = all(_has_demuxer(d) for d in ("dsf", "iff", "wsd"))
                 encoders_present = {
                     name: name in enc_out
                     for name in ("libmp3lame", "libvorbis", "libopus",
@@ -1862,11 +1873,19 @@ async def check_renderers(_tok: str = Depends(_require_token)):
                     "path": f"in-process libgme ({gme_render.lib_name()})"}
         return _check(settings.gme_path, "gme")
 
-    # Bundled compile-on-first-use engines (HivelyTracker, StSound) report
-    # whether their built binary exists yet OR a compiler is available.
+    # Bundled compile-on-first-use engines (HivelyTracker, StSound).  Available
+    # if EITHER a pre-built binary is present — on PATH (baked into a multi-stage
+    # Docker image) or already compiled into the data dir — OR a compiler is on
+    # hand to build one on first use.  The PATH check must mirror the playback
+    # path (``_ensure_hvl2wav``/``_ensure_ym2wav`` in api/stream.py), which uses
+    # ``shutil.which`` first; without it the slim Docker image (pre-built binary,
+    # no compiler) wrongly reported these as missing while they play fine.
     def _bundled(binary_name: str) -> dict:
         from soniqboom.config import get_data_dir
         import shutil as _sh
+        pre = _sh.which(binary_name)
+        if pre:
+            return {"installed": True, "path": pre}
         built = get_data_dir() / "native" / binary_name
         if built.exists():
             return {"installed": True, "path": str(built)}

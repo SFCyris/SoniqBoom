@@ -339,6 +339,17 @@ class SyncEngine extends EventTarget {
       return;
     }
 
+    // Live-station broadcast — role-AGNOSTIC (the whole room, master included,
+    // plays the same station).  A live stream has no seekable position, so it
+    // bypasses the prepare→ready→play_at barrier and the drift-correction path
+    // entirely: every member just loads the shared hub-backed relay URL.
+    if (t === 'play_station') { this._onPlayStation(msg); return; }
+    // Live now-playing for the room's station, relayed from the station relay
+    // (ICY title / resolved cover).  Role-agnostic — updates every member's
+    // Player + card via the normal trackchange path.
+    if (t === 'radio_meta') { this._onRadioMeta(msg); return; }
+    if (t === 'radio_art')  { this._onRadioArt(msg);  return; }
+
     // Slave-specific events
     if (this.role === 'slave') {
       if (t === 'prepare')  { this._slavePrepare(msg);  return; }
@@ -347,6 +358,41 @@ class SyncEngine extends EventTarget {
       if (t === 'seek')     { this._slaveSeek(msg);     return; }
       if (t === 'pause')    { this._slavePause(msg);    return; }
     }
+  }
+
+  async _onPlayStation(msg) {
+    if (!msg || !msg.url) return;
+    // Cancel any in-flight track-change barrier state — we're leaving the
+    // seekable-sync world for a live stream.
+    this._pendingBarrier = null;
+    // Update the UI card immediately (before the network load) so every member
+    // reflects the new station even if autoplay is deferred.
+    this.dispatchEvent(new CustomEvent('play_station', { detail: msg }));
+    try {
+      await Player.playStation(
+        { name: (msg.station && msg.station.name) || 'Live radio',
+          sid: msg.sid,
+          favicon: msg.station && msg.station.favicon },
+        msg.url, '');
+    } catch {
+      // Autoplay blocked on a member that didn't initiate — surface the same
+      // "tap to start" affordance the barrier path uses.
+      this.dispatchEvent(new CustomEvent('autoplay_blocked'));
+    }
+  }
+
+  _onRadioMeta(msg) {
+    // Live ICY now-playing (artist/song) for the room's station.  Player
+    // stashes it on the station track and emits trackchange, which the
+    // master/slave views re-render from.
+    try { Player.setStationNowPlaying?.(msg.song || '', msg.artist || ''); } catch { /* ignore */ }
+    this.dispatchEvent(new CustomEvent('radio_meta', { detail: msg }));
+  }
+
+  _onRadioArt(msg) {
+    // Resolved now-playing cover — swaps the station logo for the song art.
+    try { Player.updateStationArt?.(msg.cover_url); } catch { /* ignore */ }
+    this.dispatchEvent(new CustomEvent('radio_art', { detail: msg }));
   }
 
   // ── Master → API ───────────────────────────────────────────────────────
@@ -524,6 +570,11 @@ class SyncEngine extends EventTarget {
 
   _emitStateUpdate() {
     if (this.role !== 'master') return;
+    // A live radio station has no seekable position, so master→slave position
+    // sync is meaningless (and drift-correcting a live stream via playbackRate
+    // would cause audible artefacts).  The station reaches the room via the
+    // play_station broadcast instead; suppress the drift loop while it plays.
+    if (Player.stationMode) return;
     // Stamp the moment of sampling in server wall-clock. Slaves subtract their
     // own skew to get the sample time in their local clock, which removes
     // master→server→slave relay jitter from the drift calculation.
@@ -662,6 +713,10 @@ class SyncEngine extends EventTarget {
   // ── Drift evaluation (slave) ───────────────────────────────────────────
 
   _evaluateDrift(state) {
+    // Never drift-correct a live station — playbackRate nudges on an
+    // un-seekable live stream fight its buffer and click audibly.  (Belt-and-
+    // suspenders: the master already stops emitting state in station mode.)
+    if (Player.stationMode) { this._resetRate(); return; }
     if (!state || state.trackId !== Player.currentTrackId) return;
     if (!state.playing) { this._resetRate(); return; }
 

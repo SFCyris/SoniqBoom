@@ -30,12 +30,25 @@ from urllib.parse import urlsplit
 import anyio
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from soniqboom.core import radiodir
+from soniqboom.core.station_hub import StationHub, registry as _hub_registry
 
 log = logging.getLogger("soniqboom.stations")
+
+# Direct/HLS relay reconnect bound: after the FIRST audio has flowed, a station
+# blip (upstream EOF/error) reconnects under the same hub up to this many
+# CONSECUTIVE times with exponential backoff, keeping every subscriber attached.
+# Exhausting it ends the hub (subscribers get EOF → the frontend re-requests).
+_RELAY_MAX_RECONNECTS = 5
+# A reconnect cycle that has been delivering audio for at least this long counts
+# as "healthy" and resets the consecutive-failure counter.  Without this, a
+# station that flaps (yields a chunk, dies, repeats) would reset on every cycle
+# and reconnect forever; with it, only a genuinely-recovered stream resets, so a
+# persistently-flapping station is abandoned after _RELAY_MAX_RECONNECTS.
+_RELAY_HEALTHY_SECS = 30.0
 
 router = APIRouter(prefix="/stations", tags=["stations"])
 
@@ -181,6 +194,13 @@ async def _broadcast_meta(payload: dict) -> None:
     from soniqboom.api.library import _broadcast
     try:
         await _broadcast(payload)
+    except Exception:                       # noqa: BLE001 — UI nicety only
+        pass
+    # Also relay to multi-room members (they're on the multiroom WS, not the
+    # library WS) so a station playing to a room shows live now-playing + cover.
+    try:
+        from soniqboom.api.multiroom import notify_station_meta
+        await notify_station_meta(payload)
     except Exception:                       # noqa: BLE001 — UI nicety only
         pass
 
@@ -551,8 +571,14 @@ async def _hls_metadata_pump(url: str, st: dict) -> None:
                 pass
 
 
-async def _relay_hls(stream: dict, st: dict) -> StreamingResponse:
-    """Transcode an HLS station through ffmpeg into a continuous stream.
+async def _hls_producer(stream: dict, st: dict, set_info):
+    """One ffmpeg transcode attempt of an HLS station → clean ADTS/AAC audio.
+
+    Async generator (yields self-framing audio chunks) feeding a StationHub —
+    NOT a per-listener StreamingResponse anymore; the hub fans one ffmpeg's
+    output to every subscriber.  Raises on a dead master so the hub's start()
+    surfaces a clean 502.  ``set_info(media_type, headers)`` is called once the
+    transcode is confirmed alive, before the first yield.
 
     The upstream master URL has already passed ``_assert_public_url``.
     ffmpeg then fetches the variant/segment URLs the master references; the
@@ -680,33 +706,32 @@ async def _relay_hls(stream: dict, st: dict) -> StreamingResponse:
     _de.add_done_callback(_bg_tasks.discard)
 
     # Best-effort now-playing: a second ffmpeg extracts the in-band ID3 timed
-    # metadata (if any) and broadcasts radio_meta events.  Tied to this
-    # response's lifetime — cancelled when the listener stops (gen finally).
+    # metadata (if any) and broadcasts radio_meta events.  ONE pump per hub
+    # (not per listener) — cancelled in the finally below when the hub tears the
+    # producer down.
     meta_task = asyncio.get_running_loop().create_task(
         _hls_metadata_pump(stream["url"], st))
     _bg_tasks.add(meta_task)
     meta_task.add_done_callback(_bg_tasks.discard)
 
-    async def gen():
-        try:
-            yield first
-            while True:
-                chunk = await proc.stdout.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            meta_task.cancel()
-            await _kill()
-
-    return StreamingResponse(gen(), media_type=media_type, headers={
+    set_info(media_type, {
         "Cache-Control": "no-store",
         "X-Station-Name": (st.get("name") or "station").encode("ascii", "ignore").decode() or "station",
         "X-Station-Transcode": "hls",
     })
+    try:
+        yield first
+        while True:
+            chunk = await proc.stdout.read(8192)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        meta_task.cancel()
+        await _kill()
 
 
-async def _relay_direct(stream: dict, st: dict, _depth: int = 0) -> StreamingResponse:
+async def _direct_producer(stream: dict, st: dict, set_info, _depth: int = 0):
     """Byte-forward a direct Icecast/SHOUTcast mount, de-interleaving ICY
     metadata into ``radio_meta`` events.
 
@@ -717,9 +742,16 @@ async def _relay_direct(stream: dict, st: dict, _depth: int = 0) -> StreamingRes
         out the inner stream URL, re-validate it (SSRF), and recurse.
     Recursion (playlist + redirect hops combined) is bounded to ``_depth`` 5
     so a playlist/redirect loop can't spin.
+
+    Async generator (yields clean audio) feeding a StationHub — the hub fans
+    one upstream connection to every subscriber.  ``set_info(media_type,
+    headers)`` is called once the real audio stream is resolved, before the
+    first yield.
     """
     if _is_hls(stream):
-        return await _relay_hls(stream, st)
+        async for _c in _hls_producer(stream, st, set_info):
+            yield _c
+        return
 
     from soniqboom.core import ssrf_proxy
     _client_kw = dict(
@@ -757,7 +789,9 @@ async def _relay_direct(stream: dict, st: dict, _depth: int = 0) -> StreamingRes
         from urllib.parse import urljoin
         target = urljoin(stream["url"], loc)
         await _assert_public_url(target)     # validate the redirect destination
-        return await _relay_direct({**stream, "url": target}, st, _depth + 1)
+        async for _c in _direct_producer({**stream, "url": target}, st, set_info, _depth + 1):
+            yield _c
+        return
     if upstream.status_code != 200:
         await upstream.aclose()
         await client.aclose()
@@ -798,12 +832,16 @@ async def _relay_direct(stream: dict, st: dict, _depth: int = 0) -> StreamingRes
             await upstream.aclose()
             await client.aclose()
         if b"#EXT-X-" in head[:4096]:
-            return await _relay_hls(stream, st)        # ffmpeg reads stream["url"]
+            async for _c in _hls_producer(stream, st, set_info):   # ffmpeg reads stream["url"]
+                yield _c
+            return
         inner = _parse_playlist(head, stream["url"])
         if not inner:
             raise HTTPException(502, "Station playlist contained no stream URL")
         await _assert_public_url(inner)
-        return await _relay_direct({**stream, "url": inner}, st, _depth + 1)
+        async for _c in _direct_producer({**stream, "url": inner}, st, set_info, _depth + 1):
+            yield _c
+        return
 
     try:
         metaint = int(upstream.headers.get("icy-metaint", "0"))
@@ -811,103 +849,143 @@ async def _relay_direct(stream: dict, st: dict, _depth: int = 0) -> StreamingRes
         metaint = 0
     station_name = upstream.headers.get("icy-name") or st.get("name") or ""
 
-    async def gen():
-        last_title = None
-
-        async def emit_title(raw: bytes):
-            nonlocal last_title
-            m = _TITLE_RE.search(raw)
-            if not m:
-                return
-            try:
-                title = m.group(1).decode("utf-8")
-            except UnicodeDecodeError:
-                title = m.group(1).decode("latin-1", "replace")
-            title = title.strip()
-            if title and title != last_title:
-                last_title = title
-                # Parse "Artist - Song" so the player bar can show them split
-                # (falls back to the raw title when there's no clean split).
-                from soniqboom.core.nowplaying_art import parse_stream_title
-                _artist, _song = parse_stream_title(title)
-                await _broadcast_meta({
-                    "event": "radio_meta",
-                    "sid": st["sid"],
-                    "station": station_name,
-                    "title": title,
-                    "artist": _artist or "",
-                    "song": _song or "",
-                })
-                # Background now-playing cover lookup (library → Discogs →
-                # MusicBrainz); pushes a ``radio_art`` event when it finds one.
-                # Never blocks the audio stream.  Gated by the privacy setting.
-                from soniqboom.config import settings as _settings
-                if _settings.radio_art_lookup:
-                    _at = asyncio.get_running_loop().create_task(
-                        _lookup_and_push_art(st["sid"], title),
-                    )
-                    _bg_tasks.add(_at)
-                    _at.add_done_callback(_bg_tasks.discard)
-
-        try:
-            if metaint <= 0:
-                async for chunk in upstream.aiter_bytes(8192):
-                    yield chunk
-            else:
-                # ICY framing: ``metaint`` audio bytes, then 1 length byte
-                # (×16 = metadata block size, 0 = no update), repeating.
-                # Misaligning this by even one byte corrupts the audio.
-                buf = b""
-                audio_left = metaint
-                async for chunk in upstream.aiter_bytes(8192):
-                    buf += chunk
-                    while True:
-                        if audio_left > 0:
-                            take = buf[:audio_left]
-                            if not take:
-                                break
-                            yield take
-                            buf = buf[len(take):]
-                            audio_left -= len(take)
-                            if audio_left > 0:
-                                break              # need more upstream bytes
-                        else:
-                            if not buf:
-                                break
-                            meta_len = buf[0] * 16
-                            if len(buf) < 1 + meta_len:
-                                break              # metadata block split across chunks
-                            if meta_len:
-                                await emit_title(buf[1:1 + meta_len])
-                            buf = buf[1 + meta_len:]
-                            audio_left = metaint
-        finally:
-            # When the listener switches/stops a station, the browser drops the
-            # connection; Starlette handles that http.disconnect by CANCELLING
-            # the streaming task.  The cancellation is injected at the suspended
-            # ``yield`` above, so this finally runs inside an already-cancelled
-            # scope — an unshielded ``await upstream.aclose()`` would re-raise
-            # CancelledError immediately and ``client.aclose()`` would never run,
-            # leaking the upstream socket + httpx client until GC.  Shield the
-            # teardown so both actually close on abort (same idiom as cast_pipe).
-            with anyio.CancelScope(shield=True):
-                await upstream.aclose()
-                await client.aclose()
-
-    return StreamingResponse(gen(), media_type=media_type, headers={
+    set_info(media_type, {
         "Cache-Control": "no-store",
         "X-Station-Name": station_name.encode("ascii", "ignore").decode() or "station",
-        "X-Station-Metaint": str(metaint),
+        # The served stream is CLEAN — ICY metadata is de-interleaved server-side
+        # and pushed over the WS — so the client never parses it: advertise 0.
+        "X-Station-Metaint": "0",
     })
+
+    last_title = None
+
+    async def emit_title(raw: bytes):
+        nonlocal last_title
+        m = _TITLE_RE.search(raw)
+        if not m:
+            return
+        try:
+            title = m.group(1).decode("utf-8")
+        except UnicodeDecodeError:
+            title = m.group(1).decode("latin-1", "replace")
+        title = title.strip()
+        if title and title != last_title:
+            last_title = title
+            # Parse "Artist - Song" so the player bar can show them split
+            # (falls back to the raw title when there's no clean split).
+            from soniqboom.core.nowplaying_art import parse_stream_title
+            _artist, _song = parse_stream_title(title)
+            await _broadcast_meta({
+                "event": "radio_meta",
+                "sid": st["sid"],
+                "station": station_name,
+                "title": title,
+                "artist": _artist or "",
+                "song": _song or "",
+            })
+            # Background now-playing cover lookup (library → Discogs →
+            # MusicBrainz); pushes a ``radio_art`` event when it finds one.
+            # Never blocks the audio stream.  Gated by the privacy setting.
+            from soniqboom.config import settings as _settings
+            if _settings.radio_art_lookup:
+                _at = asyncio.get_running_loop().create_task(
+                    _lookup_and_push_art(st["sid"], title),
+                )
+                _bg_tasks.add(_at)
+                _at.add_done_callback(_bg_tasks.discard)
+
+    try:
+        if metaint <= 0:
+            async for chunk in upstream.aiter_bytes(8192):
+                yield chunk
+        else:
+            # ICY framing: ``metaint`` audio bytes, then 1 length byte
+            # (×16 = metadata block size, 0 = no update), repeating.
+            # Misaligning this by even one byte corrupts the audio.
+            buf = b""
+            audio_left = metaint
+            async for chunk in upstream.aiter_bytes(8192):
+                buf += chunk
+                while True:
+                    if audio_left > 0:
+                        take = buf[:audio_left]
+                        if not take:
+                            break
+                        yield take
+                        buf = buf[len(take):]
+                        audio_left -= len(take)
+                        if audio_left > 0:
+                            break              # need more upstream bytes
+                    else:
+                        if not buf:
+                            break
+                        meta_len = buf[0] * 16
+                        if len(buf) < 1 + meta_len:
+                            break              # metadata block split across chunks
+                        if meta_len:
+                            await emit_title(buf[1:1 + meta_len])
+                        buf = buf[1 + meta_len:]
+                        audio_left = metaint
+    finally:
+        # The hub cancels this producer on teardown; the cancellation is injected
+        # at the suspended ``yield``, so this finally runs inside an already-
+        # cancelled scope — an unshielded ``await upstream.aclose()`` would
+        # re-raise CancelledError immediately and ``client.aclose()`` would never
+        # run, leaking the socket + httpx client until GC.  Shield the teardown
+        # so both actually close on abort (same idiom as cast_pipe).
+        with anyio.CancelScope(shield=True):
+            await upstream.aclose()
+            await client.aclose()
+
+
+async def _producer_with_reconnect(stream: dict, st: dict, set_info):
+    """Wrap _direct_producer (which self-dispatches to HLS) with server-side
+    reconnect.  BEFORE any audio has flowed a failure propagates (so a dead
+    station surfaces as a clean 502 to the hub's first subscriber); AFTER audio
+    has flowed, an upstream EOF/error reconnects with exponential backoff up to
+    _RELAY_MAX_RECONNECTS, keeping every subscriber attached across the blip."""
+    yielded_any = False
+    attempt = 0
+    while True:
+        cycle_start = time.monotonic()
+        try:
+            async for chunk in _direct_producer(stream, st, set_info):
+                yielded_any = True
+                # Reset the consecutive-failure counter only after SUSTAINED
+                # delivery — a flapping station that yields one chunk then dies
+                # must NOT reset every cycle (that reconnects forever, spawning a
+                # fresh client/ffmpeg each time).  A rare blip after a long
+                # healthy run still resets.  (Concurrency audit 2026-07-04.)
+                if attempt and time.monotonic() - cycle_start >= _RELAY_HEALTHY_SECS:
+                    attempt = 0
+                yield chunk
+            # Clean async-for exit == upstream closed the connection (EOF).
+        except asyncio.CancelledError:
+            raise                            # hub teardown — propagate
+        except Exception as exc:             # noqa: BLE001
+            if not yielded_any:
+                raise                        # first-play failure → 502 to listener
+            log.info("station %s relay blip: %s — reconnecting", st.get("sid"), exc)
+        if not yielded_any:
+            return                           # EOF before any audio, no error → stop
+        attempt += 1
+        if attempt > _RELAY_MAX_RECONNECTS:
+            log.info("station %s: giving up after %d consecutive reconnects",
+                     st.get("sid"), attempt)
+            return
+        await asyncio.sleep(min(2 ** attempt * 0.5, 8.0))
 
 
 @router.get("/relay/{sid:path}")
 async def relay(sid: str, v: int = Query(0, ge=0)):
-    """Stream a station through the server.
+    """Stream a station through the server, SHARED via a StationHub.
 
-    HLS ``.m3u8`` stations are transcoded via ffmpeg (browsers can't play
-    HLS through <audio>); plain Icecast/SHOUTcast mounts are byte-forwarded
-    with ICY metadata de-interleaved for now-playing titles.
+    The first listener of a given (sid, v) opens ONE upstream connection (or one
+    ffmpeg for HLS); every subsequent listener — browser or cast/room target —
+    attaches to the same hub, so N listeners cost one upstream pull + one
+    transcode.  HLS ``.m3u8`` is transcoded via ffmpeg (browsers can't play HLS
+    through <audio>); plain Icecast/SHOUTcast mounts are byte-forwarded with ICY
+    metadata de-interleaved once and pushed over the WS.
     """
     st = await radiodir.resolve_station(sid)
     if not st:
@@ -916,14 +994,103 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
     if not streams:
         raise HTTPException(404, "Station has no streams")
     stream = streams[min(v, len(streams) - 1)]
-    await _assert_public_url(stream["url"])
+    await _assert_public_url(stream["url"])     # fast SSRF pre-check per request
 
-    # Radio Browser etiquette: report the play click (dedup'd server-side
-    # per IP per day) so community popularity rankings stay meaningful.
-    if stream.get("uuid"):
-        _t = asyncio.get_running_loop().create_task(radiodir.report_click(stream["uuid"]))
-        _bg_tasks.add(_t)
-        _t.add_done_callback(_bg_tasks.discard)
+    key = f"{sid}#{v}"
 
-    # Dispatch: HLS → transcode, playlist wrapper → resolve, direct → forward.
-    return await _relay_direct(stream, st)
+    async def _build() -> StationHub:
+        # Radio Browser etiquette: report the play click ONCE per hub (one
+        # upstream session), not once per listener — dedup'd server-side per IP
+        # per day anyway.  uuid validated inside report_click (anti-traversal).
+        if stream.get("uuid"):
+            _t = asyncio.get_running_loop().create_task(
+                radiodir.report_click(stream["uuid"]))
+            _bg_tasks.add(_t)
+            _t.add_done_callback(_bg_tasks.discard)
+        hub = StationHub(
+            key,
+            lambda set_info: _producer_with_reconnect(stream, st, set_info),
+            media_type="audio/mpeg",         # provisional; producer set_info finalises
+            burst=True,                       # MP3/ADTS self-frame → safe burst
+            on_teardown=_hub_registry._deregister,
+        )
+        await hub.start()                     # connects; raises 502/504 if dead
+        return hub
+
+    hub = await _hub_registry.get_or_create(key, _build)
+    return StreamingResponse(hub.stream(), media_type=hub.media_type,
+                             headers=hub.headers)
+
+
+@router.get("/hubs")
+async def hubs():
+    """Introspection: live station hubs and their subscriber counts.
+
+    Proves the fan-out (one hub with N subscribers, not N hubs) and lets the
+    multi-room layer see which stations are already warm.  Auth-gated like the
+    rest of the stations API."""
+    return _hub_registry.stats()
+
+
+# ── Hover-intent warm ─────────────────────────────────────────────────────────
+# The relay only connects on click, so the first audio is preceded by a cold
+# DNS lookup (+ a Radio Browser resolve for rb: stations).  Warming pre-runs the
+# CHEAP, side-effect-free half of the relay path on hover so the click starts
+# from a warm resolver.  Deliberately does NOT: fire report_click (a hover is
+# not a play — the earlier warm attempt polluted Radio Browser popularity), nor
+# spawn a relay (uncapped ffmpeg was the other revert reason).  Deduped per sid
+# with a short TTL and hard-capped so hovering down a long list can't stampede.
+_WARM_TTL = 30.0            # seconds a warmed sid stays "fresh" (skip re-warm)
+_WARM_MAX = 8              # max concurrent in-flight warms (list-scroll backstop)
+_WARM_MAX_TRACKED = 512    # hard cap on the freshness map (bounds memory)
+_warm_fresh: dict[str, float] = {}   # sid → monotonic expiry
+_warm_inflight: set[str] = set()
+
+
+@router.get("/warm/{sid:path}")
+async def warm(sid: str, v: int = Query(0, ge=0)):
+    """Pre-resolve a station + its stream host DNS so a later /relay click
+    starts faster.  Always answers 204 (even for unknown/non-public sids) — a
+    hover must never surface an error or leak whether a sid is valid.
+
+    Cheap half of the relay path ONLY: no report_click, no relay spawn.  See the
+    section comment above for why.
+    """
+    now = time.monotonic()
+    exp = _warm_fresh.get(sid)
+    if exp and exp > now:
+        return Response(status_code=204)            # already warm within TTL
+    # Cap + per-sid dedup.  The check-and-add is atomic under asyncio (no await
+    # between here and the add), so no lock is needed.
+    if sid in _warm_inflight or len(_warm_inflight) >= _WARM_MAX:
+        return Response(status_code=204)
+    _warm_inflight.add(sid)
+    try:
+        st = await radiodir.resolve_station(sid)     # rb: → warms the RB http pool
+        streams = (st or {}).get("streams") or []
+        if not streams:
+            return Response(status_code=204)
+        stream = streams[min(v, len(streams) - 1)]
+        url = stream.get("url")
+        if url:
+            try:
+                await _assert_public_url(url)        # getaddrinfo → OS DNS cache
+            except HTTPException:
+                return Response(status_code=204)     # non-public / unresolvable
+            _warm_fresh[sid] = now + _WARM_TTL
+        # Bound the freshness map: prune expired first, then hard-cap by dropping
+        # the soonest-to-expire entries.  Without the hard cap, a client hovering
+        # many distinct still-fresh sids within one TTL window could grow it to
+        # the count of currently-fresh stations (a few MB) before expiry reclaims.
+        if len(_warm_fresh) > _WARM_MAX_TRACKED:
+            for k in [k for k, e in _warm_fresh.items() if e <= now]:
+                _warm_fresh.pop(k, None)
+            if len(_warm_fresh) > _WARM_MAX_TRACKED:
+                for k in sorted(_warm_fresh, key=_warm_fresh.get)[
+                        :len(_warm_fresh) - _WARM_MAX_TRACKED]:
+                    _warm_fresh.pop(k, None)
+        return Response(status_code=204)
+    except Exception:                                # noqa: BLE001 — warm is best-effort
+        return Response(status_code=204)
+    finally:
+        _warm_inflight.discard(sid)

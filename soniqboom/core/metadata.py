@@ -54,8 +54,11 @@ SUPPORTED_EXTENSIONS = {
     ".dsf", ".dff", ".wsd",
     # AdLib / OPL2 FM (AdPlug): id/Apogee IMF rides the ``.imf`` entry above
     # (disambiguated from Imago Orpheus by content), plus the wider family.
+    # ``.amd`` = AMUSIC Adlib Tracker — Modland files it under ``Ad Lib/`` and
+    # AdPlug plays it; note names like ``star.amd`` collide with uade's
+    # ProWizard ``star`` prefix, so the AdLib extension must win (see extract()).
     ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
-    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm", ".amd",
     # Atari ST: SNDH archive files (psgplay), YM register dumps (StSound),
     # native sc68 disks (sc68).
     ".sndh", ".ym", ".sc68",
@@ -104,7 +107,7 @@ FORMAT_NAMES = {
     ".rad": "Reality AdLib", ".laa": "LucasArts AdLib", ".sci": "Sierra AdLib",
     ".dro": "DOSBox OPL", ".hsc": "HSC AdLib", ".rix": "RIX OPL",
     ".a2m": "AdLib Tracker 2", ".adl": "AdLib", ".bam": "Bob's AdLib",
-    ".ksm": "Ken's AdLib",
+    ".ksm": "Ken's AdLib", ".amd": "AMUSIC AdLib",
     # Atari ST
     ".sndh": "SNDH", ".ym": "YM", ".sc68": "SC68",
     # PSF console-music family (.dsf stays "DSD" here — the Dreamcast case
@@ -151,7 +154,7 @@ _GME_EXTS = {
 # ``_extract_imf`` / ``stream._render_imf``).
 _ADLIB_EXTS = {
     ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
-    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm", ".amd",
 }
 _ADLIB_DEFAULT_DURATION = 180   # seconds; the rendered WAV carries the real length
 
@@ -1992,6 +1995,16 @@ def extract(path: Path, track_id: str) -> TrackMeta:
     #     SidMon modules as ``*.sid``; only C64 files carry the PSID header.
     _uade_probe: dict | None = None
     _uade_cls = _uade.classify(path.name)
+    # A file with a known AdLib extension is AdLib, not uade — even when its
+    # NAME collides with a uade token.  AMUSIC ``star.amd`` files (Modland
+    # ``Ad Lib/…``) collide with uade's ProWizard ``star`` prefix; uade's -g
+    # then rejects them ("module check failed") but the lenient-index path
+    # below would still stamp them "ProTracker (packed)" and they fail at
+    # play.  AdPlug plays them.  (Archive members arrive here already stripped
+    # to their ``.amd`` name, so this covers the ``star.amd``/``STAR.AMD.star``
+    # zip forms too.)
+    if ext in _ADLIB_EXTS or ext == ".imf":
+        _uade_cls = None
     _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None
     if not _is_uade and ext in _SID_EXTS:
         try:

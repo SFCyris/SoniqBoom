@@ -7,13 +7,24 @@
 import { Sync } from './sync.js';
 import { enterMaster, leaveMaster } from './master.js';
 import { enterSlave, leaveSlave } from './slave.js';
+import { Auth } from '../auth.js';
 
 const $ = (id) => document.getElementById(id);
 const LABEL_KEY = 'sb_mr_label';
+const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 let _roomsPollTimer = null;
 
-document.addEventListener('DOMContentLoaded', () => {
+// Sign-in gate — /multiroom is a full SPA and every /api/multiroom call needs a
+// session.  Without this, opening it signed-out shows the UI but silently 401s
+// on everything (nothing works until you log in via the main page).  Auth.boot()
+// shows the login overlay; we POLL Auth.user rather than `await Auth.ready` so a
+// stray boot-time 401 that trips auth's re-auth flow can't orphan us (same
+// reasoning as the mobile shell).
+async function _boot() {
+  await Auth.boot();
+  while (!Auth.user) { await _sleep(120); }
+
   _initLabel();
   _bindLanding();
   refreshLanding();
@@ -49,7 +60,9 @@ document.addEventListener('DOMContentLoaded', () => {
       refreshLanding();
     }
   });
-});
+}
+
+_boot();
 
 function _initLabel() {
   const saved = localStorage.getItem(LABEL_KEY) || '';

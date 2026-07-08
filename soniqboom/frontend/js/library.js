@@ -743,9 +743,15 @@ function _fillTrackRow(tr, t, i) {
 // scroll listener, which renders the new window and may end up shifting
 // the spacers further; the user perceives this as the list "running away"
 // on its own until it bottoms out.
+// Monotonic per-track generation: a slow, failed rating PUT must not revert a
+// rating the user changed again while it was in flight — only the newest
+// request owns the cache/cell.  Shared by the row stars and the context menu.
+const _ratingGen = {};
 function _setRowRating(trackId, newRating, ratingTd) {
-  const finalRating = (_ratingsCache[trackId] === newRating) ? 0 : newRating;
+  const prevRating = _ratingsCache[trackId] || 0;
+  const finalRating = (prevRating === newRating) ? 0 : newRating;
   _ratingsCache[trackId] = finalRating;
+  const gen = (_ratingGen[trackId] = (_ratingGen[trackId] || 0) + 1);
   ratingTd.innerHTML = _renderStars(finalRating);
   const focusTarget = ratingTd.querySelector(`.star[data-val="${Math.max(1, finalRating)}"]`);
   if (focusTarget) {
@@ -757,7 +763,20 @@ function _setRowRating(trackId, newRating, ratingTd) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rating: finalRating }),
-  }).catch(() => {});
+  }).then((res) => {
+    // A silently-dropped rating looks saved but corrupts the Top-Rated smart
+    // view — a non-2xx (or a network error) must roll the optimistic change
+    // back and tell the user, not vanish.
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  }).catch(() => {
+    if (_ratingGen[trackId] !== gen) return;  // superseded by a newer rating
+    _ratingsCache[trackId] = prevRating;
+    // Only repaint the cell if its row still shows THIS track — the
+    // virtual-scroll pool may have recycled the TD to another row mid-fetch.
+    const row = ratingTd.closest('tr');
+    if (row && row.dataset.id === trackId) ratingTd.innerHTML = _renderStars(prevRating);
+    window.Toast?.error?.('Couldn’t save rating — change reverted.');
+  });
 }
 
 // ── Virtual scroll render ──────────────────────────────────────────────────────
@@ -852,7 +871,9 @@ function _vsRender(force = false) {
   _scheduleDurationProbe();
 
   markPlayingRow();
-  _applyColVisibility();
+  // NOTE: column visibility is now driven by container classes (set once in
+  // _applyColVisibility on load / pref change), so it no longer needs a
+  // per-frame re-apply here — the CSS covers freshly-pooled rows.
 
   // Restore keyboard focus indicator after a rebuild
   if (_focusedIdx >= _vsStart && _focusedIdx < _vsEnd) {
@@ -956,6 +977,96 @@ async function renderTracks(tracks) {
 
   _updateSelectionBar();
   _applyColVisibility();
+  _updateAzRail();
+}
+
+// ── A–Z jump rail ─────────────────────────────────────────────────────────────
+const _AZ = ['#','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+let _azRail = null;
+function _azSortKey() { return (sortKey && ['title','artist','album','album_artist'].includes(sortKey)) ? sortKey : (sortKey ? null : 'title'); }
+function _azInitial(t) {
+  const k = _azSortKey() || 'title';
+  const s = String((t && (t[k] ?? t.title)) || '').trim().toUpperCase();
+  const c = s[0] || '';
+  return (c >= 'A' && c <= 'Z') ? c : '#';
+}
+function _ensureAzRail() {
+  if (_azRail) return _azRail;
+  const wrap = document.getElementById('track-list-wrap');
+  if (!wrap || !wrap.parentElement) return null;
+  const rail = document.createElement('div');
+  rail.id = 'az-rail';
+  rail.hidden = true;
+  _AZ.forEach(ch => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'az-letter'; b.tabIndex = -1; b.textContent = ch;
+    b.addEventListener('click', () => _jumpToLetter(ch));
+    rail.appendChild(b);
+  });
+  wrap.parentElement.classList.add('has-az-rail');   // → position: relative (anchor)
+  wrap.parentElement.appendChild(rail);
+  _azRail = rail;
+  return rail;
+}
+function _azGroupInitial(it, key) {
+  const s = String((it && (it[key] ?? it.label ?? it.name)) || '').trim().toUpperCase();
+  const c = s[0] || '';
+  return (c >= 'A' && c <= 'Z') ? c : '#';
+}
+function _jumpToLetter(ch) {
+  const wrap = document.getElementById('track-list-wrap');
+  if (!wrap) return;
+  const trackN = (currentTracks && (currentTracks._total || currentTracks.length)) || 0;
+  if (trackN > 0) {
+    // Track list.
+    let idx = -1;
+    if (Array.isArray(currentTracks)) {
+      idx = currentTracks.findIndex(t => _azInitial(t) === ch);
+      if (idx < 0 && ch !== '#') idx = currentTracks.findIndex(t => _azInitial(t) >= ch);  // nearest ≥
+    } else if (currentTracks._isWindowedStore) {
+      // No global titles are loaded client-side; jump proportionally across the
+      // sorted total (gets you to roughly the letter — good enough at 262k).
+      const total = currentTracks._total || currentTracks.length || 0;
+      idx = Math.floor((Math.max(0, _AZ.indexOf(ch)) / _AZ.length) * total);
+    }
+    if (idx >= 0) wrap.scrollTop = idx * ROW_H;
+    return;
+  }
+  // Group-row list (Artists / Albums / Genres / …).  Scan the RENDERED rows by
+  // their name cell and scroll to the first match's exact position.  This reads
+  // the DOM directly (robust to module state), and since group rows aren't
+  // windowed they're all present once the chunked build finishes; a letter
+  // beyond the built rows (a very long list still rendering) jumps to the end —
+  // the build then fills it.  (Full windowing — deferred #15 — makes it exact.)
+  const rows = [...tbody.querySelectorAll('tr')].filter(r => r.offsetHeight > 0);
+  if (!rows.length) return;
+  const initialOf = (row) => {
+    const s = (row.querySelector('td.col-title')?.textContent || row.textContent || '').trim().toUpperCase();
+    const c = s[0] || '';
+    return (c >= 'A' && c <= 'Z') ? c : '#';
+  };
+  let target = rows.find(r => initialOf(r) === ch);
+  if (!target && ch !== '#') target = rows.find(r => initialOf(r) >= ch);
+  if (target) wrap.scrollTop += target.getBoundingClientRect().top - wrap.getBoundingClientRect().top;
+  else if (ch !== '#') wrap.scrollTop = wrap.scrollHeight;
+}
+function _updateAzRail() {
+  const rail = _ensureAzRail();
+  if (!rail) return;
+  const wrap = document.getElementById('track-list-wrap');
+  const trackN = (currentTracks && (currentTracks._total || currentTracks.length)) || 0;
+  const gridShown  = !document.getElementById('album-grid')?.hidden;
+  const tableShown = document.getElementById('track-table').style.display !== 'none';
+  // Show for a long, alphabetically-sorted track list OR a long group-row list
+  // (Artists / Albums / …) — not for the 2-D album grid.
+  let show = false;
+  if (trackN > 0) show = trackN > 40 && !!_azSortKey();
+  else if (!gridShown && tableShown && _groupItems && _groupItems.length > 40) show = true;
+  rail.hidden = !show;
+  if (wrap) {
+    wrap.classList.toggle('az-padded', show);
+    if (show) rail.style.top = wrap.offsetTop + 'px';   // align to the results area
+  }
 }
 
 // ── Lazy ratings: fetch only for visible rows ─────────────────────────────────
@@ -1112,7 +1223,199 @@ tbody.addEventListener('contextmenu', (e) => {
   const i = parseInt(tr.dataset.idx, 10);
   if (!Number.isFinite(i)) return;
   e.preventDefault();
-  if (_infoCallback) _infoCallback(currentTracks, i);
+  // Right-clicking an UNselected row selects just it; right-clicking a row
+  // that's already part of a multi-selection keeps the whole selection so the
+  // menu acts on all of them.
+  if (!_selected.has(i)) {
+    _selected.clear(); _selected.add(i); _lastClickIdx = i;
+    selectRow(tr, i); _refreshSelectionClasses(); _updateSelectionBar();
+  }
+  _showTrackContextMenu(e.clientX, e.clientY, i);
+});
+
+// ── Track context menu ────────────────────────────────────────────────────────
+let _ctxMenu = null;
+function _closeCtxMenu() {
+  if (!_ctxMenu) return;
+  _ctxMenu.remove();
+  _ctxMenu = null;
+  document.removeEventListener('mousedown', _onCtxOutside, true);
+  document.removeEventListener('keydown', _onCtxKey, true);
+  window.removeEventListener('resize', _closeCtxMenu);
+}
+function _onCtxOutside(e) {
+  // Keep the menu open while interacting with the add-to-playlist dropdown it
+  // spawned (that dropdown lives outside the menu element).
+  if (_ctxMenu && !_ctxMenu.contains(e.target)
+      && !e.target.closest('.playlist-add-dropdown')) _closeCtxMenu();
+}
+function _onCtxKey(e) { if (e.key === 'Escape') { _closeCtxMenu(); } }
+
+// Run a callback for every track the menu targets — the whole selection when
+// the right-clicked row is part of a multi-selection, else just that row.
+function _ctxTargets(i) {
+  if (_selected.size > 1 && _selected.has(i)) {
+    return [..._selected].sort((a, b) => a - b).map(j => currentTracks[j]).filter(Boolean);
+  }
+  return currentTracks[i] ? [currentTracks[i]] : [];
+}
+
+function _showTrackContextMenu(x, y, i) {
+  _closeCtxMenu();
+  const t = currentTracks[i];
+  if (!t) return;
+  const targets = _ctxTargets(i);
+  const multi = targets.length > 1;
+
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.setAttribute('role', 'menu');
+
+  const addItem = (label, fn, opts = {}) => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'ctx-item' + (opts.cls ? ' ' + opts.cls : '');
+    el.setAttribute('role', 'menuitem');
+    el.textContent = label;
+    el.addEventListener('click', (ev) => { ev.stopPropagation(); fn(el, ev); });
+    menu.appendChild(el);
+    return el;
+  };
+  const addSep = () => {
+    const s = document.createElement('div');
+    s.className = 'ctx-sep';
+    menu.appendChild(s);
+  };
+
+  addItem(multi ? `Play ${targets.length} tracks` : 'Play', () => {
+    if (multi) { Player.setQueue(targets, 0); } else { playFrom(i); }
+    _closeCtxMenu();
+  });
+  addItem('Play next', () => {
+    // Reverse so the first selected ends up immediately after the current.
+    [...targets].reverse().forEach(tr => Player.playNext(tr));
+    _closeCtxMenu();
+  });
+  addItem('Add to queue', () => {
+    targets.forEach(tr => Player.addToQueue(tr));
+    _closeCtxMenu();
+  });
+  addItem('Add to playlist…', async (el) => {
+    const mod = await import('./playlist.js');
+    mod.Playlist.showAddDropdown(el);     // operates on the current selection
+    // showAddDropdown captured the anchor rect synchronously, so we can drop
+    // the parent menu now — the playlist picker takes its place (no lingering).
+    _closeCtxMenu();
+  });
+  addSep();
+  // Rating row (single track only — a bulk rate is ambiguous).
+  if (!multi) {
+    const rateRow = document.createElement('div');
+    rateRow.className = 'ctx-rate';
+    rateRow.setAttribute('role', 'group');
+    rateRow.setAttribute('aria-label', 'Rate');
+    const cur = _ratingsCache[t.id] || 0;
+    for (let s = 1; s <= 5; s++) {
+      const star = document.createElement('span');
+      star.className = 'ctx-star' + (s <= cur ? ' on' : '');
+      star.textContent = s <= cur ? '★' : '☆';
+      star.title = `${s} star${s === 1 ? '' : 's'}`;
+      star.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        _rateTrack(t.id, s);
+        _closeCtxMenu();
+      });
+      rateRow.appendChild(star);
+    }
+    menu.appendChild(rateRow);
+    addSep();
+  }
+  // Navigation — pivot from this track to its whole artist / album.  Single
+  // selection only (a bulk "go to" is ambiguous).  Back returns to this view.
+  if (!multi && (t.artist || t.album)) {
+    if (t.artist) addItem('Go to artist', () => _goToArtist(t));
+    if (t.album)  addItem('Go to album',  () => _goToAlbum(t));
+    addSep();
+  }
+  addItem('Get info', () => {
+    if (_infoCallback) _infoCallback(currentTracks, i);
+    _closeCtxMenu();
+  });
+
+  // Position within the viewport (flip if it would overflow).
+  menu.style.cssText = 'position:fixed;visibility:hidden';
+  document.body.appendChild(menu);
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  const px = Math.min(x, window.innerWidth  - mw - 6);
+  const py = Math.min(y, window.innerHeight - mh - 6);
+  menu.style.left = `${Math.max(6, px)}px`;
+  menu.style.top  = `${Math.max(6, py)}px`;
+  menu.style.visibility = 'visible';
+  _ctxMenu = menu;
+  document.addEventListener('mousedown', _onCtxOutside, true);
+  document.addEventListener('keydown', _onCtxKey, true);
+  window.addEventListener('resize', _closeCtxMenu);
+  menu.querySelector('.ctx-item')?.focus();
+}
+
+// Persist a rating with optimistic UI + revert-on-failure; repaints the
+// visible row cell (shared by the row stars and the context menu).
+function _rateTrack(trackId, newRating) {
+  const prevRating = _ratingsCache[trackId] || 0;
+  const finalRating = (prevRating === newRating) ? 0 : newRating;
+  _ratingsCache[trackId] = finalRating;
+  const gen = (_ratingGen[trackId] = (_ratingGen[trackId] || 0) + 1);
+  _repaintRatingCell(trackId);
+  fetch(`/api/tracks/${trackId}/rating`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rating: finalRating }),
+  }).then((res) => { if (!res.ok) throw new Error(`HTTP ${res.status}`); })
+    .catch(() => {
+      if (_ratingGen[trackId] !== gen) return;  // superseded by a newer rating
+      _ratingsCache[trackId] = prevRating;
+      _repaintRatingCell(trackId);
+      window.Toast?.error?.('Couldn’t save rating — change reverted.');
+    });
+}
+function _repaintRatingCell(trackId) {
+  const cell = document.querySelector(
+    `#track-table tbody tr[data-id="${CSS.escape(trackId)}"] .col-rating`);
+  if (cell) cell.innerHTML = _renderStars(_ratingsCache[trackId] || 0);
+}
+
+// ── Hover-intent prefetch (perceived perf 2.2) ────────────────────────────────
+// Resting the cursor on a row for ~120 ms warms its art and, for the
+// server-rendered exotic formats (the ones with a multi-second cold render),
+// kicks the render ahead of the click via the existing prewarm endpoint (the
+// server caps concurrent background renders, so this can't swamp the box).
+let _hoverPrefetchTimer = null;
+const _hoverPrefetched = new Set();
+tbody.addEventListener('mouseover', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  const i = parseInt(tr.dataset.idx, 10);
+  const t = currentTracks[i];
+  if (!t || !t.id || _hoverPrefetched.has(t.id)) return;
+  clearTimeout(_hoverPrefetchTimer);
+  _hoverPrefetchTimer = setTimeout(() => {
+    if (_hoverPrefetched.has(t.id)) return;
+    _hoverPrefetched.add(t.id);
+    // Bound the memo so a long browse session can't grow it without limit.
+    if (_hoverPrefetched.size > 1000) {
+      _hoverPrefetched.delete(_hoverPrefetched.values().next().value);
+    }
+    // Art is immutable-cached, so a bare Image() request is cheap and makes
+    // the cover paint instantly if the row's info panel is opened.
+    const im = new Image(); im.decoding = 'async';
+    im.src = `/api/art/${encodeURIComponent(t.id)}?size=sm&fallback=404`;
+    // Only prewarm the renders that are actually slow-cold — native audio
+    // needs none, and gating here keeps the server's render slots for the
+    // formats that benefit (chiptune/AdLib/UADE exotica).
+    if (isRenderOnlyDuration(t)) {
+      fetch(`/api/stream/${encodeURIComponent(t.id)}/prewarm`,
+            { method: 'POST' }).catch(() => {});
+    }
+  }, 120);
 });
 
 tbody.addEventListener('keydown', (e) => {
@@ -1202,6 +1505,10 @@ function _updateSelectionBar() {
   const n = _selected.size;
   selBar.hidden = n < 2;
   if (n >= 2 && selCount) selCount.textContent = `${n} tracks selected`;
+  // "More like this" (◆) targets a SINGLE active selection.  Hide it + clear its
+  // stamped id whenever the selection isn't exactly one row (deselect, new
+  // search, multi-select) so a stale target can't leak into a later search.
+  if (simBtn && n !== 1) { simBtn.hidden = true; simBtn.dataset.id = ''; }
 }
 
 // ── selectRow (single-click visual highlight) ─────────────────────────────────
@@ -1218,10 +1525,48 @@ function selectRow(tr, idx) {
 
 function markPlayingRow() {
   tbody.querySelectorAll('tr.playing').forEach(r => r.classList.remove('playing'));
+  tbody.querySelectorAll('.row-eq').forEach(e => e.remove());
   if (Player.currentTrackId) {
     const row = tbody.querySelector(`tr[data-id="${Player.currentTrackId}"]`);
-    if (row) row.classList.add('playing');
+    if (row) {
+      row.classList.add('playing');
+      // Live "this row is alive" marker: animated equalizer bars in the number
+      // cell (CSS hides the digit + the static ▶ when .row-eq is present).
+      const numCell = row.querySelector('td.col-num');
+      if (numCell && !numCell.querySelector('.row-eq')) {
+        const eq = document.createElement('span');
+        eq.className = 'row-eq';
+        eq.setAttribute('aria-hidden', 'true');
+        eq.innerHTML = '<i></i><i></i><i></i>';
+        numCell.appendChild(eq);
+      }
+    }
   }
+}
+
+// "Locate now-playing": scroll the current track list to the playing row and
+// pulse it.  Works for plain arrays and the windowed store (whose findIndex
+// searches loaded chunks); if the track isn't in this view, says so.
+function locateNowPlaying() {
+  const id = Player.currentTrackId;
+  if (!id) { window.Toast?.info?.('Nothing is playing.'); return; }
+  let idx = -1;
+  if (currentTracks && typeof currentTracks.findIndex === 'function') {
+    idx = currentTracks.findIndex(t => t && t.id === id);
+  }
+  if (idx < 0) { window.Toast?.info?.('The playing track isn’t in this list.'); return; }
+  _focusedIdx = idx;
+  const wrap = document.getElementById('track-list-wrap');
+  if (!wrap) return;
+  // Center-ish the row in the viewport.
+  wrap.scrollTop = Math.max(0, idx * ROW_H - Math.floor(wrap.clientHeight / 2) + ROW_H);
+  requestAnimationFrame(() => {
+    const r = tbody.querySelector(`tr[data-idx="${idx}"]`);
+    if (r) {
+      r.classList.add('locate-pulse');
+      setTimeout(() => r.classList.remove('locate-pulse'), 1400);
+    }
+  });
 }
 
 function playFrom(idx) {
@@ -1388,12 +1733,18 @@ function restoreFullHeader() {
 
 // ── Column visibility ──────────────────────────────────────────────────────────
 function _applyColVisibility() {
+  // Toggle ``hide-col-*`` classes on the table CONTAINER (12 class writes on one
+  // element) instead of scanning + inline-styling every ``.col-*`` cell in the
+  // table.  Static CSS (``#track-table.hide-col-x .col-x{display:none}``) then
+  // hides descendants, so freshly-pooled virtual-scroll rows inherit the state
+  // automatically — no per-frame re-scan.  (Was called every _vsRender frame:
+  // 12 full-subtree querySelectorAll ~60×/s on the fling hot path.)
+  const table = document.getElementById('track-table');
+  if (!table) return;
   ALL_COLS.forEach(cls => {
-    // In duplicates view, force Location column visible regardless of user prefs
+    // In duplicates view, force Location column visible regardless of user prefs.
     const hidden = (cls === 'col-location' && _dupViewActive) ? false : _hiddenCols.has(cls);
-    document.querySelectorAll(`.${cls}`).forEach(el => {
-      el.style.display = hidden ? 'none' : '';
-    });
+    table.classList.toggle('hide-' + cls, hidden);
   });
 }
 
@@ -1628,7 +1979,7 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
       ? () => showArtists()
       : null;
   if (backLabel && backFn) {
-    setBrowseHeader(backLabel, backFn);
+    setBrowseHeader(backLabel, backFn, false);   // group/grid view — not a track list
   } else {
     hideBrowseHeader();
   }
@@ -1678,6 +2029,50 @@ async function showAlbumTracks(artist, albumArtist, album, backFn) {
     return ta - tb;
   });
   renderTracks(tracks);
+}
+
+// "Go to artist" — every track by this artist as a track list.  Used by the
+// track context menu so you can pivot from one track to the whole artist.
+async function showArtistTracks(artist, backFn) {
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader(`Artist: ${artist}`, backFn || (() => showArtists()));
+  _showSkeletonRows();
+  const tracks = await API('/search/filter', { limit: 500, artist });
+  renderTracks(tracks);
+}
+
+// Snapshot the current view so a "Go to …" navigation can offer a Back that
+// returns exactly here.  Plain-array views (browse/search/smart/playlist)
+// restore from an array copy + the header state; the windowed All-Tracks (or an
+// unknown state) falls back to showAll().
+function _snapshotCurrentView() {
+  if (Array.isArray(currentTracks)) {
+    const snap = currentTracks.slice();
+    const hdrLabel = browseCrumb.textContent;
+    const wasHidden = browseHdr.hidden;
+    const backOnClick = browseBack.onclick;
+    return () => {
+      renderTracks(snap);
+      if (wasHidden) hideBrowseHeader();
+      else setBrowseHeader(hdrLabel, backOnClick);
+    };
+  }
+  return () => showAll();
+}
+
+function _goToArtist(t) {
+  if (!t || !t.artist) return;
+  const back = _snapshotCurrentView();
+  _closeCtxMenu();
+  showArtistTracks(t.artist, back);
+}
+function _goToAlbum(t) {
+  if (!t || !t.album) return;
+  const back = _snapshotCurrentView();
+  _closeCtxMenu();
+  showAlbumTracks(t.artist, t.album_artist, t.album, back);
 }
 
 async function showGenres() {
@@ -1823,9 +2218,58 @@ function _loadAlbumCardArt(card, trackId) {
   img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404`;
 }
 
+// Album/group grid state: built in rAF chunks (a generation token cancels a
+// stale build when the user navigates away) and wired via EVENT DELEGATION —
+// one click/keydown listener on the grid instead of 4 listeners per card, so
+// tens of thousands of one-track SID/MOD "albums" no longer freeze the thread
+// on the flip to grid or attach 100k+ listeners.  Focus ring is pure CSS
+// (.album-card:focus-visible), so no per-card focus/blur handlers either.
+let _albumGridGen = 0;
+let _albumGridItems = [];
+let _albumGridOnClick = null;
+let _albumGridWired = false;
+
+async function _playAlbumItem(item) {
+  const name = item.label || item.album || '—';
+  const artist = item.artist || item.album_artist || '';
+  try {
+    const params = new URLSearchParams({ album: name, limit: '2000' });
+    if (artist) params.set('artist', artist);
+    const tracks = await fetch(`/api/search/filter?${params}`).then(r => r.json());
+    if (Array.isArray(tracks) && tracks.length) {
+      Player.setQueue(tracks, 0);
+      window.Toast?.ok?.(`Playing ${name}`);
+    } else {
+      window.Toast?.warn?.('No tracks found for this album.');
+    }
+  } catch (_) { window.Toast?.error?.('Couldn’t play album.'); }
+}
+
+function _wireAlbumGridDelegation(albumGrid) {
+  if (_albumGridWired) return;
+  _albumGridWired = true;
+  const itemOf = (target) => {
+    const card = target.closest('.album-card');
+    if (!card || card.dataset.idx == null) return null;
+    return _albumGridItems[+card.dataset.idx] || null;
+  };
+  albumGrid.addEventListener('click', (e) => {
+    const item = itemOf(e.target);
+    if (!item) return;
+    if (e.target.closest('.album-card-play')) { e.stopPropagation(); _playAlbumItem(item); return; }
+    _albumGridOnClick?.(item);
+  });
+  albumGrid.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const item = itemOf(e.target);
+    if (item) { e.preventDefault(); _albumGridOnClick?.(item); }
+  });
+}
+
 function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
   const albumGrid = document.getElementById('album-grid');
   if (!albumGrid) return;
+  _wireAlbumGridDelegation(albumGrid);
 
   albumGrid.innerHTML = '';
   albumGrid.hidden = false;
@@ -1863,57 +2307,55 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
     });
   }, { rootMargin: '100px' });
 
-  items.forEach(item => {
-    const name = item.label || item[nameKey] || '—';
-    const count = item[countKey] || 0;
-    const artist = item.artist || item.album_artist || '';
-    // Generate initials from first 2 words
-    const words = name.replace(/[^a-zA-Z0-9 ]/g, '').trim().split(/\s+/);
-    const initials = words.length >= 2
-      ? (words[0][0] + words[words.length - 1][0]).toUpperCase()
-      : name.substring(0, 2).toUpperCase();
+  _albumGridItems = items;
+  _albumGridOnClick = onClick;
+  const isAlbum = nameKey === 'album';
+  const gen = ++_albumGridGen;
+  const CHUNK = 150;
+  let i = 0;
 
-    const card = document.createElement('div');
-    card.className = 'album-card';
-    card.dataset.name = name;
-    card.dataset.album = name;
-    card.dataset.artist = artist;
-    if (item.track_id) card.dataset.trackId = item.track_id;
-    // Keyboard activation — cards behave like buttons (Enter/Space activates).
-    // The `keyboard-focus` class is added on keyboard-induced focus so CSS
-    // can render a focus-visible ring without lighting up on every click.
-    card.tabIndex = 0;
-    card.setAttribute('role', 'button');
-    card.setAttribute('aria-label', `${name}, ${count} ${countLabel}`);
-    card.innerHTML = `
-      <div class="album-card-art">
-        <span class="album-card-initials">${esc(initials)}</span>
-      </div>
-      <div class="album-card-info">
-        <div class="album-card-title" title="${esc(name)}">${esc(name)}</div>
-        <div class="album-card-sub">${count} ${countLabel}</div>
-      </div>`;
-    card.addEventListener('click', () => onClick(item));
-    card.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        onClick(item);
-      }
-    });
-    // Show focus ring only for keyboard-driven focus (not mouse clicks).
-    card.addEventListener('focus', () => {
-      // :focus-visible may not be supported by ancient browsers — wrap in
-      // try/catch so the focus handler never throws.
-      try {
-        if (card.matches(':focus-visible')) card.classList.add('keyboard-focus');
-      } catch (_) { /* selector unsupported — skip the ring */ }
-    });
-    card.addEventListener('blur', () => card.classList.remove('keyboard-focus'));
-    albumGrid.appendChild(card);
+  const step = () => {
+    if (gen !== _albumGridGen) return;   // a newer render superseded this build
+    const frag = document.createDocumentFragment();
+    const end = Math.min(i + CHUNK, items.length);
+    for (; i < end; i++) {
+      const item = items[i];
+      const name = item.label || item[nameKey] || '—';
+      const count = item[countKey] || 0;
+      const artist = item.artist || item.album_artist || '';
+      // Initials from first 2 words (fallback: first 2 chars).
+      const words = name.replace(/[^a-zA-Z0-9 ]/g, '').trim().split(/\s+/);
+      const initials = words.length >= 2
+        ? (words[0][0] + words[words.length - 1][0]).toUpperCase()
+        : name.substring(0, 2).toUpperCase();
 
-    // Observe for lazy-load
-    _albumArtObserver.observe(card);
-  });
+      const card = document.createElement('div');
+      card.className = 'album-card';
+      card.dataset.idx = i;                 // delegation key → _albumGridItems[idx]
+      card.dataset.name = name;
+      card.dataset.album = name;
+      card.dataset.artist = artist;
+      if (item.track_id) card.dataset.trackId = item.track_id;
+      // Cards behave like buttons; the focus ring is CSS :focus-visible.
+      card.tabIndex = 0;
+      card.setAttribute('role', 'button');
+      card.setAttribute('aria-label', `${name}, ${count} ${countLabel}`);
+      card.innerHTML = `
+        <div class="album-card-art">
+          <span class="album-card-initials">${esc(initials)}</span>
+          ${isAlbum ? `<button class="album-card-play" type="button" tabindex="-1" title="Play album" aria-label="Play ${esc(name)}">▶</button>` : ''}
+        </div>
+        <div class="album-card-info">
+          <div class="album-card-title" title="${esc(name)}">${esc(name)}</div>
+          <div class="album-card-sub">${count} ${countLabel}</div>
+        </div>`;
+      frag.appendChild(card);
+      _albumArtObserver.observe(card);      // lazy art; fires once connected + visible
+    }
+    albumGrid.appendChild(frag);
+    if (i < items.length) requestAnimationFrame(step);
+  };
+  step();
 }
 
 // Renders a grouped list (artists/albums/genres/years) into the table
@@ -1980,6 +2422,7 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
     document.getElementById('track-table').style.display = '';
     _renderGroupRows(items, nameKey, countKey, countLabel, onClick);
   }
+  _updateAzRail();
 }
 
 let _groupRenderGen = 0;
@@ -2075,13 +2518,103 @@ browseFilter.addEventListener('keydown', (e) => {
 });
 
 // ── Browse header helpers ─────────────────────────────────────────────────────
-function setBrowseHeader(label, backFn) {
+// ── Play-all / Shuffle-all (browse header) ───────────────────────────────────
+function _shuffleInPlace(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Start playing the CURRENT track list (the view's whole result set), optionally
+// shuffled.  Handles both the plain-array browse views (album/genre/year/…, ≤500)
+// and the windowed All-Tracks store (queues the bounded lookahead from 0, same
+// model as playFrom / double-click; shuffle flips Player shuffle so next() picks
+// randomly within the queued window).
+function _playAll(shuffle) {
+  const store = currentTracks;
+  if (store && store._isWindowedStore) {
+    if (shuffle && !Player.shuffle) { try { Player.toggleShuffle(); } catch (_) {} }
+    playFrom(0);
+  } else if (Array.isArray(store) && store.length) {
+    const q = shuffle ? _shuffleInPlace(store.slice()) : store;
+    Player.setQueue(q, 0);
+    window.Toast?.ok?.(shuffle ? 'Shuffling' : 'Playing');
+  }
+}
+
+let _playAllBtn = null, _shuffleAllBtn = null;
+function _ensurePlayAllBtns() {
+  if (_playAllBtn) return;
+  _playAllBtn = document.createElement('button');
+  _playAllBtn.id = 'browse-play-all';
+  _playAllBtn.className = 'browse-play-btn';
+  _playAllBtn.type = 'button';
+  _playAllBtn.textContent = '▶ Play all';
+  _playAllBtn.title = 'Play all (P)';
+  _playAllBtn.addEventListener('click', () => _playAll(false));
+  _shuffleAllBtn = document.createElement('button');
+  _shuffleAllBtn.id = 'browse-shuffle-all';
+  _shuffleAllBtn.className = 'browse-play-btn';
+  _shuffleAllBtn.type = 'button';
+  _shuffleAllBtn.textContent = '⤮ Shuffle';
+  _shuffleAllBtn.title = 'Shuffle all (Shift+P)';
+  _shuffleAllBtn.addEventListener('click', () => _playAll(true));
+  // Lead the header: Play · Shuffle · crumb · … · Back.
+  browseHdr.insertBefore(_shuffleAllBtn, browseHdr.firstChild);
+  browseHdr.insertBefore(_playAllBtn, browseHdr.firstChild);
+}
+
+function setBrowseHeader(label, backFn, playable = true) {
+  const wasHidden = browseHdr.hidden;
   browseHdr.hidden = false;
   browseCrumb.textContent = label;
   browseBack.onclick = backFn;
   _hideExportBtn();
+  _ensurePlayAllBtns();
+  // Only track-list views are "playable"; group/grid drill-in crumbs are not.
+  _playAllBtn.hidden = !playable;
+  _shuffleAllBtn.hidden = !playable;
+  // Browser-Back integration (#7): push one history entry on entering a browse
+  // depth so the system Back button pops up one level instead of leaving the app.
+  if (wasHidden) { try { history.pushState({ sbBrowse: true }, ''); } catch (_) {} }
 }
+
+// System Back: while a browse view is open, go UP one level (its Back handler)
+// and re-arm a history entry so repeated Back keeps walking up to the root,
+// instead of exiting SoniqBoom on the first press.
+window.addEventListener('popstate', () => {
+  if (!browseHdr.hidden && typeof browseBack.onclick === 'function') {
+    const fn = browseBack.onclick;
+    try { history.pushState({ sbBrowse: true }, ''); } catch (_) {}
+    fn();
+  }
+});
 function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); _currentBrowsePath = null; }
+
+// Keyboard: P = Play all, Shift+P = Shuffle all — whenever a playable track list
+// is showing and focus isn't in a text field.
+document.addEventListener('keydown', (e) => {
+  if ((e.key !== 'p' && e.key !== 'P') || e.metaKey || e.ctrlKey || e.altKey) return;
+  const el = document.activeElement;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+  const playable = currentTracks && (currentTracks._isWindowedStore ||
+    (Array.isArray(currentTracks) && currentTracks.length));
+  if (!playable) return;
+  e.preventDefault();
+  _playAll(e.shiftKey);
+});
+
+// Locate now-playing — the ⌾ player-bar button and the G key.
+document.getElementById('btn-locate')?.addEventListener('click', locateNowPlaying);
+document.addEventListener('keydown', (e) => {
+  if ((e.key !== 'g' && e.key !== 'G') || e.metaKey || e.ctrlKey || e.altKey) return;
+  const el = document.activeElement;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+  e.preventDefault();
+  locateNowPlaying();
+});
 
 // Export CSV button — injected into browse-header when a view supports it
 function _showExportBtn(onClick) {
@@ -2676,16 +3209,19 @@ async function showSmart(view, label) {
       if (!trackIds.length) { renderTracks([]); return; }
       const unique = [...new Set(trackIds)];
 
-      // Fetch all tracks in one batch request (use search filter)
-      const allTracks = [];
-      for (let i = 0; i < unique.length; i += 50) {
-        const chunk = unique.slice(i, i + 50);
-        const promises = chunk.map(id =>
-          fetch(`/api/tracks/${id}`).then(r => r.ok ? r.json() : null).catch(() => null)
-        );
-        const results = await Promise.all(promises);
-        results.forEach(t => { if (t) allTracks.push(t); });
-      }
+      // Hydrate every history track in ONE request (was N+1: a separate
+      // GET /api/tracks/{id} per unique id, batched 50 at a time, rendering
+      // nothing until all batches landed — hundreds of round-trips on a big
+      // history).  /api/tracks/meta/batch returns full objects for all ids.
+      let allTracks = [];
+      try {
+        const r = await fetch('/api/tracks/meta/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: unique }),
+        });
+        allTracks = r.ok ? await r.json() : [];
+      } catch { allTracks = []; }
       const trackMap = Object.fromEntries(allTracks.map(t => [t.id, t]));
       // Maintain history order (newest first)
       const ordered = data.map(h => trackMap[h.track_id]).filter(Boolean);

@@ -10,7 +10,7 @@ computing history with its own sound, scene, and stories.
 
 | Format | Origin | Claim to fame | Notable |
 |---|---|---|---|
-| **SID** (`.sid`, `.psid`, `.rsid`) | Commodore 64, 1982 — named for its sound chip, the MOS 6581/8580 *Sound Interface Device* | The most collected chiptune format on Earth: the High Voltage SID Collection (HVSC) curates 50,000+ tunes | Three voices + one filter, yet composers like Rob Hubbard, Martin Galway and Chris Hülsbeck coaxed whole orchestras out of it. The 6581 vs 8580 chip revisions sound audibly different — endless scene debate. SoniqBoom reads HVSC's Songlengths + STIL commentary, and lets you force either chip model. |
+| **SID** (`.sid`, `.psid`) | Commodore 64, 1982 — named for its sound chip, the MOS 6581/8580 *Sound Interface Device* | The most collected chiptune format on Earth: the High Voltage SID Collection (HVSC) curates 50,000+ tunes | Three voices + one filter, yet composers like Rob Hubbard, Martin Galway and Chris Hülsbeck coaxed whole orchestras out of it. The 6581 vs 8580 chip revisions sound audibly different — endless scene debate. RSID variants are recognised by content. SoniqBoom reads HVSC's Songlengths + STIL commentary, and lets you force either chip model. |
 
 ## Amiga trackers
 
@@ -100,8 +100,8 @@ The sound of DOS gaming: Yamaha OPL2/OPL3 FM chips, no samples at all.
 | Format | Origin | Notable |
 |---|---|---|
 | **MIDI** (`.mid`) | 1983 industry standard | Sheet music for synthesizers — SoniqBoom renders through FluidSynth with swappable SoundFonts. |
-| **FLAC / ALAC / WavPack / Musepack** | 2001+ | Lossless everyday listening. |
-| **MP3 / AAC / Ogg Vorbis / Opus** | 1993+ | The lossy canon. |
+| **FLAC / ALAC / WavPack** | 2001+ | Lossless everyday listening. |
+| **MP3 / AAC / Ogg Vorbis / Opus / Musepack** | 1993+ | The lossy canon. |
 | **DSD** (`.dsf`, `.dff`, `.wsd`) | Sony/Philips SACD, 1999 | 1-bit audio at 2.8+ MHz — the audiophile format; transcoded on the fly for browser playback. |
 
 ---

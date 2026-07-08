@@ -5,6 +5,7 @@
  * nowplaying.js — Mobile Now Playing view: artwork, scrubber, transport.
  */
 import { Player } from '../../player.js';
+import { MobileRadio } from '../radio-player.js';
 import { artPlaceholderEmoji } from '../../utils.js';
 import { fmtDur } from './_common.js';
 
@@ -49,7 +50,27 @@ export function mountNowPlaying(root, ctx) {
 
   let _scrubbing = false;
 
+  function renderStation(st) {
+    titleEl.textContent  = (st && st.name) || 'Radio';
+    artistEl.textContent = 'Internet radio';
+    art.innerHTML = '<span>\u{1F4FB}</span>';   // 📻
+    if (st && st.favicon) {
+      const img = new Image();
+      img.alt = ''; img.decoding = 'async';
+      img.onload  = () => img.classList.add('loaded');
+      img.onerror = () => img.remove();
+      art.appendChild(img);
+      img.src = st.favicon;
+    }
+    // Live stream — no seekable position.
+    scrub.value = '0'; scrub.disabled = true;
+    curEl.textContent = '● LIVE'; durEl.textContent = '';
+  }
+
   function renderTrack(t) {
+    // Radio is the active source while a station plays.
+    if (MobileRadio.active) { renderStation(MobileRadio.station); return; }
+    scrub.disabled = false;
     if (!t) {
       titleEl.textContent  = 'No track playing';
       artistEl.textContent = '';
@@ -83,15 +104,23 @@ export function mountNowPlaying(root, ctx) {
   Player.on('trackchange', renderTrack);
 
   Player.on('statechange', ({ playing }) => {
+    if (MobileRadio.active) return;         // radio owns the transport while active
     playBtn.textContent = playing ? '⏸' : '▶';
   });
 
   Player.on('timeupdate', ({ current, duration, pct }) => {
+    if (MobileRadio.active) return;
     if (!_scrubbing) {
       scrub.value = String(pct || 0);
       curEl.textContent = fmtDur(current);
     }
     durEl.textContent = fmtDur(duration);
+  });
+
+  // Radio drives the view + play button while a station is the active source.
+  MobileRadio.on('change', () => renderTrack(Player.currentTrack));
+  MobileRadio.on('state',  () => {
+    if (MobileRadio.active) playBtn.textContent = MobileRadio.playing ? '⏸' : '▶';
   });
 
   // Scrubber: pointerdown locks, input previews, change commits
@@ -108,14 +137,15 @@ export function mountNowPlaying(root, ctx) {
   });
 
   playBtn.addEventListener('click', async () => {
+    if (MobileRadio.active) { MobileRadio.toggle(); return; }
     if (!Player.currentTrack && Player.queue.length === 0) {
       ctx.toast('Tap a song to start playing');
       return;
     }
     Player.playPause();
   });
-  prevBtn.addEventListener('click', () => Player.prev());
-  nextBtn.addEventListener('click', () => Player.next());
+  prevBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.prev(); });
+  nextBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.next(); });
   shufBtn.addEventListener('click', () => {
     const on = Player.toggleShuffle();
     shufBtn.style.color = on ? 'var(--accent)' : 'var(--text)';
@@ -130,5 +160,5 @@ export function mountNowPlaying(root, ctx) {
 
   // Initial paint
   renderTrack(Player.currentTrack);
-  playBtn.textContent = Player.playing ? '⏸' : '▶';
+  playBtn.textContent = (MobileRadio.active ? MobileRadio.playing : Player.playing) ? '⏸' : '▶';
 }

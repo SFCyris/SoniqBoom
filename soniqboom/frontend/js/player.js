@@ -502,11 +502,15 @@ export const Player = (() => {
     if (!next || !next.id) return;
     const remaining = dur - current;
     if (remaining > GAPLESS_WINDOW_S || remaining <= 1) return;
-    if (_nextPreload && _nextPreload.id === next.id) return;   // already on it
+    // Subsong-aware: a multi-tune file preloaded WITHOUT ?subsong= would seam to
+    // its DEFAULT tune, so "Play all" of a SID would play tune 1 N times while
+    // the label advanced.  Key + fetch on (id, subsong) — 0-based wire index.
+    const nextSub = Number(next.subsong) > 0 ? Number(next.subsong) : 0;
+    if (_nextPreload && _nextPreload.id === next.id && _nextPreload.subsong === nextSub) return;
     _dropNextPreload();
     const abort = new AbortController();
-    _nextPreload = { id: next.id, url: null, abort };
-    fetch(`/api/stream/${next.id}`, { signal: abort.signal })
+    _nextPreload = { id: next.id, subsong: nextSub, url: null, abort };
+    fetch(`/api/stream/${next.id}${nextSub > 0 ? `?subsong=${nextSub}` : ''}`, { signal: abort.signal })
       .then(res => {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const len = parseInt(res.headers.get('content-length') || '0', 10);
@@ -514,16 +518,16 @@ export const Player = (() => {
         return res.blob();
       })
       .then(blob => {
-        // Guard on !url too: if a drop+re-preload of the same id raced this
-        // resolution, overwriting would orphan the fresher blob URL.
-        if (_nextPreload && _nextPreload.id === next.id && !_nextPreload.url) {
+        // Guard on !url too: if a drop+re-preload of the same (id, subsong) raced
+        // this resolution, overwriting would orphan the fresher blob URL.
+        if (_nextPreload && _nextPreload.id === next.id && _nextPreload.subsong === nextSub && !_nextPreload.url) {
           _nextPreload.url = URL.createObjectURL(blob);
         }
       })
       .catch(() => {
         // Preload is best-effort: on any failure the seam simply falls back
         // to the normal network fetch.
-        if (_nextPreload && _nextPreload.id === next.id && !_nextPreload.url) {
+        if (_nextPreload && _nextPreload.id === next.id && _nextPreload.subsong === nextSub && !_nextPreload.url) {
           _nextPreload = null;
         }
       });
@@ -1081,7 +1085,7 @@ export const Player = (() => {
 
   /** Switch to the full-duration SID version, continuing from `resumeAt`. */
   async function _switchToFullSid(resumeAt) {
-    if (!trackId) return;
+    if (!trackId || _extAudio) return;   // radio owns output — don't re-arm the SID track
     _sidPartial = false;
     _seekOffset = 0;
     const wasPlaying = !audio.paused;
@@ -1091,7 +1095,9 @@ export const Player = (() => {
     // Wait for enough data to seek
     await new Promise((r) => { audio.addEventListener('canplay', r, { once: true }); });
     if (resumeAt > 0) audio.currentTime = resumeAt;
-    if (wasPlaying) {
+    // A radio takeover may have landed while we awaited ``canplay`` — if so the
+    // shared element is now suspended and must not resume under the stream.
+    if (wasPlaying && !_extAudio) {
       audio.play().catch(err => {
         // Hand-off failure: log + surface, otherwise the user sees the
         // converting badge disappear and the player just sits paused.
@@ -1169,6 +1175,18 @@ export const Player = (() => {
   let _stationMode = false;
   let _station = null;
   let _stationLogo = '';   // the current station's logo URL — the art fallback
+
+  // External-audio suspend (mobile).  The mobile UI can hand audio output to a
+  // DEDICATED radio <audio> element (radio-player.js) that streams a station
+  // directly.  While suspended, the shared library element is paused with its
+  // ``src`` detached and MUST NOT auto-resume, advance the queue, recover from
+  // errors (force_transcode reload), or hand a SID partial off to its full
+  // version — every such path early-returns on this flag so the paused library
+  // track can never play UNDERNEATH the live stream.  Cleared when radio stops.
+  // (QA 2026-07-05: clearing ``src`` alone was insufficient — the ended/error/
+  // SID-handoff paths re-write ``src`` and guarded only on ``_stationMode``,
+  // which the mobile radio path never sets.)
+  let _extAudio = false;
 
   // Swap the player-bar art for a station: ``coverUrl`` when a now-playing song
   // cover was identified, else fall back to the station logo.  Re-renders via
@@ -1386,12 +1404,15 @@ export const Player = (() => {
     // is revoked on the NEXT track change (revoking while it's the active
     // src would kill playback).
     if (_activeBlobUrl) { try { URL.revokeObjectURL(_activeBlobUrl); } catch (_) {} _activeBlobUrl = null; }
-    if (_nextPreload && _nextPreload.id === track.id && _nextPreload.url) {
+    // Match on (id, subsong): a preload for the file's default tune must NOT be
+    // reused for a specific subsong (it would play the wrong tune at the seam).
+    const _curSub = Number(track.subsong) > 0 ? Number(track.subsong) : 0;
+    if (_nextPreload && _nextPreload.id === track.id && _nextPreload.subsong === _curSub && _nextPreload.url) {
       _activeBlobUrl = _nextPreload.url;
       _nextPreload = null;
       audio.src = _activeBlobUrl;
     } else {
-      _dropNextPreload();                 // stale preload for some other track
+      _dropNextPreload();                 // stale preload for some other track/tune
       audio.src = _streamUrlFor(track.id);
     }
     // Force fetch even though the element has preload="none" — without this
@@ -1621,6 +1642,7 @@ export const Player = (() => {
   }
 
   async function playPause() {
+    if (_extAudio) return;   // radio owns output — ignore stray transport calls
     if (!audio.src) return;
     if (audio.paused) {
       if (ctx && ctx.state === 'suspended') {
@@ -1736,6 +1758,15 @@ export const Player = (() => {
     _saveQueueSoon();
   }
 
+  // Insert right after the currently-playing track (front when nothing plays)
+  // so the "Play next" action jumps the queue without disturbing what's on.
+  function playNext(track) {
+    const at = queueIdx >= 0 ? queueIdx + 1 : 0;
+    queue = [...queue.slice(0, at), track, ...queue.slice(at)];
+    emit('queuechange', { queue, queueIdx });
+    _saveQueueSoon();
+  }
+
   function removeFromQueue(idx) {
     if (idx < 0 || idx >= queue.length) return;
     const wasCurrent = (idx === queueIdx);
@@ -1790,6 +1821,9 @@ export const Player = (() => {
   // RadioMode tells the player a curated-radio session is (in)active so queue
   // advance follows the radio's order regardless of the shuffle toggle.
   function setRadioActive(v) { _radioActive = !!v; }
+  // Mobile: suspend/resume the shared element while a dedicated radio element
+  // owns audio output.  See ``_extAudio`` for the full rationale.
+  function suspendForExternalAudio(v) { _extAudio = !!v; }
 
   function toggleRepeat() {
     const modes = ['none', 'all', 'one'];
@@ -1907,13 +1941,19 @@ export const Player = (() => {
     });
   });
 
-  // Record play when track has been listened to substantially (>30s or >50%)
+  // Record play once the track's been heard substantially: >=30s listened, OR
+  // >=50% AND at least 20s actually listened.  The 20s LISTEN floor keeps
+  // chiptune SFX/jingle subsongs honest — a 2s tune played to its end clears a
+  // bare 50% rule, so "Add all" of a short-tune SID would otherwise log dozens
+  // of junk plays/scrobbles — while STILL counting genuinely-short songs the
+  // user sat through (a 25s track played fully is >=20s).  (The natural-end path
+  // below floors on a >=20s duration for the same reason.)
   let _playRecorded = false;
   function _checkPlayRecording() {
     if (_playRecorded || !trackId) return;
     const dur = _duration();
     const cur = _currentTime();
-    if (cur >= 30 || (dur > 0 && cur / dur >= 0.5)) {
+    if (cur >= 30 || (cur >= 20 && dur > 0 && cur / dur >= 0.5)) {
       _playRecorded = true;
       // ``sendBeacon`` is preferred — the browser queues the POST for
       // OS-level delivery, which survives page-hide / iOS backgrounding
@@ -2085,6 +2125,19 @@ export const Player = (() => {
             priority: 'low',
           }).catch(() => {});
         } catch { /* ignore */ }
+        // Warm the server-side waveform compute for the immediate-next native
+        // track so its seek-bar waveform is ready the moment it becomes
+        // current, instead of computing on track-change.  The endpoint sends
+        // no-store (browser won't cache stale placeholders), so this GET always
+        // reaches the server and populates its computed-waveform cache; a blank
+        // result (unreadable source) isn't persisted, so an early fire is safe.
+        // Native only — a transcoded track's waveform needs its render, which
+        // the prewarm above only just kicked off, so warming it here would
+        // decode a not-yet-rendered file and throw the blank away.
+        try {
+          fetch(`/api/tracks/${t.id}/waveform`, { cache: 'no-cache', priority: 'low' })
+            .catch(() => {});
+        } catch { /* ignore */ }
       } else {
         // Server-side cached transcode/render prewarm.
         const qs = t.path ? `?path=${encodeURIComponent(t.path)}` : '';
@@ -2174,7 +2227,10 @@ export const Player = (() => {
   audio.addEventListener('ended', async () => {
     // A live station stream "ending" is an upstream drop, not a queue
     // advance — stations.js owns reconnect/downgrade; never auto-next.
-    if (_stationMode) return;
+    // ``_extAudio``: the mobile radio takeover detached this element; a stray
+    // 'ended' must not repeat-one/SID-handoff/next the paused library track
+    // under the live stream.
+    if (_stationMode || _extAudio) return;
     // Natural ended → user listened the whole way through → CONTINUE
     // signal for the P(skip) model.  Guarded by !_sidPartial because
     // SID partials also fire 'ended' at the cached boundary, and that's
@@ -2221,8 +2277,10 @@ export const Player = (() => {
       return;
     }
 
-    // Ensure play is recorded on track end
-    if (!_playRecorded && trackId) {
+    // Ensure play is recorded on natural end — but floor on a >=20s duration, so
+    // a short subsong (chiptune SFX/jingle) that simply plays out isn't logged
+    // as a play + scrobbled, while a genuinely-short song still counts.
+    if (!_playRecorded && trackId && _duration() >= 20) {
       _playRecorded = true;
       // ``sendBeacon`` is preferred — the browser queues the POST for
       // OS-level delivery, which survives page-hide / iOS backgrounding
@@ -2267,8 +2325,16 @@ export const Player = (() => {
   }
   /** Public hook used by ``playTrack`` to apply the persistent mark. */
   function _streamUrlFor(id) {
-    return _forcedIds.has(id) ? _streamUrl(id, { force_transcode: '1' })
-                              : _streamUrl(id);
+    const params = {};
+    if (_forcedIds.has(id)) params.force_transcode = '1';
+    // Subsong is 0-based on the wire (matches the server's ?subsong=).  The
+    // current track object carries the wire index in ``subsong``; forward it
+    // verbatim — but only for the track it belongs to, so a stale ``_track``
+    // left by a prefetch can't leak its subsong onto a different id.  0 or
+    // absent means the file's default tune.
+    const ss = (_track && _track.id === id) ? Number(_track.subsong) : 0;
+    if (ss > 0) params.subsong = String(ss);
+    return _streamUrl(id, params);
   }
 
   /** Extract the track id from a stream URL, regardless of query params.
@@ -2288,6 +2354,12 @@ export const Player = (() => {
     // when the *user* switched src to play a different track.  Don't toast
     // for that — only the real failure modes deserve a banner.
     if (err.code === 1) return;
+
+    // Radio owns output — the shared element was intentionally detached by the
+    // mobile takeover; its abort/decode errors are expected and must NOT
+    // trigger a force_transcode reload that would replay the library track
+    // under the live stream.
+    if (_extAudio) return;
 
     // Stale-src guard: when the user clicks a new track, ``audio.src`` is
     // replaced.  If the OLD src had a pending decode error, it can fire
@@ -2365,11 +2437,11 @@ export const Player = (() => {
     getSourceNode()      { return source; },
     fmt,
     playTrack, playPause, seek, setVolume, next, prev, setQueue,
-    addToQueue, removeFromQueue, moveInQueue,
+    addToQueue, playNext, removeFromQueue, moveInQueue,
     playStation, stopStation, updateStationArt, setStationNowPlaying,
     get stationMode() { return _stationMode; },
     get station()     { return _station; },
-    toggleShuffle, toggleRepeat, setRadioActive,
+    toggleShuffle, toggleRepeat, setRadioActive, suspendForExternalAudio,
     // Stop the transcode-status poll + WS-fallback watchdog and abort any
     // in-flight transcode-status fetch.  Called by app.js's
     // _cancelAncillaryFetches() on folder navigation to free a browser

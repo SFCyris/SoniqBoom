@@ -102,7 +102,10 @@ async def _cached_stat(file_path: Path) -> tuple[int, float]:
 # 256 KB preflight) finish faster as a single bytes object than as a
 # StreamingResponse.
 _RANGE_STREAMING_THRESHOLD = 256 * 1024
-_RANGE_STREAMING_CHUNK = 64 * 1024
+# 1 MB chunks: a 30 MB range is 30 os.pread hops through anyio's shared thread
+# pool instead of 482 at 64 KB (16x fewer), and OS readahead makes the larger
+# reads near-free.  Working set stays a few MB — trivial next to the track.
+_RANGE_STREAMING_CHUNK = 1024 * 1024
 
 
 async def _range_file_response(
@@ -146,10 +149,10 @@ async def _range_file_response(
     extra["Content-Range"] = f"bytes {start}-{end}/{total}"
     extra["Content-Length"] = str(length)
 
-    # Large slice → stream in 64 KB chunks via os.pread so we never hold
-    # the whole slice in RAM.  Five concurrent users seeking around in
-    # 30 MB FLACs used to peak the worker at 150 MB of transient buffers;
-    # with chunked pread the working-set stays at ~320 KB total.
+    # Large slice → stream in ``_RANGE_STREAMING_CHUNK`` (1 MB) reads via os.pread
+    # so we never hold the whole slice in RAM.  Five concurrent users seeking
+    # around in 30 MB FLACs used to peak the worker at 150 MB of transient
+    # buffers; chunked pread keeps the working set to a few MB.
     if length >= _RANGE_STREAMING_THRESHOLD:
         async def _stream_range():
             fd = await asyncio.to_thread(os.open, str(file_path), os.O_RDONLY)
@@ -495,8 +498,36 @@ async def _render_gme(path: Path, subsong: int = 0) -> Path:
 # disambiguates the two by content signature.
 _ADLIB_EXTS = {
     ".rol", ".cmf", ".d00", ".rad", ".laa", ".sci", ".dro",
-    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm",
+    ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm", ".amd",
 }
+
+
+def _render_ident(path_str: str) -> tuple[str, bool]:
+    """Return ``(effective_ext, is_uade_named)`` for render routing.
+
+    Keeps the renderer's uade-vs-AdLib decision in lockstep with what the
+    scanner (``metadata.extract``) indexed:
+
+      * A known AdLib extension is AdLib, never uade — even when the file
+        NAME collides with a uade token.  AMUSIC ``star.amd`` files (Modland
+        ``Ad Lib/…``) collide with uade's ProWizard ``star`` prefix; uade's
+        ``-g`` rejects them ("module check failed") while AdPlug plays them.
+      * Archive members reach us with a routing suffix appended
+        (``STAR.AMD.star``); strip it when the stem is an AdLib file so the
+        real ``.amd`` extension drives routing (mirrors
+        ``scanner._extract_from_zip``).
+    """
+    from soniqboom.core.metadata import _UADE_SUFFIX_EXTS
+    member = Path(path_str.split("::")[-1]).name
+    ext = Path(member).suffix.lower()
+    if "." in member:
+        stem, _, last = member.rpartition(".")
+        if (f".{last.lower()}" in _UADE_SUFFIX_EXTS
+                and Path(stem).suffix.lower() in _ADLIB_EXTS):
+            ext, member = Path(stem).suffix.lower(), stem
+    if ext in _ADLIB_EXTS or ext == ".imf":
+        return ext, False
+    return ext, _uade_formats.classify(member) is not None
 _ADLIB_DEFAULT_TIMEOUT_S = 8 * 60
 # AdPlug OPL emulator core.  adplay defaults to "woody" (DOSBox WoodyOPL — fast
 # but approximate); we pin "nuked" (Nuked OPL3, reverse-engineered from the
@@ -1109,12 +1140,10 @@ async def _probe_one_rendered_duration(track_id: str) -> float | None:
     if track is None:
         return None
     path_str = getattr(track, "path", "") or ""
-    ext = Path(path_str.split("::")[-1]).suffix.lower()
+    ext, _uade_named = _render_ident(path_str)
     is_adlib = ext in _ADLIB_EXTS or ext == ".imf"
     is_gme = ext in _GME_EXTS_STREAM
-    is_uade = (ext in _UADE_EXTS
-               or _uade_formats.classify(Path(path_str.split("::")[-1]).name)
-               is not None)
+    is_uade = ext in _UADE_EXTS or _uade_named
     is_hvl = ext in _HVL_EXTS
     is_sc68 = ext in _SC68_EXTS
     # Bare .dsf might be a Dreamcast rip — decidable only once local.
@@ -1507,6 +1536,12 @@ async def _ensure_hvl2wav() -> "Path | None":
     global _hvl2wav_bin
     if _hvl2wav_bin and _hvl2wav_bin.exists():
         return _hvl2wav_bin
+    # A pre-built hvl2wav on PATH (e.g. baked into a multi-stage Docker image by
+    # the builder stage) wins — no C compiler is needed at runtime.
+    _pre = shutil.which("hvl2wav")
+    if _pre:
+        _hvl2wav_bin = Path(_pre)
+        return _hvl2wav_bin
     async with _native_build_lock("hvl2wav"):
         if _hvl2wav_bin and _hvl2wav_bin.exists():
             return _hvl2wav_bin
@@ -1659,6 +1694,12 @@ async def _ensure_ym2wav() -> "Path | None":
     """Return a built StSound ``ym2wav`` path, compiling once if needed."""
     global _ym2wav_bin
     if _ym2wav_bin and _ym2wav_bin.exists():
+        return _ym2wav_bin
+    # A pre-built ym2wav on PATH (e.g. baked into a multi-stage Docker image by
+    # the builder stage) wins — no C++ compiler is needed at runtime.
+    _pre = shutil.which("ym2wav")
+    if _pre:
+        _ym2wav_bin = Path(_pre)
         return _ym2wav_bin
     async with _native_build_lock("ym2wav"):
         if _ym2wav_bin and _ym2wav_bin.exists():
@@ -4557,10 +4598,13 @@ async def _do_prewarm_render(
                 track_id=track_id, format_type="sc68", subsong=subsong,
                 render_fn=lambda: _render_sc68(file_path, subsong=subsong),
             )
-        elif (ext in _UADE_EXTS or ext in _SID_EXTS
-                or _uade_formats.classify(file_path.name) is not None):
+        elif (ext not in _ADLIB_EXTS and ext != ".imf"
+                and (ext in _UADE_EXTS or ext in _SID_EXTS
+                     or _uade_formats.classify(file_path.name) is not None)):
             # uade family: suffix tokens, Amiga prefix-form names, and
-            # magic-less .sid (SidMon — real C64 PSID returned above).
+            # magic-less .sid (SidMon — real C64 PSID returned above).  AdLib
+            # extensions are excluded so an AMUSIC ``star.amd`` (uade ``star``
+            # prefix collision) prewarms via AdPlug, matching playback.
             await get_or_render(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(file_path, subsong=subsong),
@@ -5175,11 +5219,10 @@ async def stream_track(
         if not path.exists():
             raise HTTPException(410, f"File not found on disk: {track.path}")
 
-    ext = Path(path_str.split('::')[-1] if '::' in path_str else path_str).suffix.lower()
     # Amiga prefix-form names (mdat.song) carry no token extension — detect by
-    # name so they route to uade below.  (Suffix-form is covered by _UADE_EXTS.)
-    _uade_named = _uade_formats.classify(
-        Path(path_str.split('::')[-1]).name) is not None
+    # name so they route to uade below.  ``_render_ident`` also keeps AdLib
+    # (AMUSIC ``star.amd`` etc.) out of the uade path — see its docstring.
+    ext, _uade_named = _render_ident(path_str)
 
     # Loose (non-zip) uade modules on a remote share: materialize module +
     # companion halves (TFMX smpl.X …) into one dir, mirroring AdLib below.

@@ -208,6 +208,38 @@ def _ensure_admin_interactive(verbose: bool = False) -> int:
     return 0
 
 
+def _notify_server_reload() -> None:
+    """Best-effort: ask a running server to re-read ``users.json`` so a
+    just-created or -updated account takes effect immediately — no restart.
+
+    Stays silent when nothing is listening (fresh install, or the server is on
+    a non-default port); the next server start loads the file from disk anyway.
+    ``/api/auth/reload`` is on the public allowlist, so no credentials needed.
+    In a Docker container this reaches the server in the same container, which
+    is why ``docker compose exec … soniqboom-setadm`` no longer needs a restart.
+    """
+    import time
+    import urllib.request
+    from soniqboom.config import settings
+    url = f"http://127.0.0.1:{settings.port}/api/auth/reload"
+    # Retry briefly — covers the short window where the server is still binding
+    # right after a container/process start (a host health-check can pass through
+    # the port-proxy a beat before the loopback socket is ready).  Gives up
+    # quietly if nothing ever answers; the file is on disk for the next start.
+    for i in range(5):
+        try:
+            req = urllib.request.Request(url, data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=2) as resp:  # nosec B310 - fixed localhost URL
+                if resp.status == 200:
+                    print("Notified the running server — the change is live now "
+                          "(no restart needed).")
+                    return
+        except Exception:
+            pass  # no server / wrong port / transient — harmless; file is on disk
+        if i < 4:
+            time.sleep(0.4)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = argv if argv is not None else sys.argv[1:]
     # First-run bootstrap mode (used by run.sh): create an admin interactively
@@ -299,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Created user '{user.username}' (role={user.role}, "
             f"enabled={user.enabled}, id={user.id}).",
         )
+        _notify_server_reload()
         return 0
 
     # ── Update flow ──────────────────────────────────────────────────────
@@ -350,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Updated user '{existing.username}': {', '.join(changes)}.",
         )
+        _notify_server_reload()
     return 0
 
 

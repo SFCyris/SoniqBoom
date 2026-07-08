@@ -10,8 +10,6 @@
 services:
   soniqboom:
     build: .
-    # Once a published image exists you can skip the build and just pull:
-    # image: ghcr.io/sfcyris/soniqboom:latest
     container_name: soniqboom
     ports:
       - "8080:8080"

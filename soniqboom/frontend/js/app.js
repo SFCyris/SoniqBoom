@@ -468,6 +468,7 @@ const _VU_INTERVAL_MS = 66;
 let _vuDrawTimer = null;
 let _vuBuffer = null;
 let _vuRunning = false;
+let _vuOnScreen = true;   // opt 1.8: IntersectionObserver gate — pause the draw when the meter is off-screen
 // prefers-reduced-motion gate for the VU meter.  The bars are driven by a JS
 // setTimeout loop writing the `--vu-level` custom property as an inline style;
 // the global CSS animation-neutralizer only catches @keyframes, NOT inline
@@ -590,6 +591,12 @@ function _scheduleNextVU() {
     _vuDrawTimer = null;
     return;
   }
+  if (!_vuOnScreen) {
+    // Meter scrolled/toggled off-screen — stop; the IntersectionObserver below
+    // restarts the chain when it returns to view.
+    _vuDrawTimer = null;
+    return;
+  }
   if (_vuRM && _vuRM.matches) {
     // Reduced motion: paint one representative static frame and stop the
     // chain.  The bars stay visibly present but do not dance.
@@ -610,9 +617,27 @@ function _freezeVU() {
   }
 }
 
+// Reused per-tick level buffer for the __sbVuTap mirror (see below) —
+// allocated once per channel-count change, so the 15 Hz tick stays
+// allocation-free.
+let _vuTapBuf = null;
+
+/** Mirror the per-channel levels to trackinfo's pattern-grid overlay.
+ *  ``window.__sbVuTap`` is registered by trackinfo.js and self-guards
+ *  (no-ops unless the modal's pattern grid is showing the playing
+ *  track), so this costs one function call when it isn't in use. */
+function _vuTapEmit() {
+  if (typeof window.__sbVuTap === 'function' && _vuTapBuf) {
+    try { window.__sbVuTap(_vuTapBuf, _vuChannelCount); } catch (_) {}
+  }
+}
+
 function _drawVU() {
   if (!_vuBars.length) return;
-  if (document.hidden) return;
+  if (document.hidden || !_vuOnScreen) return;
+  if (!_vuTapBuf || _vuTapBuf.length < _vuChannelCount) {
+    _vuTapBuf = new Float32Array(Math.max(1, _vuChannelCount));
+  }
 
   // VUMR (real per-channel) path — index by audio.currentTime.
   if (_vumr) {
@@ -628,8 +653,10 @@ function _drawVU() {
       // Mild gamma so quiet hits register visually without compressing
       // the loud end.  0.7 matches the FFT path for visual consistency.
       const level = Math.pow(raw, 0.7);
+      _vuTapBuf[ch] = level;
       _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
     }
+    _vuTapEmit();
     return;
   }
 
@@ -645,8 +672,10 @@ function _drawVU() {
     for (let i = start; i < end && i < bufLen; i++) sum += _vuBuffer[i];
     const avg = sum / binsPerChannel / 255;
     const level = Math.pow(avg, 0.7);
+    _vuTapBuf[ch] = level;
     _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
   }
+  _vuTapEmit();
 }
 
 // Resume the VU draw chain when the tab regains visibility.  We only
@@ -655,6 +684,24 @@ function _drawVU() {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && _vuRunning && !_vuDrawTimer) _scheduleNextVU();
 });
+
+// Off-screen gate (opt 1.8): pause the 15 Hz draw when the VU meter isn't
+// visible — a meter you can't see is pure waste.  Mirrors the
+// IntersectionObserver every other visualizer already uses.
+if (vuContainer && 'IntersectionObserver' in window) {
+  const _vuIO = new IntersectionObserver((entries) => {
+    const on = entries.some(e => e.isIntersecting);
+    if (on === _vuOnScreen) return;
+    _vuOnScreen = on;
+    if (on) {
+      if (_vuRunning && !document.hidden && !_vuDrawTimer) _scheduleNextVU();
+    } else if (_vuDrawTimer) {
+      clearTimeout(_vuDrawTimer);
+      _vuDrawTimer = null;
+    }
+  }, { threshold: 0 });
+  _vuIO.observe(vuContainer);
+}
 
 // Re-evaluate when the reduced-motion preference flips at runtime: freeze the
 // bars if it turns on, re-arm the draw chain if it turns off mid-playback.
@@ -750,7 +797,7 @@ function _parseVUMR(arrayBuf) {
 // folder navigation (_cancelAncillaryFetches) to free the connection slot.
 let _vuFetchAbort = null;
 
-async function _fetchVUMR(trackId) {
+async function _fetchVUMR(trackId, subsong) {
   if (!trackId) return null;
   // Abort any prior VUMR fetch still in flight so its slot frees and its
   // late response can't return into a track the user already left.
@@ -760,7 +807,12 @@ async function _fetchVUMR(trackId) {
   const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
   _vuFetchAbort = ctrl;
   try {
-    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu`,
+    // A multi-subsong module renders a distinct VU sidecar per tune; pass the
+    // playing subsong so the meters match it.  Append only for N>0 — subsong 0
+    // and "no subsong" both map to the default render, so keeping the URL param
+    // out for 0 avoids caching the same bytes under two URLs.
+    const sub = (Number.isInteger(subsong) && subsong > 0) ? `?subsong=${subsong}` : '';
+    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${sub}`,
                             ctrl ? { credentials: 'include', signal: ctrl.signal }
                                  : { credentials: 'include' });
     if (!res.ok) return null;
@@ -986,7 +1038,7 @@ async function _handleVU(track) {
   // Chip formats (SID, NSF, SPC, …): no Python binding exists yet for
   // libsidplay/libgme, so the server returns 404 and we render the
   // honest fallback below.
-  const fetched = await _fetchVUMR(track.id);
+  const fetched = await _fetchVUMR(track.id, track.subsong);
   if (fetched) {
     // Pass the parsed sidecar through opts — _initVU() unconditionally
     // calls _stopVU() which would otherwise clear ``_vumr`` to null
@@ -1414,13 +1466,6 @@ const _ric = (cb) => {
   return setTimeout(cb, 0);
 };
 
-function _escHtml(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function _escAttr(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
-}
-
 // Monotonic render token for the player-bar cover.  Stations all share the
 // synthetic id ``''`` so the old ``currentTrack.id !== reqTrackId`` staleness
 // guard couldn't tell two rapid radio renders apart — when the external station
@@ -1430,7 +1475,13 @@ function _escAttr(s) {
 let _artRenderGen = 0;
 
 Player.on('trackchange', (track) => {
-  playerTitle.textContent  = track.title || '—';
+  // Multi-subsong files: append "Tune N / total" (1-based label; the wire
+  // subsong is 0-based).  Only when a specific tune is loaded — a plain file
+  // play (default tune, no subsong field) shows just the title.
+  const _subTotal = track.subsongTotal || track.subsongs;   // picker sets Total; playlist tracks carry subsongs
+  const _tune = (Number.isInteger(track.subsong) && _subTotal > 1)
+    ? ` · Tune ${track.subsong + 1} / ${_subTotal}` : '';
+  playerTitle.textContent  = (track.title || '—') + _tune;
   document.title = `${track.title || 'SoniqBoom'} — SoniqBoom`;
   // Radio mode: a station swaps the seek row for a LIVE badge + ticker and
   // repurposes ◄◄/►► to surf the station list (see app.css .radio-mode +

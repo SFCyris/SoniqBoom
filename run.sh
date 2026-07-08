@@ -4,7 +4,7 @@
 
 # ── SoniqBoom · Start ────────────────────────────────────────────────────────
 # Starts the server as a background process and returns to the shell.
-# Stop with:  ./shutdown.sh
+# Stop with:  bash shutdown.sh
 set -euo pipefail
 
 BOLD=$(tput bold 2>/dev/null || true)
@@ -55,7 +55,7 @@ if [ -f "$PID_FILE" ]; then
     echo ""
     echo -e "  Already running (pid ${BOLD}$OLD_PID${RESET})"
     echo -e "  Server:  ${GREEN}http://127.0.0.1:${PORT}${NC}"
-    echo -e "  Stop:    ${BOLD}./shutdown.sh${RESET}  or  ${BOLD}kill $OLD_PID${RESET}"
+    echo -e "  Stop:    ${BOLD}bash shutdown.sh${RESET}  or  ${BOLD}kill $OLD_PID${RESET}"
     echo ""
     exit 0
   fi
@@ -76,7 +76,7 @@ if command -v lsof &>/dev/null; then
     echo -e "${BOLD}── SoniqBoom ──${RESET}"
     echo ""
     echo -e "  ${RED}Port ${PORT} is already in use (pid ${PORT_HOLDER}).${NC}"
-    echo -e "  Run ${BOLD}./shutdown.sh${RESET} first, or start with ${BOLD}--port <number>${RESET}."
+    echo -e "  Run ${BOLD}bash shutdown.sh${RESET} first, or start with ${BOLD}--port <number>${RESET}."
     echo ""
     exit 1
   fi
@@ -218,7 +218,7 @@ echo -e "  Config:    ${DIM}$CONF_FILE${NC}"
 echo -e "  Data:      ${DIM}$DATA_DIR${NC}"
 echo -e "  Log:       ${DIM}$LOG_FILE${NC}"
 echo -e "  ──────────────────────────────────────────────────────"
-echo -e "  Stop:      ${BOLD}./shutdown.sh${RESET}  or  ${BOLD}kill $APP_PID${RESET}"
+echo -e "  Stop:      ${BOLD}bash shutdown.sh${RESET}  or  ${BOLD}kill $APP_PID${RESET}"
 echo -e "  ──────────────────────────────────────────────────────"
 echo ""
 

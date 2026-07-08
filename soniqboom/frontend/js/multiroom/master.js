@@ -75,7 +75,14 @@ export function enterMaster() {
     if (Player.audio && !Player.audio.paused) Sync._emitStateUpdate();
   }, 500);
 
-  Player.on('trackchange', () => Sync._emitStateUpdate());
+  Player.on('trackchange', (t) => {
+    // A station reaches the master via play_station (not the library flow that
+    // calls _renderNow directly), and its live now-playing arrives as
+    // trackchange from setStationNowPlaying/updateStationArt — so render the
+    // card here.  _emitStateUpdate is a no-op in station mode anyway.
+    if (Player.stationMode) { _renderNow(t); return; }
+    Sync._emitStateUpdate();
+  });
   Player.on('statechange', () => Sync._emitStateUpdate());
   Player.on('timeupdate',  (p) => _tickProgress(p));
   Player.on('ended',       () => _onTrackEnded());
@@ -171,6 +178,7 @@ function _switchTab(tab) {
     tracks:    'mr-pane-tracks',
     playlists: 'mr-pane-playlists',
     albums:    'mr-pane-albums',
+    radio:     'mr-pane-radio',
   };
   for (const paneId of Object.values(panes)) {
     $(paneId).classList.add('hidden');
@@ -187,11 +195,15 @@ function _switchTab(tab) {
   search.value = '';
   search.placeholder = tab === 'playlists' ? 'Filter playlists…'
                      : tab === 'albums'    ? 'Filter albums…'
+                     : tab === 'radio'     ? 'Favorite stations'
                      : 'Search tracks…';
+  // Radio favourites are a short curated list — hide the search box for it.
+  search.style.display = (tab === 'radio') ? 'none' : '';
 
   if (tab === 'tracks')    _loadInitialLibrary();
   if (tab === 'playlists') _loadPlaylists();
   if (tab === 'albums')    _loadAlbums();
+  if (tab === 'radio')     _loadRadio();
 }
 
 function _onSearch(q) {
@@ -199,6 +211,68 @@ function _onSearch(q) {
   if (_activeTab === 'tracks')    return _searchTracks(q);
   if (_activeTab === 'playlists') return _filterPlaylists(q);
   if (_activeTab === 'albums')    return _filterAlbums(q);
+}
+
+// ── Radio tab ─────────────────────────────────────────────────────────────────
+// Pick a favourite internet-radio station → stream it to the WHOLE room.  The
+// POST broadcasts play_station to every member (incl. this master); sync.js
+// _onPlayStation plays the shared hub-backed relay URL locally.  One upstream
+// pull feeds the room — the feature the StationHub was built for.
+
+let _radioSid = null;   // sid currently streaming to the room (for the active mark)
+
+async function _loadRadio() {
+  const ul = $('mr-radio-list');
+  ul.innerHTML = '<li class="mr-empty">Loading…</li>';
+  try {
+    const r = await fetch('/api/stations/favorites', { cache: 'no-store' });
+    if (!r.ok) throw new Error('fav fetch');
+    _renderRadio(await r.json());
+  } catch (e) {
+    ul.innerHTML = '<li class="mr-empty">Stations unavailable</li>';
+  }
+}
+
+function _renderRadio(stations) {
+  const ul = $('mr-radio-list');
+  ul.innerHTML = '';
+  if (!stations || !stations.length) {
+    ul.innerHTML = '<li class="mr-empty">No favourite stations yet — add some in the main app.</li>';
+    return;
+  }
+  for (const s of stations) {
+    const li = document.createElement('li');
+    if (s.sid === _radioSid) li.classList.add('active');
+    const best = (s.streams || [])[0] || {};
+    const meta = [best.codec, best.bitrate ? `${best.bitrate}k` : ''].filter(Boolean).join(' ');
+    li.innerHTML = `
+      <span class="mr-lib-title">📻 ${_esc(s.name || 'Station')}</span>
+      <span class="mr-lib-dur">${_esc(meta)}</span>`;
+    li.onclick = () => _playStationInRoom(s);
+    ul.appendChild(li);
+  }
+}
+
+async function _playStationInRoom(station) {
+  if (!Sync.roomId || !station || !station.sid) return;
+  _radioSid = station.sid;
+  document.querySelectorAll('#mr-radio-list li').forEach(
+    li => li.classList.toggle('active',
+      li.querySelector('.mr-lib-title')?.textContent === `📻 ${station.name || 'Station'}`));
+  try {
+    const r = await fetch(
+      `/api/multiroom/${encodeURIComponent(Sync.roomId)}/play_station`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ sid: station.sid, v: 0 }),
+      });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    // Server broadcasts play_station to the whole room (incl. this master);
+    // sync.js _onPlayStation drives the local playback + now-playing card.
+  } catch (e) {
+    console.warn('play_station failed', e);
+    _radioSid = null;
+  }
 }
 
 // ── Tracks tab ──────────────────────────────────────────────────────────────

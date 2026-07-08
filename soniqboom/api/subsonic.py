@@ -1708,7 +1708,12 @@ async def get_playlist(
         _results = await run_search(pl["query"], limit=500)
         entry_tracks = [r.model_dump() if hasattr(r, "model_dump") else r for r in _results]
     else:
-        entry_tracks = store.get_tracks_batch(pl.get("track_ids") or [])
+        # Playlist entries are bare ids OR {id, subsong} objects — resolve to the
+        # base track id (Subsonic clients play the default tune; subsong is a
+        # SoniqBoom-native dimension the protocol has no field for).
+        _ids = [(e.get("id") if isinstance(e, dict) else e)
+                for e in (pl.get("track_ids") or [])]
+        entry_tracks = store.get_tracks_batch(_ids)
     entries = [_track_to_song(t_) for t_ in entry_tracks if t_]
     return _ok({
         "playlist": {

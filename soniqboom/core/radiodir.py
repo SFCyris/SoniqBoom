@@ -305,7 +305,7 @@ def _trim_station(s: dict) -> dict:
         "bitrate": s.get("bitrate") or 0,
         # Radio Browser marks HLS streams (hls=1).  The relay needs to know:
         # an HLS ``.m3u8`` playlist can't be handed to <audio> directly, it
-        # must be transcoded server-side (see stations._relay_hls).
+        # must be transcoded server-side (see stations._hls_producer).
         "hls": 1 if s.get("hls") else 0,
         "favicon": s.get("favicon") or "",
         "homepage": s.get("homepage") or "",
@@ -416,8 +416,21 @@ async def search_stations(q: str, limit: int = 30) -> list[dict]:
     return out[:limit]
 
 
+# Radio Browser station uuids are canonical UUIDs.  We validate against this
+# before EVER interpolating a uuid into an outbound RB URL path, because station
+# uuids ultimately come from the community-editable directory: a crafted value
+# like ``../../url/<victim>`` would otherwise let httpx's path normalisation turn
+# a ``byuuid`` lookup into a ``/json/url/<victim>`` (== a click report), or reach
+# any other same-host GET endpoint.  Reject anything that isn't a plain UUID.
+_RB_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+
+
 async def report_click(uuid: str) -> None:
     """Fire-and-forget play-click report (Radio Browser etiquette)."""
+    if not uuid or not _RB_UUID_RE.match(uuid):
+        return                              # never path-traverse the RB API
     try:
         await _rb_get(f"/json/url/{uuid}")
     except Exception:                       # noqa: BLE001 — best-effort only
@@ -475,6 +488,8 @@ async def resolve_station(sid: str) -> dict | None:
             continue
     if sid.startswith("rb:"):
         uuid = sid[3:]
+        if not _RB_UUID_RE.match(uuid):
+            return None                     # not a real uuid → refuse (anti-traversal)
         try:
             raw = await _rb_get(f"/json/stations/byuuid/{uuid}")
             if raw:

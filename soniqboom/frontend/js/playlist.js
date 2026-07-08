@@ -310,6 +310,16 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   _updateSidebarActive();
 }
 
+// Playlist entry for a rendered track row: a bare id (default tune) OR
+// {id, subsong} for a specific subsong.  Reorder / remove MUST round-trip this
+// — sending a bare id for a subsong entry would flatten it to the default tune
+// (reorder) or fail to match on the backend's (id, subsong) key (remove).
+function _plEntry(t) {
+  return Number.isInteger(t.subsong) ? { id: t.id, subsong: t.subsong } : t.id;
+}
+// Normalised subsong key (0/undefined == default) for local (id, subsong) matches.
+function _plSubKey(t) { const s = t && t.subsong; return (Number.isInteger(s) && s > 0) ? s : null; }
+
 function _renderTracks() {
   tracksEl.innerHTML = '';
   _updateSelBar();
@@ -328,7 +338,8 @@ function _renderTracks() {
     const contentDups  = contentPeers.filter(p => p.id !== track.id);
     const isContentDup = contentDups.length > 0;
 
-    const isCurrent  = Player.currentTrack?.id === track.id;
+    const isCurrent  = Player.currentTrack?.id === track.id
+      && _plSubKey(Player.currentTrack || {}) === _plSubKey(track);   // 0/undefined == default
     const isSelected = _selectedIdxs.has(i);
 
     const row = document.createElement('div');
@@ -372,6 +383,7 @@ function _renderTracks() {
       <div class="queue-track-info">
         <div class="queue-track-titlerow">
           <span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>
+          ${Number.isInteger(track.subsong) ? `<span class="qr-subsong" title="Subsong ${track.subsong + 1}">Tune ${track.subsong + 1}</span>` : ''}
           ${dupBadge}
         </div>
         <span class="queue-track-artist">${esc(track.artist || track.album_artist || '')}</span>
@@ -459,7 +471,7 @@ function _renderTracks() {
     // ── Remove button ───────────────────────────────────────────────────────
     row.querySelector('.queue-remove-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
-      await _removeTrack(_activeId, track.id);
+      await _removeTrack(_activeId, track);
     });
 
     // ── Drag start ──────────────────────────────────────────────────────────
@@ -531,7 +543,7 @@ function _renderTracks() {
         await _api(`/playlists/${_activeId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ track_ids: _activeTracks.map(t => t.id) }),
+          body: JSON.stringify({ track_ids: _activeTracks.map(_plEntry) }),
         });
       } catch (err) {
         // Revert the optimistic local order and re-render so the displayed
@@ -586,21 +598,29 @@ async function _addTracks(playlistId, trackIds) {
   }
 }
 
-async function _removeTrack(playlistId, trackId) {
+async function _removeTrack(playlistId, track) {
+  const entry = _plEntry(track);
+  const subKey = _plSubKey(track);
+  const prev = _activeTracks.slice();      // rollback snapshot (2.6 optimistic)
+  // Optimistic: drop it locally + repaint BEFORE the round-trip.  Match on
+  // (id, subsong) so removing one tune doesn't drop the other tunes of the file.
+  _activeTracks = _activeTracks.filter(t => !(t.id === track.id && _plSubKey(t) === subKey));
+  plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
+  _clearSelection();
+  _renderTracks();
   try {
     await _api(`/playlists/${playlistId}/tracks`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ track_ids: [trackId] }),
+      body: JSON.stringify({ track_ids: [entry] }),
     });
-    _activeTracks = _activeTracks.filter(t => t.id !== trackId);
-    plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
-    _clearSelection();
-    _renderTracks();
-    await refresh();
+    refresh();                             // sync sidebar count in the background
   } catch (err) {
+    _activeTracks = prev;                  // rollback — the optimistic UI must not lie
+    plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
+    _renderTracks();
     console.warn('Failed to remove track:', err);
-    Toast.error('Remove failed — the playlist was not changed.');
+    Toast.error('Remove failed — the track was restored.');
   }
 }
 
@@ -625,21 +645,27 @@ async function _removeSelected() {
   );
   if (!ok) return;
   const indices    = [..._selectedIdxs].sort((a, b) => a - b);
-  const idsToRemove = indices.map(i => _activeTracks[i].id);
+  const idsToRemove = indices.map(i => _plEntry(_activeTracks[i]));
+  const prev = _activeTracks.slice();      // rollback snapshot (2.6 optimistic)
+  // Optimistic: drop the selected rows + repaint before the round-trip
+  // (filter reads _selectedIdxs before _clearSelection wipes it).
+  _activeTracks = _activeTracks.filter((_, i) => !_selectedIdxs.has(i));
+  plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
+  _clearSelection();
+  _renderTracks();
   try {
     await _api(`/playlists/${_activeId}/tracks`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ track_ids: idsToRemove }),
     });
-    _activeTracks = _activeTracks.filter((_, i) => !_selectedIdxs.has(i));
-    plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
-    _clearSelection();
-    _renderTracks();
-    await refresh();
+    refresh();                             // sync sidebar count in the background
   } catch (err) {
+    _activeTracks = prev;                  // rollback
+    plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
+    _renderTracks();
     console.warn('Failed to remove selected:', err);
-    Toast.error('Remove failed — the playlist was not changed.');
+    Toast.error('Remove failed — the tracks were restored.');
   }
 }
 
@@ -795,9 +821,24 @@ document.addEventListener('panelopen', (e) => {
 
 // ── "Add to Playlist" dropdown ────────────────────────────────────────────────
 function showAddDropdown(anchorEl) {
-  _closeAddDropdown();
   const selectedTracks = Library.getSelectedTracks();
   if (!selectedTracks.length) return;
+  _showAddDropdownWith(anchorEl, () => selectedTracks.map(t => t.id), () => Library.clearSelection());
+}
+
+// Add specific entries (bare ids OR {id, subsong} objects) to a chosen
+// playlist — used by the Track Info subsong picker to pin one tune or all N.
+function showAddDropdownForEntries(anchorEl, entries) {
+  if (!entries || !entries.length) return;
+  _showAddDropdownWith(anchorEl, () => entries, null);
+}
+
+function _showAddDropdownWith(anchorEl, getEntries, onDone) {
+  _closeAddDropdown();
+  // Capture the anchor's position synchronously — a caller may remove the
+  // anchor element right after opening us, before this fetch resolves, and a
+  // late getBoundingClientRect() would then read all-zeros.
+  const rect = anchorEl.getBoundingClientRect();
 
   _api('/playlists').then(playlists => {
     _playlists = playlists;
@@ -817,8 +858,8 @@ function showAddDropdown(anchorEl) {
         item.className = 'playlist-dd-item';
         item.textContent = pl.name;
         item.addEventListener('click', () => {
-          _addTracks(pl.id, selectedTracks.map(t => t.id));
-          Library.clearSelection();
+          _addTracks(pl.id, getEntries());
+          if (onDone) onDone();
           _closeAddDropdown();
         });
         dd.appendChild(item);
@@ -830,7 +871,6 @@ function showAddDropdown(anchorEl) {
       dd.appendChild(create);
     }
 
-    const rect = anchorEl.getBoundingClientRect();
     dd.style.left   = rect.left + 'px';
     dd.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
     document.body.appendChild(dd);
@@ -860,4 +900,4 @@ Player.on('trackchange', () => {
   if (_activeId && !tracksEl.hidden) _renderTracks();
 });
 
-export const Playlist = { toggle, refresh, open, close, showAddDropdown, createPlaylist };
+export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist };

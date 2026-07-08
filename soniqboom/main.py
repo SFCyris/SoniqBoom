@@ -126,7 +126,12 @@ class _SelectiveGZipMiddleware:
     """
 
     def __init__(self, app: ASGIApp, minimum_size: int = 1000) -> None:
-        self._inner = GZipMiddleware(app, minimum_size=minimum_size)
+        # compresslevel 6 (not Starlette's default 9): the large /api/tracks +
+        # /api/search JSON pages (~1.8 MB) are gzipped synchronously on the
+        # event loop, and level 9 is markedly slower for a few percent smaller
+        # output.  Level 6 roughly halves that per-page CPU stall while keeping
+        # the ~5-8x compression these highly-repetitive JSON payloads get.
+        self._inner = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=6)
         self._raw = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

@@ -1467,12 +1467,14 @@ class TrackStore:
             cleaned["track_ids"] = updates["tracks"]
         # Prune unknown track ids from the inbound list so a playlist
         # update can't silently pin references to deleted tracks.
-        dropped: list[str] = []
+        dropped: list = []
         if "track_ids" in cleaned and isinstance(cleaned["track_ids"], list):
-            kept: list[str] = []
-            for tid in cleaned["track_ids"]:
+            kept: list = []
+            for entry in cleaned["track_ids"]:
+                # An entry is a bare id string OR {id, subsong} (subsong picker).
+                tid = entry.get("id") if isinstance(entry, dict) else entry
                 if tid in self._tracks:
-                    kept.append(tid)
+                    kept.append(entry)        # keep the original entry — preserves subsong
                 else:
                     dropped.append(tid)
             cleaned["track_ids"] = kept

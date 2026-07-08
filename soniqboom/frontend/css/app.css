@@ -1052,6 +1052,43 @@ body::before {
 }
 .btn-export-csv:hover { background: rgba(107,200,240,0.22); }
 #browse-back:hover { text-decoration: underline; }
+/* Play all / Shuffle all — lead the browse header on track-list views. */
+.browse-play-btn {
+  background: rgba(107,200,240,0.10);
+  border: 1px solid rgba(107,200,240,0.22);
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 11px;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+.browse-play-btn[hidden] { display: none; }
+.browse-play-btn:hover { background: rgba(107,200,240,0.22); }
+/* A–Z jump rail — a full-height gutter down the LEFT edge of the results, its
+   27 letters spread in equal slices top→bottom (minimises mouse travel).  ``top``
+   is synced in JS to the results area; ``bottom:0`` anchors the base. */
+.has-az-rail { position: relative; }
+#az-rail {
+  position: absolute; left: 0; bottom: 0;
+  display: flex; flex-direction: column;
+  width: 24px; z-index: 6; padding: 2px 0; user-select: none;
+  background: linear-gradient(90deg, rgba(255,255,255,0.035), transparent);
+}
+#az-rail[hidden] { display: none; }
+.az-letter {
+  flex: 1 1 0; min-height: 0;                 /* equal slices spanning full height */
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer;
+  color: var(--text2); font-weight: 700; font-size: 12px; line-height: 1;
+  padding: 0; margin: 1px 2px; border-radius: 4px;
+  transition: background 0.1s, color 0.1s;
+}
+.az-letter:hover { color: var(--accent); background: rgba(107,200,240,0.22); }
+/* Reserve the gutter so table rows don't slide under the rail. */
+#track-list-wrap.az-padded { padding-left: 26px; }
 
 /* ── Track table ──────────────────────────────────────────────────────────── */
 #track-list-wrap {
@@ -1083,6 +1120,22 @@ body::before {
   border-collapse: collapse;
   table-layout: fixed;
 }
+/* Column visibility — driven by ``hide-col-*`` classes on the table container
+   (set once in _applyColVisibility on load / column-menu change) so hiding a
+   column is a single class toggle and freshly-pooled virtual-scroll rows
+   inherit it, instead of an inline-style scan of every cell every fling frame. */
+#track-table.hide-col-num .col-num,
+#track-table.hide-col-cover .col-cover,
+#track-table.hide-col-title .col-title,
+#track-table.hide-col-album-artist .col-album-artist,
+#track-table.hide-col-artist .col-artist,
+#track-table.hide-col-album .col-album,
+#track-table.hide-col-track .col-track,
+#track-table.hide-col-year .col-year,
+#track-table.hide-col-dur .col-dur,
+#track-table.hide-col-format .col-format,
+#track-table.hide-col-location .col-location,
+#track-table.hide-col-rating .col-rating { display: none !important; }
 
 #track-table thead {
   position: sticky;
@@ -1239,6 +1292,23 @@ body::before {
 tr.playing td.col-num::after { content: "▶"; font-size: 11px; color: var(--accent); margin-left: 2px; }
 tr.playing td.col-num { color: transparent; }
 tr.playing td.col-title { color: var(--accent); }
+/* Live now-playing marker: animated equalizer bars replace the static ▶. */
+tr.playing td.col-num:has(.row-eq)::after { content: none; }
+.row-eq { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 12px; vertical-align: middle; }
+.row-eq i { width: 2px; height: 100%; background: var(--accent); transform-origin: bottom; animation: row-eq-bar 0.9s ease-in-out infinite; }
+.row-eq i:nth-child(2) { animation-delay: 0.3s; }
+.row-eq i:nth-child(3) { animation-delay: 0.15s; }
+@keyframes row-eq-bar { 0%, 100% { transform: scaleY(0.28); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .row-eq i { animation: none; }
+  .row-eq i:nth-child(1) { height: 55%; }
+  .row-eq i:nth-child(3) { height: 72%; }
+}
+/* Locate: briefly pulse the row we jumped to. */
+tr.locate-pulse > td { animation: locate-pulse-row 1.4s ease-out; }
+@keyframes locate-pulse-row { 0% { background: rgba(107,200,240,0.35); } 100% { background: transparent; } }
+#btn-locate { background: none; border: none; color: var(--text2); cursor: pointer; font-size: 15px; padding: 0 4px; line-height: 1; }
+#btn-locate:hover { color: var(--accent); }
 
 /* Row hover swap: row number → ▶ play glyph.  Discoverability fix —
    the dblclick-to-play behaviour was previously signalled only by the
@@ -1273,6 +1343,14 @@ tr.skeleton td { pointer-events: none; }
   0%   { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
+/* Stations list loading skeleton (perceived-perf 2.8) */
+.st-skel-row { display: flex; align-items: center; gap: 14px; padding: 10px 4px; }
+.st-skel-art { width: 40px; height: 40px; border-radius: 8px; flex: 0 0 auto; }
+.st-skel-line { height: 14px; width: 42%; }
+/* Track-Info artist-bio loading skeleton (perceived-perf 2.4) */
+.ti-bio-skel { padding: 4px 0; overflow: hidden; }
+.ti-bio-skel-img { float: left; width: 72px; height: 72px; border-radius: 8px; margin: 0 12px 6px 0; }
+.ti-bio-skel .skel-bar { display: block; height: 12px; margin: 0 0 8px; width: 100%; }
 
 /* ── Optimistic fade during view transitions ──────────────────────────────── */
 #track-list-wrap.view-loading {
@@ -3582,6 +3660,174 @@ body.ti-open {
   text-overflow: ellipsis;
 }
 
+/* ── Subsong picker (SID/SNDH/AHX/… multi-tune files) ─────────────── */
+.ti-sub-hdrrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ti-sub-count { color: var(--text2); font-weight: 400; font-size: var(--text-sm); }
+.ti-sub-actions { display: flex; gap: 6px; }
+.ti-sub-abtn {
+  font-size: var(--text-sm); padding: 4px 9px; border: 1px solid var(--border-bright);
+  background: transparent; color: var(--text0); border-radius: var(--radius-sm);
+  cursor: pointer; line-height: 1.2; white-space: nowrap;
+}
+.ti-sub-abtn:hover { border-color: var(--accent); color: var(--accent); }
+.ti-sub-abtn-icon { padding: 4px 8px; }
+.ti-sub-list {
+  margin-top: 8px; max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.ti-sub-row {
+  display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+  border-bottom: 1px solid var(--border); cursor: pointer; outline: none;
+}
+.ti-sub-row:last-child { border-bottom: none; }
+.ti-sub-row:hover, .ti-sub-row:focus-visible { background: var(--accent-glow); }
+.ti-sub-row.playing { background: var(--accent-glow); }
+.ti-sub-row.playing .ti-sub-name { color: var(--accent); }
+.ti-sub-eq { display: inline-flex; align-items: flex-end; gap: 2px; width: 14px; height: 13px; flex-shrink: 0; visibility: hidden; }
+.ti-sub-row.playing .ti-sub-eq { visibility: visible; }
+.ti-sub-eq i { width: 3px; background: var(--accent); border-radius: 1px; }
+.ti-sub-eq i:nth-child(1) { height: 6px;  animation: ti-sub-eq 0.9s ease-in-out infinite; }
+.ti-sub-eq i:nth-child(2) { height: 12px; animation: ti-sub-eq 0.9s ease-in-out 0.15s infinite; }
+.ti-sub-eq i:nth-child(3) { height: 8px;  animation: ti-sub-eq 0.9s ease-in-out 0.30s infinite; }
+@keyframes ti-sub-eq { 0%, 100% { transform: scaleY(0.5); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) { .ti-sub-eq i { animation: none; } }
+.ti-sub-name { flex: 1; font-size: var(--text-sm); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ti-sub-def { font-size: var(--text-xs); color: var(--accent); border: 1px solid var(--accent-dim); border-radius: var(--radius-sm); padding: 0 5px; margin-left: 6px; }
+.ti-sub-len { font-size: var(--text-sm); color: var(--text2); font-variant-numeric: tabular-nums; }
+.ti-sub-rowacts { display: flex; gap: 4px; opacity: 0; transition: opacity 0.12s; }
+.ti-sub-row:hover .ti-sub-rowacts, .ti-sub-row:focus-visible .ti-sub-rowacts, .ti-sub-row.playing .ti-sub-rowacts { opacity: 1; }
+.ti-sub-rbtn { border: none; background: transparent; color: var(--text2); cursor: pointer; font-size: var(--text-base); padding: 2px 5px; border-radius: var(--radius-sm); line-height: 1; }
+.ti-sub-rbtn:hover { color: var(--accent); background: var(--accent-glow); }
+.ti-sub-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: var(--text-sm); color: var(--text2); gap: 10px; }
+.ti-sub-jump { display: inline-flex; align-items: center; gap: 6px; }
+.ti-sub-jump input { width: 54px; text-align: center; }
+/* HVSC STIL per-tune title, shown after "Tune N" in the picker rows. Muted so
+   the tune number stays the primary anchor; ellipsises with the name. */
+.ti-sub-title { color: var(--text2); font-weight: normal; }
+.ti-sub-row.playing .ti-sub-title { color: var(--accent); opacity: 0.85; }
+/* "Tune N" tag on a subsong entry inside a playlist/queue row */
+.qr-subsong { font-size: var(--text-xs); color: var(--accent); border: 1px solid var(--accent-dim); border-radius: var(--radius-sm); padding: 0 5px; margin-left: 6px; white-space: nowrap; flex-shrink: 0; }
+
+/* SID chip badge (6581 / 8580) in the module-details section. */
+.ti-sid-chip {
+  display: inline-block; font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: var(--text-xs); letter-spacing: 0.04em; color: var(--accent);
+  border: 1px solid var(--accent-dim); border-radius: var(--radius-sm); padding: 1px 7px;
+}
+
+/* HVSC STIL commentary panel — prose, so it wraps (unlike the ASCII-art song
+   message panel, which is white-space: pre with horizontal scroll). */
+.ti-stil-src { font-size: var(--text-xs); color: var(--text2); font-weight: normal; }
+.ti-stil-wrap {
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg1); padding: 8px 12px; max-height: 320px; overflow-y: auto;
+}
+.ti-stil-body {
+  margin: 0; font-size: var(--text-sm); line-height: 1.55; color: var(--text1);
+  white-space: pre-wrap; word-break: break-word; font-family: inherit;
+}
+
+/* ── Pattern grid (tracker modules) ──────────────────────────────────────── */
+.ti-pat-hdrrow { display: flex; justify-content: space-between; align-items: center; }
+.ti-pat-follow {
+  font-size: 10px; font-weight: 600; letter-spacing: normal; text-transform: none;
+  padding: 2px 10px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text2);
+}
+.ti-pat-follow[aria-pressed="true"] {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-glow);
+}
+.ti-pat-order {
+  display: flex; gap: 4px; overflow-x: auto; padding: 8px 0;
+  scrollbar-width: thin;
+}
+.ti-pat-chip {
+  font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: 10px; padding: 1px 6px; flex-shrink: 0; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: transparent; color: var(--text2);
+}
+.ti-pat-chip.active {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-glow);
+}
+.ti-pat-chip.ti-pat-marker { opacity: 0.45; pointer-events: none; }
+.ti-pat-gridwrap {
+  border: 1px solid var(--border); border-radius: 6px;
+  max-height: 340px; overflow: auto; background: var(--bg1);
+}
+.ti-pat-grid {
+  border-collapse: separate; border-spacing: 0;
+  font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: 11px; line-height: 1.5; white-space: nowrap;
+}
+.ti-pat-grid th, .ti-pat-grid td { padding: 1px 7px; text-align: left; }
+.ti-pat-grid th {
+  position: sticky; top: 0; z-index: 2; background: var(--bg2);
+  font-weight: 600; color: hsl(var(--h, 20), 60%, 55%);
+  border-bottom: 1px solid var(--border);
+}
+.ti-pat-grid th.tprn, .ti-pat-grid td.tprn {
+  position: sticky; left: 0; z-index: 1; background: var(--bg1);
+  color: var(--text2); min-width: 26px;
+}
+.ti-pat-grid th.tprn { z-index: 3; background: var(--bg2); }
+/* Per-channel VU backdrop — --h is the column hue (set once at build),
+   --vc its live alpha (0..~0.16, driven from the VU tick).  Beat and
+   playhead tints ride background-image so they stack with the VU color. */
+.ti-pat-grid td.tpc { background-color: hsla(var(--h, 20), 70%, 55%, var(--vc, 0)); }
+.ti-pat-grid tr.tpb td { background-image: linear-gradient(rgba(127,127,127,0.10), rgba(127,127,127,0.10)); }
+.ti-pat-grid tr.tph td { background-image: linear-gradient(var(--accent-glow), var(--accent-glow)); }
+.ti-pat-grid tr.tph td.tprn { color: var(--accent); }
+/* Header VU dot — brightens with the channel's live level. */
+.tpdot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  margin-left: 5px; vertical-align: 1px;
+  background: hsl(var(--h, 20), 70%, 55%);
+  opacity: calc(0.25 + var(--vc, 0) * 4);
+}
+/* Cell segments: note / instrument / volume / effect. */
+.tpn { color: var(--text0); }
+.tpi { color: var(--text1); }
+.tpv { color: var(--text2); }
+.tpf { color: var(--accent-dim); }
+.tpe { color: var(--text2); opacity: 0.55; }
+.ti-pat-note { font-size: 11px; color: var(--text2); margin-top: 6px; }
+.ti-pat-orderrow { display: flex; align-items: center; gap: 8px; }
+.ti-pat-orderrow .ti-pat-order { flex: 1; min-width: 0; }
+.ti-pat-pos {
+  flex-shrink: 0; font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: 10px; color: var(--text2); white-space: nowrap;
+}
+.ti-pat-caption { font-size: 10.5px; color: var(--text2); margin-top: 6px; opacity: 0.85; }
+
+/* Demoscene scroller — one-line horizontal marquee of the song message. */
+.ti-msg-marquee {
+  overflow: hidden; white-space: nowrap; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--bg0); padding: 7px 0; margin-bottom: 8px;
+}
+.ti-msg-marquee span {
+  display: inline-block; padding-left: 100%;
+  font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: 13px; color: var(--accent);
+  animation: ti-scroll 22s linear infinite;
+}
+@keyframes ti-scroll { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+@media (prefers-reduced-motion: reduce) {
+  .ti-msg-marquee span { animation: none; padding-left: 0; white-space: normal; }
+}
+
+/* ── Song message (tracker modules) ──────────────────────────────────────── */
+.ti-msg-wrap {
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg1); padding: 8px 12px; overflow-x: auto;
+  max-height: 300px; overflow-y: auto;
+}
+#ti-message {
+  margin: 0; font-family: "SF Mono", "Menlo", "Fira Code", monospace;
+  font-size: 11px; line-height: 1.55; color: var(--text0);
+  white-space: pre; min-width: max-content;
+}
+
 /* ── Queue panel ─────────────────────────────────────────────────────────── */
 #queue-panel {
   position: fixed;
@@ -5084,8 +5330,13 @@ tr.dragging { opacity: 0.4; }
 .col-rating { width: 80px; text-align: center; white-space: nowrap; }
 .col-rating .star {
   cursor: pointer;
-  font-size: 12px;
-  padding: 0 1px;
+  font-size: 14px;
+  /* Bigger click target — the 12px/1px glyph was ~14px, below the WCAG
+     2.5.8 minimum.  The vertical padding fills the ~28px row (≥24px tall)
+     and the horizontal padding widens each star's hit area; the negative
+     margin keeps the five-star group from growing the column width. */
+  padding: 7px 4px;
+  margin: 0 -1px;
   transition: color 0.1s;
 }
 .col-rating .star-filled { color: var(--accent); }
@@ -5096,6 +5347,41 @@ tr.dragging { opacity: 0.4; }
 .col-rating:hover .star { color: var(--accent-dim); }
 .col-rating:hover .star:hover ~ .star { color: var(--bg4); }
 th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
+
+/* ── Track context menu (right-click) ─────────────────────────────────────── */
+.ctx-menu {
+  min-width: 180px; background: var(--bg2); border: 1px solid var(--border-bright);
+  border-radius: 8px; padding: 4px; z-index: 10000; font-size: 13px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.45);
+}
+.ctx-item {
+  display: block; width: 100%; text-align: left; background: none; border: none;
+  color: var(--text0); padding: 7px 12px; border-radius: 5px; cursor: pointer;
+  font-size: 13px; font-family: inherit;
+}
+.ctx-item:hover, .ctx-item:focus { background: var(--accent); color: #fff; outline: none; }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+.ctx-rate { display: flex; gap: 3px; padding: 5px 12px; }
+.ctx-star { cursor: pointer; font-size: 16px; line-height: 1; color: var(--bg4); }
+.ctx-star.on { color: var(--accent); }
+.ctx-rate:hover .ctx-star { color: var(--accent-dim); }
+.ctx-star:hover ~ .ctx-star { color: var(--bg4); }
+
+/* ── Album-card "play all" hover button ───────────────────────────────────── */
+.album-card-art { position: relative; }
+.album-card-play {
+  position: absolute; right: 8px; bottom: 8px; width: 34px; height: 34px;
+  border-radius: 50%; border: none; background: var(--accent); color: #fff;
+  font-size: 13px; cursor: pointer; display: flex; align-items: center;
+  justify-content: center; opacity: 0; transform: translateY(4px);
+  transition: opacity 0.12s, transform 0.12s; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.album-card:hover .album-card-play,
+.album-card:focus-within .album-card-play { opacity: 1; transform: translateY(0); }
+.album-card-play:hover { background: var(--accent-dim); }
+@media (prefers-reduced-motion: reduce) {
+  .album-card-play { transition: none; transform: none; }
+}
 
 /* ── Search preview dropdown ───────────────────────────────────────────── */
 .search-preview {
@@ -7713,10 +7999,14 @@ body.auth-blocked > #app {
 /* Now-playing card */
 #st-now {
   display: flex; align-items: center; gap: 14px;
+  min-height: 56px;   /* reserve the played-card height so starting a station never shifts the list */
   padding: 14px 16px; margin-bottom: 14px; border-radius: 10px;
   background: var(--bg3, #222); border: 1px solid var(--border-bright, #444);
 }
 #st-now.hidden { display: none; }
+/* Idle placeholder — occupies the same space but reads as "nothing playing yet". */
+#st-now.st-now-empty { opacity: 0.55; }
+#st-now.st-now-empty .st-now-name { color: var(--text2, #999); font-weight: 500; }
 .st-now-art {
   width: 56px; height: 56px; border-radius: 8px; object-fit: cover;
   flex: 0 0 auto;
@@ -7784,6 +8074,14 @@ body.auth-blocked > #app {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--text2, #888); padding: 8px 12px 3px; font-weight: 600;
 }
+/* Header row with a trailing "Show all →" affordance (Stations section). */
+.sp-group-hdr-row { display: flex; align-items: baseline; justify-content: space-between; }
+.sp-show-all {
+  background: none; border: none; cursor: pointer; padding: 0;
+  color: var(--accent); font-weight: 600; font-size: 10.5px;
+  text-transform: none; letter-spacing: normal; opacity: 0.9;
+}
+.sp-show-all:hover { opacity: 1; text-decoration: underline; }
 .sp-station-row .sp-art-ph { font-size: 15px; }
 .sp-station-row .sp-dur { color: var(--accent); font-size: 13px; }
 

@@ -492,7 +492,58 @@
 // manual (served at /manual) in a new tab.
 // v134 (2026-07-02): Internet radio / Stations out of Beta — removed the Beta
 // labels from the Stations sidebar tooltips and the welcome card.
-const SHELL_VERSION = 'v134';
+// v135 (2026-07-03): format-aware Track Info — empty tag rows hidden, module
+// sections lead for tracker files, pattern grid + follow playhead + per-column
+// VU wash, song message, BPM-from-tempo, module voice-count label fix.
+// v136 (2026-07-03): pattern grid — preserve the volume-column command letter
+// (v20/p3A), th scope="col"; (backend: old-libopenmpt guard, mtime cache key).
+// v137 (2026-07-03): Track Info — clear stale "Made with" on non-pattern tracks
+// (SID no longer inherits a tracker's value); song-message demoscene scroller,
+// order-position label, grid caption. (Backend: AMUSIC .amd → AdPlug routing.)
+// v138 (2026-07-03): AMUSIC AdLib added to the frontend AdLib name set so its
+// tracks get the VU/spectrum visualizer + duration backfill (QA F1).
+// v139 (2026-07-03): right-click track context menu (play / play next / queue /
+// add to playlist / rate / info) + album-card play-all hover; rating now toasts
+// and reverts on failure with bigger hit targets; hover-intent prefetch (art +
+// exotic-render prewarm); station relay warm-on-hover.
+// v140 (2026-07-04): subsong picker in Track Info (play/queue/shuffle any tune
+// or all N; jump-to-#; event-delegated for 256-tune files); subsong threaded
+// through the play path (?subsong=, 0-based) with "Tune N / total" in the
+// player bar; play-record gate now floors at >=30s so short chiptune SFX
+// subsongs don't inflate play-counts/scrobbles.
+// v141 (2026-07-04): subsongs in playlists — playlist entries are now bare id OR
+// {id, subsong}; the Track Info picker can pin one tune or all N into a playlist,
+// playlist rows show a "Tune N" tag and play the right subsong.
+// v142 (2026-07-04): subsong review fixes — gapless preload/seam now key on
+// (id, subsong) so "Play all" doesn't replay tune 1; playlist reorder/remove
+// round-trip subsong entries (no flatten); play-record floor relaxed to a 20s
+// listen threshold; current-row highlight matches on (id, subsong).
+// v147 (2026-07-04): QA-review hardening of the v146 features.  SECURITY: validate
+// Radio Browser uuids before interpolating into RB URLs (radiodir.py) — a crafted
+// community-directory "rb:../../url/<uuid>" sid made a station HOVER fire
+// report_click via path traversal; closed at the source (also hardens /relay).
+// Also: escape " and ' in trackinfo _escHtml (STIL-title attribute XSS); bound
+// /vu ?subsong (ge=0, le=1024); station warm targets the stream the click picks
+// (cands[0].v) not streams[0]; hard-cap _warm_fresh; delete dead unsafe app.js
+// _escHtml/_escAttr.  (app.js v112, trackinfo/app/stations.js, radiodir/stations/
+// tracks.py.)
+// v146 (2026-07-04): (1) HVSC STIL surfaced — Track-Info subsong picker rows
+// show per-tune STIL titles ((#N)→"Tune N · Title"), a raw STIL commentary
+// panel, and a SID chip badge (6581/8580) in module details; /extended now
+// returns stil + sid_model.  (2) Per-subsong VU sidecar — /vu?subsong=N returns
+// the playing tune's meters (exact sub{N} match), threaded from player.  (3)
+// Waveform prewarm for the immediate-next native track.  (4) Safe station warm
+// — hover-intent GET /stations/warm/{sid} pre-resolves DNS (no report_click, no
+// relay spawn).  (index.html, app.css v82, app.js v111, trackinfo/app/player/
+// stations.js.)
+// v145 (2026-07-04): bug 4.5 (stale ◆ target), bug 4.3 (standalone-confirm Escape
+// + confirm focus-trap), optimistic playlist remove (2.6), Track-Info bio +
+// stations loading skeletons (2.4/2.8), VU off-screen gate (1.8).
+// v144 (2026-07-04): stations now-playing card is always in the layout (muted
+// placeholder when idle) so starting a station no longer shifts the list under
+// the cursor.  v143: ?v-pinned assets served cache-first with NO revalidation
+// (immutable per URL) — drops a redundant background fetch per pinned asset.
+const SHELL_VERSION = 'v147';
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.
@@ -586,11 +637,19 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // Static asset path: cache-first with background revalidate.
+  // Static asset path.
   if (path.startsWith('/assets/')) {
+    // Content-versioned assets (``?v=N`` cache-busters — app.css, app.js,
+    // cast_picker.js…) are IMMUTABLE per URL: a content change ships a NEW url,
+    // so a cache hit is served straight from cache with NO background
+    // revalidation — dropping a redundant network round-trip on every load.
+    // Unversioned module imports (player.js, trackinfo.js…) keep
+    // stale-while-revalidate as their between-SHELL_VERSION freshness net.
+    const versioned = url.searchParams.has('v');
     e.respondWith((async () => {
       const cache = await caches.open(SHELL_CACHE);
       const hit = await cache.match(req);
+      if (versioned && hit) return hit;   // immutable — cache-first, no revalidate
       // Background refresh — don't block the response on it.
       const fetchAndUpdate = fetch(req).then(res => {
         if (res && res.status === 200) cache.put(req, res.clone());

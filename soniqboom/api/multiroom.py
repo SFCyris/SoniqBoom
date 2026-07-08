@@ -10,8 +10,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+from soniqboom.core import radiodir
 
 log = logging.getLogger("soniqboom.multiroom")
 
@@ -87,6 +91,22 @@ async def _broadcast(room_id: str, data: dict, exclude: str | None = None) -> No
             room.clients.pop(r, None)
 
 
+async def notify_station_meta(payload: dict) -> None:
+    """Relay a station ``radio_meta`` / ``radio_art`` event to any room that is
+    currently streaming that station.  Multi-room members live on the multiroom
+    WS (not the library WS the relay normally broadcasts over), so without this
+    they'd never see the live now-playing title / cover — only the station name.
+    Cheap no-op when no room is playing the sid."""
+    sid = payload.get("sid")
+    if not sid:
+        return
+    mtype = payload.get("event")             # "radio_meta" | "radio_art"
+    for room in list(_rooms.values()):
+        ct = room.current_track
+        if ct and ct.get("sid") == sid:
+            await _broadcast(room.room_id, {**payload, "type": mtype})
+
+
 def _roster_payload(room: Room) -> list[dict]:
     return [
         {"client_id": c.client_id, "label": c.label, "role": c.role}
@@ -145,6 +165,60 @@ async def room_state(room_id: str):
         "clients":   _roster_payload(r),
         "last_state": r.last_state,
     }
+
+
+class PlayStationBody(BaseModel):
+    sid: str
+    v: int = 0
+
+
+@router.post("/{room_id}/play_station")
+async def play_station(room_id: str, body: PlayStationBody):
+    """Stream an internet-radio station to every member of a room.
+
+    Unlike library-track playback (master-driven, position-synced), a live
+    station has no seekable position: every member just loads the shared,
+    hub-backed relay URL and plays at the live edge.  Because they all pull the
+    SAME StationHub, one upstream connection feeds the whole room — this is the
+    feature the hub was built for.  Any authenticated user may push a station to
+    a room (the endpoint is behind the /api auth middleware).
+    """
+    room = _rooms.get(room_id)
+    if not room:
+        raise HTTPException(404, f"No room: {room_id}")
+    st = await radiodir.resolve_station(body.sid)
+    if not st:
+        raise HTTPException(404, "Unknown station")
+    streams = st.get("streams") or []
+    if not streams:
+        raise HTTPException(404, "Station has no playable streams")
+    v = min(max(body.v, 0), len(streams) - 1)
+    # Same-origin, hub-backed URL every member (browser) pulls.  The sid is
+    # path-encoded; the relay route re-validates it (SSRF) and shares one hub.
+    url = f"/api/stations/relay/{quote(body.sid, safe='')}?v={v}"
+    track = {
+        "id":         f"station:{body.sid}",
+        "sid":        body.sid,
+        "title":      st.get("name") or "Live radio",
+        "artist":     "Live radio",
+        "is_station": True,
+        "cover_art":  st.get("favicon") or None,
+        "url":        url,
+    }
+    room.current_track = track
+    # Broadcast a live-stream directive to EVERY member (master + slaves): load
+    # the URL and play now, bypassing the seekable-position sync path.
+    await _broadcast(room_id, {
+        "type":    "play_station",
+        "ts":      _now_ms(),
+        "sid":     body.sid,
+        "v":       v,
+        "url":     url,
+        "station": {"name": st.get("name"), "favicon": st.get("favicon")},
+        "track":   track,
+    })
+    log.info("Room %s → play station %s (%s)", room_id, body.sid, st.get("name"))
+    return {"ok": True, "room_id": room_id, "sid": body.sid, "v": v, "url": url}
 
 
 # ── WebSocket endpoint ──────────────────────────────────────────────────────

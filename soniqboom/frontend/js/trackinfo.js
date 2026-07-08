@@ -26,6 +26,7 @@ import { vizGroupEnabled }     from './viz/engine.js';
 let _chaptersAbort = null;
 let _extendedAbort = null;
 let _lyricsAbort   = null;
+let _patternsAbort = null;
 
 async function _loadChapters(track) {
   const host = document.getElementById('ti-chapters');
@@ -160,7 +161,14 @@ function _fmtBitrate(bps) {
     ? `${(kbps / 1000).toFixed(1)} Mbps`   // lossless: e.g. "16.9 Mbps"
     : `${kbps} kbps`;
 }
-function _fmtChannels(n) {
+function _fmtChannels(n, track) {
+  // Module-family "channels" are VOICES (tracker channels, chip voices),
+  // not a speaker layout — an 8-channel ScreamTracker module is 8 voices
+  // mixed to stereo, not 7.1 Surround.  Speaker-layout labels only apply
+  // to real PCM audio.
+  if (track && _isModuleFamily(track)) {
+    return n === 1 ? '1 channel' : (n ? `${n} channels` : '—');
+  }
   return { 1: 'Mono', 2: 'Stereo', 6: '5.1 Surround', 8: '7.1 Surround' }[n] ?? (n ? `${n}ch` : '—');
 }
 function _fmtDate(ts) {
@@ -175,6 +183,24 @@ function _show(id, val, formatter) {
   const text = raw != null ? (formatter ? formatter(raw) : String(raw)) : null;
   el.textContent = text ?? '—';
   el.classList.toggle('ti-empty', !text);
+  // Format-aware layout: a row with no value is hidden outright instead of
+  // rendering an em-dash — a tracker module structurally has no Album
+  // Artist/ISRC/Label, and eleven dashes told the user nothing.  Sections
+  // whose rows are ALL hidden collapse too (_updateSectionVisibility).
+  const field = el.closest('.ti-field');
+  if (field) field.style.display = text ? '' : 'none';
+}
+
+/** Hide any .ti-autohide section whose field rows are all hidden. */
+function _updateSectionVisibility() {
+  if (!metaPane) return;
+  for (const sec of metaPane.querySelectorAll('.ti-section.ti-autohide')) {
+    let any = false;
+    for (const f of sec.querySelectorAll('.ti-field')) {
+      if (f.style.display !== 'none') { any = true; break; }
+    }
+    sec.style.display = any ? '' : 'none';
+  }
 }
 
 // Placeholder / "unknown artist" tokens that must NOT trigger a bio lookup —
@@ -202,6 +228,13 @@ async function _loadArtistAbout(track) {
   // Guard against a slow response racing into a DIFFERENT track's modal on
   // rapid prev/next (mirrors the artwork loader's reqTrackId check).
   const reqTrackId = track.id;
+  // Skeleton while the (external) bio fetch is in flight — pending vs absent
+  // were previously indistinguishable (perceived-perf 2.4).
+  host.innerHTML = '<div class="ti-bio-skel"><span class="ti-bio-skel-img skel-bar"></span>'
+    + '<span class="skel-bar"></span><span class="skel-bar" style="width:92%"></span>'
+    + '<span class="skel-bar" style="width:74%"></span></div>';
+  host.hidden = false;
+  let _bioRendered = false;
   try {
     // Album/track context lets the server pin the right artist for ambiguous
     // names ("Ghost" the band on this record, not anything else).
@@ -228,7 +261,13 @@ async function _loadArtistAbout(track) {
       `<h4 style="margin:0 0 6px;font-size:13px;opacity:.85">About ${esc(info.title || artist)}</h4>` +
       `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>`;
     host.hidden = false;
+    _bioRendered = true;
   } catch (e) { /* network/parse issue — leave hidden */ }
+  finally {
+    // Not rendered (no bio / error) and still on this track → drop the skeleton.
+    // If the user navigated away, the newer call owns the host — don't touch it.
+    if (!_bioRendered && _queue[_idx]?.id === reqTrackId) { host.hidden = true; host.innerHTML = ''; }
+  }
 }
 
 // ── Tag editing ────────────────────────────────────────────────────────────────
@@ -414,7 +453,7 @@ function _render(track) {
   _show('ti-format',      track.format);
   _show('ti-bit-depth',   track.bit_depth,   v => `${v}-bit`);
   _show('ti-sample-rate', track.sample_rate, _fmtRate);
-  _show('ti-channels',    track.channels,    _fmtChannels);
+  _show('ti-channels',    track.channels,    v => _fmtChannels(v, track));
   _show('ti-bitrate',     track.bitrate,     _fmtBitrate);
   _show('ti-file-size',   track.file_size,   _fmtSize);
   _show('ti-added',       track.added_at,    _fmtDate);
@@ -425,6 +464,14 @@ function _render(track) {
   _loadChapters(track);
   _loadArtistAbout(track);
   _renderTagEdit(track);
+  _loadPatterns(track);
+
+  // Format-aware section order: for module-family tracks the module
+  // identity (details, pattern grid, song message) leads, right after the
+  // main tag block; PCM audio keeps the classic tag-centric order.  The
+  // nodes are MOVED (insertBefore), so listeners and state survive.
+  _reorderSections(track);
+  _updateSectionVisibility();
 
   // Reset lyrics pane if navigating away from current lyrics
   if (_activeTab === 'lyrics') {
@@ -467,9 +514,248 @@ const _MODULE_FORMATS = new Set([
     'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
 ]);
 
+/** Module-family test: static tracker/SID/MIDI names plus the dynamic-name
+ *  scene families (uade Amiga exotica, Atari ST, PSF console rips). */
+function _isModuleFamily(track) {
+  if (!track) return false;
+  return _MODULE_FORMATS.has(track.format)
+      || isUadeAmigaTrack(track)
+      || ATARI_FORMAT_NAMES.has(track.format)
+      || PSF_FORMAT_NAMES.has(track.format);
+}
+
+// Sections that participate in the format-aware reorder, in DOM units.
+const _SECTION_ORDER_AUDIO = [
+  'ti-section-main', 'ti-section-numbering', 'ti-section-details',
+  'ti-section-module', 'ti-section-subsongs', 'ti-section-stil', 'ti-section-patterns',
+  'ti-section-message', 'ti-section-file',
+];
+const _SECTION_ORDER_MODULE = [
+  'ti-section-main', 'ti-section-module', 'ti-section-subsongs', 'ti-section-stil',
+  'ti-section-patterns', 'ti-section-message', 'ti-section-details', 'ti-section-numbering',
+  'ti-section-file',
+];
+
+function _reorderSections(track) {
+  const anchor = document.getElementById('ti-chapters');
+  if (!metaPane || !anchor) return;
+  const order = _isModuleFamily(track) ? _SECTION_ORDER_MODULE : _SECTION_ORDER_AUDIO;
+  for (const id of order) {
+    const el = document.getElementById(id);
+    if (el) metaPane.insertBefore(el, anchor);
+  }
+}
+
+// ── Subsong picker ────────────────────────────────────────────────────────────
+// Multi-tune files (SID/SNDH/AHX/SC68/UADE/GME/tracker) expose N subsongs; the
+// backend renders any one via ?subsong=<0-based>.  A "virtual track" is the base
+// track object plus a 0-based ``subsong`` + ``subsongTotal`` — the player forwards
+// ``subsong`` to the stream URL (see player.js _streamUrlFor) and shows
+// "Tune N / total".  DISPLAY is 1-based ("Tune 1".."Tune N"); the wire index is
+// always the label minus one.  Never persist/forward the 1-based number.
+const _subSection = document.getElementById('ti-section-subsongs');
+const _subListEl  = document.getElementById('ti-sub-list');
+const SUB_CAP     = 60;                 // rows rendered up-front; "jump to #" reaches the tail
+let   _subState   = null;               // { track, count, defaultWire, lengths }
+
+function _subFmtLen(sec) {
+  if (!(sec > 0)) return '';
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function _subVirtual(base, wire) {
+  // Carry only what playback needs; ``subsong`` is the 0-based wire index.
+  return { ...base, subsong: wire,
+           subsongTotal: _subState ? _subState.count : 0,
+           subsongLabel: `Tune ${wire + 1}` };
+}
+
+// HVSC STIL: parse the raw blob's ``(#N)`` subtune markers into a
+// { wire → title } map.  ``(#N)`` is 1-based (matches display "Tune N"), so
+// wire = N-1.  We take the FIRST ``TITLE:`` inside each block; ARTIST/COMMENT
+// are left for the raw commentary panel.  Files without ``(#N)`` markers (a
+// single file-level TITLE) yield null — the picker then shows bare tune
+// numbers, which is the correct graceful degrade.
+function _parseStilTitles(blob) {
+  if (!blob || typeof blob !== 'string') return null;
+  const titles = {};
+  let wire = -1;
+  for (const raw of blob.split('\n')) {
+    const mk = raw.match(/^\s*\(#(\d+)\)/);
+    if (mk) { wire = parseInt(mk[1], 10) - 1; continue; }
+    if (wire < 0) continue;
+    const tm = raw.match(/^\s*TITLE:\s?(.+?)\s*$/);
+    if (tm && titles[wire] === undefined) titles[wire] = tm[1].trim();
+  }
+  return Object.keys(titles).length ? titles : null;
+}
+
+function _subRowHtml(wire) {
+  const st = _subState;
+  const isDef = st && wire === st.defaultWire;
+  const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[wire]) : '';
+  const title = (st && st.stilTitles) ? st.stilTitles[wire] : '';
+  const titleHtml = title
+    ? ` <span class="ti-sub-title" title="${_escHtml(title)}">· ${_escHtml(title)}</span>`
+    : '';
+  return `<div class="ti-sub-row" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${wire + 1}${title ? ': ' + _escHtml(title) : ''}">`
+    + `<span class="ti-sub-eq" aria-hidden="true"><i></i><i></i><i></i></span>`
+    + `<span class="ti-sub-name">Tune ${wire + 1}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${titleHtml}</span>`
+    + `<span class="ti-sub-len">${len}</span>`
+    + `<span class="ti-sub-rowacts">`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="play" tabindex="-1" aria-label="Play tune ${wire + 1}" title="Play">&#9654;</button>`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="queue" tabindex="-1" aria-label="Add tune ${wire + 1} to queue" title="Add to queue">&#65291;</button>`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="playlist" tabindex="-1" aria-label="Add tune ${wire + 1} to a playlist" title="Add to playlist">&#9776;</button>`
+    + `</span></div>`;
+}
+
+function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles) {
+  if (!_subSection || !_subListEl) return;
+  if (!(count > 1)) { _subSection.hidden = true; _subState = null; return; }
+  _subState = {
+    track,
+    count,
+    // default_track is 1-based (PSID/SNDH header); convert to 0-based wire, or
+    // fall back to the first tune when the file doesn't record a default.
+    defaultWire: (Number(defaultTrack1) > 0) ? (Number(defaultTrack1) - 1) : 0,
+    lengths: Array.isArray(lengths) ? lengths : null,
+    // { wire → HVSC STIL tune title }, or null when the file has no per-tune
+    // STIL names — the rows then show bare "Tune N".
+    stilTitles: (stilTitles && typeof stilTitles === 'object') ? stilTitles : null,
+  };
+  const cntEl = document.getElementById('ti-sub-count');
+  if (cntEl) cntEl.textContent = `· ${count} tunes`;
+  const addLbl = document.getElementById('ti-sub-addall-lbl');
+  if (addLbl) addLbl.textContent = `Add all · ${count}`;
+  const shown = Math.min(count, SUB_CAP);
+  const rows = [];
+  for (let w = 0; w < shown; w++) rows.push(_subRowHtml(w));
+  _subListEl.innerHTML = rows.join('');
+  const moreEl = document.getElementById('ti-sub-more');
+  if (moreEl) moreEl.textContent = count > SUB_CAP ? `+ ${count - SUB_CAP} more — use “jump to #”` : '';
+  _subSection.hidden = false;
+  _highlightPlayingSubsong();
+}
+
+function _subAllVirtual() {
+  const st = _subState; if (!st) return [];
+  const out = [];
+  for (let w = 0; w < st.count; w++) out.push(_subVirtual(st.track, w));
+  return out;
+}
+
+function _subAction(act, wire, anchor) {
+  const st = _subState; if (!st || !(wire >= 0)) return;
+  if (act === 'queue') {
+    Player.addToQueue(_subVirtual(st.track, wire));
+    window.Toast?.ok?.(`Added tune ${wire + 1} to the queue`);
+  } else if (act === 'playlist') {
+    _subToPlaylist([{ id: st.track.id, subsong: wire }], anchor);
+  } else {
+    Player.setQueue([_subVirtual(st.track, wire)], 0);   // 'play' (default)
+  }
+}
+
+async function _subToPlaylist(entries, anchor) {
+  try {
+    const mod = await import('./playlist.js');
+    mod.Playlist.showAddDropdownForEntries(anchor || _subListEl, entries);
+  } catch (_) { window.Toast?.error?.('Could not open playlists.'); }
+}
+
+function _highlightPlayingSubsong() {
+  if (!_subListEl) return;
+  _subListEl.querySelectorAll('.ti-sub-row.playing').forEach(r => r.classList.remove('playing'));
+  const st = _subState, cur = Player.currentTrack;
+  if (st && cur && cur.id === st.track.id && Number.isInteger(cur.subsong)) {
+    const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${cur.subsong}"]`);
+    if (row) row.classList.add('playing');
+  }
+}
+
+// One delegated handler covers any tune count (even 256) — no per-row listeners.
+if (_subListEl) {
+  _subListEl.addEventListener('click', (e) => {
+    const row = e.target.closest('.ti-sub-row'); if (!row) return;
+    const btn = e.target.closest('.ti-sub-rbtn');
+    _subAction(btn ? btn.dataset.act : 'play', parseInt(row.dataset.wire, 10), btn || row);
+  });
+  _subListEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const row = e.target.closest('.ti-sub-row'); if (!row) return;
+    e.preventDefault();
+    _subAction('play', parseInt(row.dataset.wire, 10));
+  });
+}
+document.getElementById('ti-sub-playall')?.addEventListener('click', () => {
+  const list = _subAllVirtual(); if (list.length) Player.setQueue(list, 0);
+});
+document.getElementById('ti-sub-shuffle')?.addEventListener('click', () => {
+  const list = _subAllVirtual();
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  if (list.length) Player.setQueue(list, 0);
+});
+document.getElementById('ti-sub-addall')?.addEventListener('click', () => {
+  const list = _subAllVirtual();
+  list.forEach(vt => Player.addToQueue(vt));
+  window.Toast?.ok?.(`Added all ${list.length} tunes to the queue`);
+});
+document.getElementById('ti-sub-addall-pl')?.addEventListener('click', (e) => {
+  const st = _subState; if (!st) return;
+  const entries = [];
+  for (let w = 0; w < st.count; w++) entries.push({ id: st.track.id, subsong: w });
+  _subToPlaylist(entries, e.currentTarget);
+});
+document.getElementById('ti-sub-jump-in')?.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const n = parseInt(e.target.value, 10);
+  if (_subState && n >= 1 && n <= _subState.count) { _subAction('play', n - 1); e.target.value = ''; }
+});
+Player.on?.('trackchange', () => _highlightPlayingSubsong());
+
+// ── HVSC STIL commentary + SID chip badge ─────────────────────────────────────
+// STIL is the SID Tune Information List — per-file (and per-subtune) trivia.
+// We render the raw blob (human-authored; reads well as-is, and mirrors how
+// SID players surface STIL); the per-tune titles are separately parsed into the
+// picker rows via _parseStilTitles.
+const _stilSection = document.getElementById('ti-section-stil');
+const _stilBody    = document.getElementById('ti-stil-body');
+function _renderStil(blob) {
+  if (!_stilSection || !_stilBody) return;
+  const text = (typeof blob === 'string') ? blob.trim() : '';
+  if (!text) { _stilSection.hidden = true; _stilBody.textContent = ''; return; }
+  _stilBody.textContent = text;
+  _stilSection.hidden = false;
+}
+
+// SID chip model (6581 / 8580 / 6581/8580) from the PSID header — a field in the
+// module-details section, styled as a chip badge.  Hidden when unknown.
+const _sidChipField = document.getElementById('ti-field-sidchip');
+const _sidChipEl    = document.getElementById('ti-sidchip');
+function _renderSidChip(model) {
+  if (!_sidChipField || !_sidChipEl) return;
+  const m = (typeof model === 'string') ? model.trim() : '';
+  if (!m) { _sidChipField.style.display = 'none'; _sidChipEl.textContent = ''; return; }
+  _sidChipEl.textContent = m;
+  _sidChipField.style.display = '';
+}
+
 async function _loadExtendedInfo(track) {
     const section = document.getElementById('ti-section-module');
     if (!section) return;
+    // Reset the subsong picker for the new track — re-shown below only when the
+    // file has >1 tune, so an early-return (non-module track) leaves it hidden
+    // instead of showing the previous track's tunes.
+    if (_subSection) { _subSection.hidden = true; }
+    _subState = null;
+    // STIL panel + chip badge are SID-only extras — clear them up-front so a
+    // non-SID track (or the early-return below) never shows the prior track's.
+    _renderStil(null);
+    _renderSidChip(null);
 
     // Beyond the static tracker/SID/MIDI names: exotic-Amiga uade formats
     // (dynamic names, genre-keyed), Atari ST, and PSF console rips all
@@ -531,6 +817,14 @@ async function _loadExtendedInfo(track) {
         } else {
             subField.style.display = 'none';
         }
+        // Interactive tune list (SID/SNDH/AHX/… with >1 subsong).  default_track
+        // + hvsc_lengths + stil come from /extended when the server has them
+        // (older servers omit them → picker falls back to first-tune-default, no
+        // times, bare tune numbers).
+        const stilTitles = _parseStilTitles(data.stil);
+        _renderSubsongPicker(track, subCount, data.default_track, data.hvsc_lengths, stilTitles);
+        _renderStil(data.stil);
+        _renderSidChip(data.sid_model);
 
         // Instruments
         const instField = document.getElementById('ti-field-instruments');
@@ -550,6 +844,340 @@ async function _loadExtendedInfo(track) {
         if (_extendedAbort === _c) _extendedAbort = null;
     }
 }
+
+// ── Pattern grid (tracker modules) ────────────────────────────────────────────
+// Fed by GET /api/tracks/{id}/patterns (core/tracker_patterns.py contract):
+// order list + per-pattern cell grid + row→time map + song message + tempo.
+// AHX/HivelyTracker are absent by design — libopenmpt can't parse them, so
+// they'd cost a fetch that always answers ``available: false``.
+const _PATTERN_FORMATS = new Set([
+  'ProTracker', 'ScreamTracker 3', 'ScreamTracker 2', 'FastTracker 2',
+  'Impulse Tracker', 'MultiTracker', 'OctaMED', 'Composer 669',
+  'DigiBooster Pro', 'UltraTracker', 'Farandole', 'ASYLUM/DMP',
+  'General DigiMusic', 'Imago Orpheus', 'Oktalyzer', 'SoundFX',
+  'Grave Composer', 'DSIK',
+]);
+
+const _patSection   = document.getElementById('ti-section-patterns');
+const _patOrderEl   = document.getElementById('ti-pat-order');
+const _patWrapEl    = document.getElementById('ti-pat-gridwrap');
+const _patGridEl    = document.getElementById('ti-pat-grid');
+const _patNoteEl    = document.getElementById('ti-pat-note');
+const _patFollowBtn = document.getElementById('ti-pat-follow');
+const _patPosEl     = document.getElementById('ti-pat-pos');
+const _msgSection   = document.getElementById('ti-section-message');
+const _msgPre       = document.getElementById('ti-message');
+const _msgScrollBtn = document.getElementById('ti-msg-scroll');
+const _msgMarquee   = document.getElementById('ti-msg-marquee');
+const _msgMarqueeText = document.getElementById('ti-msg-marquee-text');
+
+let _pat = null;   // {trackId, data, byIndex, orderPos, curRow, follow,
+                   //  flatTimes/flatOrder/flatRow, rowEls, chipEls}
+
+function _resetPatterns() {
+  _pat = null;
+  if (_patSection) _patSection.hidden = true;
+  if (_msgSection) _msgSection.hidden = true;
+  if (_patGridEl)  {
+    _patGridEl.innerHTML = '';
+    // Clear the per-column VU custom properties — the <table> element
+    // survives re-renders, so without this a track that ISN'T playing
+    // would show the PREVIOUS track's frozen wash on its columns.
+    for (let c = 0; c < 64; c++) _patGridEl.style.removeProperty(`--vu${c}`);
+  }
+  if (_patOrderEl) _patOrderEl.innerHTML = '';
+  if (_patPosEl)   _patPosEl.textContent = '';
+  if (_patNoteEl)  { _patNoteEl.hidden = true; _patNoteEl.textContent = ''; }
+  // Scroller: collapse back to the plain message on every track switch.
+  if (_msgMarquee) _msgMarquee.hidden = true;
+  if (_msgScrollBtn) _msgScrollBtn.setAttribute('aria-pressed', 'false');
+  if (_msgMarqueeText) _msgMarqueeText.textContent = '';
+  // "Made with" is populated only from the libopenmpt tracker field (via the
+  // patterns payload) and lives in the always-present Module Details section,
+  // so it MUST be reset per track — otherwise a SID / uade / any non-pattern
+  // track keeps the previous tracker's value ("SID … made with FastTracker 2").
+  const mwField = document.getElementById('ti-field-madewith');
+  const mwEl    = document.getElementById('ti-madewith');
+  if (mwField) mwField.style.display = 'none';
+  if (mwEl)    mwEl.textContent = '—';
+}
+
+async function _loadPatterns(track) {
+  _resetPatterns();
+  if (!track || !track.id || !_PATTERN_FORMATS.has(track.format)) return;
+  if (_patternsAbort) { try { _patternsAbort.abort(); } catch (_) {} }
+  const _c = (typeof AbortController === 'function') ? new AbortController() : null;
+  _patternsAbort = _c;
+  try {
+    const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/patterns`,
+                            _c ? { signal: _c.signal } : undefined);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (_queue[_idx]?.id !== track.id) return;   // user navigated away
+    _applyModuleExtras(track, data);
+    if (!data.available || !Array.isArray(data.patterns) || !data.patterns.length) return;
+
+    const byIndex = new Map(data.patterns.map(p => [p.index, p]));
+    // Flatten the time map for binary search.  Full per-row map when the
+    // server sent one; otherwise order starts only (rows interpolated).
+    let flatTimes = null, flatOrder = null, flatRow = null;
+    if (Array.isArray(data.row_times) && data.row_times.length) {
+      flatTimes = []; flatOrder = []; flatRow = [];
+      data.row_times.forEach((rows, o) => rows.forEach((t, r) => {
+        flatTimes.push(t); flatOrder.push(o); flatRow.push(r);
+      }));
+    } else if (Array.isArray(data.order_times) && data.order_times.length) {
+      flatTimes = data.order_times.slice();
+      flatOrder = data.order_times.map((_, o) => o);
+      flatRow   = data.order_times.map(() => 0);
+    }
+
+    const playingThis = Player.currentTrack && Player.currentTrack.id === track.id;
+    _pat = {
+      trackId: track.id, data, byIndex, orderPos: 0, curRow: -1,
+      follow: !!(playingThis && flatTimes),
+      flatTimes, flatOrder, flatRow, rowEls: [], chipEls: [],
+    };
+    if (_pat.follow) {
+      const i = _timeIndex(Player.currentTime || 0);
+      if (i >= 0) _pat.orderPos = _pat.flatOrder[i];
+    } else {
+      const fo = data.order.findIndex(pi => pi >= 0 && byIndex.has(pi));
+      _pat.orderPos = fo >= 0 ? fo : 0;
+    }
+    _renderOrderStrip();
+    _renderPatternGrid();
+    _syncFollowBtn();
+    _patSection.hidden = false;
+    if (Array.isArray(data.truncated) && data.truncated.length) {
+      _patNoteEl.textContent =
+        `${data.truncated.length} large pattern${data.truncated.length > 1 ? 's' : ''} ` +
+        'skipped to keep the grid payload small.';
+      _patNoteEl.hidden = false;
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    // Anything else: section simply stays hidden (best-effort, like chapters).
+  } finally {
+    if (_patternsAbort === _c) _patternsAbort = null;
+  }
+}
+
+/** Song message / BPM / "Made with" ride the patterns payload. */
+function _applyModuleExtras(track, data) {
+  const msg = (data && typeof data.message === 'string') ? data.message.replace(/\s+$/, '') : '';
+  if (msg && _msgSection && _msgPre) {
+    _msgPre.textContent = msg;      // textContent — never innerHTML: scene text is untrusted
+    // Scroller line: the message flattened to one row, ◆-separated (classic
+    // demoscene scrolltext).  textContent again — untrusted scene text.
+    if (_msgMarqueeText) {
+      _msgMarqueeText.textContent =
+        msg.split('\n').map(s => s.trim()).filter(Boolean).join('  ◆  ');
+    }
+    _msgSection.hidden = false;
+  }
+  if (data && data.tempo && !track.bpm) {
+    // Initial tempo ≈ BPM for the overwhelming majority of module formats.
+    _show('ti-bpm', Math.round(data.tempo));
+  }
+  const mw = ((data && data.tracker) || '').trim();
+  const mwField = document.getElementById('ti-field-madewith');
+  const mwEl    = document.getElementById('ti-madewith');
+  if (mwField && mwEl) {
+    mwEl.textContent = mw || '—';
+    mwField.style.display = mw ? '' : 'none';
+  }
+  _updateSectionVisibility();
+}
+
+/** Last index in the flat time map with time <= t (binary search). */
+function _timeIndex(t) {
+  const a = _pat && _pat.flatTimes;
+  if (!a || !a.length) return -1;
+  let lo = 0, hi = a.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (a[mid] <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return ans;
+}
+
+function _renderOrderStrip() {
+  if (!_patOrderEl || !_pat) return;
+  _patOrderEl.innerHTML = '';
+  _pat.chipEls = [];
+  _pat.data.order.forEach((pi, pos) => {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'ti-pat-chip';
+    if (pi < 0) {
+      chip.classList.add('ti-pat-marker');
+      chip.textContent = '—';
+      chip.title = `Order ${pos}: marker`;
+    } else if (!_pat.byIndex.has(pi)) {
+      chip.classList.add('ti-pat-marker');
+      chip.textContent = String(pi).padStart(2, '0');
+      chip.title = `Order ${pos}: pattern ${pi} (grid data skipped)`;
+    } else {
+      chip.textContent = String(pi).padStart(2, '0');
+      chip.title = `Order ${pos}: pattern ${pi}`;
+      chip.addEventListener('click', () => {
+        _pat.orderPos = pos;
+        _pat.follow = false;          // manual navigation pauses follow
+        _syncFollowBtn();
+        _updateActiveChip();
+        _renderPatternGrid();
+      });
+    }
+    _patOrderEl.appendChild(chip);
+    _pat.chipEls.push(chip);
+  });
+  _updateActiveChip();
+}
+
+function _updateActiveChip() {
+  if (!_pat) return;
+  _pat.chipEls.forEach((c, pos) => c.classList.toggle('active', pos === _pat.orderPos));
+  const active = _pat.chipEls[_pat.orderPos];
+  if (active && _patOrderEl) {
+    _patOrderEl.scrollLeft = active.offsetLeft - _patOrderEl.clientWidth / 2 + active.offsetWidth / 2;
+  }
+  if (_patPosEl) {
+    _patPosEl.textContent =
+      `position ${String(_pat.orderPos).padStart(2, '0')} / ${_pat.data.order.length}`;
+  }
+}
+
+function _renderPatternGrid() {
+  if (!_patGridEl || !_pat) return;
+  const pi = _pat.data.order[_pat.orderPos];
+  const pattern = pi >= 0 ? _pat.byIndex.get(pi) : null;
+  _pat.curRow = -1;
+  _pat.rowEls = [];
+  if (!pattern || !pattern.rows.length) { _patGridEl.innerHTML = ''; return; }
+  const nCh = _pat.data.channels;
+  const hueBase = _pat.data.channels_total || nCh;
+  const esc = _escHtml;
+
+  let html = '<thead><tr><th class="tprn" scope="col"></th>';
+  for (let c = 0; c < nCh; c++) {
+    const hue = Math.round((c * 360 / hueBase) + 15);
+    html += `<th scope="col" style="--h:${hue}">${c + 1}` +
+            `<span class="tpdot" style="--h:${hue};--vc:var(--vu${c},0)"></span></th>`;
+  }
+  html += '</tr></thead><tbody>';
+  pattern.rows.forEach((row, r) => {
+    html += `<tr${r % 4 === 0 ? ' class="tpb"' : ''}>` +
+            `<td class="tprn">${String(r).padStart(2, '0')}</td>`;
+    for (let c = 0; c < nCh; c++) {
+      const hue = Math.round((c * 360 / hueBase) + 15);
+      const cell = row[c] || '';
+      // libopenmpt fixed 13-wide layout (pad=1):
+      //   note[0:3] sep[3] inst[4:6] vol[6:9] sep[9] fx[10:13]
+      // The volume column is THREE chars — command letter + 2 digits
+      // ("v20"/"p3A"), or " .." when empty — so it starts at index 6 and
+      // has no separator before it (the leading space handles alignment).
+      // Slicing at [7:9] silently dropped the command letter.
+      const empty = /^[.\s]+$/.test(cell);
+      const body = empty
+        ? `<span class="tpe">${esc(cell)}</span>`
+        : `<span class="tpn">${esc(cell.slice(0, 3))}</span> ` +
+          `<span class="tpi">${esc(cell.slice(4, 6))}</span>` +
+          `<span class="tpv">${esc(cell.slice(6, 9))}</span> ` +
+          `<span class="tpf">${esc(cell.slice(10, 13))}</span>`;
+      html += `<td class="tpc" style="--h:${hue};--vc:var(--vu${c},0)">${body}</td>`;
+    }
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  _patGridEl.innerHTML = html;
+  const tbody = _patGridEl.tBodies[0];
+  _pat.rowEls = tbody ? Array.from(tbody.rows) : [];
+}
+
+function _setPlayheadRow(r) {
+  if (!_pat || r === _pat.curRow) return;
+  const prev = _pat.rowEls[_pat.curRow];
+  if (prev) prev.classList.remove('tph');
+  const cur = _pat.rowEls[r];
+  if (cur) {
+    cur.classList.add('tph');
+    // Scroll the grid's own container — scrollIntoView would also scroll
+    // the modal pane behind it.
+    if (_patWrapEl) {
+      _patWrapEl.scrollTop = cur.offsetTop - _patWrapEl.clientHeight / 2 + cur.offsetHeight / 2;
+    }
+  }
+  _pat.curRow = r;
+}
+
+function _syncFollowBtn() {
+  if (!_patFollowBtn || !_pat) return;
+  _patFollowBtn.style.display = _pat.flatTimes ? '' : 'none';
+  _patFollowBtn.setAttribute('aria-pressed', _pat.follow ? 'true' : 'false');
+}
+
+if (_patFollowBtn) {
+  _patFollowBtn.addEventListener('click', () => {
+    if (!_pat || !_pat.flatTimes) return;
+    _pat.follow = !_pat.follow;
+    _syncFollowBtn();
+    if (_pat.follow) _patFollowTick(Player.currentTime || 0);
+  });
+}
+
+// Song-message scroller toggle — reveal the one-line demoscene marquee.
+if (_msgScrollBtn && _msgMarquee) {
+  _msgScrollBtn.addEventListener('click', () => {
+    const show = _msgMarquee.hidden;
+    _msgMarquee.hidden = !show;
+    _msgScrollBtn.setAttribute('aria-pressed', show ? 'true' : 'false');
+  });
+}
+
+function _patFollowTick(t) {
+  if (!_pat || !_pat.follow || !isOpen() || !_patSection || _patSection.hidden) return;
+  if (!Player.currentTrack || Player.currentTrack.id !== _pat.trackId) return;
+  const i = _timeIndex(t);
+  if (i < 0) return;
+  const o = _pat.flatOrder[i];
+  if (o !== _pat.orderPos) {
+    _pat.orderPos = o;
+    _updateActiveChip();
+    _renderPatternGrid();
+  }
+  let r = _pat.flatRow[i];
+  if (!_pat.data.row_times) {
+    // Order-start times only — interpolate the row inside this order.
+    // Mid-pattern speed commands drift within the pattern and re-sync at
+    // the next order boundary; the full map avoids this when available.
+    const times = _pat.data.order_times;
+    const start = times[o];
+    const end   = (o + 1 < times.length) ? times[o + 1] : (_pat.data.duration || start + 1);
+    const nRows = _pat.rowEls.length;
+    if (end > start && nRows > 0) {
+      r = Math.max(0, Math.min(nRows - 1, Math.floor((t - start) / (end - start) * nRows)));
+    }
+  }
+  _setPlayheadRow(r);
+}
+
+Player.on('timeupdate', ({ current }) => { _patFollowTick(current); });
+
+// ── Live VU → pattern-column backdrop ─────────────────────────────────────────
+// app.js's VU tick (66 ms) calls this with the per-channel levels it just
+// painted onto the meter bars; we mirror them onto the grid's per-column
+// custom properties.  Alpha is clamped to ≤0.16 so cell text never fights
+// the wash.  Self-guarding: costs one comparison when the grid isn't open.
+window.__sbVuTap = function (levels, count) {
+  if (!_pat || !_patSection || _patSection.hidden || !isOpen()) return;
+  if (!Player.currentTrack || Player.currentTrack.id !== _pat.trackId) return;
+  if (!_patGridEl) return;
+  const n = Math.min(count, _pat.data.channels);
+  for (let c = 0; c < n; c++) {
+    _patGridEl.style.setProperty(`--vu${c}`, (levels[c] * 0.16).toFixed(3));
+  }
+};
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 // Mark the panes as tabpanels once at startup so screen readers see the
@@ -633,7 +1261,7 @@ function _showLyrics(data) {
 }
 
 function _escHtml(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 async function _loadLyrics(track) {
