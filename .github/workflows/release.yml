@@ -100,7 +100,10 @@ jobs:
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          # Strip the "sha256:" prefix — a colon is an illegal artifact filename
+          # char; the manifest job re-adds the prefix when it reads these back.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
