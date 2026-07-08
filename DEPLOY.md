@@ -38,6 +38,13 @@ docker --version
 
 ## Step 1 — Get SoniqBoom and start it (4 commands)
 
+> **Skip the build?** A prebuilt multi-arch image (Intel/AMD + ARM) is published at
+> `ghcr.io/sfcyris/soniqboom:latest`. In `docker-compose.yml`, comment out `build: .`
+> and uncomment the `image:` line (there's a comment marking the spot), then use
+> `docker compose pull && docker compose up -d` at step 3 — it starts in seconds
+> instead of compiling the players. Building from source (below) is only needed to
+> modify SoniqBoom.
+
 ```bash
 # 1. Download the code
 git clone https://github.com/SFCyris/SoniqBoom.git
@@ -122,14 +129,17 @@ unaffected.
 ### Plain `docker run` (without Compose)
 
 ```bash
-docker build -t soniqboom .
+# Use the prebuilt image (no local build; Docker fetches the right CPU automatically):
+IMAGE=ghcr.io/sfcyris/soniqboom:latest
+# …or build it yourself instead:  docker build -t soniqboom . && IMAGE=soniqboom
 
 docker run -d --name soniqboom \
   -p 8080:8080 \
   -v /path/to/your/music:/music:ro \
   -v soniqboom-data:/data \
+  -e SONIQBOOM_DATA_DIR=/data \
   --restart unless-stopped \
-  soniqboom
+  "$IMAGE"
 
 docker exec soniqboom soniqboom-setadm -user me -passwd 'change-this-password'
 ```

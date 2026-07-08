@@ -10,6 +10,10 @@
 services:
   soniqboom:
     build: .
+    # ── Skip the local build — use the prebuilt multi-arch image instead: ──
+    #   comment out `build: .` above, uncomment the line below, then
+    #   `docker compose pull && docker compose up -d`
+    # image: ghcr.io/sfcyris/soniqboom:latest
     container_name: soniqboom
     ports:
       - "8080:8080"
