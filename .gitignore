@@ -6,6 +6,10 @@
 .Spotlight-V100
 .Trashes
 Icon?
+# ...but NOT the web app's own icon assets. `Icon?` (the macOS custom-folder
+# `Icon\r` rule) also matches the `icons/` directory on case-insensitive
+# filesystems; these are real, shipped assets referenced by manifest.webmanifest.
+!soniqboom/frontend/icons/
 
 # ─── Python bytecode ───────────────────────────────────────────────────────
 __pycache__/

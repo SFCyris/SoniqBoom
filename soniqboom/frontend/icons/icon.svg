@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="SoniqBoom">
+  <rect width="512" height="512" fill="#0a0a0a"/>
+  <rect width="512" height="512" rx="104" fill="#121216"/>
+  <!-- speaker: left box + cone flaring toward the waves -->
+  <path d="M118 216 H182 L326 150 V362 L182 296 H118 Z" fill="#8adbff"/>
+  <!-- radiating sound waves -->
+  <g fill="none" stroke="#ff895c" stroke-width="22" stroke-linecap="round">
+    <path d="M362 206 A62 62 0 0 1 362 306"/>
+    <path d="M388 172 A102 102 0 0 1 388 340"/>
+    <path d="M412 140 A142 142 0 0 1 412 372"/>
+  </g>
+</svg>
