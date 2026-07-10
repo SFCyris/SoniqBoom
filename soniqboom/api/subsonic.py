@@ -31,6 +31,7 @@ import functools
 import hashlib
 import hmac
 import logging
+import math
 import time
 from typing import Any
 from urllib.parse import unquote
@@ -57,6 +58,20 @@ _FOLDER_NAME = "Library"
 
 # ── Envelope helpers ─────────────────────────────────────────────────────────
 
+# The OpenSubsonic extensions we genuinely implement.  Advertised in every
+# response envelope AND returned by the dedicated getOpenSubsonicExtensions
+# endpoint, so the two never drift.  ONLY list ones we implement — clients gate
+# features on this list, so a phantom entry makes them call routes that 404.
+#   songLyrics → getLyrics + getLyricsBySongId (structured/synced)
+# NOTE: getSimilarSongs / getSimilarSongs2 (core/similar.py) are CORE Subsonic
+# endpoints (≥1.11.0) discovered via the API version, NOT the OpenSubsonic
+# `sonicSimilarity` extension (a different pair — getSonicSimilarTracks /
+# findSonicPath — we don't implement).
+_OPENSUBSONIC_EXTENSIONS = [
+    {"name": "songLyrics", "versions": [1]},
+]
+
+
 def _envelope(payload: dict[str, Any] | None = None, *, status: str = "ok") -> dict:
     """Build the canonical ``subsonic-response`` envelope.  ``payload`` is
     merged into the response root (e.g. ``{"musicFolders": {...}}``)."""
@@ -66,12 +81,7 @@ def _envelope(payload: dict[str, Any] | None = None, *, status: str = "ok") -> d
         "type": _SERVER_NAME,
         "serverVersion": __version__,
         "openSubsonic": True,
-        # Advertise OpenSubsonic extensions so capability-aware clients
-        # (Symfonium, Tempo, Feishin) actually discover them.  Without this
-        # list, our new endpoints are invisible to their intended consumers.
-        "openSubsonicExtensions": [
-            {"name": "transcodeOffload", "versions": [1]},
-        ],
+        "openSubsonicExtensions": _OPENSUBSONIC_EXTENSIONS,
     }
     if payload:
         body.update(payload)
@@ -105,19 +115,37 @@ def _xml_walk(parent: _ET.Element, tag: str, value: Any) -> None:
         elem = _ET.SubElement(parent, tag)
         # Two passes: attributes first (scalar leaves), then children.
         # The Subsonic XML schema treats lists/dicts as children and
-        # everything else as attributes on the enclosing element.
+        # everything else as attributes on the enclosing element.  The
+        # reserved "_text" key becomes the element's text content (needed by
+        # <lyrics>…text…</lyrics> and any element whose body is character data,
+        # not an attribute).
         for k, v in value.items():
+            if k == "_text":
+                continue
             if isinstance(v, (dict, list)):
                 continue
             if v is None:
                 continue
             elem.set(k, _xml_scalar(v))
+        if value.get("_text") is not None:
+            elem.text = _xml_scalar(value["_text"])
         for k, v in value.items():
             if isinstance(v, (dict, list)):
                 _xml_walk(elem, k, v)
     elif isinstance(value, list):
         for item in value:
-            _xml_walk(parent, tag, item)
+            if isinstance(item, (dict, list)):
+                _xml_walk(parent, tag, item)
+            else:
+                # A repeated *scalar* becomes a repeated child element with text
+                # content — Subsonic/OpenSubsonic XML never uses multi-valued
+                # attributes.  e.g. openSubsonicExtensions' ``versions:[1]`` →
+                # ``<versions>1</versions>`` (spec-correct, and discoverable by
+                # strict XML clients).  The previous ``parent.set(tag, …)`` path
+                # flattened the list to a single attribute — silently keeping
+                # only the LAST value of a multi-element list.
+                child = _ET.SubElement(parent, tag)
+                child.text = _xml_scalar(item)
     else:
         parent.set(tag, _xml_scalar(value))
 
@@ -135,13 +163,30 @@ def _envelope_to_xml(envelope: dict) -> bytes:
             + _ET.tostring(root, encoding="utf-8"))
 
 
+def _json_normalize(obj: Any) -> Any:
+    """Rename the reserved ``_text`` key to ``value`` for JSON output.
+
+    The XML serializer turns ``_text`` into element character data
+    (``<lyrics>…</lyrics>``); OpenSubsonic's JSON encoding carries that same
+    content in a ``value`` field.  One in-memory transform keeps both encodings
+    spec-correct from a single payload shape."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out["value" if k == "_text" else k] = _json_normalize(v)
+        return out
+    if isinstance(obj, list):
+        return [_json_normalize(v) for v in obj]
+    return obj
+
+
 def _ok(payload: dict[str, Any] | None = None, *, fmt: str = "xml") -> Response:
     data = _envelope(payload)
     f = (fmt or "xml").lower()
     if f in ("json", "jsonp"):
         # Some clients hand in ``f=jsonp&callback=fn`` — we honour the
         # callback wrapper but the response body itself is identical.
-        return JSONResponse(data)
+        return JSONResponse(_json_normalize(data))
     # Spec default — XML.
     return Response(content=_envelope_to_xml(data),
                     media_type="application/xml")
@@ -324,6 +369,29 @@ def _decode_album_id(raw: str, store) -> tuple[str | None, str | None]:
 
 # ── Mappers (SoniqBoom → Subsonic schema) ────────────────────────────────────
 
+def _safe_int(v: Any, default: int = 0, *, round_: bool = False) -> int:
+    """Coerce to int, mapping None / non-numeric / NaN / inf to ``default``.
+
+    A corrupt file can decode to a non-finite ``duration`` / ``bitrate`` /
+    ``channels`` etc. (mutagen ``audio.info.length`` = nan).  Without this,
+    ``int(round(nan))`` raises and — since @_wrap only catches _SubsonicError —
+    500s the WHOLE Subsonic listing on one bad file (the same failure mode the
+    replayGain guard fixes).
+
+    ``round_=True`` rounds to nearest instead of truncating — used for
+    ``duration`` so a 199.6 s track still reports 200 s (the pre-guard code did
+    ``int(round(x))``; plain truncation would regress it to 199)."""
+    if v is None:
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(f):
+        return default
+    return int(round(f)) if round_ else int(f)
+
+
 def _track_to_song(t: dict) -> dict:
     """Map a SoniqBoom track dict to a Subsonic ``Child`` (song) object."""
     aa = t.get("album_artist") or t.get("artist") or ""
@@ -341,23 +409,64 @@ def _track_to_song(t: dict) -> dict:
         "album":      al,
         "artist":     t.get("artist") or aa or "",
         "albumArtist": aa,
-        "track":      t.get("track_number") or 0,
+        "track":      _safe_int(t.get("track_number")),
         "year":       _normalise_year(t.get("year")),
         "genre":      genre,
         "coverArt":   t["id"],
-        "size":       t.get("file_size") or 0,
+        "size":       _safe_int(t.get("file_size")),
         "contentType": content_type,
         "suffix":     suffix,
-        "duration":   int(round((t.get("duration") or 0))),
-        "bitRate":    int(((t.get("bitrate") or 0) // 1000)),
+        "duration":   _safe_int(t.get("duration"), round_=True),
+        "bitRate":    _safe_int((t.get("bitrate") or 0) / 1000),
         "path":       t.get("path") or "",
         "isVideo":    False,
         "type":       "music",
         "albumId":    _album_id(aa, al),
         "artistId":   _artist_id(aa),
-        "discNumber": t.get("disc_number") or 0,
+        "discNumber": _safe_int(t.get("disc_number")),
         "created":    _iso(t.get("added_at")),
     }
+    # ── OpenSubsonic optional fields ────────────────────────────────────────
+    # Capability-aware clients (Symfonium, Amperfy, Feishin) read these to show
+    # bit depth / sample rate, apply ReplayGain themselves, and render
+    # multi-valued genres.  Only emit a field when the track actually carries
+    # it, so a missing tag never advertises a wrong value.
+    ch = _safe_int(t.get("channels"))
+    if ch:
+        out["channelCount"] = ch
+    sr = _safe_int(t.get("sample_rate"))
+    if sr:
+        out["samplingRate"] = sr
+    bd = _safe_int(t.get("bit_depth"))
+    if bd:
+        out["bitDepth"] = bd
+    out["mediaType"] = "song"
+    if genre_list:
+        # OpenSubsonic `genres` is a repeated element with a `name` attribute.
+        out["genres"] = [{"name": g} for g in genre_list if g]
+    # ReplayGain — the exact fields Amperfy/Symfonium look for to level volume
+    # server-side-tagged. dB gains + linear peaks; omit any that's absent.
+    # A malformed tag can parse to nan/inf (float("nan") succeeds); Starlette's
+    # JSONResponse serialises with allow_nan=False and would 500 the WHOLE
+    # listing on one bad file, so drop any non-finite value here.
+    def _fin(v, nd):
+        if v is None:
+            return None
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return None
+        return round(fv, nd) if math.isfinite(fv) else None
+    rg: dict = {}
+    for _k, _src, _nd in (("trackGain", "replaygain_track_gain", 2),
+                          ("albumGain", "replaygain_album_gain", 2),
+                          ("trackPeak", "replaygain_track_peak", 6),
+                          ("albumPeak", "replaygain_album_peak", 6)):
+        _v = _fin(t.get(_src), _nd)
+        if _v is not None:
+            rg[_k] = _v
+    if rg:
+        out["replayGain"] = rg
     # OpenSubsonic transcodedContentType / transcodedSuffix — advertise
     # the codec we'll actually DELIVER for sources the byte server
     # cannot serve natively (DSD, ALAC, AIFF, tracker, SID, MIDI, GME).
@@ -460,7 +569,16 @@ def _normalise_year(y: Any) -> int:
 def _iso(ts: float | None) -> str:
     if not ts:
         return ""
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(float(ts)))
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        # A bad timestamp — non-finite (NaN/inf, e.g. a corrupt or tampered
+        # persistence snapshot reintroducing one via default json.loads, which
+        # accepts NaN/Infinity), non-numeric, or out of range for the platform
+        # time_t — must not make time.gmtime raise and, via @_wrap, blank the
+        # WHOLE listing.  Same "one bad record can't kill the response"
+        # rationale as _safe_int; degrade to an empty string.
+        return ""
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -622,7 +740,26 @@ def _wrap(handler):
         try:
             return await handler(*args, **kwargs)
         except _SubsonicError as e:
-            return _err(e.code, e.message)
+            # Honour the caller's requested format on the error too — every
+            # handler takes ``f`` as a keyword (FastAPI injects by name), so a
+            # JSON client (Symfonium/Feishin) gets a JSON error envelope it can
+            # parse rather than XML it chokes on.
+            return _err(e.code, e.message, fmt=kwargs.get("f", "xml"))
+        except HTTPException:
+            # Auth/redirect helpers raise these deliberately (e.g. 401 with a
+            # WWW-Authenticate header); let Starlette render them unchanged.
+            raise
+        except Exception:  # noqa: BLE001 — last-resort envelope, not a swallow
+            # Any other unexpected failure would otherwise surface as a raw
+            # HTTP 500 (or, for a non-finite float reaching JSONResponse, a
+            # 500 from ``allow_nan=False``) — which Subsonic clients treat as a
+            # transport error, not a protocol error, and often show as "server
+            # unreachable".  Convert it to a generic Subsonic error envelope
+            # (code 0) so the client shows a real message; log the traceback so
+            # the operator can still see it.
+            log.exception("Unhandled error in Subsonic handler %s", handler.__name__)
+            return _err(0, "An internal server error occurred.",
+                        fmt=kwargs.get("f", "xml"))
     return _wrapped
 
 
@@ -644,6 +781,25 @@ async def ping(
 ):
     _require_user(request, sb_session, u, p, s, t)
     return _ok(fmt=f)
+
+
+@router.get("/getOpenSubsonicExtensions")
+@router.get("/getOpenSubsonicExtensions.view")
+@_wrap
+async def get_open_subsonic_extensions(
+    request: Request,
+    sb_session: str | None = Cookie(default=None),
+    u: str | None = Query(default=None),
+    p: str | None = Query(default=None),
+    s: str | None = Query(default=None),
+    t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
+):
+    # OpenSubsonic's dedicated extension-discovery endpoint.  The same list also
+    # rides on every response envelope, but a strict client may call this route
+    # directly — without it, the SPA catch-all would answer with HTML.
+    _require_user(request, sb_session, u, p, s, t)
+    return _ok({"openSubsonicExtensions": _OPENSUBSONIC_EXTENSIONS}, fmt=f)
 
 
 @router.get("/getLicense")
@@ -837,7 +993,13 @@ async def get_album(
         tracks = store.filter_tracks(artist=aa, album=al)
     tracks.sort(key=lambda x: (x.get("disc_number") or 0, x.get("track_number") or 0))
     songs = [_track_to_song(t_) for t_ in tracks]
-    total_secs = sum(t_.get("duration") or 0 for t_ in tracks)
+    # Sum the *sanitised* per-song durations, not the raw tags: a track that
+    # decoded to a non-finite duration already degraded to 0 in _track_to_song,
+    # and summing the raw value here would let one bad file's nan/inf propagate
+    # into ``int(total_secs)`` (ValueError/OverflowError) and fail the WHOLE
+    # album — the same "one bad file kills the listing" mode _track_to_song
+    # guards against.  song["duration"] is a finite int, so no int() needed.
+    total_secs = sum(s.get("duration") or 0 for s in songs)
     sample = tracks[0] if tracks else {}
     return _ok({
         "album": {
@@ -846,7 +1008,7 @@ async def get_album(
             "artist":    aa,
             "artistId":  _artist_id(aa),
             "songCount": len(songs),
-            "duration":  int(total_secs),
+            "duration":  total_secs,
             "coverArt":  sample.get("id", ""),
             "year":      _normalise_year(sample.get("year")),
             "genre":     (sample.get("genre") or [""])[0],
@@ -1618,21 +1780,29 @@ async def scrobble(
     # Mutating endpoint — refuse cookie-only auth to prevent CSRF via
     # an attacker-origin <img src=…>.
     user = _require_user_no_cookie(request, sb_session, u, p, s, t)
-    # Mirror what the existing /api/tracks/{id}/played endpoint does — the
-    # play-stat update + history append.  Done inline here so we don't
-    # incur an HTTP round-trip back to the same process.
+    from soniqboom.core.store import get_store as _gs
+    track = _gs().get_track(id)
     if submission:
-        from soniqboom.core.data import record_play
-        from soniqboom.core.store import get_store as _gs
-        store = _gs()
-        track = store.get_track(id)
+        # Mirror the /api/tracks/{id}/played path — play-stat update + history
+        # append — inline to avoid an HTTP round-trip back to the same process.
         if track:
+            from soniqboom.core.data import record_play
             await record_play(id)
             # Forward to external scrobblers (last.fm / ListenBrainz) —
             # noop until the user enables them under Settings → My Account.
             try:
                 from soniqboom.core.scrobble import submit_play
                 await submit_play(user, track)
+            except Exception:
+                pass
+    else:
+        # submission=false is the "now playing" signal (OpenSubsonic clients
+        # send it at track start).  Push it to the external now-playing widgets
+        # if the user has linked last.fm / ListenBrainz; otherwise a cheap noop.
+        if track:
+            try:
+                from soniqboom.core.scrobble import submit_now_playing
+                await submit_now_playing(user, track)
             except Exception:
                 pass
     return _ok(fmt=f)
@@ -1870,7 +2040,7 @@ async def get_user(
             "commentRole":       False,
             "podcastRole":       False,
             "streamRole":        True,
-            "jukeboxRole":       False,
+            "jukeboxRole":       target_user.role in ("admin", "edit"),
             "shareRole":         False,
         },
     }, fmt=f)
@@ -1920,3 +2090,298 @@ async def get_genres(
             ],
         },
     }, fmt=f)
+
+
+# ── Lyrics (OpenSubsonic songLyrics extension) ───────────────────────────────
+
+def _parse_lrc(text: str) -> tuple[bool, list[dict]]:
+    """Split lyrics into OpenSubsonic ``structuredLyrics`` lines.
+
+    Returns ``(synced, lines)`` where each line is ``{"start": ms, "_text": …}``
+    for a timestamped LRC line or ``{"_text": …}`` for plain text.  ``_text``
+    becomes element character data in XML and a ``value`` field in JSON."""
+    import re
+    # Minutes allow up to 3 digits — long-form tracks (DJ mixes, audiobooks,
+    # tracker "songs") can exceed 99 minutes, and a 2-digit cap would treat
+    # ``[123:45.67]`` as plain text and drop the sync for the whole line.
+    ts_re = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+    lines: list[dict] = []
+    synced = False
+    # Cap the emitted line count — a crafted .lrc with many timestamps per line
+    # (``[00:01][00:02]…text``) would otherwise amplify one line into hundreds
+    # in the response.  A real song is well under this.
+    _MAX_LINES = 5000
+    for raw in text.splitlines():
+        if len(lines) >= _MAX_LINES:
+            break
+        stamps = list(ts_re.finditer(raw))
+        body = ts_re.sub("", raw).strip()
+        if stamps:
+            synced = True
+            for m in stamps:
+                if len(lines) >= _MAX_LINES:
+                    break
+                ms = (int(m.group(1)) * 60000 + int(m.group(2)) * 1000
+                      + int((m.group(3) or "0").ljust(3, "0")[:3]))
+                lines.append({"start": ms, "_text": body})
+        else:
+            lines.append({"_text": body})
+    if synced:
+        # Stable-sort by timestamp, but an untimed line inherits the previous
+        # line's start so a trailing/interleaved plain line keeps its position
+        # instead of being hoisted to the top (where a plain "start" of 0 lands).
+        keyed = []
+        last_ms = 0
+        for ln in lines:
+            if "start" in ln:
+                last_ms = ln["start"]
+                keyed.append((ln["start"], ln))
+            else:
+                keyed.append((last_ms, ln))
+        keyed.sort(key=lambda kv: kv[0])     # stable: equal keys keep input order
+        lines = [ln for _, ln in keyed]
+    return synced, lines
+
+
+async def _lyrics_for_track_id(track_id: str) -> dict | None:
+    """Resolve lyrics for a track id via the shared native resolver
+    (embedded tags → LRCLib).  Returns ``{text, synced, artist, title}`` or
+    ``None`` when the track or its lyrics are unavailable."""
+    t = get_store().get_track(track_id)
+    if not t:
+        return None
+    try:
+        from soniqboom.api.tracks import get_lyrics as _impl
+        res = await _impl(track_id)
+    except Exception:
+        res = None
+    text = (res or {}).get("lyrics")
+    if not text:
+        return None
+    # Bound the raw text so an oversized embedded-lyrics blob can't produce an
+    # unbounded response (the line count is separately capped in _parse_lrc).
+    if len(text) > 200_000:
+        text = text[:200_000]
+    return {
+        "text": text,
+        "synced": bool((res or {}).get("synced")),
+        "artist": t.get("artist") or t.get("album_artist") or "",
+        "title": t.get("title") or "",
+    }
+
+
+@router.get("/getLyrics")
+@router.get("/getLyrics.view")
+@_wrap
+async def get_lyrics_ss(
+    request: Request,
+    artist: str = Query(default=""),
+    title: str = Query(default=""),
+    sb_session: str | None = Cookie(default=None),
+    u: str | None = Query(default=None),
+    p: str | None = Query(default=None),
+    s: str | None = Query(default=None),
+    t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
+):
+    _require_user(request, sb_session, u, p, s, t)
+    # Legacy form: match by artist+title.  Modern clients use
+    # getLyricsBySongId instead, so this linear scan runs only for old ones.
+    a = (artist or "").strip().lower()
+    ti = (title or "").strip().lower()
+    tid = None
+    if a or ti:
+        # O(N) scan over the whole library — run it off the event loop so a
+        # legacy client hitting this rare endpoint can't stall other requests
+        # on a large collection.
+        def _scan() -> str | None:
+            for cand in get_store().all_tracks():
+                if ti and (cand.get("title") or "").strip().lower() != ti:
+                    continue
+                if a and (cand.get("artist") or cand.get("album_artist") or "").strip().lower() != a:
+                    continue
+                return cand["id"]
+            return None
+        import asyncio as _asyncio
+        tid = await _asyncio.to_thread(_scan)
+    lyr = await _lyrics_for_track_id(tid) if tid else None
+    if not lyr:
+        # Spec: always return a <lyrics> element (empty body) so clients
+        # don't treat "no lyrics" as a protocol error.
+        return _ok({"lyrics": {"artist": artist, "title": title, "_text": ""}}, fmt=f)
+    return _ok({"lyrics": {"artist": lyr["artist"], "title": lyr["title"],
+                           "_text": lyr["text"]}}, fmt=f)
+
+
+@router.get("/getLyricsBySongId")
+@router.get("/getLyricsBySongId.view")
+@_wrap
+async def get_lyrics_by_song_id(
+    request: Request,
+    id: str = Query(...),
+    sb_session: str | None = Cookie(default=None),
+    u: str | None = Query(default=None),
+    p: str | None = Query(default=None),
+    s: str | None = Query(default=None),
+    t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
+):
+    _require_user(request, sb_session, u, p, s, t)
+    lyr = await _lyrics_for_track_id(id)
+    if not lyr:
+        # Spec: lyricsList.structuredLyrics is a required array — return it
+        # empty, not a bare {}, so typed clients don't null-deref on the
+        # (common) no-lyrics path.
+        return _ok({"lyricsList": {"structuredLyrics": []}}, fmt=f)
+    synced, lines = _parse_lrc(lyr["text"])
+    return _ok({"lyricsList": {"structuredLyrics": [{
+        "displayArtist": lyr["artist"],
+        "displayTitle":  lyr["title"],
+        "lang":          "xxx",       # unknown; OpenSubsonic uses ISO-639 or "xxx"
+        "offset":        0,
+        "synced":        synced,
+        "line":          lines,
+    }]}}, fmt=f)
+
+
+# ── Similar songs (OpenSubsonic sonicSimilarity extension) ────────────────────
+
+async def _similar_song_tracks(track_id: str, count: int) -> list[dict]:
+    """Seed the audio-envelope similarity engine and return the matched track
+    dicts (same engine the web 'More like this' uses)."""
+    import asyncio as _asyncio
+    from soniqboom.core.data import get_all_ratings
+    from soniqboom.core.similar import find_similar
+    store = get_store()
+    seed = store.get_track(track_id)
+    if not seed:
+        raise _SubsonicError(70, "Song not found.")
+    ratings = await get_all_ratings()
+    res = await _asyncio.to_thread(
+        find_similar, seed, store.all_tracks(), store.waveforms_view(),
+        ratings=ratings or {}, k=max(1, min(count, 100)),
+    )
+    return [r["track"] for r in res if r.get("track")]
+
+
+@router.get("/getSimilarSongs")
+@router.get("/getSimilarSongs.view")
+@router.get("/getSimilarSongs2")
+@router.get("/getSimilarSongs2.view")
+@_wrap
+async def get_similar_songs(
+    request: Request,
+    id: str = Query(...),
+    count: int = Query(default=50),
+    sb_session: str | None = Cookie(default=None),
+    u: str | None = Query(default=None),
+    p: str | None = Query(default=None),
+    s: str | None = Query(default=None),
+    t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
+):
+    _require_user(request, sb_session, u, p, s, t)
+    tracks = await _similar_song_tracks(id, count)
+    songs = [_track_to_song(tr) for tr in tracks]
+    is_v2 = "similarsongs2" in request.url.path.lower()
+    key = "similarSongs2" if is_v2 else "similarSongs"
+    return _ok({key: {"song": songs}}, fmt=f)
+
+
+# ── Jukebox (Subsonic jukeboxControl) ─────────────────────────────────────────
+
+@router.get("/jukeboxControl")
+@router.get("/jukeboxControl.view")
+@_wrap
+async def jukebox_control(
+    request: Request,
+    action: str = Query(...),
+    index: str | None = Query(default=None),
+    offset: str | None = Query(default=None),
+    id: list[str] | None = Query(default=None),
+    gain: str | None = Query(default=None),
+    sb_session: str | None = Cookie(default=None),
+    u: str | None = Query(default=None),
+    p: str | None = Query(default=None),
+    s: str | None = Query(default=None),
+    t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
+):
+    # Mutating control surface — refuse cookie-only auth (CSRF) and gate on the
+    # same roles that advertise jukeboxRole=true in getUser.
+    user = _require_user_no_cookie(request, sb_session, u, p, s, t)
+    if user.role not in ("admin", "edit"):
+        raise _SubsonicError(50, "Not authorised to control the jukebox.")
+
+    from soniqboom.core.jukebox import get_jukebox
+    jb = get_jukebox()
+    act = (action or "").strip().lower()
+
+    # Parse the numeric params by hand (they're typed str above) so a bad value
+    # returns a Subsonic error envelope (code 10) instead of FastAPI's raw 422 —
+    # keeps every client-facing error in one shape.
+    def _num(name: str, val: str | None, cast):
+        if val is None:
+            return None
+        try:
+            return cast(val)
+        except (TypeError, ValueError):
+            raise _SubsonicError(10, f"jukeboxControl {name} must be a number.")
+    idx  = _num("index", index, int)
+    offs = _num("offset", offset, float)
+    gn   = _num("gain", gain, float)
+
+    if act == "set":
+        jb.set_queue(id or [])
+    elif act == "add":
+        jb.add(id or [])
+    elif act == "clear":
+        jb.clear()
+    elif act == "remove":
+        if idx is None:
+            raise _SubsonicError(10, "jukeboxControl remove requires index.")
+        jb.remove(idx)
+    elif act == "shuffle":
+        jb.shuffle()
+    elif act == "skip":
+        if idx is None:
+            raise _SubsonicError(10, "jukeboxControl skip requires index.")
+        jb.skip(idx, offs or 0.0)
+    elif act == "start":
+        jb.start()
+    elif act == "stop":
+        jb.stop()
+    elif act == "setgain":
+        jb.set_gain(gn if gn is not None else 1.0)
+    elif act in ("get", "status"):
+        pass
+    else:
+        raise _SubsonicError(10, f"Unknown jukebox action: {action}")
+
+    # Realise the change as audio: push the new state to the Jukebox multiroom
+    # room so a browser joined to it plays it (best-effort; a read never emits).
+    if act not in ("get", "status"):
+        try:
+            from soniqboom.api.multiroom import notify_jukebox_room
+            await notify_jukebox_room()
+        except Exception:
+            pass
+
+    st = jb.status()
+    if act == "get":
+        # Full playlist view — resolve queued ids to Child entries.
+        store = get_store()
+        entries: list[dict] = []
+        for tid in jb.queue_ids():
+            tr = store.get_track(tid)
+            if tr:
+                entries.append(_track_to_song(tr))
+        return _ok({"jukeboxPlaylist": {
+            "currentIndex": st["currentIndex"],
+            "playing":      st["playing"],
+            "gain":         st["gain"],
+            "position":     st["position"],
+            "entry":        entries,
+        }}, fmt=f)
+    # Every other action returns the compact status object.
+    return _ok({"jukeboxStatus": st}, fmt=f)

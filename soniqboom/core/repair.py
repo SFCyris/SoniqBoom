@@ -197,10 +197,51 @@ def _has_bad_tracker_title(track: dict) -> bool:
     return False
 
 
+_SID_EXTS = (".sid", ".psid", ".rsid")
+
+
+def _has_cp437_corruption(track: dict) -> bool:
+    """True for a SID-family track whose text was CP437-mis-decoded from its
+    Latin-1 header bytes (e.g. ``Hülsbeck`` → ``Hⁿlsbeck``).
+
+    The old SID decoder tried UTF-8 then **CP437** before Latin-1, so a byte
+    like ``0xFC`` (Latin-1 ``ü``) became CP437's ``ⁿ`` (U+207F) — no U+FFFD, so
+    :func:`_has_replacement_char` never flagged it.  Re-extracting with the
+    corrected Latin-1-native decoder recovers the accented characters.
+
+    Detection without false-positives on *correctly* decoded names: every real
+    Latin-1 accented letter encodes to a CP437 byte in 0x80–0xA7 — the SOLE
+    exception is ``ß`` at 0xE1.  CP437's glyphs for bytes 0xC0–0xFF (except that
+    0xE1) are all box-drawing / Greek / math symbols that never occur in a
+    genuine SID name.  So a corrupted string — CP437's rendering of Latin-1
+    accented bytes — encodes back to a byte in 0xC0–0xFF (≠0xE1), while a
+    correctly-decoded name (``Hülsbeck``, ``Straße``, ``café``) never does.  A
+    name with genuine Unicode (emoji, real UTF-8) isn't cp437-encodable → skipped.
+    """
+    ext = os.path.splitext((track.get("path") or "").lower())[1]
+    if ext not in _SID_EXTS:
+        return False
+    for key in ("title", "artist", "album", "album_artist", "comment"):
+        v = track.get(key)
+        if not isinstance(v, str) or not v or v.isascii():
+            continue
+        try:
+            raw = v.encode("cp437")
+        except UnicodeEncodeError:
+            continue                       # genuine Unicode — not a CP437 artifact
+        # 0xE1 = CP437 'ß', the one legitimate Latin-1 letter in this byte range.
+        if any(0xC0 <= b <= 0xFF and b != 0xE1 for b in raw):
+            return True
+    return False
+
+
 def _needs_repair(track: dict) -> bool:
-    """A track is a repair candidate if its text was U+FFFD-garbled OR it is an
-    AHX/HVL track with a mis-extracted title (magic / mangled-path / empty)."""
-    return _has_replacement_char(track) or _has_bad_tracker_title(track)
+    """A track is a repair candidate if its text was U+FFFD-garbled, it is an
+    AHX/HVL track with a mis-extracted title (magic / mangled-path / empty), or
+    it is a SID track whose accented header text was CP437-mis-decoded."""
+    return (_has_replacement_char(track)
+            or _has_bad_tracker_title(track)
+            or _has_cp437_corruption(track))
 
 
 def find_corrupt_tracks(*, tracker_only: bool = False) -> list[dict]:

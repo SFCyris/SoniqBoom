@@ -35,6 +35,11 @@ Install it on a **Mac or Linux** machine, point it at your music folders, and li
 
 It plays your everyday files (FLAC, MP3, ALAC, and the rest) **and** the retro formats most servers can't: SID, MOD, chiptunes, AdLib, dozens more. No cloud, no account, no tracking — it all stays on your machine.
 
+<p align="center">
+  <img src="images/demo-player.gif" alt="SoniqBoom in action — browsing and playing a music library in the browser" width="820">
+</p>
+<p align="center"><sub>Your whole library, in the browser — browse, search, queue, and play, with a live now-playing bar and per-track queue.</sub></p>
+
 ---
 
 ## Install &amp; run it
@@ -170,10 +175,10 @@ SoniqBoom speaks the culture:
 - **📼 Bundled HivelyTracker decoder.** `.hvl` modules play out of the box — nothing extra to install.
 
 <p align="center">
-  <img src="images/ui-tracker-overview.jpg" alt="Tracker module info — per-channel VU, module metadata, live signal chain" width="40%">
-  <img src="images/ui-tracker2.jpg" alt="A 64-channel Impulse Tracker module with per-channel VU" width="40%">
+  <img src="images/demo-tracker.gif" alt="Live per-channel VU meters on a tracker module, with module metadata and the decode signal path" width="49%">
+  <img src="images/demo-subsong.gif" alt="A SID tune's individually-addressable subsongs and STIL commentary from HVSC" width="49%">
 </p>
-<p align="center"><sub>Open any module and you get per-channel VU meters, real module metadata — channels, patterns, instrument names — and a live decode-chain readout. Here a 16-channel ScreamTracker 3 and a 64-channel Impulse Tracker.</sub></p>
+<p align="center"><sub>Left: a ScreamTracker 3 module with <b>per-channel VU meters dancing in real time</b>, real module metadata, the scene composer's bio, and the live decode path. Right: a Rob Hubbard SID with <b>individually-addressable subsongs</b> and full <b>STIL</b> commentary, straight from HVSC.</sub></p>
 
 <p align="center">
   <img src="images/ui-galaxy.jpg" alt="The Library Galaxy — every format its own constellation" width="800">
@@ -190,10 +195,13 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 - **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites. Stations turn up in the main search too, with a **Show all** view for the full list.
 - **🎲 Instant Mix radio.** Press the radio button on any track and SoniqBoom builds an endless, self-refilling queue around it — picked by genre, artist, era, tempo and format — in a focused radio view with a live oscilloscope over the cover. A SID radio stays chiptune; a FLAC radio follows the genre.
 - **🔎 More like this & smart playlists.** Surface the closest-sounding tracks to any song (scored by audio similarity), and save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
+- **🎚️ 10-band graphic equalizer.** Ten bands from 32 Hz to 16 kHz, seven presets (Rock, Jazz, Vocal…) and clip-safe pre-gain — right in the browser. Press **E** or hit the **EQ** button.
+- **🔊 ReplayGain volume levelling.** Even out loudness across the library — choose off, per-track, or per-album, applied live at playback from the file's ReplayGain tags.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
+- **🖧 DLNA Media Server (Beta).** Optionally announce your library on the LAN as a UPnP/DLNA MediaServer so any DLNA player — a TV, a console, a network amp — can browse and play it. Off by default; switch it on in **Settings → System → Services**.
 - **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN — or send a favourite internet-radio station to a whole room, its live station, artist and cover art updating in place.
 - **📲 Touch-first mobile UI.** A dedicated phone shell — browse and play your library, tune in internet radio streamed straight to the phone, manage playlists, and a tap-to-expand mini-player.
-- **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem.
+- **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem — including a **server-owned Jukebox** queue those apps can drive, with the audio playing out through any browser joined to the Jukebox room.
 - **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required.
 - **👥 Multi-user with roles**, **last.fm + ListenBrainz scrobbling**, **time-synced lyrics**, **podcast & audiobook chapters**, **in-browser tag editing**, **field-operator search** (`artist:Ghost year:>2020 format:FLAC`), **dark mode**, **installable PWA**, and **absolutely zero telemetry**.
 
@@ -256,6 +264,23 @@ Most settings live in the admin UI. The config file is created for you on first 
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/soniqboom/SoniqBoom.conf` |
 
 Environment variables like `SONIQBOOM_HOST` / `SONIQBOOM_PORT` apply when you launch the raw `soniqboom` binary directly. With the helper scripts, change the port with `bash run.sh --port 9090` instead — `run.sh` sets the port explicitly, so it won't read `SONIQBOOM_PORT`. (It does honour `SONIQBOOM_DATA_DIR`.)
+
+---
+
+## Requirements & footprint
+
+Runs on **x86-64 and ARM64** — Raspberry Pi 4/5, ARM cloud servers, Apple Silicon, and ordinary Intel/AMD boxes. The Docker image is multi-arch, so `docker pull` fetches the right one automatically.
+
+Honest, measured numbers (idle, on the ARM64 image):
+
+| | |
+|---|---|
+| **Idle memory** | ~125 MB with an empty library. The track index lives in RAM, so memory grows with library size — budget more for very large collections and test on your target hardware. |
+| **Docker image** | ~1.3 GB on disk, **~400 MB compressed** to pull. Most of it is the bundled retro-format players and a General-MIDI SoundFont — that breadth is the point. |
+| **CPU** | Idle is near-zero. Retro formats are rendered to audio server-side on play; a SID or tracker module decodes comfortably on a Pi-class core. Large first-time library scans are the main CPU spike. |
+| **Disk** | Your music (untouched, read-only) + the `/data` volume (index, conversion cache, config, logs). The conversion cache grows as you play transcoded/retro formats and can be cleared any time. |
+
+Don't need the Amiga "exotica" family or native `.sc68` disks, and want a **faster build**? Pass `--build-arg SLIM=1` to skip the two slow source-compiled players (`uade` and `sc68`). Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console chiptune, PSF, AdLib, all modern codecs — still ships. This mainly saves *build time* (and dodges the qemu compile flakiness when you cross-build on an Apple-Silicon Mac); it trims only ~12 MB off the image, since the bulk is ffmpeg and the bundled SoundFont, not the retro players. The **default** image ships everything — that breadth is the point.
 
 ---
 

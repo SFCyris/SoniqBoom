@@ -62,6 +62,21 @@ _DURATION_RE   = re.compile(r"(\d+):(\d+)(?:\.(\d+))?")
 _autoconf_lock = threading.Lock()
 
 
+def _decode_hvsc_doc(data: bytes) -> str:
+    """Decode an HVSC DOCUMENTS file (STIL.txt / Songlengths).
+
+    These files are ISO-8859-1 (Latin-1) by HVSC convention — e.g. STIL
+    comments contain accented composer names like ``Hülsbeck`` (byte ``0xFC``).
+    Decoding as strict UTF-8 with ``errors='replace'`` (the old path) turned
+    every such byte into U+FFFD (``H�lsbeck``).  Try UTF-8 first for any modern
+    re-encodings, then fall back to Latin-1, which is single-byte and never
+    raises so we always get readable text."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 def _parse_duration(text: str) -> float:
     m = _DURATION_RE.fullmatch(text.strip())
     if not m:
@@ -169,14 +184,14 @@ class HVSC:
                     return None
                 remote_file = posixpath.join(docs_remote, name)
                 data = source.read_file(remote_file, lane="scan")
-                return data.decode("utf-8", "replace")
+                return _decode_hvsc_doc(data)
             except Exception:
                 return None
         p = Path(docs_path) / name
         if not p.is_file():
             return None
         try:
-            return p.read_text(encoding="utf-8", errors="replace")
+            return _decode_hvsc_doc(p.read_bytes())
         except OSError:
             return None
 

@@ -231,10 +231,12 @@ docker compose exec soniqboom soniqboom-setadm -user bob -passwd 'pw-1234' -role
 
 - **Renderers degrade gracefully.** If a format won't play, the player names the package
   it needs; everything else keeps working. The image bundles all the common players;
-  `uade123` (Amiga AHX) is best-effort depending on the Debian mirror.
+  `uade123` (Amiga AHX and the ~150 Amiga "exotica" formats) is compiled from source, so
+  it's best-effort — if that build fails, only those Amiga formats are disabled and
+  everything else keeps working.
 - **Memory** scales with library size (the whole index is held in RAM). Budget accordingly
   for six-figure collections.
 - **MIDI** plays with a bundled General-MIDI SoundFont out of the box; add richer
-  SoundFonts later under **Settings → SoundFonts**.
+  SoundFonts later under **Settings → Renderers → Soundfonts**.
 - **Backups**: copy the `soniqboom-data` volume, or use the in-app
   **Settings → Backup → Export .sbz** for a portable library snapshot.

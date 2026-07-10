@@ -70,7 +70,7 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
   // Icon — network icon for remote shares, folder for local
   const icon = document.createElement('span');
   icon.className = 'tree-icon';
-  const isRemote = path.startsWith('smb://') || path.startsWith('ftp://');
+  const isRemote = /^(smb|ftp|https?|webdavs?):\/\//.test(path);
   icon.textContent = isRemote ? '🌐' : '📁';
   row.appendChild(icon);
 
@@ -80,6 +80,20 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
   label.textContent = isRoot ? (alias || path) : basename(path);
   label.title = path;
   row.appendChild(label);
+
+  // Unavailable indicator — the backend reachability probe flagged this root's
+  // drive/share as offline (ejected, disconnected, or stalled).  Its tracks
+  // stay in the library (the scanner never prunes an unreachable root); this
+  // badge just explains why the folder is greyed and won't browse.
+  if (unavailable) {
+    const badge = document.createElement('span');
+    badge.className = 'tree-unavail-badge';
+    badge.textContent = 'unavailable';
+    badge.title = 'This drive or share is currently unreachable. Its tracks are '
+                + 'kept in the library — reconnect the mount to browse and play them.';
+    row.appendChild(badge);
+    row.title = `${path} — unavailable (mount offline / disconnected)`;
+  }
 
   // Audio indicator
   if (hasAudio) {
@@ -98,6 +112,10 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
 
   // Click chevron or row to expand/collapse
   async function expand() {
+    // Never fire a browse request against an offline mount — it would hit the
+    // same stalled/erroring path the backend probe flagged.  Silent here (this
+    // also runs on tree-rebuild restore); the click handler shows the toast.
+    if (unavailable) return;
     const isOpen = children.classList.contains('open');
     if (isOpen) {
       children.classList.remove('open');
@@ -153,6 +171,14 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
 
   // Click label → show tracks in this directory
   function selectAndExpand() {
+    if (unavailable) {
+      // Offline mount: don't browse it (would hit the dead share) and don't
+      // load its track list.  The tracks are kept in the library; tell the user
+      // to reconnect.
+      Toast.error('This drive or share is unavailable — reconnect the mount to '
+                + 'browse it. Its tracks are kept in the library.');
+      return;
+    }
     document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
     row.classList.add('active');
     _onSelect(path);
@@ -235,8 +261,11 @@ async function _doRefresh() {
     const aliases = (window.__sbConfig && window.__sbConfig.folder_aliases) || {};
     dirs.forEach(d => {
       const alias = aliases[d.path] || '';
-      const isNet = !!d.network_share_id;
-      const unavail = isNet && d.status === 'unavailable';
+      // A root is shown unavailable whenever the backend's reachability probe
+      // flagged it — for BOTH network shares (smb/ftp) AND locally-mounted
+      // drives (e.g. an ejected/stalled /Volumes/… mount).  Previously this was
+      // gated to network shares only, so a dropped local mount looked normal.
+      const unavail = d.status === 'unavailable';
       const li = makeNode(d.path, d.path, { isRoot: true, hasAudio: true, alias, unavailable: unavail });
       treeEl.appendChild(li);
     });

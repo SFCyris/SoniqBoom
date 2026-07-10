@@ -415,6 +415,12 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
         return is_supported_music_name(name)
 
     result: dict[str, list[Path]] = {}
+    # Roots for which os.walk hit a read error (permission denied, a
+    # disconnected network mount, an I/O fault).  os.walk swallows these
+    # silently and yields a PARTIAL (or empty) file list that is indistinguishable
+    # from "these files were deleted" — so stale-cleanup must NOT prune from such
+    # an enumeration (it would delete tracks whose files are merely unreadable).
+    walk_errors: set[str] = set()
     for d in directories:
         p = Path(d).expanduser().resolve()
         if not p.is_dir():
@@ -424,8 +430,14 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
         files: list[Path] = []
         skipped_junk = 0
 
+        _root_key = str(p)
+        def _on_walk_error(err, _root=_root_key):
+            walk_errors.add(_root)
+            log.warning("Scan walk error under %s: %s — file listing is "
+                        "incomplete, stale-cleanup will not prune this root", _root, err)
+
         # Single-pass walk — much faster than N separate rglob calls
-        for dirpath, _dirs, filenames in os.walk(p):
+        for dirpath, _dirs, filenames in os.walk(p, onerror=_on_walk_error):
             for fn in filenames:
                 if _is_junk_filename(fn):
                     skipped_junk += 1
@@ -486,7 +498,7 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                      len(files), p, skipped_junk)
         else:
             log.info("Discovered %d audio files in %s", len(files), p)
-    return result
+    return result, walk_errors
 
 
 def _find_remote_audio_files(
@@ -1026,6 +1038,14 @@ async def _async_exit_batch_mode(store) -> None:
     during the ``await asyncio.sleep(0)`` points would have written into the
     OLD ``_sorted_*`` lists, only for the rebuilt lists to overwrite them.
     """
+    # Reference-counted exit: only the OUTERMOST batch section rebuilds.  The
+    # decrement + depth check run synchronously (no await between) so a
+    # concurrent scan commit can't race the counter; a nested exit just unwinds
+    # one level and leaves the outer section's deferred rebuild intact.
+    store._batch_depth -= 1
+    if store._batch_depth > 0:
+        return
+    store._batch_depth = 0
     if not store._sorted_dirty:
         store._batch_mode = False
         return
@@ -1034,83 +1054,117 @@ async def _async_exit_batch_mode(store) -> None:
     # async/yielding rebuild aligned with TrackStore._index_track and the
     # in-line _rebuild_sorted_indexes path.
     from soniqboom.core.store import normalise_year
+    from soniqboom.core.data import _rebuild_lock_for_loop
 
-    # Single pass to build ALL 11 sorted lists (numeric + lexical), mirroring
-    # TrackStore._index_track / TrackStore._rebuild_sorted_indexes exactly so
-    # this async post-scan rebuild produces byte-identical indexes.  Building
-    # only the 4 numeric lists here left the lexical/format lists and the
-    # ``_sorted_added_at_primary`` subset STALE after every scan — so sort-by-
-    # format/title/artist/album was wrong and the duplicates-hidden default
-    # view (which walks ``_sorted_added_at_primary``) missed newly-scanned
-    # tracks until the next full restart.
     EMPTY_SORT_KEY = "￿"
-    year, added, added_primary, dur, bpm = [], [], [], [], []
-    title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
-    for tid, t in store._tracks.items():
-        y = normalise_year(t.get("year"))
-        if y is not None:
-            year.append((y, tid))
-        a = t.get("added_at", 0)
-        if a:
-            added.append((a, tid))
-            if t.get("is_duplicate_primary", True):
-                added_primary.append((a, tid))
-        d = t.get("duration", 0.0)
-        if d:
-            dur.append((d, tid))
-        b = t.get("bpm")
-        if b is not None:
-            bpm.append((b, tid))
-        title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-        artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
-        album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
-        album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-        fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+    _rebuilt_ok = False
+    try:
+        # Serialize the actual rebuild against every OTHER index rebuild —
+        # concurrent scan-commit exits AND data.rebuild_indexes — under the
+        # shared rebuild lock.  The reference count alone can NOT serialize the
+        # yielding rebuilds: two non-nested exits can each reach depth 0 and
+        # rebuild concurrently off different snapshots, and a slow/stale one
+        # could assign LAST and drop the fresher one's tracks (with
+        # _sorted_dirty cleared → no repair).  Holding the lock makes rebuilds
+        # run one-at-a-time; re-reading _tracks FRESH inside the lock plus a
+        # _mutation_seq generation guard (retry if a track write lands during
+        # the build) guarantees the assigned lists match the live track set.
+        async with _rebuild_lock_for_loop():
+            for _attempt in range(6):
+                if not store._sorted_dirty:
+                    # A prior lock holder already rebuilt everything up to date.
+                    _rebuilt_ok = True
+                    break
+                gen0 = store._mutation_seq
+                # Build ALL 10 sorted lists (numeric + lexical), mirroring
+                # TrackStore._index_track / _rebuild_sorted_indexes exactly so
+                # this async rebuild produces byte-identical indexes.
+                year, added, added_primary, dur, bpm = [], [], [], [], []
+                title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
+                for tid, t in store._tracks.items():
+                    y = normalise_year(t.get("year"))
+                    if y is not None:
+                        year.append((y, tid))
+                    a = t.get("added_at", 0)
+                    if a:
+                        added.append((a, tid))
+                        if t.get("is_duplicate_primary", True):
+                            added_primary.append((a, tid))
+                    d = t.get("duration", 0.0)
+                    if d:
+                        dur.append((d, tid))
+                    b = t.get("bpm")
+                    if b is not None:
+                        bpm.append((b, tid))
+                    title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                    artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                    album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                    album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                    fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
 
-    await asyncio.sleep(0)
+                await asyncio.sleep(0)
 
-    # Sort each list separately, yielding between them.  CPython's
-    # list.sort() for tuples of (key, str) runs in C and partially
-    # releases the GIL during comparisons.
-    # Numeric lists guard against mixed types (e.g. year as str vs int)
-    # which would raise TypeError during sort; lexical keys are all str.
-    for lst in (year, added, added_primary, dur, bpm):
-        try:
-            lst.sort()
-        except TypeError:
-            # Coerce all keys to float for a safe comparison
-            for i, (val, tid) in enumerate(lst):
-                try:
-                    lst[i] = (float(val), tid)
-                except (ValueError, TypeError):
-                    lst[i] = (0.0, tid)
-            lst.sort()
-        await asyncio.sleep(0)
-    for lst in (title, artist_s, album_artist_s, album_s, fmt):
-        lst.sort()
-        await asyncio.sleep(0)
+                # Sort each list separately, yielding between them.  ALL sorts
+                # are TypeError-guarded so a stray mixed-type key can never abort
+                # the rebuild mid-flight and strand the store in batch mode.
+                for lst in (year, added, added_primary, dur, bpm):
+                    try:
+                        lst.sort()
+                    except TypeError:
+                        for i, (val, tid) in enumerate(lst):
+                            try:
+                                lst[i] = (float(val), tid)
+                            except (ValueError, TypeError):
+                                lst[i] = (0.0, tid)
+                        lst.sort()
+                    await asyncio.sleep(0)
+                for lst in (title, artist_s, album_artist_s, album_s, fmt):
+                    try:
+                        lst.sort()
+                    except TypeError:
+                        lst.sort(key=lambda kv: (str(kv[0]), kv[1]))
+                    await asyncio.sleep(0)
 
-    store._sorted_year = year
-    store._sorted_added_at = added
-    store._sorted_added_at_primary = added_primary
-    store._sorted_duration = dur
-    store._sorted_bpm = bpm
-    store._sorted_title = title
-    store._sorted_artist = artist_s
-    store._sorted_album_artist = album_artist_s
-    store._sorted_album = album_s
-    store._sorted_format = fmt
-    store._sorted_dirty = False
-    # Only now is it safe to drop out of batch mode — any in-flight
-    # _index_track that happened during the yields ran in batch mode and
-    # set _sorted_dirty (handled on the next rebuild).
-    store._batch_mode = False
-    log.info(
-        "Sorted indexes rebuilt: %d year, %d added (%d primary), %d dur, %d bpm, "
-        "%d title, %d artist, %d album_artist, %d album, %d fmt",
-        len(year), len(added), len(added_primary), len(dur), len(bpm),
-        len(title), len(artist_s), len(album_artist_s), len(album_s), len(fmt),
-    )
+                # Generation guard: if any track-set/field write landed while we
+                # were building+sorting (the yield points above), our snapshot is
+                # stale — DON'T assign it; loop and rebuild from the fresh set.
+                # (Play/rating writes deliberately don't bump _mutation_seq, so
+                # they don't force needless retries.)
+                if store._mutation_seq != gen0:
+                    continue
+                store._sorted_year = year
+                store._sorted_added_at = added
+                store._sorted_added_at_primary = added_primary
+                store._sorted_duration = dur
+                store._sorted_bpm = bpm
+                store._sorted_title = title
+                store._sorted_artist = artist_s
+                store._sorted_album_artist = album_artist_s
+                store._sorted_album = album_s
+                store._sorted_format = fmt
+                store._sorted_dirty = False
+                _rebuilt_ok = True
+                log.info(
+                    "Sorted indexes rebuilt: %d year, %d added (%d primary), %d dur, %d bpm, "
+                    "%d title, %d artist, %d album_artist, %d album, %d fmt",
+                    len(year), len(added), len(added_primary), len(dur), len(bpm),
+                    len(title), len(artist_s), len(album_artist_s), len(album_s), len(fmt),
+                )
+                break
+            if not _rebuilt_ok:
+                # Every yielding pass raced a concurrent write (pathological
+                # continuous writer).  One atomic synchronous rebuild under the
+                # lock — no yields means no write can interleave — guarantees the
+                # sorted indexes match the live set with no further race.
+                store._rebuild_sorted_indexes()
+                store._sorted_dirty = False
+                _rebuilt_ok = True
+                log.warning("Sorted rebuild raced concurrent writes; did one atomic sync pass")
+    finally:
+        # Never leave the store stranded in batch mode (a raise, a shielded
+        # cancellation, or lock acquisition failing must all clear it).
+        if store._batch_depth == 0:
+            store._batch_mode = False
 
 
 def _compute_duplicates_in_process(all_tracks: list[dict]) -> dict:
@@ -1176,7 +1230,7 @@ async def _run_scan(
     directories: list[str],
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
 ) -> None:
-    global _progress, _scan_count
+    global _progress, _scan_count, _prog_batch_entered
 
     loop = asyncio.get_event_loop()
 
@@ -1186,7 +1240,7 @@ async def _run_scan(
 
     # ── Discover files ────────────────────────────────────────────────────────
     from soniqboom.config import settings as _settings
-    dir_files = await loop.run_in_executor(
+    dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, directories, _settings.scan_zips
     )
     total = sum(len(v) for v in dir_files.values())
@@ -1216,7 +1270,30 @@ async def _run_scan(
 
     # ── Phase 1: parallel metadata + chunked store writes ─────────────────────
     store = get_store()
-    store.enter_batch_mode()   # defer O(n) sorted-list rebuilds during scan
+    # Non-blocking commit strategy: when the library is already populated (a
+    # re-scan / re-index), DEFER the store writes — accumulate the scan's delta
+    # (new/changed tracks + orphan ids) in memory and apply it to the live store
+    # only at the very end, in one batch.  The live store is left completely
+    # untouched for the whole (multi-minute) extract phase, so browse / search /
+    # playback never thrash the live read caches while files are being processed.
+    #
+    # Crucially the delta is APPLIED to the live store via its own
+    # ``upsert_tracks_batch`` / ``delete_track_ids`` (which touch only the scan's
+    # own track ids), NOT swapped in over a stale snapshot — so any concurrent
+    # add / delete / edit to OTHER tracks during the extract window (remote
+    # freshness scan, drill-down refresh, single-track edit) is preserved, and
+    # memory stays consistent with the AOF.  For the first-ever scan (empty
+    # library) there's nothing to protect, so keep the progressive path (which
+    # also gives progressive UX and avoids one giant end-of-scan AOF write).
+    _deferred: bool = len(store._tracks) > 0
+    _pending_tracks: list[dict] = []   # accumulated new/changed track dicts
+    _pending_deleted: set[str]  = set()  # accumulated orphan ids to prune
+    if not _deferred:
+        store.enter_batch_mode()   # defer O(n) sorted-list rebuilds during scan
+        # This enter has no try/finally over the Phase-1 span, so a mid-Phase-1
+        # raise would leak the batch level — flag it for the queue crash handler
+        # to unwind (see _drain_scan_queue).
+        _prog_batch_entered = True
 
     for scan_root, files in dir_files.items():
         await upsert_scan_dir(scan_root)
@@ -1360,9 +1437,14 @@ async def _run_scan(
             )
             files_to_scan = list(files)
             skipped = 0
-            # track_ids_for_files only needed for stale cleanup, which is a
-            # no-op when there are no existing tracks.  Set to empty dict.
-            track_ids_for_files = {}
+            # Still map every discovered file to its uuid5 id so stale cleanup
+            # below can prune orphans (deleted files) — previously this was left
+            # empty, so a small scan root (≤ the incr-check threshold) NEVER had
+            # its deleted files pruned.  Cheap: this branch only runs when the
+            # root is small enough that the incremental check was skipped.
+            track_ids_for_files = {
+                p: str(uuid.uuid5(uuid.NAMESPACE_URL, str(p))) for p in files
+            }
 
         log.info(
             "Extraction starting for %s: %d files to scan, %d skipped",
@@ -1390,7 +1472,19 @@ async def _run_scan(
             try:
                 for i in range(0, n, WRITE_CHUNK):
                     chunk = track_buffer[i : i + WRITE_CHUNK]
-                    await upsert_tracks_batch(chunk)
+                    if _deferred:
+                        # Accumulate the delta off the live store — mirror the
+                        # exact model_dump + zero-embedding strip that
+                        # upsert_tracks_batch does, so the deferred apply is
+                        # byte-identical to a progressive write.
+                        for _t in chunk:
+                            _td = _t.model_dump()
+                            _emb = _td.get("embedding")
+                            if not _emb or all(v == 0.0 for v in _emb):
+                                _td.pop("embedding", None)
+                            _pending_tracks.append(_td)
+                    else:
+                        await upsert_tracks_batch(chunk)
                     await asyncio.sleep(0)
                 await store_full_art_batch(art_buffer)
                 await store_thumbs_batch(sm_thumbs, lg_thumbs)
@@ -1521,33 +1615,126 @@ async def _run_scan(
         await _flush_buffer()
 
         # ── Stale track cleanup ──────────────────────────────────────────────
-        # Reuse track_ids_for_files from the incremental check — it already
-        # maps every path to its uuid5 track ID.  No need to recompute 181K
-        # uuid5 values on the event loop.
+        # ``track_ids_for_files`` maps EVERY discovered file to its uuid5 id (in
+        # both the incremental and skip-incremental branches), so ``expected_ids``
+        # is the authoritative set of tracks that still have a file under this
+        # root.  Anything the store holds under the root that ISN'T in that set is
+        # an orphan (its file was deleted) and gets pruned — the fix for small
+        # roots whose incremental check was skipped, which the old
+        # ``_run_incr_check and track_ids_for_files`` guard silently dropped,
+        # leaving deleted files in the index forever.
         #
-        # IMPORTANT: When the incremental check was skipped (_run_incr_check
-        # is False), track_ids_for_files is empty — so expected_ids would be
-        # empty and ALL just-added tracks would be deleted as "orphans".
-        # Skip stale cleanup in that case; there were essentially no existing
-        # tracks to clean up anyway (that was the reason the incr check was
-        # skipped in the first place).
-        if _run_incr_check and track_ids_for_files:
-            expected_ids = set(track_ids_for_files.values())
-            existing_ids = await get_track_ids_for_scan_root(scan_root)
-            orphan_ids = existing_ids - expected_ids
-            if orphan_ids:
+        # SAFETY — three layers, so a transient/degraded read never wipes tracks:
+        #   1. An inaccessible root fails ``is_dir()`` at discovery and never
+        #      reaches this loop (absent from ``dir_files``).
+        #   2. A root whose walk hit a read error (``walk_errors``) has a PARTIAL
+        #      listing → skip pruning entirely.
+        #   3. A root that lists ZERO files is ambiguous — genuinely emptied vs a
+        #      silent mount failure (SMB/NFS stale handle reads empty without
+        #      raising) vs a healthy archive-only root after "scan zips" is turned
+        #      off — so never mass-delete on that signal, at ANY count.  Only a
+        #      readable root that STILL lists files can have its orphans pruned;
+        #      its live siblings prove the enumeration is real.  A genuinely
+        #      emptied root is cleared explicitly via "remove folder".
+        expected_ids = set(track_ids_for_files.values())
+        existing_ids = await get_track_ids_for_scan_root(scan_root)
+        orphan_ids = existing_ids - expected_ids
+        if scan_root in walk_errors:
+            # os.walk hit a read error somewhere under this root, so ``files`` is
+            # only a PARTIAL listing — pruning now would delete tracks whose
+            # files are merely unreadable (permission denied, a flaky mount),
+            # not deleted.  Skip; the next clean scan prunes genuine deletions.
+            log.warning(
+                "Stale cleanup: skipping %s — its scan hit read errors, so the "
+                "file listing is incomplete (won't prune from a partial read).",
+                scan_root,
+            )
+        elif not files:
+            # ZERO files enumerated (no read error) is ambiguous — a genuinely
+            # emptied folder looks identical to a silently-failed mount (an SMB/NFS
+            # stale handle can read as empty rather than raising) or a healthy
+            # archive-only root after "scan zips" is turned off.  Never mass-delete
+            # on that signal, at ANY track count — this matches the remote
+            # ghost-cleanup rule (never prune a zero-entry listing).  A root that
+            # was genuinely emptied is cleared explicitly via "remove folder"
+            # (DELETE /api/admin/dirs → delete_tracks_by_scan_root), not by a
+            # scan that could just as easily be seeing a dropped mount.
+            if existing_ids:
+                log.info(
+                    "Stale cleanup: %s listed 0 files — leaving its %d tracks in "
+                    "place (won't prune a zero-listing root; remove the folder to "
+                    "clear a genuinely-emptied one).", scan_root, len(existing_ids),
+                )
+        elif orphan_ids:
+            # The root is readable and still lists files, so an orphan here is a
+            # genuinely-deleted file (its live siblings prove the enumeration is
+            # real).  Prune it — queue for the deferred delta apply, else straight
+            # from the live store.
+            if _deferred:
+                _pending_deleted |= orphan_ids
+                log.info("Stale cleanup: %d orphan tracks queued for removal for %s",
+                         len(orphan_ids), scan_root)
+            else:
                 orphan_count = await delete_track_ids(list(orphan_ids))
                 log.info("Stale cleanup: removed %d orphan tracks for %s", orphan_count, scan_root)
-            else:
-                log.debug("Stale cleanup: no orphans for %s", scan_root)
         else:
-            log.debug("Stale cleanup: skipped for %s (incremental check was not run)", scan_root)
+            log.debug("Stale cleanup: no orphans for %s", scan_root)
 
         await upsert_scan_dir(scan_root, track_count_val=skipped + dir_counts[scan_root])
 
-    # Exit batch mode — rebuild sorted indexes with yield points so the
-    # event loop stays responsive during the O(n log n) sorts.
-    await _async_exit_batch_mode(store)
+    # Publish the scan result.  Re-scan (deferred) path: apply the accumulated
+    # delta to the LIVE store in one batch via its own concurrency-safe
+    # upsert/delete — the live store was untouched for the whole extract phase,
+    # so browse/search/playback stayed responsive; this brief batch at the end
+    # is the only moment the live view changes.  Because we apply a delta (only
+    # the scan's own ids) rather than overwrite the store, concurrent writes to
+    # other tracks during the extract survive, and memory stays consistent with
+    # the AOF.  First scan (progressive) path: exit batch mode, rebuilding the
+    # live indexes in place with yield points.
+    if _deferred:
+        # Disjointness guard: _pending_tracks / _pending_deleted accumulate
+        # across ALL roots, so with nested/overlapping registered roots a stale
+        # orphan id from one root could otherwise delete a track another root
+        # just (re-)extracted.  An upsert always wins over a delete.
+        if _pending_deleted:
+            _pending_deleted -= {t["id"] for t in _pending_tracks}
+        if _pending_tracks or _pending_deleted:
+            # Batch mode defers the O(n log n) sorted-index rebuild to a single
+            # pass in _async_exit_batch_mode; the per-chunk yields keep the loop
+            # responsive while the delta is applied.
+            #
+            # Self-heal a batch depth leaked by a crashed prior scan: local
+            # scans are queue-serialized, so a nonzero depth with no remote
+            # scan active (``_current_remote_dirs`` is populated at remote-scan
+            # start, before that scan enters batch mode) is stale and would
+            # otherwise wedge every future rebuild at the depth>0 early-return.
+            if store._batch_depth != 0 and not _current_remote_dirs:
+                store._batch_depth = 0
+            store.enter_batch_mode()
+            try:
+                for i in range(0, len(_pending_tracks), WRITE_CHUNK):
+                    store.upsert_tracks_batch(_pending_tracks[i : i + WRITE_CHUNK])
+                    await asyncio.sleep(0)
+                if _pending_deleted:
+                    await delete_track_ids(list(_pending_deleted))
+            finally:
+                # Mirror the remote-scan wrapper's proven guard: shield so a
+                # cancellation can't interrupt the rebuild mid-flight, and never
+                # let a raise leave the store stuck in batch mode (NEW-6).
+                try:
+                    await asyncio.shield(_async_exit_batch_mode(store))
+                except BaseException:
+                    store._batch_mode = False
+                    log.exception("exit_batch_mode failed after scan commit")
+            log.info("Scan commit: applied %d upserts + %d deletes to live store",
+                     len(_pending_tracks), len(_pending_deleted))
+        else:
+            # Nothing changed (incremental re-scan, all files skipped) — the live
+            # store is already correct, so do NO work at all: no rebuild, no swap.
+            log.debug("Scan: no track changes — skipping commit (live unchanged)")
+    else:
+        await _async_exit_batch_mode(store)
+        _prog_batch_entered = False   # progressive batch section closed cleanly
 
     log.info(
         "Phase 1 complete: %d tracks written in %.1fs",
@@ -1614,11 +1801,15 @@ async def _run_scan(
 _scan_queue: list[tuple[frozenset[str], Callable | None]] = []
 _current_scan_dirs: frozenset[str] = frozenset()
 _current_remote_dirs: set[str] = set()   # active remote scan roots
+# True while the PROGRESSIVE (first-scan) path holds an un-try/finally'd
+# ``enter_batch_mode`` — lets the queue's crash handler unwind exactly that
+# scan's one batch level without clobbering a concurrent remote scan's depth.
+_prog_batch_entered: bool = False
 
 
 async def _drain_scan_queue() -> None:
     """Run scans sequentially until the queue is empty."""
-    global _scan_task, _current_scan_dirs, _scan_count, _progress
+    global _scan_task, _current_scan_dirs, _scan_count, _progress, _prog_batch_entered
     while _scan_queue:
         dirs_set, cb = _scan_queue.pop(0)
         _current_scan_dirs = dirs_set
@@ -1635,6 +1826,25 @@ async def _drain_scan_queue() -> None:
                 _progress.running      = False
                 _progress.embedding    = False
                 _progress.current_file = ""
+            # The progressive first-scan path enters batch mode with no
+            # try/finally over its Phase-1 span, so a mid-Phase-1 raise leaks
+            # exactly ONE batch level (``_prog_batch_entered``), which would
+            # wedge every future sorted-index rebuild at the depth>0
+            # early-return.  Unwind precisely that one level — decrement (never
+            # zero), so a CONCURRENT remote freshness scan's own batch level is
+            # left intact.  Heal the index only once depth actually reaches 0
+            # (i.e. no remote scan still holds it).
+            try:
+                store = get_store()
+                if _prog_batch_entered and store._batch_depth > 0:
+                    store._batch_depth -= 1
+                    _prog_batch_entered = False
+                    if store._batch_depth == 0:
+                        store._batch_mode = False
+                        store._rebuild_sorted_indexes()
+                        store._sorted_dirty = False
+            except Exception:
+                log.exception("Failed to heal batch state after scan crash")
         _current_scan_dirs = frozenset()
     _scan_task = None
 
@@ -3084,7 +3294,7 @@ async def refresh_subtree_under_root(
     store = get_store()
     sub = str(Path(subdir).resolve())
 
-    dir_files = await loop.run_in_executor(
+    dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, [sub], _settings.scan_zips,
     )
     files_strs = [str(p) for fl in dir_files.values() for p in fl]
@@ -3141,7 +3351,15 @@ async def refresh_subtree_under_root(
 
     removed = 0
     gone = [t["id"] for p_str, t in existing.items() if p_str not in found]
-    if gone and Path(sub).is_dir():
+    _sub_resolved = str(Path(sub).expanduser().resolve())
+    if _sub_resolved in walk_errors:
+        # Incomplete listing (a read error under this subtree) — don't prune, or
+        # we'd delete tracks whose files are merely unreadable, not deleted.
+        log.warning(
+            "Drill-down refresh %s: scan hit read errors, file listing is "
+            "incomplete — skipping prune (a clean scan will reconcile).", sub,
+        )
+    elif gone and Path(sub).is_dir():
         cap = max(20, len(existing) // 3)
         if len(gone) <= cap:
             from soniqboom.core.data import delete_track_ids

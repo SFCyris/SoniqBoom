@@ -39,7 +39,9 @@ import { Search }     from './search.js';
 import { FolderTree } from './foldertree.js';
 // Equalizer stays a static import on purpose: its module body restores the
 // saved EQ gains from localStorage into Player.eqFilters at load — deferring
-// it would play everything flat until the user first presses E.
+// it would play everything flat until the user first presses E.  Imported
+// bare (no ?v=) like the other shell modules — it's precached and cache-busted
+// by the service worker's SHELL_VERSION, not a per-file query string.
 import { Equalizer }  from './equalizer.js';
 import { Queue }      from './queue.js';
 import { Playlist }   from './playlist.js';

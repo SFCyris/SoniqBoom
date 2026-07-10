@@ -131,6 +131,123 @@ async def _promote_if_needed(room: Room) -> None:
     })
 
 
+# ── Jukebox → multiroom bridge ───────────────────────────────────────────────
+#
+# The Subsonic jukeboxControl API is a server-owned queue with no on-box sound
+# card (SoniqBoom plays in browsers).  We realise its audio by making the
+# jukebox a *virtual master* of a reserved multiroom room: any SoniqBoom browser
+# that joins the "Jukebox" room plays whatever jukeboxControl is driving, using
+# the exact prepare/play_at/pause/seek/state messages a human master emits — so
+# the existing slave sync engine plays it with no frontend change.  master_id is
+# a phantom (never a real client) so joiners don't see a "master left" banner.
+JUKEBOX_ROOM_ID = "__jukebox__"
+JUKEBOX_MASTER_ID = "__jukebox_master__"
+# Change-detector baseline, keyed by room id so it resets when the room is
+# (re)created; the lock serialises the whole notify so two concurrent
+# jukeboxControl requests can't interleave a check-then-act across an await.
+_jb_last: dict[str, dict] = {}
+_jb_bridge_lock = asyncio.Lock()
+
+
+async def notify_jukebox_room() -> None:
+    """Push the current jukebox state to the Jukebox room.  Called after every
+    jukeboxControl mutation.  Best-effort — a bridge hiccup must never fail the
+    Subsonic command."""
+    try:
+        from soniqboom.core.jukebox import get_jukebox
+        from soniqboom.core.store import get_store
+        async with _jb_bridge_lock:
+            jb = get_jukebox()
+            st = jb.status()
+            tid = jb.current_id()
+            pos = jb.position()          # float seconds — no int-floor sync drift
+            track = get_store().get_track(tid) if tid else None
+
+            # Create/fetch under _rooms_lock — the SAME lock the WS hello handler
+            # uses to mutate _rooms — so the two room-creation paths never race
+            # (defensive: the critical section is await-free, so on the single
+            # event loop it is already atomic, but sharing the lock removes the
+            # landmine if a worker or an await is ever added here).
+            async with _rooms_lock:
+                room = _rooms.get(JUKEBOX_ROOM_ID)
+                if room is None:
+                    room = Room(room_id=JUKEBOX_ROOM_ID, room_name="Jukebox")
+                    _rooms[JUKEBOX_ROOM_ID] = room
+                    _jb_last.pop(JUKEBOX_ROOM_ID, None)   # fresh room → fresh baseline
+                # The jukebox is the (phantom) master of its room; a real WS
+                # client can only ever join it as a slave (enforced in the hello
+                # handler), so master_id is only ever None or JUKEBOX_MASTER_ID.
+                if room.master_id is None or room.master_id == JUKEBOX_MASTER_ID:
+                    room.master_id = JUKEBOX_MASTER_ID
+
+            last = _jb_last.get(JUKEBOX_ROOM_ID) or {"trackId": None, "playing": None}
+
+            # Cache the state so a late joiner syncs immediately from `welcome`.
+            # `gain` rides along for a future gain-aware sink (the browser sink
+            # currently uses its own volume; jukebox gain is control-plane only).
+            room.last_state = {
+                "trackId":      tid,
+                # Float seconds, matching the prepare/play_at/seek broadcasts —
+                # a late joiner syncing from `welcome.last_state` gets the same
+                # sub-second precision as a live in-room joiner (status()'s int
+                # floor here would re-introduce the ~1s drift position() avoids).
+                "position":     pos,
+                "playing":      st["playing"],
+                "gain":         st["gain"],
+                "duration":     (track or {}).get("duration", 0),
+                "track":        track,
+                "serverMonoMs": _mono_ms(),
+            }
+            room.current_track = track
+
+            # Decide, then COMMIT the baseline BEFORE broadcasting — so a
+            # mid-broadcast error can't leave the change-detector stale (the lock
+            # already rules out a concurrent writer).
+            track_changed = tid != last["trackId"]
+            was_playing   = last["playing"]
+            _jb_last[JUKEBOX_ROOM_ID] = {"trackId": tid, "playing": st["playing"]}
+
+            if track_changed:
+                if tid:
+                    # Load the new track on every member (barrier prepare), then,
+                    # if playing, start it.  Fire-and-forget play_at (no ready-ack
+                    # wait): a jukebox sink is typically a single device.
+                    await _broadcast(JUKEBOX_ROOM_ID, {
+                        "type": "prepare", "ts": _now_ms(),
+                        "trackId": tid, "track": track,
+                        "seek": pos, "barrierId": str(uuid.uuid4()),
+                    })
+                    if st["playing"]:
+                        await _broadcast(JUKEBOX_ROOM_ID, {
+                            "type": "play_at", "ts": _now_ms(),
+                            "serverEpochMs": _now_ms() + 600, "positionAtStart": pos,
+                        })
+                else:
+                    # Queue emptied (clear / removed the last track) — stop the
+                    # sink instead of leaving it playing the old track.
+                    await _broadcast(JUKEBOX_ROOM_ID, {
+                        "type": "pause", "ts": _now_ms(), "serverEpochMs": _now_ms(),
+                    })
+            else:
+                # Same track — sync play / pause / position.
+                if st["playing"] and was_playing is not True:
+                    await _broadcast(JUKEBOX_ROOM_ID, {
+                        "type": "play_at", "ts": _now_ms(),
+                        "serverEpochMs": _now_ms() + 200, "positionAtStart": pos,
+                    })
+                elif not st["playing"] and was_playing is not False:
+                    await _broadcast(JUKEBOX_ROOM_ID, {
+                        "type": "pause", "ts": _now_ms(), "serverEpochMs": _now_ms(),
+                    })
+                elif st["playing"]:
+                    await _broadcast(JUKEBOX_ROOM_ID, {
+                        "type": "seek", "ts": _now_ms(),
+                        "position": pos, "serverEpochMs": _now_ms(),
+                    })
+    except Exception:
+        log.debug("jukebox→multiroom bridge notify failed", exc_info=True)
+
+
 # ── REST endpoints ───────────────────────────────────────────────────────────
 
 @router.get("/rooms")
@@ -138,6 +255,11 @@ async def list_rooms():
     """Snapshot of all active rooms (for the landing page)."""
     out = []
     for r in _rooms.values():
+        # The reserved jukebox room is a phantom-mastered audio sink for the
+        # Subsonic jukebox bridge — it must never appear as a user-joinable room
+        # in the landing-page list.
+        if r.room_id == JUKEBOX_ROOM_ID:
+            continue
         out.append({
             "room_id":       r.room_id,
             "room_name":     r.room_name,
@@ -156,7 +278,9 @@ async def list_rooms():
 async def room_state(room_id: str):
     """Debug snapshot of a single room."""
     r = _rooms.get(room_id)
-    if not r:
+    # The reserved jukebox room is internal to the Subsonic bridge; don't expose
+    # its debug state (keep it fully invisible to the REST surface).
+    if not r or room_id == JUKEBOX_ROOM_ID:
         raise HTTPException(404, f"No room: {room_id}")
     return {
         "room_id":   r.room_id,
@@ -346,7 +470,15 @@ async def multiroom_ws(ws: WebSocket):
 
                     client = Client(client_id=client_id, ws=ws, label=label)
 
-                    if role_wanted == "master" and room.master_id is None:
+                    if room_id == JUKEBOX_ROOM_ID:
+                        # Reserved jukebox room: the Subsonic jukebox is the
+                        # permanent phantom master.  A real WS client may only
+                        # ever be a slave sink here — it can neither seize
+                        # mastership on join nor (see take_master) via take_master,
+                        # so it can never hijack or, on leaving, vacate the room.
+                        room.master_id = JUKEBOX_MASTER_ID
+                        client.role = "slave"
+                    elif role_wanted == "master" and room.master_id is None:
                         client.role = "master"
                         room.master_id = client_id
                     else:
@@ -389,6 +521,15 @@ async def multiroom_ws(ws: WebSocket):
                 break
 
             if mtype == "take_master":
+                if room.room_id == JUKEBOX_ROOM_ID:
+                    # The reserved jukebox room is always phantom-mastered by the
+                    # Subsonic bridge; a client can never take it.
+                    await ws.send_json({
+                        "type": "error", "ts": _now_ms(),
+                        "code": "MASTER_LOCKED",
+                        "message": "The jukebox room is controlled by the server.",
+                    })
+                    continue
                 # Serialised check-then-set so two clients sending
                 # ``take_master`` at the same time can't both become master.
                 async with room.master_lock:
@@ -504,12 +645,20 @@ async def multiroom_ws(ws: WebSocket):
                 pass
         if client is not None and room is not None:
             room.clients.pop(client.client_id, None)
-            master_vacated = (room.master_id == client.client_id)
+            is_jukebox = room.room_id == JUKEBOX_ROOM_ID
+            # A real client is never the jukebox room's master (it always joins
+            # as a slave), so master_vacated is already False there — this guard
+            # is belt-and-braces so a departing sink can never null the phantom
+            # master or wipe the queue's last_state.
+            master_vacated = (not is_jukebox
+                              and room.master_id == client.client_id)
             if master_vacated:
                 room.master_id = None
                 room.last_state = None
-            if not room.clients:
-                # GC empty room
+            if not room.clients and not is_jukebox:
+                # GC empty room — but never the reserved jukebox room: the bridge
+                # keeps it alive across the server lifetime (0 clients is normal)
+                # so its last_state survives for the next sink that joins.
                 _rooms.pop(room.room_id, None)
                 log.info("Room removed (empty): %s", room.room_id)
             else:

@@ -22,7 +22,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /out/bin  → binaries copied onto the final image's PATH
 # /out/sc68 → sc68 `make install` DESTDIR (staged /usr/local tree). Pre-create
 #             both so a best-effort renderer failure still leaves a copyable dir.
-RUN mkdir -p /out/bin /out/lib /out/share /out/sc68/usr/local/bin /out/sc68/usr/local/lib
+# Pre-create every /out subtree the runtime stage COPYs from — including
+# sc68's share dir — so a SLIM build (which skips sc68/uade) still has empty
+# dirs to copy and the runtime COPYs don't fail on a missing source path.
+RUN mkdir -p /out/bin /out/lib /out/share \
+    /out/sc68/usr/local/bin /out/sc68/usr/local/lib /out/sc68/usr/local/share
+
+# SLIM=1 skips the two heavy source-compiled renderers (uade123's Amiga
+# "exotica" family and sc68's native .sc68 disks) for a smaller, faster-building
+# image aimed at low-RAM boxes that only want the mainstream + common retro
+# formats.  Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console
+# chiptune, PSF, AdLib, all modern codecs — still ships.
+ARG SLIM=0
 
 # YM (.ym) + HVL (.hvl): pre-build the vendored engines the app would otherwise
 # compile on first play — same compile commands as api/stream.py's _build_*.
@@ -90,6 +101,7 @@ RUN set -eux; \
 # and the -j1 last resort removes emulation concurrency pressure.  No-op natively.
 ARG SC68_URL=https://downloads.sourceforge.net/project/sc68/sc68/2.2.1/sc68-2.2.1.tar.gz
 RUN set -eux; \
+    if [ "$SLIM" = "1" ]; then echo "SLIM build — skipping sc68 (.sc68 disabled)"; exit 0; fi; \
     ( curl -sfL --max-time 300 "$SC68_URL" -o /tmp/sc68.tar.gz \
       && tar xzf /tmp/sc68.tar.gz -C /tmp \
       && cd /tmp/sc68-2.2.1 \
@@ -119,6 +131,7 @@ RUN set -eux; \
 # it per render — without it, --version works but playback dies) → lib; the
 # eagleplayer/score/player data → share/uade.
 RUN set -eux; \
+    if [ "$SLIM" = "1" ]; then echo "SLIM build — skipping uade123 (Amiga exotica disabled)"; exit 0; fi; \
     ( apt-get update \
       && apt-get install -y --no-install-recommends libao-dev bzip2 \
       && git clone https://gitlab.com/heikkiorsila/bencodetools.git /tmp/bt \
@@ -154,24 +167,22 @@ RUN set -eux; \
 # --build-arg ALLOW_MISSING_RENDERERS=1.
 ARG ALLOW_MISSING_RENDERERS=0
 RUN set -eu; \
+    req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav"; \
+    if [ "$SLIM" != "1" ]; then \
+      req="$req /out/bin/uade123 /out/lib/uade/uadecore /out/lib/libzakalwe.so \
+           /out/lib/libbencodetools.so /out/share/uade/eagleplayer.conf \
+           /out/sc68/usr/local/bin/sc68 /out/sc68/usr/local/share/sc68/Replay/mcoder.bin"; \
+    fi; \
     missing=""; \
-    for f in \
-        /out/bin/uade123 /out/bin/zxtune123 /out/bin/psgplay \
-        /out/bin/ym2wav  /out/bin/hvl2wav \
-        /out/lib/uade/uadecore /out/lib/libzakalwe.so /out/lib/libbencodetools.so \
-        /out/share/uade/eagleplayer.conf \
-        /out/sc68/usr/local/bin/sc68 \
-        /out/sc68/usr/local/share/sc68/Replay/mcoder.bin ; do \
-      [ -e "$f" ] || missing="$missing $f"; \
-    done; \
+    for f in $req; do [ -e "$f" ] || missing="$missing $f"; done; \
     if [ -n "$missing" ]; then \
       echo "═══ RENDERER GAP — missing artifacts:$missing" >&2; \
       [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
         && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2 \
         || { echo "    build linux/amd64 on a native amd64 host, or override with" >&2; \
-             echo "    --build-arg ALLOW_MISSING_RENDERERS=1." >&2; exit 1; }; \
+             echo "    --build-arg ALLOW_MISSING_RENDERERS=1 (or SLIM=1 to drop uade/sc68)." >&2; exit 1; }; \
     fi; \
-    echo "All renderers present in /out."
+    echo "All required renderers present in /out (SLIM=${SLIM})."
 
 # ═══════════════════════════════ Stage 2: runtime ═══════════════════════════════
 FROM python:3.12-slim-bookworm

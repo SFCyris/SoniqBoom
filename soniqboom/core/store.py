@@ -209,7 +209,15 @@ class TrackStore:
         self._aof_append: Callable[..., None] | None = None
 
         # ── Batch mode: defer O(n) sorted-list rebuilds ─────────────────
+        # Reference-counted so concurrent scan commits on the ONE shared store
+        # (the local re-scan delta-apply + each remote freshness scan, which
+        # run on the same event loop with no lock between them) nest safely:
+        # only the OUTERMOST exit rebuilds.  With a plain boolean a nested
+        # commit reset ``_sorted_dirty`` / flipped ``_batch_mode`` out from
+        # under an outer batch section, dropping its deferred rebuild so those
+        # tracks vanished from every sorted/windowed browse view until restart.
         self._batch_mode: bool = False
+        self._batch_depth: int = 0
         self._sorted_dirty: bool = False
 
         self.history_max = 500
@@ -619,12 +627,20 @@ class TrackStore:
     # ── Batch mode: defer O(n) sorted-list operations ───────────────
 
     def enter_batch_mode(self) -> None:
-        """Enter batch mode — sorted indexes are deferred until exit."""
+        """Enter batch mode — sorted indexes deferred until the OUTERMOST exit.
+
+        Reference-counted (see ``__init__``): nesting an entry must NOT reset
+        ``_sorted_dirty``, or an outer batch section's pending rebuild is lost.
+        """
+        self._batch_depth += 1
         self._batch_mode = True
-        self._sorted_dirty = False
 
     def exit_batch_mode(self) -> None:
-        """Exit batch mode and rebuild sorted indexes if dirty."""
+        """Exit batch mode; rebuild sorted indexes on the OUTERMOST exit only."""
+        self._batch_depth -= 1
+        if self._batch_depth > 0:
+            return                       # a concurrent batch section is still open
+        self._batch_depth = 0
         self._batch_mode = False
         if self._sorted_dirty:
             self._rebuild_sorted_indexes()
@@ -1557,6 +1573,18 @@ class TrackStore:
             self._aof("delete_scan_dir", path=path)
             return True
         return False
+
+    def set_scan_dir_status(self, path: str, status: str) -> bool:
+        """Update ONLY the reachability status of a scan dir, and only when it
+        actually changed (so an availability probe that finds nothing moved
+        writes no AOF entry).  Does NOT touch ``last_scanned`` — a liveness
+        check is not a scan.  Returns True iff the status changed."""
+        sd = self._scan_dirs.get(path)
+        if sd is None or sd.get("status") == status:
+            return False
+        sd["status"] = status
+        self._aof("upsert_scan_dir", path=path, data=dict(sd))
+        return True
 
     # ── Hash lookups ─────────────────────────────────────────────────────
 

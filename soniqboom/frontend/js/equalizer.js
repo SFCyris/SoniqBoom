@@ -38,6 +38,7 @@ const btnToggle = document.getElementById('btn-eq');
 const presetSel = document.getElementById('eq-preset');
 const btnReset  = document.getElementById('eq-reset');
 const btnClose  = document.getElementById('eq-close');
+const rgSel     = document.getElementById('eq-rg');   // ReplayGain mode
 
 const bands = Array.from(document.querySelectorAll('.eq-band'));
 
@@ -224,15 +225,18 @@ function applyAll(newGains, { save = true } = {}) {
 }
 
 // ── Preset selector ───────────────────────────────────────────────────────────
-presetSel.addEventListener('change', () => {
+// Optional-chained: these ids all exist in index.html today, but guarding the
+// module-load-time wiring means a future markup change that drops one degrades
+// to "that control does nothing" instead of throwing and breaking SPA boot.
+presetSel?.addEventListener('change', () => {
   const p = PRESETS[presetSel.value];
   if (p) { applyAll(p); presetSel.value = presetSel.value; }
 });
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
-btnReset.addEventListener('click', () => {
+btnReset?.addEventListener('click', () => {
   applyAll(PRESETS.flat);
-  presetSel.value = 'flat';
+  if (presetSel) presetSel.value = 'flat';
 });
 
 // "EQ active" indicator on the toolbar button: ``on`` while the overlay
@@ -253,6 +257,9 @@ function _refreshEqBadge() {
 // ── Overlay open/close ────────────────────────────────────────────────────────
 function open() {
   overlay.classList.remove('hidden');
+  // Reflect the live ReplayGain mode each time the panel opens (the setting
+  // lives in the Player + localStorage, so it may have changed elsewhere).
+  if (rgSel && Player.replayGainMode) rgSel.value = Player.replayGainMode;
   _refreshEqBadge();
 }
 function close() {
@@ -263,8 +270,15 @@ function toggle() {
   overlay.classList.contains('hidden') ? open() : close();
 }
 
-btnClose.addEventListener('click', close);
-overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+btnClose?.addEventListener('click', close);
+overlay?.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+// ReplayGain mode — off / per-track / per-album.  Player persists the choice
+// and re-applies it to the current track immediately.
+if (rgSel) {
+  rgSel.addEventListener('change', () => {
+    if (Player.setReplayGainMode) Player.setReplayGainMode(rgSel.value);
+  });
+}
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !overlay.classList.contains('hidden')) close();
 });
@@ -276,14 +290,19 @@ try {
     applyAll(saved, { save: false });
     // Sync preset selector
     for (const [name, vals] of Object.entries(PRESETS)) {
-      if (vals.every((v, i) => v === saved[i])) { presetSel.value = name; break; }
+      if (vals.every((v, i) => v === saved[i])) { if (presetSel) presetSel.value = name; break; }
     }
   } else {
     applyAll(PRESETS.flat, { save: false });
-    presetSel.value = 'flat';
+    if (presetSel) presetSel.value = 'flat';
   }
 } catch (_) {
   applyAll(PRESETS.flat, { save: false });
 }
+
+// Reflect the live ReplayGain mode on the control at load — not only when the
+// panel is first opened — so it never shows "Off" while album-mode leveling
+// (the default) is actually applying.
+if (rgSel && Player.replayGainMode) rgSel.value = Player.replayGainMode;
 
 export const Equalizer = { toggle, open, close };

@@ -2292,6 +2292,24 @@ input[type="range"]:hover::-moz-range-thumb {
   align-items: flex-start;
 }
 
+/* ReplayGain (volume-leveling) mode selector in the EQ panel footer */
+.eq-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+}
+.eq-rg-label {
+  font-size: 13px;
+  opacity: 0.85;
+}
+#eq-rg {
+  min-width: 110px;
+}
+
 /* dB scale */
 .eq-scale {
   display: flex;
@@ -2975,8 +2993,22 @@ input[type="range"]:hover::-moz-range-thumb {
 }
 .btn-reconnect:hover { background: rgba(76,175,80,0.25); }
 
-/* Folder tree: unavailable network root */
-.tree-unavailable > .tree-node { opacity: 0.45; }
+/* Folder tree: unavailable root (network share OR local mount that's offline) */
+.tree-unavailable > .tree-node { opacity: 0.55; }
+.tree-unavail-badge {
+  margin-left: 6px;
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--warn, #e0a13a);
+  border: 1px solid var(--warn, #e0a13a);
+  border-radius: 8px;
+  opacity: 0.9;
+  white-space: nowrap;
+}
 
 /* ZIP scan checkbox */
 .admin-zip-label {

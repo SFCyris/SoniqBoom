@@ -54,7 +54,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=86">
+  <link rel="stylesheet" href="/assets/css/app.css?v=88">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -1661,6 +1661,15 @@
         </div>
       </div>
 
+      <div class="eq-foot">
+        <label class="eq-rg-label" for="eq-rg">Volume leveling</label>
+        <select id="eq-rg" title="ReplayGain — even out loudness across tracks using the track's gain tags">
+          <option value="off">Off</option>
+          <option value="track">Per track</option>
+          <option value="album">Per album</option>
+        </select>
+      </div>
+
     </div>
   </div>
 
@@ -2130,7 +2139,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=120"></script>
+  <script type="module" src="/assets/js/app.js?v=122"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

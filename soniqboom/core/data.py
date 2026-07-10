@@ -95,13 +95,34 @@ async def rebuild_indexes() -> dict:
         # endpoints and the background integrity sweep surface.
         report = store._diff_indexes(shadow)
 
-        # Atomic swap (the heal) — single synchronous block, no await, so a
-        # concurrent reader can never observe a partially-built index.
-        for attr in INDEX_ATTRS:
-            setattr(store, attr, getattr(shadow, attr))
-        store._word_list_dirty = shadow._word_list_dirty
-        store._sorted_dirty = False
-        store._batch_mode = False
+        # Swap the healed indexes in ONLY when NO scan is active.  A scan is
+        # "active" if EITHER ``_batch_depth`` > 0 (mid-extract) OR ``_batch_mode``
+        # is True with depth 0 — the latter is a scan-exit that already
+        # decremented depth to 0 (scanner.py) but is PARKED on this very rebuild
+        # lock waiting to run its own rebuild (it clears ``_batch_mode`` only in
+        # its post-rebuild finally).
+        #
+        # Why NOT swap during a scan: our shadow is a snapshot; the concurrent
+        # scan is mutating the live indexes via ``_index_track``/``_unindex_track``.
+        # Swapping would clobber those updates.  For the SORTED indexes that's
+        # recoverable (we flag ``_sorted_dirty`` so the scan's lock-serialized
+        # exit rebuilds them fresh), but the scan's exit does NOT rebuild the
+        # TAG/WORD indexes — so a mid-scan swap strands stale ``_tag_*`` /
+        # ``_word_index`` entries (verified on a 262k library: a reindex hammered
+        # during concurrent scans left +16 orphan artists / +4 words).  So during
+        # a scan we DIAGNOSE ONLY — no swap.  The heal happens on the next idle
+        # reindex or the background integrity sweep (which gates on is_scanning).
+        if store._batch_depth == 0 and not store._batch_mode:
+            for attr in INDEX_ATTRS:
+                setattr(store, attr, getattr(shadow, attr))   # atomic swap (heal)
+            store._word_list_dirty = shadow._word_list_dirty
+            store._sorted_dirty = False
+            store._batch_mode = False
+        else:
+            # A scan holds the batch — leave the live indexes untouched (no
+            # clobber) and flag sorted dirty so the scan's exit still refreshes
+            # the sorted views.  report still reflects the pre-heal diff.
+            store._sorted_dirty = True
         store._mutation_seq += 1   # invalidate seq-keyed memos (store agg cache,
                                    # subsonic _ALBUM_*_CACHE, smart.py dup memos)
         return report
@@ -517,6 +538,107 @@ async def list_scan_dirs() -> list[dict]:
 
 async def delete_scan_dir(path: str) -> bool:
     return get_store().delete_scan_dir(path)
+
+
+async def set_scan_dir_status(path: str, status: str) -> bool:
+    return get_store().set_scan_dir_status(path, status)
+
+
+# ── Scan-dir availability probe ──────────────────────────────────────────────
+# A registered root can go temporarily unreachable — an SMB/FTP share drops, or
+# a locally-mounted drive (presented at /Volumes/… or /mnt/…) is ejected or
+# stalls.  We must NEVER treat that as "the files were deleted" (the scanner's
+# stale-cleanup already refuses to prune a zero-listing / errored root); instead
+# we flag the root ``unavailable`` so the UI can show it greyed rather than
+# silently serving an empty or half-missing folder.
+import asyncio as _asyncio
+import time as _time
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+_AVAIL_PROBE_TIMEOUT = 4.0        # seconds — a mount stalled past this is "unavailable"
+_AVAIL_CACHE_TTL = 10.0           # re-probe at most this often (UI polls /dirs)
+_avail_last_probe = 0.0
+_avail_lock = _asyncio.Lock()
+# Dedicated, bounded pool for the (potentially stalling) is_dir() probes.  A hung
+# mount leaves its worker blocked until the OS returns, so we isolate these from
+# the shared default executor that the AOF writer, snapshot writer, art cache,
+# and streaming run on — a wedged mount can't starve persistence/playback.
+_probe_executor = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="availprobe")
+
+# The same remote-scheme set the rest of the app uses (admin._is_remote): SMB/FTP
+# plus WebDAV, whose scan roots are http(s):// URLs.  Without WebDAV here, a
+# connected DAV share would fall into the LOCAL branch and Path("http://…").is_dir()
+# would always be False → falsely reported "unavailable".
+_REMOTE_SCHEMES = ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")
+
+
+def _is_remote_root(path: str) -> bool:
+    return path.startswith(_REMOTE_SCHEMES)
+
+
+async def _probe_scan_dir(sd: dict) -> tuple[str, bool]:
+    """Return ``(path, reachable)`` for one scan dir, bounded so a hung mount
+    can never block the caller."""
+    path = sd.get("path", "")
+    if not path:
+        return path, False
+    if _is_remote_root(path):
+        # Remote: reachable iff its FileSource is currently registered.  Sources
+        # are registered under the scan-root URL (which IS ``path``), never the
+        # ``network_share_id`` slug — keying by the slug would report every
+        # connected share as unavailable.  A hard disconnect removes the source;
+        # transient blips keep it (it auto-reconnects) so we don't flap on loss.
+        try:
+            from soniqboom.core.filesource import get_source
+            return path, get_source(path) is not None
+        except Exception:
+            log.warning("Availability probe failed for remote root %s", path, exc_info=True)
+            return path, False
+    # Local (including a network drive mounted into the local namespace):
+    # is_dir() on a stalled mount can block, so run it on the dedicated pool with
+    # a hard timeout.
+    from pathlib import Path as _Path
+    loop = _asyncio.get_running_loop()
+    try:
+        ok = await _asyncio.wait_for(
+            loop.run_in_executor(_probe_executor, lambda: _Path(path).is_dir()),
+            timeout=_AVAIL_PROBE_TIMEOUT,
+        )
+        return path, bool(ok)
+    except _asyncio.TimeoutError:
+        return path, False           # stalled mount → treat as unavailable
+    except OSError:
+        return path, False           # ENOENT / ESTALE / EIO … → unavailable
+    except Exception:
+        log.warning("Availability probe failed for local root %s", path, exc_info=True)
+        return path, False
+
+
+async def refresh_scan_dir_availability(force: bool = False) -> list[dict]:
+    """Probe every registered scan dir's reachability and update its ``status``
+    to 'ok'/'unavailable' (only writing on an actual change).  Cached for a few
+    seconds so rapid UI polls don't re-stat a slow mount every time.  Returns
+    the fresh scan-dir list."""
+    global _avail_last_probe
+    store = get_store()
+    now = _time.monotonic()
+    if not force and (now - _avail_last_probe) < _AVAIL_CACHE_TTL:
+        return store.list_scan_dirs()
+    async with _avail_lock:
+        # Re-check under the lock — another request may have just probed.
+        now = _time.monotonic()
+        if not force and (now - _avail_last_probe) < _AVAIL_CACHE_TTL:
+            return store.list_scan_dirs()
+        dirs = store.list_scan_dirs()
+        results = await _asyncio.gather(*[_probe_scan_dir(sd) for sd in dirs])
+        reachable = dict(results)
+        for sd in dirs:
+            p = sd.get("path", "")
+            want = "ok" if reachable.get(p) else "unavailable"
+            if store.set_scan_dir_status(p, want):
+                log.info("Scan dir %s is now %s", p, want)
+        _avail_last_probe = _time.monotonic()
+        return store.list_scan_dirs()
 
 
 async def delete_tracks_by_scan_root(root_path: str) -> int:

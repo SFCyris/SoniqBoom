@@ -222,8 +222,12 @@ async def reindex():
 
 @router.get("/dirs")
 async def get_library_dirs():
-    """Return all registered scan directories."""
-    return {"dirs": await list_scan_dirs()}
+    """Return all registered scan directories, each with a live-ish reachability
+    ``status`` ('ok' / 'unavailable').  The probe is bounded + cached, so a
+    stalled mount marks the folder unavailable instead of hanging the request or
+    making it look empty."""
+    from soniqboom.core.data import refresh_scan_dir_availability
+    return {"dirs": await refresh_scan_dir_availability()}
 
 
 @router.post("/dirs")

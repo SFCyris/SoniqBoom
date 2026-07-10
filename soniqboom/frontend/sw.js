@@ -543,7 +543,7 @@
 // placeholder when idle) so starting a station no longer shifts the list under
 // the cursor.  v143: ?v-pinned assets served cache-first with NO revalidation
 // (immutable per URL) — drops a redundant background fetch per pinned asset.
-const SHELL_VERSION = 'v147';
+const SHELL_VERSION = 'v150';   // v150: folder-tree unavailable-mount badge (foldertree.js) + app.css badge style
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.
@@ -564,6 +564,7 @@ const SHELL_PRECACHE = [
   // cached on first real visit by the network-first navigation handler.
   '/assets/css/app.css',
   '/assets/js/player.js',
+  '/assets/js/equalizer.js',
   '/assets/js/library.js',
   '/assets/js/utils.js',
   '/assets/js/queue.js',

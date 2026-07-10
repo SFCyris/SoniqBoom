@@ -399,6 +399,35 @@ else:
             status_code=404,
         )
 
+
+# ── Subsonic-aware request-validation handler ──────────────────────────────
+# FastAPI raises RequestValidationError *before* a handler runs (during param
+# parsing), so subsonic's @_wrap can't catch it — a missing/invalid ``id=``
+# would otherwise leak a raw HTTP 422, which Subsonic clients treat as a
+# transport error ("server unreachable") rather than a protocol error.  For
+# /rest/* we convert it to a Subsonic error-10 envelope (required parameter
+# missing) at HTTP 200, honouring the requested ``f=`` format.  Every other
+# path keeps FastAPI's default 422 JSON.
+from fastapi.exceptions import RequestValidationError as _ReqValErr
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as _default_val_handler,
+)
+
+
+@app.exception_handler(_ReqValErr)
+async def _subsonic_validation_handler(request: Request, exc: _ReqValErr):
+    if request.url.path.startswith("/rest/"):
+        fmt = (request.query_params.get("f") or "xml").lower()
+        try:
+            loc = (exc.errors()[0].get("loc") or ())
+            pname = loc[-1] if loc else "?"
+            msg = f"Required parameter '{pname}' is missing or invalid."
+        except Exception:
+            msg = "A required parameter is missing or invalid."
+        return subsonic._err(10, msg, fmt=fmt)
+    return await _default_val_handler(request, exc)
+
+
 # Lazy-import admin router (avoids import errors if optional deps missing)
 try:
     from soniqboom.api import admin as _admin_mod

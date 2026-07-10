@@ -1140,15 +1140,33 @@ export const Player = (() => {
       replayGain.gain.value = 1.0;
       return;
     }
-    const albumDb = _parseRgDb(track.replaygain_album_gain);
-    const trackDb = _parseRgDb(track.replaygain_track_gain);
-    const peak    = _parseRgDb(track.replaygain_track_peak)
-                 || _parseRgDb(track.replaygain_album_peak);
-    let db = (mode === 'album' && albumDb !== null) ? albumDb
-           : (trackDb !== null) ? trackDb
-           : (albumDb !== null) ? albumDb
-           : null;
-    if (db === null) {
+    const albumDb   = _parseRgDb(track.replaygain_album_gain);
+    const trackDb   = _parseRgDb(track.replaygain_track_gain);
+    const albumPeak = _parseRgDb(track.replaygain_album_peak);
+    const trackPeak = _parseRgDb(track.replaygain_track_peak);
+    // Prefer the selected mode's gain; fall back to the other tag so a track
+    // tagged for only one still gets levelled (better than unity).  Pair each
+    // gain WITH ITS OWN peak (album gain ↔ album peak, track gain ↔ track peak)
+    // so the 0.99/peak clip headroom below matches the gain actually applied —
+    // and carry that source's peak through the fallback, never a mismatched one.
+    let db, peak;
+    if (mode === 'album') {
+      if (albumDb !== null) { db = albumDb; peak = albumPeak; }
+      else                  { db = trackDb; peak = trackPeak; }
+    } else {                          // 'track'
+      if (trackDb !== null) { db = trackDb; peak = trackPeak; }
+      else                  { db = albumDb; peak = albumPeak; }
+    }
+    // If the mode-matched peak is missing, fall back to whichever peak IS
+    // tagged so clip protection still engages — a file tagged with a gain but
+    // no matching peak would otherwise apply that gain UNCAPPED (bounded only
+    // by the +12 dB hard cap below) and a hot master could clip. The other
+    // scope's peak is an imperfect but safe-enough ceiling; unity has none.
+    if (peak === null || peak === undefined) {
+      peak = (trackPeak !== null && trackPeak !== undefined) ? trackPeak
+           : ((albumPeak !== null && albumPeak !== undefined) ? albumPeak : null);
+    }
+    if (db === null || db === undefined) {
       // No tags — leave the chain at unity gain.  Graceful no-op.
       replayGain.gain.value = 1.0;
       return;
@@ -1164,6 +1182,8 @@ export const Player = (() => {
     }
     // Hard sanity cap regardless of metadata — never apply > +12 dB.
     linear = Math.max(0.001, Math.min(linear, 3.98));
+    // Defence in depth: a non-finite value would throw on gain.value assignment.
+    if (!Number.isFinite(linear)) linear = 1.0;
     replayGain.gain.value = linear;
   }
 
@@ -1240,6 +1260,11 @@ export const Player = (() => {
     if (ctx && ctx.state === 'suspended') {
       try { await ctx.resume(); } catch (_) {}
     }
+    // Stations carry no ReplayGain tags and a live stream often never fires
+    // ``loadedmetadata``, so reset the RG node to unity — otherwise the
+    // previous track's gain (e.g. -8 dB) carries over and the station plays
+    // too quiet.  ``_applyReplayGain(null)`` collapses to gain = 1.0.
+    _applyReplayGain(null);
 
     // Synthetic "track" so the player bar renders the station like any
     // other now-playing item.  Empty id → art/waveform fetchers fall back

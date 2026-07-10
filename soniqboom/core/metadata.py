@@ -359,7 +359,7 @@ HEADER_BUDGET: dict[str, int | None] = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _decode_tracker_str(b: bytes) -> str:
+def _decode_tracker_str(b: bytes, *, latin1_native: bool = False) -> str:
     """Decode a fixed-size text field from a tracker / chiptune header.
 
     Tracker formats (MOD/S3M/IT/XM) and chiptune containers (SID/NSF/SPC/
@@ -374,6 +374,12 @@ def _decode_tracker_str(b: bytes) -> str:
     CP437 (the DOS code page); finally Latin-1 (single-byte, lossless,
     never raises — guarantees we always return *some* text).  Strips
     NUL padding and surrounding whitespace at the end.
+
+    ``latin1_native=True`` for formats whose header charset is ISO-8859-1
+    by *specification* rather than DOS-scene convention — the PSID/RSID SID
+    header is the case that matters: byte ``0xFC`` there is ``ü`` (Latin-1),
+    NOT CP437's ``ⁿ`` (U+207F).  For those we skip the CP437 guess entirely so
+    ``Chris Hülsbeck`` doesn't come out as ``Chris Hⁿlsbeck``.
 
     Returns ``""`` for empty / all-NUL inputs.
     """
@@ -391,11 +397,14 @@ def _decode_tracker_str(b: bytes) -> str:
         pass
     # CP437 — DOS code page, the de-facto tracker scene encoding from
     # the FastTracker / Impulse Tracker era.  Single-byte, can't fail
-    # on any byte, but we keep the try/except for paranoia.
-    try:
-        return b.decode("cp437").strip()
-    except (UnicodeDecodeError, LookupError):
-        pass
+    # on any byte, but we keep the try/except for paranoia.  Skipped for
+    # Latin-1-native formats (SID), where CP437 would corrupt accented
+    # Western-European characters.
+    if not latin1_native:
+        try:
+            return b.decode("cp437").strip()
+        except (UnicodeDecodeError, LookupError):
+            pass
     # Latin-1 catch-all: 256 distinct chars covering bytes 0x00–0xFF.
     # Never raises.  Visual output may be mojibake for Shift-JIS files,
     # but at least it's stable readable bytes the user can search on
@@ -891,9 +900,12 @@ def _extract_sid(path: Path, track_id: str) -> dict:
 
     version = struct.unpack(">H", header[4:6])[0]
 
-    title_raw     = _decode_tracker_str(header[22:54])
-    artist_raw    = _decode_tracker_str(header[54:86])
-    copyright_raw = _decode_tracker_str(header[86:118])
+    # PSID/RSID header string fields are ISO-8859-1 by spec — decode as
+    # Latin-1-native so accented names (Hülsbeck, Følner, …) aren't corrupted
+    # by the CP437 fallback that trackers need.
+    title_raw     = _decode_tracker_str(header[22:54], latin1_native=True)
+    artist_raw    = _decode_tracker_str(header[54:86], latin1_native=True)
+    copyright_raw = _decode_tracker_str(header[86:118], latin1_native=True)
 
     # Subsong info (bytes 14-17)
     subsongs = struct.unpack(">H", header[14:16])[0]
