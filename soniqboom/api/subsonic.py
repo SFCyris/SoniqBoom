@@ -1505,6 +1505,7 @@ async def get_transcode_decision(
     p: str | None = Query(default=None),
     s: str | None = Query(default=None),
     t: str | None = Query(default=None),
+    f: str = Query(default="xml"),
 ):
     """Negotiate the optimal transcode for ``id`` against the client's profile.
 
@@ -1519,7 +1520,7 @@ async def get_transcode_decision(
     from soniqboom.core.data import get_track as _gt
     track = await _gt(id)
     if track is None:
-        return _err(70, "Track not found")
+        return _err(70, "Track not found", fmt=f)
 
     # Map the client's capability profile.
     accept = {_normalise_codec(c) for c in clientCodecs.split(",") if c.strip()}
@@ -1593,7 +1594,7 @@ async def get_transcode_decision(
         }
         decision["token"]     = _sign_token(claims)
         decision["expiresIn"] = _TOKEN_TTL_SECONDS
-    return _ok({"transcodeDecision": decision})
+    return _ok({"transcodeDecision": decision}, fmt=f)
 
 
 @router.get("/getTranscodeStream")
@@ -1931,8 +1932,12 @@ async def create_playlist(
         await _update(playlistId, name=name, track_ids=songId)
         pl = store._playlists.get(playlistId)
     else:
-        pl = await _create(name or "New playlist", track_ids=songId,
-                           owner_user_id=user.id)
+        # Subsonic spec: createPlaylist needs either playlistId (update) or a
+        # name (create).  With neither, return error 10 rather than silently
+        # fabricating a "New playlist" — a param-less request must not mutate.
+        if not name:
+            raise _SubsonicError(10, "Required parameter 'name' is missing.")
+        pl = await _create(name, track_ids=songId, owner_user_id=user.id)
     if not pl:
         raise _SubsonicError(70, "Playlist not found.")
     return await get_playlist(
@@ -2257,9 +2262,12 @@ async def _similar_song_tracks(track_id: str, count: int) -> list[dict]:
     if not seed:
         raise _SubsonicError(70, "Song not found.")
     ratings = await get_all_ratings()
+    candidates = store.similar_candidates(seed)   # on-loop: atomic vs scanner, cheap
+    sample_jaccard = store.retro_sample_jaccard(seed, candidates)   # cheap inverted-index walk
     res = await _asyncio.to_thread(
-        find_similar, seed, store.all_tracks(), store.waveforms_view(),
+        find_similar, seed, candidates, store.waveforms_view(),
         ratings=ratings or {}, k=max(1, min(count, 100)),
+        sample_jaccard=sample_jaccard,
     )
     return [r["track"] for r in res if r.get("track")]
 

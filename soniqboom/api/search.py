@@ -191,9 +191,15 @@ async def similar_tracks(track_id: str, k: int = Query(10, ge=1, le=50)):
         raise HTTPException(404, "Track not found")
 
     ratings = await get_all_ratings()
+    # Build the candidate pool on the loop (synchronous, no await → atomic
+    # w.r.t. the scanner; cheaper than the old all_tracks() copy), then score
+    # off-thread.  waveforms_view() is a snapshot, also safe to hand to the thread.
+    candidates = store.similar_candidates(seed)
+    sample_jaccard = store.retro_sample_jaccard(seed, candidates)   # cheap inverted-index walk
     result = await _asyncio.to_thread(
-        find_similar, seed, store.all_tracks(), store.waveforms_view(),
+        find_similar, seed, candidates, store.waveforms_view(),
         ratings=ratings or {}, k=k,
+        sample_jaccard=sample_jaccard,
     )
 
     def _clean(t: dict) -> dict:

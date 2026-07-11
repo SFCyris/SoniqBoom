@@ -9,7 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from soniqboom.config import settings
@@ -20,6 +20,7 @@ from soniqboom.core.data import (
 )
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
+from soniqboom.api.users import require_admin
 
 router = APIRouter(prefix="/library", tags=["library"])
 
@@ -201,7 +202,7 @@ async def resolve_hash_value(h: str):
 
 
 @router.post("/reindex")
-async def reindex():
+async def reindex(_admin=Depends(require_admin)):
     """Rebuild the in-memory indexes (use after schema changes).
     Existing track documents are preserved; the index is rebuilt automatically.
     """
@@ -231,7 +232,7 @@ async def get_library_dirs():
 
 
 @router.post("/dirs")
-async def add_library_dir(body: dict):
+async def add_library_dir(body: dict, _admin=Depends(require_admin)):
     """Add a directory to the scan list and immediately scan it."""
     raw = body.get("path", "").strip()
     if not raw:
@@ -262,7 +263,7 @@ async def add_library_dir(body: dict):
 
 
 @router.delete("/dirs")
-async def remove_library_dir(body: dict):
+async def remove_library_dir(body: dict, _admin=Depends(require_admin)):
     """Remove a directory from the scan list."""
     raw = body.get("path", "").strip()
     if not raw:
@@ -275,7 +276,7 @@ async def remove_library_dir(body: dict):
 # ── Scan ──────────────────────────────────────────────────────────────────────
 
 @router.post("/scan")
-async def scan_library(body: dict | None = None):
+async def scan_library(body: dict | None = None, _admin=Depends(require_admin)):
     """Start a library scan.
 
     - If body contains {"dirs": [...]}, scan those specific dirs.

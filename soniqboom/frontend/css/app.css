@@ -2640,7 +2640,6 @@ input[type="range"]:hover::-moz-range-thumb {
   border-color: transparent;
 }
 #admin-panel.hidden { display: none; }
-#admin-auth-dialog.hidden { display: none; }
 #admin-alias-dialog.hidden { display: none; }
 #confirm-dialog.hidden { display: none; }
 .btn-danger-action {

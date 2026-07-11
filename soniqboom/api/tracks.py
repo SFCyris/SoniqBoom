@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -129,11 +130,11 @@ class _TagUpdate(_BaseModel):
     track_number: int | None = None
 
 
-from soniqboom.api.users import require_user as _require_user
+from soniqboom.api.users import require_user as _require_user, require_edit as _require_edit
 
 
 @router.put("/{track_id}/tags")
-async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_user)):
+async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_edit)):
     """Write tags into the local audio file AND mirror them into the library.
 
     Local files only — remote-share tracks (smb/ftp/webdav) and zip members
@@ -164,6 +165,10 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_us
     if "genre" in store_updates:
         store_updates["genre"] = [store_updates["genre"]]
     get_store().update_track_fields(track_id, store_updates)
+    # The edited artist/title/album change what LRCLib would return, so drop any
+    # cached lyrics for this track — the next LYRICS open re-resolves with the
+    # corrected tags instead of serving a stale (possibly mismatched) result.
+    _lyrics_cache.pop(track_id, None)
     return {"id": track_id, "applied": applied}
 
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
@@ -185,6 +190,212 @@ def _get_lrclib_client() -> httpx.AsyncClient:
             ),
         )
     return _lrclib_client
+
+
+# ── LRCLib fuzzy-fallback helpers ─────────────────────────────────────────────
+# LRCLib's exact ``/api/get`` 404s when a store/label appends release noise to
+# the title or album — "(No Narration)", "(24-bit HD audio)", "(Deluxe
+# Edition)", "(Remastered 2021)", "[Bonus Track]" — or when the tagged duration
+# differs from LRCLib's by more than its tolerance.  When that happens we clean
+# the title and fall back to the fuzzy ``/api/search``, then pick the candidate
+# closest in duration so a noisy tag still resolves WITHOUT attaching a
+# different recording's words (confidence-gated: refuse over guess).
+import re as _re
+
+# A TRAILING parenthetical / bracket group + its inner text (group 1).
+_TRAILING_GROUP_RE = _re.compile(r"\s*[\(\[]([^\(\)\[\]]*)[\)\]]\s*$")
+# Inner text that marks the group as release NOISE (safe to strip) rather than a
+# meaningful subtitle.  Only noise groups are peeled — so "(24-bit HD audio)",
+# "(No Narration)", "(Deluxe Edition)", "(Remastered 2021)", "(Live)" go, but
+# "(How Does It Feel)" or "(Pt. 2)" stay (stripping them would let a fuzzy match
+# collide with a *different* same-artist song — dangerous once write-back is on).
+_QUALIFIER_NOISE_RE = _re.compile(
+    r"(?i)(remaster|deluxe|expanded|\bedition\b|bonus|reissue|anniversary|"
+    r"\bmono\b|\bstereo\b|\bversion\b|\bmix\b|remix|\bedit\b|\blive\b|acoustic|"
+    r"instrumental|\bdemo\b|\d+\s*-?\s*bit|\d+\s*k?hz|hd\s*audio|hi-?res|"
+    r"narration|explicit|\bclean\b|\bradio\b|\bsingle\b|original|feat\.?|"
+    r"featuring|ft\.?|no\s*vocals?)"
+)
+
+# Duration windows (seconds) for accepting a fuzzy /api/search candidate.
+_LRCLIB_DUR_MAX_S = 30.0   # nothing within this of the track → refuse the match
+
+# Per-request timeouts (seconds).  The exact /api/get is quick; the full-text
+# /api/search is heavier and slower (5–9 s under load), so it gets a longer
+# budget.  Both degrade cleanly to "no lyrics" on timeout.
+_LRCLIB_GET_TIMEOUT_S = 6.0
+_LRCLIB_SEARCH_TIMEOUT_S = 12.0
+
+# Resolved-lyrics cache (in-memory, POSITIVES ONLY).  LRCLib is slow and flaky,
+# so once a track's lyrics resolve we keep them for the process lifetime: the
+# LYRICS tab re-opens instantly and — crucially — the lyrics survive LRCLib
+# later going down (the "used to have lyrics, now nothing" report).  Misses are
+# deliberately NOT cached, so a transient LRCLib outage self-heals on the next
+# open instead of pinning a false "no lyrics".  Bounded to cap memory.
+_lyrics_cache: dict[str, dict] = {}
+_LYRICS_CACHE_MAX = 4000
+
+
+def _remember_lyrics(track_id: str, result: dict) -> dict:
+    """Cache a resolved lyrics payload if it actually has lyrics; return it."""
+    if result.get("lyrics"):
+        if len(_lyrics_cache) >= _LYRICS_CACHE_MAX:
+            _lyrics_cache.clear()          # simple bound — cheap, rare
+        _lyrics_cache[track_id] = result
+    return result
+
+
+def lyrics_cache_size() -> int:
+    """Number of tracks with cached resolved lyrics (for the admin panel)."""
+    return len(_lyrics_cache)
+
+
+def clear_lyrics_cache() -> int:
+    """Empty the resolved-lyrics cache; return how many entries were dropped.
+    The next LYRICS open re-resolves online (used by Admin → System → Cache)."""
+    n = len(_lyrics_cache)
+    _lyrics_cache.clear()
+    return n
+
+
+async def _maybe_writeback_lyrics(track, lyrics_text: str) -> None:
+    """If the ``lyrics_writeback`` setting is on and this is a LOCAL file with no
+    embedded lyrics, embed the freshly-fetched lyrics into it — in the
+    background, off the response path so the LYRICS tab never waits on a tag
+    write.  A no-op when the toggle is off, for remote/zip paths, or when the
+    file already has lyrics (``write_lyrics`` re-checks and never overwrites)."""
+    try:
+        from soniqboom.core.data import get_config
+        if not await get_config("lyrics_writeback", False):
+            return
+        path_str = getattr(track, "path", "") or ""
+        if not path_str or path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+            return                              # only real local files
+        if "!" in path_str or "::" in path_str:
+            return                              # zip-virtual member — not a writable file
+        p = Path(path_str)
+
+        async def _bg() -> None:
+            log = logging.getLogger(__name__)
+            try:
+                from soniqboom.core.metadata import write_lyrics
+                wrote = await asyncio.to_thread(write_lyrics, p, lyrics_text)
+                if wrote:
+                    log.info("Lyrics writeback: embedded fetched lyrics into %s", p.name)
+            except Exception:
+                log.debug("Lyrics writeback failed for %s", p, exc_info=True)
+
+        asyncio.create_task(_bg())
+    except Exception:
+        pass
+
+
+def _strip_release_qualifiers(name: str) -> str:
+    """Strip trailing release-NOISE qualifiers from a title/album so a fuzzy
+    lyrics lookup matches the canonical release — but only groups that look like
+    noise (see ``_QUALIFIER_NOISE_RE``); a meaningful subtitle is kept.  Never
+    strips to empty."""
+    s = (name or "").strip()
+    while True:
+        m = _TRAILING_GROUP_RE.search(s)
+        if not m or not _QUALIFIER_NOISE_RE.search(m.group(1)):
+            break                             # no trailing group, or it's a real subtitle
+        stripped = s[:m.start()].strip()
+        if not stripped:
+            break                             # would empty the title — keep as-is
+        s = stripped
+    return s
+
+
+def _norm_title(name: str) -> str:
+    """Normalise a title for equality comparison: drop trailing qualifiers,
+    lowercase, strip punctuation, collapse whitespace.  So "Shaggathon (Album
+    Version)" == "Shaggathon", but "Angel" != "Angel of Death"."""
+    s = _strip_release_qualifiers(name).lower()
+    s = _re.sub(r"[^\w\s]", " ", s)
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+# A trailing "feat./ft./featuring/with …" credit — stripped so a primary-artist
+# comparison treats "Artist feat. X" == "Artist" WITHOUT the substring looseness
+# that made "Sia" match "Basia".
+_FEAT_RE = _re.compile(r"\s*[\(\[]?\s*\b(feat\.?|featuring|ft\.?|with)\b.*$", _re.IGNORECASE)
+
+
+def _artist_core(name: str) -> str:
+    """Primary artist, lowercased, trailing feat.-clause removed."""
+    return _FEAT_RE.sub("", (name or "").strip().lower()).strip()
+
+
+def _lrclib_lyrics_payload(rec: dict) -> dict | None:
+    """Shape an LRCLib record into the endpoint's response, synced over plain.
+    Returns None for an instrumental / lyric-less record."""
+    if not isinstance(rec, dict):
+        return None
+    synced = (rec.get("syncedLyrics") or "").strip()
+    if synced:
+        return {"lyrics": synced, "synced": True, "source": "LRCLib.net"}
+    plain = (rec.get("plainLyrics") or "").strip()
+    if plain:
+        return {"lyrics": plain, "synced": False, "source": "LRCLib.net"}
+    return None
+
+
+def _lrclib_best_match(results, artist: str, title: str, duration: float | None) -> dict | None:
+    """Pick the /api/search candidate most likely to be THIS recording: same
+    artist, same (cleaned) title, has lyrics, and — when we know the track
+    duration — closest in length within a tolerance.  Refuse if everything is
+    wildly off so we never show another song's lyrics (refuse over guess)."""
+    if not isinstance(results, list):
+        return None
+    wa = _artist_core(artist)
+    wt = _norm_title(title)
+    wt_raw = _strip_release_qualifiers(title).strip().lower()
+
+    def _artist_ok(r: dict) -> bool:
+        ra = _artist_core(r.get("artistName") or "")
+        if not wa or not ra:
+            return True                       # can't compare → trust the search's artist filter
+        return wa == ra                       # exact primary artist (feat.-clauses stripped)
+
+    def _title_ok(r: dict) -> bool:
+        rt = _norm_title(r.get("trackName") or "")
+        if not wt:
+            # A title that normalises to empty (punctuation-only names — "!!!",
+            # "+/-") must NOT become a wildcard matching any same-artist song.
+            # Fall back to a raw comparison so "!!!" only matches "!!!".
+            rt_raw = _strip_release_qualifiers(r.get("trackName") or "").strip().lower()
+            return bool(wt_raw) and wt_raw == rt_raw
+        if not rt:
+            return False                      # candidate has no comparable title → refuse
+        return wt == rt                       # same core title (± qualifiers)
+
+    cands = [
+        r for r in results
+        if isinstance(r, dict)
+        and (r.get("syncedLyrics") or r.get("plainLyrics"))
+        and _artist_ok(r)
+        and _title_ok(r)
+    ]
+    if not cands:
+        return None
+
+    if duration and duration > 0:
+        def _delta(r):
+            try:
+                return abs(float(r.get("duration") or 0) - float(duration))
+            except (TypeError, ValueError):
+                return float("inf")
+        # Closest duration first; a synced result breaks a tie.
+        cands.sort(key=lambda r: (_delta(r), 0 if (r.get("syncedLyrics") or "").strip() else 1))
+        best = cands[0]
+        if _delta(best) > _LRCLIB_DUR_MAX_S:
+            return None                        # nothing close enough — refuse
+        return best
+
+    # No duration to disambiguate — prefer a synced candidate, else the first.
+    cands.sort(key=lambda r: 0 if (r.get("syncedLyrics") or "").strip() else 1)
+    return cands[0]
 
 
 _ALLOWED_SORT_KEYS = {
@@ -315,10 +526,11 @@ async def read_track(track_id: str):
 
 
 @router.delete("/{track_id}")
-async def remove_track(track_id: str):
+async def remove_track(track_id: str, _user=_Depends(_require_edit)):
     removed = await delete_track(track_id)
     if not removed:
         raise HTTPException(404, "Track not found")
+    _lyrics_cache.pop(track_id, None)
     return {"deleted": track_id}
 
 
@@ -700,9 +912,151 @@ async def get_chapters(track_id: str):
     return {"id": track_id, "chapters": chapters}
 
 
+# ── Online lyrics providers (responsiveness-ordered fallback chain) ──────────
+# LRCLib is the richer source (synced + fuzzy + duration-gated); lyrics.ovh is
+# the fallback (plain-only, exact artist+title, no key).  Both are probed at
+# startup — and lazily re-probed — and the FASTER one is tried FIRST, so when
+# LRCLib is degraded (it 502'd during testing) the quicker source answers
+# without the user waiting on the slow one.  Every result still passes the same
+# confidence gate downstream, so the order changes only latency, never which
+# lyrics get attached.
+_LYRICS_OVH_TIMEOUT_S = 8.0
+_PROBE_TIMEOUT_S = 5.0
+_PROBE_INTERVAL_S = float(os.environ.get("SONIQBOOM_LYRICS_PROBE_INTERVAL_S", "1800"))  # 30 min
+
+
+async def _provider_lrclib(client, artist, title, album, duration):
+    """LRCLib: exact ``/api/get`` first, then the duration-gated fuzzy
+    ``/api/search``.  Each call is guarded so a slow/failed exact still lets the
+    fuzzy run; a total failure returns None → the resolver tries the next
+    provider."""
+    log = logging.getLogger(__name__)
+    try:
+        params = {"artist_name": artist, "track_name": title}
+        if album:
+            params["album_name"] = album
+        if duration:
+            params["duration"] = str(int(duration))
+        resp = await client.get("https://lrclib.net/api/get", params=params,
+                                timeout=_LRCLIB_GET_TIMEOUT_S)
+        if resp.status_code == 200:
+            hit = _lrclib_lyrics_payload(resp.json())
+            if hit:
+                return hit
+    except Exception:
+        log.debug("LRCLib exact lookup failed", exc_info=True)
+    try:
+        resp = await client.get(
+            "https://lrclib.net/api/search",
+            params={"artist_name": artist, "track_name": _strip_release_qualifiers(title)},
+            timeout=_LRCLIB_SEARCH_TIMEOUT_S,
+        )
+        if resp.status_code == 200:
+            cand = _lrclib_best_match(resp.json(), artist, title, duration)
+            if cand:
+                return _lrclib_lyrics_payload(cand)
+    except Exception:
+        log.debug("LRCLib fuzzy lookup failed", exc_info=True)
+    return None
+
+
+async def _provider_lyrics_ovh(client, artist, title, album, duration):
+    """lyrics.ovh: one exact ``/v1/{artist}/{title}`` lookup (plain only, no
+    key).  Uses the primary artist (feat.-clause dropped) + de-noised title so a
+    store-tagged "(Remastered)" / "feat. X" still matches its canonical entry."""
+    a = _FEAT_RE.sub("", artist).strip()
+    t = _strip_release_qualifiers(title)
+    if not a or not t:
+        return None
+    url = (
+        "https://api.lyrics.ovh/v1/"
+        f"{urllib.parse.quote(a, safe='')}/{urllib.parse.quote(t, safe='')}"
+    )
+    resp = await client.get(url, timeout=_LYRICS_OVH_TIMEOUT_S)
+    if resp.status_code == 200:
+        ly = ((resp.json() or {}).get("lyrics") or "").strip()
+        if ly:
+            return {"lyrics": ly, "synced": False, "source": "lyrics.ovh"}
+    return None
+
+
+# name, provider fn, and a representative "is it up + how fast" probe URL.
+_LYRICS_PROVIDERS = [
+    {"name": "LRCLib", "fn": _provider_lrclib,
+     "probe": "https://lrclib.net/api/get?artist_name=Coldplay&track_name=Yellow"},
+    {"name": "lyrics.ovh", "fn": _provider_lyrics_ovh,
+     "probe": "https://api.lyrics.ovh/v1/Coldplay/Yellow"},
+]
+_lyrics_order = list(range(len(_LYRICS_PROVIDERS)))   # provider indices, primary first
+_last_probe_ts = 0.0
+_probe_in_flight = False
+
+
+async def probe_lyrics_providers() -> None:
+    """Measure each provider's response latency and rank them fastest-first, so
+    the faster source is tried first.  A provider that errors/times out sorts
+    LAST (used only as a fallback).  Called at startup and lazily re-run every
+    ``_PROBE_INTERVAL_S`` — provider health drifts (LRCLib was fast, then 5–13 s
+    within a day)."""
+    global _lyrics_order, _last_probe_ts, _probe_in_flight
+    _probe_in_flight = True
+    _last_probe_ts = time.monotonic()
+    client = _get_lrclib_client()
+    log = logging.getLogger(__name__)
+
+    async def _latency(url: str) -> float:
+        t = time.monotonic()
+        try:
+            await client.get(url, timeout=_PROBE_TIMEOUT_S)
+            return time.monotonic() - t          # any HTTP response = "up"
+        except Exception:
+            return float("inf")                  # down → sort last
+
+    try:
+        lats = await asyncio.gather(*(_latency(p["probe"]) for p in _LYRICS_PROVIDERS))
+        _lyrics_order = sorted(range(len(_LYRICS_PROVIDERS)), key=lambda i: lats[i])
+        log.info(
+            "Lyrics providers ranked by responsiveness: %s",
+            ", ".join(
+                f"{_LYRICS_PROVIDERS[i]['name']}="
+                + ("down" if lats[i] == float("inf") else f"{lats[i]:.2f}s")
+                for i in _lyrics_order
+            ),
+        )
+    except Exception:
+        log.debug("lyrics provider probe failed", exc_info=True)
+    finally:
+        _probe_in_flight = False
+
+
+async def _resolve_online_lyrics(artist, title, album, duration):
+    """Try the online providers fastest-first; return the first confident hit.
+    Kicks a non-blocking background re-probe when the ranking is stale."""
+    if not _probe_in_flight and (time.monotonic() - _last_probe_ts) > _PROBE_INTERVAL_S:
+        asyncio.create_task(probe_lyrics_providers())
+    client = _get_lrclib_client()
+    log = logging.getLogger(__name__)
+    for i in list(_lyrics_order):
+        prov = _LYRICS_PROVIDERS[i]
+        try:
+            hit = await prov["fn"](client, artist, title, album, duration)
+            if hit:
+                return hit
+        except Exception:
+            log.debug("lyrics provider %s failed", prov["name"], exc_info=True)
+    return None
+
+
 @router.get("/{track_id}/lyrics")
 async def get_lyrics(track_id: str):
-    """Return lyrics for a track: embedded tags first, LRCLib fallback."""
+    """Return lyrics: embedded tags first, then the online providers
+    (LRCLib + lyrics.ovh) tried fastest-first (see ``probe_lyrics_providers``)."""
+    # 0. Serve a previously-resolved result instantly (and independently of
+    # LRCLib's current health) — see ``_lyrics_cache``.
+    cached = _lyrics_cache.get(track_id)
+    if cached is not None:
+        return cached
+
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
@@ -731,34 +1085,21 @@ async def get_lyrics(track_id: str):
         # Detect LRC synced format: lines starting with [mm:ss.xx]
         import re
         is_synced = bool(re.search(r'^\[\d{1,2}:\d{2}[.\:]\d{2,3}\]', embedded, re.MULTILINE))
-        return {"lyrics": embedded, "synced": is_synced, "source": "Embedded tags"}
+        return _remember_lyrics(track_id, {"lyrics": embedded, "synced": is_synced, "source": "Embedded tags"})
 
-    # 2. Fallback: LRCLib (free, no API key)
+    # 2. Online fallback chain — LRCLib + lyrics.ovh, tried fastest-first.  Each
+    # provider applies the same confidence gate, so the ranking only affects
+    # latency (and, when the faster source is lyrics.ovh, plain-vs-synced).
     artist = track.artist or track.album_artist or ""
     title  = track.title or ""
     album  = track.album or ""
     if not (artist and title):
         return {"lyrics": None, "source": None}
 
-    try:
-        params = {"artist_name": artist, "track_name": title}
-        if album:
-            params["album_name"] = album
-        if track.duration:
-            params["duration"] = str(int(track.duration))
-
-        client = _get_lrclib_client()
-        resp = await client.get("https://lrclib.net/api/get", params=params)
-        if resp.status_code == 200:
-            data = resp.json()
-            synced = data.get("syncedLyrics") or ""
-            plain  = data.get("plainLyrics") or ""
-            if synced.strip():
-                return {"lyrics": synced.strip(), "synced": True, "source": "LRCLib.net"}
-            if plain.strip():
-                return {"lyrics": plain.strip(), "synced": False, "source": "LRCLib.net"}
-    except Exception:
-        pass
+    online = await _resolve_online_lyrics(artist, title, album, track.duration)
+    if online:
+        await _maybe_writeback_lyrics(track, online["lyrics"])
+        return _remember_lyrics(track_id, online)
 
     return {"lyrics": None, "synced": False, "source": None}
 
@@ -1332,7 +1673,7 @@ async def get_track_waveform(track_id: str, response: Response):
 # ── Ratings ──────────────────────────────────────────────────────────────────
 
 @router.put("/{track_id}/rating")
-async def update_rating(track_id: str, body: dict):
+async def update_rating(track_id: str, body: dict, _user=_Depends(_require_edit)):
     """Set or remove a track rating (0-5). Pass {"rating": 0} to remove."""
     rating = body.get("rating", 0)
     if not isinstance(rating, int) or rating < 0 or rating > 5:

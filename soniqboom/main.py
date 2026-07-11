@@ -200,8 +200,6 @@ async def require_auth_on_api(request: Request, call_next):
             "/api/auth/register",
             "/api/auth/me",
             "/api/auth/logout",          # idempotent on a missing session
-            "/api/admin/auth",           # legacy OS auth handshake
-            "/api/admin/auth/status",
             "/api/docs",
             "/api/openapi.json",
         }
@@ -236,17 +234,6 @@ async def require_auth_on_api(request: Request, call_next):
     cookie = request.cookies.get("sb_session")
     if cookie and store.lookup_session(cookie):
         return await call_next(request)
-    # Legacy admin token still honoured for back-compat with single-tenant
-    # installs that use SONIQBOOM_ADMIN_TOKEN.
-    admin_tok = request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token")
-    if admin_tok:
-        try:
-            from soniqboom.api import admin as _admin_mod
-            if (admin_tok == _admin_mod._static_admin_token
-                or admin_tok in _admin_mod._tokens):
-                return await call_next(request)
-        except Exception:
-            pass
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": "Sign in to access this endpoint."}, status_code=401)
 
@@ -748,6 +735,11 @@ async def startup():
 
     data_dir = get_data_dir()
     _setup_logging(data_dir)
+    # Attach the access-log filter + set default verbosity dials so ordinary
+    # traffic (expected fallback-404s etc.) doesn't read as faults.  The
+    # persisted values are re-applied once the store's config is loaded below.
+    from soniqboom.core import log_control
+    log_control.install()
     log.info("SoniqBoom %s starting on %s:%s", __version__, settings.host, settings.port)
     _install_sighup_handler()
 
@@ -771,6 +763,15 @@ async def startup():
     _ss_phase("loading_library", "Loading library snapshot")
     from soniqboom.core.persistence import init_persistence
     init_persistence(data_dir)
+
+    # Now that config is loaded, apply the persisted log-verbosity dials
+    # (app level + access-log mode).  See core/log_control.py.
+    try:
+        from soniqboom.core.store import get_store
+        applied = log_control.apply_from_config(get_store().get_config)
+        log.info("Log verbosity: app=%s access=%s", applied["log_level"], applied["access_log"])
+    except Exception:
+        log.debug("log verbosity apply-from-config failed", exc_info=True)
 
     # Reclaim on-disk zip-extracts / AdLib .adlib companion dirs whose track is
     # no longer in the store (dir-aware).  Fire-and-forget — it walks the extract
@@ -1146,7 +1147,12 @@ async def startup():
     except Exception as exc:
         log.warning("Soundfont .partial reap failed: %s", exc)
 
-    log.info("SoniqBoom ready — %d tracks loaded", get_store().track_count())
+    # Library milestone — persistence has loaded and indexes are rebuilt, but
+    # the optional services (network shares, DLNA, stations, watchdog) haven't
+    # started yet; the authoritative "ready" line with the bind address + full
+    # module health is logged at the very end of startup (see mark_ready).
+    # NOTE: run.sh greps this line's "<n> tracks loaded" for its banner count.
+    log.info("Library loaded — %d tracks loaded", get_store().track_count())
 
     _ss_phase("network_shares", "Connecting network shares")
     await _init_network_shares()
@@ -1181,6 +1187,13 @@ async def startup():
     from soniqboom.core import ssrf_proxy as _ssrf_proxy
     await _ssrf_proxy.start()
 
+    # Rank the online lyrics providers (LRCLib, lyrics.ovh) by responsiveness so
+    # the faster one is tried first.  Background + best-effort — never blocks
+    # startup, and the lyrics endpoint falls back to the default order until it
+    # completes (it re-probes lazily thereafter).
+    from soniqboom.api.tracks import probe_lyrics_providers as _probe_lyrics
+    asyncio.create_task(_probe_lyrics())
+
     # Arm the deadlock watchdog last — once everything else has loaded,
     # so a slow startup step (e.g. HVSC reindex) doesn't trip the
     # watchdog while it isn't even servicing requests yet.
@@ -1200,8 +1213,43 @@ async def startup():
     # title from "starting…" to running and any status-file pollers can
     # stop spinning.  Message includes the track count so the final
     # stderr line answers "what was loaded?" at a glance.
-    from soniqboom.core.startup_status import mark_ready as _ss_mark_ready
+    from soniqboom.core.startup_status import mark_ready as _ss_mark_ready, get_status as _ss_status
     _ss_mark_ready(f"{get_store().track_count():,} tracks at http://{settings.host}:{settings.port}")
+
+    # Consolidated startup-health line — one greppable record carrying the bind
+    # address and the up/down state of every optional service, so an operator
+    # (or a log-scraping monitor) can confirm what actually came up without
+    # piecing it together from the phase-by-phase lines above.
+    from soniqboom.config import SERVICE_NAMES as _SVC_NAMES
+    _svc: list[str] = []
+    for _n in _SVC_NAMES:
+        if not _svc_on(_n):
+            _svc.append(f"{_n}=off")
+        elif _n == "dlna_server":
+            # Enabled but the SSDP socket may have failed to bind — report the
+            # real state, not just the toggle.
+            try:
+                from soniqboom.core.dlna_server import get_instance as _dlna_inst
+                _bound = _dlna_inst() is not None
+            except Exception:
+                _bound = False
+            _svc.append(f"{_n}=" + ("announcing" if _bound else "on(not-bound)"))
+        else:
+            _svc.append(f"{_n}=on")
+    try:
+        from soniqboom.core import index_health as _ih
+        _idx = "ok" if _ih.snapshot().get("index_ok", True) else "DRIFT"
+    except Exception:
+        _idx = "unknown"
+    try:
+        _startup_s = _ss_status().get("elapsed_ms", 0) / 1000.0
+    except Exception:
+        _startup_s = 0.0
+    log.info(
+        "SoniqBoom ready — listening on %s:%s · library=%s tracks index=%s · services: %s · startup %.1fs",
+        settings.host, settings.port, f"{get_store().track_count():,}", _idx,
+        "  ".join(_svc), _startup_s,
+    )
 
 
 
@@ -1467,16 +1515,31 @@ async def shutdown():
     global _aof_writer, _merger_proc
     t_total = time.monotonic()
 
-    async def _step(name: str, coro, timeout: float) -> None:
+    # Per-step health, collected for the single consolidated "stopped" line at
+    # the end so an operator (or a log-scraping monitor) can see at a glance
+    # which subsystems shut down cleanly.  ``_step`` records "ok"/"TIMEOUT"/
+    # "FAIL"; conditional steps (snapshot skip) record their own state, and a
+    # step that never ran (no AOF writer, no remote sources) simply isn't in
+    # the map — an honest picture of what was actually torn down.
+    _results: dict[str, str] = {}
+
+    async def _step(name: str, coro, timeout: float) -> bool:
+        """Run one bounded shutdown step; return True iff it completed cleanly."""
         t = time.monotonic()
         try:
             await asyncio.wait_for(coro, timeout=timeout)
             log.info("Shutdown step %s: %dms", name, (time.monotonic() - t) * 1000)
+            _results[name] = "ok"
+            return True
         except asyncio.TimeoutError:
             log.warning("Shutdown step %s timed out after %.1fs — continuing",
                         name, timeout)
+            _results[name] = "TIMEOUT"
+            return False
         except Exception:
             log.exception("Shutdown step %s failed", name)
+            _results[name] = "FAIL"
+            return False
 
     # ── Step 0: Cancel the share-health monitor early ─────────────────────
     # The monitor sleeps up to 5 min between probes; cancelling it first
@@ -1592,21 +1655,47 @@ async def shutdown():
     # Cancel the periodic flush task ON the loop first (Task.cancel is
     # loop-bound), then do the blocking flush_sync + fd close off the loop
     # so a contended flock can't freeze the async runtime.
+    aof_ok = False
     if _aof_writer:
         _aof_writer.cancel_flush_task()
-        await _step("aof-flush",
-                    asyncio.to_thread(_aof_writer.stop),
-                    timeout=2.0)
+        aof_ok = await _step("aof-flush",
+                             asyncio.to_thread(_aof_writer.stop),
+                             timeout=2.0)
 
-    # ── Step 3: Snapshot (10 s budget — large libraries justify this) ─────
-    # 100 k tracks → ~50 MB JSON; on a slow disk that's still well under
-    # 10 s.  On miss we still have the AOF, which is replayed on next
-    # startup, so the snapshot being stale by one shutdown is recoverable.
+    # ── Step 3: Snapshot — CONDITIONAL (10 s budget) ──────────────────────
+    # The full snapshot (``library.json`` — O(library), hundreds of MB on a
+    # six-figure library) is only an OPTIMISATION for a fast next boot: boot
+    # loads it and replays the AOF, so ``library.json`` + AOF already
+    # reconstruct the full state.  (The ``os.execv`` restart path relies on
+    # exactly this and skips the snapshot entirely.)
+    #
+    # So skip the expensive write when it's redundant — the AOF flushed
+    # cleanly AND is lean, which the background merger keeps it (folds it into
+    # ``library.json`` every ``merger_interval``).  That frees the port sooner
+    # on a restart.  Fall back to a full snapshot only when the AOF flush was
+    # incomplete (durability safety net) or the AOF is large (a big batch like
+    # a Demozoo apply — snapshotting now beats a long replay next boot).
     async def _write_snap() -> None:
         from soniqboom.core.persistence import write_snapshot_sync
         await asyncio.to_thread(write_snapshot_sync, get_data_dir())
 
-    await _step("snapshot", _write_snap(), timeout=10.0)
+    try:
+        _max_aof_mb = max(0.0, float(os.environ.get("SONIQBOOM_SHUTDOWN_SNAPSHOT_MAX_AOF_MB", "32")))
+    except ValueError:
+        _max_aof_mb = 32.0
+    try:
+        _aof_bytes = (get_data_dir() / "library.aof").stat().st_size
+    except OSError:
+        _aof_bytes = 0
+    if aof_ok and _aof_bytes <= _max_aof_mb * 1024 * 1024:
+        log.info("Shutdown step snapshot: SKIPPED — AOF flushed cleanly and lean "
+                 "(%.2f MB ≤ %.0f MB); next boot replays it, so the full snapshot "
+                 "write is unnecessary.", _aof_bytes / 1e6, _max_aof_mb)
+        _results["snapshot"] = "skipped"
+    else:
+        reason = "AOF flush incomplete" if not aof_ok else f"AOF is large ({_aof_bytes / 1e6:.1f} MB)"
+        log.info("Shutdown: writing the full snapshot (%s).", reason)
+        await _step("snapshot", _write_snap(), timeout=10.0)
 
     # ── Step 4: Merger (3 s budget — interruptible since merger.py fix) ───
     async def _stop_merger() -> None:
@@ -1642,7 +1731,17 @@ async def shutdown():
             timeout=1.0,
         )
 
-    log.info("Shutdown complete in %.0fms", (time.monotonic() - t_total) * 1000)
+    # One consolidated "stopped" line: the address we were bound to plus the
+    # per-subsystem shutdown health, so an operator can confirm a clean stop
+    # (and diagnose a dirty one) from a single grep.  ``shutdown.sh`` also
+    # tails for the word "stopped" to echo the final state to the terminal.
+    _clean = sum(1 for v in _results.values() if v in ("ok", "skipped"))
+    _detail = " ".join(f"{k}={v}" for k, v in _results.items()) or "nothing to stop"
+    log.info(
+        "SoniqBoom stopped — was listening on %s:%s · modules %d/%d clean [%s] · shutdown %.0fms",
+        settings.host, settings.port, _clean, len(_results), _detail,
+        (time.monotonic() - t_total) * 1000,
+    )
 
 
 # ── Frontend static files ─────────────────────────────────────────────────────
@@ -1758,18 +1857,56 @@ else:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _check_port(host: str, port: int) -> None:
-    """Raise SystemExit if the port is already in use."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-        except OSError:
+    """Ensure ``port`` is bindable, WAITING for a departing instance to free it.
+
+    A restart launches the new instance while the OLD one may still be flushing
+    a large library's AOF + snapshot and hasn't released its listen socket yet
+    — very visible on big volumes.  The app-bundle restart in particular runs
+    both processes briefly side by side.  Failing immediately turned that
+    slow-but-normal shutdown into "port already in use" and aborted the restart.
+
+    So instead of exiting on first contact, poll until the socket is actually
+    free, up to ``SONIQBOOM_PORT_WAIT_S`` seconds (default 60).  The
+    ``SO_REUSEADDR`` probe succeeds the moment the old process closes its LISTEN
+    socket (even while it lingers in TIME_WAIT), so the wait ends as soon as the
+    departing server is genuinely down — not a fixed sleep that a big flush
+    outlasts.  A port held by an *unrelated* process still fails, after the
+    timeout, with the same actionable error.
+    """
+    try:
+        wait_s = max(0.0, float(os.environ.get("SONIQBOOM_PORT_WAIT_S", "60")))
+    except ValueError:
+        wait_s = 60.0
+    deadline = time.monotonic() + wait_s
+    announced = False
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, port))
+                if announced:
+                    print(f"Port {port} is free — continuing startup.", file=sys.stderr)
+                return                                  # free — go
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
             print(
-                f"ERROR: port {port} is already in use on {host}.\n"
-                f"Use --port <number> to choose a different port.",
+                f"ERROR: port {port} is still in use on {host} after {int(wait_s)}s "
+                f"— another process is holding it.\n"
+                f"Use --port <number> to choose a different port, or set "
+                f"SONIQBOOM_PORT_WAIT_S to wait longer for a slow shutdown.",
                 file=sys.stderr,
             )
             sys.exit(1)
+        if not announced:
+            print(
+                f"Port {port} is in use — a previous instance may still be shutting "
+                f"down (flushing a large library).  Waiting up to {int(wait_s)}s for "
+                f"it to release the port…",
+                file=sys.stderr,
+            )
+            announced = True
+        time.sleep(0.25)
 
 
 def _get_local_ips() -> list[str]:

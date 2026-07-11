@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=88">
+  <link rel="stylesheet" href="/assets/css/app.css?v=89">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -497,21 +497,6 @@
   <!-- ── Admin overlay ──────────────────────────────────────────────────── -->
   <div id="admin-overlay" class="hidden">
 
-    <!-- Auth dialog -->
-    <div class="admin-dialog" id="admin-auth-dialog">
-      <h2>&#128274; Admin Access</h2>
-      <p class="dialog-sub">Enter your system login credentials to continue.</p>
-      <label for="admin-username">Username</label>
-      <input id="admin-username" type="text" autocomplete="username" placeholder="your-username">
-      <label for="admin-password">Password</label>
-      <input id="admin-password" type="password" autocomplete="current-password" placeholder="••••••••">
-      <div id="admin-auth-error" class="dialog-error"></div>
-      <div class="dialog-actions">
-        <button class="btn-secondary" id="btn-admin-cancel">Cancel</button>
-        <button class="btn-primary"   id="btn-admin-login">Unlock</button>
-      </div>
-    </div>
-
     <!-- Alias dialog (styled in-app prompt) -->
     <div class="admin-dialog hidden" id="admin-alias-dialog">
       <h2>&#128193; Folder Alias</h2>
@@ -552,6 +537,8 @@
                 role="tab" aria-controls="tab-backup" aria-selected="false">&#128190; Backup</button>
         <button class="admin-tab" data-tab="tab-system"
                 role="tab" aria-controls="tab-system" aria-selected="false">&#9881;&#65039; System</button>
+        <button class="admin-tab" data-tab="tab-metadata"
+                role="tab" aria-controls="tab-metadata" aria-selected="false">&#127760; Metadata</button>
         <button class="admin-tab admin-tab-admin-only" data-tab="tab-users"
                 role="tab" aria-controls="tab-users" aria-selected="false" hidden>&#128100; Users</button>
         <button class="admin-tab" data-tab="tab-log"
@@ -1026,26 +1013,6 @@
             <div id="admin-rpaths-msg" class="admin-msg" style="display:none"></div>
           </div>
 
-          <!-- Scene metadata (Modland MD5 index) -->
-          <div class="admin-section">
-            <h3>&#127760; Scene metadata (Modland)</h3>
-            <p class="admin-hint" style="margin-bottom:12px">
-              Match your modules against Modland's nightly MD5 index to fill
-              in scene authorship and provenance (the "Scene origin" row in
-              track info).  Exact checksum matches only — nothing is guessed.
-              Tracks indexed before v1.4.0 need a rescan to get checksums.
-            </p>
-            <div id="scene-status-line" class="admin-hint" style="margin-bottom:8px"
-                 role="status" aria-live="polite">Index: &mdash;</div>
-            <div class="admin-io-row">
-              <button id="btn-scene-refresh" class="btn-secondary">
-                Download / refresh index (~21&nbsp;MB)
-              </button>
-              <button id="btn-scene-apply">Apply to library</button>
-            </div>
-            <div id="admin-scene-msg" class="admin-msg" style="display:none"></div>
-          </div>
-
           <!-- Soundfonts -->
           <div class="admin-section">
             <h3>&#127928; Soundfonts</h3>
@@ -1076,6 +1043,17 @@
               <input id="admin-import-file" type="file" accept=".sbz" style="display:none">
             </div>
             <div id="admin-io-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Last known-good snapshot (library.json.prev) -->
+          <div class="admin-section">
+            <h3>&#128737; Last known-good snapshot</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 8px">
+              An automatic copy of the library index, refreshed whenever the server
+              starts and the index loads cleanly — a restore point if the live index is
+              ever damaged. To restore it by hand, see the deployment guide.
+            </p>
+            <div id="backup-snapshot-status" style="font-size:13px;color:var(--text2)">Loading…</div>
           </div>
 
         </div>
@@ -1115,6 +1093,7 @@
               <button id="btn-clear-agg-cache">Clear Aggregation Cache</button>
               <button id="btn-clear-remote-cache">Clear Remote Cache</button>
               <button id="btn-clear-zip-extract">Clear ZIP Extract Cache</button>
+              <button id="btn-clear-lyrics-cache">Clear Lyrics Cache <span id="lyrics-cache-count" class="admin-count"></span></button>
             </div>
             <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
               Transcode &amp; SID/MIDI/tracker render cache lives under
@@ -1183,14 +1162,36 @@
                 <input id="setting-remote-cache-mb" type="number" min="100" max="50000" step="100" value="2048">
               </div>
               <div class="admin-setting">
-                <label>Skip Authentication <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Open admin panel without OS credentials">&#9432;</span></label>
-                <input id="setting-skip-auth" type="checkbox">
-              </div>
-              <div class="admin-setting">
                 <label for="setting-theme">Theme <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Dark is the default. Light flips surfaces to a near-white palette.">&#9432;</span></label>
                 <select id="setting-theme">
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- ── Logging verbosity (applied live, persisted) ── -->
+            <h3 style="margin:28px 0 4px">&#128220; Logging</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              How much the server logs. Applies immediately &mdash; no restart. The
+              HTTP access log records one line per request; a <code>404</code> there is
+              usually a placeholder for a track without cover art, <em>not</em> an error.
+            </p>
+            <div class="admin-settings-grid">
+              <div class="admin-setting">
+                <label for="setting-log-level">Application log <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="What the app itself logs. Errors & warnings = failures plus actionable warnings like a share going offline (quietest). Normal = + lifecycle milestones (default). Verbose = full per-request / per-track detail for troubleshooting.">&#9432;</span></label>
+                <select id="setting-log-level">
+                  <option value="errors">Errors &amp; warnings</option>
+                  <option value="normal">Normal</option>
+                  <option value="verbose">Verbose</option>
+                </select>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-access-log">HTTP access log <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="One line per HTTP request. Off = none. Problems only = just 4xx/5xx, and it hides the expected cover-art 404s (default). All requests = everything (noisy).">&#9432;</span></label>
+                <select id="setting-access-log">
+                  <option value="off">Off</option>
+                  <option value="problems">Problems only</option>
+                  <option value="all">All requests</option>
                 </select>
               </div>
             </div>
@@ -1443,6 +1444,84 @@
               <button id="btn-refresh-logs">Refresh</button>
             </div>
             <pre id="admin-log-viewer" class="admin-log-viewer">Click Refresh or switch to this tab to load logs...</pre>
+          </div>
+        </div>
+
+        <!-- Tab: Metadata & Enrichment -->
+        <div class="admin-tab-pane" id="tab-metadata">
+          <div class="admin-section">
+            <h3>&#127760; Metadata &amp; Enrichment</h3>
+            <p class="admin-hint" style="margin-bottom:14px">
+              Align your library with the canonical retro-music databases. Every
+              match is exact or confidence-gated &mdash; nothing is guessed, and
+              existing tags are never overwritten.
+            </p>
+          </div>
+
+          <!-- Lyrics -->
+          <div class="admin-section">
+            <h3>&#127925; Lyrics</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              Lyrics are fetched online (LRCLib, with a fallback source) when a
+              track has none embedded, and shown in the track's Lyrics tab.
+            </p>
+            <div class="admin-setting">
+              <label>Save fetched lyrics to files <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When lyrics are found online for a local track that has none embedded, write them into the file's tags so they travel with the file. Files that already contain lyrics are never modified. Local files only. Off by default — it modifies your files.">&#9432;</span></label>
+              <input id="setting-lyrics-writeback" type="checkbox">
+            </div>
+            <div id="md-lyrics-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- HVSC (SID song-lengths + STIL) -->
+          <div class="admin-section">
+            <h3>&#127925; HVSC (SID)</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              High Voltage SID Collection song-lengths &amp; STIL notes for your SID tunes.
+              (The HVSC documents path is set under Renderers.)
+            </p>
+            <div id="md-hvsc-status" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Status: &mdash;</div>
+            <div class="admin-io-row">
+              <button id="md-hvsc-rescan" class="btn-secondary">Rescan SID lengths</button>
+            </div>
+            <div id="md-hvsc-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Scene origin (Modland) — re-homed from Renderers -->
+          <div class="admin-section">
+            <h3>&#127760; Scene origin (Modland)</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Match your modules against Modland's nightly MD5 index to fill in
+              scene authorship &amp; provenance (the "Scene origin" row in track
+              info). Exact checksum matches only. Tracks indexed before v1.4.0
+              need a rescan to get checksums.
+            </p>
+            <div id="scene-status-line" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Index: &mdash;</div>
+            <div class="admin-io-row">
+              <button id="btn-scene-refresh" class="btn-secondary">Download / refresh index (~21&nbsp;MB)</button>
+              <button id="btn-scene-apply">Apply to library</button>
+            </div>
+            <div id="admin-scene-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Scene groups (Demozoo) -->
+          <div class="admin-section">
+            <h3>&#127760; Scene groups (Demozoo)</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Match each retro composer against Demozoo's demoscene database to
+              tag the scene <em>group(s)</em> they belonged to (e.g. Fairlight
+              &bull; Maniacs of Noise). Used to surface music by the same
+              collective, and shown in track info. Matches the composer's name
+              and scene handle; ambiguous names are skipped, never guessed.
+            </p>
+            <div id="md-demozoo-status" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Index: &mdash;</div>
+            <div class="admin-io-row">
+              <button id="md-demozoo-refresh" class="btn-secondary">Download / refresh index (~192&nbsp;MB)</button>
+              <button id="md-demozoo-apply">Apply to library</button>
+            </div>
+            <div id="md-demozoo-msg" class="admin-msg" style="display:none"></div>
           </div>
         </div>
 
@@ -2141,7 +2220,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=122"></script>
+  <script type="module" src="/assets/js/app.js?v=123"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 S.F. Cyris
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Admin API — OS password auth, folder management, reindex, stats, export/import, soundfonts."""
+"""Admin API — admin-session auth, folder management, reindex, stats, export/import, soundfonts."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import aiofiles
 import httpx
-from fastapi import APIRouter, Cookie, Depends, File, HTTPException, Header, UploadFile
+from fastapi import APIRouter, Cookie, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from soniqboom.config import settings, get_data_dir
@@ -60,172 +60,46 @@ def _spawn_scan_task(coro, label: str) -> asyncio.Task:
     return task
 
 
-# ── Token store ───────────────────────────────────────────────────────────────
-# Maps token → expiry (Unix timestamp). Kept in-memory; lost on restart.
-_tokens: dict[str, float] = {}
-_TOKEN_TTL = 3600  # 1 hour
-
-
-def _issue_token() -> str:
-    tok = secrets.token_hex(32)
-    _tokens[tok] = time.time() + _TOKEN_TTL
-    return tok
-
-
 log = logging.getLogger(__name__)
 
-# Auth policy:
-#   * macOS with `dscl`     → OS-credential flow via /auth
-#   * SONIQBOOM_ADMIN_TOKEN → static token; clients send it as X-Admin-Token
-#   * neither                → open admin (warn loudly; toggleable via /auth/skip)
-_HAS_OS_AUTH = sys.platform == "darwin" and shutil.which("dscl") is not None
-_static_admin_token: str | None = os.environ.get("SONIQBOOM_ADMIN_TOKEN") or None
-_auth_disabled = not (_HAS_OS_AUTH or _static_admin_token)
-
-if _static_admin_token:
-    log.info("Admin auth: static token from SONIQBOOM_ADMIN_TOKEN")
-elif not _HAS_OS_AUTH:
-    log.warning(
-        "Admin auth is DISABLED — set SONIQBOOM_ADMIN_TOKEN, run on macOS "
-        "with `dscl`, or bind to 127.0.0.1 only.  Any client that can reach "
-        "this host can drive the admin endpoints."
-    )
+# ── Admin authentication ──────────────────────────────────────────────────────
+# Admin access requires a signed-in user with role 'admin' (session cookie
+# ``sb_session``).  That is the ONLY path.  The legacy OS-credential (dscl)
+# login, the static ``SONIQBOOM_ADMIN_TOKEN``, the in-memory token store, and
+# the ``/auth/skip`` toggle were all removed — user accounts (bootstrapped by
+# ``soniqboom-setadm``) fully supersede them, and a standing non-session
+# credential is a needless liability.
 
 
-def _require_token(
-    x_admin_token: str = Header(default=None),
-    sb_session:    str = Cookie(default=None),
-) -> str:
-    """Accept any of:
+def _require_token(sb_session: str = Cookie(default=None)) -> str:
+    """Authorise an admin request — requires a signed-in user with
+    ``role == 'admin'`` (session cookie ``sb_session``).
 
-    1. A signed-in user with ``role == 'admin'`` (cookie ``sb_session``).
-       This is the modern path used by the multi-user UI.
-    2. The legacy in-memory admin token (``X-Admin-Token`` header issued
-       by ``POST /admin/auth``).  Kept for backward compatibility with
-       single-user installs that haven't created any user accounts yet.
-    3. The static ``SONIQBOOM_ADMIN_TOKEN`` env var.
-    4. If no auth is configured at all *and* no user has been created
-       yet, ``_auth_disabled`` is True and the request is let through.
-       Once any user exists, this fallback is closed.
+    Pre-bootstrap exception: before the FIRST user exists, a fresh install is
+    still being set up (the operator runs ``soniqboom-setadm`` to create the
+    first admin), so requests are allowed through — matching the
+    ``require_user`` middleware's pre-bootstrap allowance.  The instant the
+    first user exists this closes and only an admin session is accepted.
     """
-    # ── Cookie-based user session ────────────────────────────────────────
-    # Imported lazily — admin.py is loaded before users.py runs in some
-    # boot orders, and ``init_user_store`` has to have run first.
+    # Imported lazily — admin.py is loaded before users.py runs in some boot
+    # orders, and ``init_user_store`` has to have run first.
     try:
         from soniqboom.core.users import get_user_store
         store = get_user_store()
-        if sb_session:
-            user = store.lookup_session(sb_session)
-            if user and user.role == "admin":
-                return f"user:{user.id}"
-        # If any user exists, the legacy token / auth-skip paths are
-        # closed.  This is what flips a single-tenant install into
-        # multi-tenant the moment the first admin is created.
-        if store.has_any():
-            raise HTTPException(401, "Sign in as an admin user.")
-    except HTTPException:
-        raise
     except Exception:
-        # User store not initialised yet (very early boot) — fall through
-        # to the legacy paths so the app stays operable.
-        pass
-
-    if _auth_disabled:
-        return "__skip__"
-    if not x_admin_token:
-        raise HTTPException(401, "Missing X-Admin-Token header")
-    if _static_admin_token and secrets.compare_digest(
-        x_admin_token, _static_admin_token,
-    ):
-        return x_admin_token
-    exp = _tokens.get(x_admin_token)
-    if exp is None or time.time() > exp:
-        _tokens.pop(x_admin_token, None)
-        raise HTTPException(401, "Invalid or expired admin token")
-    return x_admin_token
-
-
-# ── OS password verification ─────────────────────────────────────────────────
-
-async def _verify_password(username: str, password: str) -> bool:
-    """Verify an OS user's password.
-
-    macOS:  uses ``dscl . -authonly``
-    Other:  always returns False (auth auto-disabled at startup)
-    """
-    if not _HAS_OS_AUTH:
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "dscl", ".", "-authonly", username, password,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        return proc.returncode == 0
-    except Exception:
-        return False
+        # User store not initialised yet (very early boot) — allow, so the app
+        # stays operable; the middleware applies the same early-boot grace.
+        return "__bootstrap__"
+    if sb_session:
+        user = store.lookup_session(sb_session)
+        if user and user.role == "admin":
+            return f"user:{user.id}"
+    if store.has_any():
+        raise HTTPException(401, "Sign in as an admin user.")
+    return "__bootstrap__"       # no users yet — first-run setup (setadm)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.post("/auth")
-async def admin_auth(body: dict):
-    """Authenticate with OS credentials (macOS: dscl).
-
-    Body: { "username": "...", "password": "..." }
-    Returns: { "token": "...", "expires_in": 3600 }
-    """
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
-    if not username or not password:
-        raise HTTPException(400, "username and password are required")
-
-    ok = await _verify_password(username, password)
-    if not ok:
-        raise HTTPException(401, "Authentication failed")
-
-    token = _issue_token()
-    return {"token": token, "expires_in": _TOKEN_TTL}
-
-
-@router.get("/auth/status")
-async def admin_auth_status():
-    """Check whether authentication is currently required."""
-    return {"auth_disabled": _auth_disabled, "has_os_auth": _HAS_OS_AUTH}
-
-
-@router.post("/auth/skip")
-async def admin_auth_skip(
-    body: dict,
-    _tok: str = Depends(_require_token),
-):
-    """Enable or disable admin authentication.  Requires existing auth
-    to flip — pre-this-fix, anyone reachable could flip it open and
-    self-grant admin (P0 from pen-test).
-
-    Body: { "disabled": true }   — skip auth (open admin without credentials)
-    Body: { "disabled": false }  — require OS credentials again
-    """
-    global _auth_disabled
-    # Refuse to skip auth once a user store has been bootstrapped — at that
-    # point users / sessions are the source of truth and the skip flag
-    # would re-introduce an anonymous admin path.
-    try:
-        from soniqboom.core.users import get_user_store
-        if get_user_store().has_any() and bool(body.get("disabled", False)):
-            raise HTTPException(
-                400,
-                "Cannot disable auth once users are configured — "
-                "sign in as an admin instead.",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass
-    _auth_disabled = bool(body.get("disabled", False))
-    return {"auth_disabled": _auth_disabled}
-
 
 @router.get("/stats")
 async def admin_stats(_tok: str = Depends(_require_token)):
@@ -280,6 +154,33 @@ async def admin_scene_apply(_tok: str = Depends(_require_token)):
     join runs in an executor; the store WRITE stays on the loop thread."""
     from soniqboom.core import scene_metadata
     return await scene_metadata.apply_to_library()
+
+
+@router.get("/demozoo/status")
+async def admin_demozoo_status(_tok: str = Depends(_require_token)):
+    """Demozoo scene-group enrichment state (index name→group rows, last apply)."""
+    from soniqboom.core import demozoo
+    return demozoo.status()
+
+
+@router.post("/demozoo/refresh-index")
+async def admin_demozoo_refresh(_tok: str = Depends(_require_token)):
+    """Download Demozoo's nightly SQL dump (~192 MB) and rebuild the local
+    name→scene-group sqlite index (unambiguous matches only).  Runs in an
+    executor; returns the new status."""
+    import asyncio as _asyncio
+    from soniqboom.core import demozoo
+    return await _asyncio.get_running_loop().run_in_executor(
+        None, demozoo.refresh_index)
+
+
+@router.post("/demozoo/apply")
+async def admin_demozoo_apply(_tok: str = Depends(_require_token)):
+    """Match every retro track's composer (``artist``) against the Demozoo
+    index and fill in ``scene_group`` (real-name + handle, confidence-gated —
+    ambiguous names are skipped).  Join in an executor; store WRITE on the loop."""
+    from soniqboom.core import demozoo
+    return await demozoo.apply_to_library()
 
 
 @router.post("/verify-indexes")
@@ -796,6 +697,30 @@ async def admin_inflight(_tok: str = Depends(_require_token)):
         "inflight": deadlock_watchdog.get_inflight_snapshot(),
         "stuck_threshold_s": deadlock_watchdog.STUCK_THRESHOLD,
         "poll_interval_s": deadlock_watchdog.POLL_INTERVAL,
+    }
+
+
+@router.get("/backup/status")
+async def admin_backup_status(_tok: str = Depends(_require_token)):
+    """On-disk snapshot files under the data dir: the live index, the previous
+    write (``.bak``), and the **last known-good** copy (``.prev``, refreshed on
+    each clean startup — see ``persistence.make_prev_backup``).  Sizes + mtimes
+    only (no parse), so it's cheap enough to fetch when the Backup panel opens.
+    """
+    dd = get_data_dir()
+
+    def _info(name: str) -> dict:
+        p = dd / name
+        try:
+            st = p.stat()
+            return {"exists": True, "size": st.st_size, "mtime": int(st.st_mtime)}
+        except OSError:
+            return {"exists": False, "size": 0, "mtime": 0}
+
+    return {
+        "primary":    _info("library.json"),
+        "backup":     _info("library.json.bak"),
+        "known_good": _info("library.json.prev"),
     }
 
 
@@ -2182,22 +2107,39 @@ def _dir_size(path: Path) -> int:
         return -1
 
 
+# Short-TTL memo for the expensive dir-tree walks (see disk_usage).  Re-walking
+# the (up to ~170K-thumb) art cache on every poll cost ~1–2s; the Settings panel
+# polls this, so cache the three sizes for a minute.
+_disk_usage_memo: dict = {"sizes": None, "at": 0.0}
+_DISK_USAGE_TTL = 60.0
+
+
 @router.get("/disk-usage")
 async def disk_usage(_tok: str = Depends(_require_token)):
     """Return disk usage for data, art cache, soundfonts."""
     from soniqboom.config import get_art_cache_dir, get_soundfonts_dir, get_data_dir
     import asyncio
+    import time as _time
 
     art_dir = get_art_cache_dir()
     sf_dir = get_soundfonts_dir()
     data_dir = get_data_dir()
 
-    loop = asyncio.get_event_loop()
-    data_size, art_size, sf_size = await asyncio.gather(
-        loop.run_in_executor(None, _dir_size, data_dir),
-        loop.run_in_executor(None, _dir_size, art_dir),
-        loop.run_in_executor(None, _dir_size, sf_dir),
-    )
+    # The dir-tree walks are the only slow part; memoize just those for a short
+    # TTL.  The cheap live stats below (remote cache, track count) stay fresh.
+    now = _time.monotonic()
+    memo = _disk_usage_memo
+    if memo["sizes"] is not None and (now - memo["at"]) < _DISK_USAGE_TTL:
+        data_size, art_size, sf_size = memo["sizes"]
+    else:
+        loop = asyncio.get_event_loop()
+        data_size, art_size, sf_size = await asyncio.gather(
+            loop.run_in_executor(None, _dir_size, data_dir),
+            loop.run_in_executor(None, _dir_size, art_dir),
+            loop.run_in_executor(None, _dir_size, sf_dir),
+        )
+        memo["sizes"] = (data_size, art_size, sf_size)
+        memo["at"] = now
 
     # Remote cache stats (cheap — just sums the in-memory index)
     from soniqboom.core.remote_cache import get_cache
@@ -2264,6 +2206,13 @@ async def clear_art_cache(_tok: str = Depends(_require_token)):
             return
 
     _scan_and_unlink(str(art_dir))
+    # The on-disk pass above removed the positive thumbnails AND the ``.absent``
+    # sentinels, but the in-memory negative cache (``store._art_absent``) is a
+    # separate layer the serve path checks FIRST — so without this, a track
+    # marked absent earlier in this process keeps returning the placeholder
+    # after a "clear image cache" until the next restart.  Clear it too so every
+    # track is genuinely re-evaluated (embedded + folder art) on next request.
+    get_store().clear_art_absent()
     out: dict = {"cleared": count, "path": str(art_dir)}
     if errors:
         out["failed"] = len(errors)
@@ -2291,6 +2240,15 @@ async def clear_aggregation_cache(_tok: str = Depends(_require_token)):
     from soniqboom.api.library import invalidate_agg_cache
     invalidate_agg_cache()
     return {"cleared": True}
+
+
+@router.post("/cache/clear-lyrics")
+async def clear_lyrics_cache_ep(_tok: str = Depends(_require_token)):
+    """Empty the resolved-lyrics cache (Admin → System → Cache Management).
+    The next LYRICS open re-resolves online — use this if a track cached a
+    wrong or stale match."""
+    from soniqboom.api.tracks import clear_lyrics_cache
+    return {"cleared": clear_lyrics_cache()}
 
 
 @router.post("/cache/clear-remote")
@@ -2559,6 +2517,8 @@ async def get_settings(_tok: str = Depends(_require_token)):
     """Return current application settings (safe subset)."""
     from soniqboom.config import load_local_conf
     from soniqboom.core.data import get_config
+    from soniqboom.core import log_control
+    from soniqboom.api.tracks import lyrics_cache_size as _lyrics_cache_size
     conf = load_local_conf()
     return {
         "server": conf["server"],
@@ -2605,6 +2565,16 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # ship the historical default (cover.jpg, folder.jpg, front.jpg,
         # album.jpg + their .png/.jpeg variants, in that order).
         "folder_art_names": await get_config("folder_art_names", ""),
+        # When on, lyrics fetched online (LRCLib) for a LOCAL track that has no
+        # embedded lyrics are written back into the file's tags.  Files that
+        # already carry lyrics are never modified.  Off by default — it mutates
+        # the user's files.
+        "lyrics_writeback": await get_config("lyrics_writeback", False),
+        # In-memory resolved-lyrics cache size (Admin → System → Cache).
+        "lyrics_cache_size": _lyrics_cache_size(),
+        # Log verbosity dials (see core/log_control.py): app level +
+        # HTTP access-log mode, both applied live and persisted in config.
+        **log_control.current(),
         "remote_cache_max_mb": conf.get("remote_cache_max_mb", 2048),
         "conversion_cache_max_mb": int(conf.get("conversion_cache_max_bytes", 4 * 1024 ** 3) / (1024 ** 2)),
         # ZIP-extract cache budget — keeps extracted-from-ZIP audio bytes
@@ -2732,7 +2702,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         or "folder_art_names" in body
         or "hide_empty_folders" in body
     ):
-        from soniqboom.core.data import set_config
+        from soniqboom.core.data import set_config, get_config
         if "hide_empty_folders" in body:
             await set_config("hide_empty_folders", bool(body["hide_empty_folders"]))
         if "filter_duplicates" in body:
@@ -2744,9 +2714,14 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             await set_config("use_folder_art", new_val)
             # When folder art is turned on, clear the negative art cache so
             # tracks that previously had no embedded art get re-evaluated
-            # (this time the folder art fallback will run).
+            # (this time the folder art fallback will run).  Clear BOTH layers:
+            # in-memory AND the on-disk sentinels — clearing memory alone is a
+            # near no-op because the persistent sentinel would re-mark the track
+            # absent before the folder-art fallback is ever reached.
             if new_val:
+                from soniqboom.api.art import purge_absent_sentinels
                 get_store().clear_art_absent()
+                purge_absent_sentinels()
         if "folder_art_names" in body:
             # Stored verbatim as a CSV; the lookup side
             # (``_parse_folder_art_names`` in api/art.py) trims / lowercases
@@ -2756,6 +2731,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             # which is helpful for "what did I set this to last week?".
             raw = body["folder_art_names"]
             csv = str(raw or "").strip()
+            prev = str(await get_config("folder_art_names", "") or "").strip()
             await set_config("folder_art_names", csv)
             # Re-evaluate previously-absent tracks under the new priority
             # list — same reasoning as the ``use_folder_art`` toggle above.
@@ -2763,8 +2739,33 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             # thumbnails stay) because that would force re-extraction for
             # the entire library on every priority tweak; the operator can
             # rebuild the art cache from the System tab if they want a
-            # full refresh after reordering the list.
-            get_store().clear_art_absent()
+            # full refresh after reordering the list.  Clear both the in-memory
+            # AND the on-disk negative cache (the sentinel would otherwise
+            # re-mark tracks absent before the new priority list is consulted).
+            # Only when the value actually CHANGED — re-saving the form
+            # unchanged shouldn't wipe every sentinel + storm a full re-eval.
+            if csv != prev:
+                from soniqboom.api.art import purge_absent_sentinels
+                get_store().clear_art_absent()
+                purge_absent_sentinels()
+
+    # Log verbosity dials — applied LIVE (no restart) and persisted via config
+    # so startup's ``log_control.apply_from_config`` restores them.  The
+    # ``apply_*`` helpers normalise unknown values to the default, so we persist
+    # exactly what took effect.
+    if "log_level" in body or "access_log" in body:
+        from soniqboom.core.data import set_config
+        from soniqboom.core import log_control
+        if "log_level" in body:
+            await set_config("log_level", log_control.apply_app_log_level(str(body["log_level"])))
+        if "access_log" in body:
+            await set_config("access_log", log_control.apply_access_log_mode(str(body["access_log"])))
+
+    # Lyrics write-back toggle — persisted in config; read live by the lyrics
+    # endpoint (api/tracks.py ``_maybe_writeback_lyrics``).
+    if "lyrics_writeback" in body:
+        from soniqboom.core.data import set_config
+        await set_config("lyrics_writeback", bool(body["lyrics_writeback"]))
 
     save_local_conf(conf)
     return {"updated": True}

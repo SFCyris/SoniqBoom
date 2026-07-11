@@ -64,6 +64,9 @@ def load_snapshot(data_dir: Path) -> dict:
 
     Returns an empty state dict if neither file exists.
     """
+    global _last_loaded_from
+    _last_loaded_from = None      # set to the file a POPULATED state came from
+
     primary = data_dir / "library.json"
     backup = data_dir / "library.json.bak"
 
@@ -74,6 +77,7 @@ def load_snapshot(data_dir: Path) -> dict:
         primary_tracks = len(primary_state.get("tracks", {}))
         if primary_tracks > 0:
             log.info("Loaded snapshot from %s (%d tracks)", primary.name, primary_tracks)
+            _last_loaded_from = primary
             return primary_state
 
         # Primary loaded but has 0 tracks — check backup before accepting.
@@ -84,6 +88,7 @@ def load_snapshot(data_dir: Path) -> dict:
                 "Primary snapshot is empty but backup has %d tracks — using %s",
                 backup_tracks, backup.name,
             )
+            _last_loaded_from = backup
             return backup_state
 
         # Both empty or no backup — use primary as-is
@@ -95,10 +100,54 @@ def load_snapshot(data_dir: Path) -> dict:
     if backup_state is not None:
         log.warning("Primary snapshot missing/corrupt — falling back to %s (%d tracks)",
                      backup.name, len(backup_state.get("tracks", {})))
+        if len(backup_state.get("tracks", {})) > 0:
+            _last_loaded_from = backup
         return backup_state
 
     log.info("No snapshot found — starting with empty state")
     return {}
+
+
+# Path a POPULATED snapshot loaded from this boot (primary or the .bak
+# fallback), or None if the state was empty — consumed by ``make_prev_backup``.
+_last_loaded_from: "Path | None" = None
+
+
+def make_prev_backup(data_dir: Path) -> None:
+    """Refresh ``library.json.prev`` from the snapshot that just PROVEN-loaded.
+
+    ``library.json.bak`` is rotated on every snapshot write, so a bad write can
+    clobber it within two cycles.  ``.prev`` is refreshed ONLY here — after a
+    snapshot has demonstrably loaded and populated the store with real tracks —
+    giving a stable "last known good" to restore from by hand if both the
+    primary and the .bak go bad.
+
+    Cheap + best-effort: copies the file ``load_snapshot`` just read (no
+    re-parse), skips when ``.prev`` is already a copy of that exact file
+    (size + mtime match — ``copy2`` preserves mtime), writes atomically via a
+    temp + ``os.replace``, and swallows any error so it can never block boot.
+    """
+    src = _last_loaded_from
+    if src is None:
+        return                       # empty / no snapshot this boot — nothing good to preserve
+    import os
+    import shutil
+    try:
+        if not src.exists() or src.stat().st_size == 0:
+            return
+        prev = data_dir / "library.json.prev"
+        s = src.stat()
+        if prev.exists():
+            p = prev.stat()
+            if p.st_size == s.st_size and int(p.st_mtime) == int(s.st_mtime):
+                return               # already backed up this exact snapshot — skip the re-copy
+        tmp = data_dir / "library.json.prev.tmp"
+        shutil.copy2(src, tmp)       # preserves mtime so the skip-check works next boot
+        os.replace(tmp, prev)        # atomic — a crash mid-copy can't leave a torn .prev
+        log.info("Known-good backup refreshed: %s → library.json.prev (%.0f MB)",
+                 src.name, s.st_size / 1e6)
+    except Exception:
+        log.warning("Known-good .prev backup failed (non-fatal)", exc_info=True)
 
 
 import copy
@@ -428,3 +477,6 @@ def init_persistence(data_dir: Path) -> None:
     state = load_snapshot(data_dir)
     replay_aof(state, data_dir)
     populate_store(state)
+    # Preserve a "last known good" copy of the snapshot that just loaded, for
+    # hand-restore if the primary + .bak ever both go bad (see make_prev_backup).
+    make_prev_backup(data_dir)

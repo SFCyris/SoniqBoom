@@ -87,26 +87,54 @@ echo -e "  ${DIM}Flushing AOF → writing snapshot → stopping merger${NC}"
 
 kill -TERM "$PID" 2>/dev/null || true
 
-# Wait up to 30 seconds for graceful shutdown
+# Wait up to 30 s for the target process to exit gracefully.
+GONE=""
 for i in $(seq 1 30); do
-  if ! kill -0 "$PID" 2>/dev/null; then
-    rm -f "$PID_FILE"
-    # Also stop the menu bar icon
-    pkill -f 'soniqboom-menubar\.py' 2>/dev/null || true
-    echo -e "  ${GREEN}✓${NC} SoniqBoom stopped gracefully."
-    # Show the last shutdown log line
-    LAST=$(grep -i 'shutdown\|snapshot\|stopped' "$LOG_FILE" 2>/dev/null | tail -1 || true)
-    [ -n "$LAST" ] && echo -e "  ${DIM}$LAST${NC}"
-    echo ""
-    exit 0
-  fi
+  if ! kill -0 "$PID" 2>/dev/null; then GONE=1; break; fi
   sleep 1
 done
-
-# Still alive — force kill
-echo -e "  ${RED}Process still running after 30s — force killing...${NC}"
-kill -9 "$PID" 2>/dev/null || true
+if [ -z "$GONE" ]; then
+  echo -e "  ${RED}Process still running after 30s — force killing...${NC}"
+  kill -9 "$PID" 2>/dev/null || true
+  sleep 1
+fi
 rm -f "$PID_FILE"
 pkill -f 'soniqboom-menubar\.py' 2>/dev/null || true
-echo -e "  SoniqBoom killed."
+
+# ── Wait until the PORT is genuinely free ────────────────────────────────────
+# The target PID is not necessarily the (only) thing holding ${PORT}.  A stale
+# pidfile, a duplicate/orphaned instance, or an instance still mid-boot can keep
+# the port bound after our target exits — which is exactly what makes a
+# follow-up start (or ``restart.sh``) report "port already in use".  So don't
+# return until the port is actually released: terminate any lingering
+# *SoniqBoom* listener still on it (an unrelated process is left untouched).
+if command -v lsof &>/dev/null; then
+  for i in $(seq 1 30); do
+    HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+    if [ -z "$HOLDER" ]; then break; fi
+    HCMD=$(ps -p "$HOLDER" -o command= 2>/dev/null || true)
+    case "$HCMD" in
+      *soniqboom*)
+        if [ "$i" -le 5 ]; then
+          kill -TERM "$HOLDER" 2>/dev/null || true
+        else
+          kill -9 "$HOLDER" 2>/dev/null || true
+        fi ;;
+      *)
+        echo -e "  ${RED}Port ${PORT} is held by a non-SoniqBoom process (pid ${HOLDER}) — leaving it alone.${NC}"
+        break ;;
+    esac
+    sleep 1
+  done
+  HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+  if [ -n "$HOLDER" ]; then
+    echo -e "  ${RED}⚠  Port ${PORT} is still in use (pid ${HOLDER}) — a restart may fail to bind.${NC}"
+  else
+    echo -e "  ${GREEN}✓${NC} SoniqBoom stopped; port ${PORT} is free."
+  fi
+else
+  echo -e "  ${GREEN}✓${NC} SoniqBoom stopped."
+fi
+LAST=$(grep -i 'shutdown\|snapshot\|stopped' "$LOG_FILE" 2>/dev/null | tail -1 || true)
+[ -n "$LAST" ] && echo -e "  ${DIM}$LAST${NC}"
 echo ""

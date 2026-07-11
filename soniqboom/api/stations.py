@@ -29,8 +29,10 @@ from urllib.parse import urlsplit
 
 import anyio
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
+
+from soniqboom.api.users import require_edit
 from pydantic import BaseModel
 
 from soniqboom.core import radiodir
@@ -168,7 +170,7 @@ class StationBody(BaseModel):
 
 
 @router.post("/favorites")
-async def add_favorite(body: StationBody):
+async def add_favorite(body: StationBody, _user=Depends(require_edit)):
     # Resolve the station from a TRUSTED source (scene pack, country cache,
     # or a live Radio Browser lookup) rather than trusting the client's
     # posted ``streams``.  Without this, a user could store an arbitrary URL
@@ -182,7 +184,7 @@ async def add_favorite(body: StationBody):
 
 
 @router.delete("/favorites/{sid:path}")
-async def del_favorite(sid: str):
+async def del_favorite(sid: str, _user=Depends(require_edit)):
     radiodir.remove_favorite(sid)
     return {"ok": True, "favorites": _decorate(radiodir.get_favorites())}
 

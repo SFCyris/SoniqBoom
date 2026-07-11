@@ -137,6 +137,11 @@ async def _run(track) -> None:
             )
         if data:
             from soniqboom.core import art_cache
+            from soniqboom.core.metadata import cap_full_cover
+            # Cap the stored 'full' (off-loop); thumbs derive from the same
+            # capped source — see cap_full_cover / _persist_and_notify.
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, cap_full_cover, data)
             await art_cache.store_art(tid, data, "full")
             # Generate thumbs now so the first grid view is instant.
             try:

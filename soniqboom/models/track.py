@@ -71,6 +71,10 @@ class TrackMeta(BaseModel):
     # The matched Modland tree path ("Future Composer 1.3/Pow/intro.smod") —
     # the module's scene provenance, shown in the track-info modal.
     scene_path: str | None = None
+    # Scene group(s) the composer belonged to, from Demozoo enrichment
+    # ("Anarchy • Ate Bit • Core Design").  A retro-similarity signal + shown
+    # in the track-info modal.
+    scene_group: str | None = None
 
     # Art
     cover_art: str | None = None  # data-URI thumbnail

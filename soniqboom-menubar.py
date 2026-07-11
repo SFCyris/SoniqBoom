@@ -270,7 +270,8 @@ def _gather_status() -> str:
         except Exception:
             state = "starting"
         try:
-            _http_post_json(f"{base}/api/admin/auth/skip", {"disabled": True})
+            # ``/api/admin/stats`` needs an admin session; the menubar has none,
+            # so this stays "—" unless a signed-in session cookie is present.
             track_count = _http_get_json(
                 f"{base}/api/admin/stats", timeout=4
             ).get("track_count", "—")
@@ -446,13 +447,9 @@ def _show_webview_window(title: str, width: float, height: float,
 
 
 def _show_settings_window() -> None:
-    # Skip auth server-side so the embedded panel opens without a prompt.
-    try:
-        _http_post_json(
-            f"http://127.0.0.1:{PORT}/api/admin/auth/skip", {"disabled": True},
-        )
-    except Exception:
-        pass
+    # Admin auth was consolidated to user sessions — the embedded panel
+    # authenticates via its own ``sb_session`` cookie; the operator signs in
+    # there (there is no longer a server-side auth-skip to bypass the prompt).
     _show_webview_window(
         "SoniqBoom — Settings", 1180, 820, 880, 600, inject_js=_SETTINGS_INJECT_JS,
     )

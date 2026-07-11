@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import base64 as _b64
 import logging
+import os
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -17,7 +19,7 @@ from fastapi.responses import Response
 
 from soniqboom.core import art_cache
 from soniqboom.core.data import get_track, get_config
-from soniqboom.core.metadata import resize_cover
+from soniqboom.core.metadata import resize_cover, cap_full_cover
 from soniqboom.core.store import get_store
 
 log = logging.getLogger(__name__)
@@ -144,8 +146,15 @@ _SIZE_MAP = {
 }
 
 
-def _extract_cover(path: Path) -> tuple[bytes, str] | tuple[None, None]:
-    """Return (image_bytes, mime_type) from an audio file, or (None, None)."""
+def _extract_cover(path: Path, *, raise_on_error: bool = False) -> tuple[bytes, str] | tuple[None, None]:
+    """Return (image_bytes, mime_type) from an audio file, or (None, None).
+
+    With ``raise_on_error=True`` a read/parse failure (a truncated file, or a
+    flaky mount that drops mid-read) PROPAGATES instead of being swallowed as
+    "no art".  The caller uses that distinction to avoid caching a false
+    negative for a file it simply couldn't read — the difference between
+    "opened it, genuinely no cover" and "couldn't open it".
+    """
     ext = path.suffix.lower()
     try:
         if ext == ".mp3":
@@ -203,26 +212,34 @@ def _extract_cover(path: Path) -> tuple[bytes, str] | tuple[None, None]:
                     return data[null+1:], "image/jpeg"
 
     except Exception:
-        pass
+        if raise_on_error:
+            raise
     return None, None
 
 
-def _extract_cover_from_zip(virtual_path: str) -> tuple[bytes, str] | tuple[None, None]:
-    """Extract cover art from a file inside a (possibly nested) ZIP archive."""
+def _extract_cover_from_zip(virtual_path: str, *, raise_on_error: bool = False) -> tuple[bytes, str] | tuple[None, None]:
+    """Extract cover art from a file inside a (possibly nested) ZIP archive.
+
+    ``raise_on_error=True`` propagates a read failure (unreadable/partial
+    archive) instead of returning it as "no art" — see ``_extract_cover``.
+    """
     import tempfile
+    tmp_path: Path | None = None
     try:
         from soniqboom.core.scanner import _read_from_zip_path
         data, member_name = _read_from_zip_path(virtual_path)
         suffix = Path(member_name).suffix
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)   # bind BEFORE write so a failed write still cleans up
             tmp.write(data)
-            tmp_path = Path(tmp.name)
-        try:
-            return _extract_cover(tmp_path)
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        return _extract_cover(tmp_path, raise_on_error=raise_on_error)
     except Exception:
+        if raise_on_error:
+            raise
         return None, None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _find_folder_art_local(
@@ -369,8 +386,73 @@ def _is_art_absent_persisted(track_id: str, source_mtime: float | None = None) -
         return False
 
 
+# Per-directory memo for the folder-art mtime scan.  A fast list scroll fires
+# one art request per visible row, and many rows share a directory; without a
+# memo each would re-``scandir`` the whole folder.  Short TTL so a cover
+# dropped in is still noticed within ~a couple of seconds.  Accessed from
+# executor threads — dict get/set are individually atomic under the GIL and a
+# check-then-scan race only costs a redundant scan, so no lock is needed.
+_FOLDER_MTIME_MEMO: dict[str, tuple[float | None, float]] = {}
+_FOLDER_MTIME_TTL = 2.0            # seconds
+_FOLDER_MTIME_MEMO_CAP = 4096     # bounded; cleared wholesale when exceeded
+
+
+def _newest_folder_art_mtime(track_dir: Path) -> float | None:
+    """Newest mtime among folder-art candidate images in *track_dir*, or None.
+
+    Case-insensitive match against the built-in folder-art names via a single
+    ``scandir`` (mirrors ``_find_folder_art_local``'s case-folding contract),
+    memoized per directory for ``_FOLDER_MTIME_TTL`` seconds.  Folding this into
+    the negative-cache freshness signal is what lets a cover image DROPPED INTO
+    the folder after a "no art" miss invalidate that miss — the audio file's own
+    mtime never changes when a sibling file is added, so the file mtime alone
+    can't see it.  MUST stay off the event loop (see ``_source_mtime_for_async``)
+    since ``scandir`` can block on a hung mount.
+    """
+    key = str(track_dir)
+    now = time.monotonic()
+    hit = _FOLDER_MTIME_MEMO.get(key)
+    if hit is not None and hit[1] > now:
+        return hit[0]
+    newest: float | None = None
+    try:
+        with os.scandir(track_dir) as it:
+            for entry in it:
+                if entry.name.lower() in _FOLDER_ART_NAMES:
+                    try:
+                        m = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if newest is None or m > newest:
+                        newest = m
+    except OSError:
+        newest = None
+    if len(_FOLDER_MTIME_MEMO) >= _FOLDER_MTIME_MEMO_CAP:
+        _FOLDER_MTIME_MEMO.clear()
+    _FOLDER_MTIME_MEMO[key] = (newest, now + _FOLDER_MTIME_TTL)
+    return newest
+
+
+async def _source_mtime_for_async(path_str: str) -> float | None:
+    """Off-loop wrapper for :func:`_source_mtime_for`.
+
+    ``_source_mtime_for`` does ``stat`` + ``scandir`` I/O that can block for the
+    full mount timeout on a hung/flaky ``/Volumes`` mount.  Running it in the
+    default thread-pool keeps the event loop (and every other client) responsive
+    while one request waits on a bad mount.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _source_mtime_for, path_str)
+
+
 def _source_mtime_for(path_str: str) -> float | None:
     """Best-effort mtime of the on-disk file we'd extract art from.
+
+    For LOCAL and ZIP tracks the returned value also folds in the newest
+    folder-art candidate mtime in the track's directory (via
+    ``_newest_folder_art_mtime``), so a cover image added to the folder AFTER a
+    "no art" miss makes this value newer than the sentinel and re-opens the
+    art.  (Remote folder art is handled by the remote backfill path instead.)
 
     For FTP/SMB tracks this is the cached local copy's mtime (the thing
     that bumps when a partial download is replaced by a full one); for
@@ -395,11 +477,15 @@ def _source_mtime_for(path_str: str) -> float | None:
         if "::" in path_str:
             outer_zip = Path(path_str.split("::")[0])
             if outer_zip.exists():
-                return outer_zip.stat().st_mtime
+                mt = outer_zip.stat().st_mtime
+                folder_mt = _newest_folder_art_mtime(outer_zip.parent)
+                return max(mt, folder_mt) if folder_mt is not None else mt
             return None
         p = Path(path_str)
         if p.exists():
-            return p.stat().st_mtime
+            mt = p.stat().st_mtime
+            folder_mt = _newest_folder_art_mtime(p.parent)
+            return max(mt, folder_mt) if folder_mt is not None else mt
         return None
     except OSError:
         return None
@@ -429,6 +515,33 @@ def _clear_art_absent_persisted(track_id: str) -> None:
         _absent_sentinel_path(track_id).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def purge_absent_sentinels() -> int:
+    """Delete every on-disk ``.absent`` sentinel; returns how many were removed.
+
+    Used when a CONFIG change (enabling folder art, or reordering
+    ``folder_art_names``) should force ALL previously-"no art" tracks to be
+    re-evaluated.  The per-file mtime guard alone can't cover this case: the
+    folder image may have PRE-DATED the sentinel, so its mtime isn't newer.
+    Pairs with the in-memory ``store.clear_art_absent()`` at the same sites.
+    """
+    from soniqboom.config import get_art_cache_dir
+    base = get_art_cache_dir() / "full"
+    removed = 0
+    try:
+        for sub in base.iterdir():
+            if not sub.is_dir():
+                continue
+            for sentinel in sub.glob("*.absent"):
+                try:
+                    sentinel.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
 
 
 def _make_etag(track_id: str, size: str, mtime: float | None = None) -> str:
@@ -499,32 +612,39 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
         mime = "image/png" if cached[:4] == b"\x89PNG" else "image/jpeg"
         return cached, mime
 
-    # Negative cache (in-memory) — skip extraction for tracks known to
-    # have no art in the current process.
-    if get_store().is_art_absent(track_id):
-        return None, None
-
     track = await get_track(track_id)
     if not track:
-        # No track row → respect any pre-existing sentinel verbatim and
-        # write a fresh one for next time.
-        if _is_art_absent_persisted(track_id):
-            get_store().mark_art_absent(track_id)
-            return None, None
+        # No track row (e.g. deleted between the list render and this art
+        # fetch) → remember the miss.  There's no source file to mtime-guard
+        # against, so it's a plain sentinel.  (The old ``_is_art_absent_persisted``
+        # pre-check here was dead once that helper started returning False for a
+        # None mtime — this is the same outcome without the dead branch.)
         get_store().mark_art_absent(track_id)
         _mark_art_absent_persisted(track_id)
         return None, None
 
     path_str = track.path
 
-    # Persistent negative cache — survives restart so we don't re-run
-    # mutagen extraction on every cold boot for tagless tracks.  Honour
-    # the sentinel only when the underlying source hasn't been updated
-    # since it was written; otherwise a partial FTP/SMB download that
-    # produced a tagless first-extract would lock the art out forever.
-    if _is_art_absent_persisted(track_id, _source_mtime_for(path_str)):
-        get_store().mark_art_absent(track_id)
+    # ── Negative cache (single mtime-guarded authority) ───────────────────
+    # Honour a recorded "no art" miss ONLY when the source is UNCHANGED since
+    # the miss.  ``_source_mtime_for`` folds in BOTH the audio file's mtime and
+    # the newest folder-art candidate in its directory, so this one gate
+    # replaces the old bare in-memory short-circuit (which had no invalidation)
+    # AND the file-only persistent check.  The payoff:
+    #   * a re-tagged file (its mtime bumps) OR a folder.jpg dropped in later
+    #     (the folder mtime bumps) makes the miss STALE → we fall through and
+    #     re-extract, so newly-available art actually appears;
+    #   * a genuinely-tagless, unchanged file stays cached (fast path);
+    #   * an offline mount yields src_mtime=None → not honoured → we re-attempt
+    #     (and the read guard below keeps us from poisoning it).
+    src_mtime = await _source_mtime_for_async(path_str)
+    if _is_art_absent_persisted(track_id, src_mtime):
+        get_store().mark_art_absent(track_id)          # keep / refresh the hint
         return None, None
+    # Miss is absent or stale — drop any lingering in-memory hint so a marker
+    # set before the source changed can't keep blocking, then re-extract.
+    if get_store().is_art_absent(track_id):
+        get_store().discard_art_absent(track_id)
 
     loop = asyncio.get_running_loop()
 
@@ -533,6 +653,15 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     # zipfile I/O — run them in the default thread-pool so the event loop
     # stays responsive while other requests are served.
     data, mime = None, None
+    # Did we actually open a PRESENT source file/archive, and did the read
+    # SUCCEED?  We only write a negative sentinel when a genuinely-accessible
+    # file was read cleanly and had no art — never when the file was
+    # unreachable (offline /Volumes mount, cold remote cache) OR present-by-stat
+    # but unreadable-by-content (a mount that drops mid-read, an EIO on a flaky
+    # external disk).  Both are transient; poisoning them locks real art out
+    # until a manual cache clear — the exact bug class we're closing.
+    source_present = False
+    read_failed = False
 
     if path_str.startswith(("smb://", "ftp://")):
         # Remote track — try to extract from cached local copy
@@ -554,15 +683,23 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     elif '::' in path_str:
         outer_zip = Path(path_str.split('::')[0])
         if outer_zip.exists():
-            data, mime = await loop.run_in_executor(
-                None, _extract_cover_from_zip, path_str
-            )
+            source_present = True
+            try:
+                data, mime = await loop.run_in_executor(
+                    None, lambda: _extract_cover_from_zip(path_str, raise_on_error=True)
+                )
+            except Exception:
+                read_failed = True
     else:
         path = Path(path_str)
         if path.exists():
-            data, mime = await loop.run_in_executor(
-                None, _extract_cover, path
-            )
+            source_present = True
+            try:
+                data, mime = await loop.run_in_executor(
+                    None, lambda: _extract_cover(path, raise_on_error=True)
+                )
+            except Exception:
+                read_failed = True
 
     if data:
         # Clear any prior absent-sentinel — the source must have been
@@ -588,19 +725,27 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
             _persist_and_notify(track_id, folder_data)
             return folder_data, folder_mime or "image/jpeg"
 
-    # No art found.  Remember it to skip repeated extraction — BUT only for
-    # local / zip sources.  For remote (FTP/SMB) tracks the folder-art lookup
-    # can come up empty for transient reasons (the shared folder cache wasn't
-    # warm yet, an FTP listing hiccupped), and persisting a sentinel against an
-    # unknowable source mtime would lock the art out forever (the Linux FTP
-    # "no art" bug).  Re-attempts for remote are cheap — a track that DOES have
-    # art is served from the positive art cache after the first resolve, and
-    # the folder lookup is O(1) on the warm dir cache — so we never poison a
-    # remote track with a negative sentinel.
-    if not path_str.startswith(("ftp://", "smb://")):
-        get_store().mark_art_absent(track_id)
-        _mark_art_absent_persisted(track_id)
-    else:
+    # No art found.  Remember it to skip repeated extraction — BUT only when we
+    # actually opened a PRESENT local / zip file and it had no embedded and no
+    # folder art.  Two failure modes must NOT poison the negative cache:
+    #
+    #   * Remote (FTP/SMB) tracks — the folder-art lookup can come up empty for
+    #     transient reasons (cold folder cache, an FTP listing hiccup), and a
+    #     sentinel written against an unknowable source mtime locks the art out
+    #     forever (the Linux FTP "no art" bug).
+    #   * A LOCAL file that wasn't accessible this pass (``source_present`` is
+    #     False) — e.g. an offline ``/Volumes`` mount — OR that was present but
+    #     could not be READ (``read_failed`` — a mount that dropped mid-read, an
+    #     EIO).  Both are the SAME transient failure: the file's mtime never
+    #     changes across the outage, so once it recovers the (newer) sentinel
+    #     stays "valid" and the mtime guard in ``_is_art_absent_persisted`` can
+    #     never invalidate it — real embedded art locked out until a cache clear.
+    #
+    # Re-attempts in both cases are cheap: a track that DOES have art is served
+    # from the positive art cache after the first resolve, and an absent local
+    # file fails ``path.exists()`` in microseconds.
+    is_remote = path_str.startswith(("ftp://", "smb://"))
+    if is_remote:
         # Remote track with no art resolvable from local state.  If the scan
         # recorded an embedded cover (``cover_art`` URL set) but the bytes
         # aren't cached, recover them surgically in the BACKGROUND (fetch just
@@ -613,6 +758,14 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
                 request_backfill(track)
         except Exception:
             pass
+    elif source_present and not read_failed:
+        # Genuinely-present local / zip file that we READ cleanly and which had
+        # no embedded and no folder art — a real "tagless" track; cache the miss
+        # so we don't re-run mutagen on every request.
+        get_store().mark_art_absent(track_id)
+        _mark_art_absent_persisted(track_id)
+    # else: source not accessible this pass, or present-but-unreadable
+    # (read_failed) → transient; don't poison, re-attempt once it's readable.
     return None, None
 
 
@@ -686,9 +839,11 @@ async def _try_folder_art(
     # completes (typically a few milliseconds later).
     if data and dir_hash:
         try:
-            asyncio.create_task(
-                art_cache.store_art(_folder_art_cache_key(dir_hash), data, "full"),
-            )
+            async def _store_capped(bytes_=data, key=_folder_art_cache_key(dir_hash)):
+                loop = asyncio.get_running_loop()
+                capped = await loop.run_in_executor(None, cap_full_cover, bytes_)
+                await art_cache.store_art(key, capped, "full")
+            asyncio.create_task(_store_capped())
         except Exception:
             pass
 
@@ -737,8 +892,14 @@ def _persist_and_notify(track_id: str, data: bytes) -> None:
     """
     async def _job():
         try:
-            await art_cache.store_art(track_id, data, "full")
-            await _generate_and_cache_thumbs(track_id, data)
+            # Cap the stored 'full' — nothing renders it at native resolution
+            # (see cap_full_cover); off-loop since it may re-encode a large
+            # image.  Thumbs derive from the same (capped) source — a 1024px
+            # cap is still well above the 550px lg thumbnail.
+            loop = asyncio.get_running_loop()
+            full = await loop.run_in_executor(None, cap_full_cover, data)
+            await art_cache.store_art(track_id, full, "full")
+            await _generate_and_cache_thumbs(track_id, full)
             await _update_track_cover_ref(track_id)
         except Exception:
             log.debug("art persist failed for %s", track_id, exc_info=True)
@@ -793,14 +954,19 @@ async def cover_art(
     # the 404 path.
     mtime = _art_cached_mtime(track_id, size)
     if mtime is None:
-        # Touch the track record to find the source path's mtime as a
-        # fallback — avoids breaking If-None-Match on the first request.
+        # No cached art yet → derive a freshness stamp from the source so
+        # If-None-Match works on the first request.  Use the SAME folder-aware
+        # mtime the negative cache uses (audio file + newest folder-art
+        # candidate): otherwise a folder.jpg dropped in later wouldn't change
+        # the ETag, the client's 60s revalidation would 304, and the newly
+        # available art would never be fetched even though the server can now
+        # resolve it.
         try:
             track = await get_track(track_id)
             if track and not track.path.startswith(
-                ("smb://", "ftp://", "http://", "https://"),
+                ("http://", "https://"),
             ):
-                mtime = Path(track.path).stat().st_mtime
+                mtime = await _source_mtime_for_async(track.path)
         except OSError:
             mtime = None
         except Exception:

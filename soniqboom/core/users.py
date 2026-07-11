@@ -232,13 +232,26 @@ class UserStore:
             raw = self._path.read_text(encoding="utf-8")
             data = json.loads(raw)
             users = data.get("users", [])
-            self._users.clear()
-            self._by_username.clear()
+            # Build fresh maps and swap them in ATOMICALLY rather than
+            # clear()+repopulate.  ``lookup_session`` reads ``_users`` /
+            # ``_by_username`` WITHOUT the lock (it's the hot auth path on every
+            # request); the old clear-then-fill exposed an empty-map window
+            # during which a concurrent lookup saw "user not found", POPPED the
+            # still-valid session (see ``lookup_session`` line ~559), and then
+            # returned a *sticky* 401 on every authenticated route until the
+            # user signed in again.  A dict rebind is atomic under the GIL, so a
+            # lock-free reader always sees either the complete old map or the
+            # complete new one — never a partial state.  ``reload()`` still holds
+            # ``self._lock`` so writers remain serialised.
+            new_users: dict[str, User] = {}
+            new_by_username: dict[str, str] = {}
             for u in users:
                 _decrypt_token_fields(u)
                 user = User.from_storage(u)
-                self._users[user.id] = user
-                self._by_username[user.username.lower()] = user.id
+                new_users[user.id] = user
+                new_by_username[user.username.lower()] = user.id
+            self._users = new_users
+            self._by_username = new_by_username
             log.info("Loaded %d user(s) from %s", len(self._users), self._path)
         except (json.JSONDecodeError, OSError, ValueError, KeyError) as exc:
             # Move corrupt file aside so an admin can investigate; refuse

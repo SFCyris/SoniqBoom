@@ -2280,7 +2280,10 @@ async def _prefetch_folder_art_remote(
                 return
         if data:
             try:
-                await art_cache.store_art(cache_key, data, "full")
+                from soniqboom.core.metadata import cap_full_cover
+                loop = asyncio.get_running_loop()
+                capped = await loop.run_in_executor(None, cap_full_cover, data)
+                await art_cache.store_art(cache_key, capped, "full")
                 async with stats_lock:
                     stats["warmed"] += 1
             except Exception as exc:

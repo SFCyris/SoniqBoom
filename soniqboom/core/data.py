@@ -115,6 +115,13 @@ async def rebuild_indexes() -> dict:
         if store._batch_depth == 0 and not store._batch_mode:
             for attr in INDEX_ATTRS:
                 setattr(store, attr, getattr(shadow, attr))   # atomic swap (heal)
+            # The inverted sample-token index (B) is derived/batch-built and so
+            # deliberately NOT in INDEX_ATTRS (it would false-positive the drift
+            # diff — the live copy legitimately lags mutations until a rebuild).
+            # ``shadow.finish_rebuild()`` built a fresh one; swap it in here so a
+            # heal refreshes it too, in the same no-scan-active block.
+            store._sim_tok_postings = shadow._sim_tok_postings
+            store._sim_tok_count = shadow._sim_tok_count
             store._word_list_dirty = shadow._word_list_dirty
             store._sorted_dirty = False
             store._batch_mode = False

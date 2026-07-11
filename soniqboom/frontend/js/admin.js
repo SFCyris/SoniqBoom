@@ -63,14 +63,9 @@ function _initVizSettingsUI() {
 }
 
 const overlay        = document.getElementById('admin-overlay');
-const authDialog     = document.getElementById('admin-auth-dialog');
 const aliasDialog    = document.getElementById('admin-alias-dialog');
 const adminPanel     = document.getElementById('admin-panel');
-const authError      = document.getElementById('admin-auth-error');
-const usernameInput  = document.getElementById('admin-username');
-const passwordInput  = document.getElementById('admin-password');
 
-let _token = null;
 let _isOpen = false;
 // WCAG 2.4.3: when a modal closes, focus should return to whatever the
 // user was on before it opened.  Captured by ``open()``, restored by
@@ -106,9 +101,6 @@ function styledConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor
     if (!adminPanel.classList.contains('hidden')) {
       _confirmPreviousDialog = 'panel';
       adminPanel.classList.add('hidden');
-    } else if (!authDialog.classList.contains('hidden')) {
-      _confirmPreviousDialog = 'auth';
-      authDialog.classList.add('hidden');
     } else if (!aliasDialog.classList.contains('hidden')) {
       _confirmPreviousDialog = 'alias';
       aliasDialog.classList.add('hidden');
@@ -134,7 +126,6 @@ function _closeConfirmDialog(result) {
   confirmDialog.classList.add('hidden');
   // Restore the previous dialog, or hide overlay if confirm was standalone
   if (_confirmPreviousDialog === 'panel') adminPanel.classList.remove('hidden');
-  else if (_confirmPreviousDialog === 'auth') authDialog.classList.remove('hidden');
   else if (_confirmPreviousDialog === 'alias') aliasDialog.classList.remove('hidden');
   else overlay.classList.add('hidden'); // no parent dialog — hide overlay entirely
   overlay.classList.remove('confirm-standalone');
@@ -157,7 +148,6 @@ window.__sbConfirm = styledConfirm;
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 function _hideAllDialogs() {
-  authDialog.classList.add('hidden');
   adminPanel.classList.add('hidden');
   aliasDialog.classList.add('hidden');
   confirmDialog.classList.add('hidden');
@@ -185,7 +175,6 @@ async function open() {
       Toast.error?.('Admin access required.');
       return;
     }
-    _token = null;          // cookie session — no legacy header needed
     adminPanel.classList.remove('hidden');
     overlay.classList.remove('hidden');
     loadStats();
@@ -207,37 +196,12 @@ async function open() {
     return;
   }
 
-  const skipLocal = localStorage.getItem('sb_skip_auth') === '1';
-  if (skipLocal) {
-    // Tell the server to skip auth too, then open the panel directly.
-    try {
-      await fetch('/api/admin/auth/skip', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ disabled: true }),
-      });
-    } catch { /* best effort */ }
-    _token = '__skip__';
-    adminPanel.classList.remove('hidden');
-    overlay.classList.remove('hidden');
-    // Load data (non-blocking — panel is already visible)
-    loadStats();
-    loadDirs();
-    loadSettings();   // sync scan-zips checkbox with global setting
-    loadRendererStatus();
-    loadSoundfonts();
-    startScanPoller();
-    if (document.querySelector('.admin-tab[data-tab="tab-log"][aria-selected="true"]')) {
-      loadLogs();
-    }
-    return;
-  }
-  authError.textContent = '';
-  usernameInput.value = '';
-  passwordInput.value = '';
-  authDialog.classList.remove('hidden');
-  overlay.classList.remove('hidden');
-  usernameInput.focus();
+  // No signed-in user: admin requires an admin account.  The first admin is
+  // created out-of-band with ``soniqboom-setadm`` — there is no in-app
+  // credential prompt (the legacy OS-credential path was removed).
+  _isOpen = false;
+  const { Toast } = await import('./utils.js');
+  Toast.error?.('Sign in as an admin to open settings.');
 }
 
 function close() {
@@ -259,7 +223,6 @@ function close() {
   _adminFocusBefore = null;
 }
 
-document.getElementById('btn-admin-cancel').addEventListener('click', close);
 document.getElementById('btn-admin-close').addEventListener('click', close);
 // Escape closes the admin overlay too — EQ and Track Info already
 // honoured Escape (trackinfo.js), but Admin (the biggest modal) didn't,
@@ -319,6 +282,12 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
       // Populates the SID fidelity + renderer-path fields (and the rest
       // of the settings mirrors — cheap, idempotent).
       loadSettings();
+    } else if (tab.dataset.tab === 'tab-metadata') {
+      loadSceneStatus();
+      loadDemozooStatus();
+      loadMdHvscStatus();
+    } else if (tab.dataset.tab === 'tab-backup') {
+      loadBackupStatus();
     }
   });
 });
@@ -333,60 +302,16 @@ function _showAdminOnlyTabs() {
   });
 }
 
-document.getElementById('btn-admin-login').addEventListener('click', login);
-passwordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
-
-async function login() {
-  const username = usernameInput.value.trim();
-  const password = passwordInput.value;
-  if (!username || !password) {
-    authError.textContent = 'Username and password are required.';
-    return;
-  }
-  authError.textContent = 'Verifying...';
-
-  try {
-    const res = await fetch('/api/admin/auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      authError.textContent = data.detail || 'Authentication failed.';
-      passwordInput.value = '';
-      return;
-    }
-    const { token } = await res.json();
-    _token = token;
-    authDialog.classList.add('hidden');
-    adminPanel.classList.remove('hidden');
-    // Load data (non-blocking — panel is already visible)
-    loadStats();
-    loadDirs();
-    loadSettings();   // sync scan-zips checkbox with global setting
-    loadRendererStatus();
-    loadSoundfonts();
-    startScanPoller();
-  } catch {
-    authError.textContent = 'Network error — is the server running?';
-  }
-}
-
 // ── API helper ────────────────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
   const isFormData = opts.body instanceof FormData;
-  // Always send the session cookie (multi-user auth).  X-Admin-Token is
-  // kept as a fallback for legacy single-user installs that haven't
-  // created any user accounts yet — backend prefers the cookie when both
-  // are present.
+  // Auth is the signed-in user's session cookie (admin role) — sent same-origin.
   const res = await fetch(`/api${path}`, {
     ...opts,
     credentials: 'same-origin',
     headers: {
       ...(!isFormData ? { 'Content-Type': 'application/json' } : {}),
-      ...(_token ? { 'X-Admin-Token': _token } : {}),
       ...(opts.headers || {}),
     },
   });
@@ -1466,13 +1391,34 @@ function _formatRebuildCompleteMsg(status) {
 })();
 
 
+// ── Backup status: the last known-good snapshot (library.json.prev) ───────────
+async function loadBackupStatus() {
+  const el = document.getElementById('backup-snapshot-status');
+  if (!el) return;
+  try {
+    const res = await api('/admin/backup/status');
+    const s = await res.json();
+    const kg = s.known_good || {};
+    if (!kg.exists) {
+      el.textContent = 'Not captured yet — it appears after the next clean startup.';
+      return;
+    }
+    const mb = kg.size / (1024 * 1024);
+    const size = mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
+    const when = kg.mtime ? new Date(kg.mtime * 1000).toLocaleString() : 'unknown time';
+    el.innerHTML = `<code>library.json.prev</code> &middot; <strong>${size}</strong> &middot; captured ${when}`;
+  } catch {
+    el.textContent = 'Could not load backup status.';
+  }
+}
+
 // ── Export / Import ───────────────────────────────────────────────────────────
 
 document.getElementById('btn-admin-export').addEventListener('click', async () => {
   showMsg('admin-io-msg', 'Exporting...', 'ok');
   try {
     const res = await fetch('/api/admin/export', {
-      headers: { 'X-Admin-Token': _token },
+      credentials: 'same-origin',
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
@@ -1510,7 +1456,7 @@ document.getElementById('admin-import-file').addEventListener('change', async (e
   try {
     const res = await fetch('/api/admin/import', {
       method: 'POST',
-      headers: { 'X-Admin-Token': _token },
+      credentials: 'same-origin',
       body: formData,
     });
     const data = await res.json().catch(() => ({}));
@@ -2423,6 +2369,33 @@ document.getElementById('btn-clear-zip-extract')?.addEventListener('click', asyn
   } catch { showMsg('admin-cache-msg', 'Error clearing ZIP extract cache.', 'err'); }
 });
 
+document.getElementById('btn-clear-lyrics-cache')?.addEventListener('click', async () => {
+  showMsg('admin-cache-msg', 'Clearing lyrics cache...', 'ok');
+  try {
+    const res = await api('/admin/cache/clear-lyrics', { method: 'POST' });
+    const d = await res.json();
+    showMsg('admin-cache-msg', `Cleared ${d.cleared} cached lyrics.`, 'ok');
+    const countEl = document.getElementById('lyrics-cache-count');
+    if (countEl) countEl.textContent = '';
+  } catch { showMsg('admin-cache-msg', 'Error clearing lyrics cache.', 'err'); }
+});
+
+// "Save fetched lyrics to files" lives on the Metadata tab and saves on toggle
+// (no separate Save button there), so persist immediately on change.
+document.getElementById('setting-lyrics-writeback')?.addEventListener('change', async (e) => {
+  try {
+    await api('/admin/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ lyrics_writeback: !!e.target.checked }),
+    });
+    showMsg('md-lyrics-msg', e.target.checked
+      ? 'On — lyrics found online will be saved into local files that have none.'
+      : 'Off — files are not modified.', 'ok');
+  } catch {
+    showMsg('md-lyrics-msg', 'Could not save the setting.', 'err');
+  }
+});
+
 // ── Services panel ──────────────────────────────────────────────────────────
 // PhD-UX rationale: a service toggle is a high-stakes UX (turning subsonic
 // off means every Subsonic client on the LAN stops working), so we surface
@@ -2658,12 +2631,10 @@ async function loadSettings() {
   const xfadeEl   = document.getElementById('setting-crossfade');
   const preloadEl = document.getElementById('setting-preload-buffer');
   const delayEl   = document.getElementById('setting-convert-delay');
-  const skipEl    = document.getElementById('setting-skip-auth');
   const themeEl   = document.getElementById('setting-theme');
   if (xfadeEl)   xfadeEl.value   = localStorage.getItem('sb_crossfade')      || '0';
   if (preloadEl) preloadEl.value = localStorage.getItem('sb_preload_buffer') || '5';
   if (delayEl)   delayEl.value   = localStorage.getItem('sb_convert_delay')  || '300';
-  if (skipEl)    skipEl.checked  = localStorage.getItem('sb_skip_auth') === '1';
   if (themeEl)   themeEl.value   = localStorage.getItem('sb_theme') || 'dark';
   // Visualization preference controls (client-side, applies live).
   _initVizSettingsUI();
@@ -2689,6 +2660,10 @@ async function loadSettings() {
     if (hideEmptyEl) hideEmptyEl.checked = !!s.hide_empty_folders;
     const folderArtEl = document.getElementById('setting-use-folder-art');
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
+    const lyricsWbEl = document.getElementById('setting-lyrics-writeback');
+    if (lyricsWbEl) lyricsWbEl.checked = !!s.lyrics_writeback;
+    const lyricsCountEl = document.getElementById('lyrics-cache-count');
+    if (lyricsCountEl) lyricsCountEl.textContent = s.lyrics_cache_size ? `(${s.lyrics_cache_size})` : '';
     const folderArtNamesEl = document.getElementById('setting-folder-art-names');
     // We render the user's last value verbatim (empty = "fall back to the
     // built-in default") rather than back-filling the default into the
@@ -2696,6 +2671,11 @@ async function loadSettings() {
     // it was already overridden, and the placeholder communicates the
     // default's contents without committing them to the config.
     if (folderArtNamesEl) folderArtNamesEl.value = s.folder_art_names || '';
+    // Logging verbosity dials (server-side, applied live)
+    const logLevelEl = document.getElementById('setting-log-level');
+    if (logLevelEl) logLevelEl.value = s.log_level || 'normal';
+    const accessLogEl = document.getElementById('setting-access-log');
+    if (accessLogEl) accessLogEl.value = s.access_log || 'problems';
     const rcMbEl = document.getElementById('setting-remote-cache-mb');
     if (rcMbEl) rcMbEl.value = s.remote_cache_max_mb || 2048;
     const ccMbEl = document.getElementById('setting-conv-cache-mb');
@@ -2748,12 +2728,10 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   const xfade   = parseFloat(document.getElementById('setting-crossfade')?.value      || '0');
   const preload = parseFloat(document.getElementById('setting-preload-buffer')?.value || '5');
   const delay   = parseInt(  document.getElementById('setting-convert-delay')?.value  || '300');
-  const skipAuth = document.getElementById('setting-skip-auth')?.checked ?? false;
   const theme    = document.getElementById('setting-theme')?.value || 'dark';
   localStorage.setItem('sb_crossfade',      String(xfade));
   localStorage.setItem('sb_preload_buffer', String(Math.max(0, preload))); // takes effect on next track
   localStorage.setItem('sb_convert_delay',  String(delay));
-  localStorage.setItem('sb_skip_auth', skipAuth ? '1' : '0');
   localStorage.setItem('sb_theme', theme);
   // Apply the theme immediately so the user sees the flip without reload.
   if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
@@ -2773,6 +2751,8 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     // "use the built-in default".
     const folderArtNames = (document.getElementById('setting-folder-art-names')?.value ?? '').trim();
     const remoteCacheMb = parseInt(document.getElementById('setting-remote-cache-mb')?.value || '2048');
+    const logLevel  = document.getElementById('setting-log-level')?.value  || 'normal';
+    const accessLog = document.getElementById('setting-access-log')?.value || 'problems';
     await api('/admin/settings', {
       method: 'PUT',
       body: JSON.stringify({
@@ -2785,13 +2765,9 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
+        log_level: logLevel,
+        access_log: accessLog,
       }),
-    });
-    // Sync skip-auth to server
-    await fetch('/api/admin/auth/skip', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ disabled: skipAuth }),
     });
     // Rebuild the sidebar tree so the hide-empty toggle takes effect
     // immediately.  ``FolderTree.refresh()`` rewinds every expanded node
@@ -3470,6 +3446,94 @@ document.getElementById('btn-scene-apply')?.addEventListener('click', async (e) 
   } finally {
     btn.disabled = false;
   }
+});
+
+// ── Metadata tab: Demozoo scene groups + HVSC status/rescan ───────────────────
+
+function _renderDemozooStatus(s) {
+  const line = document.getElementById('md-demozoo-status');
+  if (!line) return;
+  if (!s || typeof s !== 'object') { line.textContent = 'Index: —'; return; }
+  let txt;
+  if (s.refreshing)                txt = 'Index: downloading…';
+  else if (!s.exists || !s.names)  txt = 'Index: not downloaded yet';
+  else {
+    const built = s.built_at ? new Date(s.built_at * 1000).toLocaleDateString() : 'unknown date';
+    txt = `Index: ${Number(s.names).toLocaleString()} name→group entries (built ${built})`;
+  }
+  if (s.applying) txt += ' · applying…';
+  else if (s.last_apply) {
+    txt += ` · last apply: ${Number(s.last_apply.matched || 0).toLocaleString()} matched, `
+         + `${Number(s.last_apply.updated || 0).toLocaleString()} tagged`;
+  }
+  if (s.error) txt += ` · ${s.error}`;
+  line.textContent = txt;
+}
+
+async function loadDemozooStatus() {
+  try {
+    const res = await api('/admin/demozoo/status');
+    if (res.ok) _renderDemozooStatus(await res.json());
+  } catch (_) { /* non-critical */ }
+}
+
+document.getElementById('md-demozoo-refresh')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  const line = document.getElementById('md-demozoo-status');
+  if (line) line.textContent = 'Index: downloading (~192 MB — this takes a few minutes)…';
+  try {
+    const res = await api('/admin/demozoo/refresh-index', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderDemozooStatus(s);
+    if (s && !s.error) showMsg('md-demozoo-msg', 'Index refreshed.', 'ok');
+    else showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+  } catch (err) {
+    showMsg('md-demozoo-msg', `Refresh failed: ${err.message}`, 'err');
+    loadDemozooStatus();
+  } finally { btn.disabled = false; }
+});
+
+document.getElementById('md-demozoo-apply')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const res = await api('/admin/demozoo/apply', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderDemozooStatus(s);
+    if (s && !s.error) {
+      showMsg('md-demozoo-msg',
+              `Applied: ${Number(s.matched || 0).toLocaleString()} matched, `
+              + `${Number(s.updated || 0).toLocaleString()} tracks tagged with scene groups.`, 'ok');
+    } else {
+      showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    showMsg('md-demozoo-msg', `Apply failed: ${err.message}`, 'err');
+  } finally { btn.disabled = false; }
+});
+
+// HVSC status/rescan mirrored into the Metadata tab (path setting stays in Renderers).
+async function loadMdHvscStatus() {
+  const line = document.getElementById('md-hvsc-status');
+  if (!line) return;
+  try {
+    const res = await api('/admin/hvsc/status');
+    line.textContent = res.ok
+      ? 'SID song-length database: ready'
+      : 'Not loaded — set the HVSC documents path under Renderers.';
+  } catch (_) { line.textContent = 'Status: —'; }
+}
+
+document.getElementById('md-hvsc-rescan')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const res = await api('/admin/hvsc/rescan-sids', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    if (s && !s.error) showMsg('md-hvsc-msg', 'SID length rescan complete.', 'ok');
+    else showMsg('md-hvsc-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    loadMdHvscStatus();
+  } catch (err) {
+    showMsg('md-hvsc-msg', `Rescan failed: ${err.message}`, 'err');
+  } finally { btn.disabled = false; }
 });
 
 // ── My Account (every signed-in user) ───────────────────────────────────────

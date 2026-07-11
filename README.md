@@ -293,7 +293,7 @@ Don't need the Amiga "exotica" family or native `.sc68` disks, and want a **fast
 
 If your music collection has a weird corner, SoniqBoom is the server that finally lights it up.
 
-**Got a format we don't render?** That's the most interesting kind of bug report. Open an [issue](https://github.com/SFCyris/SoniqBoom/issues) with a sample file, [star the repo](https://github.com/SFCyris/SoniqBoom) if it earned it, and send PRs.
+**Got a format we don't render?** That's the most interesting kind of bug report. Open an [issue](https://github.com/SFCyris/SoniqBoom/issues) with a sample file, and [star the repo](https://github.com/SFCyris/SoniqBoom) if it earned it. Format and feature ideas are welcome in [Discussions](https://github.com/SFCyris/SoniqBoom/discussions) — the code is maintained by me, but requests and bug reports genuinely steer what's built next.
 
 ---
 

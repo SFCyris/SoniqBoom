@@ -55,6 +55,7 @@ def find_similar(
     *,
     ratings: dict[str, int] | None = None,
     k: int = 20,
+    sample_jaccard: dict[str, float] | None = None,
 ) -> list[dict]:
     """Return up to ``k`` of ``[{track, score}]`` most like ``seed``.
 
@@ -69,6 +70,7 @@ def find_similar(
         seed, candidates,
         ratings=ratings or {}, recent_ids=(),
         limit=max(k * 4, 60), rng=random.Random(7),
+        sample_jaccard=sample_jaccard,
     )
     if not shortlist:
         return []

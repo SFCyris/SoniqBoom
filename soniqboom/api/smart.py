@@ -24,7 +24,9 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from soniqboom.api.users import require_edit
 
 from soniqboom.core.data import (
     get_all_play_stats, get_all_ratings, get_track,
@@ -139,7 +141,6 @@ async def instant_mix(
     # the radio only reads a handful of fields, so we read the live dicts and
     # copy just the selected ~60 on the way out (never mutating the store).
     store = get_store()
-    candidates = store.all_tracks()
     ratings = await get_all_ratings()
     try:
         history = store.get_history(40) or []
@@ -148,6 +149,10 @@ async def instant_mix(
     recent_ids = [h.get("track_id") for h in history if isinstance(h, dict) and h.get("track_id")]
 
     from soniqboom.core.radio import build_instant_mix
+    candidates = store.similar_candidates(seed_dict)   # on-loop: atomic vs scanner, cheap
+    # Precompute the retro sample-lineage Jaccard on the loop (cheap inverted-
+    # index walk) so the off-thread scorer skips re-tokenising every candidate.
+    sample_jaccard = store.retro_sample_jaccard(seed_dict, candidates)
     mix = await asyncio.to_thread(
         build_instant_mix,
         seed_dict,
@@ -155,6 +160,7 @@ async def instant_mix(
         ratings=ratings or {},
         recent_ids=recent_ids,
         limit=limit,
+        sample_jaccard=sample_jaccard,
     )
 
     def _clean(t: dict) -> dict:
@@ -365,7 +371,7 @@ async def get_duplicate_group(group_id: str):
 
 
 @router.post("/smart/duplicates/recompute")
-async def recompute_duplicates():
+async def recompute_duplicates(_user=Depends(require_edit)):
     """Force a recompute of duplicate-group annotations and persist them."""
     changed = await _do_dup_recompute()
     # Count only real groups (≥2 members) — a delete can decay a group to a lone
@@ -377,7 +383,7 @@ async def recompute_duplicates():
 
 
 @router.post("/smart/duplicates/{group_id}/primary")
-async def set_group_primary(group_id: str, track_id: str):
+async def set_group_primary(group_id: str, track_id: str, _user=Depends(require_edit)):
     """Override which track is the primary in a duplicate group.
 
     Reads the group's members straight from the maintained index (no full

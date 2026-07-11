@@ -91,6 +91,7 @@ INDEX_ATTRS = (
     "_word_index", "_word_list",
     "_tag_artist", "_tag_album_artist", "_tag_album", "_tag_genre",
     "_tag_format", "_tag_dir_hash", "_tag_scan_root_hash", "_tag_dup_group",
+    "_tag_scene_group",
     "_sorted_year", "_sorted_added_at", "_sorted_added_at_primary",
     "_sorted_duration", "_sorted_bpm",
     "_sorted_title", "_sorted_artist", "_sorted_album_artist",
@@ -115,6 +116,22 @@ def _index_sample_diff(live, exp, limit: int = 5) -> list:
     except Exception:
         pass
     return []
+
+
+# Demozoo stores a composer's collectives as a single " • "-joined string
+# (see core/demozoo.py); the scene-group index keys on each collective
+# separately.  ONE splitter shared by ``_index_track``/``_unindex_track`` and
+# ``similar_candidates`` so the indexed keys and the lookup keys can't drift.
+_SCENE_GROUP_SEP = " • "
+
+
+def _scene_group_keys(scene_group: object) -> list[str]:
+    """Individual normalised (lower/stripped) group keys from a track's
+    ``scene_group`` string, e.g. ``"Fairlight • Maniacs of Noise"`` →
+    ``["fairlight", "maniacs of noise"]``.  Empty for a missing/blank value."""
+    if not isinstance(scene_group, str) or not scene_group:
+        return []
+    return [g.strip().lower() for g in scene_group.split(_SCENE_GROUP_SEP) if g.strip()]
 
 
 class TrackStore:
@@ -158,6 +175,35 @@ class TrackStore:
         self._tag_dir_hash: dict[str, set[str]] = {}
         self._tag_scan_root_hash: dict[str, set[str]] = {}
         self._tag_dup_group: dict[str, set[str]] = {}
+        # Scene-group (Demozoo) index: each collective a retro composer belonged
+        # to → the track ids by that composer.  Lets ``similar_candidates`` pool
+        # SAME-COLLECTIVE tracks (different composer/format) that the artist/
+        # genre/format buckets miss, so the retro scorer's group signal
+        # (radio._W_R_GROUP) actually has candidates to fire on.  A track's
+        # ``scene_group`` is the multi-group string ``"Fairlight • Maniacs of
+        # Noise"``; each group is indexed separately (see ``_scene_group_keys``).
+        self._tag_scene_group: dict[str, set[str]] = {}
+
+        # ── Inverted instrument/sample-token index (retro sample lineage) ────
+        # ``token → track-ids`` for the retro tracker-sample Jaccard signal
+        # (radio._W_R_SAMPLES).  Recomputing ``instrument_tokens`` for every
+        # candidate on each "more like this" request cost ~35 ms over a ~5 K
+        # pool (measured, 262 K library); this precomputes it once so the retro
+        # scorer reads a shared-token count instead.  Singleton tokens (present
+        # in exactly ONE track) are pruned — they can never be shared, so
+        # dropping them changes no Jaccard value (lossless) while removing the
+        # bulk of the vocabulary.  Batch-built (needs global counts to know
+        # singletons), NOT maintained per-track: rebuilt by ``rebuild_indexes``/
+        # ``finish_rebuild`` and swapped in by ``data.rebuild_indexes`` (the
+        # ``index_health`` sweep triggers one after mutations; a restart always
+        # rebuilds).  ``retro_sample_jaccard`` falls back to on-the-fly
+        # tokenisation for a candidate NOT yet in the count map (added since the
+        # last build).  Caveat: a track whose ``instruments`` change IN PLACE
+        # (same id, re-scan) stays in the count map, so its sample sub-signal
+        # can lag until the next rebuild — a bounded, self-healing imprecision
+        # on ONE retro signal, never a wrong-by-more-than-that or a crash.
+        self._sim_tok_postings: dict[str, list[str]] = {}   # non-singleton token → track ids
+        self._sim_tok_count: dict[str, int] = {}            # retro-with-samples track id → |tokens|
 
         # ── Sorted indexes: list of (value, track_id) ───────────────────
         self._sorted_year: list[tuple[int, str]] = []
@@ -247,6 +293,8 @@ class TrackStore:
             self._tag_set(self._tag_dup_group, gid, tid)
         for g in t.get("genre", []):
             self._tag_set(self._tag_genre, g, tid)
+        for grp in _scene_group_keys(t.get("scene_group")):
+            self._tag_set(self._tag_scene_group, grp, tid)
 
         # Extract numeric fields used by both sorted indexes and aggregations.
         # ``normalise_year`` collapses YYYYMMDD-form ints down to YYYY so the
@@ -338,6 +386,8 @@ class TrackStore:
             self._tag_del(self._tag_dup_group, gid, tid)
         for g in t.get("genre", []):
             self._tag_del(self._tag_genre, g, tid)
+        for grp in _scene_group_keys(t.get("scene_group")):
+            self._tag_del(self._tag_scene_group, grp, tid)
 
         # Extract numeric fields used by both sorted indexes and aggregations.
         # ``normalise_year`` keeps insert/remove in agreement.
@@ -477,6 +527,7 @@ class TrackStore:
         finally:
             self.exit_batch_mode()
         self._rebuild_word_list()
+        self._build_sim_token_index()
         # ``_index_track`` adds every track to ``_unplayed_ids`` whose key
         # isn't already in ``_play_stats`` — the order above guarantees that
         # snapshot-loaded play stats correctly suppress those tids.
@@ -552,9 +603,14 @@ class TrackStore:
         for tag_idx in (
             self._tag_artist, self._tag_album_artist, self._tag_album,
             self._tag_genre, self._tag_format, self._tag_dir_hash,
-            self._tag_scan_root_hash, self._tag_dup_group,
+            self._tag_scan_root_hash, self._tag_dup_group, self._tag_scene_group,
         ):
             tag_idx.clear()
+        # Inverted sample-token index (B) is derived/batch-built, not in
+        # INDEX_ATTRS; ``rebuild_indexes``/``finish_rebuild`` refill it after
+        # this clear, so emptying it here just avoids a stale window mid-rebuild.
+        self._sim_tok_postings = {}
+        self._sim_tok_count = {}
         self._sorted_year.clear()
         self._sorted_added_at.clear()
         self._sorted_added_at_primary.clear()
@@ -586,9 +642,103 @@ class TrackStore:
             self._index_track(tid, t)
 
     def finish_rebuild(self) -> None:
-        """Finalise an async rebuild — build word list and log."""
+        """Finalise an async rebuild — build word list + sample index and log."""
         self._rebuild_word_list()
+        self._build_sim_token_index()
         log.info("Indexes rebuilt for %d tracks", len(self._tracks))
+
+    # ── Retro sample-lineage index (B) ─────────────────────────────────────
+
+    def _build_sim_token_index(self) -> None:
+        """(Re)build the inverted instrument-token index used by the retro
+        sample-lineage similarity signal.  Build-and-swap: assembles fresh
+        structures then rebinds in one step, so a reader on the loop only ever
+        sees the old-complete or new-complete index.
+
+        Singleton tokens (present in exactly one track) are dropped: they can
+        never be SHARED by two tracks, so excluding them from the postings
+        changes no pairwise Jaccard (lossless) while removing the bulk of the
+        vocabulary.  Per-track token COUNTS keep the full ``|tokens|`` so the
+        Jaccard denominator ``|A|+|B|-|A∩B|`` is exact.
+        """
+        from soniqboom.core.retro import is_retro_format, instrument_tokens
+        postings: dict[str, list[str]] = {}
+        counts: dict[str, int] = {}
+        for tid, t in self._tracks.items():
+            if not is_retro_format(t.get("format")):
+                continue
+            inst = t.get("instruments")
+            if not inst:
+                continue
+            toks = instrument_tokens(inst)
+            counts[tid] = len(toks)          # full count (incl. singletons) for |B|
+            for tok in toks:
+                postings.setdefault(tok, []).append(tid)
+        # Drop singleton tokens — lossless (a token in one track is never shared).
+        postings = {tok: ids for tok, ids in postings.items() if len(ids) > 1}
+        self._sim_tok_postings = postings    # atomic rebind (build-and-swap)
+        self._sim_tok_count = counts
+        log.info(
+            "Sample-token index: %d retro-with-samples tracks, %d shared tokens",
+            len(counts), len(postings),
+        )
+
+    def retro_sample_jaccard(self, seed: dict, candidates: list[dict]) -> dict[str, float]:
+        """``{track_id: sample-name Jaccard vs seed}`` over ``candidates`` for a
+        RETRO seed, via the inverted instrument-token index.
+
+        On the CURRENT index snapshot the value is identical to the pairwise
+        ``|A∩B|/|A∪B|`` the scorer computes on the fly (singleton pruning is
+        lossless — a token in one track is never shared, so it can't appear in
+        any intersection), but derived from a shared-token walk instead of
+        re-tokenising every candidate — ~40 ms → <1 ms over a ~5 K pool
+        (measured, 262 K library).  Empty for a non-retro / token-less seed.
+        Runs synchronously on the event loop (no ``await``, so it can't race the
+        ``data.rebuild_indexes`` swap).
+
+        A candidate ADDED since the last build (``tid`` absent from the count
+        map) falls back to an exact on-the-fly tokenisation.  NOT covered by the
+        fallback (bounded, self-healing at the next rebuild): a candidate whose
+        ``instruments`` changed IN PLACE — its id stays in the count map, so a
+        stale token count is used — and a candidate that shares with the seed
+        ONLY a token that was a singleton at build time (pruned from postings),
+        which can happen when the SEED itself is newer than the index.  These
+        lag the sample sub-signal only until the next ``_build_sim_token_index``.
+        """
+        from soniqboom.core.retro import is_retro_format, instrument_tokens
+        if not is_retro_format(seed.get("format")):
+            return {}
+        stoks = instrument_tokens(seed.get("instruments"))
+        if not stoks:
+            return {}
+        s_len = len(stoks)
+        postings = self._sim_tok_postings
+        counts = self._sim_tok_count
+        # Seed → shared-token count per track, from the non-singleton postings.
+        inter: dict[str, int] = {}
+        for tok in stoks:
+            bucket = postings.get(tok)
+            if bucket:
+                for tid in bucket:
+                    inter[tid] = inter.get(tid, 0) + 1
+        out: dict[str, float] = {}
+        for t in candidates:
+            tid = t.get("id")
+            if not tid:
+                continue
+            i = inter.get(tid)
+            if i is not None:                       # shares ≥1 sample with seed
+                union = s_len + counts.get(tid, 0) - i
+                if union > 0:
+                    out[tid] = i / union
+            elif tid not in counts and t.get("instruments"):
+                # Candidate added since the last index build → exact fallback.
+                ti = instrument_tokens(t.get("instruments"))
+                if ti:
+                    shared = len(stoks & ti)
+                    if shared:
+                        out[tid] = shared / len(stoks | ti)
+        return out
 
     def track_items_list(self) -> list[tuple[str, dict]]:
         """Return a snapshot of (track_id, track_dict) for chunked iteration."""
@@ -729,6 +879,104 @@ class TrackStore:
 
     def all_tracks(self) -> list[dict]:
         return list(self._tracks.values())
+
+    def similar_candidates(self, seed: dict, *, floor: int = 400) -> list[dict]:
+        """Bounded candidate pool for similarity / instant-mix scoring.
+
+        Returns the union of the seed's **artist**, **album_artist** and
+        **genre** buckets (via the tag indexes) plus a sample of its **format**
+        bucket — instead of the whole library.  ``build_instant_mix``'s score
+        is dominated by genre (6.0) + artist (2.4) + album_artist (1.4) +
+        format (1.6), so this pool contains essentially every track that could
+        reach the top-k, turning its O(N)-over-the-library scan into O(pool)
+        (≈6 000 vs ~260 000 here).
+
+        Strong-signal ids (artist/album_artist/genre) are never dropped; only
+        the format sample + overflow are trimmed to ``cap``.  A too-sparse seed
+        is topped up toward ``floor`` with a random sample so the mix still has
+        variety.  Keys are lower-cased to match the tag indexes.
+        """
+        import random as _rnd
+        _GENRE_CAP, _FORMAT_CAP, _ARTIST_CAP, _GROUP_CAP = 3000, 2000, 3000, 2000
+        # Generic "artist"/"album_artist" tags aren't a real similarity signal —
+        # a compilation's "Various Artists" bucket is tens of thousands of
+        # unrelated tracks and would re-inflate the pool to O(N).  Skip them.
+        _GENERIC = {
+            "various artists", "various", "va", "unknown artist", "unknown",
+            "compilation", "soundtrack", "ost", "[unknown]", "n/a",
+        }
+        # Seed a PER-SEED-DETERMINISTIC rng so a given track's sampled pool (and
+        # therefore its ranked "more like this") is stable across requests —
+        # find_similar's fixed-rng contract relied on that.  Varies across seeds.
+        _r = _rnd.Random(str(seed.get("id") or ""))
+
+        def _n(s: object) -> str:
+            return s.strip().lower() if isinstance(s, str) else ""
+
+        def _sampled(bucket: set[str], n: int) -> set[str]:
+            # Bound large buckets so a broad scene genre / common format (60–130 K
+            # tracks) can't blow the pool back up to O(N).  NOTE: for tagless
+            # retro files these buckets carry no within-bucket ranking signal so
+            # sampling is loss-free; for a large WELL-TAGGED genre (year/bpm/
+            # rating differentiate) sampling can drop the single closest track —
+            # accepted trade-off, measured via the score-parity check.
+            return bucket if len(bucket) <= n else set(_r.sample(list(bucket), n))
+
+        sid = seed.get("id")
+        ids: set[str] = set()
+        a, aa = _n(seed.get("artist")), _n(seed.get("album_artist"))
+        if a and a not in _GENERIC:                 # same-artist — strong signal, but cap runaway buckets
+            ids |= _sampled(self._tag_artist.get(a, set()), _ARTIST_CAP)
+        if aa and aa not in _GENERIC:
+            ids |= _sampled(self._tag_album_artist.get(aa, set()), _ARTIST_CAP)
+
+        g = seed.get("genre") or []
+        if isinstance(g, str):
+            g = [g]
+        gids: set[str] = set()
+        for gg in g:
+            k = _n(gg)
+            if k:
+                gids |= self._tag_genre.get(k, set())
+        ids |= _sampled(gids, _GENRE_CAP)
+
+        fmt = _n(seed.get("format"))
+        if fmt:
+            ids |= _sampled(self._tag_format.get(fmt, set()), _FORMAT_CAP)
+
+        # Scene-group (Demozoo): pool SAME-COLLECTIVE tracks — other composers'
+        # music from the group(s) this composer belonged to — which the
+        # artist/genre/format buckets miss (measured: only ~10-25% of a large
+        # collective's tracks land in the pool without this).  Retro-only; a
+        # non-retro seed has no ``scene_group`` so this is a no-op for it.
+        for grp in _scene_group_keys(seed.get("scene_group")):
+            ids |= _sampled(self._tag_scene_group.get(grp, set()), _GROUP_CAP)
+        ids.discard(sid)
+
+        # ── Tier 0: retro ↔ modern segregation ───────────────────────────
+        # Retro (chip/tracker/synth) and modern recorded audio are separate
+        # similarity universes — a retro seed's neighbours must be retro, and
+        # vice-versa.  Filter the pool to the seed's universe, then top up
+        # toward ``floor`` from the SAME universe if the filter thinned it.
+        from soniqboom.core.retro import is_retro_format
+        seed_retro = is_retro_format(seed.get("format"))
+        pool = [t for t in (self._tracks.get(tid) for tid in ids)
+                if t and is_retro_format(t.get("format")) == seed_retro]
+
+        if len(pool) < floor:
+            allids = list(self._tracks.keys())
+            _r.shuffle(allids)                      # seeded rng → deterministic
+            have = {t["id"] for t in pool}
+            for tid in allids:
+                if len(pool) >= floor:
+                    break
+                if tid == sid or tid in have:
+                    continue
+                t = self._tracks.get(tid)
+                if t and is_retro_format(t.get("format")) == seed_retro:
+                    pool.append(t)
+                    have.add(tid)
+        return pool
 
     def all_track_metas(self) -> list[dict]:
         """Return all tracks without embedding field."""
@@ -1637,6 +1885,12 @@ class TrackStore:
 
     def is_art_absent(self, track_id: str) -> bool:
         return track_id in self._art_absent
+
+    def discard_art_absent(self, track_id: str) -> None:
+        """Drop one track's in-memory 'no art' hint — used when its source
+        changed (re-tag / a folder image appeared) so the negative cache must
+        re-evaluate that track. Cheap set-discard; no-op if not present."""
+        self._art_absent.discard(track_id)
 
     def clear_art_absent(self) -> None:
         self._art_absent.clear()

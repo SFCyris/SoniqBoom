@@ -172,6 +172,38 @@ the state that must survive a restart or upgrade.
 
 ---
 
+## Backups & recovery
+
+Back up the `soniqboom-data` volume (`/data`) and you have everything. Your
+**music files are never touched** — all of this is just the index and settings.
+
+**Portable export.** For a self-contained copy of the library index, use
+**Settings → Backup → Export `.sbz`**; **Import** restores it.
+
+**On-disk snapshots.** The library index is stored as `library.json` under
+`/data`, alongside automatic copies you can fall back to:
+
+| File | What it is |
+|------|-----------|
+| `library.json` | the live index |
+| `library.json.bak` | the previous write (rotated on each save) |
+| `library.json.prev` | the last snapshot that **loaded cleanly on startup** — a stable "known good" copy |
+| `library.aof` | recent changes not yet folded into `library.json` (replayed on the next start) |
+
+**Restore by hand** — only if the index won't load (e.g. after a disk problem).
+Stop the server, then in `/data`:
+
+```bash
+cp library.json.prev library.json   # roll back to the last known-good snapshot
+rm -f library.aof                    # optional: drop unmerged changes if the journal is suspect
+```
+
+Start the server again — it rebuilds its in-memory indexes from `library.json`
+on boot. A fresh start also refreshes `library.json.prev` once the restored
+snapshot loads cleanly.
+
+---
+
 ## Updating to a newer version
 
 ```bash
@@ -238,5 +270,6 @@ docker compose exec soniqboom soniqboom-setadm -user bob -passwd 'pw-1234' -role
   for six-figure collections.
 - **MIDI** plays with a bundled General-MIDI SoundFont out of the box; add richer
   SoundFonts later under **Settings → Renderers → Soundfonts**.
-- **Backups**: copy the `soniqboom-data` volume, or use the in-app
-  **Settings → Backup → Export .sbz** for a portable library snapshot.
+- **Backups & recovery**: see the [section above](#backups--recovery) — copy the
+  `soniqboom-data` volume, export a portable `.sbz`, or restore from the on-disk
+  `library.json.prev` known-good snapshot.

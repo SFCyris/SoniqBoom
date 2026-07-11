@@ -645,6 +645,25 @@ def resize_cover(data: bytes, max_size: int, quality: int = 85) -> bytes:
         return data  # return original if resize fails
 
 
+def cap_full_cover(data: bytes, max_size: int = 1024, min_bytes: int = 262_144) -> bytes:
+    """Bound the size of a cached *full* cover.
+
+    The UI only ever renders the sm/lg thumbnails; the ``full`` tier exists as
+    the one-time resize source (and Subsonic ``getCoverArt`` at ``size > 600``),
+    so a multi-MB original is wasted disk per track for something nothing
+    displays.  Cap large covers to ``max_size`` px JPEG — still well above the
+    550 px ``lg`` thumbnail, so quality for every real surface is unchanged.
+
+    Covers already under ``min_bytes`` are returned VERBATIM to skip a pointless
+    re-encode of an already-small image.  Falls back to the original on any
+    error, or when the re-encoded result isn't actually smaller (already lean).
+    """
+    if len(data) < min_bytes:
+        return data
+    capped = resize_cover(data, max_size)
+    return capped if (capped and len(capped) < len(data)) else data
+
+
 # ── MP3 (ID3) ─────────────────────────────────────────────────────────────────
 
 def _mp3(path: Path, track_id: str) -> dict:
@@ -1933,6 +1952,66 @@ def extract_lyrics(path: Path) -> str | None:
     except Exception:
         pass
     return None
+
+
+def write_lyrics(path: Path, lyrics: str) -> bool:
+    """Embed *lyrics* into a LOCAL audio file that has NO lyrics yet.
+
+    Mirrors :func:`extract_lyrics`'s per-format tag choice — ID3 ``USLT`` for
+    MP3/AIFF, the ``lyrics`` Vorbis comment for FLAC/Ogg/Opus, the ``\\xa9lyr``
+    atom for MP4/M4A.  Returns True only when it actually wrote; False when the
+    file is missing/remote, the format can't carry lyrics, the write failed, or
+    — the key guarantee — the file ALREADY has lyrics (existing lyrics are never
+    overwritten).
+    """
+    text = (lyrics or "").strip()
+    if not text:
+        return False
+    try:
+        if not path.is_file():
+            return False
+        # Never clobber lyrics that are already embedded (belt-and-suspenders:
+        # the caller only reaches here on a miss, but re-check at the write).
+        if extract_lyrics(path):
+            return False
+    except Exception:
+        return False
+
+    ext = path.suffix.lower()
+    try:
+        if ext in (".mp3", ".aiff", ".aif"):
+            from mutagen.id3 import ID3, USLT, ID3NoHeaderError
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.setall("USLT", [USLT(encoding=3, lang="eng", desc="", text=text)])
+            tags.save(path)
+            return True
+        if ext == ".flac":
+            audio = FLAC(path)
+            audio["lyrics"] = text
+            audio.save()
+            return True
+        if ext in (".m4a", ".aac", ".mp4"):
+            audio = MP4(path)
+            audio["\xa9lyr"] = [text]
+            audio.save()
+            return True
+        if ext == ".ogg":
+            audio = OggVorbis(path)
+            audio["lyrics"] = text
+            audio.save()
+            return True
+        if ext == ".opus":
+            audio = OggOpus(path)
+            audio["lyrics"] = text
+            audio.save()
+            return True
+    except Exception as exc:                    # never let a tag write 500 a request
+        log.warning("write_lyrics failed for %s: %s", path.name, exc)
+        return False
+    return False                                 # format not in the write-supported set
 
 
 def _extract_adlib(path: Path, track_id: str) -> dict:

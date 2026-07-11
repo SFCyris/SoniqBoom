@@ -202,6 +202,13 @@ def require_admin(user: User = Depends(require_user)) -> User:
     return user
 
 
+# Mutation of SHARED library/config data (track tags, delete, global rating,
+# duplicate recompute, server-local station favorites) — allowed for admin or
+# edit, blocked for readonly.  Per-user data (own playlists) and playback stay
+# on ``require_user``.
+require_edit = require_role("admin", "edit")
+
+
 # ── Public endpoints ─────────────────────────────────────────────────────────
 
 @router.get("/auth/status")

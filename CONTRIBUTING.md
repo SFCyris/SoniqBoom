@@ -1,94 +1,54 @@
 # Contributing to SoniqBoom
 
-Thanks for wanting to help. SoniqBoom is a self-hosted music server with a
-particular obsession: it plays the formats other servers gave up on — SID,
+Thanks for wanting to get involved. SoniqBoom is a self-hosted music server with
+a particular obsession: it plays the formats other servers gave up on — SID,
 tracker modules, Amiga and Atari chiptunes, console rips, AdLib, MIDI, DSD —
-alongside every mainstream lossless and lossy codec. Contributions that make
-that work better, on more hardware, for more people, are very welcome.
+alongside every mainstream lossless and lossy codec.
 
-## Project status & roadmap
+**How contribution works here.** SoniqBoom is a single-maintainer project, and
+the code is written and maintained by me. I'm **not taking code contributions
+(pull requests) at the moment** — but the door is very much open: the most
+valuable way to shape SoniqBoom is through the GitHub channels below, and they
+genuinely drive what gets built next. Bug reports, format requests, and feature
+ideas are all warmly welcome and all read.
+
+## Ways to take part
+
+- **Report a bug.** Open an [Issue](https://github.com/SFCyris/SoniqBoom/issues)
+  with the SoniqBoom version (`Settings → About` or the footer), how you run it
+  (Docker / bare-metal, OS, CPU arch), and the exact steps. For a format that
+  won't play, include the file's extension and, if you can, a short sample.
+- **Request a format or feature.** Start a thread in
+  [Discussions → Ideas](https://github.com/SFCyris/SoniqBoom/discussions/categories/ideas).
+  That's where directions get debated and requests are upvoted, so the
+  most-wanted ones rise to the top — it's the single biggest influence on the
+  roadmap. For a retro format, a reference recording helps me check the
+  behaviour.
+- **Ask, share, compare notes.**
+  [Discussions](https://github.com/SFCyris/SoniqBoom/discussions) is the place
+  for setups, tips, and "is this a bug or just me?".
+- **Flag a docs gap.** If the in-app manual, `README.md`, or `DEPLOY.md` is
+  missing or wrong, open an issue and I'll fix it.
+
+What gets built next is driven by what's upvoted, what's broken, and what I have
+time for. No dated promises — but everything above lands in front of me and
+shapes the project.
+
+## Project status
 
 SoniqBoom is actively developed and cuts tagged releases — each `v*` tag builds
-the source archive and the multi-arch Docker image. It's a small project, so the
-honest picture:
+the source archive and the multi-arch Docker image. It's a small,
+single-maintainer project: the roadmap is shaped by the channels above and the
+code is built and maintained by me.
 
-- **Feature ideas and the roadmap live in
-  [Discussions → Ideas](https://github.com/SFCyris/SoniqBoom/discussions/categories/ideas)** —
-  that's where directions are debated and requests are upvoted, so the
-  most-wanted ones rise to the top. Start one there rather than guessing what's
-  planned.
-- **Bugs** go in [Issues](https://github.com/SFCyris/SoniqBoom/issues).
-- What gets built next is driven by what's upvoted, what's broken, and what a
-  contributor is willing to build. No dated promises.
+## Licence & forking
 
-## Ways to help
-
-- **Report a bug.** Open an issue with the SoniqBoom version (`Settings → About`
-  or the footer), how you run it (Docker / bare-metal, OS, CPU arch), and the
-  exact steps. For a format that won't play, attach the file's extension and, if
-  you can, a short sample.
-- **Request a format or feature.** Say which player/format and, for retro
-  formats, a reference recording so behaviour can be checked.
-- **Send a pull request.** Small, focused PRs are easiest to review. If it's a
-  large change, open an issue first so we can agree on the approach before you
-  write it.
-- **Improve the docs.** The in-app manual (`docs/manual/`), `README.md`, and
-  `DEPLOY.md` all take fixes.
-
-## Development setup
-
-SoniqBoom is a **Python 3.11+ / FastAPI (asyncio)** backend with a **vanilla-JS
-single-page app** — there is **no frontend build step**, so you edit
-`soniqboom/frontend/**` and reload.
-
-```bash
-git clone https://github.com/SFCyris/SoniqBoom.git
-cd SoniqBoom
-bash install.sh          # installs Python, ffmpeg, and the retro-format players
-bash run.sh --port 8080  # start the dev server
-# stop / restart:  bash shutdown.sh  ·  bash restart.sh
-```
-
-- Python changes require a server restart; frontend files are served fresh from
-  disk on reload.
-- Renderers are external binaries the server shells out to (see
-  `docs/manual/` and the format table in `README.md`). The Docker image builds
-  them from source in a multi-stage build; on bare metal `install.sh` fetches or
-  compiles them.
-
-## Tests
-
-```bash
-.venv/bin/python -m pytest tests/          # the suite lives in tests/
-```
-
-Please add or update a test with any behavioural change. For a renderer change,
-include (or point at) a small sample file that exercises it.
-
-## Coding style
-
-- **Backend:** match the surrounding code — type hints on new functions, small
-  focused modules under `soniqboom/`. Keep the audio path non-blocking (use
-  `asyncio.to_thread` for CPU/IO-bound work). Don't add a dependency without a
-  clear reason; the runtime stays lean on purpose.
-- **Frontend:** vanilla JS, no framework, no bundler. Match the existing module
-  style in `soniqboom/frontend/js/`.
-- **Comments** explain *why*, not *what*. State constraints the code can't.
-
-## Pull-request checklist
-
-- [ ] Focused scope; the diff does one thing.
-- [ ] Tests pass and cover the change.
-- [ ] No new hard dependency without discussion.
-- [ ] Docs/manual updated if user-facing behaviour changed.
-- [ ] You have the right to submit the code under the project licence.
-
-## Licence
-
-SoniqBoom is **AGPL-3.0-or-later**. By contributing you agree your contribution
-is licensed under the same terms. See [`LICENSE`](LICENSE).
+SoniqBoom is **AGPL-3.0-or-later** — see [`LICENSE`](LICENSE). You're free to
+run, study, and self-host it, and to fork and modify your own copy under those
+terms. The upstream codebase here is maintained by me, but tinkering on your own
+fork is very much in the spirit of the project.
 
 ## Security
 
-Please **do not** open a public issue for a security problem — see
-[`SECURITY.md`](SECURITY.md) for how to report it privately.
+Please **do not** open a public issue for a security problem. Report it
+privately via GitHub's **Security → Report a vulnerability** on this repository.

@@ -2449,16 +2449,43 @@ function connectWS() {
   // 5-user reconnect-storm against a flaky server.  Starts at 1s, doubles
   // up to 30s, with ±25% jitter.
   ws.onclose = async (ev) => {
-    // 4401 is our custom "auth required" close from the server.  Don't
-    // burn through backoff retrying a stale cookie — wait for the user
-    // to sign in (HTTP 401 elsewhere will already have shown the overlay)
-    // and then immediately reconnect with the fresh session.
-    if (ev && ev.code === 4401) {
+    // Known-logged-out — we can see there's no session (or the server sent its
+    // explicit 4401 "auth required" close on a mid-stream revocation).  Park
+    // until the login overlay signs us back in: ``Auth.ready`` is pending
+    // whenever logged out and re-arms on expiry, so this wakes exactly once,
+    // on the next successful sign-in, and reconnects with the fresh session.
+    if ((ev && ev.code === 4401) || !Auth.user) {
+      window.__sbWsFailures = 0;
       try { await Auth.ready; } catch { /* if Auth not yet defined */ }
       window.__sbWsBackoff = 1000;
-      setTimeout(connectWS, 200);
+      setTimeout(connectWS, 500);
       return;
     }
+    // We still BELIEVE we're signed in, but the socket dropped.  That's usually
+    // a transient network blip — but it's also exactly what a stale session
+    // looks like after the server was restarted and no longer honours our
+    // cookie, before any other /api call has 401'd to trip the re-auth overlay.
+    // A rejected handshake reaches the browser as a generic 1006 (uvicorn
+    // answers a pre-accept close with HTTP 403 and discards our 4401 code), so
+    // we can't tell the two apart from the close event.  Distinguish by probing
+    // a protected endpoint after two failures in a row: a dead session 401s,
+    // which pops the login overlay (nulling Auth.user + re-arming Auth.ready) so
+    // the NEXT close parks above and prompts re-login; a live session is a
+    // harmless 200 and we keep backing off until the network recovers.  This
+    // stops a restart-orphaned tab from silently retrying a dead cookie forever.
+    const fails = (window.__sbWsFailures = (window.__sbWsFailures || 0) + 1);
+    if (fails >= 2) {
+      try { await fetch('/api/library/scan/status', { credentials: 'same-origin' }); } catch { /* offline */ }
+      if (!Auth.user) {           // the probe revealed a dead session → park now
+        window.__sbWsFailures = 0;
+        try { await Auth.ready; } catch { /* if Auth not yet defined */ }
+        window.__sbWsBackoff = 1000;
+        setTimeout(connectWS, 500);
+        return;
+      }
+    }
+    // Genuine network blip / brief server bounce: exponential backoff with
+    // jitter, capped at 30s.
     const last = window.__sbWsBackoff || 1000;
     const next = Math.min(30000, last * 2);
     window.__sbWsBackoff = next;
@@ -2467,6 +2494,7 @@ function connectWS() {
   };
   ws.onopen = () => {
     window.__sbWsBackoff = 1000;
+    window.__sbWsFailures = 0;   // healthy again — reset the stale-probe counter
     // On RE-connect (not the first connect) recover any covers whose art_ready
     // we missed while disconnected.
     if (window.__sbWsConnectedBefore) _rebustMissingArt();
