@@ -678,8 +678,20 @@ function _fillTrackRow(tr, t, i) {
 
   // col-title
   const titleTd = cells[2];
-  titleTd.textContent = t.title || '—';
+  titleTd.textContent = t.title || '—';   // wipes any badge from a recycled row
   titleTd.title = t.title || '';
+  // Health badge — a track with a known playback defect (partial render or
+  // undecodable) gets a small tag after the title.  Re-created per fill (rare;
+  // only defective tracks) so recycled rows never carry a stale badge.
+  if (t.defect === 'partial' || t.defect === 'corrupt') {
+    const badge = document.createElement('span');
+    badge.className = `track-defect-badge track-defect-${t.defect}`;
+    badge.textContent = t.defect;
+    badge.title = t.defect_detail
+      || (t.defect === 'corrupt' ? 'Cannot be decoded by any engine'
+                                 : 'Plays with substituted content');
+    titleTd.appendChild(badge);
+  }
 
   // col-album-artist
   const aaTd = cells[3];
@@ -3236,6 +3248,17 @@ async function showSmart(view, label) {
   }
 }
 
+// Re-fetch an OPEN "Listening History" / "Most Played" smart view after a play
+// is recorded, so it reflects the new play without a manual reload (mark_played
+// has no server push).  Keyed off the live browse-crumb so there's no stale
+// active-view state to get wrong; a no-op unless one of those views is showing.
+function refreshSmartOnPlay() {
+  if (browseHdr.hidden) return;
+  const crumb = (browseCrumb.textContent || '').trim();
+  if (crumb === 'Listening History') showSmart('history', 'Listening History');
+  else if (crumb === 'Most Played')  showSmart('most-played', 'Most Played');
+}
+
 
 // ── CSV export ──────────────────────────────────────────────────────────────
 
@@ -3460,7 +3483,7 @@ export const Library = {
   setBrowseHeader, hideBrowseHeader, onInfo,
   getSelectedTracks, clearSelection, refreshBadges: _refreshTrackCount,
   // Smart & duplicates views
-  showSmart, showDuplicates,
+  showSmart, showDuplicates, refreshSmartOnPlay,
   // Keyboard navigation
   navigateTrack, addFocusedToQueue, playFocused,
   // Location / alias configuration

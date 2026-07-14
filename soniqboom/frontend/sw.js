@@ -543,7 +543,82 @@
 // placeholder when idle) so starting a station no longer shifts the list under
 // the cursor.  v143: ?v-pinned assets served cache-first with NO revalidation
 // (immutable per URL) — drops a redundant background fetch per pinned asset.
-const SHELL_VERSION = 'v150';   // v150: folder-tree unavailable-mount badge (foldertree.js) + app.css badge style
+// v160 (2026-07-13): fix "enabled the in-browser SID toggle + reloaded, still
+// plays server-side".  The in-browser-SID feature (still uncommitted, served
+// live from the working tree) added a `sidwasmvu` listener + `_handleVU` gate
+// to the VERSIONED app.js but left its import at `app.js?v=132` — and versioned
+// `?v=` assets are served CACHE-FIRST with no revalidation (see fetch handler
+// below).  So a browser that had cached `app.js?v=132` kept serving the OLD
+// app.js while the new SW sat in `waiting`, and a plain reload picked up neither
+// the new app.js NOR the unversioned `player.js` in-browser branch.  Fix, three
+// parts: (a) index.html now loads `app.js?v=133` (was 132) so the new app.js
+// lands on ONE plain reload regardless of SW-activation state — app.js has a
+// single importer, so no module-graph fork; (b) SHELL_VERSION v159→v160 so
+// activation wipes the old cache and the unversioned module graph (player.js et
+// al.) is re-fetched fresh; (c) app.js auto-applies a SW that is ALREADY WAITING
+// AT PAGE LOAD when nothing is buffering/playing (skip-waiting + one reload),
+// instead of relying on the easy-to-miss banner.  NB the `player.js` SID branch
+// is unversioned, so it only turns fresh AFTER that auto-applied second reload
+// (the reload the new app.js triggers) — not on the first paint.  Mid-session
+// updates still use the banner (never a silent reload — would lose unsaved UI).
+// v161 (2026-07-13): Firefox follow-ups to v160.  (1) Auto-skip hardening —
+// app.js now forces reg.update() on load, handles reg.installing (not just
+// reg.waiting + a future updatefound), and gates auto-apply on a time window
+// since page open (not the reg.waiting/updatefound split) so Gecko's different
+// navigation-soft-update timing can't leave the tab wedged on the old SW
+// (which was serving stale unversioned player.js → in-browser SID branch never
+// ran → SID stayed server-side on Firefox).  (2) In-browser SID no longer fails
+// SILENTLY: a WebAssembly-SIMD capability probe + console.warn at every
+// fallback path + a one-time toast, so an unsupported/failing browser explains
+// itself instead of masquerading as a normal server render.  (3) isC64SidTrack
+// now accepts PSID/RSID, matching player.js.  app.js?v=133→134.
+// v162 (2026-07-13): QA-fix to v161's auto-skip — the 12s auto-apply window
+// could reload the page a few seconds AFTER load, out from under a user who had
+// just clicked (e.g. double-click-to-play: the reload swallowed the first click
+// → "nothing happens, click again to play") because _audioBusy() can't see the
+// pre-play render/buffer window.  Auto-apply now additionally requires that the
+// user has NOT interacted since load (_userInteracted, set on first pointerdown/
+// keydown) — any interaction → the banner instead, never a silent reload.  Also:
+// in-browser-SID worker load failures no longer latch permanently on the FIRST
+// error (tolerate one transient blip; latch after 2).  app.js?v=134→135.
+// v163 (2026-07-13): 3-browser SID triage fixes.  (1) FIREFOX "blue ribbon"
+// was a FALSE ALARM — the console reason was "superseded", i.e. a 2nd SID render
+// cancelled the 1st (the user re-clicking during the ~14s render); v161 wrongly
+// reported that cancellation as a failure (toast + server fallback).  A
+// superseded render is now a silent cancellation (sentinel, no toast) — Firefox
+// in-browser SID should actually work.  (2) CHROME "some SIDs still FFT": those
+// tunes render audio but a NULL per-voice VU (digi/voiceless) — no longer emit a
+// dead sidwasmvu; FFT is the honest fallback.  (3) EDGE "plays but no History":
+// the record path is shared+works, but mark_played has no server push so an OPEN
+// Listening-History/Most-Played view stayed stale — now a 'playrecorded' event
+// live-refreshes it (fixes server-stream too).  app.js?v=135→136.
+// v164 (2026-07-13): in-browser SID OFFLOAD half (slices 4+5 of the streaming
+// plan).  playTrack now probes GET /stream/{id}/render-status first: a WARM cache
+// → instant plain server stream (0 render); COLD + capable → render in-browser to
+// the server's exact target_dur AND warm the server cache (POST /sid-audio then
+// /vu, off the playback path) so the NEXT play — any client, cast, offline — is
+// instant with zero render; else → server progressive.  The weak box stops
+// re-rendering a SID once a capable browser plays it once.  Warm-hit VU comes
+// from the warmed .vu sidecar via _handleVU's existing _fetchVUMR.  app.js?v→137.
+// v165 (2026-07-13): INSTANT first-play for SID.  The cold+capable branch no
+// longer blocks playback on the ~13x-realtime in-browser render — it plays the
+// server's progressive render immediately (instant, universal, robust) and runs
+// the in-browser render IN THE BACKGROUND purely to drive the per-voice VU and
+// warm the cache (WAV+VU).  So the FIRST play is instant on every browser and
+// every later play is a zero-render cache hit.  (Chosen over the MSE fast-start
+// for robustness + universal support + no vendored encoder; MSE remains a future
+// option to also spare the server the first-play render under heavy multi-user.)
+// v166 (2026-07-13): QA-fixes to the SID cache-warm/instant-play code.
+// D1: restored the server-/vu poll safety net on the flag-ON path so a
+// WASM-incapable browser / failed render still gets the per-voice meter (was
+// stuck on FFT).  C1: debounced the background render 400ms so skipping through
+// cold SIDs doesn't pile full renders on the serial worker.  F1: audio no longer
+// waits on the render-status probe (server stream starts immediately; the probe
+// + background render/warm are fully off the audio path).  F2: re-probe before
+// the ~50MB warm upload and skip if the server self-cached during the listen.
+// (Backend A1/A2 — admin-gate + disk-spool + upload semaphore — also landed;
+// server restarted.)  app.js?v→138.
+const SHELL_VERSION = 'v167';   // v167: track health badge (partial/corrupt) in listings + info panel
 const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // Downloaded-for-offline audio lives in a STABLE (un-versioned) cache so it
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.

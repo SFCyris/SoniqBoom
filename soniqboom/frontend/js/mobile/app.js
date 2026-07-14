@@ -13,6 +13,24 @@ window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 window.Toast = Toast;
 
+// Codec capability handshake (WIN 5) — same as desktop app.js: probe what this
+// browser can decode and hand it to the server in ``sb_caps`` so ALAC/AAC/Opus
+// direct-serve is driven by real capability, not UA-sniffing.  Best-effort.
+(function setCodecCaps() {
+  try {
+    const a = document.createElement('audio');
+    const can = (t) => { const r = a.canPlayType(t); return r === 'probably' || r === 'maybe'; };
+    const caps = [];
+    if (can('audio/mp4; codecs="alac"'))      caps.push('alac');
+    if (can('audio/mp4; codecs="mp4a.40.2"')) caps.push('aac');
+    if (can('audio/ogg; codecs="opus"'))      caps.push('opus');
+    if (can('audio/ogg; codecs="vorbis"'))    caps.push('vorbis');
+    if (can('audio/flac'))                    caps.push('flac');
+    document.cookie = 'sb_caps=' + caps.join('.')
+      + '; path=/; max-age=31536000; SameSite=Lax';
+  } catch (_) { /* server falls back to UA detection */ }
+})();
+
 import { MobileRadio }     from './radio-player.js';
 import { mountLibrary }    from './views/library.js';
 import { mountSearch }     from './views/search.js';

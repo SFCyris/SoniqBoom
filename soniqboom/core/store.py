@@ -1382,9 +1382,59 @@ class TrackStore:
         self._agg_cache[key] = (self._mutation_seq, value)
         return value
 
-    def aggregate_artists(self) -> list[dict]:
-        """All artists with track counts, sorted alphabetically."""
-        cached = self._agg_cache_get("artists")
+    def _count_primaries(self, tids: set[str]) -> int:
+        """Number of ``tids`` that are duplicate-group primaries.
+
+        Uses the exact same predicate as ``filter_tracks(filter_duplicates=
+        True)`` — ``is_duplicate_primary`` defaulting to True for any track not
+        in a duplicate group — so an aggregate legend count computed with this
+        helper agrees with what the corresponding drill-down actually returns.
+        """
+        return sum(
+            1 for tid in tids
+            if self._tracks.get(tid, {}).get("is_duplicate_primary", True)
+        )
+
+    def primary_track_count(self) -> int:
+        """Total tracks excluding non-primary duplicates.
+
+        The deduped analogue of ``track_count`` — the denominator the library
+        API uses for the "[No Artist]" / "[No Album Artist]" bucket when
+        ``filter_duplicates`` is on, so that bucket counts only the primaries
+        the drill-down would surface (never the hidden duplicate copies).
+        Memoised on ``_mutation_seq`` like the other aggregate views.
+        """
+        cached = self._agg_cache_get("primary_track_count")
+        if cached is not None:
+            return cached
+        n = sum(
+            1 for t in self._tracks.values()
+            if t.get("is_duplicate_primary", True)
+        )
+        return self._agg_cache_set("primary_track_count", n)
+
+    def aggregate_artists(self, primary_only: bool = False) -> list[dict]:
+        """All artists with track counts, sorted alphabetically.
+
+        With ``primary_only`` the count excludes non-primary duplicates so the
+        legend agrees with the deduped drill-down (``/search/filter?artist=X``
+        → ``filter_tracks(filter_duplicates=True)``); an artist whose only
+        tracks are hidden duplicate copies is dropped instead of showing an
+        inflated (or fully "ghost") count — the same class of bug the format
+        legend had.
+
+        ``primary_only`` is a PARAMETER, not read from the global
+        ``filter_duplicates`` config, precisely so it stays opt-in per caller:
+        the web library / Galaxy layer passes it (mapped from that config), but
+        the Subsonic / DLNA consumers keep their historical RAW counts — their
+        track *listings* don't dedup, so a primary-only count there would just
+        disagree with the songs they still serve.  Cached under a distinct
+        ``:primary`` key so a runtime toggle can't serve a list computed under
+        the other mode.
+        """
+        hide_dups = primary_only
+        cache_key = "artists:primary" if hide_dups else "artists"
+        cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -1392,15 +1442,26 @@ class TrackStore:
             tids = self._tag_artist.get(key)
             if not tids:
                 continue
+            if hide_dups:
+                count = self._count_primaries(tids)
+                if count == 0:
+                    continue
             tid = next(iter(tids))
             t = self._tracks.get(tid)
             name = (t.get("artist") or "").strip() if t else key
             results.append({"artist": name or key, "count": count})
         results.sort(key=lambda x: x["artist"].lower())
-        return self._agg_cache_set("artists", results)
+        return self._agg_cache_set(cache_key, results)
 
-    def aggregate_album_artists(self) -> list[dict]:
-        cached = self._agg_cache_get("album_artists")
+    def aggregate_album_artists(self, primary_only: bool = False) -> list[dict]:
+        """Album-artists with track counts.  Mirrors ``aggregate_artists``'s
+        ``primary_only`` handling — caller-controlled primary-only counts, drop
+        0-count entries, distinct ``:primary`` cache key — so the web Album
+        Artists browse legend stays consistent with its deduped drill-down
+        while Subsonic / DLNA keep raw counts."""
+        hide_dups = primary_only
+        cache_key = "album_artists:primary" if hide_dups else "album_artists"
+        cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -1408,12 +1469,16 @@ class TrackStore:
             tids = self._tag_album_artist.get(key)
             if not tids:
                 continue
+            if hide_dups:
+                count = self._count_primaries(tids)
+                if count == 0:
+                    continue
             tid = next(iter(tids))
             t = self._tracks.get(tid)
             name = (t.get("album_artist") or "").strip() if t else key
             results.append({"album_artist": name or key, "count": count})
         results.sort(key=lambda x: x["album_artist"].lower())
-        return self._agg_cache_set("album_artists", results)
+        return self._agg_cache_set(cache_key, results)
 
     def album_sample_index(self) -> dict[tuple[str, str], dict]:
         """Map ``(album_artist, album) → newest sample-track meta`` for every
@@ -1452,43 +1517,84 @@ class TrackStore:
 
     def aggregate_albums(
         self, artist: str | None = None, album_artist: str | None = None,
+        primary_only: bool = False,
     ) -> list[dict]:
-        """Albums, optionally filtered by artist/album_artist."""
-        # Cache key embeds the filter args so different (artist, album_artist)
-        # combinations cache independently.
-        cache_key = f"albums::{(artist or '').lower()}::{(album_artist or '').lower()}"
+        """Albums, optionally filtered by artist/album_artist.
+
+        With ``primary_only`` the count excludes non-primary duplicates so the
+        "N Tracks" legend agrees with the deduped album drill-down
+        (``/search/filter?album=X`` intersected with the same artist /
+        album_artist scope, ``filter_duplicates=True``); an album whose members
+        are all hidden duplicates is dropped.  Same caller-controlled,
+        Subsonic/DLNA-stays-raw contract as the other browse aggregates."""
+        # Cache key embeds the filter args + dup mode so each combination
+        # caches independently.
+        suffix = ":primary" if primary_only else ""
+        cache_key = (
+            f"albums::{(artist or '').lower()}::{(album_artist or '').lower()}{suffix}"
+        )
         cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
 
+        # ``scope`` restricts an album's global tid bucket to the requested
+        # artist / album_artist so a primary count matches what the scoped
+        # drill-down (`?album=X&artist=Y`) actually returns.  ``None`` = whole
+        # library (unfiltered albums view → `?album=X` only).
         if artist:
-            album_counter = self._agg_albums_by_artist.get(
-                artist.lower(), Counter(),
-            )
+            album_counter = self._agg_albums_by_artist.get(artist.lower(), Counter())
+            # ``or set()`` so a filtered-but-missing key means "no members"
+            # (skip), never falls through to the ``scope is None`` whole-library
+            # path below.
+            scope = self._tag_artist.get(artist.lower()) or set()
         elif album_artist:
             album_counter = self._agg_albums_by_album_artist.get(
                 album_artist.lower(), Counter(),
             )
+            scope = self._tag_album_artist.get(album_artist.lower()) or set()
         else:
             album_counter = self._agg_albums
+            scope = None
 
         results: list[dict] = []
         for key, count in album_counter.items():
             tids = self._tag_album.get(key)
             if not tids:
                 continue
-            tid = next(iter(tids))
-            t = self._tracks.get(tid)
+            if primary_only:
+                members = tids if scope is None else (tids & scope)
+                # Prefer a PRIMARY representative so the cover-art id points at
+                # a track the drill-down actually returns.
+                primaries = [
+                    x for x in members
+                    if self._tracks.get(x, {}).get("is_duplicate_primary", True)
+                ]
+                count = len(primaries)
+                if count == 0:
+                    continue
+                rep = primaries[0]
+            else:
+                rep = next(iter(tids))
+            t = self._tracks.get(rep)
             name = (t.get("album") or "").strip() if t else key
             # ``track_id`` is a representative track for the album so the
             # frontend can build its cover-art URL directly instead of
             # round-tripping a /search/filter lookup per grid card.
-            results.append({"album": name or key, "count": count, "track_id": tid})
+            results.append({"album": name or key, "count": count, "track_id": rep})
         results.sort(key=lambda x: x["album"].lower())
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_genres(self) -> list[dict]:
-        cached = self._agg_cache_get("genres")
+    def aggregate_genres(self, primary_only: bool = False) -> list[dict]:
+        """Genres with track counts.  With ``primary_only`` the count excludes
+        non-primary duplicates so the legend agrees with the deduped drill-down
+        (``/search/filter?genre=X``); a genre whose members are all hidden
+        duplicates is dropped instead of showing a "ghost" count.  Like the
+        other browse aggregates ``primary_only`` is caller-controlled (web
+        library opts in; Subsonic keeps raw).  Distinct ``:primary`` cache
+        key, mirroring the format legend."""
+        hide_dups = primary_only
+        cache_key = "genres:primary" if hide_dups else "genres"
+        cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -1496,6 +1602,10 @@ class TrackStore:
             tids = self._tag_genre.get(key)
             if not tids:
                 continue
+            if hide_dups:
+                count = self._count_primaries(tids)
+                if count == 0:
+                    continue
             # Resolve proper-cased display name from one track
             tid = next(iter(tids))
             t = self._tracks.get(tid)
@@ -1507,32 +1617,76 @@ class TrackStore:
                         break
             results.append({"genre": name, "count": count})
         results.sort(key=lambda x: x["genre"].lower())
-        return self._agg_cache_set("genres", results)
+        return self._agg_cache_set(cache_key, results)
 
-    def aggregate_formats(self) -> list[dict]:
+    def aggregate_formats(self, primary_only: bool = False) -> list[dict]:
         """Return ``[{format, count}]`` from the format tag index.
 
         Drives the library "Galaxy" visualization (per-format star
         clusters).  Counts come straight from ``_tag_format`` bucket
         sizes — O(number of distinct formats), no track scan.
+
+        With ``primary_only`` the count MUST exclude non-primary duplicates so
+        it agrees with the Galaxy drill-down (``/api/tracks?format=X`` →
+        ``filter_tracks(filter_duplicates=True)``, which only returns
+        ``is_duplicate_primary`` tracks).  Otherwise a format whose members are
+        ALL non-primary duplicates shows a non-zero count in the legend but
+        returns 0 tracks when clicked — the "ghost format" bug (e.g. Jam
+        Cracker · 3 → 0 live tracks).  In that mode we walk the bucket and
+        count primaries, dropping any format with 0.  ``primary_only`` is
+        caller-controlled (the Galaxy layer maps it from the
+        ``filter_duplicates`` config); no non-library consumer reads this.
         """
-        cached = self._agg_cache_get("formats")
+        hide_dups = primary_only
+        # Key on the dup-filter state so a runtime toggle can't serve a list
+        # computed under the other mode (the cache is also seq-invalidated).
+        cache_key = "formats:primary" if hide_dups else "formats"
+        cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
         results: list[dict] = []
         for key, tids in self._tag_format.items():
             if not key or not tids:
                 continue
-            # Resolve a display-cased name from one member track.
-            tid = next(iter(tids))
-            t = self._tracks.get(tid)
-            name = (t.get("format") if t else None) or key
-            results.append({"format": name, "count": len(tids)})
+            if hide_dups:
+                # Count only primary tracks; a format that survives ONLY as
+                # non-primary duplicates is dropped (matches the drill-down).
+                count = 0
+                name = key
+                for tid in tids:
+                    t = self._tracks.get(tid)
+                    if t is None:
+                        continue
+                    name = t.get("format") or name
+                    if t.get("is_duplicate_primary", True):
+                        count += 1
+                if count == 0:
+                    continue
+            else:
+                # Resolve a display-cased name from one member track.
+                tid = next(iter(tids))
+                t = self._tracks.get(tid)
+                name = (t.get("format") if t else None) or key
+                count = len(tids)
+            results.append({"format": name, "count": count})
         results.sort(key=lambda x: -x["count"])
-        return self._agg_cache_set("formats", results)
+        return self._agg_cache_set(cache_key, results)
 
-    def aggregate_years(self) -> list[dict]:
-        cached = self._agg_cache_get("years")
+    def aggregate_years(self, primary_only: bool = False) -> list[dict]:
+        """Years with track counts.  With ``primary_only`` the count excludes
+        non-primary duplicates so the legend agrees with the deduped drill-down
+        (``/search/filter?year_min=Y&year_max=Y``).
+
+        There is no ``_tag_year`` bucket to walk (years drive a *range* index,
+        not a tag set), so the primary path scans ``_tracks`` once — the same
+        O(N)-on-cache-miss cost the format/genre buckets already pay — keying
+        each primary by ``normalise_year`` exactly as ``_sorted_year`` (which
+        backs the drill-down) does, so the counts line up.  Any year left with
+        no primaries simply never appears (no "ghost" year).  Caller-controlled
+        like the sibling browse aggregates."""
+        hide_dups = primary_only
+        cache_key = "years:primary" if hide_dups else "years"
+        cached = self._agg_cache_get(cache_key)
         if cached is not None:
             return cached
         # Counter stores raw year values; normalize YYYYMMDD → YYYY.  The
@@ -1540,15 +1694,24 @@ class TrackStore:
         # the first was unreachable because the second matched first for any
         # 5-or-more-digit value.
         merged: dict[int, int] = {}
-        for y, count in self._agg_years.items():
-            if isinstance(y, int) and y > 9999:
-                y = y // 10000
-            merged[y] = merged.get(y, 0) + count
+        if hide_dups:
+            for t in self._tracks.values():
+                if not t.get("is_duplicate_primary", True):
+                    continue
+                y = normalise_year(t.get("year"))
+                if y is None:
+                    continue
+                merged[y] = merged.get(y, 0) + 1
+        else:
+            for y, count in self._agg_years.items():
+                if isinstance(y, int) and y > 9999:
+                    y = y // 10000
+                merged[y] = merged.get(y, 0) + count
         results = sorted(
             [{"year": y, "count": c} for y, c in merged.items()],
             key=lambda x: -x["year"],
         )
-        return self._agg_cache_set("years", results)
+        return self._agg_cache_set(cache_key, results)
 
     # ── Recently added (sorted index) ────────────────────────────────────
 

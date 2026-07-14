@@ -79,7 +79,14 @@ export function mountNowPlaying(root, ctx) {
       art.innerHTML = '<span>\u{1F50A}</span>';
       return;
     }
-    titleEl.textContent  = t.title  || '—';
+    titleEl.textContent  = t.title  || '—';   // wipes any prior badge
+    if (t.defect === 'partial' || t.defect === 'corrupt') {
+      const badge = document.createElement('span');
+      badge.className = `track-defect-badge track-defect-${t.defect}`;
+      badge.textContent = t.defect;
+      badge.title = t.defect_detail || '';
+      titleEl.appendChild(badge);
+    }
     artistEl.textContent = [t.artist || t.album_artist, t.album].filter(Boolean).join(' — ');
     // Layered placeholder + cover img (same pattern as mobile mini-player
     // and the desktop row covers).  The img fades in via the ``.loaded``

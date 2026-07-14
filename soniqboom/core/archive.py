@@ -304,3 +304,67 @@ def read_member(local_path, display_name: str) -> bytes:
     with _CACHE_LOCK:
         real = _members(local_path).get(display_name, display_name)
         return _cached_open(key, local_path).read(real)
+
+
+# ── PC-program detection ─────────────────────────────────────────────────────
+# ``.exe``/``.com`` members SoniqBoom would never surface as tracks, but whose
+# presence is a strong signal about the archive's NATURE.
+_DOS_EXEC_EXTS: tuple[str, ...] = (".exe", ".com")
+
+
+def _read_member_head(local_path, real: str, n: int) -> bytes:
+    """First *n* bytes of raw member *real* WITHOUT decompressing the rest.
+
+    ZIP streams just enough to yield *n* bytes (a packed multi-MB ``.exe``
+    sibling isn't fully inflated just to sniff its 2-byte magic); LHA readers
+    lack a streaming open, so they fall back to a full member read.  Holds the
+    cache lock like :func:`read_member` — the underlying readers aren't
+    thread-safe.  *real* is a raw stored name (from :func:`raw_namelist`).
+    """
+    key = _cache_key(local_path)
+    with _CACHE_LOCK:
+        arc = _cached_open(key, local_path)
+        if isinstance(arc, zipfile.ZipFile):
+            with arc.open(real) as fh:
+                return fh.read(n)
+        return arc.read(real)[:n]
+
+
+def has_dos_executable(local_path, within_dir: str = "") -> bool:
+    """True iff the archive holds a DOS/PC executable (an ``.exe``/``.com``
+    member whose first two bytes are the ``MZ`` magic) in *within_dir*.
+
+    This is a strong "this is a PC program bundle, not an Amiga music archive"
+    signal: Amiga executables are AmigaDOS HUNK (magic ``0x000003F3``), never
+    ``MZ``, so an MZ member reliably means x86/DOS.  The scanner uses it to
+    veto indexing a PC data payload as an Amiga module — e.g. a demo's
+    ``X.dat`` that matches PaulRobotham purely by the ``.dat`` extension while
+    its sibling ``X.EXE`` proves the archive is a PC demo (see the lenient
+    fallback in :func:`soniqboom.core.metadata.extract`).
+
+    *within_dir* scopes the check to the module's own directory inside the
+    archive (``""`` = archive root), so a DOS tool buried in an unrelated
+    subfolder of a big Amiga compilation doesn't taint every member.
+
+    Note: genuine ``.com`` files are raw code with no header, so only ``MZ``
+    ``.exe`` (and the rare ``MZ`` ``.com``) match — a headerless ``.com`` is
+    left ambiguous rather than risk a false veto.  Nested-archive outer paths
+    (``a.zip::inner.zip``) can't be opened here and yield ``False`` (admit).
+    Best-effort: returns ``False`` on a broken/unreadable archive — never
+    raises, so it can't abort a scan.
+    """
+    want = within_dir.replace("\\", "/").strip("/").lower()
+    for real in raw_namelist(local_path):
+        norm = real.replace("\\", "/")            # Amiga dirs use backslashes
+        parent, _, base = norm.rpartition("/")
+        if parent.strip("/").lower() != want:
+            continue
+        if not base.lower().endswith(_DOS_EXEC_EXTS):
+            continue
+        try:
+            head = _read_member_head(local_path, real, 2)
+        except Exception:
+            continue                              # unreadable member — skip
+        if head == b"MZ":
+            return True
+    return False

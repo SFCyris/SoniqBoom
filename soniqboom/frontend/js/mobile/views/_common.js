@@ -72,7 +72,23 @@ export function buildTrackRow(track, opts = {}) {
   meta.className = 'm-row-meta';
   const title  = document.createElement('div');
   title.className = 'm-row-title';
-  title.textContent = track.title || '—';
+  // Health badge for a known playback defect — only defective rows (rare) take
+  // the flex layout so the common path keeps its plain ellipsised text.
+  const _dfct = (track.defect === 'partial' || track.defect === 'corrupt')
+    ? track.defect : '';
+  if (_dfct) {
+    title.classList.add('m-row-title--badged');
+    const ttlText = document.createElement('span');
+    ttlText.className = 'm-row-title-text';
+    ttlText.textContent = track.title || '—';
+    const badge = document.createElement('span');
+    badge.className = `track-defect-badge track-defect-${_dfct}`;
+    badge.textContent = _dfct;
+    badge.title = track.defect_detail || '';
+    title.append(ttlText, badge);
+  } else {
+    title.textContent = track.title || '—';
+  }
   const artist = document.createElement('div');
   artist.className = 'm-row-artist';
   artist.textContent = track.artist || track.album_artist || '';

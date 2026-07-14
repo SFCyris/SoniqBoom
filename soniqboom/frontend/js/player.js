@@ -7,6 +7,10 @@
  */
 // version bump needed in index.html for player.js (queue/race/EQ chain fixes)
 import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast } from './utils.js';
+// Experimental, flag-gated in-browser SID playback (see sid-wasm-player.js).
+// Remove the feature by deleting this import + the one branch it guards below.
+import { sidWasmPlaybackEnabled, isC64SidTrack, renderSidForPlayback,
+         sidWasmSupported, sidRenderStatus } from './sid-wasm-player.js';
 
 export const Player = (() => {
   const audio = document.getElementById('audio-el');
@@ -1432,13 +1436,61 @@ export const Player = (() => {
     // Match on (id, subsong): a preload for the file's default tune must NOT be
     // reused for a specific subsong (it would play the wrong tune at the seam).
     const _curSub = Number(track.subsong) > 0 ? Number(track.subsong) : 0;
-    if (_nextPreload && _nextPreload.id === track.id && _nextPreload.subsong === _curSub && _nextPreload.url) {
-      _activeBlobUrl = _nextPreload.url;
-      _nextPreload = null;
-      audio.src = _activeBlobUrl;
-    } else {
-      _dropNextPreload();                 // stale preload for some other track/tune
-      audio.src = _streamUrlFor(track.id);
+    // ── In-browser SID render → server cache-warm (flag-gated) ─────────────
+    // SID audio ALWAYS plays from the server's instant progressive/cached stream
+    // (the fall-through below) — NEVER blocked on a render or even the probe.
+    // When the flag is on AND the browser can render, we ADDITIONALLY run the
+    // in-browser render in the BACKGROUND (debounced, entirely off the audio
+    // path) to (a) drive the per-voice VU and (b) warm the server cache (WAV+VU)
+    // so every later play — any client, cast, offline — is a zero-render cache
+    // hit.  Audio never depends on any of it.  Remove = delete this block + the
+    // app.js 'sidwarm' handler.  (VU for warm-hits / incapable browsers comes
+    // from the server .vu sidecar via _handleVU's poll — see app.js.)
+    const _sidWasmActive = false;   // SID always plays the server stream below
+    if (sidWasmPlaybackEnabled() && isC64SidTrack(track) && sidWasmSupported()) {
+      _dropNextPreload();
+      const _bgId = track.id, _bgSub = _curSub;
+      const _bgLens = Array.isArray(track.hvsc_lengths) ? track.hvsc_lengths : null;
+      const _bgFallbackDur = Math.max(1, Math.min(600, Math.round(
+        ((_bgLens && _bgLens[_bgSub] > 0) ? _bgLens[_bgSub] : (Number(track.duration) || 0)) || 180)));
+      (async () => {
+        // Debounce (C1): skipping through cold SIDs must not pile full renders
+        // on the serial worker — only the tune the user actually lands on renders.
+        await new Promise((res) => setTimeout(res, 400));
+        if (trackId !== _bgId) return;
+        const _status = await sidRenderStatus(_bgId, _bgSub);
+        if (trackId !== _bgId) return;
+        if (_status && _status.ready) return;              // already warm → nothing to render/warm
+        // Render to the SERVER's target length so a warmed WAV lands in the exact
+        // slot /stream requests.
+        const _target = (_status && _status.target_seconds > 0) ? _status.target_seconds : _bgFallbackDur;
+        if (_target > 600) return;                         // client can't render the full length
+        const r = await renderSidForPlayback(_bgId, _bgSub, _target);
+        if (!r || r.superseded) return;
+        if (r.url) { try { URL.revokeObjectURL(r.url); } catch (_) {} }   // VU/warm only — audio is the server stream
+        if (r.vumr && trackId === _bgId) {
+          emit('sidwasmvu', { id: _bgId, subsong: _bgSub, vumr: r.vumr });
+        }
+        // Warm only when the server can key it (default fidelity + matched
+        // target) AND it hasn't self-cached during the listen (F2: re-probe →
+        // skip the redundant ~50 MB upload the server would 204-drop anyway).
+        if (_status && _status.warm_eligible && _status.target_seconds === _target && r.wav) {
+          const fresh = await sidRenderStatus(_bgId, _bgSub);
+          if (!(fresh && fresh.ready)) {
+            emit('sidwarm', { id: _bgId, subsong: _bgSub, dur: _target, wav: r.wav, vumr: r.vumr });
+          }
+        }
+      })();
+    }
+    if (!_sidWasmActive) {
+      if (_nextPreload && _nextPreload.id === track.id && _nextPreload.subsong === _curSub && _nextPreload.url) {
+        _activeBlobUrl = _nextPreload.url;
+        _nextPreload = null;
+        audio.src = _activeBlobUrl;
+      } else {
+        _dropNextPreload();                 // stale preload for some other track/tune
+        audio.src = _streamUrlFor(track.id);
+      }
     }
     // Force fetch even though the element has preload="none" — without this
     // the browser would otherwise wait until play() is called to start
@@ -1984,11 +2036,17 @@ export const Player = (() => {
       // OS-level delivery, which survives page-hide / iOS backgrounding
       // (UX-under-load #6).  Fall back to ``fetch`` (with ``keepalive``)
       // when sendBeacon isn't available or rejects the call.
-      const url = `/api/tracks/${trackId}/played`;
+      const _recId = trackId;
+      const url = `/api/tracks/${_recId}/played`;
       const ok = !!(navigator.sendBeacon && navigator.sendBeacon(url));
       if (!ok) {
         fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
       }
+      // mark_played has no server push, so an already-open "Listening History"
+      // / "Most Played" view would stay stale until a manual reload.  Announce
+      // the recorded play so app.js can live-refresh it.  (This path is shared
+      // by server-stream AND in-browser blob playback, so it fixes both.)
+      emit('playrecorded', { trackId: _recId });
     }
   }
 

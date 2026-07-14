@@ -426,6 +426,7 @@ function _render(track) {
   _show('ti-album',        track.album);
   _show('ti-composer',     track.composer);
   _show('ti-year',         track.year);
+  _renderDefect(track.defect, track.defect_detail);
 
   // ── NUMBERING ──
   const trkStr = track.track_number
@@ -742,6 +743,29 @@ function _renderSidChip(model) {
   if (!m) { _sidChipField.style.display = 'none'; _sidChipEl.textContent = ''; return; }
   _sidChipEl.textContent = m;
   _sidChipField.style.display = '';
+}
+
+// Track-health badge + detail (a known playback defect flagged at scan) — a
+// "Status" row at the top of Track Info, styled like the row badge.  Hidden
+// for healthy tracks.  Mirrors _renderSidChip's manual show/hide.
+const _defectField  = document.getElementById('ti-field-defect');
+const _defectBadge  = document.getElementById('ti-defect-badge');
+const _defectDetail = document.getElementById('ti-defect-detail');
+function _renderDefect(defect, detail) {
+  if (!_defectField || !_defectBadge) return;
+  const d = (defect === 'partial' || defect === 'corrupt') ? defect : '';
+  if (!d) {
+    _defectField.style.display = 'none';
+    _defectBadge.textContent = '';
+    _defectBadge.className = 'track-defect-badge';
+    if (_defectDetail) _defectDetail.textContent = '';
+    return;
+  }
+  _defectBadge.className = `track-defect-badge track-defect-${d}`;
+  _defectBadge.textContent = d;
+  _defectBadge.title = detail || '';
+  if (_defectDetail) _defectDetail.textContent = detail || '';
+  _defectField.style.display = '';
 }
 
 async function _loadExtendedInfo(track) {

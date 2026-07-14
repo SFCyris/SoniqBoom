@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 S.F. Cyris
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""End-to-end tests for the AHX / Hively (uade123) renderer.
+"""End-to-end tests for the AHX (uade123) and Hively/HVL (hvl2wav) renderers.
 
 Two things matter here:
 
@@ -9,8 +9,11 @@ Two things matter here:
      source file — no silent zero-byte rc=8 failures (the FLAC ffmpeg-
      flag regression class).
 
-  2. ``cast_render.prepare_source_for_stream`` correctly routes .ahx
-     and .hvl through uade123 instead of openmpt123.
+  2. ``cast_render.prepare_source_for_stream`` (and stream.py's foreground
+     dispatcher) route each Amiga format to its OWN renderer — .ahx via
+     uade123, .hvl via the bundled hvl2wav — and keep both away from
+     openmpt123, which decodes neither.  (HVL was split onto hvl2wav in
+     1.5.0 because uade123 doesn't decode HivelyTracker modules.)
 
 We use a synthetic AHX file checked into the test fixtures so the
 test runs without the user's modarchive library being mounted.
@@ -155,31 +158,41 @@ async def test_render_uade_missing_binary_returns_501(
 
 # ── cast_render dispatcher: AHX / HVL routed via uade ─────────────────────
 
-def test_cast_render_routes_ahx_to_uade():
+def test_cast_render_routes_ahx_to_uade_and_hvl_to_hvl2wav():
     """Coverage check: cast_render's is_rendered_format must recognise
-    .ahx and .hvl, AND the prepare_source_for_stream branch logic
-    selects the UADE path (we can't test the actual render without
-    the binary AND a real file)."""
+    both .ahx and .hvl, AND route each to its OWN renderer — .ahx via
+    uade123 (``_UADE_EXTS``), .hvl via the bundled hvl2wav (``_HVL_EXTS``).
+    uade123/openmpt123 don't decode HivelyTracker, so .hvl gets a
+    dedicated path in ``prepare_source_for_stream``; the two must NOT be
+    conflated (the render can't be exercised here without the binaries + a
+    real file — see the end-to-end tests above)."""
     from soniqboom.core import cast_render
 
     assert cast_render.is_rendered_format(".ahx") is True
     assert cast_render.is_rendered_format(".hvl") is True
-    # And NOT misclassified as one of the other renderer families
+    # .ahx → uade123; .hvl → hvl2wav — each in its own set, not the other's
     assert ".ahx" in cast_render._UADE_EXTS
-    assert ".hvl" in cast_render._UADE_EXTS
+    assert ".hvl" in cast_render._HVL_EXTS
+    assert ".hvl" not in cast_render._UADE_EXTS
+    assert ".ahx" not in cast_render._HVL_EXTS
+    # And neither misclassified as an openmpt tracker / SID / GME format
     assert ".ahx" not in cast_render._TRACKER_EXTS
     assert ".hvl" not in cast_render._TRACKER_EXTS
     assert ".ahx" not in cast_render._SID_EXTS
     assert ".ahx" not in cast_render._GME_EXTS
 
 
-def test_stream_dispatcher_separates_uade_from_tracker():
-    """In stream.py the foreground dispatch must put .ahx/.hvl in
-    _UADE_EXTS, not _TRACKER_EXTS — otherwise the openmpt123 branch
-    would fire and silently fail at runtime."""
+def test_stream_dispatcher_separates_uade_and_hvl_from_tracker():
+    """In stream.py the foreground dispatch must keep .ahx (→ uade123,
+    ``_UADE_EXTS``) and .hvl (→ hvl2wav, ``_HVL_EXTS``) out of
+    ``_TRACKER_EXTS`` — otherwise the openmpt123 branch would fire and
+    silently fail at runtime (it decodes neither).  .ahx and .hvl each
+    live in their own set, not each other's."""
     from soniqboom.api import stream
 
     assert ".ahx" in stream._UADE_EXTS
-    assert ".hvl" in stream._UADE_EXTS
+    assert ".hvl" in stream._HVL_EXTS
+    assert ".hvl" not in stream._UADE_EXTS
+    assert ".ahx" not in stream._HVL_EXTS
     assert ".ahx" not in stream._TRACKER_EXTS
     assert ".hvl" not in stream._TRACKER_EXTS

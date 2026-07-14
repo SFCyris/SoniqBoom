@@ -28,6 +28,9 @@
  */
 import { Auth }       from './auth.js';
 import { Player }     from './player.js';
+// Experimental in-browser SID playback flag — see sid-wasm-player.js.  Removing
+// the feature: delete this import + the two references to it below.
+import { sidWasmPlaybackEnabled } from './sid-wasm-player.js';
 // Expose Player on the global so the cast picker (a plain non-module
 // script — see index.html) can read currentTrackId without becoming
 // an ES module itself.  Module-isolation purists may wince; this is
@@ -96,40 +99,138 @@ function _cancelAncillaryFetches() {
   } catch (_) { /* player not ready / no-op — non-critical */ }
 }
 
+// ── Codec capability handshake (WIN 5) ──────────────────────────────────
+// Probe what this browser can actually decode via canPlayType and hand the
+// result to the server in the ``sb_caps`` cookie, so the stream endpoint can
+// direct-serve ALAC/AAC/Opus to capable browsers (no transcode) and transcode
+// only for the rest — driven by real capability, not UA-sniffing.  FUTURE-PROOF:
+// when a browser gains a codec, canPlayType reports it and the server adapts
+// with no code change.  Runs at top-level so the cookie is set before the first
+// stream request.  Best-effort — any failure just leaves the server on its UA
+// heuristics.
+(function setCodecCaps() {
+  try {
+    const a = document.createElement('audio');
+    const can = (t) => { const r = a.canPlayType(t); return r === 'probably' || r === 'maybe'; };
+    const caps = [];
+    if (can('audio/mp4; codecs="alac"'))       caps.push('alac');
+    if (can('audio/mp4; codecs="mp4a.40.2"'))  caps.push('aac');
+    if (can('audio/ogg; codecs="opus"'))       caps.push('opus');
+    if (can('audio/ogg; codecs="vorbis"'))     caps.push('vorbis');
+    if (can('audio/flac'))                     caps.push('flac');
+    // 1-year, path=/, Lax so it rides every same-origin stream request.  An
+    // empty value (no codec probed true) is treated server-side as undeclared
+    // → UA fallback, so it's harmless.
+    document.cookie = 'sb_caps=' + caps.join('.')
+      + '; path=/; max-age=31536000; SameSite=Lax';
+  } catch (_) { /* no-op — server falls back to UA detection */ }
+})();
+
 // ── Service Worker — offline-instant shell (PERC-6) ─────────────────────
 // Registered at top-level so the SW takes control on the first
 // navigation; subsequent loads paint from the precache in <50 ms.
 // Skipped on http:// (only) because Service Workers require a secure
 // context (https or localhost).  Best-effort — registration failure is
 // silent because the app works perfectly without an SW.
+
+// True once the user has interacted with the page (a click or a key).  The SW
+// auto-apply below refuses to silently reload after ANY interaction, so it can
+// never eat a click — e.g. a double-click-to-play whose auto-reload would
+// swallow the first click, leaving "nothing happens, click again to play" — nor
+// discard a half-typed form.  Those cases fall back to the dismissible banner.
+let _userInteracted = false;
+const _markInteracted = () => { _userInteracted = true; };
+window.addEventListener('pointerdown', _markInteracted, { capture: true });
+window.addEventListener('keydown', _markInteracted, { capture: true });
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js', { scope: '/' })
       .then((reg) => {
-        // Surface a "new version — refresh" prompt when an UPDATE installs.
-        // Only prompt when there's already a controller (an actual update,
-        // not the first-ever install, which activates silently).  The new SW
-        // sits in ``waiting`` until the user accepts — see sw.js.
+        // Force an immediate update check — don't wait for the browser's lazy
+        // (~24 h) one — so a fresh deploy is detected on THIS load.
+        try { reg.update(); } catch (_) {}
+
+        // Apply a newly-installed UPDATE.  Auto-apply (skip-waiting + one
+        // reload) ONLY when the tab is pristine: the update landed within
+        // AUTO_WINDOW_MS of page open, the user has NOT interacted yet
+        // (_userInteracted — so we can never eat a click or reload mid-play/
+        // -render), and nothing is playing/buffering (_audioBusy).  Any of
+        // those false → the dismissible banner instead, so a silent reload can
+        // never swallow a click, cut playback, or wipe a half-typed form.  A
+        // once-per-session guard stops a wedged activation from re-firing.
+        // (Only act when there's already a controller — the first-ever install
+        // activates silently and must not reload.)
+        const AUTO_WINDOW_MS = 12000;
         const consider = (worker) => {
-          if (worker && navigator.serviceWorker.controller) _showUpdatePrompt(worker);
+          if (!worker || !navigator.serviceWorker.controller) return;
+          let autoTried = false;
+          try { autoTried = sessionStorage.getItem('sb_sw_autoupdate') === '1'; } catch {}
+          const fresh = (typeof performance !== 'undefined')
+            ? performance.now() < AUTO_WINDOW_MS : false;
+          if (fresh && !autoTried && !_userInteracted && !_audioBusy()) {
+            try { sessionStorage.setItem('sb_sw_autoupdate', '1'); } catch {}
+            _applyUpdate(worker);
+            // If activation wedges (no controllerchange → no reload), surface
+            // the banner after a grace period so the update stays reachable.
+            setTimeout(() => _showUpdatePrompt(worker), 5000);
+          } else {
+            _showUpdatePrompt(worker);
+          }
         };
-        if (reg.waiting) consider(reg.waiting);        // already waiting on load
-        reg.addEventListener('updatefound', () => {
-          const nw = reg.installing;
-          if (!nw) return;
-          nw.addEventListener('statechange', () => {
-            if (nw.state === 'installed') consider(nw);
+        // Consider a worker once it reaches `installed`, whatever state it is in
+        // now.  Handling reg.installing (not just reg.waiting + a FUTURE
+        // updatefound) closes a Firefox-only gap: Gecko interleaves the
+        // navigation soft-update vs `load` differently, so the new SW can be
+        // MID-INSTALL (updatefound already fired before this listener attached)
+        // when we get here — previously that update was never applied and the
+        // tab stayed on the old SW, serving stale unversioned modules.
+        const watch = (worker) => {
+          if (!worker) return;
+          if (worker.state === 'installed') { consider(worker); return; }
+          worker.addEventListener('statechange', () => {
+            if (worker.state === 'installed') consider(worker);
           });
-        });
+        };
+        if (reg.waiting) consider(reg.waiting);         // already installed & waiting at load
+        else { try { sessionStorage.removeItem('sb_sw_autoupdate'); } catch {} }   // re-arm for a future update
+        if (reg.installing) watch(reg.installing);      // mid-install at load (Firefox timing) — previously missed
+        reg.addEventListener('updatefound', () => watch(reg.installing));
       })
       .catch(() => { /* SW disabled in this browser — no fallback needed */ });
   });
 }
 
-// A small, dismissible banner shown when a newer build's SW is waiting.
-// Clicking Refresh tells the waiting SW to activate (SKIP_WAITING); once it
-// takes control we reload ONCE so the page picks up the new JS/CSS — turning
-// the old "needs a second reload" dance into a single click.
+// True if any media element is actively in use — playing, buffering/RENDERING
+// toward playback, or paused mid-track — so a SW update never interrupts it.
+// `currentTime > 0` alone would miss the buffering/rendering window (play()
+// flips paused→false but currentTime stays 0 for SECONDS on a server-rendered
+// SID / remote DSD), so key on a real source + not-ended + (playing OR advanced
+// OR data-ready).  Errs busy (true) on any exception.
+function _audioBusy() {
+  try {
+    return [...document.querySelectorAll('audio')].some(a =>
+      (a.currentSrc || a.src) && !a.ended
+      && (!a.paused || a.currentTime > 0 || a.readyState >= 2));
+  } catch { return true; }
+}
+
+// Skip-waiting the freshly-installed SW and reload ONCE as soon as it takes
+// control of the page, so the new JS/CSS is picked up.  Shared by the idle
+// auto-update path (consider() above) and the banner's Refresh button.
+let _swApplying = false;
+function _applyUpdate(worker) {
+  if (_swApplying || !worker) return;
+  _swApplying = true;
+  navigator.serviceWorker.addEventListener(
+    'controllerchange', () => window.location.reload(), { once: true },
+  );
+  worker.postMessage({ type: 'SKIP_WAITING' });
+}
+
+// A small, dismissible banner shown when a newer build's SW is waiting AND
+// audio is playing (so we don't auto-reload mid-song).  Clicking Refresh
+// applies the update via _applyUpdate — a single click.
 let _updatePromptShown = false;
 function _showUpdatePrompt(worker) {
   if (_updatePromptShown || !worker) return;
@@ -161,11 +262,7 @@ function _showUpdatePrompt(worker) {
   refresh.addEventListener('click', () => {
     refresh.disabled = true;
     refresh.textContent = 'Updating…';
-    // Reload as soon as the freshly-activated SW takes control of the page.
-    navigator.serviceWorker.addEventListener(
-      'controllerchange', () => window.location.reload(), { once: true },
-    );
-    worker.postMessage({ type: 'SKIP_WAITING' });
+    _applyUpdate(worker);
   });
   dismiss.addEventListener('click', () => { bar.remove(); _updatePromptShown = false; });
   bar.append(msg, refresh, dismiss);
@@ -1010,7 +1107,215 @@ if (_tiOverlayEl) {
 }
 
 /** Init the VU meters for tracker / SID formats; tear down otherwise. */
+// Which "<trackId>:<subsong>" the VU meter is currently showing/retrying.  The
+// SID retry is guarded on THIS key (not a bump-every-call counter): _handleVU
+// re-fires during playback for the SAME subsong, and a counter would cancel the
+// pending retry each time — so a subsong's meter never arrived until a manual
+// reclick.  Keying on track+subsong lets the retry SURVIVE same-subsong
+// re-fires and stop only on a genuine track/subsong change.
+let _vuKey = '';
+// SID's per-voice sidecar is generated by 3 background sidplayfp renders on the
+// first play, so /vu 404s at track-load.  Re-poll on this schedule to swap the
+// FFT fallback for the real 3-voice meter mid-play (instant on every later play
+// once the sidecar is cached).  Subsongs render short → catch quickly.
+// Cumulative ~5/13/25/41/63/93 s — covers a long (6-min) SID whose 3 parallel
+// isolation renders + audio cache take ~50-60 s, while catching short tunes fast.
+const _SID_VU_RETRY_MS = [5000, 8000, 12000, 16000, 22000, 30000];
+
+function _vuKeyOf(track) {
+  if (!track) return '';
+  const ss = Number.isInteger(track.subsong) ? track.subsong : 0;
+  return `${track.id}:${ss}`;
+}
+
+// Set to the _vuKey the in-browser render has already painted + uploaded, so
+// the server-poll fallback stops (no redundant re-fetch / meter re-init flicker).
+let _sidClientDone = '';
+
+function _scheduleSidVURetry(track, key, attempt = 0) {
+  if (attempt >= _SID_VU_RETRY_MS.length) return;
+  setTimeout(async () => {
+    if (key !== _vuKey) return;                 // a different track/subsong took over
+    if (key === _sidClientDone) return;         // client already rendered+painted it
+    let fetched = null;
+    try { fetched = await _fetchVUMR(track.id, track.subsong); } catch (_) {}
+    if (key !== _vuKey) return;
+    if (fetched) {
+      _initVU(fetched.channels, { useVUMR: true, vumr: fetched });
+      _removeFallbackLabel();
+    } else {
+      _scheduleSidVURetry(track, key, attempt + 1);
+    }
+  }, _SID_VU_RETRY_MS[attempt]);
+}
+
+// ── Client-side WASM SID VU offload ──────────────────────────────────
+// Instead of only waiting for the server's 3 background sidplayfp renders,
+// render the SID's per-voice VU IN THE BROWSER (libsidplayfp+reSIDfp WASM in
+// a Web Worker), show it immediately, and upload the sidecar so the server
+// caches it for every later play (any client).  The server keeps its own
+// renderer as the fallback for cast streamers / WASM-incapable browsers.
+let _sidVuWorker = null;
+let _sidVuReqId = 0;
+let _sidVuPending = null;                         // {id, resolve, reject}
+let _sidVuUnavailable = false;                    // worker/WASM failed to load → stop trying
+
+function _getSidVuWorker() {
+  if (_sidVuWorker || _sidVuUnavailable) return _sidVuWorker;
+  if (typeof Worker !== 'function') { _sidVuUnavailable = true; return null; }
+  try {
+    const w = new Worker('/assets/js/vu-sid-worker.js?v=4');
+    w.onmessage = (e) => {
+      const m = e.data || {};
+      const pend = _sidVuPending;
+      if (!pend || m.id !== pend.id) return;     // stale / superseded
+      if (m.type === 'partial') { if (pend.onPartial) pend.onPartial(m); }
+      else if (m.type === 'done')  { _sidVuPending = null; pend.resolve(m); }
+      else if (m.type === 'error') { _sidVuPending = null; pend.reject(new Error(m.error || 'worker error')); }
+    };
+    w.onerror = () => {
+      _sidVuUnavailable = true;                  // e.g. WASM blocked / OOM — give up gracefully
+      if (_sidVuPending) { const p = _sidVuPending; _sidVuPending = null; p.reject(new Error('worker crashed')); }
+    };
+    _sidVuWorker = w;
+  } catch (_) {
+    _sidVuUnavailable = true;
+  }
+  return _sidVuWorker;
+}
+
+function _renderSidVUInWorker(sidBytes, subsong, dur, onPartial) {
+  return new Promise((resolve, reject) => {
+    const w = _getSidVuWorker();
+    if (!w) { reject(new Error('worker unavailable')); return; }
+    // A newer track supersedes any in-flight render (worker handles one at a time).
+    if (_sidVuPending) { const p = _sidVuPending; _sidVuPending = null; p.reject(new Error('superseded')); }
+    const id = ++_sidVuReqId;
+    _sidVuPending = { id, resolve, reject, onPartial };
+    w.postMessage({ id, sidBytes, subsong, dur }, [sidBytes]);   // transfer the .sid buffer
+  });
+}
+
+// Duration for the client render — mirror the server's target_dur source
+// (hvsc_lengths[subsong], else track duration) so the client sidecar's frame
+// count matches what the server would produce.  Clamped to the server's bound.
+function _sidDurFor(track) {
+  const ss = Number.isInteger(track.subsong) ? track.subsong : 0;
+  const lens = Array.isArray(track.hvsc_lengths) ? track.hvsc_lengths : null;
+  let dur = (lens && lens[ss] > 0) ? lens[ss] : 0;
+  if (!dur) dur = Number(track.duration) || 0;
+  if (!dur) dur = 180;
+  return Math.max(1, Math.min(600, Math.round(dur)));
+}
+
+async function _uploadVUMR(trackId, subsong, buf) {
+  try {
+    if (!(self.crypto && crypto.subtle)) return;    // needs SHA-256 for the integrity hash
+    const digest = await crypto.subtle.digest('SHA-256', buf);
+    const hash = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0')).join('');
+    const ss = (Number.isInteger(subsong) && subsong > 0) ? subsong : 0;
+    await fetch(
+      `/api/tracks/${encodeURIComponent(trackId)}/vu?subsong=${ss}&content_hash=${hash}`,
+      { method: 'POST', credentials: 'include', keepalive: true,
+        headers: { 'Content-Type': 'application/octet-stream' }, body: buf },
+    );
+  } catch (_) { /* best-effort — the server renderer remains the fallback */ }
+}
+
+// Upload a browser-rendered SID WAV to warm the server cache so the NEXT play
+// (any client, cast, offline) streams it with ZERO render.  Plain fetch — NOT
+// keepalive: browsers cap keepalive bodies at 64 KB and this WAV is megabytes.
+// Returns true on 204; a 409/422/415 gate rejection is a benign no-op (the
+// server just keeps rendering that tune).
+async function _uploadSidWav(trackId, subsong, dur, wav) {
+  try {
+    if (!(self.crypto && crypto.subtle) || !wav || !wav.byteLength) return false;
+    const digest = await crypto.subtle.digest('SHA-256', wav);
+    const hash = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0')).join('');
+    const ss = (Number.isInteger(subsong) && subsong > 0) ? subsong : 0;
+    const r = await fetch(
+      `/api/tracks/${encodeURIComponent(trackId)}/sid-audio`
+        + `?subsong=${ss}&duration=${Math.round(dur)}&wav_sha256=${hash}`,
+      { method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/octet-stream' }, body: wav },
+    );
+    return r.ok;
+  } catch (_) { return false; }
+}
+
+// Debounce the client render so rapid track-skipping doesn't queue a full
+// 3-pass WASM render per skipped tune (the worker is serial + can't be
+// interrupted mid-render).  Only the tune the user actually lands on renders;
+// skipped-past tunes never post.  400 ms is below the perception threshold for
+// "the meter is taking a moment" while easily absorbing a scroll through a list.
+let _sidVuDebounce = null;
+function _debouncedSidVU(track, key) {
+  if (_sidVuDebounce) clearTimeout(_sidVuDebounce);
+  _sidVuDebounce = setTimeout(() => {
+    _sidVuDebounce = null;
+    if (key !== _vuKey) return;                  // user moved on during the debounce
+    _generateSidVUClient(track, key);
+  }, 400);
+}
+
+// Fetch the raw .sid, render its VU in the worker, show it, and upload it.
+// Returns true when the meter was populated locally; false → let the
+// server-poll fallback (_scheduleSidVURetry) handle it.
+async function _generateSidVUClient(track, key) {
+  if (_sidVuUnavailable) return false;
+  try {
+    const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/sid`,
+                            { credentials: 'include' });
+    if (!res.ok) return false;                    // not a C64 SID / unreachable
+    const sidBytes = await res.arrayBuffer();
+    if (key !== _vuKey) return false;             // track changed while fetching
+
+    // Stream the meter live: each partial re-normalises the frames rendered so
+    // far, so the 3-voice meter appears ~1s in and fills toward the playhead
+    // (the render runs ~13x realtime, staying ahead of playback) instead of
+    // showing FFT for the whole render.  We mutate ONE vumr object in place —
+    // _initVU stores it by reference and _drawVU reads .samples/.frames live.
+    let streamVumr = null;
+    const onPartial = (m) => {
+      if (key !== _vuKey) return;                // a newer track took over
+      if (!streamVumr) {
+        streamVumr = { channels: 3, rateHz: 30, frames: m.done,
+                       pan: new Uint8Array(3), samples: m.samples };
+        _initVU(3, { useVUMR: true, vumr: streamVumr });
+        _removeFallbackLabel();
+        _sidClientDone = key;                    // stop the server-poll fallback
+      } else {
+        streamVumr.samples = m.samples;          // live update — meter reflects next frame
+        streamVumr.frames = m.done;
+      }
+    };
+
+    const result = await _renderSidVUInWorker(
+      sidBytes, track.subsong || 0, _sidDurFor(track), onPartial);
+    if (key !== _vuKey || !result || !result.vumr) return false;
+    // The final partial (done === frames) already painted the complete,
+    // final-normalised meter, so only init here if streaming never fired
+    // (e.g. a very short tune finishing before the first emit).
+    if (!streamVumr) {
+      const parsed = _parseVUMR(result.vumr);
+      if (!parsed) return false;
+      _initVU(parsed.channels, { useVUMR: true, vumr: parsed });
+      _removeFallbackLabel();
+      _sidClientDone = key;
+    }
+    _uploadVUMR(track.id, track.subsong || 0, result.vumr);   // fire-and-forget cache fill
+    return true;
+  } catch (_) {
+    return false;                                 // superseded / worker error → fallback
+  }
+}
+
 async function _handleVU(track) {
+  const key = _vuKeyOf(track);
+  const keyChanged = (key !== _vuKey);           // real track/subsong change?
+  _vuKey = key;
   if (!track) { _stopVU(); _removeFallbackLabel(); return; }
   const primary = String(track.format || '').split('/')[0].trim();
   // Eligibility: static tracker/SID/chip names PLUS the families whose
@@ -1057,6 +1362,25 @@ async function _handleVU(track) {
     // visually plausible, factually misleading.
     _initVU(_FFT_FALLBACK_BARS, { useVUMR: false });
     _addFallbackLabel(fmtLabel);
+    // SID gets a real 3-voice sidecar.  PRIMARY path: render it in-browser
+    // (WASM) and upload — fast + offloads the server.  FALLBACK: poll the
+    // server, which also renders on play, for WASM-incapable browsers or if
+    // the client render fails.  Only start on a genuine track/subsong change
+    // so re-fires don't spawn duplicate work; both are _vuKey-guarded so a
+    // stale result can't paint over a track the user already left.
+    if (primary === 'SID' && keyChanged) {
+      // Poll the server ``.vu`` sidecar in BOTH modes — it is the safety net that
+      // paints the per-voice meter for a warm-hit, a WASM-incapable browser, or
+      // a failed/superseded in-browser render.  It self-cancels via
+      // ``_sidClientDone`` the moment the client paints, so it never double-work
+      // when the flag-on background render (player.js → ``sidwasmvu``) succeeds.
+      _scheduleSidVURetry(track, key);
+      if (!sidWasmPlaybackEnabled()) {
+        _debouncedSidVU(track, key);             // flag off → client renders the VU (offload)
+      }
+      // flag on: player.js runs the in-browser render in the background and emits
+      // ``sidwasmvu``; the poll above covers every case where it can't.
+    }
   }
 }
 
@@ -1553,6 +1877,51 @@ Player.on('trackchange', (track) => {
 
   // VU meters — show for tracker/module formats
   _handleVU(track);
+});
+
+// In-browser SID playback (flag-gated) renders audio + per-voice VU in one pass
+// and pushes the VU here, so the meter lights up in sync with the audio without
+// a server fetch or the offload cache.  Guarded by _vuKey so a late render for a
+// track the user already left can't paint over the current one.
+Player.on('sidwasmvu', ({ id, subsong, vumr }) => {
+  const key = `${id}:${Number.isInteger(subsong) ? subsong : 0}`;
+  if (key !== _vuKey || !vumr) return;
+  const parsed = _parseVUMR(vumr);
+  if (!parsed) return;
+  _initVU(parsed.channels, { useVUMR: true, vumr: parsed });
+  _removeFallbackLabel();
+  _sidClientDone = key;
+});
+
+// The flag-gated in-browser SID render fell back to the server (unsupported
+// browser, worker/WASM load failure, …).  sid-wasm-player.js fires this once
+// per session with the reason; surface a single non-blocking toast so the
+// "Play SID in browser" toggle never looks silently broken.
+window.addEventListener('sb-sidwasm-unavailable', (e) => {
+  try {
+    console.warn('[sid-wasm] falling back to server SID render:', e && e.detail);
+    Toast.info('In-browser SID isn’t available here — using the server render.');
+  } catch (_) {}
+});
+
+// A play just crossed the record threshold and was POSTed to /played.  Live-
+// refresh an open Listening-History / Most-Played view so the new play shows
+// without a manual reload (there is no server push).  Fires for BOTH server-
+// stream and in-browser-blob playback.
+Player.on('playrecorded', () => {
+  try { Library.refreshSmartOnPlay(); } catch (_) {}
+});
+
+// A SID was rendered in-browser — warm the server cache so the NEXT play (any
+// client, cast, offline) streams it with ZERO render.  Best-effort, entirely
+// off the playback path.  ORDER MATTERS: the WAV must land FIRST — the /vu
+// endpoint 425s until the SID WAV cache slot exists.  The waveform is computed
+// server-side lazily from the warmed WAV, so no client waveform upload here.
+Player.on('sidwarm', async ({ id, subsong, dur, wav, vumr }) => {
+  try {
+    const ok = await _uploadSidWav(id, subsong, dur, wav);
+    if (ok && vumr) await _uploadVUMR(id, subsong, vumr);
+  } catch (_) {}
 });
 
 // PERC-9: when a transcode finishes, the waveform we fetched at

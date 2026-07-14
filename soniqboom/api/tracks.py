@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Cookie, HTTPException, Query, Response
+from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response
 
 # Dedicated thread-pool for ``_compute_waveform`` — that helper spawns a
 # 60s-timeout ffmpeg subprocess per call and ties up its worker the whole
@@ -130,7 +130,10 @@ class _TagUpdate(_BaseModel):
     track_number: int | None = None
 
 
-from soniqboom.api.users import require_user as _require_user, require_edit as _require_edit
+from soniqboom.api.users import (
+    require_user as _require_user, require_edit as _require_edit,
+    require_admin as _require_admin,
+)
 
 
 @router.put("/{track_id}/tags")
@@ -566,6 +569,10 @@ async def get_track_extended(track_id: str):
         # header at scan time; None when the header didn't specify one.  Drives
         # a chip badge in the Track-Info header.
         "sid_model": getattr(track, "sid_model", None),
+        # Known playback defect flagged at scan ("partial" | "corrupt") + human
+        # context — drives the health badge in the info panel + listings.
+        "defect": getattr(track, "defect", None),
+        "defect_detail": getattr(track, "defect_detail", None),
     }
     return result
 
@@ -754,6 +761,293 @@ async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024)):
             "X-VU-Version":  "1",
         },
     )
+
+
+def _is_sid_format(track) -> bool:
+    """True if *track* is a C64 SID (format primary name ``SID``) — the gate
+    for both the raw-bytes and VU-upload endpoints.  Amiga SidMon ``*.sid``
+    carries a uade format name, not ``SID``."""
+    return (str(track.format or "").split("/")[0].strip() == "SID")
+
+
+@router.get("/{track_id}/sid")
+async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
+    """Serve the raw C64 SID container bytes for the client-side WASM VU worker.
+
+    The worker (``frontend/js/vu-sid-worker.js``) renders the tune in-browser to
+    produce the per-voice VU sidecar, offloading the server's 3-pass sidplayfp
+    render.  This is the ONLY route that returns SID source bytes (normal
+    playback always transcodes to WAV), so it is tightly gated: any signed-in
+    user (read), SID-format tracks only, and a PSID/RSID magic re-check on the
+    resolved bytes (415 for an Amiga SidMon ``*.sid``).  Bytes are immutable and
+    tiny (a few KB) → a plain immutable-cached Response, no range needed."""
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+    if not _is_sid_format(track):
+        raise HTTPException(415, "Not a C64 SID track")
+    # Bound a mislabelled/replaced file BEFORE reading it all into RAM.  For a
+    # plain local path we can stat cheaply; remote/zip sources fall through to
+    # the post-read length check (those members are tiny + fetched anyway).
+    _pstr = str(track.path)
+    if "::" not in _pstr and not _pstr.startswith(
+            ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")):
+        try:
+            if Path(_pstr).stat().st_size > 1024 * 1024:   # SIDs are < 64 KB
+                raise HTTPException(415, "File too large to be a SID")
+        except OSError:
+            pass
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _read_module_bytes, track.path)
+    if not data:
+        raise HTTPException(404, "SID source unreachable")
+    if len(data) > 1024 * 1024:                 # remote/zip belt-and-braces
+        raise HTTPException(415, "File too large to be a SID")
+    if data[:4] not in (b"PSID", b"RSID"):
+        raise HTTPException(415, "Not a C64 SID (missing PSID/RSID magic)")
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.post("/{track_id}/vu")
+async def upload_vu_sidecar(
+    track_id: str,
+    request: Request,
+    subsong: int = Query(0, ge=0, le=1024),
+    content_hash: str = Query(..., min_length=64, max_length=64),
+    user=_Depends(_require_edit),
+):
+    """Persist a client-rendered VUMR sidecar into the shared SID cache slot.
+
+    The browser worker computes the per-voice VU (offloading the server's
+    sidplayfp render) and uploads it here; we drop it beside the cached SID WAV
+    so the existing ``GET /vu`` serves it to every later play, any client.
+
+    Trust model: the VU sidecar drives only the cosmetic per-voice meter, and
+    the uploader is a ``require_edit`` user, so this is low-stakes.  The real
+    containment (all reject BEFORE any write) is: (1) a 256 KB hard ceiling
+    stream-read — no global body limit exists and a chunked upload has no
+    Content-Length; (2) strict VUMR structural validation incl. exact length;
+    (3) SID must be 3-channel; (4) the write target is SERVER-derived from the
+    ``sid``-format cache slot (never a client-supplied path), so an upload can
+    only land beside a genuine C64-SID render — 425 when that slot isn't cached
+    yet (client retries).  ``content_hash`` is a transit-integrity check only
+    (the same client computes body+hash, so it is NOT an anti-forgery gate).
+    Idempotent + server-prefers: skip if a ``.vu`` already exists."""
+    import hashlib
+    from soniqboom.core.openmpt_vu import (
+        parse_and_validate_vumr, write_sidecar_bytes,
+    )
+    from soniqboom.core.conversion_cache import get_sid_wav_path_for_upload
+
+    # (1) size cap — a chunked upload carries no Content-Length, so the header
+    # check alone is bypassable; stream-read with a HARD ceiling and abort the
+    # instant we cross it, before the whole body is ever in memory.
+    _MAX = 256 * 1024
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > _MAX:
+        raise HTTPException(413, "VU sidecar too large")
+    _buf = bytearray()
+    async for _chunk in request.stream():
+        _buf += _chunk
+        if len(_buf) > _MAX:
+            raise HTTPException(413, "VU sidecar too large")
+    raw = bytes(_buf)
+
+    # (2)+(3) structural validation.
+    try:
+        channels, _rate, _frames = parse_and_validate_vumr(raw)
+    except ValueError as exc:
+        raise HTTPException(422, f"invalid VUMR: {exc}")
+    if channels != 3:
+        raise HTTPException(422, "SID VU sidecar must have 3 channels")
+
+    # (4) content-hash integrity.
+    if hashlib.sha256(raw).hexdigest() != content_hash.lower():
+        raise HTTPException(422, "content_hash mismatch")
+
+    # track existence + SID gate (belt-and-braces; the slot scan also gates).
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+    if not _is_sid_format(track):
+        raise HTTPException(415, "Not a C64 SID track")
+
+    # (5) SERVER-derived destination slot.
+    wav_path = get_sid_wav_path_for_upload(track_id, subsong)
+    if wav_path is None:
+        raise HTTPException(425, "SID WAV not cached yet — retry")
+    vu_path = wav_path.with_suffix(".vu")
+
+    # Idempotent, server-wins: never overwrite an existing sidecar.
+    if vu_path.exists():
+        return Response(status_code=204)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, write_sidecar_bytes, vu_path, raw)
+    return Response(status_code=204)
+
+
+# Bound concurrent client SID-WAV uploads (A2): each body is spooled to disk, but
+# the semaphore + the Content-Length gate stop N concurrent ~50 MB uploads from
+# hammering a low-power box's RAM / disk / CPU all at once.
+_SID_UPLOAD_SEM = asyncio.Semaphore(2)
+
+
+def _validate_sid_wav(header: bytes, total_len: int, expect_data_bytes: int) -> str | None:
+    """Validate a client-rendered SID WAV from its 44-byte canonical header + the
+    total streamed byte count (the body is spooled to disk, never held in RAM).
+    Canonical RIFF/WAVE, mono / 44100 / 16-bit PCM, and a data chunk within ~1 s
+    of the expected length (rejects a truncated WAV under a full-length key).
+    The WASM worker writes exactly this canonical layout (vu-sid-worker.js
+    buildWav), so a non-canonical upload is refused."""
+    import struct
+    if len(header) < 44:
+        return "shorter than a WAV header"
+    if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+        return "not a RIFF/WAVE"
+    if header[12:16] != b"fmt ":
+        return "no fmt chunk at offset 12"
+    audio_format, channels, rate = struct.unpack("<HHI", header[20:28])
+    bits = struct.unpack("<H", header[34:36])[0]
+    if audio_format != 1:
+        return "not PCM"
+    if channels != 1:
+        return f"not mono ({channels} channels)"
+    if rate != 44100:
+        return f"sample rate {rate} != 44100"
+    if bits != 16:
+        return f"{bits}-bit != 16-bit"
+    if header[36:40] != b"data":
+        return "no data chunk at offset 36"
+    data_bytes = struct.unpack("<I", header[40:44])[0]
+    if abs(data_bytes - expect_data_bytes) > 88200 + 4096:
+        return f"data length {data_bytes} not within 1 s of expected {expect_data_bytes}"
+    if total_len < 44 + data_bytes - 4096:
+        return "body truncated (fewer bytes than the declared data chunk)"
+    return None
+
+
+@router.post("/{track_id}/sid-audio")
+async def upload_sid_audio(
+    track_id: str,
+    request: Request,
+    subsong: int = Query(0, ge=0, le=1024),
+    duration: int = Query(..., ge=1, le=3600),
+    wav_sha256: str = Query(..., min_length=64, max_length=64),
+    user=_Depends(_require_admin),
+):
+    """Cache-warm: persist a CLIENT-rendered SID WAV into the exact conversion-
+    cache slot the SERVER render would occupy, so every later play (any client,
+    cast, offline, Subsonic) streams it via the normal cached-file path with
+    ZERO ``sidplayfp`` render.  This is what lets a low-power box never re-render
+    a SID once a capable browser has played it once.
+
+    Companion to ``POST /vu`` (the VU sidecar upload); same trust tier and the
+    same "reject BEFORE any write" containment:
+      (1) ``_require_admin`` — the stored WAV is served verbatim to EVERY later
+          consumer (anonymous stream, cast, offline SW, Subsonic), and SID PCM is
+          non-deterministic so no hash can prove a client sent the real render;
+          admin-only bounds that audio-injection capability to the operator.
+          (Non-admin plays still get a warm cache via the server's own render.)
+      (2) ``_is_sid_format`` gate → 415 (Amiga SidMon ``*.sid`` renders under uade).
+      (3) ``target_dur`` is RE-DERIVED server-side, IDENTICAL to ``render_status``
+          / the SID stream branch; a client ``duration`` that disagrees → 409, so
+          the warmed slot always matches the key ``/stream`` later requests (a
+          mismatch would be invisible — the server would simply re-render).
+      (4) ``sid_warm_eligible()``: only when ALL SID fidelity settings are default,
+          so the key carries no fidelity suffix AND the WASM render (which has no
+          chip-model/filter/curve/digiboost setter) actually matches the server
+          → 409 otherwise.  Blocks cross-chip-model cache poisoning.
+      (5) streamed body with a HARD ceiling derived from ``target_dur``; WAV
+          structural validation (mono/44100/16-bit, data length within ~1 s).
+      (6) ``wav_sha256`` = transit-integrity only (the same client computes
+          body+hash; NOT anti-forgery — SID PCM is non-deterministic so no hash
+          can prove fidelity; the authenticated ADMIN user IS the trust boundary).
+      (7) per-key lock + ``get_cached`` re-check → idempotent, server-wins skip.
+    """
+    from soniqboom.config import settings
+    from soniqboom.core.conversion_cache import (
+        _cache_key, get_cached, store_cached, _lock_for,
+        get_conversion_cache_dir, sid_warm_eligible,
+    )
+
+    track = await get_track(track_id)
+    if not track:
+        raise HTTPException(404, "Track not found")
+    if not _is_sid_format(track):
+        raise HTTPException(415, "Not a C64 SID track")
+
+    # (3) RE-derive target_dur exactly like render_status / the SID stream branch.
+    target_dur = int(getattr(settings, "sid_default_duration", 300) or 300)
+    meta = track.__dict__ if hasattr(track, "__dict__") else {}
+    hvsc_lengths = meta.get("hvsc_lengths") or []
+    if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
+        target_dur = int(round(float(hvsc_lengths[subsong])))
+    elif meta.get("duration") and float(meta.get("duration") or 0) > 0:
+        target_dur = int(round(float(meta.get("duration"))))
+    target_dur = max(5, min(int(target_dur), 3600))
+    if int(duration) != target_dur:
+        raise HTTPException(409, f"duration mismatch — server target is {target_dur}s")
+
+    # (4) fidelity gate — refuse warming a slot the WASM can't reproduce.
+    if not sid_warm_eligible():
+        raise HTTPException(409, "server SID fidelity is non-default — cannot cache-warm")
+
+    # (5) Bound RAM + concurrency (A2): require Content-Length (reject chunked so
+    # we can't be forced to buffer an unbounded body), cap the size, gate
+    # concurrent uploads, and SPOOL the streamed body straight to a temp file so
+    # the ~50 MB WAV never sits in RAM.  mono/44100/16-bit = 88200 bytes/s.
+    _EXPECT = target_dur * 88200
+    _MAX = min(_EXPECT + 2 * 88200 + 4096, 64 * 1024 * 1024)
+    clen = request.headers.get("content-length")
+    if not (clen and clen.isdigit()):
+        raise HTTPException(411, "Content-Length required")
+    if int(clen) > _MAX:
+        raise HTTPException(413, "SID WAV too large")
+
+    full_key = _cache_key(track_id, "sid", subsong, duration=target_dur)
+    async with _SID_UPLOAD_SEM:
+        import hashlib
+        import tempfile
+        cdir = get_conversion_cache_dir() / "sid"
+        cdir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".wav", dir=str(cdir))
+        digest = hashlib.sha256()
+        header = bytearray()
+        total = 0
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                async for _chunk in request.stream():
+                    total += len(_chunk)
+                    if total > _MAX:
+                        raise HTTPException(413, "SID WAV too large")
+                    digest.update(_chunk)
+                    if len(header) < 44:
+                        header += _chunk[: 44 - len(header)]
+                    fh.write(_chunk)
+            if digest.hexdigest() != wav_sha256.lower():
+                raise HTTPException(422, "wav_sha256 mismatch")
+            err = _validate_sid_wav(bytes(header), total, _EXPECT)
+            if err:
+                raise HTTPException(422, f"invalid SID WAV: {err}")
+            # (7) per-key lock: idempotent, server-wins — the spooled temp file is
+            # moved into the keyed slot, or dropped if a render beat us to it.
+            async with _lock_for(full_key):
+                if await get_cached(full_key) is not None:
+                    return Response(status_code=204)      # already warmed — first-wins
+                await store_cached(full_key, "sid", Path(tmp))
+                tmp = None                                # moved into the cache
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    return Response(status_code=204)
 
 
 # Tracker-only formats — gating the lazy backfill so we don't try to

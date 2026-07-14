@@ -206,11 +206,13 @@ async def test_chromecast_play_media_payload():
 #  AirPlay — pyatv stream/play_url call shape
 # ════════════════════════════════════════════════════════════════════════
 
-async def test_airplay_play_uses_stream_url_for_ap2():
-    """AirPlay 2 receivers (Apple TV 4K, HomePod gen 2) accept
-    ``stream.stream_url(url, metadata=...)``.  Title / artist /
-    album must be in the metadata dict so the receiver's display
-    shows them."""
+async def test_airplay_play_uses_stream_file_for_ap2():
+    """AirPlay 2 receivers (Apple TV 4K, HomePod gen 2) are driven via
+    pyatv's ``stream.stream_file(url, metadata=...)`` — pyatv 0.14+
+    removed ``stream_url`` (calling it raised ``AttributeError: 'Facade
+    Stream' object has no attribute 'stream_url'`` on every play).  Title
+    / artist / album ride in the typed MediaMetadata so the receiver's
+    display shows them."""
     from soniqboom.core import cast_airplay
 
     ctrl = cast_airplay.AirPlayController(
@@ -220,7 +222,7 @@ async def test_airplay_play_uses_stream_url_for_ap2():
     # Skip the real pyatv handshake
     fake_atv = MagicMock()
     fake_atv.stream = MagicMock()
-    fake_atv.stream.stream_url = AsyncMock()
+    fake_atv.stream.stream_file = AsyncMock()
     fake_atv.stream.play_url = AsyncMock()
 
     ctrl._atv = fake_atv
@@ -235,17 +237,29 @@ async def test_airplay_play_uses_stream_url_for_ap2():
         album="Test Album",
     )
 
-    assert fake_atv.stream.stream_url.called or fake_atv.stream.play_url.called
-    # AirPlay 2 path: stream_url
-    if fake_atv.stream.stream_url.called:
-        args, kwargs = fake_atv.stream.stream_url.call_args
-        all_args = list(args) + list(kwargs.values())
-        assert any("/cast/TOK/song.alac" in str(a) for a in all_args)
+    # AirPlay 2 path: stream_file (with MediaMetadata when this pyatv
+    # exposes it, else the URL alone) — never the legacy play_url.
+    assert fake_atv.stream.stream_file.called
+    assert not fake_atv.stream.play_url.called
+    args, kwargs = fake_atv.stream.stream_file.call_args
+    all_args = list(args) + list(kwargs.values())
+    assert any("/cast/TOK/song.alac" in str(a) for a in all_args)
+    # And when this pyatv exposes MediaMetadata, title/artist/album must
+    # actually ride in it — the receiver's on-screen display depends on it.
+    # Asserting only the URL would let a regression that dropped the
+    # ``metadata=`` kwarg pass silently.
+    if cast_airplay._MEDIA_METADATA_AVAILABLE:
+        md = kwargs.get("metadata")
+        assert md is not None, "AP2 must pass MediaMetadata when pyatv supports it"
+        assert md.title == "Test Track"
+        assert md.artist == "Test Artist"
+        assert md.album == "Test Album"
 
 
 async def test_airplay_play_falls_back_to_play_url_for_ap1():
     """AirPlay 1 / RAOP (HomePod 1st gen, older AirPlay speakers)
-    don't support stream_url + metadata — fall back to play_url."""
+    have no metadata frames — fall back to ``play_url`` (no metadata),
+    not the AirPlay-2 ``stream_file`` path."""
     from soniqboom.core import cast_airplay
 
     ctrl = cast_airplay.AirPlayController(
@@ -254,7 +268,7 @@ async def test_airplay_play_falls_back_to_play_url_for_ap1():
 
     fake_atv = MagicMock()
     fake_atv.stream = MagicMock()
-    fake_atv.stream.stream_url = AsyncMock()
+    fake_atv.stream.stream_file = AsyncMock()
     fake_atv.stream.play_url = AsyncMock()
 
     ctrl._atv = fake_atv
@@ -267,9 +281,9 @@ async def test_airplay_play_falls_back_to_play_url_for_ap1():
         title="X", artist="Y", album="Z",
     )
 
-    # Must fall back to play_url; stream_url with metadata is rejected
-    # by RAOP receivers.
-    assert fake_atv.stream.play_url.called or fake_atv.stream.stream_url.called
+    # Must use play_url; the AirPlay-2 stream_file path is not taken.
+    assert fake_atv.stream.play_url.called
+    assert not fake_atv.stream.stream_file.called
 
 
 # ════════════════════════════════════════════════════════════════════════

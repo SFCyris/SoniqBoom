@@ -199,10 +199,13 @@ async def _range_file_response(
 
 router = APIRouter(prefix="/stream", tags=["stream"])
 
-# Formats ALL major browsers can decode natively (Chrome, Firefox, Safari).
-# .m4a and .aac are intentionally excluded: they may contain ALAC
-# (Apple Lossless), which only Safari supports. Chrome/Firefox fail silently
-# on ALAC, so we transcode all .m4a/.aac through ffmpeg to be safe.
+# Formats ALL major browsers can decode natively (Chrome, Firefox, Safari) by
+# extension alone.  ``.m4a``/``.aac`` are NOT here because the extension can't
+# tell AAC (universal) from ALAC (Safari-only) — the stream handler probes the
+# real codec (``_probe_codec``) and then direct-serves AAC to everyone and ALAC
+# to Safari, transcoding only ALAC-on-non-Safari (see the "probe codec first"
+# branch in ``stream_track``).  Ogg is native here but gated away from Safari
+# < 18.4 at serve time (``_safari_lacks_ogg``), which can't decode Opus/Vorbis.
 NATIVE: dict[str, str] = {
     ".mp3":  "audio/mpeg",
     ".flac": "audio/flac",
@@ -352,19 +355,47 @@ async def _await_renderer(
     pegging CPU.
     """
     async with _render_sem:
+        # Capture stderr (was DEVNULL): a renderer's own diagnostics are the
+        # only way to tell "the file isn't a valid module" (a clear 4xx the
+        # listener can act on) apart from "the renderer/infra broke" (a 502).
+        # ``communicate`` drains the pipe concurrently so a chatty renderer
+        # (ffmpeg) can't deadlock on a full 64K stderr buffer.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
+            stderr_data = b""
             try:
-                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                _, stderr_data = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
                 Path(tmp_path).unlink(missing_ok=True)
                 raise HTTPException(504, f"{kind} render timed out after {int(timeout)}s")
             if proc.returncode != 0:
                 Path(tmp_path).unlink(missing_ok=True)
+                err_text = (stderr_data or b"").decode("utf-8", "replace")
+                # uade prints "module check failed" to stderr ONLY when the
+                # input isn't a real Amiga module — e.g. a PC ``.dat``
+                # misindexed as PaulRobotham by extension.  Surface that as a
+                # clear 422 the frontend shows in the toast, instead of a
+                # cryptic "uade renderer exited with status 1" 502.  Do NOT
+                # match the generic "Can not play <name>" line — uade prints it
+                # for a legit module whose companion sample half is missing too
+                # ("score died"), which would be mislabelled as PC data.
+                low = err_text.lower()
+                if kind == "uade" and "module check failed" in low:
+                    raise HTTPException(
+                        422,
+                        "This file isn't a playable Amiga module — it looks "
+                        "like non-module data (e.g. a PC/DOS file) indexed by "
+                        "mistake.",
+                    )
+                if err_text.strip():
+                    log.warning(
+                        "%s renderer failed (exit %s): %s", kind,
+                        proc.returncode, err_text.strip()[:500])
                 raise HTTPException(
                     502, f"{kind} renderer exited with status {proc.returncode}",
                 )
@@ -387,6 +418,78 @@ async def _await_renderer(
 
 # ── SID rendering ─────────────────────────────────────────────────────────────
 
+# sidplayfp's fixed WAV output format (verified: `sidplayfp -w` writes mono,
+# 44100 Hz, 16-bit signed PCM).  Used to synthesise a full-length header for the
+# progressive stream (sidplayfp itself only writes a header sized to what it has
+# rendered so far, so its own header can't be streamed byte-0 for a growing file).
+_SID_WAV_RATE = 44100
+_SID_WAV_CHANNELS = 1
+_SID_WAV_BITS = 16
+
+# Strong refs to the detached progressive-SID finaliser tasks.  Each owns a
+# render's reap+cache lifecycle independently of the response, so a client
+# disconnect can't abort it; without a live ref asyncio may GC a bare task.
+_SID_PROG_FINALISERS: set = set()
+
+# Cap on concurrent progressive-SID renders.  Beyond this, cold web plays fall
+# back to the blocking render path so a burst of connect/disconnect requests
+# can't spawn an unbounded fleet of sidplayfp processes (each holds a CPU core
+# ~15x-realtime and a growing temp file).  A 1-element list so the generator /
+# finaliser can mutate it without a ``global`` declaration.
+_SID_PROG_MAX_CONCURRENT = 8
+_SID_PROG_ACTIVE = [0]
+# How long to wait for sidplayfp's first PCM bytes before either streaming
+# (bytes appeared) or falling back to the blocking render (proc died first —
+# so an immediate render failure surfaces as a real error, not silent silence).
+_SID_PROG_FIRST_BYTE_TIMEOUT = 3.0
+
+
+def _synth_wav_header(rate: int, channels: int, bits: int, data_bytes: int) -> bytes:
+    """A canonical 44-byte PCM WAV header declaring ``data_bytes`` of audio."""
+    byte_rate = rate * channels * bits // 8
+    block_align = channels * bits // 8
+    u16 = lambda v: int(v).to_bytes(2, "little")
+    u32 = lambda v: int(v).to_bytes(4, "little")
+    return (b"RIFF" + u32(36 + data_bytes) + b"WAVE"
+            + b"fmt " + u32(16) + u16(1) + u16(channels) + u32(rate)
+            + u32(byte_rate) + u16(block_align) + u16(bits)
+            + b"data" + u32(data_bytes))
+
+
+def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: str,
+                    mute: "tuple[int, ...]" = ()) -> list[str]:
+    """Build the sidplayfp argv shared by the blocking and progressive renders,
+    so the two paths never drift on chip-model / filter / digiboost flags.
+
+    ``mute`` is a tuple of 1-indexed voices to silence via ``-u<n>`` — used by
+    the per-voice VU pass (sid_vu) to isolate one voice per render.
+
+    SID chip-model / filter overrides (settings; defaults = no flags, i.e.
+    sidplayfp honours the tune's own PSID header).  Flags verified against
+    sidplayfp --help: -m<o|n>[f], -nf, --fcurve=<num>, --digiboost, -u<n> mute
+    voice; no space between a short flag and its value."""
+    cmd = [binary]
+    if subsong > 0:
+        cmd.append(f"-o{subsong}")
+    for _v in mute:
+        cmd.append(f"-u{int(_v)}")
+    _model = (settings.sid_model or "auto").lower()
+    if _model in ("6581", "8580"):
+        _mflag = "-mo" if _model == "6581" else "-mn"
+        if settings.sid_model_force:
+            _mflag += "f"
+        cmd.append(_mflag)
+    if not settings.sid_filter:
+        cmd.append("-nf")
+    _curve = float(getattr(settings, "sid_filter_curve", -1.0))
+    if 0.0 <= _curve <= 1.0:
+        cmd.append(f"--fcurve={_curve:g}")
+    if settings.sid_digiboost:
+        cmd.append("--digiboost")
+    cmd.extend([f"-t{int(dur)}", f"-w{out_wav}", str(path)])
+    return cmd
+
+
 async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None) -> Path:
     """Render SID file to a temp WAV via sidplayfp and return the path.
 
@@ -403,33 +506,514 @@ async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None)
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_wav.close()
 
-    cmd = [binary]
-    if subsong > 0:
-        cmd.append(f"-o{subsong}")      # sidplayfp flags: no space between flag and value
-    # SID chip-model / filter overrides (settings; defaults = no flags, i.e.
-    # sidplayfp honours the tune's own PSID header).  Flags verified against
-    # sidplayfp --help: -m<o|n>[f], -nf, --fcurve=<num>, --digiboost.
-    _model = (settings.sid_model or "auto").lower()
-    if _model in ("6581", "8580"):
-        _mflag = "-mo" if _model == "6581" else "-mn"
-        if settings.sid_model_force:
-            _mflag += "f"
-        cmd.append(_mflag)
-    if not settings.sid_filter:
-        cmd.append("-nf")
-    _curve = float(getattr(settings, "sid_filter_curve", -1.0))
-    if 0.0 <= _curve <= 1.0:
-        cmd.append(f"--fcurve={_curve:g}")
-    if settings.sid_digiboost:
-        cmd.append("--digiboost")
-    cmd.extend([
-        f"-t{dur}",
-        f"-w{tmp_wav.name}",
-        str(path),
-    ])
-
+    cmd = _sid_render_cmd(binary, path, subsong, dur, tmp_wav.name)
     await _await_renderer(cmd, Path(tmp_wav.name), timeout=dur + 30, kind="SID")
     return Path(tmp_wav.name)
+
+
+# ── SID per-voice VU (retro 3-voice meter, DeepSID-style) ────────────────────
+# The meter is built from 3 extra "isolation" renders (one per SID voice, the
+# other two muted).  That's ~3× a SID render, so it runs ONCE per tune in the
+# background, best-effort, capped + semaphore-bounded, and the result is cached
+# forever as a ``.vu`` sidecar next to the audio WAV — the same VUMR format the
+# tracker/uade meters use, so the frontend needs no changes.
+_SID_VU_MAX_DURATION = 600          # don't spend 3× on very long tunes
+_SID_VU_INFLIGHT: set = set()       # full_keys queued or generating (deduped)
+# One tune's VU gen at a time — each now runs its 3 isolation passes CONCURRENTLY
+# (3 cores), so a semaphore of 1 already keeps ~3 sidplayfp busy without starving
+# playback; more tunes queue behind it (bounded by _SID_VU_MAX_QUEUED).
+_SID_VU_SEM = asyncio.Semaphore(1)
+_SID_VU_MAX_QUEUED = 8              # bound the TOTAL backlog — a burst of many
+                                    # distinct SIDs can't pile up unbounded VU
+                                    # work; skipped tunes generate on a later play
+# Client-VU offload: a browser plays a SID, renders its per-voice VU with the
+# libsidplayfp+reSIDfp WASM core, and POSTs it to /api/tracks/{id}/vu.  The VU
+# sidecar is consumed ONLY by the browser meter, so we hold the server's own
+# 3-pass render for this grace window to let a capable client upload first
+# (true offload).  If no upload lands (cast/Subsonic play, or a WASM-incapable
+# browser), the server renders as the fallback.  The client upload and this
+# render both short-circuit on the ".vu exists" check, so whoever finishes
+# first wins and the other skips.  0 disables the delay (always render at once).
+_SID_VU_SERVER_DELAY = 30.0
+
+
+async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
+                         subsong: int, dur: int) -> None:
+    """Render the 3 voice-isolation passes and write the per-voice VUMR sidecar
+    next to ``cached_wav``.  Best-effort — any failure leaves the FFT fallback."""
+    from soniqboom.core import sid_vu, openmpt_vu
+    binary = _find_renderer(settings.sidplayfp_path, "sidplayfp")
+    tmps: list[Path] = []
+    try:
+        if not binary:
+            return
+        async with _SID_VU_SEM:
+            # Re-check under the semaphore — another play may have finished it
+            # while we queued.
+            if cached_wav.with_suffix(".vu").exists():
+                return
+            # Run the 3 voice-isolation renders CONCURRENTLY (not sequentially)
+            # so total gen time is ~one render, not three — a 6-min tune drops
+            # from ~68 s to ~23 s.  Each sidplayfp is single-threaded (one core),
+            # so 3 in parallel just uses 3 cores; the semaphore bounds how many
+            # tunes generate at once.
+            voice_wavs: list[Path] = []
+            render_coros = []
+            for mute in sid_vu.VOICE_MUTES:
+                tf = tempfile.NamedTemporaryFile(suffix=".wav", prefix="sidvu-", delete=False)
+                tf.close()
+                tp = Path(tf.name)
+                tmps.append(tp)
+                cmd = _sid_render_cmd(binary, sid_path, subsong, dur, tf.name, mute=mute)
+                render_coros.append(_await_renderer(cmd, tp, timeout=dur + 30, kind="SID-VU"))
+                voice_wavs.append(tp)
+            await asyncio.gather(*render_coros)
+            result = await asyncio.to_thread(sid_vu.build_vu, voice_wavs, float(dur))
+            if result is not None:
+                vu_path = cached_wav.with_suffix(".vu")
+                await asyncio.to_thread(openmpt_vu.write_sidecar, vu_path, result)
+                log.info("SID VU: wrote %d-voice sidecar for %s",
+                         result.channels, cached_wav.name)
+    except Exception:
+        log.debug("SID VU pass failed for %s", sid_path, exc_info=True)
+    finally:
+        for tp in tmps:
+            try:
+                tp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _SID_VU_INFLIGHT.discard(full_key)
+
+
+def _spawn_sid_vu(full_key: str, cached_wav: Path, sid_path: Path,
+                  subsong: int, dur: int) -> None:
+    """Dedup + cap + fire-and-forget the 3-pass VU generation for a cached SID
+    WAV at ``cached_wav``.  No-op if too long, already present, or in flight."""
+    if dur <= 0 or dur > _SID_VU_MAX_DURATION:
+        return
+    if full_key in _SID_VU_INFLIGHT:
+        return
+    if len(_SID_VU_INFLIGHT) >= _SID_VU_MAX_QUEUED:
+        return                                  # backlog full — retry on a later play
+    if cached_wav.with_suffix(".vu").exists():
+        return
+    _SID_VU_INFLIGHT.add(full_key)
+    task = asyncio.create_task(
+        _sid_vu_worker_delayed(full_key, cached_wav, sid_path, subsong, dur),
+        name=f"sid_vu[{full_key}]",
+    )
+    _SID_PROG_FINALISERS.add(task)              # strong ref; reuse the ref set
+    task.add_done_callback(_SID_PROG_FINALISERS.discard)
+
+
+async def _sid_vu_worker_delayed(full_key: str, cached_wav: Path, sid_path: Path,
+                                 subsong: int, dur: int) -> None:
+    """Hold ``_SID_VU_SERVER_DELAY`` seconds so a browser client can upload its
+    WASM-rendered sidecar first (offload), then generate server-side only if the
+    ``.vu`` still doesn't exist.  Owns the inflight-slot release for the skip
+    path; ``_sid_vu_worker`` releases it for the render path (both idempotent)."""
+    try:
+        if _SID_VU_SERVER_DELAY > 0:
+            await asyncio.sleep(_SID_VU_SERVER_DELAY)
+        if cached_wav.with_suffix(".vu").exists():
+            return                              # client (or a prior play) won — skip the render
+        await _sid_vu_worker(full_key, cached_wav, sid_path, subsong, dur)
+    finally:
+        _SID_VU_INFLIGHT.discard(full_key)      # idempotent; covers the skip/sleep-cancel paths
+
+
+def ensure_sid_vu_sidecar(track_id: str, sid_path: Path, subsong: int, dur: int) -> None:
+    """Fire-and-forget: ensure a per-voice VU sidecar exists for a cached SID.
+
+    Resolves the cached WAV from ``_meta`` and delegates to ``_spawn_sid_vu``.
+    Safe to call from every SID play path — dedups on the cache key.  No-op when
+    the audio isn't cached yet (the caller re-triggers on the next play)."""
+    if dur <= 0 or dur > _SID_VU_MAX_DURATION:
+        return
+    from soniqboom.core.conversion_cache import _cache_key, _meta
+    full_key = _cache_key(track_id, "sid", subsong, duration=dur)
+    entry = _meta.get(full_key)
+    if not entry:
+        return                                  # audio not cached yet — skip
+    _spawn_sid_vu(full_key, Path(entry["path"]), sid_path, subsong, dur)
+
+
+async def _await_first_sid_output(proc, tmp: Path, timeout: float) -> bool:
+    """Wait until sidplayfp has written its first PCM bytes (→ True) or exited
+    without producing any (→ False).  Lets the caller detect an immediate render
+    failure (bad tune, missing ROM) and fall back to the blocking path — which
+    surfaces a real error — instead of streaming a silent full-length 200.
+
+    On timeout with the process still alive we return True and stream anyway:
+    the generator's own idle-timeout handles a genuinely stuck render."""
+    waited = 0.0
+    while waited < timeout:
+        try:
+            if os.path.getsize(tmp) > _WAV_HEADER_LEN:
+                return True
+        except OSError:
+            pass
+        if proc.returncode is not None:
+            # Exited already — success only if it left real PCM on disk.
+            try:
+                return os.path.getsize(tmp) > _WAV_HEADER_LEN
+            except OSError:
+                return False
+        await asyncio.sleep(_GROWING_POLL_INTERVAL)
+        waited += _GROWING_POLL_INTERVAL
+    # Timed out.  Fail over only if the proc already died producing nothing;
+    # otherwise let the stream proceed.
+    return proc.returncode is None
+
+
+def _parse_audio_range(range_header: "str | None", total: int):
+    """Parse a single HTTP ``Range: bytes=…`` header against a known ``total``
+    size.  Returns ``(start, end_exclusive, is_range)``:
+      • no/whitespace/multi-range or malformed header → ``(0, total, False)``
+        (treat as a full-content request; 200).
+      • a valid single range → ``(start, end_exclusive, True)`` (206).
+      • an unsatisfiable range (start past the end) → ``None`` (caller 416s).
+    Only the FIRST range of a multi-range request is honoured (browsers send
+    single ranges for media); ``bytes=-N`` suffix ranges are supported."""
+    rh = (range_header or "").strip().lower()
+    if not rh.startswith("bytes="):
+        return (0, total, False)
+    spec = rh[len("bytes="):].split(",")[0].strip()   # first range only
+    if "-" not in spec:
+        return (0, total, False)
+    a, _, b = spec.partition("-")
+    try:
+        if a == "":                                   # suffix: bytes=-N
+            n = int(b)
+            if n <= 0:
+                return None
+            start, end_excl = max(0, total - n), total
+        else:
+            start = int(a)
+            end_excl = (int(b) + 1) if b else total
+    except ValueError:
+        return (0, total, False)
+    end_excl = min(end_excl, total)
+    if start < 0 or start >= total or start >= end_excl:
+        return None
+    return (start, end_excl, True)
+
+
+async def _serve_sid_progressive(
+    request: Request,
+    sid_path: Path,
+    subsong: int,
+    duration: int,
+    full_key: str,
+    base_headers: dict[str, str],
+    background,
+) -> "Response | None":
+    """Cold-play a SID with ~instant start: spawn sidplayfp and stream its
+    STILL-RENDERING WAV instead of awaiting the whole render.
+
+    sidplayfp renders ~15x realtime, so the first ~1 s of audio is on disk in
+    ~0.2 s; we ship a synthesised full-length WAV header immediately, then relay
+    sidplayfp's PCM (skipping its own 44-byte header) as the file grows.  On a
+    clean, fully-streamed render the finished WAV is promoted to the conversion
+    cache under ``full_key`` so the next play hits the instant Range fast-path.
+
+    Returns ``None`` (having cleaned up) when the render fails to start — the
+    caller must then use the blocking path so the error surfaces as a real 5xx
+    rather than a silent full-length-silence 200.
+
+    Answers Range/seek requests with a proper 206 + Content-Range against the
+    known full length (``44 + data_bytes``), and serves header-only probes
+    (Safari's ``bytes=0-1``) straight from the synthesised header with no render.
+    Used for the local web-UI cold path only; cache hits and non-web clients
+    (Subsonic/DLNA/Cast) stay on the existing blocking render."""
+    from soniqboom.core.conversion_cache import get_cached, store_cached
+
+    binary = _find_renderer(settings.sidplayfp_path, "sidplayfp")
+    if not binary:
+        raise HTTPException(501, "sidplayfp not installed")
+
+    data_bytes = int(duration) * _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8)
+    header = _synth_wav_header(_SID_WAV_RATE, _SID_WAV_CHANNELS, _SID_WAV_BITS, data_bytes)
+    total = _WAV_HEADER_LEN + data_bytes
+
+    # The progressive WAV is EXACTLY ``total`` bytes even before it's rendered
+    # (synthesised header + fixed-length PCM), so a Range/seek request can be
+    # answered with a proper ``206`` + ``Content-Range`` against the known total.
+    # This is what makes progressive SID safe in WebKit/Safari — which probes a
+    # media element with ``Range: bytes=0-1`` and requires a 206 — and lets an
+    # early seek stream from the requested offset instead of dropping to a full
+    # blocking render.
+    rng = _parse_audio_range(request.headers.get("range"), total)
+    if rng is None:                                   # unsatisfiable range
+        return Response(status_code=416, media_type="audio/wav",
+                        headers={"Content-Range": f"bytes */{total}",
+                                 "Accept-Ranges": "bytes"},
+                        background=background)
+    start, end_excl, is_range = rng
+
+    # Header-only range (Safari's ``bytes=0-1`` probe, or any range fully inside
+    # the 44-byte header) — serve straight from the synthesised header with NO
+    # render and NO concurrency slot.  Satisfies the probe so WebKit learns the
+    # length + range support, then issues the real playback request below.
+    if end_excl <= _WAV_HEADER_LEN:
+        body = header[start:end_excl]
+        hdrs = dict(base_headers or {})
+        hdrs["Accept-Ranges"] = "bytes"
+        hdrs["X-Stream-Mode"] = "sid-progressive-head"
+        hdrs["Content-Range"] = f"bytes {start}-{end_excl - 1}/{total}"
+        hdrs["Content-Length"] = str(len(body))
+        return Response(content=body, status_code=206, media_type="audio/wav",
+                        headers=hdrs, background=background)
+
+    # Data range → we must render.  Concurrency cap: reserve a slot in the SAME
+    # synchronous block as the check so a simultaneous burst can't all pass
+    # "< cap" before any of them increments (asyncio runs this prefix to the
+    # first ``await`` uninterrupted, so the count is authoritative here).  Over
+    # cap → return None so the caller renders blocking.
+    if _SID_PROG_ACTIVE[0] >= _SID_PROG_MAX_CONCURRENT:
+        return None
+    _SID_PROG_ACTIVE[0] += 1
+    _slot_released = {"v": False}
+
+    def _release_slot() -> None:
+        if not _slot_released["v"]:
+            _slot_released["v"] = True
+            _SID_PROG_ACTIVE[0] -= 1
+
+    tmp: "Path | None" = None
+    proc = None
+    try:
+        # Create the temp + spawn together; if the spawn itself raises (FD
+        # exhaustion, binary vanished mid-flight) unlink the orphaned temp — the
+        # finaliser that normally owns cleanup isn't created until after this.
+        tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="sidprog-")[1])
+        cmd = _sid_render_cmd(binary, sid_path, subsong, int(duration), str(tmp))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        # Detect an immediate render failure before committing to the streaming
+        # response.  If sidplayfp dies without writing PCM, reap it, drop the
+        # temp, and signal the caller to fall back to the blocking render.
+        if not await _await_first_sid_output(proc, tmp, _SID_PROG_FIRST_BYTE_TIMEOUT):
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            tmp.unlink(missing_ok=True)
+            log.info("progressive SID: no first-byte output (rc=%s) for %s — "
+                     "falling back to blocking render", proc.returncode, full_key)
+            _release_slot()
+            return None
+    except BaseException:
+        # Any failure before the finaliser exists (including CancelledError on
+        # server shutdown mid-probe) must clean up itself — the finaliser that
+        # normally owns the proc + temp isn't created until below.  ``kill`` is
+        # synchronous so it runs even while the task is being cancelled; the
+        # asyncio child watcher reaps the killed proc.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _release_slot()
+        raise
+
+    # Shared flag: the response generator flips this once it has streamed the
+    # whole declared length.  Read by the DETACHED finaliser below.  ``gen_done``
+    # is set by the generator's finally on EITHER completion or disconnect, so
+    # the finaliser waits for the generator to reach its final state before
+    # reading ``streamed_all`` (else a fast render whose proc exits before a slow
+    # client finishes would be judged incomplete and its good WAV discarded).
+    state = {"streamed_all": False}
+    gen_done = asyncio.Event()
+
+    async def _finalise() -> None:
+        # Owns the render's lifecycle INDEPENDENTLY of the response task, so a
+        # client disconnect (which cancels the generator) can't abort the
+        # reap/cache: awaiting ``proc.wait()`` inside the generator's finally
+        # was being CancelledError'd on disconnect, leaking a zombie sidplayfp.
+        try:
+            # Wait for the generator's final state.  Bounded so a response the
+            # server never iterates (client vanished before the body streamed)
+            # can't hang this task forever with an unreaped child.
+            try:
+                await asyncio.wait_for(gen_done.wait(), timeout=int(duration) + 60)
+            except asyncio.TimeoutError:
+                pass
+            # If the client didn't consume the whole stream the render is
+            # worthless — kill it NOW rather than let an unwatched sidplayfp run
+            # to completion (the drop-before-first-byte / disconnect cases).
+            if not state["streamed_all"] and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            # ``streamed_all`` means the CLIENT received a full-length stream
+            # (the generator silence-pads to ``data_bytes``), NOT that the
+            # on-disk render is complete.  Require the temp to be essentially
+            # full-length before caching, else a short exit-0 render would be
+            # promoted and every warm play would range-serve a truncated tune.
+            # 1 s of slack absorbs sidplayfp's sub-second rounding (it normally
+            # renders slightly PAST ``-t`` so this passes comfortably).
+            try:
+                _tmp_size = os.path.getsize(tmp) if tmp.exists() else 0
+            except OSError:
+                _tmp_size = 0
+            _one_sec = _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8)
+            _min_file = _WAV_HEADER_LEN + max(0, data_bytes - _one_sec)
+            good = (state["streamed_all"] and proc.returncode == 0
+                    and _tmp_size >= _min_file)
+            if good:
+                # Re-check: a concurrent render (another cold play, or a
+                # blocking Subsonic play) may have cached this key first.  If
+                # so, just drop our temp — store_cached is idempotent now, but
+                # skipping avoids a redundant move + LRU touch.
+                existing = await get_cached(full_key)
+                if existing is not None:
+                    tmp.unlink(missing_ok=True)
+                    _spawn_sid_vu(full_key, existing, sid_path, subsong, int(duration))
+                else:
+                    dest = await store_cached(full_key, "sid", tmp)   # MOVES tmp into cache
+                    log.info("progressive SID: cached %s (%d s)", full_key, int(duration))
+                    # Kick off the retro per-voice VU meter in the background —
+                    # ready for the next play; this one used the FFT fallback.
+                    _spawn_sid_vu(full_key, dest, sid_path, subsong, int(duration))
+            else:
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            log.warning("progressive SID: finalise failed for %s", full_key, exc_info=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        finally:
+            _release_slot()          # idempotent — releases the concurrency slot
+            _SID_PROG_FINALISERS.discard(fin_task)
+
+    fin_task = asyncio.create_task(_finalise())
+    _SID_PROG_FINALISERS.add(fin_task)          # strong ref so it isn't GC'd
+
+    # Map the requested byte range [start, end_excl) onto the virtual file:
+    # header region [h_lo, h_hi) served from the synthesised header; data region
+    # [d_lo, d_hi) read from the growing temp at (pos - 44).  ``streamed_all`` is
+    # set only when the range reaches the file's end (``d_hi >= data_bytes``) —
+    # completing such a range proves the render finished, so it's cacheable; a
+    # partial mid-file range isn't (and its render is killed on the client's exit).
+    h_lo, h_hi = start, min(end_excl, _WAV_HEADER_LEN)
+    d_lo, d_hi = max(start, _WAV_HEADER_LEN) - _WAV_HEADER_LEN, end_excl - _WAV_HEADER_LEN
+
+    async def _gen():
+        fd = None
+        checked_header = False
+        try:
+            if h_lo < h_hi:
+                yield header[h_lo:h_hi]
+            pos = d_lo
+            idle = 0.0
+            while pos < d_hi:
+                try:
+                    cur = os.path.getsize(tmp)
+                except OSError:
+                    cur = 0
+                if fd is None and cur > _WAV_HEADER_LEN:
+                    fd = await asyncio.to_thread(os.open, str(tmp), os.O_RDONLY)
+                if fd is not None:
+                    if not checked_header:
+                        # One-time defensive check: confirm sidplayfp really
+                        # wrote a RIFF/WAVE header of the length we skip.  If a
+                        # future binary emits a different container the offset-44
+                        # skip would desync — log it rather than ship garbage.
+                        magic = await asyncio.to_thread(os.pread, fd, 4, 0)
+                        if magic != b"RIFF":
+                            log.warning("progressive SID: temp header %r not RIFF "
+                                        "for %s — streaming anyway", magic, full_key)
+                        checked_header = True
+                    want = min(_RANGE_STREAMING_CHUNK, d_hi - pos)
+                    buf = await asyncio.to_thread(os.pread, fd, want, _WAV_HEADER_LEN + pos)
+                    if buf:
+                        yield buf
+                        pos += len(buf)
+                        idle = 0.0
+                        continue
+                # No new bytes right now.
+                if proc.returncode is not None:
+                    # Render finished: pad any rounding shortfall so the declared
+                    # Content-Length is satisfied exactly.
+                    pad = d_hi - pos
+                    while pad > 0:
+                        n = min(_RANGE_STREAMING_CHUNK, pad)
+                        yield b"\x00" * n
+                        pad -= n
+                    state["streamed_all"] = (d_hi >= data_bytes)
+                    return
+                await asyncio.sleep(_GROWING_POLL_INTERVAL)
+                idle += _GROWING_POLL_INTERVAL
+                if idle >= _GROWING_READ_TIMEOUT:
+                    # Render stalled.  Pad the remainder with silence so the
+                    # client still gets a valid, declared-length WAV rather than
+                    # a short read the <audio> element rejects — but leave
+                    # ``streamed_all`` False so this stalled render is NOT cached.
+                    log.warning("progressive SID: no new bytes in %.0fs for %s — "
+                                "padding to declared length at %d/%d",
+                                idle, full_key, pos, d_hi)
+                    pad = d_hi - pos
+                    while pad > 0:
+                        n = min(_RANGE_STREAMING_CHUNK, pad)
+                        yield b"\x00" * n
+                        pad -= n
+                    return
+            state["streamed_all"] = (d_hi >= data_bytes)   # delivered the full range
+        finally:
+            # Sync-only cleanup (survives task cancellation): close our fd and,
+            # if the client bailed early, SIGTERM the render.  The detached
+            # ``_finalise`` reaps it and decides caching — never blocked here.
+            # Order matters: close the fd BEFORE signalling ``gen_done`` so the
+            # finaliser never moves/unlinks ``tmp`` while we still hold it open.
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if not state["streamed_all"] and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            gen_done.set()          # release the finaliser (both paths)
+
+    extra = dict(base_headers or {})
+    extra["Accept-Ranges"] = "bytes"
+    extra["X-Stream-Mode"] = "sid-progressive"
+    # We know the exact byte count we will deliver (the range is padded to fill
+    # it), so always send a real Content-Length — WebKit/Safari media loading
+    # prefers a known length over an open-ended chunked stream.  A Range request
+    # gets 206 + Content-Range; a bare GET gets 200 with the full length.
+    extra["Content-Length"] = str(end_excl - start)
+    if is_range:
+        extra["Content-Range"] = f"bytes {start}-{end_excl - 1}/{total}"
+    return StreamingResponse(
+        _gen(), status_code=206 if is_range else 200, media_type="audio/wav",
+        headers=extra, background=background,
+    )
 
 
 # ── libgme rendering (NSF/SPC/GBS/VGM/AY/KSS/SAP/HES/GYM) — E-14 ─────────────
@@ -1760,12 +2344,30 @@ async def _build_ym2wav() -> "Path | None":
     return binp
 
 
+# Raw YM register-dump magics StSound's YmMusic::ymDecode accepts (see
+# soniqboom/native/stsound/StSoundLibrary/Ymload.cpp).  Anything else with a
+# .ym extension is either a foreign Atari format mislabelled .ym (e.g. the
+# Dyter-07 "YMST" native-module dumps) or a corrupt file — no bundled engine
+# (StSound, zxtune123, sc68, openmpt123) can decode them.
+# The decodability pre-flight (``ym_is_decodable`` + ``_YM_RAW_MAGICS``) lives in
+# core.metadata — shared with the scanner, which uses the SAME predicate to stamp
+# ``defect="corrupt"`` at scan, so the badge appears iff play returns 415.
+
+
 async def _render_ym(path: Path, subsong: int = 0) -> Path:
     """Render an Atari ST ``.ym`` register dump via StSound's Ym2Wav.
 
     YM files are single-tune (no subsongs).  Output is mono 16-bit
     44.1 kHz WAV — browsers and the transcode pipeline handle mono fine.
     """
+    from soniqboom.core.metadata import ym_is_decodable
+    if not ym_is_decodable(path):
+        raise HTTPException(
+            415,
+            "This .ym file isn't a YM register dump StSound can decode — it's "
+            "either a foreign Atari format mislabelled .ym or a corrupt "
+            "LHA-wrapped file. No available engine can render it.",
+        )
     binary = await _ensure_ym2wav()
     if not binary:
         raise HTTPException(
@@ -1955,6 +2557,60 @@ def _is_safari(request: Request) -> bool:
     if "Safari" not in ua:
         return False
     return not any(t in ua for t in ("Chrome", "Chromium", "Edg/", "OPR/"))
+
+
+def _safari_lacks_ogg(request: Request) -> bool:
+    """True for Safari older than 18.4.  WebKit only added Opus/Vorbis-in-Ogg
+    ``<audio>`` playback in Safari 18.4 (2025); serving native ``.ogg``/``.opus``
+    to an older Safari fails silently (the element just never plays).  Such
+    clients are routed through the transcoder to WAV instead.  Non-Safari and
+    Safari >= 18.4 return False.  Version is parsed from the UA's ``Version/x.y``
+    token (no regex); a Safari UA with no parseable version is treated as old
+    (the conservative choice — transcoding always plays)."""
+    if not _is_safari(request):
+        return False
+    ua = request.headers.get("user-agent", "")
+    tok = "Version/"
+    i = ua.find(tok)
+    if i < 0:
+        return True
+    ver = ua[i + len(tok):].split()[0]          # e.g. "18.3.1"
+    parts = ver.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return True
+    return (major, minor) < (18, 4)
+
+
+def _client_caps(request: Request) -> "set[str] | None":
+    """Parse the ``sb_caps`` cookie the web UI sets from the browser's own
+    ``HTMLMediaElement.canPlayType`` probe — a dot-separated list of codec
+    tokens the browser reported it can decode (e.g. ``aac.alac.opus.flac``).
+
+    Returns the set of client-playable codecs, or ``None`` when the cookie is
+    absent (Subsonic/DLNA/Cast, or a web client that hasn't booted the probe
+    yet) → the caller falls back to UA heuristics.  This is authoritative and
+    FUTURE-PROOF: when a browser gains a codec, its ``canPlayType`` starts
+    reporting it and the server direct-serves it with no code change."""
+    raw = request.cookies.get("sb_caps")
+    if raw is None:
+        return None
+    caps = {t for t in raw.split(".") if t}
+    # An empty set (probe glitch, or a browser that reported nothing) is treated
+    # as "undeclared" → UA fallback, never "supports nothing" (which would
+    # needlessly transcode for everyone).
+    return caps or None
+
+
+def _client_supports(codec: str, request: Request) -> "bool | None":
+    """True/False when the client has DECLARED capabilities covering ``codec``;
+    ``None`` when it hasn't declared any (caller uses a UA fallback)."""
+    caps = _client_caps(request)
+    if caps is None:
+        return None
+    return codec in caps
 
 
 async def _probe_codec(path: Path) -> str | None:
@@ -2154,7 +2810,11 @@ def _register_adlib_extract(track_id: str, out_dir: Path) -> None:
     """
     global _ZIP_EXTRACT_TOTAL_BYTES
     try:
-        size = sum(f.stat().st_size for f in out_dir.iterdir() if f.is_file())
+        # ``rglob`` (not ``iterdir``) so a nested payload counts too — Sonix
+        # keeps its bulk in an ``Instruments/`` subdir; a flat ``iterdir`` would
+        # register only the top-level module + a few companions and let the LRU
+        # byte budget overshoot ~365× before eviction fires.
+        size = sum(f.stat().st_size for f in out_dir.rglob("*") if f.is_file())
     except OSError:
         size = 0
     with _zip_state_lock:
@@ -2567,6 +3227,108 @@ def _uade_member_real_name(member_base: str) -> str | None:
     return None
 
 
+# ── Sonix Music Driver instrument-subdir handling ──────────────────────────
+# Aegis Sonix (.smus/.snx) modules keep their samples in a sibling
+# ``Instruments/`` SUBDIRECTORY, referenced by arbitrary names embedded in the
+# module's INS1 chunks — NOT by the name-transform rule the TFMX/RJP companion
+# logic encodes.  uade's SonixMusicDriver requests ``Instruments/<name>.instr``
+# (and ``Instruments/<name>.ss`` synth-sound halves) at InitPlayer time, and a
+# SINGLE missing instrument makes it abort fatally ("ExtLoad failed → score
+# died" → our 502).  So we must (a) pull the whole sibling Instruments/ subdir
+# next to the module and (b) synthesize a silent 8SVX stub for any instrument
+# the module references but the rip omits.  ``SONIX_PLAYERS`` and
+# ``sonix_instrument_names`` live in core.uade_formats — shared with the scanner
+# so the play-time stub and the scan-time ``partial`` badge agree on "missing".
+
+
+def _svx8_silence(nbytes: int = 32) -> bytes:
+    """A minimal valid IFF 8SVX one-shot sample of ``nbytes`` silence.
+
+    Used as a stand-in for a Sonix instrument the rip is missing so uade's
+    SonixMusicDriver loads it (silent) instead of aborting the whole score.
+    Verified: substituting this for a genuinely-absent instrument lets an
+    otherwise-fatal .smus render full-length audio.
+    """
+    import struct
+    body = b"\x00" * nbytes
+    vhdr = struct.pack(">IIIHBBI", nbytes, 0, 0, 8000, 1, 0, 0x10000)
+
+    def _chunk(cid: bytes, data: bytes) -> bytes:
+        out = cid + struct.pack(">I", len(data)) + data
+        return out + b"\x00" if (len(data) & 1) else out
+
+    inner = b"8SVX" + _chunk(b"VHDR", vhdr) + _chunk(b"BODY", body)
+    return b"FORM" + struct.pack(">I", len(inner)) + inner
+
+
+def _extract_sonix_instruments(
+    parts: list[str], member_dir: str, outer_zip: Path,
+    out_dir: Path, music_out: Path,
+) -> list[str]:
+    """Populate ``out_dir/Instruments`` for a Sonix module extracted to
+    ``music_out``: pull every sibling ``<member_dir>/Instruments/*`` member,
+    then stub any instrument the module references but the archive lacks.
+    Returns the list of instrument names that had to be stubbed (silent) — the
+    caller backfills a ``partial`` defect from it.  Best-effort — a failure
+    here just leaves the module to fail the render as before, never raises.
+    """
+    import os as _os
+    from soniqboom.core import archive as _archive
+    from soniqboom.core.scanner import _read_from_zip_path
+    try:
+        instr_dir_prefix = (
+            f"{member_dir}/Instruments/" if member_dir else "Instruments/")
+        instr_out = out_dir / "Instruments"
+        instr_out.mkdir(parents=True, exist_ok=True)
+        have: set[str] = set()
+        for raw in _archive.raw_namelist(outer_zip):
+            clean = raw.replace("\\", "/")
+            low = clean.lower()
+            if not low.startswith(instr_dir_prefix.lower()):
+                continue
+            base = _os.path.basename(clean)
+            if not base:            # directory entry
+                continue
+            comp_vpath = "::".join(parts[:-1] + [raw])
+            try:
+                comp_bytes, _ = _read_from_zip_path(comp_vpath)
+                (instr_out / base).write_bytes(comp_bytes)
+                have.add(base.lower())
+            except Exception:
+                continue
+        # Stub instruments the .smus references but the rip omits — one
+        # missing file otherwise aborts the whole SonixMusicDriver score.
+        try:
+            names = _uade_formats.sonix_instrument_names(music_out.read_bytes())
+        except Exception:
+            names = []
+        stubbed: list[str] = []
+        for nm in names:
+            # SECURITY: the INS1 name is module-controlled.  uade only ever
+            # requests ``Instruments/<basename>.instr`` and legit Sonix names
+            # are already bare, so reduce to a basename before building the
+            # path — otherwise a crafted name like ``/etc/cron.d/x`` or
+            # ``../../x`` would escape ``instr_out`` and write the silent stub
+            # to an arbitrary location.  Mirrors the basename the sibling
+            # extraction loop above already applies (``have`` is basename-keyed).
+            safe = _os.path.basename(nm.replace("\\", "/")).strip()
+            if not safe or safe in (".", ".."):
+                continue
+            fn = f"{safe}.instr"
+            if fn.lower() not in have:
+                try:
+                    (instr_out / fn).write_bytes(_svx8_silence())
+                    have.add(fn.lower())
+                    stubbed.append(safe)
+                except Exception:
+                    continue
+        return stubbed
+    except Exception:
+        log.warning("Sonix instrument extraction failed for %s",
+                    music_out, exc_info=True)
+        return []
+
+
 async def _extract_uade_with_companions(
     path_str: str, track_id: str, outer_zip: Path, uade_name: str,
 ) -> Path | None:
@@ -2578,7 +3340,9 @@ async def _extract_uade_with_companions(
     never play them.  Drops the module under its REAL Amiga name plus any
     same-body companion siblings into a per-track dir.  Companion matching is
     case-insensitive against the archive's raw member list (Amiga rips mix
-    SMPL./smpl.).  Mirrors ``_extract_adlib_with_companions``.
+    SMPL./smpl.).  Sonix modules additionally get their sibling
+    ``Instruments/`` subdir (see ``_extract_sonix_instruments``).  Mirrors
+    ``_extract_adlib_with_companions``.
     """
     import os as _os
     from soniqboom.core import archive as _archive
@@ -2596,9 +3360,14 @@ async def _extract_uade_with_companions(
     async with lock:
         wanted = {s.lower() for s in
                   _uade_formats.companion_sibling_names(uade_name)}
+        _player = (_uade_formats.classify(uade_name) or (None,))[0]
+        _is_sonix = _player in _uade_formats.SONIX_PLAYERS
         marker = out_dir / ".zip_mtime"
         if (music_out.exists() and marker.exists()
-                and marker.read_text() == zip_mtime):
+                and marker.read_text() == zip_mtime
+                # Sonix caches from before the Instruments/ fix have the
+                # module but no samples — force a re-extract for those.
+                and not (_is_sonix and not (out_dir / "Instruments").exists())):
             # QA m1: don't latch a companion-LESS extract forever.  If the
             # archive holds a wanted sibling that the cached dir lacks
             # (earlier partial read), fall through and re-extract.
@@ -2616,6 +3385,8 @@ async def _extract_uade_with_companions(
             if not _missing:
                 _register_adlib_extract(track_id, out_dir)  # same budget/LRU pool
                 return music_out
+
+        _sonix_stubbed: list[str] = []   # instruments silently substituted (Sonix)
 
         def _extract() -> Path | None:
             import shutil
@@ -2643,12 +3414,36 @@ async def _extract_uade_with_companions(
                         (out_dir / base).write_bytes(comp_bytes)
                     except Exception:
                         continue
+            # Sonix keeps its samples in a sibling Instruments/ subdir keyed
+            # by arbitrary INS1 names (invisible to the companion-sibling
+            # rule above) — pull the whole subdir + stub any missing halves.
+            if _is_sonix:
+                _sonix_stubbed[:] = _extract_sonix_instruments(
+                    parts, member_dir, outer_zip, out_dir, music_out) or []
             marker.write_text(zip_mtime)
             return music_out
 
         music = await asyncio.get_running_loop().run_in_executor(None, _extract)
         if music is not None:
             _register_adlib_extract(track_id, out_dir)
+            # Backfill a ``partial`` defect for the existing library — the scan
+            # sets this for freshly-scanned Sonix modules, but tracks indexed
+            # before the feature only learn they're degraded when first played.
+            # Idempotent; only fires on a cold extract that actually stubbed.
+            if _sonix_stubbed:
+                try:
+                    from soniqboom.core.store import get_store
+                    _n = len(_sonix_stubbed)
+                    _shown = ", ".join(_sonix_stubbed[:3]) + ("…" if _n > 3 else "")
+                    get_store().update_track_fields(track_id, {
+                        "defect": "partial",
+                        "defect_detail": (
+                            f"{_n} instrument{'s' if _n != 1 else ''} "
+                            f"substituted (silent): {_shown}"),
+                    })
+                except Exception:
+                    log.debug("Sonix defect backfill failed for %s", track_id,
+                              exc_info=True)
             try:
                 await asyncio.to_thread(_zip_evict_until_under_budget)
             except Exception:
@@ -4429,7 +5224,7 @@ async def render_status(
     currently cached, and whether the full-duration version is ready.
     """
     from soniqboom.core.conversion_cache import (
-        is_cache_ready, _cache_key, find_shorter_sid_entry,
+        is_cache_ready, _cache_key, find_shorter_sid_entry, sid_warm_eligible,
     )
     # Mirror the per-track duration logic used by the SID stream branch so the
     # UI never reads a stale global default while playback honours HVSC.
@@ -4461,6 +5256,7 @@ async def render_status(
         "partial": partial,
         "cached_seconds": cached_dur,
         "target_seconds": target_dur,
+        "warm_eligible": sid_warm_eligible(),
         "track_id": track_id,
     }
 
@@ -5318,6 +6114,10 @@ async def stream_track(
             # 1) Exact cache hit (correct duration)
             exact = await get_cached(full_key)
             if exact:
+                # Ensure the retro per-voice VU meter exists (background, dedup'd)
+                # — covers SIDs cached before this feature and cache-hit replays,
+                # which never reach the render-path triggers below.
+                _spawn_sid_vu(full_key, exact, path, subsong, target_dur)
                 return await _range_file_response(
                     request, exact, media_type="audio/wav",
                     headers={"X-Rendered": "sidplayfp", "X-Cache": "hit",
@@ -5341,12 +6141,44 @@ async def stream_track(
                     background=_bg,
                 )
 
-            # 3) No cache at all — render synchronously
+            # 3) No cache at all.  For the LOCAL web UI, stream sidplayfp's
+            # still-rendering WAV so playback starts in ~0.2 s instead of blocking
+            # on the full render (~tune_len/15).  ``_serve_sid_progressive`` now
+            # answers Range/seek requests with a proper 206 against the known
+            # full length, so ANY web-session GET (bare, probe, or seek) can take
+            # it — Subsonic/DLNA/Cast still fall through to the blocking path.
+            # The gate:
+            #   • GET only — a HEAD 405s at the router; never spawns a render.
+            #   • a session cookie AND no Subsonic auth params (u/s/t) — a
+            #     Subsonic/DLNA client carrying a stray cookie stays blocking.
+            #   • not the anonymous cast byte-server path.
+            # ``_serve_sid_progressive`` returns None (→ fall through to blocking)
+            # when over the concurrency cap or on an immediate render failure (so
+            # the error surfaces as a real 5xx, not silent silence).
+            _web_session = (request.method == "GET"
+                            and bool(sb_session)
+                            and not (u or s or t)
+                            and not _cast_internal_bypass_ctx.get())
+            if _web_session:
+                _resp = await _serve_sid_progressive(
+                    request, path, subsong, target_dur, full_key,
+                    base_headers={"X-Rendered": "sidplayfp", "X-Cache": "miss-progressive",
+                                  "X-SID-Target-Seconds": str(target_dur)},
+                    background=_bg,
+                )
+                if _resp is not None:
+                    return _resp
+                # else: over cap or immediate render failure — fall through to
+                # the blocking path.
+
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="sid", subsong=subsong,
                 duration=target_dur,
                 render_fn=lambda: _render_sid(path, subsong=subsong, duration=target_dur),
             )
+            # Retro per-voice VU meter — background, best-effort, dedup'd; ready
+            # for the next play (this one uses the FFT fallback if not yet done).
+            ensure_sid_vu_sidecar(track_id, path, subsong, target_dur)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "sidplayfp", "X-Cache": "hit" if hit else "miss",
@@ -5366,16 +6198,17 @@ async def stream_track(
                 headers={"X-Rendered": "fluidsynth", "X-Cache": "hit" if hit else "miss"},
                 background=_bg,
             )
-        # UADE goes BEFORE the tracker branch — both .ahx and .hvl are
-        # technically listed in _TRACKER_EXTS for scanner-side detection,
-        # but openmpt123 silently doesn't decode them.  Without this
-        # priority, every .ahx play would 501 from inside _render_tracker.
+        # UADE / HVL go BEFORE the tracker branch — .ahx and .hvl appear in
+        # the *scanner's* tracker set (metadata.py) for library detection, but
+        # openmpt123 silently doesn't decode them.  (This file's own
+        # _TRACKER_EXTS deliberately excludes both.)  Without this priority a
+        # .ahx/.hvl play would 501 from inside _render_tracker.
         if ext in _HVL_EXTS:
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="hvl", subsong=subsong,
                 render_fn=lambda: _render_hvl(path, subsong=subsong),
             )
-            # .hvl is listed in _TRACKER_EXTS for scanner detection, but openmpt123
+            # .hvl is in the scanner's tracker set for detection, but openmpt123
             # can't decode it, so the scan stored duration 0 — hvl2wav renders to the
             # tune's natural end, so persist the WAV's real length (placeholder=0
             # no-ops if a real duration was somehow already stored).
@@ -5538,7 +6371,24 @@ async def stream_track(
             and target_format.lower() in TRANSCODE_MIME
             and target_format.lower() != _src_codec
         )
-        if ext in NATIVE and not force_transcode and not _format_mismatch:
+        # Ogg/Opus: some clients (Safari < 18.4) can't decode it — route those to
+        # the transcoder (→ WAV, which every browser plays) instead of a native
+        # .ogg/.opus that fails silently.  Prefer the client's DECLARED capability
+        # (sb_caps), keyed by extension — ``.opus`` is Opus; ``.ogg`` is usually
+        # Vorbis but may be Opus, so accept EITHER (uses the vorbis cap too).
+        # Fall back to the Safari-version UA heuristic when nothing was declared.
+        if ext == ".opus":
+            _ogg_sup = _client_supports("opus", request)
+        elif ext == ".ogg":
+            _o = _client_supports("opus", request)
+            _v = _client_supports("vorbis", request)
+            _ogg_sup = None if (_o is None and _v is None) else (bool(_o) or bool(_v))
+        else:
+            _ogg_sup = None
+        _old_safari_ogg = ext in (".ogg", ".opus") and (
+            (_ogg_sup is False) if _ogg_sup is not None else _safari_lacks_ogg(request))
+        if (ext in NATIVE and not force_transcode and not _format_mismatch
+                and not _old_safari_ogg):
             return await _range_file_response(
                 request, path, media_type=NATIVE[ext],
                 background=_bg,
@@ -5567,21 +6417,29 @@ async def stream_track(
                 and target_format.lower() in TRANSCODE_MIME
                 and target_format.lower() not in ("aac", "m4a")
             )
-            if detected_codec == "aac" and not _aac_mismatch:
+            # AAC plays natively almost everywhere → direct-serve, UNLESS the
+            # client explicitly declared it can't (a rare codec-stripped
+            # Chromium / Linux-Firefox-without-an-OS-AAC-decoder) via sb_caps.
+            if (detected_codec == "aac" and not _aac_mismatch
+                    and _client_supports("aac", request) is not False):
                 return await _range_file_response(
                     request, path, media_type="audio/mp4",
                     background=_bg,
                 )
-            # Safari decodes ALAC natively; transcoding to FLAC would break it,
-            # since Safari doesn't support raw audio/flac in <audio>.  Also
-            # honour an explicit ``format=`` mismatch here so a client asking
-            # for FLAC/MP3 from ALAC actually gets the requested codec.
-            if detected_codec == "alac" and _is_safari(request) and not _aac_mismatch:
+            # ALAC (Apple Lossless): direct-serve to any client that can decode
+            # it — the client's DECLARED capability (sb_caps) when present, else
+            # the Safari UA heuristic.  Chrome/Firefox fail silently on ALAC, so
+            # they fall through to the FLAC/WAV transcode.  (Transcoding to raw
+            # audio/flac would itself break Safari, which is why ALAC-to-Safari
+            # must stay direct.)
+            _alac_sup = _client_supports("alac", request)
+            _alac_ok = _alac_sup if _alac_sup is not None else _is_safari(request)
+            if detected_codec == "alac" and _alac_ok and not _aac_mismatch:
                 return await _range_file_response(
                     request, path, media_type="audio/mp4",
                     background=_bg,
                 )
-            # ALAC on non-Safari, or unknown → fall through to transcode
+            # ALAC on a client that can't decode it, or unknown → transcode
 
         # Honour per-request transcode overrides from the OpenSubsonic transcoding
         # extension (or any caller appending ?format=&maxBitRate=&sampleRate=).

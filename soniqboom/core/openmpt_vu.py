@@ -374,6 +374,41 @@ def serialize_vumr(result: VUResult) -> bytes:
     return bytes(header) + result.pan + result.mono
 
 
+def parse_and_validate_vumr(raw: bytes, *, max_channels: int = 32,
+                            max_frames: int = 240 * 600) -> "tuple[int, int, int]":
+    """Validate a raw VUMR v1 blob (e.g. an untrusted client upload) against the
+    exact invariants :func:`serialize_vumr` guarantees, WITHOUT trusting the
+    sender.  Returns ``(channels, sample_rate, frames)`` on success; raises
+    ``ValueError`` on any structural violation so a malformed/oversized payload
+    can never reach disk or the meter parser.
+
+    Checks: magic ``b"VUMR"``, version 1, ``1 <= channels <= max_channels``,
+    ``1 <= sample_rate <= 240``, ``0 <= frames <= max_frames``, and an EXACT
+    total length ``16 + channels + frames*channels`` (rejects trailing garbage
+    or a truncated body — the frontend parser tolerates trailing bytes, so the
+    length gate is what actually bounds a hostile upload).
+    """
+    if len(raw) < 16:
+        raise ValueError("VUMR too short for header")
+    if raw[0:4] != VUMR_MAGIC:
+        raise ValueError("bad VUMR magic")
+    if raw[4] != VUMR_VERSION:
+        raise ValueError(f"unsupported VUMR version: {raw[4]}")
+    channels = raw[5]
+    sample_rate = int.from_bytes(raw[8:12], "little")
+    frames = int.from_bytes(raw[12:16], "little")
+    if not (1 <= channels <= max_channels):
+        raise ValueError(f"channels out of range: {channels}")
+    if not (1 <= sample_rate <= 240):
+        raise ValueError(f"sample_rate out of range: {sample_rate}")
+    if not (0 <= frames <= max_frames):
+        raise ValueError(f"frames out of range: {frames}")
+    expected = 16 + channels + frames * channels
+    if len(raw) != expected:
+        raise ValueError(f"length mismatch: {len(raw)} != {expected}")
+    return channels, sample_rate, frames
+
+
 def write_sidecar(path: Path, result: VUResult) -> None:
     """Atomic write of the VUMR sidecar to *path*."""
     payload = serialize_vumr(result)
@@ -381,3 +416,27 @@ def write_sidecar(path: Path, result: VUResult) -> None:
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_bytes(payload)
     os.replace(tmp, path)
+
+
+def write_sidecar_bytes(path: Path, raw: bytes) -> None:
+    """Atomic write of pre-serialized VUMR *raw* bytes (validated upstream) to
+    *path* — the client-upload analogue of :func:`write_sidecar`.
+
+    Unlike :func:`write_sidecar` (serialised behind ``_SID_VU_SEM`` server-side),
+    concurrent client uploads for the same track are unsynchronised, so the tmp
+    name is made unique per write — a shared ``<name>.tmp`` would let one
+    writer's ``os.replace`` rename the tmp out from under another's, raising
+    ``FileNotFoundError``.  Each writer renames its own tmp; last rename wins,
+    the sidecar is never torn."""
+    import uuid
+    tmp = path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp.write_bytes(raw)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise

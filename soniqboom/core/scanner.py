@@ -600,11 +600,17 @@ async def purge_junk_tracks() -> dict:
 
 def _extract_one_remote(
     file_data: bytes, remote_path: str, track_id: str,
+    pc_program_archive: bool = False,
 ) -> tuple[str, TrackMeta | str, None, None]:
     """Extract metadata from an already-downloaded file buffer.
 
     Runs in a worker process like _extract_one.  Writes data to a temp file
     because mutagen requires a seekable file handle for most formats.
+
+    ``pc_program_archive`` is precomputed by the caller (the archive can't be
+    re-opened cheaply here in the worker) — True when *remote_path* is a member
+    of an archive that also holds a DOS ``MZ`` executable, which vetoes the
+    uade lenient fallback (see :func:`soniqboom.core.metadata.extract`).
     """
     import shutil
     import tempfile
@@ -626,7 +632,10 @@ def _extract_one_remote(
                 tmp_path = Path(tmp.name)
             cleanup = lambda: tmp_path.unlink(missing_ok=True)  # noqa: E731
         try:
-            meta = extract(tmp_path, track_id)
+            meta = extract(
+                tmp_path, track_id,
+                pc_program_check=(lambda: True) if pc_program_archive else None,
+            )
             meta.path = remote_path
             meta.mtime = 0.0
             meta.file_size = len(file_data)
@@ -641,6 +650,22 @@ def _extract_one_remote(
             cleanup()
     except Exception as exc:
         return remote_path, f"{type(exc).__name__}: {exc}", None, None
+
+
+def _pc_memo_key(remote_path: str) -> tuple[str, str]:
+    """``(archive_rel, member_dir)`` key for the PC-program-archive memo.
+
+    Keyed by the member's DIRECTORY inside the archive, not the archive alone:
+    the PC-executable signal is scoped to the module's own folder (see
+    ``archive.has_dos_executable``), so a DOS tool in an unrelated subdir of a
+    big compilation must not taint modules in other subdirs.  Both the writer
+    (``_fetch_zip_member``) and reader (``_process_one``) derive the key from
+    the same ``remote_path`` so they can never disagree.
+    """
+    arc, _, member = remote_path.partition("::")
+    mnorm = member.replace("\\", "/")           # Amiga dirs use backslashes
+    mdir = mnorm.rsplit("/", 1)[0] if "/" in mnorm else ""
+    return (arc, mdir)
 
 
 # ── Phase 1 helpers ───────────────────────────────────────────────────────────
@@ -775,8 +800,43 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
             except Exception:
                 continue                            # extras are optional
         try:
-            meta = extract(tmp_path, track_id)
+            # Veto a lenient uade admit when the archive is a PC program
+            # bundle (a DOS ``MZ`` .exe/.com beside the module) — e.g. a
+            # demo's ``X.dat`` that only matched PaulRobotham by extension.
+            # Lazy: ``extract`` calls this ONLY on a ``-g`` rejection, so a
+            # healthy archive never pays the raw-namelist scan.
+            meta = extract(
+                tmp_path, track_id,
+                pc_program_check=lambda: archive.has_dos_executable(
+                    outer, member_dir),
+            )
             meta.path = virtual_path
+            # Aegis Sonix modules pull samples from a sibling ``Instruments/``
+            # subdir; when the archive is missing some, the play path fills them
+            # with silence (a degraded render).  Flag the track ``partial`` here
+            # — while we already hold the .smus bytes + the archive — so the UI
+            # can badge it without a first play.  Same "missing" computation the
+            # renderer uses (api/stream.py), so badge and render agree.
+            if (_uade.classify(uade_name) or (None,))[0] in _uade.SONIX_PLAYERS:
+                try:
+                    _prefix = (f"{member_dir}/Instruments/"
+                               if member_dir else "Instruments/").lower()
+                    _present = {
+                        r.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                        for r in archive.raw_namelist(outer)
+                        if r.replace("\\", "/").lower().startswith(_prefix)
+                    }
+                    _missing = _uade.sonix_missing_instruments(data, _present)
+                    if _missing:
+                        _n = len(_missing)
+                        _shown = ", ".join(_missing[:3]) + ("…" if _n > 3 else "")
+                        meta.defect = "partial"
+                        meta.defect_detail = (
+                            f"{_n} instrument{'s' if _n != 1 else ''} "
+                            f"substituted (silent): {_shown}")
+                except Exception:
+                    log.debug("Sonix instrument check failed for %s",
+                              virtual_path, exc_info=True)
             return meta
         finally:
             shutil.rmtree(tdir, ignore_errors=True)
@@ -800,6 +860,30 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
         tmp_path.unlink(missing_ok=True)
 
 
+def _dir_has_dos_executable(directory: Path) -> bool:
+    """True iff *directory* holds a DOS ``MZ`` ``.exe``/``.com`` file — the
+    loose-file analogue of :func:`archive.has_dos_executable` (see it for why
+    an ``MZ`` sibling means "PC program data, not an Amiga module").  Reads
+    only the 2-byte magic per candidate.  Best-effort: returns False on any
+    OS error so it can never abort a scan.
+    """
+    try:
+        for p in directory.glob("*"):
+            if p.suffix.lower() not in (".exe", ".com"):
+                continue
+            try:
+                if not p.is_file():
+                    continue
+                with open(p, "rb") as fh:
+                    if fh.read(2) == b"MZ":
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
 def _extract_one(path: Path) -> tuple[Path, TrackMeta | str, bytes | None, bytes | None]:
     """Run in a **worker process** — extract metadata for a single file.
 
@@ -814,7 +898,13 @@ def _extract_one(path: Path) -> tuple[Path, TrackMeta | str, bytes | None, bytes
         if '::' in path_str:
             meta = _extract_from_zip(path_str, track_id)
         else:
-            meta = extract(path, track_id)
+            # Loose local file: a PC data payload (a demo's ``X.dat`` matching
+            # PaulRobotham by extension) sitting beside its ``X.EXE`` in an
+            # unpacked demo folder gets the same veto as the archive case.
+            # Lazy — ``extract`` calls this only on a ``-g`` rejection.
+            meta = extract(
+                path, track_id,
+                pc_program_check=lambda: _dir_has_dos_executable(path.parent))
 
         # Stamp mtime — for ZIP files, use the outer archive's mtime
         actual_path = Path(path_str.split('::')[0]) if '::' in path_str else path
@@ -2877,6 +2967,16 @@ async def _remote_scan_body(
             get_cache().validate_size(scan_root, arc_rel, arc_size)
             local_archive = get_cache().fetch(scan_root, arc_rel, source,
                                               lane="scan")
+            # Memoize (per archive) whether this is a PC program bundle — a
+            # DOS ``MZ`` .exe/.com in the module's own directory.  Computed
+            # here where the archive is already local: one raw-namelist scan
+            # per archive, not per member.  _process_one reads it to veto a
+            # lenient uade admit for a PC data payload (e.g. a demo's X.dat
+            # that matched PaulRobotham purely by extension).
+            _pc_key = _pc_memo_key(remote_path)
+            if _pc_key not in _arc_pc_exe:
+                _arc_pc_exe[_pc_key] = archive.has_dos_executable(
+                    local_archive, _pc_key[1])
             try:
                 return archive.read_member(local_archive, member)
             except Exception as exc:
@@ -2914,6 +3014,13 @@ async def _remote_scan_body(
     # latter must never be barren-marked off a transient outage).
     _indexed_arcs: set[str] = set()
     _failed_fetch_arcs: set[str] = set()
+    # Per-(archive, member-dir) "is this a PC program bundle (holds a DOS MZ
+    # .exe/.com in that dir)?" memo, populated in _fetch_zip_member (where the
+    # archive is already local) and read in _process_one to veto a lenient
+    # uade admit for a PC data payload misindexed by extension (e.g. a demo's
+    # X.dat).  Keyed by member dir — see _pc_memo_key — so a DOS tool in one
+    # subfolder can't taint modules in a sibling subfolder.
+    _arc_pc_exe: dict[tuple[str, str], bool] = {}
 
     async def _process_one(remote_path: str) -> None:
         nonlocal track_count
@@ -3020,9 +3127,13 @@ async def _remote_scan_body(
                     _phase_counts["download"] -= 1
                     _phase_counts["extract"] += 1
                 try:
+                    _pc_arc = (
+                        _arc_pc_exe.get(_pc_memo_key(remote_path), False)
+                        if "::" in remote_path else False
+                    )
                     _, result, _, _ = await loop.run_in_executor(
                         executor, _extract_one_remote,
-                        file_data, remote_path, track_id,
+                        file_data, remote_path, track_id, _pc_arc,
                     )
                 except BrokenExecutor:
                     # Worker processes died (killed / crashed) — the pool

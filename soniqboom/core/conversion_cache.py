@@ -187,6 +187,29 @@ def _cache_path(cache_key: str, format_type: str) -> Path:
     return base / shard / f"{cache_key}.wav"
 
 
+def sid_warm_eligible() -> bool:
+    """True only when ALL SID fidelity settings are at their defaults.
+
+    This is the exact condition under which ``_cache_key`` appends NO fidelity
+    suffix for ``format_type == "sid"`` — and it is also the only case where a
+    browser (WASM libsidplayfp/reSIDfp) render can MATCH the server render,
+    because the WASM core has no chip-model / filter / curve / digiboost setter.
+    Used to gate client SID audio cache-warming (``POST /tracks/{id}/sid-audio``):
+    non-default fidelity → warming is refused so a client can never poison a
+    slot with audio the server would have rendered differently."""
+    _model = (getattr(settings, "sid_model", "auto") or "auto").lower()
+    if _model in ("6581", "8580"):
+        return False
+    if not getattr(settings, "sid_filter", True):
+        return False
+    _curve = float(getattr(settings, "sid_filter_curve", -1.0))
+    if 0.0 <= _curve <= 1.0:
+        return False
+    if getattr(settings, "sid_digiboost", False):
+        return False
+    return True
+
+
 def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
     """Return the on-disk path to the VU sidecar for *track_id* at
     *subsong* (0-based wire index), or None if that subsong hasn't been
@@ -206,18 +229,55 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
     its FFT-spectrum visualiser.
     """
     want = f"{track_id}__sub{int(subsong)}"
+    want_sid_prefix = want + "__"      # SID keys append __dur{D}[+fidelity parts]
     with _state_lock:
         for cache_key, entry in _meta.items():
-            if cache_key != want:
-                continue
-            if entry.get("format_type") not in ("tracker", "uade"):
-                # tracker renders get VU from libopenmpt; uade renders from
-                # the Paula --write-audio dump (uade_vu.py).  Same VUMR blob.
+            fmt = entry.get("format_type")
+            if fmt in ("tracker", "uade"):
+                # tracker renders get VU from libopenmpt; uade renders from the
+                # Paula --write-audio dump (uade_vu.py).  Their keys are exactly
+                # "<track_id>__sub<N>" → match by equality.
+                if cache_key != want:
+                    continue
+            elif fmt == "sid":
+                # SID renders get VU from 3 sidplayfp voice-isolation passes
+                # (sid_vu.py).  Their key carries a "__dur<D>[+fidelity]" suffix,
+                # so match on the "<track_id>__sub<N>__" prefix — the trailing
+                # "__" keeps sub1 from also matching sub10/sub12.
+                if not cache_key.startswith(want_sid_prefix):
+                    continue
+            else:
                 continue
             wav_path = Path(entry["path"])
             sidecar  = wav_path.with_suffix(".vu")
             if sidecar.exists():
                 return sidecar
+    return None
+
+
+def get_sid_wav_path_for_upload(track_id: str, subsong: int = 0) -> Path | None:
+    """Return the cached SID WAV anchor for *track_id*/*subsong* whose ``.vu``
+    a client may write, or None when no SID WAV is cached yet.
+
+    Companion to :func:`get_vu_sidecar_path` for the client-VU upload path
+    (``POST /api/tracks/{id}/vu``): identical ``sid``-format prefix scan, but
+    returns the anchor WAV *without* requiring the sidecar to already exist —
+    the caller derives ``wav_path.with_suffix(".vu")`` as the write target.
+
+    Restricting to ``format_type == "sid"`` entries is the security gate: an
+    Amiga SidMon ``*.sid`` renders under ``uade`` (never ``sid``), so an upload
+    can only ever land beside a genuine C64-SID render, never poison another
+    format's slot.  Returns None (→ caller replies 425) when the WAV isn't
+    cached, so a client can't create arbitrary files.
+    """
+    want_sid_prefix = f"{track_id}__sub{int(subsong)}__"
+    with _state_lock:
+        for cache_key, entry in _meta.items():
+            if entry.get("format_type") != "sid":
+                continue
+            if not cache_key.startswith(want_sid_prefix):
+                continue
+            return Path(entry["path"])
     return None
 
 
@@ -297,6 +357,19 @@ async def store_cached(
     now = time.time()
 
     with _state_lock:
+        # Idempotent accounting: if this key already had an entry (e.g. two
+        # concurrent cold renders of the same tune both finishing, or a
+        # progressive render racing a blocking one), the new WAV replaced the
+        # old file at ``dest`` via os.replace above — so drop the previous
+        # entry's bytes from the running total before adding the new size.
+        # Without this, a second store of the same key permanently inflates
+        # ``_total_bytes`` (only one file exists on disk) and drives
+        # ``_maybe_evict`` to prematurely evict legitimate entries.
+        prev = _meta.get(cache_key)
+        if prev:
+            # Clamp at 0 (mirrors _purge_entry / _maybe_evict) so a drifted
+            # counter can never go negative.
+            _total_bytes = max(0, _total_bytes - int(prev.get("size_bytes", 0) or 0))
         _meta[cache_key] = {
             "path": str(dest),
             "size_bytes": size_bytes,
@@ -366,6 +439,18 @@ async def register_existing(
     return dest_path
 
 
+def _unlink_cached(path_str: str) -> None:
+    """Unlink a cached WAV AND its per-channel VU sidecar (``<wav>.vu``, written
+    by the tracker/uade/SID VU pipelines).  Without removing the sidecar too,
+    evicting a chip render would orphan its ``.vu`` on disk forever."""
+    p = Path(path_str)
+    for f in (p, p.with_suffix(".vu")):
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _purge_entry(cache_key: str) -> None:
     """Remove a single cache entry from metadata.
 
@@ -390,10 +475,7 @@ def _purge_entry(cache_key: str) -> None:
             _pending_purge[cache_key] = entry["path"]
             deferred = True
     if entry and not deferred:
-        try:
-            Path(entry["path"]).unlink(missing_ok=True)
-        except Exception:
-            pass
+        _unlink_cached(entry["path"])
 
 
 def _maybe_evict() -> None:
@@ -452,10 +534,7 @@ def _maybe_evict() -> None:
                 immediate_unlinks.append(entry)
     # Unlink outside the lock so a slow disk doesn't block other callers.
     for entry in immediate_unlinks:
-        try:
-            Path(entry["path"]).unlink(missing_ok=True)
-        except Exception:
-            pass
+        _unlink_cached(entry["path"])
 
 
 def pin(cache_key: str) -> int:

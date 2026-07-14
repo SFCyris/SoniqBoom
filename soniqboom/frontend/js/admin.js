@@ -9,6 +9,8 @@ import { runRestartFlow } from './restart.js';
 import { Auth }           from './auth.js';
 import { Toast, trapFocus } from './utils.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
+// Experimental in-browser SID playback toggle (see sid-wasm-player.js).
+import { sidWasmPlaybackEnabled, setSidWasmPlayback } from './sid-wasm-player.js';
 import { mountScanFlow }   from './viz/scanflow.js';
 import { mountCacheCascade } from './viz/cachecascade.js';
 import { mountFtpLanes }   from './viz/ftplanes.js';
@@ -39,13 +41,16 @@ function _initVizSettingsUI() {
   const lib  = document.getElementById('setting-viz-library');
   const adm  = document.getElementById('setting-viz-admin');
   const vu   = document.getElementById('setting-viz-vustyle');
+  const sidw = document.getElementById('setting-sid-wasm-playback');   // experimental: in-browser SID
   if (en)  en.checked  = s.enabled    !== false;
   if (np)  np.checked  = s.nowPlaying !== false;
   if (lib) lib.checked = s.library    !== false;
   if (adm) adm.checked = s.admin      !== false;
   if (vu)  vu.value    = s.vuStyle === 'circuit' ? 'circuit' : 'bars';
+  if (sidw) sidw.checked = sidWasmPlaybackEnabled();
   if (_vizSettingsWired) return;     // bind change handlers exactly once
   _vizSettingsWired = true;
+  if (sidw) sidw.addEventListener('change', () => setSidWasmPlayback(sidw.checked));
   if (en)  en.addEventListener('change',  () => setVizSettings({ enabled:    en.checked }));
   if (np)  np.addEventListener('change',  () => setVizSettings({ nowPlaying: np.checked }));
   if (lib) lib.addEventListener('change', () => setVizSettings({ library:    lib.checked }));

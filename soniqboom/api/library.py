@@ -97,19 +97,40 @@ async def _broadcast(data: dict) -> None:
 
 # ── Aggregation cache (event-driven: cached until scan invalidates) ───────────
 
-_AGG_CACHE: dict[str, list] = {}
+# Entry is ``(mutation_seq, data)`` — the HTTP cache is gated on the store's
+# ``_mutation_seq`` (same freshness signal the store's own aggregate cache uses)
+# so ANY track mutation — not just a scan-complete/reindex/filter-toggle — makes
+# a stale legend recompute.  Without the seq gate the Galaxy legend could serve
+# counts from before a retag / set-primary / metadata backfill and disagree with
+# the (always-fresh) ``/api/tracks?format=X`` drill-down.
+_AGG_CACHE: dict[str, tuple[int, list]] = {}
 # Parallel dict: cache_key → (etag, raw_json_bytes).  Computed lazily on first
 # HTTP hit so we don't pay the hash+serialise cost when the cache is populated
 # only via internal helpers.
 _AGG_ETAGS: dict[str, tuple[str, bytes]] = {}
 
 
+def _current_agg_seq() -> int:
+    try:
+        return int(getattr(get_store(), "_mutation_seq", 0))
+    except Exception:
+        return 0
+
+
 def _cache_get(key: str) -> list | None:
-    return _AGG_CACHE.get(key)
+    entry = _AGG_CACHE.get(key)
+    if entry is None:
+        return None
+    seq, data = entry
+    if seq != _current_agg_seq():          # a mutation happened → stale
+        _AGG_CACHE.pop(key, None)
+        _AGG_ETAGS.pop(key, None)
+        return None
+    return data
 
 
 def _cache_set(key: str, data: list) -> None:
-    _AGG_CACHE[key] = data
+    _AGG_CACHE[key] = (_current_agg_seq(), data)
     # Drop any stale etag entry; it will be recomputed on the next request.
     _AGG_ETAGS.pop(key, None)
 
@@ -125,6 +146,30 @@ def invalidate_agg_cache() -> None:
         notify_library_changed()
     except Exception:                       # noqa: BLE001 — never break a scan
         pass
+
+
+def _dedup_on(store) -> bool:
+    """Whether the web library legends should show primary-only (deduped)
+    counts — driven by the ``filter_duplicates`` config.  This is the ONE place
+    the config is mapped to the aggregates' ``primary_only`` parameter, so the
+    dedup preference reaches the web browse/Galaxy views without leaking into
+    the Subsonic / DLNA consumers of the same store methods."""
+    return bool(store.get_config("filter_duplicates", False))
+
+
+def _tagged_denominator(store) -> int:
+    """Total-track count to subtract the tagged buckets from when sizing the
+    "[No Artist]" / "[No Album Artist]" catch-all.
+
+    Must match the mode the aggregate was computed in: with ``filter_duplicates``
+    on, ``aggregate_artists`` counts only primaries, so the untagged remainder
+    has to be measured against the primary-only total too — otherwise the
+    hidden duplicate copies (which have artists) would inflate the untagged
+    bucket and it would list tracks the drill-down never shows.
+    """
+    if _dedup_on(store):
+        return store.primary_track_count()
+    return store.track_count()
 
 
 def _etag_response(request: Request, cache_key: str, result: list) -> Response:
@@ -393,8 +438,12 @@ async def list_artists(request: Request):
     cached = _cache_get("artists")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_artists()
-        untagged = store.track_count() - sum(d["count"] for d in cached)
+        # ``list(...)`` copies the store's MEMOISED aggregate before we append
+        # the synthetic "[No Artist]" bucket — appending to the returned list
+        # in place would corrupt the store's cache (the same object is served
+        # to Subsonic / DLNA) until the next mutation.
+        cached = list(store.aggregate_artists(primary_only=_dedup_on(store)))
+        untagged = _tagged_denominator(store) - sum(d["count"] for d in cached)
         if untagged > 0:
             cached.append({"artist": "", "count": untagged, "label": "[No Artist]"})
         _cache_set("artists", cached)
@@ -406,8 +455,8 @@ async def list_album_artists(request: Request):
     cached = _cache_get("album_artists")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_album_artists()
-        untagged = store.track_count() - sum(d["count"] for d in cached)
+        cached = list(store.aggregate_album_artists(primary_only=_dedup_on(store)))
+        untagged = _tagged_denominator(store) - sum(d["count"] for d in cached)
         if untagged > 0:
             cached.append({"album_artist": "", "count": untagged, "label": "[No Album Artist]"})
         _cache_set("album_artists", cached)
@@ -424,12 +473,15 @@ async def list_albums(
     cached = _cache_get(cache_key)
     if cached is None:
         store = get_store()
-        rows = store.aggregate_albums(artist=artist, album_artist=album_artist)
-        cached = []
-        for d in rows:
-            d["artist"] = artist or ""
-            d["album_artist"] = album_artist or ""
-            cached.append(d)
+        rows = store.aggregate_albums(
+            artist=artist, album_artist=album_artist,
+            primary_only=_dedup_on(store),
+        )
+        # New dicts (don't mutate the store's memoised album rows in place).
+        cached = [
+            {**d, "artist": artist or "", "album_artist": album_artist or ""}
+            for d in rows
+        ]
         _cache_set(cache_key, cached)
     return _etag_response(request, cache_key, cached)
 
@@ -438,7 +490,8 @@ async def list_albums(
 async def list_genres(request: Request):
     cached = _cache_get("genres")
     if cached is None:
-        cached = get_store().aggregate_genres()
+        store = get_store()
+        cached = store.aggregate_genres(primary_only=_dedup_on(store))
         _cache_set("genres", cached)
     return _etag_response(request, "genres", cached)
 
@@ -447,7 +500,8 @@ async def list_genres(request: Request):
 async def list_years(request: Request):
     cached = _cache_get("years")
     if cached is None:
-        cached = get_store().aggregate_years()
+        store = get_store()
+        cached = store.aggregate_years(primary_only=_dedup_on(store))
         _cache_set("years", cached)
     return _etag_response(request, "years", cached)
 
@@ -457,6 +511,7 @@ async def list_formats(request: Request):
     """Per-format track counts — drives the library Galaxy visualization."""
     cached = _cache_get("formats")
     if cached is None:
-        cached = get_store().aggregate_formats()
+        store = get_store()
+        cached = store.aggregate_formats(primary_only=_dedup_on(store))
         _cache_set("formats", cached)
     return _etag_response(request, "formats", cached)

@@ -266,6 +266,28 @@ def find_corrupt_tracks(*, tracker_only: bool = False) -> list[dict]:
     return out
 
 
+# Formats whose defect is detectable from a lone re-extracted file (no archive
+# sibling context needed): YM's corruption check reads only the file header.
+# Sonix "partial" needs the archive's Instruments/ dir, which a lone temp-file
+# re-extract can't see — those backfill via the play-time path instead.
+_DEFECT_BACKFILL_FORMATS = frozenset({"YM"})
+
+
+def find_defect_backfill_candidates() -> list[dict]:
+    """Tracks eligible for a track-health-defect backfill re-extract.
+
+    Only formats in :data:`_DEFECT_BACKFILL_FORMATS` (currently ``YM``): a
+    re-extract runs the same decodability check the play path uses and stamps
+    ``defect="corrupt"`` on the undecodable ones.  Already-defective tracks are
+    included too so a re-run is idempotent (no change → no store write).
+    """
+    from soniqboom.core.store import get_store
+
+    store = get_store()
+    return [t for t in store.all_tracks()
+            if t.get("format") in _DEFECT_BACKFILL_FORMATS]
+
+
 # ── Per-track re-extraction ──────────────────────────────────────────────────
 
 # Fields the decoder fix can actually improve.  Restricted to the
@@ -285,6 +307,9 @@ _REPAIRABLE_FIELDS: tuple[str, ...] = (
     "year",
     "composer", "comment", "label",
     "instruments",
+    # Track-health defect — re-extraction newly produces this (undecodable YM,
+    # Sonix missing instruments).  Included so a re-extract backfills the badge.
+    "defect", "defect_detail",
 )
 
 
@@ -300,6 +325,12 @@ def _changed_fields(old: dict, new: dict) -> dict:
         if k not in new:
             continue
         if old.get(k) != new[k]:
+            # A context-less re-extract (a lone temp file) can't see an
+            # archive's missing-instrument state, so it must never CLEAR an
+            # existing defect to None — only set or upgrade one.  (A full
+            # re-scan, which has the archive, is what clears a stale defect.)
+            if k in ("defect", "defect_detail") and new[k] is None:
+                continue
             out[k] = new[k]
     return out
 

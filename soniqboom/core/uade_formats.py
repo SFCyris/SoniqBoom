@@ -341,3 +341,57 @@ def display_name(player: str) -> str:
         return _FRIENDLY[player]
     name = player.replace("_", " ").replace("-", " ")
     return _CAMEL_RE.sub(" ", name)
+
+
+# ── Aegis Sonix (SonixMusicDriver) ────────────────────────────────────────────
+# Sonix ``.smus`` modules keep their samples in a sibling ``Instruments/`` subdir
+# keyed by arbitrary INS1 names (invisible to the companion-sibling rule).  Both
+# the scanner (to flag a track ``partial`` when the archive is missing some) and
+# the play path (to stub the missing ones with silence) need to know which
+# instruments a module references and which are present — shared here so the two
+# sites agree on what counts as "missing".
+SONIX_PLAYERS = frozenset({"SonixMusicDriver"})
+
+
+def sonix_instrument_names(smus_bytes: bytes) -> list[str]:
+    """INS1 instrument names referenced by an IFF SMUS module, in order.
+
+    Each INS1 chunk is a 4-byte index/flags header followed by a
+    NUL-terminated instrument name; uade turns that name into the file
+    request ``Instruments/<name>.instr``.
+    """
+    import struct
+    names: list[str] = []
+    if smus_bytes[:4] != b"FORM" or smus_bytes[8:12] != b"SMUS":
+        return names
+    pos = 12
+    n = len(smus_bytes)
+    while pos + 8 <= n:
+        cid = smus_bytes[pos:pos + 4]
+        ln = struct.unpack(">I", smus_bytes[pos + 4:pos + 8])[0]
+        body = smus_bytes[pos + 8:pos + 8 + ln]
+        if cid == b"INS1" and len(body) > 4:
+            nm = body[4:].split(b"\x00", 1)[0].decode("latin-1").strip()
+            if nm:
+                names.append(nm)
+        pos += 8 + ln + (ln & 1)
+    return names
+
+
+def sonix_missing_instruments(smus_bytes: bytes,
+                              present_basenames_lower: set[str]) -> list[str]:
+    """INS1 names whose ``<name>.instr`` is NOT in *present_basenames_lower*.
+
+    Callers supply the set of lowercased basenames actually available (from an
+    archive namelist at scan, or the extracted dir at play).  Preserves module
+    order and de-dups so a repeated instrument is reported once.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for nm in sonix_instrument_names(smus_bytes):
+        key = f"{nm}.instr".lower()
+        if key in present_basenames_lower or key in seen:
+            continue
+        seen.add(key)
+        out.append(nm)
+    return out

@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=89">
+  <link rel="stylesheet" href="/assets/css/app.css?v=90">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -1228,6 +1228,10 @@
                   <option value="circuit">Circuit board</option>
                 </select>
               </div>
+              <div class="admin-setting">
+                <label for="setting-sid-wasm-playback">Play SID in browser <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Experimental: render C64 SID tunes entirely in the browser (WASM) instead of on the server — the per-voice VU meter comes free and perfectly synced, and the server never renders SID. Costs a few seconds of render before playback starts. Off = server renders + streams SID as usual.">&#9432;</span></label>
+                <input id="setting-sid-wasm-playback" type="checkbox">
+              </div>
             </div>
             <div class="admin-io-row" style="margin-top:24px">
               <button id="btn-save-settings">Save Settings</button>
@@ -1801,6 +1805,7 @@
 
             <div class="ti-section ti-autohide" id="ti-section-main">
               <div class="ti-section-hdr">Track Info</div>
+              <div class="ti-field" id="ti-field-defect" style="display:none"><span class="ti-label">Status</span><span class="ti-value ti-value-wrap"><span class="track-defect-badge" id="ti-defect-badge"></span> <span id="ti-defect-detail"></span></span></div>
               <div class="ti-field"><span class="ti-label">Title</span><span class="ti-value" id="ti-title">—</span></div>
               <div class="ti-field"><span class="ti-label">Artist</span><span class="ti-value" id="ti-artist">—</span></div>
               <div class="ti-field"><span class="ti-label">Album Artist</span><span class="ti-value" id="ti-album-artist">—</span></div>
@@ -2220,7 +2225,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=123"></script>
+  <script type="module" src="/assets/js/app.js?v=138"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

@@ -16,6 +16,7 @@ import struct
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
@@ -1581,6 +1582,18 @@ def uade_get_info(path: Path) -> dict:
     except (_sp.TimeoutExpired, OSError) as exc:
         return {"_ok": False, "_error": str(exc)}
     info: dict = {"_ok": r.returncode == 0}
+    # uade prints "module check failed" to stderr ONLY when the input is
+    # genuinely NOT an Amiga module (a PC ``.dat``/``.fc``, a Gravis ``.pat``
+    # patch, a ``.jpg`` image that matched an eagleplayer token by name).  A
+    # REAL module whose companion sample half is merely absent fails ``-g``
+    # with "score died" instead — verified: TFMX ``mdat.X`` and RJP ``.sng``
+    # sans companion → "score died"; MELLOW.DAT/MENTAL.FC/Star.jpg/bass.pat →
+    # "module check failed".  Expose the distinction so the scanner's lenient
+    # "remote loose module" admit (below) can refuse non-module data instead
+    # of stamping it a bogus Amiga format that 422s at play (mirrors the
+    # play-time guard in api/stream.py).
+    _stderr = (r.stderr or "")
+    info["_module_check_failed"] = "module check failed" in _stderr.lower()
     for line in r.stdout.splitlines():
         key, sep, val = line.partition(":")
         if sep:
@@ -1718,6 +1731,47 @@ def _extract_sndh(path: Path, track_id: str) -> dict:
     return d
 
 
+# Raw YM magics StSound's ymDecode accepts (mirrors Ymload.cpp's enum); every
+# other real YM is LHA-wrapped with an ``-lh5-`` payload.  Kept in sync with the
+# play-time gate in api/stream.py, which imports ``ym_is_decodable`` from here.
+_YM_RAW_MAGICS = (b"YM2!", b"YM3!", b"YM3b", b"YM4!", b"YM5!", b"YM6!",
+                  b"MIX1", b"YMT1", b"YMT2")
+
+
+def ym_is_decodable(path: Path) -> bool:
+    """Cheap pre-flight: can StSound actually load this ``.ym``?
+
+    StSound accepts only a raw YM magic or an ``-lh5-`` LZH-wrapped payload.
+    A handful of files carry a corrupt ``-lh5-`` header (binary bytes clobber
+    the LHA level-0 header, which ``lha``/``7z`` reject too) or are a foreign
+    Atari format ("YMST") mislabelled ``.ym`` — the vendored depacker then
+    yields garbage and ymDecode fails.
+
+    The LHA level-0 header checksum (byte 1 == sum(header[2:2+size]) & 0xFF) is
+    used as a cheap *corruption heuristic* — NOTE StSound's own ``depackFile``
+    does not validate it (it gates only on ``size!=0 && id=="-lh5-"``); a file
+    whose payload is intact but whose checksum byte is wrong would decode in
+    StSound yet be rejected here.  Over this library that never happens: all
+    files that fail the checksum are also payload-corrupt and fail ym2wav, so
+    the heuristic has zero real false-rejects — but it is deliberately stricter
+    than the engine.  Used to reject at play (honest 415) and to stamp
+    ``defect="corrupt"`` at scan.  Returns True on I/O error (real error at play).
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return True
+    if head[:4] in _YM_RAW_MAGICS:
+        return True
+    if head[2:7] == b"-lh5-":
+        hsize = head[0]
+        if hsize == 0 or 2 + hsize > len(head):
+            return False
+        return (sum(head[2:2 + hsize]) & 0xFF) == head[1]
+    return False        # unknown magic (e.g. "YMST") — not a YM StSound reads
+
+
 def _extract_ym(path: Path, track_id: str) -> dict:
     """YM metadata parsed straight from the (usually LHA-wrapped) header.
 
@@ -1777,6 +1831,14 @@ def _extract_ym(path: Path, track_id: str) -> dict:
         d["artist"] = artist   # TrackMeta.artist is str — never None
     if comment:
         d["comment"] = comment
+    # Flag files no engine can render (foreign "YMST", corrupt -lh5-) so the UI
+    # can badge them instead of the user hitting a bare 415 at play.  Same
+    # predicate as the play-time gate, so the badge appears iff play 415s.
+    if not ym_is_decodable(path):
+        d["defect"] = "corrupt"
+        d["defect_detail"] = (
+            "Not a YM register dump any available engine can decode "
+            "(foreign Atari format or corrupt LHA wrapper)")
     return d
 
 
@@ -2052,8 +2114,20 @@ def _extract_imf(path: Path, track_id: str) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def extract(path: Path, track_id: str) -> TrackMeta:
-    """Extract full metadata from any supported audio file."""
+def extract(
+    path: Path, track_id: str,
+    *, pc_program_check: Callable[[], bool] | None = None,
+) -> TrackMeta:
+    """Extract full metadata from any supported audio file.
+
+    ``pc_program_check`` is an optional, lazily-evaluated veto used only by the
+    uade lenient fallback below: callers that materialise a module from an
+    archive pass a callable that returns True when that archive is a PC program
+    bundle (a DOS ``MZ`` ``.exe``/``.com`` sibling).  It is invoked at most
+    once, and ONLY when a ``uade123 -g`` rejection would otherwise be
+    leniently overridden — so a normal scan never pays for it.  See the
+    ``QA C1`` block for why.
+    """
     ext = path.suffix.lower()
     file_size = path.stat().st_size if path.exists() else None
 
@@ -2130,8 +2204,20 @@ def extract(path: Path, track_id: str) -> TrackMeta:
             # classification; genuinely corrupt files fail at play with a
             # clear 422.  Local files WITH their companions present keep the
             # strict content verdict.
+            # D1: uade's "module check failed" verdict is authoritative — the
+            # file is NOT a module (PC .dat/.fc, Gravis .pat, .jpg image, etc.
+            # that matched an eagleplayer token purely by name/extension).  It
+            # must NEVER be admitted leniently, even when it sits alone with no
+            # companion — "lone file" is the shape of BOTH a remote loose
+            # module AND a mis-classified PC data file, so it can't be the
+            # discriminator.  A genuine companion-needing module reports "score
+            # died" instead (``_module_check_failed`` False) and stays eligible
+            # for the lenient path.  This is the systemic fix for the ~540
+            # non-music files mis-indexed as Paul Tonge/Paul Robotham/Zound
+            # Monitor/Future Composer/ProTracker(packed)/... buckets.
             _lenient = False
-            if _uade_cls is not None:
+            if _uade_cls is not None and not _uade_probe.get(
+                    "_module_check_failed"):
                 _sibs = _uade.companion_sibling_names(path.name)
                 _here = {p.name.lower() for p in path.parent.glob("*")}
                 if not any(s.lower() in _here for s in _sibs):
@@ -2140,6 +2226,22 @@ def extract(path: Path, track_id: str) -> TrackMeta:
                 raise ValueError(
                     f"uade123 rejected {path.name}: unknown/corrupt Amiga "
                     f"module or missing companion sample file"
+                )
+            # QA C1b: "no companion beside it" is NOT proof of a remote
+            # loose module — a lone PC data file (a demo's ``X.dat`` that
+            # matched PaulRobotham purely by the ``.dat`` extension) also
+            # sits alone, and the lenient path above would stamp it an
+            # Amiga module that 502s at play.  A DOS ``MZ`` ``.exe``/``.com``
+            # sibling in the SAME archive proves the archive is a PC program
+            # bundle, not an Amiga module scanned without its sample half —
+            # so refuse rather than admit.  Checked here (not eagerly) so the
+            # cost lands only on the rare ``-g`` rejection, never a clean scan.
+            if pc_program_check is not None and pc_program_check():
+                _fmt = _uade.display_name(_uade_cls[0]) if _uade_cls else "an Amiga module"
+                raise ValueError(
+                    f"{path.name} matched {_fmt} by extension, but its archive "
+                    f"contains a DOS/PC executable (MZ header) — PC program "
+                    f"data, not a playable Amiga module"
                 )
             _uade_probe = {"_ok": False}   # classify-only metadata below
 

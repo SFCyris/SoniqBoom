@@ -655,6 +655,34 @@ async def metadata_repair_start(
     return {"started": True, "total": len(candidates)}
 
 
+@router.post("/metadata/backfill-defects")
+async def metadata_backfill_defects(_tok: str = Depends(_require_token)):
+    """Backfill the track-health ``defect`` badge onto EXISTING tracks.
+
+    A normal (incremental) scan skips unchanged files, so the ``defect`` field
+    added later never lands on tracks indexed before the feature.  This re-runs
+    the extractor over the defect-eligible formats (currently ``YM`` — its
+    corruption check reads only the file header, so it's cheap) and stamps
+    ``defect="corrupt"`` on the undecodable ones.  Non-destructive: only the
+    ``defect``/``defect_detail`` fields are written, and only when they change.
+    Reuses the repair task machinery (watch ``repair_progress`` WS events /
+    poll ``/admin/metadata/repair-status``).  409 if a repair is already
+    running.  Sonix "partial" tracks backfill via the play path, not here.
+    """
+    from soniqboom.core.repair import (
+        find_defect_backfill_candidates, start_repair, is_running,
+    )
+    if is_running():
+        raise HTTPException(409, "A repair/backfill task is already running")
+
+    candidates = find_defect_backfill_candidates()
+    started = await start_repair(candidates)
+    if not started:
+        raise HTTPException(409, "A repair/backfill task is already running")
+
+    return {"started": True, "total": len(candidates)}
+
+
 @router.post("/metadata/repair-cancel")
 async def metadata_repair_cancel(_tok: str = Depends(_require_token)):
     """Ask the in-flight repair task to stop after the current file."""
@@ -2707,6 +2735,12 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             await set_config("hide_empty_folders", bool(body["hide_empty_folders"]))
         if "filter_duplicates" in body:
             await set_config("filter_duplicates", bool(body["filter_duplicates"]))
+            # The HTTP aggregation cache (/library/formats etc.) is not keyed on
+            # this toggle, and the store's format aggregate now counts primaries
+            # only when it's on — so a toggle must drop both caches, else the
+            # Galaxy legend keeps serving counts computed under the old mode.
+            from soniqboom.api.library import invalidate_agg_cache
+            invalidate_agg_cache()
         if "dedup_folders" in body:
             await set_config("dedup_folders", bool(body["dedup_folders"]))
         if "use_folder_art" in body:

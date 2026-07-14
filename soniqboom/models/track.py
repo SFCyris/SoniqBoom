@@ -53,6 +53,18 @@ class TrackMeta(BaseModel):
     patterns: int | None = None
     subsongs: int | None = None
 
+    # Track health — a known playback defect detected at scan time, surfaced as
+    # a badge in listings + the info panel.  ``defect`` is a coarse class the UI
+    # styles on; ``defect_detail`` is the human context shown as tooltip/text.
+    #   "partial" — plays, but with degraded/substituted content (e.g. an Aegis
+    #               Sonix .smus whose archive is missing some instruments, which
+    #               the renderer fills with silent stand-ins).
+    #   "corrupt" — cannot be decoded by any available engine (e.g. a foreign
+    #               "YMST" file mislabelled .ym, or a corrupt LHA-wrapped .ym);
+    #               plays return an honest 415.
+    defect: str | None = None
+    defect_detail: str | None = None
+
     # SID (C64) / HVSC enrichment.  ``sid_md5`` is the MD5 of the whole .sid
     # file — the key HVSC's Songlengths database is indexed by — cached at scan
     # time so the re-apply join needs no file I/O (and works for remote tracks,
