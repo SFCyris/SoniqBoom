@@ -264,18 +264,41 @@ def _mb_only_record(name: str, art: dict) -> dict:
     }
 
 
-async def get_artist_info(name: str, album: str | None = None, track: str | None = None) -> dict:
+async def get_artist_info(
+    name: str, album: str | None = None, track: str | None = None,
+    *, is_retro: bool = False,
+) -> dict:
     """Return ``{name, found, bio, image, url, source}`` for an artist.
 
     ``album`` / ``track`` give MusicBrainz context so ambiguous names resolve
     to the musician on this record. Cached to disk; concurrent requests for
     one artist share a single resolution.
+
+    ``is_retro`` (tracker / SID / chip formats) flips the resolution order to
+    **Demozoo-first**: scene handles like "Skaven" or "Purple Motion" identify
+    a demoscene musician on Demozoo, not the mainstream band a fuzzy
+    MusicBrainz search would return.  Only a CONFIDENT Demozoo match (a name
+    resolving to exactly one scener) is used; otherwise we fall through to the
+    MusicBrainz path below.
     """
     name = (name or "").strip()
     if not name or _is_placeholder_artist(name):
         # Placeholder / unknown artist — refuse the lookup entirely rather
         # than let a fuzzy MusicBrainz match invent a wrong bio.
         return {"name": name, "found": False}
+
+    if is_retro:
+        # Demozoo-first for scene music.  Built fresh each call (the offline
+        # sqlite lookup is microseconds; the live per-scener enrichment is
+        # itself disk-cached), so it doesn't share the MusicBrainz name-cache
+        # and can never serve a mainstream bio for a scene handle.
+        try:
+            from soniqboom.core import demozoo
+            card = await demozoo.artist_card(name, track_title=track)
+            if card is not None:
+                return card
+        except Exception:                       # noqa: BLE001 — never break the panel
+            log.debug("Demozoo artist_card failed for %r", name, exc_info=True)
 
     cached = _read_cache(name)
     if cached is not None:

@@ -343,6 +343,24 @@ def display_name(player: str) -> str:
     return _CAMEL_RE.sub(" ", name)
 
 
+def format_labels() -> frozenset[str]:
+    """Every human-facing format label uade can attach to a track — the friendly
+    map's values plus ``display_name`` of each eagleplayer in the conf.
+
+    Lets the retro classifier (``core.retro``) recognise uade-rendered Amiga
+    exotica as retro/scene music without hard-coding the ~175 player names.
+    Best-effort: uade's *runtime* ``-g`` playername (e.g. "TFMX Pro",
+    "SoundMon 2.0") can differ from these conf-derived labels, so ``retro``
+    also carries a small curated supplement for the observed variants.  Returns
+    an empty set if the conf can't be read (uade not installed)."""
+    try:
+        labels = set(_FRIENDLY.values())
+        labels |= {display_name(p) for p in set(player_map().values())}
+        return frozenset(l for l in labels if l)
+    except Exception:                                   # noqa: BLE001
+        return frozenset()
+
+
 # ── Aegis Sonix (SonixMusicDriver) ────────────────────────────────────────────
 # Sonix ``.smus`` modules keep their samples in a sibling ``Instruments/`` subdir
 # keyed by arbitrary INS1 names (invisible to the companion-sibling rule).  Both

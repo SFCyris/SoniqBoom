@@ -72,15 +72,63 @@ def _build_family() -> dict[str, str]:
 _FAMILY = _build_family()
 RETRO_FORMATS = frozenset(_FAMILY.keys())
 
+# ── uade / Amiga exotica (Paula) ──────────────────────────────────────────────
+# uade renders ~175 exotic Amiga formats, each stored under uade's RUNTIME
+# playername ("TFMX Pro", "SoundMon 2.0", "Rob Hubbard", "Jochen Hippel ST", …).
+# They're not a clean static family — the runtime playername varies (version
+# suffixes, spacing) from uade's conf-derived labels — so we recognise them from
+# uade's own label table (``uade_formats.format_labels()``) UNIONed with a
+# curated supplement for the runtime variants that table misses.  All map to the
+# Paula chip family.  (A durable per-track family marker stamped at scan time
+# would be fully robust; this string match is best-effort but covers the classic
+# composers + every uade format observed in a large real library.)
+_AMIGA_EXOTICA = frozenset({
+    "Paul Tonge", "Paul Robotham", "DIGI Booster", "Zound Monitor", "PreTracker",
+    "Musicline Editor", "MusiclineEditor", "Protracker and family",
+    "ProTracker (packed)", "ArtOfNoise (4ch)", "UFO", "Future Composer",
+    "FutureComposer 1.3", "FutureComposer 1.4", "Core Design", "Protracker4",
+    "Tronic", "Amiga Custom", "Sonix Music Driver", "Forgotten Worlds Game",
+    "Speedy System", "Jochen Hippel", "Jochen Hippel ST", "Hippel-COSO",
+    "Sonic Arranger", "Mike Davies", "AMOS", "Ashley Hogg", "Ben Daglish",
+    "Benn Daglish", "David Whittaker", "Rob Hubbard", "TFMX Pro", "SoundMon 2.0",
+    "DeltaMusic 2.0", "FredMonitor", "Amiga",
+})
+
+_uade_retro_cache: frozenset[str] | None = None
+
+
+def _uade_retro_formats() -> frozenset[str]:
+    """uade/Amiga-exotica format labels recognised as retro — the curated
+    supplement UNIONed with uade's own conf-derived labels (lazy + cached, so a
+    missing uade install just yields the curated set; no import-time I/O)."""
+    global _uade_retro_cache
+    if _uade_retro_cache is None:
+        labels = set(_AMIGA_EXOTICA)
+        try:
+            from soniqboom.core import uade_formats as _uf
+            labels |= _uf.format_labels()
+        except Exception:                               # noqa: BLE001
+            pass
+        _uade_retro_cache = frozenset(labels)
+    return _uade_retro_cache
+
 
 def is_retro_format(fmt: str | None) -> bool:
-    """True when *fmt* is a chip/tracker/synth format (its own similarity universe)."""
-    return bool(fmt) and fmt in RETRO_FORMATS
+    """True when *fmt* is a chip/tracker/synth/Amiga-exotica format (its own
+    similarity universe).  Covers the static families AND uade's Amiga formats
+    (TFMX, Hippel, Hubbard, Whittaker, ProWizard …), whose dynamic playernames
+    aren't in the static set."""
+    return bool(fmt) and (fmt in RETRO_FORMATS or fmt in _uade_retro_formats())
 
 
 def chip_family(fmt: str | None) -> str | None:
-    """Coarse sound-chip family for *fmt* (``sid``/``tracker``/``nes``/…), or None."""
-    return _FAMILY.get(fmt) if fmt else None
+    """Coarse sound-chip family for *fmt* (``sid``/``tracker``/``paula``/…), or None."""
+    if not fmt:
+        return None
+    fam = _FAMILY.get(fmt)
+    if fam is not None:
+        return fam
+    return "paula" if fmt in _uade_retro_formats() else None
 
 
 _TOK = _re.compile(r"[^a-z0-9]+")
