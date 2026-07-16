@@ -3388,6 +3388,98 @@ input[type="range"]:hover::-moz-range-thumb {
   transform: scale(1.04);
 }
 
+/* ── Scene pane (retro/demoscene tracks) ───────────────────────────────────── */
+.ti-scene-pane {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px 28px;
+  display: none;
+  flex-direction: column;
+}
+.ti-scene-pane.active { display: flex; }
+.ti-scene-pane.hidden { display: none; }
+
+.ti-scene-artist { margin-bottom: 18px; }
+.ti-scene-name {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text0);
+  line-height: 1.2;
+}
+.ti-scene-sub  { font-size: 13px; color: var(--text1); margin-top: 3px; }
+.ti-scene-aka  { font-size: 12px; color: var(--text2); margin-top: 2px; }
+
+.ti-scene-block {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.ti-scene-h {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text2);
+  margin-bottom: 8px;
+}
+.ti-scene-rel-title { font-size: 15px; font-weight: 600; color: var(--text0); }
+.ti-scene-meta      { font-size: 12.5px; color: var(--text1); margin-top: 3px; }
+.ti-scene-compo     { font-size: 12.5px; color: var(--text1); margin-top: 5px; }
+
+.ti-scene-chips { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 5px; }
+.ti-scene-chip {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 10px;
+  background: var(--border-bright, rgba(255,255,255,0.12));
+  color: var(--text1);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.ti-scene-chip:hover { background: var(--accent); color: #fff; }
+
+.ti-scene-disco { list-style: none; margin: 0; padding: 0; }
+.ti-scene-disco li {
+  font-size: 13px;
+  color: var(--text0);
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.ti-scene-disco li a { color: var(--text0); text-decoration: none; }
+.ti-scene-disco li a:hover { color: var(--accent); text-decoration: underline; }
+.ti-scene-disco-m { font-size: 11.5px; color: var(--text2); }
+.ti-scene-more {
+  display: inline-block;
+  margin-top: 9px;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.ti-scene-more:hover { text-decoration: underline; }
+
+.ti-scene-baseline .ti-scene-b-row {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text2);
+  padding: 2px 0;
+}
+.ti-scene-b-k { min-width: 96px; color: var(--text2); opacity: 0.8; }
+.ti-scene-empty {
+  color: var(--text2);
+  font-size: 13px;
+  padding: 22px 8px;
+  text-align: center;
+}
+
+/* Year row corrected from a matched Demozoo production — a subtle accent so the
+   overwrite is visible without shouting. */
+.ti-value.ti-year-scene {
+  color: var(--accent);
+  cursor: help;
+  border-bottom: 1px dotted var(--accent);
+}
+
 /* ── Sidebar ambient glow ──────────────────────────────────────────────────── */
 #sidebar-glow {
   position: absolute;

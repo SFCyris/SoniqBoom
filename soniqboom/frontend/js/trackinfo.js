@@ -27,6 +27,7 @@ let _chaptersAbort = null;
 let _extendedAbort = null;
 let _lyricsAbort   = null;
 let _patternsAbort = null;
+let _sceneAbort    = null;
 
 async function _loadChapters(track) {
   const host = document.getElementById('ti-chapters');
@@ -124,14 +125,17 @@ const artPhEl      = document.getElementById('ti-art-ph');
 // Tabs
 const tabInfo     = document.getElementById('ti-tab-info');
 const tabLyrics   = document.getElementById('ti-tab-lyrics');
+const tabScene    = document.getElementById('ti-tab-scene');
 const metaPane    = document.getElementById('ti-meta-pane');
 const lyricsPane  = document.getElementById('ti-lyrics-pane');
 const lyricsState = document.getElementById('ti-lyrics-state');
+const scenePane   = document.getElementById('ti-scene-pane');
+const sceneBody   = document.getElementById('ti-scene-body');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let _queue       = [];
 let _idx         = 0;
-let _activeTab   = 'info';   // 'info' | 'lyrics'
+let _activeTab   = 'info';   // 'info' | 'lyrics' | 'scene'
 let _lyricsCache = {};        // track_id → {lyrics, synced, source, lines} | 'loading' | 'error'
 let _syncedLines = [];        // [{time: seconds, text: '...'}, ...]
 let _activeLine  = -1;        // index of currently highlighted line
@@ -241,6 +245,17 @@ async function _loadArtistAbout(track) {
     let q = '/api/artist/info?name=' + encodeURIComponent(artist);
     if (track.album) q += '&album=' + encodeURIComponent(track.album);
     if (track.title) q += '&track=' + encodeURIComponent(track.title);
+    // Format drives Demozoo-first identification for retro/scene music so a
+    // scene handle resolves to the demoscene musician, not a mainstream band.
+    if (track.format) q += '&format=' + encodeURIComponent(track.format);
+    // Explicit scene flag: the uade Amiga-exotica formats (TFMX, Hippel,
+    // Hubbard, Whittaker, ProWizard …) carry dynamic playernames that aren't in
+    // the server's static retro-format set, yet those composers are exactly the
+    // ones whose handles collide with mainstream MusicBrainz entities.  Reuse
+    // the same scene detection the pattern/subsong UI uses.
+    const _scene = isUadeAmigaTrack(track) || _MODULE_FORMATS.has(track.format)
+        || ATARI_FORMAT_NAMES.has(track.format) || PSF_FORMAT_NAMES.has(track.format);
+    if (_scene) q += '&retro=1';
     const r = await fetch(q);
     if (_queue[_idx]?.id !== reqTrackId) return;   // user navigated away
     if (!r.ok) return;
@@ -249,17 +264,41 @@ async function _loadArtistAbout(track) {
     if (!info || !info.found || !info.bio) return;
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    // Allow-list the URL SCHEME on hrefs — esc() blocks attribute breakout but
+    // not a `javascript:`/`data:` URI (a Demozoo scener's user-contributed
+    // external link is untrusted).  Only http(s) may become a live anchor.
+    const safeUrl = (u) => (/^https?:\/\//i.test(String(u == null ? '' : u)) ? String(u) : '');
     const full = info.bio;
     const bio = full.length > 420 ? full.slice(0, 420).replace(/\s+\S*$/, '') + '…' : full;
     const img = info.image
       ? `<img src="${esc(info.image)}" alt="${esc(info.title || artist)}" loading="lazy" decoding="async" style="float:left;width:72px;height:72px;object-fit:cover;border-radius:8px;margin:0 12px 8px 0">`
       : '';
-    const link = info.url
-      ? ` <a href="${esc(info.url)}" target="_blank" rel="noopener" style="white-space:nowrap">Read on ${esc(info.source || 'Wikipedia')} ▸</a>`
+    const _infoUrl = safeUrl(info.url);
+    const link = _infoUrl
+      ? ` <a href="${esc(_infoUrl)}" target="_blank" rel="noopener" style="white-space:nowrap">Read on ${esc(info.source || 'Wikipedia')} ▸</a>`
       : '';
+    // Demozoo enrichment ships an external-links list (Bandcamp / Soundcloud /
+    // Wikipedia / Discogs …).  Render them as chips labelled by host so we
+    // don't hardcode Demozoo's link_class vocabulary.
+    let linksHtml = '';
+    if (Array.isArray(info.links) && info.links.length) {
+      const chip = (l) => {
+        const u = safeUrl(l && l.url);
+        if (!u) return '';
+        let label = l.class || 'link';
+        try { label = new URL(u).hostname.replace(/^www\./, ''); } catch { /* keep class */ }
+        return `<a href="${esc(u)}" target="_blank" rel="noopener" style="display:inline-block;`
+          + `font-size:11px;padding:2px 8px;margin:4px 5px 0 0;border-radius:10px;`
+          + `background:var(--surface-2,rgba(255,255,255,.08));color:var(--text-2,#bbb);`
+          + `text-decoration:none;white-space:nowrap">${esc(label)}</a>`;
+      };
+      const chips = info.links.slice(0, 10).map(chip).join('');
+      if (chips) linksHtml = `<div style="margin-top:6px">${chips}</div>`;
+    }
     host.innerHTML =
       `<h4 style="margin:0 0 6px;font-size:13px;opacity:.85">About ${esc(info.title || artist)}</h4>` +
-      `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>`;
+      `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>` +
+      linksHtml;
     host.hidden = false;
     _bioRendered = true;
   } catch (e) { /* network/parse issue — leave hidden */ }
@@ -267,6 +306,199 @@ async function _loadArtistAbout(track) {
     // Not rendered (no bio / error) and still on this track → drop the skeleton.
     // If the user navigated away, the newer call owns the host — don't touch it.
     if (!_bioRendered && _queue[_idx]?.id === reqTrackId) { host.hidden = true; host.innerHTML = ''; }
+  }
+}
+
+// ── Scene tab (retro/demoscene tracks) ─────────────────────────────────────────
+// Demozoo-sourced composer identity + discography + this track's release
+// details, fetched from /api/artist/scene (which resolves the scener with the
+// same confidence gate as /artist/info).  Baseline module context (Modland
+// origin, format) always shows so the tab is never a dead end, even when the
+// composer doesn't resolve on Demozoo.  When a production matches this track,
+// its canonical release year is reflected into the INFO tab's Year row.
+//
+// The payload is resolved on EVERY retro-track render (not just when the SCENE
+// tab is active) so the Year overwrite reaches the default INFO view, and is
+// cached per-track (_sceneCache) so toggling to the tab is instant with no
+// re-fetch / skeleton flash.
+let _sceneCache = {};   // track_id → payload | 'loading' | 'error'
+
+/** Render a resolved scene payload (or an empty-state marker) into the pane. */
+function _renderScene(track, info) {
+  if (!sceneBody || !track) return;
+  const artist  = ((track.artist) || '').trim();
+  const esc     = _escHtml;
+  const safeUrl = (u) => (/^https?:\/\//i.test(String(u == null ? '' : u)) ? String(u) : '');
+  const hostOf  = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return 'link'; } };
+  const chip    = (u, label) => {
+    const su = safeUrl(u); if (!su) return '';
+    return `<a href="${esc(su)}" target="_blank" rel="noopener" class="ti-scene-chip">${esc(label)}</a>`;
+  };
+  // Baseline context — present for ANY scene track, independent of a Demozoo
+  // match, so the tab always shows something.
+  const baseline = () => {
+    const rows = [];
+    if (track.scene_path)
+      rows.push(`<div class="ti-scene-b-row"><span class="ti-scene-b-k">Scene archive</span><span>Modland: ${esc(track.scene_path)}</span></div>`);
+    if (track.format)
+      rows.push(`<div class="ti-scene-b-row"><span class="ti-scene-b-k">Format</span><span>${esc(track.format)}</span></div>`);
+    return rows.length ? `<div class="ti-scene-block ti-scene-baseline">${rows.join('')}</div>` : '';
+  };
+  const empty = (msg) => `<div class="ti-scene-empty">${esc(msg)}</div>`;
+
+  if (!info || !info.found || !info.artist) {
+    const msg = info && info.__noartist ? 'No composer name to look up on Demozoo.'
+      : info && info.__net             ? 'Couldn’t reach the scene database.'
+      : `No demoscene entry found for “${artist}”.`;
+    sceneBody.innerHTML = baseline() + empty(msg);
+    return;
+  }
+
+  const a     = info.artist;
+  const rel   = info.release;
+  const disco = Array.isArray(info.discography) ? info.discography : [];
+  const parts = [];
+
+  // ── Artist block ──
+  let ab = `<div class="ti-scene-artist"><div class="ti-scene-name">${esc(a.real_name || artist)}</div>`;
+  const sub = [];
+  if (a.real_name && a.real_name.toLowerCase() !== artist.toLowerCase()) sub.push(`“${esc(artist)}”`);
+  if (Array.isArray(a.groups) && a.groups.length) sub.push('Member of ' + esc(a.groups.slice(0, 5).join(', ')));
+  if (sub.length) ab += `<div class="ti-scene-sub">${sub.join(' · ')}</div>`;
+  const seen = new Set([artist.toLowerCase(), (a.real_name || '').toLowerCase()]);
+  const aliases = (a.aliases || []).filter(n => n && !seen.has(String(n).toLowerCase()));
+  if (aliases.length) ab += `<div class="ti-scene-aka">aka ${esc(aliases.slice(0, 6).join(', '))}</div>`;
+  const aChips = [chip(a.url, 'Demozoo')]
+    .concat((a.links || []).slice(0, 12).map(l => chip(l && l.url, hostOf(l && l.url))))
+    .filter(Boolean).join('');
+  if (aChips) ab += `<div class="ti-scene-chips">${aChips}</div>`;
+  ab += `</div>`;
+  parts.push(ab);
+
+  // ── This release block ──
+  if (rel) {
+    let rb = `<div class="ti-scene-block"><div class="ti-scene-h">This release</div>`;
+    if (rel.title) rb += `<div class="ti-scene-rel-title">${esc(rel.title)}</div>`;
+    const meta = [];
+    if (rel.year) meta.push(String(rel.year));
+    if (rel.type) meta.push(esc(rel.type));
+    if (Array.isArray(rel.platforms) && rel.platforms.length) meta.push(esc(rel.platforms.join(', ')));
+    if (meta.length) rb += `<div class="ti-scene-meta">${meta.join(' · ')}</div>`;
+    (rel.placings || []).slice(0, 4).forEach(p => {
+      const where = [p.competition, p.party].filter(Boolean).map(esc).join(' at ');
+      const rank  = p.rank ? `#${esc(p.rank)} · ` : '';
+      const yr    = p.year ? ` (${p.year})` : '';
+      const txt   = `${rank}${where}${yr}`.trim();
+      if (txt) rb += `<div class="ti-scene-compo">🏆 ${txt}</div>`;
+    });
+    (rel.parties || []).slice(0, 3).forEach(pt => {
+      if (pt && pt.name) rb += `<div class="ti-scene-compo">▸ Released at ${esc(pt.name)}${pt.year ? ` (${pt.year})` : ''}</div>`;
+    });
+    const rChips = [chip(rel.url, 'Demozoo')]
+      .concat((rel.links || []).slice(0, 8).map(l => chip(l && l.url, hostOf(l && l.url))))
+      .filter(Boolean).join('');
+    if (rChips) rb += `<div class="ti-scene-chips">${rChips}</div>`;
+    rb += `</div>`;
+    parts.push(rb);
+  }
+
+  // ── Discography ──
+  if (disco.length) {
+    let db = `<div class="ti-scene-block"><div class="ti-scene-h">More by ${esc(artist)}</div><ul class="ti-scene-disco">`;
+    disco.forEach(p => {
+      const su    = safeUrl(p.url);
+      const label = esc(p.title);
+      const inner = su ? `<a href="${esc(su)}" target="_blank" rel="noopener">${label}</a>` : label;
+      const m     = [p.year, p.type].filter(Boolean).map(esc).join(' · ');
+      db += `<li>${inner}${m ? ` <span class="ti-scene-disco-m">${m}</span>` : ''}</li>`;
+    });
+    db += `</ul>`;
+    const allUrl = safeUrl(a.url);
+    if (allUrl) db += `<a class="ti-scene-more" href="${esc(allUrl)}" target="_blank" rel="noopener">See all on Demozoo ▸</a>`;
+    db += `</div>`;
+    parts.push(db);
+  }
+
+  parts.push(baseline());
+  sceneBody.innerHTML = parts.join('');
+}
+
+/** Reflect a matched production's canonical release year into the INFO Year row
+ *  (display-time overwrite).  Runs regardless of the active tab so the default
+ *  INFO view shows the corrected year.  Guarded on the track still being shown. */
+function _applySceneYear(track, info, reqTrackId) {
+  const rel = info && info.release;
+  if (!(rel && rel.year)) return;
+  if (_queue[_idx]?.id !== reqTrackId) return;
+  const yEl = document.getElementById('ti-year');
+  if (!yEl || Number(rel.year) === Number(track.year)) return;
+  yEl.textContent = String(rel.year);
+  yEl.title = `Demozoo release year${track.year ? ` · file tag says ${track.year}` : ''}`;
+  yEl.classList.remove('ti-empty');
+  yEl.classList.add('ti-year-scene');
+  const field = yEl.closest('.ti-field');
+  if (field) field.style.display = '';
+  _updateSectionVisibility();
+}
+
+async function _loadScene(track) {
+  if (!sceneBody) return;
+  const reqTrackId = track && track.id;
+  if (!track) { sceneBody.innerHTML = ''; return; }
+  const artist = ((track.artist) || '').trim();
+
+  // No composer name → immediate, cached baseline-only state.
+  if (!artist || _isPlaceholderArtist(artist)) {
+    const payload = { found: false, __noartist: true };
+    if (reqTrackId) _sceneCache[reqTrackId] = payload;
+    _renderScene(track, payload);
+    return;
+  }
+
+  const cached = reqTrackId ? _sceneCache[reqTrackId] : null;
+  if (cached === 'loading') return;                    // in flight — will render on resolve
+  if (cached && cached !== 'error') {                  // resolved payload → instant
+    _renderScene(track, cached);
+    _applySceneYear(track, cached, reqTrackId);
+    return;
+  }
+
+  if (reqTrackId) _sceneCache[reqTrackId] = 'loading';
+  // Skeleton while the (external) Demozoo fetch is in flight.  Written into the
+  // pane even when INFO is active (harmless — the pane is hidden) so the tab is
+  // pre-populated when opened.
+  sceneBody.innerHTML = '<div class="ti-bio-skel"><span class="skel-bar"></span>'
+    + '<span class="skel-bar" style="width:88%"></span>'
+    + '<span class="skel-bar" style="width:70%"></span></div>';
+
+  if (_sceneAbort) { try { _sceneAbort.abort(); } catch (_) {} }
+  const _c = (typeof AbortController === 'function') ? new AbortController() : null;
+  _sceneAbort = _c;
+  try {
+    let q = '/api/artist/scene?name=' + encodeURIComponent(artist) + '&retro=1';
+    if (track.title)  q += '&track='  + encodeURIComponent(track.title);
+    if (track.format) q += '&format=' + encodeURIComponent(track.format);
+    const r = await fetch(q, _c ? { signal: _c.signal } : undefined);
+    if (!r.ok) throw new Error('http ' + r.status);
+    const info = await r.json();
+    if (reqTrackId) _sceneCache[reqTrackId] = info;    // cache resolved payload
+    // Apply the year + render only if still on this track (else the pane/INFO
+    // row belong to a newer track; the payload stays cached for a revisit).
+    if (_queue[_idx]?.id === reqTrackId) {
+      _renderScene(track, info);
+      _applySceneYear(track, info, reqTrackId);
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      // Track switched mid-fetch — drop the 'loading' marker so a revisit
+      // re-fetches instead of sticking forever.
+      if (reqTrackId) delete _sceneCache[reqTrackId];
+      return;
+    }
+    if (reqTrackId) _sceneCache[reqTrackId] = 'error';
+    if (_queue[_idx]?.id === reqTrackId) _renderScene(track, { found: false, __net: true });
+  } finally {
+    if (_sceneAbort === _c) _sceneAbort = null;
   }
 }
 
@@ -426,6 +658,10 @@ function _render(track) {
   _show('ti-album',        track.album);
   _show('ti-composer',     track.composer);
   _show('ti-year',         track.year);
+  // Clear any prior track's Demozoo year-overwrite marker; _loadScene re-applies
+  // it below when THIS track confidently matches a scene production.
+  const _yEl0 = document.getElementById('ti-year');
+  if (_yEl0) { _yEl0.classList.remove('ti-year-scene'); _yEl0.title = ''; }
   _renderDefect(track.defect, track.defect_detail);
 
   // ── NUMBERING ──
@@ -463,7 +699,16 @@ function _render(track) {
   // ── Chapters (podcast/audiobook) — appended after the regular tags
   // when the file has them.  Click jumps the player.
   _loadChapters(track);
-  _loadArtistAbout(track);
+  // Scene/retro tracks route the artist identity to the SCENE tab (richer:
+  // discography, release, links), so the INFO-pane bio block is suppressed for
+  // them to avoid showing the same person twice.  Regular audio keeps it.
+  const _scene = _isSceneTrack(track);
+  if (_scene) {
+    const _ab = document.getElementById('ti-artist-about');
+    if (_ab) { _ab.hidden = true; _ab.innerHTML = ''; }
+  } else {
+    _loadArtistAbout(track);
+  }
   _renderTagEdit(track);
   _loadPatterns(track);
 
@@ -473,6 +718,28 @@ function _render(track) {
   // nodes are MOVED (insertBefore), so listeners and state survive.
   _reorderSections(track);
   _updateSectionVisibility();
+
+  // Tab set: INFO always; a retro/scene track shows SCENE (which REPLACES
+  // Lyrics — modules have no lyrics), regular audio keeps Lyrics.  Lyrics is
+  // never dropped for regular tracks even when empty: the empty state is the
+  // affordance that lazily fetches lyrics from the server on click.
+  if (tabScene)  tabScene.hidden  = !_scene;
+  if (tabLyrics) tabLyrics.hidden = _scene;
+  // Navigating prev/next across a retro↔regular boundary can leave the active
+  // tab hidden — fall back to Info so no invisible pane is "current".
+  if ((_activeTab === 'lyrics' && _scene) || (_activeTab === 'scene' && !_scene)) {
+    _switchTab('info');
+  }
+
+  // Resolve the SCENE data for EVERY retro track (not just when the SCENE tab
+  // is active) so the Year overwrite reaches the default INFO view and the pane
+  // is pre-populated for an instant tab-open.  _loadScene is cached + idempotent
+  // per track.  Non-retro: clear the pane.
+  if (_scene) {
+    _loadScene(track);
+  } else if (sceneBody) {
+    sceneBody.innerHTML = '';
+  }
 
   // Reset lyrics pane if navigating away from current lyrics
   if (_activeTab === 'lyrics') {
@@ -523,6 +790,16 @@ function _isModuleFamily(track) {
       || isUadeAmigaTrack(track)
       || ATARI_FORMAT_NAMES.has(track.format)
       || PSF_FORMAT_NAMES.has(track.format);
+}
+
+/** Demoscene-track test — drives the SCENE-vs-LYRICS tab swap.  It's the
+ *  module family MINUS General MIDI: GM/karaoke MIDI isn't demoscene (no
+ *  Demozoo entry to show) and .kar files can carry real lyrics, so MIDI keeps
+ *  the Lyrics tab rather than getting an always-empty Scene tab.  (Module
+ *  section reordering still uses _isModuleFamily, so MIDI's module details are
+ *  unaffected.) */
+function _isSceneTrack(track) {
+  return _isModuleFamily(track) && track && track.format !== 'MIDI';
 }
 
 // Sections that participate in the format-aware reorder, in DOM units.
@@ -1214,14 +1491,21 @@ if (metaPane && lyricsPane) {
   lyricsPane.setAttribute('aria-labelledby', 'ti-tab-lyrics');
   lyricsPane.tabIndex = 0;
 }
+if (scenePane) {
+  scenePane.setAttribute('role', 'tabpanel');
+  scenePane.setAttribute('aria-labelledby', 'ti-tab-scene');
+  scenePane.tabIndex = 0;
+}
 
 function _switchTab(tab) {
   _activeTab = tab;
   tabInfo.classList.toggle('active', tab === 'info');
   tabLyrics.classList.toggle('active', tab === 'lyrics');
+  if (tabScene) tabScene.classList.toggle('active', tab === 'scene');
   tabInfo.setAttribute('aria-selected',   tab === 'info'   ? 'true' : 'false');
   tabLyrics.setAttribute('aria-selected', tab === 'lyrics' ? 'true' : 'false');
-  // Single show/hide convention: both panes default to ``hidden`` and we
+  if (tabScene) tabScene.setAttribute('aria-selected', tab === 'scene' ? 'true' : 'false');
+  // Single show/hide convention: every pane defaults to ``hidden`` and we
   // add ``active`` for the visible one.  Previously meta used ``hidden``
   // while lyrics used ``active``, so during the open animation both
   // panes could be visible (Visual-Test #1 caught the race).
@@ -1229,11 +1513,17 @@ function _switchTab(tab) {
   metaPane.classList.toggle('hidden', tab !== 'info');
   lyricsPane.classList.toggle('active', tab === 'lyrics');
   lyricsPane.classList.toggle('hidden', tab !== 'lyrics');
+  if (scenePane) {
+    scenePane.classList.toggle('active', tab === 'scene');
+    scenePane.classList.toggle('hidden', tab !== 'scene');
+  }
   if (tab === 'lyrics') _loadLyrics(_queue[_idx]);
+  else if (tab === 'scene') _loadScene(_queue[_idx]);
 }
 
 tabInfo.addEventListener('click',   () => _switchTab('info'));
 tabLyrics.addEventListener('click', () => _switchTab('lyrics'));
+if (tabScene) tabScene.addEventListener('click', () => _switchTab('scene'));
 
 // ── Lyrics loading ────────────────────────────────────────────────────────────
 function _setLyricsState(html) {

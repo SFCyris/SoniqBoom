@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=90">
+  <link rel="stylesheet" href="/assets/css/app.css?v=91">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -1798,6 +1798,11 @@
                     role="tab" aria-controls="ti-meta-pane"   aria-selected="true">Info</button>
             <button id="ti-tab-lyrics" class="ti-tab-btn"
                     role="tab" aria-controls="ti-lyrics-pane" aria-selected="false">Lyrics</button>
+            <!-- Scene tab: shown INSTEAD of Lyrics for retro/demoscene tracks
+                 (which have no lyrics); hidden for regular audio.  Populated by
+                 trackinfo._loadScene from /api/artist/scene (Demozoo). -->
+            <button id="ti-tab-scene" class="ti-tab-btn" hidden
+                    role="tab" aria-controls="ti-scene-pane" aria-selected="false">Scene</button>
           </div>
 
           <!-- Metadata pane -->
@@ -1927,6 +1932,13 @@
           <!-- Lyrics pane -->
           <div id="ti-lyrics-pane" class="ti-lyrics-pane">
             <div id="ti-lyrics-state" class="ti-lyrics-state">No lyrics loaded.</div>
+          </div>
+
+          <!-- Scene pane (retro/demoscene tracks) — Demozoo identity,
+               discography, and this track's release details.  Populated by
+               trackinfo._loadScene; hidden for regular audio. -->
+          <div id="ti-scene-pane" class="ti-scene-pane hidden">
+            <div id="ti-scene-body" class="ti-scene-body"></div>
           </div>
 
         </div>
@@ -2225,7 +2237,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=138"></script>
+  <script type="module" src="/assets/js/app.js?v=139"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling
