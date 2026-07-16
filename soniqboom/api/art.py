@@ -673,11 +673,27 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
         source = get_source(scan_root)
         cache = get_cache()
         try:
-            local_path = cache.get_cached(scan_root, remote_path)
-            if local_path and local_path.exists():
-                data, mime = await loop.run_in_executor(
-                    None, _extract_cover, local_path
-                )
+            if "::" in remote_path:
+                # Composite remote-archive member — split the "::" tail FIRST so
+                # we look up (and extract from) the OUTER archive, not the whole
+                # "archive.zip::member" string (which is never a cache key, so the
+                # embedded cover was silently never extracted).  The cover lives
+                # inside the member, so extract it from that member within the
+                # locally-cached archive.  Mirror the non-blocking get_cached
+                # semantics of the plain-remote branch below (no forced fetch —
+                # the is_remote backfill covers the not-yet-cached case).
+                arc_rel, member = remote_path.split("::", 1)
+                local_path = cache.get_cached(scan_root, arc_rel)
+                if local_path and local_path.exists():
+                    data, mime = await loop.run_in_executor(
+                        None, lambda: _extract_cover_from_zip(f"{local_path}::{member}")
+                    )
+            else:
+                local_path = cache.get_cached(scan_root, remote_path)
+                if local_path and local_path.exists():
+                    data, mime = await loop.run_in_executor(
+                        None, _extract_cover, local_path
+                    )
         except Exception:
             pass
     elif '::' in path_str:

@@ -186,6 +186,23 @@ async def _run(track) -> None:
 
 def _fetch_remote_cover(path_str: str, file_size: int, ext: str):
     """Return (cover_bytes, mime) or (None, None).  Blocking — call via thread."""
+    if "::" in path_str:
+        # Composite remote-archive member (``…archive.zip::member.ext``): the
+        # ``::`` tail must be partitioned BEFORE the remote scheme, or the
+        # partial/atom range reads below ask the FTP/SMB server for the literal
+        # ``archive.zip::member`` filename (no such file → cover lost) or read
+        # the raw container without extracting the member.  A range read can't
+        # reach inside a zip member anyway, so pull the whole member — the outer
+        # archive is reused from the remote-cache, not re-fetched — via the
+        # shared ``::``-before-remote resolver and read its cover from bytes.
+        from soniqboom.core.source_bytes import read_source_bytes
+        # ``lane="scan"`` — cover backfill is a background pass; keep it off the
+        # playback stream pool.  (Note: a transient network failure returns
+        # None here → the caller records a short negative-cooldown, delaying
+        # this background pre-fetch; the interactive art path (_resolve_full_art)
+        # still resolves the cover from the cached archive independently.)
+        return _cover_from_bytes(read_source_bytes(path_str, lane="scan"), ext)
+
     from soniqboom.core.filesource import get_source, parse_remote_path
     try:
         scan_root, remote_path = parse_remote_path(path_str)

@@ -80,6 +80,23 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
             return t, md5, False            # cached — no I/O, nothing to persist
         path_str = t.get("path") or ""
         if path_str.startswith(("smb://", "ftp://")):
+            if "::" in path_str:
+                # SID inside a REMOTE archive ("…/archive.zip::member.sid"):
+                # route through the shared resolver, which splits the "::" tail
+                # BEFORE the remote fetch (fetch outer container → extract
+                # member).  ``lane="scan"`` — this is a bulk background re-apply
+                # pass and must not compete with playback on the stream lane.
+                from soniqboom.core.source_bytes import read_source_bytes
+                async with io_sem:
+                    data = await loop.run_in_executor(
+                        None, lambda: read_source_bytes(path_str, lane="scan"),
+                    )
+                if data is None:
+                    skipped_unreadable += 1
+                    return t, None, False
+                return t, hashlib.md5(data).hexdigest(), True
+            # Plain remote SID — unchanged scan-lane direct read (no "::" tail,
+            # no remote-cache write-through).
             from soniqboom.core.filesource import parse_remote_path, get_source
             try:
                 scan_root, rel = parse_remote_path(path_str)

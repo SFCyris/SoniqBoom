@@ -331,6 +331,11 @@ def _changed_fields(old: dict, new: dict) -> dict:
             # re-scan, which has the archive, is what clears a stale defect.)
             if k in ("defect", "defect_detail") and new[k] is None:
                 continue
+            # A provenance-stamped year (Demozoo canonical backfill, or a
+            # deliberate user edit) outranks whatever the re-extract read from
+            # the file — the file never carried the right year to begin with.
+            if k == "year" and old.get("year_source") in ("demozoo", "user"):
+                continue
             out[k] = new[k]
     return out
 
@@ -498,16 +503,35 @@ async def _process_remote(t: dict, source_lookup) -> tuple[bool, bool, str | Non
         return False, False, "remote-no-source"
 
     loop = asyncio.get_running_loop()
-    try:
-        # ``lane='scan'`` so this borrows from the scan pool, not the
-        # streaming pool — keeps audio playback responsive while the
-        # repair churns through hundreds of files.
-        data: bytes = await loop.run_in_executor(
-            None, lambda: source.read_file(remote_subpath, lane="scan"),
-        )
-    except Exception as exc:
-        log.warning("Repair: download failed for %s: %s", path_str, exc)
-        return False, False, f"remote-download: {type(exc).__name__}: {exc}"
+
+    if "::" in remote_subpath:
+        # Composite remote-archive member (``ftp://…/archive.zip::member``):
+        # the ``::`` tail is NOT a real remote file, so handing
+        # ``remote_subpath`` whole to ``source.read_file`` would 550/ENOENT
+        # (or, if the container name alone resolved, read the raw archive
+        # without extracting the member).  Route it through the shared
+        # resolver, which partitions ``::`` first, mirrors only the OUTER
+        # container into the remote-cache, then extracts the member.  Plain
+        # (non-archive) remote paths keep the scan-lane read_file() path
+        # below unchanged.
+        from soniqboom.core.source_bytes import read_source_bytes
+        # ``lane="scan"`` mirrors the plain-remote branch below — a bulk repair
+        # pass must borrow the scan pool, not the playback stream pool.
+        data = await loop.run_in_executor(
+            None, lambda: read_source_bytes(path_str, lane="scan"))
+        if data is None:
+            return False, False, "remote-archive-extract-failed"
+    else:
+        try:
+            # ``lane='scan'`` so this borrows from the scan pool, not the
+            # streaming pool — keeps audio playback responsive while the
+            # repair churns through hundreds of files.
+            data = await loop.run_in_executor(
+                None, lambda: source.read_file(remote_subpath, lane="scan"),
+            )
+        except Exception as exc:
+            log.warning("Repair: download failed for %s: %s", path_str, exc)
+            return False, False, f"remote-download: {type(exc).__name__}: {exc}"
 
     new_meta, err = await loop.run_in_executor(
         None, _re_extract_remote_sync, data, path_str, tid,

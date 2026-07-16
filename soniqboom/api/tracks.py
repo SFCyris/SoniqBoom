@@ -94,8 +94,15 @@ async def _resolve_zip_member_to_local(path_str: str):
             data, member_name = await loop.run_in_executor(
                 None, _read_from_zip_path, path_str)
         tmp = tempfile.NamedTemporaryFile(suffix=_Path(member_name).suffix, delete=False)
-        tmp.write(data)
-        tmp.close()
+        try:
+            tmp.write(data)
+            tmp.close()
+        except Exception:
+            # Don't orphan the just-created (delete=False) temp if the write
+            # fails mid-stream (e.g. ENOSPC) — unlink before degrading.
+            tmp.close()
+            _Path(tmp.name).unlink(missing_ok=True)
+            raise
         return _Path(tmp.name)
     except Exception:                       # noqa: BLE001 — degrade, never 500
         return None
@@ -167,6 +174,11 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_ed
     store_updates: dict = dict(applied)
     if "genre" in store_updates:
         store_updates["genre"] = [store_updates["genre"]]
+    if "year" in store_updates:
+        # A hand-edited year is authoritative: mark its provenance so the
+        # Demozoo year backfill (demozoo.collect_updates) never overwrites a
+        # deliberate user correction on a later apply.
+        store_updates["year_source"] = "user"
     get_store().update_track_fields(track_id, store_updates)
     # The edited artist/title/album change what LRCLib would return, so drop any
     # cached lyrics for this track — the next LYRICS open re-resolves with the
@@ -590,35 +602,14 @@ _PATTERN_FORMAT_NAMES = frozenset({
 
 
 def _read_module_bytes(path_str: str) -> bytes | None:
-    """Raw module bytes for a local path, archive-virtual path, or remote
-    path (with optional archive tail).  Blocking — run in an executor.
-    Returns None when the file can't be reached; never raises."""
-    try:
-        outer, sep, rest = path_str.partition("::")
-        if outer.startswith(("smb://", "ftp://", "http://", "https://",
-                             "webdav://", "webdavs://")):
-            # Mirror the remote OUTER file (the module itself, or the
-            # archive containing it) into the local remote-cache first.
-            from soniqboom.core.filesource import get_source, parse_remote_path
-            from soniqboom.core.remote_cache import get_cache
-            scan_root, remote_path = parse_remote_path(outer)
-            source = get_source(scan_root) if remote_path else None
-            if source is None:
-                return None
-            local = get_cache().fetch(scan_root, remote_path, source)
-            if not local:
-                return None
-            outer = str(local)
-        if sep:
-            # Archive member (possibly nested zips) — the scanner's reader
-            # already handles zip/LHA/disk-image chains.
-            from soniqboom.core.scanner import _read_from_zip_path
-            data, _member = _read_from_zip_path(f"{outer}::{rest}")
-            return data
-        p = Path(outer)
-        return p.read_bytes() if p.exists() else None
-    except Exception:
-        return None
+    """Raw module bytes for a local / archive-virtual / remote / composite
+    remote-archive path.  Thin alias over the shared canonical resolver
+    (``core.source_bytes.read_source_bytes``) so the SID-bytes endpoint, the
+    VU backfill, and the core services (hvsc_apply / repair / art_backfill)
+    all share ONE ``::``-before-remote implementation.  Blocking — run in an
+    executor.  Never raises; returns None on any miss."""
+    from soniqboom.core.source_bytes import read_source_bytes
+    return read_source_bytes(path_str)
 
 
 # Extracted pattern payloads, LRU keyed by (track_id, mtime).  The row→time
@@ -1091,37 +1082,24 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     if ext not in _VU_BACKFILL_EXTS:
         log.debug("VU backfill skipped — ext %r not in tracker set", ext)
         return None
-    # Resolve the source bytes — local file, remote-cache mirror, or
-    # ZIP virtual path.  Reuses the same logic the pattern endpoint
-    # already does.
+    # Resolve raw module bytes via the shared resolver, the SAME helper the
+    # SID-bytes endpoint uses.  It partitions the ``::`` archive tail FIRST,
+    # so a composite remote-archive path (``ftp://…foo.zip::inner.mod``)
+    # fetches the OUTER ``.zip`` into the local remote-cache — a cache HIT
+    # returns the copy playback already downloaded, no re-fetch — and THEN
+    # extracts the member before handing bytes to libopenmpt.
+    #
+    # The previous hand-rolled block here checked ``startswith("ftp://")``
+    # BEFORE the ``"::" in path`` case, so a remote-zip module never reached
+    # the archive extractor: it fed either a bogus ``…zip::member`` remote path
+    # (fetch fails) or the raw ZIP container (unparseable) to libopenmpt →
+    # None → 404 → FFT fallback.  ``subsong`` is intentionally NOT applied here;
+    # the bytes are subsong-agnostic and the tune is selected downstream in
+    # ``extract_vu``.
     path_str = track.path
-    src_bytes: bytes | None = None
-    try:
-        if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
-            # Fetch remote → local (cache-only previously missed never-played
-            # tracks).  The whole function is wrapped in try/except below, so a
-            # fetch failure just means no backfill → 404 → FFT fallback.
-            from soniqboom.core.filesource import get_source, parse_remote_path
-            from soniqboom.core.remote_cache import get_cache
-            scan_root, remote_path = parse_remote_path(path_str)
-            source = get_source(scan_root) if remote_path else None
-            if source is not None:
-                local = await asyncio.get_event_loop().run_in_executor(
-                    None, get_cache().fetch, scan_root, remote_path, source)
-                if local and local.exists():
-                    src_bytes = local.read_bytes()
-        elif "::" in path_str:
-            # ZIP-virtual path — _read_from_zip_path returns bytes.
-            from soniqboom.core.scanner import _read_from_zip_path
-            data, _name = _read_from_zip_path(path_str)
-            src_bytes = data
-        else:
-            p = Path(path_str)
-            if p.exists():
-                src_bytes = p.read_bytes()
-    except Exception:
-        log.warning("VU backfill source-read failed for %s", path_str, exc_info=True)
-        return None
+    src_bytes = await asyncio.get_event_loop().run_in_executor(
+        None, _read_module_bytes, path_str,
+    )
     if not src_bytes:
         log.debug("VU backfill found no bytes for %s", path_str)
         return None
@@ -1878,6 +1856,29 @@ async def get_track_waveform(track_id: str, response: Response):
         # remaining after the cold-start fix.
         if cached_path:
             src_for_waveform = str(cached_path)
+        elif '::' in path_str:
+            # Transcoded-format member inside a LOCAL or REMOTE archive with no
+            # cached transcode yet.  ffmpeg can't read the ``archive.zip::member``
+            # virtual path — nor our composite ``ftp://host/scan:/…zip::member``
+            # form — directly, and the plain-remote branch below would hand the
+            # whole composite string to get_cache().fetch (no such remote file →
+            # HTTP 502).  Partition the ``::`` tail FIRST and extract the member
+            # to a local temp, exactly like the plain-audio branch does further
+            # down.
+            local = await _resolve_zip_member_to_local(path_str)
+            if local is None:
+                raise HTTPException(404, "Waveform not available for this format")
+            try:
+                result = await _compute_waveform_safe(str(local))
+                stored, response = _normalise_waveform(result)
+                if not _waveform_is_blank(stored):
+                    await store_waveform(track_id, stored)
+                return {"waveform": response}
+            finally:
+                try:
+                    local.unlink()
+                except Exception:
+                    pass
         elif path_str.startswith(("smb://", "ftp://")):
             # Remote transcoded source (e.g. a .m4a/.aac on an FTP/SMB share)
             # with no cached transcode yet: ffmpeg can't open our internal
