@@ -36,7 +36,6 @@ import socket
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from soniqboom.core import cast_codecs, cast_tokens
@@ -448,6 +447,7 @@ class CastSession:
                 start_background_render,
                 is_cache_ready,
             )
+            from soniqboom.core.cast_render import materialize_source
             from soniqboom.config import settings as _settings, get_active_soundfont
         except Exception:
             log.exception("cast prewarm: import of render helpers failed")
@@ -474,6 +474,21 @@ class CastSession:
                 if not needs_transcode and src_ext in NATIVE:
                     continue
 
+                # NOTE: each branch below resolves the source to a LOCAL path via
+                # ``_local_src()`` ONLY after its ``is_cache_ready`` check passes
+                # — i.e. exactly where the old ``Path(track.path)`` sat.  Keeping
+                # the resolve after the cache-check means an already-prewarmed
+                # upcoming track is NOT re-fetched.  ``_local_src`` handles the
+                # "remote scheme checked before the archive member" bug: it
+                # partitions the ``::`` archive tail FIRST so a composite path
+                # (``ftp://…a.zip::x.mod``) fetches only the OUTER container then
+                # extracts the member, and lands a plain ``ftp://…`` source in the
+                # local cache — a raw virtual path can't be handed to the
+                # renderers / ffmpeg.  Returns ``None`` (→ skip this item) on a
+                # miss; the foreground play will still resolve it.
+                async def _local_src(_t=track, _it=item):
+                    return await materialize_source(_t.path, _it.track_id, lane="scan")
+
                 # Build the cache-key matching what cast_stream / the
                 # main stream handler use.  If the entry is already
                 # cached (or in-flight), start_background_render is
@@ -486,7 +501,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "sid",
                         lambda p=path, ss=int(item.subsong or 0), d=target_dur:
@@ -500,7 +517,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "midi",
                         lambda p=path: _render_midi(p),
@@ -514,7 +533,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "hvl",
                         lambda p=path, ss=int(item.subsong or 0):
@@ -530,7 +551,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "uade",
                         lambda p=path, ss=int(item.subsong or 0):
@@ -543,7 +566,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "tracker",
                         lambda p=path, ss=int(item.subsong or 0):
@@ -556,7 +581,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     await start_background_render(
                         ck, "gme",
                         lambda p=path, ss=int(item.subsong or 0):
@@ -588,7 +615,9 @@ class CastSession:
                     )
                     if await is_cache_ready(ck):
                         continue
-                    path = Path(track.path)
+                    path = await _local_src()
+                    if path is None:
+                        continue
                     src_dur = float(getattr(track, "duration", 0) or 0) or None
                     await start_background_render(
                         ck, "transcoded",

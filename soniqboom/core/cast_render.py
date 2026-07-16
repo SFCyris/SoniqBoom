@@ -32,12 +32,23 @@ unchanged) — the function is safe to call on every cast request.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 from pathlib import Path
 
 from soniqboom.core.conversion_cache import get_or_render
 
 log = logging.getLogger(__name__)
+
+# Remote-source schemes the cast render path resolves.  Deliberately limited to
+# the schemes ``filesource.parse_remote_path`` actually accepts (it RAISES
+# ValueError on http/webdav) — matching the effective handled set keeps the
+# tuple honest and lets a webdav/http path degrade to a clean ``None`` miss
+# instead of a caught-ValueError traceback.  Same set as cast_stream's inline
+# composite-remote branch.  (``core.source_bytes`` lists the broader aspirational
+# set, but its resolution funnels through the same smb/ftp-only parse_remote_path.)
+_REMOTE_SCHEMES = ("smb://", "ftp://")
 
 
 # ── Extension sets ─────────────────────────────────────────────────────────
@@ -111,6 +122,76 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     return None
 
 
+async def materialize_source(
+    track_path: str, track_id: str, *, lane: str = "stream",
+) -> Path | None:
+    """Resolve any track-path shape to a LOCAL filesystem ``Path`` the renderers
+    (and ffmpeg) can read, or ``None`` on a miss.
+
+    Handles all four shapes::
+
+        /local/file.mod                          → returned as-is
+        /local/archive.zip::inner.mod            → stable extracted member
+        ftp://host/share:/dir/file.mod           → fetched into the remote-cache
+        ftp://host/share:/dir/archive.zip::x.mod → OUTER fetched, member extracted
+
+    The ``::`` archive tail is partitioned **first**, so a composite
+    remote-archive path fetches only the OUTER container (a cache hit reuses the
+    copy playback already downloaded — no re-fetch) and THEN extracts the
+    member.  This is the fix for the "remote scheme checked before the archive
+    member" bug in the cast render paths: a resolver that tested the remote
+    scheme first would hand the whole ``…archive.zip::member`` string to the
+    remote fetch (no such remote file exists) or read the raw container without
+    extracting the member.  It mirrors ``core.source_bytes.read_source_bytes``
+    but returns a PATH — renderers need a filesystem path, not bytes.
+
+    Local archive members go through ``_get_or_extract_zip_member`` — the same
+    stable, mtime-gated, ``_zip_pin``-able extraction cache the foreground
+    stream uses — so there's no temp-file churn or double extraction, and a
+    caller may pin the returned member by ``track_id``.
+
+    ``lane`` selects the remote-cache I/O pool for the OUTER fetch: foreground
+    callers use the default ``"stream"`` (playback-priority); background prewarm
+    passes ``lane="scan"`` so bulk pulls don't starve playback.  Blocking
+    network / disk I/O runs in an executor.  Never raises — returns ``None`` on
+    any miss so callers degrade gracefully.
+    """
+    try:
+        outer, sep, member = track_path.partition("::")
+        if outer.startswith(_REMOTE_SCHEMES):
+            # Mirror ONLY the OUTER remote file (the module itself, or the
+            # archive that contains it) into the local remote-cache first.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            scan_root, remote_path = parse_remote_path(outer)
+            source = get_source(scan_root) if remote_path else None
+            if source is None:
+                return None
+            loop = asyncio.get_running_loop()
+            local_outer = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    get_cache().fetch, scan_root, remote_path, source, lane=lane,
+                ),
+            )
+            if not local_outer:
+                return None
+            outer = str(local_outer)
+        if sep:
+            # Archive member (local outer, or the remote outer just fetched) —
+            # extract via the shared, pinnable on-disk cache.
+            from soniqboom.api.stream import _get_or_extract_zip_member
+            return await _get_or_extract_zip_member(f"{outer}::{member}", track_id)
+        p = Path(outer)
+        return p if p.exists() else None
+    except Exception:
+        # Non-fatal: the caller degrades (renderer FileNotFoundError → 410,
+        # prewarm → skip).  Keep the traceback at warning so a genuine
+        # remote/archive fetch failure stays diagnosable.
+        log.warning("cast: materialize_source failed for %s", track_path, exc_info=True)
+        return None
+
+
 async def prepare_source_for_stream(
     *,
     track_id: str,
@@ -131,9 +212,10 @@ async def prepare_source_for_stream(
     ``subsong`` is honoured for SID / tracker / GME; ignored for MIDI
     and other single-track formats.
 
-    Raises ``FileNotFoundError`` if the source doesn't exist on disk,
-    ``RuntimeError`` if the required renderer binary is missing.  The
-    caller (cast_stream) maps both to user-visible HTTP responses.
+    Raises ``FileNotFoundError`` if the source doesn't exist on disk (the
+    caller maps it to 410); the underlying ``_render_*`` helpers raise
+    ``HTTPException(501, "<binary> not installed")`` when the required renderer
+    binary is missing, which cast_stream re-raises unchanged.
     """
     # Strip ``outer.zip::inner.mod`` to the inner filename for the
     # extension test, but feed the renderer the FULL path — the
@@ -142,18 +224,25 @@ async def prepare_source_for_stream(
     src_ext = Path(visible_path).suffix.lower()
     path_obj = Path(track_path)
 
-    # ZIP-contained rendered sources: resolve to the real extracted file via
-    # the SAME stable extraction cache the foreground stream uses.  The
-    # renderers (sidplayfp / fluidsynth / openmpt123 / uade123 / hvl2wav) take
-    # a filesystem path and can't read a ``zip::member`` virtual path — without
-    # this, a COLD cast render of any zip-contained tracker/SID/HVL fails (it
-    # only worked when the foreground play had already warmed the cache).
-    # Shared cache ⇒ no temp churn and no double-extraction.
-    if "::" in track_path and is_rendered_format(src_ext):
-        from soniqboom.api.stream import _get_or_extract_zip_member
-        extracted = await _get_or_extract_zip_member(track_path, track_id)
-        if extracted is not None:
-            path_obj = extracted
+    # Archive- or remote-contained rendered sources: resolve to the real LOCAL
+    # file the renderers (sidplayfp / fluidsynth / openmpt123 / uade123 /
+    # hvl2wav) can read — they take a filesystem path and can't read a
+    # ``zip::member`` virtual path OR a ``ftp://…`` remote URL.  ``materialize_
+    # source`` partitions the ``::`` archive tail FIRST, so a COMPOSITE
+    # remote-archive path (``ftp://…album.zip::inner.mod``) fetches only the
+    # OUTER container then extracts the member — the "remote scheme checked
+    # before the archive member" bug this call closes.  Without it, a COLD cast
+    # render of any remote / remote-zip / zip-contained tracker/SID/HVL fails
+    # (both the audio render AND the render-time VU sidecar).  Local archive
+    # members reuse the same stable extraction cache the foreground stream uses
+    # ⇒ no temp churn and no double-extraction.  cast_stream normally
+    # pre-resolves to a local path, so for that caller this is a no-op; it keeps
+    # the function correct in isolation for any other caller.
+    if is_rendered_format(src_ext) and (
+            "::" in track_path or track_path.startswith(_REMOTE_SCHEMES)):
+        resolved = await materialize_source(track_path, track_id)
+        if resolved is not None:
+            path_obj = resolved
 
     if src_ext in _SID_EXTS:
         # Late import — keeps the cast modules independently loadable

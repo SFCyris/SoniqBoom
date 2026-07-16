@@ -268,7 +268,46 @@ async def cast_stream(
         # downstream.  Without this, ``path_obj.exists()`` returns
         # False for any ZIP-contained track and the cast call 410s.
         _zip_track_id_for_unpin: str | None = None
-        if "::" in track.path:
+        if track.path.startswith(("smb://", "ftp://")) and "::" in track.path:
+            # COMPOSITE remote archive member — ``ftp://host/share:/a.zip::x.mod``.
+            # Partition the ``::`` tail FIRST, fetch only the OUTER archive into
+            # the local remote-cache, THEN extract the member with the same
+            # machinery a local zip uses.  Mirrors the proven streaming model in
+            # stream.stream_track (~5857).  The previous code let the generic
+            # ``"::" in track.path`` branch below run first and handed the whole
+            # ``…a.zip::x.mod`` string (ftp:// outer) to _get_or_extract_zip_member,
+            # which requires a LOCAL outer zip → None → 410.  This is the
+            # "remote scheme checked before the archive member" bug for cast.
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            from soniqboom.core.remote_cache import get_cache
+            from soniqboom.api.stream import _get_or_extract_zip_member, _zip_pin
+            scan_root, remote_path = parse_remote_path(track.path)
+            if not remote_path or "::" not in remote_path:
+                raise HTTPException(400, "Remote archive path is malformed.")
+            source = get_source(scan_root)
+            if source is None:
+                raise HTTPException(503, "Network share unavailable.")
+            zip_rel, _member = remote_path.split("::", 1)
+            import asyncio
+            loop = asyncio.get_running_loop()
+            try:
+                _local_zip = await loop.run_in_executor(
+                    None, get_cache().fetch, scan_root, zip_rel, source,
+                )
+            except Exception as exc:
+                log.warning("cast: remote archive fetch failed for %s: %s", track.path, exc)
+                raise HTTPException(502, "Could not fetch archive from network share.")
+            extracted = await _get_or_extract_zip_member(
+                f"{_local_zip}::{_member}", track_id,
+            )
+            if extracted is None:
+                raise HTTPException(410, "Track missing inside the remote archive.")
+            path_obj = extracted
+            # Pin the extracted member so the LRU sweeper can't unlink it
+            # mid-render; unpinned in _counting_gen / the early-raise handler.
+            _zip_pin(track_id)
+            _zip_track_id_for_unpin = track_id
+        elif "::" in track.path:
             from soniqboom.api.stream import (
                 _get_or_extract_zip_member,
                 _zip_pin, _zip_unpin,
@@ -323,12 +362,11 @@ async def cast_stream(
         # We wrap the whole setup in try/except so any early-raise after
         # the ZIP pin (above) releases the pin instead of leaking it —
         # QA-1 P0 flagged the gap between pin and the response generator's
-        # finally block.
-        from soniqboom.core.cast_render import (
-            prepare_source_for_stream, is_rendered_format,
-        )
-        target_subsong = int(claims.get("sn") or 0)
-        was_rendered = is_rendered_format(_ext_for(track.path))
+        # finally block.  The cast_render import + the ``is_rendered_format``
+        # probe live INSIDE the try (not before it) so even an ImportError on
+        # a broken install releases the pin via the ``except BaseException``
+        # handler rather than leaking the extracted member until restart.
+        #
         # Cache-key for the rendered source (SID/MIDI/tracker/GME WAV).
         # Pinned during stream so a concurrent N+1/N+2 prewarm cannot
         # evict it mid-pump.  Audio-2 P0: without this pin, eviction
@@ -336,11 +374,24 @@ async def cast_stream(
         # — Linux/macOS survive via open-fd semantics; Windows breaks.
         _rendered_ck: str | None = None
         try:
+            from soniqboom.core.cast_render import (
+                prepare_source_for_stream, is_rendered_format,
+            )
+            target_subsong = int(claims.get("sn") or 0)
+            was_rendered = is_rendered_format(_ext_for(track.path))
             if was_rendered:
                 try:
                     path_obj, _eff_src = await prepare_source_for_stream(
                         track_id   = track_id,
-                        track_path = str(path_obj) if not track.path.startswith(("smb://", "ftp://")) else track.path,
+                        # ALWAYS the RESOLVED LOCAL path — path_obj has already
+                        # been materialized to a local file for every shape
+                        # above (composite-remote-zip → extracted member,
+                        # local-zip → extracted member, plain-remote → fetched
+                        # copy, plain-local → itself).  The old code passed the
+                        # raw ``track.path`` (an ftp:// URL) for remote sources,
+                        # which _render_* can't read → cold remote render + VU
+                        # sidecar both failed.
+                        track_path = str(path_obj),
                         subsong    = target_subsong,
                     )
                     # Phase mark — render done, transcode about to start.
