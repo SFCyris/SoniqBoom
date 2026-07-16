@@ -210,6 +210,38 @@ def sid_warm_eligible() -> bool:
     return True
 
 
+def _find_orphan_sidecar(track_id: str, subsong: int) -> Path | None:
+    """Find a VU sidecar whose WAV is absent — evicted, never cached, or written
+    ahead of the audio.
+
+    ``get_vu_sidecar_path`` scans ``_meta``, so it can only ever see sidecars
+    whose audio is still cached.  Sidecars now outlive their WAV (eviction keeps
+    them) and can even predate one (the VU pass runs from the source file), so a
+    ``_meta`` miss must fall back to the deterministic on-disk layout:
+    ``<fmt>/<shard>/<track_id>__sub<N>[__…].vu``.
+
+    Matching mirrors ``get_vu_sidecar_path``: tracker/uade keys are exactly
+    ``<id>__sub<N>``; SID keys carry a ``__dur<D>[+fidelity]`` tail, so the
+    trailing ``__`` in the glob keeps ``sub1`` from matching ``sub10``.
+    """
+    base = get_conversion_cache_dir()
+    exact = f"{track_id}__sub{int(subsong)}"
+    shard = track_id[:2]
+    for fmt in FORMAT_TYPES:
+        d = base / fmt / shard
+        if not d.is_dir():
+            continue
+        p = d / f"{exact}.vu"                      # tracker / uade
+        if p.exists():
+            return p
+        try:
+            for cand in sorted(d.glob(f"{exact}__*.vu")):   # sid
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
     """Return the on-disk path to the VU sidecar for *track_id* at
     *subsong* (0-based wire index), or None if that subsong hasn't been
@@ -252,7 +284,10 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
             sidecar  = wav_path.with_suffix(".vu")
             if sidecar.exists():
                 return sidecar
-    return None
+    # No cached WAV to hang the sidecar off — but one may still exist on disk:
+    # eviction now KEEPS sidecars, and the VU pass can write one before (or
+    # without) the audio ever being cached.  Look it up by its deterministic path.
+    return _find_orphan_sidecar(track_id, subsong)
 
 
 def get_sid_wav_path_for_upload(track_id: str, subsong: int = 0) -> Path | None:
@@ -440,15 +475,26 @@ async def register_existing(
 
 
 def _unlink_cached(path_str: str) -> None:
-    """Unlink a cached WAV AND its per-channel VU sidecar (``<wav>.vu``, written
-    by the tracker/uade/SID VU pipelines).  Without removing the sidecar too,
-    evicting a chip render would orphan its ``.vu`` on disk forever."""
-    p = Path(path_str)
-    for f in (p, p.with_suffix(".vu")):
-        try:
-            f.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Unlink an evicted cached WAV — deliberately KEEPING its ``<wav>.vu``
+    per-channel VU sidecar.
+
+    The sidecar is ~26 KB against a ~26 MB WAV, and it is far more expensive to
+    regenerate: a SID sidecar costs a 3-pass sidplayfp render (~40-90 s
+    wall-clock), where re-rendering the audio itself costs ~30 s.  Destroying
+    the expensive-but-tiny artifact to reclaim the space of the cheap-but-huge
+    one is backwards — it made a returning listener watch the FFT fallback for
+    ~90 s ("came back to the track and the VU meter was gone", measured on a
+    Firefox client whose in-browser render can't upload in time).
+
+    Keeping it means a re-render after eviction serves the real per-voice meter
+    immediately.  ``get_vu_sidecar_path`` locates these now-WAV-less sidecars by
+    their deterministic path (``_find_orphan_sidecar``), and ``clear_cache``
+    removes them on an explicit wipe, so they can't accumulate unbounded.
+    """
+    try:
+        Path(path_str).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _purge_entry(cache_key: str) -> None:
@@ -908,16 +954,22 @@ async def clear_cache(types: list[str] | None = None) -> dict:
     cache_dir = get_conversion_cache_dir()
 
     def _purge_disk() -> int:
+        # Sweep the VU sidecars too, not just the WAVs.  Eviction deliberately
+        # KEEPS ``.vu`` files (tiny, expensive to regenerate) and the VU pass can
+        # write one with no WAV at all, so an explicit user-requested wipe is the
+        # only thing that reaps them — globbing "*.wav" alone left them orphaned
+        # on disk forever (301 such strays were measured before this fix).
         n = 0
         for sub in selected:
             d = cache_dir / sub
             if d.exists():
-                for f in d.rglob("*.wav"):
-                    try:
-                        f.unlink(missing_ok=True)
-                        n += 1
-                    except OSError:
-                        pass
+                for pat in ("*.wav", "*.vu"):
+                    for f in d.rglob(pat):
+                        try:
+                            f.unlink(missing_ok=True)
+                            n += 1
+                        except OSError:
+                            pass
         return n
 
     deleted = await asyncio.to_thread(_purge_disk)

@@ -472,6 +472,17 @@ def save_local_conf(data: dict[str, Any], path: Path = _CONF_PATH) -> None:
 _local_conf = load_local_conf()
 
 
+def _conf_int(section: str, key: str, default: int) -> int:
+    """Read an int from the local conf WITHOUT letting a garbage value brick
+    startup — eager ``int(...)`` in a Settings class-body default runs at
+    import time, so ``sid_render_parallel: "abc"`` would raise before the
+    server could even log a complaint.  Fall back to the default instead."""
+    try:
+        return int(_local_conf.get(section, {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Pydantic settings ─────────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
@@ -518,6 +529,16 @@ class Settings(BaseSettings):
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
+    # PROGRESSIVE-SID render pool: max concurrent sidplayfp audio renders on
+    # the web-UI streaming path — live streams plus abandoned-but-finishing
+    # ("detached") ones share this pool, live-first.  Each render holds ~one
+    # CPU core at ~15x realtime.  Honest scope of the bound: it caps the
+    # PROGRESSIVE pool only — cold plays beyond it (and every Subsonic/DLNA/
+    # cast cold play) fall through to the blocking render path, which is
+    # deduped per tune but not globally capped; and the per-voice VU generator
+    # is a separate pool that can add up to 3 more short-lived sidplayfp
+    # processes.  Lower this on small hosts.
+    sid_render_parallel: int = _conf_int("renderers", "sid_render_parallel", 3)
     # SID render fidelity (sidplayfp, ReSIDfp core).  Defaults leave sidplayfp
     # honouring each tune's own PSID header — i.e. exactly the pre-setting
     # behaviour, so existing conversion-cache keys stay valid until changed.

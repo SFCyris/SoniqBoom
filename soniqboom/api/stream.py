@@ -431,13 +431,58 @@ _SID_WAV_BITS = 16
 # disconnect can't abort it; without a live ref asyncio may GC a bare task.
 _SID_PROG_FINALISERS: set = set()
 
-# Cap on concurrent progressive-SID renders.  Beyond this, cold web plays fall
-# back to the blocking render path so a burst of connect/disconnect requests
-# can't spawn an unbounded fleet of sidplayfp processes (each holds a CPU core
-# ~15x-realtime and a growing temp file).  A 1-element list so the generator /
-# finaliser can mutate it without a ``global`` declaration.
-_SID_PROG_MAX_CONCURRENT = 8
+# Cap on concurrent progressive-SID render PROCESSES — live streams AND
+# detached (abandoned-but-finishing, see below) renders share one pool, sized
+# by the ``sid_render_parallel`` setting (default 3; each sidplayfp holds a CPU
+# core at ~15x realtime plus a growing temp file).  Admission is live-first:
+# a new play evicts the oldest detached render when the pool is full, and only
+# falls back to the blocking path when every slot is a live stream.  A
+# 1-element list so the generator / finaliser can mutate the count without a
+# ``global`` declaration.  (A killed victim's slot is released synchronously at
+# eviction; its finaliser's own release is idempotent.)
 _SID_PROG_ACTIVE = [0]
+
+# Detached renders: a listener skipped away mid-tune, but the render is left
+# to FINISH and be cached — previously the temp was discarded on disconnect,
+# so a tune you never played to the end could never become warm ("came back
+# and it wasn't cached", measured live).  Keyed by cache key so (a) eviction
+# can pick the oldest, (b) a comeback play for the same tune kills its own
+# now-redundant duplicate instead of rendering twice.
+# value: {"proc": Process, "release": slot-release fn, "t": monotonic start}
+_SID_DETACHED: dict[str, dict] = {}
+
+
+def _sid_render_cap() -> int:
+    """The live+detached render-pool size (``sid_render_parallel``, min 1)."""
+    try:
+        return max(1, int(getattr(settings, "sid_render_parallel", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _kill_detached(entry: dict) -> None:
+    """Kill one detached render and free its pool slot NOW.  Its finaliser
+    still runs (reaps the proc, unlinks the temp — rc != 0 fails the cache
+    gate) and its own slot release is an idempotent no-op."""
+    try:
+        if entry["proc"].returncode is None:
+            entry["proc"].kill()
+    except ProcessLookupError:
+        pass
+    entry["release"]()
+
+
+def _evict_oldest_detached() -> bool:
+    """Free a pool slot for a LIVE play by sacrificing the oldest detached
+    render (a background cache-warm loses to a person listening, always).
+    False when there is nothing detached to evict — every slot is live."""
+    if not _SID_DETACHED:
+        return False
+    key = min(_SID_DETACHED, key=lambda k: _SID_DETACHED[k]["t"])
+    _kill_detached(_SID_DETACHED.pop(key))
+    return True
+
+
 # How long to wait for sidplayfp's first PCM bytes before either streaming
 # (bytes appeared) or falling back to the blocking render (proc died first —
 # so an immediate render failure surfaces as a real error, not silent silence).
@@ -534,7 +579,23 @@ _SID_VU_MAX_QUEUED = 8              # bound the TOTAL backlog — a burst of man
 # browser), the server renders as the fallback.  The client upload and this
 # render both short-circuit on the ".vu exists" check, so whoever finishes
 # first wins and the other skips.  0 disables the delay (always render at once).
-_SID_VU_SERVER_DELAY = 30.0
+#
+# 8s, not 30s: the grace window is a BET that a browser uploads first, and only
+# Blink can win it.  Measured on the same 92s tune: Chromium finishes its WASM
+# render in 8.2s (~13x realtime) and uploads; Firefox manages 900 of 2760 frames
+# in 22s (~1.4x realtime) and would need ~67s — so on Gecko the server sat idle
+# for 30s waiting for an upload that never came, then took ~23s more to render,
+# leaving the listener on the FFT fallback for ~84s (measured: WAV cached 21:16,
+# sidecar written 21:17:24).  8s still lets a fast client win the race while
+# bounding the worst case to roughly the render itself.
+#
+# Known, accepted race: on tunes ≥ ~90 s even Blink needs longer than 8 s, so
+# the server may start (and complete) a redundant 3-pass render alongside the
+# client's upload.  Deliberate: a short flat grace optimises for the clients
+# that can't upload at all (Gecko), where every extra grace-second is an extra
+# second of FFT fallback; the loser of the race only wastes CPU, never
+# correctness (the worker skips the write when a sidecar landed mid-render).
+_SID_VU_SERVER_DELAY = 8.0
 
 
 async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
@@ -571,6 +632,18 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
             result = await asyncio.to_thread(sid_vu.build_vu, voice_wavs, float(dur))
             if result is not None:
                 vu_path = cached_wav.with_suffix(".vu")
+                # A client upload may have landed while our 3 passes rendered
+                # (on tunes ≥ ~90 s a fast Blink client finishes AFTER the 8 s
+                # grace, so both sides race deliberately — see
+                # _SID_VU_SERVER_DELAY).  Client and server sidecars are
+                # equivalent (0.97-1.0 measured correlation), so keep theirs
+                # rather than overwrite.
+                if vu_path.exists():
+                    return
+                # The shard dir may not exist: the sidecar can now be written
+                # for a SID whose audio was never cached (see
+                # ``ensure_sid_vu_sidecar``), so nothing else has created it.
+                vu_path.parent.mkdir(parents=True, exist_ok=True)
                 await asyncio.to_thread(openmpt_vu.write_sidecar, vu_path, result)
                 log.info("SID VU: wrote %d-voice sidecar for %s",
                          result.channels, cached_wav.name)
@@ -587,8 +660,13 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
 
 def _spawn_sid_vu(full_key: str, cached_wav: Path, sid_path: Path,
                   subsong: int, dur: int) -> None:
-    """Dedup + cap + fire-and-forget the 3-pass VU generation for a cached SID
-    WAV at ``cached_wav``.  No-op if too long, already present, or in flight."""
+    """Dedup + cap + fire-and-forget the 3-pass VU generation, writing the
+    sidecar beside ``cached_wav``.
+
+    ``cached_wav`` is only an ANCHOR for the sidecar's name — the render reads
+    the source ``sid_path``, so the WAV need not exist (``ensure_sid_vu_sidecar``
+    passes the cache key's would-be path for a SID whose audio isn't cached).
+    No-op if too long, already present, or in flight."""
     if dur <= 0 or dur > _SID_VU_MAX_DURATION:
         return
     if full_key in _SID_VU_INFLIGHT:
@@ -623,19 +701,31 @@ async def _sid_vu_worker_delayed(full_key: str, cached_wav: Path, sid_path: Path
 
 
 def ensure_sid_vu_sidecar(track_id: str, sid_path: Path, subsong: int, dur: int) -> None:
-    """Fire-and-forget: ensure a per-voice VU sidecar exists for a cached SID.
+    """Fire-and-forget: ensure a per-voice VU sidecar exists for a SID.
 
-    Resolves the cached WAV from ``_meta`` and delegates to ``_spawn_sid_vu``.
-    Safe to call from every SID play path — dedups on the cache key.  No-op when
-    the audio isn't cached yet (the caller re-triggers on the next play)."""
+    The VU pass renders the 3 voice-isolation passes from the SOURCE ``.sid``;
+    the cached WAV was only ever used to derive the sidecar's NAME.  So resolve
+    that name from the cache key directly and spawn regardless of whether the
+    audio is cached.
+
+    This used to bail out ("audio not cached yet — skip") on exactly the COLD
+    play that needs the meter most, deferring it to a later play.  Combined with
+    the progressive finaliser discarding the render whenever a listener skips
+    away mid-tune (so no WAV is ever committed, and the "later play" is another
+    cold play), that made the sidecar unreachable indefinitely — a permanent FFT
+    fallback.  Writing it from the source breaks that loop: the meter is ready
+    for the rest of THIS play and instant on every later one, cached or not.
+
+    Safe to call from every SID play path — dedups on the cache key and
+    short-circuits once the sidecar exists.
+    """
     if dur <= 0 or dur > _SID_VU_MAX_DURATION:
         return
-    from soniqboom.core.conversion_cache import _cache_key, _meta
+    from soniqboom.core.conversion_cache import _cache_key, _cache_path
     full_key = _cache_key(track_id, "sid", subsong, duration=dur)
-    entry = _meta.get(full_key)
-    if not entry:
-        return                                  # audio not cached yet — skip
-    _spawn_sid_vu(full_key, Path(entry["path"]), sid_path, subsong, dur)
+    # The would-be WAV path: _spawn_sid_vu only reads ``.with_suffix(".vu")``
+    # off it, so it need not exist.
+    _spawn_sid_vu(full_key, _cache_path(full_key, "sid"), sid_path, subsong, dur)
 
 
 async def _await_first_sid_output(proc, tmp: Path, timeout: float) -> bool:
@@ -768,9 +858,18 @@ async def _serve_sid_progressive(
     # Data range → we must render.  Concurrency cap: reserve a slot in the SAME
     # synchronous block as the check so a simultaneous burst can't all pass
     # "< cap" before any of them increments (asyncio runs this prefix to the
-    # first ``await`` uninterrupted, so the count is authoritative here).  Over
-    # cap → return None so the caller renders blocking.
-    if _SID_PROG_ACTIVE[0] >= _SID_PROG_MAX_CONCURRENT:
+    # first ``await`` uninterrupted, so the count is authoritative here).
+    #
+    # A COMEBACK play first retires its own detached duplicate: the fresh live
+    # render supersedes it (two sidplayfp processes rendering the same tune is
+    # pure waste), and killing it frees a slot before the cap check.
+    dup = _SID_DETACHED.pop(full_key, None)
+    if dup is not None:
+        _kill_detached(dup)
+    # Live-first admission: a full pool evicts the oldest DETACHED render (a
+    # background cache-warm) to make room; only when every slot is a live
+    # stream does the cold play fall back to the blocking render (None).
+    if _SID_PROG_ACTIVE[0] >= _sid_render_cap() and not _evict_oldest_detached():
         return None
     _SID_PROG_ACTIVE[0] += 1
     _slot_released = {"v": False}
@@ -826,13 +925,16 @@ async def _serve_sid_progressive(
         _release_slot()
         raise
 
-    # Shared flag: the response generator flips this once it has streamed the
-    # whole declared length.  Read by the DETACHED finaliser below.  ``gen_done``
-    # is set by the generator's finally on EITHER completion or disconnect, so
-    # the finaliser waits for the generator to reach its final state before
-    # reading ``streamed_all`` (else a fast render whose proc exits before a slow
-    # client finishes would be judged incomplete and its good WAV discarded).
-    state = {"streamed_all": False}
+    # Shared flags: the response generator flips ``streamed_all`` once it has
+    # streamed the whole declared length, marks ``stalled`` when the render hung
+    # (padded to length, not cacheable, not worth finishing), and parks the
+    # registry entry in ``detached`` when a disconnect left the render finishing
+    # in the background.  Read by the DETACHED finaliser below.  ``gen_done`` is
+    # set by the generator's finally on EITHER completion or disconnect, so the
+    # finaliser waits for the generator to reach its final state before reading
+    # these (else a fast render whose proc exits before a slow client finishes
+    # would be judged incomplete and its good WAV discarded).
+    state = {"streamed_all": False, "stalled": False, "detached": None}
     gen_done = asyncio.Event()
 
     async def _finalise() -> None:
@@ -849,15 +951,22 @@ async def _serve_sid_progressive(
             except asyncio.TimeoutError:
                 pass
             # If the client didn't consume the whole stream the render is
-            # worthless — kill it NOW rather than let an unwatched sidplayfp run
-            # to completion (the drop-before-first-byte / disconnect cases).
-            if not state["streamed_all"] and proc.returncode is None:
+            # normally DETACHED to finish for the cache (see the generator's
+            # finally).  Kill it only when nothing detached it: a stalled
+            # render, an older same-key duplicate, or a response the server
+            # never iterated (client vanished before the body streamed).
+            detached = state.get("detached") is not None
+            if not state["streamed_all"] and not detached and proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
+            # A detached render legitimately keeps running for its remaining
+            # render time (~duration/15 plus margin); a live-completed or
+            # killed one reaps in seconds.
+            _reap_s = int(duration) + 60 if detached else 15
             try:
-                await asyncio.wait_for(proc.wait(), timeout=15)
+                await asyncio.wait_for(proc.wait(), timeout=_reap_s)
             except asyncio.TimeoutError:
                 try:
                     proc.kill()
@@ -867,21 +976,24 @@ async def _serve_sid_progressive(
                     await proc.wait()
                 except Exception:
                     pass
-            # ``streamed_all`` means the CLIENT received a full-length stream
-            # (the generator silence-pads to ``data_bytes``), NOT that the
-            # on-disk render is complete.  Require the temp to be essentially
-            # full-length before caching, else a short exit-0 render would be
-            # promoted and every warm play would range-serve a truncated tune.
-            # 1 s of slack absorbs sidplayfp's sub-second rounding (it normally
-            # renders slightly PAST ``-t`` so this passes comfortably).
+            # Cache admission is RENDER integrity, nothing about the client:
+            # exit 0 plus an essentially full-length temp (1 s of slack absorbs
+            # sidplayfp's sub-second rounding; it normally renders slightly
+            # PAST ``-t``).  What the CLIENT consumed is deliberately not a
+            # condition: sidplayfp runs ~15x realtime, so most real skips
+            # happen AFTER the render already finished — the first gate here
+            # (``streamed_all or detached``) threw a COMPLETE rc-0 render away
+            # in exactly that window (QA-reproduced live: a finished 26 MB
+            # temp unlinked because the listener left at 6% consumed).  Every
+            # kill path stays rejected by rc alone: evicted → -9, stalled and
+            # terminated → -15, reap-timeout kill → nonzero.
             try:
                 _tmp_size = os.path.getsize(tmp) if tmp.exists() else 0
             except OSError:
                 _tmp_size = 0
             _one_sec = _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8)
             _min_file = _WAV_HEADER_LEN + max(0, data_bytes - _one_sec)
-            good = (state["streamed_all"] and proc.returncode == 0
-                    and _tmp_size >= _min_file)
+            good = (proc.returncode == 0 and _tmp_size >= _min_file)
             if good:
                 # Re-check: a concurrent render (another cold play, or a
                 # blocking Subsonic play) may have cached this key first.  If
@@ -893,12 +1005,27 @@ async def _serve_sid_progressive(
                     _spawn_sid_vu(full_key, existing, sid_path, subsong, int(duration))
                 else:
                     dest = await store_cached(full_key, "sid", tmp)   # MOVES tmp into cache
-                    log.info("progressive SID: cached %s (%d s)", full_key, int(duration))
+                    log.info("progressive SID: cached %s (%d s)%s", full_key,
+                             int(duration),
+                             " — finished after the listener left" if detached else "")
                     # Kick off the retro per-voice VU meter in the background —
                     # ready for the next play; this one used the FFT fallback.
                     _spawn_sid_vu(full_key, dest, sid_path, subsong, int(duration))
             else:
                 tmp.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            # Server shutdown cancels finalisers — don't orphan a (possibly
+            # detached, minutes-long) sidplayfp past this process's lifetime.
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         except Exception:
             log.warning("progressive SID: finalise failed for %s", full_key, exc_info=True)
             try:
@@ -906,6 +1033,11 @@ async def _serve_sid_progressive(
             except OSError:
                 pass
         finally:
+            # Drop OUR registry entry (a comeback/eviction may already have
+            # replaced or removed it — never pop someone else's).
+            _ent = state.get("detached")
+            if _ent is not None and _SID_DETACHED.get(full_key) is _ent:
+                _SID_DETACHED.pop(full_key, None)
             _release_slot()          # idempotent — releases the concurrency slot
             _SID_PROG_FINALISERS.discard(fin_task)
 
@@ -914,10 +1046,11 @@ async def _serve_sid_progressive(
 
     # Map the requested byte range [start, end_excl) onto the virtual file:
     # header region [h_lo, h_hi) served from the synthesised header; data region
-    # [d_lo, d_hi) read from the growing temp at (pos - 44).  ``streamed_all`` is
-    # set only when the range reaches the file's end (``d_hi >= data_bytes``) —
-    # completing such a range proves the render finished, so it's cacheable; a
-    # partial mid-file range isn't (and its render is killed on the client's exit).
+    # [d_lo, d_hi) read from the growing temp at (pos - 44).  ``streamed_all``
+    # (the range reached the file's end) only matters for the generator's
+    # kill/detach decision — cache admission is decided by RENDER integrity in
+    # the finaliser (rc 0 + full-length temp), so a mid-file range's or an
+    # abandoned stream's completed render is promoted all the same.
     h_lo, h_hi = start, min(end_excl, _WAV_HEADER_LEN)
     d_lo, d_hi = max(start, _WAV_HEADER_LEN) - _WAV_HEADER_LEN, end_excl - _WAV_HEADER_LEN
 
@@ -975,6 +1108,7 @@ async def _serve_sid_progressive(
                     log.warning("progressive SID: no new bytes in %.0fs for %s — "
                                 "padding to declared length at %d/%d",
                                 idle, full_key, pos, d_hi)
+                    state["stalled"] = True
                     pad = d_hi - pos
                     while pad > 0:
                         n = min(_RANGE_STREAMING_CHUNK, pad)
@@ -983,21 +1117,44 @@ async def _serve_sid_progressive(
                     return
             state["streamed_all"] = (d_hi >= data_bytes)   # delivered the full range
         finally:
-            # Sync-only cleanup (survives task cancellation): close our fd and,
-            # if the client bailed early, SIGTERM the render.  The detached
-            # ``_finalise`` reaps it and decides caching — never blocked here.
-            # Order matters: close the fd BEFORE signalling ``gen_done`` so the
-            # finaliser never moves/unlinks ``tmp`` while we still hold it open.
+            # Sync-only cleanup (survives task cancellation): close our fd,
+            # then decide the render's fate.  The detached ``_finalise`` reaps
+            # it and decides caching — never blocked here.  Order matters:
+            # close the fd BEFORE signalling ``gen_done`` so the finaliser
+            # never moves/unlinks ``tmp`` while we still hold it open.
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+            # NB: when the render ALREADY exited (returncode set) there is
+            # nothing to kill or detach — the finaliser's integrity gate
+            # (rc 0 + full-length) caches a finished temp regardless of how
+            # much the client consumed.
             if not state["streamed_all"] and proc.returncode is None:
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+                # The listener skipped away mid-tune.  DETACH the healthy
+                # render — let it finish and be cached — instead of killing it:
+                # discarding an already-mostly-paid-for render meant a tune you
+                # never played to the end could NEVER become warm (each replay
+                # re-entered the same discard loop).  It keeps holding its pool
+                # slot until its finaliser runs, so total sidplayfp processes
+                # stay bounded by _sid_render_cap(); a live play can reclaim
+                # the slot at admission (oldest-detached eviction).  Exceptions:
+                # a STALLED render isn't worth finishing, and if an older
+                # detached render of this same key is already finishing, this
+                # one is the redundant copy.
+                if state["stalled"] or full_key in _SID_DETACHED:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                else:
+                    entry = {"proc": proc, "release": _release_slot,
+                             "t": time.monotonic()}
+                    _SID_DETACHED[full_key] = entry
+                    state["detached"] = entry
+                    log.info("progressive SID: listener left — finishing %s in "
+                             "the background for the cache", full_key)
             gen_done.set()          # release the finaliser (both paths)
 
     extra = dict(base_headers or {})
@@ -6155,6 +6312,23 @@ async def stream_track(
             # ``_serve_sid_progressive`` returns None (→ fall through to blocking)
             # when over the concurrency cap or on an immediate render failure (so
             # the error surfaces as a real 5xx, not silent silence).
+            # Retro per-voice VU meter — spawned HERE, before the progressive
+            # branch below can return.  Two reasons this must not sit further
+            # down (where it used to, after ``get_or_render``):
+            #   • the progressive path returns early, so a normal WEB play never
+            #     reached it at all — the meter was generated only for the
+            #     blocking (Subsonic/DLNA/cast) callers;
+            #   • the VU pass renders from the SOURCE .sid and writes to the
+            #     cache key's deterministic ``.vu`` path, so it does NOT depend
+            #     on the audio ever being cached.  That matters because a
+            #     listener who skips away mid-tune leaves NOTHING cached (the
+            #     progressive finaliser discards the temp unless the client
+            #     consumed every byte) — under the old placement the sidecar
+            #     could then never be generated, on this play or any later one.
+            # Idempotent + dedup'd on the cache key, so calling it on every play
+            # (warm or cold) is free once the sidecar exists.
+            ensure_sid_vu_sidecar(track_id, path, subsong, target_dur)
+
             _web_session = (request.method == "GET"
                             and bool(sb_session)
                             and not (u or s or t)
@@ -6176,9 +6350,6 @@ async def stream_track(
                 duration=target_dur,
                 render_fn=lambda: _render_sid(path, subsong=subsong, duration=target_dur),
             )
-            # Retro per-voice VU meter — background, best-effort, dedup'd; ready
-            # for the next play (this one uses the FFT fallback if not yet done).
-            ensure_sid_vu_sidecar(track_id, path, subsong, target_dur)
             return await _range_file_response(
                 request, cached_path, media_type="audio/wav",
                 headers={"X-Rendered": "sidplayfp", "X-Cache": "hit" if hit else "miss",

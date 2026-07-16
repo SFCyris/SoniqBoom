@@ -1118,9 +1118,17 @@ let _vuKey = '';
 // first play, so /vu 404s at track-load.  Re-poll on this schedule to swap the
 // FFT fallback for the real 3-voice meter mid-play (instant on every later play
 // once the sidecar is cached).  Subsongs render short → catch quickly.
-// Cumulative ~5/13/25/41/63/93 s — covers a long (6-min) SID whose 3 parallel
-// isolation renders + audio cache take ~50-60 s, while catching short tunes fast.
-const _SID_VU_RETRY_MS = [5000, 8000, 12000, 16000, 22000, 30000];
+//
+// Cumulative ~3/8/16/28/44/66/96/141/201/261 s.  The old ladder stopped at ~93 s
+// nominal — but its comment ("~50-60 s") predated the server's client-offload
+// grace window, which is strictly ADDITIVE on top of the render, so the real
+// budget was ~63 s of useful polling against a measured ~84 s sidecar latency:
+// the poll reliably died BEFORE the sidecar landed, stranding the listener on
+// FFT for the rest of the tune.  The server side now spawns the VU pass at play
+// start with a shorter grace (≈8 s + ~23 s render ≈ 31 s typical), but the pass
+// is serialised behind a Semaphore(1), so a few queued tunes can push it minutes
+// out.  Poll long and back off — a 404 is cheap, a dead meter is not.
+const _SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 60000, 60000];
 
 function _vuKeyOf(track) {
   if (!track) return '';
@@ -1136,17 +1144,42 @@ function _scheduleSidVURetry(track, key, attempt = 0) {
   if (attempt >= _SID_VU_RETRY_MS.length) return;
   setTimeout(async () => {
     if (key !== _vuKey) return;                 // a different track/subsong took over
-    if (key === _sidClientDone) return;         // client already rendered+painted it
+    if (key === _sidClientDone) return;         // client render COMPLETED — sidecar exists
     let fetched = null;
     try { fetched = await _fetchVUMR(track.id, track.subsong); } catch (_) {}
     if (key !== _vuKey) return;
     if (fetched) {
+      // The server's sidecar landed first — whatever the client is still
+      // grinding on is now redundant, so stop it (see _cancelSidVURender).
+      _cancelSidVURender();
       _initVU(fetched.channels, { useVUMR: true, vumr: fetched });
       _removeFallbackLabel();
     } else {
       _scheduleSidVURetry(track, key, attempt + 1);
     }
   }, _SID_VU_RETRY_MS[attempt]);
+}
+
+/** Abandon any in-flight / queued client WASM VU render.
+ *
+ *  The worker renders a tune serially and can't be interrupted mid-render, so
+ *  terminating it is the only way to stop one.  Worth doing: on Gecko the render
+ *  runs at ~1.4x realtime (measured 900/2760 frames in 22 s, vs Blink finishing
+ *  the same tune in 8.2 s), so an abandoned render would otherwise keep a core
+ *  busy for MINUTES producing a sidecar the server has already handed us.
+ *  ``_sidVuUnavailable`` is left alone — this is a deliberate cancellation, not
+ *  a capability failure, so the next track may still use the client path.
+ */
+function _cancelSidVURender() {
+  if (_sidVuDebounce) { clearTimeout(_sidVuDebounce); _sidVuDebounce = null; }
+  if (_sidVuPending) {
+    const p = _sidVuPending; _sidVuPending = null;
+    try { p.reject(new Error('superseded')); } catch (_) {}
+  }
+  if (_sidVuWorker) {
+    try { _sidVuWorker.terminate(); } catch (_) {}
+    _sidVuWorker = null;                        // _getSidVuWorker respawns on demand
+  }
 }
 
 // ── Client-side WASM SID VU offload ──────────────────────────────────
@@ -1285,7 +1318,12 @@ async function _generateSidVUClient(track, key) {
                        pan: new Uint8Array(3), samples: m.samples };
         _initVU(3, { useVUMR: true, vumr: streamVumr });
         _removeFallbackLabel();
-        _sidClientDone = key;                    // stop the server-poll fallback
+        // NB: _sidClientDone is deliberately NOT set here.  The first partial
+        // means "a meter is painting", not "a sidecar exists" — latching on it
+        // killed the server poll ~1 s in, and on a browser whose render never
+        // finishes (Gecko: ~1.4x realtime vs Blink's ~13x) the safety net was
+        // gone for the rest of the tune.  It is set only on a COMPLETE render
+        // below, where a real sidecar has actually been produced.
       } else {
         streamVumr.samples = m.samples;          // live update — meter reflects next frame
         streamVumr.frames = m.done;
@@ -1303,8 +1341,10 @@ async function _generateSidVUClient(track, key) {
       if (!parsed) return false;
       _initVU(parsed.channels, { useVUMR: true, vumr: parsed });
       _removeFallbackLabel();
-      _sidClientDone = key;
     }
+    // The render COMPLETED — a real sidecar exists to upload, so the server poll
+    // is now genuinely redundant for this key.
+    _sidClientDone = key;
     _uploadVUMR(track.id, track.subsong || 0, result.vumr);   // fire-and-forget cache fill
     return true;
   } catch (_) {
@@ -1369,6 +1409,12 @@ async function _handleVU(track) {
     // so re-fires don't spawn duplicate work; both are _vuKey-guarded so a
     // stale result can't paint over a track the user already left.
     if (primary === 'SID' && keyChanged) {
+      // Reaching this branch means /vu just 404'd, which PROVES any earlier
+      // "the client already produced this key's sidecar" claim is stale (the
+      // upload never landed, or the file is gone).  Clear it, or the poll below
+      // would return at attempt 0 and leave this play stranded on FFT forever —
+      // the exact failure on a revisit to a SID painted earlier this session.
+      if (_sidClientDone === key) _sidClientDone = '';
       // Poll the server ``.vu`` sidecar in BOTH modes — it is the safety net that
       // paints the per-voice meter for a warm-hit, a WASM-incapable browser, or
       // a failed/superseded in-browser render.  It self-cancels via
