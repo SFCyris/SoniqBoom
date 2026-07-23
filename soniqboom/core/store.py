@@ -134,6 +134,42 @@ def _scene_group_keys(scene_group: object) -> list[str]:
     return [g.strip().lower() for g in scene_group.split(_SCENE_GROUP_SEP) if g.strip()]
 
 
+def _carry_enrichment(old: dict, new: dict) -> None:
+    """Preserve post-scan enrichment from ``old`` onto a freshly-built ``new``
+    (mutated in place).  A rescan builds a fresh track straight from the file,
+    so without this an ``upsert`` (a full replace) would wipe every field an
+    apply pass produced — the Demozoo year backfill would revert to the rip
+    year, scene_group/scene_path would vanish until the next manual apply.
+
+    Idempotent: a no-op when ``new`` already carries the field (an already-
+    merged AOF record replays unchanged).
+
+    Each enrichment is keyed on an IDENTITY and is carried only while that
+    identity is unchanged — otherwise a changed composer/file would keep stale
+    data forever (no apply pass has a withdraw branch for it):
+
+      * ``scene_group`` (Demozoo, composer→group) — carried while ``artist`` is
+        unchanged;
+      * ``scene_path`` (Modland, md5 join) — carried while ``file_md5`` is
+        unchanged;
+      * the ``year``/``year_source``/``year_file`` triple — a USER year is a
+        deliberate choice, carried regardless; a DEMOZOO year is composer-
+        derived, so carried only while ``artist`` is unchanged (a changed
+        composer drops it, and the next apply re-evaluates)."""
+    same_artist = old.get("artist") == new.get("artist")
+    same_md5 = old.get("file_md5") == new.get("file_md5")
+    if old.get("scene_group") and not new.get("scene_group") and same_artist:
+        new["scene_group"] = old["scene_group"]
+    if old.get("scene_path") and not new.get("scene_path") and same_md5:
+        new["scene_path"] = old["scene_path"]
+    src = old.get("year_source")
+    if new.get("year_source") in (None, "") and \
+            (src == "user" or (src == "demozoo" and same_artist)):
+        new["year"] = old.get("year")
+        new["year_source"] = src
+        new["year_file"] = old.get("year_file")
+
+
 class TrackStore:
     """Central in-memory data store with indexed search."""
 
@@ -767,10 +803,14 @@ class TrackStore:
             tid = t["id"]
             old = self._tracks.get(tid)
             if old:
+                _carry_enrichment(old, t)     # keep post-scan enrichment
                 self._unindex_track(tid, old)
             self._tracks[tid] = t
             self._index_track(tid, t)
         self._mutation_seq += 1
+        # ``t`` now carries the merged enrichment, so the AOF record replays
+        # the same result — the carry is idempotent (a stamped record re-upserted
+        # already has year_source set, so the guard below is a no-op on replay).
         self._aof("batch_upsert_tracks", count=len(tracks), data=tracks)
         return len(tracks)
 

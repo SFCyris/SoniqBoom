@@ -186,6 +186,64 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_ed
     _lyrics_cache.pop(track_id, None)
     return {"id": track_id, "applied": applied}
 
+
+class _YearUpdate(_BaseModel):
+    year: int | None = None      # the corrected year (None = "no year")
+    revert: bool = False         # restore the file/rip year, dropping the stamp
+
+
+@router.put("/{track_id}/year")
+async def update_year(track_id: str, body: _YearUpdate, user=_Depends(_require_edit)):
+    """Store-only year correction — the ONLY year-edit path for retro formats.
+
+    Modules / SID / chip formats can't be tag-written (mutagen doesn't support
+    the containers), so the file-writing tag editor refuses them.  That left a
+    wrong Demozoo release-year backfill uncorrectable.  This edits the LIBRARY
+    record only (no file write), so it works for any format, remote share, or
+    archive member:
+
+      * ``revert: true`` restores the preserved original (``year_file``) and
+        clears the provenance — the manual counterpart to the backfill's own
+        stale-stamp revert;
+      * otherwise ``year`` is stamped with ``year_source="user"``, which the
+        Demozoo backfill treats as authoritative and never overwrites (and
+        which now survives a rescan, see store.upsert_tracks_batch).
+
+    The original file/rip year is preserved once in ``year_file`` so a user
+    stamp is itself revertible.
+    """
+    from soniqboom.core.store import get_store
+    store = get_store()
+    t = store.get_track(track_id)          # the raw store dict (has .get)
+    if not t:
+        raise HTTPException(404, "Track not found")
+    if body.revert:
+        # Only a stamped year can be reverted — refuse on an unstamped track so
+        # a stray revert (a direct API / mobile-shell caller) can't blank a
+        # real file year that was never overridden.
+        if t.get("year_source") not in ("demozoo", "user"):
+            raise HTTPException(409, "Nothing to revert — this year isn't a "
+                                     "Demozoo or manual override.")
+        # "The file/rip year is right, not Demozoo's" — a deliberate user
+        # choice, so it's stamped ``user`` (sticky): the backfill and the
+        # display-time scene overwrite both leave a user year alone, so this
+        # survives the next apply.  ``year_file`` is KEPT as the anchor so a
+        # later edit/revert can still recover the true original.
+        updates: dict = {"year": t.get("year_file"), "year_source": "user"}
+    else:
+        y = body.year
+        if y is not None and not (1000 <= int(y) <= 2100):
+            raise HTTPException(422, "Year must be between 1000 and 2100.")
+        updates = {"year": (int(y) if y is not None else None),
+                   "year_source": "user"}
+        # Preserve whatever the file/rip carried, ONCE — a second user edit (or
+        # editing over a demozoo stamp) must keep the true original, not stamp
+        # our own prior value as the "file" year.
+        if t.get("year_source") not in ("user", "demozoo") and t.get("year") is not None:
+            updates["year_file"] = t.get("year")
+    get_store().update_track_fields(track_id, updates)
+    return {"id": track_id, "applied": updates}
+
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
 
 _lrclib_client: httpx.AsyncClient | None = None

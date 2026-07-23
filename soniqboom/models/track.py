@@ -87,6 +87,17 @@ class TrackMeta(BaseModel):
     # ("Anarchy • Ate Bit • Core Design").  A retro-similarity signal + shown
     # in the track-info modal.
     scene_group: str | None = None
+    # Provenance of ``year`` when it did NOT come from the file's own tag:
+    # "demozoo" (canonical scene release year, from the Demozoo backfill) or
+    # "user" (a deliberate hand-edit).  ``year_file`` preserves whatever the
+    # file/rip originally carried so a stamp can be reverted.  These outlive a
+    # rescan (see store.upsert_tracks_batch): a fresh extract re-reads the file
+    # year, which for scene rips is exactly the wrong value the backfill
+    # replaced — carrying the provenance forward stops a scan silently undoing
+    # the correction.  None ⇒ the year is the file's own and a rescan may
+    # refresh it normally.
+    year_source: str | None = None
+    year_file: int | None = None
 
     # Art
     cover_art: str | None = None  # data-URI thumbnail

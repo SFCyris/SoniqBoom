@@ -429,6 +429,11 @@ function _renderScene(track, info) {
 function _applySceneYear(track, info, reqTrackId) {
   const rel = info && info.release;
   if (!(rel && rel.year)) return;
+  // Only enhance a track with NO persisted year provenance — i.e. one the
+  // Demozoo apply hasn't covered yet.  A stored demozoo year is already shown
+  // (identical value) and a user-pinned year must never be overridden, so
+  // this display-time overwrite stays out of the way of both.
+  if (track.year_source === 'demozoo' || track.year_source === 'user') return;
   if (_queue[_idx]?.id !== reqTrackId) return;
   const yEl = document.getElementById('ti-year');
   if (!yEl || Number(rel.year) === Number(track.year)) return;
@@ -516,18 +521,91 @@ function _renderTagEdit(track) {
   // share), so hide the edit affordance entirely for any non-local track rather
   // than showing a disabled button.
   const remote = /^(smb|ftp|webdav|webdavs|https?):\/\//.test(track.path || '');
-  if (remote) return;
-  // …and only to containers mutagen can actually write (MP3/FLAC/M4A/
-  // OGG/Opus/WavPack/Musepack).  Modules, SID, uade exotica, SNDH/PSF,
-  // chiptunes, WAV/AIFF/DSD and archive members would only ever produce
-  // a 422 on save — hide the affordance, matching the remote pattern.
-  if (!canEditTags(track)) return;
-  const btn = document.createElement('button');
-  btn.id = 'ti-edit-tags';
-  btn.textContent = '✏️ Edit tags';
-  btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
-  btn.addEventListener('click', () => _showTagForm(track, wrap));
-  wrap.appendChild(btn);
+  // Full tag editor writes the FILE, so it needs a local, mutagen-writable
+  // container (MP3/FLAC/M4A/OGG/Opus/WavPack/Musepack).  Remote shares,
+  // archive members, modules, SID, chip formats etc. would 422 on a file write.
+  if (!remote && canEditTags(track)) {
+    const btn = document.createElement('button');
+    btn.id = 'ti-edit-tags';
+    btn.textContent = '✏️ Edit tags';
+    btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+    btn.addEventListener('click', () => _showTagForm(track, wrap));
+    wrap.appendChild(btn);
+    return;
+  }
+  // Retro/module tracks can't be file-tagged, but their Demozoo-backfilled
+  // release year is worth being able to correct or revert — that's a
+  // STORE-ONLY edit (PUT /year), so it works for remote/archive tracks too.
+  if (_isModuleFamily(track)) {
+    const btn = document.createElement('button');
+    btn.id = 'ti-edit-year';
+    btn.textContent = '✏️ Edit year';
+    btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+    btn.addEventListener('click', () => _showYearForm(track, wrap));
+    wrap.appendChild(btn);
+  }
+}
+
+function _showYearForm(track, wrap) {
+  wrap.innerHTML = '';
+  const form = document.createElement('div');
+  form.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12.5px';
+  const lab = document.createElement('label');
+  lab.textContent = 'Year'; lab.style.opacity = '.7';
+  const inp = document.createElement('input');
+  inp.type = 'number'; inp.min = '1000'; inp.max = '2100';
+  inp.value = (track.year != null ? track.year : '');
+  inp.style.cssText = 'font-size:12.5px;padding:4px 8px;width:88px';
+  const save = document.createElement('button');
+  save.textContent = 'Save'; save.style.cssText = 'font-size:12px;padding:4px 12px';
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  cancel.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.7';
+  cancel.addEventListener('click', () => _renderTagEdit(track));
+  form.append(lab, inp, save, cancel);
+  // A stamped year (Demozoo or a prior user edit) that preserved the original
+  // gets a one-click revert to the file/rip value.
+  if ((track.year_source === 'demozoo' || track.year_source === 'user')
+      && track.year_file != null) {
+    const rev = document.createElement('button');
+    rev.textContent = `↺ Revert to file year (${track.year_file})`;
+    rev.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.85';
+    rev.addEventListener('click', () => _saveYear(track, wrap, { revert: true }));
+    form.appendChild(rev);
+  }
+  save.addEventListener('click', () => {
+    const v = inp.value.trim();
+    const n = v === '' ? null : parseInt(v, 10);
+    if (v !== '' && !(n >= 1000 && n <= 2100)) {
+      window.Toast?.error?.('Year must be between 1000 and 2100.'); return;
+    }
+    _saveYear(track, wrap, { year: n });
+  });
+  wrap.appendChild(form);
+  inp.focus();
+}
+
+async function _saveYear(track, wrap, body) {
+  try {
+    const r = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/year`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), credentials: 'same-origin',
+    });
+    if (!r.ok) {
+      let msg = 'Could not update the year.';
+      try { msg = (await r.json()).detail || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const res = await r.json();
+    Object.assign(track, res.applied || {});     // year, year_source, year_file
+    window.Toast?.ok?.('Year updated.');
+    // Guard the post-await repaint: the user may have hit ◀/▶ during the PUT,
+    // and re-rendering the old track would overwrite the newer one's panel
+    // (mirrors every other async render's _queue[_idx] check).
+    if (_queue[_idx]?.id === track.id) _render(track);   // re-render INFO (Year row + marker)
+  } catch (e) {
+    window.Toast?.error?.(e.message || 'Could not update the year.');
+  }
 }
 function _showTagForm(track, wrap) {
   wrap.innerHTML = '';
@@ -588,7 +666,8 @@ function _showTagForm(track, wrap) {
       Object.assign(track, res.applied || {});
       if (res.applied && res.applied.genre) track.genre = [res.applied.genre];
       window.Toast?.ok?.('Tags saved — file and library updated.');
-      _render(track);
+      // Don't repaint a track the user navigated away from during the save.
+      if (_queue[_idx]?.id === track.id) _render(track);
     } catch (e) {
       window.Toast?.error?.(e.message || 'Could not save tags.');
       save.disabled = false; save.textContent = 'Save tags';
@@ -658,10 +737,23 @@ function _render(track) {
   _show('ti-album',        track.album);
   _show('ti-composer',     track.composer);
   _show('ti-year',         track.year);
-  // Clear any prior track's Demozoo year-overwrite marker; _loadScene re-applies
-  // it below when THIS track confidently matches a scene production.
+  // Mark a non-file year from its PERSISTED provenance (the Demozoo backfill or
+  // a manual edit both store year_source), so the accent marker + tooltip are
+  // right the moment the panel opens — no wait on the scene fetch.  _loadScene
+  // may still add the marker for an as-yet-unapplied track (year_source unset).
   const _yEl0 = document.getElementById('ti-year');
-  if (_yEl0) { _yEl0.classList.remove('ti-year-scene'); _yEl0.title = ''; }
+  if (_yEl0) {
+    const _ys = track.year_source;
+    if ((_ys === 'demozoo' || _ys === 'user') && track.year != null) {
+      _yEl0.classList.add('ti-year-scene');
+      _yEl0.title = _ys === 'demozoo'
+        ? `Demozoo release year${track.year_file != null ? ` · file tag says ${track.year_file}` : ''}`
+        : 'Year set manually';
+    } else {
+      _yEl0.classList.remove('ti-year-scene');
+      _yEl0.title = '';
+    }
+  }
   _renderDefect(track.defect, track.defect_detail);
 
   // ── NUMBERING ──
