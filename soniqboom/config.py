@@ -529,15 +529,15 @@ class Settings(BaseSettings):
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
-    # PROGRESSIVE-SID render pool: max concurrent sidplayfp audio renders on
-    # the web-UI streaming path — live streams plus abandoned-but-finishing
-    # ("detached") ones share this pool, live-first.  Each render holds ~one
-    # CPU core at ~15x realtime.  Honest scope of the bound: it caps the
-    # PROGRESSIVE pool only — cold plays beyond it (and every Subsonic/DLNA/
-    # cast cold play) fall through to the blocking render path, which is
-    # deduped per tune but not globally capped; and the per-voice VU generator
-    # is a separate pool that can add up to 3 more short-lived sidplayfp
-    # processes.  Lower this on small hosts.
+    # SID render pool size — caps concurrent sidplayfp AUDIO renders.  Applies
+    # SEPARATELY to each of the two render paths: the PROGRESSIVE pool (web-UI
+    # streaming; live streams plus abandoned-but-finishing "detached" renders,
+    # live-first) and the BLOCKING pool (Subsonic/DLNA/cast + web plays that
+    # spill past the progressive pool).  Each render holds ~one CPU core at
+    # ~15x realtime.  Worst-case concurrent sidplayfp is therefore
+    # 2×sid_render_parallel (both pools full) + up to 3 more from the separate
+    # per-voice VU generator (one tune, 3 isolation passes).  Lower on small
+    # hosts.
     sid_render_parallel: int = _conf_int("renderers", "sid_render_parallel", 3)
     # SID render fidelity (sidplayfp, ReSIDfp core).  Defaults leave sidplayfp
     # honouring each tune's own PSID header — i.e. exactly the pre-setting

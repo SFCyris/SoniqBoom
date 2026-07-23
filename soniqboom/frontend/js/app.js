@@ -1140,20 +1140,28 @@ function _vuKeyOf(track) {
 // the server-poll fallback stops (no redundant re-fetch / meter re-init flicker).
 let _sidClientDone = '';
 
+// The key with a live retry ladder, so a same-track replay (which re-fires
+// _handleVU with an UNCHANGED key) can re-arm the poll when it landed on FFT
+// without spawning a SECOND ladder alongside a still-running one.
+let _sidPollActive = '';
+
 function _scheduleSidVURetry(track, key, attempt = 0) {
-  if (attempt >= _SID_VU_RETRY_MS.length) return;
+  if (attempt === 0) _sidPollActive = key;
+  const _end = () => { if (_sidPollActive === key) _sidPollActive = ''; };
+  if (attempt >= _SID_VU_RETRY_MS.length) { _end(); return; }   // ladder exhausted
   setTimeout(async () => {
-    if (key !== _vuKey) return;                 // a different track/subsong took over
-    if (key === _sidClientDone) return;         // client render COMPLETED — sidecar exists
+    if (key !== _vuKey) return _end();          // a different track/subsong took over
+    if (key === _sidClientDone) return _end();  // client render COMPLETED — sidecar exists
     let fetched = null;
     try { fetched = await _fetchVUMR(track.id, track.subsong); } catch (_) {}
-    if (key !== _vuKey) return;
+    if (key !== _vuKey) return _end();
     if (fetched) {
       // The server's sidecar landed first — whatever the client is still
       // grinding on is now redundant, so stop it (see _cancelSidVURender).
       _cancelSidVURender();
       _initVU(fetched.channels, { useVUMR: true, vumr: fetched });
       _removeFallbackLabel();
+      _end();
     } else {
       _scheduleSidVURetry(track, key, attempt + 1);
     }
@@ -1405,10 +1413,14 @@ async function _handleVU(track) {
     // SID gets a real 3-voice sidecar.  PRIMARY path: render it in-browser
     // (WASM) and upload — fast + offloads the server.  FALLBACK: poll the
     // server, which also renders on play, for WASM-incapable browsers or if
-    // the client render fails.  Only start on a genuine track/subsong change
-    // so re-fires don't spawn duplicate work; both are _vuKey-guarded so a
-    // stale result can't paint over a track the user already left.
-    if (primary === 'SID' && keyChanged) {
+    // the client render fails.  Run whenever this play landed on FFT and no
+    // ladder is already polling this key — so a SAME-TRACK REPLAY of a tune
+    // whose sidecar isn't ready yet re-arms the poll (the old ``keyChanged``
+    // gate skipped it, stranding the replay on FFT even as the sidecar landed
+    // seconds later).  ``_sidPollActive`` stops a still-running ladder from
+    // being duplicated; both are _vuKey-guarded so a stale result can't paint
+    // over a track the user already left.
+    if (primary === 'SID' && _sidPollActive !== key) {
       // Reaching this branch means /vu just 404'd, which PROVES any earlier
       // "the client already produced this key's sidecar" claim is stale (the
       // upload never landed, or the file is gone).  Clear it, or the poll below
@@ -1421,7 +1433,7 @@ async function _handleVU(track) {
       // ``_sidClientDone`` the moment the client paints, so it never double-work
       // when the flag-on background render (player.js → ``sidwasmvu``) succeeds.
       _scheduleSidVURetry(track, key);
-      if (!sidWasmPlaybackEnabled()) {
+      if (!sidWasmPlaybackEnabled() && !_sidVuPending) {
         _debouncedSidVU(track, key);             // flag off → client renders the VU (offload)
       }
       // flag on: player.js runs the in-browser render in the background and emits

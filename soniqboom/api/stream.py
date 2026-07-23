@@ -451,6 +451,16 @@ _SID_PROG_ACTIVE = [0]
 # value: {"proc": Process, "release": slot-release fn, "t": monotonic start}
 _SID_DETACHED: dict[str, dict] = {}
 
+# Every in-flight progressive render tagged with a monotonic admission id, so a
+# render can tell whether a NEWER render for the same key has superseded it — a
+# browser seek aborts the old request and issues a new range GET near-
+# simultaneously, and if the new admission runs before the old generator's
+# disconnect handler, the old one would detach into a duplicate.  The old render
+# instead sees it's no longer the latest for its key and bows out (terminates)
+# rather than detaching.
+_SID_PROG_GEN = [0]                        # monotonic admission counter
+_SID_PROG_INFLIGHT: dict[str, int] = {}    # full_key → latest admission id
+
 
 def _sid_render_cap() -> int:
     """The live+detached render-pool size (``sid_render_parallel``, min 1)."""
@@ -481,6 +491,26 @@ def _evict_oldest_detached() -> bool:
     key = min(_SID_DETACHED, key=lambda k: _SID_DETACHED[k]["t"])
     _kill_detached(_SID_DETACHED.pop(key))
     return True
+
+
+# The BLOCKING SID render path (Subsonic / DLNA / cast, and web plays that spill
+# past the progressive pool) is used by callers that can't stream a
+# still-rendering WAV, so it awaits the whole render.  It was globally
+# UNBOUNDED: N distinct cold plays span N concurrent sidplayfp (get_or_render
+# only dedups the SAME key).  Gate it behind a semaphore sized to
+# ``sid_render_parallel`` so it can't spawn an unbounded fleet.  Separate from
+# the progressive pool's live-first counter (that one needs non-blocking
+# try/evict semantics), so the two SID render paths are each capped at the
+# setting — worst case 2×sid_render_parallel audio renders + the VU pool.  Sized
+# once on first use (a cap change takes effect on restart, like most settings).
+_SID_BLOCKING_SEM: "asyncio.Semaphore | None" = None
+
+
+def _sid_blocking_sem() -> "asyncio.Semaphore":
+    global _SID_BLOCKING_SEM
+    if _SID_BLOCKING_SEM is None:
+        _SID_BLOCKING_SEM = asyncio.Semaphore(_sid_render_cap())
+    return _SID_BLOCKING_SEM
 
 
 # How long to wait for sidplayfp's first PCM bytes before either streaming
@@ -548,11 +578,15 @@ async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None)
         raise HTTPException(501, "sidplayfp not installed")
 
     dur = int(duration if duration is not None else settings.sid_default_duration)
-    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_wav.close()
-
-    cmd = _sid_render_cmd(binary, path, subsong, dur, tmp_wav.name)
-    await _await_renderer(cmd, Path(tmp_wav.name), timeout=dur + 30, kind="SID")
+    # Bound concurrent blocking renders (see _sid_blocking_sem).  Create the
+    # temp INSIDE the semaphore so a CancelledError while WAITING to acquire
+    # (all slots busy, client hangs up) can't leak a 0-byte temp — nothing is
+    # created until we hold a permit.
+    async with _sid_blocking_sem():
+        tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_wav.close()
+        cmd = _sid_render_cmd(binary, path, subsong, dur, tmp_wav.name)
+        await _await_renderer(cmd, Path(tmp_wav.name), timeout=dur + 30, kind="SID")
     return Path(tmp_wav.name)
 
 
@@ -872,12 +906,20 @@ async def _serve_sid_progressive(
     if _SID_PROG_ACTIVE[0] >= _sid_render_cap() and not _evict_oldest_detached():
         return None
     _SID_PROG_ACTIVE[0] += 1
+    _SID_PROG_GEN[0] += 1
+    _my_gen = _SID_PROG_GEN[0]
+    _SID_PROG_INFLIGHT[full_key] = _my_gen     # I am now the latest render for this key
     _slot_released = {"v": False}
 
     def _release_slot() -> None:
         if not _slot_released["v"]:
             _slot_released["v"] = True
             _SID_PROG_ACTIVE[0] -= 1
+
+    def _drop_inflight() -> None:
+        # Identity-guarded so we never remove a newer render's entry.
+        if _SID_PROG_INFLIGHT.get(full_key) == _my_gen:
+            _SID_PROG_INFLIGHT.pop(full_key, None)
 
     tmp: "Path | None" = None
     proc = None
@@ -904,6 +946,7 @@ async def _serve_sid_progressive(
             tmp.unlink(missing_ok=True)
             log.info("progressive SID: no first-byte output (rc=%s) for %s — "
                      "falling back to blocking render", proc.returncode, full_key)
+            _drop_inflight()          # finaliser (the usual popper) is never created here
             _release_slot()
             return None
     except BaseException:
@@ -922,6 +965,7 @@ async def _serve_sid_progressive(
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+        _drop_inflight()              # finaliser never created on this path
         _release_slot()
         raise
 
@@ -943,13 +987,23 @@ async def _serve_sid_progressive(
         # reap/cache: awaiting ``proc.wait()`` inside the generator's finally
         # was being CancelledError'd on disconnect, leaking a zombie sidplayfp.
         try:
-            # Wait for the generator's final state.  Bounded so a response the
-            # server never iterates (client vanished before the body streamed)
-            # can't hang this task forever with an unreaped child.
+            # Wait for the generator's final state.  A response the SERVER NEVER
+            # ITERATES (client vanished before the body streamed) never sets
+            # gen_done, so give the generator a short window to START; if it
+            # hasn't, don't pin a live pool slot for the whole render — with the
+            # pool at 3, three such stuck slots would disable the progressive
+            # path for everyone for ~duration s.  A generator that HAS started is
+            # a genuinely slow client; wait the rest of the budget for it.
             try:
-                await asyncio.wait_for(gen_done.wait(), timeout=int(duration) + 60)
+                await asyncio.wait_for(gen_done.wait(), timeout=15)
             except asyncio.TimeoutError:
-                pass
+                if state.get("started"):
+                    try:
+                        await asyncio.wait_for(gen_done.wait(),
+                                               timeout=int(duration) + 45)
+                    except asyncio.TimeoutError:
+                        pass
+                # else: never iterated → treat as abandoned, reap below.
             # If the client didn't consume the whole stream the render is
             # normally DETACHED to finish for the cache (see the generator's
             # finally).  Kill it only when nothing detached it: a stalled
@@ -1033,11 +1087,12 @@ async def _serve_sid_progressive(
             except OSError:
                 pass
         finally:
-            # Drop OUR registry entry (a comeback/eviction may already have
-            # replaced or removed it — never pop someone else's).
+            # Drop OUR registry entries (a comeback/eviction/newer render may
+            # already have replaced them — never pop someone else's).
             _ent = state.get("detached")
             if _ent is not None and _SID_DETACHED.get(full_key) is _ent:
                 _SID_DETACHED.pop(full_key, None)
+            _drop_inflight()
             _release_slot()          # idempotent — releases the concurrency slot
             _SID_PROG_FINALISERS.discard(fin_task)
 
@@ -1055,6 +1110,7 @@ async def _serve_sid_progressive(
     d_lo, d_hi = max(start, _WAV_HEADER_LEN) - _WAV_HEADER_LEN, end_excl - _WAV_HEADER_LEN
 
     async def _gen():
+        state["started"] = True     # the server is iterating us → not an abandoned response
         fd = None
         checked_header = False
         try:
@@ -1139,11 +1195,13 @@ async def _serve_sid_progressive(
                 # re-entered the same discard loop).  It keeps holding its pool
                 # slot until its finaliser runs, so total sidplayfp processes
                 # stay bounded by _sid_render_cap(); a live play can reclaim
-                # the slot at admission (oldest-detached eviction).  Exceptions:
-                # a STALLED render isn't worth finishing, and if an older
-                # detached render of this same key is already finishing, this
-                # one is the redundant copy.
-                if state["stalled"] or full_key in _SID_DETACHED:
+                # the slot at admission (oldest-detached eviction).  Exceptions,
+                # all "this render is redundant, don't detach a duplicate": a
+                # STALLED render isn't worth finishing; an older detached render
+                # of this key is already finishing; or a NEWER render for this
+                # key was admitted (a seek superseded us).
+                superseded = _SID_PROG_INFLIGHT.get(full_key) != _my_gen
+                if state["stalled"] or full_key in _SID_DETACHED or superseded:
                     try:
                         proc.terminate()
                     except ProcessLookupError:
