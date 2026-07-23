@@ -618,7 +618,9 @@
 // the ~50MB warm upload and skip if the server self-cached during the listen.
 // (Backend A1/A2 — admin-gate + disk-spool + upload semaphore — also landed;
 // server restarted.)  app.js?v→138.
-const SHELL_VERSION = 'v168';   // v168 (1.8.0): SCENE tab (trackinfo.js/index.html/app.css?v=91), SID VU
+const SHELL_VERSION = 'v169';   // v169: P1/P2 fixes — year provenance (persist across
+                                // rescan + store-only year editor, app.js?v=140), SID render
+                                // pool hardening (blocking cap, seek-supersede, stuck-slot).   // v168 (1.8.0): SCENE tab (trackinfo.js/index.html/app.css?v=91), SID VU
                                 // overhaul (app.js?v=139 — source-decoupled sidecars, longer poll ladder,
                                 // _sidClientDone fix), Demozoo-first artist identity.  Versioned pins bumped
                                 // so cached shells pick the new modules up on one reload (see v160 history).
