@@ -617,8 +617,16 @@ class Settings(BaseSettings):
 
 
 def load_prefs() -> dict:
-    if PREFS_PATH.exists():
-        return json.loads(PREFS_PATH.read_text())
+    try:
+        if PREFS_PATH.exists():
+            return json.loads(PREFS_PATH.read_text())
+    except (OSError, ValueError):
+        # Corrupt/unreadable prefs must not raise — callers (and the demozoo
+        # auto-apply toggle) fall back to defaults, and the next save_prefs
+        # overwrites the bad file, self-healing.  Mirrors load_local_conf.
+        import logging
+        logging.getLogger(__name__).warning(
+            "prefs file unreadable/corrupt; using defaults", exc_info=True)
     return {}
 
 

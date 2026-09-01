@@ -1506,12 +1506,24 @@ async function loadRendererStatus() {
       const iconEl = document.getElementById(`renderer-icon-${n}`);
       if (!iconEl) return;
       if (info && info.installed) {
+        // File exists but the binary won't actually RUN \u2014 a system library it
+        // links was upgraded out from under it (e.g. Homebrew bumped boost under
+        // a prebuilt zxtune123 \u2192 dyld symbol-not-found abort).  Distinct from
+        // "missing": the path is present, so the fix is reinstall/replace, not
+        // install.  This is the case the old file-exists check false-greened.
+        if (info.runs === false) {
+          iconEl.textContent = '!';
+          iconEl.className = 'renderer-icon renderer-warn';
+          iconEl.title =
+            `Found at ${info.path || '(configured path)'} but it fails to run \u2014 a `
+            + 'system library it depends on was likely upgraded. Reinstall or '
+            + 'replace this renderer (see the server log for the exact error).';
         // ffmpeg has a deeper feature audit \u2014 even when installed it can
         // be missing libmp3lame / libvorbis / DSD demuxers (Homebrew's
         // default bottle is a classic culprit).  Surface "warning" tier
         // so the user knows playback will fail for some formats even
         // though the binary itself exists.
-        if (n === 'ffmpeg' && info.fully_capable === false) {
+        } else if (n === 'ffmpeg' && info.fully_capable === false) {
           iconEl.textContent = '!';
           iconEl.className = 'renderer-icon renderer-warn';
           iconEl.title =
@@ -3473,7 +3485,22 @@ function _renderDemozooStatus(s) {
   }
   if (s.error) txt += ` · ${s.error}`;
   line.textContent = txt;
+  const cb = document.getElementById('md-demozoo-autoapply');
+  if (cb && typeof s.auto_apply === 'boolean') cb.checked = s.auto_apply;
 }
+
+document.getElementById('md-demozoo-autoapply')?.addEventListener('change', async (e) => {
+  const cb = e.currentTarget; const enabled = cb.checked; cb.disabled = true;
+  try {
+    const res = await api('/admin/demozoo/auto-apply',
+                          { method: 'POST', body: JSON.stringify({ enabled }) });
+    const s = await res.json().catch(() => null);
+    if (s && !s.error) _renderDemozooStatus(s);
+    else { cb.checked = !enabled; showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err'); }
+  } catch (err) {
+    cb.checked = !enabled; showMsg('md-demozoo-msg', `Failed: ${err.message}`, 'err');
+  } finally { cb.disabled = false; }
+});
 
 async function loadDemozooStatus() {
   try {
@@ -3513,6 +3540,31 @@ document.getElementById('md-demozoo-apply')?.addEventListener('click', async (e)
     }
   } catch (err) {
     showMsg('md-demozoo-msg', `Apply failed: ${err.message}`, 'err');
+  } finally { btn.disabled = false; }
+});
+
+document.getElementById('md-demozoo-reset')?.addEventListener('click', async (e) => {
+  if (!confirm(
+        'Remove ALL Demozoo enrichment from your library?\n\n'
+        + '• Release years filled from Demozoo (reverted to the file’s own)\n'
+        + '• Scene groups\n'
+        + '• Auto-filled composers on scene modules\n\n'
+        + 'Your own tag edits are kept. This also turns OFF auto-apply after '
+        + 'scans, so it stays reset until you click Apply (or re-enable the toggle).')) return;
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const res = await api('/admin/demozoo/reset', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderDemozooStatus(s);
+    if (s && !s.error) {
+      showMsg('md-demozoo-msg',
+              `Reset: ${Number(s.cleared || 0).toLocaleString()} tracks restored to file metadata. `
+              + `Auto-apply after scans turned off.`, 'ok');
+    } else {
+      showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    showMsg('md-demozoo-msg', `Reset failed: ${err.message}`, 'err');
   } finally { btn.disabled = false; }
 });
 

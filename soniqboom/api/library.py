@@ -515,3 +515,15 @@ async def list_formats(request: Request):
         cached = store.aggregate_formats(primary_only=_dedup_on(store))
         _cache_set("formats", cached)
     return _etag_response(request, "formats", cached)
+
+
+@router.get("/scene-groups")
+async def list_scene_groups(request: Request):
+    """Demoscene groups with track counts — the browse facet over the Demozoo
+    ``scene_group`` enrichment.  Empty until the Demozoo apply has run."""
+    cached = _cache_get("scene_groups")
+    if cached is None:
+        store = get_store()
+        cached = store.aggregate_scene_group(primary_only=_dedup_on(store))
+        _cache_set("scene_groups", cached)
+    return _etag_response(request, "scene_groups", cached)

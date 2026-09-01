@@ -1234,7 +1234,7 @@ body::before {
 .col-track        { width: 54px; text-align: center; font-variant-numeric: tabular-nums; }
 .col-year         { width: 48px; }
 .col-dur          { width: 60px; text-align: right; }
-.col-format       { width: 70px; text-align: center; color: var(--text2); font-size: 11px; }
+.col-format       { width: 96px; text-align: left; color: var(--text2); font-size: 11px; }
 .col-location     { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text2); }
 
 #track-table tbody tr {
@@ -6035,6 +6035,32 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   white-space: nowrap;
   text-transform: uppercase;
 }
+
+/* Surround-sound marker — a compact channel-layout pill (5.1 / 7.1 / 4.0) shown
+   next to the format badge in the list and next to the format name in the info
+   panel.  Rendered ONLY for real multichannel PCM audio; module/chip "channels"
+   are synth voices, not speakers, so they never get it (see surroundLabel).  The
+   text ("5.1") carries the meaning on its own.  Sits inline so it never changes
+   a virtual-scroll row's height. */
+.surround-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  vertical-align: middle;
+  white-space: nowrap;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  cursor: help;
+}
+/* Explicit: the display:inline-block above would otherwise beat the UA [hidden]
+   rule and leave an empty pill on every mono/stereo row. */
+.surround-badge[hidden] { display: none; }
 
 /* Track-health badge — a known playback defect flagged at scan time.  A
    leading glyph + the text label carry the meaning, so it is never conveyed

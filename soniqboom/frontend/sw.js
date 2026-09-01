@@ -618,7 +618,123 @@
 // the ~50MB warm upload and skip if the server self-cached during the listen.
 // (Backend A1/A2 — admin-gate + disk-spool + upload semaphore — also landed;
 // server restarted.)  app.js?v→138.
-const SHELL_VERSION = 'v169';   // v169: P1/P2 fixes — year provenance (persist across
+const SHELL_VERSION = 'v194';   // v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+                                // (run-probe) so a present-but-broken renderer
+                                // (dyld/loader failure) shows red instead of a
+                                // false ✓; needs the backend admin.py restart too.
+                                // v190: surround badge polish — Type column left-
+                                // aligned + widened so FLAC/5.1 line up across rows;
+                                // dropped the ⊙ glyph (text-only pill).
+                                // v189: surround badge (5.1 / 7.1 / …) next to the
+                                // format in the list + info panel; shared
+                                // surroundLabel/isModuleFamily in utils.js so a
+                                // module's synth "voices" never read as speakers.
+                                // v188: search box ships `readonly`, dropped on first
+                                // keystroke / right-click — stops Edge's password
+                                // manager offering the saved login on the search
+                                // field (Edge ignores type=search + autocomplete=off).
+                                // v187: cross-scope QA round 7 — refreshSmartOnPlay
+                                // gates on the nav-token view identity, not crumb
+                                // text, so a play-record can't clobber a folder /
+                                // album that merely shares the "Most Played" crumb.
+                                // v186: cross-scope QA round 6 — the drill / "Go to
+                                // artist/album" pivots now clear _viewIsAllTracks at
+                                // entry (via restoreFullHeader), so a pivot FROM All
+                                // Tracks isn't yanked back by a scan; + showFolder
+                                // flag-consistency + playlist commit-after-recheck.
+                                // v185: cross-scope QA round 5 — stale-view-flag
+                                // family: showAlbums/setGroupHeader now clears the
+                                // folder path, showSmart/showDuplicates/search clear
+                                // _viewIsAllTracks at entry (so a mid-fetch scan
+                                // refresh can't clobber them); + stations country
+                                // bucket-race + playlist open-race guards.
+                                // v184: cross-scope QA round 4 — CLOSE the render
+                                // race across ALL async view paths: guard showSmart
+                                // /showDuplicates, make showGalaxy bump the token,
+                                // fix the folder QUIET refresh to capture-not-optout
+                                // (so it bails on nav-away), and guard search.js
+                                // query() via exported beginView/viewStillCurrent.
+                                // v183: cross-scope QA round 3 — extend the render-
+                                // race guard to the track DRILLS + folders (a slow
+                                // drill no longer paints under a newer facet's
+                                // header) and clear _viewIsAllTracks in
+                                // setGroupHeader so a background refresh can't
+                                // cancel an in-flight facet nav.
+                                // v182: cross-scope QA round 2 — group-view render
+                                // race guard (_browseNavGen: a slow first fetch no
+                                // longer paints under a faster second view's header)
+                                // + untagged-drill ([No Artist]/[No Album Artist])
+                                // now discloses its 5k-fetch cap like other drills.
+                                // v181: cross-scope QA — Artists/Album-Artists
+                                // count is a TRACK count (was mislabeled "Albums"
+                                // → "Tracks"); group-row counts pluralise ("1
+                                // Album"); an artist/album-artist with no album
+                                // tag falls back to a flat track list instead of
+                                // an empty album view.
+                                // v177: adversarial-review fixes — the persisted
+                                // sort arrow is no longer painted on views that
+                                // render in their own order (search/drills/smart/
+                                // duplicates/format): restoreFullHeader restores
+                                // sort STATE only, and ONLY showAll paints the
+                                // arrow (via _paintSortIndicator) since it alone
+                                // re-applies the sort.  Folder views rebuild a
+                                // clean sortable header (_rebuildTrackHeader) so
+                                // they don't inherit a stale arrow/colspan.  Boot
+                                // view-restore falls back to All Tracks if the
+                                // restored view's fetch rejects (app.js?v=152 +
+                                // library.js). v176: final-QA-round fixes — (a) sorting the
+                                // All-Tracks view now KEEPS isInAllTracksView()
+                                // true (was demoted → lost post-scan refresh);
+                                // (b) sorting a large FOLDER view bails with a
+                                // toast instead of refetching the whole library;
+                                // (c) restoreFullHeader() clears the folder path
+                                // so smart/duplicates/pivot/search views can't be
+                                // yanked back into a stale folder by a scan; plus
+                                // showGalaxy clears the All-Tracks flag
+                                // (app.js?v=151 + library.js + search.js).
+                                // v175: QA-round fixes — post-scan main-panel
+                                // refresh now goes through ONE shared helper
+                                // (_refreshMainAfterScan) gated on a precise
+                                // Library.isInAllTracksView() flag, used by the
+                                // WS complete + embedding handlers AND the HTTP
+                                // stuck-badge watchdog — so a scan/embedding event
+                                // (or the watchdog fallback) never yanks a group /
+                                // SEARCH / format-filter view back to All Tracks.
+                                // Search renders via showSearchResults() (full
+                                // sortable header, no stale group filter). Frontend
+                                // search operators trimmed to the 6 the backend
+                                // implements (title:/composer:/albumartist: now show
+                                // 'Unknown field'). Small-library All-Tracks applies
+                                // the persisted sort; a persisted non-windowed sort
+                                // key no longer paints a false arrow on the windowed
+                                // view (app.js?v=150 + library.js + search.js).
+                                // v174: visual-QA fixes — Scene-groups reload no
+                                // longer shows a track list.  Root cause: a WS
+                                // scan-complete/embedding event fires seconds after
+                                // a server restart and its handler called showAll(),
+                                // overwriting the restored view — now gated on the
+                                // user actually being on All Tracks (also stops any
+                                // scan-complete yanking you out of a group/search
+                                // view mid-session).  Plus: boot restore skips the
+                                // default showAll(); windowed-store repaint guarded
+                                // on still-active view; non-windowed sort columns
+                                // (track#/path) no longer paint a phantom sort arrow;
+                                // group-view switch hides the stale filter bar
+                                // synchronously (app.js?v=149 + library.js).
+                                // v171: QA-round-2 fixes — carry hand-edited artist
+                                // BEFORE the scene_group/year identity check (edit no
+                                // longer drops enrichment on rescan); ALL drill-downs
+                                // (genre/year/scene-group/album/artist) 500→2000 with an
+                                // honest "showing first N of M" crumb cue when capped
+                                // (count-vs-list parity); store editor now covers
+                                // remote/archive non-module files; post-scan facet reveal
+                                // polls a backoff ladder, not fixed timers
+                                // (app.js?v=142 + library.js/trackinfo.js under its graph).
+                                // v170: enhancements — post-scan Demozoo auto-apply,
+                                // Scene-groups browse facet, store-only info editor,
+                                // 'featured in demo', detach-and-finish blocking renders
+                                // (app.js?v=141 + library.js/trackinfo.js under its graph).
+                                // v169: P1/P2 fixes — year provenance (persist across
                                 // rescan + store-only year editor, app.js?v=140), SID render
                                 // pool hardening (blocking cap, seek-supersede, stuck-slot).   // v168 (1.8.0): SCENE tab (trackinfo.js/index.html/app.css?v=91), SID VU
                                 // overhaul (app.js?v=139 — source-decoupled sidecars, longer poll ladder,

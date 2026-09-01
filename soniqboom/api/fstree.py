@@ -1485,17 +1485,33 @@ async def _remote_tracks_with_meta(path: str, recursive: bool) -> list[dict]:
     rh = path_hash(scan_root)
 
     if recursive:
-        dicts = store.filter_tracks(scan_root_hash=rh, limit=10000)
-        prefix = remote_path.rstrip("/")
-        if prefix != "/":
-            dicts = [
-                d for d in dicts
-                if d.get("path", "").startswith(f"{scan_root}:{prefix}/")
-            ]
-    else:
-        dh = path_hash(remote_path)
-        dicts = store.filter_tracks(dir_hash=dh, scan_root_hash=rh, limit=5000)
+        # Collect EVERY indexed track under the folder from the scan-root's
+        # sorted-path cache (already TrackMeta-shaped) via a bisect over the
+        # ``{scan_root}:/{rel}/`` prefix — the same O(log n + k) walk the
+        # ``_remote_children_from_store`` / ``_subtree_has_indexed_audio``
+        # helpers use.  The old ``filter_tracks(scan_root_hash, limit=10000)``
+        # + Python prefix-filter fetched only the FIRST 10 000 tracks of the
+        # whole scan root and filtered those, so a folder whose tracks fell
+        # outside that window (e.g. an artist deep in a full iTunes library >
+        # 10 000 tracks) came back EMPTY — the parent folder showed "No tracks
+        # found" while its leaf album folders, queried directly by dir_hash
+        # below, still worked.  The bisect is unbounded and scan-root-size
+        # independent, and returns tracks in stable path order.
+        from bisect import bisect_left
+        sorted_paths, sorted_dicts = _get_or_build_scan_root_sorted(store, rh)
+        rel = remote_path.strip("/")
+        prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
+        i = bisect_left(sorted_paths, prefix)
+        n = len(sorted_paths)
+        out: list[dict] = []
+        while i < n and sorted_paths[i].startswith(prefix):
+            out.append(sorted_dicts[i])       # already model-dumped + _scanned
+            i += 1
+        return out
 
+    # Non-recursive: the tracks DIRECTLY inside this folder, by dir hash.
+    dh = path_hash(remote_path)
+    dicts = store.filter_tracks(dir_hash=dh, scan_root_hash=rh, limit=5000)
     results: list[dict] = []
     for d in dicts:
         try:

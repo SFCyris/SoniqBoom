@@ -178,13 +178,15 @@ def _write_dump(tmp_path, *, with_supertype: bool):
         prod_rows = ("5000\tZap Tune Deluxe\tmusic\t1992-06-01\n"
                      "6000\tZap Tune Deluxe Party Invitation\tproduction\t1993-01-01\n"
                      "7000\tUndated Groove Tune\tmusic\t\\N\n"
-                     "8000\tOcean Loader 2\tmusic\t1987-03-01")
+                     "8000\tOcean Loader 2\tmusic\t1987-03-01\n"
+                     "9000\tSecond Reality\tproduction\t1993-08-01")   # a DEMO using 8000
     else:
         prod_cols = "id, title"
         prod_rows = ("5000\tZap Tune Deluxe\n"
                      "6000\tZap Tune Deluxe Party Invitation\n"
                      "7000\tUndated Groove Tune\n"
-                     "8000\tOcean Loader 2")
+                     "8000\tOcean Loader 2\n"
+                     "9000\tSecond Reality")
     dump = (
         "COPY public.demoscene_releaser (id, name, first_name, surname, is_group) FROM stdin;\n"
         "100\tzap\tAnn\tSmith\tf\n200\tzap\tBob\tJones\tf\n"
@@ -197,6 +199,9 @@ def _write_dump(tmp_path, *, with_supertype: bool):
         f"COPY public.productions_production ({prod_cols}) FROM stdin;\n{prod_rows}\n\\.\n"
         "COPY public.productions_production_author_nicks (id, production_id, nick_id) FROM stdin;\n"
         "1\t5000\t1000\n2\t6000\t2000\n3\t7000\t1000\n4\t8000\t3000\n\\.\n"
+        # demo 9000 uses music 8000 (Ocean Loader 2) as its soundtrack
+        "COPY public.productions_soundtracklink (id, production_id, soundtrack_id) FROM stdin;\n"
+        "1\t9000\t8000\n\\.\n"
     )
     import gzip as _gz
     p = tmp_path / "dump.sql.gz"
@@ -209,7 +214,7 @@ def test_parse_dump_shared_handle_music_only(tmp_path):
     """With supertypes present, the shared handle 'zap' only carries the
     MUSICIAN's (releaser 100) music production as disambiguation evidence — the
     coder namesake's colliding DEMO title is excluded."""
-    unique, ambig, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    unique, ambig, _, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
     rids = {row[1] for row in ambig if row[0] == "zap"}
     assert rids == {100}                       # coder (200) contributes no music
     assert not any("party" in row[4] for row in ambig)   # demo tokens absent
@@ -219,7 +224,7 @@ def test_parse_dump_no_supertype_column_degrades(tmp_path):
     """A dump WITHOUT a supertype column keeps the previous all-productions
     behaviour for disambiguation, and yields ONLY veto rows (year None) for the
     year gate — no dates ⇒ no year is ever stamped, but nothing crashes."""
-    unique, ambig, prod_years = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=False))
+    unique, ambig, prod_years, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=False))
     rids = {row[1] for row in ambig if row[0] == "zap"}
     assert rids == {100, 200}                  # no supertype ⇒ no filtering
     assert prod_years and all(y is None for _, _, y in prod_years)
@@ -228,12 +233,19 @@ def test_parse_dump_no_supertype_column_degrades(tmp_path):
 def test_parse_dump_prod_years_shapes(tmp_path):
     """prod_years: MUSIC only, digit tokens kept, undated rows preserved as
     year-None vetoes, the demo excluded."""
-    _, _, prod_years = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    _, _, prod_years, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
     assert sorted(prod_years) == [
         ("100", "deluxe tune zap", 1992),
         ("100", "groove tune undated", None),   # undated ⇒ veto row
         ("300", "2 loader ocean", 1987),        # '2' survives _year_toks
     ]
+
+
+def test_parse_dump_soundtrack_links(tmp_path):
+    """The 4th return maps a MUSIC production → the demo(s) that used it,
+    resolved to the demo's title + year (inverting the demo→music link)."""
+    _, _, _, prod_soundtrack = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    assert prod_soundtrack == [(8000, "Second Reality", 1993)]
 
 
 # ── _production_year: exact-identity + veto + consensus gate ─────────────────
@@ -289,6 +301,15 @@ def _run_collect(monkeypatch, tracks):
     import soniqboom.core.store as store_mod
     monkeypatch.setattr(store_mod, "get_store", lambda: _FakeStore(tracks))
     return demozoo.collect_updates()
+
+
+def test_production_soundtracks_offline(tmp_path, monkeypatch):
+    """After a build, the 'featured in' lookup resolves a music production id to
+    the demo(s) that used it; an unknown id (or a pre-soundtrack index) → []."""
+    _built_index(tmp_path, monkeypatch)
+    assert demozoo._production_soundtracks(8000) == [{"title": "Second Reality", "year": 1993}]
+    assert demozoo._production_soundtracks(99999) == []
+    assert demozoo._production_soundtracks("not-an-int") == []
 
 
 def test_collect_updates_stamps_and_preserves_original(tmp_path, monkeypatch):
@@ -358,3 +379,253 @@ def test_collect_updates_undated_veto_blocks_stamp(tmp_path, monkeypatch):
     ])
     assert matched == 1                         # resolves via ambig title match
     assert batch == []                          # but no year is stamped
+
+
+# ── composer credit gate (the wrong-write cardinal sin) ──────────────────────
+# A no-artist scene module's ``composer`` is persisted PERMANENTLY (fill-only,
+# no provenance/revert), so a "by X" credit may name the composer ONLY when it
+# is a bare "By X" signature or a MUSIC-qualified credit.  These lock the gate
+# against the two holes that shipped twice: a non-music word DETACHED from "by"
+# by punctuation ("graphics: by X"), and a non-music word simply OMITTED from a
+# blacklist ("gr by X", "sfx by X").  The gate is a whitelist — any unrecognised
+# word before "by" is refused — so both classes stay closed.
+@pytest.mark.parametrize("sample", [
+    # non-music word adjacent to "by"
+    "gfx by felisuco", "graphics by felisuco", "logo by felisuco",
+    "ripped by felisuco", "cracked by felisuco", "code by felisuco",
+    "coded by felisuco", "design by felisuco", "greets by felisuco",
+    # non-music word DETACHED by punctuation (the CRITICAL leak)
+    "graphics: by felisuco", "graphics - by felisuco", "graphics/ by felisuco",
+    "graphics. by felisuco", "graphics, by felisuco", "graphics| by felisuco",
+    "logo/by felisuco", "pixels. by felisuco",
+    # non-music word OMITTED from any blacklist (the HIGH leak)
+    "gr by felisuco", "grfx by felisuco", "grafik by felisuco",
+    "sfx by felisuco", "fx by felisuco", "vocals by felisuco",
+    "samples by felisuco", "sampled by felisuco", "words by felisuco",
+    "lyrics by felisuco", "text by felisuco", "voice by felisuco",
+    "presented by felisuco", "made by felisuco", "arranged by felisuco",
+    "remix by felisuco", "trained by felisuco",
+])
+def test_music_credits_rejects_non_music(sample):
+    """Not a composer credit → nothing is persistable."""
+    assert demozoo._music_credits([sample]) == []
+
+
+@pytest.mark.parametrize("sample,handle", [
+    ("by felisuco", "felisuco"),
+    ("By felisuco", "felisuco"),
+    ("music by felisuco", "felisuco"),
+    ("composed by felisuco", "felisuco"),
+    ("tune by felisuco", "felisuco"),
+    ("song by felisuco", "felisuco"),
+    ("melody by felisuco", "felisuco"),
+    ("great music by felisuco", "felisuco"),
+    ("by 4-mat", "4-mat"),                       # hyphenated handle kept intact
+    ("by U4ia", "U4ia"),
+])
+def test_music_credits_accepts_genuine(sample, handle):
+    """Bare or music-qualified "by X" → the composer handle, original case."""
+    assert demozoo._music_credits([sample]) == [handle]
+
+
+@pytest.mark.parametrize("sample,handle", [
+    ("By Purple Motion -93", "Purple Motion"),   # space-dash year tag trimmed
+    ("By Purple Motion 1993", "Purple Motion"),  # bare year tag trimmed
+    ("By Purple Motion of the Future Crew", "Purple Motion"),  # group tail
+    ("music by Jugi - Complex", "Jugi"),         # " - group" tail
+    ("by Jester & Yolk", "Jester"),              # collaborator tail
+])
+def test_music_credits_trims_tail(sample, handle):
+    assert demozoo._music_credits([sample]) == [handle]
+
+
+@pytest.mark.parametrize("sample", [
+    "ripped by pirate / music by felisuco",      # first credit is a rip, not music
+    "gfx by artist, music by felisuco",
+    "cracked by group | tune by felisuco",
+])
+def test_music_credits_multi_credit_finds_the_music(sample):
+    """A non-music credit FOLLOWED by a real music credit must not swallow it."""
+    assert demozoo._music_credits([sample]) == ["felisuco"]
+
+
+def test_author_hints_persist_gate():
+    """``author_hints_from_track`` exposes a music credit for PERSISTENCE only
+    when it is genuine; a graphics/rip credit yields no persistable credit."""
+    _, credits = demozoo.author_hints_from_track(
+        title="Fast Music", instruments=["gfx by felisuco"])
+    assert credits == {}                         # nothing to write
+    _, credits = demozoo.author_hints_from_track(
+        title="Fast Music", instruments=["music by Purple Motion"])
+    assert credits == {"purple motion": "Purple Motion"}  # normalised→original
+
+
+# ── cross-slot credit split (a role word one sample slot up from "by X") ──────
+# Sample lists spell one credit fragment per slot, so a "gfx"/"ripped"/… credit
+# can land in the slot BEFORE the "by X" — which, scanned per-slot, would read
+# as a bare composer signature.  A KNOWN role word in the previous slot vetoes
+# it; an unrelated previous word (a date, a bpm, a greeting — the overwhelming
+# real-library case) must NOT, or 800+ genuine signatures would be lost.
+@pytest.mark.parametrize("instruments", [
+    ["gfx", "by kapteinar"],
+    ["graphics", "by kapteinar"],
+    ["ripped and converted", "by thexder"],
+    ["#### ripped ####", "by mr.young"],
+    ["Bad Samples", "by Luv Kohli"],
+    ["in full stereo sound", "by www.elysis.de"],
+    ["graphics", "by kapteinar", "music", "by someone"],  # role split, real music elsewhere
+])
+def test_music_credits_cross_slot_role_split_rejected(instruments):
+    """A non-music role in the previous slot must not leak a bare "by X"."""
+    assert "kapteinar" not in [c.lower() for c in demozoo._music_credits(instruments)]
+    if instruments == ["gfx", "by kapteinar"]:
+        assert demozoo._music_credits(instruments) == []
+
+
+@pytest.mark.parametrize("instruments,handle", [
+    (["Chip Land", "By Zeus"], "Zeus"),
+    (["twenty seconds", "by pkk"], "pkk"),
+    (["200bpm", "By Midnight Flip '97"], "Midnight Flip"),  # + apostrophe-year trim
+    (["Composed Nov. 12 1992", "by SWAMPFOX"], "SWAMPFOX"),
+    (["greetings to everyone", "music", "by kapteinar"], "kapteinar"),  # prev slot = music word
+])
+def test_music_credits_cross_slot_signature_accepted(instruments, handle):
+    """A bare "By <scener>" trailing UNRELATED text is a real signature."""
+    assert demozoo._music_credits(instruments) == [handle]
+
+
+@pytest.mark.parametrize("sample,handle", [
+    ("music by Catch 22", "Catch 22"),           # 22 is not a plausible year
+    ("music by Area 51", "Area 51"),
+    ("by 2 Unlimited", "2 Unlimited"),
+])
+def test_music_credits_preserves_numeric_handle(sample, handle):
+    """The year-tail trim must not eat a digit-bearing handle (would collide
+    with a different, real scener)."""
+    assert demozoo._music_credits([sample]) == [handle]
+
+
+# ── cross-slot role word that is NOT the previous slot's LAST word ────────────
+# The veto scans the WHOLE previous slot, not just its trailing word — a role
+# verb is routinely non-terminal ("cracked together", "converted in 0.30 min").
+# These are confirmed real-library wrong-writes (a cracker/converter written as
+# the composer) that a last-word-only check let through.
+@pytest.mark.parametrize("instruments", [
+    ["cracked together", "by sinatra"],
+    ["samples & jingles", "by loxley"],
+    ["ORIGINAL BY JENS", "CONVERTED IN 0.30 MIN", "BY TYAN"],
+    ["Converted with Pro-Wizard", "by Gryzor"],
+])
+def test_music_credits_cross_slot_nonterminal_role_rejected(instruments):
+    assert demozoo._music_credits(instruments) == []
+
+
+# ── "tracked" is a MUSIC verb (sequenced in a tracker), not a rip role ────────
+@pytest.mark.parametrize("sample,handle", [
+    ("tracked by necros", "necros"),
+    ("written and tracked by necros", "necros"),
+    ("Composed & Tracked by SMASH", "SMASH"),
+    ("tracked 2001-01-08 by eSeMGy", "eSeMGy"),
+])
+def test_music_credits_tracked_is_music(sample, handle):
+    assert demozoo._music_credits([sample]) == [handle]
+
+
+def test_music_credits_cross_slot_music_word_suppresses_veto():
+    """A previous slot that pairs a role with a MUSIC word is not a veto —
+    "music & gfx / by X" means X did the music (too)."""
+    assert demozoo._music_credits(["music & gfx", "by artist"]) == ["artist"]
+
+
+def test_music_credits_non_str_slot_is_safe():
+    """A non-str slot (int/None/dict) must not raise — it would abort the whole
+    batch apply.  Guarded to empty; a valid credit alongside still resolves."""
+    assert demozoo._music_credits([123, "by artist", None, {"x": 1}]) == ["artist"]
+
+
+# ── lookup_scener: sole-producer shared handle resolves without a title ───────
+# A handle lands in ambig_prod when >1 releaser carries it, but only the ones
+# who RELEASED something appear — so a "shared" handle often has a single real
+# candidate.  It must resolve outright (the productionless namesakes can't be a
+# music track's author); requiring a title match stranded famous handles like
+# "Purple Motion" (→ Jonne Valtonen) whose title was single-token.  In the test
+# index, "zap" is shared by 100 (musician) + 200 (coder), but only 100's MUSIC
+# production reaches ambig_prod — so "zap" resolves to 100 with no title.
+def test_lookup_scener_sole_producer_resolves_without_title(tmp_path, monkeypatch):
+    _built_index(tmp_path, monkeypatch)
+    card = demozoo.lookup_scener("zap")            # NO title
+    assert card and card["releaser_id"] == 100 and card["real_name"] == "Ann Smith"
+    # and still resolves the same with a title present
+    card2 = demozoo.lookup_scener("zap", "Zap Tune Deluxe")
+    assert card2 and card2["releaser_id"] == 100
+    # a handle no one released is still unknown
+    assert demozoo.lookup_scener("nobody-here") is None
+
+
+def test_lookup_scener_real_name_paren_handle_prefers_primary(tmp_path, monkeypatch):
+    """"Real Name (Handle)" whose parenthetical collides with a DIFFERENT scener
+    must resolve to the authoritative pre-paren name, not refuse.  In the test
+    index "alpha" (400), "beta" (500), "moby" (300) are distinct unique sceners;
+    "alpha (moby)" pools both → disagree → old code refused.  Now the
+    paren-stripped primary wins (regardless of which side the collision is on)."""
+    _built_index(tmp_path, monkeypatch)
+    assert demozoo.lookup_scener("alpha (moby)", "x")["releaser_id"] == 400
+    assert demozoo.lookup_scener("beta (moby)", "x")["releaser_id"] == 500
+
+
+# ── reset_enrichment: withdraw enrichment, preserve file tags + user edits ────
+def test_reset_enrichment_withdraws_only_enrichment(monkeypatch):
+    """Clears the Demozoo year backfill (→ year_file), scene_group, and the
+    no-artist-module composer; leaves user hand-edits, user years, real
+    file-tag composers (non-retro), and already-clean tracks untouched."""
+    tracks = [
+        {"id": "1", "format": "ProTracker", "artist": "", "composer": "4-mat",
+         "scene_group": "Anarchy • Cosine", "year": 1991,
+         "year_source": "demozoo", "year_file": 2007},
+        {"id": "2", "format": "ScreamTracker 3", "artist": "Purple Motion",
+         "composer": "", "scene_group": "Future Crew", "year": 1993,
+         "year_source": "demozoo", "year_file": None},
+        {"id": "3", "format": "ProTracker", "artist": "", "composer": "My Fix",
+         "scene_group": "My Crew", "user_edited": ["composer", "scene_group"]},
+        {"id": "4", "format": "ProTracker", "artist": "", "year": 1988,
+         "year_source": "user", "year_file": 1990},
+        {"id": "5", "format": "MP3", "artist": "", "composer": "J.S. Bach"},
+        {"id": "6", "format": "ProTracker", "artist": "", "composer": "",
+         "scene_group": ""},
+    ]
+    import soniqboom.core.store as store_mod
+    monkeypatch.setattr(store_mod, "get_store", lambda: _FakeStore(tracks))
+    count, batch = demozoo.reset_enrichment()
+    bd = dict(batch)
+    assert count == 2
+    assert bd["1"] == {"year": 2007, "year_source": None, "year_file": None,
+                       "scene_group": None, "composer": None}
+    assert bd["2"] == {"year": None, "year_source": None, "year_file": None,
+                       "scene_group": None}          # empty composer not touched
+    for untouched in ("3", "4", "5", "6"):           # user edits / user year /
+        assert untouched not in bd                   # file tag / already clean
+    # idempotent: applying the batch (no scene_group/composer/demozoo-year left)
+    # yields nothing on a second pass
+    cleaned = []
+    for t in tracks:
+        t = dict(t)
+        t.update(bd.get(t["id"], {}))
+        cleaned.append(t)
+    monkeypatch.setattr(store_mod, "get_store", lambda: _FakeStore(cleaned))
+    assert demozoo.reset_enrichment()[0] == 0
+
+
+def test_auto_apply_toggle_roundtrip(monkeypatch):
+    """The post-scan auto-apply preference defaults ON, persists both ways, and
+    surfaces in status() — it drives the admin toggle and the scanner guard that
+    keeps a Reset from being undone by the next scan."""
+    import soniqboom.config as cfg
+    mem: dict = {}
+    monkeypatch.setattr(cfg, "load_prefs", lambda: dict(mem))
+    monkeypatch.setattr(cfg, "save_prefs", lambda d: (mem.clear(), mem.update(d)))
+    assert demozoo.auto_apply_enabled() is True          # default ON
+    demozoo.set_auto_apply(False)                        # Reset turns it off
+    assert demozoo.auto_apply_enabled() is False
+    assert demozoo.status()["auto_apply"] is False
+    demozoo.set_auto_apply(True)                         # Apply turns it back on
+    assert demozoo.auto_apply_enabled() is True

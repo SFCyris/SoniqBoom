@@ -98,6 +98,13 @@ class TrackMeta(BaseModel):
     # refresh it normally.
     year_source: str | None = None
     year_file: int | None = None
+    # Field names the user hand-edited in the LIBRARY only (store-only editor
+    # for formats that can't be tag-written — modules, SID, chip, archive
+    # members).  Those fields are re-read from the file on a rescan and would
+    # revert, so they're carried forward like the year (see
+    # store._carry_enrichment).  A file-write tag edit needs no entry here — the
+    # file itself holds the value.
+    user_edited: list[str] | None = None
 
     # Art
     cover_art: str | None = None  # data-URI thumbnail

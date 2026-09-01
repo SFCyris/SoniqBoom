@@ -244,6 +244,65 @@ async def update_year(track_id: str, body: _YearUpdate, user=_Depends(_require_e
     get_store().update_track_fields(track_id, updates)
     return {"id": track_id, "applied": updates}
 
+
+class _MetaUpdate(_BaseModel):
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    album_artist: str | None = None
+    genre: str | None = None          # comma-separated; stored as a list
+    composer: str | None = None
+    comment: str | None = None
+    year: int | None = None
+
+
+_META_TEXT_FIELDS = ("title", "artist", "album", "album_artist", "composer", "comment")
+
+
+@router.put("/{track_id}/meta")
+async def update_meta(track_id: str, body: _MetaUpdate, user=_Depends(_require_edit)):
+    """Store-only metadata edit — the metadata editor for formats that can't be
+    tag-written (modules, SID, chip, archive members, remote shares).
+
+    Only the fields the client actually sends are touched (partial update).
+    Each hand-set field is recorded in ``user_edited`` so a rescan's fresh file
+    extract doesn't revert it (see store._carry_enrichment); ``year`` rides its
+    own provenance (year_source=user + year_file preserved once), exactly like
+    PUT /{id}/year, so the two stay consistent.  No file is written, so this
+    works for any format/source.
+    """
+    from soniqboom.core.store import get_store
+    store = get_store()
+    t = store.get_track(track_id)
+    if not t:
+        raise HTTPException(404, "Track not found")
+    fields = body.model_dump(exclude_unset=True)     # only what the client sent
+    updates: dict = {}
+    edited = set(x for x in (t.get("user_edited") or []) if isinstance(x, str))
+    for k, v in fields.items():
+        if k == "year":
+            if v is not None and not (1000 <= int(v) <= 2100):
+                raise HTTPException(422, "Year must be between 1000 and 2100.")
+            updates["year"] = int(v) if v is not None else None
+            updates["year_source"] = "user"
+            if t.get("year_source") not in ("user", "demozoo") and t.get("year") is not None:
+                updates["year_file"] = t.get("year")
+            # year is tracked by year_source, not user_edited
+        elif k == "genre":
+            updates["genre"] = [g.strip() for g in (v or "").split(",") if g.strip()]
+            edited.add("genre")
+        elif k in _META_TEXT_FIELDS:
+            updates[k] = "" if v is None else str(v)
+            edited.add(k)
+    if not updates:
+        return {"id": track_id, "applied": {}}
+    if any(k != "year" for k in updates if k not in ("year_source", "year_file")):
+        updates["user_edited"] = sorted(edited)
+    store.update_track_fields(track_id, updates)
+    # Edited artist/title/album change the LRCLib match — drop cached lyrics.
+    _lyrics_cache.pop(track_id, None)
+    return {"id": track_id, "applied": updates}
+
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
 
 _lrclib_client: httpx.AsyncClient | None = None

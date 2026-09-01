@@ -72,6 +72,39 @@ def test_carry_no_provenance_lets_file_year_win():
     assert new.get("year_source") in (None, "")
 
 
+def test_carry_user_edited_fields_survive_rescan():
+    """Store-only metadata edits (non-taggable formats) carry across a rescan's
+    fresh file extract; year still rides its own provenance."""
+    old = {"artist": "OldFile", "title": "Real Title", "composer": "P. Hajba",
+           "user_edited": ["title", "composer"]}
+    new = {"artist": "OldFile", "title": "mojibake�", "composer": ""}
+    _carry_enrichment(old, new)
+    assert new["title"] == "Real Title"
+    assert new["composer"] == "P. Hajba"
+    assert new["user_edited"] == ["title", "composer"]
+
+
+def test_carry_edited_artist_does_not_drop_enrichment():
+    """Regression (QA round 2): hand-editing the Artist via the store-only editor
+    must NOT drop the track's scene_group / demozoo year on the next rescan.  The
+    edited artist is restored BEFORE the identity check, so same_artist compares
+    the user's corrected value against itself (True) rather than the file's stale
+    demoscene handle — otherwise the very act of fixing the artist wiped the
+    enrichment that motivated opening the editor."""
+    old = {"artist": "Matthew Simmonds", "file_md5": "m1",
+           "user_edited": ["artist"],
+           "scene_group": "Anarchy", "scene_path": "MOD/4mat/x.mod",
+           "year": 1991, "year_source": "demozoo", "year_file": None}
+    new = {"artist": "4-mat", "file_md5": "m1",      # file still holds the handle
+           "scene_group": None, "scene_path": None, "year": None}
+    _carry_enrichment(old, new)
+    assert new["artist"] == "Matthew Simmonds"       # hand edit restored
+    assert new["scene_group"] == "Anarchy"           # …and enrichment KEPT
+    assert new["scene_path"] == "MOD/4mat/x.mod"
+    assert new["year"] == 1991 and new["year_source"] == "demozoo"
+    assert new["user_edited"] == ["artist"]
+
+
 def test_carry_is_idempotent_on_replay():
     """Replaying an already-merged record (AOF replay) changes nothing."""
     old = {"artist": "A", "year": 1994, "year_source": "demozoo", "year_file": 1986}

@@ -12,7 +12,7 @@
  *   TrackInfo.openSingle(track)        — open panel for a single track
  */
 import { Player }              from './player.js';
-import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags } from './utils.js';
+import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel } from './utils.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -349,7 +349,8 @@ function _renderScene(track, info) {
   if (!info || !info.found || !info.artist) {
     const msg = info && info.__noartist ? 'No composer name to look up on Demozoo.'
       : info && info.__net             ? 'Couldn’t reach the scene database.'
-      : `No demoscene entry found for “${artist}”.`;
+      : artist                          ? `No demoscene entry found for “${artist}”.`
+      :                                   'No demoscene entry found for this track.';
     sceneBody.innerHTML = baseline() + empty(msg);
     return;
   }
@@ -360,12 +361,16 @@ function _renderScene(track, info) {
   const parts = [];
 
   // ── Artist block ──
-  let ab = `<div class="ti-scene-artist"><div class="ti-scene-name">${esc(a.real_name || artist)}</div>`;
+  // The scene handle: NAME-first carries it in track.artist; TITLE-first leaves
+  // that blank and the resolved handle arrives in a.name.  Fall back to a.name
+  // so the header never renders empty and the handle sub-line isn't a stray “”.
+  const handle = artist || (a && a.name) || '';
+  let ab = `<div class="ti-scene-artist"><div class="ti-scene-name">${esc(a.real_name || handle)}</div>`;
   const sub = [];
-  if (a.real_name && a.real_name.toLowerCase() !== artist.toLowerCase()) sub.push(`“${esc(artist)}”`);
+  if (handle && a.real_name && a.real_name.toLowerCase() !== handle.toLowerCase()) sub.push(`“${esc(handle)}”`);
   if (Array.isArray(a.groups) && a.groups.length) sub.push('Member of ' + esc(a.groups.slice(0, 5).join(', ')));
   if (sub.length) ab += `<div class="ti-scene-sub">${sub.join(' · ')}</div>`;
-  const seen = new Set([artist.toLowerCase(), (a.real_name || '').toLowerCase()]);
+  const seen = new Set([handle.toLowerCase(), (a.real_name || '').toLowerCase()]);
   const aliases = (a.aliases || []).filter(n => n && !seen.has(String(n).toLowerCase()));
   if (aliases.length) ab += `<div class="ti-scene-aka">aka ${esc(aliases.slice(0, 6).join(', '))}</div>`;
   const aChips = [chip(a.url, 'Demozoo')]
@@ -394,6 +399,13 @@ function _renderScene(track, info) {
     (rel.parties || []).slice(0, 3).forEach(pt => {
       if (pt && pt.name) rb += `<div class="ti-scene-compo">▸ Released at ${esc(pt.name)}${pt.year ? ` (${pt.year})` : ''}</div>`;
     });
+    // "Featured in": demos/intros this track scored (from the offline index).
+    const feat = (Array.isArray(rel.featured_in) ? rel.featured_in : [])
+      .filter(f => f && f.title).slice(0, 5);
+    if (feat.length) {
+      const names = feat.map(f => esc(f.title) + (f.year ? ` (${f.year})` : '')).join(', ');
+      rb += `<div class="ti-scene-compo">🎬 Featured in ${names}</div>`;
+    }
     const rChips = [chip(rel.url, 'Demozoo')]
       .concat((rel.links || []).slice(0, 8).map(l => chip(l && l.url, hostOf(l && l.url))))
       .filter(Boolean).join('');
@@ -404,7 +416,7 @@ function _renderScene(track, info) {
 
   // ── Discography ──
   if (disco.length) {
-    let db = `<div class="ti-scene-block"><div class="ti-scene-h">More by ${esc(artist)}</div><ul class="ti-scene-disco">`;
+    let db = `<div class="ti-scene-block"><div class="ti-scene-h">More by ${esc(a.real_name || handle)}</div><ul class="ti-scene-disco">`;
     disco.forEach(p => {
       const su    = safeUrl(p.url);
       const label = esc(p.title);
@@ -451,9 +463,12 @@ async function _loadScene(track) {
   const reqTrackId = track && track.id;
   if (!track) { sceneBody.innerHTML = ''; return; }
   const artist = ((track.artist) || '').trim();
+  const hasArtist = artist && !_isPlaceholderArtist(artist);
+  const title = (track.title || '').trim();
 
-  // No composer name → immediate, cached baseline-only state.
-  if (!artist || _isPlaceholderArtist(artist)) {
+  // Nothing to resolve from (no artist tag AND no song title) → baseline only.
+  // With a title but no artist we fall through to a TITLE-first lookup below.
+  if (!hasArtist && !title) {
     const payload = { found: false, __noartist: true };
     if (reqTrackId) _sceneCache[reqTrackId] = payload;
     _renderScene(track, payload);
@@ -480,9 +495,14 @@ async function _loadScene(track) {
   const _c = (typeof AbortController === 'function') ? new AbortController() : null;
   _sceneAbort = _c;
   try {
-    let q = '/api/artist/scene?name=' + encodeURIComponent(artist) + '&retro=1';
-    if (track.title)  q += '&track='  + encodeURIComponent(track.title);
-    if (track.format) q += '&format=' + encodeURIComponent(track.format);
+    // NAME-first when the module has an artist tag; TITLE-first otherwise (the
+    // server resolves the composer from the song title, narrowed by year/hints).
+    let q = '/api/artist/scene?retro=1';
+    if (hasArtist)          q += '&name='     + encodeURIComponent(artist);
+    if (title)              q += '&track='    + encodeURIComponent(title);
+    if (track.format)       q += '&format='   + encodeURIComponent(track.format);
+    if (track.id)           q += '&track_id=' + encodeURIComponent(track.id);
+    if (track.year != null) q += '&year='     + encodeURIComponent(track.year);
     const r = await fetch(q, _c ? { signal: _c.signal } : undefined);
     if (!r.ok) throw new Error('http ' + r.status);
     const info = await r.json();
@@ -533,56 +553,116 @@ function _renderTagEdit(track) {
     wrap.appendChild(btn);
     return;
   }
-  // Retro/module tracks can't be file-tagged, but their Demozoo-backfilled
-  // release year is worth being able to correct or revert — that's a
-  // STORE-ONLY edit (PUT /year), so it works for remote/archive tracks too.
-  if (_isModuleFamily(track)) {
-    const btn = document.createElement('button');
-    btn.id = 'ti-edit-year';
-    btn.textContent = '✏️ Edit year';
-    btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
-    btn.addEventListener('click', () => _showYearForm(track, wrap));
-    wrap.appendChild(btn);
-  }
+  // Reaching here means the file-write editor was declined, so this is a track
+  // the tagwriter can't touch: a module/SID/chip format, an archive member, OR
+  // any file (incl. a plain MP3/FLAC) living on a remote share.  Its metadata is
+  // still worth correcting (a wrong Demozoo year, a mojibake title, a blank
+  // artist), so offer the STORE-ONLY editor (PUT /meta + /year) for ALL of them
+  // — it writes the library, survives rescans, and works regardless of format
+  // or source.  (The panel only ever opens for real library tracks, guarded by
+  // the ``!track.id`` return above, so there's no non-editable pseudo-track to
+  // exclude.)  Previously this was gated on _isModuleFamily, which silently left
+  // remote/archive non-module files (e.g. an MP3 on an SMB mount) with no editor
+  // at all.
+  const btn = document.createElement('button');
+  btn.id = 'ti-edit-info';
+  btn.textContent = '✏️ Edit info';
+  btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+  btn.addEventListener('click', () => _showInfoForm(track, wrap));
+  wrap.appendChild(btn);
 }
 
-function _showYearForm(track, wrap) {
+// Store-only info editor (non-taggable formats).  Mirrors the file-write tag
+// form's fields but saves to the LIBRARY only (PUT /meta); the Year field keeps
+// its Demozoo revert affordance (PUT /year).
+const _META_FIELDS = [
+  ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
+  ['album_artist', 'Album artist'], ['composer', 'Composer'],
+  ['genre', 'Genre'], ['year', 'Year'], ['comment', 'Comment'],
+];
+
+function _showInfoForm(track, wrap) {
   wrap.innerHTML = '';
   const form = document.createElement('div');
-  form.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12.5px';
-  const lab = document.createElement('label');
-  lab.textContent = 'Year'; lab.style.opacity = '.7';
-  const inp = document.createElement('input');
-  inp.type = 'number'; inp.min = '1000'; inp.max = '2100';
-  inp.value = (track.year != null ? track.year : '');
-  inp.style.cssText = 'font-size:12.5px;padding:4px 8px;width:88px';
+  form.style.cssText = 'display:grid;grid-template-columns:92px 1fr;gap:6px 10px;align-items:center;font-size:12.5px';
+  const inputs = {};
+  for (const [key, label] of _META_FIELDS) {
+    const lab = document.createElement('label');
+    lab.textContent = label; lab.style.opacity = '.7';
+    const inp = document.createElement('input');
+    inp.type = key === 'year' ? 'number' : 'text';
+    if (key === 'year') { inp.min = '1000'; inp.max = '2100'; }
+    inp.value = key === 'genre'
+      ? (Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || ''))
+      : (track[key] ?? '');
+    inp.style.cssText = 'font-size:12.5px;padding:4px 8px;min-width:0';
+    inputs[key] = inp;
+    form.append(lab, inp);
+  }
+  const row = document.createElement('div');
+  row.style.cssText = 'grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;margin-top:4px';
   const save = document.createElement('button');
   save.textContent = 'Save'; save.style.cssText = 'font-size:12px;padding:4px 12px';
   const cancel = document.createElement('button');
   cancel.textContent = 'Cancel';
   cancel.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.7';
   cancel.addEventListener('click', () => _renderTagEdit(track));
-  form.append(lab, inp, save, cancel);
-  // A stamped year (Demozoo or a prior user edit) that preserved the original
-  // gets a one-click revert to the file/rip value.
+  row.append(save, cancel);
+  // One-click revert for a stamped year with a preserved original.
   if ((track.year_source === 'demozoo' || track.year_source === 'user')
       && track.year_file != null) {
     const rev = document.createElement('button');
-    rev.textContent = `↺ Revert to file year (${track.year_file})`;
+    rev.textContent = `↺ Revert year to file (${track.year_file})`;
     rev.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.85';
     rev.addEventListener('click', () => _saveYear(track, wrap, { revert: true }));
-    form.appendChild(rev);
+    row.appendChild(rev);
   }
+  form.appendChild(row);
   save.addEventListener('click', () => {
-    const v = inp.value.trim();
-    const n = v === '' ? null : parseInt(v, 10);
-    if (v !== '' && !(n >= 1000 && n <= 2100)) {
-      window.Toast?.error?.('Year must be between 1000 and 2100.'); return;
+    const body = {};
+    for (const [key] of _META_FIELDS) {
+      const raw = inputs[key].value;
+      if (key === 'year') {
+        const v = raw.trim();
+        const n = v === '' ? null : parseInt(v, 10);
+        if (v !== '' && !(n >= 1000 && n <= 2100)) {
+          window.Toast?.error?.('Year must be between 1000 and 2100.'); return;
+        }
+        if (n !== (track.year ?? null)) body.year = n;
+      } else if (key === 'genre') {
+        const cur = Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || '');
+        if (raw !== cur) body.genre = raw;
+      } else if (raw !== (track[key] ?? '')) {
+        body[key] = raw;
+      }
     }
-    _saveYear(track, wrap, { year: n });
+    if (!Object.keys(body).length) { _renderTagEdit(track); return; }
+    _saveMeta(track, wrap, body);
   });
   wrap.appendChild(form);
-  inp.focus();
+  inputs.title?.focus();
+}
+
+async function _saveMeta(track, wrap, body) {
+  try {
+    const r = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/meta`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), credentials: 'same-origin',
+    });
+    if (!r.ok) {
+      let msg = 'Could not update the info.';
+      try { msg = (await r.json()).detail || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const res = await r.json();
+    const applied = res.applied || {};
+    Object.assign(track, applied);
+    if (applied.genre) track.genre = applied.genre;   // server stores a list
+    window.Toast?.ok?.('Info updated.');
+    if (_queue[_idx]?.id === track.id) _render(track);   // guard against nav during save
+  } catch (e) {
+    window.Toast?.error?.(e.message || 'Could not update the info.');
+  }
 }
 
 async function _saveYear(track, wrap, body) {
@@ -780,6 +860,16 @@ function _render(track) {
 
   // ── FILE ──
   _show('ti-format',      track.format);
+  // Surround pill next to the format name — the compact at-a-glance marker that
+  // mirrors the track-list badge (the long-form "5.1 Surround" stays on the
+  // Channels line below).  Hidden for mono/stereo and for module formats.
+  const _surEl = document.getElementById('ti-surround');
+  if (_surEl) {
+    const _surLbl = surroundLabel(track);
+    _surEl.textContent = _surLbl || '';
+    _surEl.title = _surLbl ? `${_surLbl} surround` : '';
+    _surEl.hidden = !_surLbl;
+  }
   _show('ti-bit-depth',   track.bit_depth,   v => `${v}-bit`);
   _show('ti-sample-rate', track.sample_rate, _fmtRate);
   _show('ti-channels',    track.channels,    v => _fmtChannels(v, track));
@@ -866,23 +956,11 @@ function _render(track) {
 }
 
 // ── Module / SID / MIDI extended info ─────────────────────────────────────────
-const _MODULE_FORMATS = new Set([
-    'SID', 'MIDI', 'ProTracker', 'ScreamTracker 3', 'FastTracker 2',
-    'Impulse Tracker', 'MultiTracker', 'OctaMED', 'Composer 669',
-    'DigiBooster Pro', 'AHX', 'HivelyTracker', 'UltraTracker',
-    'ScreamTracker 2', 'Farandole', 'ASYLUM/DMP', 'General DigiMusic',
-    'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
-]);
-
-/** Module-family test: static tracker/SID/MIDI names plus the dynamic-name
- *  scene families (uade Amiga exotica, Atari ST, PSF console rips). */
-function _isModuleFamily(track) {
-  if (!track) return false;
-  return _MODULE_FORMATS.has(track.format)
-      || isUadeAmigaTrack(track)
-      || ATARI_FORMAT_NAMES.has(track.format)
-      || PSF_FORMAT_NAMES.has(track.format);
-}
+// MODULE_FORMAT_NAMES + isModuleFamily moved to utils.js so the track-list
+// surround badge shares ONE definition of "what is a module" with this panel.
+// Local aliases keep every existing reference in this file working unchanged.
+const _MODULE_FORMATS = MODULE_FORMAT_NAMES;
+const _isModuleFamily = isModuleFamily;
 
 /** Demoscene-track test — drives the SCENE-vs-LYRICS tab swap.  It's the
  *  module family MINUS General MIDI: GM/karaoke MIDI isn't demoscene (no

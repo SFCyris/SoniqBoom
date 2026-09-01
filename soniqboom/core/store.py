@@ -52,7 +52,8 @@ def _tokenize_text(text: str) -> list[str]:
 def _tokenize_track(track: dict) -> set[str]:
     """Extract all searchable tokens from a track dict."""
     tokens: set[str] = set()
-    for field in ("title", "artist", "album_artist", "album", "composer"):
+    for field in ("title", "artist", "album_artist", "album", "composer",
+                  "scene_group"):
         tokens.update(_tokenize_text(track.get(field, "")))
     return tokens
 
@@ -156,6 +157,18 @@ def _carry_enrichment(old: dict, new: dict) -> None:
         deliberate choice, carried regardless; a DEMOZOO year is composer-
         derived, so carried only while ``artist`` is unchanged (a changed
         composer drops it, and the next apply re-evaluates)."""
+    # Store-only hand edits (non-taggable formats) are restored FIRST, so the
+    # identity comparisons below see the user's corrected artist rather than the
+    # file's stale one — otherwise editing the Artist would compute same_artist
+    # against the file value and wrongly DROP this track's scene_group and
+    # demozoo year on the next rescan.  ('year' rides its own provenance below,
+    # so it's excluded here to avoid a double-write.)
+    edited = old.get("user_edited")
+    if isinstance(edited, list) and edited:
+        for f in edited:
+            if f != "year" and f in old:
+                new[f] = old[f]
+        new["user_edited"] = list(edited)
     same_artist = old.get("artist") == new.get("artist")
     same_md5 = old.get("file_md5") == new.get("file_md5")
     if old.get("scene_group") and not new.get("scene_group") and same_artist:
@@ -1152,6 +1165,7 @@ class TrackStore:
         album_artist: str | None = None,
         album: str | None = None,
         genre: str | None = None,
+        scene_group: str | None = None,
         format_: str | None = None,
         year_min: int | None = None,
         year_max: int | None = None,
@@ -1183,6 +1197,8 @@ class TrackStore:
             sets.append(self._tag_album.get(album.lower(), set()))
         if genre:
             sets.append(self._tag_genre.get(genre.lower(), set()))
+        if scene_group:
+            sets.append(self._tag_scene_group.get(scene_group.lower(), set()))
         if format_:
             sets.append(self._tag_format.get(format_.lower(), set()))
         if dir_hash:
@@ -1657,6 +1673,36 @@ class TrackStore:
                         break
             results.append({"genre": name, "count": count})
         results.sort(key=lambda x: x["genre"].lower())
+        return self._agg_cache_set(cache_key, results)
+
+    def aggregate_scene_group(self, primary_only: bool = False) -> list[dict]:
+        """Demoscene groups with track counts — a browse facet over the Demozoo
+        ``scene_group`` enrichment (a track credited to "Fairlight • Maniacs of
+        Noise" counts under both).  Mirrors ``aggregate_genres``: ``primary_only``
+        excludes hidden duplicates (web library opts in, Subsonic keeps raw),
+        cached under a distinct ``:primary`` key."""
+        hide_dups = primary_only
+        cache_key = "scene_group:primary" if hide_dups else "scene_group"
+        cached = self._agg_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        results: list[dict] = []
+        for key, tids in self._tag_scene_group.items():
+            if not tids:
+                continue
+            count = self._count_primaries(tids) if hide_dups else len(tids)
+            if count == 0:
+                continue
+            # Proper-cased display name from one member's scene_group string.
+            name = key
+            t = self._tracks.get(next(iter(tids)))
+            if t:
+                for g in (t.get("scene_group") or "").split(_SCENE_GROUP_SEP):
+                    if g.strip().lower() == key:
+                        name = g.strip()
+                        break
+            results.append({"scene_group": name, "count": count})
+        results.sort(key=lambda x: x["scene_group"].lower())
         return self._agg_cache_set(cache_key, results)
 
     def aggregate_formats(self, primary_only: bool = False) -> list[dict]:

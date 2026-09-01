@@ -28,7 +28,7 @@ or include their source code.
 | Tool | License | Usage |
 |------|---------|-------|
 | [FFmpeg](https://ffmpeg.org/) | LGPL-2.1 / GPL-2.0 (depending on build configuration) | Audio transcoding and format conversion. Invoked via subprocess for on-the-fly audio stream delivery. |
-| [libsidplayfp / sidplayfp](https://github.com/libsidplayfp/sidplayfp) | GPL-2.0 | Commodore 64 SID music emulation and playback. Invoked via subprocess to render SID files to audio. |
+| [libresidfp / libsidplayfp / sidplayfp](https://github.com/libsidplayfp/sidplayfp) | GPL-2.0-or-later | Commodore 64 SID music emulation and playback (accurate reSIDfp engine). Built from upstream source by install.sh (libresidfp → libsidplayfp → sidplayfp CLI, since Homebrew's libsidplayfp ships only the lighter `sidlite` engine) with the library closure bundled locally via `@loader_path` so a `brew upgrade` can't orphan it. Invoked via subprocess to render SID files to audio. |
 | [FluidSynth](https://github.com/FluidSynth/fluidsynth) | LGPL-2.1 | Software MIDI synthesizer. Invoked via subprocess to render MIDI files to audio using SoundFont banks. |
 | [libopenmpt / openmpt123](https://lib.openmpt.org/libopenmpt/) | BSD-3-Clause | Tracker module file playback (MOD, XM, S3M, IT, etc.). Invoked via subprocess to render module files to audio. |
 | [UADE / uade123](https://zakalwe.fi/uade/) | GPL-2.0 | Exotic Amiga music formats (AHX, TFMX, Future Composer, SidMon, and ~150 others) via emulated original Amiga player code. Invoked via subprocess. |

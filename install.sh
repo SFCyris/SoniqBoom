@@ -15,8 +15,138 @@ warn()    { echo -e "${YELLOW}⚠ $*${NC}"; }
 section() { echo -e "\n${BOLD}── $* ──${RESET}"; }
 die()     { echo -e "${RED}✗ $*${NC}" >&2; exit 1; }
 
+# ── Self-contained bundling (macOS) ──────────────────────────────────────────
+# From-source renderers (zxtune123, sidplayfp) link Homebrew dylibs dynamically,
+# so a later `brew upgrade` can orphan them (dyld "Symbol not found" / "Library
+# not loaded").  These copy a binary's full non-system dylib closure next to it
+# and repoint every reference to @loader_path, so it carries its own libs and no
+# future upgrade can break it.  Call _bundle_selfcontained with errexit+nounset
+# OFF (the array/otool/grep plumbing legitimately returns non-zero).
+_deps_src(){  # <macho> -> absolute SOURCE paths of bundle-worthy deps (resolves @loader_path)
+  local f="$1" dir; dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd)"
+  otool -L "$f" | awk '/\(compatibility version/{print $1}' | while read -r p; do
+    case "$p" in
+      /usr/lib/*|/System/*|"") ;;                          # system: skip
+      @loader_path/*) echo "$dir/${p#@loader_path/}" ;;    # sibling: resolve to abs
+      @rpath/*|@executable_path/*) ;;                       # unsupported: leak-check catches
+      /*) echo "$p" ;;                                      # absolute non-system: include
+    esac
+  done
+}
+_bundle_selfcontained(){  # <src_binary> <dest_dir>; non-zero on leak/missing dep
+  local src="$1" dest="$2" base; base="$(basename "$src")"
+  mkdir -p "$dest"; cp "$src" "$dest/$base"; chmod u+w "$dest/$base"
+  local -a todo closure=(); todo=($(_deps_src "$src"))
+  while [ "${#todo[@]}" -gt 0 ]; do
+    local dep="${todo[0]}"; todo=("${todo[@]:1}")
+    case " ${closure[*]} " in *" $dep "*) continue;; esac
+    [ -f "$dep" ] || { warn "  bundle: dep not found: $dep"; continue; }
+    closure+=("$dep"); todo+=($(_deps_src "$dep"))
+  done
+  local dep b f p
+  for dep in "${closure[@]}"; do                            # copy each in; clean @loader_path id
+    b="$(basename "$dep")"; cp "$dep" "$dest/$b"; chmod u+w "$dest/$b"
+    install_name_tool -id "@loader_path/$b" "$dest/$b" 2>/dev/null
+  done
+  for f in "$dest/$base" "$dest"/*.dylib; do                # repoint absolute non-system deps
+    [ -e "$f" ] || continue
+    for p in $(otool -L "$f" | awk '/\(compatibility version/{print $1}' | grep -E '^/' | grep -vE '^/usr/lib/|^/System/'); do
+      install_name_tool -change "$p" "@loader_path/$(basename "$p")" "$f" 2>/dev/null
+    done
+  done
+  for f in "$dest/$base" "$dest"/*.dylib; do codesign --force --sign - "$f" >/dev/null 2>&1; done
+  local leak=""                                             # falsifiable self-containment check
+  for f in "$dest"/*; do
+    for p in $(otool -L "$f" | awk '/\(compatibility version/{print $1}'); do
+      case "$p" in
+        /usr/lib/*|/System/*|"") ;;
+        @loader_path/*) [ -f "$dest/${p#@loader_path/}" ] || leak="$leak ${p}[missing]" ;;
+        *) leak="$leak $p" ;;
+      esac
+    done
+  done
+  [ -z "${leak// /}" ] || { warn "  bundle: unbundled refs remain:$leak"; return 1; }
+  return 0
+}
+_install_selfcontained(){  # <stage_dir> <dest_bin_dir>: install binary+dylibs, root-owned-safe
+  local stage="$1" dest="$2" sudo=""
+  [ -w "$dest" ] || sudo="sudo"
+  if [ -n "$sudo" ] && ! command -v sudo &>/dev/null; then
+    warn "cannot write $dest — copy $stage/* there by hand"; return 1
+  fi
+  $sudo cp "$stage"/* "$dest/" || { warn "could not install to $dest"; return 1; }
+}
+
+# ── Renderer cleanup (--clean / --rebuild) ───────────────────────────────────
+# Remove ONLY the renderers install.sh built from source (real files in the
+# install prefix) + their bundled @loader_path dylib closure + the build-on-first-
+# use helpers.  A Homebrew-managed player is a symlink into the Cellar — brew owns
+# it, so we skip it (the operator uses `brew reinstall <name>`).  Call with
+# errexit+nounset OFF (array/otool/grep plumbing).
+_clean_bundled_siblings(){  # <binary> <dir>: rm the binary's transitive @loader_path dylibs
+  command -v otool >/dev/null 2>&1 || return 0
+  local bin="$1" dir="$2"
+  local -a todo seen=()
+  todo=($(otool -L "$bin" 2>/dev/null | awk '/\(compatibility version/{print $1}' | sed -n 's#^@loader_path/##p'))
+  while [ "${#todo[@]}" -gt 0 ]; do
+    local n="${todo[0]}"; todo=("${todo[@]:1}")
+    case " ${seen[*]} " in *" $n "*) continue;; esac
+    [ -f "$dir/$n" ] || continue
+    seen+=("$n")
+    todo+=($(otool -L "$dir/$n" 2>/dev/null | awk '/\(compatibility version/{print $1}' | sed -n 's#^@loader_path/##p' | grep -vFx "$n"))
+  done
+  local n; for n in "${seen[@]}"; do rm -f "$dir/$n"; done
+}
+_clean_renderers(){
+  local bindir removed=0 name bin
+  bindir="$(brew --prefix 2>/dev/null || echo /usr/local)/bin"
+  for name in zxtune123 sidplayfp psgplay uade123 sc68; do
+    bin="$bindir/$name"
+    if [ -L "$bin" ]; then
+      warn "  $name is Homebrew-managed (symlink) — skipping (use 'brew reinstall $name')"
+    elif [ -f "$bin" ]; then
+      _clean_bundled_siblings "$bin" "$bindir"
+      rm -f "$bin" && { info "  removed $name + bundled libs"; removed=$((removed + 1)); }
+    fi
+  done
+  for name in ym2wav hvl2wav; do
+    if [ -f "$DATA_DIR/native/$name" ]; then
+      rm -f "$DATA_DIR/native/$name" && { info "  removed $name (rebuilds on first play)"; removed=$((removed + 1)); }
+    fi
+  done
+  info "cleaned $removed renderer artifact(s)"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
+
+# ── CLI options ──────────────────────────────────────────────────────────────
+MODE=install
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean)   MODE=clean ;;
+    --rebuild) MODE=rebuild ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: install.sh [--clean | --rebuild | --help]
+
+  (no option)   Install/update SoniqBoom and its renderers (idempotent —
+                already-present renderers are left as-is).
+  --rebuild     Delete the from-source renderers, then run the install so they
+                are rebuilt from scratch.
+  --clean       Delete the from-source renderers and exit (no install).
+  --help        Show this message.
+
+--clean/--rebuild affect ONLY the renderers install.sh builds from source —
+zxtune123, sidplayfp, psgplay (+ their bundled libraries) and the build-on-first-
+use ym2wav/hvl2wav.  Homebrew-managed players (fluidsynth, openmpt123, adplay,
+sc68, uade123) are left untouched; use `brew reinstall <name>` to rebuild those.
+EOF
+      exit 0 ;;
+    *) warn "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
 
 OS_KIND="$(uname -s)"
 case "$OS_KIND" in
@@ -25,6 +155,26 @@ case "$OS_KIND" in
   *)      die "Unsupported platform: $OS_KIND.  SoniqBoom targets macOS and Linux." ;;
 esac
 info "Detected platform: ${PLATFORM}"
+
+# Data dir (mirrors run.sh) — where the build-on-first-use helpers live.
+if [ -n "${SONIQBOOM_DATA_DIR:-}" ]; then
+  DATA_DIR="$SONIQBOOM_DATA_DIR"
+elif [ "$PLATFORM" = "macos" ]; then
+  DATA_DIR="$HOME/Library/Application Support/SoniqBoom"
+else
+  DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soniqboom"
+fi
+
+# --clean / --rebuild: wipe the from-source renderers up front.  --clean stops
+# here; --rebuild falls through into the normal install, which rebuilds them.
+if [ "$MODE" = clean ] || [ "$MODE" = rebuild ]; then
+  section "Removing from-source renderers (--$MODE)"
+  set +eu; _clean_renderers; set -eu
+  if [ "$MODE" = clean ]; then
+    info "Clean complete.  Run './install.sh' (or './install.sh --rebuild') to rebuild."
+    exit 0
+  fi
+fi
 
 # ── Pre-flight: tools we assume are already present ──────────────────────────
 # On Linux we build a couple of players from source (git clone + make), and git
@@ -82,22 +232,57 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "ffmpeg (system): $(ffmpeg -version 2>&1 | head -1)"
 
-  if ! command -v sidplayfp &>/dev/null; then
-    info "Installing libsidplayfp library…"
-    brew install libsidplayfp
-    brew install pkgconf 2>/dev/null || true
-
-    SIDPLAYFP_VER="2.16.2"
-    info "Building sidplayfp CLI player v${SIDPLAYFP_VER} from source…"
-    TMPBUILD="$(mktemp -d)"
-    curl -sL "https://github.com/libsidplayfp/sidplayfp/releases/download/v${SIDPLAYFP_VER}/sidplayfp-${SIDPLAYFP_VER}.tar.gz" \
-      -o "$TMPBUILD/sidplayfp.tar.gz"
-    tar xzf "$TMPBUILD/sidplayfp.tar.gz" -C "$TMPBUILD"
-    (cd "$TMPBUILD/sidplayfp-${SIDPLAYFP_VER}" && \
-      ./configure --prefix="$(brew --prefix)" --quiet && \
-      make -j"$(sysctl -n hw.ncpu)" --quiet && \
-      make install --quiet)
-    rm -rf "$TMPBUILD"
+  # sidplayfp (C64 SID) — built from source with the accurate reSIDfp engine.
+  # Homebrew's libsidplayfp 3.x ships ONLY the lightweight `sidlite` engine
+  # (reSIDfp was split into an external libresidfp that has no brew formula), and
+  # a from-source binary linking Homebrew's rolling libsidplayfp gets orphaned by
+  # the next `brew upgrade libsidplayfp` (dyld "Library not loaded").  So build the
+  # whole chain — libresidfp → libsidplayfp(+reSIDfp) → sidplayfp CLI — into a
+  # private prefix and bundle its dylib closure via @loader_path
+  # (_bundle_selfcontained).  All three are GPL-2.0-or-later, used at arm's length
+  # (subprocess) and built from upstream source, so SoniqBoom's AGPL-3.0 is
+  # unaffected.  The --version probe re-heals a present-but-orphaned binary.
+  if command -v sidplayfp &>/dev/null && sidplayfp --version &>/dev/null; then
+    info "sidplayfp already installed: $(command -v sidplayfp)"
+  else
+    BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+    RESIDFP_VER="1.2.2"; LIBSID_VER="3.1.0"; SIDCLI_VER="3.1.0"
+    if [ -z "$BREW_PREFIX" ]; then
+      warn "sidplayfp: brew unavailable — skipping (SID disabled)"
+    else
+      brew install pkgconf 2>/dev/null || true
+      SID_TMP="$(mktemp -d)"; SID_PREFIX="$SID_TMP/prefix"; mkdir -p "$SID_PREFIX"
+      SID_PKGCONF="$SID_PREFIX/lib/pkgconfig:$BREW_PREFIX/lib/pkgconfig"
+      info "Building the accurate SID chain (libresidfp→libsidplayfp→sidplayfp, ~2-3 min)…"
+      _sid_lib(){  # <url> <subdir> <log>: fetch + configure + make + make install
+        curl -sfL "$1" -o "$SID_TMP/s.tgz" && tar xzf "$SID_TMP/s.tgz" -C "$SID_TMP" \
+          && ( cd "$SID_TMP/$2" && PKG_CONFIG_PATH="$SID_PKGCONF" ./configure --prefix="$SID_PREFIX" --quiet \
+               && make -j"$(sysctl -n hw.ncpu)" && make install ) >"$SID_TMP/$3" 2>&1
+      }
+      if _sid_lib "https://github.com/libsidplayfp/libresidfp/releases/download/v${RESIDFP_VER}/libresidfp-${RESIDFP_VER}.tar.gz" "libresidfp-${RESIDFP_VER}" "1_residfp.log" \
+         && _sid_lib "https://github.com/libsidplayfp/libsidplayfp/releases/download/v${LIBSID_VER}/libsidplayfp-${LIBSID_VER}.tar.gz" "libsidplayfp-${LIBSID_VER}" "2_libsid.log" \
+         && curl -sfL "https://github.com/libsidplayfp/sidplayfp/releases/download/v${SIDCLI_VER}/sidplayfp-${SIDCLI_VER}.tar.gz" -o "$SID_TMP/cli.tgz" \
+         && tar xzf "$SID_TMP/cli.tgz" -C "$SID_TMP" \
+         && ( cd "$SID_TMP/sidplayfp-${SIDCLI_VER}" && PKG_CONFIG_PATH="$SID_PKGCONF" ./configure --prefix="$SID_PREFIX" --quiet \
+              && make -j"$(sysctl -n hw.ncpu)" ) >"$SID_TMP/3_cli.log" 2>&1; then
+        SIDBIN="$(find "$SID_TMP/sidplayfp-${SIDCLI_VER}" -name sidplayfp -type f -perm -u+x -print -quit 2>/dev/null)"
+        SID_STAGE="$SID_TMP/stage"
+        if [ -n "$SIDBIN" ] && [ -x "$SIDBIN" ]; then
+          set +eu; _bundle_selfcontained "$SIDBIN" "$SID_STAGE"; _sid_ok=$?; set -eu
+          if [ "$_sid_ok" -eq 0 ] && "$SID_STAGE/sidplayfp" --version >/dev/null 2>&1; then
+            _install_selfcontained "$SID_STAGE" "$BREW_PREFIX/bin" || true
+          else
+            warn "sidplayfp self-contained bundling failed — see $SID_TMP (SID disabled)"
+          fi
+        else
+          warn "sidplayfp CLI build produced no binary — see $SID_TMP/3_cli.log (SID disabled)"
+        fi
+      else
+        warn "sidplayfp chain build failed — see $SID_TMP/*.log (SID disabled)"
+      fi
+      # Clean up only on a verified-working install (keep logs for diagnosis otherwise).
+      command -v sidplayfp &>/dev/null && sidplayfp --version &>/dev/null && rm -rf "$SID_TMP"
+    fi
   fi
   info "sidplayfp: $(command -v sidplayfp || echo 'not found')"
 
@@ -481,7 +666,7 @@ case "$(uname -m)" in
   *)             ZXARCH="" ;;
 esac
 ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/zxtune_r5100_linux_${ZXARCH}.tar.gz"
-if command -v zxtune123 &>/dev/null; then
+if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
 elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
@@ -496,22 +681,44 @@ elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   info "zxtune123: $(command -v zxtune123 || echo 'not installed — PSF/USF/GSF/… disabled')"
 elif [ "$PLATFORM" = "macos" ]; then
   warn "Building zxtune123 from source (one-time, ~10-15 min; needs boost)…"
-  brew list boost &>/dev/null || brew install boost
+  brew list boost &>/dev/null || brew install boost || true
   ZX_TMP="$(mktemp -d)"
-  if git clone -q https://github.com/vitamin-caig/zxtune.git "$ZX_TMP/zxtune" \
+  # Capture brew paths defensively — a failed `brew install boost` or `brew --prefix`
+  # must skip this OPTIONAL section, not abort the whole installer (set -e).
+  BREW_BOOST="$(brew --prefix boost 2>/dev/null || true)"
+  BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+  if [ -z "$BREW_BOOST" ] || [ -z "$BREW_PREFIX" ]; then
+    warn "zxtune123: boost/brew unavailable — skipping (PSF/USF/GSF/… disabled)"
+    rm -rf "$ZX_TMP"
+  elif git clone -q https://github.com/vitamin-caig/zxtune.git "$ZX_TMP/zxtune" \
       && git -C "$ZX_TMP/zxtune" checkout -q "$ZXTUNE_REV"; then
     ( cd "$ZX_TMP/zxtune" \
       && sed -i '' 's/if (!subLocation\.unique())/if (subLocation.use_count() != 1)/; s/if (!Subdata\.unique())/if (Subdata.use_count() != 1)/' src/core/plugins/archives/raw_supp.cpp \
       && sed -i '' 's/#    define FMT_CONSTEVAL consteval/#    define FMT_CONSTEVAL/' 3rdparty/fmt/include/fmt/core.h \
-      && env CPATH="$(brew --prefix boost)/include" LIBRARY_PATH="$(brew --prefix boost)/lib" \
+      && env CPATH="$BREW_BOOST/include" LIBRARY_PATH="$BREW_BOOST/lib" \
          make system.zlib=1 platform=darwin -C apps/zxtune123 -j"$(sysctl -n hw.ncpu)" ) \
-      >/dev/null 2>&1 || true
+      >"$ZX_TMP/build.log" 2>&1 || true
     ZXBIN="$ZX_TMP/zxtune/bin/darwin/release/zxtune123"
     if [ -x "$ZXBIN" ]; then
-      cp "$ZXBIN" "$(brew --prefix)/bin/zxtune123"
+      # Make the build self-contained so a later `brew upgrade boost` can't orphan
+      # it (boost 1.92 relocated program_options::arg into detail:: — renaming the
+      # exported symbol — and every earlier build stopped loading).  boost is
+      # BSL-1.0 and these are the user's own local dylibs, so bundling is fine.
+      # errexit/nounset off around the bundler (its otool/grep plumbing returns 1).
+      STAGE="$ZX_TMP/stage"
+      set +eu; _bundle_selfcontained "$ZXBIN" "$STAGE"; _ok=$?; set -eu
+      if [ "$_ok" -eq 0 ] && "$STAGE/zxtune123" --version >/dev/null 2>&1; then
+        _install_selfcontained "$STAGE" "$BREW_PREFIX/bin" || true
+      else
+        warn "zxtune123 self-contained bundling failed — see $ZX_TMP/build.log (PSF/USF/GSF/… disabled)"
+      fi
+    else
+      warn "zxtune123 build failed — see $ZX_TMP/build.log"
     fi
   fi
-  rm -rf "$ZX_TMP"
+  # Keep the temp tree (and build.log) on failure; clean up only on a verified-
+  # working install (mirrors sidplayfp — a rebuild-over-orphan failure keeps its log).
+  command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null && rm -rf "$ZX_TMP"
   info "zxtune123: $(command -v zxtune123 || echo 'build failed — PSF/USF/GSF/… disabled (re-run install.sh to retry)')"
 else
   warn "zxtune123: no prebuilt for this platform — PSF-family formats disabled"

@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=91">
+  <link rel="stylesheet" href="/assets/css/app.css?v=93">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -108,7 +108,8 @@
                placeholder="Search… try  artist:Ghost  year:&gt;2020  format:FLAC"
                title='Field search: artist: album: album_artist: genre: format: year:>2020 (or <2020, or 2010-2020).  Quote values with spaces.'
                aria-label="Search library — supports artist:, album:, year:, format: filters"
-               autocomplete="off">
+               autocomplete="off"
+               readonly>
         <button id="search-clear" type="button" class="search-clear" hidden
                 aria-label="Clear search">&times;</button>
       </div>
@@ -150,6 +151,8 @@
             <li data-view="albums"       tabindex="0" role="button">Albums</li>
             <li data-view="genres"       tabindex="0" role="button">Genres</li>
             <li data-view="years"        tabindex="0" role="button">Years</li>
+            <li data-view="scene_groups" tabindex="0" role="button" hidden
+                title="Browse by demoscene group (from Demozoo enrichment)">Scene groups</li>
             <li data-view="galaxy"       tabindex="0" role="button" title="Explore your library as a galaxy of format clusters — click one to filter to that format">Galaxy</li>
           </ul>
           <div id="browse-filter-wrap" hidden>
@@ -1524,7 +1527,14 @@
             <div class="admin-io-row">
               <button id="md-demozoo-refresh" class="btn-secondary">Download / refresh index (~192&nbsp;MB)</button>
               <button id="md-demozoo-apply">Apply to library</button>
+              <button id="md-demozoo-reset" class="btn-secondary"
+                      title="Remove all Demozoo enrichment (release years, scene groups, auto-filled composers). Your own tag edits are kept.">Reset enrichment</button>
             </div>
+            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+              <input type="checkbox" id="md-demozoo-autoapply">
+              <span>Re-apply automatically after each library scan
+                <span style="opacity:.7">(off keeps a reset in place until you re-apply)</span></span>
+            </label>
             <div id="md-demozoo-msg" class="admin-msg" style="display:none"></div>
           </div>
         </div>
@@ -1782,7 +1792,7 @@
           </div>
           <!-- Quick stats under artwork -->
           <div class="ti-stats">
-            <div class="ti-stat-row"><span id="ti-format">—</span></div>
+            <div class="ti-stat-row"><span id="ti-format">—</span><span id="ti-surround" class="surround-badge" hidden></span></div>
             <div class="ti-stat-row"><span id="ti-bit-depth">—</span> / <span id="ti-sample-rate">—</span></div>
             <div class="ti-stat-row"><span id="ti-channels">—</span> · <span id="ti-bitrate">—</span></div>
             <div class="ti-stat-row ti-stat-size"><span id="ti-file-size">—</span></div>
@@ -2237,7 +2247,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=140"></script>
+  <script type="module" src="/assets/js/app.js?v=166"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

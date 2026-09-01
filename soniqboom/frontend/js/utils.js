@@ -206,6 +206,44 @@ export function isRenderOnlyDuration(t) {
 }
 
 /**
+ * Static tracker / SID / MIDI format names.  Kept here (not in trackinfo.js) so
+ * both the info panel and the track list agree on what a "module" is — the
+ * surround badge must never disagree with the panel's channel label.
+ */
+export const MODULE_FORMAT_NAMES = new Set([
+  'SID', 'MIDI', 'ProTracker', 'ScreamTracker 3', 'FastTracker 2',
+  'Impulse Tracker', 'MultiTracker', 'OctaMED', 'Composer 669',
+  'DigiBooster Pro', 'AHX', 'HivelyTracker', 'UltraTracker',
+  'ScreamTracker 2', 'Farandole', 'ASYLUM/DMP', 'General DigiMusic',
+  'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
+]);
+
+/** Module-family test: static tracker/SID/MIDI names plus the dynamic-name
+ *  scene families (uade Amiga exotica, Atari ST, PSF console rips).  These
+ *  formats' ``channels`` are synth VOICES, not a speaker layout. */
+export function isModuleFamily(t) {
+  if (!t) return false;
+  return MODULE_FORMAT_NAMES.has(t.format)
+      || isUadeAmigaTrack(t)
+      || ATARI_FORMAT_NAMES.has(t.format)
+      || PSF_FORMAT_NAMES.has(t.format);
+}
+
+/**
+ * Speaker-layout tag for a REAL multichannel PCM track ("5.1", "7.1", …), or
+ * null for mono/stereo AND for every module/chip format (whose ``channels`` are
+ * synth voices — an 8-voice .s3m is NOT 7.1).  Single source of truth for the
+ * surround badge in both the track list and the info panel; mirrors the panel's
+ * long-form ``_fmtChannels`` label (6→5.1, 8→7.1).
+ */
+export function surroundLabel(t) {
+  if (!t || isModuleFamily(t)) return null;
+  const n = t.channels;
+  if (!n || n <= 2) return null;
+  return { 3: '2.1', 4: '4.0', 6: '5.1', 7: '6.1', 8: '7.1' }[n] || `${n}ch`;
+}
+
+/**
  * Containers whose tags core/tagwriter.py (mutagen, easy interface) can
  * actually WRITE: ID3/EasyMP3, EasyMP4, VorbisComment, APEv2.  An
  * ALLOWLIST by extension, not a format-name denylist, because (a) the
