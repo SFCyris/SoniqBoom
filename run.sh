@@ -40,6 +40,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Mount-safe "is the port busy?" probe.  A localhost /dev/tcp connect only ever
+# touches the loopback stack, so — unlike `lsof` — it can NOT block on a stale
+# network mount (SMB/NFS/FTP fd).  That deadlock used to wedge this start script
+# in its port pre-check, before the server ever launched.  True (0) iff
+# something is accepting on PORT (the server binds 0.0.0.0, which 127.0.0.1 hits).
+_port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; }
+
 # ── Pre-flight ───────────────────────────────────────────────────────────────
 if [ ! -f "$SONIQBOOM" ]; then
   echo -e "${RED}SoniqBoom not installed. Run: bash install.sh${NC}"
@@ -68,18 +75,29 @@ fi
 # process).  Without this, we'd launch a second process that fails to bind and
 # dies — and the readiness check below would then falsely succeed against the
 # incumbent, reporting "ready" while the new code never ran.  ``shutdown.sh``'s
-# port fallback can clear an orphan.  Degrades to no-op if lsof is unavailable.
-if command -v lsof &>/dev/null; then
-  PORT_HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-  if [ -n "$PORT_HOLDER" ]; then
-    echo ""
-    echo -e "${BOLD}── SoniqBoom ──${RESET}"
-    echo ""
-    echo -e "  ${RED}Port ${PORT} is already in use (pid ${PORT_HOLDER}).${NC}"
-    echo -e "  Run ${BOLD}bash shutdown.sh${RESET} first, or start with ${BOLD}--port <number>${RESET}."
-    echo ""
-    exit 1
+# port fallback can clear an orphan.
+#
+# Detection uses the mount-safe _port_busy probe, NOT lsof — lsof can deadlock
+# on a stale network-mount fd, which used to hang this start indefinitely before
+# the server launched.  lsof is used only to NAME the holder in the message, and
+# is bounded with -S so it can't block; if it's absent or times out we still
+# refuse to start, just without the pid.
+if _port_busy; then
+  PORT_HOLDER=""
+  if command -v lsof &>/dev/null; then
+    PORT_HOLDER=$(lsof -S 5 -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   fi
+  echo ""
+  echo -e "${BOLD}── SoniqBoom ──${RESET}"
+  echo ""
+  if [ -n "$PORT_HOLDER" ]; then
+    echo -e "  ${RED}Port ${PORT} is already in use (pid ${PORT_HOLDER}).${NC}"
+  else
+    echo -e "  ${RED}Port ${PORT} is already in use.${NC}"
+  fi
+  echo -e "  Run ${BOLD}bash shutdown.sh${RESET} first, or start with ${BOLD}--port <number>${RESET}."
+  echo ""
+  exit 1
 fi
 
 # ── First-run admin bootstrap ────────────────────────────────────────────────

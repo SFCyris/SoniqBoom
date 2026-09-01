@@ -2125,6 +2125,7 @@ const views = {
   albums:        () => Library.showAlbums(),
   genres:        () => Library.showGenres(),
   years:         () => Library.showYears(),
+  scene_groups:  () => Library.showSceneGroups(),
   galaxy:        () => Library.showGalaxy(),
 };
 
@@ -2160,7 +2161,20 @@ function _bindNav(rootSel, viewMap) {
       );
       li.setAttribute('aria-current', 'page');
       const view = li.dataset.view;
-      if (viewMap[view]) viewMap[view]();
+      const _viewP = viewMap[view] ? viewMap[view]() : null;
+      // During a boot view-restore, fall back to All Tracks if the restored
+      // view's async render rejects (e.g. its /api fetch fails) — the default
+      // boot showAll() was skipped, so without this the pane would be left on the
+      // skeleton shimmer.  No-op for normal clicks (fire-and-forget as before).
+      if (_restoringBootView && _viewP && typeof _viewP.catch === 'function') {
+        _viewP.catch(() => {
+          // Fall back to All Tracks THROUGH its nav item (not a bare
+          // Library.showAll()) so the sidebar highlight, aria-current, and
+          // sb_last_view all move to All Tracks too — otherwise they'd stay
+          // pointing at the view whose fetch just failed.
+          try { document.querySelector('#nav-library li[data-view="all"]')?.click(); } catch (_) {}
+        });
+      }
       // Remember the last-active view across reloads so power-users land
       // back where they were (UX/UI #1 #17).
       try {
@@ -2184,25 +2198,71 @@ function _bindNav(rootSel, viewMap) {
   });
 }
 
+let _restoringBootView = false;   // true only while the boot view-restore click runs
 _bindNav('#nav-library', views);
 _bindNav('#nav-smart',   smartViews);
 
-// Restore the last-active view (UX/UI #1 #17) — Library.showAll runs at
-// boot below, but if the user was on a different view at last reload we
-// switch to it after the initial render so they land where they were.
+// Restore the last-active view (UX/UI #1 #17).  If the user was on a non-'all'
+// view at last reload, restore it — and SKIP the boot Library.showAll() below.
+// showAll() is async (count probe → windowed render); left to run it would race
+// the restored view's own async render and, completing second, overwrite it with
+// a track list — the "Scene-groups restore shows tracks" bug.  The nav <li>s are
+// already wired (\_bindNav ran above), so we can resolve the target synchronously
+// to decide whether to suppress showAll; only the click itself is deferred.
+let _bootRestoreView = false;
 try {
   const saved = JSON.parse(localStorage.getItem('sb_last_view') || 'null');
   if (saved && saved.view && saved.view !== 'all') {
     const sel = saved.section === 'smart'
       ? `#nav-smart li[data-view="${saved.view}"]`
       : `#nav-library li[data-view="${saved.view}"]`;
-    // Defer to the next microtask so views/smartViews entries are wired.
-    Promise.resolve().then(() => {
-      const li = document.querySelector(sel);
-      if (li) li.click();
-    });
+    const li = document.querySelector(sel);
+    if (li) {
+      _bootRestoreView = true;   // synchronous → the boot showAll() below is skipped
+      Promise.resolve().then(() => {
+        _restoringBootView = true;    // activate() attaches a showAll fallback on reject
+        li.click();                   // activate runs synchronously here
+        _restoringBootView = false;
+      });
+    }
   }
 } catch {}
+
+// Reveal the "Scene groups" browse facet only when the library actually carries
+// Demozoo scene enrichment — it stays hidden (and out of the way) for a library
+// with no demoscene music, and appears once an apply/scan has populated groups.
+// Re-run after a scan completes too: the post-scan auto-apply may have landed
+// the FIRST scene data, which the boot-time check (already run) couldn't see.
+function _refreshSceneGroupsFacet() {
+  return fetch('/api/library/scene-groups', { credentials: 'same-origin' })
+    .then((r) => (r.ok ? r.json() : []))
+    .then((groups) => {
+      const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
+      if (!li || !Array.isArray(groups) || !groups.length) return false;
+      li.hidden = false;
+      let badge = li.querySelector('.nav-count');
+      if (!badge) { badge = document.createElement('span'); badge.className = 'nav-count'; li.appendChild(badge); }
+      badge.textContent = groups.length.toLocaleString();
+      return true;                              // facet revealed — stop any poll
+    })
+    .catch(() => false);
+}
+// Poll the facet after a scan until the (backgrounded) post-scan Demozoo
+// auto-apply has landed its scene data, then stop.  The auto-apply settles ~10s
+// after the scan and, on a large library / modest CPU (e.g. a 4-core box with
+// 200K+ tracks), the first-ever apply can run well past any single fixed timer.
+// So instead of two guessed timeouts we walk a backoff ladder (~4 min total),
+// bailing the instant the facet reveals — or when the ladder is exhausted (a
+// library with no demoscene music, where the facet correctly stays hidden).
+function _pollSceneGroupsFacet(delays) {
+  const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
+  if (li && !li.hidden) return;                 // already revealed — nothing to do
+  _refreshSceneGroupsFacet().then((revealed) => {
+    if (revealed || !delays.length) return;
+    setTimeout(() => _pollSceneGroupsFacet(delays.slice(1)), delays[0]);
+  });
+}
+_refreshSceneGroupsFacet();
 
 // ── Remote-freshness helpers ──────────────────────────────────────────────────
 //
@@ -2636,6 +2696,26 @@ requestAnimationFrame(() => {
 // once we've seen processed >= total; the moment the backend says the
 // scan is not running we flip the badge to "Done" ourselves.  Cleared
 // by any subsequent non-running scan_progress event.
+// Decide how to refresh the main panel after a scan finishes, WITHOUT stealing
+// the user's place.  A folder viewer whose folder was touched refreshes in
+// place; the canonical All-Tracks list refreshes via showAll(); every OTHER view
+// — a group list (Genres / Scene groups / …), a search result, a format filter —
+// is left exactly as-is.  A re-index must never yank the user out of where they
+// navigated.  Shared by the WS scan-complete handler, the WS embedding handler,
+// AND the HTTP stuck-badge watchdog so the three can't drift (the watchdog is
+// the fallback for a dropped final WS frame — the very case that most needs this
+// guard).  `allowAllTracksRefresh` is false for silent background freshness
+// scans, which must not reset the All-Tracks scroll position.
+function _refreshMainAfterScan(finished, allowAllTracksRefresh = true) {
+  if (Library.isInFolderView && Library.isInFolderView()) {
+    if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
+      Library.refreshCurrentFolderInPlace();
+    }
+  } else if (allowAllTracksRefresh && Library.isInAllTracksView && Library.isInAllTracksView()) {
+    Library.showAll();
+  }
+}
+
 let _stuckBadgeTimer = null;
 function _armStuckBadgeWatchdog() {
   if (_stuckBadgeTimer) return;
@@ -2655,13 +2735,10 @@ function _armStuckBadgeWatchdog() {
           // Same in-place rule as the WS completion handler: don't reset a
           // folder viewer to root (the HTTP status carries last_dirs too).
           const finished = Array.isArray(st.last_dirs) ? st.last_dirs : [];
-          if (Library.isInFolderView && Library.isInFolderView()) {
-            if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
-              Library.refreshCurrentFolderInPlace();
-            }
-          } else {
-            Library.showAll();
-          }
+          // Same "don't steal the user's place" rule as the WS handler — and
+          // crucially the watchdog (a dropped-final-frame fallback) must honor it
+          // too, or a group/search view is still yanked to All Tracks here.
+          _refreshMainAfterScan(finished);
           FolderTree.refresh();
         } catch (_) { /* defensive — module may not be ready */ }
       }
@@ -2762,11 +2839,10 @@ function connectWS() {
         scanBadge.hidden = false;
         scanBadge.textContent = 'Computing embeddings…';
         _disarmStuckBadgeWatchdog();
-        // Library is already usable — refresh, but don't yank a folder viewer
-        // back to root just because phase-2 embeddings started.
-        if (!(Library.isInFolderView && Library.isInFolderView())) {
-          Library.showAll();
-        }
+        // Library is already usable — refresh All Tracks in place if that's where
+        // the user is, but never yank a folder / group / search view just because
+        // phase-2 embeddings started.
+        _refreshMainAfterScan([], !msg.silent);
         // Don't rebuild the sidebar tree here — embeddings add no folders, and
         // FolderTree.refresh() collapses every expanded node back to root.
         FolderTree.setScanActive(true);
@@ -2780,6 +2856,12 @@ function connectWS() {
         _disarmStuckBadgeWatchdog();
         Library.refreshBadges();
         FolderTree.setScanActive(false);
+        // The post-scan Demozoo auto-apply runs a few seconds AFTER scan
+        // completion (backgrounded), so poll the Scene-groups facet on a backoff
+        // ladder until it lands — a library gaining its first scene data reveals
+        // the facet without a page reload, even when the apply outlasts a single
+        // fixed timer on a big library / slow box.
+        _pollSceneGroupsFacet([8000, 12000, 20000, 40000, 60000, 90000]);
         // Refresh the MAIN panel by what the user is actually looking at.
         // The old unconditional Library.showAll() reset the view to root on
         // EVERY scan completion \u2014 the "re-index finishes and I lose my place"
@@ -2788,14 +2870,15 @@ function connectWS() {
         // only a NON-silent (explicit re-index) completion with no open folder
         // falls back to showAll().  The in-place refresh runs for silent +
         // visible scans alike, so drill-down freshness updates quietly.
+        // Refresh the main panel without stealing the user's place: All Tracks in
+        // place, a touched folder in place, every other view (group list, search
+        // result, format filter) left alone.  Silent freshness scans don't
+        // refresh All Tracks (would reset scroll for a background poll).  This is
+        // also what made a boot-time scan-complete overwrite a just-restored
+        // Scene-groups view with a track list (the WS event fires seconds after a
+        // server restart).
         const finished = Array.isArray(msg.last_dirs) ? msg.last_dirs : [];
-        if (Library.isInFolderView && Library.isInFolderView()) {
-          if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
-            Library.refreshCurrentFolderInPlace();
-          }
-        } else if (!msg.silent) {
-          Library.showAll();
-        }
+        _refreshMainAfterScan(finished, !msg.silent);
         // Only rebuild the sidebar tree on an EXPLICIT re-index (which may add
         // or remove roots).  A silent drill-down / freshness completion must
         // NOT \u2014 FolderTree.refresh() rebuilds from root and would collapse the
@@ -3382,7 +3465,10 @@ document.addEventListener('keydown', (e) => {
 })();
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-Library.showAll();
+// Skip the default All-Tracks render when a non-'all' view is being restored
+// above — otherwise showAll()'s async windowed render races and overwrites the
+// restored view (e.g. Scene groups) with a track list.
+if (!_bootRestoreView) Library.showAll();
 FolderTree.refresh();
 // Populate the sidebar playlist list on startup.  Without this, the sidebar
 // only rendered once the user opened the right-hand playlist panel (which

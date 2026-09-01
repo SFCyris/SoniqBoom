@@ -282,9 +282,10 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   // view visible so the user sees the existing playlists rather than a
   // "0 tracks" empty-state that looks identical to a real empty playlist.
   let loadFailed = false;
+  let loadedTracks = [];
   try {
-    const data    = await _api(`/playlists/${id}`);
-    _activeTracks = data.tracks || [];
+    const data   = await _api(`/playlists/${id}`);
+    loadedTracks = data.tracks || [];
   } catch (err) {
     loadFailed = true;
     console.warn('Failed to open playlist:', err);
@@ -295,6 +296,13 @@ async function _openPlaylist(id, name, _focusPanel = true) {
     _activeId = null;
     return;
   }
+
+  // A newer _openPlaylist (rapid A→B) may have superseded this one while it
+  // loaded — _activeId now points at B.  Bail BEFORE mutating shared state so B's
+  // slower load isn't overwritten by A's tracks (a later re-render would paint
+  // A's tracks under B's header) or panel.
+  if (_activeId !== id) return;
+  _activeTracks = loadedTracks;   // commit only after confirming we're still current
 
   plActiveNm.textContent = name;
   plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;

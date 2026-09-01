@@ -697,6 +697,7 @@ const _BUCKETS = [
 ];
 
 async function _renderCountry(cont, country, bucket = 'top10') {
+  const gen = _renderGen;   // top-level view-switch guard (matches the sibling renderers)
   _setCrumbs([
     { label: 'World', fn: _renderWorld },
     { label: cont.continent, fn: () => _renderContinent(cont) },
@@ -706,16 +707,20 @@ async function _renderCountry(cont, country, bucket = 'top10') {
   body.innerHTML = `<div class="st-tabs">${_BUCKETS.map(([k, lbl]) =>
     `<button class="st-tab ${k === bucket ? 'on' : ''}" data-b="${k}">${lbl}</button>`).join('')}
     </div><div class="st-tab-body"><div class="st-empty">Loading…</div></div>`;
+  // Capture THIS render's tab-body: a rapid bucket switch (or country re-select)
+  // replaces it, so a late fetch must not fill a tab-body that's been detached.
+  const tb = body.querySelector('.st-tab-body');
   body.querySelectorAll('.st-tab').forEach((b) => {
     b.addEventListener('click', () => _renderCountry(cont, country, b.dataset.b));
   });
   try {
     const stations = await _fetchJson(
       `/api/stations/country/${encodeURIComponent(country.code)}?bucket=${bucket}`);
-    _stationRows(body.querySelector('.st-tab-body'), stations);
+    if (gen !== _renderGen || !tb.isConnected) return;   // superseded by a newer view / bucket
+    _stationRows(tb, stations);
   } catch (e) {
-    const tb = body.querySelector('.st-tab-body');
-    if (tb) tb.innerHTML = `<div class="st-empty">Could not load: ${esc(e.message)}</div>`;
+    if (gen !== _renderGen || !tb.isConnected) return;
+    tb.innerHTML = `<div class="st-empty">Could not load: ${esc(e.message)}</div>`;
   }
 }
 

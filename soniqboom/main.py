@@ -729,6 +729,11 @@ def _reap_orphaned_forkservers() -> int:
     return reaped
 
 
+# Strong refs to detached fire-and-forget startup tasks — without a live reference
+# asyncio may garbage-collect a bare create_task() mid-flight (CPython docs).
+_BG_TASKS: "set" = set()
+
+
 @app.on_event("startup")
 async def startup():
     global _aof_writer, _merger_proc
@@ -781,6 +786,40 @@ async def startup():
         asyncio.create_task(reap_orphan_zip_extracts(), name="reap_zip_extracts")
     except Exception:
         log.debug("zip-extract reap scheduling failed", exc_info=True)
+
+    # Full renderer health check a few seconds after boot: exec-probe every
+    # plain-binary renderer and log a one-line summary, WARNing on any that are
+    # present-but-broken (e.g. a from-source zxtune123/sidplayfp orphaned by a
+    # Homebrew library upgrade — dyld "Symbol not found"/"Library not loaded" —
+    # which passes a file-exists check but 501s at play time).  Surfaces it once,
+    # loudly, so the operator learns before a listener hits a dead format.
+    # Fire-and-forget with a strong ref (asyncio may GC a bare task); the short
+    # delay keeps the exec probes off the boot-critical path.
+    async def _probe_renderer_health():
+        try:
+            await asyncio.sleep(5)
+            from soniqboom.api.admin import validate_renderers
+            status = await validate_renderers()
+            broken = {n: v for n, v in status.items() if v["status"] == "broken"}
+            missing = sorted(n for n, v in status.items() if v["status"] == "missing")
+            ok = sum(1 for v in status.values() if v["status"] == "ok")
+            log.info("renderer health: %d ok, %d broken, %d missing (of %d binary renderers)",
+                     ok, len(broken), len(missing), len(status))
+            for name, v in broken.items():
+                log.warning(
+                    "renderer %s is installed at %s but FAILS TO LOAD — a shared "
+                    "library was upgraded out from under it; reinstall or rebuild it "
+                    "to fix (its formats are disabled until then).", name, v["path"])
+            if missing:
+                log.info("renderers not installed (their formats are unavailable): %s",
+                         ", ".join(missing))
+        except Exception:
+            log.debug("renderer health probe failed", exc_info=True)
+    try:
+        _t = asyncio.create_task(_probe_renderer_health(), name="renderer_health_probe")
+        _BG_TASKS.add(_t); _t.add_done_callback(_BG_TASKS.discard)
+    except Exception:
+        log.debug("renderer health probe scheduling failed", exc_info=True)
 
     # Pre-warm the per-scan-root sorted cache for every LOCAL scan root.
     # Pays the one-time O(bucket-size) iterate + TrackMeta shape cost
@@ -1552,6 +1591,13 @@ async def shutdown():
             await asyncio.wait_for(_cast_reaper_task, timeout=1.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
+
+    # Cancel any detached fire-and-forget startup tasks still pending (e.g. the
+    # renderer-health probe within its 5 s delay) so shutdown doesn't log a stray
+    # "Task was destroyed but it is pending".
+    for _t in list(_BG_TASKS):
+        if not _t.done():
+            _t.cancel()
 
     # Stop the deadlock watchdog so its asyncio.sleep doesn't keep the
     # event loop alive past the shutdown budget.  Idempotent.

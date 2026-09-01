@@ -6,7 +6,7 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations } from './utils.js';
+import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel } from './utils.js';
 
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
@@ -148,6 +148,34 @@ const groupFilterInput  = document.getElementById('group-filter-input');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentTracks = [];
+// True ONLY while the canonical All-Tracks list is the current main view — set
+// by showAll(), cleared by every other render (renderTracks default + the group
+// list).  Distinguishes All Tracks from a search result, a group drill, or a
+// format filter (all of which also flow through renderTracks / a windowed
+// store), so a post-scan refresh can update All Tracks in place without yanking
+// the user out of any other view.  Read via Library.isInAllTracksView().
+let _viewIsAllTracks = false;
+// Generation tokens for the streamed group-list / album-grid renders (their
+// rows/cards paint across animation frames): bumped by their own renderer AND by
+// renderTracks, so drilling into a track view cancels the outgoing stream's
+// pending batches instead of letting it append onto/behind the new view.
+// Declared here so renderTracks (defined above their renderers) can invalidate.
+let _groupRenderGen = 0;
+let _albumGridGen = 0;
+// Cross-view navigation generation.  Every async view-entry (group lists +
+// All Tracks) bumps this at its start and captures the value; after its fetch
+// resolves it bails if a NEWER view was requested meanwhile, so a slow first
+// fetch can't overwrite a faster second view's content (repro: click Artists
+// then Genres before /library/artists resolves — the late artist render used
+// to paint artist rows under the "Genre" header).  renderTracks bumps it too,
+// so navigating to any track view also invalidates a still-loading group list.
+let _browseNavGen = 0;
+// Identity of the smart view currently on screen, for refreshSmartOnPlay's
+// auto-refresh — recorded as the nav token at render time + the view key, so a
+// play-record refreshes ONLY the genuine History/Most-Played view, not a folder
+// or album that merely happens to share the "Most Played" crumb text.
+let _smartViewToken = -1;
+let _smartViewKey = null;
 let sortKey = null;
 let sortAsc = true;
 // Extra query params for the windowed track view (the chunked /tracks fetcher
@@ -552,7 +580,7 @@ const _CANONICAL_ROW_HTML = `
     <td class="col-track"></td>
     <td class="col-year"></td>
     <td class="col-dur"></td>
-    <td class="col-format"><span class="fmt-badge"></span></td>
+    <td class="col-format"><span class="fmt-badge"></span><span class="surround-badge" hidden></span></td>
     <td class="col-location"></td>
     <td class="col-rating"></td>`;
 
@@ -736,6 +764,21 @@ function _fillTrackRow(tr, t, i) {
   const fmtBadge = cells[9].firstElementChild;
   fmtBadge.className = `fmt-badge fmt-${_fmtClass(t.format)}`;
   fmtBadge.textContent = t.format || '';
+  // Surround marker (5.1 / 7.1 / …) — only real multichannel PCM audio, never
+  // module "voices" (see surroundLabel).  Inline, so the row height stays fixed
+  // for the virtual scroll; always toggled so a pooled row reused for a stereo
+  // track drops a prior badge.
+  const surBadge = fmtBadge.nextElementSibling;
+  if (surBadge) {                                  // defensive: never break the row render
+    const surLbl = surroundLabel(t);
+    if (surLbl) {
+      surBadge.textContent = surLbl;
+      surBadge.title = `${surLbl} surround`;
+      surBadge.hidden = false;
+    } else {
+      surBadge.hidden = true;
+    }
+  }
 
   // col-location
   const locTd = cells[10];
@@ -924,9 +967,37 @@ document.addEventListener('themechange', () => {
   _vsRender(true);
 });
 
+// Render full-search results as a flat, sortable track list.  Search used to
+// call renderTracks() directly, which leaves whatever header/filter chrome the
+// previous view set up — so searching from e.g. Genres showed the results under
+// a "Genre" colspan header with no sortable columns and a live "Filter genres…"
+// bar (typing in which wiped the results).  Restoring the full header + hiding
+// the group filter/grid toggle first makes search results always look and
+// behave like a proper track list, regardless of where the search was launched.
+function showSearchResults(tracks) {
+  hideBrowseHeader();
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  renderTracks(tracks);
+}
+
 async function renderTracks(tracks) {
   _leaveGalaxy();          // switching to a table view exits the galaxy
   currentTracks = tracks;
+  // Cancel any in-flight group-list / album-grid stream (both paint across
+  // animation frames).  Rendering a track list — a group drill, a search, or All
+  // Tracks — means that streamed view is gone, so its pending batches must NOT
+  // keep appending stale rows/cards on top of / behind these tracks.
+  // (Repro: click a genre before its 447-row list finished streaming.)
+  _groupRenderGen++;
+  _albumGridGen++;
+  _browseNavGen++;         // a track view is now rendering → cancel any still-loading group list
+  // Default: a bare renderTracks (search result, group drill, format filter, a
+  // folder view) is NOT the canonical All-Tracks list — showAll() re-asserts the
+  // flag after it renders.  Keeps isInAllTracksView() honest for the post-scan
+  // refresh gate.
+  _viewIsAllTracks = false;
   _selected.clear();
   _lastClickIdx = -1;
   _focusedIdx   = -1;
@@ -1632,15 +1703,28 @@ function _restoreSortState() {
   document.querySelectorAll('th[data-sort]').forEach(t => {
     if (t.dataset.sort) t.setAttribute('aria-sort', 'none');
   });
+  // Restore the persisted sort STATE (sortKey/sortAsc) only — do NOT paint the
+  // header arrow here.  restoreFullHeader() runs for every flat track view
+  // (search, drills, smart, duplicates, format), but only showAll() actually
+  // re-applies the persisted sort to the data.  Painting the arrow here would
+  // show e.g. a "Year ↑" indicator over a Most-Played list ordered by play
+  // count — a lying indicator.  The view that honors the sort paints it via
+  // _paintSortIndicator().
   if (key) {
     sortKey = key;
     sortAsc = asc !== '0';
-    // Apply visual + aria indicator to the header
-    const th = document.querySelector(`th[data-sort="${sortKey}"]`);
-    if (th) {
-      th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
-      _updateAriaSort(th, sortAsc);
-    }
+  }
+}
+
+// Paint the sort arrow (+ aria) for the CURRENT sortKey/sortAsc.  Called only by
+// the view that genuinely renders the data in that order (showAll), never by the
+// shared restoreFullHeader — see _restoreSortState.
+function _paintSortIndicator() {
+  if (!sortKey) return;
+  const th = document.querySelector(`th[data-sort="${sortKey}"]`);
+  if (th) {
+    th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
+    _updateAriaSort(th, sortAsc);
   }
 }
 
@@ -1663,6 +1747,40 @@ function _compareTrack(a, b, key, asc) {
 // attach sites can't drift.
 function _onSortHeaderClick(th) {
   const key = th.dataset.sort;
+
+  // Windowed mode: the loaded chunks cover ~20K of N rows, so an in-memory sort
+  // would lie about positions outside the loaded window.  We round-trip to the
+  // backend, which has pre-computed sorted indexes per column (store.py
+  // _SORT_INDEX_MAP).  Keys without a backend index (track_number, path) can't
+  // sort here — bail with an explanation FIRST, before touching sort state or
+  // header classes, so a non-sortable column doesn't paint a phantom sort arrow
+  // (nor clear the real active sort's indicator).
+  // Bail FIRST (before touching sort state or header classes) for windowed views
+  // that can't be server-sorted, so we don't paint a phantom arrow or clobber the
+  // real active sort:
+  //   • keys with no backend sort index (track_number, path), OR
+  //   • a FOLDER windowed store — its rows come from /api/fstree, not /api/tracks,
+  //     so routing through _rebuildWindowedStore would refetch the WHOLE library
+  //     and replace the folder with it.  (Small folders use the in-memory path
+  //     below and DO sort correctly.)
+  const inFolder = !!(isInFolderView && isInFolderView());
+  if (currentTracks && currentTracks._isWindowedStore
+      && (!WINDOWED_SORT_KEYS.has(key) || inFolder)) {
+    if (window.Toast?.info) {
+      window.Toast.info(inFolder
+        ? 'Sorting isn’t available in a large folder view yet — open it from All Tracks to sort.'
+        : `Sort by ${key.replace('_', ' ')} isn't available in the full-library view yet.`);
+    }
+    return;
+  }
+
+  // A sort re-renders the CURRENT view reordered — it does NOT change which view
+  // we're on.  Capture the All-Tracks flag so we can restore it after the render
+  // (both _rebuildWindowedStore→renderTracks and the in-memory renderTracks clear
+  // it), or a *sorted* All-Tracks view would silently stop receiving the
+  // post-scan in-place refresh (isInAllTracksView would read false).
+  const wasAllTracks = _viewIsAllTracks;
+
   if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
   document.querySelectorAll('th[data-sort]').forEach(t => {
     t.classList.remove('sorted', 'sorted-asc', 'sorted-desc');
@@ -1671,29 +1789,17 @@ function _onSortHeaderClick(th) {
   _updateAriaSort(th, sortAsc);
   _saveSortState();
 
-  // Windowed mode: the loaded chunks cover ~20K of N rows, so an
-  // in-memory sort would lie about positions outside the loaded window.
-  // Round-trip to the backend instead, which has pre-computed sorted
-  // indexes per column (store.py _SORT_INDEX_MAP).  Keys without a
-  // backend index (track_number, path) toast-explain instead of producing
-  // a partial sort.
   if (currentTracks && currentTracks._isWindowedStore) {
-    if (!WINDOWED_SORT_KEYS.has(key)) {
-      if (window.Toast?.info) {
-        window.Toast.info(
-          `Sort by ${key.replace('_', ' ')} isn't available in the full-library view yet.`,
-        );
-      }
-      return;
-    }
     const total = currentTracks._total;
     _rebuildWindowedStore(total, key, sortAsc ? 'asc' : 'desc');
+    _viewIsAllTracks = wasAllTracks;
     return;
   }
 
   // Small-library path: client-side sort over the full in-memory array.
   const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
   renderTracks(sorted);
+  _viewIsAllTracks = wasAllTracks;
 }
 
 document.querySelectorAll('#track-table th[data-sort]').forEach(th => {
@@ -1721,26 +1827,63 @@ const FULL_HEADERS = `
   <th class="col-rating">★</th>`.trim();
 
 function setGroupHeader(label) {
+  // Leaving All Tracks AND any folder view the instant a group view is entered —
+  // clear both "which view am I on" flags SYNCHRONOUSLY (before this view's async
+  // data load) so a background _refreshMainAfterScan can't see a stale
+  // isInAllTracksView()/isInFolderView()===true mid-fetch and fire showAll() /
+  // refreshCurrentFolderInPlace(), which would clobber the group nav just made.
+  // showAlbums is the only group view that doesn't also call hideBrowseHeader at
+  // entry, so without the path clear here a folder→Albums nav could be repainted
+  // with the old folder's tracks by its in-flight background scan.
+  _viewIsAllTracks = false;
+  _currentBrowsePath = null;
+  // Hide the PREVIOUS group view's filter bar synchronously on entering a new
+  // group view, so it doesn't linger through this view's async data load —
+  // navigating e.g. Scene groups → Genres used to keep the stale "Filter scene
+  // groups…" bar on screen for the whole fetch.  renderGroupList re-shows it
+  // with this view's own label + count once the data lands.
+  if (groupFilterBar) { groupFilterBar.hidden = true; if (groupFilterInput) groupFilterInput.value = ''; }
   if (!trackTableHead) return;
   trackTableHead.innerHTML = `<th colspan="12" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`;
 }
 
-function restoreFullHeader() {
-  _dupViewActive = false;  // leaving duplicates view — restore user column prefs
+// Rebuild the full sortable track-table header (FULL_HEADERS + fresh sort
+// listeners + column visibility/resize).  Paints NO sort arrow (the view that
+// re-applies the sort paints it) and does NOT clear the folder path — so both a
+// non-folder view (via restoreFullHeader) and a folder view (via showFolder) can
+// present the same clean, sortable columns instead of inheriting a stale arrow
+// or a group colspan header from whatever view came before.
+function _rebuildTrackHeader() {
   if (!trackTableHead) return;
   trackTableHead.innerHTML = FULL_HEADERS;
   // Re-attach sort listeners after rebuilding the header.  Uses the same
-  // ``_onSortHeaderClick`` as the initial wire-up — single source of
-  // truth so the two attach sites can't drift on what counts as a
-  // sortable header click.
+  // ``_onSortHeaderClick`` as the initial wire-up — single source of truth so
+  // the two attach sites can't drift on what counts as a sortable header click.
   trackTableHead.querySelectorAll('th[data-sort]').forEach(th => {
     if (!th.dataset.sort) return;
     th.addEventListener('click', () => _onSortHeaderClick(th));
   });
-  // Restore persisted sort indicator
-  _restoreSortState();
   _applyColVisibility();
   _initColResize();
+}
+
+function restoreFullHeader() {
+  _dupViewActive = false;  // leaving duplicates view — restore user column prefs
+  // Leaving folder context: every non-folder flat-track view (All Tracks, drills,
+  // smart views, duplicates, "Go to artist/album" pivots, search results) calls
+  // restoreFullHeader, while showFolder does NOT — so this is the one place that
+  // reliably clears the folder path.  Without it, navigating folder → Most Played
+  // (or a pivot) left _currentBrowsePath set, so isInFolderView() stayed true and
+  // a post-scan refresh yanked the user back into the old folder.
+  _currentBrowsePath = null;
+  // Same reasoning for the All-Tracks flag: a drill / "Go to artist/album" pivot
+  // launched FROM All Tracks would otherwise leave _viewIsAllTracks true across its
+  // fetch, so a non-silent scan completion would fire showAll() and yank the user
+  // back to All Tracks.  showAll re-asserts the flag true after its own render, so
+  // clearing it here (before that) is safe.
+  _viewIsAllTracks = false;
+  _rebuildTrackHeader();
+  _restoreSortState();  // restore sortKey/sortAsc STATE + aria baseline (no paint)
 }
 
 // ── Column visibility ──────────────────────────────────────────────────────────
@@ -1868,6 +2011,7 @@ const WINDOWED_SORT_KEYS = new Set([
 ]);
 
 async function showAll() {
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   _hideGroupFilter();
   _hideGridToggle();
@@ -1884,6 +2028,7 @@ async function showAll() {
     const { count } = await API('/tracks/count');
     total = Number(count) || 0;
   } catch { /* fall through to legacy path */ }
+  if (_gen !== _browseNavGen) return;   // a newer view was requested while probing the count
 
   if (total > limit) {
     // Pick up persisted sort state so the windowed view comes back the
@@ -1896,6 +2041,12 @@ async function showAll() {
     const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
     const sortOrder = sortBy ? (sortAsc ? 'asc' : 'desc') : null;
     _rebuildWindowedStore(total, sortBy, sortOrder);
+    _viewIsAllTracks = true;        // re-assert after renderTracks(store) cleared it
+    // Paint the sort arrow ONLY for a key the windowed store actually honors
+    // (a WINDOWED_SORT_KEY).  A persisted track_number/path key leaves the store
+    // in default order, so no arrow — restoreFullHeader no longer auto-paints it,
+    // so there is nothing stale to clear here.
+    if (sortBy) _paintSortIndicator();
     _updateNavBadge('all', total);  // exact total, no "+" needed
     return;
   }
@@ -1903,8 +2054,17 @@ async function showAll() {
   // Small-library path (≤ 5000): legacy single-fetch array — simpler,
   // no chunking overhead, no skeleton rows for unloaded slots.
   const tracks = await API('/tracks', { limit });
+  if (_gen !== _browseNavGen) return;   // a newer view was requested while fetching the page
   _showAddFolderCta = (total === 0);   // genuinely-empty library → offer the add-folder CTA
-  renderTracks(tracks);
+  // Apply the persisted sort in memory so the header arrow (painted by
+  // _restoreSortState inside restoreFullHeader) matches the data.  The small-
+  // library path renders a plain unsorted array from /tracks; the windowed path
+  // sorts server-side, and this is its ≤5000-track equivalent.  Any key works
+  // here (in-memory _compareTrack), unlike the windowed WINDOWED_SORT_KEYS set.
+  const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
+  renderTracks(rows);
+  _viewIsAllTracks = true;             // re-assert after renderTracks cleared it
+  if (sortKey) _paintSortIndicator();  // small path applies ANY key in memory → arrow is honest
   const truncated = tracks.length >= limit;
   _updateNavBadge('all', tracks.length, truncated);
   if (truncated) _refreshTrackCount();
@@ -1932,7 +2092,11 @@ function _rebuildWindowedStore(total, sortBy, sortOrder) {
   // When a chunk lands, re-paint the visible window so the skeleton
   // rows we showed get replaced with real data.  ``_vsRender(true)``
   // forces the render even though _vsStart/_vsEnd didn't move.
-  store.setOnChunkLoad(() => _vsRender(true));
+  // Guard the repaint on the store still being the active view: a late chunk
+  // from a windowed store the user (or a boot view-restore) has since navigated
+  // away from must NOT overwrite the new view — this is what let a slow initial
+  // All-Tracks chunk repaint tracks over a just-restored Scene-groups list.
+  store.setOnChunkLoad(() => { if (currentTracks === store) _vsRender(true); });
   // Reset scroll + selection — the indexes the user was looking at no
   // longer point at the same tracks.
   _selected.clear();
@@ -1944,15 +2108,17 @@ function _rebuildWindowedStore(total, sortBy, sortOrder) {
 }
 
 async function showArtists() {
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   setGroupHeader('Artist');
   _hideGridToggle();
   _showSkeletonRows(12);
   const artists = await API('/library/artists');
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('artists', artists.length);
-  renderGroupList(artists, 'artist', 'count', 'Albums', (item) => {
+  renderGroupList(artists, 'artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.artist) {
-      showUntaggedTracks('artist', '[No Artist]', () => showArtists());
+      showUntaggedTracks('artist', '[No Artist]', () => showArtists(), item.count);
     } else {
       showAlbums(item.artist, null, 'artist');
     }
@@ -1960,16 +2126,18 @@ async function showArtists() {
 }
 
 async function showAlbumArtists() {
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   setGroupHeader('Album Artist');
   _hideGridToggle();
   _showSkeletonRows(12);
   const albumArtists = await API('/library/album-artists');
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('album_artists', albumArtists.length);
-  renderGroupList(albumArtists, 'album_artist', 'count', 'Albums', (item) => {
+  renderGroupList(albumArtists, 'album_artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.album_artist) {
       // "[No Album Artist]" — show all untagged tracks directly
-      showUntaggedTracks('album_artist', '[No Album Artist]', () => showAlbumArtists());
+      showUntaggedTracks('album_artist', '[No Album Artist]', () => showAlbumArtists(), item.count);
     } else {
       showAlbums(null, item.album_artist, 'album_artist');
     }
@@ -1977,12 +2145,27 @@ async function showAlbumArtists() {
 }
 
 async function showAlbums(artist = null, albumArtist = null, backView = null) {
+  const _gen = ++_browseNavGen;
   const params = {};
   if (artist) params.artist = artist;
   if (albumArtist) params.album_artist = albumArtist;
   setGroupHeader('Album');
   _showSkeletonRows(12);
   const albums = await API('/library/albums', params);
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  // An artist / album-artist whose tracks carry no album tag yields zero album
+  // groups — drilling in would dead-end on an "No tracks found" empty state even
+  // though the artist HAS tracks (e.g. loose singles).  Fall back to the flat
+  // track list for that artist so the drill is never a dead end.
+  if (albums.length === 0 && (artist || albumArtist)) {
+    const fbBack = backView === 'album_artist'
+      ? () => showAlbumArtists()
+      : backView === 'artist'
+        ? () => showArtists()
+        : undefined;
+    if (artist) { showArtistTracks(artist, fbBack); return; }
+    if (albumArtist) { showAlbumArtistTracks(albumArtist, fbBack); return; }
+  }
   if (!artist && !albumArtist) _updateNavBadge('albums', albums.length);
   const backLabel = artist || albumArtist || null;
   const backFn = backView === 'album_artist'
@@ -1999,14 +2182,15 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
     const backTo = () => showAlbums(artist, albumArtist, backView);
     if (item.label || !item.album) {
       // "[No Album]" — show tracks without album metadata
-      showUntaggedTracks('album', '[No Album]', backTo);
+      showUntaggedTracks('album', '[No Album]', backTo, item.count);
     } else {
       showAlbumTracks(item.artist, item.album_artist, item.album, backTo);
     }
   });
 }
 
-async function showUntaggedTracks(field, label, backFn) {
+async function showUntaggedTracks(field, label, backFn, total = 0) {
+  const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
@@ -2014,11 +2198,18 @@ async function showUntaggedTracks(field, label, backFn) {
   _showSkeletonRows();
   // Fetch a large batch and filter client-side (tag index can't query empty fields)
   const all = await API('/tracks', { limit: 5000 });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   const filtered = all.filter(t => !t[field] || !t[field].toString().trim());
   renderTracks(filtered);
+  // This drill fetches only the first 5,000 tracks and filters client-side, so a
+  // large untagged set (e.g. 200k+ mod/SID files with no album-artist) is shown
+  // only partially.  Disclose the shortfall in the crumb like every other capped
+  // drill instead of silently implying the (now accurate) badge count is listed.
+  _noteDrillCap(filtered.length, total);
 }
 
 async function showAlbumTracks(artist, albumArtist, album, backFn) {
+  const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
@@ -2028,11 +2219,12 @@ async function showAlbumTracks(artist, albumArtist, album, backFn) {
   setBrowseHeader(label, backFn || (() => showAlbums()));
   _showSkeletonRows();
   // Build filter params — omit empty/null values so the API isn't confused
-  const params = { limit: 500 };
+  const params = { limit: _DRILL_LIMIT };
   if (albumArtist) params.album_artist = albumArtist;
   else if (artist) params.artist = artist;
   if (album) params.album = album;
   const tracks = await API('/search/filter', params);
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   // Sort by disc number, then track number (album track order)
   tracks.sort((a, b) => {
     const da = a.disc_number ?? 0, db = b.disc_number ?? 0;
@@ -2041,18 +2233,38 @@ async function showAlbumTracks(artist, albumArtist, album, backFn) {
     return ta - tb;
   });
   renderTracks(tracks);
+  _noteDrillCap(tracks.length);            // album total unknown here → generic cue if capped
 }
 
 // "Go to artist" — every track by this artist as a track list.  Used by the
 // track context menu so you can pivot from one track to the whole artist.
 async function showArtistTracks(artist, backFn) {
+  const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
   setBrowseHeader(`Artist: ${artist}`, backFn || (() => showArtists()));
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { limit: 500, artist });
+  const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, artist });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _noteDrillCap(tracks.length);            // artist total unknown here → generic cue if capped
+}
+
+// Flat track list for an album-artist.  Mirrors showArtistTracks; used as the
+// zero-album fallback in showAlbums so an album-artist whose tracks have no
+// album tag still resolves to its tracks instead of an empty album view.
+async function showAlbumArtistTracks(albumArtist, backFn) {
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader(`Album Artist: ${albumArtist}`, backFn || (() => showAlbumArtists()));
+  _showSkeletonRows();
+  const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, album_artist: albumArtist });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  renderTracks(tracks);
+  _noteDrillCap(tracks.length);
 }
 
 // Snapshot the current view so a "Go to …" navigation can offer a Back that
@@ -2088,33 +2300,96 @@ function _goToAlbum(t) {
 }
 
 async function showGenres() {
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   setGroupHeader('Genre');
   _hideGridToggle();
   _showSkeletonRows(12);
   const genres = await API('/library/genres');
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('genres', genres.length);
-  renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => showGenreTracks(item.genre));
+  renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => showGenreTracks(item.genre, item.count));
 }
 
-async function showGenreTracks(genre) {
+// Drill-down fetch ceiling — the /search/filter endpoint's `le` bound.  The
+// row list is virtual-scrolled (see createWindowedStore / _vsRender), so a full
+// facet only holds track dicts in memory, not DOM rows.
+const _DRILL_LIMIT = 2000;
+
+// Append an honest capped-list note to the browse crumb when a drill-down is
+// bigger than the fetch ceiling, so a giant facet (e.g. a 124K-track "Module"
+// genre, or a prolific composer's "every track" pivot) renders a visibly-capped
+// list rather than silently dropping the overflow — the count-vs-list mismatch
+// the user would otherwise hit after clicking a row whose badge promised far
+// more.  Two modes: when the true total is known (facet rows carry a count) the
+// note is precise ("of 124,738"); when it isn't (artist/album pivots don't
+// pre-know the size) the note fires only once the fetch actually hit the ceiling.
+// Scene groups top out well under the ceiling, so this note never shows for them.
+function _noteDrillCap(shown, total = 0) {
+  let note = '';
+  if (total > 0) {
+    if (shown >= total) return;
+    note = ` — showing first ${shown.toLocaleString()} of ${total.toLocaleString()} (refine to narrow)`;
+  } else if (shown >= _DRILL_LIMIT) {
+    note = ` — showing first ${shown.toLocaleString()} (refine to narrow)`;
+  } else {
+    return;
+  }
+  try { browseCrumb.textContent += note; } catch (_) { /* crumb missing — non-fatal */ }
+}
+
+async function showGenreTracks(genre, total = 0) {
+  const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
   setBrowseHeader(`Genre: ${genre}`, () => showGenres());
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { genre, limit: 500 });
+  const tracks = await API('/search/filter', { genre, limit: _DRILL_LIMIT });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _noteDrillCap(tracks.length, total);
 }
 
 async function showYears() {
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   setGroupHeader('Year');
   _hideGridToggle();
   _showSkeletonRows(12);
   const years = await API('/library/years');
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('years', years.length);
-  renderGroupList(years, 'year', 'count', 'Tracks', (item) => showYearTracks(item.year));
+  renderGroupList(years, 'year', 'count', 'Tracks', (item) => showYearTracks(item.year, item.count));
+}
+
+async function showSceneGroups() {
+  const _gen = ++_browseNavGen;
+  hideBrowseHeader();
+  setGroupHeader('Scene group');
+  _hideGridToggle();
+  _showSkeletonRows(12);
+  const groups = await API('/library/scene-groups');
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  _updateNavBadge('scene_groups', groups.length);
+  renderGroupList(groups, 'scene_group', 'count', 'Tracks',
+                  (item) => showSceneGroupTracks(item.scene_group, item.count));
+}
+
+async function showSceneGroupTracks(scene_group, total = 0) {
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader(`Scene group: ${scene_group}`, () => showSceneGroups());
+  _showSkeletonRows();
+  // Keeps the drill-down list consistent with the group-row count the user just
+  // clicked — the biggest scene groups here run ~1.7K tracks, well under
+  // _DRILL_LIMIT, so the whole group renders and _noteDrillCap stays silent.
+  const tracks = await API('/search/filter', { scene_group, limit: _DRILL_LIMIT });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  renderTracks(tracks);
+  _noteDrillCap(tracks.length, total);
 }
 
 // ── Library Galaxy view (viz #6) ──────────────────────────────────────────
@@ -2126,9 +2401,19 @@ function _leaveGalaxy() {
   if (wrap) wrap.style.display = '';
 }
 async function showGalaxy() {
+  // Bump the nav token even though Galaxy renders no track list: a group/drill/
+  // smart fetch still in flight when the user clicks Galaxy would otherwise pass
+  // its own guard (token unchanged) and its renderGroupList/renderTracks would
+  // call _leaveGalaxy(), yanking the user back out of the Galaxy they just opened.
+  const _gen = ++_browseNavGen;
   hideBrowseHeader();
   _hideGroupFilter();
   _hideGridToggle();
+  // Galaxy is a canvas viz, not a track list — it never goes through
+  // renderTracks(), so clear the All-Tracks flag explicitly.  Otherwise, coming
+  // from All Tracks, a post-scan refresh would think we're still on All Tracks
+  // and renderTracks/_leaveGalaxy would yank the user out of the Galaxy view.
+  _viewIsAllTracks = false;
   setGroupHeader('Galaxy');
   // Hide the table surfaces, reveal the galaxy canvas host.
   const wrap = document.getElementById('track-list-wrap');
@@ -2140,6 +2425,7 @@ async function showGalaxy() {
   // Lazy-mount; clicking a cluster filters the library to that format.
   if (!_galaxy && view) {
     const { mountGalaxy } = await import('./viz/galaxy.js');
+    if (_gen !== _browseNavGen) return;   // superseded during the (first-mount) import
     _galaxy = mountGalaxy(view, {
       onPickFormat: (fmt, count) => showFormatTracks(fmt, count),
     });
@@ -2148,6 +2434,7 @@ async function showGalaxy() {
   }
 }
 async function showFormatTracks(format, count = 0) {
+  const _gen = ++_browseNavGen;
   restoreFullHeader();
   setBrowseHeader(`Format: ${format}`, () => showGalaxy());
   _hideGridToggle();
@@ -2166,25 +2453,38 @@ async function showFormatTracks(format, count = 0) {
       total = hit ? Number(hit.count) || 0 : 0;
     } catch { /* fall through to single-fetch */ }
   }
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while probing the count
   if (total > WINDOW_THRESHOLD) {
     const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
     const sortOrder = sortBy ? (sortAsc ? 'asc' : 'desc') : null;
     _rebuildWindowedStore(total, sortBy, sortOrder);   // renders the windowed store
+    // The store fetched server-SORTED chunks, so paint the arrow to match — same
+    // as showAll's windowed branch (restoreFullHeader no longer auto-paints it).
+    if (sortBy) _paintSortIndicator();
     return;
   }
-  // Small format: a single format-filtered fetch (no chunking overhead).
+  // Small format: a single format-filtered fetch (no chunking overhead).  Apply
+  // the persisted sort in memory + paint the arrow, mirroring showAll's small
+  // path AND the windowed format branch above — so the same "Format:" view sorts
+  // consistently regardless of size.
   const tracks = await API('/tracks', { format, limit: WINDOW_THRESHOLD });
-  renderTracks(tracks);
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
+  renderTracks(rows);
+  if (sortKey) _paintSortIndicator();
 }
 
-async function showYearTracks(year) {
+async function showYearTracks(year, total = 0) {
+  const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
   setBrowseHeader(`Year: ${year}`, () => showYears());
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { year_min: year, year_max: year, limit: 500 });
+  const tracks = await API('/search/filter', { year_min: year, year_max: year, limit: _DRILL_LIMIT });
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _noteDrillCap(tracks.length, total);
 }
 
 // ── Grid toggle helpers ────────────────────────────────────────────────────────
@@ -2236,7 +2536,6 @@ function _loadAlbumCardArt(card, trackId) {
 // tens of thousands of one-track SID/MOD "albums" no longer freeze the thread
 // on the flip to grid or attach 100k+ listeners.  Focus ring is pure CSS
 // (.album-card:focus-visible), so no per-card focus/blur handlers either.
-let _albumGridGen = 0;
 let _albumGridItems = [];
 let _albumGridOnClick = null;
 let _albumGridWired = false;
@@ -2276,6 +2575,13 @@ function _wireAlbumGridDelegation(albumGrid) {
     const item = itemOf(e.target);
     if (item) { e.preventDefault(); _albumGridOnClick?.(item); }
   });
+}
+
+// Pluralise a group-row count label: "1 Album" / "2 Albums", "1 Track" /
+// "3 Tracks".  countLabel is stored plural; drop the trailing "s" when the
+// count is exactly 1 so single-item rows read grammatically.
+function _countText(n, countLabel) {
+  return `${n} ${n === 1 ? countLabel.replace(/s$/, '') : countLabel}`;
 }
 
 function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
@@ -2351,7 +2657,7 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
       // Cards behave like buttons; the focus ring is CSS :focus-visible.
       card.tabIndex = 0;
       card.setAttribute('role', 'button');
-      card.setAttribute('aria-label', `${name}, ${count} ${countLabel}`);
+      card.setAttribute('aria-label', `${name}, ${_countText(count, countLabel)}`);
       card.innerHTML = `
         <div class="album-card-art">
           <span class="album-card-initials">${esc(initials)}</span>
@@ -2359,7 +2665,7 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
         </div>
         <div class="album-card-info">
           <div class="album-card-title" title="${esc(name)}">${esc(name)}</div>
-          <div class="album-card-sub">${count} ${countLabel}</div>
+          <div class="album-card-sub">${_countText(count, countLabel)}</div>
         </div>`;
       frag.appendChild(card);
       _albumArtObserver.observe(card);      // lazy art; fires once connected + visible
@@ -2381,6 +2687,7 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
   _groupOnClick  = onClick;
 
   currentTracks = [];
+  _viewIsAllTracks = false;   // a group list is not the All-Tracks view
   loadingEl.hidden = true;
   emptyEl.hidden = items.length > 0;
 
@@ -2403,8 +2710,9 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
         : nameKey === 'album' ? 'Albums'
         : nameKey === 'genre' ? 'Genres'
         : nameKey === 'year' ? 'Years'
+        : nameKey === 'scene_group' ? 'Scene groups'
         : nameKey.charAt(0).toUpperCase() + nameKey.slice(1);
-      groupFilterLabel.textContent = `${items.length} ${viewLabel}`;
+      groupFilterLabel.textContent = `${items.length.toLocaleString()} ${viewLabel}`;
       groupFilterInput.value = '';
       groupFilterInput.placeholder = `Filter ${viewLabel.toLowerCase()}…`;
       groupFilterBar.hidden = false;
@@ -2437,8 +2745,6 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
   _updateAzRail();
 }
 
-let _groupRenderGen = 0;
-
 function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
   // Group rows replace the tbody — drop any pool nodes that were here.
   _vsResetPool();
@@ -2456,7 +2762,7 @@ function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
       <td class="col-num"></td>
       <td class="col-cover"></td>
       <td class="col-title" colspan="7" style="font-weight:500;${item.label ? 'font-style:italic;color:var(--text2)' : ''}">${esc(item.label || item[nameKey] || '—')}</td>
-      <td class="col-dur" style="color:var(--text2)">${item[countKey]} ${countLabel}</td>
+      <td class="col-dur" style="color:var(--text2)">${_countText(item[countKey] || 0, countLabel)}</td>
       <td class="col-rating"></td>`;
     tr.style.cursor = 'pointer';
     tr.addEventListener('click', () => onClick(item));
@@ -2963,12 +3269,30 @@ Player.on('trackchange', (track) => {
 });
 
 async function showFolder(path, recursive = false, opts = {}) {
+  // A real folder navigation bumps the nav token; a quiet in-place refresh only
+  // CAPTURES it (no bump) so it stays a background op — but it still bails below
+  // if the user navigated to another view during its fetch.  (_sameTrackList
+  // compares against the NEW view's currentTracks, so it can't catch that on its
+  // own — a quiet refresh landing under a genre list would wipe it otherwise.)
+  const _gen = opts.quiet ? _browseNavGen : ++_browseNavGen;
   _currentBrowsePath = path;
+  _viewIsAllTracks = false;   // a folder is never All Tracks — keep both flags consistent
+                              // (showFolder doesn't call restoreFullHeader, which is where
+                              // the other flat-track views clear this)
   _currentBrowseRecursive = recursive;
   _hideGridToggle();
   // ``opts.quiet`` = an in-place freshness refresh (not a user navigation):
   // skip the skeleton flash and don't re-schedule another background scan.
-  if (!opts.quiet) _showSkeletonRows();
+  if (!opts.quiet) {
+    // Present clean, sortable track columns — a folder must not inherit a stale
+    // sort arrow (folders render in /api/fstree order, not the persisted sort)
+    // or a group colspan header from whatever view came before.  Rebuild here
+    // rather than via restoreFullHeader so the folder path we just set is kept.
+    // (Skipped on the quiet in-place refresh so it doesn't reset column widths.)
+    _rebuildTrackHeader();
+    _hideGroupFilter();
+    _showSkeletonRows();
+  }
 
   setBrowseHeader(path.split('/').filter(Boolean).pop() || path, () => {
     hideBrowseHeader();
@@ -3027,6 +3351,7 @@ async function showFolder(path, recursive = false, opts = {}) {
     const firstChunk = windowed
       ? (Array.isArray(first.tracks) ? first.tracks : [])
       : (Array.isArray(first) ? first : []);
+    if (_gen !== _browseNavGen) return;   // superseded by a newer view (or nav during a quiet refresh)
 
     // Branch-folder case: the clicked directory has no DIRECT audio
     // (e.g. ``modarchive_2007`` root holds only zip subfolders).  Auto-flatten
@@ -3039,8 +3364,21 @@ async function showFolder(path, recursive = false, opts = {}) {
     // Whole folder fit in the first chunk → render it directly (the common
     // album-sized case; no windowed store needed).
     if (total <= firstChunk.length) {
-      if (opts.quiet && _sameTrackList(firstChunk, currentTracks)) return;
-      renderTracks(firstChunk);
+      // Preserve a sort the user applied to THIS folder across a quiet freshness
+      // refresh.  A small folder is sortable in memory (see _onSortHeaderClick),
+      // which paints an arrow for sortKey; the fresh chunk comes back in fstree
+      // order.  If that arrow is currently painted, re-apply the sort so the rows
+      // keep matching it — otherwise a background scan would silently snap the
+      // folder back to disk order and leave the arrow lying.  (A freshly-entered,
+      // unsorted folder has no arrow — _rebuildTrackHeader cleared it — so it
+      // correctly renders in fstree order.)
+      const folderSorted = sortKey && trackTableHead &&
+        trackTableHead.querySelector(`th[data-sort="${sortKey}"].sorted`);
+      const rows = folderSorted
+        ? [...firstChunk].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc))
+        : firstChunk;
+      if (opts.quiet && _sameTrackList(rows, currentTracks)) return;
+      renderTracks(rows);
       if (!opts.quiet) _scheduleBackgroundRefresh(path);
       return;
     }
@@ -3079,6 +3417,16 @@ async function showFolder(path, recursive = false, opts = {}) {
  * ``_has_audio`` — directory-level, not track-level dedup.)
  */
 async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, prefetched = null) {
+  const _gen = opts.quiet ? _browseNavGen : ++_browseNavGen;   // quiet = capture only, still bails on nav-away
+  // A windowed folder renders fstree-order chunks and is never sorted (the sort
+  // handler bails for windowed folders), so clear any painted sort arrow — the
+  // quiet in-place refresh skips _rebuildTrackHeader, so a sorted small folder a
+  // background scan grows past the chunk threshold would otherwise land here with
+  // a stale arrow lying over unsorted rows.
+  if (trackTableHead) trackTableHead.querySelectorAll('th[data-sort]').forEach(t => {
+    t.classList.remove('sorted', 'sorted-asc', 'sorted-desc');
+    if (t.dataset.sort) t.setAttribute('aria-sort', 'none');
+  });
   const enc = encodeURIComponent(path);
   // Non-recursive (a single leaf folder with thousands of direct tracks, e.g.
   // an archive bucket) collapses duplicate groups server-side, matching the
@@ -3097,6 +3445,7 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
       return;
     }
   }
+  if (_gen !== _browseNavGen) return;   // superseded by a newer view (or nav during a quiet refresh)
   const total      = Number(firstRes?.total || 0);
   const firstChunk = Array.isArray(firstRes?.tracks) ? firstRes.tracks : [];
 
@@ -3130,7 +3479,11 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   // Preload chunk 0 from the first response so ``fetchChunk(0)``
   // short-circuits the moment ``_vsRender`` reaches into the store.
   store._chunks.set(0, firstChunk);
-  store.setOnChunkLoad(() => _vsRender(true));
+  // Guard the repaint on the store still being the active view: a late chunk
+  // from a windowed store the user (or a boot view-restore) has since navigated
+  // away from must NOT overwrite the new view — this is what let a slow initial
+  // All-Tracks chunk repaint tracks over a just-restored Scene-groups list.
+  store.setOnChunkLoad(() => { if (currentTracks === store) _vsRender(true); });
   // Reset scroll + selection — the indexes the user was looking at no
   // longer point at the same tracks.
   _selected.clear();
@@ -3202,6 +3555,9 @@ function clearSelection() {
  * @param {string} label  Human-readable heading for the browse header
  */
 async function showSmart(view, label) {
+  const _gen = ++_browseNavGen;
+  _viewIsAllTracks = false;   // leave All Tracks synchronously so a mid-fetch scan
+                              // refresh can't fire showAll() and clobber this view
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
@@ -3213,6 +3569,7 @@ async function showSmart(view, label) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`${res.status}`);
     const data = await res.json();
+    if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
 
     if (view === 'history') {
       // History returns [{track_id, title, artist, ts}, ...]
@@ -3234,16 +3591,20 @@ async function showSmart(view, label) {
         });
         allTracks = r.ok ? await r.json() : [];
       } catch { allTracks = []; }
+      if (_gen !== _browseNavGen) return;   // superseded during the history hydrate
       const trackMap = Object.fromEntries(allTracks.map(t => [t.id, t]));
       // Maintain history order (newest first)
       const ordered = data.map(h => trackMap[h.track_id]).filter(Boolean);
       renderTracks(ordered);
+      _smartViewToken = _browseNavGen; _smartViewKey = view;   // this render is the live smart view
     } else {
       // All other smart views return track arrays directly
       renderTracks(Array.isArray(data) ? data : []);
+      _smartViewToken = _browseNavGen; _smartViewKey = view;
     }
   } catch (err) {
     console.error('Smart view fetch failed:', err);
+    if (_gen !== _browseNavGen) return;   // superseded — don't clobber the newer view
     renderTracks([]);
   }
 }
@@ -3253,10 +3614,14 @@ async function showSmart(view, label) {
 // has no server push).  Keyed off the live browse-crumb so there's no stale
 // active-view state to get wrong; a no-op unless one of those views is showing.
 function refreshSmartOnPlay() {
-  if (browseHdr.hidden) return;
-  const crumb = (browseCrumb.textContent || '').trim();
-  if (crumb === 'Listening History') showSmart('history', 'Listening History');
-  else if (crumb === 'Most Played')  showSmart('most-played', 'Most Played');
+  // Gate on the recorded view IDENTITY (nav token), NOT the crumb text — a folder
+  // or bare-titled album named "Most Played" shares the crumb but is not the smart
+  // view, and refreshing it would clobber the user's actual view.  The token goes
+  // stale the moment any other view renders (each bumps _browseNavGen), so this
+  // fires only while the genuine History / Most-Played smart list is on screen.
+  if (browseHdr.hidden || _smartViewToken !== _browseNavGen) return;
+  if (_smartViewKey === 'history')          showSmart('history', 'Listening History');
+  else if (_smartViewKey === 'most-played') showSmart('most-played', 'Most Played');
 }
 
 
@@ -3303,6 +3668,8 @@ function _exportCSV(tracks, filename = 'soniqboom-export.csv') {
  * with the primary track shown and variants collapsed beneath.
  */
 async function showDuplicates() {
+  const _gen = ++_browseNavGen;
+  _viewIsAllTracks = false;   // leave All Tracks synchronously (see showSmart)
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
@@ -3314,6 +3681,7 @@ async function showDuplicates() {
     const res = await fetch('/api/smart/duplicates?limit=200');
     if (!res.ok) throw new Error(`${res.status}`);
     const groups = await res.json();
+    if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
 
     if (!groups.length) {
       renderTracks([]);
@@ -3353,6 +3721,7 @@ async function showDuplicates() {
     _showExportBtn(() => _exportCSV(flatTracks, 'soniqboom-duplicates.csv'));
   } catch (err) {
     console.error('Duplicates fetch failed:', err);
+    if (_gen !== _browseNavGen) return;   // superseded — don't clobber the newer view
     renderTracks([]);
   }
 }
@@ -3478,8 +3847,23 @@ function patchTrackDuration(id, seconds) {
 export const Library = {
   patchTrackDuration,
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
-  showGenres, showYears, showGalaxy, showFolder, renderTracks,
+  showGenres, showYears, showSceneGroups, showGalaxy, showFolder, renderTracks,
+  showSearchResults,
+  // Cross-view render-race token: an async caller in another module (search.js)
+  // captures it before its fetch and bails if a newer view superseded it, the
+  // same guard the in-file views use — so a search that resolves after the user
+  // clicked a nav facet no longer paints results over that facet.
+  beginView: () => {
+    // Search is leaving All Tracks / any folder: clear both flags synchronously
+    // (before the /api/search fetch) so a scan completing mid-search can't fire
+    // showAll()/refreshCurrentFolderInPlace() and clobber the pending results.
+    _viewIsAllTracks = false;
+    _currentBrowsePath = null;
+    return ++_browseNavGen;
+  },
+  viewStillCurrent: (t) => t === _browseNavGen,
   isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace,
+  isInAllTracksView: () => _viewIsAllTracks,
   setBrowseHeader, hideBrowseHeader, onInfo,
   getSelectedTracks, clearSelection, refreshBadges: _refreshTrackCount,
   // Smart & duplicates views

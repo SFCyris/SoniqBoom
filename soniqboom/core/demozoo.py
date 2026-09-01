@@ -45,6 +45,7 @@ _TABLES = {
 # current track's title matches ONE candidate's production; otherwise it refuses.
 _PROD_AUTHOR = "public.productions_production_author_nicks"   # M2M production↔nick
 _PROD_TABLE = "public.productions_production"                 # production→title
+_PROD_SOUNDTRACK = "public.productions_soundtracklink"        # demo↔the music it uses
 
 _STOP = frozenset(
     "a an and at by de el for from in la le of on or the to with".split())
@@ -73,6 +74,16 @@ def _toks_match(track: frozenset, prod: frozenset) -> bool:
     return shared >= 2 and shared >= (min(len(track), len(prod)) + 1) // 2
 
 
+def _destylize(s: object) -> str:
+    """Undo common scene title stylizations before matching a production title:
+    "][" (and "]|[") is how modules write the Roman "II", so "Unreal ][" matches
+    Demozoo's "Unreal II".  Applied only to the loose production-title match, not
+    the confidence-critical identity resolvers."""
+    if not isinstance(s, str):
+        return ""
+    return s.replace("]|[", " ii ").replace("][", " ii ")
+
+
 def _year_toks(s: object) -> frozenset:
     """Title tokens for the YEAR gate — like ``_title_toks`` but keeps single
     DIGITS.  ``_title_toks`` drops <2-char tokens, so "Last Ninja 2" collapses
@@ -97,6 +108,44 @@ def _db_path() -> Path:
     return d / "demozoo.sqlite"
 
 
+def has_index() -> bool:
+    """Cheap check for a built local index — no sqlite open (used by the
+    post-scan auto-apply to skip work when nothing has been downloaded yet)."""
+    try:
+        return _db_path().exists()
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def last_apply_at() -> int:
+    """Unix time of the last successful apply, or 0 — for debouncing the
+    post-scan auto-apply so back-to-back scans don't re-churn the whole library."""
+    la = _status.get("last_apply") or {}
+    return int(la.get("at") or 0)
+
+
+def auto_apply_enabled() -> bool:
+    """Whether a completed library scan re-runs the Demozoo apply automatically.
+    Default ON; the Reset button turns it OFF (so a reset holds across scans) and
+    Apply turns it back ON.  Persisted in prefs so it survives a restart."""
+    from soniqboom.config import load_prefs
+    try:
+        return bool(load_prefs().get("demozoo_auto_apply", True))
+    except Exception:                                   # noqa: BLE001
+        return True
+
+
+def set_auto_apply(enabled: bool) -> None:
+    """Persist the post-scan auto-apply preference (see ``auto_apply_enabled``)."""
+    from soniqboom.config import load_prefs, save_prefs
+    try:
+        prefs = load_prefs()
+        prefs["demozoo_auto_apply"] = bool(enabled)
+        save_prefs(prefs)
+    except Exception:                                   # noqa: BLE001
+        log.warning("could not persist demozoo_auto_apply", exc_info=True)
+
+
 def status() -> dict:
     db = _db_path()
     exists = db.exists()
@@ -115,6 +164,7 @@ def status() -> dict:
         except Exception:                                   # noqa: BLE001
             names = _status["names"]
     return {**_status, "names": names, "exists": exists,
+            "auto_apply": auto_apply_enabled(),
             "size": db.stat().st_size if exists else 0}
 
 
@@ -157,6 +207,7 @@ def _parse_dump(path: Path):
     prod_title: dict[str, str | None] = {}      # production_id → title
     prod_super: dict[str, str | None] = {}      # production_id → supertype
     prod_yr: dict[str, int] = {}                # production_id → release year
+    soundtrack_of: dict[str, list[str]] = {}    # music_prod_id → [demo_prod_id]
     cur: str | None = None
     cols: list[str] | None = None
     idx: dict[str, int] = {}
@@ -166,7 +217,8 @@ def _parse_dump(path: Path):
                 if line.startswith("COPY "):
                     m = re.match(r"COPY (public\.\w+) \(([^)]*)\) FROM stdin;", line)
                     if m and (m.group(1) in _TABLES
-                              or m.group(1) in (_PROD_AUTHOR, _PROD_TABLE)):
+                              or m.group(1) in (_PROD_AUTHOR, _PROD_TABLE,
+                                                _PROD_SOUNDTRACK)):
                         cur = m.group(1)
                         cols = [c.strip() for c in m.group(2).split(",")]
                         idx = {c: i for i, c in enumerate(cols)}
@@ -184,6 +236,13 @@ def _parse_dump(path: Path):
                 pi, ni = idx.get("production_id"), idx.get("nick_id")
                 if pi is not None and ni is not None:
                     prod_nicks.setdefault(parts[pi], []).append(parts[ni])
+            elif cur == _PROD_SOUNDTRACK:
+                # ``production_id`` = the DEMO/intro; ``soundtrack_id`` = the
+                # MUSIC it uses.  Invert to music→[demos] for the "featured in"
+                # lookup (a track knows nothing about the demos that used it).
+                di, mi = idx.get("production_id"), idx.get("soundtrack_id")
+                if di is not None and mi is not None:
+                    soundtrack_of.setdefault(parts[mi], []).append(parts[di])
             elif cur == _PROD_TABLE:
                 ii, ti, si = idx.get("id"), idx.get("title"), idx.get("supertype")
                 if ii is not None and ti is not None:
@@ -318,7 +377,26 @@ def _parse_dump(path: Path):
                 for toks in rel_prod_toks.get(rid, ()):
                     ambig.append(
                         (name, rid_int, real or name, groups, " ".join(sorted(toks))))
-    return unique, ambig, prod_years
+
+    # "Featured in" evidence: for each MUSIC production, the demos/intros that
+    # used it as their soundtrack — resolved to the demo's title + year for the
+    # SCENE tab's release block.  Keyed by the music production's Demozoo id (the
+    # same id the live discography match yields in scene_card).
+    prod_soundtrack: list[tuple[int, str, int | None]] = []   # (music_id, demo_title, demo_year)
+    for music_id, demo_ids in soundtrack_of.items():
+        try:
+            m_int = int(music_id)
+        except (TypeError, ValueError):
+            continue
+        seen: set[str] = set()
+        for demo_id in demo_ids:
+            if demo_id in seen:
+                continue
+            seen.add(demo_id)
+            title = prod_title.get(demo_id)
+            if title:
+                prod_soundtrack.append((m_int, title, prod_yr.get(demo_id)))
+    return unique, ambig, prod_years, prod_soundtrack
 
 
 def refresh_index(dump_path: Path | None = None) -> dict:
@@ -349,7 +427,7 @@ def refresh_index(dump_path: Path | None = None) -> dict:
             src = tmp
         else:
             src = dump_path
-        unique, ambig, prod_years = _parse_dump(src)
+        unique, ambig, prod_years, prod_soundtrack = _parse_dump(src)
         db = _db_path()
         con = sqlite3.connect(db)
         try:
@@ -385,13 +463,25 @@ def refresh_index(dump_path: Path | None = None) -> dict:
                 except (TypeError, ValueError):
                     continue
             con.executemany("INSERT INTO prod_year VALUES (?,?,?)", _py_rows)
+            con.execute("DROP TABLE IF EXISTS prod_soundtrack")
+            con.execute("CREATE TABLE prod_soundtrack "
+                        "(music_id INTEGER, demo_title TEXT, demo_year INTEGER)")
+            con.execute("CREATE INDEX ix_prod_soundtrack ON prod_soundtrack(music_id)")
+            _st_rows = []
+            for mid, dtitle, dyear in prod_soundtrack:
+                try:
+                    _st_rows.append((int(mid), dtitle,
+                                     int(dyear) if dyear is not None else None))
+                except (TypeError, ValueError):
+                    continue
+            con.executemany("INSERT INTO prod_soundtrack VALUES (?,?,?)", _st_rows)
             con.commit()
         finally:
             con.close()
         _status.update(built_at=int(time.time()), names=len(unique))
         log.info("Demozoo index built: %d unique names + %d shared-handle "
-                 "production rows + %d dated music productions",
-                 len(unique), len(ambig), len(prod_years))
+                 "production rows + %d dated music productions + %d soundtrack links",
+                 len(unique), len(ambig), len(prod_years), len(prod_soundtrack))
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = f"refresh failed: {exc}"
         log.warning("Demozoo refresh failed: %s", exc)
@@ -507,8 +597,34 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
             stamped = t.get("year_source") == "demozoo"
             a = (t.get("artist") or "").strip()
             if not a:
+                # No artist tag — TITLE-first: resolve the composer from the song
+                # title, but ONLY when the module carries an author hint (an
+                # in-module "by X" credit or a multi-word archive dir) — that both
+                # bounds the cost (the LIKE scans are skipped for the vast
+                # unresolvable majority) and keeps precision high (a hint-
+                # corroborated resolution, ``_display`` set).  Stamp the author
+                # into ``composer`` (leaving ``artist`` blank so the SCENE tab
+                # stays title-first) + the crew into ``scene_group``; both index
+                # for search.  Only fills EMPTY fields.
+                upd: dict = {}
                 if stamped:
-                    batch.append((t["id"], _revert(t)))
+                    upd.update(_revert(t))
+                if not (t.get("composer") or "").strip():
+                    narrow, credits = author_hints_from_track(
+                        title=t.get("title"), path=t.get("path"),
+                        instruments=t.get("instruments"))
+                    if credits:                              # only a music CREDIT may write
+                        tb = lookup_by_title(t.get("title") or "",
+                                             author_hints=tuple(narrow),
+                                             credit_hints=credits)
+                        if tb and tb.get("_persist"):        # credit-corroborated only
+                            matched += 1
+                            upd["composer"] = tb["_persist"]
+                            crew = " • ".join(tb.get("groups") or [])
+                            if crew and not (t.get("scene_group") or "").strip():
+                                upd["scene_group"] = crew   # fill-only
+                if upd:
+                    batch.append((t["id"], upd))
                 continue
             ttoks = _title_toks(t.get("title"))
             rid = None
@@ -644,22 +760,53 @@ def lookup_scener(name: str, track_title: str | None = None) -> dict | None:
             if len(hits) == 1:
                 rid, row = next(iter(hits.items()))
                 return _scener_card(rid, row[1], row[2])
-            if len(hits) > 1:                   # variants disagree → refuse
+            if len(hits) > 1:
+                # Variants disagree (only possible when the artist carries a
+                # parenthetical).  A parenthetical group/handle that collides
+                # with an UNRELATED scener must not veto the authoritative
+                # pre-paren name — "Mark Cooksey (Dr K)" is the person "mark
+                # cooksey"; "dr k" is a homonym of a different scener.  Prefer
+                # the paren-stripped primary when it alone resolves to one
+                # scener; otherwise the disagreement is genuine → refuse.
+                primary = _norm(re.sub(r"\([^)]*\)", "", name))
+                if len(primary) >= 2:
+                    row = con.execute(
+                        "SELECT releaser_id, real_name, groups FROM scener "
+                        "WHERE name = ?", (primary,)).fetchone()
+                    if row and row[0] is not None:
+                        return _scener_card(int(row[0]), row[1], row[2])
                 return None
-            # 2) Shared handle — pick the candidate whose production matches THIS
-            #    track's title.  No title / no match / >1 match ⇒ refuse.
-            ttoks = _title_toks(track_title)
-            if len(ttoks) < 2 or not _has_ambig_table(con):
+            # 2) Shared handle.  A name lands in ``ambig_prod`` when >1 Demozoo
+            #    releaser carries it — but only the ones who RELEASED something
+            #    appear here, so a "shared" handle often has a single real
+            #    candidate (the productionless namesakes can't be a music
+            #    track's author).  Gather the candidates:
+            if not _has_ambig_table(con):
                 return None
-            winners: dict[int, tuple] = {}
+            cands: dict[int, tuple] = {}        # rid → (real, groups)
+            prods: dict[int, list[frozenset]] = {}
             for v in variants:
                 for rid, real, groups, ptoks in con.execute(
                     "SELECT releaser_id, real_name, groups, ptoks "
                     "FROM ambig_prod WHERE name = ?", (v,),
                 ):
-                    if rid is not None and _toks_match(
-                            ttoks, frozenset((ptoks or "").split())):
-                        winners[int(rid)] = (real, groups)
+                    if rid is None:
+                        continue
+                    rid = int(rid)
+                    cands[rid] = (real, groups)
+                    prods.setdefault(rid, []).append(
+                        frozenset((ptoks or "").split()))
+            if not cands:
+                return None
+            if len(cands) == 1:                 # sole producer of that handle → them
+                rid, (real, groups) = next(iter(cands.items()))
+                return _scener_card(rid, real, groups)
+            # Genuinely >1 candidate — the track title must pick ONE production.
+            ttoks = _title_toks(track_title)
+            if len(ttoks) < 2:
+                return None
+            winners = {rid: cands[rid] for rid, plist in prods.items()
+                       if any(_toks_match(ttoks, pt) for pt in plist)}
             if len(winners) != 1:              # 0 = no evidence, >1 = still ambiguous
                 return None
             rid, (real, groups) = next(iter(winners.items()))
@@ -916,26 +1063,298 @@ async def fetch_production_detail(production_id: int) -> dict | None:
     return out
 
 
-async def scene_card(name: str, track_title: str | None = None) -> dict:
-    """Full demoscene enrichment for a retro track's SCENE tab.
+def _production_soundtracks(music_id: object, limit: int = 6) -> list[dict]:
+    """Demos/intros that used a MUSIC production as their soundtrack, newest
+    first → ``[{title, year}]``.  Offline + best-effort: empty on any error or a
+    pre-soundtrack index (no ``prod_soundtrack`` table) — never raises."""
+    try:
+        mid = int(music_id)
+    except (TypeError, ValueError):
+        return []
+    db = _db_path()
+    if not db.exists():
+        return []
+    try:
+        con = sqlite3.connect(db)
+        try:
+            if not con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='prod_soundtrack'"
+            ).fetchone():
+                return []
+            rows = con.execute(
+                "SELECT demo_title, demo_year FROM prod_soundtrack WHERE music_id = ?",
+                (mid,),
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+    seen: set[str] = set()
+    out: list[dict] = []
+    for title, year in sorted(rows, key=lambda r: (r[1] or 0), reverse=True):
+        t = (title or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append({"title": t, "year": year})
+        if len(out) >= limit:
+            break
+    return out
 
-    Resolves the composer offline (Demozoo-first identity, same confidence gate
-    as ``artist_card`` — including shared-handle disambiguation by ``track_title``)
-    then LIVE-enriches with their discography and, when the current track matches
-    exactly ONE of their productions by title, that production's release details
-    (canonical date/year → the retro year overwrite, type, platform, release
-    party, competition placing, links).  Every live call is disk-cached; any
-    failure degrades to identity-only.  Never raises.
 
-    Returns ``{found, artist, discography, release}`` (``found: False`` when the
-    composer doesn't resolve to a scener — the panel then shows only baseline
-    module context).
+# A "by X" credit in a module's sample/instrument text names the COMPOSER only
+# when it is a bare "By X" signature or is qualified by a MUSIC word ("music by
+# X", "composed by X", "tune by X").  A wrong composer write is permanent, so
+# the word before "by" is gated by POSITION (the sample list is one credit
+# fragment per slot):
+#   • same slot  → WHITELIST — only a music word or nothing; a blacklist is
+#     unwinnable there (defeated by any omitted word "gr by X", and by any
+#     punctuation that detaches the prefix "graphics: by X").
+#   • previous slot (a bare "By X" here, its role word one slot up) → a targeted
+#     ROLE blacklist; a whitelist would wrongly kill 800+ real "By <scener>"
+#     signatures that trail unrelated sample text (measured on the library).
+_MUSIC_BY_WORDS = frozenset(
+    "music musik musics muzik muzak composed compose composition composer "
+    "tune tunes song songs melody melodies score scored soundtrack theme "
+    "tracked mus msc".split())              # "tracked" = sequenced in a tracker
+_ROLE_BY_WORDS = frozenset(
+    "gfx graphics graphix graphic grafix grafik grafics gr grfx gpx graphx gph "
+    "pixels pixel logo logos font fonts design designed ripped rip ripper ripping "
+    "cracked crack code coded coding program programmed programming prog "
+    "greets greetings greetz loader art artwork picture pics image images "
+    "converted conversion convert ported swap swapped trained trainer sfx fx "
+    "sound sounds sample samples sampled voice voices vocals words lyrics text "
+    "ascii ansi vga menu docs chars charset copper wizard prowizard".split())
+# name AFTER "by": starts alnum; "/" and "|" are hard stops (clause separators,
+# so a later "music by Y" after "ripped by X / …" is still reachable); "-" is
+# kept so hyphenated handles ("4-mat") survive.
+_BY_RE = re.compile(r"\bby\b\s+([A-Za-z0-9][A-Za-z0-9 .'&-]{1,39})", re.I)
+# the last alphabetic word BEFORE a "by", skipping any trailing punctuation.
+_PRED_RE = re.compile(r"([A-Za-z]+)[^A-Za-z]*$")
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _slot_role_veto(text: str) -> bool:
+    """Does a PREVIOUS sample slot veto a bare "By X" in the next slot?  Yes when
+    the slot credits a non-music ROLE ("cracked together", "converted in 0.30
+    min", "samples & jingles") and does NOT also name a music role — the WHOLE
+    slot is scanned, not just its last word, because the role verb is often
+    non-terminal.  A slot that pairs a role with a music word ("composed &
+    sampled") is not a veto: the credit is (also) musical."""
+    toks = {w.lower() for w in _WORD_RE.findall(text or "")}
+    return bool(toks & _ROLE_BY_WORDS) and not (toks & _MUSIC_BY_WORDS)
+
+
+def _music_credits(instruments: "list | None") -> list[str]:
+    """Composer handles from a module's sample/instrument text.  The sample list
+    is one credit fragment per slot, so two positions get two gates:
+      • predecessor IN the same slot → strict WHITELIST: "music/composed/tune/…
+        by X" or a bare "By X"; every other word (known-bad OR unknown) refused,
+        so an omitted role word or a punctuation-detached prefix ("graphics: by
+        X") cannot leak a wrong composer.
+      • bare "By X" whose role word is in the PREVIOUS slot → the whole previous
+        slot is scanned for a KNOWN role word (with no co-occurring music word);
+        a whitelist is wrong here (800+ real library signatures follow unrelated
+        text, measured), but a last-word-only check missed non-terminal roles
+        ("cracked together" / "by X").  Only the IMMEDIATELY preceding slot is
+        inspected — a role word ≥2 slots up (or a source named far above a bare
+        re-statement, e.g. a converted cover) is a known, rare residual.
+    A wrong composer write is permanent, so this errs toward missing a credit.
+    Original case kept."""
+    ins_list = list(instruments or [])
+    out: list[str] = []
+    for i, ins in enumerate(ins_list[:6]):
+        s = ins if isinstance(ins, str) else ""
+        for m in _BY_RE.finditer(s):
+            pm = _PRED_RE.search(s[:m.start()])
+            if pm is not None:
+                if pm.group(1).lower() not in _MUSIC_BY_WORDS:
+                    continue                # non-music / unrecognised qualifier
+            elif i > 0:                     # bare here — scan the previous slot
+                prev = ins_list[i - 1]
+                if _slot_role_veto(prev if isinstance(prev, str) else ""):
+                    continue                # "gfx"/"ripped"/… by X across slots
+            # Trim the group / collaborator / year tail so "By Purple Motion of
+            # the Future Crew", "By Purple Motion -93" and "… '97" all →
+            # "Purple Motion", while a numeric handle ("Catch 22", "Area 51") and
+            # a hyphen handle ("4-mat") are kept — only a plausible YEAR (a
+            # space-dash tail, a 'NN apostrophe-year, or 19xx/20xx) is stripped.
+            h = re.sub(r"\s+(?:of|from|feat\.?|ft\.?|and)\b.*$"
+                       r"|\s*[/&|].*$|\s+-.*$|\s+['’]\d{2}$"
+                       r"|\s+(?:19|20)\d{2}$", "",
+                       m.group(1), flags=re.I).strip(" .-'")
+            if len(h) >= 2:
+                out.append(h)
+    return out
+
+
+def author_hints_from_track(*, title: str | None = None, path: str | None = None,
+                            instruments: "list | None" = None,
+                            ) -> "tuple[list[str], dict[str, str]]":
+    """Return ``(narrow, credits)`` for a scene module with NO artist tag.
+
+    ``credits`` is ``{normalised: original-case}`` for AUTHORSHIP handles only —
+    an in-module music "by X" credit (see ``_music_credits``).  These are the ONLY
+    hints allowed to PERSIST an author (a wrong composer write is permanent), and
+    the original case is kept for the stored value.
+
+    ``narrow`` is the normalised list used ONLY to NARROW a title search for
+    DISPLAY (never to write): the credits PLUS weak signals — the archive's parent
+    directory and the title's trailing handle, kept only when multi-word (a bare
+    single word there resolves to a random namesake)."""
+    credits: dict[str, str] = {}
+    for c in _music_credits(instruments):
+        n = _norm(c)
+        if len(n) >= 2 and n not in credits:
+            credits[n] = c
+    weak: list[str] = []
+    m = re.search(r"\s[-–—]\s*([A-Za-z0-9 .'&]{2,40})$", title or "")
+    if m:
+        weak.append(m.group(1))
+    parts = [x for x in re.split(r"[/\\]", (path or "").split("::", 1)[0]) if x]
+    if len(parts) >= 2:
+        weak.append(re.sub(r"[_\-]+", " ", parts[-2]))
+    narrow = list(credits)
+    for h in weak:                                          # dir/suffix — multi-word only
+        n = _norm(h)
+        if len(n.split()) >= 2 and n not in credits and n not in narrow:
+            narrow.append(n)
+    return narrow, credits
+
+
+def _title_seed_ok(toks: frozenset) -> bool:
+    """A token set distinctive enough to search on: ≥2 tokens, or one ≥5 chars."""
+    return len(toks) >= 2 or any(len(t) >= 5 for t in toks)
+
+
+def lookup_by_title(title: str, *, year: int | None = None,
+                    author_hints: tuple = (),
+                    credit_hints: "dict | None" = None) -> dict | None:
+    """Title-FIRST offline Demozoo identity: the scener who released a production
+    whose title matches THIS track's.  A wrong attribution is worse than none, so
+    the confidence gate is strict:
+      • the title needs a distinctive seed (≥2 tokens, or one ≥5 chars);
+      • a candidate production's title must be a token-SUBSET of the track title
+        and itself distinctive;
+      • a UNIQUE candidate resolves ONLY when its production title is MULTI-word
+        (a bare single common word — "Access", "Agenda" — is coincidence, not
+        authorship) OR an author hint agrees; a SHARED title resolves ONLY when
+        the hints point to exactly one candidate; credited-author evidence that
+        points at a DIFFERENT scener refuses.
+    Refuses (``None``) otherwise.  Reads the local sqlite only; never raises.
+    Returns ``{releaser_id, real_name, groups[], url, _display}`` or ``None``.
+    ``year`` is accepted for API stability but intentionally NOT used to break
+    ties — scene rip tags carry the RIP year, not the composition year, so it
+    would select a namesake."""
+    ttoks = _title_toks(title)
+    if not _title_seed_ok(ttoks):
+        return None
+    # Search EVERY distinctive token (not just the longest) so a ripper's extra
+    # suffix ("Access [Longmix]") can't hide the real title token.  Bounded.
+    seeds = sorted((t for t in ttoks if len(t) >= 5), key=len, reverse=True)[:4]
+    if not seeds:
+        return None
+    db = _db_path()
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(db)
+        try:
+            if not _has_scener_table(con) or not _has_ambig_table(con):
+                return None
+            cand: dict[int, dict] = {}
+
+            def _consider(rid: object, ptoks: object,
+                          real: object = None, groups: object = None) -> None:
+                pt = frozenset((ptoks or "").split())
+                if rid is None or not pt or not (pt <= ttoks) or not _title_seed_ok(pt):
+                    return
+                d = cand.setdefault(int(rid), {})
+                if len(pt) >= 2:
+                    d["multi"] = True                       # multi-word title = corroborated
+                if real is not None:
+                    d["real_name"], d["groups"] = real, groups
+
+            for seed in seeds:
+                like = f"%{seed}%"
+                for _n, rid, real, groups, ptoks in con.execute(
+                        "SELECT name, releaser_id, real_name, groups, ptoks "
+                        "FROM ambig_prod WHERE ptoks LIKE ?", (like,)):
+                    _consider(rid, ptoks, real, groups)
+                for rid, ptoks, _yr in con.execute(
+                        "SELECT releaser_id, ptoks, year FROM prod_year WHERE ptoks LIKE ?", (like,)):
+                    _consider(rid, ptoks)
+            if not cand:
+                return None
+            for rid, d in cand.items():                     # fill any missing name
+                if "real_name" not in d:
+                    r = (con.execute("SELECT real_name, groups FROM scener "
+                                     "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone()
+                         or con.execute("SELECT real_name, groups FROM ambig_prod "
+                                        "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone())
+                    if r:
+                        d["real_name"], d["groups"] = r[0], r[1]
+            # _H = every releaser the author hints point to; inter = candidates one
+            # points to.
+            _H: set[int] = set()
+            inter: dict[int, str] = {}
+            for h in author_hints:
+                for v in _name_variants(h):
+                    rr = con.execute("SELECT releaser_id FROM scener WHERE name = ?", (v,)).fetchone()
+                    if rr and rr[0] is not None:
+                        _H.add(int(rr[0]))
+                        if int(rr[0]) in cand:
+                            inter.setdefault(int(rr[0]), h)
+                    for (arid,) in con.execute("SELECT releaser_id FROM ambig_prod WHERE name = ?", (v,)):
+                        if arid is not None:
+                            _H.add(int(arid))
+                            if int(arid) in cand:
+                                inter.setdefault(int(arid), h)
+            # A MULTI-word production title (≥2 shared tokens) is distinctive
+            # enough to resolve on its own; single-token subset matches ("Motion"
+            # for a "Global Motion" track) are pollution and never resolve alone.
+            strong = [rid for rid, d in cand.items() if d.get("multi")]
+            winner: int | None = None
+            disp: str | None = None
+            if len(inter) == 1:                             # title + credited author AGREE
+                winner = next(iter(inter))
+                disp = inter[winner]
+            elif len(strong) == 1:                          # exactly ONE multi-word match
+                only = strong[0]
+                if _H and only not in _H:                   # credit points elsewhere → refuse
+                    return None
+                winner = only
+            if winner is None:                              # bare single word (needs a hint)
+                return None                                 # or a shared title → refuse
+            d = cand[winner]
+            card = _scener_card(winner, d.get("real_name"), d.get("groups"))
+            if disp:
+                card["_display"] = disp.title()
+                # PERSIST-eligible ONLY when the corroborating hint is a music
+                # CREDIT (not a weak dir/suffix, not the no-hint strong path) —
+                # a wrong composer write is permanent.  Original case preserved.
+                cred = (credit_hints or {}).get(disp)
+                if cred:
+                    card["_persist"] = cred
+            return card
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+async def _scene_card_from_base(base: dict, name: str,
+                                track_title: str | None) -> dict:
+    """Shared LIVE enrichment for an ALREADY-resolved Demozoo identity — the
+    scener's discography plus, when the current track matches exactly ONE of
+    their productions by title, that production's release details (year overwrite,
+    type, platform, party, placing, links).  Every live call is disk-cached; any
+    failure degrades to identity-only.  Never raises.  ``base`` is the offline
+    identity (``{releaser_id, real_name, groups, url}``); ``name`` is the display
+    handle.  Returns ``{found, artist, discography, release}``.
     """
     import asyncio
     try:
-        base = lookup_scener(name, track_title)
-        if base is None:
-            return {"found": False}
         rid = base["releaser_id"]
         details, prods = await asyncio.gather(
             fetch_scener_details(rid),
@@ -960,8 +1379,8 @@ async def scene_card(name: str, track_title: str | None = None) -> dict:
         # Release block — the ONE production whose title matches this track
         # (refuse >1: two matches ⇒ ambiguous, no year overwrite).
         release = None
-        ttoks = _title_toks(track_title)
-        if len(ttoks) >= 2 and prods:
+        ttoks = _title_toks(_destylize(track_title))     # "][" → "ii" so a module's
+        if len(ttoks) >= 2 and prods:                    # "Unreal ][" matches "Unreal II"
             winners = [p for p in prods
                        if _toks_match(ttoks, _title_toks(p.get("title")))]
             if len(winners) == 1:
@@ -984,6 +1403,11 @@ async def scene_card(name: str, track_title: str | None = None) -> dict:
                         "platforms": w.get("platforms") or [], "parties": [],
                         "placings": [], "links": [], "url": w.get("url") or "",
                     }
+                # "Featured in": demos/intros that used this track as their
+                # soundtrack — the reverse link the live API doesn't expose,
+                # read from the offline index (empty on a pre-soundtrack index).
+                if release is not None and w.get("id"):
+                    release["featured_in"] = _production_soundtracks(w.get("id"))
         # Discography — newest-first music, minus the current release (shown in
         # its own block), capped for the panel.
         rel_id = release.get("id") if release else None
@@ -993,8 +1417,56 @@ async def scene_card(name: str, track_title: str | None = None) -> dict:
         return {"found": True, "artist": artist,
                 "discography": disco, "release": release}
     except Exception:                       # noqa: BLE001 — never break the panel
-        log.debug("Demozoo scene_card failed for %r", name, exc_info=True)
+        log.debug("Demozoo scene-card enrichment failed for %r", name, exc_info=True)
         return {"found": False}
+
+
+async def scene_card(name: str, track_title: str | None = None) -> dict:
+    """Full demoscene enrichment for a retro track's SCENE tab, resolving the
+    composer NAME-first (Demozoo-first identity, same confidence gate as
+    ``artist_card`` — including shared-handle disambiguation by ``track_title``).
+    Returns ``{found, artist, discography, release}`` (``found: False`` when the
+    composer doesn't resolve to a scener — the panel then shows baseline context).
+    """
+    import asyncio
+    try:                                    # sqlite off the event loop; degrade on error
+        base = await asyncio.to_thread(lookup_scener, name, track_title)
+    except Exception:                       # noqa: BLE001
+        base = None
+    if base is None:
+        return {"found": False}
+    return await _scene_card_from_base(base, name, track_title)
+
+
+async def scene_card_by_title(track_title: str | None, *, year: int | None = None,
+                              author_hints: tuple = (),
+                              credit_hints: "dict | None" = None) -> dict:
+    """Title-FIRST demoscene enrichment for a retro track with NO artist tag:
+    resolve the composer from the SONG TITLE, narrowed by author hints (in-module
+    credit / archive dir / title handle) or the release year when several sceners
+    share the title.  Refuses over guessing (see ``lookup_by_title``).  Same
+    ``{found, artist, discography, release}`` shape as ``scene_card``.
+    """
+    import asyncio
+    try:                                    # LIKE scans + sqlite off the event loop
+        base = await asyncio.to_thread(
+            lookup_by_title, track_title or "", year=year,
+            author_hints=tuple(author_hints), credit_hints=credit_hints)
+    except Exception:                       # noqa: BLE001
+        base = None
+    if base is None:
+        return {"found": False}
+    # The card's ``name`` is the scene HANDLE (``a.name`` → the “handle” sub-line);
+    # prefer the resolved handle (``_display``) over the real name so a title-first
+    # card labels it like a name-first one ("Purple Motion", not "Jonne Valtonen").
+    disp = base.get("_display") or base.get("real_name") or (track_title or "")
+    card = await _scene_card_from_base(base, disp, track_title)
+    # Persist author+crew ONLY when a music CREDIT corroborated (``_persist``) —
+    # never on a bare directory/title hint.  The frontend ignores ``_writeback``.
+    if card.get("found") and base.get("_persist"):
+        card["_writeback"] = {"composer": base["_persist"],
+                              "scene_group": " • ".join(base.get("groups") or [])}
+    return card
 
 
 async def artist_card(name: str, track_title: str | None = None) -> dict | None:
@@ -1064,6 +1536,87 @@ async def apply_to_library() -> dict:
             "matched": matched, "updated": updated, "at": int(time.time()),
         }
         return {**status(), "matched": matched, "updated": updated}
+    except Exception as exc:                            # noqa: BLE001
+        _status["error"] = str(exc)
+        return {**status(), "error": str(exc)}
+    finally:
+        _status["applying"] = False
+
+
+def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
+    """Build the batch that WITHDRAWS the Demozoo scene enrichment — the exact
+    inverse of ``collect_updates``.  (Scoped to the Demozoo layer: the separate
+    Modland artist/``scene_path`` fill is NOT touched.)
+
+    A field is cleared only when it can ONLY have come from an apply pass, and
+    a user's own hand-edit (recorded in ``user_edited``) is always preserved:
+
+      * ``year`` stamped ``year_source == "demozoo"`` → reverted to the
+        preserved ``year_file`` (a USER year, ``year_source == "user"``, is left
+        untouched);
+      * ``scene_group`` → cleared — it is a SoniqBoom-only field, never read
+        from a file tag, so any value is enrichment;
+      * ``composer`` on a NO-ARTIST retro module → cleared — module formats
+        (ProTracker, ScreamTracker, …) carry no composer tag, so such a value
+        is always the title-first enrichment.  (A composer on an artist-tagged
+        or non-retro track may be a real file/user tag and is left alone.)
+
+    Reads the store snapshot only; the caller writes the batch on the loop
+    thread (see ``reset_to_file_state``).  Idempotent — a clean library yields
+    an empty batch."""
+    from soniqboom.core.retro import is_retro_format
+    from soniqboom.core.store import get_store
+    store = get_store()
+    batch: list[tuple[str, dict]] = []
+    for t in store.all_tracks():
+        ue = t.get("user_edited") or []
+        upd: dict = {}
+        if t.get("year_source") == "demozoo":
+            upd.update(year=t.get("year_file"), year_source=None, year_file=None)
+        if (t.get("scene_group") or "").strip() and "scene_group" not in ue:
+            upd["scene_group"] = None
+        if ((t.get("composer") or "").strip()
+                and not (t.get("artist") or "").strip()
+                and is_retro_format(t.get("format"))
+                and "composer" not in ue):
+            upd["composer"] = None
+        if upd:
+            batch.append((t["id"], upd))
+    return len(batch), batch
+
+
+async def reset_to_file_state() -> dict:
+    """Async apply of ``reset_enrichment`` — collect off-loop, store WRITE on the
+    loop thread (mirrors ``apply_to_library``).  Shares the ``applying`` lock so
+    a reset and an apply can't run at once.
+
+    A Reset must LAND even if a post-scan auto-apply is mid-write, so it waits
+    (bounded) for the shared lock to clear rather than silently no-op.  The
+    caller sets the toggle OFF first, so no NEW auto-apply can start and the
+    coalescing runner breaks on the same flag — this only waits out an apply
+    that was already in flight, then supersedes it."""
+    import asyncio
+    from soniqboom.core.store import get_store
+    for _ in range(600):                                # ~60 s ceiling
+        if not _status["applying"]:
+            break                                       # no await before the
+        await asyncio.sleep(0.1)                         # claim below → atomic
+    if _status["applying"]:
+        return {**status(), "error": "apply already running"}
+    _status.update(applying=True, error=None)
+    try:
+        loop = asyncio.get_running_loop()
+        count, batch = await loop.run_in_executor(None, reset_enrichment)
+        cleared = 0
+        if batch:
+            store = get_store()
+            store.enter_batch_mode()
+            try:
+                cleared = store.update_track_fields_batch(batch)
+            finally:
+                store.exit_batch_mode()
+        _status["last_reset"] = {"cleared": cleared, "at": int(time.time())}
+        return {**status(), "cleared": cleared}
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = str(exc)
         return {**status(), "error": str(exc)}

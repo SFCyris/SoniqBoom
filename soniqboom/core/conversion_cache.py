@@ -699,13 +699,36 @@ async def get_or_render(
             502, "Cache fill failed in a concurrent render — try again",
         )
 
-    try:
-        tmp_path = await render_fn()
-        dest = await store_cached(key, format_type, tmp_path)
-        return dest, False
-    finally:
-        event.set()
-        _inflight.pop(key, None)
+    # Run the render + store in a DETACHED, shield-protected task so a client
+    # disconnect (which cancels THIS caller) doesn't abort a mostly-done render.
+    # It finishes in the background and fills the cache, so the next play — the
+    # returning listener, or a Subsonic/DLNA/cast retry — is instant instead of
+    # re-rendering from scratch (the blocking analogue of the progressive path's
+    # detach-and-finish).  The inflight Event + slot are released by the TASK, so
+    # waiters wake correctly whether or not the original caller stuck around; SID
+    # renders are bounded by ``stream._sid_blocking_sem`` so detached ones can't
+    # pile up unbounded, and other formats' renders are short.
+    async def _render_and_store() -> Path:
+        try:
+            tmp_path = await render_fn()
+            return await store_cached(key, format_type, tmp_path)
+        finally:
+            event.set()
+            _inflight.pop(key, None)
+
+    task = asyncio.ensure_future(_render_and_store())
+    _detached_renders.add(task)
+
+    def _reap(t: asyncio.Task) -> None:
+        _detached_renders.discard(t)
+        if not t.cancelled():
+            t.exception()          # retrieve so a caller-cancelled failure doesn't warn
+
+    task.add_done_callback(_reap)
+    # shield: a cancelled caller re-raises CancelledError but leaves the task
+    # running to completion (and to fill the cache).
+    dest = await asyncio.shield(task)
+    return dest, False
 
 
 # ── SID progressive playback helpers ─────────────────────────────────────────
@@ -727,6 +750,11 @@ _bg_renders: "weakref.WeakValueDictionary[str, asyncio.Task]" = (
 # entries immediately on task completion (no orphan keys) while the asyncio
 # task itself stays alive for the duration of its execution.
 _bg_render_strong: set[asyncio.Task] = set()
+
+# Strong refs to detached get_or_render tasks (see get_or_render): a client
+# disconnect cancels the caller but the shielded render task must survive to
+# finish + cache, so it needs a reference the GC won't collect mid-run.
+_detached_renders: set[asyncio.Task] = set()
 
 
 async def find_shorter_sid_entry(

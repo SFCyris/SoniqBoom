@@ -131,6 +131,7 @@ async def filter_tracks(
     album_artist: str | None = None,
     album: str | None = None,
     genre: str | None = None,
+    scene_group: str | None = None,
     format: str | None = None,
     year_min: int | None = None,
     year_max: int | None = None,
@@ -143,6 +144,19 @@ async def filter_tracks(
     matching on artist / album_artist / album.  Genre stays as TagField with
     default comma separator.
     """
+    # ``scene_group`` (the Demozoo browse facet) is NOT a full-text field, so
+    # resolve it — and any co-filters — straight against the store's maintained
+    # ``_tag_scene_group`` index rather than the FT engine.
+    if scene_group:
+        from soniqboom.core.store import get_store
+        store = get_store()
+        return store.filter_tracks(
+            artist=artist, album_artist=album_artist, album=album, genre=genre,
+            scene_group=scene_group, format_=format,
+            year_min=year_min, year_max=year_max, limit=limit, offset=offset,
+            # Honour the "hide duplicates" config so the drill-down LIST matches
+            # the deduped browse COUNT (every FT-routed facet already does this).
+            filter_duplicates=bool(store.get_config("filter_duplicates", False)))
     parts: list[str] = []
     if artist:
         parts.append(f"@artist_tag:{{{_esc_tag(artist)}}}")

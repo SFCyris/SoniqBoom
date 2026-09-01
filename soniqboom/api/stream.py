@@ -392,6 +392,25 @@ async def _await_renderer(
                         "like non-module data (e.g. a PC/DOS file) indexed by "
                         "mistake.",
                     )
+                # A dynamic-LOADER failure: the binary is present but can't start
+                # because a shared library was upgraded out from under it (e.g.
+                # Homebrew bumped boost under a from-source zxtune123 → dyld
+                # "Symbol not found").  An install/setup problem, not bad input —
+                # give an actionable message, not a cryptic "exited with status -6".
+                if any(m in low for m in (
+                    "dyld", "symbol not found", "error while loading shared librar",
+                    "image not found", "cannot open shared object",
+                )):
+                    log.error(
+                        "%s renderer at %s FAILS TO LOAD (exit %s): %s — a system "
+                        "library upgrade likely orphaned it; re-run install.sh",
+                        kind, cmd[0], proc.returncode, err_text.strip()[:300])
+                    raise HTTPException(
+                        501,
+                        f"The {kind} renderer is installed but can't run — a shared "
+                        f"library was upgraded out from under it. Reinstall or "
+                        f"rebuild the renderer to fix it.",
+                    )
                 if err_text.strip():
                     log.warning(
                         "%s renderer failed (exit %s): %s", kind,

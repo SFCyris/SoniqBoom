@@ -121,15 +121,20 @@ Run these from inside the SoniqBoom folder:
 
 | You want to… | Command |
 |--------------|---------|
+| **Start the server** | `bash startup.sh` (same as `bash run.sh`) |
 | **Change the port** (default is 8080) | `bash run.sh --port 9090` |
 | **Stop the server** | `bash shutdown.sh` |
 | **Restart the server** | `bash restart.sh` |
+| **Rebuild the retro-format players** | `bash install.sh --rebuild` |
+| **Delete the built-from-source players** | `bash install.sh --clean` |
 | **Create or reset your admin login** | `bash setup-admin.sh` |
 | Set an admin login non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
 
 > Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords are at least 8 characters. Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in. If the server is already running, the change takes effect right away (`setup-admin.sh` tells it to reload).
 
 > **`install.sh` sets up every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdLib/OPL). If one ever fails to install, SoniqBoom names the exact missing package and everything else keeps working. (HivelyTracker `.hvl` needs nothing extra — it's bundled and compiled on first run.)
+>
+> If a player ever stops working after a system update, `bash install.sh --rebuild` rebuilds the players SoniqBoom compiles from source (the rest are managed by your package manager). `bash install.sh --clean` just removes them, and `bash install.sh --help` lists all the options. On startup SoniqBoom also checks every player and logs a one-line health summary, so a broken one is easy to spot.
 
 ---
 

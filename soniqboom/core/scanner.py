@@ -1897,6 +1897,87 @@ _current_remote_dirs: set[str] = set()   # active remote scan roots
 _prog_batch_entered: bool = False
 
 
+# Post-scan Demozoo auto-apply — a single COALESCING runner so no scan's
+# enrichment delta is ever dropped.  Every drain sets a ``pending`` flag; the
+# runner loops while pending is set, so a scan that drains WHILE a prior apply
+# is running (or right after one) still gets folded in on the next pass instead
+# of being stranded until some unrelated future scan (QA round-1 MAJOR).  Strong
+# refs keep the task alive; a settle sleep coalesces bursts so a folder-watch
+# storm can't re-churn the whole library back-to-back on a small host.
+_scene_autoapply_tasks: set = set()
+_scene_autoapply_pending = False
+_scene_autoapply_running = False
+_SCENE_AUTOAPPLY_SETTLE_S = 10
+
+
+def _spawn_scene_autoapply() -> None:
+    """Mark the library dirty for Demozoo scene enrichment (composer groups +
+    canonical release years) and ensure the coalescing runner is going, so the
+    manual Admin → Demozoo → Apply step is no longer required after a scan.
+
+    A no-op when no index has been downloaded yet.  Idempotent (a re-apply
+    updates only what changed) and provenance survives rescans, so it never
+    fights a user's manual edit."""
+    from soniqboom.core import demozoo
+    if not demozoo.has_index():
+        return
+    if not demozoo.auto_apply_enabled():
+        return                                  # user turned post-scan re-apply
+                                                # OFF (e.g. after a Reset) — a
+                                                # scan must not silently re-enrich
+    global _scene_autoapply_pending
+    _scene_autoapply_pending = True
+    _ensure_scene_autoapply_runner()
+
+
+def _ensure_scene_autoapply_runner() -> None:
+    global _scene_autoapply_running
+    if _scene_autoapply_running:
+        return                                  # a runner is already draining `pending`
+    _scene_autoapply_running = True
+
+    async def _run() -> None:
+        from soniqboom.core import demozoo
+        global _scene_autoapply_pending, _scene_autoapply_running
+        lock_retries = 0
+        try:
+            while _scene_autoapply_pending:
+                _scene_autoapply_pending = False
+                if not demozoo.auto_apply_enabled():
+                    break                       # toggled OFF (e.g. a Reset)
+                                                # mid-coalesce — must NOT re-enrich
+                                                # a just-reset library
+                try:
+                    res = await demozoo.apply_to_library()
+                    if res.get("error") == "apply already running":
+                        # A manual Admin apply holds the lock — retry our delta
+                        # once it clears (bounded, so a WEDGED manual apply can't
+                        # spin this forever; a later scan re-triggers regardless).
+                        lock_retries += 1
+                        if lock_retries <= 5:
+                            _scene_autoapply_pending = True
+                    else:
+                        lock_retries = 0
+                        updated = res.get("updated") or 0
+                        if updated:
+                            log.info("Post-scan Demozoo auto-apply: %d track(s) "
+                                     "enriched", updated)
+                except Exception:               # noqa: BLE001 — best-effort
+                    log.debug("Post-scan Demozoo auto-apply failed", exc_info=True)
+                if _scene_autoapply_pending:
+                    # Coalesce a burst of drains (folder-watch) into fewer applies.
+                    await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S)
+        finally:
+            _scene_autoapply_running = False
+
+    try:
+        t = asyncio.create_task(_run(), name="demozoo-autoapply")
+        _scene_autoapply_tasks.add(t)
+        t.add_done_callback(_scene_autoapply_tasks.discard)
+    except RuntimeError:
+        _scene_autoapply_running = False        # no running loop (shouldn't happen here)
+
+
 async def _drain_scan_queue() -> None:
     """Run scans sequentially until the queue is empty."""
     global _scan_task, _current_scan_dirs, _scan_count, _progress, _prog_batch_entered
@@ -1936,6 +2017,9 @@ async def _drain_scan_queue() -> None:
             except Exception:
                 log.exception("Failed to heal batch state after scan crash")
         _current_scan_dirs = frozenset()
+    # Whole queue drained (all local + remote scans done) — fold the results
+    # into the Demozoo scene enrichment in the background.
+    _spawn_scene_autoapply()
     _scan_task = None
 
 

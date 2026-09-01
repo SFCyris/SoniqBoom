@@ -301,9 +301,18 @@ function _fmtDur(sec) {
 // what looks like an operator (``word:value``) that isn't one we know
 // about, we highlight that token red so the user understands why the
 // preview is empty.
+// EXACTLY the operators the backend advanced-query parser implements
+// (api/search.py _parse_advanced_query: artist, album_artist, album, genre,
+// year, format).  title:/composer:/albumartist: used to be listed here too but
+// the backend silently discards them — a query like `artist:Metallica title:One`
+// returned all Metallica tracks, ignoring the title.  Keeping this in lockstep
+// with the backend means unsupported fields now surface an honest "Unknown
+// field" hint instead of wrong results; plain free-text search still matches
+// title/composer text, so nothing is lost.  If the backend gains a field, add
+// it here in the same change.
 const _SUPPORTED_OPS = new Set([
-  'artist', 'album_artist', 'albumartist', 'album',
-  'year', 'genre', 'format', 'title', 'composer',
+  'artist', 'album_artist', 'album',
+  'year', 'genre', 'format',
 ]);
 let _syntaxHintShown = false;
 
@@ -355,13 +364,22 @@ function _renderBadOpsWarning(container, badOps) {
 async function query(text) {
   _hidePreview();
   if (!text.trim()) { Library.showAll(); return; }
+  // A full search is a view change: claim the cross-view nav token so that if the
+  // user clicks a nav facet before results land, the late results don't paint over
+  // that facet (search → nav render race).
+  const _tok = Library.beginView();
   // Previously an uncaught fetch/json error here left the library blank with
   // no explanation.  Surface failures and keep the prior view intact.
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(text)}&limit=200`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const tracks = await res.json();
-    Library.renderTracks(tracks);
+    if (!Library.viewStillCurrent(_tok)) return;   // superseded by a newer view while searching
+    // showSearchResults (not bare renderTracks) so results always render as a
+    // proper sortable track list with the group header/filter chrome cleared —
+    // otherwise a search launched from a group view (Genres, Scene groups, …)
+    // shows the results under that view's stale header + live filter bar.
+    Library.showSearchResults(tracks);
   } catch (err) {
     console.error('Search failed:', err);
     Toast.error('Search failed — check the server log.');
@@ -493,6 +511,24 @@ input.addEventListener('focus', () => {
     _syntaxHintShown = true;
   }
 });
+
+// ── Edge password-manager suppression ────────────────────────────────────────
+// Edge's built-in password manager offers the site's saved LOGIN on any field it
+// classifies as a username — which, only in Edge, includes this search box: it
+// ignores the type="search" + autocomplete="off" hints that keep Safari/Firefox
+// (and Chrome) out of the way, because a logged-in SPA has no visible login form
+// for it to target.  Autofill never fires on a READONLY field, so the box starts
+// readonly (see index.html) and we drop that the instant the user actually acts —
+// keydown fires BEFORE the character is inserted, so the first keystroke is not
+// lost, and contextmenu covers right-click → Paste.  Re-armed on blur so the box
+// is readonly again at every focus (the moment Edge decides whether to offer).
+// Programmatic changes (the clear button, search restore) set .value directly and
+// are unaffected — readonly only blocks USER text entry, not scripted writes.
+const _armSearchReadonly  = () => input.setAttribute('readonly', '');
+const _dropSearchReadonly = () => input.removeAttribute('readonly');
+input.addEventListener('keydown', _dropSearchReadonly);
+input.addEventListener('contextmenu', _dropSearchReadonly);
+input.addEventListener('blur', _armSearchReadonly);
 
 clear.addEventListener('click', () => {
   input.value = '';

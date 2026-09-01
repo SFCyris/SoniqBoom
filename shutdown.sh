@@ -29,6 +29,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Mount-safe "is the port busy?" probe.  A localhost /dev/tcp connect only ever
+# touches the loopback stack, so — unlike `lsof` — it can NOT block on a stale
+# network mount (SMB/NFS/FTP fd), which is the exact deadlock that used to wedge
+# this whole script on a restart.  True (0) iff something is accepting on PORT.
+_port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; }
+
 # ── Find the process ─────────────────────────────────────────────────────────
 PID=""
 
@@ -60,8 +66,11 @@ fi
 # or whether the pidfile/argv match.  Guarded so we only adopt a Python /
 # soniqboom process and never kill an unrelated app that happens to hold the
 # port.  Degrades safely if lsof is unavailable.
-if [ -z "$PID" ]; then
-  PORT_PID=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+if [ -z "$PID" ] && _port_busy; then
+  # -S bounds lsof's per-fd kernel stat calls so a stale network mount can't
+  # deadlock the lookup; gated on _port_busy so we skip lsof entirely when the
+  # port is already free (nothing to find).
+  PORT_PID=$(lsof -S 5 -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   if [ -n "$PORT_PID" ]; then
     PORT_CMD=$(ps -p "$PORT_PID" -o command= 2>/dev/null || true)
     case "$PORT_CMD" in
@@ -108,32 +117,37 @@ pkill -f 'soniqboom-menubar\.py' 2>/dev/null || true
 # follow-up start (or ``restart.sh``) report "port already in use".  So don't
 # return until the port is actually released: terminate any lingering
 # *SoniqBoom* listener still on it (an unrelated process is left untouched).
-if command -v lsof &>/dev/null; then
-  for i in $(seq 1 30); do
-    HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-    if [ -z "$HOLDER" ]; then break; fi
-    HCMD=$(ps -p "$HOLDER" -o command= 2>/dev/null || true)
-    case "$HCMD" in
-      *soniqboom*)
-        if [ "$i" -le 5 ]; then
-          kill -TERM "$HOLDER" 2>/dev/null || true
-        else
-          kill -9 "$HOLDER" 2>/dev/null || true
-        fi ;;
-      *)
-        echo -e "  ${RED}Port ${PORT} is held by a non-SoniqBoom process (pid ${HOLDER}) — leaving it alone.${NC}"
-        break ;;
-    esac
-    sleep 1
-  done
-  HOLDER=$(lsof -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-  if [ -n "$HOLDER" ]; then
-    echo -e "  ${RED}⚠  Port ${PORT} is still in use (pid ${HOLDER}) — a restart may fail to bind.${NC}"
-  else
-    echo -e "  ${GREEN}✓${NC} SoniqBoom stopped; port ${PORT} is free."
+#
+# Readiness is decided by the mount-safe _port_busy probe, NOT by lsof — the
+# common case (target exited, port already free) returns instantly without ever
+# calling lsof.  lsof is invoked ONLY to identify+kill a genuine lingering
+# listener, and is bounded with -S so a stale network-mount fd can't deadlock it
+# (the bug that used to hang this script forever on a restart).
+for i in $(seq 1 30); do
+  _port_busy || break                       # port free → done (no lsof needed)
+  if command -v lsof &>/dev/null; then
+    HOLDER=$(lsof -S 5 -ti "TCP:${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+    if [ -n "$HOLDER" ]; then
+      HCMD=$(ps -p "$HOLDER" -o command= 2>/dev/null || true)
+      case "$HCMD" in
+        *soniqboom*)
+          if [ "$i" -le 5 ]; then
+            kill -TERM "$HOLDER" 2>/dev/null || true
+          else
+            kill -9 "$HOLDER" 2>/dev/null || true
+          fi ;;
+        *)
+          echo -e "  ${RED}Port ${PORT} is held by a non-SoniqBoom process (pid ${HOLDER}) — leaving it alone.${NC}"
+          break ;;
+      esac
+    fi
   fi
+  sleep 1
+done
+if _port_busy; then
+  echo -e "  ${RED}⚠  Port ${PORT} is still in use — a restart may fail to bind.${NC}"
 else
-  echo -e "  ${GREEN}✓${NC} SoniqBoom stopped."
+  echo -e "  ${GREEN}✓${NC} SoniqBoom stopped; port ${PORT} is free."
 fi
 LAST=$(grep -i 'shutdown\|snapshot\|stopped' "$LOG_FILE" 2>/dev/null | tail -1 || true)
 [ -n "$LAST" ] && echo -e "  ${DIM}$LAST${NC}"

@@ -178,9 +178,39 @@ async def admin_demozoo_refresh(_tok: str = Depends(_require_token)):
 async def admin_demozoo_apply(_tok: str = Depends(_require_token)):
     """Match every retro track's composer (``artist``) against the Demozoo
     index and fill in ``scene_group`` (real-name + handle, confidence-gated —
-    ambiguous names are skipped).  Join in an executor; store WRITE on the loop."""
+    ambiguous names are skipped).  Join in an executor; store WRITE on the loop.
+    Re-enables post-scan auto-apply (an explicit Apply opts back in)."""
     from soniqboom.core import demozoo
+    demozoo.set_auto_apply(True)
     return await demozoo.apply_to_library()
+
+
+@router.post("/demozoo/reset")
+async def admin_demozoo_reset(_tok: str = Depends(_require_token)):
+    """Withdraw the Demozoo scene enrichment — the release-year backfill,
+    ``scene_group``, and auto-filled ``composer`` — undoing ``/demozoo/apply``.
+    The user's own hand-edits are preserved.  Scoped to the Demozoo layer: the
+    separate Modland artist/``scene_path`` fill (``/scene/apply``) is left in
+    place.  Turns OFF post-scan auto-apply so the reset HOLDS across scans (the
+    Apply button, or the auto-apply toggle, turns it back on).  Collect in an
+    executor, store WRITE on the loop."""
+    from soniqboom.core import demozoo
+    demozoo.set_auto_apply(False)
+    return await demozoo.reset_to_file_state()
+
+
+@router.post("/demozoo/auto-apply")
+async def admin_demozoo_auto_apply(body: dict, _tok: str = Depends(_require_token)):
+    """Enable/disable re-running the Demozoo apply automatically after a library
+    scan.  ``{"enabled": bool}``.  Returns the updated status."""
+    from soniqboom.core import demozoo
+    raw = body.get("enabled", True)
+    # Coerce safely: a JSON string like "false"/"0" is truthy under bool(), so
+    # interpret non-bool inputs explicitly rather than silently enabling.
+    enabled = raw if isinstance(raw, bool) else \
+        str(raw).strip().lower() in ("true", "1", "yes", "on")
+    demozoo.set_auto_apply(enabled)
+    return demozoo.status()
 
 
 @router.post("/verify-indexes")
@@ -1687,6 +1717,93 @@ def _resolve_ftp_share_from_body(body: dict, conf: dict) -> dict | None:
 
 # ── Renderers ────────────────────────────────────────────────────────────────
 
+# Exec-probeable plain-binary renderers: (key, settings.<attr>).  Shared by the
+# admin panel (below) and the startup health probe (main.py) so both agree on
+# what "present but broken" means.  ffmpeg has its own richer feature-probe; gme
+# is an in-process libgme binding; ym2wav/hvl2wav build on first use — none has a
+# standalone binary to exec here.
+_PROBE_RENDERER_SPECS = (
+    ("sidplayfp", "sidplayfp_path"), ("fluidsynth", "fluidsynth_path"),
+    ("openmpt123", "openmpt123_path"), ("uade123", "uade123_path"),
+    ("adplay", "adplay_path"), ("psgplay", "psgplay_path"),
+    ("sc68", "sc68_path"), ("zxtune123", "zxtune123_path"),
+)
+
+
+async def probe_renderer_runs(path: str) -> bool | None:
+    """Does the binary actually LOAD and start?  ``installed`` only means the
+    file is present — a prebuilt/from-source binary whose shared libs were
+    upgraded out from under it (e.g. Homebrew bumped boost under a from-source
+    zxtune123 → dyld symbol-not-found abort) still passes ``is_file()``.  Exec the
+    binary and watch for a dynamic-LOADER failure (aborted before it ran → killed
+    by a signal / negative returncode, or a loader banner on stderr).  A plain
+    non-zero exit (a tool with no ``--version`` printing usage) still means it
+    LOADED → True.  ``None`` when there's nothing to probe.  MUST use
+    ``create_subprocess_exec`` — ``subprocess.run`` fork()s unsafely from a
+    Core-Foundation process on macOS (see the ffmpeg probe below)."""
+    if not path:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            path, "--version",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=4)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        return True                        # started and kept running → it loaded fine
+    if proc.returncode is not None and proc.returncode < 0:
+        return False                       # killed by a signal → loader abort
+    blob = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace")).lower()
+    return not any(m in blob for m in (
+        "dyld", "symbol not found", "error while loading shared librar",
+        "image not found", "cannot open shared object",
+    ))
+
+
+async def validate_renderers() -> "dict[str, dict]":
+    """Full exec-probe of every plain-binary renderer — the eight in
+    ``_PROBE_RENDERER_SPECS`` plus ffmpeg — for the startup health summary.
+    Returns ``{name: {"path": str, "status": "ok"|"broken"|"missing"}}``.  Each is
+    resolved via its configured ``*_path`` setting when that names an existing
+    file, else via PATH (ffmpeg's default setting is the literal ``"ffmpeg"``,
+    i.e. PATH); ``broken`` means present but fails to LOAD — the zxtune123/boost
+    and sidplayfp/libsidplayfp orphan class.  gme (in-process libgme binding) and
+    ym2wav/hvl2wav (compiled on first use) have no standalone binary to probe here
+    and are validated at use time."""
+    resolved: "dict[str, str]" = {}
+    for name, attr in list(_PROBE_RENDERER_SPECS) + [("ffmpeg", "ffmpeg_path")]:
+        configured = getattr(settings, attr, "") or ""
+        if name == "ffmpeg" and configured == "ffmpeg":
+            configured = ""                       # the literal default means "use PATH"
+        path = configured if (configured and Path(configured).is_file()) else shutil.which(name)
+        resolved[name] = path or ""
+    names = list(resolved)
+    results = await asyncio.gather(
+        *(probe_renderer_runs(resolved[n]) if resolved[n] else _none() for n in names)
+    )
+    out: "dict[str, dict]" = {}
+    for name, runs in zip(names, results):
+        path = resolved[name]
+        out[name] = {"path": path,
+                     "status": "missing" if not path else ("ok" if runs else "broken")}
+    return out
+
+
+async def _none():
+    """Awaitable that yields ``None`` (for a renderer with no resolved path)."""
+    return None
+
+
 @router.get("/renderers")
 async def check_renderers(_tok: str = Depends(_require_token)):
     """Check which format renderers are installed."""
@@ -1846,7 +1963,7 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         return {"installed": bool(cxx),
                 "path": f"(builds on first use{'' if cxx else ' — NO C++ compiler found'})"}
 
-    return {
+    _status = {
         "ffmpeg": ff_check,
         "sidplayfp": _check(settings.sidplayfp_path, "sidplayfp"),
         "fluidsynth": _check(settings.fluidsynth_path, "fluidsynth"),
@@ -1867,6 +1984,33 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         "ym2wav": _bundled("ym2wav"),
         "hvl2wav": _bundled("hvl2wav"),
     }
+    # ``installed`` only means the file exists.  Actually EXEC the plain-binary
+    # renderers so a present-but-broken one (dyld/loader failure — e.g. a
+    # prebuilt zxtune123 orphaned by a Homebrew boost bump) reports runs:false
+    # and shows red in the UI instead of a false ✓.  ffmpeg carries its own
+    # richer feature-probe above; gme is the in-process libgme binding and
+    # ym2wav/hvl2wav build on first use, so none of those has a standalone binary
+    # to run here.  Probed concurrently with a short timeout, so the added
+    # latency is one slow probe, not their sum.
+    _probe_keys = [
+        k for k in ("sidplayfp", "fluidsynth", "openmpt123", "uade123",
+                    "adplay", "psgplay", "sc68", "zxtune123")
+        if _status[k].get("installed") and _status[k].get("path")
+    ]
+    if _probe_keys:
+        # Defensive: probing is best-effort UI enrichment — an unexpected escape
+        # (a transport error, or CancelledError on client disconnect mid-probe)
+        # must not 500 the whole panel.  Leave ``runs`` unset on failure.
+        try:
+            _runs = await asyncio.gather(
+                *(probe_renderer_runs(_status[k]["path"]) for k in _probe_keys)
+            )
+            for _k, _r in zip(_probe_keys, _runs):
+                if _r is not None:
+                    _status[_k]["runs"] = _r
+        except Exception:
+            log.debug("renderer run-probe failed", exc_info=True)
+    return _status
 
 
 # ── Bundled ffmpeg installer ────────────────────────────────────────────────
