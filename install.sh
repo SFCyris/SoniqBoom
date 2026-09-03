@@ -122,18 +122,24 @@ VENV="$SCRIPT_DIR/.venv"
 
 # ── CLI options ──────────────────────────────────────────────────────────────
 MODE=install
+SLIM=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --clean)   MODE=clean ;;
     --rebuild) MODE=rebuild ;;
+    --slim)    SLIM=1 ;;
     -h|--help)
       cat <<'EOF'
-Usage: install.sh [--clean | --rebuild | --help]
+Usage: install.sh [--slim] [--clean | --rebuild | --help]
 
   (no option)   Install/update SoniqBoom and its renderers (idempotent —
                 already-present renderers are left as-is).
+  --slim        Skip the slow zxtune123 build (~10-15 min on macOS).  ONLY the
+                PSF family won't play — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF
+                (PlayStation / N64 / GBA / DS / Saturn / Dreamcast rips).  Every
+                other format is unaffected.  Re-run without --slim to add it.
   --rebuild     Delete the from-source renderers, then run the install so they
-                are rebuilt from scratch.
+                are rebuilt from scratch (combine with --slim to skip zxtune).
   --clean       Delete the from-source renderers and exit (no install).
   --help        Show this message.
 
@@ -668,6 +674,8 @@ esac
 ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/zxtune_r5100_linux_${ZXARCH}.tar.gz"
 if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
+elif [ "$SLIM" = "1" ]; then
+  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) won't play.  Re-run without --slim to add it."
 elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
   if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \

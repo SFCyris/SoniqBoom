@@ -127,6 +127,7 @@ Run these from inside the SoniqBoom folder:
 | **Restart the server** | `bash restart.sh` |
 | **Rebuild the retro-format players** | `bash install.sh --rebuild` |
 | **Delete the built-from-source players** | `bash install.sh --clean` |
+| **Skip the slow zxtune build** (only the PSF family won't play) | `bash install.sh --slim` |
 | **Create or reset your admin login** | `bash setup-admin.sh` |
 | Set an admin login non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
 
@@ -134,7 +135,7 @@ Run these from inside the SoniqBoom folder:
 
 > **`install.sh` sets up every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX), `libgme` (console chiptunes), and `adplay` (AdLib/OPL). If one ever fails to install, SoniqBoom names the exact missing package and everything else keeps working. (HivelyTracker `.hvl` needs nothing extra — it's bundled and compiled on first run.)
 >
-> If a player ever stops working after a system update, `bash install.sh --rebuild` rebuilds the players SoniqBoom compiles from source (the rest are managed by your package manager). `bash install.sh --clean` just removes them, and `bash install.sh --help` lists all the options. On startup SoniqBoom also checks every player and logs a one-line health summary, so a broken one is easy to spot.
+> If a player ever stops working after a system update, `bash install.sh --rebuild` rebuilds the players SoniqBoom compiles from source (the rest are managed by your package manager). `bash install.sh --clean` just removes them. In a hurry? `bash install.sh --slim` skips the slow `zxtune123` build (~10–15 min on macOS) — only the **PSF family** (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) won't play, and re-running without `--slim` adds it back. `bash install.sh --help` lists all the options. On startup SoniqBoom also checks every player and logs a one-line health summary, so a broken one is easy to spot.
 
 ---
 
@@ -259,6 +260,41 @@ ZIP archives are scanned and played **inline** — tracks inside `.zip` files ap
 
 ---
 
+## Comparison
+
+How SoniqBoom stacks up against the five self-hosted music servers it's most often weighed against — Navidrome, Jellyfin, Plexamp, Music Assistant, and Lyrion Music Server. Snapshot as of September 2026, taken from each project's own documentation; projects evolve, so check their docs for the latest.
+
+| | **SoniqBoom** | Navidrome | Jellyfin | Plexamp | Music Assistant | Lyrion |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Retro / tracker / chiptune formats** (SID, MOD, XM, IT, AHX, NSF, SPC, VGM, PSF, AdLib…) | ✅ **40+ families** | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Everyday formats** (FLAC, ALAC, MP3, AAC, Opus, DSD) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Free — no paid tier** | ✅ AGPL | ✅ | ✅ | 💰 Plex Pass gates offline, EQ &amp; remote streaming | ✅ | ✅ |
+| **Zero cloud · no account · no telemetry** | ✅ | ✅ | ✅ | ❌ account required | ✅ | ✅ |
+| **Multi-room sync** (native) | ✅ any browsers on the LAN | ❌ | ⚠ SyncPlay (video-oriented) | ❌ | ✅ via Home Assistant hub | ✅ via Squeezebox players |
+| **Cast — AirPlay · Chromecast · DLNA** | ✅ all three *(Beta)* | ❌ | ⚠ Chromecast; DLNA via plugin | ✅ AirPlay · Chromecast | ✅ all three | ⚠ via bridge plugins |
+| **Subsonic / OpenSubsonic API** (Amperfy, Symfonium, DSub…) | ✅ + server-side Jukebox | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Internet radio** (Radio Browser directory) | ✅ + curated scene station pack | ⚠ manual station list | ❌ | ❌ | ✅ | ✅ (plugin) |
+| **Demoscene metadata** (HVSC song lengths &amp; STIL · Demozoo composer, crew &amp; release year) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Plays tracks inside ZIP archives** (no unpacking) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Network shares without mounting** (FTP · SMB · WebDAV) | ✅ | ❌ | ❌ | ❌ | ✅ (SMB · NFS · WebDAV) | ❌ |
+| **In-browser tag editing** (writes real tags) | ✅ | ❌ read-only | ⚠ database only | ⚠ database only | ❌ | ❌ |
+| **Graphic equalizer in the web player** | ✅ 10-band | ❌ | ❌ | 💰 Plex Pass | ❌ | ❌ |
+| **Tracker visualization** (per-channel VU · live pattern view) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Smart playlists &amp; audio similarity** | ✅ + Instant Mix radio | ⚠ similarity via plugin | ⚠ via plugins | 💰 Plex Pass | ✅ | ⚠ via plugin |
+
+### Where SoniqBoom reigns supreme
+
+- **It plays the formats no one else touches.** Forty-plus retro families — SID, ~20 tracker formats, AHX and HivelyTracker, ~150 Amiga exotics, Atari ST, the whole PSF family, console chiptunes, AdLib/OPL2, and MIDI. None of the servers above render *any* of them.
+- **Scene metadata** Correct per-tune SID lengths and STIL credits from HVSC, plus composer, crew, and release year from Demozoo - metadata no other server carries.
+- **Your ZIP hoards just work.** Tracks inside `.zip` archives appear and play in place; every other server needs them unpacked first.
+- **Multi-room that needs nothing extra.** Lockstep playback across any browsers on your LAN — no Squeezebox hardware, no Home Assistant hub.
+- **Your files where they already are.** Attach FTP, SMB, and WebDAV shares straight from the admin UI with no OS mount - only Music Assistant comes close.
+- **Real tag editing, in the browser.** It writes actual tags; Navidrome is read-only by design, and Jellyfin and Plexamp only edit their own database.
+- **A full listening toolkit, free.** A 10-band EQ, ReplayGain, Instant Mix radio, audio-similarity "more like this," and self-updating smart playlists — with no paid tier, no account, and no telemetry.
+- **Channel-by-channel visualization.** Per-channel VU meters, a live pattern view for tracker modules, and the Library Galaxy — a view of your collection no other server offers.
+
+---
+
 ## Configuration
 
 Most settings live in the admin UI. The config file is created for you on first run:
@@ -285,7 +321,9 @@ Honest, measured numbers (idle, on the ARM64 image):
 | **CPU** | Idle is near-zero. Retro formats are rendered to audio server-side on play; a SID or tracker module decodes comfortably on a Pi-class core. Large first-time library scans are the main CPU spike. |
 | **Disk** | Your music (untouched, read-only) + the `/data` volume (index, conversion cache, config, logs). The conversion cache grows as you play transcoded/retro formats and can be cleared any time. |
 
-Don't need the Amiga "exotica" family or native `.sc68` disks, and want a **faster build**? Pass `--build-arg SLIM=1` to skip the two slow source-compiled players (`uade` and `sc68`). Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console chiptune, PSF, AdLib, all modern codecs — still ships. This mainly saves *build time* (and dodges the qemu compile flakiness when you cross-build on an Apple-Silicon Mac); it trims only ~12 MB off the image, since the bulk is ffmpeg and the bundled SoundFont, not the retro players. The **default** image ships everything — that breadth is the point.
+**Building the Docker image** and don't need the Amiga "exotica" family or native `.sc68` disks? Pass `--build-arg SLIM=1` to skip the two players the *image* compiles from source (`uade` and `sc68`). Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console chiptune, PSF, AdLib, all modern codecs — still ships. This mainly saves *build time* (and dodges the qemu compile flakiness when you cross-build on an Apple-Silicon Mac); it trims only ~12 MB off the image, since the bulk is ffmpeg and the bundled SoundFont, not the retro players. The **default** image ships everything — that breadth is the point.
+
+The **native installer** compiles a different set. On macOS it builds `zxtune123`, `sidplayfp`, and `psgplay` from source (`uade` and `sc68` come from Homebrew there), and the zxtune build is the slow one at roughly 10–15 minutes. Its shortcut is `bash install.sh --slim`, which skips only zxtune: the **PSF family** — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF (PlayStation, N64, GBA, DS, Saturn, and Dreamcast rips) — won't play until you re-run the installer without `--slim`. Every other format is unaffected. (On Linux the same flag simply skips the prebuilt zxtune download, with the identical effect.)
 
 ---
 
