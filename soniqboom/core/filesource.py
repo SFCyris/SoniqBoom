@@ -216,6 +216,7 @@ class FileSource(ABC):
     def walk_with_stat(
         self, top: str, *,
         skip_subtree_fn: "Callable[[DirEntry], bool] | None" = None,
+        error_sink: "list | None" = None,
     ) -> Iterator[tuple[str, list["DirEntry"], list["DirEntry"]]]:
         """Yield ``(dirpath, dir_entries, file_entries)`` preserving the
         ``DirEntry.size`` and ``DirEntry.mtime`` already returned by
@@ -227,6 +228,14 @@ class FileSource(ABC):
         are walked.  Used by the freshness loop to skip subtrees whose
         ``dir.mtime`` hasn't changed since the last walk (turning a
         30 K-entry walk into a 50-entry walk when nothing changed).
+
+        ``error_sink`` (optional): if a directory listing FAILS mid-walk
+        (network/protocol error) the walk logs and continues over the
+        remaining directories — but it also appends ``(dirpath, reason)``
+        here so the caller can tell a PARTIAL walk (some dir failed) apart
+        from a complete one.  This matters for ghost cleanup: a subtree
+        absent because its listing errored is NOT proof its files were
+        deleted, and purging it would be silent data loss.
 
         The default implementation bridges through ``list_dir`` so every
         backend works without an override.  Backends whose underlying
@@ -246,6 +255,8 @@ class FileSource(ABC):
                 entries = self.list_dir(current)
             except Exception as exc:
                 log.warning("walk_with_stat: list_dir(%s) failed: %s", current, exc)
+                if error_sink is not None:
+                    error_sink.append((current, str(exc)))
                 continue
             dir_entries = [e for e in entries if e.is_dir]
             file_entries = [e for e in entries if not e.is_dir]
@@ -795,11 +806,18 @@ class _FTPConnectionPool:
         self._waiting_stream = 0
         self._waiting_scan   = 0
         self._waiting_browse = 0
+        # Set when a reactive too-many-clients trip resizes the pool DOWN, so
+        # _maybe_relax_cap knows to reconcile the live size back up later even
+        # for a trip that persisted no cap (observed<2 first-connection
+        # refusal).  Keeps the never-tripped common pool off the reconcile path.
+        self._cap_dirty = False
 
-        # Background warm + keep-alive thread.  Skipped when min_size is 0
-        # because there's nothing to maintain — the pool is purely on-
-        # demand in that mode (the old behaviour, before the warm-min
-        # feature landed).  Daemon so it doesn't block interpreter exit.
+        # Background warm + keep-alive thread.  Runs when there's a warm floor
+        # to maintain (min_size > 0) OR whenever the pool has a real server
+        # identity (host+port) — the latter so the periodic detected-cap
+        # recovery (F1) works even in purely-on-demand mode (min_size == 0),
+        # where the warm/refresh work below is skipped but cap-decay still runs.
+        # Daemon so it doesn't block interpreter exit.
         #
         # Both events live on the instance regardless of whether the
         # thread starts, so callers (``_release`` → ``_kalive_stop_or_nudge``
@@ -808,7 +826,7 @@ class _FTPConnectionPool:
         self._kalive_stop   = threading.Event()
         self._kalive_nudge  = threading.Event()
         self._kalive_thread: threading.Thread | None = None
-        if self._min_size > 0:
+        if self._min_size > 0 or (self._host and self._port):
             self._kalive_thread = threading.Thread(
                 target=self._keepalive_loop,
                 name=f"ftp-keepalive[{self._label or 'pool'}]",
@@ -956,15 +974,30 @@ class _FTPConnectionPool:
             # the cap one slot below where we were and resize.  Done
             # outside the lock to avoid holding the pool lock across
             # disk IO.
-            if _is_too_many_clients_error(exc) and self._host:
+            if _is_too_many_clients_error(exc) and self._host and self._port:
                 try:
                     from soniqboom.core import ftp_pool_config as _fcc
                     new_cap = _fcc.record_too_many_clients(
                         self._host, self._port, observed,
                     )
-                    # Resize down so subsequent borrows respect the
-                    # learned cap immediately rather than re-tripping.
-                    self.resize(max(1, new_cap))
+                    # A trip must BACK OFF, never grow.  Resize to the resolved
+                    # clamp min(configured, detected-1) but never above the
+                    # reactive value — as a single min():
+                    #   * normal reactive → detected-1 (the -1 headroom slot),
+                    #     not the raw detected (which was one over and briefly
+                    #     re-opened the offending slot);
+                    #   * manual pin → record returns the pin unchanged, so this
+                    #     lands at min(configured, pin-1) and NEVER grows the
+                    #     pool above its clamp (no grow-on-trip mini-storm);
+                    #   * observed<2 refusal (new_cap==1, no cap persisted) →
+                    #     min(1, configured)=1, a hard backoff.
+                    self.resize(min(max(1, new_cap),
+                                    _resolve_pool_size(self._host, self._port)[0]))
+                    # Mark dirty so the keepalive loop reconciles the live size
+                    # back up later — critical for the observed<2 refusal, which
+                    # shrank us to 1 but persisted NO cap (so get_detected_cap
+                    # stays None and the fast path would otherwise skip us).
+                    self._cap_dirty = True
                 except Exception:
                     log.exception("Failed to record too-many-clients for %s",
                                   self._label)
@@ -1124,12 +1157,15 @@ class _FTPConnectionPool:
         (existing reactive flow already handles the resize-down).
         """
         # Warm immediately so the FIRST borrow lands on an established
-        # connection rather than triggering a sync TCP handshake.
-        try:
-            self._top_up_idle()
-        except Exception:
-            log.exception("FTP keepalive initial warm failed (pool=%s)",
-                          self._label)
+        # connection rather than triggering a sync TCP handshake.  Only when
+        # there's a warm floor — a min_size==0 (on-demand) pool runs this loop
+        # solely for cap recovery and must NOT start holding idle sockets.
+        if self._min_size > 0:
+            try:
+                self._top_up_idle()
+            except Exception:
+                log.exception("FTP keepalive initial warm failed (pool=%s)",
+                              self._label)
 
         probe_consecutive_fails = 0  # back off after repeated failures
 
@@ -1139,25 +1175,90 @@ class _FTPConnectionPool:
             self._kalive_nudge.clear()
             if self._kalive_stop.is_set():
                 return
-            try:
-                self._refresh_idle()
-                self._top_up_idle()
-            except Exception:
-                log.exception("FTP keepalive cycle failed (pool=%s)",
-                              self._label)
-
-            # Optional growth probe — runs at the same cadence as
-            # keepalive (default 60 s) so we don't hammer the server.
-            if self._host and self._port:
+            if self._min_size > 0:
                 try:
-                    grew = self._maybe_probe_grow()
-                    if grew:
-                        probe_consecutive_fails = 0
-                    else:
-                        probe_consecutive_fails += 1
+                    self._refresh_idle()
+                    self._top_up_idle()
                 except Exception:
-                    log.exception("FTP grow-probe failed (pool=%s)",
+                    log.exception("FTP keepalive cycle failed (pool=%s)",
                                   self._label)
+
+            if self._host and self._port:
+                # Cap-decay: let a reactively-lowered detected cap creep back
+                # toward the user's configured budget after a trip-free spell,
+                # so a TRANSIENT 421/530 doesn't pin the pool below what the
+                # user asked for until a manual reset.  Runs for EVERY real
+                # pool (incl. on-demand min_size==0), and before the grow-probe
+                # so the probe sees the recovered clamp.
+                try:
+                    self._maybe_relax_cap()
+                except Exception:
+                    log.exception("FTP cap-relax failed (pool=%s)", self._label)
+
+                # Optional growth probe — pushes ABOVE the budget on demand.
+                # Gated to warm pools (min_size>0): it opens+idles a probe
+                # connection that ONLY _refresh_idle (also min_size>0) keeps
+                # alive, so running it on an on-demand pool would strand an
+                # unrefreshed idle socket.  Same cadence as keepalive (60 s).
+                if self._min_size > 0:
+                    try:
+                        grew = self._maybe_probe_grow()
+                        if grew:
+                            probe_consecutive_fails = 0
+                        else:
+                            probe_consecutive_fails += 1
+                    except Exception:
+                        log.exception("FTP grow-probe failed (pool=%s)",
+                                      self._label)
+
+    def _maybe_relax_cap(self) -> None:
+        """Recover a reactively-lowered pool toward the configured budget after
+        a trip-free spell, and reconcile the live ``max_size`` to the resolved
+        source of truth.
+
+        A 421/530 clamps ``max_size = min(configured, detected-1)``.  If the
+        trip was transient (temporary overload) the pool would otherwise stay
+        stuck below the user's configured budget until a manual reset.  Two
+        recovery paths, both handled here:
+
+        * Persisted cap → ``ftp_pool_config.relax_detected_cap`` does the AIMD
+          time-gate + persistence (+1 per ``_CAP_DECAY_INTERVAL_S``, dropped
+          straight back by the reactive handler if the higher value trips).
+        * A trip that persisted NO cap (``observed < 2`` first-connection
+          refusal still resizes the live pool down to 1) — ``_cap_dirty`` marks
+          it so we reconcile back up even though ``get_detected_cap`` is None.
+
+        We then resize the live pool to ``_resolve_pool_size`` (which also
+        corrects the reactive handler's off-by-one: it resizes to ``detected``,
+        the resolved clamp is ``detected-1``).  Unlike auto-grow this never
+        exceeds the configured budget — it only undoes a reactive clamp, so it
+        needs neither the ``auto_grow`` opt-in nor a demand gate (a higher
+        ``max_size`` opens no sockets until something borrows).
+        """
+        from soniqboom.core import ftp_pool_config as _fcc
+        has_cap = _fcc.get_detected_cap(self._host, self._port) is not None
+        # Fast path: never-tripped pool with nothing to reconcile — skip the
+        # conf read entirely (keeps idle on-demand pools cheap).
+        if not has_cap and not self._cap_dirty:
+            return
+        if has_cap:
+            _mx, _mn, configured_total, _det = _resolve_pool_size(self._host, self._port)
+            _fcc.relax_detected_cap(self._host, self._port, configured_total)
+        # Reconcile the live pool to the (possibly raised / cleared) clamp.
+        max_size, _min, _ct, det_now = _resolve_pool_size(self._host, self._port)
+        with self._cond:
+            cur = self._max_size
+        if max_size != cur:
+            self.resize(max_size)
+            log.info(
+                "FTP cap-reconcile: pool=%s max %d → %d (detected_cap now %s)",
+                self._label, cur, max_size, det_now,
+            )
+        # Once no cap remains AND the live size matches the resolved budget,
+        # there's nothing left to reconcile — clear the dirty flag so a
+        # never-re-tripping on-demand pool returns to the cheap fast path.
+        if det_now is None and max_size == self._max_size:
+            self._cap_dirty = False
 
     def _maybe_probe_grow(self) -> bool:
         """Attempt one growth-probe cycle.  Returns True if the pool
@@ -1613,6 +1714,43 @@ def _close_all_ftp_pools() -> None:
 atexit.register(_close_all_ftp_pools)
 
 
+# FTP reply codes that genuinely mean "the server does not implement this
+# command" — the ONLY condition under which MLSD should be disabled for a
+# source.  ``ftplib`` raises ``error_perm`` for EVERY 5xx reply (including 550
+# file-not-found and 530 not-logged-in), so an ``isinstance`` check alone is far
+# too broad: a single 550 on a bogus path once disabled MLSD share-wide, which
+# forced every later listing onto LIST (mtime=0) and broke incremental skip.
+# Inspect the leading 3-digit reply code and disable only on 500 / 502.
+_MLSD_UNSUPPORTED_CODES = frozenset({"500", "502"})
+# A latched source re-probes MLSD after this long, so it can recover from a
+# latch (transient 500/502, or a server that later gains MLSD) without a
+# process restart.  reconnect() clears the latch immediately; this is the
+# fallback for a LIST-degraded-but-reachable source that never reconnects.
+#
+# Kept SHORT (30 min) deliberately.  A latch degrades every listing to LIST
+# (coarse mtimes) and can re-arm a full re-extract storm, so a FALSE latch
+# (transient/desynced 500) must not persist for hours.  The only cost on a
+# server that genuinely lacks MLSD is one wasted MLSD command per interval —
+# it simply re-latches on the first 500/502 after each re-probe (the streak
+# below is already ≥ the latch threshold, so recovery is immediate).
+_MLSD_REPROBE_S = 30 * 60
+# Latch MLSD off only after this many CONSECUTIVE "unsupported" (500/502)
+# replies.  A one-off desync/"500 OOPS" on an otherwise MLSD-capable server
+# (vsftpd under load, a stale pooled control channel) no longer flips the
+# whole source to LIST — a single spurious 500 is absorbed by the LIST
+# fallback for that one listing and MLSD is retried on the next.  A server
+# that truly lacks MLSD answers 500/502 every time, so it still latches
+# within two listings.
+_MLSD_LATCH_STREAK = 2
+
+
+def _mlsd_unsupported(exc: Exception) -> bool:
+    """True iff *exc* is an FTP reply that means MLSD itself is unsupported."""
+    if not isinstance(exc, ftplib.error_perm):
+        return False
+    return str(exc).strip()[:3] in _MLSD_UNSUPPORTED_CODES
+
+
 class FTPFileSource(FileSource):
     """Direct FTP access via stdlib ftplib.
 
@@ -1630,6 +1768,17 @@ class FTPFileSource(FileSource):
         self._password = password or ""
         self._remote_path = remote_path.rstrip("/") or "/"
         self._use_mlsd: bool = True  # try MLSD first, fall back to LIST
+        self._mlsd_disabled_at: float = 0.0  # wall time MLSD was latched off (0 = never); drives the periodic re-probe
+        self._mlsd_fail_streak: int = 0  # consecutive 500/502 MLSD replies; latches at _MLSD_LATCH_STREAK
+        # One FTPFileSource per share is SHARED across threads (scanner scan
+        # lane, interactive browse lane, freshness poller — see _active_sources
+        # + the pool's lane split).  The MLSD latch trio above is read-decide-
+        # written from all of them; without this lock a torn interleave could
+        # leave the inconsistent pair (_use_mlsd=False, _mlsd_disabled_at=0.0),
+        # which the re-probe guard would never clear — wedging the share on
+        # LIST until process restart.  The lock guards ONLY the small state
+        # mutations, never the socket round-trip, so listings still parallelise.
+        self._mlsd_lock = threading.Lock()
         self._encoding: str = "utf-8"  # downgraded to latin-1 on decode errors
 
     @property
@@ -1660,6 +1809,14 @@ class FTPFileSource(FileSource):
             # ``scan`` lane: this is a health probe, not user playback.
             with self._pool.borrow(lane="scan"):
                 pass
+            # A fresh connection is our chance to re-probe MLSD: if the source
+            # was latched to LIST by a transient/bogus failure, re-enable
+            # structured listing so it can recover.  A server that genuinely
+            # lacks MLSD simply re-latches on the next listing (500/502).
+            with self._mlsd_lock:
+                self._use_mlsd = True
+                self._mlsd_disabled_at = 0.0
+                self._mlsd_fail_streak = 0
             return True
         except Exception as exc:
             log.info("FTP reconnect to %s:%d failed: %s: %s",
@@ -1695,41 +1852,139 @@ class FTPFileSource(FileSource):
                      self._host)
             self._encoding = "latin-1"
 
-    def _list_entries(self, path: str, lane: str = "scan") -> list[DirEntry]:
+    def _note_mlsd_failure(self, exc: Exception) -> None:
+        """Record an MLSD listing error and latch MLSD off ONLY after
+        ``_MLSD_LATCH_STREAK`` consecutive "command not implemented"
+        (500/502) replies.
+
+        A one-off desync / "500 OOPS" on an otherwise MLSD-capable server
+        (vsftpd under load, a stale pooled control channel) is absorbed by
+        the per-call LIST fallback for that single listing and MLSD is
+        retried on the next — it no longer flips the whole source to LIST
+        (which reports coarse mtimes and can re-arm a full re-extract
+        storm).  A server that truly lacks MLSD answers 500/502 every time,
+        so it still latches within two listings.
+
+        A non-unsupported error (550 bogus path, 530 auth, a borrow
+        timeout, a socket error) is NOT evidence MLSD is missing — the
+        streak and the latch are left untouched.  See ``_mlsd_unsupported``.
+        """
+        with self._mlsd_lock:
+            if not _mlsd_unsupported(exc):
+                # A non-500/502 MLSD error (borrow timeout, socket error, a 550
+                # bogus path, 530 auth) is not evidence MLSD is missing AND it
+                # breaks the "consecutive" run — reset so only genuinely
+                # back-to-back 500/502s (what a truly MLSD-less server emits
+                # every time) latch, not a 500 / socket-blip / 500 sequence.
+                self._mlsd_fail_streak = 0
+                return
+            self._mlsd_fail_streak += 1
+            if self._mlsd_fail_streak >= _MLSD_LATCH_STREAK:
+                # Latch as a CONSISTENT pair: whenever _use_mlsd is False,
+                # _mlsd_disabled_at is a real timestamp so the re-probe fires.
+                self._use_mlsd = False
+                self._mlsd_disabled_at = time.time()
+
+    def _mark_mlsd_ok(self) -> None:
+        """A successful MLSD listing → clear the latch as a CONSISTENT trio
+        (_use_mlsd=True, streak=0, disabled_at=0).  Re-asserting _use_mlsd=True
+        here (not merely clearing the counters) means every critical section
+        leaves a VALID pair, so a concurrent latch/success race can only
+        resolve to one of the two consistent states — never the wedged
+        (_use_mlsd=False, _mlsd_disabled_at=0) pair."""
+        with self._mlsd_lock:
+            self._use_mlsd = True
+            self._mlsd_fail_streak = 0
+            self._mlsd_disabled_at = 0.0
+
+    def _list_entries(self, path: str, lane: str = "scan", *,
+                      error_sink: "list | None" = None) -> list[DirEntry]:
         # ``lane`` selects the pool bucket: ``"scan"`` (default) for bulk
         # scanner walks; ``"stream"`` for INTERACTIVE folder browsing so a
         # running scan (which saturates the scan lane) can't starve the file
         # browser.  The symptom was a remote folder rendering EMPTY mid-scan:
         # the listing borrow timed out on the contended scan lane and
         # fstree's _remote_list_children swallowed the exception → [].
+        #
+        # ``error_sink`` (optional): a listing that HARD-FAILS (borrow
+        # timeout, socket error, or an FTP error that isn't a genuinely-empty
+        # dir) still returns [] here — an interactive browse must render
+        # empty, not crash — but it ALSO appends ``(abs_path, reason)`` to
+        # ``error_sink`` so a WALK can tell "this dir failed to list" apart
+        # from "this dir is genuinely empty".  Without that signal a single
+        # transient per-directory failure during a full / drift-sweep walk
+        # makes the whole subtree look deleted, and ghost cleanup purges
+        # every track under it (silent subtree data loss — QA finding).
+        #
+        # Archive-internal virtual paths ("archive.zip::member/…") are NOT
+        # real FTP directories — the server answers 550 for them.  That 550
+        # must never reach the MLSD-unsupported check below: a single bogus 550
+        # once disabled MLSD for the WHOLE source, degrading every subsequent
+        # listing to LIST (which reports mtime=0) and breaking incremental
+        # scan-skip.  Archive contents are enumerated by the archive layer,
+        # never by FTP LIST.
+        if "::" in path:
+            # Refuse to FTP-list only GENUINE archive / disk-image interiors.
+            # A benign user directory that merely CONTAINS "::" in its name
+            # (e.g. "Artist :: Album", "Live :: 1998") IS a real, listable
+            # server directory and must NOT be short-circuited — doing so
+            # makes its whole subtree invisible in the browser and unscanned
+            # by the indexer (every track inside silently missing).
+            from soniqboom.core import archive as _archive
+            from soniqboom.core import diskimage as _diskimage
+            outer = path.split("::", 1)[0]
+            if _archive.is_archive_name(outer) or _diskimage.is_disk_image(outer):
+                return []
         abs_path = self._abs(path)
 
+        # Periodic re-probe (under the latch lock): a source latched to LIST is
+        # given MLSD another try after _MLSD_REPROBE_S, so a transient/bogus
+        # latch recovers without a restart.  A torn concurrent write could also
+        # leave the inconsistent pair (_use_mlsd=False, _mlsd_disabled_at<=0);
+        # treat that as "re-probe due" so it self-heals instead of wedging on
+        # LIST forever.  ``use_mlsd`` is snapshotted here and drives THIS call;
+        # the socket round-trip below runs WITHOUT the lock held so concurrent
+        # listings on other lanes still parallelise.
+        with self._mlsd_lock:
+            if not self._use_mlsd and (
+                self._mlsd_disabled_at <= 0.0
+                or time.time() - self._mlsd_disabled_at > _MLSD_REPROBE_S
+            ):
+                self._use_mlsd = True
+            use_mlsd = self._use_mlsd
+
         # Prefer MLSD (structured output, RFC 3659)
-        if self._use_mlsd:
+        if use_mlsd:
             try:
-                return self._list_via_mlsd(abs_path, lane)
+                entries = self._list_via_mlsd(abs_path, lane)
+                self._mark_mlsd_ok()          # success → consistent "MLSD on" state
+                return entries
             except UnicodeDecodeError:
                 self._switch_encoding_latin1()
                 try:
-                    return self._list_via_mlsd(abs_path, lane)
+                    entries = self._list_via_mlsd(abs_path, lane)
+                    self._mark_mlsd_ok()
+                    return entries
                 except Exception as exc:
-                    if isinstance(exc, ftplib.error_perm):
-                        self._use_mlsd = False   # genuine "MLSD unsupported"
+                    self._note_mlsd_failure(exc)
                     log.info("MLSD failed on %s (%s), using LIST fallback",
                              self._host, exc)
-                    self._reset()
             except Exception as exc:
-                # Only a genuine 5xx "command not understood" (error_perm) means
-                # the server lacks MLSD.  A transient borrow-timeout / socket
-                # error must NOT disable MLSD for the whole source — that would
-                # degrade every later listing (incl. the scanner) to slower LIST.
-                if isinstance(exc, ftplib.error_perm):
-                    self._use_mlsd = False
+                # Latch decision is delegated to _note_mlsd_failure: disable
+                # MLSD only on repeated genuine "command unrecognized / not
+                # implemented" (FTP 500/502).  Any other error_perm (550 bogus
+                # path, 530 auth), a borrow-timeout, or a socket error is NOT
+                # evidence the server lacks MLSD.
+                self._note_mlsd_failure(exc)
                 log.info("MLSD not supported on %s (%s), using LIST fallback",
                          self._host, exc)
-                self._reset()
 
-        # Fallback: LIST (universally supported)
+        # Fallback: LIST (universally supported).  On error the pool's borrow()
+        # already marks the connection broken and discards it, so there is
+        # nothing to reset here (the old self._reset() was removed in the
+        # pooled-connection refactor and would AttributeError).  A hard failure
+        # is recorded in ``error_sink`` as a ROOT-RELATIVE dir path so the
+        # scanner can protect exactly that subtree's tracks from ghost cleanup.
         try:
             return self._list_via_list(abs_path, lane)
         except UnicodeDecodeError:
@@ -1738,11 +1993,13 @@ class FTPFileSource(FileSource):
                 return self._list_via_list(abs_path, lane)
             except Exception as exc:
                 log.warning("FTP LIST failed for %s: %s", abs_path, exc)
-                self._reset()
+                if error_sink is not None:
+                    error_sink.append((self._rel(abs_path), str(exc)))
                 return []
         except Exception as exc:
             log.warning("FTP LIST failed for %s: %s", abs_path, exc)
-            self._reset()
+            if error_sink is not None:
+                error_sink.append((self._rel(abs_path), str(exc)))
             return []
 
     def _list_via_mlsd(self, abs_path: str, lane: str = "scan") -> list[DirEntry]:
@@ -1781,6 +2038,18 @@ class FTPFileSource(FileSource):
 
         Unix:    drwxr-xr-x  2 user group  4096 Jan 01 12:00 filename
         Windows: 01-01-26  12:00PM       <DIR>  dirname
+
+        The date/time columns are parsed to a real mtime where possible.
+        A genuinely MLSD-less server (LIST is the ONLY listing path) would
+        otherwise report mtime=0 for every file, defeating the scanner's
+        incremental ``(mtime, size)`` skip and re-downloading the whole
+        share on every poll — the exact multi-minute full-re-index symptom
+        the MLSD path avoids.  LIST dates are coarse (minute precision,
+        year sometimes omitted) and locale-dependent, so parsing is
+        best-effort: an unparseable date yields ``0.0`` (identical to the
+        old behaviour — no regression, just no incremental win for that
+        line), while a parsed date is stable across polls of the same
+        server so skip works from the second LIST scan onward.
         """
         if not line or line.startswith("total "):
             return None
@@ -1797,9 +2066,11 @@ class FTPFileSource(FileSource):
                 size = int(parts[4])
             except ValueError:
                 size = 0
+            mtime = FTPFileSource._parse_list_mtime_unix(
+                parts[5], parts[6], parts[7])
             entry_path = f"{parent}/{name}" if parent != "/" else f"/{name}"
             return DirEntry(name=name, path=entry_path, is_dir=is_dir,
-                            size=size, mtime=0.0)
+                            size=size, mtime=mtime)
 
         # Windows-style: 01-01-26  12:00PM  <DIR>  dirname
         wparts = line.split(None, 3)
@@ -1814,11 +2085,82 @@ class FTPFileSource(FileSource):
                     size = int(wparts[2])
                 except ValueError:
                     pass
+            mtime = FTPFileSource._parse_list_mtime_windows(wparts[0], wparts[1])
             entry_path = f"{parent}/{name}" if parent != "/" else f"/{name}"
             return DirEntry(name=name, path=entry_path, is_dir=is_dir,
-                            size=size, mtime=0.0)
+                            size=size, mtime=mtime)
 
         return None
+
+    _LIST_MONTHS = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+
+    @staticmethod
+    def _parse_list_mtime_unix(mon: str, day: str, year_or_time: str) -> float:
+        """Parse the ``MMM DD (HH:MM | YYYY)`` columns of a Unix LIST line
+        into a Unix timestamp; 0.0 if unparseable.
+
+        ``ls`` omits the year for files newer than ~6 months (showing
+        ``HH:MM`` instead) and shows ``YYYY`` (no time) once older.  For the
+        recent form we keep the real minute-precision time and infer the
+        year (this year, or last year if that would fall in the future —
+        ``ls``'s own rule).
+
+        Irreducible LIST tradeoff (deliberate choice, see the two review
+        rounds): the recent form carries a time, the aged form does not, so
+        ONE representation can't be stable across the ~6-month display switch
+        AND detect a same-day re-tag.  We keep the time here, which means:
+          * a same-day, same-size re-tag is DETECTED while the file is still
+            recent (its minute changes → re-extract), and
+          * a file re-extracts exactly ONCE as it ages past ~6 months (its
+            stored HH:MM no longer matches the aged midnight), after which the
+            stored value is the aged midnight and stays stable.
+        The alternative (store midnight always) is stable across the switch
+        but SILENTLY misses same-size same-day re-tags forever — a permanent
+        correctness miss traded for avoiding a bounded, visible, self-
+        correcting re-extract.  We prefer the visible re-extract.  (Aged
+        same-size re-tags are undetectable from LIST regardless — the aged
+        form has no time; that needs MDTM/MLSD.)  All of this is moot on an
+        MLSD-capable server, which never reaches LIST.
+        """
+        import datetime
+        mon_i = FTPFileSource._LIST_MONTHS.get(str(mon)[:3].lower())
+        if mon_i is None:
+            return 0.0
+        try:
+            day_i = int(day)
+        except (ValueError, TypeError):
+            return 0.0
+        now = datetime.datetime.now()
+        try:
+            if ":" in year_or_time:
+                hh, mm = year_or_time.split(":", 1)
+                year = now.year
+                cand = datetime.datetime(year, mon_i, day_i, int(hh), int(mm))
+                if cand.timestamp() > now.timestamp() + 86400:
+                    cand = cand.replace(year=year - 1)
+                dt = cand
+            else:
+                dt = datetime.datetime(int(year_or_time), mon_i, day_i)
+            return dt.timestamp()
+        except (ValueError, OSError, OverflowError):
+            return 0.0
+
+    @staticmethod
+    def _parse_list_mtime_windows(date_s: str, time_s: str) -> float:
+        """Parse a Windows/IIS LIST ``MM-DD-YY HH:MM(AM|PM)`` date into a
+        Unix timestamp; 0.0 if unparseable."""
+        import datetime
+        stamp = f"{date_s} {time_s}"
+        for fmt in ("%m-%d-%y %I:%M%p", "%m-%d-%Y %I:%M%p",
+                    "%m-%d-%y %H:%M", "%m-%d-%Y %H:%M"):
+            try:
+                return datetime.datetime.strptime(stamp, fmt).timestamp()
+            except (ValueError, OSError, OverflowError):
+                continue
+        return 0.0
 
     @staticmethod
     def _parse_mtime(val: str) -> float:
@@ -1854,6 +2196,7 @@ class FTPFileSource(FileSource):
     def walk_with_stat(
         self, top: str, *,
         skip_subtree_fn: "Callable[[DirEntry], bool] | None" = None,
+        error_sink: "list | None" = None,
     ) -> Iterator[tuple[str, list[DirEntry], list[DirEntry]]]:
         """FTP-specific walk that preserves the size+mtime MLSD already
         returns in the listing response.
@@ -1861,6 +2204,13 @@ class FTPFileSource(FileSource):
         ``skip_subtree_fn`` (optional) is called on every dir entry
         before we'd recurse into it.  Returning ``True`` prunes the
         subtree — used by the freshness loop with a dir-mtime cap.
+
+        ``error_sink`` (optional): threaded into ``_list_entries`` so a
+        per-directory listing that HARD-FAILS (borrow timeout / socket /
+        5xx that isn't an empty dir) is recorded even though the walk
+        continues.  A non-empty sink means the walk was PARTIAL — the
+        caller must suppress ghost cleanup, or a transiently-unreadable
+        subtree gets purged as if its files were deleted.
 
         Why override the base bridge implementation: MLSD returns size
         and mtime in the SAME response as the directory listing — one
@@ -1890,10 +2240,15 @@ class FTPFileSource(FileSource):
         while stack:
             current = stack.pop()
             try:
-                entries = self._list_entries(current)
+                entries = self._list_entries(current, error_sink=error_sink)
             except Exception as exc:
                 log.warning("walk_with_stat: _list_entries(%s) failed: %s",
                             current, exc)
+                if error_sink is not None:
+                    # Record ROOT-RELATIVE (same frame _list_entries uses and
+                    # the scanner's ghost keys are in) so per-subtree ghost
+                    # protection actually matches this failed directory.
+                    error_sink.append((self._rel(current), str(exc)))
                 continue
             dir_entries: list[DirEntry] = []
             file_entries: list[DirEntry] = []

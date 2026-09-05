@@ -90,6 +90,18 @@ _POOL_WAIT_SKIP_THRESHOLD = 1
 # it stuck (and refuse to start another concurrent one for the same share).
 _INFLIGHT_TIMEOUT_S = 600  # 10 min — large libraries can take this long
 
+# Soft ceiling on the gap between FULL walks (dir_mtime_cap=None).  Only a full
+# walk runs ghost cleanup (deleted remote files → purged phantom tracks).  Drift
+# sweeps otherwise fire every 5th poll, so once adaptive cadence relaxes toward
+# the 4h max a stable/delete-only share could go ~20h (5 × 4h) without one.
+# Once a poll fires and it's been longer than this since the last full walk, the
+# poll is promoted to a full walk.  Note the effective ghost-cleanup latency is
+# therefore ~max(poll_cadence, this): a share relaxed past 3h simply does a full
+# walk on EVERY poll (so latency ≈ its ~4h cadence, not 3h) — still far better
+# than the ~20h drift-sweep-only bound, and cheap since a relaxed share polls
+# rarely.
+_FULL_WALK_CEILING_S = 3 * 60 * 60  # 3 h
+
 
 # ── Per-share state ─────────────────────────────────────────────────────────
 
@@ -103,6 +115,16 @@ class ShareState:
     scan_root: str
     last_check_ts: float = 0.0
     last_change_ts: float = 0.0
+    # Start of the CURRENT no-change spell.  Seeded on first poll and reset
+    # to ``now`` on every observed change.  ``adaptive_interval`` uses the
+    # elapsed dry spell to relax a quiet share toward the 4 h max — without
+    # it, a share that burst-changed once (or never changes at all) stayed
+    # pinned near the 5-min floor / 30-min cold-start forever.
+    quiet_since_ts: float = 0.0
+    # Wall-clock of the last FULL walk (dir_mtime_cap=None) for this share.
+    # Ghost cleanup only runs on a full walk; this bounds the gap between them
+    # (see _FULL_WALK_CEILING_S) independently of the relaxed poll cadence.
+    last_full_walk_ts: float = 0.0
     # Recent inter-arrival times (seconds between change observations).
     # Deque-like list capped at _CHANGE_HISTORY_CAP entries.
     change_intervals: list[float] = field(default_factory=list)
@@ -122,6 +144,8 @@ class ShareState:
             scan_root=d.get("scan_root", ""),
             last_check_ts=float(d.get("last_check_ts", 0.0)),
             last_change_ts=float(d.get("last_change_ts", 0.0)),
+            quiet_since_ts=float(d.get("quiet_since_ts", 0.0)),
+            last_full_walk_ts=float(d.get("last_full_walk_ts", 0.0)),
             change_intervals=[float(x) for x in d.get("change_intervals", [])],
             total_polls=int(d.get("total_polls", 0)),
             total_new_tracks=int(d.get("total_new_tracks", 0)),
@@ -140,19 +164,34 @@ class ShareState:
                 if len(self.change_intervals) > _CHANGE_HISTORY_CAP:
                     self.change_intervals = self.change_intervals[-_CHANGE_HISTORY_CAP:]
         self.last_change_ts = now_ts
+        self.quiet_since_ts = now_ts   # a change restarts the dry-spell clock
         self.total_new_tracks += count
 
     def adaptive_interval(self) -> float:
-        """Compute the next sleep interval (seconds) based on observed history.
+        """Compute the next sleep interval (seconds) from observed history.
 
         Cold start (<_ADAPTIVE_MIN_SAMPLES) → 30 min default.
-        Otherwise: clamp(median(intervals) × 0.5, min=5min, max=4h).
+        Otherwise the base is ``median(intervals) × 0.5``.
+
+        Either base is then relaxed by the CURRENT dry spell: an interval of
+        ``(now − quiet_since_ts) × 0.5`` is taken whenever it is larger, so a
+        share whose changes have stopped eases off toward the 4 h max instead
+        of polling at its old busy cadence (or the 30-min cold-start) forever.
+        The 0.5 factor matches the median formula, so the relaxation is
+        continuous: while changes keep arriving at the historical rate the
+        dry term never exceeds the median term and has no effect; only once
+        the share goes quieter than usual does it take over.  Clamped to
+        [5 min, 4 h].
         """
         if len(self.change_intervals) < _ADAPTIVE_MIN_SAMPLES:
-            return _COLD_START_INTERVAL_S
-        median = statistics.median(self.change_intervals)
-        target = median * 0.5
-        return max(_MIN_INTERVAL_S, min(_MAX_INTERVAL_S, target))
+            base = float(_COLD_START_INTERVAL_S)
+        else:
+            base = statistics.median(self.change_intervals) * 0.5
+        if self.quiet_since_ts > 0:
+            dry = time.time() - self.quiet_since_ts
+            if dry > 0:
+                base = max(base, dry * 0.5)
+        return max(_MIN_INTERVAL_S, min(_MAX_INTERVAL_S, base))
 
 
 # ── Module-level state ──────────────────────────────────────────────────────
@@ -297,6 +336,12 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
     """
     st = _reg.states.setdefault(scan_root, ShareState(scan_root=scan_root))
     now = time.time()
+    # Seed the dry-spell clock so even a never-changing share relaxes toward
+    # the 4h max (adaptive_interval reads quiet_since_ts).  Prefer a persisted
+    # last_change_ts so an already-quiet share doesn't restart the relaxation
+    # clock on every restart/upgrade.
+    if st.quiet_since_ts <= 0:
+        st.quiet_since_ts = st.last_change_ts or now
 
     # Concurrency guard: don't start a second poll for the same share
     # if one is in-flight.  The scanner itself dedupes via
@@ -352,6 +397,10 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
     DRIFT_SWEEP_EVERY = 5
     SAFETY_BUFFER_S = 15 * 60
     cap_reason = "fast"
+    full_walk_overdue = (
+        st.last_full_walk_ts > 0
+        and (now - st.last_full_walk_ts) > _FULL_WALK_CEILING_S
+    )
     if st.last_check_ts <= 0 or st.total_polls < 2:
         dir_mtime_cap = None
         cap_reason = "cold_start"
@@ -360,6 +409,15 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
         cap_reason = "drift_sweep"
         log.info("freshness: %s drift sweep (full walk) — poll #%d",
                  scan_root, st.total_polls)
+    elif full_walk_overdue:
+        # Wall-clock ceiling: even a heavily-relaxed share (cadence pushed
+        # toward the 4h max) must run a full walk — and thus ghost cleanup —
+        # at least this often, or deleted remote files would linger for ~20h.
+        dir_mtime_cap = None
+        cap_reason = "full_walk_ceiling"
+        log.info("freshness: %s forced full walk — %.1fh since last (ceiling %.1fh)",
+                 scan_root, (now - st.last_full_walk_ts) / 3600.0,
+                 _FULL_WALK_CEILING_S / 3600.0)
     else:
         dir_mtime_cap = max(0.0, st.last_check_ts - SAFETY_BUFFER_S)
 
@@ -371,17 +429,20 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
     t0 = time.time()
     plan: dict = {}
     try:
-        from soniqboom.core.scanner import start_remote_scan, get_progress
+        from soniqboom.core.scanner import start_remote_scan
 
-        await start_remote_scan(
+        # Use the plan RETURNED by this scan — never get_progress().last_plan.
+        # That global is process-wide + last-writer-wins, so a concurrent
+        # sibling-share scan (background tick vs. a folder-open check_now)
+        # would overwrite it and make THIS share record the OTHER share's
+        # new-track count into its cadence + fire a mis-attributed toast.
+        plan = dict(await start_remote_scan(
             share_id="",  # freshness-triggered scans don't need share_id
             scan_root=scan_root,
             source=source,
             on_progress=None,  # quiet — freshness doesn't drive scan badge
             dir_mtime_cap=dir_mtime_cap,
-        )
-        progress = get_progress()
-        plan = dict(progress.last_plan or {})
+        ) or {})
     except Exception as exc:
         log.warning("freshness: scan of %s failed: %s", scan_root, exc)
     finally:
@@ -389,22 +450,38 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
         _reg.inflight.pop(scan_root, None)
         st.last_check_ts = time.time()
         st.total_polls += 1
+        # Reset the full-walk ceiling clock ONLY on the scanner's authoritative
+        # "a full walk completed and ghost cleanup was authorized" signal —
+        # NOT merely because we requested dir_mtime_cap=None.  A deduped scan
+        # (concurrent admin re-index) or a crashed scan returns {} → falsy; a
+        # partial/zero-listing walk returns full_walk_ok False.  Stamping on
+        # any of those would defer ghost cleanup by another ceiling interval
+        # (indefinitely, on a chronically-degraded share) while telemetry
+        # falsely reported a clean full walk.
+        if plan.get("full_walk_ok"):
+            st.last_full_walk_ts = st.last_check_ts
 
     # Telemetry: structured one-liner.
     walked  = int(plan.get("walked", 0))
     extract = int(plan.get("extract", 0))
+    # "new" = genuinely-new files (store misses).  Cadence is driven off
+    # THIS, not extract: extract also counts re-extracts (drift / a share
+    # stuck on mtime=0), which would otherwise pin a churning share to the
+    # 5-min floor forever.  Fall back to extract for pre-"new" scan plans.
+    new     = int(plan.get("new", extract))
     skip    = int(plan.get("skip", 0))
     mtime_refresh = int(plan.get("mtime_refresh", 0))
     log.info(
-        "freshness: share=%s walked=%d fresh=%d skip=%d mtime_refresh=%d "
+        "freshness: share=%s walked=%d fresh=%d new=%d skip=%d mtime_refresh=%d "
         "latency_ms=%.0f cadence_min=%.1f reason=%s cap=%s",
-        scan_root, walked, extract, skip, mtime_refresh,
+        scan_root, walked, extract, new, skip, mtime_refresh,
         latency_ms, st.adaptive_interval() / 60.0, reason, cap_reason,
     )
 
-    # Record change for adaptive cadence + fire toast callback.
-    if extract > 0:
-        st.record_change(extract, time.time())
+    # Record change for adaptive cadence + fire toast callback.  Use NEW
+    # arrivals, not extract (re-extracts must not tighten the cadence).
+    if new > 0:
+        st.record_change(new, time.time())
         _save_state()
         cb = _reg.on_new_tracks
         if cb is not None:
@@ -412,7 +489,7 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
                 # Sample new track titles from the plan (if available).  The
                 # scanner doesn't currently expose this; the WS event just
                 # carries the count + scan_root, frontend can fetch detail.
-                await cb(scan_root, extract, [])
+                await cb(scan_root, new, [])
             except Exception:
                 log.exception("freshness: on_new_tracks callback raised")
 

@@ -2206,13 +2206,52 @@ def _list_remote_zip_members(root_path: str, zip_fe, source,
     return out
 
 
+def _mtime_matches_tolerant(stored_mtime: float, listed_mtime: float) -> bool:
+    """True iff a stored mtime and a freshly-listed mtime denote the SAME
+    modification, tolerant of the MLSD(seconds)↔LIST(minutes) precision gap.
+
+    MLSD carries seconds; a Unix LIST fallback carries only minutes (seconds
+    truncated to :00).  So when a source flips MLSD↔LIST the same unchanged
+    file's stored vs listed mtime can differ by up to 59 s — far past the 2 s
+    tolerance — which would re-extract ~the whole share on every latch
+    transition.  When EITHER value is minute-aligned (a LIST value, or an MLSD
+    file modified exactly on the minute) we compare at MINUTE granularity so
+    the transition is a no-op; otherwise full-second precision is kept so a
+    genuine sub-minute re-tag is still detected.  Blind spot: a same-minute
+    re-tag of a file whose mtime lands on :00 (~1-in-60 × same-minute).
+    """
+    if stored_mtime <= 0:
+        return False
+    a, b = stored_mtime, listed_mtime
+    if int(stored_mtime) % 60 == 0 or int(listed_mtime) % 60 == 0:
+        a -= int(a) % 60
+        b -= int(b) % 60
+    return abs(a - b) < 2.0
+
+
+def _rel_under_any_dir(rel: str, dirs: set[str]) -> bool:
+    """True iff root-relative file path *rel* lies within any directory in
+    *dirs* (also root-relative).  A dir of "" or "/" (the whole root failed
+    to list) matches everything.  Used by ghost cleanup to protect tracks
+    under a subtree whose listing hard-failed — those files only LOOK deleted
+    because their directory couldn't be listed, not because they were removed.
+    """
+    for d in dirs:
+        f = d.rstrip("/")
+        if f in ("", "/"):
+            return True
+        if rel == f or rel.startswith(f + "/"):
+            return True
+    return False
+
+
 def _find_remote_audio_entries(
     root_path: str, source: "FileSource",
     *,
     dir_mtime_cap: float | None = None,
     scan_zips: bool = True,
     archive_skip: dict | None = None,
-) -> tuple[list, int, bool]:
+) -> tuple[list, int, bool, set]:
     """Discover audio files via ``walk_with_stat`` — yields DirEntry
     objects preserving ``size`` and ``mtime`` from the underlying
     directory-listing response.
@@ -2229,11 +2268,15 @@ def _find_remote_audio_entries(
     walked normally — i.e. correctness is preserved even when the
     optimization is unsupported.
 
-    Returns ``(entries, pruned_subtree_count, walk_ok)``.  ``walk_ok`` is
-    False when the walk DIED midway (network error, listing failure) —
-    the entries list is then PARTIAL and must never be treated as ground
-    truth for ghost cleanup: everything not yet walked would look
-    deleted.
+    Returns ``(entries, pruned_subtree_count, walk_completed, failed_dirs)``.
+    ``walk_completed`` is False only when the walk itself DIED midway (an
+    exception escaped the whole walk) — the entries list is then PARTIAL in
+    an unknown shape and ghost cleanup must be skipped entirely.
+    ``failed_dirs`` is the set of ROOT-RELATIVE directory paths whose listing
+    hard-failed (borrow timeout / socket / transient 5xx) while the rest of
+    the walk succeeded; ghost cleanup must skip tracks under those subtrees
+    (they only LOOK deleted) but may still purge cleanly-walked subtrees, so
+    one flaky directory can't disable ghost cleanup for the whole share.
 
     Used by ``start_remote_scan`` to decide which files actually need
     re-extraction (mtime+size match → skip) vs. which need a fresh
@@ -2259,8 +2302,9 @@ def _find_remote_audio_entries(
         pruned[0] += 1
         return True
 
+    listing_errors: list = []
     try:
-        walk_kwargs: dict = {}
+        walk_kwargs: dict = {"error_sink": listing_errors}
         if dir_mtime_cap is not None and dir_mtime_cap > 0:
             walk_kwargs["skip_subtree_fn"] = _skip
         for _dirpath, _dir_entries, file_entries in source.walk_with_stat("/", **walk_kwargs):
@@ -2305,9 +2349,24 @@ def _find_remote_audio_entries(
                     ))
     except Exception as exc:
         log.error("Remote walk_with_stat failed for %s: %s", root_path, exc)
-        walk_ok = False
+        walk_completed = False
     else:
-        walk_ok = True
+        walk_completed = True
+    # A per-directory listing that HARD-FAILED (borrow timeout / socket /
+    # transient 5xx) is swallowed to [] inside the source so an interactive
+    # browse renders empty instead of crashing — but for a WALK that means the
+    # failed subtree's files are absent from ``entries`` and would look
+    # deleted.  We surface the ROOT-RELATIVE paths that failed so the caller
+    # can protect EXACTLY those subtrees from ghost cleanup (per-subtree),
+    # rather than the old all-or-nothing suppression that let one reliably-
+    # failing directory disable ghost cleanup for the whole share forever.
+    failed_dirs = {p for p, _ in listing_errors}
+    if failed_dirs:
+        log.warning(
+            "Remote walk of %s had %d directory listing failure(s) — "
+            "ghost cleanup will SKIP those subtree(s) only; first: %s",
+            root_path, len(failed_dirs), sorted(failed_dirs)[:3],
+        )
     if synth_arcs or barren_skips:
         log.info(
             "Archive skip for %s: %d archive(s) synthesized from the store, "
@@ -2324,7 +2383,7 @@ def _find_remote_audio_entries(
             "Discovered %d remote audio entries in %s (pruned %d subtree(s))",
             len(entries), root_path, pruned[0],
         )
-    return entries, pruned[0], walk_ok
+    return entries, pruned[0], walk_completed, failed_dirs
 
 
 async def _prefetch_folder_art_remote(
@@ -2490,8 +2549,22 @@ async def start_remote_scan(
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
     *,
     dir_mtime_cap: float | None = None,
-) -> None:
+) -> dict:
     """Scan a remote FileSource — download files, extract metadata, upsert.
+
+    Returns this scan's plan dict (``scan_root``/``walked``/``extract``/
+    ``new``/``skip``/``mtime_refresh``/``ghosts``), or an empty dict if the
+    scan was deduped away OR raised at any point (including a crash mid-
+    extraction, AFTER the plan was computed).  Returning {} on a crashed
+    scan is deliberate: a scan that died part-way did not fully index its
+    discoveries, so the freshness poller must not record its ``new`` count
+    into the cadence or fire a "N new tracks" toast for tracks that may not
+    all have landed.  Callers (the
+    freshness poller) MUST use this return value rather than the process-
+    global ``get_progress().last_plan`` — that global is last-writer-wins
+    and a concurrent sibling-share scan overwrites it, which would attribute
+    one share's new-track count (and its "N new tracks" toast) to another
+    and mis-tighten the wrong share's poll cadence.
 
     ``dir_mtime_cap`` (optional, Unix epoch seconds) enables the fast-
     path walk: subtrees whose parent dir.mtime hasn't changed since
@@ -2555,7 +2628,10 @@ async def start_remote_scan(
             # Send a synthetic broadcast so the UI's "Re-Index" button
             # gets feedback instead of looking unresponsive.
             await on_progress(_progress)
-        return
+        # Deduped: the in-flight scan owns the plan.  Return an EMPTY plan so
+        # a freshness poller records no change / fires no toast off a stale
+        # global (the dedupe-skip stale-last_plan contamination path).
+        return {}
 
     # Register BEFORE the walk.  The walk/enumeration phase — which
     # downloads remote archives just to list their members — is the most
@@ -2574,12 +2650,13 @@ async def start_remote_scan(
 
     executor = ProcessPoolExecutor(max_workers=SCAN_WORKERS)
     batch_state = {"entered": False}
+    plan: dict = {}
     try:
-        await _remote_scan_body(
+        plan = await _remote_scan_body(
             share_id, scan_root, source, on_progress,
             dir_mtime_cap=dir_mtime_cap, executor=executor,
             batch_state=batch_state,
-        )
+        ) or {}
     except Exception:
         # A dead scan must NEVER leave zombie state.  Before this guard,
         # one unhandled BrokenProcessPool left running=true forever,
@@ -2619,6 +2696,10 @@ async def start_remote_scan(
                 await on_progress(_progress)
             except BaseException:
                 pass
+    # Reached on the normal and handled-exception paths (a cancellation
+    # re-raises out of the finally above and never gets here).  ``plan`` is
+    # this scan's own plan, or {} if the body died before building one.
+    return plan
 
 
 async def _remote_scan_body(
@@ -2630,8 +2711,12 @@ async def _remote_scan_body(
     dir_mtime_cap: float | None,
     executor: ProcessPoolExecutor,
     batch_state: dict,
-) -> None:
+) -> dict:
     """The working half of :func:`start_remote_scan`.
+
+    Returns this scan's plan dict (the same one stashed in
+    ``_progress.last_plan`` for the admin UI) so the wrapper can hand it
+    straight back to the caller without a racy global read.
 
     Split out so the wrapper can guarantee scan-state cleanup (progress
     flags, ``_current_remote_dirs``, ``_scan_count``, executor shutdown,
@@ -2761,10 +2846,15 @@ async def _remote_scan_body(
         scan_zips=_settings.scan_remote_zips,
         archive_skip=archive_skip,
     )
-    entries, _pruned, walk_ok = await loop.run_in_executor(
+    entries, _pruned, walk_completed, walk_failed_dirs = await loop.run_in_executor(
         None, _walk_fn, scan_root, source,
     )
-    if not walk_ok:
+    # ``walk_ok`` (strict) gates the enum-sidecar schema stamp: a full, clean
+    # walk with zero listing failures is the only walk that proves the barren/
+    # schema verdicts.  Ghost cleanup uses the finer ``walk_completed`` +
+    # ``walk_failed_dirs`` signal instead (per-subtree — see the gate below).
+    walk_ok = walk_completed and not walk_failed_dirs
+    if not walk_completed:
         log.warning(
             "Walk of %s died midway — the %d entries collected are "
             "PARTIAL: ghost cleanup and sidecar updates are disabled "
@@ -2803,21 +2893,22 @@ async def _remote_scan_body(
     to_extract: list = []                          # full extract path
     to_refresh: list[tuple[str, float]] = []       # (track_id, new_mtime)
     seen_rel_paths: set[str] = set()
+    new_count = 0                                  # genuinely-new files (not yet in the store)
     for fe in entries:
         rel = fe.path  # already root-relative from walk_with_stat
         seen_rel_paths.add(rel)
         existing = existing_map.get(rel)
         if existing is None:
             to_extract.append(fe)
+            new_count += 1
             continue
         stored_mtime, stored_size, tid = existing
-        if (stored_size == fe.size and stored_mtime > 0
-                and abs(stored_mtime - fe.mtime) < 2.0):
-            # Genuine match — skip entirely.  Tolerant compare, mirroring
-            # the local path's 1 s drift allowance: FTP listing mtimes can
-            # shift sub-second precision between MLSD and a LIST fallback,
-            # and the old EXACT float equality flipped an entire share
-            # (21,197 files) to full re-download when that happened.
+        if stored_size == fe.size and _mtime_matches_tolerant(stored_mtime, fe.mtime):
+            # Genuine match — skip entirely.  The tolerant compare absorbs the
+            # MLSD(seconds)↔LIST(minutes) precision gap so a latch transition
+            # doesn't re-extract the whole share (see _mtime_matches_tolerant);
+            # the old EXACT float equality flipped an entire share (21,197
+            # files) to full re-download on any precision shift.
             continue
         if stored_size == fe.size and stored_mtime == 0 and fe.mtime > 0:
             # Legacy entry: size matches, mtime never captured.  Bump
@@ -2827,25 +2918,37 @@ async def _remote_scan_body(
         # Drift — re-extract.
         to_extract.append(fe)
 
-    # Ghosts: store paths not seen on the remote → delete after scan.
-    ghost_ids: list[str] = [
-        tid for rel, (_m, _s, tid) in existing_map.items()
+    # Ghosts: store paths not seen on the remote → delete after scan.  Keep
+    # the rel with each id so ghost cleanup can protect the ones under a
+    # subtree whose listing hard-failed (they only LOOK deleted).
+    ghost_pairs: list[tuple[str, str]] = [
+        (rel, tid) for rel, (_m, _s, tid) in existing_map.items()
         if rel not in seen_rel_paths and tid
     ]
+    ghost_ids: list[str] = [tid for _rel, tid in ghost_pairs]
 
     total = len(to_extract)
     scan_plan = {
         "scan_root":     scan_root,
         "walked":        len(entries),
         "extract":       total,
+        "new":           new_count,
         "mtime_refresh": len(to_refresh),
         "skip":          len(entries) - total - len(to_refresh),
         "ghosts":        len(ghost_ids),
+        # True iff this was a FULL walk that completed and saw real ground
+        # truth — i.e. the exact condition under which ghost cleanup is
+        # authorized to run below.  The freshness poller stamps its full-walk
+        # ceiling clock ONLY on this, never on "a full walk was requested":
+        # a deduped/crashed/partial walk must not reset the clock (it ran no
+        # cleanup) or ghost cleanup could be deferred indefinitely.
+        "full_walk_ok":  (dir_mtime_cap is None and walk_completed
+                          and len(entries) > 0),
     }
     log.info(
-        "Remote scan plan for %s: walked=%d, extract=%d, mtime_refresh=%d, "
-        "skip=%d, ghosts_to_delete=%d",
-        scan_root, scan_plan["walked"], scan_plan["extract"],
+        "Remote scan plan for %s: walked=%d, extract=%d (new=%d), "
+        "mtime_refresh=%d, skip=%d, ghosts_to_delete=%d",
+        scan_root, scan_plan["walked"], scan_plan["extract"], scan_plan["new"],
         scan_plan["mtime_refresh"], scan_plan["skip"], scan_plan["ghosts"],
     )
     # Self-diagnosing anomaly check: a plan that wants to re-extract most
@@ -3407,11 +3510,16 @@ async def _remote_scan_body(
     # the scan crashing first prevented a mass index wipe.  Ghost truth
     # requires a FULL walk (manual re-index, cold start, drift sweep —
     # the latter runs every 5th poll, so real ghosts still clear fast).
-    # SAFETY 3: a walk that died midway returned PARTIAL entries — the
-    # unwalked remainder would all look deleted.  ``walk_ok`` gates this
-    # the same way the cap does.
+    # SAFETY 3: a walk that DIED midway (``walk_completed`` False) returned
+    # PARTIAL entries of unknown shape — skip entirely, same as the cap.
+    # SAFETY 4 (per-subtree): a walk that completed but had per-directory
+    # listing failures is trustworthy EXCEPT under the failed subtrees.  We
+    # purge the ghosts that are NOT under any ``walk_failed_dirs`` path and
+    # protect the rest — so one reliably-failing directory (a permission-
+    # denied subdir, a symlink that 550s on LIST, a load-shed borrow timeout)
+    # can no longer disable ghost cleanup for the WHOLE share indefinitely.
     if ghost_ids and len(entries) > 0 and (dir_mtime_cap is not None
-                                           or not walk_ok):
+                                           or not walk_completed):
         log.info(
             "Ghost cleanup for %s skipped (%s): %d absent path(s) are "
             "unverified (next clean full walk decides)",
@@ -3419,13 +3527,22 @@ async def _remote_scan_body(
             "capped walk" if dir_mtime_cap is not None else "partial walk",
             len(ghost_ids),
         )
-    if ghost_ids and len(entries) > 0 and dir_mtime_cap is None and walk_ok:
+    if ghost_ids and len(entries) > 0 and dir_mtime_cap is None and walk_completed:
+        if walk_failed_dirs:
+            purge_ids = [tid for rel, tid in ghost_pairs
+                         if not _rel_under_any_dir(rel, walk_failed_dirs)]
+            protected = len(ghost_ids) - len(purge_ids)
+        else:
+            purge_ids = ghost_ids
+            protected = 0
         try:
-            removed = await delete_track_ids(ghost_ids)
+            removed = await delete_track_ids(purge_ids) if purge_ids else 0
             log.info(
                 "Ghost cleanup for %s: removed %d track(s) whose remote "
-                "files no longer exist",
+                "files no longer exist%s",
                 scan_root, removed,
+                (f" ({protected} under failed subtree(s) protected)"
+                 if protected else ""),
             )
         except Exception as exc:
             log.warning("Ghost cleanup for %s failed: %s", scan_root, exc)
@@ -3464,6 +3581,9 @@ async def _remote_scan_body(
     # shutdown all live in start_remote_scan's ``finally`` — they must
     # run on the abort path too, not just here on success.
     log.info("Remote scan complete: %d tracks from %s", track_count, scan_root)
+    # Hand this scan's own plan back to the wrapper (and thence to the
+    # freshness poller) so cadence/toast never read the racy global.
+    return scan_plan
 
 
 # ── Drill-down freshness ──────────────────────────────────────────────────────

@@ -1632,6 +1632,7 @@ async def ftp_pool_probe_cap(body: dict, _tok: str = Depends(_require_token)):
     factory = _build_ftp_factory(host, port, username, password, encoding)
     opened: list = []
     detected = None
+    found_limit = False   # True only if the probe was actually REJECTED
     last_error = ""
     try:
         for n in range(1, max_probe + 1):
@@ -1645,12 +1646,22 @@ async def ftp_pool_probe_cap(body: dict, _tok: str = Depends(_require_token)):
                 # errors; landing here means the rejection was permanent
                 # (which is exactly what "too many clients" looks like).
                 last_error = f"{type(exc).__name__}: {exc}"
-                # n connections succeeded → cap is n  (detected stored as n)
-                detected = n
+                # The n-th open was REJECTED while the previous n-1 are still
+                # held (opened isn't drained until the finally) — so the server
+                # accepted n-1 concurrent and the cap is n-1, NOT n.  This
+                # matches the reactive path (record_too_many_clients stores
+                # observed_in_use-1) and the no-rejection floor branch (which
+                # stores len(opened)); storing n over-reported by one and, once
+                # F1 pins it, froze that too-high value so an out-of-band
+                # health-check connection using the reserved headroom slot
+                # would trip 421/530 forever.  Floor at 1 (a first-connection
+                # rejection ⇒ hard saturation).
+                detected = max(1, n - 1)
+                found_limit = True
                 break
         else:
-            # Made it to max_probe without rejection — cap is at least
-            # max_probe.  Record that as the floor.
+            # Made it to max_probe without rejection — this is only a FLOOR
+            # (the server tolerates AT LEAST max_probe), NOT the real limit.
             detected = max_probe
     finally:
         for conn in opened:
@@ -1661,7 +1672,11 @@ async def ftp_pool_probe_cap(body: dict, _tok: str = Depends(_require_token)):
                 except Exception: pass
 
     if detected is not None:
-        ftp_pool_config.set_detected_cap(host, port, detected)
+        # Pin only when we actually FOUND the limit (got rejected).  A no-
+        # rejection floor is recorded decay-eligible so the AIMD recovery can
+        # still creep it toward the configured budget — pinning a floor as an
+        # authoritative ceiling would strand the pool below the real limit.
+        ftp_pool_config.set_detected_cap(host, port, detected, manual=found_limit)
 
     changes = reload_ftp_pool_sizes()
     return {
