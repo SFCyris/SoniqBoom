@@ -1142,10 +1142,6 @@
                 <input id="setting-dedup-folders" type="checkbox">
               </div>
               <div class="admin-setting">
-                <label>Do not display empty folders <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Hide subfolders that contain no playable audio anywhere — photo dumps, video-only directories, build outputs sharing a scan root with the music library.">&#9432;</span></label>
-                <input id="setting-hide-empty-folders" type="checkbox">
-              </div>
-              <div class="admin-setting">
                 <label>Use Folder Art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
                 <input id="setting-use-folder-art" type="checkbox" checked>
               </div>
@@ -1215,10 +1211,6 @@
               <div class="admin-setting">
                 <label for="setting-viz-nowplaying">Now-playing <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Decode signal-chain, CRT oscilloscope mode and the VU meter skin on the player screen.">&#9432;</span></label>
                 <input id="setting-viz-nowplaying" type="checkbox" checked>
-              </div>
-              <div class="admin-setting">
-                <label for="setting-viz-library">Library <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="The Galaxy view — every format a drifting constellation.">&#9432;</span></label>
-                <input id="setting-viz-library" type="checkbox" checked>
               </div>
               <div class="admin-setting">
                 <label for="setting-viz-admin">Admin diagnostics <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Scan-pipeline flow, cache-hit cascade and FTP-pool lanes in the admin panels.">&#9432;</span></label>
@@ -2247,7 +2239,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=166"></script>
+  <script type="module" src="/assets/js/app.js?v=167"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

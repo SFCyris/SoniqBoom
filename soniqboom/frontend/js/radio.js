@@ -15,6 +15,7 @@
 import { Player } from './player.js';
 import { Playlist } from './playlist.js';
 import { Toast } from './utils.js';
+import { vizGroupEnabled } from './viz/engine.js';
 
 const REFILL_AT = 8;       // refill when this few tracks remain after current
 const REFILL_BATCH = 30;
@@ -89,9 +90,17 @@ function _sizeScope() {
   cv.height = Math.max(2, Math.round(r.height * dpr));
 }
 
+/** Clear the scope canvas to blank (used when the viz gate turns off). */
+function _clearScope() {
+  const cv = $('radio-scope');
+  if (cv) { const g = cv.getContext('2d'); g.clearRect(0, 0, cv.width, cv.height); }
+}
+
 function _drawScope() {
   _raf = null;
   if (!_overlayOpen()) return;
+  // Now-playing viz gate: master / now-playing off → clear + stop the loop.
+  if (!vizGroupEnabled('nowPlaying')) { _clearScope(); return; }
   const cv = $('radio-scope');
   const an = Player.analyser;
   if (cv) {
@@ -125,6 +134,7 @@ function _drawScope() {
 
 function _startScope() {
   if (_raf) cancelAnimationFrame(_raf);
+  if (!vizGroupEnabled('nowPlaying')) { _clearScope(); return; }   // viz off → don't animate
   _sizeScope();
   _raf = requestAnimationFrame(_drawScope);
 }
@@ -132,6 +142,14 @@ function _startScope() {
 function _stopScope() {
   if (_raf) { cancelAnimationFrame(_raf); _raf = null; }
 }
+
+// Live re-gate on a viz-settings change: turning now-playing OFF stops + blanks
+// the station oscilloscope immediately; turning it ON resumes it if the radio
+// overlay is open.
+window.addEventListener('sb:viz-settings', () => {
+  if (!vizGroupEnabled('nowPlaying')) { _stopScope(); _clearScope(); }
+  else if (_overlayOpen()) _startScope();
+});
 
 // ── Public API ────────────────────────────────────────────────────────────────
 

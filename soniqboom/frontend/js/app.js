@@ -557,6 +557,25 @@ function _readVuStyle() {
   }
 }
 
+// Whether the now-playing viz group (which the VU meter belongs to) is ON.
+// The player-bar VU meter is a now-playing visualization, so the "Enable
+// visualizations" master switch and the "Now-playing" group toggle must gate
+// whether it renders at ALL — not just its bars/circuit STYLE (the bug: the
+// meter kept dancing with every toggle off).  Read straight from localStorage
+// to avoid an import cycle with the viz engine (mirrors _readVuStyle).
+function _nowPlayingVizOn() {
+  try {
+    const s = JSON.parse(localStorage.getItem('sb_viz_settings') || '{}');
+    return s.enabled !== false && s.nowPlaying !== false;
+  } catch {
+    return true;   // default-on: never let a parse error hide the meter
+  }
+}
+
+// Last track handed to _handleVU — so a live settings change can re-init the
+// meter for the current track when the group is toggled back ON.
+let _vuLastTrack = null;
+
 // VU draw cadence — pinned to 15 Hz instead of the browser's
 // requestAnimationFrame default (60 Hz).  The earlier 60 Hz draw was
 // what triggered Firefox audio underruns: the main thread spending
@@ -576,7 +595,14 @@ const _vuRM = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: re
 
 function _initVU(channelCount, opts) {
   if (!vuContainer) return;
-  _stopVU();
+  _stopVU();   // clears + hides the container (vuContainer.hidden = true)
+
+  // Master / now-playing viz gate.  This is the single choke point every VU
+  // render path funnels through (_handleVU, the modal re-parent in
+  // _placeVUContainer, the SID retry ladder), so gating here hides the meter
+  // in ALL instances when visualizations are off — _stopVU above already hid
+  // it, so we just decline to rebuild.
+  if (!_nowPlayingVizOn()) return;
 
   const useVUMR = !!(opts && opts.useVUMR);
   // Restore the parsed VUMR sidecar AFTER _stopVU cleared it — see
@@ -814,6 +840,25 @@ if (_vuRM) {
   else if (_vuRM.addListener) _vuRM.addListener(_onVuRM);   // Safari < 14
 }
 
+// Live re-gate when the viz settings change (fired by setVizSettings in the
+// viz engine).  Turning the master/now-playing group OFF stops + hides the
+// meter immediately; turning it back ON re-inits it for the current track —
+// without either, the meter kept dancing until the next track change.  Only
+// act when the now-playing gate actually FLIPPED — a Library/Admin/VU-style
+// change fires the same event but must not churn (re-fetch + rebuild) the meter.
+let _vuVizWasOn = _nowPlayingVizOn();
+window.addEventListener('sb:viz-settings', () => {
+  const on = _nowPlayingVizOn();
+  if (on === _vuVizWasOn) return;
+  _vuVizWasOn = on;
+  if (!on) {
+    _stopVU();
+    _removeFallbackLabel();
+  } else if (_vuLastTrack) {
+    _handleVU(_vuLastTrack);
+  }
+});
+
 function _stopVU() {
   _vuRunning = false;
   if (_vuDrawTimer) {
@@ -831,6 +876,13 @@ function _stopVU() {
   if (vuContainer) {
     vuContainer.hidden = true;
     vuContainer.innerHTML = '';
+  }
+  // Clear the pattern-grid VU wash (trackinfo's __sbVuTap) — otherwise the
+  // last-painted per-column tint stays frozen on the grid after the meter
+  // stops (e.g. when the now-playing viz is toggled off mid-play).  The tap
+  // self-guards when the grid isn't open, so this is a no-op off the pattern tab.
+  if (_vuChannelCount > 0 && typeof window.__sbVuTap === 'function') {
+    try { window.__sbVuTap(new Float32Array(_vuChannelCount), _vuChannelCount); } catch (_) {}
   }
   _vuBars = [];
   _vuAnalyser = null;
@@ -1361,10 +1413,17 @@ async function _generateSidVUClient(track, key) {
 }
 
 async function _handleVU(track) {
+  _vuLastTrack = track;                            // remembered for the viz re-gate
   const key = _vuKeyOf(track);
   const keyChanged = (key !== _vuKey);           // real track/subsong change?
   _vuKey = key;
   if (!track) { _stopVU(); _removeFallbackLabel(); return; }
+  // Now-playing viz gate — bail BEFORE the FFT-fallback branch so a disabled
+  // meter doesn't leave an orphan "Spectrum — …" label under the seek bar or
+  // kick off the background SID WASM render/poll for a meter that's hidden.
+  // (_initVU is also gated, but that's only the meter BUILD; the label + SID
+  // work are _handleVU's own siblings of that call.)
+  if (!_nowPlayingVizOn()) { _stopVU(); _removeFallbackLabel(); return; }
   const primary = String(track.format || '').split('/')[0].trim();
   // Eligibility: static tracker/SID/chip names PLUS the families whose
   // format names can't live in a static set — the ~175 exotic uade
@@ -2770,6 +2829,25 @@ function _bustArtImg(trackId) {
   } catch (_) { /* ignore */ }
 }
 
+// Bust EVERY on-screen cover (loaded or not) — used when a library-wide art
+// setting changes (e.g. Use Folder Art), so covers re-resolve under the new
+// rule immediately: folder art appears when it's turned on, and already-shown
+// folder art disappears when it's turned off.
+function _bustAllArt() {
+  try {
+    // Reuse the library-wide epoch so an on-screen bust and a later recycle-time
+    // re-fill (library.js _fillTrackRow) share ONE cache key — no double-fetch.
+    const t = window.__sbArtEpoch || Date.now();
+    document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
+      let u;
+      try { u = new URL(img.src, location.href); } catch (_) { return; }
+      u.searchParams.set('_t', t);
+      img.classList.remove('loaded');
+      img.src = u.pathname + u.search;
+    });
+  } catch (_) { /* ignore */ }
+}
+
 // On WS re-connect we may have missed art_ready events while the socket was
 // down (e.g. a 403 after a server restart) — re-fetch covers still showing the
 // placeholder so the list recovers without a manual reload.  Only touches
@@ -2804,6 +2882,17 @@ function connectWS() {
       pending.add(msg.track_id);
       if (pending.size > 8000) pending.clear();   // bound it
       _bustArtImg(msg.track_id);
+      return;
+    }
+    if (msg.event === 'art_refresh') {
+      // A library-wide art setting changed (Use Folder Art) and the server
+      // purged the art cache.  Bump a library-wide epoch so BOTH on-screen
+      // covers (via _bustAllArt) AND off-screen virtual-scroll rows that recycle
+      // back later (library.js _fillTrackRow appends this epoch) re-request under
+      // the new rule — otherwise recycled rows would reuse the immutable-cached
+      // (24h) old cover via the bare URL.
+      window.__sbArtEpoch = Date.now();
+      _bustAllArt();
       return;
     }
     if (msg.event === 'scan_progress') {

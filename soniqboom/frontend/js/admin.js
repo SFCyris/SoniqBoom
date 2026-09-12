@@ -38,13 +38,11 @@ function _initVizSettingsUI() {
   const s = getVizSettings();
   const en   = document.getElementById('setting-viz-enabled');
   const np   = document.getElementById('setting-viz-nowplaying');
-  const lib  = document.getElementById('setting-viz-library');
   const adm  = document.getElementById('setting-viz-admin');
   const vu   = document.getElementById('setting-viz-vustyle');
   const sidw = document.getElementById('setting-sid-wasm-playback');   // experimental: in-browser SID
   if (en)  en.checked  = s.enabled    !== false;
   if (np)  np.checked  = s.nowPlaying !== false;
-  if (lib) lib.checked = s.library    !== false;
   if (adm) adm.checked = s.admin      !== false;
   if (vu)  vu.value    = s.vuStyle === 'circuit' ? 'circuit' : 'bars';
   if (sidw) sidw.checked = sidWasmPlaybackEnabled();
@@ -53,7 +51,6 @@ function _initVizSettingsUI() {
   if (sidw) sidw.addEventListener('change', () => setSidWasmPlayback(sidw.checked));
   if (en)  en.addEventListener('change',  () => setVizSettings({ enabled:    en.checked }));
   if (np)  np.addEventListener('change',  () => setVizSettings({ nowPlaying: np.checked }));
-  if (lib) lib.addEventListener('change', () => setVizSettings({ library:    lib.checked }));
   if (adm) adm.addEventListener('change', () => { setVizSettings({ admin: adm.checked }); if (adm.checked) _ensureAdminViz(); });
   if (vu)  vu.addEventListener('change',  () => {
     setVizSettings({ vuStyle: vu.value });
@@ -2673,8 +2670,6 @@ async function loadSettings() {
     if (dupEl) dupEl.checked = !!s.filter_duplicates;
     const dedupFoldersEl = document.getElementById('setting-dedup-folders');
     if (dedupFoldersEl) dedupFoldersEl.checked = !!s.dedup_folders;
-    const hideEmptyEl = document.getElementById('setting-hide-empty-folders');
-    if (hideEmptyEl) hideEmptyEl.checked = !!s.hide_empty_folders;
     const folderArtEl = document.getElementById('setting-use-folder-art');
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
     const lyricsWbEl = document.getElementById('setting-lyrics-writeback');
@@ -2759,7 +2754,6 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const sidDur = parseInt(document.getElementById('setting-sid-duration')?.value || '180');
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
     const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
-    const hideEmpty = document.getElementById('setting-hide-empty-folders')?.checked ?? false;
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
@@ -2778,7 +2772,6 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         renderers: { sid_default_duration: sidDur },
         filter_duplicates: filterDups,
         dedup_folders: dedupFolders,
-        hide_empty_folders: hideEmpty,
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,

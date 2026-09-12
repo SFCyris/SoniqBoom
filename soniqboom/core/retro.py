@@ -92,6 +92,10 @@ _AMIGA_EXOTICA = frozenset({
     "Sonic Arranger", "Mike Davies", "AMOS", "Ashley Hogg", "Ben Daglish",
     "Benn Daglish", "David Whittaker", "Rob Hubbard", "TFMX Pro", "SoundMon 2.0",
     "DeltaMusic 2.0", "FredMonitor", "Amiga",
+    # Amiga Paula formats whose scanner NAME matches neither uade's runtime label
+    # table nor the list above (observed in a real library falling through to
+    # non-retro). SIDMon is an AMIGA editor, not C64 SID.
+    "JamCracker", "CustomMade", "SIDMon 1.0", "SIDMon 2.0",
 })
 
 _uade_retro_cache: frozenset[str] | None = None
@@ -129,6 +133,58 @@ def chip_family(fmt: str | None) -> str | None:
     if fam is not None:
         return fam
     return "paula" if fmt in _uade_retro_formats() else None
+
+
+# ── Coarse user-facing family (library "Galaxy" browse-by-family filter) ──────
+# Every rule reads ONLY chip_family(fmt) plus a PCM compression check, so the
+# /api/library/formats endpoint can label a format from its NAME alone — no
+# per-track work.  Buckets: trackers | chiptune | lossless | lossy | other.
+# Lossless is decided by metadata._is_lossless_format (the single source of truth
+# — covers the DSD quality tiers DSD64/128/256/512, WavPack, TTA — imported
+# lazily in coarse_family so this never re-declares/drifts from it).  Every other
+# chip_family==None format the scanner can stamp is recorded LOSSY audio.
+_LOSSY_NAMES = frozenset({"MP3", "AAC", "Ogg Vorbis", "Opus", "Musepack", "M4A", "WMA"})
+# fine chip_family -> coarse family.  Anything chip-ish not listed defaults to
+# chiptune (a new console chip should read as chiptune, never leak to "other").
+_COARSE_BY_CHIP = {
+    "tracker": "trackers",          # classic SAMPLE-based multichannel modules
+    "paula": "chiptune",            # Amiga exotica (custom players dominate; real
+                                    # Amiga trackers already ride fine="tracker")
+    "ahx": "chiptune",              # Amiga synth-trackers (waveform synthesis)
+    "adlib": "chiptune",            # AdPlug OPL2/OPL3 FM (incl. AdLib Tracker 2)
+    "atari": "chiptune",            # Atari ST YM2149 PSG (YM/SNDH/SC68)
+    "sid": "chiptune",              # C64 MOS 6581/8580
+    "psf": "chiptune",              # sequenced console rips (PS1/N64/GBA/DS/…)
+    "midi": "other",                # no fixed sound source
+}
+
+
+def coarse_family(fmt: str | None) -> str:
+    """Coarse user-facing family for the library Galaxy family filter:
+    ``trackers`` | ``chiptune`` | ``lossless`` | ``lossy`` | ``other``.
+
+    Derived purely from the format NAME (via :func:`chip_family` plus a PCM
+    compression name set), so ``/api/library/formats`` can label every format
+    without touching individual tracks.  trackers = classic sample-based module
+    trackers; chiptune = every synth/chip/console/Amiga-exotica format; lossless
+    / lossy = modern PCM split by compression; other = MIDI and anything with no
+    fixed sound source.  A retro/chip family not in the table still resolves to
+    chiptune (never "other")."""
+    if not fmt:
+        return "other"
+    fam = chip_family(fmt)
+    if fam is not None:
+        return _COARSE_BY_CHIP.get(fam, "chiptune")
+    # PCM / recorded audio.  Reuse metadata's canonical lossless authority so the
+    # DSD quality tiers (DSD64/128/256/512), WavPack and TTA stay in lock-step
+    # with is_lossless and can never drift from it again.  (Lazy import: retro is
+    # a low-level module and metadata pulls in heavier deps.)
+    from soniqboom.core.metadata import _is_lossless_format
+    if _is_lossless_format(fmt):
+        return "lossless"
+    if fmt in _LOSSY_NAMES:
+        return "lossy"
+    return "other"
 
 
 _TOK = _re.compile(r"[^a-z0-9]+")

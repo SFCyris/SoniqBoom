@@ -119,7 +119,13 @@ export function mountSignalChain(host, getState) {
   render(getState().format);
 
   const ctl = registerViz({
-    host, group: 'nowPlaying', fps: 20,
+    // trackinfo.js owns this embed's visibility: it hides the whole
+    // #ti-section-signal wrapper (header + this host) when the now-playing
+    // group is off and unregisters/re-mounts on toggle.  So the engine must
+    // NOT also hide the host — doing so left the host stuck hidden after a
+    // re-mount (the old entry that hid it is gone, the new one never knows).
+    // hideWhenOff:false → the engine only freezes; trackinfo does the hiding.
+    host, group: 'nowPlaying', fps: 20, hideWhenOff: false,
     draw(dt) {
       const st = getState();
       if (st.format !== curFmt) render(st.format);

@@ -111,6 +111,15 @@ function _mountSignalChainFor(track) {
   }
 }
 
+// Live re-gate: toggling the now-playing viz while the modal is open must hide
+// the WHOLE "Signal path" section (header + canvas) or re-mount it on re-enable.
+// The engine only hides the canvas host (#ti-signal-chain); this re-runs the
+// section-level mount so the "Signal path" heading doesn't dangle when off and
+// the chain comes back when re-enabled with the modal still open.
+window.addEventListener('sb:viz-settings', () => {
+  if (isOpen() && _sigTrack) _mountSignalChainFor(_sigTrack);
+});
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const overlay      = document.getElementById('ti-overlay');
 const panel        = document.getElementById('ti-panel');

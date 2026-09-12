@@ -2354,14 +2354,13 @@ async def disk_usage(_tok: str = Depends(_require_token)):
 
 # ── Cache management ─────────────────────────────────────────────────────────
 
-@router.post("/cache/clear-art")
-async def clear_art_cache(_tok: str = Depends(_require_token)):
-    """Clear the artwork cache directory.
+def _purge_art_dir() -> tuple[int, list[str]]:
+    """Recursively unlink every file in the on-disk art cache directory.
 
-    Continues on individual ``unlink`` failures so a single locked or
-    permission-denied file doesn't abort the whole clear (which previously
-    surfaced as a 500 even though most files had been removed already).
-    """
+    Returns ``(removed_count, error_samples)``.  Continues on individual
+    ``unlink`` failures so one locked/permission-denied file doesn't abort the
+    whole clear.  Shared by the clear-art endpoint and the ``use_folder_art``
+    settings change (both need a full art re-evaluation on next request)."""
     from soniqboom.config import get_art_cache_dir
     art_dir = get_art_cache_dir()
     count = 0
@@ -2393,6 +2392,20 @@ async def clear_art_cache(_tok: str = Depends(_require_token)):
             return
 
     _scan_and_unlink(str(art_dir))
+    return count, errors
+
+
+@router.post("/cache/clear-art")
+async def clear_art_cache(_tok: str = Depends(_require_token)):
+    """Clear the artwork cache directory.
+
+    Continues on individual ``unlink`` failures so a single locked or
+    permission-denied file doesn't abort the whole clear (which previously
+    surfaced as a 500 even though most files had been removed already).
+    """
+    from soniqboom.config import get_art_cache_dir
+    art_dir = get_art_cache_dir()
+    count, errors = _purge_art_dir()
     # The on-disk pass above removed the positive thumbnails AND the ``.absent``
     # sentinels, but the in-memory negative cache (``store._art_absent``) is a
     # separate layer the serve path checks FIRST — so without this, a track
@@ -2829,6 +2842,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 log.exception("HVSC reconfigure failed")
     if "scan_zips" in body:
         conf["scan_zips"] = bool(body["scan_zips"])
+        settings.scan_zips = conf["scan_zips"]   # runtime effect, no restart (mirror scan_remote_zips)
     if "scan_remote_zips" in body:
         conf["scan_remote_zips"] = bool(body["scan_remote_zips"])
         settings.scan_remote_zips = conf["scan_remote_zips"]   # runtime effect, no restart
@@ -2904,17 +2918,23 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             await set_config("dedup_folders", bool(body["dedup_folders"]))
         if "use_folder_art" in body:
             new_val = bool(body["use_folder_art"])
+            old_val = bool(await get_config("use_folder_art", True))
             await set_config("use_folder_art", new_val)
-            # When folder art is turned on, clear the negative art cache so
-            # tracks that previously had no embedded art get re-evaluated
-            # (this time the folder art fallback will run).  Clear BOTH layers:
-            # in-memory AND the on-disk sentinels — clearing memory alone is a
-            # near no-op because the persistent sentinel would re-mark the track
-            # absent before the folder-art fallback is ever reached.
-            if new_val:
-                from soniqboom.api.art import purge_absent_sentinels
+            # The folder-art fallback is read per art request, but cover art
+            # (folder AND embedded) is cached and the serve path short-circuits
+            # on a cache hit — so a flip was invisible until each track happened
+            # to re-resolve (or, on turn-OFF, NEVER, since nothing invalidated).
+            # On an ACTUAL change, purge the art cache so every track is
+            # re-evaluated under the new setting (embedded art re-extracts
+            # unchanged; folder art appears on ON / disappears on OFF), clear the
+            # in-memory negative cache, and tell every client to re-request its
+            # on-screen covers now.  Gated on old!=new so an unrelated Save (which
+            # always re-sends this field) doesn't needlessly drop all art.
+            if new_val != old_val:
+                _purge_art_dir()
                 get_store().clear_art_absent()
-                purge_absent_sentinels()
+                from soniqboom.api.library import _broadcast
+                await _broadcast({"event": "art_refresh"})
         if "folder_art_names" in body:
             # Stored verbatim as a CSV; the lookup side
             # (``_parse_folder_art_names`` in api/art.py) trims / lowercases

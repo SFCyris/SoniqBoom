@@ -1706,7 +1706,12 @@ class TrackStore:
         return self._agg_cache_set(cache_key, results)
 
     def aggregate_formats(self, primary_only: bool = False) -> list[dict]:
-        """Return ``[{format, count}]`` from the format tag index.
+        """Return ``[{format, count, family}]`` from the format tag index.
+
+        ``family`` is the coarse browse-by-family bucket (trackers / chiptune /
+        lossless / lossy / other) via :func:`soniqboom.core.retro.coarse_family`,
+        derived from the format name so the Galaxy family filter needs no extra
+        per-track work.
 
         Drives the library "Galaxy" visualization (per-format star
         clusters).  Counts come straight from ``_tag_format`` bucket
@@ -1723,6 +1728,7 @@ class TrackStore:
         caller-controlled (the Galaxy layer maps it from the
         ``filter_duplicates`` config); no non-library consumer reads this.
         """
+        from soniqboom.core.retro import coarse_family
         hide_dups = primary_only
         # Key on the dup-filter state so a runtime toggle can't serve a list
         # computed under the other mode (the cache is also seq-invalidated).
@@ -1754,8 +1760,14 @@ class TrackStore:
                 t = self._tracks.get(tid)
                 name = (t.get("format") if t else None) or key
                 count = len(tids)
-            results.append({"format": name, "count": count})
-        results.sort(key=lambda x: -x["count"])
+            # `family` = coarse browse-by-family bucket for the Galaxy filter
+            # (trackers/chiptune/lossless/lossy/other), derived from the name.
+            results.append({"format": name, "count": count, "family": coarse_family(name)})
+        # Count desc, then name asc as a stable tiebreaker so equal-count formats
+        # keep a deterministic order across rebuilds (dict insertion order can
+        # differ between scans) — otherwise the Galaxy cluster layout, which is
+        # index-positional, would reshuffle equal-count formats each rebuild.
+        results.sort(key=lambda x: (-x["count"], x["format"].lower()))
         return self._agg_cache_set(cache_key, results)
 
     def aggregate_years(self, primary_only: bool = False) -> list[dict]:

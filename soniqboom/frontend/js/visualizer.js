@@ -23,6 +23,7 @@
  *                      pupils dilate on bass kicks, gentle head bob, occasional blink
  */
 import { Player } from './player.js';
+import { vizGroupEnabled } from './viz/engine.js';
 
 const canvas = document.getElementById('visualizer-canvas');
 const ctx2d  = canvas.getContext('2d');
@@ -2577,7 +2578,12 @@ if (_reduceMotionMQ.addEventListener) {
 }
 
 function start() {
-  if (_userPrefersStillVisualizer()) {
+  // Now-playing viz gate: the full-screen oscilloscope/CRT/spectrogram is the
+  // most prominent now-playing visualization, so the "Enable visualizations"
+  // master switch and the "Now-playing" group toggle must turn it off (they
+  // previously only governed the smaller embeds + VU meter).  Off → same
+  // fully-hidden state as reduced-motion.
+  if (!vizGroupEnabled('nowPlaying') || _userPrefersStillVisualizer()) {
     canvas.style.opacity = '0';
     _wantRunning = false;
     _suspend();
@@ -2599,5 +2605,14 @@ function stop() {
 // Auto-start/stop with playback
 Player.on('statechange', ({ playing }) => playing ? start() : stop());
 Player.on('trackchange', () => { resize(); _spectroColumn = 0; start(); });
+
+// Live re-gate when the viz settings change (setVizSettings in the engine).
+// Turning the master / now-playing group OFF hides the canvas immediately;
+// turning it back ON resumes it if a track is playing — without this the
+// full-screen visualizer kept animating until the next play/track change.
+window.addEventListener('sb:viz-settings', () => {
+  if (!vizGroupEnabled('nowPlaying')) stop();
+  else if (Player.playing) start();
+});
 
 export const Visualizer = { start, stop, toggleMode, setMode, get mode() { return _mode; } };

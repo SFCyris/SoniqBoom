@@ -508,7 +508,12 @@ async def list_years(request: Request):
 
 @router.get("/formats")
 async def list_formats(request: Request):
-    """Per-format track counts — drives the library Galaxy visualization."""
+    """Per-format track counts + coarse family — drives the library Galaxy view.
+
+    Each entry is ``{format, count, family}`` where ``family`` is the coarse
+    browse-by-family bucket (trackers/chiptune/lossless/lossy/other) the Galaxy
+    family filter groups by.
+    """
     cached = _cache_get("formats")
     if cached is None:
         store = get_store()

@@ -5127,6 +5127,10 @@ tr.dragging { opacity: 0.4; }
   border-radius: 0;
   background: #070a0f;
 }
+#galaxy-view.galaxy-flex { display: flex; flex-direction: column; }
+/* body holds the three co-located surfaces (canvas / legend / list), filling
+   the column below the toolbar — no magic pixel offset to keep in sync. */
+.galaxy-body { position: relative; flex: 1 1 auto; min-height: 0; }
 #galaxy-view canvas { position: absolute; inset: 0; }
 .galaxy-legend {
   position: absolute;
@@ -5152,6 +5156,187 @@ tr.dragging { opacity: 0.4; }
   transform: translateY(-1px);
   box-shadow: 0 0 14px hsla(var(--gx-hue, 200), 70%, 55%, 0.5);
   outline: none;
+}
+
+/* ── Galaxy / List toggle + sortable format list ───────────────────────────
+   The galaxy is a proportional-area chart of formats; the List is its
+   sortable, searchable, accessible equivalent.  Both sit inside #galaxy-view
+   (always a dark scene), switched by the .mode-galaxy / .mode-list classes. */
+.galaxy-toolbar {
+  flex: 0 0 auto;
+  z-index: 3;
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 14px;
+  background: rgba(7,10,15,0.92);
+  border-bottom: 1px solid #141c28;
+}
+.galaxy-mode-toggle {
+  display: inline-flex;
+  border: 1px solid #2a3546;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(10,14,20,0.7);
+}
+.galaxy-mode-btn {
+  font: 600 12px/1 system-ui, sans-serif;
+  color: #93a1b3;
+  background: transparent;
+  border: none;
+  padding: 6px 15px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.galaxy-mode-btn + .galaxy-mode-btn { border-left: 1px solid #2a3546; }
+.galaxy-mode-btn:hover:not(.is-disabled) { color: #e6edf5; }
+.galaxy-mode-btn.active { color: #071019; background: #6fd3ff; }
+/* Galaxy unavailable: aria-disabled (stays focusable + describable) rather than
+   the `disabled` attribute, which drops it from the tab order and hides its reason. */
+.galaxy-mode-btn.is-disabled { opacity: 0.4; cursor: not-allowed; }
+.galaxy-mode-btn:focus-visible { outline: 2px solid #6fd3ff; outline-offset: -2px; }
+.galaxy-search {
+  flex: 0 1 240px;
+  font: 500 13px/1 system-ui, sans-serif;
+  color: #e6edf5;
+  background: rgba(10,14,20,0.7);
+  border: 1px solid #2a3546;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.galaxy-search::placeholder { color: #6c7a8c; }
+.galaxy-search:focus-visible { outline: none; border-color: #6fd3ff; }
+.galaxy-count { margin-left: auto; font: 500 12px/1 system-ui, sans-serif; color: #7f8da0; }
+.galaxy-reason {
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 500 12px/1.3 system-ui, sans-serif; color: #c9a94a;
+}
+
+/* ── Family filter (second toolbar row; filters both surfaces) ─────────────── */
+.galaxy-family-bar {
+  flex: 0 0 auto;
+  z-index: 3;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px;
+  overflow-x: auto; scrollbar-width: thin;
+  background: rgba(7,10,15,0.85);
+  border-bottom: 1px solid #141c28;
+}
+.galaxy-fam-chip {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: baseline; gap: 6px;
+  font: 600 12px/1 system-ui, sans-serif;
+  color: hsl(var(--gx-hue, 210), 30%, 72%);
+  background: hsla(var(--gx-hue, 210), 45%, 22%, 0.35);
+  border: 1px solid hsla(var(--gx-hue, 210), 45%, 50%, 0.4);
+  border-radius: 999px;
+  padding: 5px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s, color .12s, border-color .12s;
+}
+/* the "All" chip has no hue — neutral steel */
+.galaxy-fam-chip[data-family="all"] {
+  color: #aeb9c8;
+  background: rgba(120,140,165,0.14);
+  border-color: #2a3546;
+}
+.galaxy-fam-chip:hover { color: #e6edf5; }
+.galaxy-fam-chip.active {
+  color: #071019;
+  background: hsl(var(--gx-hue, 210), 65%, 62%);
+  border-color: hsl(var(--gx-hue, 210), 65%, 62%);
+}
+.galaxy-fam-chip[data-family="all"].active {
+  color: #071019; background: #9fb0c4; border-color: #9fb0c4;
+}
+.galaxy-fam-chip:focus-visible { outline: 2px solid #6fd3ff; outline-offset: 2px; }
+.galaxy-fam-n { font-weight: 500; font-variant-numeric: tabular-nums; opacity: 0.85; font-size: 11px; }
+
+/* mode visibility */
+#galaxy-view.mode-list canvas,
+#galaxy-view.mode-list .galaxy-legend { display: none; }
+#galaxy-view.mode-galaxy .galaxy-list { display: none; }
+
+/* the list surface fills below the toolbar and scrolls */
+.galaxy-list {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 6px 14px 18px;
+}
+.galaxy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 500 13px/1.3 system-ui, sans-serif;
+  color: #cdd6e2;
+}
+.galaxy-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  text-align: left;
+  padding: 0;
+  background: #0b0f16;
+  border-bottom: 1px solid #1f2937;
+  font-size: 12px; color: #8b98ab;
+}
+.galaxy-table thead th:nth-child(2) { text-align: right; }
+.galaxy-th-btn {
+  width: 100%;
+  display: flex; align-items: center; gap: 4px;
+  font: 600 12px/1 system-ui, sans-serif;
+  color: #8b98ab;
+  background: transparent; border: none;
+  padding: 10px 10px;
+  cursor: pointer;
+}
+.galaxy-table thead th:nth-child(2) .galaxy-th-btn { justify-content: flex-end; }
+.galaxy-th-btn:hover { color: #e6edf5; }
+.galaxy-th-btn:focus-visible { outline: 2px solid #6fd3ff; outline-offset: -2px; }
+.galaxy-sort-caret { font-size: 9px; color: #6fd3ff; }
+.galaxy-table tbody tr { border-bottom: 1px solid rgba(31,41,55,0.6); }
+.galaxy-table tbody tr:hover { background: rgba(111,211,255,0.06); }
+.galaxy-table tbody tr[aria-current="true"] { background: rgba(111,211,255,0.12); }
+.galaxy-table td { padding: 0; }
+/* Format cell is a row-header <th scope=row> so Tracks/Share announce with it. */
+.galaxy-table tbody th { padding: 0; font-weight: 400; text-align: left; }
+.galaxy-row-btn {
+  width: 100%;
+  display: flex; align-items: center; gap: 9px;
+  font: 600 13px/1 system-ui, sans-serif;
+  color: hsl(var(--gx-hue, 200), 65%, 80%);
+  background: transparent; border: none;
+  padding: 9px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.galaxy-row-btn:hover { color: #fff; }
+.galaxy-row-btn:focus-visible { outline: 2px solid #6fd3ff; outline-offset: -2px; }
+.galaxy-dot {
+  flex: 0 0 auto;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: hsl(var(--gx-hue, 200), 75%, 60%);
+  box-shadow: 0 0 8px hsla(var(--gx-hue, 200), 80%, 55%, 0.6);
+}
+.galaxy-num { text-align: right; padding-right: 10px !important; color: #e6edf5; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.galaxy-share { padding-right: 10px !important; min-width: 120px; }
+.galaxy-share .galaxy-bar {
+  display: inline-block; vertical-align: middle;
+  width: var(--w, 0%); max-width: calc(100% - 46px); min-width: 3px; height: 8px;
+  border-radius: 4px;
+  /* fixed mid-high lightness + inset light border keeps every hue (incl. deep
+     blues ~220-255) ≥3:1 against the #070a0f scene — WCAG 1.4.11 non-text contrast. */
+  background: hsl(var(--gx-hue, 200), 72%, 62%);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.30);
+  margin-right: 8px;
+}
+.galaxy-share .galaxy-pct { color: #8b98ab; font-variant-numeric: tabular-nums; font-size: 12px; }
+.galaxy-retry {
+  margin-left: 6px;
+  font: 600 12px/1 system-ui, sans-serif; color: #6fd3ff;
+  background: transparent; border: 1px solid #2a3546; border-radius: 6px;
+  padding: 4px 10px; cursor: pointer;
+}
+@media (prefers-reduced-motion: reduce) {
+  .galaxy-mode-btn, .galaxy-chip { transition: none; }
 }
 
 /* ── Keyboard shortcuts overlay ────────────────────────────────────────── */

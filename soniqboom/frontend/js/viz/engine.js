@@ -35,19 +35,29 @@ const SETTINGS_KEY = 'sb_viz_settings';
 // ── settings ────────────────────────────────────────────────────────────────
 const DEFAULT_SETTINGS = {
   enabled: true,            // master switch
-  nowPlaying: true,         // signal chain, CRT mode, VU circuit
-  library: true,            // galaxy
+  nowPlaying: true,         // signal chain, CRT mode, VU meter, full-screen visualizer
   admin: true,              // scan flow, cache cascade, FTP lanes, transcode packets
+  // The former per-group ``library`` toggle was retired: the Galaxy view owns
+  // its animate-vs-list choice in-view (localStorage ``sb_galaxy_view``).  The
+  // galaxy still registers with group 'library', so ``vizGroupEnabled('library')``
+  // now resolves to the MASTER switch alone (library key absent → not `false`).
 };
 
 function loadSettings() {
+  let s;
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    s = raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
+  // Migration: drop a stored ``library`` key (the toggle is gone) so a user who
+  // once disabled it isn't stranded with the galaxy permanently forced to List.
+  if (s && 'library' in s) {
+    delete s.library;
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* ignore */ }
+  }
+  return s;
 }
 
 let _settings = loadSettings();
@@ -58,6 +68,13 @@ export function setVizSettings(patch) {
   _settings = { ..._settings, ...patch };
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(_settings)); } catch { /* ignore */ }
   _reevaluateAll();
+  // Notify non-registered consumers that read the settings on their own loop
+  // (the player-bar VU meter in app.js is deliberately NOT engine-registered —
+  // it reads Player.vuAnalyser directly for audio-thread safety — so it can't
+  // be re-gated by _reevaluateAll and listens for this instead).
+  try {
+    window.dispatchEvent(new CustomEvent('sb:viz-settings', { detail: getVizSettings() }));
+  } catch { /* ignore */ }
 }
 
 /** True when the master switch is on AND the group is on AND reduced-motion
@@ -91,17 +108,10 @@ function _ensureObserver() {
   }, { threshold: 0.12 });
 }
 
-/** Whether an entry should currently be drawing. */
-function _shouldRun(e) {
-  return e.onScreen
-    && !document.hidden
-    && !prefersReducedMotion()
-    && vizGroupEnabled(e.group)
-    && !e.stopped;
-}
-
 function _sync(e) {
-  const run = _shouldRun(e);
+  const rm = prefersReducedMotion();
+  const groupOn = vizGroupEnabled(e.group);
+  const run = e.onScreen && !document.hidden && !rm && groupOn && !e.stopped;
   if (run && !e.running) {
     e.running = true;
     e.last = 0;
@@ -109,9 +119,32 @@ function _sync(e) {
   } else if (!run && e.running) {
     e.running = false;
   }
-  // When an embed is gated off but reduced-motion / disabled, show a frozen
-  // frame so the surface isn't blank.
-  if (!run && !e._frozenOnce && (prefersReducedMotion() || !vizGroupEnabled(e.group))) {
+
+  // Two distinct "not running" reasons, with OPPOSITE visual intent:
+  //   • The user turned this group (or the master switch) OFF → HIDE the
+  //     surface entirely.  "Enable visualizations" unchecked means gone, not
+  //     a static ghost frame.  Overlay embeds only (hideWhenOff:true); a
+  //     navigable view such as the library galaxy opts out and freezes.
+  //   • reduced-motion (group still ON) → keep the surface but FREEZE one
+  //     representative static frame, so an accessibility preference doesn't
+  //     blank a section the user hasn't asked to remove.
+  // The engine only ever touches ``hidden`` for a hideWhenOff host, and only
+  // for the group-off case it caused — tracked via ``_engineHidden`` so it can
+  // never clobber a hidden state the APP set for its own reasons (e.g. the
+  // galaxy view hidden while the user is on another library view).
+  if (e.host && e.hideWhenOff) {
+    if (!groupOn) {
+      if (!e.host.hidden) e.host.hidden = true;
+      e._engineHidden = true;
+      e._frozenOnce = false;
+      return;
+    }
+    if (e._engineHidden) {
+      e.host.hidden = false;                    // reveal only what WE hid
+      e._engineHidden = false;
+    }
+  }
+  if (!run && !e._frozenOnce && (rm || !groupOn)) {
     try { e.freeze && e.freeze(); } catch { /* listener isolation */ }
     e._frozenOnce = true;
   }
@@ -155,14 +188,19 @@ function _tick(now) {
  * @param {number} [opts.fps=30]    per-component frame cap
  * @param {(dt:number, now:number)=>void} opts.draw   per-frame draw
  * @param {()=>void} [opts.freeze]  render one static frame (reduced-motion / off)
+ * @param {boolean} [opts.hideWhenOff=true]  when the user turns this group (or
+ *   the master switch) OFF, hide the host entirely.  Set false for a navigable
+ *   VIEW (e.g. the library galaxy) that the user opens on purpose — those
+ *   freeze a static frame instead of vanishing.
  * @returns {{ unregister: ()=>void, refresh: ()=>void }}
  */
-export function registerViz({ host, group, fps = 30, draw, freeze }) {
+export function registerViz({ host, group, fps = 30, draw, freeze, hideWhenOff = true }) {
   _ensureObserver();
   const token = _nextToken++;
   const entry = {
-    token, host, group, fps, draw, freeze,
-    onScreen: false, running: false, stopped: false, last: 0, _frozenOnce: false,
+    token, host, group, fps, draw, freeze, hideWhenOff,
+    onScreen: false, running: false, stopped: false, last: 0,
+    _frozenOnce: false, _engineHidden: false,
   };
   _entries.set(token, entry);
   if (host) {

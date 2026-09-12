@@ -618,7 +618,25 @@
 // the ~50MB warm upload and skip if the server self-cached during the listen.
 // (Backend A1/A2 — admin-gate + disk-spool + upload semaphore — also landed;
 // server restarted.)  app.js?v→138.
-const SHELL_VERSION = 'v194';   // v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v195 (2026-09-11): visualization toggles now actually turn things OFF —
+// the player-bar/track-info VU meter is gated on the master + now-playing viz
+// switches (it previously only picked bars-vs-circuit and always rendered), and
+// a user-disabled group HIDES its overlay embeds instead of freezing a static
+// frame (the library galaxy, a navigable view, still freezes).  Bump re-fetches
+// the cache-first app.js + viz/engine.js + viz/galaxy.js for returning users.
+// v196 (2026-09-11): Galaxy view gains a Galaxy | List toggle — a sortable,
+// searchable Format · Tracks · Share table (the accessible equivalent of the
+// star-cluster chart), forced to List under master-viz-off / reduce-motion.
+// The per-group "Library" viz setting is retired (galaxy owns its mode in-view).
+// v197: Galaxy QA fixes — tbody-only re-render (keyboard focus survives sort),
+// row-header <th scope=row>, persisted sort, aria-disabled Galaxy toggle,
+// share-bar non-text contrast, error-state Retry in both modes, flex layout.
+// v198: Galaxy "browse by family" filter row (trackers/chiptune/lossless/lossy/
+// other, backend-classified) filtering both galaxy + list, subtotals, persisted.
+// v199: settings-toggle QA fixes — removed the inert "hide empty folders" toggle;
+// use-folder-art now busts art (art_refresh WS event) on change so it's live.
+// Bump re-fetches app.js + admin.js + index.html.
+const SHELL_VERSION = 'v199';   // v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.

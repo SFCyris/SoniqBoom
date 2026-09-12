@@ -692,7 +692,11 @@ function _fillTrackRow(tr, t, i) {
     if (coverImg.dataset.tid !== (t.id || '') || pendingBust) {
       if (pendingBust) window.__sbArtPending.delete(t.id);
       coverImg.dataset.tid = t.id || '';
-      const src = wantedSrc && pendingBust ? `${wantedSrc}&_t=${Date.now()}` : wantedSrc;
+      // Bust cache-busting token: per-track (art_ready) or the library-wide
+      // epoch (art_refresh, e.g. Use Folder Art changed) so a recycled row does
+      // not reuse the immutable-cached cover via the bare URL.
+      const bust = pendingBust ? Date.now() : (window.__sbArtEpoch || 0);
+      const src = wantedSrc ? (bust ? `${wantedSrc}&_t=${bust}` : wantedSrc) : '';
       coverImg.dataset.src = src;
       coverImg.removeAttribute('src');
       coverImg.classList.remove('loaded');
@@ -2444,15 +2448,19 @@ async function showFormatTracks(format, count = 0) {
   // browsable, not capped.  The chunked fetcher reads _windowedFilter.
   _windowedFilter = { format };
   const WINDOW_THRESHOLD = 5000;
-  // Prefer the count the Galaxy chip already showed; probe once if absent.
-  let total = Number(count) || 0;
-  if (!total) {
-    try {
-      const fmts = await API('/library/formats');
-      const hit = Array.isArray(fmts) ? fmts.find(f => f.format === format) : null;
-      total = hit ? Number(hit.count) || 0 : 0;
-    } catch { /* fall through to single-fetch */ }
-  }
+  // Resolve an AUTHORITATIVE count from the (cached + ETag'd) formats endpoint
+  // before choosing the fetch strategy.  The count handed in by the Galaxy view
+  // is only a display hint and can be stale if a scan completed while the galaxy
+  // was open: a too-low count would pick the single-fetch branch and silently
+  // truncate the tail (or under-size the windowed store), and a too-high count
+  // would leave phantom skeleton rows past the real data.  The passed count is
+  // used only as an instant fallback when the probe itself fails.
+  let total = 0;
+  try {
+    const fmts = await API('/library/formats');
+    const hit = Array.isArray(fmts) ? fmts.find(f => f.format === format) : null;
+    total = hit ? Number(hit.count) || 0 : 0;
+  } catch { total = Number(count) || 0; /* network error → fall back to the hint */ }
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while probing the count
   if (total > WINDOW_THRESHOLD) {
     const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
@@ -2527,7 +2535,11 @@ function _loadAlbumCardArt(card, trackId) {
   };
   // fallback=404 so art-less albums keep their letter initials instead
   // of the generic ♪ placeholder JPEG overwriting them as a background.
-  img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404`;
+  // Append the library-wide art epoch (bumped on art_refresh, e.g. Use Folder
+  // Art changed) so cards loaded after a setting change re-resolve, matching
+  // the track list's _fillTrackRow behavior.
+  const _e = window.__sbArtEpoch ? `&_t=${window.__sbArtEpoch}` : '';
+  img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404${_e}`;
 }
 
 // Album/group grid state: built in rAF chunks (a generation token cancels a
