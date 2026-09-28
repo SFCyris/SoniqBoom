@@ -44,6 +44,7 @@ or include their source code.
 |------|---------|-------|
 | [HivelyTracker replayer](https://github.com/pete-gordon/hivelytracker) | BSD-3-Clause | Vendored under `soniqboom/native/hvl/`; compiled on first use into the `hvl2wav` helper for `.hvl` playback. |
 | [ST-Sound (StSound) by Arnaud Carre](https://github.com/arnaud-carre/StSound) | BSD (per-file headers, (c) 1995-1999 Arnaud Carre) / MIT (repository license) | Vendored under `soniqboom/native/stsound/`; compiled on first use into the `ym2wav` helper for Atari ST `.ym` playback. |
+| [libxmp XPK-SQSH depacker](https://github.com/libxmp/libxmp/blob/master/src/depackers/unsqsh.c) by Claudio Matsuoka (algorithm by Bert Jahn; checksum by Sipos Attila) | MIT | Ported to Python in `soniqboom/core/xpk.py` (licence notice in the module); unpacks XPK-SQSH packed Amiga modules. |
 
 
 ## Data / Assets
@@ -53,6 +54,10 @@ or include their source code.
 | [GeneralUser GS SoundFont](https://schristiancollins.com/generaluser.php) by S. Christian Collins | Free (attribution required) | Default SoundFont for MIDI synthesis via FluidSynth |
 | [MuseScore_General SoundFont](https://musescore.org/en/handbook/3/soundfonts-and-sfx) | MIT | Alternative SoundFont for MIDI synthesis |
 | [FluidR3_GM SoundFont](https://github.com/musescore/MuseScore/tree/master/share/sound) | MIT | Alternative General MIDI SoundFont for MIDI synthesis |
+| [Wikidata](https://www.wikidata.org) video-game titles (`soniqboom/data/game_titles/wikidata.tsv.gz`) | [CC0 1.0](https://www.wikidata.org/wiki/Wikidata:Licensing) | Game titles per retro platform, matched against archive names. Data from Wikidata. |
+| [No-Intro](https://no-intro.org) DAT game titles (`soniqboom/data/game_titles/nointro.tsv.gz`) | [DAT-o-MATIC Data Usage License](https://datomatic.no-intro.org/terms.html) | Game titles per retro platform, matched against archive names. |
+| [MAME software lists](https://github.com/mamedev/mame/tree/master/hash) titles (`soniqboom/data/game_titles/mame.tsv.gz`) | CC0 1.0 | Game titles per retro platform, matched against archive names. |
+| [ZXDB](https://github.com/zxdb/ZXDB) ZX Spectrum game titles (`soniqboom/data/game_titles/zxdb.tsv.gz`) | [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) | ZX Spectrum game titles, matched against archive names. Contains information from ZXDB, made available under the ODbL; the derived title file is available under the ODbL. |
 
 
 ---

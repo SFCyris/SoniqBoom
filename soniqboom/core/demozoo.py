@@ -26,6 +26,7 @@ import gzip
 import logging
 import re
 import sqlite3
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -46,6 +47,8 @@ _TABLES = {
 _PROD_AUTHOR = "public.productions_production_author_nicks"   # M2M production↔nick
 _PROD_TABLE = "public.productions_production"                 # production→title
 _PROD_SOUNDTRACK = "public.productions_soundtracklink"        # demo↔the music it uses
+_PROD_TYPES = "public.productions_production_types"           # M2M production↔type
+_PROD_TYPE = "public.productions_productiontype"              # type id→name ("Game" …)
 
 _STOP = frozenset(
     "a an and at by de el for from in la le of on or the to with".split())
@@ -99,6 +102,70 @@ _status: dict = {
     "refreshing": False, "applying": False, "error": None,
     "built_at": None, "names": 0, "last_apply": None,
 }
+
+# Index-derived lookups, memoised across applies: the post-scan runner joins
+# the whole library after every scan, and the title search (LIKE scans) cost
+# ~27 s of a ~35 s join on a 263K library although its answers only change
+# with the index.  Both memos are dropped as soon as the index file's
+# signature (size + mtime) changes.  ``_title_memo`` is also read by the
+# artist panel's worker threads — plain dict get/set, whole-dict swap on reset.
+_memo_lock = threading.Lock()
+_memo_sig: tuple | None = None
+_title_memo: dict = {}      # (title tokens, hints, credits) → card | None
+_handle_memo: dict = {}     # artist string → [scener hits, ambig rows | None]
+_MEMO_CAP = 50_000
+_MISS = object()
+# The handle memo's rows are tuples/frozensets the cyclic GC tracks (~280K
+# objects after a full join of a 263K library), which took every full
+# collection from ~0.1 to ~55 ms.  Once the memo has grown by this many
+# entries since the last freeze, the apply freezes the heap (one collection),
+# so later full collections skip it; values are acyclic, so a reset or a
+# clear-at-cap still frees them by refcount.
+_MEMO_FREEZE_GROWTH = 5_000
+_memo_frozen: tuple[int, int] = (0, 0)   # (id of the handle memo, its size) at the last freeze
+
+
+def _memos() -> tuple[dict, dict]:
+    """``(_title_memo, _handle_memo)`` for the current index file (its path,
+    size and mtime)."""
+    global _memo_sig, _title_memo, _handle_memo
+    p = _db_path()
+    try:
+        st = p.stat()
+        sig = (str(p), st.st_size, st.st_mtime_ns)
+    except OSError:
+        sig = None
+    with _memo_lock:
+        if sig != _memo_sig:
+            _memo_sig, _title_memo, _handle_memo = sig, {}, {}
+        return _title_memo, _handle_memo
+
+
+def _freeze_grown_memo() -> bool:
+    """Freeze the heap when the handle memo grew by ``_MEMO_FREEZE_GROWTH``
+    entries since the last freeze (a new memo — index changed — or one
+    cleared at its cap counts from zero).  Runs on the loop after an apply;
+    True when it froze."""
+    global _memo_frozen
+    memo = _memos()[1]
+    mid, base = _memo_frozen
+    if mid != id(memo) or len(memo) < base:
+        base = 0
+    if len(memo) - base < _MEMO_FREEZE_GROWTH:
+        return False
+    _memo_frozen = (id(memo), len(memo))
+    from soniqboom.core.store import freeze_long_lived_heap
+    freeze_long_lived_heap("the Demozoo apply memo")
+    return True
+
+
+def _memo_put(memo: dict, key, value) -> None:
+    global _memo_frozen
+    if len(memo) >= _MEMO_CAP:
+        memo.clear()                                    # bounded; refills lazily
+        if _memo_frozen[0] == id(memo):
+            _memo_frozen = (id(memo), 0)                # its growth counts from zero
+    memo[key] = value
 
 
 def _db_path() -> Path:
@@ -164,8 +231,71 @@ def status() -> dict:
         except Exception:                                   # noqa: BLE001
             names = _status["names"]
     return {**_status, "names": names, "exists": exists,
+            "games": _game_rows(db) if exists else None,
             "auto_apply": auto_apply_enabled(),
             "size": db.stat().st_size if exists else 0}
+
+
+def _game_rows(db: Path) -> int | None:
+    """Game-soundtrack rows of the index; None for an index built before
+    they were (refreshing it adds them)."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if not _has_table(con, "music_game"):
+                return None
+            return con.execute("SELECT COUNT(*) FROM music_game").fetchone()[0]
+        finally:
+            con.close()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _has_table(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                       (name,)).fetchone() is not None
+
+
+def _game_name(title: str) -> str:
+    """A Demozoo game production's title for display: trailing tags and a
+    version cut ("Atomic Robokid (Preview)" → "Atomic Robokid", "Mr. Boomer
+    V1.00" → "Mr. Boomer")."""
+    from soniqboom.core.game_titles import display_title
+    from soniqboom.core.game_titles_dat import VERSION_RE
+    t, prev = display_title(title), None
+    while prev != t:
+        prev, t = t, VERSION_RE.sub("", t).strip()
+    return t or display_title(title)
+
+
+def _demozoo_game(rows: list[tuple[frozenset, str]], ytoks: frozenset,
+                  title: str | None) -> str | None:
+    """``game_by_demozoo`` of a track whose composer's game-soundtrack rows are
+    ``rows`` (``(music title's _year_toks, game title)``): the game of the
+    music production with EXACTLY the track's title (``ytoks``, as the year
+    backfill) — one game only — and only when the tune is named after it
+    (its title is the game's, or starts with it: "Rick Dangerous", "High
+    Technique (tune 3)").  A scene tune that a later game reused names no
+    game: measured on a real library, the links agree with the song database
+    on 41 % of shared tracks; under this gate 11 of the 12 tracks both name
+    are the same game (3 of them with the song database's version suffix,
+    "Mole Mayhem V1.1"), one differs ("sliding-skill-game": "Sliding Skill" /
+    "Asteroids (Vertical)").  None otherwise."""
+    if not ytoks:
+        return None
+    from soniqboom.core.game_titles import title_key
+    cands: dict[str, str] = {}
+    for ptoks, game in rows:
+        if ptoks == ytoks:
+            name = _game_name(game)
+            k = title_key(name)
+            if k:
+                cands.setdefault(k, name)
+    if len(cands) != 1:
+        return None
+    key, name = next(iter(cands.items()))
+    tk = title_key(title or "")
+    return name if tk == key or tk.startswith(key + " ") else None
 
 
 def _norm(s: object) -> str:
@@ -208,6 +338,8 @@ def _parse_dump(path: Path):
     prod_super: dict[str, str | None] = {}      # production_id → supertype
     prod_yr: dict[str, int] = {}                # production_id → release year
     soundtrack_of: dict[str, list[str]] = {}    # music_prod_id → [demo_prod_id]
+    prod_types: dict[str, set[str]] = {}        # production_id → {productiontype_id}
+    type_name: dict[str, str] = {}              # productiontype_id → name
     cur: str | None = None
     cols: list[str] | None = None
     idx: dict[str, int] = {}
@@ -218,7 +350,8 @@ def _parse_dump(path: Path):
                     m = re.match(r"COPY (public\.\w+) \(([^)]*)\) FROM stdin;", line)
                     if m and (m.group(1) in _TABLES
                               or m.group(1) in (_PROD_AUTHOR, _PROD_TABLE,
-                                                _PROD_SOUNDTRACK)):
+                                                _PROD_SOUNDTRACK, _PROD_TYPES,
+                                                _PROD_TYPE)):
                         cur = m.group(1)
                         cols = [c.strip() for c in m.group(2).split(",")]
                         idx = {c: i for i, c in enumerate(cols)}
@@ -236,6 +369,14 @@ def _parse_dump(path: Path):
                 pi, ni = idx.get("production_id"), idx.get("nick_id")
                 if pi is not None and ni is not None:
                     prod_nicks.setdefault(parts[pi], []).append(parts[ni])
+            elif cur == _PROD_TYPES:
+                pi, ti = idx.get("production_id"), idx.get("productiontype_id")
+                if pi is not None and ti is not None:
+                    prod_types.setdefault(parts[pi], set()).add(parts[ti])
+            elif cur == _PROD_TYPE:
+                ii, ni = idx.get("id"), idx.get("name")
+                if ii is not None and ni is not None:
+                    type_name[parts[ii]] = _unesc(parts[ni]) or ""
             elif cur == _PROD_SOUNDTRACK:
                 # ``production_id`` = the DEMO/intro; ``soundtrack_id`` = the
                 # MUSIC it uses.  Invert to music→[demos] for the "featured in"
@@ -396,7 +537,28 @@ def _parse_dump(path: Path):
             title = prod_title.get(demo_id)
             if title:
                 prod_soundtrack.append((m_int, title, prod_yr.get(demo_id)))
-    return unique, ambig, prod_years, prod_soundtrack
+
+    # Game names: a MUSIC production that is the soundtrack of a production of
+    # type "Game" → (composer's releaser id, the music title's ``_year_toks``,
+    # the game's title) — the evidence for ``game_by_demozoo``
+    # (``_demozoo_game``: exact title identity, and only for a tune named
+    # after the game; a scene tune a later game reused names no game).
+    game_types = {tid for tid, name in type_name.items() if name == "Game"}
+    games = {pid for pid, tids in prod_types.items() if tids & game_types}
+    music_games: list[tuple[str, str, str]] = []
+    for music_id, demo_ids in soundtrack_of.items():
+        if prod_super and prod_super.get(music_id, "music") != "music":
+            continue
+        titles = sorted({prod_title[d] for d in demo_ids if d in games and prod_title.get(d)})
+        ytoks = _year_toks(prod_title.get(music_id))
+        if not titles or not ytoks:
+            continue
+        ytoks_str = " ".join(sorted(ytoks))
+        rids = {nick_rel.get(n) for n in prod_nicks.get(music_id, ())} - {None}
+        for rid in sorted(rids):
+            if not _isgroup(rel.get(rid, {})):
+                music_games.extend((rid, ytoks_str, g) for g in titles)
+    return unique, ambig, prod_years, prod_soundtrack, music_games
 
 
 def refresh_index(dump_path: Path | None = None) -> dict:
@@ -427,7 +589,7 @@ def refresh_index(dump_path: Path | None = None) -> dict:
             src = tmp
         else:
             src = dump_path
-        unique, ambig, prod_years, prod_soundtrack = _parse_dump(src)
+        unique, ambig, prod_years, prod_soundtrack, music_games = _parse_dump(src)
         db = _db_path()
         con = sqlite3.connect(db)
         try:
@@ -475,13 +637,26 @@ def refresh_index(dump_path: Path | None = None) -> dict:
                 except (TypeError, ValueError):
                     continue
             con.executemany("INSERT INTO prod_soundtrack VALUES (?,?,?)", _st_rows)
+            con.execute("DROP TABLE IF EXISTS music_game")
+            con.execute("CREATE TABLE music_game "
+                        "(releaser_id INTEGER, ptoks TEXT, game TEXT)")
+            con.execute("CREATE INDEX ix_music_game_rid ON music_game(releaser_id)")
+            _mg_rows = []
+            for rid, ptoks, game in music_games:
+                try:
+                    _mg_rows.append((int(rid), ptoks, game))
+                except (TypeError, ValueError):
+                    continue
+            con.executemany("INSERT INTO music_game VALUES (?,?,?)", _mg_rows)
             con.commit()
         finally:
             con.close()
         _status.update(built_at=int(time.time()), names=len(unique))
         log.info("Demozoo index built: %d unique names + %d shared-handle "
-                 "production rows + %d dated music productions + %d soundtrack links",
-                 len(unique), len(ambig), len(prod_years), len(prod_soundtrack))
+                 "production rows + %d dated music productions + %d soundtrack links "
+                 "+ %d game soundtracks",
+                 len(unique), len(ambig), len(prod_years), len(prod_soundtrack),
+                 len(music_games))
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = f"refresh failed: {exc}"
         log.warning("Demozoo refresh failed: %s", exc)
@@ -545,14 +720,17 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
     """Join every retro track's ``artist`` against the index; return
     ``(matched, batch)`` WITHOUT touching the store (run in an executor).
 
-    Stamps two things per resolved track:
+    Stamps three things per resolved track:
       * ``scene_group`` — the composer's collective(s), as before;
       * ``year`` — the Demozoo canonical release year, under the strict
         ``_production_year`` gate (exact title identity, undated-sibling veto,
         single-year consensus).  Scene rips routinely carry the RIP year (or
         none) in the tag, so the canonical year replaces it; the original is
         preserved once in ``year_file`` and the overwrite is marked
-        ``year_source: "demozoo"`` (idempotent across re-applies).
+        ``year_source: "demozoo"`` (idempotent across re-applies);
+      * ``game_by_demozoo`` — the game the tune was made for (``_demozoo_game``;
+        withdrawn when it no longer derives, or the composer no longer
+        resolves).
 
     Wrong stamps get an EXIT: a track carrying ``year_source == "demozoo"``
     whose year the current gate no longer endorses (gate tightened, index
@@ -577,6 +755,11 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
     # Prolific composers appear thousands of times — cache their production
     # rows (parsed once per releaser) instead of re-querying per track.
     prod_cache: dict[int, list[tuple[frozenset, int | None]]] = {}
+    game_cache: dict[int, list[tuple[frozenset, str]]] = {}
+    # Handle lookups depend only on the artist string and the index: memoised
+    # across applies (``_memos``), so a re-join after a scan re-queries only
+    # artists it has not seen.
+    handle_memo = _memos()[1]
 
     def _revert(t: dict) -> dict:
         """Withdraw a stale demozoo stamp: restore the preserved original
@@ -591,6 +774,7 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
         has_years = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prod_year'"
         ).fetchone() is not None
+        has_games = _has_table(con, "music_game")
         for t in store.all_tracks():
             if not is_retro_format(t.get("format")):
                 continue
@@ -609,19 +793,28 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
                 upd: dict = {}
                 if stamped:
                     upd.update(_revert(t))
+                if t.get("game_by_demozoo"):
+                    upd["game_by_demozoo"] = None       # only a resolved composer names one
+                group = (t.get("scene_group") or "").strip()
+                if (group and not (t.get("composer") or "").strip()
+                        and "scene_group" not in (t.get("user_edited") or [])):
+                    # A group is only ever resolved from the artist (or,
+                    # below, together with a composer): with neither, it is
+                    # left over from an artist that was cleared — withdraw it.
+                    upd["scene_group"] = None
+                    group = ""
                 if not (t.get("composer") or "").strip():
                     narrow, credits = author_hints_from_track(
                         title=t.get("title"), path=t.get("path"),
                         instruments=t.get("instruments"))
                     if credits:                              # only a music CREDIT may write
-                        tb = lookup_by_title(t.get("title") or "",
-                                             author_hints=tuple(narrow),
-                                             credit_hints=credits)
+                        tb = _lookup_by_title(con, t.get("title") or "",
+                                              tuple(narrow), credits)
                         if tb and tb.get("_persist"):        # credit-corroborated only
                             matched += 1
                             upd["composer"] = tb["_persist"]
                             crew = " • ".join(tb.get("groups") or [])
-                            if crew and not (t.get("scene_group") or "").strip():
+                            if crew and not group:
                                 upd["scene_group"] = crew   # fill-only
                 if upd:
                     batch.append((t["id"], upd))
@@ -629,36 +822,48 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
             ttoks = _title_toks(t.get("title"))
             rid = None
             groups = None
-            # 1) Unique handle — collect across ALL variants and refuse when
-            #    they point at DIFFERENT sceners (same gate as lookup_scener;
-            #    taking the first hit was order-nondeterministic, QA M1).
-            hits: dict[int, str] = {}
-            for v in _name_variants(a):
-                row = con.execute(
-                    "SELECT releaser_id, groups FROM scener WHERE name = ?", (v,)
-                ).fetchone()
-                if row and row[0] is not None:
-                    hits[int(row[0])] = row[1]
+            hm = handle_memo.get(a)
+            if hm is None:
+                # 1) Unique handle — collect across ALL variants and refuse
+                #    when they point at DIFFERENT sceners (same gate as
+                #    lookup_scener; taking the first hit was order-
+                #    nondeterministic, QA M1).
+                hits: dict[int, str] = {}
+                for v in _name_variants(a):
+                    row = con.execute(
+                        "SELECT releaser_id, groups FROM scener WHERE name = ?", (v,)
+                    ).fetchone()
+                    if row and row[0] is not None:
+                        hits[int(row[0])] = row[1]
+                hm = [hits, None]                   # ambig rows: fetched on demand
+                _memo_put(handle_memo, a, hm)
+            hits = hm[0]
             if len(hits) == 1:
                 rid, groups = next(iter(hits.items()))
             # 2) Shared handle — this track's title must pick ONE candidate.
             elif not hits and has_ambig and len(ttoks) >= 2:
+                if hm[1] is None:
+                    hm[1] = tuple(
+                        (int(arid), agroups, frozenset((ptoks or "").split()))
+                        for v in _name_variants(a)
+                        for arid, agroups, ptoks in con.execute(
+                            "SELECT releaser_id, groups, ptoks FROM ambig_prod "
+                            "WHERE name = ?", (v,))
+                        if arid is not None)
                 winners: dict[int, str] = {}
-                for v in _name_variants(a):
-                    for arid, agroups, ptoks in con.execute(
-                        "SELECT releaser_id, groups, ptoks FROM ambig_prod "
-                        "WHERE name = ?", (v,),
-                    ):
-                        if arid is not None and _toks_match(
-                                ttoks, frozenset((ptoks or "").split())):
-                            winners[int(arid)] = agroups
+                for arid, agroups, pset in hm[1]:
+                    if _toks_match(ttoks, pset):
+                        winners[arid] = agroups
                 if len(winners) == 1:
                     rid, groups = next(iter(winners.items()))
             if rid is None:
                 # Unresolvable (or variant-ambiguous) — withdraw any stamp we
                 # can no longer stand behind.
-                if stamped:
-                    batch.append((t["id"], _revert(t)))
+                upd = _revert(t) if stamped else {}
+                if t.get("game_by_demozoo"):
+                    upd["game_by_demozoo"] = None
+                if upd:
+                    batch.append((t["id"], upd))
                 continue
             matched += 1
             updates: dict = {}
@@ -685,12 +890,28 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
                     updates["year_source"] = "demozoo"
                     # Preserve the tag/rip year ONCE — a re-apply after an index
                     # update must not clobber the true original with our own
-                    # earlier overwrite.
-                    if not stamped and t.get("year") is not None:
+                    # earlier overwrite.  A song-database year was not in the
+                    # file either (it only fills a missing one): keep year_file.
+                    if (not stamped and t.get("year") is not None
+                            and t.get("year_source") != "songdb"):
                         updates["year_file"] = t.get("year")
                 elif y is None and stamped:
                     # The tightened gate no longer endorses this stamp — revert.
                     updates.update(_revert(t))
+            # The game this tune was made for (``_demozoo_game``).
+            game = None
+            if has_games:
+                gtoks = _year_toks(t.get("title"))
+                if gtoks:
+                    grows = game_cache.get(rid)
+                    if grows is None:
+                        grows = [(frozenset((p or "").split()), g) for p, g in
+                                 con.execute("SELECT ptoks, game FROM music_game "
+                                             "WHERE releaser_id = ?", (rid,))]
+                        game_cache[rid] = grows
+                    game = _demozoo_game(grows, gtoks, t.get("title"))
+            if (t.get("game_by_demozoo") or None) != game:
+                updates["game_by_demozoo"] = game
             if updates:
                 batch.append((t["id"], updates))
     finally:
@@ -1245,7 +1466,21 @@ def lookup_by_title(title: str, *, year: int | None = None,
     Returns ``{releaser_id, real_name, groups[], url, _display}`` or ``None``.
     ``year`` is accepted for API stability but intentionally NOT used to break
     ties — scene rip tags carry the RIP year, not the composition year, so it
-    would select a namesake."""
+    would select a namesake.
+
+    Memoised per index file (``_memos``): the answer depends only on the
+    title's tokens and the hints."""
+    return _lookup_by_title(None, title, tuple(author_hints), credit_hints)
+
+
+def _copy_card(card: dict | None) -> dict | None:
+    return None if card is None else {**card, "groups": list(card.get("groups") or [])}
+
+
+def _lookup_by_title(con: "sqlite3.Connection | None", title: str,
+                     author_hints: tuple, credit_hints: "dict | None") -> dict | None:
+    """``lookup_by_title`` on an open connection (``collect_updates`` shares
+    its own; None opens one).  Returns a copy of the memoised card."""
     ttoks = _title_toks(title)
     if not _title_seed_ok(ttoks):
         return None
@@ -1254,93 +1489,110 @@ def lookup_by_title(title: str, *, year: int | None = None,
     seeds = sorted((t for t in ttoks if len(t) >= 5), key=len, reverse=True)[:4]
     if not seeds:
         return None
-    db = _db_path()
-    if not db.exists():
-        return None
+    memo = _memos()[0]
+    key = (ttoks, author_hints, tuple(sorted((credit_hints or {}).items())))
+    cached = memo.get(key, _MISS)
+    if cached is not _MISS:
+        return _copy_card(cached)
+    own = con is None
+    if own:
+        db = _db_path()
+        if not db.exists():
+            return None
     try:
-        con = sqlite3.connect(db)
+        if own:
+            con = sqlite3.connect(db)
         try:
-            if not _has_scener_table(con) or not _has_ambig_table(con):
-                return None
-            cand: dict[int, dict] = {}
-
-            def _consider(rid: object, ptoks: object,
-                          real: object = None, groups: object = None) -> None:
-                pt = frozenset((ptoks or "").split())
-                if rid is None or not pt or not (pt <= ttoks) or not _title_seed_ok(pt):
-                    return
-                d = cand.setdefault(int(rid), {})
-                if len(pt) >= 2:
-                    d["multi"] = True                       # multi-word title = corroborated
-                if real is not None:
-                    d["real_name"], d["groups"] = real, groups
-
-            for seed in seeds:
-                like = f"%{seed}%"
-                for _n, rid, real, groups, ptoks in con.execute(
-                        "SELECT name, releaser_id, real_name, groups, ptoks "
-                        "FROM ambig_prod WHERE ptoks LIKE ?", (like,)):
-                    _consider(rid, ptoks, real, groups)
-                for rid, ptoks, _yr in con.execute(
-                        "SELECT releaser_id, ptoks, year FROM prod_year WHERE ptoks LIKE ?", (like,)):
-                    _consider(rid, ptoks)
-            if not cand:
-                return None
-            for rid, d in cand.items():                     # fill any missing name
-                if "real_name" not in d:
-                    r = (con.execute("SELECT real_name, groups FROM scener "
-                                     "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone()
-                         or con.execute("SELECT real_name, groups FROM ambig_prod "
-                                        "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone())
-                    if r:
-                        d["real_name"], d["groups"] = r[0], r[1]
-            # _H = every releaser the author hints point to; inter = candidates one
-            # points to.
-            _H: set[int] = set()
-            inter: dict[int, str] = {}
-            for h in author_hints:
-                for v in _name_variants(h):
-                    rr = con.execute("SELECT releaser_id FROM scener WHERE name = ?", (v,)).fetchone()
-                    if rr and rr[0] is not None:
-                        _H.add(int(rr[0]))
-                        if int(rr[0]) in cand:
-                            inter.setdefault(int(rr[0]), h)
-                    for (arid,) in con.execute("SELECT releaser_id FROM ambig_prod WHERE name = ?", (v,)):
-                        if arid is not None:
-                            _H.add(int(arid))
-                            if int(arid) in cand:
-                                inter.setdefault(int(arid), h)
-            # A MULTI-word production title (≥2 shared tokens) is distinctive
-            # enough to resolve on its own; single-token subset matches ("Motion"
-            # for a "Global Motion" track) are pollution and never resolve alone.
-            strong = [rid for rid, d in cand.items() if d.get("multi")]
-            winner: int | None = None
-            disp: str | None = None
-            if len(inter) == 1:                             # title + credited author AGREE
-                winner = next(iter(inter))
-                disp = inter[winner]
-            elif len(strong) == 1:                          # exactly ONE multi-word match
-                only = strong[0]
-                if _H and only not in _H:                   # credit points elsewhere → refuse
-                    return None
-                winner = only
-            if winner is None:                              # bare single word (needs a hint)
-                return None                                 # or a shared title → refuse
-            d = cand[winner]
-            card = _scener_card(winner, d.get("real_name"), d.get("groups"))
-            if disp:
-                card["_display"] = disp.title()
-                # PERSIST-eligible ONLY when the corroborating hint is a music
-                # CREDIT (not a weak dir/suffix, not the no-hint strong path) —
-                # a wrong composer write is permanent.  Original case preserved.
-                cred = (credit_hints or {}).get(disp)
-                if cred:
-                    card["_persist"] = cred
-            return card
+            card = _resolve_title(con, ttoks, seeds, author_hints, credit_hints)
         finally:
-            con.close()
+            if own:
+                con.close()
     except sqlite3.Error:
+        return None                                     # never memoised
+    _memo_put(memo, key, card)
+    return _copy_card(card)
+
+
+def _resolve_title(con: sqlite3.Connection, ttoks: frozenset, seeds: list,
+                   author_hints: tuple, credit_hints: "dict | None") -> dict | None:
+    """The uncached title-first resolution (see ``lookup_by_title``)."""
+    if not _has_scener_table(con) or not _has_ambig_table(con):
         return None
+    cand: dict[int, dict] = {}
+
+    def _consider(rid: object, ptoks: object,
+                  real: object = None, groups: object = None) -> None:
+        pt = frozenset((ptoks or "").split())
+        if rid is None or not pt or not (pt <= ttoks) or not _title_seed_ok(pt):
+            return
+        d = cand.setdefault(int(rid), {})
+        if len(pt) >= 2:
+            d["multi"] = True                       # multi-word title = corroborated
+        if real is not None:
+            d["real_name"], d["groups"] = real, groups
+
+    for seed in seeds:
+        like = f"%{seed}%"
+        for _n, rid, real, groups, ptoks in con.execute(
+                "SELECT name, releaser_id, real_name, groups, ptoks "
+                "FROM ambig_prod WHERE ptoks LIKE ?", (like,)):
+            _consider(rid, ptoks, real, groups)
+        for rid, ptoks, _yr in con.execute(
+                "SELECT releaser_id, ptoks, year FROM prod_year WHERE ptoks LIKE ?", (like,)):
+            _consider(rid, ptoks)
+    if not cand:
+        return None
+    for rid, d in cand.items():                     # fill any missing name
+        if "real_name" not in d:
+            r = (con.execute("SELECT real_name, groups FROM scener "
+                             "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone()
+                 or con.execute("SELECT real_name, groups FROM ambig_prod "
+                                "WHERE releaser_id = ? LIMIT 1", (rid,)).fetchone())
+            if r:
+                d["real_name"], d["groups"] = r[0], r[1]
+    # _H = every releaser the author hints point to; inter = candidates one
+    # points to.
+    _H: set[int] = set()
+    inter: dict[int, str] = {}
+    for h in author_hints:
+        for v in _name_variants(h):
+            rr = con.execute("SELECT releaser_id FROM scener WHERE name = ?", (v,)).fetchone()
+            if rr and rr[0] is not None:
+                _H.add(int(rr[0]))
+                if int(rr[0]) in cand:
+                    inter.setdefault(int(rr[0]), h)
+            for (arid,) in con.execute("SELECT releaser_id FROM ambig_prod WHERE name = ?", (v,)):
+                if arid is not None:
+                    _H.add(int(arid))
+                    if int(arid) in cand:
+                        inter.setdefault(int(arid), h)
+    # A MULTI-word production title (≥2 shared tokens) is distinctive
+    # enough to resolve on its own; single-token subset matches ("Motion"
+    # for a "Global Motion" track) are pollution and never resolve alone.
+    strong = [rid for rid, d in cand.items() if d.get("multi")]
+    winner: int | None = None
+    disp: str | None = None
+    if len(inter) == 1:                             # title + credited author AGREE
+        winner = next(iter(inter))
+        disp = inter[winner]
+    elif len(strong) == 1:                          # exactly ONE multi-word match
+        only = strong[0]
+        if _H and only not in _H:                   # credit points elsewhere → refuse
+            return None
+        winner = only
+    if winner is None:                              # bare single word (needs a hint)
+        return None                                 # or a shared title → refuse
+    d = cand[winner]
+    card = _scener_card(winner, d.get("real_name"), d.get("groups"))
+    if disp:
+        card["_display"] = disp.title()
+        # PERSIST-eligible ONLY when the corroborating hint is a music
+        # CREDIT (not a weak dir/suffix, not the no-hint strong path) —
+        # a wrong composer write is permanent.  Original case preserved.
+        cred = (credit_hints or {}).get(disp)
+        if cred:
+            card["_persist"] = cred
+    return card
 
 
 async def _scene_card_from_base(base: dict, name: str,
@@ -1509,29 +1761,64 @@ async def artist_card(name: str, track_title: str | None = None) -> dict | None:
     }
 
 
-async def apply_to_library() -> dict:
+# Skip signature (mirrors ``scene_metadata._last_auto_sig``): the store's
+# ``_mutation_seq`` after the last apply that covered the whole library, plus
+# the index file's signature — an unchanged library + index has nothing new to
+# join.  Per process: a restart always joins once.
+_last_apply_sig: tuple | None = None
+
+
+def _index_sig() -> tuple | None:
+    try:
+        st = _db_path().stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+async def apply_to_library(*, force: bool = False) -> dict:
     """Async apply: sqlite JOIN in an executor, store WRITE on the loop thread
-    (mirrors ``scene_metadata.apply_to_library``)."""
+    (mirrors ``scene_metadata.apply_to_library``).
+
+    Returns ``skipped: "unchanged"`` without joining when neither the library
+    nor the index changed since the last apply (the post-scan runner calls it
+    after every scan); ``force`` (the Admin Apply button) always joins."""
     import asyncio
     from soniqboom.core.store import get_store
+    global _last_apply_sig
     if _status["applying"]:
         return {**status(), "error": "apply already running"}
+    store = get_store()
+    if not force and (store._mutation_seq, _index_sig()) == _last_apply_sig:
+        return {**status(), "skipped": "unchanged", "matched": 0, "updated": 0}
     _status.update(applying=True, error=None)
     try:
         loop = asyncio.get_running_loop()
+        seq0 = store._mutation_seq
         matched, batch = await loop.run_in_executor(None, collect_updates)
-        updated = 0
+        updated = own_bumps = 0
         if batch:
             # Batch mode defers the per-item sorted-index maintenance to ONE
             # O(n log n) rebuild on exit — without it a ~20K-item batch spent
             # ~19 s of loop-thread time on incremental bisect.insort against
             # 262K-entry lists, stalling every request mid-apply (QA M3).
-            store = get_store()
             store.enter_batch_mode()
             try:
+                s0 = store._mutation_seq
                 updated = store.update_track_fields_batch(batch)
+                own_bumps = store._mutation_seq - s0
             finally:
                 store.exit_batch_mode()
+        # Only our own write moved the seq since the join started → the next
+        # call has nothing new to join; anything else makes it run.
+        _last_apply_sig = ((store._mutation_seq, _index_sig())
+                           if store._mutation_seq == seq0 + own_bumps else None)
+        if updated:
+            # year / composer / scene_group are shown in the folder listings.
+            from soniqboom.core.folder_album import refresh_album_caches
+            await refresh_album_caches([tid for tid, _upd in batch])
+        batch = None
+        _freeze_grown_memo()
         _status["last_apply"] = {
             "matched": matched, "updated": updated, "at": int(time.time()),
         }
@@ -1560,6 +1847,7 @@ def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
         (ProTracker, ScreamTracker, …) carry no composer tag, so such a value
         is always the title-first enrichment.  (A composer on an artist-tagged
         or non-retro track may be a real file/user tag and is left alone.)
+      * ``game_by_demozoo`` → cleared (the game follows, ``store.game_follow``).
 
     Reads the store snapshot only; the caller writes the batch on the loop
     thread (see ``reset_to_file_state``).  Idempotent — a clean library yields
@@ -1575,6 +1863,8 @@ def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
             upd.update(year=t.get("year_file"), year_source=None, year_file=None)
         if (t.get("scene_group") or "").strip() and "scene_group" not in ue:
             upd["scene_group"] = None
+        if t.get("game_by_demozoo"):
+            upd["game_by_demozoo"] = None
         if ((t.get("composer") or "").strip()
                 and not (t.get("artist") or "").strip()
                 and is_retro_format(t.get("format"))
@@ -1615,6 +1905,9 @@ async def reset_to_file_state() -> dict:
                 cleared = store.update_track_fields_batch(batch)
             finally:
                 store.exit_batch_mode()
+            if cleared:
+                from soniqboom.core.folder_album import refresh_album_caches
+                await refresh_album_caches([tid for tid, _upd in batch])
         _status["last_reset"] = {"cleared": cleared, "at": int(time.time())}
         return {**status(), "cleared": cleared}
     except Exception as exc:                            # noqa: BLE001

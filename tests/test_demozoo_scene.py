@@ -214,7 +214,7 @@ def test_parse_dump_shared_handle_music_only(tmp_path):
     """With supertypes present, the shared handle 'zap' only carries the
     MUSICIAN's (releaser 100) music production as disambiguation evidence — the
     coder namesake's colliding DEMO title is excluded."""
-    unique, ambig, _, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    unique, ambig, _, _, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
     rids = {row[1] for row in ambig if row[0] == "zap"}
     assert rids == {100}                       # coder (200) contributes no music
     assert not any("party" in row[4] for row in ambig)   # demo tokens absent
@@ -224,7 +224,7 @@ def test_parse_dump_no_supertype_column_degrades(tmp_path):
     """A dump WITHOUT a supertype column keeps the previous all-productions
     behaviour for disambiguation, and yields ONLY veto rows (year None) for the
     year gate — no dates ⇒ no year is ever stamped, but nothing crashes."""
-    unique, ambig, prod_years, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=False))
+    unique, ambig, prod_years, _, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=False))
     rids = {row[1] for row in ambig if row[0] == "zap"}
     assert rids == {100, 200}                  # no supertype ⇒ no filtering
     assert prod_years and all(y is None for _, _, y in prod_years)
@@ -233,7 +233,7 @@ def test_parse_dump_no_supertype_column_degrades(tmp_path):
 def test_parse_dump_prod_years_shapes(tmp_path):
     """prod_years: MUSIC only, digit tokens kept, undated rows preserved as
     year-None vetoes, the demo excluded."""
-    _, _, prod_years, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    _, _, prod_years, _, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
     assert sorted(prod_years) == [
         ("100", "deluxe tune zap", 1992),
         ("100", "groove tune undated", None),   # undated ⇒ veto row
@@ -244,7 +244,7 @@ def test_parse_dump_prod_years_shapes(tmp_path):
 def test_parse_dump_soundtrack_links(tmp_path):
     """The 4th return maps a MUSIC production → the demo(s) that used it,
     resolved to the demo's title + year (inverting the demo→music link)."""
-    _, _, _, prod_soundtrack = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
+    _, _, _, prod_soundtrack, _ = demozoo._parse_dump(_write_dump(tmp_path, with_supertype=True))
     assert prod_soundtrack == [(8000, "Second Reality", 1993)]
 
 

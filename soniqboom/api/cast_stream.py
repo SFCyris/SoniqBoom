@@ -95,18 +95,12 @@ def _safe_header_filename(raw: str) -> str:
 
 # ── Main route ────────────────────────────────────────────────────────────
 
-@router.get("/cast/{token}/{filename}")
-async def cast_stream(
-    token: str,
-    filename: str,
-    request: Request,
-):
-    """Serve a track's bytes to a Cast / AirPlay / DLNA renderer.
-
-    ``filename`` is cosmetic (shows up in some renderers' "Now Playing"
-    strings) — we ignore everything except its extension, which we
-    use to pick the Content-Type and contentFeatures.dlna.org header.
-    """
+async def _authorize_cast(token: str, request: Request, *, bind: bool = True):
+    """Token signature + replay check + user re-auth + track lookup — shared by
+    GET and HEAD.  GET binds the link to the first IP that plays it; HEAD
+    (``bind=False``) is refused for another IP once bound but never binds
+    itself — a DLNA control point probing the link must not lock the TV's
+    GET out.  Returns ``(claims, track, track_id)``; raises 404 / 410."""
     claims = cast_tokens.verify_token(token)
     if claims is None:
         # Indistinguishable response for "bad signature" / "expired" /
@@ -114,7 +108,7 @@ async def cast_stream(
         raise HTTPException(404, "Stream link no longer valid.")
 
     remote_ip = request.client.host if request.client else None
-    if not cast_tokens.replay_ok(claims, remote_ip):
+    if not cast_tokens.replay_ok(claims, remote_ip, bind=bind):
         # log.debug rather than .warning — port-scanners hitting bad URLs
         # otherwise drive log volume linearly with the attack rate.
         log.debug(
@@ -160,6 +154,90 @@ async def cast_stream(
     track = await get_track(track_id)
     if track is None:
         raise HTTPException(410, "Track no longer in library.")
+
+    return claims, track, track_id
+
+
+def _cast_delivery(claims: dict, track) -> tuple:
+    """(target_codec, bitrate, sample_rate, src_ext, src_codec, native_fastpath)
+    — the delivery decision GET and HEAD must agree on."""
+    target_codec = (claims.get("c") or "").lower() or None
+    target_bitrate = int(claims.get("br") or 0) or None
+    target_sample_rate = int(claims.get("sr") or 0) or None
+    src_ext = _ext_for(track.path)
+    src_codec = src_ext.lstrip(".") if src_ext else "?"
+    use_native_fastpath = (
+        target_codec is None
+        or target_codec == src_codec
+        or (src_ext in _NATIVE_EXTS and not target_codec)
+    )
+    return target_codec, target_bitrate, target_sample_rate, src_ext, src_codec, use_native_fastpath
+
+
+@router.head("/cast/{token}/{filename}")
+async def cast_stream_head(token: str, filename: str, request: Request):
+    """HEAD for renderers that probe before playing (some DLNA TVs).  Same
+    auth and delivery decision as GET, but never starts a render/transcode:
+    a native or cached file answers with its real headers via the stream
+    endpoint's HEAD; a to-be-transcoded one with the Content-Type + DLNA
+    headers the chunked GET will send."""
+    claims, track, track_id = await _authorize_cast(token, request, bind=False)
+    filename = _safe_header_filename(filename)
+    target_codec, target_bitrate, target_sample_rate, src_ext, src_codec, fast = \
+        _cast_delivery(claims, track)
+    cached_path = None
+    if not fast and target_codec:
+        try:
+            ck = _ck(track_id=track_id, format_type="transcoded",
+                     codec=target_codec, target_rate=target_sample_rate)
+            cached_path = await get_cached(ck)
+        except Exception:
+            cached_path = None
+    if fast or cached_path is not None:
+        from soniqboom.api.stream import (
+            stream_track_head, _set_cast_internal_bypass, _reset_cast_internal_bypass,
+        )
+        bypass = _set_cast_internal_bypass(True)
+        try:
+            response = await stream_track_head(
+                track_id=track_id, request=request, subsong=0,
+                target_format=target_codec, max_bitrate_kbps=target_bitrate or 0,
+                target_sample_rate=target_sample_rate or 0, force_transcode=False,
+                sb_session=None, u=None, p=None, s=None, t=None,
+            )
+        finally:
+            _reset_cast_internal_bypass(bypass)
+        for k, v in dlna_response_headers(target_codec or src_codec).items():
+            if v:
+                response.headers[k] = v
+        response.headers.setdefault("Content-Disposition", f'inline; filename="{filename}"')
+        return response
+    spec = CODECS.get((target_codec or "mp3").lower())
+    headers = {
+        "Accept-Ranges": "none",
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    for k, v in dlna_response_headers(target_codec or "mp3").items():
+        if v:
+            headers[k] = v
+    return Response(status_code=200, headers=headers,
+                    media_type=spec.content_type if spec else "audio/mpeg")
+
+
+@router.get("/cast/{token}/{filename}")
+async def cast_stream(
+    token: str,
+    filename: str,
+    request: Request,
+):
+    """Serve a track's bytes to a Cast / AirPlay / DLNA renderer.
+
+    ``filename`` is cosmetic (shows up in some renderers' "Now Playing"
+    strings) — we ignore everything except its extension, which we
+    use to pick the Content-Type and contentFeatures.dlna.org header.
+    """
+    claims, track, track_id = await _authorize_cast(token, request)
 
     # Sanitise the filename before reflecting into Content-Disposition.
     filename = _safe_header_filename(filename)

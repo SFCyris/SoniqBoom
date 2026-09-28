@@ -19,7 +19,7 @@
   <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
   <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
   <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
-  <link rel="stylesheet" href="/assets/css/mobile.css?v=7">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=16">
 </head>
 <body>
   <div id="m-app">
@@ -153,14 +153,13 @@
 
     <!-- ── Action sheet (long-press menu) ───────────────────────────────── -->
     <div id="m-sheet-backdrop" class="m-sheet-backdrop hidden"></div>
-    <div id="m-sheet" class="m-sheet hidden" role="dialog" aria-modal="true">
+    <div id="m-sheet" class="m-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="m-sheet-title">
       <div class="m-sheet-header" id="m-sheet-title">Actions</div>
-      <ul id="m-sheet-actions" class="m-sheet-actions"></ul>
+      <ul id="m-sheet-actions" class="m-sheet-actions" role="none"></ul>
       <button id="m-sheet-cancel" class="m-sheet-cancel">Cancel</button>
     </div>
 
     <!-- ── Toast (transient feedback) ───────────────────────────────────── -->
-    <div id="m-toast" class="m-toast hidden"></div>
 
   </div>
 
@@ -171,7 +170,7 @@
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
 
-  <script type="module" src="/assets/js/mobile/app.js?v=14"></script>
+  <script type="module" src="/assets/js/mobile/app.js?v=21"></script>
   <!-- Same cast picker the desktop shell loads.  Picker is a classic
        script that wires itself to #btn-cast on either route. -->
   <script src="/assets/js/cast_picker.js?v=2" defer></script>

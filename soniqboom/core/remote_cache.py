@@ -18,6 +18,7 @@ import struct
 import subprocess
 import threading
 import time
+import uuid
 import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +38,9 @@ _DEFAULT_MAX_MB = 2048
 # cache with fresh entries may transiently overshoot the byte budget by
 # the grace window's working set; that's disk headroom, not corruption.
 _EVICTION_GRACE_S = 60
+# How long a playback (stream-lane) fetch waits for a background fetch of the
+# same file before downloading it on its own lane (see ``RemoteCache.fetch``).
+_STREAM_LOCK_WAIT_S = 0.5
 
 # Eviction telemetry — during a scan whose working set exceeds the cache
 # limit, EVERY insert evicts (1,489 per-batch INFO lines / 22 GB churn
@@ -159,11 +163,32 @@ class RemoteCache:
             weakref.WeakValueDictionary()
         )
         self._fetch_locks_guard = threading.Lock()
+        # Stream-lane fetches of ONE key additionally queue on this lock, so
+        # at most one of them ever bypasses a background holder of the main
+        # lock (see ``fetch``) — concurrent playback requests for the same
+        # file (stream GET + waveform + VU + Range re-requests) must share a
+        # single download, not each pull the whole file into RAM.
+        self._stream_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = (
+            weakref.WeakValueDictionary()
+        )
         # Serialises index-file writes that happen OUTSIDE _mutex (the
         # eviction hot path snapshots under _mutex, writes under this).
         self._save_lock = threading.Lock()
         self._load_index()
         self._total_bytes = sum(e.get("size", 0) for e in self._index.values())
+        self._sweep_part_files()
+
+    def _sweep_part_files(self) -> None:
+        """Remove ``*.part`` temps and ``*.evicted-*`` throwaways a killed
+        process left behind — never indexed, so nothing else would remove them."""
+        try:
+            for p in [*self._root.rglob("*.part"), *self._root.rglob("*.evicted-*")]:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     def _load_index(self) -> None:
         if self._index_path.exists():
@@ -275,6 +300,14 @@ class RemoteCache:
                 self._fetch_locks[key] = lock
         return lock
 
+    def _stream_lock_for_key(self, key: str) -> threading.Lock:
+        with self._fetch_locks_guard:
+            lock = self._stream_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._stream_locks[key] = lock
+        return lock
+
     def fetch(self, share_id: str, remote_path: str, source: FileSource,
               *, lane: str = "stream") -> Path:
         """Download *remote_path* into the cache (or return the cached copy).
@@ -296,56 +329,44 @@ class RemoteCache:
         # local write.  Double-checked locking: the cache may have filled
         # while we awaited the lock.
         lock = self._lock_for_key(key)
-        with lock:
-            cached = self.get_cached(share_id, remote_path)
-            if cached is not None:
-                return cached
-
-            local = self._cache_path(key, remote_path)
-            local.parent.mkdir(parents=True, exist_ok=True)
-
-            # Heavy I/O happens outside the index mutex; only the
-            # dict-update is serialised against eviction / total-byte
-            # accounting.  Two concurrent fetches of *different* remote
-            # files used to race on ``+=`` against ``_total_bytes`` and
-            # the ``_save_index`` write — the global mutex still covers
-            # that, on top of the per-key serialisation we added here.
-            data = source.read_file(remote_path, lane=lane)
-            local.write_bytes(data)
-            size = len(data)
-            # Drop the in-RAM copy before the (potentially slow) seektable
-            # step — archives ride through here at up to ~1.5 GB apiece,
-            # and two concurrent scan fetches holding whole-file buffers
-            # spike RSS by gigabytes.
-            del data
-
-            # Post-fetch: FLAC files without a SEEKTABLE block can't be
-            # seeked reliably by the browser's audio element — Chromium's
-            # FFmpegDemuxer fails with "PTS is not defined" when the Range
-            # request lands mid-frame.  Inject a SEEKTABLE losslessly with
-            # ``metaflac`` so seeking just works.  Best-effort: skipped if
-            # the file isn't FLAC, ``metaflac`` isn't installed, or the
-            # file already has a SEEKTABLE.  Modifies ONLY the cache copy;
-            # the source on the FTP/SMB share is untouched.
-            if remote_path.lower().endswith(".flac"):
-                _add_flac_seektable_best_effort(local)
-                # The SEEKTABLE injection grew the file — index the REAL
-                # on-disk size or the byte accounting undercounts.
+        if lane != "stream":
+            with lock:
+                # Double-checked: the cache may have filled while we waited.
+                cached = self.get_cached(share_id, remote_path)
+                if cached is not None:
+                    return cached
+                local = self._download_to_cache(key, share_id, remote_path, source, lane)
+        else:
+            # A PLAYBACK fetch never queues behind a BACKGROUND (scan /
+            # prewarm) fetch of the same file for longer than
+            # ``_STREAM_LOCK_WAIT_S``: that one may sit on the pool's
+            # low-priority lane for many seconds, so after the wait it
+            # downloads on its own (stream) lane into a private temp.  Stream
+            # fetches of one key queue on ``_stream_lock_for_key`` first, so
+            # only ONE of them can bypass; the rest find the file cached.
+            slock = self._stream_lock_for_key(key)
+            # Queue behind the stream fetch ahead of us, but keep checking the
+            # cache: whichever download (the background one or the bypass)
+            # lands first serves every waiting playback request.
+            while not slock.acquire(timeout=0.1):
+                cached = self.get_cached(share_id, remote_path)
+                if cached is not None:
+                    return cached
+            try:
+                cached = self.get_cached(share_id, remote_path)
+                if cached is not None:
+                    return cached
+                got = lock.acquire(timeout=_STREAM_LOCK_WAIT_S)
                 try:
-                    size = local.stat().st_size
-                except OSError:
-                    pass
-
-            with self._mutex:
-                self._index[key] = {
-                    "share_id": share_id,
-                    "remote": remote_path,
-                    "local": str(local),
-                    "size": size,
-                    "fetched": time.time(),
-                    "last_access": time.time(),
-                }
-                self._total_bytes += size
+                    cached = self.get_cached(share_id, remote_path)
+                    if cached is not None:
+                        return cached
+                    local = self._download_to_cache(key, share_id, remote_path, source, lane)
+                finally:
+                    if got:
+                        lock.release()
+            finally:
+                slock.release()
         # Evict + persist in one pass (a single index write per fetch —
         # the old insert-save + evict-save double write hammered the disk
         # at scan rates).  ``protect_key`` keeps the entry we are about to
@@ -354,6 +375,63 @@ class RemoteCache:
         # entry exceeded the cache limit (fetch returned an already-
         # unlinked path → FileNotFoundError downstream).
         self._evict_if_needed(protect_key=key)
+        return local
+
+    def _download_to_cache(self, key: str, share_id: str, remote_path: str,
+                           source: "FileSource", lane: str) -> Path:
+        """Fetch into a private temp file, finish it (FLAC seektable), move it
+        into place atomically and index it — counting its bytes only if no
+        concurrent fetch of the same key indexed it first."""
+        local = self._cache_path(key, remote_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        tmp = local.with_name(local.name + f".{uuid.uuid4().hex}.part")
+        try:
+            # Heavy I/O happens outside the index mutex; only the dict update
+            # is serialised against eviction / total-byte accounting.
+            data = source.read_file(remote_path, lane=lane)
+            tmp.write_bytes(data)
+            size = len(data)
+            # Drop the in-RAM copy before the (potentially slow) seektable
+            # step — archives ride through here at up to ~1.5 GB apiece.
+            del data
+            # FLAC files without a SEEKTABLE can't be seeked reliably by the
+            # browser (Chromium "PTS is not defined"); inject one losslessly on
+            # the cache copy only (best-effort; the share is untouched).
+            if remote_path.lower().endswith(".flac"):
+                _add_flac_seektable_best_effort(tmp)
+                try:
+                    size = tmp.stat().st_size      # the seektable grew the file
+                except OSError:
+                    pass
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        now = time.time()
+        with self._mutex:
+            # Move into place and index in ONE hold: an eviction that claimed
+            # this key can't delete the fresh file in between (it re-checks the
+            # index under the same mutex right before its unlink).
+            try:
+                os.replace(tmp, local)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            prev = self._index.get(key)
+            self._index[key] = {
+                "share_id": share_id,
+                "remote": remote_path,
+                "local": str(local),
+                "size": size,
+                "fetched": now,
+                "last_access": now,
+            }
+            self._total_bytes += size - (int(prev.get("size", 0) or 0) if prev else 0)
         return local
 
     def _evict_if_needed(self, protect_key: str | None = None) -> None:
@@ -369,7 +447,7 @@ class RemoteCache:
         playback ``get_cached`` calls behind it during scan floods.
         """
         now = time.time()
-        victims: list[dict] = []
+        victims: list[tuple[str, dict]] = []
         with self._mutex:
             if self._total_bytes > self._max_bytes:
                 by_access = sorted(
@@ -399,16 +477,33 @@ class RemoteCache:
                         continue
                     self._index.pop(k)
                     claimed += entry.get("size", 0)
-                    victims.append(entry)
+                    victims.append((k, entry))
                 self._total_bytes = max(0, self._total_bytes - claimed)
             # Snapshot the payload under the mutex; write it outside.
             payload = json.dumps(self._index)
         self._write_index_payload(payload)
         if victims:
             removed = 0
-            for entry in victims:
+            for k, entry in victims:
+                # A fetch may have re-downloaded and re-indexed this very
+                # key since it was claimed (a bypass download finishing
+                # late): its fresh file must not be deleted from under it.
                 try:
-                    Path(entry["local"]).unlink(missing_ok=True)
+                    # Under the mutex only the check and a RENAME (atomic,
+                    # fast): a re-indexed file is never touched, and the slow
+                    # unlink of a big archive happens outside, so cache
+                    # lookups (some on the event loop) never wait for it.
+                    with self._mutex:
+                        if k in self._index:
+                            continue
+                        src = Path(entry["local"])
+                        doomed = src.with_name(f"{src.name}.evicted-{uuid.uuid4().hex}")
+                        try:
+                            os.replace(src, doomed)
+                        except FileNotFoundError:
+                            doomed = None
+                    if doomed is not None:
+                        doomed.unlink(missing_ok=True)
                     removed += entry.get("size", 0)
                 except OSError as exc:
                     # File stays on disk but left the index — surface it

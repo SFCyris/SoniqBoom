@@ -83,7 +83,11 @@ _SUFFIX_OWNED_ELSEWHERE = frozenset({
     "ym", "sndh", "sc68",
     # PSF console-rip family (zxtune owns the suffix; uade's ``psf`` token is
     # SoundFactory, still reachable in prefix form ``psf.song``)
-    "psf",
+    "psf", "psf2", "ssf", "dsf", "2sf", "gsf", "usf", "ncsf",
+    "minipsf", "minipsf2", "minissf", "minidsf", "mini2sf", "minigsf",
+    "miniusf", "minincsf",
+    # AdLib AMUSIC
+    "amd",
     # other engines / plain audio (defensive — some uade tokens are short and
     # generic; never let a name-prefilter shadow a real audio suffix)
     "nsf", "nsfe", "spc", "gbs", "vgm", "vgz", "ay", "kss", "sap", "gym",
@@ -92,6 +96,34 @@ _SUFFIX_OWNED_ELSEWHERE = frozenset({
     "mp3", "flac", "ogg", "opus", "m4a", "mp4", "aac", "wav", "aiff",
     "aif", "wv", "mpc",
 })
+
+# Owned extensions a content-verified Amiga module may still carry: a
+# ProTracker-family module saved as ``bp.song.mod`` / ``one.mod``, SidMon as
+# ``fred.sid``.  For every OTHER owned extension (plain audio, chip formats,
+# AdLib, MIDI, …) a uade name match never decides playback.
+_NAME_OVERRIDABLE_SUFFIXES = frozenset({
+    "mod", "s3m", "xm", "it", "mtm", "med", "oct", "669", "dbm",
+    "ult", "stm", "far", "amf", "gdm", "okt", "sfx", "wow", "dsm",
+    "sid",
+})
+
+
+def ext_owned_elsewhere(ext: str) -> bool:
+    """Does another engine (or plain audio decoding) own this file extension?
+
+    ``ext`` may carry the dot and any case (``".MP3"``, ``"xm"``).  A uade
+    name token in PREFIX position (``one.``, ``p10.``, ``fred.``) must not
+    override such an extension: ``One.wav`` is a WAV, ``UFO.XM`` a
+    FastTracker module."""
+    return ext.lower().lstrip(".") in _SUFFIX_OWNED_ELSEWHERE
+
+
+def owned_ext_can_be_amiga(ext: str) -> bool:
+    """May a file with this owned extension still be an Amiga module when
+    the scanner verified its content as one (tracker extensions and
+    ``.sid``)?  Plain audio and the other engines' extensions never are."""
+    return ext.lower().lstrip(".") in _NAME_OVERRIDABLE_SUFFIXES
+
 
 # Prefix tokens other engines keep even in PREFIX position: archived Amiga
 # collections named ``mod.X`` / ``med.X`` already route through libopenmpt via
@@ -270,6 +302,37 @@ def companion_sibling_names(name: str) -> tuple[str, ...]:
             seen.add(cand.lower())
             uniq.append(cand)
     return tuple(uniq)
+
+
+# Players whose modules come as TWO files — the module plus a sample /
+# instrument half beside it (the pairs listed with COMPANION_PREFIXES above;
+# TFHD variants are single-file).  Used only to word a failed render.
+_COMPANION_PLAYERS = frozenset({
+    "TFMX", "TFMX-7V", "TFMX-Pro", "TFMX_ST", "RichardJoseph",
+    "RichardJoseph_Player", "UFO", "PaulRobotham", "TimeTracker",
+    "DirkBialluch", "PierreAdane", "JochenHippel-CoSo", "Jochen_Hippel_ST",
+    "ThomasHermann", "JasonPage", "BladePacker", "SynthDream",
+    "Alcatraz_Packer", "Quartet", "Maximum_Effect", "Ashley_Hogg",
+})
+# Suffix-form pairs whose companion is ``<body>.<suffix>``.
+_COMPANION_SUFFIX_BY_PLAYER = {"UFO": "bank", "PaulRobotham": "ssd"}
+
+
+def expected_companions(name: str) -> tuple[str, ...] | None:
+    """For a module whose player needs a separate sample half: the usual
+    names of that half (``mdat.X`` → ``smpl.X`` / ``smp.X``; UFO ``X.mus``
+    → ``X.bank``) — possibly empty when the naming isn't known.  None for a
+    single-file player or a name uade doesn't claim."""
+    cls = classify(name)
+    if cls is None or cls[0] not in _COMPANION_PLAYERS:
+        return None
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    first, _, rest = base.partition(".")
+    if first.lower() == cls[1] and rest:
+        return (f"smpl.{rest}", f"smp.{rest}")
+    suffix = _COMPANION_SUFFIX_BY_PLAYER.get(cls[0])
+    stem = base.rpartition(".")[0]
+    return (f"{stem}.{suffix}",) if suffix and stem else ()
 
 
 # Conf tokens that collide with ubiquitous NON-music file suffixes (QA

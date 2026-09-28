@@ -52,6 +52,16 @@ class TrackMeta(BaseModel):
     instruments: list[str] | None = None
     patterns: int | None = None
     subsongs: int | None = None
+    # First subsong NUMBER the replayer uses when it is not 0 (uade: modules
+    # that report "min 1 max 3").  The 0-based picker index N maps to replayer
+    # subsong ``N + subsong_base``; None ⇒ numbering starts at 0.
+    subsong_base: int | None = None
+    # 0-based index of the file's DEFAULT tune — the one it plays unasked (a
+    # PSID/RSID header's start song, an SNDH ``!#`` tag) — recorded only when
+    # that is not tune 1; None ⇒ tune 1.  The bare track id plays this tune,
+    # and the multi-tune wire mapping (renderers, Subsonic tune ids, the web
+    # picker) swaps it with tune 1 (see core/subsonic_index.py ``wire_tune``).
+    start_subsong: int | None = None
 
     # Track health — a known playback defect detected at scan time, surfaced as
     # a badge in listings + the info panel.  ``defect`` is a coarse class the UI
@@ -88,7 +98,9 @@ class TrackMeta(BaseModel):
     # in the track-info modal.
     scene_group: str | None = None
     # Provenance of ``year`` when it did NOT come from the file's own tag:
-    # "demozoo" (canonical scene release year, from the Demozoo backfill) or
+    # "demozoo" (canonical scene release year, from the Demozoo backfill),
+    # "songdb" (the UADE song database filled a MISSING year — carried by a
+    # rescan only while the file is unchanged and still has no year) or
     # "user" (a deliberate hand-edit).  ``year_file`` preserves whatever the
     # file/rip originally carried so a stamp can be reverted.  These outlive a
     # rescan (see store.upsert_tracks_batch): a fresh extract re-reads the file
@@ -98,6 +110,57 @@ class TrackMeta(BaseModel):
     # refresh it normally.
     year_source: str | None = None
     year_file: int | None = None
+    # Provenance of ``album`` for retro formats:
+    #   "tag"              — the file's own header (SPC ID666 game, NSF/NSFe/GBS
+    #                        name, VGM GD3 game, PSF ``game=``);
+    #   "modland"          — the game/collection folder of the exact-MD5 Modland
+    #                        match (``Format/Author/<Game>/file``);
+    #   "modland-filename" — the ``<game>-<part>`` Modland file name, applied
+    #                        only when the local title equals ``<part>``;
+    #   "folder"           — the opt-in "album from folder name" pass;
+    #   "songdb"           — the album (game / production) of the exact-MD5
+    #                        match in the UADE song database (core/songdb.py).
+    # None ⇒ an ordinary file tag (or no album).  The derived sources
+    # ("modland", "modland-filename", "folder", "songdb") survive a rescan while
+    # the file still carries no album (see store._carry_enrichment); a real tag
+    # that appears later wins.  Apply passes fill an empty album (a "folder"
+    # album may be upgraded by a Modland one, a "folder" or "modland-filename"
+    # guess by a song-database one), withdraw their own album when it no
+    # longer applies (the file header's name comes back —
+    # ``folder_album.header_album_back``) and never touch a field listed in
+    # ``user_edited``.
+    album_source: str | None = None
+    # The game (or production) the music belongs to — distinct from the album
+    # so a modern remix can name its game too.  A retro track's game is an
+    # album the user typed (``game_source`` "user-album"), else the first of
+    # its per-source names below in precedence order (``game_source`` = that
+    # source) — usually its album's; kept in step by ``store.game_follow``.
+    # A file's own GAME tag (``game_source`` None) or a game the user typed
+    # (``user_edited``) is never replaced.  ``game:`` searches it.
+    game: str = ""
+    game_source: str | None = None
+    # The game name each source gives a retro track, written only by that
+    # source: the file's header (the extractor), the Modland game folder or
+    # file name, the Demozoo game a tune named after it is the soundtrack of
+    # and the song database (their applies), the archive's name when
+    # it is a known game of the track's platform (core/game_titles.py), the
+    # folder name (the folder pass) — each cleared by its own withdrawals.  ``game`` is one of
+    # them (see above); the others, distinct, are ``game_aliases``, which
+    # ``game:`` searches too (``store.game_follow``).
+    game_by_tag: str | None = None
+    game_by_modland: str | None = None
+    game_by_demozoo: str | None = None
+    game_by_modland_filename: str | None = None
+    game_by_songdb: str | None = None
+    game_by_archive: str | None = None
+    game_by_folder: str | None = None
+    game_aliases: list[str] | None = None
+    # Fields the UADE song database (core/songdb.py) filled that have no
+    # provenance field of their own — "artist", "label" — so a rescan keeps
+    # them while the file is unchanged (store._carry_enrichment), a refreshed
+    # index updates or withdraws them, and its Reset clears exactly them.  (Its
+    # albums and years are marked by ``album_source`` / ``year_source`` "songdb".)
+    songdb_fields: list[str] | None = None
     # Field names the user hand-edited in the LIBRARY only (store-only editor
     # for formats that can't be tag-written — modules, SID, chip, archive
     # members).  Those fields are re-read from the file on a rescan and would

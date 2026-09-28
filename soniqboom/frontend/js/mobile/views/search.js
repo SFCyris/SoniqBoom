@@ -9,6 +9,7 @@ import { attachRowGestures } from '../gestures.js';
 import { buildTrackRow, fmtDur, trackActions } from './_common.js';
 
 const DEBOUNCE_MS = 250;
+const SEARCH_LIMIT = 100;      // rows listed; hitting it means more matched
 
 export function mountSearch(root, ctx) {
   let _gestureCleanups = [];
@@ -21,7 +22,7 @@ export function mountSearch(root, ctx) {
   root.innerHTML = `
     <div class="m-search-bar">
       <input class="m-search-input" id="m-search-input" type="search"
-             placeholder="Search artist, album, title…"
+             placeholder="Search… or try game:uridium"
              autocomplete="off" autocapitalize="off" autocorrect="off">
     </div>
     <ul class="m-list" id="m-search-list"></ul>
@@ -56,12 +57,19 @@ export function mountSearch(root, ctx) {
     const mySeq = ++_seq;
 
     try {
-      const url = `/api/search?q=${encodeURIComponent(q)}&limit=100`;
+      const url = `/api/search?q=${encodeURIComponent(q)}&limit=${SEARCH_LIMIT}`;
       const res = await fetch(url);
       const tracks = await res.json();
       if (mySeq !== _seq) return;          // superseded by a later query
 
       _last = Array.isArray(tracks) ? tracks : [];
+      // A search that hit the cap matched more than it lists: hand the player a
+      // queue source so shuffle deals from ALL matches, not just these rows (the
+      // search endpoint has no offset, so only the shuffled order is pageable).
+      const source = (_last.length >= SEARCH_LIMIT && /[\p{L}\p{N}]/u.test(q))
+        ? { ordered: null, shuffle: { url: '/api/tracks/shuffled', params: { q } },
+            total: null, label: `Search: ${q}` }
+        : null;
       if (!_last.length) {
         empty.textContent = `No matches for "${q}".`;
         empty.classList.remove('hidden');
@@ -78,7 +86,7 @@ export function mountSearch(root, ctx) {
 
         const row = buildTrackRow(t, { trailing: dur });
         const c = attachRowGestures(row, {
-          onTap:         () => Player.setQueue(_last, idx),
+          onTap:         () => Player.setQueue(_last, idx, source ? { source } : {}),
           onLongPress:   () => ctx.showSheet({ title: t.title || 'Track', actions: trackActions(t, gctx) }),
           onSwipeAction: () => { Player.addToQueue(t); ctx.toast('Added to queue'); },
           swipeLabel:    '+ Queue',

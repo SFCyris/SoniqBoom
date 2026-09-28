@@ -27,27 +27,497 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
+import heapq
 import itertools
 import json
 import logging
 import math
 import os
-import struct
+import re
+import stat
+import sys
+import weakref
 import subprocess
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import (
     BrokenExecutor, ProcessPoolExecutor, ThreadPoolExecutor,
 )
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Iterable
 
 from soniqboom.core.metadata import (
     SUPPORTED_EXTENSIONS, extract, is_supported_music_name,
 )
+
+
+def prepare_worker_forkserver() -> None:
+    """macOS: start the multiprocessing forkserver the scan pools fork their
+    workers from (``_process_pool``) — at start-up, before the server uses
+    the network.  It preloads only the ``soniqboom`` package (version
+    strings — no settings), so every worker imports the app itself and reads
+    the settings file as it is now, as a spawned worker does, and
+    ``soniqboom._forkserver_guard`` (a client that sends nothing no longer
+    kills it); a non-empty preload also puts the app's ``sys_path`` and
+    ``'soniqboom'`` on the forkserver's command line, which
+    ``main._reap_orphaned_forkservers`` matches.  A later start in the same
+    process (the bundled app's Stop/Start) finds the forkserver a stop kept
+    (``shutdown_worker_pools``) still running — ``ensure_running`` then
+    starts nothing — and should it have died, it is started again without a
+    fork (``_spawnv_passfds_nofork``).  A no-op outside macOS."""
+    if sys.platform != "darwin":
+        return
+    import multiprocessing
+    from multiprocessing import forkserver
+    _install_nofork_spawn()
+    try:
+        multiprocessing.set_forkserver_preload(["soniqboom", "soniqboom._forkserver_guard"])
+        forkserver.ensure_running()
+    except Exception:                                       # noqa: BLE001
+        log.warning("could not start the worker forkserver now — it starts "
+                    "with the first scan", exc_info=True)
+
+
+def _spawnv_passfds_nofork(path, args, passfds):
+    """``multiprocessing.util.spawnv_passfds`` without a fork (macOS): the
+    stdlib's forks the server before it execs, and once the server has used
+    the network Network.framework's fork handler can crash that child — so
+    starting the worker forkserver (or the resource tracker) again after one
+    died must not fork.  ``posix_spawn`` passes every inheritable
+    descriptor, so every other one is swept to close-on-exec first and
+    ``passfds`` are made inheritable for the call (all under
+    ``forksafe.spawn_lock``) and back again after it."""
+    from soniqboom.core import forksafe
+    fds = sorted({int(fd) for fd in passfds})
+    made: list[int] = []
+    with _spawn_lock:
+        forksafe._cloexec_locked()              # nothing else passes to the forkserver
+        try:
+            for fd in fds:
+                if not os.get_inheritable(fd):
+                    os.set_inheritable(fd, True)
+                    made.append(fd)
+            return os.posix_spawn(path, list(args), dict(os.environ))
+        finally:
+            for fd in made:
+                try:
+                    os.set_inheritable(fd, False)
+                except OSError:
+                    pass
+
+
+from soniqboom.core.forksafe import spawn_lock as _spawn_lock   # shared with forksafe._cloexec_all
+
+
+def _install_nofork_spawn() -> None:
+    from multiprocessing import util
+    if hasattr(os, "posix_spawn") and util.spawnv_passfds is not _spawnv_passfds_nofork:
+        util.spawnv_passfds = _spawnv_passfds_nofork
+
+
+def _worker_init() -> None:
+    """In each scan worker as it starts: its own process group, so
+    ``_kill_pool`` kills a decoder it started (uade123, openmpt123 …) with
+    it; and no descriptor above stderr left inheritable — the forkserver's
+    "alive" pipe and the pool's pipes would otherwise pass to every decoder
+    the worker starts, and one that outlives a killed worker would keep the
+    forkserver from ever exiting."""
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    try:
+        fds = [int(n) for n in os.listdir("/dev/fd")]
+    except (OSError, ValueError):
+        fds = []
+    for fd in fds:
+        if fd > 2:
+            try:
+                os.set_inheritable(fd, False)
+            except OSError:
+                pass
+
+
+# Seconds with no extraction finishing before the workers count as hung.
+_EXTRACT_STUCK_S = 90
+# Once a file hung its worker alone, the source is probed (``_source_answers``,
+# ``_PROBE_S`` a try) again with growing pauses (from ``_STALL_PAUSE_S``) for up
+# to ``_STALL_GRACE_S`` — a share waking up or reconnecting — before the root is
+# given up; while it answers, only the hung file is.  Files in a row that fail
+# with a source error before the source is probed.
+_PROBE_S = 10
+_STALL_PAUSE_S = 5.0
+_STALL_GRACE_S = 180.0
+_MAX_SOURCE_ERRORS = 20
+# Files ahead in the queue looked at for one the probe hasn't read yet.
+_PROBE_LOOKAHEAD = 32
+# Members of one file on disk in a row that hung alone (nothing extracted in
+# between) before the rest of the deepest archive they all lie in is skipped
+# (``_common_archive``): they share the cause — a nested archive re-read for
+# every member, a share that answers from its cache — and each would cost
+# another 90 s.
+_MAX_ARCHIVE_HANGS = 5
+
+
+def _common_archive(paths) -> str:
+    """The deepest archive all of ``paths`` (members of one file on disk) lie
+    in: ``a.zip::b.zip::x``, ``a.zip::b.zip::y`` → ``a.zip::b.zip``;
+    ``a.zip::b.zip::x``, ``a.zip::c.zip::y`` → ``a.zip``."""
+    chains = [str(p).split("::")[:-1] for p in paths]
+    common: list[str] = []
+    for parts in zip(*chains):
+        if any(x != parts[0] for x in parts):
+            break
+        common.append(parts[0])
+    return "::".join(common)
+
+
+def _in_archives(path, archives) -> "str | None":
+    """The one of ``archives`` that ``path`` lies in (at any depth), or None."""
+    s = str(path)
+    for a in archives:
+        if s.startswith(a + "::"):
+            return a
+    return None
+_SOURCE_ERRNOS = frozenset(getattr(errno, n) for n in (
+    "EIO", "ENXIO", "ETIMEDOUT", "ENOTCONN", "ESTALE", "EHOSTDOWN", "EHOSTUNREACH",
+    "ENETDOWN", "ENETUNREACH", "ECONNRESET", "ECONNABORTED") if hasattr(errno, n))
+_ERRNO_RE = re.compile(r"\[Errno (\d+)\]")
+
+
+def _is_source_error(msg: str) -> bool:
+    """An extraction error text (``_extract_one``) that says the SOURCE
+    failed — the share, not the file: an I/O error, a timeout, a lost
+    connection."""
+    m = _ERRNO_RE.search(msg or "")
+    return (m is not None and int(m.group(1)) in _SOURCE_ERRNOS) or (msg or "").startswith("TimeoutError")
+
+
+def _read_uncached(path: str) -> None:
+    """64 KB from the middle of ``path``, past the file system cache where
+    the platform allows it (macOS: ``F_NOCACHE``; elsewhere the range is
+    dropped from the page cache first) — a file not read before, so a share
+    that stopped answering can't answer from what it cached.  Only a SOURCE
+    error (``_SOURCE_ERRNOS``: I/O, a timeout, a lost connection …) is
+    raised: any other answer — the file gone, a permission, not a regular
+    file (opened without blocking: a FIFO would wait for a writer) — is an
+    answer of the file system."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        if exc.errno in _SOURCE_ERRNOS:
+            raise
+        return
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return
+        os.set_blocking(fd, True)
+        off = max(0, st.st_size // 2 - 32768) & ~0xFFF
+        try:
+            if sys.platform == "darwin":
+                import fcntl
+                fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)
+            elif hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(fd, off, 65536, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass                                # not supported here: a plain read
+        os.pread(fd, 65536, off)
+    except OSError as exc:
+        if exc.errno in _SOURCE_ERRNOS:
+            raise
+    finally:
+        os.close(fd)
+
+
+def _source_answers(path, timeout: float = _PROBE_S, listing=None, fresh=None) -> bool:
+    """Whether the file system holding ``path`` still answers: ``listing``'s
+    first entry listed (when given — a folder that is gone doesn't answer),
+    ``path``'s first 64 KB read and ``fresh``'s read past the cache
+    (``_read_uncached``; each when given — an archive member's: its
+    archive's; a file that is gone answers, it was deleted meanwhile),
+    within ``timeout`` seconds together.  The reads run in a daemon thread —
+    on a share that stopped answering they can block for good.  Any other
+    error doesn't answer."""
+    real = None if path is None else str(path).split("::", 1)[0]
+    unread = None if fresh is None else str(fresh).split("::", 1)[0]
+    done = threading.Event()
+    ok: list[bool] = []
+
+    def _read() -> None:
+        try:
+            if listing is not None:
+                with os.scandir(listing) as it:
+                    next(it, None)
+            if real is not None:
+                try:
+                    with open(real, "rb") as fh:
+                        fh.read(65536)
+                except FileNotFoundError:
+                    pass
+            if unread is not None:
+                _read_uncached(unread)
+            ok.append(True)
+        except OSError:
+            ok.append(False)
+        finally:
+            done.set()
+    threading.Thread(target=_read, daemon=True, name="scan-source-probe").start()
+    return done.wait(timeout) and bool(ok) and ok[0]
+
+
+# A scan pool being (or that was) killed → the daemon thread killing it
+# (``_kill_pool_bg``).  A pool in here is never touched again: its manager
+# thread may hold the lock ``submit`` and ``shutdown`` take for good — it
+# joins the killed workers, and one stuck in an uninterruptible read on a
+# hung share never exits.
+_pool_killers: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_pool_killers_lock = threading.Lock()
+
+
+def _kill_pool_bg(executor) -> threading.Thread:
+    """``_kill_pool`` in a daemon thread, never the caller's (it may wait on
+    the pool's lock for good; the thread never holds up the process's
+    exit).  One per pool: a pool already being killed returns that
+    thread."""
+    with _pool_killers_lock:
+        t = _pool_killers.get(executor)
+        if t is None:
+            t = threading.Thread(target=_kill_pool, args=(executor,), daemon=True,
+                                 name="scan-pool-kill")
+            _pool_killers[executor] = t
+            t.start()
+    return t
+
+
+def _pool_stopped(executor) -> bool:
+    """The pool was killed (``_kill_pool_bg``), broke or was shut down —
+    read without its lock (``submit`` waits on it)."""
+    return (executor in _pool_killers or bool(getattr(executor, "_broken", False))
+            or bool(getattr(executor, "_shutdown_thread", False)))
+
+
+def _release_pool(executor) -> None:
+    """A scan pool whose work is done: shut down (its workers exit once
+    idle) in a daemon thread — the caller is the event loop, and a pool a
+    stop killed meanwhile may hold its lock for good.  A stopped pool is
+    left alone."""
+    if executor is None or _pool_stopped(executor):
+        return
+    threading.Thread(target=lambda: executor.shutdown(wait=False), daemon=True,
+                     name="scan-pool-release").start()
+
+
+def _unread_file(requeue: deque, file_iter, avoid=()) -> Path | None:
+    """A file a root's scan hasn't read yet, for the source probe
+    (``_source_answers``' ``fresh``): the first of the next ones to extract
+    — ``requeue``, then ``file_iter`` (what is taken from it goes back, in
+    order, at the end of ``requeue``, which runs first; up to
+    ``_PROBE_LOOKAHEAD`` looked at) — whose file isn't one of ``avoid``'s
+    (an archive member's file: its archive), so what the probe reads of it
+    can't come from a cache.  None when there is none."""
+    skip = {str(p).split("::", 1)[0] for p in avoid if p is not None}
+    for p in list(itertools.islice(requeue, _PROBE_LOOKAHEAD)):
+        if str(p).split("::", 1)[0] not in skip:
+            return p
+    for _ in range(max(0, _PROBE_LOOKAHEAD - len(requeue))):
+        p = next(file_iter, None)
+        if p is None:
+            break
+        requeue.append(p)
+        if str(p).split("::", 1)[0] not in skip:
+            return p
+    return None
+
+
+async def _kill_pool_async(executor, timeout: float = 10.0) -> None:
+    """``_kill_pool_bg``, waited for up to ``timeout`` so the pool is gone
+    before what comes next (a probe of the source, a new pool) — the scan
+    goes on either way.  A pool already being killed isn't waited for
+    again: one wait per pool."""
+    if executor is None or executor in _pool_killers:
+        return
+    t = _kill_pool_bg(executor)
+    deadline = time.monotonic() + timeout
+    step = 0.005
+    while t.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(step)
+        step = min(step * 2, 0.1)
+    if t.is_alive():
+        log.warning("a scan pool is still shutting down (a worker can't exit)")
+
+
+def _pool_canary() -> bool:
+    """A no-op job: a new pool that runs it can start workers at all."""
+    return True
+
+
+def _ours(pid) -> bool:
+    """``pid`` is a live scan worker of ours (a forkserver child running the
+    app) — checked by its command line, never by the pid alone (it may have
+    been reused)."""
+    from soniqboom.core import procinfo
+    return isinstance(pid, int) and pid > 0 and procinfo.is_our_forkserver_child(pid)
+
+
+def _kill_worker(proc) -> None:
+    """Kill one worker — with its process group (``_worker_init``) when it
+    is verifiably ours and leads it, so what it started dies too."""
+    import signal
+    pid = getattr(proc, "pid", None)
+    if sys.platform == "darwin":
+        ours = _ours(pid)
+    else:
+        try:
+            ours = bool(proc.is_alive())        # our child, not reaped: the pid is still its
+        except Exception:                                   # noqa: BLE001
+            ours = False
+    if ours and isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
+        try:
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except Exception:                                       # noqa: BLE001
+        pass
+    if sys.platform == "darwin" and _ours(pid):
+        # ``proc.kill`` does nothing once the pool thinks the worker is gone
+        # (its forkserver died); the process may still run.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _kill_pool(executor) -> None:
+    """Kill a dead or hung pool's workers, then shut it down.  Killing first
+    lets the pool's manager thread — which may be waiting for a worker to
+    exit, holding the lock ``shutdown`` takes — go on; the process dict is
+    read again after the shutdown (which refuses new submits), so a worker a
+    racing submit had just started is killed too (``shutdown`` drops the
+    pool's reference to the dict, not the dict).  It may still wait on that
+    lock for good (a worker that can't exit): the server calls it through
+    ``_kill_pool_bg``."""
+    procs = getattr(executor, "_processes", None)
+    done: set[int] = set()
+
+    def _kill_all() -> None:
+        for proc in list((procs or {}).values()):
+            if id(proc) not in done:
+                done.add(id(proc))
+                _kill_worker(proc)
+    _kill_all()
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:                                       # noqa: BLE001
+        pass
+    _kill_all()
+
+
+# Every scan pool alive → the server run (``begin_run`` epoch) that made it,
+# so a stop can end its run's pools (``shutdown_worker_pools``).
+_live_pools: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_run_epoch = 0
+# Set by a stop: no new scan pool (a scan still running would replace the
+# pool the stop just killed while the server exits).  ``begin_run`` clears
+# it.  ``_pools_lock`` makes "check the flag + register the pool" and "set
+# the flag + list the pools" atomic, so no pool is made after a stop listed
+# them.
+_pools_closed = False
+_pools_lock = threading.Lock()
+
+
+def begin_run() -> int:
+    """A server run starts (``main.startup``): a new run epoch; pools a
+    previous run in this process left are killed; the scan state it left
+    reset (the bundled app stops and starts the server in one process — the
+    old event loop, and every scan task, pause event and queued scan bound
+    to it, are gone); scans may make pools again; the worker forkserver made
+    ready.  Returns the epoch: ``shutdown_worker_pools(epoch)`` acts on this
+    run alone, even if a previous run's stop ends after this start.  The
+    stale pools are killed in the background (``_kill_pool_bg``) — one whose
+    worker can't exit would hold this start up for good."""
+    global _run_epoch, _pools_closed
+    with _pools_lock:
+        _run_epoch += 1
+        epoch = _run_epoch
+        _pools_closed = False
+        stale = [pool for pool, e in list(_live_pools.items()) if e < epoch]
+    for pool in stale:
+        _kill_pool_bg(pool)
+    _reset_scan_state()
+    prepare_worker_forkserver()
+    return epoch
+
+
+def shutdown_worker_pools(epoch: int | None = None, timeout: float = 2.5) -> bool:
+    """At a stop: no new scan pools from now on, and every scan pool's
+    workers killed — a stop during a scan otherwise leaves them running.  A
+    scan still running ends its root (the files left count as not indexed).
+    With ``epoch`` (``begin_run``), only that run's pools — and pools stay
+    open if a newer run has started meanwhile.  The pools are killed in
+    daemon threads (``_kill_pool_bg``), waited for up to ``timeout`` seconds
+    together: False when one is still ending then (a worker that can't
+    exit — the stop goes on without it).
+
+    The forkserver is KEPT: it exits by itself with the process (its
+    "alive" pipe closes once the server and every process it forked are
+    gone — the pools killed here, the merger stopped before), and a start
+    in the same process (the bundled app's Stop/Start/Restart) reuses it.
+    Stopping it would make that start fork a new one from a server that
+    has used the network, which can crash in Network.framework's fork
+    handler — every pool of every later scan with it."""
+    global _pools_closed
+    with _pools_lock:
+        if epoch is None or epoch == _run_epoch:
+            _pools_closed = True
+        pools = [pool for pool, e in list(_live_pools.items()) if epoch is None or e <= epoch]
+    threads = [_kill_pool_bg(pool) for pool in pools]
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    left = sum(t.is_alive() for t in threads)
+    if left:
+        log.warning("%d scan pool(s) still shutting down (a worker can't exit)", left)
+    return not left
+
+
+def _process_pool(max_workers: int) -> ProcessPoolExecutor:
+    """A process pool for scan work.  On macOS its workers fork from the
+    multiprocessing forkserver (``prepare_worker_forkserver``) — a small
+    single-threaded process that never used the network — not from the
+    server: ``spawn`` forks the server before it execs, and once the server
+    has used the network Network.framework's fork handler
+    (``nw_settings_child_has_forked``) can crash every new worker, which made
+    scans index nothing after a TOSEC / Redump download (crash reports:
+    "crashed on child side of fork pre-exec").  Elsewhere the platform's
+    default start method, as before.  Each worker runs ``_worker_init``.
+    Raises ``RuntimeError`` once the server is stopping
+    (``shutdown_worker_pools``)."""
+    with _pools_lock:
+        if _pools_closed:
+            raise RuntimeError("the server is stopping — no new scan workers")
+        pool = None
+        if sys.platform == "darwin":
+            import multiprocessing
+            try:
+                pool = ProcessPoolExecutor(max_workers=max_workers,
+                                           mp_context=multiprocessing.get_context("forkserver"),
+                                           initializer=_worker_init)
+            except (ValueError, RuntimeError):
+                pool = None
+        if pool is None:
+            pool = ProcessPoolExecutor(max_workers=max_workers, initializer=_worker_init)
+        _live_pools[pool] = _run_epoch
+    return pool
+
+
 from soniqboom.core import diskimage
 from soniqboom.core import archive
 from soniqboom.core.art_cache import store_full_art_batch, store_thumbs_batch
@@ -134,7 +604,7 @@ class ScanProgress:
         # Append queue info (combine local + remote active dirs)
         all_active = set(_current_scan_dirs) | _current_remote_dirs
         d["current_dirs"] = sorted(all_active) if all_active else []
-        d["queued"] = [sorted(q_dirs) for q_dirs, _ in _scan_queue]
+        d["queued"] = [sorted(q_dirs) for q_dirs, *_ in _scan_queue]
         d["queue_depth"] = len(_scan_queue)
         return d
 
@@ -307,6 +777,20 @@ def _basename_of(path_str: str) -> str:
     return path_str
 
 
+def _member_basename(path_str: str) -> str:
+    """A track's own file name.  For an archive member (``a.zip::b.mod``,
+    ``a.zip::n.zip::b.mod``, ``a.zip::SUB\\b.mod``) that is the name after the
+    LAST ``::`` and its last ``/`` or ``\\``, never ``a.zip::b.mod``."""
+    if "::" in path_str:
+        return path_str.rsplit("::", 1)[1].replace("\\", "/").rsplit("/", 1)[-1]
+    return _basename_of(path_str)
+
+
+def _member_stem(path_str: str) -> str:
+    """Stem of :func:`_member_basename` — the title fallback."""
+    return Path(_member_basename(path_str)).stem
+
+
 # ── HVSC auto-detection ──────────────────────────────────────────────────────
 # When a scan turns up SID files and the user hasn't configured an HVSC
 # DOCUMENTS folder yet, look for one up the directory tree (DOCUMENTS sits at
@@ -389,9 +873,10 @@ def _detect_hvsc_docs_remote(source, scan_root: str, sid_rel_dirs: set[str]) -> 
     return None
 
 
-async def _apply_hvsc_autoconfig(docs_path: str) -> None:
+async def _apply_hvsc_autoconfig(docs_path: str) -> bool:
     """Auto-configure HVSC from a detected DOCUMENTS path (no-op if a path is
-    already set) and tell connected clients so the admin UI updates live."""
+    already set) and tell connected clients so the admin UI updates live.
+    Returns whether it configured HVSC just now."""
     from soniqboom.core.hvsc import auto_configure
     loop = asyncio.get_event_loop()
     applied = await loop.run_in_executor(None, auto_configure, docs_path)
@@ -402,9 +887,143 @@ async def _apply_hvsc_autoconfig(docs_path: str) -> None:
             await _broadcast({"event": "hvsc_configured", "docs_path": docs_path})
         except Exception:
             pass
+    return bool(applied)
 
 
-def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[str, list[Path]]:
+def _scope_walk(paths, onerror, root: str):
+    """``os.walk``-shaped iteration over a SCOPED scan's changed paths, with
+    the full walk's semantics: a directory is walked recursively (symlinked
+    directories are not followed), an existing file — or a symlink to one —
+    yields just itself, a path that no longer exists yields nothing (its
+    tracks are pruned by the scoped stale cleanup).
+
+    "Exists" is checked with the EXACT on-disk spelling of every component
+    below ``root``: on a case-insensitive filesystem a case-only rename
+    (``song.mp3`` → ``Song.mp3``) reports both names and both would stat
+    fine, so the old spelling would be indexed alongside the new one.  A path
+    whose component is a symlinked directory is outside what the full walk
+    indexes and counts as gone.  Any error other than "not found" goes to
+    ``onerror`` (→ the root is not pruned) instead of reading as a deletion."""
+    import os
+    import stat as _stat
+    listings: dict[str, "set[str] | None"] = {}
+    root = root.rstrip(os.sep) or os.sep
+
+    def _names(d: str) -> "set[str] | None":
+        if d not in listings:
+            try:
+                listings[d] = set(os.listdir(d))
+            except (FileNotFoundError, NotADirectoryError):
+                listings[d] = None
+        return listings[d]
+
+    for sp in sorted(paths):
+        try:
+            rel = sp[len(root):].strip(os.sep)
+            if not rel or not sp.startswith(root):
+                continue
+            cur, gone = root, False
+            comps = rel.split(os.sep)
+            for i, comp in enumerate(comps):
+                names = _names(cur)
+                if names is None or comp not in names:
+                    gone = True
+                    break
+                cur = os.path.join(cur, comp)
+                if i < len(comps) - 1 and os.path.islink(cur):
+                    gone = True
+                    break
+            if gone:
+                continue
+            try:
+                st = os.lstat(sp)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if _stat.S_ISLNK(st.st_mode):
+                try:
+                    if _stat.S_ISREG(os.stat(sp).st_mode):
+                        yield os.path.dirname(sp), [], [os.path.basename(sp)]
+                except (FileNotFoundError, NotADirectoryError):
+                    pass                        # dangling link: gone
+                continue
+            if _stat.S_ISDIR(st.st_mode):
+                yield from os.walk(sp, onerror=onerror)
+            elif _stat.S_ISREG(st.st_mode):
+                yield os.path.dirname(sp), [], [os.path.basename(sp)]
+        except OSError as exc:
+            onerror(exc)
+
+
+def _is_gone(path: str) -> bool:
+    """The path no longer exists (not found / a dangling link / a parent that
+    became a file) — any OTHER stat error (EACCES on a folder without search
+    permission, EIO, ESTALE) means "can't tell", never "deleted"."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _archive_has_members(store, archive_path: str) -> bool:
+    """Does the store hold tracks inside ``archive_path`` (``archive::…``)?
+    Via the per-folder index — the archive's own folder only."""
+    return archive_path in _archives_with_members(store, [archive_path])
+
+
+def _archives_with_members(store, archive_paths) -> "set[str]":
+    """The top-level archives among ``archive_paths`` the store holds tracks
+    inside (``archive::…``) — one pass over each archive folder's index, not
+    one per archive (a folder of many damaged archives stays linear)."""
+    from soniqboom.core.data import path_hash as _ph
+    by_dir: dict[str, set[str]] = {}
+    for a in archive_paths:
+        by_dir.setdefault(os.path.dirname(a), set()).add(a)
+    out: set[str] = set()
+    for d, wanted in by_dir.items():
+        found: set[str] = set()
+        for tid in store._tag_dir_hash.get(_ph(d), ()):
+            t = store._tracks.get(tid)
+            path = (t.get("path") or "") if t is not None else ""
+            if "::" in path:
+                outer = path.split("::", 1)[0]
+                if outer in wanted:
+                    found.add(outer)
+                    if len(found) == len(wanted):
+                        break                   # every archive of this folder has members
+        out |= found
+    return out
+
+
+def _in_failed_archive(path: str, failed: "set[str]") -> bool:
+    """Is ``path`` (``a.zip::m`` / ``a.zip::n.zip::m``) inside an archive — or a
+    nested archive — that couldn't be read this time?  An unreadable NESTED zip
+    protects only its own members, not the outer zip's."""
+    if not failed or "::" not in path:
+        return False
+    parts = path.split("::")
+    return any("::".join(parts[:k]) in failed for k in range(1, len(parts)))
+
+
+def _find_audio_files(directories: list[str], scan_zips: bool = True,
+                      scope: "dict[str, frozenset[str]] | None" = None,
+                      known_archives: "dict[str, tuple[float | None, list[str]]] | None" = None,
+                      failed_archives: "set[str] | None" = None,
+                      ) -> dict[str, list[Path]]:
+    """Discover the audio files of each root.  With ``scope`` (root → changed
+    paths, from the folder watcher) a root lists only the files under those
+    paths, still attributed to the root.
+
+    ``known_archives`` (archive path → (mtime its indexed members carry, their
+    virtual paths)): an archive whose mtime is unchanged is listed from that,
+    without being opened — an automatic rescan otherwise re-read every nested
+    zip in full just to name its members.  Manual scans pass None.
+
+    ``failed_archives`` (optional, filled in): archives that exist but could
+    not be read (corrupt, encrypted, permission) — their already-indexed
+    members must not be pruned as deleted."""
     import io
     import os
     import zipfile
@@ -437,19 +1056,35 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                         "incomplete, stale-cleanup will not prune this root", _root, err)
 
         # Single-pass walk — much faster than N separate rglob calls
-        for dirpath, _dirs, filenames in os.walk(p, onerror=_on_walk_error):
+        _scoped = scope.get(str(p)) if scope else None
+        _walk = (_scope_walk(_scoped, _on_walk_error, str(p)) if _scoped is not None
+                 else os.walk(p, onerror=_on_walk_error))
+        for dirpath, _dirs, filenames in _walk:
             for fn in filenames:
                 if _is_junk_filename(fn):
                     skipped_junk += 1
                     continue
                 full = os.path.join(dirpath, fn)
                 lower = fn.lower()
+                is_container = scan_zips and (lower.endswith((".zip", ".lha", ".lzh"))
+                                              or diskimage.is_disk_image(lower))
 
-                if _is_audio(fn):
-                    files.append(Path(full))
+                if is_container and known_archives is not None and full in known_archives:
+                    k_mtime, k_members = known_archives[full]
+                    try:
+                        unchanged = (k_mtime is not None
+                                     and abs(os.stat(full).st_mtime - k_mtime) < 1.0)
+                    except OSError:
+                        unchanged = False
+                    if unchanged:
+                        files.extend(Path(m) for m in k_members)
+                        continue
 
-                elif scan_zips and lower.endswith(".zip"):
-                    # Scan inside ZIP files
+                if scan_zips and lower.endswith(".zip"):
+                    # Scan inside ZIP files.  Tried BEFORE the audio-name test:
+                    # ``ST.zip`` / ``MA.zip`` match Amiga prefix tokens but are
+                    # archives; a name that isn't a readable zip falls through.
+                    _before = len(files)
                     try:
                         with zipfile.ZipFile(full, 'r') as zf:
                             for member in zf.namelist():
@@ -457,13 +1092,17 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                                 if _is_junk_filename(member_basename):
                                     skipped_junk += 1
                                     continue
-                                if _is_audio(member):
-                                    # Direct audio file in ZIP
-                                    files.append(Path(f"{full}::{member}"))
-                                elif member.lower().endswith(".zip"):
+                                if member.lower().endswith(".zip"):
                                     # Nested ZIP (e.g. modarchive: outer.zip → track.it.zip → track.it)
                                     try:
                                         inner_data = zf.read(member)
+                                    except Exception as exc:    # bad CRC, zlib, encrypted
+                                        log.warning("Cannot read nested ZIP %s::%s: %s",
+                                                    full, member, exc)
+                                        if failed_archives is not None:
+                                            failed_archives.add(str(Path(f"{full}::{member}")))
+                                        continue
+                                    try:
                                         with zipfile.ZipFile(io.BytesIO(inner_data), 'r') as inner_zf:
                                             for inner_name in inner_zf.namelist():
                                                 if _is_junk_filename(_basename_of(inner_name)):
@@ -471,26 +1110,77 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True) -> dict[st
                                                     continue
                                                 if _is_audio(inner_name):
                                                     files.append(Path(f"{full}::{member}::{inner_name}"))
-                                    except (zipfile.BadZipFile, OSError):
-                                        pass
-                    except (zipfile.BadZipFile, OSError) as exc:
+                                        continue
+                                    except zipfile.BadZipFile:
+                                        pass            # not a zip: maybe a module named *.zip
+                                    except Exception as exc:    # corrupt / encrypted member
+                                        log.warning("Cannot read nested ZIP %s::%s: %s",
+                                                    full, member, exc)
+                                        if failed_archives is not None:
+                                            failed_archives.add(str(Path(f"{full}::{member}")))
+                                        continue
+                                if _is_audio(member):
+                                    # Direct audio file in ZIP
+                                    files.append(Path(f"{full}::{member}"))
+                        continue
+                    except zipfile.BadZipFile as exc:
+                        del files[_before:]
+                        # truncated / damaged: keep what was indexed from it
+                        # (only ``full::…`` members are protected — a real
+                        # module named like this still indexes below)
+                        if failed_archives is not None and not _is_gone(full):
+                            failed_archives.add(full)
+                        if not _is_audio(fn):
+                            log.warning("Cannot read ZIP %s: %s", full, exc)
+                            continue
+                    except Exception as exc:                # unreadable / corrupt: keep members
+                        del files[_before:]
                         log.warning("Cannot read ZIP %s: %s", full, exc)
+                        if failed_archives is not None and not _is_gone(full):
+                            failed_archives.add(full)       # (vanished / dangling: a deletion)
+                        continue
 
                 elif scan_zips and diskimage.is_disk_image(lower):
                     # Crack open vintage disk images (C64 .d64/.d71/.d81,
                     # Amiga .adf) and surface embedded SID / tracker tunes as
-                    # ``::``-members — exactly like ZIP entries.
+                    # ``::``-members — exactly like ZIP entries.  Tried before
+                    # the audio-name test (``MA.adf`` matches a prefix token).
                     try:
-                        for member in diskimage.list_members(full):
-                            files.append(Path(f"{full}::{member}"))
-                    except OSError as exc:
-                        log.warning("Cannot read disk image %s: %s", full, exc)
+                        _members = list(diskimage.list_members(full, strict=True))
+                    except Exception as exc:
+                        if failed_archives is not None and not _is_gone(full):
+                            failed_archives.add(full)        # keep its indexed members
+                        if isinstance(exc, OSError) or not _is_audio(fn):
+                            # (a game disk without a filesystem is routine: once
+                            # discovery is done the scan warns only for one that
+                            # holds indexed tracks)
+                            (log.debug if isinstance(exc, diskimage.NotListable)
+                             else log.warning)("Cannot read disk image %s: %s", full, exc)
+                            continue
+                        _members = []                        # not an image: maybe a module
+                    if _members or not _is_audio(fn):
+                        files.extend(Path(f"{full}::{m}") for m in _members)
+                        continue
 
                 elif scan_zips and lower.endswith((".lha", ".lzh")):
                     # Amiga LHA/LZH archives — surface the modules inside
-                    # (handles the ``MOD.title`` Amiga prefix naming).
-                    for member in archive.list_members(full):
-                        files.append(Path(f"{full}::{member}"))
+                    # (handles the ``MOD.title`` Amiga prefix naming).  Tried
+                    # before the audio-name test (``ST.lha``).
+                    try:
+                        _members = list(archive.list_members(full, strict=True))
+                    except Exception as exc:
+                        if failed_archives is not None and not _is_gone(full):
+                            failed_archives.add(full)        # keep its indexed members
+                        if isinstance(exc, OSError) or not _is_audio(fn):
+                            log.warning("Cannot read LHA archive %s: %s", full, exc)
+                            continue
+                        _members = []                        # not an archive: maybe a module
+                    if _members or not _is_audio(fn):
+                        files.extend(Path(f"{full}::{m}") for m in _members)
+                        continue
+
+                if _is_audio(fn):
+                    files.append(Path(full))
 
         result[str(p)] = sorted(set(files))
         if skipped_junk:
@@ -578,7 +1268,7 @@ async def purge_junk_tracks() -> dict:
 
         title = (t.get("title") or "").strip()
         if title and _TMP_TITLE_RE.match(title):
-            real_stem = Path(base).stem
+            real_stem = _member_stem(path)
             if real_stem and real_stem != title:
                 title_fixups.append((t["id"], real_stem))
 
@@ -615,7 +1305,10 @@ def _extract_one_remote(
     import shutil
     import tempfile
     try:
-        real_base = _basename_of(remote_path)
+        # The member's own name for an archive member, like the local
+        # ``_extract_from_zip`` — ``a.zip::SUB\b.bd`` named its temp file
+        # ``a.zip::SUB\b.bd`` and was titled ``SUB\b``.
+        real_base = _member_basename(remote_path)
         from soniqboom.core import uade_formats as _uade
         if _uade.classify(real_base) is not None:
             # Amiga prefix-form names (mdat.song) lose their identity in a
@@ -1002,9 +1695,13 @@ def _compute_incremental(
             continue
         stored_mtime, stored_size = existing
         actual_mtime, actual_size = path_stats[ps]
-        if (stored_mtime is not None and stored_size is not None
-                and abs(stored_mtime - actual_mtime) < 1.0
-                and stored_size == actual_size):
+        if stored_mtime is None or abs(stored_mtime - actual_mtime) >= 1.0:
+            continue
+        # An archive member (``a.zip::x.mod``) stores the MEMBER's size but the
+        # stat is the outer archive's, so sizes never match — every full scan
+        # re-extracted every member.  The archive's mtime (what extraction
+        # stamps on its members) decides: a rewritten archive gets a new one.
+        if "::" in ps or (stored_size is not None and stored_size == actual_size):
             fresh.add(ps)
 
     return fresh, track_ids_for_files
@@ -1020,9 +1717,8 @@ def _compute_waveform(path: str, points: int = 200):
     normalised against the per-axis peak.  8 kHz was below the Nyquist for
     most musical content and lost transient detail; 22 kHz keeps everything
     up to the typical CD bandwidth half-rate while staying small.
-    Return shape: ``{"peaks": [...], "rms": [...]}`` when numpy is
-    available.  Plain RMS list returned on the pure-Python fallback so the
-    public API keeps a JSON-array shape for older clients.
+    Return shape: ``{"peaks": [...], "rms": [...]}`` (numpy or the
+    pure-Python fallback); ``[0.0] * points`` for an empty decode.
     NOTE: still a sync function; callers ``run_in_executor`` it from
     asyncio paths (see ``api/tracks.py`` ``_WAVEFORM_POOL``).  Going async
     would require rewriting every caller and the dedicated thread pool
@@ -1047,12 +1743,18 @@ def _pcm_to_waveform(raw: bytes, points: int = 200):
     """Crunch raw mono 22.05 kHz f32le PCM into a compact waveform.
 
     Split out from ``_compute_waveform`` so the ffmpeg DECODE can be driven by
-    ``asyncio.create_subprocess_exec`` on the event loop (fork-safe on macOS —
+    ``forksafe.spawn`` on the event loop (no fork on macOS —
     ``subprocess.run`` fork from a worker thread segfaults once the process has
     initialised Core Foundation, e.g. after the stations relay's outbound
     networking), while this CPU-bound crunch still runs in a worker thread.
-    Return shape mirrors ``_compute_waveform``: ``{"peaks", "rms"}`` on the
-    numpy path, a flat RMS list on the pure-Python fallback.
+    Return shape mirrors ``_compute_waveform``: ``{"peaks", "rms"}`` on both
+    the numpy path and the pure-Python fallback (a flat zero list only for
+    empty input).
+
+    The fallback reads the samples through a zero-copy ``memoryview`` of the
+    f32le bytes (an ``array('f')`` copy on big-endian hosts) — never a Python
+    float object per sample, which cost ~1 MB of RAM per second of audio —
+    and reduces each bin with C-level ``sum``/``max``/``min``.
     """
     if not raw:
         return [0.0] * points
@@ -1062,10 +1764,8 @@ def _pcm_to_waveform(raw: bytes, points: int = 200):
     if n_samples == 0:
         return [0.0] * points
 
-    # NumPy when available — vectorised RMS is order-of-magnitude faster than
-    # the pure-Python ``sum(s*s for s in chunk)`` over million-sample chunks
-    # (typical for any track over a few minutes).  Falls back to struct so
-    # this module still imports cleanly on systems without numpy.
+    # NumPy when available (it is not a declared dependency) — vectorised.
+    # Otherwise the pure-Python fallback below, same output shape.
     try:
         import numpy as _np
         samples = _np.frombuffer(raw[: n_samples * 4], dtype=_np.float32)
@@ -1092,28 +1792,78 @@ def _pcm_to_waveform(raw: bytes, points: int = 200):
     except ImportError:
         pass
 
-    samples = struct.unpack(f"<{n_samples}f", raw[: n_samples * 4])
+    import operator
+    import sys
+    if sys.byteorder == "little":
+        # Zero-copy view of the f32le bytes (no second buffer the size of
+        # the decode — ~317 MB for a 60-minute track).
+        samples = memoryview(raw)[: n_samples * 4].cast("f")
+    else:
+        import array
+        samples = array.array("f")
+        samples.frombytes(raw[: n_samples * 4])
+        samples.byteswap()                      # f32le on the wire
     chunk_size = max(1, n_samples // points)
 
     rms_values: list[float] = []
+    peak_values: list[float] = []
     for i in range(points):
-        start = i * chunk_size
-        end = min(start + chunk_size, n_samples)
-        if start >= n_samples:
+        chunk = samples[i * chunk_size:(i + 1) * chunk_size]
+        if not chunk:
             rms_values.append(0.0)
+            peak_values.append(0.0)
             continue
-        chunk = samples[start:end]
-        mean_sq = sum(s * s for s in chunk) / len(chunk)
-        rms_values.append(math.sqrt(mean_sq))
+        rms_values.append(math.sqrt(sum(map(operator.mul, chunk, chunk)) / len(chunk)))
+        peak_values.append(max(max(chunk), -min(chunk)))
 
-    peak = max(rms_values) if rms_values else 1.0
-    if peak > 0:
-        rms_values = [v / peak for v in rms_values]
-
-    return rms_values
+    for vals in (rms_values, peak_values):
+        top = max(vals) if vals else 0.0
+        if top > 0:
+            vals[:] = [v / top for v in vals]
+    return {"peaks": peak_values, "rms": rms_values}
 
 
 # ── Non-blocking helpers ──────────────────────────────────────────────────────
+
+async def _sort_yielding(lst: list, run: int = 20_000, slice_: int = 8_000) -> list:
+    """``sorted(lst)`` without one long stall: sort ``run``-sized slices, then
+    merge them ``slice_`` items at a time with yields; the cyclic GC is paused
+    inside each step (the tuples are acyclic — a full collection landing in a
+    step was the stall).  Raises TypeError like ``list.sort`` (the caller's
+    mixed-type fallback)."""
+    import gc
+    if len(lst) <= run:
+        lst.sort()
+        return lst
+
+    runs = []
+    for i in range(0, len(lst), run):
+        was = gc.isenabled()
+        gc.disable()
+        try:
+            r = lst[i : i + run]
+            r.sort()
+        finally:
+            if was:
+                gc.enable()
+        runs.append(r)
+        await asyncio.sleep(0)
+    out: list = []
+    merged = heapq.merge(*runs)
+    while True:
+        was = gc.isenabled()
+        gc.disable()
+        try:
+            part = list(itertools.islice(merged, slice_))
+            out.extend(part)
+        finally:
+            if was:
+                gc.enable()
+        if not part:
+            break
+        await asyncio.sleep(0)
+    return out
+
 
 async def _async_exit_batch_mode(store) -> None:
     """Exit batch mode with yield points between sorted-index rebuilds.
@@ -1121,7 +1871,10 @@ async def _async_exit_batch_mode(store) -> None:
     ``_rebuild_sorted_indexes`` is O(n log n) and freezes the event loop for
     hundreds of milliseconds on large libraries.  By splitting the work into
     per-field sorts with ``asyncio.sleep(0)`` between them, HTTP requests can
-    be served in the gaps.
+    be served in the gaps.  Only the lists marked dirty (``store._dirty_sorted``)
+    are rebuilt: all ten after a scan's inserts/deletes, but just the re-keyed
+    ones after a field-update batch (a Modland/folder album pass re-sorts
+    ``_sorted_album`` alone).
 
     Keep ``_batch_mode = True`` until the freshly-built lists are assigned —
     if we flipped to False first, any ``_index_track`` running concurrently
@@ -1136,18 +1889,19 @@ async def _async_exit_batch_mode(store) -> None:
     if store._batch_depth > 0:
         return
     store._batch_depth = 0
-    if not store._sorted_dirty:
+    if not store._dirty_sorted:
         store._batch_mode = False
         return
 
     # Single source of truth for the year-collapse rule — keeps this
     # async/yielding rebuild aligned with TrackStore._index_track and the
     # in-line _rebuild_sorted_indexes path.
-    from soniqboom.core.store import normalise_year
+    from soniqboom.core.store import (normalise_year, SORTED_LISTS, _game_fold_value,
+                                      _sortable_duration)
     from soniqboom.core.data import _rebuild_lock_for_loop
 
-    EMPTY_SORT_KEY = "￿"
-    _rebuilt_ok = False
+    EMPTY_SORT_KEY = "\uffff"
+    _numeric = frozenset(SORTED_LISTS[:5])
     try:
         # Serialize the actual rebuild against every OTHER index rebuild —
         # concurrent scan-commit exits AND data.rebuild_indexes — under the
@@ -1157,104 +1911,142 @@ async def _async_exit_batch_mode(store) -> None:
         # could assign LAST and drop the fresher one's tracks (with
         # _sorted_dirty cleared → no repair).  Holding the lock makes rebuilds
         # run one-at-a-time; re-reading _tracks FRESH inside the lock plus a
-        # _mutation_seq generation guard (retry if a track write lands during
-        # the build) guarantees the assigned lists match the live track set.
+        # _mutation_seq / _duration_seq generation guard (retry if a track write
+        # lands during the build) guarantees the assigned lists match the live
+        # track set.
         async with _rebuild_lock_for_loop():
             for _attempt in range(6):
-                if not store._sorted_dirty:
+                plan = store.sorted_rebuild_plan()
+                if not plan:
                     # A prior lock holder already rebuilt everything up to date.
-                    _rebuilt_ok = True
                     break
-                gen0 = store._mutation_seq
-                # Build ALL 10 sorted lists (numeric + lexical), mirroring
-                # TrackStore._index_track / _rebuild_sorted_indexes exactly so
-                # this async rebuild produces byte-identical indexes.
-                year, added, added_primary, dur, bpm = [], [], [], [], []
-                title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
-                for tid, t in store._tracks.items():
-                    y = normalise_year(t.get("year"))
-                    if y is not None:
-                        year.append((y, tid))
-                    a = t.get("added_at", 0)
-                    if a:
-                        added.append((a, tid))
-                        if t.get("is_duplicate_primary", True):
-                            added_primary.append((a, tid))
-                    d = t.get("duration", 0.0)
-                    if d:
-                        dur.append((d, tid))
-                    b = t.get("bpm")
-                    if b is not None:
-                        bpm.append((b, tid))
-                    title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                    artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                    album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                    album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                    fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                names = frozenset(plan)
+                # Duration-only writes (a render / probe backfill) bump only
+                # ``_duration_seq`` but still re-key ``_sorted_duration``.
+                gen0 = (store._mutation_seq, getattr(store, "_duration_seq", 0))
+                built: dict[str, list] = {}
+                if len(names) == len(SORTED_LISTS) and all(v is None for v in plan.values()):
+                    # Build ALL sorted lists (numeric, lexical, the ``game:``
+                    # fold side lists) in one pass, mirroring
+                    # TrackStore._index_track / _rebuild_sorted_indexes exactly
+                    # so this async rebuild produces byte-identical indexes.
+                    year, added, added_primary, dur, bpm = [], [], [], [], []
+                    title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
+                    title_fold = []
+                    # Snapshot + chunks with yields (the build loop alone was ~2 s
+                    # at 263K); a write landing meanwhile fails the generation
+                    # guard below and the pass is retried.
+                    _snap = list(store._tracks.items())
+                    import gc as _gc
+                    for _ci in range(0, len(_snap), 5_000):
+                        if _ci:
+                            await asyncio.sleep(0)
+                        # GC paused per chunk: a full collection landing in one
+                        # (the build allocates ~3M acyclic tuples) was the stall.
+                        _was_gc = _gc.isenabled()
+                        _gc.disable()
+                        try:
+                            for tid, t in _snap[_ci:_ci + 5_000]:
+                                y = normalise_year(t.get("year"))
+                                if y is not None:
+                                    year.append((y, tid))
+                                a = t.get("added_at", 0)
+                                if a:
+                                    added.append((a, tid))
+                                    if t.get("is_duplicate_primary", True):
+                                        added_primary.append((a, tid))
+                                d = t.get("duration", 0.0)
+                                if _sortable_duration(d):
+                                    dur.append((d, tid))
+                                b = t.get("bpm")
+                                if b is not None:
+                                    bpm.append((b, tid))
+                                title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                tf = _game_fold_value(t.get("title"))
+                                if tf is not None:
+                                    title_fold.append((tf, tid))
+                        finally:
+                            if _was_gc:
+                                _gc.enable()
 
+                    # In ``SORTED_LISTS`` order (store._SORTED_SPECS).
+                    built = dict(zip(SORTED_LISTS, (year, added, added_primary, dur, bpm,
+                                                    title, artist_s, album_artist_s,
+                                                    album_s, fmt, title_fold)))
+                else:
+                    # Field-update batches: merge only the re-keyed ids back
+                    # into each list (a full build for lists an insert dirtied).
+                    for name in SORTED_LISTS:
+                        if name in names:
+                            built[name] = store.build_sorted_list(name, plan[name])
+                            await asyncio.sleep(0)
                 await asyncio.sleep(0)
 
                 # Sort each list separately, yielding between them.  ALL sorts
                 # are TypeError-guarded so a stray mixed-type key can never abort
                 # the rebuild mid-flight and strand the store in batch mode.
-                for lst in (year, added, added_primary, dur, bpm):
+                for name, lst in list(built.items()):
                     try:
-                        lst.sort()
+                        built[name] = await _sort_yielding(lst)
+                        continue
                     except TypeError:
-                        for i, (val, tid) in enumerate(lst):
-                            try:
-                                lst[i] = (float(val), tid)
-                            except (ValueError, TypeError):
-                                lst[i] = (0.0, tid)
-                        lst.sort()
-                    await asyncio.sleep(0)
-                for lst in (title, artist_s, album_artist_s, album_s, fmt):
-                    try:
-                        lst.sort()
-                    except TypeError:
-                        lst.sort(key=lambda kv: (str(kv[0]), kv[1]))
+                        if name in _numeric:
+                            for i, (val, tid) in enumerate(lst):
+                                try:
+                                    lst[i] = (float(val), tid)
+                                except (ValueError, TypeError):
+                                    lst[i] = (0.0, tid)
+                            lst.sort()
+                        else:
+                            lst.sort(key=lambda kv: (str(kv[0]), kv[1]))
                     await asyncio.sleep(0)
 
                 # Generation guard: if any track-set/field write landed while we
                 # were building+sorting (the yield points above), our snapshot is
                 # stale — DON'T assign it; loop and rebuild from the fresh set.
-                # (Play/rating writes deliberately don't bump _mutation_seq, so
-                # they don't force needless retries.)
-                if store._mutation_seq != gen0:
+                # (Play/rating and cover-art-only writes deliberately don't bump
+                # _mutation_seq, and touch no sorted list, so they don't force
+                # needless retries.)
+                if (store._mutation_seq, getattr(store, "_duration_seq", 0)) != gen0:
                     continue
-                store._sorted_year = year
-                store._sorted_added_at = added
-                store._sorted_added_at_primary = added_primary
-                store._sorted_duration = dur
-                store._sorted_bpm = bpm
-                store._sorted_title = title
-                store._sorted_artist = artist_s
-                store._sorted_album_artist = album_artist_s
-                store._sorted_album = album_s
-                store._sorted_format = fmt
-                store._sorted_dirty = False
-                _rebuilt_ok = True
-                log.info(
-                    "Sorted indexes rebuilt: %d year, %d added (%d primary), %d dur, %d bpm, "
-                    "%d title, %d artist, %d album_artist, %d album, %d fmt",
-                    len(year), len(added), len(added_primary), len(dur), len(bpm),
-                    len(title), len(artist_s), len(album_artist_s), len(album_s), len(fmt),
-                )
-                break
-            if not _rebuilt_ok:
+                _replaced = [getattr(store, name) for name in built]
+                for name, lst in built.items():
+                    setattr(store, name, lst)
+                store._sorted_rebuilt(names)
+                log.info("Sorted indexes rebuilt: %s",
+                         ", ".join(f"{n[len('_sorted_'):]} {len(lst)}"
+                                   for n, lst in built.items()))
+                # Free the replaced lists one per yield (all at once was a
+                # ~0.2 s deallocation stall).
+                for _i in range(len(_replaced)):
+                    _replaced[_i] = None
+                    await asyncio.sleep(0)
+            if store._dirty_sorted:
                 # Every yielding pass raced a concurrent write (pathological
                 # continuous writer).  One atomic synchronous rebuild under the
                 # lock — no yields means no write can interleave — guarantees the
                 # sorted indexes match the live set with no further race.
-                store._rebuild_sorted_indexes()
+                store._rebuild_sorted_indexes(set(store._dirty_sorted))
                 store._sorted_dirty = False
-                _rebuilt_ok = True
                 log.warning("Sorted rebuild raced concurrent writes; did one atomic sync pass")
     finally:
         # Never leave the store stranded in batch mode (a raise, a shielded
         # cancellation, or lock acquisition failing must all clear it).
         if store._batch_depth == 0:
             store._batch_mode = False
+    # A large commit (a first scan, a full rescan) grew the long-lived heap:
+    # freeze it so the cyclic GC stops re-walking the library.  The collect
+    # only walks objects not frozen before, so it costs in proportion to the
+    # delta — once per large commit, not on every gen-2 pass afterwards.
+    if store._batch_depth == 0:
+        from soniqboom.core.store import FREEZE_AFTER_UPSERTS, freeze_long_lived_heap
+        if getattr(store, "_upserts_since_freeze", 0) >= FREEZE_AFTER_UPSERTS:
+            store._upserts_since_freeze = 0
+            freeze_long_lived_heap("a large scan commit")
 
 
 def _compute_duplicates_in_process(all_tracks: list[dict]) -> dict:
@@ -1266,20 +2058,82 @@ def _compute_duplicates_in_process(all_tracks: list[dict]) -> dict:
 async def _run_duplicate_detection_async() -> None:
     """Detect duplicates: heavy compute in a subprocess, apply in batches."""
     store = get_store()
-    all_tracks = store.all_track_metas()
-    if not all_tracks:
+    # Only the fields the grouping reads, copied in chunks with yields (the
+    # whole-track copy stalled the loop ~0.4 s and doubled the pickle).
+    snap = list(store._tracks.values())
+    if not snap:
         return
+    all_tracks: list[dict] = []
+    for i in range(0, len(snap), 20_000):
+        all_tracks.extend({k: t.get(k) for k in _DUP_INPUT_FIELDS} for t in snap[i : i + 20_000])
+        await asyncio.sleep(0)
+    del snap
 
     # Run the CPU-heavy algorithm in its own process (separate GIL)
-    dup_executor = ProcessPoolExecutor(max_workers=1)
+    dup_executor = _process_pool(1)
     try:
         loop = asyncio.get_event_loop()
         annotations = await loop.run_in_executor(
             dup_executor, _compute_duplicates_in_process, all_tracks,
         )
     finally:
-        dup_executor.shutdown(wait=False)
+        _release_pool(dup_executor)
 
+    updated = await _apply_duplicate_annotations(annotations)
+    dup_count = sum(1 for a in annotations.values() if a["duplicate_group_id"] is not None)
+    log.info("Duplicate detection: annotated %d tracks (%d in duplicate groups)", updated, dup_count)
+
+
+async def _refresh_browse_after_commit(store, old_versions: "dict[str, dict | None]") -> None:
+    """Folder-browse caches are validated by track COUNT / folder mtime, which
+    an in-place re-tag doesn't move: re-shape the re-extracted rows in place,
+    and patch the per-root listing where tracks came or went
+    (``fstree.patch_scan_root_rows``; an out-of-step entry is dropped)."""
+    try:
+        from soniqboom.api import fstree
+        from soniqboom.core.folder_album import _drop_browse_disk_cache, refresh_album_caches
+        existing: list[str] = []
+        added: dict[str, list[dict]] = {}
+        removed: dict[str, set[str]] = {}
+        for tid, old in old_versions.items():
+            new = store._tracks.get(tid)
+            if old is not None and new is not None:
+                existing.append(tid)
+            elif new is not None and new.get("scan_root_hash"):
+                added.setdefault(new["scan_root_hash"], []).append(new)
+            elif old is not None and old.get("scan_root_hash"):
+                removed.setdefault(old["scan_root_hash"], set()).add(old.get("path") or "")
+        from soniqboom.core.folder_album import mark_browse_disk_stale
+        same_count_change = False
+        changed_roots = set(added) | set(removed)
+        for h in changed_roots:
+            n_in, n_out = len(added.get(h, ())), len(removed.get(h, ()))
+            same_count_change = same_count_change or (n_in == n_out and n_in > 0)
+            if not await fstree.patch_scan_root_rows(
+                    h, removed.get(h, set()), added.get(h, []),
+                    len(store._tag_scan_root_hash.get(h, ()))):
+                fstree.invalidate_scan_root(h)
+            await asyncio.sleep(0)
+        if same_count_change:
+            # the on-disk copy is validated by track count only: a same-count
+            # change would restore stale rows at boot
+            _drop_browse_disk_cache()
+        elif changed_roots:
+            # count moved (the disk copy invalidates itself at boot); the
+            # in-memory rows are current, so a graceful shutdown re-saves them
+            mark_browse_disk_stale()
+        if existing:
+            await refresh_album_caches(existing)
+    except Exception:                                   # noqa: BLE001 — cosmetic
+        log.debug("browse cache refresh after commit failed", exc_info=True)
+
+
+async def _apply_duplicate_annotations(annotations: dict) -> int:
+    """Write duplicate annotations, skipping unchanged ones; returns how many
+    tracks changed (their folder-browse rows are refreshed: folder dedup reads
+    the flags)."""
+    store = get_store()
+    _touched: list[str] = []
     # Apply annotations in batches with yield points.  Two anti-bloat
     # measures, both load-bearing on a 170K-track library:
     #   1. SKIP tracks whose annotation is UNCHANGED.  This pass runs at
@@ -1308,39 +2162,401 @@ async def _run_duplicate_detection_async() -> None:
             changed.append((tid, new_fields))
         if changed:
             updated += store.update_track_fields_batch(changed)
+            _touched.extend(tid for tid, _f in changed)
         await asyncio.sleep(0)
-
-    dup_count = sum(1 for a in annotations.values() if a["duplicate_group_id"] is not None)
-    log.info("Duplicate detection: annotated %d tracks (%d in duplicate groups)", updated, dup_count)
+    if _touched:
+        try:
+            from soniqboom.core.folder_album import refresh_album_caches
+            await refresh_album_caches(_touched)
+        except Exception:                               # noqa: BLE001 — cosmetic
+            log.debug("browse cache refresh after re-grouping failed", exc_info=True)
+    return updated
 
 
 # ── Main scan coroutine ────────────────────────────────────────────────────────
 
+def _is_container_name(path: str) -> bool:
+    """Names whose tracks are ``<file>::<member>`` — the containers
+    ``_find_audio_files`` opens (ZIP, LHA/LZH, disk images): their track ids
+    can't be derived from the path alone."""
+    from soniqboom.core import diskimage
+    lower = path.lower()
+    return lower.endswith((".zip", ".lha", ".lzh")) or diskimage.is_disk_image(lower)
+
+
+class _FolderPaths:
+    """Sorted paths of every folder that holds tracks, kept in step with the
+    store's per-folder index (``_tag_dir_hash``) by diffing its keys on each
+    use — a scoped scan finds the folders under a changed path by binary
+    search instead of visiting every folder of the library.  A folder's path
+    comes from one of its tracks, never from ``_hash_lookups`` (persisted
+    only by the clean-shutdown snapshot, and written from a worker thread)."""
+
+    def __init__(self) -> None:
+        self.by_hash: dict[str, str] = {}
+        self.sorted: list[str] = []
+
+    def sync(self, store) -> list[str]:
+        import bisect
+        import os
+        cur = store._tag_dir_hash
+        for h in self.by_hash.keys() - cur.keys():
+            p = self.by_hash.pop(h)
+            i = bisect.bisect_left(self.sorted, p)
+            if i < len(self.sorted) and self.sorted[i] == p:
+                del self.sorted[i]
+        added = cur.keys() - self.by_hash.keys()
+        if added:
+            tracks = store._tracks
+            fresh: list[str] = []
+            for h in added:
+                for tid in cur[h]:
+                    t = tracks.get(tid)
+                    if t is not None:
+                        p = os.path.dirname((t.get("path") or "").split("::", 1)[0])
+                        self.by_hash[h] = p
+                        fresh.append(p)
+                        break
+            if len(fresh) > 64:
+                self.sorted.extend(fresh)
+                self.sorted.sort()
+            else:
+                for p in fresh:
+                    bisect.insort(self.sorted, p)
+        return self.sorted
+
+
+_folder_paths = _FolderPaths()
+
+
+def _scoped_track_ids(store, root: str, scoped: frozenset[str]) -> set[str]:
+    """Ids of the root's tracks that live under a SCOPED scan's changed paths
+    (a changed path may be a file — incl. an archive, whose members are
+    ``<archive>::<member>`` — or a folder, possibly deleted).
+
+    Touches only the folders that can hold such tracks: a changed file's own
+    folder, and every known folder at or under a changed path (found by
+    binary search in ``_folder_paths``)."""
+    import bisect
+    import os
+    from soniqboom.core.data import path_hash
+    sep = os.sep
+    root = root.rstrip(sep) or sep
+    scoped_set = set(scoped)
+    rootlen = len(root)
+
+    def _under(p: str) -> bool:
+        while len(p) > rootlen:
+            if p in scoped_set:
+                return True
+            p = os.path.dirname(p)
+        return False
+
+    folders = _folder_paths.sync(store)
+    dirs: set[str] = set()
+    out: set[str] = set()
+    tracks = store._tracks
+    for sp in scoped_set:
+        # A plain file (not an archive, not a known folder): its only track is
+        # uuid5(path) — no need to visit a folder of thousands.
+        if (not _is_container_name(sp)
+                and path_hash(sp) not in store._tag_dir_hash):
+            tid = str(uuid.uuid5(uuid.NAMESPACE_URL, sp))
+            if tid in tracks:
+                out.add(tid)
+            pre = sp.rstrip(sep) + sep
+            i = bisect.bisect_left(folders, pre)
+            if not (i < len(folders) and folders[i].startswith(pre)):
+                continue                        # nothing below it either
+        dirs.add(os.path.dirname(sp))
+        dirs.add(sp)
+        pre = sp.rstrip(sep) + sep
+        i = bisect.bisect_left(folders, pre)
+        while i < len(folders) and folders[i].startswith(pre):
+            dirs.add(folders[i])
+            i += 1
+    root_ids = store._tag_scan_root_hash.get(path_hash(root), ())   # live set, not a copy
+    out = {tid for tid in out if tid in root_ids}
+    for d in dirs:
+        for tid in store._tag_dir_hash.get(path_hash(d), ()):
+            if tid not in root_ids:
+                continue
+            t = tracks.get(tid)
+            if t is None:
+                continue
+            b = (t.get("path") or "").split("::", 1)[0]
+            if b in scoped_set or _under(os.path.dirname(b)):
+                out.add(tid)
+    return out
+
+
+# Fields a re-extraction never produces but a stored track carries on: kept
+# across a re-extract (and ignored when deciding whether the file changed).
+_KEEP_ON_REEXTRACT = ("added_at", "duplicate_group_id", "format_score", "is_duplicate_primary")
+_REEXTRACT_VOLATILE = frozenset(_KEEP_ON_REEXTRACT) | {"mtime", "file_size"}
+# Fields a later pass writes onto a stored track — art found for it, a rendered
+# / probed / HVSC duration, STIL + tune lengths, a playback-detected defect,
+# the default tune, content hashes.  A fresh extract differs from them without
+# the file having changed, so while the file is the same (size, and hash when
+# both sides have one) they don't count as a change — unless the stored track
+# has no value at all and the extract has one (a checksum an older build
+# didn't compute): that is new information and is written.
+_POST_SCAN_FIELDS = frozenset(("cover_art", "duration", "stil", "hvsc_lengths",
+                               "subsongs", "start_subsong", "sid_md5", "file_md5"))
+_SMALL_COMMIT = 2500     # commit deltas up to this size merge into the live sorted indexes
+_DRILL_WRITE_CHUNK = 25  # folder-click refresh: rows per store write (a loop turn after each)
+_DUP_INPUT_FIELDS = ("id", "title", "artist", "album_artist", "duration", "format",
+                     "bitrate", "added_at")   # what compute_duplicate_groups reads
+_DUP_INCR_MAX = 20_000   # deltas up to this size re-group duplicates incrementally
+
+
+def _same_track_content(old: dict, new: dict) -> bool:
+    """Would upserting the freshly-extracted ``new`` leave the stored ``old``
+    unchanged apart from mtime/size?  Compared after the upsert's own
+    enrichment carry-over, over the union of both key sets (a field only the
+    stored track has would be dropped by the upsert — that is a change; a
+    field the stored track predates, extracted empty, is not)."""
+    from soniqboom.core.store import _carry_enrichment
+    cand = dict(new)
+    _carry_enrichment(old, cand)
+    same_file = (old.get("file_size") == new.get("file_size")
+                 and not any(old.get(h) and new.get(h) and old[h] != new[h]
+                             for h in ("file_md5", "sid_md5")))
+    for k in cand.keys() | old.keys():
+        if k in _REEXTRACT_VOLATILE or old.get(k) == cand.get(k):
+            continue
+        if k not in old and cand[k] in (None, ""):
+            continue
+        if same_file and k in _POST_SCAN_FIELDS and old.get(k):
+            continue
+        return False
+    return True
+
+
+def _in_bucket0(t: dict) -> bool:
+    """Does ``t`` fall in duplicate-duration bucket 0 (under 5 s, unknown, or
+    non-finite — what ``duplicates._duration_bucket`` maps to 0)?  A numeric
+    test: normalising every track's title to find out cost ~0.7 s."""
+    try:
+        d = float(t.get("duration", 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(d) or d < 5
+
+
+async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") -> bool:
+    """Re-group only the duplicate groups a small commit can have touched.
+
+    A group key is title | artist | 5-second duration bucket, so the only
+    groups whose membership can change are the old and new keys of the
+    changed / removed tracks.  Their members are found in the maintained
+    duration index (one bucket each; tracks under 5 s or of unknown length —
+    not in that index — by one pass over the library) and re-annotated with
+    the same ``compute_duplicate_groups`` the full pass uses.  Returns False
+    (caller runs the full pass) when the duration index is mid-rebuild."""
+    import bisect
+    from soniqboom.core.duplicates import (compute_duplicate_groups, group_key_for,
+                                           key_duration_bucket)
+    store = get_store()
+    if store._batch_mode or "_sorted_duration" in store._dirty_sorted:
+        return False
+    keys: set[str] = set()
+    untitled: set[str] = set()
+    for tid, old in delta.items():
+        if old is not None:
+            k = group_key_for(old)
+            if k:
+                keys.add(k)
+        cur = store._tracks.get(tid)
+        if cur is not None:
+            k = group_key_for(cur)
+            if k:
+                keys.add(k)
+            else:
+                untitled.add(tid)
+    members: dict[str, dict] = {}
+    seen = 0
+    for b in sorted({key_duration_bucket(k) for k in keys}):
+        if b <= 0:
+            snap = list(store._tracks.values())
+            cands: list = []
+            for i in range(0, len(snap), 20_000):
+                cands.extend(t for t in snap[i : i + 20_000] if _in_bucket0(t))
+                await asyncio.sleep(0)
+        else:
+            lst = store._sorted_duration
+            lo = bisect.bisect_left(lst, (5 * b,))
+            hi = bisect.bisect_left(lst, (5 * (b + 1),))
+            cands = [store._tracks.get(tid) for _d, tid in lst[lo:hi]]
+        for t in cands:
+            if t is None:
+                continue
+            seen += 1
+            if seen % 1000 == 0:
+                await asyncio.sleep(0)
+            if group_key_for(t) in keys:
+                members[t["id"]] = t
+    for tid in untitled:
+        t = store._tracks.get(tid)
+        if t is not None:
+            members[tid] = t
+    annotations = compute_duplicate_groups(list(members.values()))
+    updated = await _apply_duplicate_annotations(annotations)
+    log.info("Duplicate detection (incremental): %d group key(s), %d candidate(s), "
+             "%d track(s) re-grouped, %d annotation(s) changed",
+             len(keys), seen, len(members), updated)
+    return True
+
+
+_FP_KEY = "archive_listing_fp:"
+_ARCHIVE_LISTING_VERSION = 1      # bump when archive discovery rules change
+
+
+def _listing_fingerprint() -> str:
+    """What decides which archive members discovery lists: the supported
+    formats, the installed uade's name tokens, the owned-extension table and
+    the discovery rules' version."""
+    import hashlib
+    from soniqboom.core import metadata as _md, uade_formats as _uf
+    try:
+        tokens = sorted(_uf.player_map())
+    except Exception:                                   # noqa: BLE001
+        tokens = []
+    raw = repr((_ARCHIVE_LISTING_VERSION, sorted(_md.SUPPORTED_EXTENSIONS), tokens,
+                sorted(_uf._SUFFIX_OWNED_ELSEWHERE)))
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+async def _known_archive_members(store, roots: list[str]) -> "dict[str, tuple[float | None, list[str]]]":
+    """archive path → (the mtime its indexed members carry — None when they
+    disagree —, their virtual paths), for the archives under ``roots``.
+    Built on the loop in chunks (store access), from the per-root id sets."""
+    from soniqboom.core.data import path_hash
+    out: dict[str, list] = {}
+    for root in roots:
+        ids = list(store._tag_scan_root_hash.get(path_hash(root), ()))
+        for i in range(0, len(ids), 5_000):
+            for tid in ids[i : i + 5_000]:
+                t = store._tracks.get(tid)
+                if t is None:
+                    continue
+                p = t.get("path") or ""
+                if "::" not in p:
+                    continue
+                outer = p.split("::", 1)[0]
+                m = t.get("mtime")
+                e = out.get(outer)
+                if e is None:
+                    out[outer] = [m, [p]]
+                else:
+                    if e[0] is None or m is None or abs(e[0] - m) >= 1.0:
+                        e[0] = None
+                    e[1].append(p)
+            await asyncio.sleep(0)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def _root_is_live(root: str) -> bool:
+    """A scoped scan may prune tracks under a changed path only while the root
+    itself is demonstrably mounted (readable and listing something) — the same
+    guard as the full scan's "never prune a zero listing" rule, applied to the
+    root rather than to the (possibly genuinely emptied) changed folder."""
+    import os
+    try:
+        with os.scandir(root) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
 async def _run_scan(
     directories: list[str],
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
-) -> None:
+    scope: "dict[str, frozenset[str]] | None" = None,
+    light: bool = False,
+) -> bool:
+    """Scan ``directories``; returns whether the library changed (tracks
+    added, updated or removed).  ``scope`` (root → changed paths, from the
+    folder watcher) limits a root to those files/folders: discovery, the
+    unchanged-file check and orphan pruning then cost what changed, not the
+    whole library."""
     global _progress, _scan_count, _prog_batch_entered
+    _changed = False
+    _hvsc_new = False          # HVSC auto-configured by THIS scan → apply even if nothing changed
+    # {track id: its stored version before this scan (None = new)} for every
+    # track the commit added, changed or removed — lets duplicate detection and
+    # HVSC re-process just those.  None = unknown (first scan / progressive).
+    _dup_delta: "dict[str, dict | None] | None" = None
 
     loop = asyncio.get_event_loop()
 
-    # ProcessPoolExecutor: each worker has its own GIL so metadata
-    # extraction (zipfile, mutagen) never competes with the event loop.
-    executor = ProcessPoolExecutor(max_workers=SCAN_WORKERS)
+    _registered0 = set(get_store()._scan_dirs)
+    if scope or light:
+        # A watcher / automatic scan of a root the user removed meanwhile
+        # (queued before the removal) must not re-register and re-index it.
+        directories = [d for d in directories if str(Path(d).resolve()) in _registered0]
+        if scope:
+            scope = {r: v for r, v in scope.items() if r in _registered0}
+
+    def _removed_now(root: str) -> bool:
+        """Registered when this scan started, removed by the user since."""
+        return root in _registered0 and root not in get_store()._scan_dirs
+
+    def _drop_removed_roots(chunk: list) -> list:
+        """A commit chunk minus the tracks of roots removed meanwhile (the
+        removal's purge may already have run)."""
+        gone = {path_hash(r) for r in _registered0 if r not in get_store()._scan_dirs}
+        if not gone:
+            return chunk
+        return [t for t in chunk if t.get("scan_root_hash") not in gone]
 
     # ── Discover files ────────────────────────────────────────────────────────
     from soniqboom.config import settings as _settings
+    _known_archives = None
+    _fp = _listing_fingerprint()
+    _full_roots = [] if scope else [str(Path(x).resolve()) for x in directories]
+    _light: list[str] = []
+    if light and _full_roots:
+        # Only roots last enumerated in full under the SAME discovery rules
+        # (supported formats, uade tokens) may be listed from the store — an
+        # upgrade that learned a format re-enumerates once, automatically.
+        _light = [d for d in _full_roots
+                  if get_store().get_config(_FP_KEY + path_hash(d)) == _fp]
+        if _light:
+            _known_archives = await _known_archive_members(get_store(), _light)
+    _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
-        None, _find_audio_files, directories, _settings.scan_zips
+        None, _find_audio_files, directories, _settings.scan_zips, scope, _known_archives,
+        _failed_archives,
     )
+    # Roots enumerated in full now with no read error: their fingerprint is
+    # recorded once this scan has committed (an interrupted scan leaves the
+    # old one → the next automatic scan enumerates again).
+    _protecting = _archives_with_members(
+        get_store(), [a for a in _failed_archives if "::" not in a])
+    _images = sorted(a for a in _protecting if diskimage.is_disk_image(a.lower()))
+    if _images:
+        log.warning("%d unreadable disk image(s) keep their indexed tracks: %s%s",
+                    len(_images), ", ".join(_images[:5]), " …" if len(_images) > 5 else "")
+    _fp_record = [d for d in _full_roots
+                  if d in dir_files and d not in walk_errors and d not in _light
+                  and not any(a.startswith(d.rstrip(os.sep) + os.sep) for a in _protecting)]
     total = sum(len(v) for v in dir_files.values())
+
+    # ProcessPoolExecutor: each worker has its own GIL so metadata
+    # extraction (zipfile, mutagen) never competes with the event loop.
+    # Sized to the work: a watcher scan of one file forks one worker, not
+    # SCAN_WORKERS copies of the server (workers start on first submit).
+    executor = _process_pool(max(1, min(SCAN_WORKERS, total)))
 
     # Additive progress: when a remote scan is already running, add to the
     # existing total instead of overwriting it.
     if _scan_count > 0 and _progress.running:
         _progress.total += total
     else:
-        _progress = ScanProgress(total=total, running=True)
+        # A scoped (watcher) scan keeps the previous scan's summary.
+        _progress = ScanProgress(total=total, running=True,
+                                 last_plan=dict(_progress.last_plan) if scope else {})
     _scan_count += 1
     # Remember the resolved dirs this scan covers — survives completion (unlike
     # ``current_dirs``, cleared the instant the scan ends) so the scan-complete
@@ -1386,6 +2602,9 @@ async def _run_scan(
         _prog_batch_entered = True
 
     for scan_root, files in dir_files.items():
+        if _removed_now(scan_root):
+            log.info("Scan: %s was removed while scanning — skipped", scan_root)
+            continue
         await upsert_scan_dir(scan_root)
 
         # HVSC auto-detect: if this root has SID files and no HVSC DOCUMENTS
@@ -1410,18 +2629,19 @@ async def _run_scan(
                         # transient failure (raises) is caught below and leaves
                         # the root un-probed so the next scan retries.
                         _hvsc_probed_roots.add(scan_root)
-                        if docs:
-                            await _apply_hvsc_autoconfig(docs)
+                        if docs and await _apply_hvsc_autoconfig(docs):
+                            _hvsc_new = True
                 except Exception:
                     log.debug("HVSC local auto-detect failed", exc_info=True)
 
         def _parent_dir(fp: Path) -> str:
-            s = str(fp)
-            if '::' in s:
-                return str(Path(s.split('::')[0]).parent)
-            return str(fp.parent)
+            return os.path.dirname(str(fp).split('::', 1)[0])
 
-        unique_dirs = list({_parent_dir(p) for p in files} | {scan_root})
+        def _unique_dirs(fl: list, root: str) -> list[str]:
+            return list({os.path.dirname(str(p).split('::', 1)[0]) for p in fl} | {root})
+
+        unique_dirs = (_unique_dirs(files, scan_root) if len(files) < 20_000
+                       else await asyncio.to_thread(_unique_dirs, files, scan_root))
         hash_map = await store_hash_lookups_batch(unique_dirs)
 
         # ── Incremental scan: skip unchanged files ───────────────────────────
@@ -1437,23 +2657,38 @@ async def _run_scan(
         # and the stat() calls for 60-120K files over a network mount cost
         # 60-120+ seconds with zero benefit.
 
-        existing_ids = await get_track_ids_for_scan_root(scan_root)
+        _scoped = scope.get(scan_root) if scope else None
+        if _scoped is not None:
+            existing_ids = _scoped_track_ids(store, scan_root, _scoped)
+            _scoped_existing = set(existing_ids)
+        else:
+            existing_ids = await get_track_ids_for_scan_root(scan_root)
 
         # Convert Path objects to strings for pickling across process boundary
-        files_strs = [str(p) for p in files]
+        files_strs = ([str(p) for p in files] if len(files) < 20_000
+                      else await asyncio.to_thread(lambda fl=files: [str(p) for p in fl]))
 
         # Only run incremental check if a meaningful fraction of files might
         # be unchanged.  With 1 existing track out of 60K files, stat-checking
         # all 60K (60+ seconds on a network mount) saves at most 1 extraction.
-        _run_incr_check = len(existing_ids) > max(100, len(files) // 50)
+        # (A small root is always checked: skipping re-extracted every file
+        # on every rescan, stamped them new and ran the post-scan passes.)
+        _run_incr_check = bool(existing_ids) and len(existing_ids) > len(files) // 50
+        if _scoped is not None and existing_ids:
+            # A scoped scan touches few files: always compare mtime/size so a
+            # touched-but-unchanged file isn't re-extracted and re-written.
+            _run_incr_check = True
         if _run_incr_check:
             # Build a small {track_id: (mtime, file_size)} lookup — only
             # existing tracks matter, so bounded by store size, not file count.
             mtime_size_map: dict[str, tuple[float | None, int | None]] = {}
-            for tid in existing_ids:
-                trk = store._tracks.get(tid)
-                if trk:
-                    mtime_size_map[tid] = (trk.get("mtime"), trk.get("file_size"))
+            _eids = list(existing_ids)
+            for _ci in range(0, len(_eids), 20_000):
+                for tid in _eids[_ci : _ci + 20_000]:
+                    trk = store._tracks.get(tid)
+                    if trk:
+                        mtime_size_map[tid] = (trk.get("mtime"), trk.get("file_size"))
+                await asyncio.sleep(0)
 
             log.info(
                 "Incremental check for %s: stat-checking %d files (%d existing tracks) …",
@@ -1465,10 +2700,17 @@ async def _run_scan(
 
             # Use multiple workers for the stat check to saturate network I/O
             INCR_WORKERS = min(4, max(1, len(files_strs) // 5000))
-            incr_executor = ProcessPoolExecutor(max_workers=INCR_WORKERS)
+            # A small (scoped) check runs in a thread: spawning a process pool
+            # costs more than stat-ing a handful of files.
+            _small = len(files_strs) <= 2000
+            incr_executor = None if _small else _process_pool(INCR_WORKERS)
             try:
                 t0 = time.time()
-                if INCR_WORKERS == 1:
+                if _small:
+                    fresh_strs, tid_map_strs = await asyncio.to_thread(
+                        _compute_incremental, files_strs, mtime_size_map,
+                    )
+                elif INCR_WORKERS == 1:
                     fresh_strs, tid_map_strs = await loop.run_in_executor(
                         incr_executor, _compute_incremental, files_strs, mtime_size_map,
                     )
@@ -1497,17 +2739,20 @@ async def _run_scan(
                     scan_root, time.time() - t0, len(fresh_strs), len(files_strs),
                 )
             finally:
-                incr_executor.shutdown(wait=False)
+                _release_pool(incr_executor)
 
-            # Map string results back to Path keys
-            str_to_path = {str(p): p for p in files}
-            fresh_paths = {str_to_path[s] for s in fresh_strs if s in str_to_path}
-            track_ids_for_files = {
-                str_to_path[s]: tid for s, tid in tid_map_strs.items()
-                if s in str_to_path
-            }
-
-            files_to_scan = [p for p in files if p not in fresh_paths]
+            # Map string results back to Path keys (a thread for a big root:
+            # these per-file passes were seconds of loop time at 170K files)
+            def _map_back(files=files, fresh_strs=fresh_strs, tid_map_strs=tid_map_strs):
+                str_to_path = {str(p): p for p in files}
+                fresh_paths = {str_to_path[s] for s in fresh_strs if s in str_to_path}
+                tids = {str_to_path[s]: tid for s, tid in tid_map_strs.items()
+                        if s in str_to_path}
+                return fresh_paths, tids, [p for p in files if p not in fresh_paths]
+            if len(files) < 20_000:
+                fresh_paths, track_ids_for_files, files_to_scan = _map_back()
+            else:
+                fresh_paths, track_ids_for_files, files_to_scan = await asyncio.to_thread(_map_back)
             skipped = len(files) - len(files_to_scan)
             if skipped:
                 log.info("Incremental scan: skipping %d unchanged files", skipped)
@@ -1587,7 +2832,8 @@ async def _run_scan(
             lg_thumbs    = {}
 
         async def _handle_result(fut):
-            """Process one completed extraction future."""
+            """Process one completed extraction future; returns its result
+            (the metadata, or the error text)."""
             nonlocal track_buffer
             path, result, sm_thumb, lg_thumb = await fut
 
@@ -1622,84 +2868,316 @@ async def _run_scan(
                 or _progress.processed == total
             ):
                 await on_progress(_progress)
+            return result
 
         file_iter = iter(files_to_scan)
-        active: dict[asyncio.Future, Path] = {}
+        # future → (file, or None for a pool's canary; the pool generation)
+        active: dict[asyncio.Future, tuple[Path | None, int]] = {}
+        cfs: dict[asyncio.Future, object] = {}   # … its pool (concurrent) future
+        # When the pool dies — its workers crashed (at start, or on a file
+        # that kills them) or hung — the files it was extracting become
+        # SUSPECTS (after a hang: those a worker ran; the ones only queued
+        # behind them go back to the normal stream).  Every new pool first
+        # runs a no-op canary; once that works, each suspect runs ALONE in
+        # it, so one that kills or hangs its worker there is the culprit —
+        # given up as an error — and the others and the rest of the root go
+        # on.  Failures that reach us from an already-replaced pool (one
+        # ``asyncio.wait`` round late) are requeued, never counted against
+        # the new pool.  Three pools in a row that die without settling a
+        # single file (workers that crash at start whatever the file, a
+        # forkserver that can't be reached, a pool that starts but refuses
+        # every file) give the rest of the root up as errors (Re-Index to
+        # retry) — never silently, never an endless run of new pools, and no
+        # executor error escapes (it would bypass this root's flush +
+        # cleanup and leave the scan a zombie).  A suspect that hangs alone
+        # may be the file — or the SOURCE stopped answering (a hung share):
+        # the hung pool is killed, then the root, a file already read from
+        # it and one not read yet are tried (``_source_down``); if they
+        # don't answer within a grace period the rest of the root is given
+        # up the same way, instead of 90 s per remaining file — while they
+        # answer, only the hung file is; after ``_MAX_ARCHIVE_HANGS`` members
+        # of one archive in a row hung alone, the rest of that archive's
+        # members are skipped (not indexed, Re-Index to retry).  So is the rest of the root when
+        # ``_MAX_SOURCE_ERRORS`` files in a row failed with a source error
+        # (EIO, a timeout …) and the source doesn't answer.  A pool that
+        # was killed is never touched again (``_pool_stopped``: its lock
+        # may be held for good); the next root starts a new one.
+        suspects: deque[Path] = deque()
+        requeue: deque[Path] = deque()   # queued behind a hang: run again, normally
+        gen = 0                 # the current pool's generation
+        pool_ok = False         # the current pool's canary (or any file) worked
+        settled = False         # the current pool settled a file (indexed, failed, or its culprit found)
+        pool_dead = False       # a new pool is needed before the next submit
+        pool_gone = False       # gave up: no more pools for this root
+        bad_pools = 0           # pools in a row that died without settling a file
+        source_errors = 0       # files in a row that failed with a source error
+        stalled = False         # the source stopped answering — give the root up
+        last_ok: Path | None = None     # a file of this root read fine (probed when one hangs)
+        solo_path: Path | None = None   # the suspect running alone in this pool
+        hang_run: list[str] = []        # members of one file on disk in a row that hung alone (nothing extracted since)
+        skipped_archives: dict[str, int] = {}   # archive whose other members are skipped → how many
 
-        # Seed initial window.  A BrokenExecutor here (worker processes
-        # killed) must not escape — it would bypass this root's flush +
-        # cleanup and leave the scan a zombie.  Stop submitting, drain
-        # whatever is in flight, and finish the root early.
-        try:
-            for path in itertools.islice(file_iter, INFLIGHT):
-                fut = loop.run_in_executor(executor, _extract_one, path)
-                active[fut] = path
-        except BrokenExecutor:
-            log.error("Extraction pool died while seeding %s — finishing "
-                      "this root early (Re-Index to retry)", scan_root)
-            file_iter = iter(())
-        while active:
-            done, _ = await asyncio.wait(
-                active.keys(), return_when=asyncio.FIRST_COMPLETED,
-                timeout=90,  # seconds — skip stuck workers
-            )
+        async def _skip_member(path: Path, archive: str) -> None:
+            skipped_archives[archive] += 1
+            _progress.errors += 1
+            _progress.processed += 1
+            await _tick()
 
-            if not done:
-                # Every remaining future is stuck (corrupted file, hung worker).
-                stuck_paths = [str(p) for p in active.values()]
-                log.error(
-                    "Extraction timed out for %d file(s), skipping: %s",
-                    len(stuck_paths),
-                    stuck_paths[:5],  # log first 5 to avoid flooding
-                )
-                for fut in list(active):
-                    fut.cancel()
-                _progress.errors    += len(active)
-                _progress.processed += len(active)
-                active.clear()
+        async def _tick() -> None:
+            if on_progress and (_progress.processed % PROGRESS_EVERY == 0
+                                or _progress.processed == total):
+                await on_progress(_progress)
+
+        async def _fail(path: Path, why: str) -> None:
+            log.error("Worker error for %s: %s", path, why)
+            _progress.errors    += 1
+            _progress.processed += 1
+            await _tick()
+
+        def _live() -> int:
+            """Files (not canaries) in flight in the current pool."""
+            return sum(1 for p, g in active.values() if g == gen and p is not None)
+
+        def _submit(fn, *args) -> asyncio.Future:
+            if _pool_stopped(executor):
+                raise RuntimeError("the extraction pool was stopped")
+            cf = executor.submit(fn, *args)
+            fut = asyncio.wrap_future(cf, loop=loop)
+            cfs[fut] = cf
+            return fut
+
+        def _submit_canary() -> None:
+            active[_submit(_pool_canary)] = (None, gen)
+
+        async def _source_down(avoid: Path | None = None) -> bool:
+            """Whether the source stopped answering: the root's listing, a
+            file already read from it and one not read yet (``_unread_file``;
+            never the one that hung, ``avoid``) are tried — ``_PROBE_S``
+            together — again with growing pauses for up to ``_STALL_GRACE_S``
+            (a share that wakes up or reconnects) before the answer is
+            "down".  A stop answers "down" at once."""
+            fresh = _unread_file(requeue, file_iter, (avoid, last_ok))
+            waited, pause = 0.0, _STALL_PAUSE_S
+            while True:
+                if await asyncio.to_thread(_source_answers, last_ok, _PROBE_S, scan_root,
+                                           fresh=fresh):
+                    return False
+                if _pools_closed or waited >= _STALL_GRACE_S:
+                    return True
+                log.warning("%s doesn't answer — waiting for it (%.0f s so far)", scan_root, waited)
+                _progress.current_file = f"Waiting for {Path(scan_root).name or scan_root} to answer…"
                 if on_progress:
                     await on_progress(_progress)
+                await asyncio.sleep(pause)
+                waited += pause + _PROBE_S
+                pause = min(pause * 2, 60.0)
+
+        try:
+            if executor is None or _pool_stopped(executor):
+                # An earlier root gave its pool up (or a stop killed it): a
+                # new one, never a submit to the old one.
+                executor = None
+                executor = _process_pool(max(1, min(SCAN_WORKERS, total)))
+            _submit_canary()
+        except (BrokenExecutor, RuntimeError, OSError):
+            pool_dead = True
+
+        while True:
+            if pool_dead and not pool_gone:
+                bad_pools = 0 if settled else bad_pools + 1
+                await _kill_pool_async(executor)
+                new_pool = None
+                if bad_pools < 3 and not stalled:
+                    try:
+                        new_pool = _process_pool(max(1, min(SCAN_WORKERS, total)))
+                    except Exception as exc:                    # noqa: BLE001
+                        log.warning("No new extraction pool for %s: %s", scan_root, exc)
+                if new_pool is None:
+                    pool_gone = True
+                    lost = len(suspects) + len(requeue) + sum(1 for _ in file_iter)
+                    suspects.clear()
+                    requeue.clear()
+                    _progress.errors += lost
+                    _progress.processed += lost
+                    if _pools_closed:
+                        log.info("Server stopping — %d file(s) of %s not indexed "
+                                 "this time", lost, scan_root)
+                    elif stalled:
+                        log.error("Extraction stalled on %s — %d file(s) not indexed "
+                                  "(Re-Index to retry)", scan_root, lost)
+                    else:
+                        log.error("Extraction pool died again while scanning %s — "
+                                  "%d file(s) not indexed (Re-Index to retry)",
+                                  scan_root, lost)
+                    await _tick()
+                else:
+                    log.warning("Extraction pool died while scanning %s — "
+                                "starting a new one", scan_root)
+                    executor = new_pool
+                    gen += 1
+                    pool_ok = settled = pool_dead = False
+                    solo_path = None
+                    try:
+                        _submit_canary()
+                    except (BrokenExecutor, RuntimeError, OSError):
+                        pool_dead = True
+            if not pool_gone and not pool_dead:
+                path = None
+                try:
+                    if suspects:
+                        if pool_ok and not _live():     # a suspect runs alone
+                            path = suspects.popleft()
+                            active[_submit(_extract_one, path)] = (path, gen)
+                            solo_path = path
+                    elif pool_ok or gen == 0:
+                        while _live() < INFLIGHT:
+                            path = requeue.popleft() if requeue else next(file_iter, None)
+                            if path is None:
+                                break
+                            if skipped_archives and (box := _in_archives(path, skipped_archives)):
+                                await _skip_member(path, box)
+                                path = None
+                                continue
+                            active[_submit(_extract_one, path)] = (path, gen)
+                except (BrokenExecutor, RuntimeError, OSError) as exc:
+                    # The pool can't take work: dead, or its forkserver gone.
+                    log.debug("Extraction pool refused work: %s", exc)
+                    if path is not None:
+                        suspects.appendleft(path)
+                    pool_dead = True
+            if not active:
+                if pool_dead and not pool_gone:
+                    continue                    # a new pool, then submit again
                 break
 
+            done, _ = await asyncio.wait(
+                active.keys(), return_when=asyncio.FIRST_COMPLETED,
+                timeout=_EXTRACT_STUCK_S,
+            )
+            if not done:
+                # Nothing finished for 90 s: the workers hang.  A suspect
+                # running alone is the culprit; otherwise the files a worker
+                # ran run again alone in a new pool, and the ones only queued
+                # behind them go back to the normal stream.
+                stuck = [(f, p, g) for f, (p, g) in active.items() if p is not None]
+                solo_stuck = (pool_ok and solo_path is not None
+                              and [p for _f, p, g in stuck if g == gen] == [solo_path])
+                ran = [(p, g) for f, p, g in stuck if f in cfs and cfs[f].running()]
+                if ran:
+                    queued = [p for f, p, g in stuck if not (f in cfs and cfs[f].running())]
+                else:                           # can't tell: every one is a suspect
+                    ran, queued = [(p, g) for _f, p, g in stuck], []
+                for fut in list(active):
+                    fut.cancel()
+                active.clear()
+                cfs.clear()
+                for p, g in ran:
+                    if solo_stuck and g == gen:
+                        await _fail(p, "extraction hung (> 90 s) — skipped")
+                        settled = True
+                    else:
+                        suspects.append(p)
+                requeue.extend(queued)
+                pool_dead = True
+                if solo_stuck:
+                    await _kill_pool_async(executor)    # the hung worker goes before the source is probed
+                    if await _source_down(avoid=solo_path):
+                        stalled = True
+                    else:
+                        hung = str(solo_path)
+                        outer = hung.split("::", 1)[0] if "::" in hung else None
+                        if outer is None:
+                            hang_run = []                   # a plain file never counts
+                        elif hang_run and hang_run[0].split("::", 1)[0] == outer:
+                            hang_run.append(hung)
+                        else:
+                            hang_run = [hung]
+                        if len(hang_run) >= _MAX_ARCHIVE_HANGS:
+                            box = _common_archive(hang_run)
+                            skipped_archives.setdefault(box, 0)
+                            for p in [p for p in suspects if _in_archives(p, (box,))]:
+                                suspects.remove(p)
+                                await _skip_member(p, box)
+                            hang_run = []
+                else:
+                    log.error("Extraction timed out: %d file(s) ran — trying them one at a "
+                              "time: %s", len(ran), [str(p) for p, _ in ran[:5]])
+                continue
+
             for fut in done:
-                fut_path = active.pop(fut)
+                fut_path, fut_gen = active.pop(fut)
+                cfs.pop(fut, None)
+                if fut_path is not None and fut_path == solo_path and fut_gen == gen:
+                    solo_path = None
+                    was_solo = True
+                else:
+                    was_solo = False
+                if fut.cancelled():                 # its pool was killed
+                    if fut_path is not None:
+                        suspects.append(fut_path)
+                    continue
+                if fut_path is None:                # a canary
+                    if fut.exception() is None:
+                        if fut_gen == gen:
+                            pool_ok = True
+                    elif fut_gen == gen:
+                        pool_dead = True
+                    continue
                 try:
-                    await _handle_result(fut)
+                    res = await _handle_result(fut)
+                    if fut_gen == gen:
+                        pool_ok = settled = True
+                    if isinstance(res, str) and _is_source_error(res):
+                        source_errors += 1
+                    else:
+                        source_errors = 0                   # the source answers
+                        if not isinstance(res, str):
+                            last_ok = fut_path
+                            hang_run = []
+                except BrokenExecutor as exc:
+                    if fut_gen != gen:
+                        suspects.append(fut_path)   # late news from a replaced pool
+                        continue
+                    pool_dead = True
+                    if pool_ok and was_solo:
+                        # Alone in a pool that worked: it killed its worker.
+                        await _fail(fut_path, f"{exc} — the file kills its worker; skipped")
+                        settled = True
+                    else:
+                        suspects.append(fut_path)
                 except Exception as exc:
-                    log.error("Worker error for %s: %s", fut_path, exc)
-                    _progress.errors    += 1
-                    _progress.processed += 1
                     # ``_handle_result`` broadcasts on the %PROGRESS_EVERY
-                    # /``== total`` condition; the error path needs the
-                    # same check or the user-visible badge stalls at the
-                    # last successful broadcast.  If the LAST N files all
-                    # error here (e.g. corrupt frames in a bulk-failed
-                    # batch), missing this broadcast leaves the badge
-                    # stuck at e.g. "99% (X/Y)" with running=true.
-                    if on_progress and (
-                        _progress.processed % PROGRESS_EVERY == 0
-                        or _progress.processed == total
-                    ):
-                        await on_progress(_progress)
+                    # /``== total`` condition; the error path does the same
+                    # (``_fail``), or the badge stalls at e.g. "99% (X/Y)".
+                    await _fail(fut_path, str(exc))
+                    if fut_gen == gen:
+                        settled = True
+            if source_errors >= _MAX_SOURCE_ERRORS and not stalled and not pool_gone:
+                if await _source_down():
+                    stalled = pool_dead = True  # the rest of the root is given up
+                else:
+                    source_errors = 0           # the source answers: these files fail
 
             # Honour the pause flag BEFORE submitting new work — paused
             # scans drain the in-flight window naturally and then idle
             # at this gate until the user clicks Resume.  In-flight
             # futures keep running; the gate only blocks new submissions.
             await _await_resume()
-
-            # Refill the window with new tasks
-            try:
-                for path in itertools.islice(file_iter, len(done)):
-                    new_fut = loop.run_in_executor(executor, _extract_one, path)
-                    active[new_fut] = path
-            except BrokenExecutor:
-                log.error("Extraction pool died mid-scan of %s — draining "
-                          "in-flight files and finishing this root early "
-                          "(Re-Index to retry)", scan_root)
-                file_iter = iter(())
-
             await asyncio.sleep(0)  # yield to event loop every iteration
+
+        for box, n in skipped_archives.items():
+            log.error("Extraction hung on %d members of %s in a row — its other %d member(s) "
+                      "were skipped, not indexed (Re-Index to retry)", _MAX_ARCHIVE_HANGS, box, n)
+        if suspects or requeue:
+            # Failures that reached us after the root was given up (late news
+            # from a replaced pool): not indexed either — counted, not lost.
+            more = len(suspects) + len(requeue)
+            log.error("%d more file(s) of %s not indexed (Re-Index to retry)", more, scan_root)
+            _progress.errors += more
+            _progress.processed += more
+            suspects.clear()
+            requeue.clear()
+            await _tick()
 
         # Flush any remaining tracks for this root
         await _flush_buffer()
@@ -1727,9 +3205,37 @@ async def _run_scan(
         #      its live siblings prove the enumeration is real.  A genuinely
         #      emptied root is cleared explicitly via "remove folder".
         expected_ids = set(track_ids_for_files.values())
-        existing_ids = await get_track_ids_for_scan_root(scan_root)
+        if _scoped is not None:
+            # The deferred store is untouched since the lookup above; a
+            # progressive write only ADDS this scan's own (expected) ids.
+            existing_ids = _scoped_existing
+        else:
+            existing_ids = await get_track_ids_for_scan_root(scan_root)
         orphan_ids = existing_ids - expected_ids
-        if scan_root in walk_errors:
+        if orphan_ids and _failed_archives:
+            # An archive that exists but couldn't be read this time: its
+            # indexed members are not deletions (a later readable scan decides).
+            orphan_ids = {tid for tid in orphan_ids
+                          if not _in_failed_archive((store._tracks.get(tid) or {}).get("path") or "",
+                                                    _failed_archives)}
+        if _scoped is not None and orphan_ids and scan_root not in walk_errors and not stalled:
+            # Scoped: the changed file / folder is gone (or lost files) while
+            # the root is still mounted → a genuine deletion.  Never on a root
+            # that reads empty (a dropped mount looks exactly like that).
+            if await asyncio.to_thread(_root_is_live, scan_root):
+                if _deferred:
+                    _pending_deleted |= orphan_ids
+                else:
+                    await delete_track_ids(list(orphan_ids))
+                    _changed = True
+                log.info("Stale cleanup (scoped): %d track(s) removed under %d "
+                         "changed path(s) of %s", len(orphan_ids), len(_scoped), scan_root)
+            else:
+                log.warning("Stale cleanup (scoped): %s reads empty or unreadable — "
+                            "not pruning %d track(s)", scan_root, len(orphan_ids))
+        elif _scoped is not None:
+            pass
+        elif scan_root in walk_errors:
             # os.walk hit a read error somewhere under this root, so ``files`` is
             # only a PARTIAL listing — pruning now would delete tracks whose
             # files are merely unreadable (permission denied, a flaky mount),
@@ -1766,11 +3272,16 @@ async def _run_scan(
                          len(orphan_ids), scan_root)
             else:
                 orphan_count = await delete_track_ids(list(orphan_ids))
+                _changed = _changed or orphan_count > 0
                 log.info("Stale cleanup: removed %d orphan tracks for %s", orphan_count, scan_root)
         else:
             log.debug("Stale cleanup: no orphans for %s", scan_root)
 
-        await upsert_scan_dir(scan_root, track_count_val=skipped + dir_counts[scan_root])
+        # A scoped scan saw only part of the root: its count is recomputed from
+        # the store once the delta is committed (below).
+        if not _removed_now(scan_root):
+            await upsert_scan_dir(scan_root, track_count_val=(
+                None if _scoped is not None else skipped + dir_counts[scan_root]))
 
     # Publish the scan result.  Re-scan (deferred) path: apply the accumulated
     # delta to the LIVE store in one batch via its own concurrency-safe
@@ -1781,6 +3292,13 @@ async def _run_scan(
     # other tracks during the extract survive, and memory stays consistent with
     # the AOF.  First scan (progressive) path: exit batch mode, rebuilding the
     # live indexes in place with yield points.
+    _gone = [r for r in dir_files if _removed_now(r)]
+    if _gone:
+        from soniqboom.core.data import path_hash as _ph_gone
+        _gone_h = {_ph_gone(r) for r in _gone}
+        _pending_tracks = [t for t in _pending_tracks if t.get("scan_root_hash") not in _gone_h]
+        _pending_deleted = {tid for tid in _pending_deleted
+                            if (store._tracks.get(tid) or {}).get("scan_root_hash") not in _gone_h}
     if _deferred:
         # Disjointness guard: _pending_tracks / _pending_deleted accumulate
         # across ALL roots, so with nested/overlapping registered roots a stale
@@ -1788,43 +3306,102 @@ async def _run_scan(
         # just (re-)extracted.  An upsert always wins over a delete.
         if _pending_deleted:
             _pending_deleted -= {t["id"] for t in _pending_tracks}
-        if _pending_tracks or _pending_deleted:
-            # Batch mode defers the O(n log n) sorted-index rebuild to a single
-            # pass in _async_exit_batch_mode; the per-chunk yields keep the loop
-            # responsive while the delta is applied.
-            #
-            # Self-heal a batch depth leaked by a crashed prior scan: local
-            # scans are queue-serialized, so a nonzero depth with no remote
-            # scan active (``_current_remote_dirs`` is populated at remote-scan
-            # start, before that scan enters batch mode) is stale and would
-            # otherwise wedge every future rebuild at the depth>0 early-return.
-            if store._batch_depth != 0 and not _current_remote_dirs:
-                store._batch_depth = 0
-            store.enter_batch_mode()
-            try:
-                for i in range(0, len(_pending_tracks), WRITE_CHUNK):
-                    store.upsert_tracks_batch(_pending_tracks[i : i + WRITE_CHUNK])
-                    await asyncio.sleep(0)
-                if _pending_deleted:
-                    await delete_track_ids(list(_pending_deleted))
-            finally:
-                # Mirror the remote-scan wrapper's proven guard: shield so a
-                # cancellation can't interrupt the rebuild mid-flight, and never
-                # let a raise leave the store stuck in batch mode (NEW-6).
-                try:
-                    await asyncio.shield(_async_exit_batch_mode(store))
-                except BaseException:
-                    store._batch_mode = False
-                    log.exception("exit_batch_mode failed after scan commit")
-            log.info("Scan commit: applied %d upserts + %d deletes to live store",
-                     len(_pending_tracks), len(_pending_deleted))
-        else:
-            # Nothing changed (incremental re-scan, all files skipped) — the live
-            # store is already correct, so do NO work at all: no rebuild, no swap.
-            log.debug("Scan: no track changes — skipping commit (live unchanged)")
+        # A re-extracted file whose metadata equals the stored track (touched,
+        # rewritten identically, copied over itself) only needs its mtime/size
+        # refreshed: no re-index, and it is not a library change.  A genuinely
+        # changed one keeps the stored ``added_at`` (it is not a new track)
+        # and duplicate annotation (re-grouped below).
+        _touch: list[tuple[str, dict]] = []
+        _material: list[dict] = []
+        _old_versions: dict[str, "dict | None"] = {}
+        for _i, _td in enumerate(_pending_tracks):
+            _old = store._tracks.get(_td["id"])
+            if _old is not None and _same_track_content(_old, _td):
+                _touch.append((_td["id"], {"mtime": _td.get("mtime"),
+                                           "file_size": _td.get("file_size")}))
+            else:
+                if _old is not None:
+                    for _k in _KEEP_ON_REEXTRACT:
+                        if _k in _old:
+                            _td[_k] = _old[_k]
+                _old_versions[_td["id"]] = _old
+                _material.append(_td)
+            if _i % 2000 == 1999:
+                await asyncio.sleep(0)
+        for _tid in _pending_deleted:
+            _old_versions[_tid] = store._tracks.get(_tid)
+        for i in range(0, len(_touch), 500):          # cheap: no index is touched
+            store.update_track_fields_batch(_touch[i : i + 500])
+            await asyncio.sleep(0)
+        from soniqboom.api.fstree import root_commit as _root_commit
+        # Browse clicks during the commit keep the pre-commit rows (no rebuild
+        # from a half-committed store) until the patch below lands.
+        with _root_commit({path_hash(r) for r in dir_files}):
+            if _material or _pending_deleted:
+                _changed = True
+                _dup_delta = _old_versions
+                if len(_material) + len(_pending_deleted) <= _SMALL_COMMIT:
+                    # A small delta (a watcher scan, a few edited files) is merged
+                    # into the live sorted indexes per track (~1 ms each) — batch
+                    # mode would re-sort every sorted index of the whole library.
+                    for i in range(0, len(_material), 25):
+                        store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + 25]))
+                        await asyncio.sleep(0)
+                    _del = list(_pending_deleted)
+                    for i in range(0, len(_del), 50):
+                        await delete_track_ids(_del[i : i + 50])
+                else:
+                    # Batch mode defers the O(n log n) sorted-index rebuild to a single
+                    # pass in _async_exit_batch_mode; the per-chunk yields keep the loop
+                    # responsive while the delta is applied.
+                    #
+                    # Self-heal a batch depth leaked by a crashed prior scan: local
+                    # scans are queue-serialized, so a nonzero depth with no remote
+                    # scan active (``_current_remote_dirs`` is populated at remote-scan
+                    # start, before that scan enters batch mode) is stale and would
+                    # otherwise wedge every future rebuild at the depth>0 early-return.
+                    if store._batch_depth != 0 and not _current_remote_dirs:
+                        store._batch_depth = 0
+                    store.enter_batch_mode()
+                    try:
+                        for i in range(0, len(_material), WRITE_CHUNK):
+                            store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + WRITE_CHUNK]))
+                            await asyncio.sleep(0)
+                        if _pending_deleted:
+                            _del = list(_pending_deleted)
+                            for i in range(0, len(_del), 500):
+                                await delete_track_ids(_del[i : i + 500])
+                    finally:
+                        # Mirror the remote-scan wrapper's proven guard: shield so a
+                        # cancellation can't interrupt the rebuild mid-flight, and never
+                        # let a raise leave the store stuck in batch mode (NEW-6).
+                        try:
+                            await asyncio.shield(_async_exit_batch_mode(store))
+                        except BaseException:
+                            store._batch_mode = False
+                            log.exception("exit_batch_mode failed after scan commit")
+                log.info("Scan commit: applied %d upserts + %d deletes to live store "
+                         "(%d unchanged re-reads refreshed)",
+                         len(_material), len(_pending_deleted), len(_touch))
+                await _refresh_browse_after_commit(store, _old_versions)
+            elif _touch:
+                log.info("Scan commit: %d re-read file(s) unchanged — mtime refreshed only",
+                         len(_touch))
+            else:
+                # Nothing changed (incremental re-scan, all files skipped) — the live
+                # store is already correct, so do NO work at all: no rebuild, no swap.
+                log.debug("Scan: no track changes — skipping commit (live unchanged)")
     else:
         await _async_exit_batch_mode(store)
         _prog_batch_entered = False   # progressive batch section closed cleanly
+        _changed = _changed or bool(all_track_ids)
+
+    if scope and _changed:
+        from soniqboom.core.data import path_hash as _ph
+        for _root in scope:
+            if _root in dir_files and not _removed_now(_root):
+                await upsert_scan_dir(_root, track_count_val=len(
+                    store._tag_scan_root_hash.get(_ph(_root), ())))
 
     log.info(
         "Phase 1 complete: %d tracks written in %.1fs",
@@ -1842,18 +3419,15 @@ async def _run_scan(
     # the progress label flips to "Detecting duplicates…" immediately —
     # the user sees that something specific is happening instead of
     # assuming the scan is stuck.
-    _progress.current_file = "Detecting duplicates…"
-    if on_progress:
-        await on_progress(_progress)
-    try:
-        await _run_duplicate_detection_async()
-    except Exception as exc:
-        log.error("Duplicate detection failed (non-fatal): %s", exc)
+    # Nothing added, updated or removed → the duplicate groups, HVSC data and
+    # aggregations are all still right: skip the (library-wide) passes.  The
+    # folder watcher's rescans are usually exactly this.
+    for d in _fp_record:
+        if not _removed_now(d) and get_store().get_config(_FP_KEY + path_hash(d)) != _fp:
+            get_store().set_config(_FP_KEY + path_hash(d), _fp)
 
-    # Invalidate aggregation caches now that new tracks are in the store
-    _progress.current_file = "Refreshing aggregations…"
-    if on_progress:
-        await on_progress(_progress)
+    if not _changed:
+        log.info("Scan: nothing changed — skipping duplicate detection and post-scan passes")
 
     # HVSC: apply per-tune durations + STIL to SID tracks now that they're
     # indexed.  SID extraction runs in worker processes whose HVSC singleton is
@@ -1862,17 +3436,35 @@ async def _run_scan(
     # pre-configured HVSC and one auto-detected during THIS scan.  Idempotent.
     try:
         from soniqboom.core.hvsc import get_hvsc
-        if get_hvsc().is_configured() and any(
+        if (_changed or _hvsc_new) and get_hvsc().is_configured() and any(
             str(p).split("::")[0].lower().endswith(_SID_DETECT_EXTS)
             for fl in dir_files.values() for p in fl
         ):
             from soniqboom.core.hvsc_apply import apply_hvsc_to_library
-            await apply_hvsc_to_library(reload=False)
+            _hvsc_ids = (set(_dup_delta) if (not _hvsc_new and _dup_delta is not None)
+                         else None)
+            await apply_hvsc_to_library(reload=False, ids=_hvsc_ids)
     except Exception:
         log.debug("HVSC post-scan apply failed", exc_info=True)
 
-    from soniqboom.api.library import invalidate_agg_cache
-    invalidate_agg_cache()
+    # Duplicate groups: re-group whatever this scan (and the HVSC apply above,
+    # and any edit since the last pass) changed — incrementally for a small
+    # delta, the full subprocess pass for a big one.
+    if _changed or _hvsc_new:
+        _progress.current_file = "Detecting duplicates…"
+        if on_progress:
+            await on_progress(_progress)
+        try:
+            await _regroup_duplicates_now()
+        except Exception as exc:
+            log.error("Duplicate detection failed (non-fatal): %s", exc)
+
+    if _changed:
+        _progress.current_file = "Refreshing aggregations…"
+        if on_progress:
+            await on_progress(_progress)
+        from soniqboom.api.library import invalidate_agg_cache
+        invalidate_agg_cache()
 
     _scan_count = max(0, _scan_count - 1)
     if _scan_count == 0:
@@ -1883,13 +3475,23 @@ async def _run_scan(
     if on_progress:
         await on_progress(_progress)
 
-    executor.shutdown(wait=False)
+    _release_pool(executor)
+    return _changed
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-_scan_queue: list[tuple[frozenset[str], Callable | None]] = []
+# (dirs, on_progress, scope): ``scope`` None = full scan of every dir; a dict
+# root → changed paths = a scoped (folder-watcher) scan of just those paths.
+# 4th field ``light``: an AUTOMATIC full scan (startup reconcile, the
+# watcher's full fallback) — unchanged archives are listed from the store.
+_scan_queue: list[tuple[frozenset[str], Callable | None,
+                        "dict[str, frozenset[str]] | None", bool]] = []
 _current_scan_dirs: frozenset[str] = frozenset()
+_current_scan_scoped: bool = False       # the running local scan is a scoped (watcher) one
+_current_scan_light: bool = False        # … an automatic ("light") full one
+_SCOPED_MERGE_MAX = 4096                  # merged queued scope per root beyond this → full scan
+
 _current_remote_dirs: set[str] = set()   # active remote scan roots
 # True while the PROGRESSIVE (first-scan) path holds an un-try/finally'd
 # ``enter_batch_mode`` — lets the queue's crash handler unwind exactly that
@@ -1897,37 +3499,341 @@ _current_remote_dirs: set[str] = set()   # active remote scan roots
 _prog_batch_entered: bool = False
 
 
-# Post-scan Demozoo auto-apply — a single COALESCING runner so no scan's
+def _reset_scan_state() -> None:
+    """``begin_run``: the scan state a previous server run in this process
+    left behind — its event loop closed under a running scan (cancelled, so
+    no ``finally`` of the scan code counted it down), its pause event bound
+    to that loop — back to idle; a batch level the progressive first-scan
+    path left open is unwound (as ``_drain_scan_queue`` does after a crash)."""
+    global _pause_event, _scan_count, _scan_task, _progress, _prog_batch_entered
+    global _current_scan_dirs, _current_scan_scoped, _current_scan_light
+    _pause_event = None
+    _scan_task = None
+    _scan_queue.clear()
+    _current_scan_dirs = frozenset()
+    _current_scan_scoped = False
+    _current_scan_light = False
+    _current_remote_dirs.clear()
+    if _scan_count or _progress.running:
+        _scan_count = 0
+        _progress = ScanProgress()
+    if _prog_batch_entered:
+        try:
+            store = get_store()
+            if store._batch_depth > 0:
+                store._batch_depth -= 1
+                if store._batch_depth == 0:
+                    store._batch_mode = False
+                    store._rebuild_sorted_indexes()
+                    store._sorted_dirty = False
+        except Exception:                                   # noqa: BLE001
+            log.exception("could not unwind a scan's batch state")
+        _prog_batch_entered = False
+
+
+# Post-scan scene enrichment — a single COALESCING runner so no scan's
 # enrichment delta is ever dropped.  Every drain sets a ``pending`` flag; the
 # runner loops while pending is set, so a scan that drains WHILE a prior apply
 # is running (or right after one) still gets folded in on the next pass instead
 # of being stranded until some unrelated future scan (QA round-1 MAJOR).  Strong
 # refs keep the task alive; a settle sleep coalesces bursts so a folder-watch
 # storm can't re-churn the whole library back-to-back on a small host.
+#
+# One runner, fixed order: Modland (fills/corrects the artist Demozoo's
+# composer match reads, and sets game albums) → the UADE song database (fills
+# what is still empty) → Demozoo → the one-time header
+# game backfill → the folder-album pass (after Modland, so a Modland game
+# wins over a folder guess without a replace round-trip).
 _scene_autoapply_tasks: set = set()
 _scene_autoapply_pending = False
 _scene_autoapply_running = False
 _SCENE_AUTOAPPLY_SETTLE_S = 10
+# How long a post-scan pass waits for the local one-time header-game backfill
+# to finish before the shares' backfills (``repair.wait_idle``).
+_BACKFILL_WAIT_S = 10.0
+# ``scan_root_hash`` of the remote roots whose one-time header-game backfill
+# (``repair.run_remote_album_backfill``) waits for the runner.
+_remote_backfill_pending: set[str] = set()
+
+
+def _scene_enrichment_wanted() -> bool:
+    from soniqboom.core import demozoo, scene_metadata, songdb
+    if scene_metadata.has_index():
+        return True
+    if songdb.has_index() and songdb.auto_apply_enabled():
+        return True
+    return demozoo.has_index() and demozoo.auto_apply_enabled()
+
+
+_dup_runner_task: "asyncio.Task | None" = None
+_DUP_REGROUP_SETTLE_S = 3.0        # a burst of edits → one re-group
+_DUP_FULL_MIN_INTERVAL_S = 600.0   # background full passes (big remote deltas) ≤ 1 / 10 min
+_dup_full_last = float("-inf")
+
+
+_DUP_PENDING_KEY = "dup_regroup_pending"   # persisted: changes not yet re-grouped
+_dup_lock_pair: "tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None" = None
+
+
+def _dup_lock() -> asyncio.Lock:
+    """One re-group at a time (per event loop): a background full pass
+    computed from an older snapshot must not land over a newer incremental
+    result."""
+    global _dup_lock_pair
+    loop = asyncio.get_running_loop()
+    if _dup_lock_pair is None or _dup_lock_pair[0] is not loop:
+        _dup_lock_pair = (loop, asyncio.Lock())
+    return _dup_lock_pair[1]
+
+
+async def _regroup_duplicates_now(*, background: bool = False) -> None:
+    """Re-group the duplicate groups touched by the store's pending changes
+    (``TrackStore.take_dup_dirty``): incrementally for up to
+    ``_DUP_INCR_MAX`` tracks, else one full pass.  While a batch section holds
+    the sorted indexes (a remote scan) the changes stay pending for the
+    runner.  A pass that fails puts the work back (as a full pass)."""
+    global _dup_full_last
+    store = get_store()
+    if background:
+        # A background FULL pass is rate-limited.  The wait happens outside the
+        # lock and before taking the pending set (a scan ending meanwhile takes
+        # it and re-groups itself), and scans are re-checked after it.
+        if store._dup_dirty_overflow:
+            wait = _dup_full_last + _DUP_FULL_MIN_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        while (_scan_task is not None and not _scan_task.done()) or store._batch_mode:
+            await asyncio.sleep(2)
+    lock = _dup_lock()
+    if not background and lock.locked():
+        # A background pass is running: this scan's changes stay pending and
+        # the runner (which loops while anything is pending) takes them —
+        # the scan queue doesn't wait seconds behind a full pass.
+        _ensure_dup_runner()
+        return
+    async with lock:
+        if store._batch_mode or "_sorted_duration" in store._dirty_sorted:
+            _ensure_dup_runner()
+            return
+        delta, overflow = store.take_dup_dirty()
+        if not delta and not overflow:
+            _clear_dup_pending(store)
+            return
+        try:
+            done = False
+            if not overflow and len(delta) <= _DUP_INCR_MAX:
+                try:
+                    done = await _run_duplicate_detection_incremental(delta)
+                except Exception:                           # noqa: BLE001 — full pass below
+                    log.warning("Incremental duplicate detection failed — running the "
+                                "full pass", exc_info=True)
+            if not done:
+                _dup_full_last = time.monotonic()
+                await _run_duplicate_detection_async()
+        except BaseException:
+            store._dup_dirty_overflow = True             # put the work back
+            raise
+        _clear_dup_pending(store)
+
+
+def _clear_dup_pending(store) -> None:
+    if not store._dup_dirty and not store._dup_dirty_overflow:
+        if store.get_config(_DUP_PENDING_KEY):
+            store.set_config(_DUP_PENDING_KEY, False)
+        if store.get_config(_DUP_PENDING_DELTA_KEY):
+            store.set_config(_DUP_PENDING_DELTA_KEY, None)
+
+
+def _on_dup_dirty() -> None:
+    """Store callback: duplicate-relevant changes are pending.  Persist that,
+    so a shutdown before the re-group still gets one (a full pass) after the
+    next start."""
+    store = get_store()
+    if not store.get_config(_DUP_PENDING_KEY):
+        store.set_config(_DUP_PENDING_KEY, True)
+    _ensure_dup_runner()
+
+
+def _ensure_dup_runner() -> None:
+    global _dup_runner_task
+    if _dup_runner_alive():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return                                  # not on the loop (replay, a thread)
+    _dup_runner_task = loop.create_task(_dup_regroup_runner(), name="dup-regroup")
+
+
+async def _dup_regroup_runner() -> None:
+    """Background re-grouping for changes made outside a local scan (tag
+    edits, duration backfills, enrichment, remote scans).  A running local
+    scan re-groups at its own end; a remote scan's batch must close first."""
+    store = get_store()
+    while True:
+        await asyncio.sleep(_DUP_REGROUP_SETTLE_S)
+        while (_scan_task is not None and not _scan_task.done()) or store._batch_mode:
+            await asyncio.sleep(2)
+        if not store._dup_dirty and not store._dup_dirty_overflow:
+            return
+        try:
+            await _regroup_duplicates_now(background=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                               # noqa: BLE001
+            log.exception("Background duplicate re-grouping failed")
+
+
+def install_dup_regroup() -> None:
+    """Called right after the library is loaded (the journal replay goes
+    through ``bulk_load`` and records nothing): from here on every
+    duplicate-relevant write schedules the runner.  Changes a previous run
+    recorded but never re-grouped (shutdown inside the settle / rate-limit
+    window, an interrupted first scan) are healed by one full pass."""
+    store = get_store()
+    store._on_dup_dirty = _on_dup_dirty
+    if store.get_config(_DUP_PENDING_KEY):
+        saved = store.get_config(_DUP_PENDING_DELTA_KEY)
+        if saved:
+            # consumed now: a crash later in THIS run must not re-use it
+            store.set_config(_DUP_PENDING_DELTA_KEY, None)
+        if isinstance(saved, dict) and saved:
+            log.info("Duplicate groups: re-grouping %d change(s) left by the previous run",
+                     len(saved))
+            for tid, old in saved.items():
+                store._dup_dirty.setdefault(tid, old if isinstance(old, dict) else None)
+        else:
+            log.info("Duplicate groups: changes from the previous run were not re-grouped — "
+                     "scheduling a full pass")
+            store._dup_dirty_overflow = True
+    if store._dup_dirty or store._dup_dirty_overflow:
+        _ensure_dup_runner()
+
+
+def _dup_runner_alive() -> bool:
+    t = _dup_runner_task
+    return t is not None and not t.done() and not t.cancelling()
+
+
+_DUP_PENDING_DELTA_KEY = "dup_regroup_pending_delta"
+
+
+def finalize_dup_pending() -> None:
+    """Last shutdown step before the journal is flushed: if a duplicate-relevant
+    write landed after ``cancel_background_tasks`` saved the pending set, the
+    saved set is incomplete — drop it so the next start runs a full pass."""
+    try:
+        store = get_store()
+        saved = store.get_config(_DUP_PENDING_DELTA_KEY)
+        busy = ((_dup_lock_pair is not None and _dup_lock_pair[1].locked())
+                or (_scan_task is not None and not _scan_task.done()))
+        if saved and (busy or store._dup_dirty_overflow
+                      or not set(store._dup_dirty) <= set(saved)):
+            store.set_config(_DUP_PENDING_DELTA_KEY, None)
+    except Exception:                                   # noqa: BLE001
+        log.debug("finalizing the pending duplicate re-group failed", exc_info=True)
+
+
+def cancel_background_tasks() -> None:
+    """Shutdown: stop the duplicate re-group runner and keep what it had not
+    re-grouped yet — the ids + their previous values (a small set), so the
+    next start re-groups just those; after a crash only the flag survives and
+    the next start runs one full pass."""
+    if _dup_runner_task is not None and not _dup_runner_task.done():
+        _dup_runner_task.cancel()
+    try:
+        store = get_store()
+        busy = _dup_lock_pair is not None and _dup_lock_pair[1].locked()
+        if store._dup_dirty and not store._dup_dirty_overflow and not busy:
+            # (a re-group in flight has taken part of the work: then only the
+            # flag survives and the next start runs one full pass)
+            store.set_config(_DUP_PENDING_DELTA_KEY, dict(store._dup_dirty))
+    except Exception:                                   # noqa: BLE001
+        log.debug("saving the pending duplicate re-group failed", exc_info=True)
 
 
 def _spawn_scene_autoapply() -> None:
-    """Mark the library dirty for Demozoo scene enrichment (composer groups +
-    canonical release years) and ensure the coalescing runner is going, so the
-    manual Admin → Demozoo → Apply step is no longer required after a scan.
+    """Mark the library dirty for scene enrichment — the Modland join (once an
+    index is downloaded), the UADE song database and the Demozoo composer
+    groups + canonical release years (each unless the user switched its
+    auto-apply off) — and ensure the
+    coalescing runner is going, so the manual Admin Apply steps are no longer
+    required after a scan.  The runner finishes with the folder-album pass;
+    without any index this schedules just that pass.
 
-    A no-op when no index has been downloaded yet.  Idempotent (a re-apply
-    updates only what changed) and provenance survives rescans, so it never
-    fights a user's manual edit."""
-    from soniqboom.core import demozoo
-    if not demozoo.has_index():
+    Idempotent (a re-apply updates only what changed) and provenance survives
+    rescans, so it never fights a user's manual edit."""
+    try:
+        wanted = _scene_enrichment_wanted()
+    except Exception:                               # noqa: BLE001
+        log.debug("scene enrichment check failed", exc_info=True)
+        wanted = False
+    if not wanted and not _remote_backfill_pending:
+        _schedule_folder_album_pass()
         return
-    if not demozoo.auto_apply_enabled():
-        return                                  # user turned post-scan re-apply
-                                                # OFF (e.g. after a Reset) — a
-                                                # scan must not silently re-enrich
     global _scene_autoapply_pending
     _scene_autoapply_pending = True
     _ensure_scene_autoapply_runner()
+
+
+def schedule_startup_reconcile() -> None:
+    """One incremental rescan of the local roots after startup (unless
+    switched off), so changes made while the server was stopped are indexed.
+    Skipped when a full scan is already running or queued."""
+    from soniqboom.config import settings
+    if not getattr(settings, "startup_reconcile_scan", True):
+        log.info("Startup reconcile: switched off in Settings — skipped")
+        return
+
+    async def _go() -> None:
+        try:
+            dirs = [d["path"] for d in get_store().list_scan_dirs()
+                    if not str(d.get("path", "")).startswith(
+                        ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://"))]
+            # (is_dir off the loop: a hung mount must not freeze it)
+            live = await asyncio.to_thread(lambda: [d for d in dirs if Path(d).is_dir()])
+            if live:
+                log.info("Startup reconcile: incremental rescan of %d local folder(s)", len(live))
+                await start_scan(live, light=True)
+        except Exception:                               # noqa: BLE001
+            log.exception("Startup reconcile scan failed")
+    try:
+        t = asyncio.get_running_loop().create_task(_go(), name="startup-reconcile")
+        _scene_autoapply_tasks.add(t)
+        t.add_done_callback(_scene_autoapply_tasks.discard)
+    except RuntimeError:
+        pass
+
+
+def schedule_startup_enrichment() -> None:
+    """Called once the library has loaded: an upgrade whose Modland apply
+    learned something new (``scene_metadata.MODLAND_APPLY_VERSION``) or whose
+    extractor now reads console-rip game names (the one-time header-game
+    backfill) heals without a manual step or a rescan; an album revert that a
+    restart interrupted (``folder_album.resume_pending_revert``) is resumed.
+    Never blocks startup — it only schedules background work."""
+    try:
+        from soniqboom.core import folder_album
+        folder_album.resume_pending_revert()
+    except Exception:                               # noqa: BLE001
+        log.debug("album revert resume failed", exc_info=True)
+    try:
+        from soniqboom.core import game_titles      # lists or matching may have changed
+        game_titles.schedule()
+    except Exception:                               # noqa: BLE001
+        log.debug("game-title startup pass failed", exc_info=True)
+    try:
+        from soniqboom.core import scene_metadata, repair
+        from soniqboom.core.store import get_store
+        need_modland = scene_metadata.has_index() and not scene_metadata.apply_version_current()
+        need_backfill = not get_store().get_config(repair.ALBUM_BACKFILL_CONFIG_KEY)
+    except Exception:                               # noqa: BLE001
+        log.debug("startup enrichment check failed", exc_info=True)
+        return
+    if need_modland or need_backfill:
+        global _scene_autoapply_pending
+        _scene_autoapply_pending = True
+        _ensure_scene_autoapply_runner()
 
 
 def _ensure_scene_autoapply_runner() -> None:
@@ -1937,33 +3843,77 @@ def _ensure_scene_autoapply_runner() -> None:
     _scene_autoapply_running = True
 
     async def _run() -> None:
-        from soniqboom.core import demozoo
+        from soniqboom.core import demozoo, repair, scene_metadata, songdb
         global _scene_autoapply_pending, _scene_autoapply_running
         lock_retries = 0
         try:
             while _scene_autoapply_pending:
                 _scene_autoapply_pending = False
-                if not demozoo.auto_apply_enabled():
-                    break                       # toggled OFF (e.g. a Reset)
-                                                # mid-coalesce — must NOT re-enrich
-                                                # a just-reset library
+                # Never join a half-written library: wait out a running scan
+                # (its own drain re-triggers this runner anyway).
+                while is_scanning():
+                    await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S or 0.05)
+                retry = False
+                if scene_metadata.has_index():
+                    try:
+                        res = await scene_metadata.apply_to_library(auto=True)
+                        if res.get("error") == "apply already running":
+                            retry = True
+                        elif not res.get("skipped"):
+                            la = res.get("last_apply") or {}
+                            if la.get("updated"):
+                                log.info("Post-scan Modland apply: %d track(s) "
+                                         "updated (%d album changes)",
+                                         la["updated"], la.get("albums", 0))
+                    except Exception:           # noqa: BLE001 — best-effort
+                        log.debug("Post-scan Modland apply failed", exc_info=True)
+                if songdb.has_index() and songdb.auto_apply_enabled():
+                    try:
+                        res = await songdb.apply_to_library()
+                        if res.get("error") == "apply already running":
+                            retry = True
+                        elif not res.get("skipped"):
+                            la = res.get("last_apply") or {}
+                            if la.get("updated"):
+                                log.info("Post-scan song-database apply: %d track(s) "
+                                         "updated", la["updated"])
+                    except Exception:           # noqa: BLE001 — best-effort
+                        log.debug("Post-scan song-database apply failed", exc_info=True)
+                # Toggled OFF (e.g. a Reset) — must NOT re-enrich a just-reset
+                # library, not even mid-coalesce.
+                if demozoo.has_index() and demozoo.auto_apply_enabled():
+                    try:
+                        res = await demozoo.apply_to_library()
+                        if res.get("error") == "apply already running":
+                            retry = True
+                        else:
+                            updated = res.get("updated") or 0
+                            if updated:
+                                log.info("Post-scan Demozoo auto-apply: %d track(s) "
+                                         "enriched", updated)
+                    except Exception:           # noqa: BLE001 — best-effort
+                        log.debug("Post-scan Demozoo auto-apply failed", exc_info=True)
+                if retry:
+                    # A manual Admin apply holds the lock — retry our delta
+                    # once it clears (bounded, so a WEDGED manual apply can't
+                    # spin this forever; a later scan re-triggers regardless).
+                    lock_retries += 1
+                    if lock_retries <= 5:
+                        _scene_autoapply_pending = True
+                else:
+                    lock_retries = 0
                 try:
-                    res = await demozoo.apply_to_library()
-                    if res.get("error") == "apply already running":
-                        # A manual Admin apply holds the lock — retry our delta
-                        # once it clears (bounded, so a WEDGED manual apply can't
-                        # spin this forever; a later scan re-triggers regardless).
-                        lock_retries += 1
-                        if lock_retries <= 5:
-                            _scene_autoapply_pending = True
-                    else:
-                        lock_retries = 0
-                        updated = res.get("updated") or 0
-                        if updated:
-                            log.info("Post-scan Demozoo auto-apply: %d track(s) "
-                                     "enriched", updated)
+                    if await repair.run_album_backfill_once():
+                        # Let it finish (and settle) first, briefly: the
+                        # shares' own backfills below would find the task busy
+                        # and wait for their next scan.  Bounded — a read
+                        # stuck on a hung mount must not hold every later
+                        # pass (enrichment, folder pass, the shares).
+                        await repair.wait_idle(_BACKFILL_WAIT_S)
                 except Exception:               # noqa: BLE001 — best-effort
-                    log.debug("Post-scan Demozoo auto-apply failed", exc_info=True)
+                    log.debug("Header-game album backfill failed to start", exc_info=True)
+                await _run_remote_album_backfills()
+                _schedule_folder_album_pass()
                 if _scene_autoapply_pending:
                     # Coalesce a burst of drains (folder-watch) into fewer applies.
                     await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S)
@@ -1971,23 +3921,85 @@ def _ensure_scene_autoapply_runner() -> None:
             _scene_autoapply_running = False
 
     try:
-        t = asyncio.create_task(_run(), name="demozoo-autoapply")
+        t = asyncio.create_task(_run(), name="scene-autoapply")
         _scene_autoapply_tasks.add(t)
         t.add_done_callback(_scene_autoapply_tasks.discard)
     except RuntimeError:
         _scene_autoapply_running = False        # no running loop (shouldn't happen here)
 
 
+def _queue_remote_album_backfill(scan_root: str, plan: dict) -> bool:
+    """After a completed scan of remote root ``scan_root`` (its ``plan``):
+    queue its one-time header-game backfill (``repair.run_remote_album_backfill``)
+    for the enrichment runner, unless it already ran — one config read then.
+    A full walk that extracted every file (a first scan) needs none: the
+    current extractor just read them all.  Returns True when queued."""
+    import hashlib
+    try:
+        from soniqboom.core import repair
+        root_hash = hashlib.sha256(scan_root.encode()).hexdigest()[:16]
+        if repair.remote_album_backfill_done(root_hash):
+            return False
+        if (plan.get("full_walk_ok") and not plan.get("skip")
+                and not plan.get("mtime_refresh")):
+            repair.mark_remote_album_backfill_done(root_hash)
+            return False
+    except Exception:                                   # noqa: BLE001
+        log.debug("remote album backfill check failed", exc_info=True)
+        return False
+    _remote_backfill_pending.add(root_hash)
+    return True
+
+
+async def _run_remote_album_backfills() -> None:
+    """The runner's step for the queued remote roots (after the local
+    backfill, so the two never compete for the one repair task).  A root that
+    has to wait — another repair is running, or the root went offline — stays
+    queued for the next runner pass (a later scan of it queues it again)."""
+    from soniqboom.core import repair
+    for root_hash in sorted(_remote_backfill_pending):
+        try:
+            res = await repair.run_remote_album_backfill(root_hash)
+        except Exception:                               # noqa: BLE001 — best-effort
+            log.debug("Remote header-game album backfill failed to start", exc_info=True)
+            res = True                                  # a later scan re-queues it
+        if res is None:
+            break                                       # the repair task is busy
+        _remote_backfill_pending.discard(root_hash)
+
+
+def _schedule_folder_album_pass() -> None:
+    """Post-scan hook for the opt-in "album from folder name" pass
+    (``core/folder_album.py``) — a no-op while the setting is off; otherwise a
+    coalescing background runner that skips work when the library didn't
+    change.  Never lets a failure escape into the scan path."""
+    try:
+        from soniqboom.core import folder_album
+        folder_album.schedule_after_scan()
+    except Exception:                                   # noqa: BLE001
+        log.debug("folder-album post-scan hook failed", exc_info=True)
+    try:
+        from soniqboom.core import game_titles       # game from the archive name
+        game_titles.schedule()
+    except Exception:                                   # noqa: BLE001
+        log.debug("game-title post-scan hook failed", exc_info=True)
+
+
 async def _drain_scan_queue() -> None:
     """Run scans sequentially until the queue is empty."""
-    global _scan_task, _current_scan_dirs, _scan_count, _progress, _prog_batch_entered
+    global _scan_task, _current_scan_dirs, _current_scan_scoped, _current_scan_light
+    global _scan_count, _progress, _prog_batch_entered
+    any_changed = False
     while _scan_queue:
-        dirs_set, cb = _scan_queue.pop(0)
+        dirs_set, cb, scope, light = _scan_queue.pop(0)
         _current_scan_dirs = dirs_set
-        log.info("Scan queue: starting scan of %d dir(s), %d remaining in queue",
-                 len(dirs_set), len(_scan_queue))
+        _current_scan_scoped = scope is not None
+        _current_scan_light = bool(light) and scope is None
+        log.info("Scan queue: starting %s scan of %d dir(s), %d remaining in queue",
+                 "scoped" if scope else "full", len(dirs_set), len(_scan_queue))
         try:
-            await _run_scan(list(dirs_set), cb)
+            any_changed = bool(await _run_scan(list(dirs_set), cb, scope=scope,
+                                               light=_current_scan_light)) or any_changed
         except Exception:
             log.exception("Scan failed with unhandled error")
             # Ensure progress state is always cleaned up so the UI
@@ -2017,10 +4029,40 @@ async def _drain_scan_queue() -> None:
             except Exception:
                 log.exception("Failed to heal batch state after scan crash")
         _current_scan_dirs = frozenset()
-    # Whole queue drained (all local + remote scans done) — fold the results
-    # into the Demozoo scene enrichment in the background.
-    _spawn_scene_autoapply()
+        _current_scan_scoped = False
+        _current_scan_light = False
+    # Local scan queue drained — fold the results into the scene enrichment
+    # (Modland, Demozoo, the header-game backfill) and then the folder-album
+    # pass, in that order, in the background.  (Remote scans trigger the same
+    # runner from ``start_remote_scan``; the runner waits out any scan still
+    # running, local or remote.)  Skipped when no scan changed anything.
+    if any_changed:
+        _spawn_scene_autoapply()
     _scan_task = None
+
+
+def forget_root(path: str) -> None:
+    """A scan root was removed: drop it from every queued scan, so a scan
+    queued before the removal doesn't re-register and re-index it."""
+    norm = str(Path(path).resolve())
+    for i in range(len(_scan_queue) - 1, -1, -1):
+        dirs, cb, scope, light = _scan_queue[i]
+        if norm not in dirs:
+            continue
+        rest = frozenset(dirs - {norm})
+        if not rest:
+            del _scan_queue[i]
+        else:
+            _scan_queue[i] = (rest, cb, None if scope is None
+                              else {r: v for r, v in scope.items() if r != norm}, light)
+
+
+def full_scan_active() -> bool:
+    """A full (not watcher-scoped) scan is running or queued, local or remote —
+    whether a manual "scan now" request would be redundant."""
+    return ((bool(_current_scan_dirs) and not _current_scan_scoped and not _current_scan_light)
+            or bool(_current_remote_dirs)
+            or any(q_scope is None and not q_light for _d, _cb, q_scope, q_light in _scan_queue))
 
 
 def is_scanning(path: str | None = None) -> bool:
@@ -2033,34 +4075,101 @@ def is_scanning(path: str | None = None) -> bool:
     norm = str(Path(path).resolve())
     if norm in _current_scan_dirs:
         return True
-    return any(norm in q_dirs for q_dirs, _ in _scan_queue)
+    return any(norm in q_dirs for q_dirs, *_ in _scan_queue)
 
 
 async def start_scan(
     directories: list[str],
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
+    *,
+    scope: "dict[str, Iterable[str]] | None" = None,
+    rescan_if_running: bool = False,
+    light: bool = False,
 ) -> asyncio.Task:
     """Queue a scan.  If one is already running the request is queued and will
-    run automatically once the current scan finishes — duplicates are skipped."""
+    run automatically once the current scan finishes — duplicates are skipped.
+
+    ``scope`` (root → changed file/folder paths) queues a SCOPED scan of just
+    those paths (the folder watcher).  A queued full scan of the same roots
+    absorbs it; queued scoped scans of the same roots are merged into one.  A
+    scan already RUNNING never absorbs it — it may have walked past the change.
+    ``rescan_if_running`` gives a full request the same rule (the watcher's
+    full fallback): it queues behind a running full scan of the same roots
+    instead of being dropped as a duplicate.  ``light`` marks an automatic
+    full scan: archives unchanged since their members were indexed are listed
+    from the store instead of re-read (a manual request clears it)."""
     global _scan_task
     norm_dirs = frozenset(str(Path(d).resolve()) for d in directories)
 
-    # Skip if these dirs are already being scanned right now
-    if norm_dirs and norm_dirs.issubset(_current_scan_dirs):
+    if scope:
+        # Changed paths are normalized LEXICALLY (never ``resolve()``d): a
+        # symlinked file inside the root is indexed under its in-library path,
+        # and resolving it would scan its target — possibly outside the root.
+        nscope = {}
+        full_roots: list[str] = []
+        for r, paths in scope.items():
+            nr = str(Path(r).resolve())
+            pre = nr.rstrip(os.sep) + os.sep
+            keep = frozenset(q for q in (os.path.normpath(os.path.abspath(x)) for x in paths)
+                             if q == nr or q.startswith(pre))
+            if nr in keep:
+                full_roots.append(nr)           # the root itself changed → full scan
+            elif keep:
+                nscope[nr] = keep
+        if full_roots:
+            await start_scan(full_roots, on_progress, rescan_if_running=True, light=True)
+        if not nscope:
+            return _scan_task
+        norm_dirs = frozenset(nscope)
+        for i, (q_dirs, q_cb, q_scope, q_light) in enumerate(_scan_queue):
+            if q_scope is None and norm_dirs.issubset(q_dirs):
+                log.info("Scoped scan absorbed by a queued full scan: %s", sorted(norm_dirs))
+                if _scan_task and not _scan_task.done():
+                    return _scan_task
+                break
+            if q_scope is not None and q_dirs == norm_dirs and q_cb is on_progress:
+                merged = {r: q_scope.get(r, frozenset()) | nscope.get(r, frozenset())
+                          for r in norm_dirs}
+                if any(len(v) > _SCOPED_MERGE_MAX for v in merged.values()):
+                    # Too many changed paths piled up behind a running scan:
+                    # one full incremental rescan is cheaper than the scope.
+                    _scan_queue[i] = (q_dirs, q_cb, None, True)
+                    log.info("Queued scoped scan grew past %d paths — full rescan of %s",
+                             _SCOPED_MERGE_MAX, sorted(norm_dirs))
+                else:
+                    _scan_queue[i] = (q_dirs, q_cb, merged, False)
+                log.info("Scoped scan merged into a queued one: %s", sorted(norm_dirs))
+                if _scan_task and not _scan_task.done():
+                    return _scan_task
+                break
+        else:
+            _scan_queue.append((norm_dirs, on_progress, nscope, False))
+        if _scan_task and not _scan_task.done():
+            return _scan_task
+        _scan_task = asyncio.create_task(_drain_scan_queue())
+        return _scan_task
+
+    # Skip if these dirs are already being FULLY scanned right now (a running
+    # scoped scan covers only a few paths — a full request still queues; a
+    # manual request never counts a running AUTOMATIC one as done)
+    if (norm_dirs and norm_dirs.issubset(_current_scan_dirs) and not _current_scan_scoped
+            and not rescan_if_running and not (_current_scan_light and not light)):
         log.info("Scan skipped — dirs already being scanned: %s", norm_dirs)
         if _scan_task and not _scan_task.done():
             return _scan_task
         # Shouldn't happen, but fall through to create task if needed
 
     # Skip if these dirs are already queued
-    for queued_dirs, _ in _scan_queue:
-        if norm_dirs.issubset(queued_dirs):
+    for i, (queued_dirs, q_cb, q_scope, q_light) in enumerate(_scan_queue):
+        if q_scope is None and norm_dirs.issubset(queued_dirs):
+            if q_light and not light:
+                _scan_queue[i] = (queued_dirs, q_cb, None, False)   # manual wins
             log.info("Scan skipped — dirs already queued: %s", norm_dirs)
             if _scan_task and not _scan_task.done():
                 return _scan_task
             break
 
-    _scan_queue.append((norm_dirs, on_progress))
+    _scan_queue.append((norm_dirs, on_progress, None, light))
 
     if _scan_task and not _scan_task.done():
         log.info("Scan already running — queued %d dir(s) (queue depth: %d)",
@@ -2312,7 +4421,8 @@ def _find_remote_audio_entries(
                 if _is_junk_filename(fe.name):
                     skipped_junk += 1
                     continue
-                if is_supported_music_name(fe.name):
+                if (is_supported_music_name(fe.name)
+                        and not (scan_zips and fe.name.lower().endswith((".zip", ".lha", ".lzh")))):
                     entries.append(fe)
                 elif scan_zips and fe.name.lower().endswith((".zip", ".lha", ".lzh")):
                     if archive_skip is not None:
@@ -2648,7 +4758,7 @@ async def start_remote_scan(
     if on_progress:
         await on_progress(_progress)
 
-    executor = ProcessPoolExecutor(max_workers=SCAN_WORKERS)
+    executor = _process_pool(SCAN_WORKERS)
     batch_state = {"entered": False}
     plan: dict = {}
     try:
@@ -2672,7 +4782,7 @@ async def start_remote_scan(
         # prevent.  Only after the flags are safe do we attempt the
         # (shielded) awaits, each swallowing BaseException so a
         # cancellation can't abort the remaining cleanup steps.
-        executor.shutdown(wait=False)
+        _release_pool(executor)
         _current_remote_dirs.discard(scan_root)
         _scan_count = max(0, _scan_count - 1)
         if _scan_count == 0:
@@ -2699,6 +4809,18 @@ async def start_remote_scan(
     # Reached on the normal and handled-exception paths (a cancellation
     # re-raises out of the finally above and never gets here).  ``plan`` is
     # this scan's own plan, or {} if the body died before building one.
+    # A scan that extracted (new / changed files) or found removed ones feeds
+    # the same post-scan enrichment runner as a local scan (Modland → Demozoo →
+    # header-game backfill → folder pass); a no-change freshness poll (only
+    # skips / mtime refreshes) just gets the cheap, seq-gated folder pass —
+    # unless this share's one-time header-game backfill is still due (a
+    # completed scan that listed files proves the share reachable).
+    backfill_due = (bool(plan.get("walked"))
+                    and _queue_remote_album_backfill(scan_root, plan))
+    if plan.get("extract") or plan.get("ghosts") or backfill_due:
+        _spawn_scene_autoapply()
+    else:
+        _schedule_folder_album_pass()
     return plan
 
 
@@ -3612,10 +5734,12 @@ async def refresh_subtree_under_root(
     store = get_store()
     sub = str(Path(subdir).resolve())
 
+    _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
-        None, _find_audio_files, [sub], _settings.scan_zips,
+        None, _find_audio_files, [sub], _settings.scan_zips, None, None, _failed_archives,
     )
     files_strs = [str(p) for fl in dir_files.values() for p in fl]
+    _old_versions: dict[str, "dict | None"] = {}
     if len(files_strs) > max_files:
         return {"skipped": True, "checked": len(files_strs),
                 "added": 0, "updated": 0, "removed": 0, "errors": 0}
@@ -3624,7 +5748,11 @@ async def refresh_subtree_under_root(
     # Existing index entries under this subtree (scoped to the parent root).
     prefix = sub.rstrip("/") + "/"
     existing: dict[str, dict] = {}
-    for tid in await get_track_ids_for_scan_root(root):
+    # (from the root's cached sorted browse rows when they are in step — a
+    # binary search instead of visiting every track of the root per click)
+    from soniqboom.api.fstree import cached_ids_under
+    _ids = cached_ids_under(store, path_hash(str(Path(root).resolve())), prefix)
+    for tid in (_ids if _ids is not None else await get_track_ids_for_scan_root(root)):
         t = store._tracks.get(tid)
         if t:
             p_str = t.get("path") or ""
@@ -3640,13 +5768,26 @@ async def refresh_subtree_under_root(
     to_scan = [s for s in files_strs if s not in fresh]
 
     added = updated = errors = 0
+    _root_keys = {root, str(Path(root).resolve())}
+    return await _drill_down_apply(store, root, sub, to_scan, existing, found, walk_errors,
+                                   _failed_archives, _old_versions, len(files_strs), loop,
+                                   registered=bool(_root_keys & set(store._scan_dirs)),
+                                   root_keys=_root_keys)
+
+
+async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_errors,
+                            _failed_archives, _old_versions, n_checked, loop, *,
+                            registered: bool = False, root_keys: "set[str] | None" = None) -> dict:
+    """The second half of ``refresh_subtree_under_root``: extract, then write
+    and patch the browse cache inside the root's commit window."""
+    added = updated = errors = 0
+    ready: list = []
     if to_scan:
         def _pdir(s: str) -> str:
             return str(Path(s.split("::")[0]).parent) if "::" in s else str(Path(s).parent)
 
         unique_dirs = list({_pdir(s) for s in to_scan} | {root})
         hash_map = await store_hash_lookups_batch(unique_dirs)
-        buf: list = []
         for s in to_scan:
             _p, result, _sm, _lg = await loop.run_in_executor(None, _extract_one, Path(s))
             if isinstance(result, str):
@@ -3656,20 +5797,12 @@ async def refresh_subtree_under_root(
             if not track:
                 errors += 1
                 continue
-            if store.get_track(track.id) is None:
-                added += 1
-            else:
-                updated += 1
-            buf.append(track)
-            if len(buf) >= 200:
-                await upsert_tracks_batch(buf)
-                buf = []
-        if buf:
-            await upsert_tracks_batch(buf)
+            ready.append(track)
 
-    removed = 0
-    gone = [t["id"] for p_str, t in existing.items() if p_str not in found]
+    gone = [t["id"] for p_str, t in existing.items()
+            if p_str not in found and not _in_failed_archive(p_str, _failed_archives)]
     _sub_resolved = str(Path(sub).expanduser().resolve())
+    prune = False
     if _sub_resolved in walk_errors:
         # Incomplete listing (a read error under this subtree) — don't prune, or
         # we'd delete tracks whose files are merely unreadable, not deleted.
@@ -3680,8 +5813,7 @@ async def refresh_subtree_under_root(
     elif gone and Path(sub).is_dir():
         cap = max(20, len(existing) // 3)
         if len(gone) <= cap:
-            from soniqboom.core.data import delete_track_ids
-            removed = await delete_track_ids(gone)
+            prune = True
         else:
             log.warning(
                 "Drill-down refresh %s: %d of %d tracks vanished — over the "
@@ -3689,5 +5821,44 @@ async def refresh_subtree_under_root(
                 "will reconcile).", sub, len(gone), len(existing), cap,
             )
 
+    # Writes + browse patch inside the root's commit window (clicks meanwhile
+    # get the pre-commit rows, never a rebuild from a half-written store).
+    from soniqboom.api.fstree import root_commit as _root_commit
+    removed = 0
+
+    def _root_removed() -> bool:
+        # the folder was removed while this refresh ran: write nothing (more)
+        return registered and not ((root_keys or set()) & set(store._scan_dirs))
+    if _root_removed():
+        return {"added": 0, "updated": 0, "removed": 0,
+                "checked": n_checked, "errors": errors, "skipped": True}
+    stopped = False
+    with _root_commit({path_hash(root)}):
+        # Small chunks with a loop turn after each: a store upsert doesn't
+        # yield, so 200-row chunks blocked the loop ~1.9 s for 5,000 new files
+        # (perf round 7).  The removal check runs before every chunk.
+        for i in range(0, len(ready), _DRILL_WRITE_CHUNK):
+            if _root_removed():
+                stopped = True
+                break
+            chunk = ready[i : i + _DRILL_WRITE_CHUNK]
+            for track in chunk:
+                _prev = store.get_track(track.id)
+                if _prev is None:
+                    added += 1
+                else:
+                    updated += 1
+                _old_versions.setdefault(track.id, _prev)
+            await upsert_tracks_batch(chunk)
+            await asyncio.sleep(0)
+        if not stopped and _root_removed():
+            stopped = True
+        if prune and not stopped:
+            from soniqboom.core.data import delete_track_ids
+            for _tid in gone:
+                _old_versions.setdefault(_tid, store._tracks.get(_tid))
+            removed = await delete_track_ids(gone)
+        if _old_versions and not stopped:
+            await _refresh_browse_after_commit(store, _old_versions)
     return {"added": added, "updated": updated, "removed": removed,
-            "checked": len(files_strs), "errors": errors, "skipped": False}
+            "checked": n_checked, "errors": errors, "skipped": stopped}

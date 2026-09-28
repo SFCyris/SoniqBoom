@@ -56,7 +56,10 @@ STUCK_THRESHOLD = float(os.environ.get("SONIQBOOM_WATCHDOG_STUCK_S", "90"))
 # positives and obscure a real deadlock.
 _IGNORE_PREFIXES = (
     "/api/stream",
-    "/api/rest/stream",   # Subsonic stream
+    "/rest/stream",       # Subsonic stream (mounted at /rest)
+    "/rest/download",
+    "/rest/getTranscodeStream",
+    "/rest/radioStream",  # Subsonic live radio relay
     "/api/library/ws",
     "/api/admin/cache/conversion/stream",  # SSE
 )

@@ -58,8 +58,7 @@ function _renderUpNext() {
   const ul = $('radio-upnext-list');
   if (!ul) return;
   ul.innerHTML = '';
-  const q = Player.queue, idx = Player.queueIdx;
-  const next = q.slice(idx + 1, idx + 13);
+  const next = Player.autoUpcoming.slice(0, 12);      // the mix, not the queue behind it
   if (!next.length) {
     ul.innerHTML = '<li class="radio-upnext-empty">Fetching more similar tracks…</li>';
     return;
@@ -74,7 +73,12 @@ function _renderUpNext() {
     const im = li.querySelector('img');
     im.onerror = () => { im.classList.add('noart'); im.removeAttribute('src'); };
     li.title = 'Play now';
-    li.addEventListener('click', () => { Player.setQueue(q, idx + 1 + i); });
+    // Jump to THIS row: the mix need not be contiguous (a hand-queued track may
+    // sit among it), so find the row instead of computing an index.
+    li.addEventListener('click', () => {
+      const at = Player.queue.indexOf(t);
+      if (at >= 0) Player.setQueue(Player.queue, at);
+    });
     ul.appendChild(li);
   });
 }
@@ -151,6 +155,19 @@ window.addEventListener('sb:viz-settings', () => {
   else if (_overlayOpen()) _startScope();
 });
 
+// Radio owns the play order, so the shuffle toggle is refused meanwhile — show
+// that BEFORE the click (dimmed, and named as unavailable; still clickable so the
+// refusal toast can explain).
+function _markShuffleUnavailable(on) {
+  const b = $('btn-shuffle');
+  if (!b) return;
+  b.classList.toggle('is-unavailable', on);
+  // NOT aria-disabled: the button still answers (it explains itself), and assistive
+  // tech would tell its users not to bother.  The state goes into the name instead.
+  b.setAttribute('aria-label', on ? 'Shuffle \u2014 unavailable while Radio Mode is running' : 'Shuffle');
+  b.title = on ? 'Shuffle is unavailable while Radio Mode picks the order' : 'Shuffle (S)';
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 function start(seedTrack) {
@@ -161,6 +178,7 @@ function start(seedTrack) {
   // The radio's curated order replaces shuffle while the session runs, so
   // "next" follows the mix instead of random-jumping to an unrelated artist.
   try { Player.setRadioActive(true); } catch (_) {}
+  _markShuffleUnavailable(true);
   openOverlay();
 }
 
@@ -171,6 +189,7 @@ function stop() {
   $('btn-radio')?.classList.remove('on');
   // Radio over — the queue keeps playing, and the shuffle toggle resumes effect.
   try { Player.setRadioActive(false); } catch (_) {}
+  _markShuffleUnavailable(false);
   closeOverlay();
   Toast?.info?.('Radio stopped — the queue keeps playing.');
 }
@@ -194,7 +213,7 @@ function closeOverlay() {
 }
 
 async function saveAsPlaylist() {
-  const ids = Player.queue.slice(Player.queueIdx).map(t => t.id).filter(Boolean);
+  const ids = [Player.currentTrack, ...Player.autoUpcoming].map(t => t && t.id).filter(Boolean);
   if (!ids.length) { Toast?.info?.('Nothing to save yet.'); return; }
   try {
     const r = await fetch('/api/playlists', {
@@ -206,7 +225,7 @@ async function saveAsPlaylist() {
       try { msg = (await r.json()).detail || msg; } catch (_) {}
       throw new Error(msg);
     }
-    (Toast?.ok || Toast?.info)?.(`Saved as “Radio · ${_seedLabel}” (${ids.length} tracks).`);
+    (Toast?.ok || Toast?.info)?.(`Saved as “Radio · ${_seedLabel}” (${ids.length} track${ids.length === 1 ? '' : 's'}).`);
     try { Playlist.refresh(); } catch (_) {}
   } catch (e) {
     Toast?.error?.(e.message || 'Could not save the playlist.');
@@ -215,7 +234,9 @@ async function saveAsPlaylist() {
 
 async function maybeRefill(force = false) {
   if (!_active || _refillBusy) return 0;
-  const remaining = Player.queue.length - Player.queueIdx - 1;
+  // Count the radio's OWN tracks ahead: the mix sits right after the current
+  // track, in front of whatever was queued before the session started.
+  const remaining = Player.autoAhead;
   if (!force && remaining >= REFILL_AT) return 0;
   const seed = Player.currentTrack;
   if (!seed || !seed.id) return 0;
@@ -228,7 +249,7 @@ async function maybeRefill(force = false) {
     const have = new Set(Player.queue.map(t => t.id));
     let added = 0;
     for (const t of (Array.isArray(mix) ? mix.slice(1) : [])) {
-      if (t && t.id && !have.has(t.id)) { Player.addToQueue(t); have.add(t.id); added++; }
+      if (t && t.id && !have.has(t.id)) { Player.addToQueue(t, { auto: true }); have.add(t.id); added++; }
     }
     if (added && _overlayOpen()) _renderUpNext();
     return added;

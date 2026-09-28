@@ -8,9 +8,13 @@ rendered tracker-module audio cache.  It carries pre-computed
 per-channel volume samples that the frontend indexes by playback time
 to render true per-channel VU bars.
 
-A VUMR file is produced by ``soniqboom/core/openmpt_vu.py`` during the
-same transcode pass that produces the audio WAV / MP3, using
-``libopenmpt`` via a thin ``ctypes`` binding.
+For tracker modules a VUMR file is produced by
+``soniqboom/core/openmpt_vu.py`` during the same transcode pass that
+produces the audio WAV / MP3, using ``libopenmpt`` via a thin ``ctypes``
+binding.  SID tunes get theirs from ``soniqboom/core/sid_vu.py`` (or from
+the browser's SID worker, which uploads it), and Amiga modules from a
+background uade pass (``soniqboom/core/uade_vu.py``).  All use the layout
+below.
 
 ---
 
@@ -111,12 +115,31 @@ to the final `.vu` path.  Readers never see a partial file.
 
 ## Fallback behaviour
 
-If a VUMR sidecar is absent (legacy cache, no transcode on record,
-libopenmpt unavailable on this host, non-tracker format), the
-`/api/tracks/<id>/vu` endpoint returns HTTP 404.  The frontend
-gracefully falls back to its FFT-spectrum visualiser and labels itself:
+If no VUMR sidecar exists (legacy cache, no transcode on record,
+libopenmpt unavailable on this host, a format without per-voice data),
+`GET /api/tracks/<id>/vu` returns HTTP 404.  For an Amiga track, a miss
+also starts the background per-voice pass, unless the request passes
+`start=0`.  The frontend then shows its FFT-spectrum visualiser with a
+label under the seek bar:
 
-> `Spectrum — per-voice meters not available for <format>`
+* **404 without an `X-VU-Unavailable` header** — meters may still arrive
+  (an Amiga pass pending or running, a SID sidecar still rendering).  For
+  SID and Amiga tracks the label reads
+  `Spectrum — per-voice meters loading…` and the player asks again on a
+  retry schedule.
+* **404 with `X-VU-Unavailable`** — no meters will come for this track,
+  and the player stops asking.  The value says why, and the label follows
+  it:
+
+  | Value         | Meaning                                              | Label |
+  |---------------|------------------------------------------------------|-------|
+  | `off`         | the per-voice VU setting for Amiga modules is off    | `Spectrum — per-voice meters are turned off (Settings → Renderers)` for an admin, `Spectrum — per-voice meters are turned off on this server` for anyone else |
+  | `unsupported` | this uade build can't produce per-voice data          | `Spectrum — per-voice meters not available on this server` |
+  | `skipped`     | this tune's per-voice pass ran without a result       | `Spectrum — per-voice meters not available for this tune` |
+
+Other formats show `Spectrum — per-voice meters not available for <format>`
+straight away, and a `loading…` label turns into that one when the player
+stops waiting.
 
 ---
 

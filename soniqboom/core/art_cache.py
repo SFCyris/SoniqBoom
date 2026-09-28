@@ -169,7 +169,12 @@ async def delete_art_batch(track_ids: list[str]) -> tuple[int, int]:
     if not track_ids:
         return 0, 0
     loop = asyncio.get_event_loop()
+
+    def _chunk(ids: list[str]) -> int:
+        return sum(_delete_art_sync(tid) for tid in ids)
+    # ~256 ids per executor job: one job per id queued 60K futures on the loop.
     freed_list = await asyncio.gather(*(
-        loop.run_in_executor(None, _delete_art_sync, tid) for tid in track_ids
+        loop.run_in_executor(None, _chunk, track_ids[i : i + 256])
+        for i in range(0, len(track_ids), 256)
     ))
     return len(track_ids), sum(freed_list)

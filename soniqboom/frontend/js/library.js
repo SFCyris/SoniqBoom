@@ -133,6 +133,48 @@ async function refreshCurrentFolderInPlace() {
   if (wrap) requestAnimationFrame(() => { try { wrap.scrollTop = scrollY; } catch (_) {} });
 }
 
+// ── Reload the open group / drill / search view in place ──────────────────────
+// An admin action changed tags (a retro-album toggle, "Read game names", a
+// Modland / Demozoo apply): the Albums, Album Artists, Genres, … lists and the
+// drills and searches under them re-read their data, keeping the scroll
+// position and the group filter text.  Each such view records how to open
+// itself again once it has rendered (``_setViewReload``); every view entry
+// clears the record first (setGroupHeader, restoreFullHeader, renderTracks,
+// showFolder, beginView), so it names the view on screen or nothing.
+let _viewReload = null;          // { key, fn }
+let _reloadingView = false;      // a reload is running: no skeleton flash, no focus grab
+function _setViewReload(key, fn) { _viewReload = { key, fn }; }
+async function reloadCurrentView() {
+  const r = _viewReload;
+  if (!r || _reloadingView) return false;
+  const stations = document.getElementById('stations-view');
+  if (stations && !stations.hidden) return false;        // the stations view covers the library
+  const scrollers = ['track-list-wrap', 'album-grid'].map((id) => document.getElementById(id)).filter(Boolean);
+  const tops = scrollers.map((el) => el.scrollTop);
+  const filter = (groupFilterBar && !groupFilterBar.hidden && groupFilterInput) ? groupFilterInput.value : '';
+  _reloadingView = true;
+  try { await r.fn(); } catch (_) { return false; } finally { _reloadingView = false; }
+  if (!_viewReload || _viewReload.key !== r.key) return false;   // the listener moved on meanwhile
+  if (filter && groupFilterInput && groupFilterBar && !groupFilterBar.hidden) {
+    groupFilterInput.value = filter;
+    groupFilterInput.dispatchEvent(new Event('input'));
+  }
+  // Group rows stream in over a few frames: keep asking until the list is
+  // tall enough again (or ~0.5 s passed).
+  scrollers.forEach((el, i) => {
+    const y = tops[i];
+    if (!(y > 0)) return;
+    let tries = 0;
+    const put = () => {
+      if (!_viewReload || _viewReload.key !== r.key) return;
+      el.scrollTop = y;
+      if (el.scrollTop < y - 1 && ++tries < 30) requestAnimationFrame(put);
+    };
+    requestAnimationFrame(put);
+  });
+  return true;
+}
+
 const loadingEl        = document.getElementById('track-loading');
 const browseHdr        = document.getElementById('browse-header');
 const browseCrumb      = document.getElementById('browse-crumb');
@@ -184,6 +226,38 @@ let sortAsc = true;
 // format view keeps filtering by that format.
 let _windowedFilter = null;
 let activeRow = null;
+
+// ── Queue source of the CURRENT track view ────────────────────────────────────
+// When the list on screen is only part of a larger server-side result set (the
+// windowed All-Tracks / format / folder stores, or a drill-down / search that hit
+// its fetch cap), this describes that whole set to the player:
+//
+//   ordered : { url, params }  — page the view's own order (offset/limit)
+//   shuffle : { url, params, seedParam? } — page a seeded permutation of the SAME
+//             filter (see /api/tracks/shuffled)
+//   total   : result-set size when known
+//
+// Player keeps only a small window queued and extends it from here, so Play-all,
+// auto-advance and — crucially — SHUFFLE cover every matching track instead of
+// the rows this list happens to hold.  ``null`` = the array on screen IS the
+// complete set (playlist, album, small folder…): the player handles it locally.
+// Cleared by renderTracks(); each view re-asserts it after rendering.
+let _viewQueueSource = null;
+const SHUFFLE_URL = '/api/tracks/shuffled';
+const QUEUE_WINDOW = 100;     // rows handed to the player up front (it extends itself)
+
+// Source for a drill-down / search list fetched with a cap: only attached when
+// the list is actually truncated — a complete array needs no server round-trips.
+function _setCappedSource(shown, cap, total, shuffleParams, orderedSpec, label) {
+  const truncated = total > 0 ? shown < total : shown >= cap;
+  if (!truncated) { _viewQueueSource = null; return; }
+  _viewQueueSource = {
+    ordered: orderedSpec || null,
+    shuffle: { url: SHUFFLE_URL, params: shuffleParams },
+    total: total > 0 ? total : null,
+    label: label || '',
+  };
+}
 
 // ── Windowed track store (large-library viewing) ──────────────────────────────
 //
@@ -496,6 +570,14 @@ function _renderStars(rating) {
 
 // ── Skeleton loading rows ─────────────────────────────────────────────────────
 function _showSkeletonRows(count = 18) {
+  if (_reloadingView) return;      // the rows on screen stay until the fresh ones replace them
+  // The header (Play all / Shuffle) can already be showing the NEW view while its
+  // rows are still being fetched — without this the buttons play the previous list.
+  currentTracks = [];
+  _viewQueueSource = null;
+  // …and no selection: the selection bar's actions index ``currentTracks``, and a
+  // bar left over from the previous view queued ``undefined`` rows (→ playback crash).
+  _selected.clear(); _lastClickIdx = -1; _focusedIdx = -1; _updateSelectionBar();
   const albumGrid = document.getElementById('album-grid');
   if (albumGrid) albumGrid.hidden = true;
   // Restore the track-list scroll container in case we're arriving from the
@@ -558,8 +640,10 @@ function _updateNavBadge(view, count, truncated = false) {
 
 async function _refreshTrackCount() {
   try {
-    const { count } = await API('/tracks/count');
-    _updateNavBadge('all', count);
+    // ``visible`` = what the All-Tracks list serves (duplicate primaries only when
+    // "hide duplicates" is on); ``count`` is the raw index size.
+    const { count, visible } = await API('/tracks/count');
+    _updateNavBadge('all', visible ?? count);
   } catch {}
 }
 
@@ -978,12 +1062,37 @@ document.addEventListener('themechange', () => {
 // bar (typing in which wiped the results).  Restoring the full header + hiding
 // the group filter/grid toggle first makes search results always look and
 // behave like a proper track list, regardless of where the search was launched.
-function showSearchResults(tracks) {
+const SEARCH_LIMIT = 200;      // keep in sync with search.js (/api/search?limit=)
+// ``reload``: re-runs this search (search.js), so an admin action that changed
+// tags refreshes the results in place (reloadCurrentView).
+function showSearchResults(tracks, query = '', reload = null) {
+  // Keep the Back handler of a previous search in place while the header is
+  // rebuilt, so a second, third… search does not push another history entry.
+  const again = !browseHdr.hidden && browseCrumb.textContent.startsWith('Search: ');
   hideBrowseHeader();
+  if (query) {
+    const n = tracks.length;
+    const coversAll = n >= SEARCH_LIMIT && /[\p{L}\p{N}]/u.test(query);   // same test as the shuffle source below
+    if (again) browseHdr.hidden = false;
+    // At the cap the real number of matches is unknown — don't call 200 "the results".
+    const head = n >= SEARCH_LIMIT
+      ? `Search: ${query} — listing first ${SEARCH_LIMIT} matches`
+      : `Search: ${query} — ${n.toLocaleString()} result${n === 1 ? '' : 's'}`;
+    setBrowseHeader(head + (coversAll ? ' · Shuffle covers all matches' : ''), () => showAll(), n > 0);
+  }
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
   renderTracks(tracks);
+  // A search that hit the result cap matched more than it lists — let shuffle /
+  // play-through reach ALL matches (the list endpoint has no offset, so only the
+  // shuffled order is pageable).
+  // (Text with no letter or digit — "*", "…" — matches nothing in particular; the
+  // server would deal the whole library for it, so such a list shuffles only itself.)
+  if (query && /[\p{L}\p{N}]/u.test(query)) {
+    _setCappedSource(tracks.length, SEARCH_LIMIT, 0, { q: query }, null, `Search: ${query}`);
+  }
+  if (query && typeof reload === 'function') _setViewReload(`search\0${query}`, reload);
 }
 
 async function renderTracks(tracks) {
@@ -1002,6 +1111,8 @@ async function renderTracks(tracks) {
   // flag after it renders.  Keeps isInAllTracksView() honest for the post-scan
   // refresh gate.
   _viewIsAllTracks = false;
+  _viewQueueSource = null;   // views re-assert their queue source after rendering
+  _viewReload = null;        // …and their reload (see reloadCurrentView)
   _selected.clear();
   _lastClickIdx = -1;
   _focusedIdx   = -1;
@@ -1102,7 +1213,7 @@ function _azGroupInitial(it, key) {
 }
 function _jumpToLetter(ch) {
   const wrap = document.getElementById('track-list-wrap');
-  if (!wrap) return;
+  if (!wrap || _viewLoading()) return;
   const trackN = (currentTracks && (currentTracks._total || currentTracks.length)) || 0;
   if (trackN > 0) {
     // Track list.
@@ -1498,8 +1609,10 @@ tbody.addEventListener('mouseover', (e) => {
     // Only prewarm the renders that are actually slow-cold — native audio
     // needs none, and gating here keeps the server's render slots for the
     // formats that benefit (chiptune/AdLib/UADE exotica).
+    // ``pw``: this page's prewarm tag, so the player's retain (which drops
+    // prewarms for tracks no longer coming up) can drop this one too.
     if (isRenderOnlyDuration(t)) {
-      fetch(`/api/stream/${encodeURIComponent(t.id)}/prewarm`,
+      fetch(`/api/stream/${encodeURIComponent(t.id)}/prewarm?pw=${encodeURIComponent(Player.prewarmId || '')}`,
             { method: 'POST' }).catch(() => {});
     }
   }, 120);
@@ -1634,9 +1747,13 @@ function markPlayingRow() {
 // "Locate now-playing": scroll the current track list to the playing row and
 // pulse it.  Works for plain arrays and the windowed store (whose findIndex
 // searches loaded chunks); if the track isn't in this view, says so.
+// The view's rows are still being fetched (skeleton on screen).
+function _viewLoading() { return !!tbody.firstElementChild?.classList.contains('skeleton'); }
+
 function locateNowPlaying() {
   const id = Player.currentTrackId;
   if (!id) { window.Toast?.info?.('Nothing is playing.'); return; }
+  if (_viewLoading()) { window.Toast?.info?.('Still loading this view \u2014 try again in a moment.'); return; }
   let idx = -1;
   if (currentTracks && typeof currentTracks.findIndex === 'function') {
     idx = currentTracks.findIndex(t => t && t.id === id);
@@ -1656,28 +1773,47 @@ function locateNowPlaying() {
   });
 }
 
-function playFrom(idx) {
-  // For a plain array (small libraries, group views, search results, etc.)
-  // the queue IS the full list — Player handles auto-next from the array.
-  // For the WindowedTrackStore (large All-Tracks view) we can't pass the
-  // 267 000-entry proxy as the queue — Player would iterate it and force
-  // every chunk to load.  Instead, slice the currently-loaded contiguous
-  // window starting at ``idx`` and queue THAT.  When the user's auto-next
-  // reaches the end of that window, the played-track listener can extend
-  // the queue further from the store.  This is the same lazy-queue model
-  // Spotify / Apple Music use for "Songs" view in large libraries.
+function playFrom(idx, o = {}) {
+  const explicit = o.explicit !== false;     // false: "Play all" — an unplayable first row is skipped, not reported-and-left
+  // A view that is only PART of a larger result set (windowed store, capped
+  // drill-down / search) hands the player a small window plus its queue source;
+  // the player then extends the queue itself — forwards through the list, or
+  // through a seeded shuffle of the WHOLE set when shuffle is on.  (It used to
+  // get a fixed 500-row slice and nothing else, so shuffle only ever picked
+  // inside those 500 and sequential play looped back after them.)
+  const src = _viewQueueSource;
   if (currentTracks && currentTracks._isWindowedStore) {
-    // 500 lookahead is plenty: at typical track lengths that's 30+ hours
-    // of music in the queue.  If the user keeps it playing for that long
-    // the ``played`` event handler extends.  We also kick off background
-    // chunk loads ahead so auto-next can keep flowing without bursts of
-    // skeleton placeholders.
-    currentTracks.ensureRange(idx, idx + 500);
-    const queue = currentTracks.loadedSliceFrom(idx, 500);
-    if (queue.length) Player.setQueue(queue, 0);
-    return;
+    const slice = currentTracks.loadedSliceFrom(idx, QUEUE_WINDOW);
+    if (slice.length) {
+      Player.setQueue(slice, 0, src ? { source: { ...src, offset: idx }, explicit } : { explicit });
+      return true;
+    }
+    // Row not in memory (chunk evicted, or never scrolled to — e.g. "Play all"
+    // after scrolling deep): fetch the window straight from the source instead
+    // of silently doing nothing.
+    if (src && src.ordered) {
+      return Player.playSource(src, { offset: idx, explicit }).then((ok) => {
+        if (ok === false) window.Toast?.error?.('Couldn\u2019t start playback \u2014 try again.');
+        return ok;                                   // null = superseded by a newer click: not an error
+      });
+    } else {
+      currentTracks.ensureRange(idx, idx + QUEUE_WINDOW);
+      window.Toast?.info?.('Still loading this view \u2014 try again in a moment.');
+    }
+    return false;
   }
-  Player.setQueue(currentTracks, idx);
+  // Capped list the server can page in this very order (a drill-down as fetched,
+  // row index = server offset): same small window as above — not 2,000 rows in the
+  // queue panel and in localStorage.
+  if (src && src.ordered) {
+    Player.setQueue(currentTracks.slice(idx, idx + QUEUE_WINDOW), 0,
+                    { source: { ...src, offset: idx }, explicit });
+    return true;
+  }
+  // Otherwise the queue IS the list.  A capped list without an ordered endpoint
+  // (search, client-sorted) still carries its source so SHUFFLE reaches every match.
+  Player.setQueue(currentTracks, idx, src ? { source: { ...src, offset: 0 }, explicit } : { explicit });
+  return true;
 }
 
 // ── Sort persistence — save/restore sort column + direction ──────────────────
@@ -1784,6 +1920,7 @@ function _onSortHeaderClick(th) {
   // it), or a *sorted* All-Tracks view would silently stop receiving the
   // post-scan in-place refresh (isInAllTracksView would read false).
   const wasAllTracks = _viewIsAllTracks;
+  if (_viewLoading()) return;              // nothing to sort yet (would flash "No tracks found")
 
   if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
   document.querySelectorAll('th[data-sort]').forEach(t => {
@@ -1801,9 +1938,13 @@ function _onSortHeaderClick(th) {
   }
 
   // Small-library path: client-side sort over the full in-memory array.
+  const keepSrc = _viewQueueSource;
   const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
   renderTracks(sorted);
   _viewIsAllTracks = wasAllTracks;
+  // A capped list sorted in the browser no longer matches the server's page
+  // order, so sequential extension is off — shuffle still covers the whole set.
+  if (keepSrc) _viewQueueSource = { ...keepSrc, ordered: null };
 }
 
 document.querySelectorAll('#track-table th[data-sort]').forEach(th => {
@@ -1841,6 +1982,7 @@ function setGroupHeader(label) {
   // with the old folder's tracks by its in-flight background scan.
   _viewIsAllTracks = false;
   _currentBrowsePath = null;
+  _viewReload = null;          // the view entering records its own reload once rendered
   // Hide the PREVIOUS group view's filter bar synchronously on entering a new
   // group view, so it doesn't linger through this view's async data load —
   // navigating e.g. Scene groups → Genres used to keep the stale "Filter scene
@@ -1886,6 +2028,7 @@ function restoreFullHeader() {
   // back to All Tracks.  showAll re-asserts the flag true after its own render, so
   // clearing it here (before that) is safe.
   _viewIsAllTracks = false;
+  _viewReload = null;          // (see reloadCurrentView)
   _rebuildTrackHeader();
   _restoreSortState();  // restore sortKey/sortAsc STATE + aria baseline (no paint)
 }
@@ -2017,6 +2160,7 @@ const WINDOWED_SORT_KEYS = new Set([
 async function showAll() {
   const _gen = ++_browseNavGen;
   hideBrowseHeader();
+  setBrowseHeader('All Tracks', null);      // Play all / Shuffle, no Back (root view)
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
@@ -2029,8 +2173,11 @@ async function showAll() {
   // 5000 rows we may not even render.
   let total = 0;
   try {
-    const { count } = await API('/tracks/count');
-    total = Number(count) || 0;
+    // Size the list from ``visible``, not the raw ``count``: with "hide
+    // duplicates" on, /tracks only serves primaries, and a store sized from the
+    // raw total ends in thousands of rows that can never load.
+    const { count, visible } = await API('/tracks/count');
+    total = Number(visible ?? count) || 0;
   } catch { /* fall through to legacy path */ }
   if (_gen !== _browseNavGen) return;   // a newer view was requested while probing the count
 
@@ -2109,6 +2256,18 @@ function _rebuildWindowedStore(total, sortBy, sortOrder) {
   const wrap = document.getElementById('track-list-wrap');
   if (wrap) wrap.scrollTop = 0;
   renderTracks(store);
+  // The player pages this same list (same sort + filter) for sequential play, and
+  // its seeded permutation for shuffle — across ALL ``total`` tracks.
+  const viewParams = {};
+  if (sortBy)    viewParams.sort  = sortBy;
+  if (sortOrder) viewParams.order = sortOrder;
+  if (_windowedFilter) Object.assign(viewParams, _windowedFilter);
+  _viewQueueSource = {
+    ordered: { url: '/api/tracks', params: viewParams },
+    shuffle: { url: SHUFFLE_URL, params: _windowedFilter ? { ..._windowedFilter } : {} },
+    total,
+    label: _windowedFilter?.format ? `Format: ${_windowedFilter.format}` : 'All Tracks',
+  };
 }
 
 async function showArtists() {
@@ -2127,6 +2286,7 @@ async function showArtists() {
       showAlbums(item.artist, null, 'artist');
     }
   });
+  _setViewReload('artists', () => showArtists());
 }
 
 async function showAlbumArtists() {
@@ -2146,6 +2306,7 @@ async function showAlbumArtists() {
       showAlbums(null, item.album_artist, 'album_artist');
     }
   });
+  _setViewReload('album-artists', () => showAlbumArtists());
 }
 
 async function showAlbums(artist = null, albumArtist = null, backView = null) {
@@ -2191,6 +2352,7 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
       showAlbumTracks(item.artist, item.album_artist, item.album, backTo);
     }
   });
+  _setViewReload(`albums\0${artist || ''}\0${albumArtist || ''}`, () => showAlbums(artist, albumArtist, backView));
 }
 
 async function showUntaggedTracks(field, label, backFn, total = 0) {
@@ -2205,6 +2367,12 @@ async function showUntaggedTracks(field, label, backFn, total = 0) {
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   const filtered = all.filter(t => !t[field] || !t[field].toString().trim());
   renderTracks(filtered);
+  // Only the first 5,000 tracks were examined, so the list is partial whenever the
+  // library is bigger.  SHUFFLE deals from the server's full "tag is blank" set;
+  // list-order play covers the rows shown (no ordered endpoint for a blank tag).
+  _setCappedSource(filtered.length, all.length >= 5000 ? 0 : Infinity, total,
+                   { untagged: field }, null, label);
+  _setViewReload(`untagged\0${field}`, () => showUntaggedTracks(field, label, backFn, total));
   // This drill fetches only the first 5,000 tracks and filters client-side, so a
   // large untagged set (e.g. 200k+ mod/SID files with no album-artist) is shown
   // only partially.  Disclose the shortfall in the crumb like every other capped
@@ -2237,7 +2405,14 @@ async function showAlbumTracks(artist, albumArtist, album, backFn) {
     return ta - tb;
   });
   renderTracks(tracks);
+  {
+    const f = { album };
+    if (albumArtist) f.album_artist = albumArtist; else if (artist) f.artist = artist;
+    _setCappedSource(tracks.length, _DRILL_LIMIT, 0, f, null, label);
+  }
   _noteDrillCap(tracks.length);            // album total unknown here → generic cue if capped
+  _setViewReload(`album\0${artist || ''}\0${albumArtist || ''}\0${album || ''}`,
+                 () => showAlbumTracks(artist, albumArtist, album, backFn));
 }
 
 // "Go to artist" — every track by this artist as a track list.  Used by the
@@ -2252,7 +2427,10 @@ async function showArtistTracks(artist, backFn) {
   const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, artist });
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { artist },
+                   { url: '/api/search/filter', params: { artist } }, `Artist: ${artist}`);
   _noteDrillCap(tracks.length);            // artist total unknown here → generic cue if capped
+  _setViewReload(`artist\0${artist}`, () => showArtistTracks(artist, backFn));
 }
 
 // Flat track list for an album-artist.  Mirrors showArtistTracks; used as the
@@ -2268,7 +2446,11 @@ async function showAlbumArtistTracks(albumArtist, backFn) {
   const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, album_artist: albumArtist });
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { album_artist: albumArtist },
+                   { url: '/api/search/filter', params: { album_artist: albumArtist } },
+                   `Album Artist: ${albumArtist}`);
   _noteDrillCap(tracks.length);
+  _setViewReload(`album-artist\0${albumArtist}`, () => showAlbumArtistTracks(albumArtist, backFn));
 }
 
 // Snapshot the current view so a "Go to …" navigation can offer a Back that
@@ -2278,13 +2460,16 @@ async function showAlbumArtistTracks(albumArtist, backFn) {
 function _snapshotCurrentView() {
   if (Array.isArray(currentTracks)) {
     const snap = currentTracks.slice();
+    const snapSrc = _viewQueueSource;
     const hdrLabel = browseCrumb.textContent;
     const wasHidden = browseHdr.hidden;
+    const wasPlayable = !_playAllBtn || !_playAllBtn.hidden;   // a "0 results" header has no Play all / Shuffle
     const backOnClick = browseBack.onclick;
     return () => {
       renderTracks(snap);
+      _viewQueueSource = snapSrc;
       if (wasHidden) hideBrowseHeader();
-      else setBrowseHeader(hdrLabel, backOnClick);
+      else setBrowseHeader(hdrLabel, backOnClick, wasPlayable);
     };
   }
   return () => showAll();
@@ -2313,6 +2498,7 @@ async function showGenres() {
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('genres', genres.length);
   renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => showGenreTracks(item.genre, item.count));
+  _setViewReload('genres', () => showGenres());
 }
 
 // Drill-down fetch ceiling — the /search/filter endpoint's `le` bound.  The
@@ -2333,13 +2519,13 @@ function _noteDrillCap(shown, total = 0) {
   let note = '';
   if (total > 0) {
     if (shown >= total) return;
-    note = ` — showing first ${shown.toLocaleString()} of ${total.toLocaleString()} (refine to narrow)`;
+    note = ` — listing first ${shown.toLocaleString()} of ${total.toLocaleString()} · Shuffle covers all matches`;
   } else if (shown >= _DRILL_LIMIT) {
-    note = ` — showing first ${shown.toLocaleString()} (refine to narrow)`;
+    note = ` — listing first ${shown.toLocaleString()} · Shuffle covers all matches`;
   } else {
     return;
   }
-  try { browseCrumb.textContent += note; } catch (_) { /* crumb missing — non-fatal */ }
+  try { browseCrumb.textContent += note; browseCrumb.title = browseCrumb.textContent; } catch (_) { /* crumb missing — non-fatal */ }
 }
 
 async function showGenreTracks(genre, total = 0) {
@@ -2352,7 +2538,10 @@ async function showGenreTracks(genre, total = 0) {
   const tracks = await API('/search/filter', { genre, limit: _DRILL_LIMIT });
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, total, { genre },
+                   { url: '/api/search/filter', params: { genre } }, `Genre: ${genre}`);
   _noteDrillCap(tracks.length, total);
+  _setViewReload(`genre\0${genre}`, () => showGenreTracks(genre, total));
 }
 
 async function showYears() {
@@ -2365,6 +2554,7 @@ async function showYears() {
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   _updateNavBadge('years', years.length);
   renderGroupList(years, 'year', 'count', 'Tracks', (item) => showYearTracks(item.year, item.count));
+  _setViewReload('years', () => showYears());
 }
 
 async function showSceneGroups() {
@@ -2378,6 +2568,7 @@ async function showSceneGroups() {
   _updateNavBadge('scene_groups', groups.length);
   renderGroupList(groups, 'scene_group', 'count', 'Tracks',
                   (item) => showSceneGroupTracks(item.scene_group, item.count));
+  _setViewReload('scene-groups', () => showSceneGroups());
 }
 
 async function showSceneGroupTracks(scene_group, total = 0) {
@@ -2393,7 +2584,11 @@ async function showSceneGroupTracks(scene_group, total = 0) {
   const tracks = await API('/search/filter', { scene_group, limit: _DRILL_LIMIT });
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, total, { scene_group },
+                   { url: '/api/search/filter', params: { scene_group } },
+                   `Scene group: ${scene_group}`);
   _noteDrillCap(tracks.length, total);
+  _setViewReload(`scene-group\0${scene_group}`, () => showSceneGroupTracks(scene_group, total));
 }
 
 // ── Library Galaxy view (viz #6) ──────────────────────────────────────────
@@ -2492,7 +2687,11 @@ async function showYearTracks(year, total = 0) {
   const tracks = await API('/search/filter', { year_min: year, year_max: year, limit: _DRILL_LIMIT });
   if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
   renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, total, { year_min: year, year_max: year },
+                   { url: '/api/search/filter', params: { year_min: year, year_max: year } },
+                   `Year: ${year}`);
   _noteDrillCap(tracks.length, total);
+  _setViewReload(`year\0${year}`, () => showYearTracks(year, total));
 }
 
 // ── Grid toggle helpers ────────────────────────────────────────────────────────
@@ -2556,11 +2755,18 @@ async function _playAlbumItem(item) {
   const name = item.label || item.album || '—';
   const artist = item.artist || item.album_artist || '';
   try {
-    const params = new URLSearchParams({ album: name, limit: '2000' });
+    const params = new URLSearchParams({ album: name, limit: String(_DRILL_LIMIT) });
     if (artist) params.set('artist', artist);
     const tracks = await fetch(`/api/search/filter?${params}`).then(r => r.json());
     if (Array.isArray(tracks) && tracks.length) {
-      Player.setQueue(tracks, 0);
+      // An "album" that hit the fetch cap (a 60K-file catch-all bucket) matched
+      // more than it returned — same capped-list source as the album drill-down.
+      const filter = { album: name };
+      if (artist) filter.artist = artist;
+      const source = tracks.length >= _DRILL_LIMIT
+        ? { ordered: null, shuffle: { url: SHUFFLE_URL, params: filter }, total: null, label: name }
+        : null;
+      Player.setQueue(tracks, 0, source ? { source } : {});
       window.Toast?.ok?.(`Playing ${name}`);
     } else {
       window.Toast?.warn?.('No tracks found for this album.');
@@ -2735,7 +2941,8 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
       };
       // ``preventScroll`` keeps the freshly-opened group view from
       // jumping if the filter input was previously below the viewport.
-      setTimeout(() => groupFilterInput.focus({ preventScroll: true }), 50);
+      // (Not on a reload: the listener is busy elsewhere, e.g. in Settings.)
+      if (!_reloadingView) setTimeout(() => groupFilterInput.focus({ preventScroll: true }), 50);
     }
   } else {
     browseFilterWrap.hidden = true;
@@ -2849,32 +3056,83 @@ browseFilter.addEventListener('keydown', (e) => {
 
 // ── Browse header helpers ─────────────────────────────────────────────────────
 // ── Play-all / Shuffle-all (browse header) ───────────────────────────────────
-function _shuffleInPlace(a) {
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-// Start playing the CURRENT track list (the view's whole result set), optionally
-// shuffled.  Handles both the plain-array browse views (album/genre/year/…, ≤500)
-// and the windowed All-Tracks store (queues the bounded lookahead from 0, same
-// model as playFrom / double-click; shuffle flips Player shuffle so next() picks
-// randomly within the queued window).
+// Start playing the CURRENT view's whole result set, optionally shuffled.
+//   • Shuffle → the player turns shuffle ON and starts on a RANDOM track drawn
+//     from the entire set: server-side for a view with a queue source (any size —
+//     all 75 000 tracks of a big library are reachable), locally for a complete
+//     array.
+//   • Play → from the first track, in list order.
 function _playAll(shuffle) {
   const store = currentTracks;
-  if (store && store._isWindowedStore) {
-    if (shuffle && !Player.shuffle) { try { Player.toggleShuffle(); } catch (_) {} }
-    playFrom(0);
-  } else if (Array.isArray(store) && store.length) {
-    const q = shuffle ? _shuffleInPlace(store.slice()) : store;
-    Player.setQueue(q, 0);
-    window.Toast?.ok?.(shuffle ? 'Shuffling' : 'Playing');
+  const src = _viewQueueSource;
+  const playable = store && (store._isWindowedStore || (Array.isArray(store) && store.length));
+  if (!playable) { window.Toast?.info?.(_viewLoading() ? 'Still loading this view \u2014 try again in a moment.' : 'Nothing to play in this view.'); return; }
+  if (shuffle && src && src.shuffle) {
+    // ``rows``: a list without an ordered endpoint can only get its list order
+    // back (shuffle switched off later) from the rows shown here.
+    const rows = (!src.ordered && Array.isArray(store)) ? store : null;
+    // A cold deal of a big library takes a few hundred ms: show that the click
+    // registered (and stop a second one) instead of sitting there unchanged.
+    // (aria-busy only — the flag is what stops the second click.  ``disabled``
+    // drops keyboard focus, and the global [aria-disabled] rule forces a
+    // not-allowed cursor + pointer-events:none, which reads as "broken".)
+    if (_shuffleDealing) return;
+    _shuffleDealing = true;
+    if (_shuffleAllBtn) _shuffleAllBtn.setAttribute('aria-busy', 'true');
+    const deal = ++_shuffleDealId;
+    const release = () => {
+      if (deal !== _shuffleDealId) return;      // a newer deal owns the button now
+      _shuffleDealing = false;
+      if (_shuffleAllBtn) _shuffleAllBtn.removeAttribute('aria-busy');
+    };
+    // The player gives up on a page that never answers (PAGE_TIMEOUT_MS) and
+    // resolves false → the toast below.  This timer is only the backstop for a
+    // browser without AbortSignal.timeout: the button must not stay dead for the
+    // session.  A second click supersedes the stuck deal (it resolves null).
+    let reported = false;
+    const bail = setTimeout(() => {
+      if (deal !== _shuffleDealId) return;
+      reported = true;
+      release();
+      window.Toast?.error?.('Couldn\u2019t start shuffle \u2014 try again.');
+    }, SHUFFLE_DEAL_BAIL_MS);
+    Player.playSource(src, { shuffle: true, rows }).then((ok) => {
+      if (ok) window.Toast?.ok?.(_shuffleScopeText(src));
+      else if (ok === false && !reported) window.Toast?.error?.('Couldn\u2019t start shuffle \u2014 try again.');
+    }).finally(() => { clearTimeout(bail); release(); });
+    return;
   }
+  // One confirmation, and only once something actually started: playFrom answers
+  // true / false, or a promise when it has to fetch the first rows (null = a newer
+  // click took over — say nothing).
+  let started = true;
+  if (store._isWindowedStore || !shuffle) {
+    started = playFrom(0, { explicit: false });               // windows the queue where it can
+  } else {
+    Player.setQueue(store, 0, { shuffle: true });             // a complete list: deal all of it
+  }
+  Promise.resolve(started).then((ok) => {
+    if (!ok) return;
+    // No shuffle source for this view: deal what is queued — but only once the
+    // NEW queue is in place (playFrom may have had to fetch its first rows).
+    if (shuffle && !Player.shuffle) Player.toggleShuffle();
+    if (shuffle) window.Toast?.ok?.('Shuffling this view.');
+  });
+}
+
+// "Shuffling all 251,026 tracks" — the one place the listener is told that the
+// shuffle covers the whole view, not the rows on screen.
+function _shuffleScopeText(src) {
+  const total = Player.queueSource?.total ?? src?.total;
+  const n = typeof total === 'number' && total > 0 ? `${total.toLocaleString()} tracks` : 'every matching track';
+  const label = src?.label && src.label !== 'All Tracks' ? ` \u00b7 ${src.label}` : '';
+  return `Shuffling ${src?.label === 'All Tracks' ? 'all ' : ''}${n}${label}.`;
 }
 
 let _playAllBtn = null, _shuffleAllBtn = null;
+let _shuffleDealing = false;       // a "Shuffle all" request is in flight
+let _shuffleDealId = 0;
+const SHUFFLE_DEAL_BAIL_MS = 25000; // backstop only — the player times a page out after 20 s
 function _ensurePlayAllBtns() {
   if (_playAllBtn) return;
   _playAllBtn = document.createElement('button');
@@ -2882,6 +3140,7 @@ function _ensurePlayAllBtns() {
   _playAllBtn.className = 'browse-play-btn';
   _playAllBtn.type = 'button';
   _playAllBtn.textContent = '▶ Play all';
+  _playAllBtn.setAttribute('aria-label', 'Play all');
   _playAllBtn.title = 'Play all (P)';
   _playAllBtn.addEventListener('click', () => _playAll(false));
   _shuffleAllBtn = document.createElement('button');
@@ -2889,26 +3148,51 @@ function _ensurePlayAllBtns() {
   _shuffleAllBtn.className = 'browse-play-btn';
   _shuffleAllBtn.type = 'button';
   _shuffleAllBtn.textContent = '⤮ Shuffle';
+  _shuffleAllBtn.setAttribute('aria-label', 'Shuffle all');
   _shuffleAllBtn.title = 'Shuffle all (Shift+P)';
   _shuffleAllBtn.addEventListener('click', () => _playAll(true));
+  // The view sets its queue source AFTER the header, so say what Shuffle covers
+  // when the pointer / focus gets there.
+  _shuffleAllBtn.addEventListener('pointerenter', _paintShuffleAllTitle);
+  _shuffleAllBtn.addEventListener('focus', _paintShuffleAllTitle);
   // Lead the header: Play · Shuffle · crumb · … · Back.
   browseHdr.insertBefore(_shuffleAllBtn, browseHdr.firstChild);
   browseHdr.insertBefore(_playAllBtn, browseHdr.firstChild);
 }
 
 function setBrowseHeader(label, backFn, playable = true) {
-  const wasHidden = browseHdr.hidden;
+  // "Header hidden" no longer means "root view" (All Tracks has a header too), so
+  // decide from whether there already was something to go back to.
+  const hadBack = !browseHdr.hidden && typeof browseBack.onclick === 'function';
   browseHdr.hidden = false;
   browseCrumb.textContent = label;
-  browseBack.onclick = backFn;
+  browseCrumb.title = label;               // the crumb ellipsises when it is long
+  // A root view (All Tracks) has nowhere to go back to: it still gets the header
+  // — that is where Play all / Shuffle live — just without the Back button.
+  const hasBack = typeof backFn === 'function';
+  browseBack.onclick = hasBack ? backFn : null;
+  browseBack.hidden = !hasBack;
   _hideExportBtn();
   _ensurePlayAllBtns();
   // Only track-list views are "playable"; group/grid drill-in crumbs are not.
   _playAllBtn.hidden = !playable;
   _shuffleAllBtn.hidden = !playable;
+  _paintShuffleAllTitle();
   // Browser-Back integration (#7): push one history entry on entering a browse
   // depth so the system Back button pops up one level instead of leaving the app.
-  if (wasHidden) { try { history.pushState({ sbBrowse: true }, ''); } catch (_) {} }
+  if (hasBack && !hadBack) { try { history.pushState({ sbBrowse: true }, ''); } catch (_) {} }
+}
+
+// Say what Shuffle covers: a capped list shuffles every MATCHING track, not just
+// the rows listed (the crumb's "showing first N" describes the list only).
+function _paintShuffleAllTitle() {
+  if (!_shuffleAllBtn) return;
+  const src = _viewQueueSource;
+  const n = src && typeof src.total === 'number' && src.total > 0 ? src.total : 0;
+  _shuffleAllBtn.title = (src && src.shuffle)
+    ? (n ? `Shuffle all ${n.toLocaleString()} matching tracks (Shift+P)`
+         : 'Shuffle all matching tracks (Shift+P)')
+    : 'Shuffle all (Shift+P)';
 }
 
 // System Back: while a browse view is open, go UP one level (its Back handler)
@@ -2921,6 +3205,16 @@ window.addEventListener('popstate', () => {
     fn();
   }
 });
+// Is a dialog actually ON SCREEN?  Class / attribute tests are not enough: the
+// Stations info panel is a permanent role="dialog" that is hidden by its PARENT's
+// CSS, and the shortcuts sheet has no role at all.  (Runs on a keypress only.)
+function _modalOpen() {
+  for (const el of document.querySelectorAll('.pl-modal-backdrop, [role="dialog"], #admin-overlay, #shortcuts-overlay')) {
+    if (el.getClientRects().length) return true;
+  }
+  return false;
+}
+
 function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); _currentBrowsePath = null; }
 
 // Keyboard: P = Play all, Shift+P = Shuffle all — whenever a playable track list
@@ -2928,7 +3222,8 @@ function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _
 document.addEventListener('keydown', (e) => {
   if ((e.key !== 'p' && e.key !== 'P') || e.metaKey || e.ctrlKey || e.altKey) return;
   const el = document.activeElement;
-  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+  if (_modalOpen()) return;                // never play "behind" an open dialog
   const playable = currentTracks && (currentTracks._isWindowedStore ||
     (Array.isArray(currentTracks) && currentTracks.length));
   if (!playable) return;
@@ -2941,7 +3236,8 @@ document.getElementById('btn-locate')?.addEventListener('click', locateNowPlayin
 document.addEventListener('keydown', (e) => {
   if ((e.key !== 'g' && e.key !== 'G') || e.metaKey || e.ctrlKey || e.altKey) return;
   const el = document.activeElement;
-  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+  if (_modalOpen()) return;
   e.preventDefault();
   locateNowPlaying();
 });
@@ -3288,6 +3584,7 @@ async function showFolder(path, recursive = false, opts = {}) {
   // own — a quiet refresh landing under a genre list would wipe it otherwise.)
   const _gen = opts.quiet ? _browseNavGen : ++_browseNavGen;
   _currentBrowsePath = path;
+  _viewReload = null;         // a folder refreshes its own way (refreshCurrentFolderInPlace)
   _viewIsAllTracks = false;   // a folder is never All Tracks — keep both flags consistent
                               // (showFolder doesn't call restoreFullHeader, which is where
                               // the other flat-track views clear this)
@@ -3351,7 +3648,7 @@ async function showFolder(path, recursive = false, opts = {}) {
     try {
       first = await fetch(
         `/api/fstree/tracks-with-meta?path=${enc}&recursive=false` +
-        `&offset=0&limit=${CHUNK_SIZE}&filter_duplicates=true`,
+        `&offset=0&limit=${CHUNK_SIZE}`,       // no filter_duplicates → the server applies the setting
       ).then(r => r.json());
     } catch {
       loadingEl.hidden = true;
@@ -3422,8 +3719,9 @@ async function showFolder(path, recursive = false, opts = {}) {
  * Folder duplicate-collapsing is OWNED BY THE SERVER: we pass no
  * ``filter_duplicates`` param, so the endpoint resolves the
  * ``dedup_folders`` config toggle (Settings → "Hide duplicates when
- * browsing folders"; default off → folder views show every audio file on
- * disk).  Resolving it server-side means ``total`` and every chunk read
+ * browsing folders"; default on).  That holds for a single folder and for a
+ * flattened parent alike — the web UI used to force dedup on for single folders,
+ * which made the checkbox do nothing there.  Resolving it server-side means ``total`` and every chunk read
  * the same setting, so the windowed scroll stays consistent.  (Empty
  * folders are hidden separately via ``hide_empty_folders`` +
  * ``_has_audio`` — directory-level, not track-level dedup.)
@@ -3440,13 +3738,9 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
     if (t.dataset.sort) t.setAttribute('aria-sort', 'none');
   });
   const enc = encodeURIComponent(path);
-  // Non-recursive (a single leaf folder with thousands of direct tracks, e.g.
-  // an archive bucket) collapses duplicate groups server-side, matching the
-  // old shallow-listing behaviour; recursive flattens uses the config default.
-  const extra = recursive ? '' : '&filter_duplicates=true';
   const urlFor = (off, lim) =>
     `/api/fstree/tracks-with-meta?path=${enc}&recursive=${recursive}` +
-    `&offset=${off}&limit=${lim}${extra}`;
+    `&offset=${off}&limit=${lim}`;
   let firstRes = prefetched;
   if (!firstRes) {
     try {
@@ -3504,6 +3798,16 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   const wrap = document.getElementById('track-list-wrap');
   if (wrap) wrap.scrollTop = 0;
   renderTracks(store);
+  // Same endpoint + params as the chunk fetcher above, so the player's queue is
+  // exactly this listing (stubs, remote paths, the dedup setting) — in folder
+  // order for sequential play, or as its seeded permutation for shuffle.
+  const folderParams = { path, recursive: String(recursive) };
+  _viewQueueSource = {
+    ordered: { url: '/api/fstree/tracks-with-meta', params: folderParams },
+    shuffle: { url: '/api/fstree/tracks-with-meta', params: folderParams, seedParam: 'shuffle_seed' },
+    total,
+    label: path.split('/').filter(Boolean).pop() || path,    // display only — the crumb shows the folder name too
+  };
 }
 
 /**
@@ -3523,7 +3827,9 @@ function _renderBranchEmpty(path) {
   renderTracks([]);
 
   const folderName = path.split('/').filter(Boolean).pop() || path;
-  const safeName   = String(folderName).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Escaped for text AND the title attribute (a folder may be named with quotes).
+  const safeName   = String(folderName).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   emptyEl.innerHTML = `
     <span class="empty-icon" aria-hidden="true">&#128193;</span>
     <h4>${safeName} has no direct music files</h4>
@@ -3831,8 +4137,13 @@ async function _probeVisibleAdlibDurations() {
 // the cached track object in place; the server persists the same value via
 // backfill, so a later folder re-fetch stays consistent.  Gated on the 180s
 // placeholder, so it never overwrites a real or duration-capped (SID/GME) value.
-function patchTrackDuration(id, seconds) {
-  if (!id || !isFinite(seconds) || seconds <= 0 || !tbody) return;
+// A row's length is its DEFAULT tune's: a subsong's length (``subsong`` > 0)
+// never lands on it, and nor does anything over 12 h (a growing render's
+// provisional header, not a length).
+const _MAX_PATCH_SEC = 12 * 3600;
+function patchTrackDuration(id, seconds, subsong = 0) {
+  if (!id || !isFinite(seconds) || seconds <= 0 || seconds > _MAX_PATCH_SEC || !tbody) return;
+  if (Number(subsong) > 0) return;
   const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
   const row = tbody.querySelector(`tr[data-id="${sel}"]`);
   if (!row) return;                       // only a currently-visible row
@@ -3856,8 +4167,52 @@ function patchTrackDuration(id, seconds) {
   }
 }
 
+// Mirror a Track Info save (PUT /tags, /meta, /year) into the view on screen.
+// Every loaded copy of the track in the current list takes the new fields (an
+// array, or a windowed store's loaded chunks — an evicted chunk re-fetches
+// fresh when scrolled back to), and its visible row(s) are re-filled in place,
+// keeping the row's state classes (playing / selected / focused).  A track list
+// is not re-fetched, re-sorted or re-entered, so the scroll position, the nav
+// token and the view flags stay as they are — and the edited row stays where it
+// is even when it no longer fits the list (renamed out of an album drill, a
+// sorted column).  (The folder view's own in-place refresh can't do this: it
+// keeps its rows when the track ids are unchanged.)  With no track rows on
+// screen — a group list (Albums, Artists, …), or an empty drill / search — an
+// edit to any of _GROUPING_FIELDS re-reads a view that can re-open itself, in
+// place (reloadCurrentView keeps its scroll + filter).
+const _GROUPING_FIELDS = ['artist', 'album_artist', 'album', 'genre', 'year'];
+function patchTrack(id, fields) {
+  if (!id || !fields || typeof fields !== 'object') return;
+  const list = currentTracks;
+  if (!list || !list.length) {
+    if (_viewReload && _GROUPING_FIELDS.some((k) => k in fields)) reloadCurrentView();
+    return;
+  }
+  const apply = (t) => { if (t && t.id === id) Object.assign(t, fields); };
+  if (list._isWindowedStore) {
+    for (const arr of list._chunks.values()) arr.forEach(apply);
+  } else if (Array.isArray(list)) {
+    list.forEach(apply);
+  }
+  if (!tbody) return;
+  // A windowed row is read from its loaded chunk directly — indexing the store
+  // would re-fetch a chunk evicted since the row was painted.
+  const at = list._isWindowedStore
+    ? (i) => list._chunks.get(Math.floor(i / CHUNK_SIZE))?.[i % CHUNK_SIZE]
+    : (i) => list[i];
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+  tbody.querySelectorAll(`tr[data-id="${sel}"]`).forEach((row) => {
+    const idx = parseInt(row.dataset.idx, 10);
+    const t = (idx >= 0 && idx < list.length) ? at(idx) : null;
+    if (!t || t.id !== id) return;
+    const cls = row.className;            // _fillTrackRow resets it; an edit changes no state class
+    _fillTrackRow(row, t, idx);
+    row.className = cls;
+  });
+}
+
 export const Library = {
-  patchTrackDuration,
+  patchTrackDuration, patchTrack,
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
   showGenres, showYears, showSceneGroups, showGalaxy, showFolder, renderTracks,
   showSearchResults,
@@ -3871,10 +4226,11 @@ export const Library = {
     // showAll()/refreshCurrentFolderInPlace() and clobber the pending results.
     _viewIsAllTracks = false;
     _currentBrowsePath = null;
+    _viewReload = null;
     return ++_browseNavGen;
   },
   viewStillCurrent: (t) => t === _browseNavGen,
-  isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace,
+  isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace, reloadCurrentView,
   isInAllTracksView: () => _viewIsAllTracks,
   setBrowseHeader, hideBrowseHeader, onInfo,
   getSelectedTracks, clearSelection, refreshBadges: _refreshTrackCount,

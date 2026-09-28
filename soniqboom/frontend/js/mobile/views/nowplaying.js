@@ -71,12 +71,25 @@ export function mountNowPlaying(root, ctx) {
     // Radio is the active source while a station plays.
     if (MobileRadio.active) { renderStation(MobileRadio.station); return; }
     scrub.disabled = false;
+    // Nothing loaded, but a queue waits for ▶ (restored after a reload, or
+    // resumed from another device): show that track at the position ▶ starts.
+    const cued = t ? null : (Player.cuedTrack || null);
+    if (cued) {
+      t = cued;
+      const sec = Player.cuedSec || 0;
+      const dur = Number(cued.duration) || 0;
+      scrub.value = String(dur > 0 ? Math.min(100, (sec / dur) * 100) : 0);
+      curEl.textContent = fmtDur(sec) || '0:00';
+      durEl.textContent = fmtDur(dur);
+    }
+    _shownCuedKey = cued ? `${cued.id}~${cued.subsong ?? ''}` : null;
     if (!t) {
       titleEl.textContent  = 'No track playing';
       artistEl.textContent = '';
       // Layered placeholder with the default 🔊 glyph (no track to ask
       // ``artPlaceholderEmoji`` about format).
       art.innerHTML = '<span>\u{1F50A}</span>';
+      scrub.value = '0'; curEl.textContent = '0:00'; durEl.textContent = '0:00';
       return;
     }
     titleEl.textContent  = t.title  || '—';   // wipes any prior badge
@@ -109,6 +122,17 @@ export function mountNowPlaying(root, ctx) {
   }
 
   Player.on('trackchange', renderTrack);
+  // The cued track (see renderTrack) appears, changes or goes: the resume /
+  // restore, a queue edit, a clear.  Nothing to do while a track is loaded.
+  let _shownCuedKey = null;
+  const _renderCued = () => {
+    if (MobileRadio.active || Player.currentTrack) return;
+    const c = Player.cuedTrack || null;
+    if ((c ? `${c.id}~${c.subsong ?? ''}` : null) === _shownCuedKey) return;
+    renderTrack(null);
+  };
+  Player.on('cue', _renderCued);
+  Player.on('queuechange', _renderCued);
 
   Player.on('statechange', ({ playing }) => {
     if (MobileRadio.active) return;         // radio owns the transport while active
@@ -153,10 +177,15 @@ export function mountNowPlaying(root, ctx) {
   });
   prevBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.prev(); });
   nextBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.next(); });
+  const paintShuffle = () => {
+    shufBtn.style.color = Player.shuffle ? 'var(--accent)' : 'var(--text)';
+    shufBtn.setAttribute('aria-pressed', Player.shuffle ? 'true' : 'false');
+  };
+  Player.on('shufflechange', paintShuffle);
+  paintShuffle();      // a restored queue may already have shuffle on
   shufBtn.addEventListener('click', () => {
-    const on = Player.toggleShuffle();
-    shufBtn.style.color = on ? 'var(--accent)' : 'var(--text)';
-    ctx.toast(on ? 'Shuffle on' : 'Shuffle off');
+    if (Player.radioActive) { ctx.toast('Radio Mode picks the order \u2014 shuffle is available again when radio stops.'); return; }
+    ctx.toast(Player.toggleShuffle() ? 'Shuffle on' : 'Shuffle off');
   });
   repBtn.addEventListener('click', () => {
     const mode = Player.toggleRepeat();

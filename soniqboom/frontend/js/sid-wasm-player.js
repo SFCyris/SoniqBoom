@@ -20,7 +20,7 @@
 'use strict';
 
 const FLAG_KEY = 'sb.sidWasmPlayback';
-const WORKER_URL = '/assets/js/vu-sid-worker.js?v=4';
+const WORKER_URL = '/assets/js/vu-sid-worker.js?v=6';
 
 export function sidWasmPlaybackEnabled() {
   // Default OFF (opt-in): only an explicit '1' (user turned it on in Settings)
@@ -140,7 +140,7 @@ function _renderAudioVU(sidBytes, subsong, dur) {
 
 /**
  * Render a C64 SID to a playable object URL + its VUMR, in the browser.
- * @returns {Promise<{url:string, vumr:ArrayBuffer|null, frames:number}|null>}
+ * @returns {Promise<{url:string, wav:ArrayBuffer, vumr:ArrayBuffer|null, frames:number, tune:number|null}|null>}
  *   `url` is an object URL the caller MUST revoke when done; null on any failure
  *   (caller then falls back to the normal server-stream path).
  */
@@ -154,13 +154,14 @@ export async function renderSidForPlayback(trackId, subsong, durSec) {
     const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/sid`, { credentials: 'include' });
     if (!res.ok) { console.warn('[sid-wasm] /sid fetch failed:', res.status); return null; }
     const sidBytes = await res.arrayBuffer();
-    const { wav, vumr, frames } = await _renderAudioVU(sidBytes, Number(subsong) || 0, durSec);
+    const { wav, vumr, frames, tune } = await _renderAudioVU(sidBytes, Number(subsong) || 0, durSec);
     if (!wav || !wav.byteLength) { console.warn('[sid-wasm] render produced no audio'); return null; }
     const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
     // Return the raw WAV too (a fresh allocation, distinct from the Blob's copy)
     // so the caller can upload it to warm the server cache — the next play of
     // this SID (any client, cast, offline) then streams it with zero render.
-    return { url, wav, vumr: vumr || null, frames: frames || 0 };
+    // ``tune``: the tune the worker rendered, which that upload must name.
+    return { url, wav, vumr: vumr || null, frames: frames || 0, tune: Number.isInteger(tune) ? tune : null };
   } catch (e) {
     // A superseded render is a cancellation, not a failure — a newer play took
     // over.  Return a sentinel so the caller abandons quietly (no toast, no

@@ -13,9 +13,10 @@ This module gives the startup sequence a single source of truth that
   1. **Prints** a friendly progress line to stderr at every phase
      boundary (humans tailing the terminal see what's happening)
   2. **Writes** a small JSON status file to the data dir so external
-     watchers — the macOS menubar app, monitoring scripts, anyone — can
-     poll the current phase without the HTTP API (which isn't listening
-     yet during the slow phases)
+     watchers — the macOS menubar app, monitoring scripts — can poll the
+     current phase without the HTTP API (which isn't listening yet during
+     the slow phases).  Owner-only: it also carries the reload token that
+     ``soniqboom-setadm`` presents to ``POST /api/auth/reload``
   3. Tracks per-phase elapsed time so the final "ready" line can
      report where the wall-clock went
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -51,24 +53,47 @@ _status: dict[str, Any] = {
     "phase_elapsed_ms": 0,    # for the current (incomplete) phase
     "phases":         [],     # list of {phase, label, elapsed_ms} completed
     "pid":            os.getpid(),
+    "host":           None,   # bind address / port / data dir, set by init()
+    "port":           None,
+    "data_dir":       None,
+    "reload_token":   None,   # per-run secret for POST /api/auth/reload
 }
 
 _status_file: Path | None = None
+
+# Request header that carries ``reload_token`` to ``POST /api/auth/reload``.
+RELOAD_TOKEN_HEADER = "X-SoniqBoom-Reload-Token"
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
 def init(data_dir: Path) -> None:
-    """Initialise the tracker.  Idempotent — safe to call once at the top
-    of the lifespan handler before anything else.
+    """Initialise the tracker — call once at the top of the lifespan
+    handler before anything else (a second call starts a new run: fresh
+    timers and a new reload token).
 
     Sets ``started_at`` and the status-file path, prints the opening
     banner, and writes the first status snapshot to disk so a menubar app
     that polls is never racing the first real phase.
+
+    Also records where this server listens (``host`` / ``port``), which
+    ``data_dir`` it serves, and a fresh random ``reload_token``, so a
+    same-host tool working on that data dir (``soniqboom-setadm``'s reload
+    notification) reaches THIS server: it knocks on the recorded port and
+    proves with the token that it read this run's status file — any other
+    instance refuses without reloading.  ``cli()`` patches ``settings.host`` /
+    ``settings.port`` to the bound values before uvicorn starts, so they are
+    the real ones by the time the lifespan calls us.
     """
     global _status_file
+    from soniqboom.config import settings
     with _LOCK:
+        _status["pid"]          = os.getpid()
+        _status["host"]         = settings.host
+        _status["port"]         = settings.port
+        _status["data_dir"]     = str(Path(data_dir).absolute())
+        _status["reload_token"] = secrets.token_urlsafe(32)
         now = time.time()
         _status["started_at"]   = now
         _status["phase_start"]  = now
@@ -147,14 +172,24 @@ def mark_ready(message: str = "") -> None:
 def get_status() -> dict[str, Any]:
     """Return a snapshot of the current status.  Safe to call from any
     thread; the returned dict is a shallow copy so the caller can mutate
-    it without racing the tracker.
+    it without racing the tracker.  Leaves out the reload token (only the
+    owner-only status file carries it — see :func:`reload_token`).
     """
     with _LOCK:
         # Refresh phase_elapsed_ms so a long-running phase doesn't appear
         # stuck at 0 to a poller.
         if _status["phase_start"]:
             _status["phase_elapsed_ms"] = round((time.time() - _status["phase_start"]) * 1000)
-        return dict(_status)
+        snapshot = dict(_status)
+    snapshot.pop("reload_token", None)
+    return snapshot
+
+
+def reload_token() -> str | None:
+    """This run's ``POST /api/auth/reload`` secret (see :func:`init`), or
+    None before init() — then no token-bearing reload is accepted."""
+    with _LOCK:
+        return _status.get("reload_token")
 
 
 def status_file_path() -> Path | None:
@@ -198,15 +233,23 @@ def _write_status_file() -> None:
     """Atomically write the current status to ``startup-status.json``.
 
     Atomic via tmp+rename so a polling reader can't catch a half-written
-    file.  Failures are swallowed — startup progress reporting must not
-    be in the critical path.
+    file.  Owner-only (0600): it carries the reload token.  Failures are
+    swallowed — startup progress reporting must not be in the critical path.
     """
     if _status_file is None:
         return
     try:
         snapshot = get_status()
+        snapshot["reload_token"] = reload_token()
         tmp = _status_file.with_suffix(".json.new")
-        with open(tmp, "w") as f:
+        # Created 0600 (and re-chmodded: a leftover tmp keeps its old mode) —
+        # never readable by others, not even before the token is written.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            try:
+                os.fchmod(f.fileno(), 0o600)
+            except (AttributeError, OSError):
+                pass
             json.dump(snapshot, f)
             f.flush()
             os.fsync(f.fileno())

@@ -51,7 +51,7 @@ _FIELD_TO_OUT: dict[str, tuple[str, bool]] = {
     "track_number": ("track",        True),
     "file_size":    ("size",         True),
     "disc_number":  ("discNumber",   True),
-    "year":         ("year",         True),
+    "year":         ("year",         False),    # optional: unknown → omitted
     "channels":     ("channelCount", False),
     "sample_rate":  ("samplingRate", False),
     "bit_depth":    ("bitDepth",     False),
@@ -153,13 +153,14 @@ def test_all_fields_nonfinite_at_once_renders():
     assert song["track"] == 0
     assert song["size"] == 0
     assert song["discNumber"] == 0
-    assert song["year"] == 0
     # Optional fields drop out entirely rather than emit 0.
+    assert "year" not in song
     assert "channelCount" not in song
     assert "samplingRate" not in song
     assert "bitDepth" not in song
-    # All four RG values were non-finite -> the sub-dict is empty -> omitted.
-    assert "replayGain" not in song
+    # All four RG values were non-finite -> the sub-dict is empty (OpenSubsonic:
+    # a supported field is sent with its empty value, never with a bad one).
+    assert song["replayGain"] == {}
 
     # XML path has NO allow_nan guard — a leaked non-finite would serialise as
     # the attribute literal ``duration="nan"`` without raising.  Parse the
@@ -171,9 +172,9 @@ def test_all_fields_nonfinite_at_once_renders():
     # element namespace-agnostically with the {*} wildcard.
     song_el = ET.fromstring(xml.body).find(".//{*}song")
     assert song_el is not None, "song element missing from XML render"
-    for attr in ("duration", "bitRate", "track", "size", "discNumber", "year"):
+    for attr in ("duration", "bitRate", "track", "size", "discNumber"):
         assert int(song_el.get(attr, "")) == 0
-    for attr in ("channelCount", "samplingRate", "bitDepth"):
+    for attr in ("channelCount", "samplingRate", "bitDepth", "year"):
         assert song_el.get(attr) is None
 
 
@@ -288,7 +289,8 @@ def test_iso_degrades_bad_timestamp_to_empty(ts):
 def test_iso_keeps_a_real_timestamp():
     # Falsifying companion: a valid epoch still formats — the guard drops only
     # bad values, it does not blanket-empty every timestamp.
-    assert subsonic._iso(1_700_000_000) == "2023-11-14T22:13:20"
+    # UTC with the zone designator — without the Z clients read local time.
+    assert subsonic._iso(1_700_000_000) == "2023-11-14T22:13:20Z"
 
 
 def test_getsong_asgi_survives_nonfinite_added_at(monkeypatch):
@@ -310,4 +312,5 @@ def test_getsong_asgi_survives_nonfinite_added_at(monkeypatch):
     # Without the _iso guard this comes back status="failed" (code-0 envelope,
     # no song) — the whole listing blanked on one bad timestamp.
     assert doc["subsonic-response"]["status"] == "ok"
-    assert doc["subsonic-response"]["song"]["created"] == ""
+    # "" is not an xs:dateTime: an unusable timestamp drops the attribute.
+    assert "created" not in doc["subsonic-response"]["song"]

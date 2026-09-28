@@ -62,12 +62,20 @@ async def rebuild_indexes() -> dict:
     while the Galaxy legend still showed the cached "41").
 
     Cost: peak memory roughly doubles the index footprint transiently (shadow
-    + live held together until the swap + GC).  Concurrent ``_tracks`` mutation
-    during the build is excluded by the snapshot (rare — reindex starts scans
-    only AFTER this returns; ``record_play``/``set_rating`` don't touch these
-    indexes) and self-corrects on the next rebuild.
+    + live held together until the swap + GC).
 
-    Returns the pre-heal drift report from ``store._diff_indexes``
+    The shadow is built from a snapshot across ~500 ``await`` yields, so a
+    write landing meanwhile (an edit, an enrichment pass, a play, a duration
+    backfill — all move ``store.index_generation()``) would be missing from
+    it.  Such a build is NOT swapped in: the live indexes, maintained
+    incrementally, stay, and the result says ``skipped:
+    "concurrent-mutation"``.  Likewise while a scan holds the batch
+    (``skipped: "scan-active"``; the sorted lists are flagged for its exit
+    rebuild).  A skipped result carries no drift (``index_ok`` True, empty
+    ``mismatches``): a diff against an outdated shadow is not drift.  Callers
+    retry (reindex) or re-check on their next tick (the integrity sweep).
+
+    Otherwise returns the pre-heal drift report from ``store._diff_indexes``
     (``{index_ok, mismatches, indexes, ...}``) so reindex endpoints and the
     background integrity sweep can detect-and-report, not just blindly cure.
     """
@@ -76,63 +84,100 @@ async def rebuild_indexes() -> dict:
     store = get_store()
 
     async with _rebuild_lock_for_loop():
+        # A scan holding the batch would make the swap below refuse anyway —
+        # don't spend a full shadow build (~7 s, doubled index memory) to find
+        # that out.  Its exit rebuilds the sorted lists itself.
+        if store._batch_depth != 0 or store._batch_mode:
+            store._sorted_dirty = True
+            return {"index_ok": True, "mismatches": [], "indexes": {},
+                    "skipped": "scan-active", "track_count": len(store._tracks),
+                    "mutation_seq": store._mutation_seq}
         shadow = TrackStore()
         shadow._tracks = dict(store._tracks)        # consistent snapshot for the build
         # _index_track derives _unplayed_ids from membership in _play_stats, so the
         # shadow MUST see the real play stats or it would mark every track unplayed.
         shadow._play_stats = dict(store._play_stats)
+        gen0 = store.index_generation()             # no await since the snapshot
         shadow.enter_batch_mode()
         items = shadow.track_items_list()
         BATCH = 500
+        # The cyclic GC is paused per slice: the build allocates millions of
+        # small acyclic objects and otherwise trips full collections that
+        # traverse the whole track heap (250-340 ms pauses).
+        import gc
         for i in range(0, len(items), BATCH):
-            shadow.index_tracks_batch(items[i : i + BATCH])
+            was = gc.isenabled()
+            gc.disable()
+            try:
+                shadow.index_tracks_batch(items[i : i + BATCH])
+            finally:
+                if was:
+                    gc.enable()
             await asyncio.sleep(0)
-        shadow.exit_batch_mode()   # one sort() per sorted index, on the shadow
-        shadow.finish_rebuild()    # builds the shadow's _word_list
+        # One sort per sorted index on the (private) shadow, yielding between
+        # them — the one-shot ``exit_batch_mode`` sorted all of them in a
+        # single multi-second stall.  Same lists, same key functions.
+        from soniqboom.core.store import SORTED_LISTS
+        shadow._batch_depth = 0
+        shadow._batch_mode = False
+        for _name in SORTED_LISTS:
+            _lst = shadow.build_sorted_list(_name)
+            _lst.sort()
+            setattr(shadow, _name, _lst)
+            await asyncio.sleep(0)
+        shadow._sorted_rebuilt(SORTED_LISTS)
+        shadow._primary_order_memo.clear()
+        shadow._rebuild_word_list()
+        for _ in shadow._iter_build_sim_token_index():
+            await asyncio.sleep(0)
+
+        # Swap only when NO scan is active and nothing wrote meanwhile —
+        # checked here with no await until the swap below.  A scan is "active"
+        # if EITHER ``_batch_depth`` > 0 (mid-extract) OR ``_batch_mode`` is
+        # True with depth 0 — a scan-exit that already decremented depth to 0
+        # (scanner.py) but is PARKED on this very rebuild lock waiting to run
+        # its own rebuild (it clears ``_batch_mode`` only in its post-rebuild
+        # finally).  Its exit rebuilds the SORTED indexes (flagged dirty
+        # below) but not the tag/word ones, so a mid-scan swap would strand
+        # stale ``_tag_*`` / ``_word_index`` entries (verified on a 262k
+        # library: a reindex hammered during concurrent scans left +16 orphan
+        # artists / +4 words).  A write since the snapshot would be LOST by a
+        # swap (the shadow never saw it) — the stale-swap drift the sweep
+        # then "healed" by rebuilding again.
+        scan_active = store._batch_depth != 0 or store._batch_mode
+        if scan_active or store.index_generation() != gen0:
+            if scan_active:
+                store._sorted_dirty = True
+            return {"index_ok": True, "mismatches": [], "indexes": {},
+                    "skipped": "scan-active" if scan_active else "concurrent-mutation",
+                    "track_count": len(store._tracks),
+                    "mutation_seq": store._mutation_seq}
 
         # Diagnose BEFORE healing: diff the live (possibly drifted) indexes
         # against the freshly-built shadow.  This is the drift report the reindex
         # endpoints and the background integrity sweep surface.
         report = store._diff_indexes(shadow)
-
-        # Swap the healed indexes in ONLY when NO scan is active.  A scan is
-        # "active" if EITHER ``_batch_depth`` > 0 (mid-extract) OR ``_batch_mode``
-        # is True with depth 0 — the latter is a scan-exit that already
-        # decremented depth to 0 (scanner.py) but is PARKED on this very rebuild
-        # lock waiting to run its own rebuild (it clears ``_batch_mode`` only in
-        # its post-rebuild finally).
-        #
-        # Why NOT swap during a scan: our shadow is a snapshot; the concurrent
-        # scan is mutating the live indexes via ``_index_track``/``_unindex_track``.
-        # Swapping would clobber those updates.  For the SORTED indexes that's
-        # recoverable (we flag ``_sorted_dirty`` so the scan's lock-serialized
-        # exit rebuilds them fresh), but the scan's exit does NOT rebuild the
-        # TAG/WORD indexes — so a mid-scan swap strands stale ``_tag_*`` /
-        # ``_word_index`` entries (verified on a 262k library: a reindex hammered
-        # during concurrent scans left +16 orphan artists / +4 words).  So during
-        # a scan we DIAGNOSE ONLY — no swap.  The heal happens on the next idle
-        # reindex or the background integrity sweep (which gates on is_scanning).
-        if store._batch_depth == 0 and not store._batch_mode:
-            for attr in INDEX_ATTRS:
-                setattr(store, attr, getattr(shadow, attr))   # atomic swap (heal)
-            # The inverted sample-token index (B) is derived/batch-built and so
-            # deliberately NOT in INDEX_ATTRS (it would false-positive the drift
-            # diff — the live copy legitimately lags mutations until a rebuild).
-            # ``shadow.finish_rebuild()`` built a fresh one; swap it in here so a
-            # heal refreshes it too, in the same no-scan-active block.
-            store._sim_tok_postings = shadow._sim_tok_postings
-            store._sim_tok_count = shadow._sim_tok_count
-            store._word_list_dirty = shadow._word_list_dirty
-            store._sorted_dirty = False
-            store._batch_mode = False
-        else:
-            # A scan holds the batch — leave the live indexes untouched (no
-            # clobber) and flag sorted dirty so the scan's exit still refreshes
-            # the sorted views.  report still reflects the pre-heal diff.
-            store._sorted_dirty = True
+        _old = [getattr(store, attr) for attr in INDEX_ATTRS]
+        for attr in INDEX_ATTRS:
+            setattr(store, attr, getattr(shadow, attr))   # atomic swap (heal)
+        # The inverted sample-token index (B) is derived/batch-built and so
+        # deliberately NOT in INDEX_ATTRS (it would false-positive the drift
+        # diff — the live copy legitimately lags mutations until a rebuild).
+        # ``shadow.finish_rebuild()`` built a fresh one; swap it in here so a
+        # heal refreshes it too, in the same block.
+        store._sim_tok_postings = shadow._sim_tok_postings
+        store._sim_tok_count = shadow._sim_tok_count
+        store._word_list_dirty = shadow._word_list_dirty
+        store._sorted_dirty = False
+        store._batch_mode = False
         store._mutation_seq += 1   # invalidate seq-keyed memos (store agg cache,
                                    # subsonic _ALBUM_*_CACHE, smart.py dup memos)
-        return report
+    # Free the replaced indexes one at a time (outside the lock, after the
+    # swap): dropping them all at once was a ~0.3 s deallocation stall.
+    for i in range(len(_old)):
+        _old[i] = None
+        await asyncio.sleep(0)
+    return report
 
 
 # ── Hash helpers ─────────────────────────────────────────────────────────────
@@ -430,9 +475,15 @@ async def ft_search_dicts(
                                sort_by=sort_by, sort_order=sort_order)
 
 
-_TAG_RE = re.compile(r'@(\w+):\{([^}]*)\}')
+# A tag value runs to the first UNESCAPED "}": search._esc_tag backslash-escapes
+# "{", "}", "\" and the other specials, so ``\}`` / ``\\`` are part of the value
+# (``[^}]*`` stopped at the escaped brace — ``a{b}`` parsed as "a{b\" plus a
+# stray free-text "}").  An unescaped "{" (never in _esc_tag output) also ends
+# the scan: without that, every ``@x:{`` of an unterminated query scanned to the
+# end of the string — quadratic (9 s for 60 KB of ``@a:{\}``; now ~3 ms).
+_TAG_RE = re.compile(r'@(\w+):\{((?:\\.|[^\\{}])*)\}', re.DOTALL)
 _YEAR_RE = re.compile(r'@year:\[([^\]]+)\]')
-_UNESCAPE_RE = re.compile(r'\\(.)')
+_UNESCAPE_RE = re.compile(r'\\(.)', re.DOTALL)
 
 
 def _parse_tag_query(query: str) -> dict:
@@ -442,6 +493,7 @@ def _parse_tag_query(query: str) -> dict:
       @artist_tag:{value}        -> artist="value"
       @album_artist_tag:{value}  -> album_artist="value"
       @album_tag:{value}         -> album="value"
+      @game_tag:{value}          -> game="value"
       @genre:{value}             -> genre="value"
       @format:{value}            -> format_="value"
       @dir_hash:{value}          -> dir_hash="value"
@@ -449,6 +501,9 @@ def _parse_tag_query(query: str) -> dict:
       @year:[min max]            -> year_min=min, year_max=max
       *                          -> all tracks
       plain text                 -> query="text"
+
+    Tag values arrive backslash-escaped (``search._esc_tag``): each ends at its
+    first unescaped ``}`` and every ``\\x`` reads back as ``x``, for all fields.
     """
     if not query or query.strip() == "*":
         return {}
@@ -460,6 +515,7 @@ def _parse_tag_query(query: str) -> dict:
         "artist_tag": "artist",
         "album_artist_tag": "album_artist",
         "album_tag": "album",
+        "game_tag": "game",          # search box game: → game (SID/Atari: title) prefix
         "genre": "genre",
         "format": "format_",
         "dir_hash": "dir_hash",
@@ -667,3 +723,18 @@ async def set_config(key: str, value) -> None:
 
 async def get_config(key: str, default=None):
     return get_store().get_config(key, default)
+
+
+async def folder_dedup_enabled() -> bool:
+    """Effective value of Settings → "Hide duplicates when browsing folders".
+
+    Default ON.  A stored ``dedup_folders`` only counts once ``dedup_folders_set``
+    marks it as saved by a version in which the checkbox works: before that the
+    web UI forced dedup on for every plain folder and the settings form re-posted
+    an unchecked box on each save, so a stored ``False`` reflects no one's choice —
+    honouring it would make duplicates appear in folders after an upgrade.
+    """
+    store = get_store()
+    if not store.get_config("dedup_folders_set", False):
+        return True
+    return bool(store.get_config("dedup_folders", True))

@@ -49,7 +49,17 @@ _state: dict = {
     "last_mismatches": [],
 }
 _task: asyncio.Task | None = None
-_last_swept_seq: int | None = None   # store._mutation_seq at the last sweep rebuild (gate)
+_last_swept_seq: tuple | None = None   # ``_gate_seq`` at the last sweep rebuild
+
+
+def _gate_seq(store) -> tuple:
+    """The sweep gate: ``(_mutation_seq, _duration_seq)``.  One helper for the
+    seed, the compare and the stamp, so they can't differ in shape.  Plays
+    (``_play_seq``) are left out: ``record_play`` maintains ``_unplayed_ids``
+    itself, and a full rebuild after every listening session would cost ~7 s
+    of chunked loop time at 263K tracks; a play landing DURING a rebuild still
+    makes it skip its swap (``data.rebuild_indexes``)."""
+    return (store._mutation_seq, getattr(store, "_duration_seq", 0))
 
 
 def snapshot() -> dict:
@@ -87,7 +97,7 @@ async def _sweep_once() -> dict | None:
     from soniqboom.core.store import get_store
     from soniqboom.core.data import rebuild_indexes
     store = get_store()
-    seq = store._mutation_seq
+    seq = _gate_seq(store)
     if _last_swept_seq == seq:
         return None  # nothing has mutated since the last rebuild -> no new drift possible
     # Don't fight an in-progress scan: it churns _tracks heavily and rebuilds the
@@ -99,7 +109,11 @@ async def _sweep_once() -> dict | None:
     except Exception:
         pass
     report = await rebuild_indexes()                  # non-blocking shadow-swap: diagnoses + heals
-    _last_swept_seq = store._mutation_seq             # post-rebuild (includes the rebuild's own bump)
+    if report.get("skipped"):
+        # A write landed during the build (or a scan started): nothing was
+        # swapped or verified — leave the gate so the next tick retries.
+        return None
+    _last_swept_seq = _gate_seq(store)                # post-swap (includes the rebuild's own bump)
     drift = not report.get("index_ok", True)
     record(report, kind="sweep", healed=True)         # the rebuild healed it; index_ok is True now
     if drift:
@@ -146,7 +160,7 @@ def start(interval: float | None = None) -> asyncio.Task | None:
         return None
     try:
         from soniqboom.core.store import get_store
-        _last_swept_seq = get_store()._mutation_seq
+        _last_swept_seq = _gate_seq(get_store())
     except Exception:
         _last_swept_seq = None
     _task = asyncio.create_task(_sweep_loop(interval))

@@ -19,7 +19,7 @@ from fastapi.responses import Response
 
 from soniqboom.core import art_cache
 from soniqboom.core.data import get_track, get_config
-from soniqboom.core.metadata import resize_cover, cap_full_cover
+from soniqboom.core.metadata import cap_full_cover, id3_picture, resize_cover
 from soniqboom.core.store import get_store
 
 log = logging.getLogger(__name__)
@@ -157,13 +157,17 @@ def _extract_cover(path: Path, *, raise_on_error: bool = False) -> tuple[bytes, 
     """
     ext = path.suffix.lower()
     try:
-        if ext == ".mp3":
-            from mutagen.mp3 import MP3
-            audio = MP3(path)
-            for tag in (audio.tags or {}).values():
-                if hasattr(tag, "data") and hasattr(tag, "mime") and tag.data:
-                    mime = (tag.mime[0] if isinstance(tag.mime, list) else tag.mime) or "image/jpeg"
-                    return tag.data, mime
+        if ext in (".mp3", ".aiff", ".aif"):
+            # AIFF's ID3 tag is a chunk of the IFF container — AIFF reads it.
+            if ext == ".mp3":
+                from mutagen.mp3 import MP3
+                audio = MP3(path)
+            else:
+                from mutagen.aiff import AIFF
+                audio = AIFF(path)
+            pic = id3_picture(audio.tags)
+            if pic is not None:
+                return pic.data, pic.mime or "image/jpeg"
 
         elif ext in (".m4a", ".aac", ".mp4"):
             from mutagen.mp4 import MP4, MP4Cover
@@ -896,6 +900,14 @@ async def _generate_and_cache_thumbs(track_id: str, full_data: bytes) -> dict[st
 _bg_tasks: set[asyncio.Task] = set()
 
 
+def _bg_art_write_done(t: "asyncio.Task") -> None:
+    """Drop the strong ref and surface a failed background write (a full
+    disk) in the log instead of asyncio's "exception was never retrieved"."""
+    _bg_tasks.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        log.warning("Art cache write failed: %s", t.exception())
+
+
 def _persist_and_notify(track_id: str, data: bytes) -> None:
     """Cache freshly-extracted art (full + thumbs), update the DB cover ref, and
     THEN broadcast ``art_ready`` so list/grid ``<img>`` elements refresh.
@@ -1004,8 +1016,14 @@ async def cover_art(
         # Fallback: get full art, resize, cache, and serve
         full_data, mime = await _resolve_full_art(track_id)
         if full_data:
-            thumbs = await _generate_and_cache_thumbs(track_id, full_data)
-            return _etag_response(thumbs[size], "image/jpeg", etag)
+            # Resize only the bucket this request asked for (the other one is
+            # made when it is asked for) and store it off the request path.
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, resize_cover, full_data, _SIZE_MAP[size])
+            t = loop.create_task(art_cache.store_art(track_id, data, size))
+            _bg_tasks.add(t)
+            t.add_done_callback(_bg_art_write_done)
+            return _etag_response(data, "image/jpeg", etag)
 
         # Nothing resolved.  Default: serve the cached placeholder
         # (strong ETag → one download covers every tagless track).

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from pathlib import Path
 
 from soniqboom.config import get_data_dir
 from soniqboom.core.users import (
@@ -205,39 +207,294 @@ def _ensure_admin_interactive(verbose: bool = False) -> int:
     print(f"  ✓ Admin '{user.username}' created — sign in with it once the")
     print("    server is ready.")
     print("")
+    if verbose:
+        # setup-admin.sh may run while the server is up; run.sh's silent
+        # --ensure-admin runs before it starts, so there's nobody to tell.
+        _notify_server_reload(data_dir)
     return 0
 
 
-def _notify_server_reload() -> None:
-    """Best-effort: ask a running server to re-read ``users.json`` so a
-    just-created or -updated account takes effect immediately — no restart.
+def _pid_alive(pid: int) -> bool:
+    """Whether process *pid* exists.  On Windows ``os.kill(pid, 0)`` is no
+    probe (signal 0 is ``CTRL_C_EVENT`` there — it would interrupt the
+    server), so there we assume alive and let the HTTP probe + data-dir check
+    decide."""
+    if os.name == "nt":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True        # exists, owned by another user
+    except OSError:
+        return False
+    return True
 
-    Stays silent when nothing is listening (fresh install, or the server is on
-    a non-default port); the next server start loads the file from disk anyway.
-    ``/api/auth/reload`` is on the public allowlist, so no credentials needed.
-    In a Docker container this reaches the server in the same container, which
-    is why ``docker compose exec … soniqboom-setadm`` no longer needs a restart.
+
+def _loopback_host(bind_host: str) -> str | None:
+    """The loopback address that reaches a server bound to *bind_host*, or
+    None when it is bound to a non-loopback interface (loopback can't reach
+    it, and ``/api/auth/reload`` only accepts loopback callers).  A hostname
+    is resolved the way uvicorn binds it (first IPv4 address)."""
+    import ipaddress
+    import socket
+    h = (bind_host or "").strip().strip("[]").lower()
+    if h in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    try:
+        ip = ipaddress.ip_address(h.split("%", 1)[0])
+    except ValueError:
+        try:       # "localhost", or Debian's "127.0.1.1 <hostname>"
+            first = socket.getaddrinfo(h, None, socket.AF_INET, socket.SOCK_STREAM)[0]
+            ip = ipaddress.ip_address(first[4][0])
+        except (OSError, IndexError, ValueError):
+            return None
+    if ip.is_unspecified:
+        return "::1"       # "::" — the IPv6 wildcard
+    if ip.is_loopback:
+        return str(ip)
+    return None
+
+
+def _same_dir(a: str, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+# What a server's reload token looks like (``secrets.token_urlsafe``).  Checked
+# before it goes into a header: a mangled file must not crash setadm after the
+# account was already written.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+
+
+def _read_status(data_dir: Path) -> dict | None:
+    """The server record in ``<data_dir>/startup-status.json``, or None when
+    there is none usable: no file, unparseable, or written by a server that
+    records no port / pid / data dir / reload token (a version before this).
+    Raises PermissionError when the file exists but this user can't read it."""
+    import json
+    try:
+        text = (data_dir / "startup-status.json").read_text(encoding="utf-8")
+    except PermissionError:
+        raise
+    except OSError:
+        return None
+    try:
+        status = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(status, dict):
+        return None
+    port, pid = status.get("port"), status.get("pid")
+    if isinstance(port, bool) or isinstance(pid, bool):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    token = status.get("reload_token")
+    if not (0 < port < 65536 and isinstance(pid, int) and pid > 0
+            and isinstance(status.get("data_dir"), str)
+            and isinstance(token, str) and _TOKEN_RE.fullmatch(token)):
+        return None
+    status["port"] = port
+    return status
+
+
+# How long to wait for a server that is still starting (its HTTP port opens
+# only once startup finishes — a big library takes a while), how long one
+# reload may take, and how much of its answer to read.
+_READY_WAIT_S = 60.0
+_TIMEOUT_S = 5.0
+_MAX_ANSWER = 64 * 1024
+# A port that keeps refusing may belong to a server that is restarting (in a
+# container the new run can even get the same pid): this long for its new
+# status file to appear before giving up.
+_RESTART_GRACE_S = 10.0
+
+
+def _notify_server_reload(data_dir: Path) -> None:
+    """Best-effort: ask the server that serves *data_dir* to re-read
+    ``users.json`` so a just-created or -updated account takes effect
+    immediately — no restart.
+
+    The server records its pid, bind address, port, data dir and a per-run
+    reload token in ``<data_dir>/startup-status.json`` at startup; that file —
+    not this process's own ``settings.port`` — says where to knock.  The token
+    goes along, and a server refuses a token that isn't its own without
+    reloading anything, so a throw-away instance (another ``SONIQBOOM_DATA_DIR``),
+    a copied data dir or a stale status file never reloads some other server.
+    A server that is still starting is waited for (up to ``_READY_WAIT_S``);
+    one that restarted meanwhile (new token) is knocked again.  "Live now" is
+    printed only when the server reloaded users.json and reported this same
+    data dir; every other outcome says why it wasn't.
+
+    ``/api/auth/reload`` takes these calls from loopback only; inside a Docker
+    container that is the server in the same container, which is why
+    ``docker compose exec … soniqboom-setadm`` needs no restart.
     """
+    try:
+        _notify(data_dir)
+    except KeyboardInterrupt:
+        print("\nStopped — users.json is written; if the server doesn't show the "
+              "change, restart it.")
+
+
+def _notify(data_dir: Path) -> None:
+    import http.client
+    import json
     import time
+    import urllib.error
     import urllib.request
-    from soniqboom.config import settings
-    url = f"http://127.0.0.1:{settings.port}/api/auth/reload"
-    # Retry briefly — covers the short window where the server is still binding
-    # right after a container/process start (a host health-check can pass through
-    # the port-proxy a beat before the loopback socket is ready).  Gives up
-    # quietly if nothing ever answers; the file is on disk for the next start.
-    for i in range(5):
+    from soniqboom.core.startup_status import RELOAD_TOKEN_HEADER
+
+    def _no_server(why: str = "") -> None:
+        print(f"No running server found for {data_dir}{why} — a server starting "
+              "now picks the change up by itself; one that is already running "
+              "needs a restart to apply it.")
+
+    def _not_live(why: str) -> None:
+        print(f"{why} — restart the server to apply the change.")
+
+    def _restarted(token: str) -> bool:
+        """The status file now names a newer run of this data dir's server."""
         try:
-            req = urllib.request.Request(url, data=b"", method="POST")
-            with urllib.request.urlopen(req, timeout=2) as resp:  # nosec B310 - fixed localhost URL
-                if resp.status == 200:
-                    print("Notified the running server — the change is live now "
-                          "(no restart needed).")
+            fresh = _read_status(data_dir)
+        except PermissionError:
+            return False
+        return (fresh is not None and fresh["reload_token"] != token
+                and _same_dir(fresh["data_dir"], data_dir))
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None          # a redirect is an answer, not a place to go
+
+    # Never through an HTTP(S)_PROXY from the environment: the proxy would
+    # relay the request from elsewhere, and the server refuses relayed reloads.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+    for _round in range(3):      # a restart mid-way → find the new run, knock again
+        # ── Find this data dir's running server, waiting while it starts ──
+        deadline = None
+        while True:
+            try:
+                status = _read_status(data_dir)
+            except PermissionError as e:
+                print(f"Can't read {data_dir / 'startup-status.json'} ({e.strerror}) "
+                      "— run soniqboom-setadm as the server's OS user.  users.json "
+                      "is written; restart the server to apply the change.")
+                return
+            if status is None:
+                _no_server()
+                return
+            if not _same_dir(status["data_dir"], data_dir):
+                # A copied data dir: the file is the original's server's.
+                _no_server(f" (its startup-status.json is the server's for "
+                           f"{status['data_dir']})")
+                return
+            if status["pid"] == os.getpid() or not _pid_alive(status["pid"]):
+                _no_server()
+                return
+            if status.get("ready"):
+                break
+            if deadline is None:
+                print(f"Waiting for the server for {data_dir} to finish starting…",
+                      flush=True)
+                deadline = time.monotonic() + _READY_WAIT_S
+            elif time.monotonic() >= deadline:
+                print(f"The server for {data_dir} is still starting after "
+                      f"{_READY_WAIT_S:.0f} s — if it loaded its accounts before this "
+                      "change, restart it once it is up to apply the change.")
+                return
+            time.sleep(0.5)
+
+        # ── Knock ──
+        port, token = status["port"], status["reload_token"]
+        target = _loopback_host(status.get("host") or "")
+        if target is None:
+            _not_live(f"The server for {data_dir} listens only on "
+                      f"{status.get('host')}:{port}, not on loopback, so it couldn't "
+                      "be notified")
+            return
+        url_host = f"[{target}]" if ":" in target else target
+        req = urllib.request.Request(
+            f"http://{url_host}:{port}/api/auth/reload", data=b"", method="POST",
+            headers={RELOAD_TOKEN_HEADER: token})
+        raw = None
+        # Retry a refused connection briefly — the server marks itself ready a
+        # beat before uvicorn opens the port.
+        for attempt in range(5):
+            try:
+                with opener.open(req, timeout=_TIMEOUT_S) as resp:  # nosec B310 - loopback URL
+                    raw = resp.read(_MAX_ANSWER)
+                break
+            except urllib.error.HTTPError as e:
+                code = e.code
+                try:
+                    detail = json.loads(e.read(4096)).get("detail")
+                except Exception:
+                    detail = None
+                e.close()
+                if code == 409 and _restarted(token):
+                    break                    # → next round with the new run
+                if code == 409:
+                    _no_server(f" (the server on port {port} serves another data "
+                               "dir — the status file is stale)")
+                elif code == 500:
+                    print(f"The server for {data_dir} failed to reload users.json "
+                          f"(HTTP 500: {detail or e.reason}) — the change is NOT live.  "
+                          "See the server log.  If it moved users.json aside "
+                          "(users.json.corrupt-*), restore that file and fix its "
+                          "owner/permissions first, then run soniqboom-setadm again "
+                          "as the server's OS user.")
+                else:
+                    _not_live(f"The server on port {port} refused the reload "
+                              f"(HTTP {code})")
+                return
+            except urllib.error.URLError as e:
+                if not isinstance(e.reason, ConnectionRefusedError):
+                    _not_live(f"Couldn't connect to port {port} ({e.reason})")
                     return
-        except Exception:
-            pass  # no server / wrong port / transient — harmless; file is on disk
-        if i < 4:
-            time.sleep(0.4)
+                if attempt < 4:
+                    time.sleep(0.4)
+            except TimeoutError:
+                # It may have received the request — don't send it again.
+                print(f"The server on port {port} didn't answer within "
+                      f"{_TIMEOUT_S:.0f} s — the change may or may not be live; "
+                      "restart the server to be sure.")
+                return
+            except (OSError, http.client.HTTPException) as e:
+                _not_live(f"Whatever answered on port {port} isn't a SoniqBoom "
+                          f"server ({type(e).__name__})")
+                return
+        else:
+            give_up = time.monotonic() + _RESTART_GRACE_S
+            while not _restarted(token) and time.monotonic() < give_up:
+                time.sleep(0.5)
+            if _restarted(token):
+                continue                     # it went down and came back
+            _not_live(f"The server for {data_dir} isn't answering on port {port}")
+            return
+        if raw is None:
+            continue                         # 409 from a restarted server
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            body = None
+        served = body.get("data_dir") if isinstance(body, dict) else None
+        if not isinstance(served, str):
+            _not_live(f"Whatever answered on port {port} isn't a SoniqBoom server")
+            return
+        if not _same_dir(served, data_dir):
+            _not_live(f"The server on port {port} serves {served}, not {data_dir}")
+            return
+        print(f"Notified the running server (port {port}) — the change is live now "
+              "(no restart needed).")
+        return
+    _not_live(f"The server for {data_dir} kept restarting while it was notified")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -331,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Created user '{user.username}' (role={user.role}, "
             f"enabled={user.enabled}, id={user.id}).",
         )
-        _notify_server_reload()
+        _notify_server_reload(data_dir)
         return 0
 
     # ── Update flow ──────────────────────────────────────────────────────
@@ -383,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Updated user '{existing.username}': {', '.join(changes)}.",
         )
-        _notify_server_reload()
+        _notify_server_reload(data_dir)
     return 0
 
 

@@ -1,0 +1,103 @@
+{
+ "mame": {
+  "counts": {
+   "amiga": 3844,
+   "atari8": 587,
+   "atarist": 326,
+   "c64": 1767,
+   "cpc": 3338,
+   "dreamcast": 991,
+   "gamegear": 1043,
+   "gb": 4917,
+   "gba": 3898,
+   "megadrive": 4166,
+   "msx": 6903,
+   "n64": 1204,
+   "nds": 12,
+   "neogeo": 460,
+   "nes": 6537,
+   "pce": 1576,
+   "psx": 3910,
+   "saturn": 3394,
+   "sms": 770,
+   "snes": 5640,
+   "x68000": 2744,
+   "zx": 15080
+  },
+  "credit": "MAME software lists (mamedev.org)",
+  "generated": "2026-09-26",
+  "licence": "CC0 1.0",
+  "name": "MAME software lists",
+  "url": "https://github.com/mamedev/mame/tree/master/hash"
+ },
+ "nointro": {
+  "counts": {
+   "arcade": 2,
+   "atari8": 44,
+   "c64": 2884,
+   "cpc": 6,
+   "gamegear": 449,
+   "gb": 2934,
+   "gba": 2434,
+   "megadrive": 1537,
+   "msx": 739,
+   "n64": 548,
+   "nds": 5730,
+   "nes": 3113,
+   "pce": 368,
+   "psx": 1021,
+   "sms": 528,
+   "snes": 2609,
+   "x68000": 1
+  },
+  "credit": "No-Intro (no-intro.org)",
+  "generated": "2026-09-26",
+  "licence": "DAT-o-MATIC Data Usage License",
+  "name": "No-Intro",
+  "url": "https://datomatic.no-intro.org/terms.html"
+ },
+ "wikidata": {
+  "counts": {
+   "amiga": 3247,
+   "arcade": 5571,
+   "atari8": 488,
+   "atarist": 1956,
+   "c64": 4351,
+   "cpc": 2132,
+   "dos": 4689,
+   "dreamcast": 1491,
+   "gamegear": 492,
+   "gb": 2384,
+   "gba": 2629,
+   "megadrive": 2745,
+   "msx": 1524,
+   "n64": 1025,
+   "nds": 4607,
+   "neogeo": 548,
+   "nes": 3891,
+   "pce": 1105,
+   "ps2": 8367,
+   "psx": 5576,
+   "saturn": 1827,
+   "sms": 834,
+   "snes": 3864,
+   "x68000": 282,
+   "zx": 2698
+  },
+  "credit": "Data from Wikidata",
+  "generated": "2026-09-26",
+  "licence": "CC0 1.0",
+  "name": "Wikidata",
+  "url": "https://www.wikidata.org/wiki/Wikidata:Licensing"
+ },
+ "zxdb": {
+  "counts": {
+   "zx": 19896
+  },
+  "credit": "Contains information from ZXDB, made available under the ODbL",
+  "generated": "2026-09-26",
+  "licence": "ODbL 1.0",
+  "name": "ZXDB",
+  "url": "https://github.com/zxdb/ZXDB"
+ }
+}

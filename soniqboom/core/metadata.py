@@ -9,12 +9,14 @@ Supported: MP3, FLAC, ALAC/M4A, AAC, Ogg Vorbis, Opus, AIFF, WAV, WavPack, Musep
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import logging
 import re
 import struct
 import subprocess
 import time
+import unicodedata
 from pathlib import Path
 from typing import Callable
 
@@ -24,12 +26,35 @@ from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
-from mutagen.aiff import AIFF
+from mutagen.aiff import AIFF, AIFFInfo
+from mutagen.id3 import ID3
 
 from soniqboom.core import forksafe
 from soniqboom.models.track import TrackMeta
 
 log = logging.getLogger(__name__)
+
+_EASY_GAME_REGISTERED = False
+
+
+def register_easy_game_key() -> None:
+    """Teach mutagen's easy interface the ``game`` key (process-wide, once):
+    an ID3 ``TXXX:GAME`` frame and an MP4 ``----:com.apple.iTunes:GAME`` atom
+    (Vorbis comments and APEv2 take any key as it is) — the keys the tag
+    editor writes and ``_id3_game`` / ``_mp4`` read.  Run at import, so the
+    generic easy-tag reader (``extract``'s fallback) sees a GAME tag in every
+    process, not only in one that has written tags."""
+    global _EASY_GAME_REGISTERED
+    if _EASY_GAME_REGISTERED:
+        return
+    from mutagen.easyid3 import EasyID3
+    from mutagen.easymp4 import EasyMP4Tags
+    EasyID3.RegisterTXXXKey("game", "GAME")
+    EasyMP4Tags.RegisterFreeformKey("game", "GAME")
+    _EASY_GAME_REGISTERED = True
+
+
+register_easy_game_key()
 
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus",
@@ -292,9 +317,9 @@ _MOD_MAGIC_CHANNELS = {
 #   * Tracker formats: header is tens to hundreds of bytes at offset 0;
 #           we pad to KB-range for safety on unusual variants.
 #   * SID/PSID: 128-byte header at offset 0; 256 B is overkill.
-#   * SPC: 256-byte header + ID666 tag at offset 0x2E; 64 KB lets us
-#           read the optional extended tag block at end of file (but for
-#           SPC the file IS only 64 KB).
+#   * SPC: 256-byte header + ID666 tag at offset 0x2E; the optional
+#           extended (xid6) tag starts at 0x10200, past the 64 KB RAM image,
+#           so SPC is always fetched whole (budget None below).
 #
 # All values are upper bounds — the partial fetch may stop earlier on
 # EOF.  If extract returns a result whose ``title`` is just the
@@ -317,8 +342,12 @@ HEADER_BUDGET: dict[str, int | None] = {
     ".flac": 1536 * 1024,
     ".ogg":  512 * 1024,
     ".opus": 512 * 1024,
-    ".aiff": 512 * 1024,
-    ".aif":  512 * 1024,
+    # AIFF: the tag is an ``ID3 `` chunk that ffmpeg / mutagen (and our own
+    # ``write_lyrics``) place AFTER the ``SSND`` audio chunk, at the file END —
+    # a front read parses cleanly (COMM gives the duration) but finds no tag,
+    # and the "looks incomplete" check can't tell, so fetch the whole file.
+    ".aiff": None,
+    ".aif":  None,
     ".wav":  128 * 1024,
     # Tracker formats — header at start, small
     ".mod":  64 * 1024,    # MOD samples can inflate; 64 KB covers most
@@ -415,6 +444,316 @@ def _decode_tracker_str(b: bytes, *, latin1_native: bool = False) -> str:
 
 def _str(v) -> str:
     return str(v).strip() if v is not None else ""
+
+
+def _psf_tag_text(blob: bytes) -> str:
+    """A PSF ``[TAG]`` block's text: UTF-8 when it decodes as such (the spec's
+    ``utf8=1`` sets) — unless, without ``utf8=1``, it reads as legacy bytes
+    (``_unlikely_utf8``: a legacy "ß´" is valid UTF-8 for an NKo letter) and
+    a legacy reading is plausible, or holds a C1 control; else whichever of
+    Western (cp1252 — Latin-1 plus Windows punctuation) and Shift-JIS (cp932,
+    the usual encoding of Japanese sets) reads more plausibly
+    (``_legacy_text``)."""
+    utf8 = b"utf8=1" in blob.lower()
+    try:
+        text: str | None = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is not None:
+        if utf8 or not _unlikely_utf8(text):
+            return text
+        legacy = _legacy_text(blob)
+        if legacy is not None and (legacy[1] > 0 or _has_c1(text)):
+            return legacy[0]
+        return text
+    if utf8:
+        return blob.decode("utf-8", "replace")
+    legacy = _legacy_text(blob)
+    return legacy[0] if legacy is not None else blob.decode("cp1252", "replace")
+
+
+def _legacy_text(blob: bytes) -> tuple[str, float] | None:
+    """The more plausible of the cp1252 and cp932 readings of ``blob`` with
+    its score (``_western_score`` / ``_japanese_score``; a tie is Japanese:
+    a lone kanji and a lone accented letter score alike), or None when
+    neither decodes."""
+    try:
+        western = blob.decode("cp1252")
+    except UnicodeDecodeError:
+        western = None
+    try:
+        japanese = blob.decode("cp932")
+    except UnicodeDecodeError:
+        japanese = None
+    ws = _western_score(western) if western is not None else None
+    js = _japanese_score(japanese) if japanese is not None else None
+    if ws is not None and (js is None or ws > js):
+        return western, ws
+    if js is not None:
+        return japanese, js
+    return None
+
+
+def _has_c1(text: str) -> bool:
+    return any(0x80 <= ord(c) <= 0x9F for c in text)
+
+
+def _stray_mark(text: str) -> bool:
+    """Does ``text`` hold a combining mark (U+0300–036F) on nothing it could
+    mark: at the start of a line or of a ``key=value`` value (half-width
+    katakana often decode as one), or after a character that is no letter,
+    digit or math symbol (a decomposed "≠" is "=" + U+0338) — looking past
+    marks stacked on one base."""
+    base = ""
+    in_value = False
+    for c in text:
+        if c == "\n":
+            base, in_value = "", False
+        elif 0x300 <= ord(c) <= 0x36F:
+            if not base or not (base.isalnum() or unicodedata.category(base) == "Sm"):
+                return True
+        elif c == "=" and not in_value:
+            base, in_value = "", True                   # the tag's own separator
+        else:
+            base = c
+    return False
+
+
+def _unlikely_utf8(text: str) -> bool:
+    """Does ``text`` (a UTF-8 decode) read as legacy bytes: a C1 control or a
+    combining mark on no letter or digit (half-width katakana often decode
+    as one) anywhere; or, for all its non-ASCII, lone IPA letters and
+    Armenian … NKo characters between ASCII — what two legacy bytes (a
+    Latin-1 letter and a symbol) often decode as.  Such a letter beside
+    other non-ASCII text ("Λsʜᴇs", "שלום", "ətˈæk") is real text, and so is
+    a mark on a letter or digit (a decomposed "Garçon", "Z0̸NE")."""
+    if _has_c1(text) or _stray_mark(text):
+        return True
+    n = len(text)
+    lone = False
+    for k, c in enumerate(text):
+        o = ord(c)
+        if o < 0x80:
+            continue
+        if not ((0x250 <= o <= 0x2AF or 0x530 <= o <= 0x7FF)
+                and (k == 0 or text[k - 1].isascii()) and (k + 1 == n or text[k + 1].isascii())):
+            return False
+        lone = True
+    return lone
+
+
+# cp1252 letters of its 0x80–0x9F range (Czech, French …); as Shift-JIS bytes
+# they lead a kanji ("ŠC" is 海).
+_C1_LETTERS = frozenset("ŠŒŽšœžŸ")
+# Windows punctuation (0x80–0x9F), each with the places it sits in Western
+# text; and Latin-1 symbols and the no-break space.
+_WESTERN_PUNCT = frozenset("‘’“”–—…•™€‚„‹›")
+_WESTERN_SYMBOLS = frozenset("©®°±²³µ·¹º¼½¾¿×÷«»¡§¶£¥¢¬´¸¨\xa0")
+_W_SYMBOL = 1.0
+
+
+def _latin_letter(c: str) -> bool:
+    return ((c.isascii() and c.isalpha()) or ("\xc0" <= c <= "\xff" and c not in "×÷")
+            or c in _C1_LETTERS)
+
+
+def _western_score(text: str) -> float:
+    """How plausibly ``text`` (a cp1252 decode) is Western: accented letters
+    inside words, Windows punctuation where it goes ("Don’t", " – ", "“Live”",
+    "Game™"), symbols — against runs of odd characters, a capital inside a
+    word ("žÙ", "šA"), and anything else — "ƒ" (the Shift-JIS katakana lead
+    byte) among it."""
+    score = 0.0
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i].isascii():
+            i += 1
+            continue
+        j = i
+        while j < n and not text[j].isascii():
+            j += 1
+        if j - i > 2:
+            score -= j - i - 2                      # Western text: one or two at a time
+        before = text[i - 1] if i else ""
+        after = text[j] if j < n else ""
+        # a run with no ASCII letter beside it is no part of a word
+        anchored = (before.isascii() and before.isalpha()) or (after.isascii() and after.isalpha())
+        for k in range(i, j):
+            c = text[k]
+            prev = text[k - 1] if k else ""
+            nxt = text[k + 1] if k + 1 < n else ""
+            in_word = anchored and ((bool(prev) and _latin_letter(prev))
+                                    or (bool(nxt) and _latin_letter(nxt)))
+            if c.isalpha() and c != "ß" and ((c.isupper() and prev.isalpha() and prev.islower())
+                                             or (c.islower() and nxt.isalpha() and nxt.isupper())):
+                score -= 2                          # a capital inside a word ("GRÜßE" is none)
+            pa = bool(prev) and prev.isalnum()
+            na = bool(nxt) and nxt.isalnum()
+            if c in _C1_LETTERS:
+                tail = text[k + 1:k + 3]
+                if (c in "ŠŒŽ" and not prev.isalpha() and len(tail) == 2 and tail.isascii()
+                        and tail.isalpha() and (tail.islower() or tail.isupper())):
+                    score += 3                      # "Škoda", "Œuvre", "ŠKODA"
+                elif c != "Ÿ":
+                    score += 1.5 if in_word else 0.5
+            elif _latin_letter(c):
+                score += 3 if in_word else 1.5
+            elif c in _WESTERN_PUNCT:
+                if c == "’" and pa and (na or not nxt or nxt in " ,.!?;:)"):
+                    score += 3                      # Don’t, Rock ‘n’ Roll
+                elif c in "‘“„‚‹" and (not prev or prev in " ([/-") and na:
+                    score += 2
+                elif c in "’”›" and (pa or prev in ".!?") and (not nxt or nxt in " )],.!?:;/-"):
+                    score += 2
+                elif c in "–—" and prev == " " and na:
+                    score += 3                      # "After Dark –prologue-"
+                elif c in "–—" and ((prev == " " and nxt == " ") or (pa and (na or nxt == " "))):
+                    score += 2
+                elif c == "…" and (pa or prev in ".!?") and (not nxt or not nxt.isalnum()):
+                    score += 2
+                elif c == "™" and pa and (not nxt or not nxt.isalnum()):
+                    score += 2
+                elif c == "€" and (na or (bool(prev) and prev.isdigit())):
+                    score += 2
+                elif c == "•" and prev in (" ", "") and nxt == " ":
+                    score += 2
+                else:
+                    score -= 1
+            elif c == "¥":                          # a price: "¥500", "500 ¥"
+                near = text[max(k - 2, 0):k] + text[k + 1:k + 3]
+                score += 1 if any(d.isdigit() for d in near) else -1
+            elif c in _WESTERN_SYMBOLS:
+                score += _W_SYMBOL
+            else:
+                score -= 3
+        i = j
+    return score
+
+
+# Half-width katakana (U+FF61–FF9F) — what Latin-1 symbols and capitals read
+# as in cp932: a run with a voicing mark after a letter or a small kana after
+# a full-size one ("ｼﾞ", "ﾛｯｸﾏﾝ"), or of three or more with two different
+# letters ("ﾀｲﾄﾙ"), is Japanese; so, a little less, are two full-size letters
+# standing alone ("ﾕﾒ") — beside Latin text ("CD³²" reads as "CDｳｲ") they say
+# nothing either way; a run of middle dots ("･･･") is an ellipsis, a lone one
+# a separator ("R･I･O･T"); anything else counts against it ("°°°°" reads as
+# "ｰｰｰｰ", "·°·" as "ｷｰｷ").
+_HW_WORD = 2.0
+_HW_DOTS = 1.5
+_HW_SEPARATOR = 0.5
+_HW_OTHER = -2.5
+_HW_VOICED = frozenset("ﾞﾟ")
+_HW_SMALL = frozenset("ｧｨｩｪｫｬｭｮｯ")
+
+
+def _half_width_scores(text: str) -> dict[int, float]:
+    """The score of each half-width katakana in ``text``, by index."""
+    out: dict[int, float] = {}
+    n = len(text)
+    i = 0
+    while i < n:
+        if not 0xFF61 <= ord(text[i]) <= 0xFF9F:
+            i += 1
+            continue
+        j = i
+        while j < n and 0xFF61 <= ord(text[j]) <= 0xFF9F:
+            j += 1
+        run = text[i:j]
+        letters = {c for c in run if 0xFF66 <= ord(c) <= 0xFF9D and c != "ｰ"}
+        # a voicing mark after a letter ("ｼﾞ"), or a small kana after a
+        # full-size one ("ｼｮ", "ﾛｯｸ") — "ß´" reads as a mark first, "©®" as
+        # two small kana, "«»" as a small one first
+        marked = any(run[m - 1] in letters
+                     and (run[m] in _HW_VOICED
+                          or (run[m] in _HW_SMALL and run[m - 1] not in _HW_SMALL))
+                     for m in range(1, len(run)))
+        if letters and (marked or (len(run) >= 3 and len(letters) >= 2)):
+            w = _HW_WORD
+        elif len(run) == 2 and len(letters) == 2:
+            # two letters: a word on its own ("ﾕﾒ"); beside Latin text ("CD³²"
+            # reads as "CDｳｲ"), or small kana ("©®"), no evidence either way
+            before = text[i - 1] if i else ""
+            after = text[j] if j < n else ""
+            alone = not (before.isascii() and before.isalnum()) and not (
+                after.isascii() and after.isalnum())
+            w = _HW_WORD * 0.75 if alone and _HW_SMALL.isdisjoint(run) else 0.0
+        elif len(run) >= 2 and set(run) == {"･"}:
+            w = _HW_DOTS
+        elif run == "･":
+            w = _HW_SEPARATOR
+        else:
+            w = _HW_OTHER
+        for k in range(i, j):
+            out[k] = w
+        i = j
+    return out
+
+
+def _japanese_score(text: str) -> float:
+    """How plausibly ``text`` (a cp932 decode) is Japanese: kana, common
+    (JIS level-1) and rarer (level-2) kanji, full-width forms, half-width
+    katakana words (``_half_width_scores``) — against anything else; a kanji
+    beside a Latin letter counts less ("Dušan" read as cp932 puts one inside
+    a word)."""
+    score = 0.0
+    n = len(text)
+    half = _half_width_scores(text)
+    for k, c in enumerate(text):
+        if c.isascii():
+            continue
+        o = ord(c)
+        if 0x3041 <= o <= 0x30FF:                   # hiragana, katakana, ー
+            score += 4
+            continue
+        if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0xF900 <= o <= 0xFAFF:
+            try:
+                code = int.from_bytes(c.encode("cp932"), "big")
+            except UnicodeEncodeError:
+                code = 0
+            s = 3 if 0x889F <= code <= 0x9872 else (2.5 if 0x989F <= code <= 0xEAA4 else 0.5)
+        elif 0x3000 <= o <= 0x303F or 0xFF01 <= o <= 0xFF5E:
+            s = 2                                   # CJK punctuation, full-width forms
+        elif 0xFF61 <= o <= 0xFF9F:
+            score += half[k]                        # half-width katakana
+            continue
+        elif unicodedata.east_asian_width(c) in ("W", "F"):
+            s = 0.5
+        else:
+            score -= 6                              # user-defined, control …
+            continue
+        for nb in (text[k - 1] if k else "", text[k + 1] if k + 1 < n else ""):
+            if nb and nb.isascii() and nb.isalpha():
+                s -= 1
+        score += s
+    return score
+
+
+def _mp4_game(tags, g) -> str:
+    """The GAME of an MP4 tag — the ``----:com.apple.iTunes:GAME`` freeform
+    atom the tag editor writes, or one another tool wrote in another case."""
+    v = (g("----:com.apple.iTunes:GAME", "") or "").strip()
+    if v or not tags:
+        return v
+    for k in list(tags.keys()):
+        if k.lower() == "----:com.apple.itunes:game":
+            v = (g(k, "") or "").strip()
+            if v:
+                return v
+    return ""
+
+
+def _id3_game(tags) -> str:
+    """The GAME of an ID3 tag — a ``TXXX:GAME`` user frame (there is no
+    standard frame; this is the key the tag editor writes)."""
+    getall = getattr(tags, "getall", None)
+    for frame in (getall("TXXX") if getall else []):
+        if (getattr(frame, "desc", "") or "").strip().upper() == "GAME":
+            # A multi-value frame: its first value (they'd join with NULs).
+            for v in (getattr(frame, "text", None) or [frame]):
+                if _str(v):
+                    return _str(v)
+    return ""
 
 
 def _list(v) -> list[str]:
@@ -667,19 +1006,25 @@ def cap_full_cover(data: bytes, max_size: int = 1024, min_bytes: int = 262_144) 
 
 # ── MP3 (ID3) ─────────────────────────────────────────────────────────────────
 
-def _mp3(path: Path, track_id: str) -> dict:
-    audio = MP3(path)
-    tags = audio.tags or {}
+def id3_picture(tags):
+    """The cover of an ID3 tag: its front-cover ``APIC`` (type 3), else its
+    first ``APIC`` with image data, else None — never another frame that
+    carries ``mime`` + ``data`` (a ``GEOB``, e.g. DJ software's Serato data).
+    ID3v2.2 ``PIC`` frames load as ``APIC``.  Shared with ``api/art``."""
+    pics = [f for f in (tags.getall("APIC") if tags is not None else []) if f.data]
+    return next((f for f in pics if f.type == 3), pics[0] if pics else None)
+
+
+def _id3_fields(tags) -> dict:
+    """The track fields of an ID3 tag — shared by MP3 (a tag at the head of
+    the file) and AIFF (an ``ID3 `` chunk inside the IFF container): text
+    frames, the GAME (``_id3_game``), the cover (``id3_picture``), ReplayGain.
+    ``tags`` None (a file with no ID3 tag) reads as an empty tag."""
+    if tags is None:
+        tags = ID3()
     trck = str(tags.get("TRCK", ""))
     tpos = str(tags.get("TPOS", ""))
     d: dict = {
-        "id": track_id,
-        "path": str(path),
-        "format": "MP3",
-        "duration": audio.info.length,
-        "bitrate": audio.info.bitrate,
-        "channels": audio.info.channels,
-        "sample_rate": audio.info.sample_rate,
         "title": _str(tags.get("TIT2")),
         "artist": _str(tags.get("TPE1")),
         "album_artist": _str(tags.get("TPE2")),
@@ -688,6 +1033,7 @@ def _mp3(path: Path, track_id: str) -> dict:
         "comment": _str(next(iter(tags.getall("COMM") or []), "")),
         "label": _str(tags.get("TPUB")),
         "isrc": _str(tags.get("TSRC")),
+        "game": _id3_game(tags),
         "bpm": _float(tags.get("TBPM")),
         "genre": _list(tags.get("TCON")),
         "year": _year(tags.get("TDRC") or tags.get("TYER")),
@@ -696,12 +1042,55 @@ def _mp3(path: Path, track_id: str) -> dict:
         "disc_number": _int(tpos),
         "total_discs": _total(tpos),
     }
-    for tag in tags.values():
-        if hasattr(tag, "mime") and hasattr(tag, "data") and tag.data:
-            mime = tag.mime[0] if getattr(tag, "mime", None) else "image/jpeg"
-            d["cover_art"] = _cover_b64(tag.data, mime)
-            break
+    pic = id3_picture(tags)
+    if pic is not None:
+        d["cover_art"] = _cover_b64(pic.data, pic.mime or "image/jpeg")
     d.update(_replaygain_from_id3(tags))
+    return d
+
+
+def _mp3(path: Path, track_id: str) -> dict:
+    audio = MP3(path)
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "MP3",
+        "duration": audio.info.length,
+        "bitrate": audio.info.bitrate,
+        "channels": audio.info.channels,
+        "sample_rate": audio.info.sample_rate,
+    }
+    d.update(_id3_fields(audio.tags))
+    return d
+
+
+# ── AIFF (ID3 chunk) ──────────────────────────────────────────────────────────
+
+def _aiff(path: Path, track_id: str) -> dict:
+    """AIFF: the tag is an ID3 ``ID3 `` chunk inside the IFF container, never
+    at the head of the file — ``MP3`` / ``ID3(path)`` can't read it; the
+    stream info comes from the COMM chunk."""
+    try:
+        audio = AIFF(path)
+        info, tags = audio.info, audio.tags
+    except Exception as exc:
+        _swallow_io(exc)
+        # A bad ID3 chunk (an unsupported version, a cut frame) fails the
+        # whole load: keep the COMM stream info without tags.  A bad COMM
+        # still raises here.
+        with open(path, "rb") as fh:
+            info, tags = AIFFInfo(fh), None
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "AIFF",
+        "duration": info.length,
+        "bitrate": info.bitrate,
+        "channels": info.channels,
+        "sample_rate": info.sample_rate,
+        "bit_depth": info.bits_per_sample,
+    }
+    d.update(_id3_fields(tags))
     return d
 
 
@@ -747,6 +1136,7 @@ def _flac(path: Path, track_id: str) -> dict:
         "comment": g("comment"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
+        "game": (g("game") or "").strip(),
         "bpm": _float(g("bpm", None)),
         "genre": audio.get("genre", []),
         "year": _year(g("date", None)),
@@ -770,7 +1160,10 @@ def _mp4(path: Path, track_id: str) -> dict:
 
     def g(key, default=""):
         v = tags.get(key, [default])
-        return str(v[0]) if v else default
+        if not v:
+            return default
+        # A freeform ``----:`` atom holds bytes (``str()`` would give "b'…'").
+        return v[0].decode("utf-8", "replace") if isinstance(v[0], bytes) else str(v[0])
 
     # ``tags.get("trkn", default)`` returns the default only when the key is
     # absent — an explicit empty list, or a 1-element tuple from a malformed
@@ -835,6 +1228,7 @@ def _mp4(path: Path, track_id: str) -> dict:
         "comment": g("\xa9cmt"),
         "label": g("----:com.apple.iTunes:LABEL", "") or g("\xa9grp", ""),
         "isrc": g("----:com.apple.iTunes:ISRC", ""),
+        "game": _mp4_game(tags, g),
         "bpm": _float(g("tmpo", None)),
         "genre": _list(tags.get("\xa9gen", [])),
         "year": _year(g("\xa9day", None)),
@@ -867,7 +1261,9 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "duration": audio.info.length,
         "bitrate": getattr(audio.info, "bitrate", None),
         "channels": audio.info.channels,
-        "sample_rate": audio.info.sample_rate,
+        # (Opus has no sample-rate field: it always decodes at 48 kHz —
+        # reading ``info.sample_rate`` raised and dropped every tag)
+        "sample_rate": getattr(audio.info, "sample_rate", None) or (48000 if fmt == "Opus" else None),
         "title": g("title", path.stem),
         "artist": g("artist"),
         "album_artist": g("albumartist") or g("album_artist"),
@@ -876,6 +1272,7 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "comment": g("comment"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
+        "game": (g("game") or "").strip(),
         "bpm": _float(g("bpm", None)),
         "genre": tags.get("genre", []),
         "year": _year(g("date", None)),
@@ -996,7 +1393,28 @@ def _extract_sid(path: Path, track_id: str) -> dict:
     except Exception:
         log.exception("HVSC enrichment failed for %s", path)
 
+    # The default tune (header start song, 1-based) when it isn't tune 1: the
+    # bare track id plays it, so it is recorded (0-based) for the Subsonic tune
+    # ids and the web picker, and the track's duration is ITS length.
+    start = sid_default_tune(default_song, d.get("subsongs"))
+    if start:
+        d["start_subsong"] = start
+        lengths = d.get("hvsc_lengths")
+        if lengths and start < len(lengths) and lengths[start]:
+            d["duration"] = lengths[start]
+
     return d
+
+
+def sid_default_tune(start_song, count) -> int | None:
+    """0-based index of a multi-tune file's default tune from its 1-based
+    start song (PSID/RSID header word, SNDH ``!#``) and tune count — only when
+    it is a valid tune other than tune 1, else None (the ``start_subsong``
+    field's convention)."""
+    if (isinstance(start_song, int) and isinstance(count, int)
+            and 2 <= start_song <= count):
+        return start_song - 1
+    return None
 
 
 # ── MIDI ─────────────────────────────────────────────────────────────────────
@@ -1061,40 +1479,217 @@ def _extract_midi(path: Path, track_id: str) -> dict:
 
 # ── libgme chiptune (NSF / SPC / GBS / VGM / AY / KSS / SAP / HES / GYM) ──
 
+# Rippers fill unknown header fields with a placeholder rather than leaving
+# them blank ("<?>" is the NSF/GBS convention).  Never an album, never an
+# artist (``_extract_gme`` filters both through ``_game_name``).
+_GAME_PLACEHOLDERS = frozenset({"<?>", "?", "??", "???", "unknown", "n/a", "-"})
+
+
+def _game_name(raw: str) -> str:
+    """A header's game-name field, trimmed with inner whitespace collapsed —
+    or ``""`` when it is empty, a ripper placeholder, or not text at all
+    (control characters ⇒ a binary/garbage field, never shown as an album)."""
+    if not raw:
+        return ""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return ""
+    s = " ".join(raw.split())
+    if not s or s.lower() in _GAME_PLACEHOLDERS:
+        return ""
+    return s
+
+
+def _nsfe_auth(path: Path) -> tuple[str, str]:
+    """``(game, artist)`` from an NSFe file's ``auth`` chunk.
+
+    NSFe is chunked (``[u32 LE size][4-byte id][data]`` after the ``NSFE``
+    magic); ``auth`` holds four NUL-terminated strings — game title, artist,
+    copyright, ripper.  Walks chunk HEADERS only (seeking past each body), so
+    a large ``DATA`` chunk is never read; a truncated partial fetch simply
+    ends the walk."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"NSFE":
+                return "", ""
+            for _ in range(64):                    # a real file has < 10 chunks
+                h = f.read(8)
+                if len(h) < 8:
+                    break
+                size, cid = struct.unpack("<I4s", h)
+                if cid == b"auth":
+                    fields = f.read(min(size, 4096)).split(b"\x00")
+                    game = _decode_tracker_str(fields[0]) if fields else ""
+                    artist = _decode_tracker_str(fields[1]) if len(fields) > 1 else ""
+                    return game, artist
+                if cid == b"NEND":
+                    break
+                f.seek(size, 1)
+    except (OSError, struct.error) as exc:
+        _swallow_io(exc)
+    return "", ""
+
+
+# SPC extended ID666 ("xid6") — after the 64 KB RAM dump + DSP/extra RAM.
+_SPC_XID6_OFFSET = 0x10200
+_SPC_XID6_MAX = 0x4000          # the real chunk is a few hundred bytes
+
+
+def _spc_xid6_game(path: Path) -> str:
+    """The game name from an SPC's extended ID666 (``xid6``) chunk, or ``""``.
+
+    The fixed ID666 game field is 32 bytes, so longer names are cut off
+    ("Street Fighter 2 - The World Warr"); the extended tag's sub-chunk 0x02
+    holds the full string.  Sub-chunk header: id u8, type u8, length u16 LE;
+    type 0 keeps its value in the length field (no payload), otherwise the
+    payload is ``length`` bytes padded to 4.  Anything malformed → ``""``."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(_SPC_XID6_OFFSET)
+            blob = f.read(_SPC_XID6_MAX)
+    except OSError as exc:
+        _swallow_io(exc)
+        return ""
+    if len(blob) < 8 or blob[:4] != b"xid6":
+        return ""
+    end = min(8 + struct.unpack_from("<I", blob, 4)[0], len(blob))
+    pos = 8
+    while pos + 4 <= end:
+        sid, typ = blob[pos], blob[pos + 1]
+        length = struct.unpack_from("<H", blob, pos + 2)[0]
+        pos += 4
+        if typ == 0:
+            continue
+        if pos + length > end:
+            break
+        if sid == 0x02 and typ == 1:
+            return _game_name(_decode_tracker_str(blob[pos:pos + length]))
+        pos += (length + 3) & ~3
+    return ""
+
+
+# GD3 lives at the END of a VGM (after the command stream).  A .vgz is gzip, so
+# reaching it means decompressing up to that point — capped so a corrupt or
+# hostile offset can't make the scan worker inflate gigabytes.
+_VGM_MAX_GD3_OFFSET = 64 * 1024 * 1024
+_GD3_MAX_BYTES = 64 * 1024
+
+
+def _vgm_gd3(path: Path) -> dict[str, str]:
+    """``{"track", "game", "author"}`` from a VGM/VGZ GD3 tag (English field,
+    Japanese fallback), or ``{}``.
+
+    Reads the 0x18-byte header, then seeks straight to the GD3 block (a gzip
+    stream's forward seek decompresses-and-discards without buffering the
+    whole file).  GD3 strings are NUL-terminated UTF-16LE in a fixed order:
+    track EN/JP, game EN/JP, system EN/JP, author EN/JP, date, ripper, notes."""
+    import gzip
+    try:
+        with open(path, "rb") as raw:
+            gz = raw.read(2) == b"\x1f\x8b"
+            raw.seek(0)
+            f = gzip.GzipFile(fileobj=raw) if gz else raw
+            try:
+                hdr = f.read(0x18)
+                if len(hdr) < 0x18 or hdr[:4] != b"Vgm ":
+                    return {}
+                gd3_rel = struct.unpack_from("<I", hdr, 0x14)[0]
+                off = 0x14 + gd3_rel
+                if not gd3_rel or off > _VGM_MAX_GD3_OFFSET:
+                    return {}
+                f.seek(off)
+                th = f.read(12)
+                if len(th) < 12 or th[:4] != b"Gd3 ":
+                    return {}
+                length = struct.unpack_from("<I", th, 8)[0]
+                body = f.read(min(length, _GD3_MAX_BYTES))
+            finally:
+                if gz:
+                    f.close()
+    except Exception as exc:               # corrupt gzip/zlib stream, short file…
+        _swallow_io(exc)                   # — never fail the whole extract
+        return {}
+    body = body[: len(body) - (len(body) % 2)]
+    fields = body.decode("utf-16-le", "replace").split("\x00")
+
+    def pick(en: int, jp: int) -> str:
+        for i in (en, jp):
+            if i < len(fields):
+                v = " ".join(fields[i].split())
+                if v and "�" not in v:
+                    return v
+        return ""
+
+    return {"track": pick(0, 1), "game": pick(2, 3), "author": pick(6, 7)}
+
+
 def _extract_gme(path: Path, track_id: str) -> dict:
     """Best-effort header read for libgme-rendered chiptune formats.
 
     Most of these formats have a small, well-documented header with a
     title + artist string.  We parse just enough to display in the UI;
     detailed track-list metadata (multi-song NSFs, SPC ID666) needs
-    the actual gme library and is left to the renderer."""
+    the actual gme library and is left to the renderer.
+
+    The GAME a console rip belongs to is read into ``album`` (provenance
+    ``album_source="tag"``) from the header field each format defines for it:
+    SPC ID666 game title (0x4E; the extended ``xid6`` tag's full name when
+    the 32-byte field is full), the NSF name / NSFe ``auth`` game title, the
+    GBS title, and the VGM/VGZ GD3 game name."""
     from soniqboom.config import settings
     ext = path.suffix.lower()
     fmt = FORMAT_NAMES.get(ext, ext.lstrip(".").upper())
     title = path.stem
     artist = ""
+    game = ""
     duration = float(getattr(settings, "sid_default_duration", 180))
     try:
         with open(path, "rb") as f:
             hdr = f.read(256)
-    except OSError:
+    except OSError as exc:
+        _swallow_io(exc)
         hdr = b""
 
     # NSF header (NES Sound Format) — 0x80 bytes, fields at fixed offsets.
+    # The "name" field is the game (or, for a homebrew release, the album).
     if ext in (".nsf", ".nsfe") and hdr[:5] == b"NESM\x1a":
         title  = _decode_tracker_str(hdr[0x0E:0x2E])
         artist = _decode_tracker_str(hdr[0x2E:0x4E])
+        game   = _game_name(title)
+    # NSFe — chunked; the game/artist live in the ``auth`` chunk.
+    elif ext in (".nsf", ".nsfe") and hdr[:4] == b"NSFE":
+        g, a = _nsfe_auth(path)
+        game = _game_name(g)
+        if _game_name(a):
+            artist = a
     # SPC700 ID666 (SNES) — 0x100 byte SPC header + 0xD0-byte ID666 block.
+    # Byte 0x23 = 27 means "no ID666 tag" (the fields are then garbage).
     elif ext == ".spc" and hdr[:33] == b"SNES-SPC700 Sound File Data v0.30":
         title  = _decode_tracker_str(hdr[0x2E:0x4E])
         artist = _decode_tracker_str(hdr[0xB1:0xD1])
-    # GBS (Game Boy Sound) — 0x70 byte header.
+        if len(hdr) > 0x6E and hdr[0x23] != 27:
+            game = _game_name(_decode_tracker_str(hdr[0x4E:0x6E]))
+            if game and b"\x00" not in hdr[0x4E:0x6E]:
+                # A full field may be a cut-off name — prefer the extended tag.
+                game = _spc_xid6_game(path) or game
+    # GBS (Game Boy Sound) — 0x70 byte header; the title field is the game.
     elif ext == ".gbs" and hdr[:3] == b"GBS":
         title  = _decode_tracker_str(hdr[0x10:0x30])
         artist = _decode_tracker_str(hdr[0x30:0x50])
+        game   = _game_name(title)
+    # VGM / VGZ — GD3 tag (track, game, author).
+    elif ext in (".vgm", ".vgz"):
+        gd3 = _vgm_gd3(path)
+        if gd3.get("track"):
+            title = gd3["track"]
+        if gd3.get("author"):
+            artist = gd3["author"]
+        game = _game_name(gd3.get("game", ""))
     # Other formats fall back to filename; gme renderer will surface
     # the proper metadata when streaming.
 
+    # A ripper placeholder ("<?>") or a garbage field names nobody — left
+    # empty, the Modland apply can credit the real composer.
+    artist = _game_name(artist)
     d = {
         "id": track_id,
         "path": str(path),
@@ -1105,6 +1700,10 @@ def _extract_gme(path: Path, track_id: str) -> dict:
     }
     if artist:
         d["artist"] = artist   # TrackMeta.artist is str — never None
+    if game:
+        d["album"] = game
+        d["album_source"] = "tag"
+        d["game_by_tag"] = game                # the header's own game name
     return d
 
 
@@ -1322,6 +1921,15 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     try:
         with open(path, "rb") as f:
             raw = f.read()  # read full file for instrument headers
+        if raw[:4] == b"XPKF":
+            # An XPK-packed module: parse the unpacked one (uade plays one
+            # unpacked too — ``api.stream._xpk_unpacked``; openmpt unpacks
+            # XPK itself).
+            from soniqboom.core import xpk as _xpk
+            try:
+                raw = _xpk.unpack(raw)
+            except _xpk.XpkError as exc:
+                log.debug("XPK unpack failed for %s: %s", path, exc)
 
         if ext == ".mod" and len(raw) >= 1084:
             title = _decode_tracker_str(raw[0:20])
@@ -1568,19 +2176,41 @@ def uade_get_info(path: Path) -> dict:
     Returns the parsed key/value lines (playername, modulename, subsongs, …)
     plus ``_ok``: True iff uade accepted the file.  ``_ok`` False covers
     unknown formats, corrupt modules, MISSING COMPANION halves (TFMX without
-    its ``smpl.``), and uade123 not being installed at all.
+    its ``smpl.``), and uade123 not being installed at all.  An XPK-SQSH
+    packed module is probed unpacked (``xpk``); another XPK method, or
+    damaged packed data, is ``_ok`` False.
     """
+    import shutil as _shutil
     import subprocess as _sp
+    from soniqboom.core import xpk as _xpk
     binary = _find_uade123()
     if not binary:
         return {"_ok": False, "_error": "uade123 not installed"}
+    # uade refuses an XPK-packed module ("Please depack first"): probe an
+    # unpacked copy (in a temp folder, with its companion halves linked).
+    probe = Path(path)
+    unpacked = None
+    try:
+        with open(probe, "rb") as fh:
+            packed = _xpk.xpk_method(fh.read(12)) is not None
+    except OSError:
+        packed = False
+    if packed:
+        try:
+            unpacked = probe = _xpk.write_unpacked(
+                probe, _xpk.unpack_file(probe), _uade.companion_sibling_names(probe.name))
+        except (_xpk.XpkError, OSError) as exc:
+            return {"_ok": False, "_error": f"XPK: {exc}"}
     try:
         r = forksafe.run(
-            [binary, "-g", str(path)],
+            [binary, "-g", str(probe)],
             capture_output=True, text=True, timeout=_UADE123_INFO_TIMEOUT_S,
         )
     except (_sp.TimeoutExpired, OSError) as exc:
         return {"_ok": False, "_error": str(exc)}
+    finally:
+        if unpacked is not None:
+            _shutil.rmtree(unpacked.parent, ignore_errors=True)
     info: dict = {"_ok": r.returncode == 0}
     # uade prints "module check failed" to stderr ONLY when the input is
     # genuinely NOT an Amiga module (a PC ``.dat``/``.fc``, a Gravis ``.pat``
@@ -1641,6 +2271,10 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
         lo, hi = int(m.group(1)), int(m.group(2))
         if hi > lo:
             d["subsongs"] = hi - lo + 1
+            # Numbering starts at ``lo`` (Hippel families report min 1): keep
+            # it, so picker index N can map to replayer subsong N + lo.
+            if lo:
+                d["subsong_base"] = lo
     return d
 
 
@@ -1728,6 +2362,9 @@ def _extract_sndh(path: Path, track_id: str) -> dict:
         d["year"] = year
     if subsongs and subsongs > 1:
         d["subsongs"] = subsongs
+        start = sid_default_tune(default_track, subsongs)
+        if start:
+            d["start_subsong"] = start      # the default tune (``!#``), 0-based
     return d
 
 
@@ -1903,8 +2540,8 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     raw = b""
     try:
         raw = path.read_bytes()
-    except OSError:
-        pass
+    except OSError as exc:
+        _swallow_io(exc)
     version = raw[3] if len(raw) >= 4 and raw[:3] == b"PSF" else None
     fmt = _PSF_VERSION_NAMES.get(version or -1) or FORMAT_NAMES.get(
         path.suffix.lower(), "PSF")
@@ -1914,7 +2551,7 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     # program can't fake a tag block.
     idx = raw.rfind(b"[TAG]", max(0, len(raw) - 65536))
     if idx != -1:
-        for line in raw[idx + 5:].decode("utf-8", "replace").splitlines():
+        for line in _psf_tag_text(raw[idx + 5:]).splitlines():
             k, sep, v = line.partition("=")
             if sep:
                 tags.setdefault(k.strip().lower(), v.strip())
@@ -1937,6 +2574,8 @@ def _extract_psf(path: Path, track_id: str) -> dict:
         d["artist"] = tags["artist"]
     if tags.get("game"):
         d["album"] = tags["game"]
+        d["album_source"] = "tag"
+        d["game_by_tag"] = tags["game"]        # the header's own game name
     year = tags.get("year", "")[:4]
     if year.isdigit():
         d["year"] = int(year)
@@ -1945,14 +2584,16 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     return d
 
 
-def _wants_scene_md5(ext: str, name: str) -> bool:
-    """Should this file's MD5 be cached for the Modland scene join?
+def _wants_scene_md5(ext: str, name: str, d: dict) -> bool:
+    """Should this file's MD5 be cached for the scene joins (Modland, the
+    UADE song database)?
 
-    Chiptune/tracker-family formats Modland hosts.  C64 ``.sid`` is
-    excluded — it already carries ``sid_md5`` for the HVSC join.
+    Chiptune/tracker-family formats Modland hosts.  A C64 ``.sid`` is
+    excluded — it already carries ``sid_md5`` for the HVSC join; an Amiga
+    SidMon module named ``.sid`` (no ``sid_md5``) is not.
     """
     if ext in _SID_EXTS:
-        return False
+        return "sid_md5" not in d
     if (ext in _TRACKER_EXTS or ext in _UADE_SUFFIX_EXTS
             or ext in _ATARI_EXTS or ext in _GME_EXTS
             or ext in _ADLIB_EXTS or ext in _PSF_EXTS):
@@ -2005,9 +2646,9 @@ def extract_lyrics(path: Path) -> str | None:
                     return str(vals[0]).strip() or None
             return None
         elif ext in (".aiff", ".aif"):
-            from mutagen.id3 import ID3
-            tags = ID3(path)
-            for key in tags:
+            # The ID3 tag is a chunk of the IFF container, not the file head.
+            tags = AIFF(path).tags
+            for key in (tags or {}):
                 if key.startswith("USLT"):
                     return str(tags[key].text).strip() or None
             return None
@@ -2041,7 +2682,7 @@ def write_lyrics(path: Path, lyrics: str) -> bool:
 
     ext = path.suffix.lower()
     try:
-        if ext in (".mp3", ".aiff", ".aif"):
+        if ext == ".mp3":
             from mutagen.id3 import ID3, USLT, ID3NoHeaderError
             try:
                 tags = ID3(path)
@@ -2049,6 +2690,16 @@ def write_lyrics(path: Path, lyrics: str) -> bool:
                 tags = ID3()
             tags.setall("USLT", [USLT(encoding=3, lang="eng", desc="", text=text)])
             tags.save(path)
+            return True
+        if ext in (".aiff", ".aif"):
+            # Through the container: its ID3 chunk.  ``ID3().save(path)``
+            # would prepend a tag before ``FORM`` — an unreadable file.
+            from mutagen.id3 import USLT
+            audio = AIFF(path)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.setall("USLT", [USLT(encoding=3, lang="eng", desc="", text=text)])
+            audio.save()
             return True
         if ext == ".flac":
             audio = FLAC(path)
@@ -2114,11 +2765,61 @@ def _extract_imf(path: Path, track_id: str) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _is_io_error(exc: BaseException) -> bool:
+    """Is ``exc`` (or what it wraps — mutagen re-raises an ``OSError`` as a
+    ``MutagenError``) an I/O error rather than an unparsable file?  Only an
+    ``OSError`` with an ``errno`` counts: mutagen reports a short read of a
+    truncated file as an errno-less ``IOError``."""
+    seen = 0
+    e: BaseException | None = exc
+    while e is not None and seen < 8:
+        if isinstance(e, OSError) and e.errno is not None:
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
+# Set for the duration of ``extract(strict_io=True)``: the helpers that read
+# an unreadable file as "no tags" (``_swallow_io``) let an I/O error through.
+_STRICT_IO: contextvars.ContextVar[bool] = contextvars.ContextVar("_STRICT_IO", default=False)
+
+
+def _swallow_io(exc: BaseException) -> None:
+    """Called by a helper that treats a file it can't read as having no tags:
+    re-raises ``exc`` when it is an I/O error (``_is_io_error``) inside
+    ``extract(strict_io=True)``, so it can't pass for an empty tag."""
+    if _STRICT_IO.get() and _is_io_error(exc):
+        raise exc
+
+
 def extract(
     path: Path, track_id: str,
     *, pc_program_check: Callable[[], bool] | None = None,
+    strict_io: bool = False,
 ) -> TrackMeta:
     """Extract full metadata from any supported audio file.
+
+    A file that fails to parse is returned as a stub (the file name as title,
+    no tags) so a scan still lists it.  ``strict_io``: an I/O error while
+    reading (``_is_io_error``) raises instead — also one a format helper
+    would otherwise read as "no tags" (``_swallow_io``) — for a re-extract,
+    whose stub would replace stored fields.
+    """
+    token = _STRICT_IO.set(bool(strict_io))
+    try:
+        return _extract(path, track_id, pc_program_check=pc_program_check,
+                        strict_io=strict_io)
+    finally:
+        _STRICT_IO.reset(token)
+
+
+def _extract(
+    path: Path, track_id: str,
+    *, pc_program_check: Callable[[], bool] | None = None,
+    strict_io: bool = False,
+) -> TrackMeta:
+    """``extract``'s body.
 
     ``pc_program_check`` is an optional, lazily-evaluated veto used only by the
     uade lenient fallback below: callers that materialise a module from an
@@ -2170,15 +2871,35 @@ def extract(
     # zip forms too.)
     if ext in _ADLIB_EXTS or ext == ".imf":
         _uade_cls = None
+    # A PREFIX token never overrides an extension another engine owns — the
+    # playback routing rule (``stream._uade_name_routes``): ``One.mp3`` /
+    # ``Two.wav`` / ``P10.mp3`` are plain audio (never probed with uade — it
+    # rejected them and they were never indexed), ``ONE.IT`` / ``UFO.XM`` are
+    # tracker modules.  Tracker extensions and ``.sid`` can still BE Amiga
+    # modules: those are probed, and a rejection falls back to the normal
+    # extractor instead of failing the file.
+    _owned_prefix = False
+    if (_uade_cls is not None and ext not in _UADE_SUFFIX_EXTS
+            and _uade.ext_owned_elsewhere(ext)):
+        if _uade.owned_ext_can_be_amiga(ext):
+            _owned_prefix = True
+        else:
+            _uade_cls = None
     _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None
-    if not _is_uade and ext in _SID_EXTS:
+    if ext in _SID_EXTS:
+        # ``.sid`` is decided by content, whatever the name: a PSID/RSID header
+        # is a C64 tune (no uade boot); anything else must pass uade's strict
+        # check — ``Fred.sid`` junk is not indexed as a C64 tune.
         try:
             with open(path, "rb") as _fh:
                 _sid_magic = _fh.read(4)
         except OSError:
             _sid_magic = b""
-        if _sid_magic not in (b"PSID", b"RSID"):
-            _is_uade = True
+        _is_c64 = _sid_magic in (b"PSID", b"RSID")
+        _is_uade = not _is_c64
+        _owned_prefix = False
+        if _is_c64:
+            _uade_cls = None
     if _is_uade:
         # Cheap binary sniff first (QA M1): Amiga modules are binary; a file
         # whose head is pure printable text (README.md next to the music,
@@ -2191,11 +2912,13 @@ def extract(
             _head = b""
         _texty = _head and all(
             32 <= b < 127 or b in (9, 10, 13) for b in _head)
-        if _texty or not _head:
+        if (_texty or not _head) and not _owned_prefix:
             raise ValueError(
                 f"not an Amiga module (text or empty content): {path.name}")
-        _uade_probe = uade_get_info(path)
-        if not _uade_probe.get("_ok"):
+        _uade_probe = uade_get_info(path) if not (_texty or not _head) else {"_ok": False}
+        if not _uade_probe.get("_ok") and _owned_prefix:
+            _uade_probe = None          # not Amiga after all: its own extension decides
+        elif not _uade_probe.get("_ok"):
             # QA C1: remote loose modules are scanned from a LONE temp copy —
             # a companion-needing format (TFMX mdat/smpl, RJP sng/ins) always
             # fails -g here even though play-time materialization fetches the
@@ -2270,7 +2993,8 @@ def extract(
                 try:
                     with open(path, "rb") as _fh:
                         _m4 = _fh.read(4)
-                except OSError:
+                except OSError as exc:
+                    _swallow_io(exc)
                     _m4 = b""
                 if _m4[:3] == b"PSF":
                     d = _extract_psf(path, track_id)
@@ -2295,15 +3019,7 @@ def extract(
         elif ext == ".opus":
             d = _vorbis(path, track_id, OggOpus(path), "Opus")
         elif ext in (".aiff", ".aif"):
-            audio = AIFF(path)
-            d = _mp3(path, track_id)  # AIFF uses ID3 tags
-            d.update({
-                "format": "AIFF",
-                "duration": audio.info.length,
-                "sample_rate": audio.info.sample_rate,
-                "channels": audio.info.channels,
-                "bit_depth": audio.info.bits_per_sample,
-            })
+            d = _aiff(path, track_id)
         else:
             # Generic fallback via mutagen auto-detect (easy=True gives Vorbis-like keys)
             audio = MutagenFile(path, easy=True)
@@ -2322,12 +3038,15 @@ def extract(
                 "artist": (audio.get("artist") or [""])[0],
                 "album_artist": (audio.get("albumartist") or [""])[0],
                 "album": (audio.get("album") or [""])[0],
+                "game": str((audio.get("game") or [""])[0] or "").strip(),
                 "genre": audio.get("genre") or [],
                 "year": _year((audio.get("date") or [None])[0]),
                 "track_number": _int(trck),
                 "total_tracks": _total(trck),
             }
-    except Exception:
+    except Exception as exc:
+        if strict_io and _is_io_error(exc):
+            raise
         d = {"id": track_id, "path": str(path), "title": path.stem,
              "format": FORMAT_NAMES.get(ext, ""), "duration": 0.0}
 
@@ -2349,7 +3068,7 @@ def extract(
     # Scene-enrichment MD5 (Modland join key) — chiptune/tracker-family
     # files only, capped so no big PCM file is ever hashed.  Mirrors the
     # HVSC ``sid_md5`` pattern; costs one small read at scan time.
-    if "file_md5" not in d and _wants_scene_md5(ext, path.name):
+    if "file_md5" not in d and _wants_scene_md5(ext, path.name, d):
         try:
             if path.stat().st_size <= 8 * 1024 * 1024:
                 import hashlib as _hashlib

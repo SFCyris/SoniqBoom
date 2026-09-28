@@ -16,6 +16,7 @@ import io
 import logging
 import os
 import pickle
+import threading
 import time
 import uuid
 import zipfile
@@ -52,7 +53,7 @@ router = APIRouter(prefix="/fstree", tags=["fstree"])
 # load speed: 80 MB of native Python dicts loads in ~300 ms via pickle
 # vs. several seconds via the stdlib ``json`` module.
 _BROWSE_CACHE_FILENAME = "browse_cache.pickle"
-_BROWSE_CACHE_VERSION = 1
+_BROWSE_CACHE_VERSION = 2          # 2: rows carry the game fields (game, game_aliases …)
 
 
 def _is_remote(path: str) -> bool:
@@ -778,6 +779,161 @@ _TRACKS_META_CACHE: dict[tuple[str, bool], dict] = {}
 # false-positives of pure directory mtime (which doesn't bump when the
 # scanner upserts an existing path).
 _STORE_RECURSIVE_CACHE: dict[str, dict] = {}
+# Per-scan-root generation, part of every per-folder listing's fingerprint:
+# ``invalidate_scan_root`` bumps it when a root's track SET changed without its
+# COUNT changing (a move = one delete + one add), which the bucket-size
+# fingerprint can't see.
+_ROOT_GEN: dict[str, int] = {}
+
+
+_PATCH_MAX = 20_000     # rows IN beyond this → drop and rebuild instead (rows out are cheap)
+# Roots with a commit in flight: their cached listing is served as it was
+# before the commit (never rebuilt from a half-committed store) until the
+# commit patches it — ``root_commit``.
+_ROOTS_COMMITTING: dict[str, int] = {}
+
+
+class root_commit:
+    """``with fstree.root_commit(hashes):`` around a commit's store writes and
+    its browse patch."""
+
+    def __init__(self, hashes) -> None:
+        self._h = [h for h in hashes if h]
+
+    def __enter__(self):
+        for h in self._h:
+            _ROOTS_COMMITTING[h] = _ROOTS_COMMITTING.get(h, 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        for h in self._h:
+            n = _ROOTS_COMMITTING.get(h, 0) - 1
+            if n > 0:
+                _ROOTS_COMMITTING[h] = n
+            else:
+                _ROOTS_COMMITTING.pop(h, None)
+        return False
+
+
+def _shape_row(d: dict) -> "dict | None":
+    """A store track as a browse row — exactly what the root cache holds."""
+    try:
+        out = TrackMeta(**{k: v for k, v in d.items()
+                           if k in TrackMeta.model_fields and k != "embedding"}
+                        ).model_dump(exclude={"embedding"})
+    except Exception:
+        return None
+    out["_scanned"] = True
+    return out
+
+
+async def patch_scan_root_rows(scan_root_hash: str, removed_paths: "set[str]",
+                               added: "list[dict]", new_size: int) -> bool:
+    """Apply a commit's rows OUT (by path) and rows IN (store dicts) to one
+    scan root's cached sorted listing, then invalidate the listings derived
+    from it.  Idempotent: every cached copy of a touched path is replaced.
+    Rows are shaped in chunks with yields; the entry is replaced in one
+    assignment (a reader never sees half an update).  Only an entry that was
+    in step with the store before the commit is patched (else a write that
+    bypassed this refresh would survive as ghost rows).  No cached entry →
+    nothing to do.  Returns False when the caller should drop the root."""
+    import asyncio
+    entry = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
+    if entry is None:
+        return True
+    if len(added) > _PATCH_MAX:
+        return False
+    if entry.get("size") != new_size - len(added) + len(removed_paths):
+        return False
+    from bisect import bisect_left, bisect_right
+    shaped: list[tuple[str, dict]] = []
+    for i in range(0, len(added), 1_000):
+        shaped.extend((r["path"], r) for r in map(_shape_row, added[i : i + 1_000])
+                      if r is not None)
+        if len(added) > 1_000:
+            await asyncio.sleep(0)
+    if _SCAN_ROOT_FULL_CACHE.get(scan_root_hash) is not entry:
+        return False                          # replaced meanwhile: let it rebuild
+    shaped.sort(key=lambda x: x[0])
+    touched = set(removed_paths) | {p for p, _d in shaped}
+    old_paths, old_dicts = entry["paths"], entry["dicts"]
+    # Cut out the [lo, hi) run of every touched path (all copies — idempotent),
+    # copying the lists once: a reader in a worker thread keeps the old ones.
+    paths: list[str] = []
+    dicts: list[dict] = []
+    if len(touched) * 16 > len(old_paths):
+        # many paths: one membership pass beats a bisect per path
+        from itertools import compress
+        keep = [p not in touched for p in old_paths]
+        paths = list(compress(old_paths, keep))
+        dicts = list(compress(old_dicts, keep))
+    else:
+        pos = 0
+        for p in sorted(touched):
+            lo = bisect_left(old_paths, p)
+            hi = bisect_right(old_paths, p, lo)
+            if hi > lo:
+                paths.extend(old_paths[pos:lo])
+                dicts.extend(old_dicts[pos:lo])
+                pos = hi
+        paths.extend(old_paths[pos:])
+        dicts.extend(old_dicts[pos:])
+    if shaped:
+        # Merge the two sorted runs by slices: a bisect per added row from the
+        # previous position, then one slice copy per gap — linear in the root
+        # (a one-by-one ``insert`` cost 56 ms for 512 rows landing at the head
+        # of a 112K root, a re-sort ~40-50 ms; perf round 7).
+        new_paths: list[str] = []
+        new_dicts: list[dict] = []
+        pos = 0
+        for p, d in shaped:
+            i = bisect_left(paths, p, pos)
+            if i > pos:
+                new_paths.extend(paths[pos:i])
+                new_dicts.extend(dicts[pos:i])
+                pos = i
+            new_paths.append(p)
+            new_dicts.append(d)
+        new_paths.extend(paths[pos:])
+        new_dicts.extend(dicts[pos:])
+        paths, dicts = new_paths, new_dicts
+    _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {"size": new_size, "paths": paths, "dicts": dicts}
+    _bump_root_gen(scan_root_hash)
+    return True
+
+
+def _bump_root_gen(scan_root_hash: str) -> None:
+    # (The listing memos hold their source list and check identity: listings
+    # rebuilt under the new generation are new lists — nothing to clear.)
+    _ROOT_GEN[scan_root_hash] = _ROOT_GEN.get(scan_root_hash, 0) + 1
+
+
+def cached_ids_under(store, scan_root_hash: str, prefix: str) -> "list[str] | None":
+    """Track ids whose path starts with ``prefix``, from the root's cached
+    sorted rows by binary search — or None when no in-step cache exists (the
+    caller scans the root instead)."""
+    e = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
+    if (e is None or scan_root_hash in _ROOTS_COMMITTING
+            or e.get("size") != len(store._tag_scan_root_hash.get(scan_root_hash, ()))):
+        return None
+    from bisect import bisect_left
+    paths, dicts = e["paths"], e["dicts"]
+    i = bisect_left(paths, prefix)
+    out: list[str] = []
+    while i < len(paths) and paths[i].startswith(prefix):
+        out.append(dicts[i].get("id"))
+        i += 1
+    return out
+
+
+def invalidate_scan_root(scan_root_hash: str) -> None:
+    """Drop one scan root's sorted cache and every per-folder listing / memo
+    built from it (they hold its row dicts); other roots keep theirs."""
+    _SCAN_ROOT_FULL_CACHE.pop(scan_root_hash, None)
+    _bump_root_gen(scan_root_hash)
+    with _MEMO_LOCK:                          # frees the dropped rows' memos
+        for memo in (_DEDUP_MEMO, _DIRECT_MEMO, _BYID_MEMO):
+            memo.clear()
 
 
 # ── per-scan-root sorted-by-path cache ──────────────────────────────────
@@ -908,9 +1064,13 @@ def _store_recursive_tracks_under(store, p: Path) -> list[dict] | None:
     # fingerprint.  Adding/removing tracks under one of these roots
     # bumps the count; rating bumps / play-count writes / unrelated
     # scans do not.
-    bucket_sizes = tuple(
-        len(store.get_track_ids_for_scan_root(h)) for h in ancestor_hashes
-    )
+    def _served_size(h: str) -> int:
+        if h in _ROOTS_COMMITTING:
+            e = _SCAN_ROOT_FULL_CACHE.get(h)
+            if e is not None:
+                return e.get("size", -1)       # the rows a commit-window click is served
+        return len(store._tag_scan_root_hash.get(h, ()))
+    bucket_sizes = tuple((_served_size(h), _ROOT_GEN.get(h, 0)) for h in ancestor_hashes)
     cached = _STORE_RECURSIVE_CACHE.get(p_str)
     if cached is not None and cached.get("bucket_sizes") == bucket_sizes:
         cache_stats.hit("per_path")
@@ -1207,12 +1367,14 @@ def _get_or_build_scan_root_sorted(
 
     Returns ``([], [])`` when the bucket is empty.
     """
-    tids_set = store.get_track_ids_for_scan_root(scan_root_hash)
-    current_size = len(tids_set)
+    current_size = len(store._tag_scan_root_hash.get(scan_root_hash, ()))
     cached = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
-    if cached is not None and cached.get("size") == current_size:
+    if cached is not None and (cached.get("size") == current_size
+                               or scan_root_hash in _ROOTS_COMMITTING):
+        # (a commit in flight: serve the pre-commit rows until it patches them)
         cache_stats.hit("scan_root")
         return cached["paths"], cached["dicts"]
+    tids_set = store.get_track_ids_for_scan_root(scan_root_hash)
     cache_stats.miss("scan_root")
     if not tids_set:
         _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {
@@ -1250,6 +1412,14 @@ async def tracks_with_meta(
     offset: int = Query(0, ge=0),
     limit: int = Query(0, ge=0),
     filter_duplicates: bool | None = Query(None),
+    shuffle_seed: int | None = Query(
+        None,
+        description=(
+            "When set, the SAME listing is returned as a seeded pseudo-random "
+            "permutation instead of fstree order — the shuffle play queue pages "
+            "through it with offset/limit, so shuffle covers the whole folder."
+        ),
+    ),
 ):
     """Hybrid listing: filesystem for file discovery, store for metadata.
 
@@ -1271,21 +1441,41 @@ async def tracks_with_meta(
     (audio-fingerprint-clustered alternate encodings) server-side.  When
     OMITTED (the default — ``None``) it is resolved from the
     ``dedup_folders`` config toggle (Settings → "Hide duplicates when
-    browsing folders"; default off, so folder views show every file on
-    disk).  An explicit ``true``/``false`` query param overrides the
+    browsing folders"; default ON — see ``data.folder_dedup_enabled``).  An
+    explicit ``true``/``false`` query param overrides the
     config.  Resolving the value server-side keeps the windowed total and
     its chunks consistent — every request reads the same setting, so the
     count can't disagree with the rows.
     """
     if filter_duplicates is None:
-        from soniqboom.core.data import get_config as _get_config
-        filter_duplicates = bool(await _get_config("dedup_folders", False))
+        from soniqboom.core.data import folder_dedup_enabled
+        filter_duplicates = await folder_dedup_enabled()
+
+    async def _page(res: list[dict], stable: bool = True):
+        """Paginate ``res`` — in seeded shuffle order when ``shuffle_seed`` is set.
+
+        The reorder is O(listing) per page (plus a hash+sort on the first page of
+        a seed), so it runs in a worker thread; ``res`` is a finished list that
+        nothing mutates.
+        """
+        if shuffle_seed is not None and res:
+            if limit > 0:
+                # One page: only ITS rows are materialised (O(limit) once the
+                # order and the id→row map are cached), not the whole listing.
+                total, rows = await asyncio.to_thread(
+                    _shuffled_page, res, path, recursive,
+                    bool(filter_duplicates), shuffle_seed, offset, limit, stable)
+                return {"total": total, "tracks": rows}
+            res = await asyncio.to_thread(
+                _shuffled_listing, res, path, recursive,
+                bool(filter_duplicates), shuffle_seed, stable)
+        return _maybe_paginate(res, offset, limit, recursive)
 
     if _is_remote(path):
         result = await _remote_tracks_with_meta(path, recursive)
         if filter_duplicates:
-            result = _drop_duplicate_alternates(result)
-        return _maybe_paginate(result, offset, limit, recursive)
+            result = _drop_duplicate_alternates(result)   # a fresh list per request: nothing to memoise on
+        return await _page(result, stable=False)
 
     p = Path(path).resolve()
     if not p.exists() or not p.is_dir():
@@ -1307,8 +1497,8 @@ async def tracks_with_meta(
         store_results = _store_recursive_tracks_under(store, p)
         if store_results is not None and len(store_results) > 0:
             if filter_duplicates:
-                store_results = _drop_duplicate_alternates(store_results)
-            return _maybe_paginate(store_results, offset, limit, recursive)
+                store_results = _deduped(store_results)
+            return await _page(store_results)
         # Empty store-side result: either the subtree truly has no tracks
         # (and the FS walk will agree, fast) or it's un-indexed.  Either
         # way we fall through to ``_discover_audio`` below for correctness.
@@ -1328,14 +1518,18 @@ async def tracks_with_meta(
         store_results = _store_recursive_tracks_under(store, p)
         if store_results is not None and len(store_results) > 0:
             prefix_len = len(str(p).rstrip("/")) + 1
-            direct = [
-                t for t in store_results
+            # Memoised on the (cached) recursive listing, so every page of a big
+            # flat folder gets the SAME list back — which is what lets the dedup /
+            # id-map memos hit instead of being rebuilt (and evicting the entries
+            # that do help) on each 50-row page.
+            direct = _memo(_DIRECT_MEMO, store_results, lambda rows: [
+                t for t in rows
                 if "/" not in t.get("path", "")[prefix_len:]
-            ]
+            ])
             if direct:
                 if filter_duplicates:
-                    direct = _drop_duplicate_alternates(direct)
-                return _maybe_paginate(direct, offset, limit, recursive)
+                    direct = _deduped(direct)
+                return await _page(direct)
     # NOTE: invalidation key is the directory's OWN mtime — not the
     # store's global ``_mutation_seq``.  The cache's job is to skip
     # re-walking THIS directory when its file set hasn't changed; the
@@ -1395,7 +1589,7 @@ async def tracks_with_meta(
                 # ``limit > 0`` caller gets the windowed ``{total:0}`` shape
                 # consistently — the warm-cache path already does, and the
                 # frontend's branch-folder auto-flatten keys on total === 0.
-                return _maybe_paginate([], offset, limit, recursive)
+                return await _page([])
             _TRACKS_META_CACHE[cache_key] = {
                 "mtime": mtime_now,
                 "files": files,
@@ -1422,8 +1616,108 @@ async def tracks_with_meta(
         _TRACKS_META_CACHE[cache_key]["results"] = results
 
     if filter_duplicates:
-        results = _drop_duplicate_alternates(results)
-    return _maybe_paginate(results, offset, limit, recursive)
+        results = _deduped(results)
+    return await _page(results)
+
+
+def _shuffled_listing(results: list[dict], path: str, recursive: bool,
+                      dedup: bool, seed: int, stable: bool = True) -> list[dict]:
+    """``results`` reordered as the seeded shuffle permutation of its track ids.
+
+    Same listing, different order — so a shuffled folder queue honours exactly
+    what the folder view shows (unscanned stubs, remote paths, the
+    ``dedup_folders`` setting).  The ordered id list is LRU-cached per
+    (path, recursive, dedup, seed, listing size).  This FULL reorder is O(listing)
+    and only serves un-paginated callers; pages go through ``_shuffled_page``.
+    """
+    from soniqboom.core import shuffle_order
+    seed = shuffle_order.normalize_seed(seed)
+    by_id = _by_id(results) if stable else {d.get("id"): d for d in results if d.get("id")}
+    key = ("folder", path.rstrip("/") or path, bool(recursive), dedup, seed, len(by_id))
+    order = shuffle_order.cached_order(key, lambda: list(by_id.keys()), seed)
+    out = [by_id[i] for i in order if i in by_id]
+    if len(out) != len(by_id):
+        # Same folder + size but different ids (files renamed / swapped since the
+        # order was dealt): it no longer covers the listing.  Re-deal from the
+        # rows at hand and REPLACE the entry, so later pages hit it again.
+        order = shuffle_order.cached_order(key, lambda: list(by_id.keys()), seed,
+                                           refresh=True)
+        out = [by_id[i] for i in order if i in by_id]
+    return out
+
+
+# Identity memos for per-request O(listing) work.  The LOCAL listings come out of
+# caches that hand back the SAME list object until they are rebuilt (and are
+# replaced wholesale, never mutated), so ``id(list)`` + an ``is`` check is a safe
+# key.  Remote listings are rebuilt on every request — they bypass the memos
+# (``stable=False``) rather than churn the slots.  Without them every 50-row page of a 126 K-row folder re-ran the dedup
+# pass on the event loop (4.8 ms) and rebuilt the id→row map (11.7 ms).
+# Small listings are cheap to redo and an un-cached FS walk makes a fresh list per
+# request — memoising those would only pin garbage — so: big lists only, few slots.
+_LISTING_MEMO_MAX = 4
+_LISTING_MEMO_MIN_ROWS = 5000
+_DEDUP_MEMO: "dict[int, tuple[list, list]]" = {}
+_DIRECT_MEMO: "dict[int, tuple[list, list]]" = {}
+_BYID_MEMO: "dict[int, tuple[list, dict]]" = {}
+
+
+_MEMO_LOCK = threading.Lock()    # the loop (_deduped) and to_thread workers (_by_id) both come here
+
+
+def _memo(memo: dict, src: list, build):
+    # The entry holds ``src`` itself, so its id() cannot be recycled while it is
+    # memoised; the ``is`` check covers an entry that was evicted and re-used.
+    with _MEMO_LOCK:
+        hit = memo.get(id(src))
+        if hit is not None and hit[0] is src:
+            memo[id(src)] = memo.pop(id(src))     # LRU: a live listing isn't evicted first
+            return hit[1]
+    value = build(src)                      # outside the lock: O(listing)
+    if len(src) < _LISTING_MEMO_MIN_ROWS:
+        return value
+    with _MEMO_LOCK:
+        while len(memo) >= _LISTING_MEMO_MAX:
+            memo.pop(next(iter(memo)))
+        memo[id(src)] = (src, value)
+    return value
+
+
+def _deduped(results: list[dict]) -> list[dict]:
+    """``_drop_duplicate_alternates`` memoised per listing object — and the memo
+    returns the same deduped LIST each time, which keeps ``_by_id`` warm too."""
+    return _memo(_DEDUP_MEMO, results, _drop_duplicate_alternates)
+
+
+def _by_id(results: list[dict]) -> dict:
+    # Every listing row carries an id (scanned tracks their store id, unscanned
+    # stubs ``_track_id(path)``), so nothing is dropped here.
+    return _memo(_BYID_MEMO, results,
+                 lambda rows: {d.get("id"): d for d in rows if d.get("id")})
+
+
+def _shuffled_page(results: list[dict], path: str, recursive: bool, dedup: bool,
+                   seed: int, offset: int, limit: int,
+                   stable: bool = True) -> tuple[int, list[dict]]:
+    """One page of the seeded shuffle of ``results`` → ``(total, rows)``.
+
+    Same order and cache entry as :func:`_shuffled_listing`; only the requested
+    slice is turned into rows.  A cached order that no longer covers the listing
+    (a page id is gone: files renamed / swapped under the same size) is re-dealt
+    and replaced.
+    """
+    from soniqboom.core import shuffle_order
+    seed = shuffle_order.normalize_seed(seed)
+    by_id = _by_id(results) if stable else {d.get("id"): d for d in results if d.get("id")}
+    key = ("folder", path.rstrip("/") or path, bool(recursive), dedup, seed, len(by_id))
+    order = shuffle_order.cached_order(key, lambda: list(by_id.keys()), seed)
+    page = order[offset: offset + limit]
+    # (The listing SIZE is part of the key, so a cached order always has the right
+    # length; what can drift under it is WHICH ids — files renamed / swapped.)
+    if any(i not in by_id for i in page):
+        order = shuffle_order.cached_order(key, lambda: list(by_id.keys()), seed,
+                                           refresh=True)
+        page = order[offset: offset + limit]
+    return len(order), [by_id[i] for i in page if i in by_id]
 
 
 def _drop_duplicate_alternates(results: list[dict]) -> list[dict]:

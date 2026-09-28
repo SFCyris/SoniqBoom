@@ -189,7 +189,7 @@ export function mountRadio(root, ctx) {
 
   async function playStation(st) {
     const c = _pickStream(st);
-    if (!c) { ctx.toast('This browser can’t play any of this station’s streams'); return; }
+    if (!c) { ctx.toast('This browser can’t play any of this station’s streams', 'error'); return; }
     // Prefer DIRECT playback (station → phone) so the server never relays it;
     // fall back to the relay when direct isn't viable (mixed content / HLS /
     // playlist wrapper) or if the direct attempt fails at runtime (a SHOUTcast
@@ -205,8 +205,8 @@ export function mountRadio(root, ctx) {
     } catch (err) {
       if (canDirect) {
         try { await MobileRadio.play(st, relayUrl); }
-        catch { MobileRadio.stop(); ctx.toast('Could not start the station'); return; }
-      } else { MobileRadio.stop(); ctx.toast('Could not start the station'); return; }
+        catch { MobileRadio.stop(); ctx.toast('Could not start the station', 'error'); return; }
+      } else { MobileRadio.stop(); ctx.toast('Could not start the station', 'error'); return; }
     }
     highlightPlaying();
   }
@@ -229,7 +229,7 @@ export function mountRadio(root, ctx) {
     } catch {
       st.favorite = was;                 // rollback on failure
       btn.textContent = st.favorite ? '★' : '☆';
-      ctx.toast('Could not update favourites');
+      ctx.toast('Could not update favourites', 'error');
     }
   }
 

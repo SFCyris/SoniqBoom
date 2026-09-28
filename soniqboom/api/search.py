@@ -27,13 +27,23 @@ def _parse_advanced_query(q: str) -> str | None:
 
     Returns a tag-filter query string, or None if the input is plain text.
     Supported syntax:
-      artist:VALUE, album_artist:VALUE, album:VALUE, genre:VALUE,
+      artist:VALUE, album_artist:VALUE, album:VALUE (exact album),
+      game:VALUE (case-insensitive PREFIX of the track's game or one of its
+      other names — ``TrackMeta.game`` / ``game_aliases`` — or, for a C64
+      SID / Atari ST tune whose game is unknown or only guessed from its
+      folder / a Modland file name (not typed or cleared by the user), of its
+      title, where HVSC rips name the
+      game: ``game:uridium`` finds
+      "Uridium 2"; a leading "The", accents and runs of whitespace are
+      ignored, so ``game:"last ninja"`` also finds "The Last Ninja" and
+      ``game:pokemon`` finds "Pokémon"),
+      genre:VALUE,
       year:VALUE, year:>VALUE, year:<VALUE, year:VALUE-VALUE,
       format:VALUE
     Values can be quoted: artist:"The Ghost Inside"
     """
     # Check if input contains any field: prefix
-    if not re.search(r'\b(artist|album_artist|album|genre|year|format):', q):
+    if not re.search(r'\b(artist|album_artist|album|game|genre|year|format):', q):
         return None
 
     parts: list[str] = []
@@ -51,6 +61,8 @@ def _parse_advanced_query(q: str) -> str | None:
             parts.append(f"@album_artist_tag:{{{_esc_tag(value)}}}")
         elif field == 'album':
             parts.append(f"@album_tag:{{{_esc_tag(value)}}}")
+        elif field == 'game':
+            parts.append(f"@game_tag:{{{_esc_tag(value)}}}")
         elif field == 'genre':
             parts.append(f"@genre:{{{_esc_tag(value)}}}")
         elif field == 'format':
@@ -118,11 +130,7 @@ async def quick_search(
     limit: int = Query(8, ge=1, le=20),
 ):
     """Lightweight search for autocomplete preview — returns minimal results."""
-    advanced = _parse_advanced_query(q)
-    if advanced:
-        return await ft_search(advanced, limit=limit)
-    safe = q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
-    return await ft_search(safe, limit=limit)
+    return await run_search(q, limit=limit)
 
 
 @router.get("/filter", response_model=list[TrackMeta])

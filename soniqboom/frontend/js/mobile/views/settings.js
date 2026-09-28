@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * settings.js — Mobile read-only settings: server health, scan dirs.
- * Use the desktop UI at `/` for write actions in v1.
+ * settings.js — Mobile settings: server health, scan dirs (read-only) and the
+ * browser-local playback preference.  Use the desktop UI at `/` for admin actions.
  */
 import { esc } from './_common.js';
+import { Player } from '../../player.js';
 
 export function mountSettings(root, ctx) {
   root.innerHTML = `
@@ -23,6 +24,22 @@ export function mountSettings(root, ctx) {
         <h3>Music Folders</h3>
         <div class="m-settings-card" id="m-set-dirs">
           <div class="m-settings-row"><span class="label">Loading…</span></div>
+        </div>
+      </div>
+
+      <div class="m-settings-section">
+        <h3>Playback</h3>
+        <div class="m-settings-card">
+          <label class="m-settings-row" for="set-shuffle-replay">
+            <span class="label">Let shuffle repeat tracks you’ve heard
+              <small>Off: each track plays once per shuffle. This browser only; takes effect the next time you turn shuffle on.</small></span>
+            <input type="checkbox" id="set-shuffle-replay">
+          </label>
+          <label class="m-settings-row" for="set-queue-sync" id="set-queue-sync-row"${Player.queueSyncSupported === false ? ' style="display:none"' : ''}>
+            <span class="label">Sync the play queue across devices
+              <small>Keeps this browser’s queue on the server for your other devices and Subsonic apps, and offers to resume a newer queue saved elsewhere.</small></span>
+            <input type="checkbox" id="set-queue-sync">
+          </label>
         </div>
       </div>
 
@@ -50,6 +67,18 @@ export function mountSettings(root, ctx) {
   const versionEl = root.querySelector('#set-version');
   const tracksEl  = root.querySelector('#set-tracks');
   const dirsCard  = root.querySelector('#m-set-dirs');
+  // Same browser-local preference the desktop Settings page edits; the player
+  // reads it at the next shuffle deal.
+  const shufReplay = root.querySelector('#set-shuffle-replay');
+  shufReplay.checked = Player.shuffleReplaysPlayed;
+  shufReplay.addEventListener('change', () => Player.setShuffleReplaysPlayed(shufReplay.checked));
+  const qsync = root.querySelector('#set-queue-sync');
+  const qsyncRow = root.querySelector('#set-queue-sync-row');
+  qsync.checked = Player.queueSync;
+  qsync.addEventListener('change', () => Player.setQueueSync(qsync.checked));
+  // The player learns whether the server keeps a queue a few seconds after load:
+  // this view may already be up by then.
+  Player.on('queuesync', ({ supported }) => { qsyncRow.style.display = supported === false ? 'none' : ''; });
 
   async function refresh() {
     try {
@@ -64,7 +93,7 @@ export function mountSettings(root, ctx) {
 
       statusEl.textContent  = h.status === 'ok' ? 'Online' : 'Offline';
       versionEl.textContent = h.version || '—';
-      tracksEl.textContent  = (c.count ?? 0).toLocaleString();
+      tracksEl.textContent  = (c.visible ?? c.count ?? 0).toLocaleString();   // same number as the desktop badge
 
       const dirs = (d && Array.isArray(d.dirs)) ? d.dirs : [];
       if (!dirs.length) {
@@ -88,6 +117,12 @@ export function mountSettings(root, ctx) {
     }
   }
 
-  root.addEventListener('viewactive', refresh);
+  root.addEventListener('viewactive', () => {
+    shufReplay.checked = Player.shuffleReplaysPlayed;
+    qsync.checked = Player.queueSync;
+    // The server has no queue to sync with: no row (mobile.css has no [hidden] rule).
+    qsyncRow.style.display = Player.queueSyncSupported === false ? 'none' : '';
+    refresh();
+  });
   refresh();
 }

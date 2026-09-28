@@ -16,6 +16,30 @@ const dropZone = document.getElementById('queue-drop-zone');
 
 document.getElementById('btn-queue-close').addEventListener('click', () => close());
 
+// ── A queue saved on another device ───────────────────────────────────────────
+// The "Resume the queue from …?" toast times out; this row keeps the offer
+// reachable until something plays or the queue is resumed (Player 'queueoffer').
+const offerEl     = document.getElementById('queue-offer');
+const offerText   = document.getElementById('queue-offer-text');
+const offerBtn    = document.getElementById('btn-queue-offer');
+function _paintOffer() {
+  if (!offerEl) return;
+  const who = Player.queueOffer || null;
+  if (who) {
+    offerText.textContent = `Queue saved on ${who}`;
+    offerBtn.setAttribute('aria-label', `Resume the queue from ${who}`);
+  }
+  if (offerEl.hidden === !who) return;
+  // Hiding the row under keyboard focus would drop focus to <body>.
+  if (!who && offerEl.contains(document.activeElement)) {
+    try { document.getElementById('btn-queue-close').focus({ preventScroll: true }); } catch (_) {}
+  }
+  offerEl.hidden = !who;
+}
+if (offerBtn) offerBtn.addEventListener('click', () => { Player.resumeQueueOffer?.(); });
+Player.on('queueoffer', _paintOffer);
+_paintOffer();
+
 // ── Clear queue with confirmation + undo ──────────────────────────────────────
 //
 // Clicking ``Clear`` while the queue has ≥5 tracks pops a styled confirm
@@ -24,8 +48,7 @@ document.getElementById('btn-queue-close').addEventListener('click', () => close
 // restores the previous queue and play position from a swap variable.
 const CLEAR_CONFIRM_MIN  = 5;
 const UNDO_WINDOW_MS     = 5000;
-let _undoQueue   = null;          // snapshot of Player.queue from the last clear
-let _undoIdx     = 0;
+let _undoQueue   = null;          // Player.snapshotQueue() from the last clear
 let _undoTimer   = null;
 let _undoToast   = null;
 
@@ -62,8 +85,9 @@ function _dismissUndoToast() {
 }
 
 function _applyUndo() {
-  if (!_undoQueue || !_undoQueue.length) { _dismissUndoToast(); return; }
-  Player.setQueue(_undoQueue, _undoIdx);
+  if (!_undoQueue) { _dismissUndoToast(); return; }
+  _restoring = true;
+  try { Player.restoreQueue(_undoQueue); } finally { _restoring = false; }
   _undoQueue = null;
   _dismissUndoToast();
   refresh();
@@ -107,7 +131,6 @@ function _showClearConfirm(count) {
 
 document.getElementById('btn-queue-clear').addEventListener('click', async () => {
   const q   = Player.queue;
-  const idx = Player.queueIdx;
   if (!q || !q.length) return;
 
   if (q.length >= CLEAR_CONFIRM_MIN) {
@@ -115,14 +138,14 @@ document.getElementById('btn-queue-clear').addEventListener('click', async () =>
     if (!ok) return;
   }
 
-  // Snapshot for undo BEFORE we clear.
-  _undoQueue = q.slice();
-  _undoIdx   = Math.max(0, Math.min(idx, _undoQueue.length - 1));
+  // Snapshot for undo BEFORE we clear — the queue plus its source / shuffle
+  // state, so Undo brings back exactly what was there.
+  _undoQueue = Player.snapshotQueue();
 
   Player.setQueue([], 0);
 
   _dismissUndoToast();
-  _undoToast = _renderUndoToast(_undoQueue.length);
+  _undoToast = _renderUndoToast(q.length);
   _undoTimer = setTimeout(() => {
     _undoQueue = null;
     _dismissUndoToast();
@@ -153,6 +176,9 @@ function esc(s) {
 // ``queuechange``-driven refresh for those self-initiated mutations; every
 // other queue change (adds from the library, clear, undo) still rebuilds.
 let _suppressRefresh = false;
+let _renderedIds = null;          // ids of the rows currently in the DOM (null = unknown)
+let _statusRowShown = false;      // the "loading more…" row is in the DOM
+let _restoring = false;           // Undo is putting the old queue back right now
 
 // Re-sync row indices + playing highlight after a spot-update.  Handlers
 // read ``row.dataset.idx`` at event time, so this sweep is all that's
@@ -166,6 +192,10 @@ function _renumber() {
     row.classList.toggle('playing', i === idx);
     const icon = row.querySelector('.queue-playing-icon');
     if (icon) icon.innerHTML = i === idx ? '&#9654;' : '';
+    // Durations of rendered formats arrive after the row was built (the track
+    // object is patched in place) — repaint the one cell that can change.
+    const dur = row.querySelector('.queue-track-dur');
+    if (dur && q[i]) { const txt = fmtDur(q[i].duration); if (dur.textContent !== txt) dur.textContent = txt; }
   });
 }
 
@@ -177,9 +207,30 @@ function refresh() {
   // Update count badge
   countEl.textContent = q.length ? `(${q.length})` : '';
 
+  // The panel is closed most of the time, and 'queuechange' fires on every track
+  // change and every 50-track extension: rebuilding ~250 rows (+ their cover
+  // requests and listeners) for nobody is pure main-thread waste.  open() refreshes.
+  // A queue the listener started AFTER clearing makes "Undo" a trap: it would
+  // replace what is playing now with the old queue.
+  // (Rows Radio Mode appends on its own are not "a new queue the listener started".)
+  if (_undoQueue && q.length && !_restoring && Player.autoAhead < q.length) { _undoQueue = null; _dismissUndoToast(); }
+
+  if (panel.classList.contains('hidden')) { _renderedIds = null; return; }
+
+  // Same tracks in the same order as the rows on screen → only the playing
+  // marker moved (every track change emits 'queuechange').  The spot-update is
+  // ~100× cheaper than a rebuild at 260 rows and re-requests no cover art.
+  if (_renderedIds && _renderedIds.length === q.length && q.every((t, i) => (t && t.id) === _renderedIds[i])
+      && !_statusRowShown) {
+    _renumber();
+    return;
+  }
+  _renderedIds = q.map(t => t && t.id);
+
   listEl.innerHTML = '';
 
   if (!q.length) {
+    _statusRowShown = false;
     const empty = document.createElement('div');
     empty.className = 'queue-empty';
     empty.textContent = 'No tracks queued.';
@@ -250,7 +301,7 @@ function refresh() {
         Player.removeFromQueue(ri);   // queuechange listener does the rebuild
         return;
       }
-      _suppressRefresh = true;
+      _suppressRefresh = true; _renderedIds = null;
       Player.removeFromQueue(ri);     // emits queuechange synchronously
       _suppressRefresh = false;
       row.remove();
@@ -345,7 +396,7 @@ function refresh() {
       if (isNaN(fromIdx) || fromIdx === toIdx) return;
       // Spot-update: move the dragged node into place and renumber instead
       // of rebuilding every row (keeps scroll position, no art re-fetch).
-      _suppressRefresh = true;
+      _suppressRefresh = true; _renderedIds = null;
       Player.moveInQueue(fromIdx, toIdx);   // emits queuechange synchronously
       _suppressRefresh = false;
       const rows = listEl.querySelectorAll('.queue-row');
@@ -362,6 +413,18 @@ function refresh() {
 
     listEl.appendChild(row);
   });
+
+  // A view-backed queue refills itself a page at a time.  Right after shuffle is
+  // switched on there is nothing behind the current track for a moment — say so,
+  // or the toggle looks like it wiped the queue.
+  const src = Player.queueSource;
+  _statusRowShown = !!(src && src.hasMore && idx >= q.length - 1);   // hasMore: not ended AND not parked by Radio Mode
+  if (_statusRowShown) {
+    const more = document.createElement('div');
+    more.className = 'queue-empty';          // visual only: no live region, it is rebuilt often
+    more.textContent = src.mode === 'shuffled' ? 'Shuffling the rest of the list…' : 'Loading the next tracks…';
+    listEl.appendChild(more);
+  }
 }
 
 // ── Drop zone — receives library track drops ──────────────────────────────────

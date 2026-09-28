@@ -24,6 +24,7 @@ from fastapi import APIRouter, Cookie, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from soniqboom.config import settings, get_data_dir
+from soniqboom.core import forksafe
 from soniqboom.core.data import (
     delete_scan_dir,
     delete_tracks_by_scan_root,
@@ -31,8 +32,11 @@ from soniqboom.core.data import (
     list_scan_dirs,
     upsert_scan_dir,
 )
+from soniqboom.core import folder_album as _folder_album
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
+
+_BG_TASKS: set = set()     # strong refs to fire-and-forget tasks
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -62,6 +66,15 @@ def _spawn_scan_task(coro, label: str) -> asyncio.Task:
 
 log = logging.getLogger(__name__)
 
+
+def _flag(v) -> bool:
+    """A settings switch sent as JSON: a boolean, a number, or the text
+    "true" / "false" / "on" / "off" / "yes" / "no" / "1" / "0" (``bool("false")``
+    would be True)."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "on", "yes")
+    return bool(v)
+
 # ── Admin authentication ──────────────────────────────────────────────────────
 # Admin access requires a signed-in user with role 'admin' (session cookie
 # ``sb_session``).  That is the ONLY path.  The legacy OS-credential (dscl)
@@ -80,6 +93,11 @@ def _require_token(sb_session: str = Cookie(default=None)) -> str:
     first admin), so requests are allowed through — matching the
     ``require_user`` middleware's pre-bootstrap allowance.  The instant the
     first user exists this closes and only an admin session is accepted.
+
+    A valid session of a NON-admin user gets 403, not 401: the web client
+    treats any ``/api`` 401 as an expired session and shows the sign-in
+    overlay, which would sign-out-loop an edit/readonly user opening
+    Preferences.  401 stays for a missing or invalid session.
     """
     # Imported lazily — admin.py is loaded before users.py runs in some boot
     # orders, and ``init_user_store`` has to have run first.
@@ -92,8 +110,10 @@ def _require_token(sb_session: str = Cookie(default=None)) -> str:
         return "__bootstrap__"
     if sb_session:
         user = store.lookup_session(sb_session)
-        if user and user.role == "admin":
-            return f"user:{user.id}"
+        if user:
+            if user.role == "admin":
+                return f"user:{user.id}"
+            raise HTTPException(403, "Admin role required.")
     if store.has_any():
         raise HTTPException(401, "Sign in as an admin user.")
     return "__bootstrap__"       # no users yet — first-run setup (setadm)
@@ -140,18 +160,31 @@ async def admin_scene_status(_tok: str = Depends(_require_token)):
 @router.post("/scene/refresh-index")
 async def admin_scene_refresh(_tok: str = Depends(_require_token)):
     """Download Modland's nightly allmods_md5 index (~21 MB) and rebuild the
-    local sqlite join table.  Runs in an executor; returns the new status."""
+    local sqlite join table.  Runs in an executor; returns the new status.
+    A successful rebuild re-applies the index to the library in the
+    background (a new index can add, change or drop matches)."""
     import asyncio as _asyncio
     from soniqboom.core import scene_metadata
-    return await _asyncio.get_running_loop().run_in_executor(
+    st = await _asyncio.get_running_loop().run_in_executor(
         None, scene_metadata.refresh_index)
+    if not st.get("error") and scene_metadata.has_index():
+        from soniqboom.core import scanner
+        scanner._spawn_scene_autoapply()
+    return st
 
 
 @router.post("/scene/apply")
 async def admin_scene_apply(_tok: str = Depends(_require_token)):
-    """Join every scanned module's ``file_md5`` against the Modland index and
-    fill in missing artists (exact-match only, never overwrites).  The sqlite
-    join runs in an executor; the store WRITE stays on the loop thread."""
+    """Join every scanned module's ``file_md5`` against the Modland index
+    (exact-MD5 matches only) and apply what the match implies: store the
+    ``scene_path``; fill an empty artist with the Modland credit or correct a
+    legacy mis-credit; set the game album (``album_source`` "modland", or
+    "modland-filename" for the gated ``<game>-<part>`` file-name guess) or
+    withdraw one that no longer derives; drop the ``scene_path`` and Modland
+    album of a track whose md5 left the index.  A tag album and any field the
+    user edited are never touched.  The sqlite join runs in an executor; the
+    store writes are compare-and-set on the loop thread.  The same pass also
+    runs automatically after scans once an index has been downloaded."""
     from soniqboom.core import scene_metadata
     return await scene_metadata.apply_to_library()
 
@@ -182,7 +215,7 @@ async def admin_demozoo_apply(_tok: str = Depends(_require_token)):
     Re-enables post-scan auto-apply (an explicit Apply opts back in)."""
     from soniqboom.core import demozoo
     demozoo.set_auto_apply(True)
-    return await demozoo.apply_to_library()
+    return await demozoo.apply_to_library(force=True)
 
 
 @router.post("/demozoo/reset")
@@ -211,6 +244,128 @@ async def admin_demozoo_auto_apply(body: dict, _tok: str = Depends(_require_toke
         str(raw).strip().lower() in ("true", "1", "yes", "on")
     demozoo.set_auto_apply(enabled)
     return demozoo.status()
+
+
+@router.get("/songdb/status")
+async def admin_songdb_status(_tok: str = Depends(_require_token)):
+    """UADE song-database enrichment state (index rows, last apply / reset,
+    auto-apply)."""
+    from soniqboom.core import songdb
+    return songdb.status()
+
+
+@router.post("/songdb/refresh-index")
+async def admin_songdb_refresh(_tok: str = Depends(_require_token)):
+    """Download the audacious-uade-tools song database (metadata + song
+    lengths, ~27 MB) and rebuild the local sqlite index.  Runs in an executor;
+    a failed or implausible download keeps the current index.  A successful
+    rebuild re-applies it in the background while auto-apply is on."""
+    import asyncio as _asyncio
+    from soniqboom.core import songdb
+    st = await _asyncio.get_running_loop().run_in_executor(None, songdb.refresh_index)
+    if not st.get("error") and songdb.has_index() and songdb.auto_apply_enabled():
+        from soniqboom.core import scanner
+        scanner._spawn_scene_autoapply()
+    return st
+
+
+@router.post("/songdb/apply")
+async def admin_songdb_apply(_tok: str = Depends(_require_token)):
+    """Join every module's ``file_md5`` against the song database (exact
+    matches only) and fill what is empty: artist, label, album (``album_source``
+    "songdb", also over a guessed album), year (``year_source`` "songdb") and
+    an unknown length.  Fields the user edited are never touched.  Turns
+    post-scan auto-apply back on."""
+    from soniqboom.core import songdb
+    songdb.set_auto_apply(True)
+    return await songdb.apply_to_library(force=True)
+
+
+@router.post("/songdb/reset")
+async def admin_songdb_reset(_tok: str = Depends(_require_token)):
+    """Withdraw every artist, label, album and year the song database filled
+    (lengths stay).  Turns post-scan auto-apply OFF so the reset holds across
+    scans."""
+    from soniqboom.core import songdb
+    songdb.set_auto_apply(False)
+    return await songdb.reset_to_file_state()
+
+
+@router.get("/game-titles/status")
+async def admin_game_titles_status(_tok: str = Depends(_require_token)):
+    """The game-title lists a retro track's archive name is matched against
+    (bundled and downloaded, with their title counts), a download in progress
+    and the last pass."""
+    import asyncio as _asyncio
+    from soniqboom.core import game_titles
+    return await _asyncio.to_thread(game_titles.status)
+
+
+@router.post("/game-titles/download/{source}")
+async def admin_game_titles_download(source: str, local: bool = False,
+                                     _tok: str = Depends(_require_token)):
+    """Download a title list on request — ``tosec`` (home computers, a ~100 MB
+    DAT pack) or ``redump`` (disc consoles, ~10 MB) — in the background; the
+    status reports its progress, and the archive pass runs again when it is
+    in.  The downloaded files are kept and reused; ``?local=true`` builds the
+    list from them alone, without the network."""
+    from soniqboom.core import game_titles
+    if source not in game_titles.DOWNLOAD_SOURCES:
+        raise HTTPException(404, "Unknown list")
+    return game_titles.start_download(source, local=bool(local))
+
+
+@router.post("/game-titles/download/{source}/stop")
+async def admin_game_titles_stop(source: str, _tok: str = Depends(_require_token)):
+    """Stop a running title-list download (the files it finished stay kept;
+    a Redump download continues from there next time)."""
+    import asyncio as _asyncio
+    from soniqboom.core import game_titles
+    if source not in game_titles.DOWNLOAD_SOURCES:
+        raise HTTPException(404, "Unknown list")
+    await _asyncio.to_thread(game_titles.cancel_download, source, "you")
+    return await _asyncio.to_thread(game_titles.status)
+
+
+@router.delete("/game-titles/download/{source}")
+async def admin_game_titles_remove(source: str, _tok: str = Depends(_require_token)):
+    """Delete a downloaded title list; the archive pass runs again."""
+    import asyncio as _asyncio
+    from soniqboom.core import game_titles
+    if source not in game_titles.DOWNLOAD_SOURCES:
+        raise HTTPException(404, "Unknown list")
+    try:
+        game_titles.remove_download(source)
+    except game_titles.DownloadRunning:
+        raise HTTPException(409, "The list is being downloaded — remove it when that has finished.")
+    return await _asyncio.to_thread(game_titles.status)
+
+
+@router.delete("/game-titles/files/{source}")
+async def admin_game_titles_delete_files(source: str, _tok: str = Depends(_require_token)):
+    """Delete a title list's kept downloaded files (the list stays); the
+    next download fetches them again."""
+    import asyncio as _asyncio
+    from soniqboom.core import game_titles
+    if source not in game_titles.DOWNLOAD_SOURCES:
+        raise HTTPException(404, "Unknown list")
+    try:
+        await _asyncio.to_thread(game_titles.delete_files, source)
+    except game_titles.DownloadRunning:
+        raise HTTPException(409, "The list is being downloaded — delete its files when that has finished.")
+    return await _asyncio.to_thread(game_titles.status)
+
+
+@router.post("/songdb/auto-apply")
+async def admin_songdb_auto_apply(body: dict, _tok: str = Depends(_require_token)):
+    """Enable/disable re-running the song-database apply after each library
+    scan.  ``{"enabled": bool}``.  Returns the updated status."""
+    from soniqboom.core import songdb
+    raw = body.get("enabled", True)
+    enabled = raw if isinstance(raw, bool) else \
+        str(raw).strip().lower() in ("true", "1", "yes", "on")
+    songdb.set_auto_apply(enabled)
+    return songdb.status()
 
 
 @router.post("/verify-indexes")
@@ -253,7 +408,7 @@ async def admin_add_dir(body: dict, _tok: str = Depends(_require_token)):
     conf = load_local_conf()
 
     if "scan_zips" in body:
-        want_zips = bool(body["scan_zips"])
+        want_zips = _flag(body["scan_zips"])
         if want_zips != settings.scan_zips:
             conf["scan_zips"] = want_zips
             settings.scan_zips = want_zips      # runtime update for the scan
@@ -305,7 +460,7 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
     (large libraries can have 100K+ tracks under a single root).
     """
     raw = (body.get("path") or "").strip()
-    purge = bool(body.get("purge_tracks", False))
+    purge = _flag(body.get("purge_tracks", False))
     if not raw:
         raise HTTPException(400, "path is required")
     path = _normalize_dir_path(raw)
@@ -328,6 +483,8 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
     # Disarm the filesystem watcher for the removed root.
     try:
         from soniqboom.core import watcher
+        from soniqboom.core.scanner import forget_root
+        forget_root(path)
         await watcher.remove_root(path)
     except Exception:
         log.exception("watcher.remove_root failed for %s", path)
@@ -467,11 +624,23 @@ async def admin_reindex(_tok: str = Depends(_require_token)):
     Response surfaces ``skipped`` so the UI can warn the user when one or
     more remote shares couldn't be reached — previously a silent skip
     made it look like a re-index "jumped to Done" because no scan task
-    actually ran for those shares.
+    actually ran for those shares.  ``reindex_skipped`` names why the index
+    swap itself was skipped (store writes kept landing during the rebuild);
+    the live indexes, maintained incrementally, then stay in place.
     """
     report = await rebuild_indexes()   # diagnoses drift + heals it (atomic swap)
+    # A store write that lands during the build (an enrichment pass, a play)
+    # makes the rebuild skip its swap (``skipped``) rather than install
+    # indexes that miss it; retry a couple of times, then report the skip.
+    for _ in range(2):
+        # Only a write that raced the build is worth another try; a running
+        # scan keeps the batch for minutes.
+        if report.get("skipped") != "concurrent-mutation":
+            break
+        report = await rebuild_indexes()
     from soniqboom.core import index_health
-    index_health.record(report, kind="reindex", healed=True)
+    if not report.get("skipped"):
+        index_health.record(report, kind="reindex", healed=True)
     if not report.get("index_ok", True):
         log.warning("admin_reindex corrected index drift: %s", report.get("mismatches"))
     # Invalidate the HTTP aggregation cache immediately after the rebuild — not
@@ -491,7 +660,8 @@ async def admin_reindex(_tok: str = Depends(_require_token)):
     if dirs:
         result = await _scan_dirs_split(dirs, _progress_cb)
     return {
-        "reindexed": True,
+        "reindexed": not report.get("skipped"),
+        "reindex_skipped": report.get("skipped"),
         "drift_detected": not report.get("index_ok", True),
         "drift": report.get("mismatches", []),
         "scanning":  bool(result["started"]),
@@ -637,7 +807,7 @@ async def metadata_repair_scan(
     paths for the UI preview.
     """
     body = body or {}
-    tracker_only = bool(body.get("tracker_only", False))
+    tracker_only = _flag(body.get("tracker_only", False))
 
     from soniqboom.core.repair import find_corrupt_tracks
     candidates = find_corrupt_tracks(tracker_only=tracker_only)
@@ -647,6 +817,17 @@ async def metadata_repair_scan(
         "tracker_only": tracker_only,
         "sample": [t.get("path", "") for t in candidates[:50]],
     }
+
+
+def _repair_busy_error() -> HTTPException:
+    """The 409 for a start refused because a repair is running — or its last
+    run is still finishing (its album-cache refresh / duplicate re-group), when
+    the status already says it is done."""
+    from soniqboom.core.repair import is_running
+    if is_running():
+        return HTTPException(409, "A repair/backfill task is already running")
+    return HTTPException(409, "The last repair/backfill is still finishing — "
+                              "try again in a moment")
 
 
 @router.post("/metadata/repair-start")
@@ -664,7 +845,7 @@ async def metadata_repair_start(
     events or poll ``/admin/metadata/repair-status`` for progress.
     """
     body = body or {}
-    tracker_only = bool(body.get("tracker_only", False))
+    tracker_only = _flag(body.get("tracker_only", False))
     limit = int(body.get("limit", 0))
 
     from soniqboom.core.repair import (
@@ -679,8 +860,9 @@ async def metadata_repair_start(
 
     started = await start_repair(candidates)
     if not started:
-        # Race: another caller started in the meantime.
-        raise HTTPException(409, "A repair task is already running")
+        # Race: another caller started in the meantime, or the last run is
+        # still finishing.
+        raise _repair_busy_error()
 
     return {"started": True, "total": len(candidates)}
 
@@ -708,9 +890,71 @@ async def metadata_backfill_defects(_tok: str = Depends(_require_token)):
     candidates = find_defect_backfill_candidates()
     started = await start_repair(candidates)
     if not started:
-        raise HTTPException(409, "A repair/backfill task is already running")
+        raise _repair_busy_error()
 
     return {"started": True, "total": len(candidates)}
+
+
+@router.post("/metadata/backfill-game-albums")
+async def metadata_backfill_game_albums(
+    body: dict | None = None,
+    _tok: str = Depends(_require_token),
+):
+    """Backfill the in-file GAME name into the album of EXISTING console rips
+    (SPC ID666, NSF / NSFe, GBS, VGM / VGZ GD3, the PSF family's ``game=`` →
+    ``album_source="tag"``), and
+    re-read the GAME tag of every modern file (MP3 / FLAC / M4A / Ogg / Opus …
+    — only their ``game`` is written; a network-share MP3 / FLAC / M4A is
+    read only as far as its tags, ``tag_window``).
+
+    A normal (incremental) scan skips unchanged files, so tracks indexed
+    before the extractor read the game keep an empty (or folder / Modland-
+    derived) album and no game.  This re-runs the extractor over those
+    formats and writes only what changed: a header game replaces a derived
+    album, a derived album stays when the header has none, and an album or
+    game the user edited is never touched.  (The console rips alone are also
+    read once automatically — ``repair.run_album_backfill_once`` and
+    ``run_remote_album_backfill``.)
+
+    Body (optional): ``{"include_remote": bool}`` — default true; false reads
+    local files only.  Files in a music folder that is away (a network share
+    marked offline, a local folder gone or empty — ``_offline_local_roots``)
+    are left out (``deferred``); with nothing to read no run starts
+    (``started`` False, ``total`` 0).  Reuses the repair task machinery
+    (watch ``repair_progress`` WS events / poll
+    ``/admin/metadata/repair-status``; ``/admin/metadata/repair-cancel``
+    stops it).  409 while a repair runs or its last run is still finishing
+    (``_repair_busy_error``)."""
+    from soniqboom.core.repair import (
+        _defer_offline_roots, find_album_backfill_candidates,
+        find_game_tag_candidates, start_repair, is_running,
+    )
+    from soniqboom.core.store import get_store
+    include_remote = _flag((body or {}).get("include_remote", True))
+    if is_running():
+        raise HTTPException(409, "A repair/backfill task is already running")
+
+    store = get_store()
+    from soniqboom.core.repair import _offline_local_roots
+    offline = await _offline_local_roots(store)
+    if is_running():
+        raise HTTPException(409, "A repair/backfill task is already running")
+    candidates = find_album_backfill_candidates(include_remote=include_remote)
+    # Modern files: their GAME tag only (the rest of their tags stay as scanned).
+    tagged = await find_game_tag_candidates(include_remote=include_remote)
+    candidates, deferred = _defer_offline_roots(store, candidates, offline)
+    tagged, deferred_tagged = _defer_offline_roots(store, tagged, offline)
+    if not candidates and not tagged:
+        return {"started": False, "total": 0, "game_tag_files": 0,
+                "deferred": deferred + deferred_tagged}
+    started = await start_repair(candidates + tagged,
+                                 game_only_ids={t["id"] for t in tagged},
+                                 kind="game-names")
+    if not started:
+        raise _repair_busy_error()
+
+    return {"started": True, "total": len(candidates) + len(tagged),
+            "game_tag_files": len(tagged), "deferred": deferred + deferred_tagged}
 
 
 @router.post("/metadata/repair-cancel")
@@ -858,15 +1102,28 @@ def _graceful_pre_exec_flush() -> None:
     """Run the work FastAPI's shutdown hook would do before ``os.execv``.
 
     ``execv`` replaces the process image, so neither FastAPI's shutdown event
-    nor any ``atexit`` handler fires.  Two things have to happen here:
+    nor any ``atexit`` handler fires.  Three things have to happen here:
 
-      1. Flush the AOF buffer + close its fd.
-      2. Terminate the background merger process.  ``execv`` keeps the
+      1. Stop the scan worker pools and the TOSEC / Redump downloads — first,
+         so no scan or download writes after the flush.  ``execv`` keeps the
+         pid, so pool workers left running would stay this process's
+         children for good (the exec'd image's first start reaps its
+         leftover forkserver — ``main._reap_at_start``); a download must not
+         write after the stop.  Both are bounded: a pool whose worker can't
+         exit is left to that reap.
+      2. Flush the AOF buffer + close its fd.
+      3. Terminate the background merger process.  ``execv`` keeps the
          parent PID alive but loses the daemon-cleanup guarantee — without
          an explicit terminate, the old merger keeps running and the new
          exec'd instance spawns *another* merger, both racing on
          ``library.json.new``.
     """
+    try:
+        from soniqboom.core import game_titles, scanner
+        game_titles.cancel_downloads()
+        scanner.shutdown_worker_pools()
+    except Exception:
+        log.exception("Pre-restart scan-pool / download stop failed — continuing")
     try:
         from soniqboom import main as _main_mod
         writer = getattr(_main_mod, "_aof_writer", None)
@@ -978,7 +1235,7 @@ async def admin_services_set(
     from soniqboom.config import SERVICE_NAMES, set_service_enabled
     if name not in SERVICE_NAMES:
         raise HTTPException(404, f"Unknown service: {name}")
-    enabled = bool(payload.get("enabled"))
+    enabled = _flag(payload.get("enabled"))
     set_service_enabled(name, enabled)
     return {"name": name, "enabled": enabled, "needs_restart": True}
 
@@ -1191,7 +1448,7 @@ async def remove_share(body: dict, _tok: str = Depends(_require_token)):
     from soniqboom.core.remote_cache import get_cache
 
     share_id = (body.get("id") or "").strip()
-    purge = bool(body.get("purge_tracks", False))
+    purge = _flag(body.get("purge_tracks", False))
     if not share_id:
         raise HTTPException(400, "id is required")
 
@@ -1483,7 +1740,7 @@ async def set_ftp_pool(body: dict, _tok: str = Depends(_require_token)):
     # and bumps the configured scan budget on success.  Off by default
     # — user must opt in per-server because some shared NAS appliances
     # treat over-the-cap probes as abuse.
-    auto_grow = bool(body.get("auto_grow", False))
+    auto_grow = _flag(body.get("auto_grow", False))
 
     label = f"{host}:{port}"
     conf = load_local_conf()
@@ -1754,12 +2011,12 @@ async def probe_renderer_runs(path: str) -> bool | None:
     by a signal / negative returncode, or a loader banner on stderr).  A plain
     non-zero exit (a tool with no ``--version`` printing usage) still means it
     LOADED → True.  ``None`` when there's nothing to probe.  MUST use
-    ``create_subprocess_exec`` — ``subprocess.run`` fork()s unsafely from a
+    ``forksafe.spawn`` (no fork) — ``subprocess.run`` fork()s unsafely from a
     Core-Foundation process on macOS (see the ffmpeg probe below)."""
     if not path:
         return None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await forksafe.spawn(
             path, "--version",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -1853,18 +2110,18 @@ async def check_renderers(_tok: str = Depends(_require_token)):
                 # "bundled ffmpeg is missing everything" banner + a needless
                 # re-download prompt for a perfectly healthy binary.
                 #
-                # MUST use create_subprocess_exec, NOT subprocess.run: on macOS a
+                # MUST use forksafe.spawn, NOT subprocess.run: on macOS a
                 # fork() from a Core-Foundation-initialised process segfaults in
                 # subprocess._execute_child — both on the main thread (which also
                 # STARVED the event loop, stalling an in-flight /admin/reindex
                 # index refill so ``_tag_format`` stayed cleared-but-empty and
                 # format filters returned 0) AND from a worker thread (so
                 # ``asyncio.to_thread`` does not help — see scanner.py:882).
-                # create_subprocess_exec spawns fork-safely on the loop and never
-                # blocks it; it's the same pattern used everywhere else here.
+                # forksafe.spawn starts it without a fork (posix_spawn) and never
+                # blocks the loop; it's the same pattern used everywhere else here.
                 for _ in range(2):
                     try:
-                        proc = await asyncio.create_subprocess_exec(
+                        proc = await forksafe.spawn(
                             bin_, "-hide_banner", arg,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
@@ -2574,6 +2831,11 @@ async def get_logs(
     except Exception as exc:
         result = [f"Error reading log: {exc}"]
 
+    # Credential query strings (Subsonic p/t/s, apiKey, stream tokens) are
+    # redacted at READ time too: the access-log filter only cleans lines
+    # written since it existed, and never sees a URL another logger printed.
+    from soniqboom.core.log_control import redact_query
+    result = [redact_query(ln) if "?" in ln else ln for ln in result]
     return {"lines": result, "count": len(result)}
 
 
@@ -2716,7 +2978,7 @@ async def hvsc_rescan_sids(_tok: str = Depends(_require_token)):
 async def get_settings(_tok: str = Depends(_require_token)):
     """Return current application settings (safe subset)."""
     from soniqboom.config import load_local_conf
-    from soniqboom.core.data import get_config
+    from soniqboom.core.data import folder_dedup_enabled, get_config
     from soniqboom.core import log_control
     from soniqboom.api.tracks import lyrics_cache_size as _lyrics_cache_size
     conf = load_local_conf()
@@ -2745,6 +3007,7 @@ async def get_settings(_tok: str = Depends(_require_token)):
         },
         "scan_zips": settings.scan_zips,
         "scan_remote_zips": settings.scan_remote_zips,
+        "startup_reconcile_scan": settings.startup_reconcile_scan,
         "art_cache_dir": settings.art_cache_dir,
         "expose_local_files": settings.expose_local_files,
         "folder_aliases": conf.get("folder_aliases", {}),
@@ -2752,8 +3015,8 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # Folder-tree duplicate filter — independent of the search/library
         # ``filter_duplicates`` above.  When True, ``/api/fstree/tracks-with-meta``
         # collapses duplicate alternate encodings while browsing folders;
-        # default off so folder views mirror what's on disk.
-        "dedup_folders": await get_config("dedup_folders", False),
+        # default on (the EFFECTIVE value — see ``data.folder_dedup_enabled``).
+        "dedup_folders": await folder_dedup_enabled(),
         "use_folder_art": await get_config("use_folder_art", True),
         # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
         # drops subdirectories whose subtree contains zero indexed audio
@@ -2770,6 +3033,26 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # already carry lyrics are never modified.  Off by default — it mutates
         # the user's files.
         "lyrics_writeback": await get_config("lyrics_writeback", False),
+        # Retro album enrichment (core/folder_album.py, core/scene_metadata.py).
+        # ``retro_album_from_folder``: opt-in — fill an empty retro album from
+        # the folder name.  ``modland_filename_game``: fill an empty tracker/
+        # Amiga album from a "<game>-<part>" Modland file name when the local
+        # title equals <part>.
+        "retro_album_from_folder": await get_config("retro_album_from_folder", False),
+        "modland_filename_game": await get_config("modland_filename_game", True),
+        # A retro track's game from its archive's name when that is a known
+        # game of the track's platform (core/game_titles.py) — on by default.
+        "game_from_archive_name": await get_config("game_from_archive_name", True),
+        # Subsonic: group album-less tracks into per-folder albums (read by
+        # api/subsonic.py; same default as there — on).
+        "subsonic_folder_albums": await get_config(
+            _folder_album.SUBSONIC_FOLDER_ALBUMS_KEY,
+            _folder_album.SUBSONIC_FOLDER_ALBUMS_DEFAULT),
+        # Playback: render the next retro/Amiga track ahead of time, and the
+        # extra per-voice VU pass for uade (Amiga) renders (read by the render
+        # pipeline).
+        "render_prewarm": await get_config("render_prewarm", True),
+        "uade_vu_meters": await get_config("uade_vu_meters", True),
         # In-memory resolved-lyrics cache size (Admin → System → Cache).
         "lyrics_cache_size": _lyrics_cache_size(),
         # Log verbosity dials (see core/log_control.py): app level +
@@ -2805,7 +3088,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 val = body["renderers"][k]
                 if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
                          "sid_digiboost"):
-                    val = bool(val)            # coerce — keep the schema honest
+                    val = _flag(val)           # coerce — keep the schema honest
                 elif k == "sid_model":
                     val = str(val).lower()
                     if val not in ("auto", "6581", "8580"):
@@ -2838,18 +3121,34 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             try:
                 from soniqboom.core.hvsc import get_hvsc
                 get_hvsc().configure(body["renderers"]["hvsc_docs_path"] or None)
+                if get_hvsc().is_configured():
+                    # Scans only join HVSC onto the tracks they changed: apply
+                    # the new database to the SIDs already indexed, once.
+                    from soniqboom.core.hvsc_apply import apply_hvsc_to_library
+
+                    async def _apply_new_hvsc() -> None:
+                        try:
+                            await apply_hvsc_to_library(reload=False)
+                        except Exception:
+                            log.exception("HVSC apply after a path change failed")
+                    _t = asyncio.create_task(_apply_new_hvsc(), name="hvsc-apply")
+                    _BG_TASKS.add(_t)
+                    _t.add_done_callback(_BG_TASKS.discard)
             except Exception:
                 log.exception("HVSC reconfigure failed")
     if "scan_zips" in body:
-        conf["scan_zips"] = bool(body["scan_zips"])
+        conf["scan_zips"] = _flag(body["scan_zips"])
         settings.scan_zips = conf["scan_zips"]   # runtime effect, no restart (mirror scan_remote_zips)
     if "scan_remote_zips" in body:
-        conf["scan_remote_zips"] = bool(body["scan_remote_zips"])
+        conf["scan_remote_zips"] = _flag(body["scan_remote_zips"])
         settings.scan_remote_zips = conf["scan_remote_zips"]   # runtime effect, no restart
+    if "startup_reconcile_scan" in body:
+        conf["startup_reconcile_scan"] = _flag(body["startup_reconcile_scan"])
+        settings.startup_reconcile_scan = conf["startup_reconcile_scan"]
     if "art_cache_dir" in body:
         conf["art_cache_dir"] = body["art_cache_dir"]
     if "expose_local_files" in body:
-        conf["expose_local_files"] = bool(body["expose_local_files"])
+        conf["expose_local_files"] = _flag(body["expose_local_files"])
     if "folder_aliases" in body and isinstance(body["folder_aliases"], dict):
         conf["folder_aliases"] = body["folder_aliases"]
 
@@ -2905,9 +3204,9 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
     ):
         from soniqboom.core.data import set_config, get_config
         if "hide_empty_folders" in body:
-            await set_config("hide_empty_folders", bool(body["hide_empty_folders"]))
+            await set_config("hide_empty_folders", _flag(body["hide_empty_folders"]))
         if "filter_duplicates" in body:
-            await set_config("filter_duplicates", bool(body["filter_duplicates"]))
+            await set_config("filter_duplicates", _flag(body["filter_duplicates"]))
             # The HTTP aggregation cache (/library/formats etc.) is not keyed on
             # this toggle, and the store's format aggregate now counts primaries
             # only when it's on — so a toggle must drop both caches, else the
@@ -2915,9 +3214,11 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             from soniqboom.api.library import invalidate_agg_cache
             invalidate_agg_cache()
         if "dedup_folders" in body:
-            await set_config("dedup_folders", bool(body["dedup_folders"]))
+            await set_config("dedup_folders", _flag(body["dedup_folders"]))
+            # From here on the stored value is the user's own (data.folder_dedup_enabled).
+            await set_config("dedup_folders_set", True)
         if "use_folder_art" in body:
-            new_val = bool(body["use_folder_art"])
+            new_val = _flag(body["use_folder_art"])
             old_val = bool(await get_config("use_folder_art", True))
             await set_config("use_folder_art", new_val)
             # The folder-art fallback is read per art request, but cover art
@@ -2978,7 +3279,120 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
     # endpoint (api/tracks.py ``_maybe_writeback_lyrics``).
     if "lyrics_writeback" in body:
         from soniqboom.core.data import set_config
-        await set_config("lyrics_writeback", bool(body["lyrics_writeback"]))
+        await set_config("lyrics_writeback", _flag(body["lyrics_writeback"]))
 
+    # Plain config-backed toggles, each read live by its owner.  Only keys the
+    # form actually sent are written, so an older cached admin page (which
+    # doesn't know them) can never flip them.
+    result: dict = {"updated": True}
+    for key in ("subsonic_folder_albums", "render_prewarm", "uade_vu_meters"):
+        if key in body:
+            from soniqboom.core.data import set_config
+            await set_config(key, _flag(body[key]))
+    if "uade_vu_meters" in body and _flag(body["uade_vu_meters"]):
+        # Saving the VU option ON retries a build that earlier refused the
+        # per-voice dump (the latch would otherwise hold for hours).  Off needs
+        # nothing: the setting alone gates the pass.
+        from soniqboom.api.stream import reset_uade_vu_latch
+        reset_uade_vu_latch()
+
+    # Persist the conf-file settings NOW — the album passes below can take
+    # seconds, and a concurrent Save must not have its conf write clobbered by
+    # this request writing back the conf it loaded before awaiting them.
     save_local_conf(conf)
-    return {"updated": True}
+
+    # Retro album options act immediately, but only on an actual CHANGE (an
+    # unrelated Save re-sends the current value): switching ON fills now,
+    # switching OFF reverts exactly the albums that option stamped
+    # (``album_source``), never a tag or a hand edit.  The setting itself is
+    # stored first, so a failing pass is reported without undoing the choice.
+    if "retro_album_from_folder" in body or "modland_filename_game" in body:
+        from soniqboom.core.data import set_config, get_config
+        from soniqboom.core import folder_album
+        if "retro_album_from_folder" in body:
+            new_val = _flag(body["retro_album_from_folder"])
+            old_val = bool(await get_config(folder_album.CONFIG_KEY, False))
+            await set_config(folder_album.CONFIG_KEY, new_val)
+            if old_val and not new_val:
+                # Recorded with the option (no await between), so a restart
+                # before the revert below finishes still resumes it.
+                folder_album.mark_revert_pending(folder_album.SOURCE_FOLDER)
+            if new_val != old_val:
+                try:
+                    if new_val:
+                        res = await folder_album.apply_folder_albums(force=True)
+                        result["folder_albums_filled"] = res.get("albums", 0)
+                        result["folder_tracks_updated"] = res.get("updated", 0)
+                    else:
+                        result["folder_albums_reverted"] = \
+                            await folder_album.revert_album_source(folder_album.SOURCE_FOLDER)
+                        result["folder_tracks_updated"] = \
+                            folder_album.status()["last_revert"]["updated"]
+                except Exception as exc:                # noqa: BLE001
+                    log.exception("folder-album pass failed")
+                    result["album_pass_error"] = str(exc)
+        if "modland_filename_game" in body:
+            from soniqboom.core import scene_metadata
+            key = scene_metadata.MODLAND_FILENAME_CONFIG_KEY
+            new_val = _flag(body["modland_filename_game"])
+            old_val = bool(await get_config(key, True))
+            await set_config(key, new_val)
+            if old_val and not new_val:
+                folder_album.mark_revert_pending(folder_album.SOURCE_MODLAND_FILENAME)
+            if new_val != old_val:
+                try:
+                    if new_val:
+                        # Re-run the Modland join (exact-MD5 matches only)
+                        # when an index exists; otherwise the next manual
+                        # Apply uses the setting.
+                        if scene_metadata.has_index():
+                            st = await scene_metadata.apply_to_library()
+                            if st.get("error") == "apply already running":
+                                # A running apply (post-scan runner or a
+                                # manual Apply) may have read the option
+                                # before this switch: queue a follow-up auto
+                                # apply.  Its skip signature includes the
+                                # option, so it really joins, and the runner
+                                # retries while the running one holds the lock.
+                                from soniqboom.core import scanner
+                                scanner._spawn_scene_autoapply()
+                                result["started"] = True
+                            elif st.get("error"):
+                                result["album_pass_error"] = st["error"]
+                            else:
+                                la = st.get("last_apply") or {}
+                                result["modland_albums_filled"] = la.get("albums", 0)
+                                result["modland_tracks_updated"] = la.get("updated", 0)
+                    else:
+                        result["modland_albums_reverted"] = \
+                            await folder_album.revert_album_source(
+                                folder_album.SOURCE_MODLAND_FILENAME)
+                        n = folder_album.status()["last_revert"]["updated"]
+                        # Albums freed by the revert may now take a folder name.
+                        if folder_album.enabled():
+                            res = await folder_album.apply_folder_albums(force=True)
+                            n += res.get("updated", 0)
+                        result["modland_tracks_updated"] = n
+                except Exception as exc:                # noqa: BLE001
+                    log.exception("Modland file-name album pass failed")
+                    result["album_pass_error"] = str(exc)
+
+    # Game from the archive name: switching it runs the pass at once (on:
+    # names every matching archive member, off: withdraws those names).
+    if "game_from_archive_name" in body:
+        from soniqboom.core.data import set_config, get_config
+        from soniqboom.core import game_titles
+        new_val = _flag(body["game_from_archive_name"])
+        old_val = bool(await get_config(game_titles.CONFIG_KEY, True))
+        await set_config(game_titles.CONFIG_KEY, new_val)
+        if new_val != old_val:
+            try:
+                res = await game_titles.apply_archive_games(force=True)
+                result["archive_tracks_updated"] = res.get("updated", 0)
+                result["archive_games_named"] = res.get("named", 0)
+                result["archive_games_primary"] = res.get("primary", 0)
+            except Exception as exc:                    # noqa: BLE001
+                log.exception("game-from-archive pass failed")
+                result["album_pass_error"] = str(exc)
+
+    return result

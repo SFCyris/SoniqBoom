@@ -12,7 +12,8 @@
  *   TrackInfo.openSingle(track)        — open panel for a single track
  */
 import { Player }              from './player.js';
-import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel } from './utils.js';
+import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
+         subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -454,7 +455,8 @@ function _applySceneYear(track, info, reqTrackId) {
   // Demozoo apply hasn't covered yet.  A stored demozoo year is already shown
   // (identical value) and a user-pinned year must never be overridden, so
   // this display-time overwrite stays out of the way of both.
-  if (track.year_source === 'demozoo' || track.year_source === 'user') return;
+  if (track.year_source === 'demozoo' || track.year_source === 'user'
+      || track.year_source === 'songdb') return;
   if (_queue[_idx]?.id !== reqTrackId) return;
   const yEl = document.getElementById('ti-year');
   if (!yEl || Number(rel.year) === Number(track.year)) return;
@@ -539,7 +541,7 @@ async function _loadScene(track) {
 // ── Tag editing ────────────────────────────────────────────────────────────────
 const _TAG_FIELDS = [
   ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
-  ['album_artist', 'Album artist'], ['genre', 'Genre'], ['year', 'Year'],
+  ['album_artist', 'Album artist'], ['game', 'Game'], ['genre', 'Genre'], ['year', 'Year'],
 ];
 function _renderTagEdit(track) {
   const wrap = document.getElementById('ti-tagedit-wrap');
@@ -587,7 +589,8 @@ function _renderTagEdit(track) {
 const _META_FIELDS = [
   ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
   ['album_artist', 'Album artist'], ['composer', 'Composer'],
-  ['genre', 'Genre'], ['year', 'Year'], ['comment', 'Comment'],
+  ['game', 'Game'], ['genre', 'Genre'], ['year', 'Year'], ['label', 'Label'],
+  ['comment', 'Comment'],
 ];
 
 function _showInfoForm(track, wrap) {
@@ -652,6 +655,21 @@ function _showInfoForm(track, wrap) {
   inputs.title?.focus();
 }
 
+// Tell the open library view which of this track's fields a save changed, so
+// its row shows them without a re-navigation (app.js → Library.patchTrack).
+// Values are read off ``track`` AFTER the local merge, in the shape the library
+// rows carry (genre as a list).  Sent whether or not the panel still shows this
+// track — the server has the new values either way.
+function _announceEdit(track, applied) {
+  const keys = Object.keys(applied || {});
+  if (!track || !track.id || !keys.length) return;
+  const fields = {};
+  for (const k of keys) fields[k] = track[k];
+  try {
+    document.dispatchEvent(new CustomEvent('soniqboom:track-edited', { detail: { id: track.id, fields } }));
+  } catch (_) {}
+}
+
 async function _saveMeta(track, wrap, body) {
   try {
     const r = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/meta`, {
@@ -667,6 +685,7 @@ async function _saveMeta(track, wrap, body) {
     const applied = res.applied || {};
     Object.assign(track, applied);
     if (applied.genre) track.genre = applied.genre;   // server stores a list
+    _announceEdit(track, applied);
     window.Toast?.ok?.('Info updated.');
     if (_queue[_idx]?.id === track.id) _render(track);   // guard against nav during save
   } catch (e) {
@@ -687,6 +706,7 @@ async function _saveYear(track, wrap, body) {
     }
     const res = await r.json();
     Object.assign(track, res.applied || {});     // year, year_source, year_file
+    _announceEdit(track, res.applied);
     window.Toast?.ok?.('Year updated.');
     // Guard the post-await repaint: the user may have hit ◀/▶ during the PUT,
     // and re-rendering the old track would overwrite the newer one's panel
@@ -737,6 +757,8 @@ function _showTagForm(track, wrap) {
         if (v && n && n !== track.year) body.year = n;
       } else if (v && v !== (track[key] || '')) {
         body[key] = v;
+      } else if (key === 'game' && !v && track.game && track.game_source == null) {
+        body.game = '';                     // clearing the field removes the GAME tag
       }
     }
     if (!Object.keys(body).length) { _renderTagEdit(track); return; }
@@ -752,8 +774,15 @@ function _showTagForm(track, wrap) {
         throw new Error(msg);
       }
       const res = await r.json();
-      Object.assign(track, res.applied || {});
-      if (res.applied && res.applied.genre) track.genre = [res.applied.genre];
+      const applied = { ...(res.applied || {}) };
+      Object.assign(track, applied);
+      if (applied.genre) track.genre = [applied.genre];
+      // ``applied`` is what went into the FILE; the store also stamped the
+      // edit's provenance (api/tracks.py update_tags) — mirror it, so a Demozoo
+      // year no longer overlays a hand-typed one and this object matches a re-read.
+      if ('year' in applied) track.year_source = applied.year_source = 'user';
+      if ('game' in applied) track.game_source = applied.game_source = null;
+      _announceEdit(track, applied);
       window.Toast?.ok?.('Tags saved — file and library updated.');
       // Don't repaint a track the user navigated away from during the save.
       if (_queue[_idx]?.id === track.id) _render(track);
@@ -824,6 +853,72 @@ function _render(track) {
   _show('ti-artist',       track.artist);
   _show('ti-album-artist', track.album_artist);
   _show('ti-album',        track.album);
+  // A GUESSED album (Modland file name / folder name) gets a small muted note;
+  // a header tag or an exact Modland game folder needs none, and neither does
+  // an album the user has edited since.
+  const _albEl = document.getElementById('ti-album');
+  if (_albEl && track.album
+      && !(Array.isArray(track.user_edited) && track.user_edited.includes('album'))) {
+    const _albNote = track.album_source === 'modland-filename' ? 'guessed from Modland file name'
+                   : track.album_source === 'folder' ? 'guessed from folder name' : '';
+    if (_albNote) {
+      // A real space before the note, so it reads (and is spoken) as its own
+      // phrase rather than running into the album name.
+      _albEl.appendChild(document.createTextNode(' '));
+      const note = document.createElement('span');
+      note.className = 'ti-album-source';
+      note.style.cssText = 'color:var(--text2);font-size:0.85em;margin-left:2px';
+      note.title = 'Not from the file’s own tags';
+      note.textContent = `(${_albNote})`;
+      _albEl.appendChild(note);
+    }
+  }
+  _show('ti-game',         track.game);
+  // Where a game came from, as visible text (a tooltip alone can't be reached
+  // by keyboard or touch) — except the file's own GAME tag (game_source null)
+  // and a game the user typed, which need none.
+  const _gameEl = document.getElementById('ti-game');
+  if (_gameEl && track.game
+      && !(Array.isArray(track.user_edited) && track.user_edited.includes('game'))) {
+    const _gNote = {
+      'modland-filename': 'guessed from Modland file name',
+      'folder':           'guessed from folder name',
+      'songdb':           'from the song database',
+      'demozoo':          'from Demozoo',
+      'archive':          'from the archive name',
+      'modland':          'from the Modland game folder',
+      'tag':              'from the file header',
+      'user-album':       'from the album you set',
+    }[track.game_source] || '';
+    if (_gNote) {
+      _gameEl.appendChild(document.createTextNode(' '));
+      const note = document.createElement('span');
+      note.className = 'ti-album-source';
+      note.style.cssText = 'color:var(--text2);font-size:0.85em;margin-left:2px';
+      note.textContent = `(${_gNote})`;
+      _gameEl.appendChild(note);
+    }
+  }
+  // The other names the game goes by (game_aliases — ``game:`` finds them
+  // too), each with the source that gives it.
+  const _aliases = Array.isArray(track.game_aliases) ? track.game_aliases : [];
+  if (_gameEl && track.game && _aliases.length) {
+    const _by = [
+      ['game_by_tag', 'the file header'], ['game_by_modland', 'Modland'],
+      ['game_by_demozoo', 'Demozoo'], ['game_by_songdb', 'the song database'],
+      ['game_by_modland_filename', 'a Modland file name'], ['game_by_archive', 'the archive name'],
+      ['game_by_folder', 'the folder name'],
+    ];
+    const _key = (v) => String(v || '').split(/\s+/).join(' ').trim().toLowerCase();
+    const also = document.createElement('span');
+    also.className = 'ti-game-aliases';
+    also.style.cssText = 'display:block;color:var(--text2);font-size:0.85em;margin-top:2px';
+    also.textContent = 'also ' + _aliases.map((a) => {
+      const hit = _by.find(([f]) => _key(track[f]) === _key(a));
+      return hit ? `${a} (${hit[1]})` : a;
+    }).join(' \u00b7 ');
+    _gameEl.appendChild(also);
+  }
   _show('ti-composer',     track.composer);
   _show('ti-year',         track.year);
   // Mark a non-file year from its PERSISTED provenance (the Demozoo backfill or
@@ -833,10 +928,11 @@ function _render(track) {
   const _yEl0 = document.getElementById('ti-year');
   if (_yEl0) {
     const _ys = track.year_source;
-    if ((_ys === 'demozoo' || _ys === 'user') && track.year != null) {
+    if ((_ys === 'demozoo' || _ys === 'user' || _ys === 'songdb') && track.year != null) {
       _yEl0.classList.add('ti-year-scene');
       _yEl0.title = _ys === 'demozoo'
         ? `Demozoo release year${track.year_file != null ? ` · file tag says ${track.year_file}` : ''}`
+        : _ys === 'songdb' ? 'Year from the audacious-uade-tools song database'
         : 'Year set manually';
     } else {
       _yEl0.classList.remove('ti-year-scene');
@@ -1005,15 +1101,18 @@ function _reorderSections(track) {
 
 // ── Subsong picker ────────────────────────────────────────────────────────────
 // Multi-tune files (SID/SNDH/AHX/SC68/UADE/GME/tracker) expose N subsongs; the
-// backend renders any one via ?subsong=<0-based>.  A "virtual track" is the base
-// track object plus a 0-based ``subsong`` + ``subsongTotal`` — the player forwards
-// ``subsong`` to the stream URL (see player.js _streamUrlFor) and shows
-// "Tune N / total".  DISPLAY is 1-based ("Tune 1".."Tune N"); the wire index is
-// always the label minus one.  Never persist/forward the 1-based number.
+// backend renders any one via ?subsong=<wire>.  A "virtual track" is the base
+// track object plus the wire index in ``subsong``, ``subsongTotal`` and the
+// file's start song in ``subsongStart`` — the player forwards ``subsong`` to the
+// stream URL (see player.js _streamUrlFor) and shows "Tune N / total".  DISPLAY
+// is the tune's number ("Tune 1".."Tune N", in that order); the wire index is
+// NOT always the number minus one — wire 0 is the file's default tune (its
+// start song).  utils.js subsongWireToTune / subsongTuneToWire hold the one
+// mapping; never persist/forward a tune number as a wire.
 const _subSection = document.getElementById('ti-section-subsongs');
 const _subListEl  = document.getElementById('ti-sub-list');
 const SUB_CAP     = 60;                 // rows rendered up-front; "jump to #" reaches the tail
-let   _subState   = null;               // { track, count, defaultWire, lengths }
+let   _subState   = null;               // { track, count, start, lengths, stilTitles }
 
 function _subFmtLen(sec) {
   if (!(sec > 0)) return '';
@@ -1021,49 +1120,61 @@ function _subFmtLen(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+const _subWire = (tune) => subsongTuneToWire(tune, _subState ? _subState.start : 1, _subState ? _subState.count : 0);
+const _subTune = (wire) => subsongWireToTune(wire, _subState ? _subState.start : 1, _subState ? _subState.count : 0);
+
 function _subVirtual(base, wire) {
-  // Carry only what playback needs; ``subsong`` is the 0-based wire index.
+  // Carry only what playback needs; ``subsong`` is the wire index.
+  // ``duration``: the row's stored length is the default tune's (wire 0), so
+  // another tune carries its own (HVSC Songlengths, in tune order) or none
+  // until it plays.
+  const tune = _subTune(wire);
+  const lens = _subState && Array.isArray(_subState.lengths) ? _subState.lengths : null;
+  const own = lens ? Number(lens[tune - 1]) : 0;
   return { ...base, subsong: wire,
+           duration: own > 0 ? own : (wire === 0 ? base.duration : 0),
            subsongTotal: _subState ? _subState.count : 0,
-           subsongLabel: `Tune ${wire + 1}` };
+           subsongStart: _subState ? _subState.start : 1,
+           subsongLabel: `Tune ${tune}` };
 }
 
 // HVSC STIL: parse the raw blob's ``(#N)`` subtune markers into a
-// { wire → title } map.  ``(#N)`` is 1-based (matches display "Tune N"), so
-// wire = N-1.  We take the FIRST ``TITLE:`` inside each block; ARTIST/COMMENT
-// are left for the raw commentary panel.  Files without ``(#N)`` markers (a
-// single file-level TITLE) yield null — the picker then shows bare tune
-// numbers, which is the correct graceful degrade.
+// { N-1 → title } map, keyed by tune (``(#N)`` is tune N, as displayed).  We
+// take the FIRST ``TITLE:`` inside each block; ARTIST/COMMENT are left for the
+// raw commentary panel.  Files without ``(#N)`` markers (a single file-level
+// TITLE) yield null — the picker then shows bare tune numbers, which is the
+// correct graceful degrade.
 function _parseStilTitles(blob) {
   if (!blob || typeof blob !== 'string') return null;
   const titles = {};
-  let wire = -1;
+  let idx = -1;
   for (const raw of blob.split('\n')) {
     const mk = raw.match(/^\s*\(#(\d+)\)/);
-    if (mk) { wire = parseInt(mk[1], 10) - 1; continue; }
-    if (wire < 0) continue;
+    if (mk) { idx = parseInt(mk[1], 10) - 1; continue; }
+    if (idx < 0) continue;
     const tm = raw.match(/^\s*TITLE:\s?(.+?)\s*$/);
-    if (tm && titles[wire] === undefined) titles[wire] = tm[1].trim();
+    if (tm && titles[idx] === undefined) titles[idx] = tm[1].trim();
   }
   return Object.keys(titles).length ? titles : null;
 }
 
-function _subRowHtml(wire) {
+function _subRowHtml(tune) {
   const st = _subState;
-  const isDef = st && wire === st.defaultWire;
-  const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[wire]) : '';
-  const title = (st && st.stilTitles) ? st.stilTitles[wire] : '';
+  const wire = _subWire(tune);
+  const isDef = st && tune === st.start;
+  const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[tune - 1]) : '';
+  const title = (st && st.stilTitles) ? st.stilTitles[tune - 1] : '';
   const titleHtml = title
     ? ` <span class="ti-sub-title" title="${_escHtml(title)}">· ${_escHtml(title)}</span>`
     : '';
-  return `<div class="ti-sub-row" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${wire + 1}${title ? ': ' + _escHtml(title) : ''}">`
+  return `<div class="ti-sub-row" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${tune}${isDef ? ' (default)' : ''}${title ? ': ' + _escHtml(title) : ''}">`
     + `<span class="ti-sub-eq" aria-hidden="true"><i></i><i></i><i></i></span>`
-    + `<span class="ti-sub-name">Tune ${wire + 1}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${titleHtml}</span>`
+    + `<span class="ti-sub-name">Tune ${tune}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${titleHtml}</span>`
     + `<span class="ti-sub-len">${len}</span>`
     + `<span class="ti-sub-rowacts">`
-    +   `<button type="button" class="ti-sub-rbtn" data-act="play" tabindex="-1" aria-label="Play tune ${wire + 1}" title="Play">&#9654;</button>`
-    +   `<button type="button" class="ti-sub-rbtn" data-act="queue" tabindex="-1" aria-label="Add tune ${wire + 1} to queue" title="Add to queue">&#65291;</button>`
-    +   `<button type="button" class="ti-sub-rbtn" data-act="playlist" tabindex="-1" aria-label="Add tune ${wire + 1} to a playlist" title="Add to playlist">&#9776;</button>`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="play" tabindex="-1" aria-label="Play tune ${tune}" title="Play">&#9654;</button>`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="queue" tabindex="-1" aria-label="Add tune ${tune} to queue" title="Add to queue">&#65291;</button>`
+    +   `<button type="button" class="ti-sub-rbtn" data-act="playlist" tabindex="-1" aria-label="Add tune ${tune} to a playlist" title="Add to playlist">&#9776;</button>`
     + `</span></div>`;
 }
 
@@ -1073,12 +1184,12 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles) 
   _subState = {
     track,
     count,
-    // default_track is 1-based (PSID/SNDH header); convert to 0-based wire, or
-    // fall back to the first tune when the file doesn't record a default.
-    defaultWire: (Number(defaultTrack1) > 0) ? (Number(defaultTrack1) - 1) : 0,
+    // default_track is the 1-based start song (PSID/SNDH header); the first
+    // tune when the file doesn't record one (or records one out of range).
+    start: subsongStart(defaultTrack1, count),
+    // Per-tune lengths / HVSC STIL titles, both in tune order (index = tune-1),
+    // or null — the rows then show bare "Tune N".
     lengths: Array.isArray(lengths) ? lengths : null,
-    // { wire → HVSC STIL tune title }, or null when the file has no per-tune
-    // STIL names — the rows then show bare "Tune N".
     stilTitles: (stilTitles && typeof stilTitles === 'object') ? stilTitles : null,
   };
   const cntEl = document.getElementById('ti-sub-count');
@@ -1087,7 +1198,7 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles) 
   if (addLbl) addLbl.textContent = `Add all · ${count}`;
   const shown = Math.min(count, SUB_CAP);
   const rows = [];
-  for (let w = 0; w < shown; w++) rows.push(_subRowHtml(w));
+  for (let t = 1; t <= shown; t++) rows.push(_subRowHtml(t));
   _subListEl.innerHTML = rows.join('');
   const moreEl = document.getElementById('ti-sub-more');
   if (moreEl) moreEl.textContent = count > SUB_CAP ? `+ ${count - SUB_CAP} more — use “jump to #”` : '';
@@ -1095,18 +1206,23 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles) 
   _highlightPlayingSubsong();
 }
 
-function _subAllVirtual() {
+// Every tune of the file, in tune order (1..N), as wire indexes.
+function _subAllWires() {
   const st = _subState; if (!st) return [];
   const out = [];
-  for (let w = 0; w < st.count; w++) out.push(_subVirtual(st.track, w));
+  for (let t = 1; t <= st.count; t++) out.push(_subWire(t));
   return out;
+}
+function _subAllVirtual() {
+  const st = _subState; if (!st) return [];
+  return _subAllWires().map(w => _subVirtual(st.track, w));
 }
 
 function _subAction(act, wire, anchor) {
   const st = _subState; if (!st || !(wire >= 0)) return;
   if (act === 'queue') {
     Player.addToQueue(_subVirtual(st.track, wire));
-    window.Toast?.ok?.(`Added tune ${wire + 1} to the queue`);
+    window.Toast?.ok?.(`Added tune ${_subTune(wire)} to the queue`);
   } else if (act === 'playlist') {
     _subToPlaylist([{ id: st.track.id, subsong: wire }], anchor);
   } else {
@@ -1125,8 +1241,10 @@ function _highlightPlayingSubsong() {
   if (!_subListEl) return;
   _subListEl.querySelectorAll('.ti-sub-row.playing').forEach(r => r.classList.remove('playing'));
   const st = _subState, cur = Player.currentTrack;
-  if (st && cur && cur.id === st.track.id && Number.isInteger(cur.subsong)) {
-    const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${cur.subsong}"]`);
+  if (st && cur && cur.id === st.track.id) {
+    // A plain play of the file (no ``subsong``) is its default tune: wire 0.
+    const wire = Number.isInteger(cur.subsong) ? cur.subsong : 0;
+    const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${wire}"]`);
     if (row) row.classList.add('playing');
   }
 }
@@ -1146,15 +1264,14 @@ if (_subListEl) {
   });
 }
 document.getElementById('ti-sub-playall')?.addEventListener('click', () => {
-  const list = _subAllVirtual(); if (list.length) Player.setQueue(list, 0);
+  const list = _subAllVirtual(); if (list.length) Player.setQueue(list, 0, { explicit: false });   // "Play all": a dead first tune is skipped, like the library's
 });
 document.getElementById('ti-sub-shuffle')?.addEventListener('click', () => {
+  // The player owns shuffling: it starts on a random tune, deals the rest, and
+  // lights the shuffle button (a local shuffle here played a shuffled order
+  // while the button stayed dark).
   const list = _subAllVirtual();
-  for (let i = list.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [list[i], list[j]] = [list[j], list[i]];
-  }
-  if (list.length) Player.setQueue(list, 0);
+  if (list.length) Player.setQueue(list, 0, { shuffle: true });
 });
 document.getElementById('ti-sub-addall')?.addEventListener('click', () => {
   const list = _subAllVirtual();
@@ -1163,14 +1280,12 @@ document.getElementById('ti-sub-addall')?.addEventListener('click', () => {
 });
 document.getElementById('ti-sub-addall-pl')?.addEventListener('click', (e) => {
   const st = _subState; if (!st) return;
-  const entries = [];
-  for (let w = 0; w < st.count; w++) entries.push({ id: st.track.id, subsong: w });
-  _subToPlaylist(entries, e.currentTarget);
+  _subToPlaylist(_subAllWires().map(w => ({ id: st.track.id, subsong: w })), e.currentTarget);
 });
 document.getElementById('ti-sub-jump-in')?.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
-  const n = parseInt(e.target.value, 10);
-  if (_subState && n >= 1 && n <= _subState.count) { _subAction('play', n - 1); e.target.value = ''; }
+  const n = parseInt(e.target.value, 10);           // the TUNE number, as displayed
+  if (_subState && n >= 1 && n <= _subState.count) { _subAction('play', _subWire(n)); e.target.value = ''; }
 });
 Player.on?.('trackchange', () => _highlightPlayingSubsong());
 
@@ -1302,7 +1417,7 @@ async function _loadExtendedInfo(track) {
         // (older servers omit them → picker falls back to first-tune-default, no
         // times, bare tune numbers).
         const stilTitles = _parseStilTitles(data.stil);
-        _renderSubsongPicker(track, subCount, data.default_track, data.hvsc_lengths, stilTitles);
+        _renderSubsongPicker(track, subCount, data.default_track ?? subsongStartOf(track), data.hvsc_lengths, stilTitles);
         _renderStil(data.stil);
         _renderSidChip(data.sid_model);
 

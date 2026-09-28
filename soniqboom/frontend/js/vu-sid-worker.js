@@ -28,6 +28,29 @@ const VU_HZ = 30;
 const SPF = Math.floor(RATE / VU_HZ);   // 1470 samples per VU frame
 const MAX_DUR = 600;                    // server's _SID_VU_MAX_DURATION
 
+// ``subsong`` arrives as the WIRE index (the ?subsong= the stream uses), not a
+// tune number: wire 0 is the file's default tune (its PSID start song) and,
+// when that is not tune 1, wire start-1 is tune 1 — the mapping in utils.js
+// subsongWireToTune, repeated here because a classic worker cannot import the
+// module.  sid_load takes the 1-based tune number (0 = the start song), as
+// sidplayfp's -o does; the header's song count and start song are read from
+// the PSID/RSID bytes themselves (big-endian u16 at 0x0E / 0x10).
+function tuneForWire(bytes, wire) {
+  const w = Math.max(0, Math.floor(Number(wire) || 0));
+  if (w === 0) return 0;
+  let songs = 0, start = 1;
+  if (bytes.length >= 0x12) {
+    const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    if (magic === 'PSID' || magic === 'RSID') {
+      songs = (bytes[0x0e] << 8) | bytes[0x0f];
+      start = (bytes[0x10] << 8) | bytes[0x11];
+    }
+  }
+  if (!(start >= 1 && (!(songs > 0) || start <= songs))) start = 1;
+  if (start !== 1 && w === start - 1) return 1;
+  return w + 1;
+}
+
 let _modPromise = null;
 function getModule() {
   if (!_modPromise) {
@@ -95,7 +118,8 @@ async function renderVU(sidBytes, subsong, durSec, onPartial) {
   setd(0);   // pinned warm-up → deterministic client render
   const p = M._malloc(bytes.length);
   M.HEAPU8.set(bytes, p);
-  const songs = load(p, bytes.length, subsong);
+  const tune = tuneForWire(bytes, subsong);      // reported with the result: the server checks it
+  const songs = load(p, bytes.length, tune);
   M._free(p);
   if (!songs) throw new Error('sid_load failed: ' + errFn());
 
@@ -130,7 +154,7 @@ async function renderVU(sidBytes, subsong, durSec, onPartial) {
     M._free(outPtr);
   }
   const nf = done || frames;
-  return { vumr: buildVUMR(cols, nf), frames: nf };
+  return { vumr: buildVUMR(cols, nf), frames: nf, tune };
 }
 
 // Wrap mono 16-bit 44100 Hz PCM in a WAV container the browser <audio> can play.
@@ -159,7 +183,8 @@ async function renderAudioVU(sidBytes, subsong, durSec) {
   const errFn = M.cwrap('sid_error', 'string', []);
   sets(0); setd(0);
   const p = M._malloc(bytes.length); M.HEAPU8.set(bytes, p);
-  const songs = load(p, bytes.length, subsong); M._free(p);
+  const tune = tuneForWire(bytes, subsong);
+  const songs = load(p, bytes.length, tune); M._free(p);
   if (!songs) throw new Error('sid_load failed: ' + errFn());
   const frames = Math.max(1, Math.round(durSec * VU_HZ));
   const aPtr = M._malloc(frames * SPF * 2);      // 16-bit mono PCM
@@ -171,7 +196,7 @@ async function renderAudioVU(sidBytes, subsong, durSec) {
     const cols = [new Float64Array(got), new Float64Array(got), new Float64Array(got)];
     const vu = M.HEAPF32.subarray(vPtr >> 2, (vPtr >> 2) + got * 3);
     for (let f = 0; f < got; f++) { cols[0][f] = vu[f * 3]; cols[1][f] = vu[f * 3 + 1]; cols[2][f] = vu[f * 3 + 2]; }
-    return { wav, vumr: buildVUMR(cols, got), frames: got };
+    return { wav, vumr: buildVUMR(cols, got), frames: got, tune };
   } finally {
     M._free(aPtr); M._free(vPtr);
   }
@@ -187,19 +212,21 @@ self.onmessage = async (e) => {
     if (!sidBytes || !sidBytes.byteLength) throw new Error('no sid bytes');
     if (msg.mode === 'audiovu') {
       // Browser-plays-SID path: audio blob + VU, one pass.
-      const { wav, vumr, frames } = await renderAudioVU(sidBytes, Number(subsong) || 0, durSec);
+      const { wav, vumr, frames, tune } = await renderAudioVU(sidBytes, Number(subsong) || 0, durSec);
       if (!wav) throw new Error('render produced no audio');
       const transfer = vumr ? [wav, vumr] : [wav];
-      self.postMessage({ id, type: 'done', wav, vumr, frames }, transfer);
+      // ``tune``: the 1-based tune rendered (0 = the file's default) — an
+      // upload of a tune other than the default must name it.
+      self.postMessage({ id, type: 'done', wav, vumr, frames, tune }, transfer);
     } else {
       // VU-only offload path: stream partial snapshots, final VUMR for upload.
-      const { vumr, frames } = await renderVU(
+      const { vumr, frames, tune } = await renderVU(
         sidBytes, Number(subsong) || 0, durSec,
         (done, samples) => self.postMessage(
           { id, type: 'partial', done, samples }, [samples.buffer]),
       );
       if (!vumr) throw new Error('silent render (no VU)');
-      self.postMessage({ id, type: 'done', vumr, frames }, [vumr]);
+      self.postMessage({ id, type: 'done', vumr, frames, tune }, [vumr]);
     }
   } catch (err) {
     self.postMessage({ id, type: 'error', error: String((err && err.message) || err) });

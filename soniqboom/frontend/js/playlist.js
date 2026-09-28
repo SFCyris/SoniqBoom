@@ -23,7 +23,7 @@
  */
 import { Player } from './player.js';
 import { Library } from './library.js';
-import { artPlaceholderEmoji, Toast, probeAdlibDurations } from './utils.js';
+import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf } from './utils.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -391,7 +391,7 @@ function _renderTracks() {
       <div class="queue-track-info">
         <div class="queue-track-titlerow">
           <span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>
-          ${Number.isInteger(track.subsong) ? `<span class="qr-subsong" title="Subsong ${track.subsong + 1}">Tune ${track.subsong + 1}</span>` : ''}
+          ${Number.isInteger(track.subsong) ? (() => { const n = subsongWireToTune(track.subsong, subsongStartOf(track), track.subsongs); return `<span class="qr-subsong" title="Tune ${n}">Tune ${n}</span>`; })() : ''}
           ${dupBadge}
         </div>
         <span class="queue-track-artist">${esc(track.artist || track.album_artist || '')}</span>

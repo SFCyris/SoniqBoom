@@ -39,6 +39,7 @@ store's ``set_config``/``get_config`` and surfaced in Settings.
 from __future__ import annotations
 
 import logging
+import re
 
 # ── App verbosity: UI value → level on the ``soniqboom`` logger tree ──────────
 # Only the ``soniqboom`` logger is moved (not root), so "verbose" doesn't drown
@@ -102,6 +103,44 @@ def _record_path(record: logging.LogRecord) -> str:
     return ""
 
 
+# Query parameters that carry credentials: Subsonic plain/enc password (p),
+# token + salt (t, s), OpenSubsonic apiKey, signed stream/radio/cast tokens.
+# Their values are replaced before an access line is emitted in ANY mode.
+_SECRET_PARAMS = frozenset({"p", "t", "s", "token", "tok", "apikey",
+                            "transcodeparams", "password", "passwd"})
+_QS_PAIR_RE = re.compile(r"(?<=[?&])([^=&#\s]+)=([^&#\s]*)")
+
+
+_CAST_TOKEN_RE = re.compile(r"^(/cast/)[^/?]+")
+
+
+def _is_secret_name(raw: str) -> bool:
+    # Names are compared percent-DECODED: ``?%70=secret`` is ``p`` to Starlette.
+    from urllib.parse import unquote_plus
+    return unquote_plus(raw).lower() in _SECRET_PARAMS
+
+
+def redact_query(path: str) -> str:
+    """``/rest/ping.view?u=bob&p=secret`` → ``…?u=bob&p=***``; the signed
+    token in ``/cast/<token>/<file>`` → ``/cast/***/<file>``."""
+    if path.startswith("/cast/"):
+        path = _CAST_TOKEN_RE.sub(r"\1***", path)
+    if "?" not in path:
+        return path
+    return _QS_PAIR_RE.sub(
+        lambda m: f"{m.group(1)}=***" if _is_secret_name(m.group(1)) else m.group(0),
+        path)
+
+
+def _redact_record(record: logging.LogRecord) -> None:
+    args = record.args
+    if (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)
+            and ("?" in args[2] or args[2].startswith("/cast/"))):
+        clean = redact_query(args[2])
+        if clean != args[2]:
+            record.args = args[:2] + (clean,) + args[3:]
+
+
 class _AccessLogFilter(logging.Filter):
     """Gate on ``uvicorn.access`` — one instance, mode flipped at runtime."""
 
@@ -110,10 +149,11 @@ class _AccessLogFilter(logging.Filter):
         self.mode = DEFAULT_ACCESS_MODE
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        if self.mode == "all":
-            return True
         if self.mode == "off":
             return False
+        _redact_record(record)
+        if self.mode == "all":
+            return True
         # "problems": only 4xx/5xx, minus the by-design fallback-404s.
         status = _record_status(record)
         if status is None:

@@ -201,9 +201,14 @@ function _wireOverlayControls(el) {
     const msgEl = el.querySelector('#auth-bootstrap-retry-msg');
     msgEl.hidden = true;
     try {
-      const r = await fetch('/api/auth/reload', {
+      let r = await fetch('/api/auth/reload', {
         method: 'POST', credentials: 'same-origin',
       });
+      // 403 = an admin exists now, so the server only re-reads users.json for
+      // the CLI — which already told it about the new account.  Just read it.
+      if (r.status === 403) {
+        r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+      }
       if (!r.ok) throw new Error(`status ${r.status}`);
       STATE.authStatus = await r.json();
     } catch (e) {

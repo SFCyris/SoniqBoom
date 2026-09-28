@@ -16,6 +16,8 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response
 
+from soniqboom.core import forksafe
+
 # Dedicated thread-pool for ``_compute_waveform`` — that helper spawns a
 # 60s-timeout ffmpeg subprocess per call and ties up its worker the whole
 # time.  Letting it share the default executor with AOF flush + art reads
@@ -27,6 +29,12 @@ _WAVEFORM_POOL = ThreadPoolExecutor(
 )
 
 
+# Waveform decodes are full-file ffmpeg runs: cap how many run at once so a
+# burst (track skipping, several listeners) can't crowd out the renders and
+# streams that playback is waiting on.
+_WAVEFORM_DECODE_SEM = asyncio.Semaphore(2)
+
+
 async def _compute_waveform_safe(path: str, points: int = 200):
     """Compute a track's waveform WITHOUT forking ffmpeg from a worker thread.
 
@@ -35,13 +43,186 @@ async def _compute_waveform_safe(path: str, points: int = 200):
     SEGFAULTS on macOS once the process has initialised Core Foundation (e.g.
     after the stations relay's outbound networking) — the worker dies and every
     waveform comes back all-zero (blank).  Decode ffmpeg on the EVENT LOOP via
-    ``create_subprocess_exec`` instead — the same fork-safe pattern the whole
+    ``forksafe.spawn`` instead (posix_spawn, no fork) — the pattern the whole
     streaming path uses — then crunch the PCM in the pool (numpy doesn't fork).
     """
+    async with _WAVEFORM_DECODE_SEM:
+        return await _compute_waveform_unbounded(path, points)
+
+
+# Decodes up to this many bytes of PCM (~47 s at 22.05 kHz mono f32le) are
+# reduced from the whole buffer, exactly as before; a longer decode switches
+# to per-block statistics as it streams in, so a long track never holds its
+# whole decode in memory (a 30-minute file was +353 MB of peak RSS).
+_WAVEFORM_EXACT_BYTES = 4 * 1024 * 1024
+# Samples per block statistic in streaming mode.  A streamed decode has over
+# 5,000 samples per waveform point, so a block boundary moves at most ~10 %
+# of a point's samples into its neighbour — invisible at 200 points.
+_WAVEFORM_BLOCK = 512
+# Decoded bytes handed to the reducer per worker-thread hop.
+_WAVEFORM_FEED_BYTES = 256 * 1024
+# A decode still running after this long is killed (blank waveform).
+_WAVEFORM_DECODE_TIMEOUT_S = 60.0
+
+
+class _WaveformAccumulator:
+    """Reduce mono f32le PCM to a ``{"peaks", "rms"}`` waveform as it arrives.
+
+    Up to ``_WAVEFORM_EXACT_BYTES`` the bytes are kept and ``result`` is
+    ``scanner._pcm_to_waveform`` of the whole buffer (identical output to the
+    buffered decode).  Past that, every ``_WAVEFORM_BLOCK`` samples collapse
+    to (max |x|, sum x²) and ``result`` bins the blocks by their start sample
+    with the same bin width and tail truncation as ``_pcm_to_waveform``,
+    then normalises the same way.  Memory: the exact-mode buffer, then ~16
+    bytes per block (~1.2 MB for 60 minutes).  numpy when available, else a
+    pure-Python path with the same output.  Not thread-safe: feed it from one
+    caller at a time (CPU work — run ``feed`` / ``result`` off the loop)."""
+
+    def __init__(self, points: int = 200):
+        self.points = points
+        self._buf = bytearray()
+        self._streaming = False
+        self._carry = b""
+        # Per-block max |x| and sum of squares: numpy arrays (one per feed),
+        # or flat ``array('d')`` on the pure-Python path (8 bytes a value).
+        self._pk: list = []
+        self._ss: list = []
+        self._pk_d = None
+        self._ss_d = None
+        self._n = 0                  # samples reduced into full blocks
+
+    def feed(self, data: bytes) -> None:
+        if not self._streaming:
+            self._buf += data
+            if len(self._buf) < _WAVEFORM_EXACT_BYTES:
+                return
+            self._streaming = True
+            data, self._buf = self._buf, bytearray()      # no copy of the buffer
+        if self._carry:
+            data = self._carry + data
+        whole = len(data) // (_WAVEFORM_BLOCK * 4) * (_WAVEFORM_BLOCK * 4)
+        if whole:
+            self._reduce(memoryview(data)[:whole])
+        self._carry = bytes(data[whole:])
+
+    @staticmethod
+    def _samples(mv):
+        import sys
+        if sys.byteorder == "little":
+            return mv.cast("f")
+        import array
+        a = array.array("f")
+        a.frombytes(mv)
+        a.byteswap()                                  # f32le on the wire
+        return a
+
+    def _reduce(self, mv) -> None:
+        try:
+            import numpy as _np
+        except ImportError:
+            _np = None
+        if _np is not None:
+            a = _np.frombuffer(mv, dtype="<f4").reshape(-1, _WAVEFORM_BLOCK)
+            self._pk.append(_np.abs(a).max(axis=1).astype(_np.float64))
+            self._ss.append(_np.einsum("ij,ij->i", a, a, dtype=_np.float64))
+            self._n += a.size
+            return
+        import array
+        import operator
+        s = self._samples(mv)
+        if self._pk_d is None:
+            self._pk_d, self._ss_d = array.array("d"), array.array("d")
+        pk, ss, B = self._pk_d, self._ss_d, _WAVEFORM_BLOCK
+        for j in range(0, len(s), B):
+            blk = s[j:j + B]
+            pk.append(max(max(blk), -min(blk)))
+            ss.append(sum(map(operator.mul, blk, blk)))
+        self._n += len(s)
+
+    def result(self):
+        points = self.points
+        if not self._streaming:
+            from soniqboom.core.scanner import _pcm_to_waveform
+            try:
+                return _pcm_to_waveform(bytes(self._buf), points)
+            except Exception:                         # noqa: BLE001 — a few samples only
+                return [0.0] * points
+        tail = self._carry[: len(self._carry) // 4 * 4]
+        tail_n = len(tail) // 4
+        tail_pk = tail_ss = 0.0
+        if tail_n:
+            import operator
+            t = self._samples(memoryview(tail))
+            tail_pk = float(max(max(t), -min(t)))
+            tail_ss = float(sum(map(operator.mul, t, t)))
+        n = self._n + tail_n
+        cs = max(1, n // points)
+        usable = cs * points
+        B = _WAVEFORM_BLOCK
+        try:
+            import numpy as _np
+        except ImportError:
+            _np = None
+        if _np is not None:
+            pk = _np.concatenate(self._pk + [_np.array([tail_pk])]) if tail_n else \
+                _np.concatenate(self._pk)
+            ss = _np.concatenate(self._ss + [_np.array([tail_ss])]) if tail_n else \
+                _np.concatenate(self._ss)
+            cnt = _np.full(len(pk), B, dtype=_np.float64)
+            if tail_n:
+                cnt[-1] = tail_n
+            starts = _np.arange(len(pk), dtype=_np.int64) * B
+            keep = starts < usable
+            bins = _np.minimum(starts[keep] // cs, points - 1)
+            peaks = _np.zeros(points)
+            _np.maximum.at(peaks, bins, pk[keep])
+            sums = _np.bincount(bins, weights=ss[keep], minlength=points)
+            cnts = _np.bincount(bins, weights=cnt[keep], minlength=points)
+            rms = _np.sqrt(_np.divide(sums, cnts, out=_np.zeros(points), where=cnts > 0))
+            rms_peak, peak_peak = float(rms.max()), float(peaks.max())
+            if rms_peak > 0:
+                rms = rms / rms_peak
+            if peak_peak > 0:
+                peaks = peaks / peak_peak
+            return {"peaks": peaks.tolist(), "rms": rms.tolist()}
+        import math
+        peaks = [0.0] * points
+        sums = [0.0] * points
+        cnts = [0] * points
+
+        def _add(j: int, p: float, q: float, c: int) -> None:
+            start = j * B
+            if start >= usable:
+                return
+            b = min(start // cs, points - 1)
+            if p > peaks[b]:
+                peaks[b] = p
+            sums[b] += q
+            cnts[b] += c
+
+        full = len(self._pk_d) if self._pk_d is not None else 0
+        for j in range(min(full, -(-usable // B))):
+            _add(j, self._pk_d[j], self._ss_d[j], B)
+        if tail_n:
+            _add(full, tail_pk, tail_ss, tail_n)
+        rms = [math.sqrt(sums[i] / cnts[i]) if cnts[i] else 0.0 for i in range(points)]
+        rms_peak, peak_peak = max(rms), max(peaks)
+        if rms_peak > 0:
+            rms = [v / rms_peak for v in rms]
+        if peak_peak > 0:
+            peaks = [v / peak_peak for v in peaks]
+        return {"peaks": [float(v) for v in peaks], "rms": rms}
+
+
+async def _compute_waveform_unbounded(path: str, points: int = 200):
+    """ffmpeg-decode ``path`` to mono 22.05 kHz f32le and reduce it to a
+    waveform as it streams (``_WaveformAccumulator``), the reduction off the
+    loop in ``_WAVEFORM_POOL``.  A spawn failure, a decode running longer
+    than ``_WAVEFORM_DECODE_TIMEOUT_S`` (ffmpeg is killed) or any other error
+    gives the blank ``[0.0] * points`` (never stored)."""
     from soniqboom.config import settings
-    from soniqboom.core.scanner import _pcm_to_waveform
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await forksafe.spawn(
             settings.ffmpeg_path, "-i", path,
             "-ac", "1", "-ar", "22050", "-f", "f32le", "-",
             stdout=asyncio.subprocess.PIPE,
@@ -49,17 +230,34 @@ async def _compute_waveform_safe(path: str, points: int = 200):
         )
     except Exception:               # noqa: BLE001 — ffmpeg missing / spawn failure
         return [0.0] * points
+    loop = asyncio.get_running_loop()
+    acc = _WaveformAccumulator(points)
+
+    async def _drain() -> None:
+        pending = bytearray()
+        while True:
+            chunk = await proc.stdout.read(262144)
+            if chunk:
+                pending += chunk
+            if len(pending) >= _WAVEFORM_FEED_BYTES or (not chunk and pending):
+                data, pending = bytes(pending), bytearray()
+                await loop.run_in_executor(_WAVEFORM_POOL, acc.feed, data)
+            if not chunk:
+                break
+        await proc.wait()
+
     try:
-        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except Exception:               # noqa: BLE001 — timeout / transport error
+        await asyncio.wait_for(_drain(), timeout=_WAVEFORM_DECODE_TIMEOUT_S)
+    except (Exception, asyncio.CancelledError) as exc:   # noqa: BLE001 — timeout / error / cancel
         try:
             proc.kill()
             await proc.wait()
         except Exception:
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return [0.0] * points
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_WAVEFORM_POOL, _pcm_to_waveform, raw, points)
+    return await loop.run_in_executor(_WAVEFORM_POOL, acc.result)
 
 
 async def _resolve_zip_member_to_local(path_str: str):
@@ -135,6 +333,7 @@ class _TagUpdate(_BaseModel):
     genre: str | None = None
     year: int | None = None
     track_number: int | None = None
+    game: str | None = None             # the file's GAME tag (TXXX:GAME / GAME / ----:GAME)
 
 
 from soniqboom.api.users import (
@@ -179,12 +378,27 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_ed
         # Demozoo year backfill (demozoo.collect_updates) never overwrites a
         # deliberate user correction on a later apply.
         store_updates["year_source"] = "user"
+    if "game" in store_updates:
+        store_updates["game_source"] = None     # the file's own GAME tag now
     get_store().update_track_fields(track_id, store_updates)
+    await _refresh_rows(track_id)
     # The edited artist/title/album change what LRCLib would return, so drop any
     # cached lyrics for this track — the next LYRICS open re-resolves with the
     # corrected tags instead of serving a stale (possibly mismatched) result.
-    _lyrics_cache.pop(track_id, None)
+    _forget_lyrics(track_id)
     return {"id": track_id, "applied": applied}
+
+
+async def _refresh_rows(track_id: str) -> None:
+    """An edited track's cached folder-browse row (and the album aggregation
+    cache) is refreshed like an enrichment pass's — else the Folders view
+    shows the old values until its music folder changes."""
+    try:
+        from soniqboom.core.folder_album import refresh_album_caches
+        await refresh_album_caches([track_id])
+    except Exception:                                   # noqa: BLE001
+        logging.getLogger(__name__).debug("browse-row refresh after an edit failed",
+                                          exc_info=True)
 
 
 class _YearUpdate(_BaseModel):
@@ -239,9 +453,12 @@ async def update_year(track_id: str, body: _YearUpdate, user=_Depends(_require_e
         # Preserve whatever the file/rip carried, ONCE — a second user edit (or
         # editing over a demozoo stamp) must keep the true original, not stamp
         # our own prior value as the "file" year.
-        if t.get("year_source") not in ("user", "demozoo") and t.get("year") is not None:
+        # (a song-database year only filled a missing one — not the file's)
+        if (t.get("year_source") not in ("user", "demozoo", "songdb")
+                and t.get("year") is not None):
             updates["year_file"] = t.get("year")
     get_store().update_track_fields(track_id, updates)
+    await _refresh_rows(track_id)
     return {"id": track_id, "applied": updates}
 
 
@@ -253,10 +470,13 @@ class _MetaUpdate(_BaseModel):
     genre: str | None = None          # comma-separated; stored as a list
     composer: str | None = None
     comment: str | None = None
+    label: str | None = None
+    game: str | None = None
     year: int | None = None
 
 
-_META_TEXT_FIELDS = ("title", "artist", "album", "album_artist", "composer", "comment")
+_META_TEXT_FIELDS = ("title", "artist", "album", "album_artist", "composer", "comment",
+                     "label", "game")
 
 
 @router.put("/{track_id}/meta")
@@ -285,7 +505,8 @@ async def update_meta(track_id: str, body: _MetaUpdate, user=_Depends(_require_e
                 raise HTTPException(422, "Year must be between 1000 and 2100.")
             updates["year"] = int(v) if v is not None else None
             updates["year_source"] = "user"
-            if t.get("year_source") not in ("user", "demozoo") and t.get("year") is not None:
+            if (t.get("year_source") not in ("user", "demozoo", "songdb")
+                    and t.get("year") is not None):
                 updates["year_file"] = t.get("year")
             # year is tracked by year_source, not user_edited
         elif k == "genre":
@@ -294,14 +515,31 @@ async def update_meta(track_id: str, body: _MetaUpdate, user=_Depends(_require_e
         elif k in _META_TEXT_FIELDS:
             updates[k] = "" if v is None else str(v)
             edited.add(k)
+            if k == "album":
+                updates["album_source"] = None   # the listener's own album, not a derived one
+            elif k == "game":
+                updates["game_source"] = None    # the listener's own game
     if not updates:
         return {"id": track_id, "applied": {}}
     if any(k != "year" for k in updates if k not in ("year_source", "year_file")):
         updates["user_edited"] = sorted(edited)
+    # A field the user set is no longer the song database's fill.
+    sf = t.get("songdb_fields") or []
+    if any(f in edited for f in sf):
+        updates["songdb_fields"] = [f for f in sf if f not in edited] or None
+    before = {k: t.get(k) for k in ("game", "game_source", "game_aliases")}
     store.update_track_fields(track_id, updates)
+    await _refresh_rows(track_id)
+    # The game (and its other names) a retro album implies
+    # (``store.game_follow``) came with it.
+    cur = store.get_track(track_id) or {}
+    applied = dict(updates)
+    for k, v in before.items():
+        if k not in applied and cur.get(k) != v:
+            applied[k] = cur.get(k)
     # Edited artist/title/album change the LRCLib match — drop cached lyrics.
-    _lyrics_cache.pop(track_id, None)
-    return {"id": track_id, "applied": updates}
+    _forget_lyrics(track_id)
+    return {"id": track_id, "applied": applied}
 
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
 
@@ -358,14 +596,38 @@ _LRCLIB_DUR_MAX_S = 30.0   # nothing within this of the track → refuse the mat
 _LRCLIB_GET_TIMEOUT_S = 6.0
 _LRCLIB_SEARCH_TIMEOUT_S = 12.0
 
-# Resolved-lyrics cache (in-memory, POSITIVES ONLY).  LRCLib is slow and flaky,
-# so once a track's lyrics resolve we keep them for the process lifetime: the
-# LYRICS tab re-opens instantly and — crucially — the lyrics survive LRCLib
-# later going down (the "used to have lyrics, now nothing" report).  Misses are
-# deliberately NOT cached, so a transient LRCLib outage self-heals on the next
-# open instead of pinning a false "no lyrics".  Bounded to cap memory.
+# Resolved-lyrics cache (in-memory).  LRCLib is slow and flaky, so once a
+# track's lyrics resolve we keep them for the process lifetime: the LYRICS tab
+# re-opens instantly and — crucially — the lyrics survive LRCLib later going
+# down (the "used to have lyrics, now nothing" report).  Bounded to cap memory.
 _lyrics_cache: dict[str, dict] = {}
 _LYRICS_CACHE_MAX = 4000
+
+# Negative cache: track_id → monotonic expiry.  A CLEAN miss (every provider
+# answered and none had the song) is remembered for a day, so re-opening the
+# tab — or a Subsonic client asking on every track change — doesn't re-query
+# both providers (~1 s) each time.  A provider ERROR (timeout, 5xx, 429) is
+# never remembered, so a transient outage still self-heals on the next open.
+_lyrics_miss: dict[str, float] = {}
+_LYRICS_MISS_TTL_S = float(os.environ.get("SONIQBOOM_LYRICS_MISS_TTL_S", "86400"))
+_LYRICS_MISS_MAX = 20000
+_MISS = object()        # provider answer: "no lyrics for this song" (not an error)
+
+
+def _remember_lyrics_miss(track_id: str) -> None:
+    if len(_lyrics_miss) >= _LYRICS_MISS_MAX:
+        now = time.monotonic()
+        for k in [k for k, exp in _lyrics_miss.items() if exp <= now]:
+            _lyrics_miss.pop(k, None)
+        if len(_lyrics_miss) >= _LYRICS_MISS_MAX:
+            _lyrics_miss.clear()           # simple bound — cheap, rare
+    _lyrics_miss[track_id] = time.monotonic() + _LYRICS_MISS_TTL_S
+
+
+def _forget_lyrics(track_id: str) -> None:
+    """Drop cached lyrics — found or not — for a track whose tags changed."""
+    _lyrics_cache.pop(track_id, None)
+    _lyrics_miss.pop(track_id, None)
 
 
 def _remember_lyrics(track_id: str, result: dict) -> dict:
@@ -378,15 +640,18 @@ def _remember_lyrics(track_id: str, result: dict) -> dict:
 
 
 def lyrics_cache_size() -> int:
-    """Number of tracks with cached resolved lyrics (for the admin panel)."""
+    """Number of tracks with cached resolved lyrics (for the admin panel;
+    remembered misses are not counted)."""
     return len(_lyrics_cache)
 
 
 def clear_lyrics_cache() -> int:
-    """Empty the resolved-lyrics cache; return how many entries were dropped.
-    The next LYRICS open re-resolves online (used by Admin → System → Cache)."""
+    """Empty the resolved-lyrics cache (and the remembered misses); return how
+    many resolved entries were dropped.  The next LYRICS open re-resolves
+    online (used by Admin → System → Cache)."""
     n = len(_lyrics_cache)
     _lyrics_cache.clear()
+    _lyrics_miss.clear()
     return n
 
 
@@ -567,8 +832,10 @@ async def list_tracks(
 
     The All Tracks windowed view passes ``sort=<col>&order=<asc|desc>`` to
     drive the per-column lexical / numeric sort indexes maintained by the
-    in-memory store, so a sort click on a 267K-row library remains O(limit)
-    per page instead of O(N log N) per click.
+    in-memory store: pages are slices of those sorted indexes (O(limit)).
+    With duplicates hidden, a page at offset >= 5,000 slices a primary-only
+    order memoised until the next track write (one O(N) build, ~125 ms at
+    263K tracks, then ~1 ms per 500-row page); shallower pages walk and filter.
     """
     # Defensive whitelist — silently ignore unknown sort keys so a stale
     # frontend can't 400 the page; we fall back to the default sort instead.
@@ -597,7 +864,98 @@ async def list_tracks(
 
 @router.get("/count")
 async def count_tracks():
-    return {"count": await track_count()}
+    """Library size.
+
+    ``count`` is the raw number of indexed tracks.  ``visible`` is how many rows
+    the All-Tracks LIST actually serves: with the "hide duplicates" setting on,
+    ``GET /api/tracks`` returns duplicate-group primaries only, so a list sized
+    from ``count`` would end in rows that never load.  Size lists from
+    ``visible``.
+    """
+    from soniqboom.core.store import get_store
+    store = get_store()
+    total = await track_count()
+    hide_dups = bool(store.get_config("filter_duplicates", False))
+    return {"count": total,
+            "visible": store.primary_track_count() if hide_dups else total}
+
+
+@router.get("/shuffled")
+async def shuffled_tracks(
+    seed: int = Query(..., description="Shuffle seed — same seed ⇒ same order."),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    q: str | None = Query(None, description="Search-box query (same syntax as /api/search)."),
+    artist: str | None = None,
+    album_artist: str | None = None,
+    album: str | None = None,
+    genre: str | None = None,
+    scene_group: str | None = None,
+    format: str | None = None,
+    year_min: int | None = None,
+    year_max: int | None = None,
+    untagged: str | None = Query(None, pattern="^(artist|album_artist|album|genre)$"),
+):
+    """One page of a seeded SHUFFLE ORDER over every track matching the filter.
+
+    The play-queue counterpart of ``GET /api/tracks`` / ``/api/search/filter``:
+    same predicates (resolved by the store's single ``_candidate_ids`` resolver,
+    honouring the "hide duplicates" setting exactly like those lists do), but
+    ordered as a pseudo-random permutation of the WHOLE result set instead of a
+    sorted page.  The client pages through it sequentially, so shuffle covers
+    every matching track — not just the rows its list happens to have loaded —
+    with no repeats until the set is exhausted.
+
+    Response: ``{"total", "seed", "offset", "tracks": [TrackMeta…]}``.
+    """
+    from soniqboom.core import shuffle_order
+    from soniqboom.core.data import _parse_tag_query
+    from soniqboom.core.store import get_store
+
+    store = get_store()
+    seed = shuffle_order.normalize_seed(seed)
+    hide_dups = bool(store.get_config("filter_duplicates", False))
+
+    preds: dict = {}
+    if q:
+        # Identical parse path to /api/search so "shuffle these results" means
+        # exactly the tracks the search would list (uncapped).
+        from soniqboom.api.search import _parse_advanced_query
+        advanced = _parse_advanced_query(q)
+        tagq = advanced or q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
+        preds.update(_parse_tag_query(tagq))
+    for name, val in (("artist", artist), ("album_artist", album_artist),
+                      ("album", album), ("genre", genre),
+                      ("scene_group", scene_group), ("format_", format),
+                      ("year_min", year_min), ("year_max", year_max),
+                      ("untagged", untagged)):
+        if val is not None and val != "":
+            preds[name] = val
+
+    # No store version in the key — see ``shuffle_order``: a seed belongs to one
+    # shuffle session, the order is mutation-stable, and ids deleted since are
+    # skipped below.
+    cache_key = ("tracks", hide_dups, seed,
+                 tuple(sorted((k, str(v)) for k, v in preds.items())))
+    order = shuffle_order.peek(cache_key)
+    if order is None:
+        # The store is not thread-safe, so the candidate ids are resolved here on
+        # the loop (index intersections; ``untagged`` and the dedup filter are
+        # O(N) passes — tens of ms on a 260 K library).  The hash+sort of that
+        # SNAPSHOT (~150 ms, once per seed+filter) runs in a worker thread so the
+        # loop keeps getting slices; later pages are O(limit).
+        ids_snapshot = store.filter_track_ids(filter_duplicates=hide_dups, **preds)
+        order = await asyncio.to_thread(
+            shuffle_order.cached_order, cache_key, lambda: ids_snapshot, seed)
+
+    total = len(order)
+    page_ids = order[offset: offset + limit]
+    tracks = [store._meta_dict(tid) for tid in page_ids if tid in store._tracks]
+    return Response(
+        content=orjson.dumps({"total": total, "seed": seed, "offset": offset,
+                              "tracks": tracks}),
+        media_type="application/json",
+    )
 
 
 # ── Ratings (batch endpoints — must be before /{track_id} to avoid capture) ──
@@ -662,7 +1020,7 @@ async def remove_track(track_id: str, _user=_Depends(_require_edit)):
     removed = await delete_track(track_id)
     if not removed:
         raise HTTPException(404, "Track not found")
-    _lyrics_cache.pop(track_id, None)
+    _forget_lyrics(track_id)
     return {"deleted": track_id}
 
 
@@ -679,12 +1037,12 @@ async def get_track_extended(track_id: str):
         "channels": track.channels,
         "patterns": track.patterns,
         "subsongs": track.subsongs,
-        # The file's intended default tune (1-based, matching the PSID/SNDH
-        # header).  ``None`` when unknown — the client then treats the first
-        # tune (wire subsong 0) as the default.  Read the ?subsong= wire index
-        # as 0-based: display "Tune K" -> ?subsong=K-1.
-        "default_track": getattr(track, "default_track", None),
-        # Per-subsong lengths (seconds), indexed by 0-based wire subsong, when
+        # The file's default tune (1-based: the PSID start song / SNDH ``!#``
+        # — what the bare id and ``?subsong=0`` play), or ``None`` when
+        # unknown: the client then treats tune 1 as the default.  Wire ↔ tune
+        # mapping: ``stream.sid_wire_tune`` (utils.js ``subsongWireToTune``).
+        "default_track": await _default_track(track_id, track),
+        # Per-tune lengths (seconds, in tune order: index = tune - 1), when
         # an HVSC Songlengths DB is configured; else None — the picker then
         # shows tune numbers without times (graceful degrade).
         "hvsc_lengths": getattr(track, "hvsc_lengths", None),
@@ -704,6 +1062,39 @@ async def get_track_extended(track_id: str):
         "defect_detail": getattr(track, "defect_detail", None),
     }
     return result
+
+
+async def _default_track(track_id: str, track) -> int | None:
+    """The 1-based default tune of a multi-tune SID / SNDH (see /extended):
+    the one the scan recorded, else read from a plain local file's header
+    (SID: 18 bytes; SNDH: ``psgplay -i``) — the renderers read the same.
+    None for other formats, single-tune files and sources that aren't local
+    (the picker then assumes tune 1)."""
+    if not (isinstance(track.subsongs, int) and track.subsongs > 1):
+        return None
+    from soniqboom.api import stream as _stream
+    rec = _stream._recorded_start_song(track)
+    if rec is not None:
+        return rec
+    p = str(track.path or "")
+    local = bool(p) and "::" not in p and not p.startswith(_REMOTE_PREFIXES)
+    fam = str(track.format or "").split("/")[0].strip().upper()
+    if fam == "SID":
+        got = _stream._SID_START_SONG.get(track_id)
+        if got is None and local:
+            got = await _stream.sid_start_song(track_id, track, Path(p))
+        return got
+    if fam == "SNDH" and local:
+        try:
+            start, _times, count = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, _stream._sndh_info, Path(p)),
+                timeout=10.0)
+        except Exception:
+            return None
+        start = _stream.sid_wire_tune(0, start, count)
+        _stream._persist_start_song(track_id, start, count)
+        return start
+    return None
 
 
 # Format names (metadata.FORMAT_NAMES values) whose files libopenmpt can
@@ -797,8 +1188,13 @@ async def get_patterns(track_id: str):
 
 
 @router.get("/{track_id}/vu")
-async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024)):
+async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024),
+                         start: bool = Query(True)):
     """Return the binary VUMR sidecar for a rendered tracker module.
+
+    ``start=false``: a miss never starts the Amiga per-voice pass (the
+    player asks that way when a track loads, and starts the pass once it
+    has played a few seconds).
 
     ``subsong`` (0-based wire index, default 0) selects the tune: a
     multi-subsong UADE/tracker file renders a distinct sidecar per tune,
@@ -835,7 +1231,12 @@ async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024)):
       * 404 when the track isn't a tracker format, the source file
         can't be reached, or libopenmpt isn't available on this
         host.  The frontend falls back to its FFT-spectrum
-        visualiser with the honest label.
+        visualiser with the honest label.  For an Amiga track whose
+        meters can't come at all it carries ``X-VU-Unavailable``
+        (``off``: the setting is off; ``unsupported``: this uade build
+        can't dump voices; ``skipped``: this tune's pass ran without a
+        result — longer than the pass allows, or uade failed on it), so
+        the player stops asking.
     """
     from fastapi.responses import Response
     from soniqboom.core.conversion_cache import (
@@ -846,13 +1247,38 @@ async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024)):
     if not track:
         raise HTTPException(404, "Track not found")
 
-    sidecar = get_vu_sidecar_path(track_id, subsong)
+    from soniqboom.api import stream as _stream
+    sidecar = get_vu_sidecar_path(
+        track_id, subsong,
+        uade_variant=_stream.uade_cache_variant(
+            subsong, _stream._uade_base_known(track_id, track) or 0))
     if sidecar is None:
+        # Amiga (uade) meters come from a second full uade pass, started
+        # only here — i.e. only when the web now-playing meter asks for the
+        # track that is actually playing.  It runs in the background; this
+        # request 404s and the player's poll picks the sidecar up later.
+        if start is not False:
+            _stream.request_uade_vu(track_id, subsong)
         # Lazy-backfill path.  Only attempt for known tracker formats
         # (we don't want to spin up libopenmpt against a 10 GB FLAC).
         sidecar = await _try_backfill_vu_sidecar(track, track_id, subsong)
 
     if sidecar is None:
+        # An Amiga track whose meters can't come (the setting is off, this
+        # uade build can't dump voices, or this tune's pass already ran
+        # without a result): say so, so the player stops polling.  Every
+        # other miss — a pass pending or running, other formats — stays a
+        # plain 404 and the player's retry ladder keeps asking.
+        reason = _stream.uade_vu_unavailable_reason()
+        if reason is not None and (
+                _stream.is_uade_routed(getattr(track, "path", "") or "", track)
+                or _stream._ck(track_id, "uade", subsong=subsong) in _stream._UADE_VU_WANTED):
+            raise HTTPException(404, "Per-voice Amiga meters unavailable",
+                                headers={"X-VU-Unavailable": reason})
+        skipped = _stream.uade_vu_skipped_reason(track_id, subsong)
+        if skipped is not None:
+            raise HTTPException(404, "No per-voice meters for this tune",
+                                headers={"X-VU-Unavailable": skipped})
         raise HTTPException(404, "No VU sidecar (not a tracker render or libopenmpt unavailable)")
     try:
         data = sidecar.read_bytes()
@@ -913,11 +1339,36 @@ async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
         raise HTTPException(415, "File too large to be a SID")
     if data[:4] not in (b"PSID", b"RSID"):
         raise HTTPException(415, "Not a C64 SID (missing PSID/RSID magic)")
+    if len(data) >= 0x12:
+        # The worker renders the tune each wire selects from this header; the
+        # server's O(1) paths (render length / key, the upload gates) need the
+        # same start song.
+        from soniqboom.api import stream as _stream
+        _count = int.from_bytes(data[0x0E:0x10], "big")
+        if _count > 0 and _stream._recorded_start_song(track) is None:
+            _start = _stream.sid_wire_tune(0, int.from_bytes(data[0x10:0x12], "big"),
+                                           _count)
+            _stream._note_sid_start_song(track_id, _start)
+            _stream._persist_start_song(track_id, _start, _count)
     return Response(
         content=data,
         media_type="application/octet-stream",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
+
+
+def _client_tune_mismatch(track_id: str, subsong: int, tune: "int | None") -> bool:
+    """A browser-rendered SID for wire ``subsong`` > 0 must say which 1-based
+    tune it rendered, and it must be the tune the server renders for that
+    wire (``stream.sid_wire_tune`` with the start song the server knows —
+    tune ``subsong + 1`` unless the file's default isn't tune 1).  A page
+    still running the older worker — which read the wire index as the tune
+    number — renders another tune and must never store it in this slot."""
+    if subsong <= 0:
+        return False
+    from soniqboom.api import stream as _stream
+    return tune != _stream.sid_wire_tune(
+        subsong, _stream.sid_start_song_known(track_id, None))
 
 
 @router.post("/{track_id}/vu")
@@ -926,6 +1377,7 @@ async def upload_vu_sidecar(
     request: Request,
     subsong: int = Query(0, ge=0, le=1024),
     content_hash: str = Query(..., min_length=64, max_length=64),
+    tune: int | None = Query(None, ge=1, le=1025),
     user=_Depends(_require_edit),
 ):
     """Persist a client-rendered VUMR sidecar into the shared SID cache slot.
@@ -944,12 +1396,18 @@ async def upload_vu_sidecar(
     only land beside a genuine C64-SID render — 425 when that slot isn't cached
     yet (client retries).  ``content_hash`` is a transit-integrity check only
     (the same client computes body+hash, so it is NOT an anti-forgery gate).
-    Idempotent + server-prefers: skip if a ``.vu`` already exists."""
+    Idempotent + server-prefers: skip if a ``.vu`` already exists.  For a
+    subsong > 0, ``tune`` must name the 1-based tune the browser rendered,
+    the one the server renders for that wire — 409 otherwise (see
+    ``_client_tune_mismatch``)."""
     import hashlib
     from soniqboom.core.openmpt_vu import (
         parse_and_validate_vumr, write_sidecar_bytes,
     )
     from soniqboom.core.conversion_cache import get_sid_wav_path_for_upload
+
+    if _client_tune_mismatch(track_id, subsong, tune):
+        raise HTTPException(409, "client SID renderer is out of date — reload the page")
 
     # (1) size cap — a chunked upload carries no Content-Length, so the header
     # check alone is bypassable; stream-read with a HARD ceiling and abort the
@@ -1046,6 +1504,7 @@ async def upload_sid_audio(
     subsong: int = Query(0, ge=0, le=1024),
     duration: int = Query(..., ge=1, le=3600),
     wav_sha256: str = Query(..., min_length=64, max_length=64),
+    tune: int | None = Query(None, ge=1, le=1025),
     user=_Depends(_require_admin),
 ):
     """Cache-warm: persist a CLIENT-rendered SID WAV into the exact conversion-
@@ -1076,12 +1535,17 @@ async def upload_sid_audio(
           body+hash; NOT anti-forgery — SID PCM is non-deterministic so no hash
           can prove fidelity; the authenticated ADMIN user IS the trust boundary).
       (7) per-key lock + ``get_cached`` re-check → idempotent, server-wins skip.
+      (8) subsong > 0: ``tune`` must name the rendered 1-based tune, the one
+          the server renders for that wire → 409 otherwise
+          (``_client_tune_mismatch``).
     """
-    from soniqboom.config import settings
     from soniqboom.core.conversion_cache import (
         _cache_key, get_cached, store_cached, _lock_for,
         get_conversion_cache_dir, sid_warm_eligible,
     )
+
+    if _client_tune_mismatch(track_id, subsong, tune):
+        raise HTTPException(409, "client SID renderer is out of date — reload the page")
 
     track = await get_track(track_id)
     if not track:
@@ -1090,14 +1554,8 @@ async def upload_sid_audio(
         raise HTTPException(415, "Not a C64 SID track")
 
     # (3) RE-derive target_dur exactly like render_status / the SID stream branch.
-    target_dur = int(getattr(settings, "sid_default_duration", 300) or 300)
-    meta = track.__dict__ if hasattr(track, "__dict__") else {}
-    hvsc_lengths = meta.get("hvsc_lengths") or []
-    if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
-        target_dur = int(round(float(hvsc_lengths[subsong])))
-    elif meta.get("duration") and float(meta.get("duration") or 0) > 0:
-        target_dur = int(round(float(meta.get("duration"))))
-    target_dur = max(5, min(int(target_dur), 3600))
+    from soniqboom.api import stream as _stream
+    target_dur = _stream._sid_target_seconds(track, subsong)
     if int(duration) != target_dur:
         raise HTTPException(409, f"duration mismatch — server target is {target_dur}s")
 
@@ -1317,9 +1775,12 @@ _PROBE_INTERVAL_S = float(os.environ.get("SONIQBOOM_LYRICS_PROBE_INTERVAL_S", "1
 async def _provider_lrclib(client, artist, title, album, duration):
     """LRCLib: exact ``/api/get`` first, then the duration-gated fuzzy
     ``/api/search``.  Each call is guarded so a slow/failed exact still lets the
-    fuzzy run; a total failure returns None → the resolver tries the next
-    provider."""
+    fuzzy run.  Returns the lyrics payload; ``_MISS`` when both lookups
+    answered cleanly (200 / 404) without a match; None when either failed
+    (network error, timeout, 5xx, 429) → the resolver tries the next provider
+    and the miss is not remembered."""
     log = logging.getLogger(__name__)
+    clean = True
     try:
         params = {"artist_name": artist, "track_name": title}
         if album:
@@ -1332,7 +1793,10 @@ async def _provider_lrclib(client, artist, title, album, duration):
             hit = _lrclib_lyrics_payload(resp.json())
             if hit:
                 return hit
+        elif resp.status_code != 404:
+            clean = False
     except Exception:
+        clean = False
         log.debug("LRCLib exact lookup failed", exc_info=True)
     try:
         resp = await client.get(
@@ -1343,10 +1807,15 @@ async def _provider_lrclib(client, artist, title, album, duration):
         if resp.status_code == 200:
             cand = _lrclib_best_match(resp.json(), artist, title, duration)
             if cand:
-                return _lrclib_lyrics_payload(cand)
+                hit = _lrclib_lyrics_payload(cand)
+                if hit:
+                    return hit
+        elif resp.status_code != 404:
+            clean = False
     except Exception:
+        clean = False
         log.debug("LRCLib fuzzy lookup failed", exc_info=True)
-    return None
+    return _MISS if clean else None
 
 
 async def _provider_lyrics_ovh(client, artist, title, album, duration):
@@ -1356,7 +1825,7 @@ async def _provider_lyrics_ovh(client, artist, title, album, duration):
     a = _FEAT_RE.sub("", artist).strip()
     t = _strip_release_qualifiers(title)
     if not a or not t:
-        return None
+        return _MISS
     url = (
         "https://api.lyrics.ovh/v1/"
         f"{urllib.parse.quote(a, safe='')}/{urllib.parse.quote(t, safe='')}"
@@ -1366,7 +1835,8 @@ async def _provider_lyrics_ovh(client, artist, title, album, duration):
         ly = ((resp.json() or {}).get("lyrics") or "").strip()
         if ly:
             return {"lyrics": ly, "synced": False, "source": "lyrics.ovh"}
-    return None
+        return _MISS
+    return _MISS if resp.status_code == 404 else None
 
 
 # name, provider fn, and a representative "is it up + how fast" probe URL.
@@ -1419,21 +1889,28 @@ async def probe_lyrics_providers() -> None:
 
 
 async def _resolve_online_lyrics(artist, title, album, duration):
-    """Try the online providers fastest-first; return the first confident hit.
+    """Try the online providers fastest-first; return ``(hit, clean)`` — the
+    first confident hit (or None), and whether EVERY provider answered with a
+    clean "not found" (only then is a miss worth remembering).
     Kicks a non-blocking background re-probe when the ranking is stale."""
     if not _probe_in_flight and (time.monotonic() - _last_probe_ts) > _PROBE_INTERVAL_S:
         asyncio.create_task(probe_lyrics_providers())
     client = _get_lrclib_client()
     log = logging.getLogger(__name__)
+    clean = True
     for i in list(_lyrics_order):
         prov = _LYRICS_PROVIDERS[i]
         try:
             hit = await prov["fn"](client, artist, title, album, duration)
+            if hit is _MISS:
+                continue
             if hit:
-                return hit
+                return hit, False
+            clean = False
         except Exception:
+            clean = False
             log.debug("lyrics provider %s failed", prov["name"], exc_info=True)
-    return None
+    return None, clean
 
 
 @router.get("/{track_id}/lyrics")
@@ -1445,6 +1922,8 @@ async def get_lyrics(track_id: str):
     cached = _lyrics_cache.get(track_id)
     if cached is not None:
         return cached
+    if _lyrics_miss.get(track_id, 0.0) > time.monotonic():
+        return {"lyrics": None, "synced": False, "source": None}
 
     track = await get_track(track_id)
     if not track:
@@ -1476,6 +1955,20 @@ async def get_lyrics(track_id: str):
         is_synced = bool(re.search(r'^\[\d{1,2}:\d{2}[.\:]\d{2,3}\]', embedded, re.MULTILINE))
         return _remember_lyrics(track_id, {"lyrics": embedded, "synced": is_synced, "source": "Embedded tags"})
 
+    # Chip / tracker / Amiga formats: an online "artist + title" lookup for a
+    # tune only ever misses (~1 s per call, spent sending tune titles to third
+    # parties) — same rule as the Subsonic path.  MIDI keeps the online chain
+    # (karaoke files), and every format keeps the embedded-tag read above.
+    from soniqboom.core.retro import chip_family, is_retro_format
+    fmt = getattr(track, "format", None)
+    if is_retro_format(fmt) and chip_family(fmt) != "midi":
+        if path is not None:
+            # The file's own tags were readable and hold none: remember the
+            # miss (a remote file not in the local cache yet might still
+            # carry tags, so that case is not remembered).
+            _remember_lyrics_miss(track_id)
+        return {"lyrics": None, "synced": False, "source": None}
+
     # 2. Online fallback chain — LRCLib + lyrics.ovh, tried fastest-first.  Each
     # provider applies the same confidence gate, so the ranking only affects
     # latency (and, when the faster source is lyrics.ovh, plain-vs-synced).
@@ -1485,18 +1978,23 @@ async def get_lyrics(track_id: str):
     if not (artist and title):
         return {"lyrics": None, "source": None}
 
-    online = await _resolve_online_lyrics(artist, title, album, track.duration)
+    online, clean = await _resolve_online_lyrics(artist, title, album, track.duration)
     if online:
         await _maybe_writeback_lyrics(track, online["lyrics"])
         return _remember_lyrics(track_id, online)
+    if clean and path is not None:
+        # Only a full answer is remembered: every provider said "not found"
+        # AND the file's own tags were readable (a remote track whose file
+        # isn't in the local cache yet may still carry embedded lyrics).
+        _remember_lyrics_miss(track_id)
 
     return {"lyrics": None, "synced": False, "source": None}
 
 
 def _sid_target_duration(track, subsong: int = 0) -> int:
-    """Per-tune SID render length, IDENTICAL to the stream path's logic
-    (stream.py ~5262).  Prefer HVSC per-subsong length, then the stored
-    duration, then the global default; clamp 5..3600.
+    """Per-tune SID render length — the stream path's own
+    (``stream._sid_target_seconds``): the HVSC length of the tune the wire
+    plays, then the stored duration, then the global default; clamp 5..3600.
 
     The waveform MUST use this same value (and the same cache key) as the
     audio render — otherwise it renders the SID at ``sid_default_duration``
@@ -1504,192 +2002,197 @@ def _sid_target_duration(track, subsong: int = 0) -> int:
     of trailing silence.  The 200 waveform bars then spread across 300 s,
     so the real signal lands in only the leftmost ~18 % of the seek bar.
     """
-    from soniqboom.config import settings
-    meta = track.__dict__ if hasattr(track, "__dict__") else (track or {})
-    target = settings.sid_default_duration
-    hvsc_lengths = meta.get("hvsc_lengths") or []
-    if hvsc_lengths and 0 <= subsong < len(hvsc_lengths):
-        target = int(round(float(hvsc_lengths[subsong])))
-    elif meta.get("duration") and float(meta["duration"]) > 0:
-        target = int(round(float(meta["duration"])))
-    return max(5, min(int(target), 3600))
+    from soniqboom.api import stream as _stream
+    return _stream._sid_target_seconds(track, subsong)
+
+
+_WAVEFORM_PENDING = object()      # "the audio isn't rendered yet — ask again"
+_REMOTE_PREFIXES = ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")
+
+
+def _source_unreachable(path_str: str) -> bool:
+    """True when a track's source can't be reached right now: its network
+    share isn't connected, or its local scan root is marked ``unavailable``
+    (an ejected drive / dropped mount).  Registry and stored state only —
+    never touches the filesystem, so a stalled mount can't block the loop."""
+    try:
+        outer = (path_str or "").split("::", 1)[0]
+        if outer.startswith(_REMOTE_PREFIXES):
+            from soniqboom.core.filesource import get_source, parse_remote_path
+            scan_root, _rp = parse_remote_path(path_str)
+            return bool(scan_root) and get_source(scan_root) is None
+        from soniqboom.core.store import get_store
+        best = None
+        for sd in get_store().list_scan_dirs():
+            p = sd.get("path") or ""
+            if p and (outer == p or outer.startswith(p.rstrip("/") + "/")):
+                if best is None or len(p) > len(best.get("path") or ""):
+                    best = sd
+        return best is not None and best.get("status") == "unavailable"
+    except Exception:
+        return False
 
 
 async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str,
-                                          *, sid_duration: int | None = None):
-    """Get WAV path for a converted format via the conversion cache.
+                                          *, sid_duration: int | None = None,
+                                          dreamcast: bool = False,
+                                          subsong: int = 0,
+                                          uade_base: int = 0,
+                                          uade_named: bool = False,
+                                          appear_wait: float = 5.0,
+                                          finish_wait: float = 120.0):
+    """WAV path of a rendered format's cached render, for the waveform.
 
-    Uses get_or_render() which has thundering-herd prevention — if the
-    stream endpoint is currently rendering the same track, this waits for it
-    instead of starting a duplicate render.
+    NEVER starts a render.  The waveform request is fired just before the
+    audio request and is aborted on every track change; when it owned the
+    shared render, an abort or a differently-prepared source (an archive
+    member without its Amiga name / companion files) failed the render the
+    audio request was waiting on — the "first play fails, retry works" bug.
+    Now it only ATTACHES: cached → path; a render in flight → wait for it;
+    nothing yet → wait ``appear_wait`` s for playback to start one, else
+    return ``_WAVEFORM_PENDING`` (the client asks again later).  A track whose
+    source is offline can't render at all, so that case returns None at once
+    (no pending, no 5 s hold).  Progressive SID streams count as renders in
+    flight: the waveform is ready the moment the finished render is cached.
 
     ``sid_duration`` (SID only) MUST match the stream path's per-tune length
-    so the waveform reuses the already-rendered stream WAV instead of
-    rendering a separate default-duration one padded with silence.
+    so the waveform reads the already-rendered stream WAV.  ``subsong`` picks
+    that tune's render (the stream path keys every tune separately);
+    ``uade_base`` is an Amiga module's subsong base, part of its key;
+    ``uade_named`` is ``stream._render_ident``'s verdict (a verified Amiga
+    module with a tracker extension renders through uade, not openmpt).
     """
-    import tempfile
-    from pathlib import Path as _Path
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
         _ADLIB_EXTS, _GME_EXTS_STREAM,
-        _SNDH_EXTS, _YM_EXTS, _SC68_EXTS, _PSF_STREAM_EXTS,
-        _render_sid, _render_midi, _render_tracker, _render_uade, _render_hvl,
-        _render_adlib, _render_imf, _render_gme,
-        _render_sndh, _render_ym, _render_sc68, _render_psf,
-        _dsf_is_dreamcast, _is_c64_sid,
+        _SNDH_EXTS, _YM_EXTS, _SC68_EXTS, _PSF_STREAM_EXTS, _UADE_LIVE,
+        _SID_PROG_DONE,
     )
-    from soniqboom.core.conversion_cache import get_or_render
+    from soniqboom.core.conversion_cache import (
+        _cache_key, get_cached, inflight_event,
+    )
 
-    _zip_tmp = None
-    try:
-        # Resolve actual file path (extract from ZIP if needed)
-        if '::' in path_str and path_str.startswith(("ftp://", "smb://")):
-            # Remote ZIP member — ``_read_from_zip_path`` can't open an
-            # ``ftp://…zip`` outer, so fetch the archive to the local cache
-            # first, then extract the member (same as the stream path).
-            from soniqboom.core import archive as _archive
-            from soniqboom.core.filesource import get_source, parse_remote_path
-            from soniqboom.core.remote_cache import get_cache
-            scan_root, remote_path = parse_remote_path(path_str)
-            source = get_source(scan_root)
-            if source is None or "::" not in remote_path:
-                return None                    # degrade — no waveform, no 500
-            arc_rel, member_name = remote_path.split("::", 1)
-            local_archive = get_cache().fetch(scan_root, arc_rel, source)
-            data = _archive.read_member(local_archive, member_name)
-            suffix = _Path(member_name).suffix
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            tmp.write(data)
-            tmp.close()
-            path = _Path(tmp.name)
-            _zip_tmp = path
-        elif '::' in path_str:
-            from soniqboom.core.scanner import _read_from_zip_path
-            data, member_name = _read_from_zip_path(path_str)
-            suffix = _Path(member_name).suffix
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            tmp.write(data)
-            tmp.close()
-            path = _Path(tmp.name)
-            _zip_tmp = path
-        elif path_str.startswith(("ftp://", "smb://")):
-            # Plain remote file (no ``::``).  The renderers need a REAL local
-            # path — ``Path("ftp://…")`` collapses to ``ftp:/…`` and
-            # openmpt123 / libopenmpt / sidplayfp can't open it.  This was the
-            # bug behind "remote MOD → SRC_NOT_SUPPORTED": the waveform render
-            # shares the audio render through ``get_or_render``'s thundering-
-            # herd dedup, so a failed render here also failed the audio.  Fetch
-            # to the local cache first, exactly like the stream endpoint does.
-            from soniqboom.core.filesource import get_source, parse_remote_path
-            from soniqboom.core.remote_cache import get_cache
-            scan_root, remote_path = parse_remote_path(path_str)
-            source = get_source(scan_root) if remote_path else None
-            if source is None:
-                return None                    # degrade — no waveform, no 500
-            try:
-                loop = asyncio.get_event_loop()
-                path = _Path(await loop.run_in_executor(
-                    None, get_cache().fetch, scan_root, remote_path, source))
-            except Exception:
-                return None                    # FTP hiccup — degrade, no 500
-        else:
-            path = _Path(path_str)
+    if ext in _SID_EXTS:
+        cands = [("sid", None, sid_duration), ("uade", None, None)]
+    elif ext in _MIDI_EXTS:
+        from soniqboom.config import get_active_soundfont
+        sf = get_active_soundfont()
+        cands = [("midi", str(sf) if sf else "", None)]
+    elif ext in _HVL_EXTS:
+        cands = [("hvl", None, None)]
+    elif ext in _UADE_EXTS or uade_named:
+        cands = [("uade", None, None)]
+    elif ext == ".imf":
+        cands = [("imf", None, None)]
+    elif ext in _ADLIB_EXTS:
+        cands = [("adlib", None, None)]
+    elif ext in _GME_EXTS_STREAM:
+        cands = [("gme", None, None)]
+    elif ext in _PSF_STREAM_EXTS or dreamcast:
+        cands = [("psf", None, None)]
+    elif ext in _SNDH_EXTS:
+        cands = [("sndh", None, None)]
+    elif ext in _YM_EXTS:
+        cands = [("ym", None, None)]
+    elif ext in _SC68_EXTS:
+        cands = [("sc68", None, None)]
+    elif ext not in _TRACKER_EXTS:
+        # Exotic-Amiga prefix/suffix names (mdat.song, song.fc13).
+        cands = [("uade", None, None)]
+    else:
+        cands = [("tracker", None, None)]
+    # MIDI / PSF / YM render one tune only — always keyed as subsong 0.
+    from soniqboom.api.stream import uade_cache_key
+    keys = [uade_cache_key(track_id, subsong, uade_base) if fmt == "uade" else
+            _cache_key(track_id, fmt, subsong if fmt not in ("midi", "psf", "ym") else 0,
+                       sf, duration=dur) for fmt, sf, dur in cands]
 
-        # Determine format type and build render function
-        render_dur = None
-        if ext in _SID_EXTS and _is_c64_sid(path):
-            # C64 SID → sidplayfp.  Render (and cache-key) at the SAME
-            # per-tune duration the stream uses, so this reuses the stream's
-            # WAV instead of rendering a default-length one padded with
-            # silence (which squashed the waveform into the left ~18% of the
-            # seek bar).  A non-C64 ``.sid`` (Amiga SidMon) is NOT gated here
-            # and falls through to the uade branch below — matching the
-            # stream, which routes it to _render_uade (stream.py:5253).
-            fmt, sf_path = "sid", None
-            render_dur = sid_duration
-            render_fn = lambda: _render_sid(path, subsong=0, duration=render_dur)
-        elif ext in _MIDI_EXTS:
-            from soniqboom.config import get_active_soundfont
-            sf = get_active_soundfont()
-            fmt, sf_path = "midi", (str(sf) if sf else "")
-            render_fn = lambda: _render_midi(path)
-        elif ext in _HVL_EXTS:
-            # HivelyTracker — bundled hvl2wav (uade/openmpt can't decode HVL).
-            fmt, sf_path = "hvl", None
-            render_fn = lambda: _render_hvl(path, subsong=0)
-        elif ext in _UADE_EXTS:
-            # AHX — uade123, distinct cache namespace so an accidental
-            # tracker-render of the same file (if we ever mis-route)
-            # doesn't poison the right output.
-            fmt, sf_path = "uade", None
-            render_fn = lambda: _render_uade(path, subsong=0)
-        elif ext == ".imf":
-            # .imf is overloaded: Imago Orpheus (openmpt) vs id/Apogee AdLib
-            # (AdPlug).  _render_imf sniffs the content and routes; cache key
-            # matches the stream path's format_type="imf".  Must precede the
-            # tracker fallback (.imf is also in _TRACKER_EXTS for scanning).
-            fmt, sf_path = "imf", None
-            render_fn = lambda: _render_imf(path, subsong=0)
-        elif ext in _ADLIB_EXTS:
-            # AdLib / OPL2 FM (ROL/CMF/D00/RAD/…) via AdPlug — openmpt can't
-            # decode these, so the tracker fallback below would just fail.
-            fmt, sf_path = "adlib", None
-            render_fn = lambda: _render_adlib(path, subsong=0)
-        elif ext in _GME_EXTS_STREAM:
-            # Console chiptunes (NSF/SPC/GBS/VGM/AY/KSS/…) via libgme.
-            fmt, sf_path = "gme", None
-            render_fn = lambda: _render_gme(path, subsong=0)
-        elif ext in _PSF_STREAM_EXTS or (
-                ext == ".dsf" and _dsf_is_dreamcast(path)):
-            # PSF console rips (+ Dreamcast .dsf) via zxtune123 — matches
-            # the stream path's format_type="psf".
-            fmt, sf_path = "psf", None
-            render_fn = lambda: _render_psf(path)
-        elif ext in _SNDH_EXTS:
-            fmt, sf_path = "sndh", None
-            render_fn = lambda: _render_sndh(path, subsong=0)
-        elif ext in _YM_EXTS:
-            fmt, sf_path = "ym", None
-            render_fn = lambda: _render_ym(path)
-        elif ext in _SC68_EXTS:
-            fmt, sf_path = "sc68", None
-            render_fn = lambda: _render_sc68(path, subsong=0)
-        elif ext not in _TRACKER_EXTS:
-            # Exotic-Amiga prefix/suffix names (mdat.song, song.fc13) reach
-            # here with an unknown ext — matches format_type="uade".
-            fmt, sf_path = "uade", None
-            render_fn = lambda: _render_uade(path, subsong=0)
-        else:  # tracker
-            fmt, sf_path = "tracker", None
-            render_fn = lambda: _render_tracker(path, subsong=0)
+    async def _hit():
+        for k in keys:
+            p = await get_cached(k)
+            if p is not None:
+                return p
+        return None
 
-        wav_path, _ = await get_or_render(
-            track_id=track_id, format_type=fmt, subsong=0,
-            render_fn=render_fn, soundfont_path=sf_path,
-            duration=render_dur,
-        )
-        return wav_path
-    finally:
-        if _zip_tmp is not None:
-            _zip_tmp.unlink(missing_ok=True)
+    def _running():
+        for k in keys:
+            ev = inflight_event(k)
+            if ev is not None:
+                return ev
+            live = _UADE_LIVE.get(k)
+            if live is not None and not live["complete"].is_set():
+                return live["complete"]
+            prog = _SID_PROG_DONE.get(k)
+            if prog is not None and not prog.is_set():
+                return prog
+        return None
+
+    loop = asyncio.get_event_loop()
+    hit = await _hit()
+    if hit is not None:
+        return hit
+    ev = _running()
+    if ev is None and _source_unreachable(path_str):
+        return None        # nothing can render it now: blank, not pending
+    deadline = loop.time() + appear_wait
+    while ev is None and loop.time() < deadline:
+        await asyncio.sleep(0.1)
+        hit = await _hit()
+        if hit is not None:
+            return hit
+        ev = _running()
+    if ev is None:
+        return _WAVEFORM_PENDING
+    # Follow the render to the cache — also across a hand-over: a SID
+    # prewarm retired for a progressive play of the same tune ends its event
+    # with nothing stored while the progressive render (a different event)
+    # carries on.  Out of time with a render still running → pending (the
+    # player asks again); nothing running and nothing cached → the render
+    # failed: None (blank waveform).
+    finish_by = loop.time() + finish_wait
+    settle_by = None                 # a finished live uade render being stored
+    while True:
+        remaining = finish_by - loop.time()
+        if remaining <= 0:
+            return _WAVEFORM_PENDING
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return _WAVEFORM_PENDING
+        hit = await _hit()
+        if hit is not None:
+            return hit
+        ev2 = _running()
+        if ev2 is None:
+            return await _hit()      # None → the render failed: blank waveform
+        if ev2 is not ev:
+            ev, settle_by = ev2, None
+            continue
+        # The same (live uade) render finished a moment before the cache
+        # took the file: give the store up to 5 s.
+        if settle_by is None:
+            settle_by = loop.time() + 5.0
+        elif loop.time() >= settle_by:
+            return _WAVEFORM_PENDING
+        await asyncio.sleep(0.1)
 
 
 def _normalise_waveform(result):
-    """Normalise ``_compute_waveform`` output to ``(stored, response)``.
+    """Normalise ``_compute_waveform_safe`` output to ``(stored, response)``.
 
-    ``_compute_waveform`` returns either a flat list (pure-Python path)
-    or a ``{"peaks", "rms"}`` dict (numpy path).  The store layer only
-    accepts a flat list, so we keep one of the two arrays for storage.
+    ``_compute_waveform_safe`` returns a ``{"peaks", "rms"}`` dict (numpy
+    and pure-Python paths alike), or a flat ``[0.0] * points`` list for an
+    empty decode or an ffmpeg spawn/timeout failure.  The store layer only
+    accepts a flat list, so we keep one array for storage.
 
     User observation (2026-05-23) on a high-dynamic-range DSF: storing
     RMS produced a waveform display where the loud transients dominated
     visually and quieter passages rendered as 1-pixel bars indistinct
     from the seek-track background — read as "blocks with gaps".  PEAKS
     are visually more uniform (less compressed by averaging) and match
-    user expectation of a waveform display.  Store peaks when the numpy
-    path produced them; fall back to the rms array (or the bare list
-    from the pure-Python path) otherwise.  The API response carries the
-    full dict when available so the client can mix the two views.
+    user expectation of a waveform display.  Store peaks, falling back to
+    the rms array; a bare list (the blank/failed case) passes through
+    unchanged.  The API response carries the full dict when available.
     """
     if isinstance(result, dict):
         stored = result.get("peaks") or result.get("rms") or []
@@ -1721,11 +2224,15 @@ def _waveform_is_blank(stored) -> bool:
 
 
 @router.get("/{track_id}/waveform")
-async def get_track_waveform(track_id: str, response: Response):
+async def get_track_waveform(track_id: str, response: Response,
+                             subsong: int = Query(default=0, ge=0)):
     """Return waveform amplitude data, computing on-demand if not cached.
 
     For converted formats (SID, MIDI, tracker modules) the waveform is
     computed from the conversion-cache WAV rather than the raw source file.
+    ``subsong`` (rendered formats) reads that tune's render; the stored
+    per-track waveform belongs to the default tune, so another tune's is
+    computed from its render and not stored.
     """
     import asyncio
     from pathlib import Path as _Path
@@ -1755,7 +2262,9 @@ async def get_track_waveform(track_id: str, response: Response):
     # makes the next call self-heal instead of forever-serving the
     # poisoned zeros, no manual ``/api/admin/cache/waveforms`` clear
     # required.
-    waveform = await get_waveform(track_id)
+    if not isinstance(subsong, int):
+        subsong = 0                       # (a direct call passes the Query default)
+    waveform = await get_waveform(track_id) if subsong == 0 else None
     if waveform is not None and not _waveform_is_blank(waveform):
         return {"waveform": waveform}
 
@@ -1770,7 +2279,7 @@ async def get_track_waveform(track_id: str, response: Response):
     # AdLib waveform instead of a failed uade render — including library rows
     # scanned before ``.amd`` was recognized (mirrors ``stream._render_ident``).
     from soniqboom.api.stream import _render_ident
-    ext, _ = _render_ident(path_str)
+    ext, _uade_named = _render_ident(path_str, track)
 
     loop = asyncio.get_event_loop()
 
@@ -1778,40 +2287,41 @@ async def get_track_waveform(track_id: str, response: Response):
     from soniqboom.api.stream import (
         _SNDH_EXTS, _YM_EXTS, _SC68_EXTS, _PSF_STREAM_EXTS,
     )
-    from soniqboom.core import uade_formats as _uadef
     # ``.dsf`` is ambiguous (Sony DSD vs Dreamcast rip) — the scanner already
     # content-sniffed it, so trust the STORE's format field here (no file
     # access needed; works for remote paths too).
     _dreamcast = ext == ".dsf" and (
         getattr(track, "format", "") or "").startswith("DSF")
-    _base_name = path_str.split("::")[-1].rsplit("/", 1)[-1]
+    # ``_uade_named``: an Amiga name (mdat.song) — but never a uade name
+    # token over an extension another engine owns (``P10.mp3`` is an MP3 and
+    # takes the native path below), exactly as playback routes it.
     if (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _TRACKER_EXTS
             or ext in _UADE_EXTS or ext in _HVL_EXTS
             or ext in _ADLIB_EXTS or ext in _GME_EXTS_STREAM
             or ext in _SNDH_EXTS or ext in _YM_EXTS or ext in _SC68_EXTS
             or ext in _PSF_STREAM_EXTS or _dreamcast
-            or _uadef.classify(_base_name) is not None):
+            or _uade_named):
         # SID: pass the per-tune duration so the waveform reuses the stream's
         # render (see _sid_target_duration).  Other converted formats render
         # full-length by nature and need no duration hint.
-        _sid_dur = _sid_target_duration(track) if ext in _SID_EXTS else None
-        try:
-            wav_path = await _waveform_from_conversion_cache(
-                track_id, path_str, ext, sid_duration=_sid_dur)
-        except HTTPException as exc:
-            # A render that EXITED nonzero (502 — e.g. fluidsynth can't parse
-            # this .mid, an AdLib tune with no resolvable instruments) means the
-            # file is unrenderable; degrade to a blank waveform like every other
-            # branch instead of throwing a 502 error toast.  Re-raise genuine
-            # transient/availability errors (501 renderer-missing, 503/504
-            # timeout) so a real misconfiguration stays visible.
-            if exc.status_code == 502:
-                wav_path = None
-            else:
-                raise
-        result = await _compute_waveform_safe(str(wav_path) if wav_path else "")
+        _sid_dur = _sid_target_duration(track, subsong) if ext in _SID_EXTS else None
+        from soniqboom.api.stream import _uade_base_known
+        wav_path = await _waveform_from_conversion_cache(
+            track_id, path_str, ext, sid_duration=_sid_dur, dreamcast=_dreamcast,
+            subsong=subsong, uade_base=_uade_base_known(track_id, track) or 0,
+            uade_named=_uade_named)
+        if wav_path is _WAVEFORM_PENDING:
+            # The audio isn't rendered yet (and nothing is rendering it): say
+            # so instead of rendering here — the player asks again once the
+            # track is playing.
+            return {"waveform": None, "pending": True}
+        if wav_path is None:
+            # The render failed (unrenderable file): a blank waveform, never
+            # an error toast.
+            return {"waveform": None}
+        result = await _compute_waveform_safe(str(wav_path))
         stored, response = _normalise_waveform(result)
-        if not _waveform_is_blank(stored):
+        if subsong == 0 and not _waveform_is_blank(stored):
             await store_waveform(track_id, stored)
         return {"waveform": response}
 
@@ -2108,14 +2618,31 @@ async def read_rating(track_id: str):
 async def mark_played(track_id: str, sb_session: str | None = Cookie(default=None)):
     """Record a play event for the track (increments count, sets last_played).
 
-    Also pushes the event to the listening history log (smart.py) and
-    forwards the play to last.fm / ListenBrainz if the signed-in user
-    has scrobble tokens configured.
+    Also pushes the event to the listening history log (smart.py), shows the
+    signed-in listener in Subsonic ``getNowPlaying`` (player "SoniqBoom
+    Web"), and forwards the play to last.fm / ListenBrainz if that user has
+    scrobble tokens configured.
     """
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
     stats = await record_play(track_id)
+
+    user = None
+    if sb_session:
+        try:
+            from soniqboom.core.users import get_user_store
+            user = get_user_store().lookup_session(sb_session)
+        except Exception:
+            user = None
+    if user is not None:
+        # The web / mobile player only reports a play once it crossed the
+        # record threshold (never on a preload), so this is a real listen.
+        try:
+            from soniqboom.api.subsonic import _note_now_playing
+            _note_now_playing(user, track_id, "SoniqBoom Web", from_scrobble=True)
+        except Exception:
+            pass
 
     # Push to listening history (non-blocking, fire-and-forget)
     try:
@@ -2129,12 +2656,9 @@ async def mark_played(track_id: str, sb_session: str | None = Cookie(default=Non
     try:
         from soniqboom.core.scrobble import submit_play
         from soniqboom.core.store import get_store
-        from soniqboom.core.users import get_user_store
-        store = get_store()
-        full_track = store.get_track(track_id)
-        if full_track and sb_session:
-            user = get_user_store().lookup_session(sb_session)
-            if user:
+        if user is not None:
+            full_track = get_store().get_track(track_id)
+            if full_track:
                 await submit_play(user, full_track)
     except Exception:
         pass

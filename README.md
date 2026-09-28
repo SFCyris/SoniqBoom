@@ -175,6 +175,17 @@ SoniqBoom speaks the culture:
 
 - **🎚️ Per-channel VU meters for tracker modules.** Watch every Paula voice and sample slot dance in real time, right in the browser. Your `.it` files have never looked like this.
 - **🧬 Real SID metadata from HVSC.** Per-tune song lengths straight from `Songlengths.md5` — so your SID tunes show *correct* durations instead of a flat three-minute guess — plus full **STIL** credits for every subtune.
+- **🎼 Module credits from the audacious-uade-tools song database.** Download it once under **gear → Metadata** and your Amiga and tracker modules get their artist, game or demo, publisher, release year and, for many, their song length — matched by checksum against about 380,000 modules compiled from some 400 scene sources ([audacious-uade-tools](https://github.com/mvtiaine/audacious-uade-tools) by Matti Tiainen, licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)).
+- **🎮 Game names from archive names.** An Amiga TFMX tune inside `Turrican.lha` or an SPC rip inside `Super_Mario_World.zip` gets its game from the archive's name when that name is a known game of the tune's platform, checked against the included title lists of Wikidata, No-Intro, the MAME software lists and ZXDB and, on request, TOSEC and Redump (their downloads are kept: a removed list is added again without downloading, TOSEC is downloaded again only for a newer release, and an Update rebuilds a Redump list only when its contents changed). How a retro track's game is chosen — a game you type (or an album you set on a retro track) always wins; otherwise the first of these that names one:
+  1. **The file itself** — the game in an SPC, NSF/NSFe, GBS, VGM/VGZ or PSF-family header, or a GAME tag
+  2. **Modland** — the game folder of the tune's exact Modland match
+  3. **Demozoo** — the game the tune is the soundtrack of, when composer, title and game name match
+  4. **The song database** (audacious-uade-tools) — the game of an exact checksum match
+  5. **A Modland file name** such as `gold of the aztecs-intro` (spelled as the title lists spell the game), while *Guess game from Modland file names* is on
+  6. **The archive's name**, when it is a known game of the track's platform, while *Game from archive names* is on
+  7. **The folder or archive name**, while *Album from folder name for retro formats* is on
+
+  The names the other sources give become the game's other names (Track Info's *also* line; `game:` search finds any of them).
 - **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own — or flip to a sortable, searchable list and browse by format family (trackers, chiptune, lossless, lossy).
 - **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
 - **🗂️ Multi-subtune aware.** SID, NSF, and HVL tunes with multiple subsongs are addressed individually, not flattened into one.
@@ -274,7 +285,7 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 | **Cast — AirPlay · Chromecast · DLNA** | ✅ all three *(Beta)* | ❌ | ⚠ Chromecast; DLNA via plugin | ✅ AirPlay · Chromecast | ✅ all three | ⚠ via bridge plugins |
 | **Subsonic / OpenSubsonic API** (Amperfy, Symfonium, DSub…) | ✅ + server-side Jukebox | ✅ | ❌ | ❌ | ❌ | ❌ |
 | **Internet radio** (Radio Browser directory) | ✅ + curated scene station pack | ⚠ manual station list | ❌ | ❌ | ✅ | ✅ (plugin) |
-| **Demoscene metadata** (HVSC song lengths &amp; STIL · Demozoo composer, crew &amp; release year) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Demoscene metadata** (HVSC song lengths &amp; STIL · Demozoo composer, crew, release year &amp; game soundtracks · audacious-uade-tools module credits, games &amp; lengths) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Plays tracks inside ZIP archives** (no unpacking) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Network shares without mounting** (FTP · SMB · WebDAV) | ✅ | ❌ | ❌ | ❌ | ✅ (SMB · NFS · WebDAV) | ❌ |
 | **In-browser tag editing** (writes real tags) | ✅ | ❌ read-only | ⚠ database only | ⚠ database only | ❌ | ❌ |
@@ -285,7 +296,7 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 ### Where SoniqBoom reigns supreme
 
 - **It plays the formats no one else touches.** Forty-plus retro families — SID, ~20 tracker formats, AHX and HivelyTracker, ~150 Amiga exotics, Atari ST, the whole PSF family, console chiptunes, AdLib/OPL2, and MIDI. None of the servers above render *any* of them.
-- **Scene metadata** Correct per-tune SID lengths and STIL credits from HVSC, plus composer, crew, and release year from Demozoo - metadata no other server carries.
+- **Scene metadata** Correct per-tune SID lengths and STIL credits from HVSC, composer, crew, release year and the game a tune was made for from Demozoo, plus module artists, games, publishers, years and many song lengths from the audacious-uade-tools song database - metadata no other server carries.
 - **Your ZIP hoards just work.** Tracks inside `.zip` archives appear and play in place; every other server needs them unpacked first.
 - **Multi-room that needs nothing extra.** Lockstep playback across any browsers on your LAN — no Squeezebox hardware, no Home Assistant hub.
 - **Your files where they already are.** Attach FTP, SMB, and WebDAV shares straight from the admin UI with no OS mount - only Music Assistant comes close.
@@ -398,6 +409,12 @@ Data / assets:
 
 - [GeneralUser GS SoundFont](https://schristiancollins.com/generaluser.php) by S. Christian Collins (Free, attribution required) — default SoundFont for MIDI synthesis
 - [HVSC (High Voltage SID Collection)](https://www.hvsc.c64.org/) (Free archive of SID music) — Songlengths.md5 and STIL metadata used for SID playback
+- [audacious-uade-tools](https://github.com/mvtiaine/audacious-uade-tools) song database by Matti Tiainen, licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) — module artists, publishers, albums, years and song lengths; downloaded by the user under gear → Metadata, not included with SoniqBoom
+- [Wikidata](https://www.wikidata.org) video-game titles, [CC0 1.0](https://www.wikidata.org/wiki/Wikidata:Licensing) — game titles per retro platform, matched against archive names
+- [No-Intro](https://no-intro.org) DAT game titles, [DAT-o-MATIC Data Usage License](https://datomatic.no-intro.org/terms.html) — game titles per retro platform
+- [MAME software lists](https://github.com/mamedev/mame/tree/master/hash) titles, CC0 1.0 — game titles per retro platform
+- [ZXDB](https://github.com/zxdb/ZXDB) ZX Spectrum game titles, [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) — contains information from ZXDB, made available under the ODbL
+- [TOSEC](https://www.tosecdev.org) and [Redump](http://redump.org) DAT game titles — downloaded by the user under gear → Metadata, not included with SoniqBoom
 
 The full per-component license texts are recorded in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 

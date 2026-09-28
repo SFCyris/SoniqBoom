@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=93">
+  <link rel="stylesheet" href="/assets/css/app.css?v=102">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -105,11 +105,12 @@
       </div>
       <div class="search-wrap">
         <input id="search-input" type="search"
-               placeholder="Search… try  artist:Ghost  year:&gt;2020  format:FLAC"
-               title='Field search: artist: album: album_artist: genre: format: year:>2020 (or <2020, or 2010-2020).  Quote values with spaces.'
-               aria-label="Search library — supports artist:, album:, year:, format: filters"
-               autocomplete="off"
-               readonly>
+               placeholder="Search… try  artist:Ghost  game:uridium  format:FLAC"
+               title='Field search: artist: album: game: album_artist: genre: format: year:>2020 (or <2020, or 2010-2020).  Quote values with spaces.'
+               aria-label="Search library — supports artist:, album:, game:, album_artist:, genre:, year:, format: filters"
+               role="combobox" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="search-preview-list"
+               autocomplete="off">
         <button id="search-clear" type="button" class="search-clear" hidden
                 aria-label="Clear search">&times;</button>
       </div>
@@ -131,7 +132,7 @@
            title="User guide &amp; documentation (opens a new tab)"
            aria-label="Open the user guide and documentation in a new tab">&#128214;</a>
         <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
-        <button id="btn-admin" title="Admin settings" aria-label="Admin settings">&#9881;</button>
+        <button id="btn-admin" title="Settings" aria-label="Settings">&#9881;</button>
       </div>
     </header>
 
@@ -397,7 +398,7 @@
 
       <div class="player-right">
         <div class="player-extra-controls">
-          <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle" aria-label="Toggle shuffle">&#8652;</button>
+          <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle (S)" aria-label="Shuffle" aria-pressed="false">&#8652;</button>
           <button id="btn-repeat"  class="ctrl-toggle" title="Repeat"  aria-label="Toggle repeat mode">&#8635;</button>
           <button id="btn-radio"   class="ctrl-toggle" title="Start radio from this track" aria-label="Start an endless radio mix from the current track">&#128251;</button>
           <button id="btn-download" class="ctrl-toggle" title="Download for offline" aria-label="Download the current track for offline">&#10515;</button>
@@ -463,7 +464,7 @@
         <li>
           <span class="wf-icon" aria-hidden="true">&#128269;</span>
           <div><strong>Search anything</strong><br>
-            Try <code>artist:Ghost year:&gt;2020 format:FLAC</code> in the top bar.</div>
+            Try <code>artist:Ghost year:&gt;2020 format:FLAC</code> or <code>game:uridium</code> in the top bar.</div>
         </li>
         <li>
           <span class="wf-icon" aria-hidden="true">&#128377;&#65039;</span>
@@ -881,6 +882,24 @@
             </p>
           </div>
 
+          <!-- Playback preparation (server settings, saved on change) -->
+          <div class="admin-section">
+            <h3>&#9193;&#65039; Playback preparation</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              Background work the server does for retro and Amiga tracks. Saved as
+              soon as you change it; applies to every user.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-render-prewarm">Prepare upcoming tracks in advance <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Renders the next retro or Amiga track while the current one plays, so it starts instantly, and renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. Turn off on a low-power server; those tracks then show their length once they have played.">&#9432;</span></label>
+              <input id="setting-render-prewarm" type="checkbox" checked disabled>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-uade-vu-meters">Per-voice VU meters for Amiga modules <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Runs an extra background pass for each new Amiga track to drive its per-channel meters. Turn off to save CPU.">&#9432;</span></label>
+              <input id="setting-uade-vu-meters" type="checkbox" checked disabled>
+            </div>
+            <div id="admin-playprep-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
           <!-- HVSC (High Voltage SID Collection) -->
           <div class="admin-section">
             <h3>
@@ -1112,37 +1131,53 @@
           <!-- Settings -->
           <div class="admin-section">
             <h3>&#9881;&#65039; Settings</h3>
+            <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
+              Crossfade, preload buffer, “Converting…” notice delay, “Let shuffle repeat tracks you’ve heard” and theme are saved in <strong>this browser only</strong>.
+              Everything else here is a server setting and applies to every user.
+            </p>
             <div class="admin-settings-grid" id="admin-settings-grid">
               <div class="admin-setting">
-                <label>Crossfade (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
+                <label for="setting-crossfade">Crossfade (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
                 <input id="setting-crossfade" type="number" min="0" max="12" step="0.5" value="0">
               </div>
               <div class="admin-setting">
-                <label>Preload Buffer (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
-                <input id="setting-preload-buffer" type="number" min="0" max="30" step="1" value="5">
+                <label for="setting-preload-buffer">Preload buffer (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
+                <input id="setting-preload-buffer" type="number" min="0" max="30" step="1" value="0">
               </div>
               <div class="admin-setting">
-                <label>Convert Delay (ms) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait before converting SID/MIDI/tracker formats">&#9432;</span></label>
-                <input id="setting-convert-delay" type="number" min="0" max="5000" step="50" value="300">
+                <label for="setting-convert-delay">“Converting…” notice delay (ms) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="How long a slow conversion (formats your browser can’t play directly, such as DSD or ALAC) may take before the “Converting…” notice appears. Retro and Amiga tracks show “Rendering…” after 1 second instead. Saved in this browser.">&#9432;</span></label>
+                <input id="setting-convert-delay" type="number" min="0" max="30000" step="100" value="6000">
               </div>
               <div class="admin-setting">
-                <label>Scan ZIPs <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Index audio files inside ZIP archives">&#9432;</span></label>
+                <label for="setting-shuffle-replay">Let shuffle repeat tracks you’ve heard <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: a shuffle plays each track once before anything repeats — what you’ve already heard stays behind the current track for Previous. On: anything can come round again. This browser only; takes effect the next time you turn shuffle on.">&#9432;</span></label>
+                <input id="setting-shuffle-replay" type="checkbox">
+              </div>
+              <div class="admin-setting" id="setting-queue-sync-row">
+                <label for="setting-queue-sync">Sync the play queue across devices <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Keeps this browser’s queue on the server, where your other devices and Subsonic apps can pick it up, and offers to resume a newer queue saved on another device. This browser only.">&#9432;</span></label>
+                <input id="setting-queue-sync" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-scan-zips">Scan ZIPs <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Index audio files inside ZIP archives">&#9432;</span></label>
                 <input id="setting-scan-zips" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>Scan ZIPs on remote shares <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Also crack open .zip files on FTP/SMB sources and index the songs inside. Each archive is downloaded once to the cache, so this is heavier than local zip scanning.">&#9432;</span></label>
+                <label for="setting-scan-remote-zips">Scan ZIPs on remote shares <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Also crack open .zip files on FTP/SMB sources and index the songs inside. Each archive is downloaded once to the cache, so this is heavier than local zip scanning.">&#9432;</span></label>
                 <input id="setting-scan-remote-zips" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>Hide duplicates in search <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="In search and library views, hide lower-quality copies of the same track (keeps the best encoding). Does not affect folder browsing.">&#9432;</span></label>
+                <label for="setting-startup-reconcile-scan">Rescan local folders after startup <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="A few minutes after SoniqBoom starts, check your local music folders for files added, changed or removed while it was stopped. Only changed files are read again.">&#9432;</span></label>
+                <input id="setting-startup-reconcile-scan" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-filter-duplicates">Hide duplicates in search <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="In search and library views, hide lower-quality copies of the same track (keeps the best encoding). Does not affect folder browsing.">&#9432;</span></label>
                 <input id="setting-filter-duplicates" type="checkbox">
               </div>
               <div class="admin-setting">
-                <label>Hide duplicates when browsing folders <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When browsing the folder tree, collapse duplicate alternate encodings of a track. Off by default — folder views show every audio file actually on disk.">&#9432;</span></label>
-                <input id="setting-dedup-folders" type="checkbox">
+                <label for="setting-dedup-folders">Hide duplicates when browsing folders <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When browsing folders, show only the best copy of a track that exists in several encodings. Turn off to list every audio file actually on disk. The open folder refreshes when you save.">&#9432;</span></label>
+                <input id="setting-dedup-folders" type="checkbox" checked>
               </div>
               <div class="admin-setting">
-                <label>Use Folder Art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
+                <label for="setting-use-folder-art">Use folder art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
                 <input id="setting-use-folder-art" type="checkbox" checked>
               </div>
               <div class="admin-setting">
@@ -1150,14 +1185,14 @@
                 <input id="setting-folder-art-names" type="text" placeholder="cover.jpg,folder.jpg,front.jpg,album.jpg" autocomplete="off" spellcheck="false">
               </div>
               <div class="admin-setting">
-                <label>SID Duration (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fallback play length used only when HVSC has no entry for the tune. Tunes with HVSC data play their exact length instead.">&#9432;</span></label>
+                <label for="setting-sid-duration">SID duration (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fallback play length used only when HVSC has no entry for the tune. Tunes with HVSC data play their exact length instead.">&#9432;</span></label>
                 <input id="setting-sid-duration" type="number" min="30" max="600" step="10" value="180">
                 <div id="setting-sid-duration-hint"
                      class="setting-hint"
                      style="font-size:11px;color:var(--text2);margin-top:2px"></div>
               </div>
               <div class="admin-setting">
-                <label>Remote Cache (MB) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Max disk space for cached network files">&#9432;</span></label>
+                <label for="setting-remote-cache-mb">Remote cache (MB) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Max disk space for cached network files">&#9432;</span></label>
                 <input id="setting-remote-cache-mb" type="number" min="100" max="50000" step="100" value="2048">
               </div>
               <div class="admin-setting">
@@ -1224,7 +1259,7 @@
                 </select>
               </div>
               <div class="admin-setting">
-                <label for="setting-sid-wasm-playback">Play SID in browser <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Experimental: render C64 SID tunes entirely in the browser (WASM) instead of on the server — the per-voice VU meter comes free and perfectly synced, and the server never renders SID. Costs a few seconds of render before playback starts. Off = server renders + streams SID as usual.">&#9432;</span></label>
+                <label for="setting-sid-wasm-playback">Play SID in browser <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Experimental: also renders C64 SID tunes in this browser (WASM) to drive the per-voice VU meter and, when it can, to warm the server’s cache. Playback still streams from the server, so it starts just as fast. Saved in this browser.">&#9432;</span></label>
                 <input id="setting-sid-wasm-playback" type="checkbox">
               </div>
             </div>
@@ -1287,6 +1322,13 @@
                 <label>Password</label>
                 <code>your SoniqBoom password</code>
               </div>
+              <p class="admin-hint" style="font-size:11px;margin:0">
+                Apps that sign in with a token (salt + hash, which many Subsonic
+                apps use by default) work with your SoniqBoom password too. You
+                can optionally generate a separate Subsonic app password (token
+                apps must then use it) or an OpenSubsonic API key for apps that
+                support keys &mdash; both are under My Account below.
+              </p>
               <div class="subsonic-card-row">
                 <label>API version</label>
                 <code>1.16.1 / OpenSubsonic</code>
@@ -1304,6 +1346,20 @@
                 </div>
               </div>
             </div>
+            <p class="admin-hint" style="margin:12px 0 4px">
+              Tracks with no album tag (typical of SID, tracker and chip archives)
+              are listed in Subsonic apps as albums named after their folder.
+              A folder shared by many artists, such as a compo pack, becomes one
+              album per artist; letter folders (A, B … or A-F) are grouped per
+              artist under their parent folder and named after it, so an artist
+              gets one album for the whole archive, not one per letter.
+              Turn this off to reach them only by browsing folders.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-subsonic-folder-albums">Group album-less tracks into folder albums <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="In Subsonic apps, tracks that have no album are grouped into albums named after the folder they are in; a folder with many artists becomes one album per artist, and letter folders are grouped per artist under their parent. Retro tracks that “Album from folder name” (Metadata tab) already named keep that album. Saved as soon as you change it.">&#9432;</span></label>
+              <input id="setting-subsonic-folder-albums" type="checkbox" checked disabled>
+            </div>
+            <div id="subsonic-folder-albums-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- My Account (per-user scrobble tokens) -->
@@ -1335,6 +1391,9 @@
               <button id="btn-change-password" class="btn-secondary">Change password…</button>
             </div>
             <div id="admin-account-msg" class="admin-msg" style="display:none"></div>
+            <!-- Subsonic app password + API keys (filled by admin.js _mountSubsonicPassword / _mountApiKeys) -->
+            <div id="my-subsonic-password" class="subsonic-pw" style="margin-top:18px"></div>
+            <div id="my-api-keys" style="margin-top:18px"></div>
           </div>
 
           <!-- Application -->
@@ -1451,9 +1510,12 @@
           <div class="admin-section">
             <h3>&#127760; Metadata &amp; Enrichment</h3>
             <p class="admin-hint" style="margin-bottom:14px">
-              Align your library with the canonical retro-music databases. Every
-              match is exact or confidence-gated &mdash; nothing is guessed, and
-              existing tags are never overwritten.
+              Align your library with the canonical retro-music databases. Exact
+              or confidence-gated matches fill empty fields. Two options guess
+              instead &mdash; the game from a Modland file name and the album from
+              a folder name &mdash; and the albums they add are marked in Track
+              Info. Tags in your files and anything you typed are never
+              overwritten.
             </p>
           </div>
 
@@ -1491,9 +1553,11 @@
             <h3>&#127760; Scene origin (Modland)</h3>
             <p class="admin-hint" style="margin-bottom:12px">
               Match your modules against Modland's nightly MD5 index to fill in
-              scene authorship &amp; provenance (the "Scene origin" row in track
-              info). Exact checksum matches only. Tracks indexed before v1.4.0
-              need a rescan to get checksums.
+              scene authorship, the game (as the album) &amp; provenance (the
+              "Scene origin" row in track info). Credits and game folders come
+              from exact checksum matches; the option below can also guess the
+              game from a Modland file name. Tracks indexed before v1.4.0 need a
+              rescan to get checksums.
             </p>
             <div id="scene-status-line" class="admin-hint" style="margin-bottom:8px"
                  role="status" aria-live="polite">Index: &mdash;</div>
@@ -1501,7 +1565,141 @@
               <button id="btn-scene-refresh" class="btn-secondary">Download / refresh index (~21&nbsp;MB)</button>
               <button id="btn-scene-apply">Apply to library</button>
             </div>
+            <div class="admin-setting" style="margin-top:10px">
+              <label for="setting-modland-filename-game">Guess game from Modland file names <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="For modules with an exact Modland match, takes the game from a Modland file name such as “gold of the aztecs-intro” when the track’s title matches the part after the dash and other files in the same Modland folder share the game name, or the part starts with a usual tune-part word such as intro, title, ingame, level or gameover. Never replaces an album from the file itself or one you typed; the guess is then another name of the game, which game: finds. Saved as soon as you change it.">&#9432;</span></label>
+              <input id="setting-modland-filename-game" type="checkbox" checked disabled>
+            </div>
             <div id="admin-scene-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- UADE song database (audacious-uade-tools) -->
+          <div class="admin-section">
+            <h3>&#127932; Song database (audacious-uade-tools)</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              Match your modules against the song database of the audacious-uade
+              player to fill in empty artists, labels (publisher or group), albums
+              (the game or production), years and many song lengths. Only exact
+              checksum matches are used; a production name that several groups
+              used carries the group, e.g. &ldquo;Megademo (The Silents)&rdquo;.
+              Tags in your files and anything you typed are never overwritten.
+            </p>
+            <p class="admin-hint" style="margin-bottom:12px">
+              Data: <a href="https://github.com/mvtiaine/audacious-uade-tools"
+                 target="_blank" rel="noopener noreferrer">audacious-uade-tools</a>
+              by Matti Tiainen, compiled from about 400 scene sources, licensed
+              <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"
+                 target="_blank" rel="noopener noreferrer">CC&nbsp;BY-NC-SA&nbsp;4.0</a>.
+              It is downloaded from GitHub when you click Download.
+            </p>
+            <div id="md-songdb-status" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Index: &mdash;</div>
+            <div class="admin-io-row">
+              <button id="md-songdb-refresh" class="btn-secondary">Download / refresh index (~27&nbsp;MB)</button>
+              <button id="md-songdb-apply">Apply to library</button>
+              <button id="md-songdb-reset" class="btn-secondary"
+                      title="Remove the artists, labels, albums and years the song database filled. Your own edits are kept.">Reset enrichment</button>
+            </div>
+            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+              <input type="checkbox" id="md-songdb-autoapply">
+              <span>Re-apply automatically after each library scan
+                <span>(off keeps a reset in place until you re-apply)</span></span>
+            </label>
+            <div id="md-songdb-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Game names from archive names (known game titles per platform) -->
+          <div class="admin-section">
+            <h3>&#128230; Game names from archive names</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              A retro track inside an archive takes the archive&rsquo;s name as its game when
+              that name is a known game of the track&rsquo;s platform &mdash; &ldquo;Turrican.lha&rdquo;
+              for Amiga TFMX tunes, &ldquo;Super_Mario_World.zip&rdquo; for SNES SPC rips. An archive
+              holding just one tracker module or SID named like it (&ldquo;axelf.mod.zip&rdquo;) is skipped. A retro
+              track&rsquo;s game comes, in this order, from its file&rsquo;s own tags, Modland,
+              Demozoo, the song database, a Modland file name, the archive name and, if you turned
+              it on below, the folder name.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-game-from-archive">Game from archive names <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Names a retro track&rsquo;s game after its archive when the archive is named like a game of the track&rsquo;s platform in the lists below. Generic names (music, intro, disk 1 &hellip;), part names and any name the archive&rsquo;s own tunes credit as their composer, artist, group, label or releaser are skipped; a one-word name shorter than eight letters needs two lists of the track&rsquo;s platform to agree, and a tracker module (MOD, XM, S3M, IT, MED, AHX &hellip;) needs a name of two or more words that two lists of its platform agree on and that is no module&rsquo;s title in that archive. Another source&rsquo;s game still comes first; the archive name is then another name of the game, which game: finds. Turning it off removes only the names it added. Saved as soon as you change it.">&#9432;</span></label>
+              <input id="setting-game-from-archive" type="checkbox" checked disabled>
+            </div>
+            <div id="md-game-titles-status" class="admin-hint" style="margin:8px 0"
+                 role="status" aria-live="polite">Game title lists: &mdash;</div>
+            <p class="admin-hint" style="margin-bottom:8px">
+              Included: game titles from
+              <a href="https://www.wikidata.org" target="_blank" rel="noopener noreferrer">Wikidata</a> (CC0),
+              <a href="https://no-intro.org" target="_blank" rel="noopener noreferrer">No-Intro</a>,
+              the <a href="https://www.mamedev.org" target="_blank" rel="noopener noreferrer">MAME</a>
+              software lists (CC0) and
+              <a href="https://github.com/zxdb/ZXDB" target="_blank" rel="noopener noreferrer">ZXDB</a>
+              (ODbL). More titles can be downloaded from
+              <a href="https://www.tosecdev.org" target="_blank" rel="noopener noreferrer">TOSEC</a>
+              (home computers: C64, Amiga, Atari ST, ZX Spectrum, CPC, MSX &hellip;) and
+              <a href="http://redump.org" target="_blank" rel="noopener noreferrer">Redump</a>
+              (disc consoles: PlayStation, Saturn, Dreamcast &hellip;); they are fetched only
+              when you click Download or Update. The downloaded files are kept in SoniqBoom&rsquo;s
+              data folder: a removed list is added again from them without downloading, an update
+              downloads the TOSEC pack only for a newer release, and a stopped Redump download
+              continues where it stopped.
+            </p>
+            <div class="admin-io-row">
+              <button id="md-gt-dl-tosec" class="btn-secondary" data-gt-source="tosec">Download TOSEC (~100&nbsp;MB)</button>
+              <button id="md-gt-rm-tosec" class="btn-secondary" data-gt-remove="tosec" hidden>Remove TOSEC</button>
+              <button id="md-gt-stop-tosec" class="btn-secondary" data-gt-stop="tosec" hidden>Stop</button>
+              <button id="md-gt-del-tosec" class="btn-secondary" data-gt-delete="tosec" hidden>Delete the downloaded pack</button>
+            </div>
+            <div class="admin-io-row" style="margin-top:6px">
+              <button id="md-gt-dl-redump" class="btn-secondary" data-gt-source="redump">Download Redump (~10&nbsp;MB)</button>
+              <button id="md-gt-rm-redump" class="btn-secondary" data-gt-remove="redump" hidden>Remove Redump</button>
+              <button id="md-gt-stop-redump" class="btn-secondary" data-gt-stop="redump" hidden>Stop</button>
+              <button id="md-gt-del-redump" class="btn-secondary" data-gt-delete="redump" hidden>Delete the downloaded lists</button>
+            </div>
+            <div id="md-game-titles-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Retro albums from folder names -->
+          <div class="admin-section">
+            <h3>&#128193; Retro albums</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              Modules and chip tunes rarely carry an album. Optionally, a retro
+              track without one can take the name of its folder or archive.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-retro-album-folder">Album from folder name for retro formats <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Gives retro tracks that have no album the name of their folder or archive (Gold_of_the_Aztecs → “Gold of the Aztecs”), skipping generic, artist and format folders. While it is on, a retro track's folder name is also another name of its game, which game: finds. Turning it off removes only the albums and names it added. Saved as soon as you change it.">&#9432;</span></label>
+              <input id="setting-retro-album-folder" type="checkbox" disabled>
+            </div>
+            <div id="md-retro-album-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Game names from file tags (SPC / NSF / GBS / VGM headers, GAME tags) -->
+          <div class="admin-section">
+            <h3>&#127918; Game names from file tags</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              SPC, NSF/NSFe, GBS and VGM/VGZ files and PSF-family rips (PSF, USF,
+              GSF, 2SF, SSF &hellip;) carry their game's name, which is shown as the
+              album and the game; these files are read once
+              automatically (a network share after its next completed scan).
+              Other music files (MP3, FLAC, M4A, Ogg, Opus &hellip;) can carry a
+              GAME tag, read when they are scanned. This reads again the chip-music
+              files whose game has not been read from the file yet, and every other
+              music file's GAME tag; from an FTP or SMB share, an MP3, FLAC or M4A file is read only as far
+              as its tags where the file allows it (files inside archives are read
+              whole). It fills empty albums, replaces albums taken from a folder,
+              a Modland name or the song database, updates games, and refreshes the other details
+              read from those chip-music files (such as titles); albums and games
+              you typed are never changed.
+            </p>
+            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer">
+              <input type="checkbox" id="md-game-tags-remote" checked>
+              <span>Include network shares
+                <span>(their files are read over the network, which can take hours on a large share)</span></span>
+            </label>
+            <div class="admin-io-row">
+              <button id="btn-md-game-tags" class="btn-secondary">Read game names</button>
+              <button id="btn-md-game-tags-cancel" class="btn-secondary" type="button"
+                      style="display:none">Cancel</button>
+            </div>
+            <div id="md-game-tags-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- Scene groups (Demozoo) -->
@@ -1525,7 +1723,7 @@
             <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
               <input type="checkbox" id="md-demozoo-autoapply">
               <span>Re-apply automatically after each library scan
-                <span style="opacity:.7">(off keeps a reset in place until you re-apply)</span></span>
+                <span>(off keeps a reset in place until you re-apply)</span></span>
             </label>
             <div id="md-demozoo-msg" class="admin-msg" style="display:none"></div>
           </div>
@@ -1817,6 +2015,7 @@
               <div class="ti-field"><span class="ti-label">Artist</span><span class="ti-value" id="ti-artist">—</span></div>
               <div class="ti-field"><span class="ti-label">Album Artist</span><span class="ti-value" id="ti-album-artist">—</span></div>
               <div class="ti-field"><span class="ti-label">Album</span><span class="ti-value" id="ti-album">—</span></div>
+              <div class="ti-field"><span class="ti-label">Game</span><span class="ti-value" id="ti-game">—</span></div>
               <div class="ti-field"><span class="ti-label">Composer</span><span class="ti-value" id="ti-composer">—</span></div>
               <div class="ti-field"><span class="ti-label">Year</span><span class="ti-value" id="ti-year">—</span></div>
             </div>
@@ -1955,6 +2154,10 @@
       <span class="queue-title">Queue <span id="queue-count"></span></span>
       <button id="btn-queue-clear" title="Clear queue">Clear</button>
       <button id="btn-queue-close" aria-label="Close queue">&times;</button>
+    </div>
+    <div id="queue-offer" class="queue-offer" hidden>
+      <span id="queue-offer-text" class="queue-offer-text"></span>
+      <button id="btn-queue-offer" type="button">Resume</button>
     </div>
     <div id="queue-list" class="queue-list">
       <div class="queue-empty">No tracks queued.</div>
@@ -2207,6 +2410,8 @@
           <div class="sc-row"><kbd>↓</kbd><span>Volume down</span></div>
           <div class="sc-row"><kbd>M</kbd><span>Mute / Unmute</span></div>
           <div class="sc-row"><kbd>S</kbd><span>Toggle shuffle</span></div>
+          <div class="sc-row"><kbd>P</kbd><span>Play all in this view</span></div>
+          <div class="sc-row"><kbd>Shift</kbd>+<kbd>P</kbd><span>Shuffle all in this view</span></div>
           <div class="sc-row"><kbd>R</kbd><span>Cycle repeat mode</span></div>
         </div>
         <div class="shortcuts-col">
@@ -2239,7 +2444,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=167"></script>
+  <script type="module" src="/assets/js/app.js?v=175"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

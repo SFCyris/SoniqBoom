@@ -8,7 +8,14 @@ import asyncio
 
 import pytest
 
-from soniqboom.core import scanner, demozoo
+from soniqboom.core import scanner, demozoo, scene_metadata
+
+
+@pytest.fixture(autouse=True)
+def _no_modland_index(monkeypatch):
+    """The post-scan runner also applies Modland metadata; never let these tests
+    read (or write through) the machine's real Modland index."""
+    monkeypatch.setattr(scene_metadata, "has_index", lambda: False)
 
 
 async def _drain_runner():

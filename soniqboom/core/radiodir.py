@@ -296,6 +296,17 @@ def _group_key(name: str) -> str:
     return base or (name or "").lower()
 
 
+def _http_url(url) -> str:
+    """Radio Browser data is third-party: keep a homepage only when it is an
+    http(s) URL (a ``javascript:`` one would be handed to every client)."""
+    from urllib.parse import urlsplit
+    url = (url or "").strip()[:2048] if isinstance(url, str) else ""
+    try:
+        return url if urlsplit(url).scheme.lower() in ("http", "https") else ""
+    except ValueError:
+        return ""
+
+
 def _trim_station(s: dict) -> dict:
     return {
         "uuid": s.get("stationuuid"),
@@ -308,7 +319,7 @@ def _trim_station(s: dict) -> dict:
         # must be transcoded server-side (see stations._hls_producer).
         "hls": 1 if s.get("hls") else 0,
         "favicon": s.get("favicon") or "",
-        "homepage": s.get("homepage") or "",
+        "homepage": _http_url(s.get("homepage")),
         "country": s.get("countrycode") or "",
         "tags": s.get("tags") or "",
         "votes": s.get("votes") or 0,
@@ -458,6 +469,19 @@ def remove_favorite(sid: str) -> list[dict]:
     favs = [f for f in get_favorites() if f.get("sid") != sid]
     _write_json(_FAVS_FILE, favs)
     return favs
+
+
+def update_favorite(sid: str, station: dict) -> list[dict] | None:
+    """Replace the favourite ``sid`` with ``station`` IN PLACE — it keeps its
+    position in every list — with one atomic write.  ``None`` (and no write)
+    when ``sid`` isn't a favourite."""
+    favs = get_favorites()
+    for i, f in enumerate(favs):
+        if isinstance(f, dict) and f.get("sid") == sid:
+            favs[i] = station
+            _write_json(_FAVS_FILE, favs)
+            return favs
+    return None
 
 
 def is_favorite(sid: str) -> bool:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -411,7 +412,21 @@ def populate_store(state: dict) -> None:
     )
 
 
+# Held while the library's files (library.json + the AOF) are rewritten (the
+# merger's ``_do_merge``, ``write_snapshot_sync``) or loaded at a start
+# (``init_persistence``): a merge of a stopped run that is still ending (the
+# bundled app restarts the server in one process and doesn't wait for every
+# job of the stopped one) finishes before the next run reads the files.
+library_files_lock = threading.RLock()
+
+
 def write_snapshot_sync(data_dir: Path) -> None:
+    """``_write_snapshot_sync`` under ``library_files_lock``."""
+    with library_files_lock:
+        _write_snapshot_sync(data_dir)
+
+
+def _write_snapshot_sync(data_dir: Path) -> None:
     """Write a full snapshot synchronously.  Used during shutdown.
 
     Safety: refuses to overwrite a populated snapshot with an empty state.
@@ -472,10 +487,18 @@ def write_snapshot_sync(data_dir: Path) -> None:
 
 
 def init_persistence(data_dir: Path) -> None:
-    """Full startup sequence: load snapshot → replay AOF → populate store."""
+    """Full startup sequence: load snapshot → replay AOF → populate store —
+    the files read under ``library_files_lock`` (waiting for a merge of a
+    stopped run still ending)."""
     data_dir.mkdir(parents=True, exist_ok=True)
-    state = load_snapshot(data_dir)
-    replay_aof(state, data_dir)
+    if not library_files_lock.acquire(timeout=1.0):
+        log.info("Waiting for a merge of the previous server run to finish before loading the library")
+        library_files_lock.acquire()
+    try:
+        state = load_snapshot(data_dir)
+        replay_aof(state, data_dir)
+    finally:
+        library_files_lock.release()
     populate_store(state)
     # Preserve a "last known good" copy of the snapshot that just loaded, for
     # hand-restore if the primary + .bak ever both go bad (see make_prev_backup).

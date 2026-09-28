@@ -124,6 +124,7 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "aof_flush_interval": 0.1,
     "scan_zips": True,
     "scan_remote_zips": True,   # also crack open .zip on remote (FTP/SMB) sources
+    "startup_reconcile_scan": True,   # incremental rescan of local folders shortly after startup
     "expose_local_files": True,
     "display_startup_logo": True,
     # Internet-radio now-playing cover lookup (library → Discogs → MusicBrainz).
@@ -241,6 +242,7 @@ _CONF_TEMPLATE = """\
 
   "scan_zips": true,
   "scan_remote_zips": true,
+  "startup_reconcile_scan": true,
   "expose_local_files": true,
   "display_startup_logo": true,
   "radio_art_lookup": true,
@@ -592,6 +594,10 @@ class Settings(BaseSettings):
     # Remote ZIP traversal — also crack open .zip on FTP/SMB sources (each
     # archive is downloaded once to the remote cache, then enumerated).
     scan_remote_zips: bool = _local_conf.get("scan_remote_zips", True)
+    # A few minutes after startup, incrementally rescan the local folders so
+    # files added / changed / removed while the server was stopped are picked
+    # up (the folder watcher only sees changes while it runs).
+    startup_reconcile_scan: bool = bool(_local_conf.get("startup_reconcile_scan", True))
 
     # UI — startup logo animation
     display_startup_logo: bool = _local_conf.get("display_startup_logo", True)

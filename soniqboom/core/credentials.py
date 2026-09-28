@@ -10,6 +10,7 @@ No separate key file is needed.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import platform
 
@@ -19,8 +20,15 @@ _SALT = b"SoniqBoom-credential-store-v1"
 
 
 def _derive_key() -> bytes:
-    identity = f"{platform.node()}:{platform.machine()}".encode()
-    raw = hashlib.pbkdf2_hmac("sha256", identity, _SALT, iterations=100_000)
+    return _derive_key_for(f"{platform.node()}:{platform.machine()}")
+
+
+@functools.lru_cache(maxsize=4)
+def _derive_key_for(identity: str) -> bytes:
+    """The key for one machine identity — memoised: the derivation is a
+    100k-iteration PBKDF2 (~11 ms), and users.json encrypts / decrypts a
+    few fields per user on every save / load."""
+    raw = hashlib.pbkdf2_hmac("sha256", identity.encode(), _SALT, iterations=100_000)
     return base64.urlsafe_b64encode(raw)
 
 

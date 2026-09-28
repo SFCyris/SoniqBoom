@@ -42,6 +42,8 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 
+from soniqboom.core import forksafe
+
 log = logging.getLogger(__name__)
 
 # Chunk size for ffmpeg → response pump.  64 KB is the sweet spot:
@@ -332,7 +334,7 @@ async def render_stream(
     # already tells us "something went wrong" and the user can re-try.
     # When we genuinely need stderr for diagnosis we drain it via a
     # concurrent task (below).
-    proc = await asyncio.create_subprocess_exec(
+    proc = await forksafe.spawn(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

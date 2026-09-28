@@ -181,10 +181,14 @@ input, select, textarea { touch-action: manipulation; }
   grid-area: mini;
   height: var(--mini-h);
   display: grid;
-  grid-template-columns: 48px 1fr 44px 44px;
+  /* art · title · ▶ · ⏭ · cast (#btn-cast, cast_picker.js) — the cast button
+     needs its own column, or it wraps onto a row of its own and pushes the
+     progress bar out of sight under the tab bar. */
+  grid-template-columns: 48px minmax(0, 1fr) 44px 44px 44px;
   grid-template-rows: 1fr 2px;
   align-items: center;
-  gap: 12px;
+  column-gap: 8px;
+  row-gap: 4px;
   padding: 8px 12px 0;
   background: var(--surface-2);
   border-top: 1px solid var(--border);
@@ -237,14 +241,14 @@ input, select, textarea { touch-action: manipulation; }
 .m-mp-title  { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .m-mp-artist { font-size: 12px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.m-mp-play, .m-mp-next {
+.m-mp-play, .m-mp-next, .m-mp-cast {
   width: 44px; height: 44px;
   display: flex; align-items: center; justify-content: center;
   font-size: 18px;
   color: var(--text);
   border-radius: 50%;
 }
-.m-mp-play:active, .m-mp-next:active { background: var(--surface); }
+.m-mp-play:active, .m-mp-next:active, .m-mp-cast:active { background: var(--surface); }
 
 #m-mp-progress {
   grid-column: 1 / -1;
@@ -539,21 +543,33 @@ input, select, textarea { touch-action: manipulation; }
 
 /* ── Toast ─────────────────────────────────────────────────────────────── */
 
-.m-toast {
-  position: fixed;
-  left: 50%;
-  bottom: calc(var(--mini-h) + var(--tabbar-h) + var(--safe-bottom) + 16px);
-  transform: translateX(-50%);
-  background: rgba(0, 0, 0, 0.85);
-  color: white;
-  padding: 10px 18px;
-  border-radius: 20px;
-  font-size: 14px;
-  z-index: 200;
-  pointer-events: none;
-  animation: m-fade-in 0.15s ease;
+
+/* The SHARED toast (utils.js Toast — every confirmation and error on the phone) is
+   built for the desktop: bottom:24px, and each toast takes pointer events — on a
+   phone that is the tab bar and the mini-player, blocked for the 5 s an error shows.
+   Here: taps pass through (a toast has nothing to tap) and it sits just above the
+   mini-player, near the thumb that caused it.  On Now Playing that slot is the
+   shuffle/repeat row, so there it docks under the top bar, below the slot the
+   Buffering/Converting pill uses.  !important: the host is styled inline. */
+.sb-toast-host {
+  bottom: calc(var(--mini-h) + var(--tabbar-h) + var(--safe-bottom) + 16px) !important;
+  top: auto !important;
+  width: 92vw;
 }
-.m-toast.hidden { display: none; }
+body:has(#m-view-nowplaying.active) .sb-toast-host {
+  top: calc(var(--topbar-h) + var(--safe-top) + 56px) !important;
+  bottom: auto !important;
+}
+.sb-toast-host * {
+  pointer-events: none !important;
+  max-width: 100% !important;
+}
+/* …except an offer toast (Toast.action, e.g. "Resume the queue from …?"):
+   its Resume / × buttons are the point of it. */
+.sb-toast-host .sb-toast-action,
+.sb-toast-host .sb-toast-action * {
+  pointer-events: auto !important;
+}
 
 /* ── Render / transcode badges ─────────────────────────────────────────────
    The shared player.js looks up #converting-badge / #buffering-badge by id and
@@ -580,6 +596,22 @@ input, select, textarea { touch-action: manipulation; }
   animation: m-fade-in 0.15s ease;
 }
 .m-badge[hidden] { display: none; }
+/* On Now Playing the slot above the mini-player is the transport (shuffle/
+   repeat at 375x812, Play/Pause at 320x568), and that view doesn't scroll the
+   controls out from under a fixed pill the way a list does.  Dock the pill
+   under the top bar there — over the artwork, which isn't interactive — and
+   let its body pass taps through in case a short viewport still puts a control
+   beneath it.  The badges follow #m-content in mobile.html, hence `~`. */
+#m-content:has(> #m-view-nowplaying.active) ~ .m-badge {
+  top: calc(var(--topbar-h) + var(--safe-top) + 12px);
+  bottom: auto;
+  pointer-events: none;
+}
+/* No :has() (Safari < 15.4, Firefox < 121): the pill can't be docked, so it
+   stays on the transport row — at least don't let it eat the taps. */
+@supports not selector(:has(a)) {
+  .m-badge { pointer-events: none; }
+}
 .m-badge .badge-cancel,
 .m-badge .progress-cancel {
   background: none;
@@ -587,8 +619,12 @@ input, select, textarea { touch-action: manipulation; }
   color: rgba(255, 255, 255, 0.7);
   font-size: 17px;
   line-height: 1;
-  padding: 0 2px;
+  /* A finger-sized target (~36px) without growing the pill: the padding is taken
+     back by the negative margin. */
+  padding: 10px 11px;
+  margin: -10px -11px -10px -4px;
   cursor: pointer;
+  pointer-events: auto;   /* stays tappable where the pill body passes taps through */
 }
 .m-badge .badge-cancel[hidden] { display: none; }
 /* Determinate transcode progress (DSD/ALAC on mobile) — minimal so it reads as
@@ -648,6 +684,19 @@ input, select, textarea { touch-action: manipulation; }
   min-width: 0;
 }
 .m-settings-row.column { flex-direction: column; align-items: flex-start; }
+/* A toggle row's label must be allowed to wrap: with flex-shrink:0 a long label
+   pushes the checkbox out of the card (overflow:hidden) on a 320px phone. */
+label.m-settings-row .label { flex-shrink: 1; min-width: 0; }
+label.m-settings-row .label small { display: block; margin-top: 3px; font-size: 12px; opacity: 0.85; }
+/* A toggle row is a <label>, so the whole row is the touch target; the box itself
+   still gets a finger-sized, accent-coloured control instead of the 13px default. */
+.m-settings-row input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  margin: 0 0 0 12px;
+  accent-color: var(--accent);
+}
 .m-settings-row.column .value { text-align: left; width: 100%; }
 
 /* ── Library group nav ─────────────────────────────────────────────────── */

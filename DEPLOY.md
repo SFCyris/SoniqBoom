@@ -60,7 +60,7 @@ docker compose up -d
 
 # 4. Create your login — replace 'me' and the password with your own (keep the quotes)
 docker compose exec soniqboom soniqboom-setadm -user me -passwd 'change-this-password'
-#    You'll see:  Created user 'me' …  ·  Notified the running server — the change is live now
+#    You'll see:  Created user 'me' …  ·  Notified the running server (port 8080) — the change is live now
 ```
 
 That's it — the server is running. Go to **Step 2** to open it.
@@ -233,6 +233,53 @@ Here SoniqBoom is **not** published on the host — only Caddy is — so the sin
 over TLS. (Prefer Traefik or nginx-proxy-manager? Point any reverse proxy at the
 `soniqboom` container's port `8080`.)
 
+### Behind nginx
+
+Retro formats (Amiga modules, SID, MIDI, …) are rendered on first play, and audio is
+streamed while it renders. With nginx in front, turn off response buffering for the
+audio streams (web player, Subsonic apps and internet radio), allow long reads, keep
+the port in the `Host` header, and pass WebSocket upgrades through:
+
+```nginx
+# in the http { } block
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# in the server { } block
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
+
+location ~ ^/(api/stream/|api/stations/relay/|rest/(stream|download|radioStream|getTranscodeStream)) {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
+```
+
+Audio that is still rendering or being converted to another format is also sent with
+`X-Accel-Buffering: no`, so nginx streams it even where the second location is missing.
+
+HTTP status 499 lines for `/api/tracks/<id>/waveform` in the nginx log are normal: the
+player cancels that request when you skip to another track.
+
 ---
 
 ## Configuration
@@ -241,6 +288,7 @@ over TLS. (Prefer Traefik or nginx-proxy-manager? Point any reverse proxy at the
 |----------|---------|-------|
 | `SONIQBOOM_DATA_DIR` | `/data` | Where all state is written (set in the image). |
 | `TZ` | container default | Set e.g. `Europe/Berlin` for correct log/scan timestamps. |
+| `SONIQBOOM_SUBSONIC_CORS` | `1` | Set to `0` to stop web-based Subsonic players hosted on other sites from calling `/rest`. Native apps are not affected. |
 
 To change the **host** port, edit the mapping in `docker-compose.yml` (`"9000:8080"`
 publishes on 9000) rather than the in-container port.

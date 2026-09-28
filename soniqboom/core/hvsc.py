@@ -314,6 +314,9 @@ class HVSC:
         except OSError:
             return []
 
+    _real_root_for: "str | None" = None
+    _real_root: str = ""
+
     def stil_key_for(self, track_path: str) -> str | None:
         """The HVSC-relative STIL key (``/MUSICIANS/.../foo.sid``) for a
         track, or None if it can't be resolved relative to the HVSC root.
@@ -346,10 +349,19 @@ class HVSC:
                 return None
             rel = t_rel[len(prefix):] if prefix not in ("", "/") else t_rel
             return rel or None
-        # Local: resolve both to absolute real paths for a robust compare.
+        # Local: resolve both to absolute real paths for a robust compare —
+        # the root once (cached), and a track path already under it (a scan
+        # root is resolved, so its tracks are) by a prefix strip: two
+        # ``realpath`` calls per SID were seconds over a 60K-tune collection.
         try:
-            rel = os.path.relpath(os.path.realpath(track_path),
-                                  os.path.realpath(root))
+            if self._real_root_for != root:
+                self._real_root = os.path.realpath(root)
+                self._real_root_for = root
+            real_root = self._real_root
+            if track_path.startswith(real_root.rstrip(os.sep) + os.sep):
+                rel = track_path[len(real_root.rstrip(os.sep)) + 1:]
+            else:
+                rel = os.path.relpath(os.path.realpath(track_path), real_root)
         except (ValueError, OSError):
             return None
         if rel.startswith(".."):

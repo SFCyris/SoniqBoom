@@ -65,7 +65,7 @@ let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
 import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES,
          ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, isUadeAmigaTrack,
-         Toast, trapFocus } from './utils.js';
+         Toast, trapFocus, subsongWireToTune, subsongStartOf } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -300,6 +300,12 @@ let _waveformData    = null;   // Float array [0..1], 200 values
 // change (a fresh _fetchWaveform supersedes it) and on folder navigation
 // (_cancelAncillaryFetches) so the connection slot frees immediately.
 let _waveformFetchAbort = null;
+// Pending re-ask for a waveform whose audio was still being rendered (see
+// _WAVEFORM_RETRY_MS).  A new fetch replaces it; a failed track stops it.
+let _waveformRetryTimer = null;
+// Track whose re-asks were stopped by a playback failure — asked once more if
+// it does start playing after all (Play pressed again, a retry).
+let _waveformStoppedFor = null;
 
 const WAVE_H = 44; // visual height of waveform — much taller than the 3px seek-bar track
 
@@ -379,7 +385,10 @@ function _drawWaveform(pct = 0) {
   }
 }
 
-async function _fetchWaveform(trackId) {
+// ``subsong``: the tune that is playing (a multi-tune SID / Amiga file renders
+// each tune on its own) — the waveform is that tune's.
+async function _fetchWaveform(trackId, subsong = 0, attempt = 0) {
+  const ss = Number(subsong) > 0 ? Number(subsong) : 0;
   const progressEl = document.querySelector('.player-progress');
   // Clear the OLD track's waveform immediately so the canvas blanks the
   // moment the user clicks a new song — otherwise the prior song's bars
@@ -405,6 +414,9 @@ async function _fetchWaveform(trackId) {
   if (_waveformFetchAbort) {
     try { _waveformFetchAbort.abort(); } catch (_) {}
   }
+  clearTimeout(_waveformRetryTimer);
+  _waveformRetryTimer = null;
+  _waveformStoppedFor = null;
 
   // Stash this fetch's trackId so that, if the user advances tracks
   // while we're awaiting the response, the LATE arrival of the prior
@@ -412,9 +424,9 @@ async function _fetchWaveform(trackId) {
   // Compared against the current track at every assignment site below.
   const fetchedFor = trackId;
   const isStillCurrent = () => {
-    const cur = (Player.currentTrack && Player.currentTrack.id)
-      || (Player.queue && Player.queue[Player.queueIdx] && Player.queue[Player.queueIdx].id);
-    return cur === fetchedFor;
+    const cur = Player.currentTrack || (Player.queue && Player.queue[Player.queueIdx]);
+    // Same file, same tune: a switch to another tune of it drops a late reply.
+    return !!cur && cur.id === fetchedFor && (Number(cur.subsong) > 0 ? Number(cur.subsong) : 0) === ss;
   };
 
   const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
@@ -435,13 +447,24 @@ async function _fetchWaveform(trackId) {
     // gets reused varies per session).  ``no-cache`` forces a
     // revalidation hit; combined with the backend's ``Cache-Control:
     // no-store`` header on this endpoint the body is always fresh.
-    const res  = await fetch(`/api/tracks/${trackId}/waveform`,
+    const res  = await fetch(`/api/tracks/${trackId}/waveform${ss > 0 ? `?subsong=${ss}` : ''}`,
                              ctrl ? { cache: 'no-cache', signal: ctrl.signal }
                                   : { cache: 'no-cache' });
     if (!isStillCurrent()) return;  // user advanced; discard late response
     if (!res.ok) { _waveformData = null; progressEl?.classList.remove('has-waveform'); return; }
     const data = await res.json();
     if (!isStillCurrent()) return;
+    // A rendered track (SID, Amiga, tracker…) whose audio isn't rendered yet:
+    // the server no longer renders just for the waveform — ask again shortly.
+    if (data && data.pending) {
+      if (attempt < _WAVEFORM_RETRY_MS.length) {
+        _waveformRetryTimer = setTimeout(() => {
+          _waveformRetryTimer = null;
+          if (isStillCurrent()) _fetchWaveform(trackId, ss, attempt + 1);
+        }, _WAVEFORM_RETRY_MS[attempt]);
+      }
+      return;
+    }
     // The waveform endpoint returns two shapes that drifted apart over
     // time:
     //   • First fetch (computed inline)   → `{peaks: [...], rms: [...]}`
@@ -511,6 +534,31 @@ async function _fetchWaveform(trackId) {
     if (_waveformFetchAbort === ctrl) _waveformFetchAbort = null;
   }
 }
+
+// Re-ask schedule for a waveform whose audio was still being rendered.
+const _WAVEFORM_RETRY_MS = [2000, 4000, 8000, 15000, 30000];
+
+// A track that failed to play will not get rendered audio from this attempt —
+// stop re-asking for its waveform (each re-ask holds a connection up to 5 s).
+// An autoplay block is not a failure: that track plays on the next click.  A
+// waveform already drawn stays.
+Player.on('error', ({ track, error } = {}) => {
+  if (!track || !track.id || (error && error.name === 'NotAllowedError')) return;
+  const cur = Player.currentTrack;
+  if (!cur || cur.id !== track.id) return;
+  if (_waveformRetryTimer || _waveformFetchAbort) {
+    clearTimeout(_waveformRetryTimer);
+    _waveformRetryTimer = null;
+    if (_waveformFetchAbort) { try { _waveformFetchAbort.abort(); } catch (_) {} _waveformFetchAbort = null; }
+    if (!_waveformData) _waveformStoppedFor = track.id;
+  }
+});
+Player.on('statechange', ({ playing } = {}) => {
+  if (!playing || !_waveformStoppedFor) return;
+  const cur = Player.currentTrack;
+  if (cur && cur.id === _waveformStoppedFor && !_waveformData) _fetchWaveform(cur.id, cur.subsong);
+  else _waveformStoppedFor = null;
+});
 
 // Debounce ``resize`` via rAF: the event fires many times per drag (often
 // once per pixel) and each call to ``_resizeWaveformCanvas`` forces a
@@ -947,8 +995,13 @@ function _parseVUMR(arrayBuf) {
 // fetch.  Aborted on track change (a fresh _fetchVUMR supersedes it) and on
 // folder navigation (_cancelAncillaryFetches) to free the connection slot.
 let _vuFetchAbort = null;
+// _fetchVUMR's answer when the server says no sidecar is coming for this track
+// — ``{unavailable: true, reason}``, from a 404 carrying ``X-VU-Unavailable``:
+// 'off' (per-voice Amiga meters are switched off), 'unsupported' (this uade
+// build can't make them) or 'skipped' (this tune's pass ran without a result)
+// — as opposed to null, "not yet / try later".
 
-async function _fetchVUMR(trackId, subsong) {
+async function _fetchVUMR(trackId, subsong, { start = true } = {}) {
   if (!trackId) return null;
   // Abort any prior VUMR fetch still in flight so its slot frees and its
   // late response can't return into a track the user already left.
@@ -962,11 +1015,21 @@ async function _fetchVUMR(trackId, subsong) {
     // playing subsong so the meters match it.  Append only for N>0 — subsong 0
     // and "no subsong" both map to the default render, so keeping the URL param
     // out for 0 avoids caching the same bytes under two URLs.
-    const sub = (Number.isInteger(subsong) && subsong > 0) ? `?subsong=${subsong}` : '';
-    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${sub}`,
+    const qs = new URLSearchParams();
+    if (Number.isInteger(subsong) && subsong > 0) qs.set('subsong', String(subsong));
+    // ``start=0``: answer from the cache only — a miss must not start the
+    // Amiga per-voice pass (a second full uade render).  The re-ask ladder
+    // asks for it once the track has played a few seconds, so a track skipped
+    // right away never costs that pass.
+    if (!start) qs.set('start', '0');
+    const q = qs.toString();
+    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${q ? `?${q}` : ''}`,
                             ctrl ? { credentials: 'include', signal: ctrl.signal }
                                  : { credentials: 'include' });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const reason = res.headers.get('X-VU-Unavailable');
+      return reason ? { unavailable: true, reason: reason.trim().toLowerCase() } : null;
+    }
     const buf = await res.arrayBuffer();
     return _parseVUMR(buf);
   } catch (err) {
@@ -1010,7 +1073,25 @@ function _layoutPreset(channels, hostWidth, inModal) {
   return 'numeric';
 }
 
-function _addFallbackLabel(format) {
+// Format named by the spectrum label, so the ladder can turn "loading…" into
+// "not available" once it gives up.
+let _vuFallbackFormat = '';
+// The spectrum label's words when no per-voice meters will come: why, when the
+// server said (``X-VU-Unavailable``), else "not available for <format>".
+function _vuFallbackText(format, reason) {
+  if (reason === 'off') {
+    return Auth.isAdmin
+      ? 'Spectrum — per-voice meters are turned off (Settings → Renderers)'
+      : 'Spectrum — per-voice meters are turned off on this server';
+  }
+  if (reason === 'skipped') return 'Spectrum — per-voice meters not available for this tune';
+  if (reason === 'unsupported') return 'Spectrum — per-voice meters not available on this server';
+  return `Spectrum — per-voice meters not available for ${format}`;
+}
+// ``pending``: a per-voice sidecar may still arrive (a re-ask ladder is
+// polling for it) — say it is loading, not that there is none.  ``reason``:
+// the server's ``X-VU-Unavailable`` value, when it said none is coming.
+function _addFallbackLabel(format, pending = false, reason = '') {
   // The label lives inside ``.player-progress`` and is positioned
   // ABSOLUTELY below the seek-bar / waveform row.  ``.player-progress``
   // is already ``position: relative`` (see ``css/app.css`` "Seek bar
@@ -1028,7 +1109,8 @@ function _addFallbackLabel(format) {
   //
   const host = document.querySelector('.player-progress');
   if (!host) return;
-  const msg = `Spectrum — per-voice meters not available for ${format}`;
+  _vuFallbackFormat = format;
+  const msg = pending ? 'Spectrum — per-voice meters loading…' : _vuFallbackText(format, reason);
   if (_vuFallbackLabel && _vuFallbackLabel.parentNode === host) {
     _vuFallbackLabel.textContent = msg;
     return;
@@ -1059,6 +1141,15 @@ function _removeFallbackLabel() {
   if (_vuFallbackLabel) {
     _vuFallbackLabel.remove();
     _vuFallbackLabel = null;
+  }
+}
+
+// The re-ask ladder ended without meters: a "loading…" label still showing
+// becomes the final "not available" (with the server's ``reason`` when it said
+// none is coming).  No label (meters painted, viz off) → nothing to do.
+function _settleFallbackLabel(reason = '') {
+  if (_vuFallbackLabel && _vuFallbackLabel.isConnected) {
+    _addFallbackLabel(_vuFallbackFormat || 'this format', false, reason);
   }
 }
 
@@ -1181,6 +1272,23 @@ let _vuKey = '';
 // is serialised behind a Semaphore(1), so a few queued tunes can push it minutes
 // out.  Poll long and back off — a 404 is cheap, a dead meter is not.
 const _SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 60000, 60000];
+// Amiga modules: the server builds the sidecar once the render is cached — 4 s
+// later (a head start for the next track's prewarm), one more uade pass
+// (0.2–6.4 s on the local fixtures) — so it lands some 5–12 s after the first
+// ask (measured 6 s JamCracker, 9 s Hippel-COSO tune 2).  Ask every 3 s through
+// that window, then back off — but never beyond 15 s: the server drops a queued
+// pass that has not been polled for ``_UADE_VU_POLL_FRESH_S`` (20 s, api/
+// stream.py), so every rung stays under it with room for fetch latency and
+// timer drift (tests/js/frontend_contracts.test.mjs checks the two against
+// each other).  Cumulative ~3/6/9/12/15/19/24/32/44/59/74/89/104/119/134/149/
+// 164 s after the pass was asked for.
+const _AMIGA_VU_RETRY_MS = [3000, 3000, 3000, 3000, 3000, 4000, 5000, 8000, 12000,
+                            15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000];
+// The Amiga pass is asked for only once the track has played this long (the
+// player's next-track prewarm settle): a track skipped sooner never costs it.
+const _AMIGA_VU_SETTLE_S = 3;
+const _AMIGA_VU_SETTLE_POLL_MS = 1000;
+const _AMIGA_VU_SETTLE_MAX_WAITS = 3600;   // an hour paused in the first seconds
 
 function _vuKeyOf(track) {
   if (!track) return '';
@@ -1197,16 +1305,35 @@ let _sidClientDone = '';
 // without spawning a SECOND ladder alongside a still-running one.
 let _sidPollActive = '';
 
-function _scheduleSidVURetry(track, key, attempt = 0) {
-  if (attempt === 0) _sidPollActive = key;
-  const _end = () => { if (_sidPollActive === key) _sidPollActive = ''; };
-  if (attempt >= _SID_VU_RETRY_MS.length) { _end(); return; }   // ladder exhausted
+function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
+  const amiga = isUadeAmigaTrack(track);
+  const ladder = amiga ? _AMIGA_VU_RETRY_MS : _SID_VU_RETRY_MS;
+  if (attempt === 0 && settleWaits === 0) _sidPollActive = key;
+  // ``final``: polling ended without meters for the track still playing — the
+  // spectrum label stops saying "loading…".
+  const _end = (final = false, reason = '') => {
+    if (_sidPollActive === key) _sidPollActive = '';
+    if (final && key === _vuKey) _settleFallbackLabel(reason);
+  };
+  if (attempt >= ladder.length) { _end(true); return; }   // ladder exhausted
   setTimeout(async () => {
     if (key !== _vuKey) return _end();          // a different track/subsong took over
     if (key === _sidClientDone) return _end();  // client render COMPLETED — sidecar exists
+    // Amiga: this first ask starts the server's per-voice pass — wait until the
+    // track has actually played a few seconds (paused, or still rendering,
+    // counts as not yet).
+    if (amiga && attempt === 0 && !(Player.playing && (Player.currentTime || 0) >= _AMIGA_VU_SETTLE_S)) {
+      if (settleWaits < _AMIGA_VU_SETTLE_MAX_WAITS) {
+        _scheduleSidVURetry(track, key, 0, settleWaits + 1);
+      } else {
+        _end();
+      }
+      return;
+    }
     let fetched = null;
     try { fetched = await _fetchVUMR(track.id, track.subsong); } catch (_) {}
     if (key !== _vuKey) return _end();
+    if (fetched && fetched.unavailable) return _end(true, fetched.reason);   // none is coming — stop asking
     if (fetched) {
       // The server's sidecar landed first — whatever the client is still
       // grinding on is now redundant, so stop it (see _cancelSidVURender).
@@ -1217,7 +1344,7 @@ function _scheduleSidVURetry(track, key, attempt = 0) {
     } else {
       _scheduleSidVURetry(track, key, attempt + 1);
     }
-  }, _SID_VU_RETRY_MS[attempt]);
+  }, settleWaits > 0 ? _AMIGA_VU_SETTLE_POLL_MS : ladder[attempt]);
 }
 
 /** Abandon any in-flight / queued client WASM VU render.
@@ -1257,7 +1384,7 @@ function _getSidVuWorker() {
   if (_sidVuWorker || _sidVuUnavailable) return _sidVuWorker;
   if (typeof Worker !== 'function') { _sidVuUnavailable = true; return null; }
   try {
-    const w = new Worker('/assets/js/vu-sid-worker.js?v=4');
+    const w = new Worker('/assets/js/vu-sid-worker.js?v=6');
     w.onmessage = (e) => {
       const m = e.data || {};
       const pend = _sidVuPending;
@@ -1290,26 +1417,44 @@ function _renderSidVUInWorker(sidBytes, subsong, dur, onPartial) {
 }
 
 // Duration for the client render — mirror the server's target_dur source
-// (hvsc_lengths[subsong], else track duration) so the client sidecar's frame
-// count matches what the server would produce.  Clamped to the server's bound.
+// (the tune's HVSC length — hvsc_lengths is in tune order, and the wire
+// subsong maps to a tune via the start song — else track duration) so the
+// client sidecar's frame count matches what the server would produce.
+// Clamped to the server's bound.
 function _sidDurFor(track) {
   const ss = Number.isInteger(track.subsong) ? track.subsong : 0;
   const lens = Array.isArray(track.hvsc_lengths) ? track.hvsc_lengths : null;
-  let dur = (lens && lens[ss] > 0) ? lens[ss] : 0;
+  const ti = subsongWireToTune(ss, subsongStartOf(track), track.subsongTotal || track.subsongs) - 1;
+  let dur = (lens && lens[ti] > 0) ? lens[ti] : 0;
   if (!dur) dur = Number(track.duration) || 0;
   if (!dur) dur = 180;
   return Math.max(1, Math.min(600, Math.round(dur)));
 }
 
-async function _uploadVUMR(trackId, subsong, buf) {
+// The query naming what a browser-rendered SID upload (POST /vu, /sid-audio)
+// holds: ``subsong=<wire>``, plus ``tune=<n>`` — the 1-based tune the worker
+// rendered (its 'done' message) — for any wire but 0: the server requires it
+// and checks it against its own tune for that wire.  null when a wire > 0 comes
+// without a tune: that upload would be refused, so it is not sent.
+// (Kept here, not in utils.js: a new named import from an unversioned module
+// fails to link against a stale cached copy.)
+function _sidUploadQuery(subsong, tune) {
+  const ss = (Number.isInteger(subsong) && subsong > 0) ? subsong : 0;
+  if (!ss) return 'subsong=0';
+  if (!(Number.isInteger(tune) && tune >= 1)) return null;
+  return `subsong=${ss}&tune=${tune}`;
+}
+
+async function _uploadVUMR(trackId, subsong, buf, tune) {
   try {
+    const which = _sidUploadQuery(subsong, tune);
+    if (!which) return;
     if (!(self.crypto && crypto.subtle)) return;    // needs SHA-256 for the integrity hash
     const digest = await crypto.subtle.digest('SHA-256', buf);
     const hash = Array.from(new Uint8Array(digest))
       .map((b) => b.toString(16).padStart(2, '0')).join('');
-    const ss = (Number.isInteger(subsong) && subsong > 0) ? subsong : 0;
     await fetch(
-      `/api/tracks/${encodeURIComponent(trackId)}/vu?subsong=${ss}&content_hash=${hash}`,
+      `/api/tracks/${encodeURIComponent(trackId)}/vu?${which}&content_hash=${hash}`,
       { method: 'POST', credentials: 'include', keepalive: true,
         headers: { 'Content-Type': 'application/octet-stream' }, body: buf },
     );
@@ -1321,16 +1466,17 @@ async function _uploadVUMR(trackId, subsong, buf) {
 // keepalive: browsers cap keepalive bodies at 64 KB and this WAV is megabytes.
 // Returns true on 204; a 409/422/415 gate rejection is a benign no-op (the
 // server just keeps rendering that tune).
-async function _uploadSidWav(trackId, subsong, dur, wav) {
+async function _uploadSidWav(trackId, subsong, dur, wav, tune) {
   try {
+    const which = _sidUploadQuery(subsong, tune);
+    if (!which) return false;
     if (!(self.crypto && crypto.subtle) || !wav || !wav.byteLength) return false;
     const digest = await crypto.subtle.digest('SHA-256', wav);
     const hash = Array.from(new Uint8Array(digest))
       .map((b) => b.toString(16).padStart(2, '0')).join('');
-    const ss = (Number.isInteger(subsong) && subsong > 0) ? subsong : 0;
     const r = await fetch(
       `/api/tracks/${encodeURIComponent(trackId)}/sid-audio`
-        + `?subsong=${ss}&duration=${Math.round(dur)}&wav_sha256=${hash}`,
+        + `?${which}&duration=${Math.round(dur)}&wav_sha256=${hash}`,
       { method: 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/octet-stream' }, body: wav },
     );
@@ -1405,7 +1551,7 @@ async function _generateSidVUClient(track, key) {
     // The render COMPLETED — a real sidecar exists to upload, so the server poll
     // is now genuinely redundant for this key.
     _sidClientDone = key;
-    _uploadVUMR(track.id, track.subsong || 0, result.vumr);   // fire-and-forget cache fill
+    _uploadVUMR(track.id, track.subsong || 0, result.vumr, result.tune);   // fire-and-forget cache fill
     return true;
   } catch (_) {
     return false;                                 // superseded / worker error → fallback
@@ -1452,7 +1598,13 @@ async function _handleVU(track) {
   // Chip formats (SID, NSF, SPC, …): no Python binding exists yet for
   // libsidplay/libgme, so the server returns 404 and we render the
   // honest fallback below.
-  const fetched = await _fetchVUMR(track.id, track.subsong);
+  // Amiga: ask the cache only (``start: false``) — a cached sidecar still
+  // paints at once, but a miss leaves starting the per-voice pass to the
+  // re-ask ladder below, once the track has really played.
+  const fetched0 = await _fetchVUMR(track.id, track.subsong, { start: !isUadeAmigaTrack(track) });
+  // "None is coming" paints the spectrum like a miss, but arms no re-ask ladder.
+  const vuUnavailable = !!(fetched0 && fetched0.unavailable);
+  const fetched = vuUnavailable ? null : fetched0;
   if (fetched) {
     // Pass the parsed sidecar through opts — _initVU() unconditionally
     // calls _stopVU() which would otherwise clear ``_vumr`` to null
@@ -1468,7 +1620,11 @@ async function _handleVU(track) {
     // slice of the post-mix stereo FFT spectrum (low / mid / high) —
     // visually plausible, factually misleading.
     _initVU(_FFT_FALLBACK_BARS, { useVUMR: false });
-    _addFallbackLabel(fmtLabel);
+    // "loading…" while a per-voice sidecar may still arrive: SID always polls
+    // (and may render it in-browser), Amiga unless the server said none is
+    // coming.  The ladder turns it into "not available" when it gives up.
+    const willPoll = primary === 'SID' || (isUadeAmigaTrack(track) && !vuUnavailable);
+    _addFallbackLabel(fmtLabel, willPoll, vuUnavailable ? fetched0.reason : '');
     // SID gets a real 3-voice sidecar.  PRIMARY path: render it in-browser
     // (WASM) and upload — fast + offloads the server.  FALLBACK: poll the
     // server, which also renders on play, for WASM-incapable browsers or if
@@ -1479,6 +1635,12 @@ async function _handleVU(track) {
     // seconds later).  ``_sidPollActive`` stops a still-running ladder from
     // being duplicated; both are _vuKey-guarded so a stale result can't paint
     // over a track the user already left.
+    // Amiga modules: the per-voice sidecar is built in the background right
+    // after the first render (it no longer delays the audio) — poll for it the
+    // same way so the meter switches from the spectrum to real voices mid-play.
+    if (primary !== 'SID' && isUadeAmigaTrack(track) && _sidPollActive !== key && !vuUnavailable) {
+      _scheduleSidVURetry(track, key);
+    }
     if (primary === 'SID' && _sidPollActive !== key) {
       // Reaching this branch means /vu just 404'd, which PROVES any earlier
       // "the client already produced this key's sidecar" claim is stale (the
@@ -1595,9 +1757,36 @@ function _commitSeek() {
 seekBar.addEventListener('change', _commitSeek);
 seekBar.addEventListener('pointerup', _commitSeek);
 
-btnShuffle.addEventListener('click', () => {
-  btnShuffle.classList.toggle('on', Player.toggleShuffle());
+// Also paint right after the toggle: the service worker serves un-versioned
+// modules stale-while-revalidate, so on the first load after an upgrade this
+// file can run against an older player.js that never emits 'shufflechange'.
+function _toggleShuffleFromUi() {
+  if (Player.radioActive) {                 // the player refuses the toggle; say why
+    window.Toast?.info?.('Radio Mode picks the order — shuffle is available again when radio stops.');
+    return;
+  }
+  Player.toggleShuffle();
+  _paintShuffleBtn();
+}
+btnShuffle.addEventListener('click', _toggleShuffleFromUi);
+// Paint from the player's own state, not from the click: "Shuffle all" and a
+// queue restored after a reload also switch shuffle on, and the button used to
+// stay dark while shuffle was actually active.
+function _paintShuffleBtn() {
+  btnShuffle.classList.toggle('on', !!Player.shuffle);
+  btnShuffle.setAttribute('aria-pressed', Player.shuffle ? 'true' : 'false');
+}
+Player.on('shufflechange', _paintShuffleBtn);
+// Play on a queue restored after a reload STARTS a track (playTrack emits
+// 'playing:false' while it loads), so the optimistic-play watchdog must stand
+// down on 'trackchange' — or a cold start gets a false "Playback failed" shake.
+Player.on('trackchange', () => { try { _clearPlayWatchdog(); } catch (_) {} });
+// The queue ran dry because the next page could not be fetched (server or network
+// gone): the player stays on the last track and retries on the next Next / Play.
+Player.on('queuestall', () => {
+  window.Toast?.error?.('Couldn’t load the next tracks — check the connection, then press Next.');
 });
+_paintShuffleBtn();
 // Per-mode glyph + label so the user can read the repeat state at a
 // glance.  Previously the icon stayed identical for all three modes and
 // only the tooltip differed (UX/UI #1 #4).
@@ -1645,7 +1834,10 @@ async function startRadio(seed) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const mix = await r.json();                  // [seed, ...rest]
     const rest = Array.isArray(mix) ? mix.slice(1) : [];
-    rest.forEach(t => { if (t && t.id) Player.addToQueue(t); });
+    Player.clearAutoUpcoming?.();                // leftovers of an earlier session
+    // {auto}: the mix plays NEXT (ahead of whatever was already queued) and is
+    // the app's pick, not the listener's — a later shuffle deal may replace it.
+    rest.forEach(t => { if (t && t.id) Player.addToQueue(t, { auto: true }); });
     RadioMode.start(seed);                       // session bar + radio-mode overlay
   } catch (e) {
     window.Toast?.error?.('Could not start radio. Try again.');
@@ -1756,7 +1948,7 @@ Player.on('trackchange', () => _renderDownloadBtn());
 _renderDownloadBtn();
 // When the decoded WAV reveals a tune's true length, correct the AdLib/IMF
 // "3:00" placeholder row in place (server persists the same value via backfill).
-Player.on('durationknown', ({ id, seconds }) => Library.patchTrackDuration(id, seconds));
+Player.on('durationknown', ({ id, seconds, subsong }) => Library.patchTrackDuration(id, seconds, subsong));
 
 // ── Player callbacks ──────────────────────────────────────────────────────────
 // timeupdate fires ~4Hz. We coalesce all DOM writes into a single rAF pass
@@ -1772,11 +1964,19 @@ function _applyTimeUpdate() {
   if (!_tuLatest) return;
   const { current, duration, pct } = _tuLatest;
   const curStr = Player.fmt(current);
-  const durStr = Player.fmt(duration);
+  // No length yet (a render still growing, a tune nobody has timed): a dash,
+  // not a "0:00" that reads as an empty track.
+  const durKnown = isFinite(duration) && duration > 0;
+  const durStr = durKnown ? Player.fmt(duration) : '–:––';
   const pctRounded = Math.round(pct * 10) / 10;  // 0.1% granularity — plenty
 
   if (curStr !== _tuLast.curStr) { timeCur.textContent = curStr; _tuLast.curStr = curStr; }
-  if (durStr !== _tuLast.durStr) { timeDur.textContent = durStr; _tuLast.durStr = durStr; }
+  if (durStr !== _tuLast.durStr) {
+    if (durKnown) timeDur.textContent = durStr;
+    else timeDur.innerHTML = `<span aria-hidden="true">${durStr}</span><span class="sr-only">Length unknown</span>`;
+    timeDur.title = durKnown ? '' : 'Length unknown';
+    _tuLast.durStr = durStr;
+  }
   if (pctRounded !== _tuLast.pct) {
     seekBar.value = pct;
     // CSS rule on #seek-bar now uses ``linear-gradient(... var(--pct))``
@@ -1917,14 +2117,22 @@ const _ric = (cb) => {
 // token is still the latest.  Works for real tracks too.
 let _artRenderGen = 0;
 
-Player.on('trackchange', (track) => {
-  // Multi-subsong files: append "Tune N / total" (1-based label; the wire
-  // subsong is 0-based).  Only when a specific tune is loaded — a plain file
-  // play (default tune, no subsong field) shows just the title.
+// Multi-subsong files: the title plus "Tune N / total" — the tune's number,
+// mapped from the wire subsong with the file's start song (utils.js).  Only
+// when a specific tune is loaded — a plain file play (default tune, no subsong
+// field) shows just the title.
+function _barTitle(track) {
   const _subTotal = track.subsongTotal || track.subsongs;   // picker sets Total; playlist tracks carry subsongs
   const _tune = (Number.isInteger(track.subsong) && _subTotal > 1)
-    ? ` · Tune ${track.subsong + 1} / ${_subTotal}` : '';
-  playerTitle.textContent  = (track.title || '—') + _tune;
+    ? ` · Tune ${subsongWireToTune(track.subsong, subsongStartOf(track), _subTotal)} / ${_subTotal}` : '';
+  return (track.title || '—') + _tune;
+}
+
+Player.on('trackchange', (track) => {
+  _cuedShownKey = null;                          // a real track owns the bar now
+  if (_playerBarEl) _playerBarEl.classList.remove('is-cued');
+  playerTitle.textContent  = _barTitle(track);
+  playerTitle.removeAttribute('title');
   document.title = `${track.title || 'SoniqBoom'} — SoniqBoom`;
   // Radio mode: a station swaps the seek row for a LIVE badge + ticker and
   // repurposes ◄◄/►► to surf the station list (see app.css .radio-mode +
@@ -1937,6 +2145,60 @@ Player.on('trackchange', (track) => {
     _buildPathCrumb(track);
   });
 
+  _paintBarArt(track);
+
+  // Waveform — fetch and render behind seek bar
+  _fetchWaveform(track.id, track.subsong);
+
+  // VU meters — show for tracker/module formats
+  _handleVU(track);
+});
+
+// Nothing loaded yet, but a queue waits (restored after a reload, or resumed
+// from another device): the bar shows the track Play starts, at the position it
+// starts from, instead of "—" — no audio is loaded.  The first real play's
+// 'trackchange' repaints everything.  Repaints only when the cued entry
+// changes, so a queue edit costs one comparison.
+let _cuedShownKey = null;
+function _paintCued() {
+  if (Player.currentTrack || Player.stationMode) return;
+  const t = Player.cuedTrack;
+  const key = t ? `${t.id}~${Number.isInteger(t.subsong) ? t.subsong : ''}` : null;
+  if (key === _cuedShownKey) return;
+  const had = _cuedShownKey !== null;
+  _cuedShownKey = key;
+  if (_playerBarEl) _playerBarEl.classList.toggle('is-cued', !!t);
+  if (!t) {
+    if (!had) return;                            // never painted one: leave the bar as it is
+    playerTitle.textContent = '—';
+    playerTitle.removeAttribute('title');
+    playerMetaTags.replaceChildren();
+    playerPathCrumb.replaceChildren();
+    ++_artRenderGen;
+    playerArt.innerHTML = '<span class="art-placeholder">&#128266;</span>';
+    _tuLatest = { current: 0, duration: 0, pct: 0 };
+    _applyTimeUpdate();
+    timeDur.textContent = '0:00'; timeDur.title = ''; _tuLast.durStr = '0:00';
+    return;
+  }
+  playerTitle.textContent = _barTitle(t);
+  playerTitle.title = 'Up next — press Play';
+  _ric(() => {
+    if (_cuedShownKey !== key) return;
+    _buildMetaTags(t);
+    _buildPathCrumb(t);
+  });
+  _paintBarArt(t);
+  const sec = Player.cuedSec || 0;
+  const dur = Number(t.duration) || 0;
+  _tuLatest = { current: sec, duration: dur, pct: dur > 0 ? Math.min(100, (sec / dur) * 100) : 0 };
+  _applyTimeUpdate();
+}
+Player.on('cue', _paintCued);
+Player.on('queuechange', _paintCued);
+
+// The player-bar cover (+ the glows behind the bar, sidebar and header).
+function _paintBarArt(track) {
   // Always try the art API — it extracts embedded + folder art lazily.
   // ``fallback=404`` tells the server to return a cacheable 404 (no
   // body) instead of the generic grey placeholder JPEG when the track
@@ -1988,13 +2250,8 @@ Player.on('trackchange', (track) => {
     };
     img.src = artSrc;
   }
-
-  // Waveform — fetch and render behind seek bar
-  _fetchWaveform(track.id);
-
-  // VU meters — show for tracker/module formats
-  _handleVU(track);
-});
+}
+_paintCued();         // a queue restored before this module finished booting
 
 // In-browser SID playback (flag-gated) renders audio + per-voice VU in one pass
 // and pushes the VU here, so the meter lights up in sync with the audio without
@@ -2034,10 +2291,10 @@ Player.on('playrecorded', () => {
 // off the playback path.  ORDER MATTERS: the WAV must land FIRST — the /vu
 // endpoint 425s until the SID WAV cache slot exists.  The waveform is computed
 // server-side lazily from the warmed WAV, so no client waveform upload here.
-Player.on('sidwarm', async ({ id, subsong, dur, wav, vumr }) => {
+Player.on('sidwarm', async ({ id, subsong, dur, wav, vumr, tune }) => {
   try {
-    const ok = await _uploadSidWav(id, subsong, dur, wav);
-    if (ok && vumr) await _uploadVUMR(id, subsong, vumr);
+    const ok = await _uploadSidWav(id, subsong, dur, wav, tune);
+    if (ok && vumr) await _uploadVUMR(id, subsong, vumr, tune);
   } catch (_) {}
 });
 
@@ -2051,7 +2308,7 @@ Player.on('transcode-ready', ({ trackId }) => {
   const cur = Player.currentTrack || (Player.queue && Player.queue[Player.queueIdx]);
   // Guard against late events from a prior track (user already advanced).
   if (cur && cur.id === trackId) {
-    _fetchWaveform(trackId);
+    _fetchWaveform(trackId, cur.subsong);
   }
 });
 
@@ -2581,6 +2838,31 @@ document.querySelectorAll('#nav-stations li').forEach(li => {
 
 // ── Admin → main page sync ────────────────────────────────────────────────────
 // Fired by admin.js after adding/removing/scanning folders so the tree and alias state stay in sync
+// An admin action changed tags on the server (a retro-album toggle, "Read
+// game names", a Modland or Demozoo apply / reset): refresh the view that
+// shows them without moving the listener — the open folder in place, All
+// Tracks, or a group list (Albums, Album Artists, Genres, …), a drill under
+// one or a search, re-read in place with its scroll position and filter
+// (Library.reloadCurrentView).  Smart views, the Galaxy and the stations view
+// are left as they are.  (A scan completing keeps its own, quieter rule:
+// folder / All Tracks only.)
+document.addEventListener('soniqboom:library-changed', () => {
+  try {
+    if (Library.isInFolderView && Library.isInFolderView()) Library.refreshCurrentFolderInPlace();
+    else if (Library.isInAllTracksView && Library.isInAllTracksView()) Library.showAll();
+    else if (Library.reloadCurrentView) Library.reloadCurrentView();
+  } catch (_) {}
+});
+
+// A Track Info save (tags / info / year) changed one track: its row in the open
+// track list takes the new values in place — no re-read, so the listener keeps
+// their scroll position, sort and selection — and a group list it may regroup
+// (Albums, Artists, …) is re-read in place (Library.patchTrack).
+document.addEventListener('soniqboom:track-edited', (e) => {
+  const d = (e && e.detail) || {};
+  try { Library.patchTrack(d.id, d.fields); } catch (_) {}
+});
+
 document.addEventListener('soniqboom:dirs-changed', async () => {
   try {
     const cfg = await fetch('/api/ui-config').then(r => r.json());
@@ -3309,7 +3591,7 @@ document.addEventListener('keydown', (e) => {
 
   // S — toggle shuffle
   if (e.code === 'KeyS') {
-    btnShuffle.classList.toggle('on', Player.toggleShuffle());
+    _toggleShuffleFromUi();
     return;
   }
 
@@ -3341,16 +3623,25 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Enter — play focused track (when not in a text input)
+  // Enter — play focused track (when not in a text input).  A focused native
+  // button or link keeps Enter: it activates that control (preventing it here
+  // made every <button> — player bar, sidebar, the search operator chips —
+  // unusable from the keyboard).
   if (e.code === 'Enter') {
+    if (t && typeof t.closest === 'function' && t.closest('button, a[href], summary')) return;
     e.preventDefault();
     Library.playFocused();
     return;
   }
 
-  // J / K — navigate tracks down / up in library
-  if (e.code === 'KeyJ') { Library.navigateTrack(1); return; }
-  if (e.code === 'KeyK') { Library.navigateTrack(-1); return; }
+  // J / K — navigate tracks down / up in library.  A button still focused
+  // from an earlier click lets go, so the Enter that follows plays the track
+  // (Enter on a focused button activates the button — see above).
+  if (e.code === 'KeyJ' || e.code === 'KeyK') {
+    if (t && typeof t.closest === 'function' && t.closest('button, a[href], summary')) t.blur();
+    Library.navigateTrack(e.code === 'KeyJ' ? 1 : -1);
+    return;
+  }
 
   // A — add focused track to queue
   if (e.code === 'KeyA') { Library.addFocusedToQueue(); return; }

@@ -260,6 +260,7 @@ def _mb_only_record(name: str, art: dict) -> dict:
         "image": None,
         "url": f"https://musicbrainz.org/artist/{art['id']}",
         "source": "MusicBrainz",
+        "mbid": art.get("id"),
         "fetched_at": time.time(),
     }
 
@@ -334,6 +335,7 @@ async def _fetch_locked(name: str, album: str | None, track: str | None,
                     "image": (data.get("thumbnail") or {}).get("source"),
                     "url": (data.get("content_urls", {}).get("desktop", {}) or {}).get("page"),
                     "source": "Wikipedia",
+                    "mbid": art.get("id"),
                     "fetched_at": time.time(),
                 }
             else:

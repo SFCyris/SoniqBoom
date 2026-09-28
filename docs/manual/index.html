@@ -220,10 +220,10 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <table>
       <thead><tr><th>Operator</th><th>Matches</th></tr></thead>
       <tbody>
-        <tr><td><code>artist:</code> <code>album:</code> <code>albumartist:</code></td><td>That field only.</td></tr>
-        <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;1990</code></td><td>Exact year, or after / before a year.</td></tr>
+        <tr><td><code>artist:</code> <code>album:</code> <code>album_artist:</code> <code>genre:</code></td><td>That field only.</td></tr>
+        <tr><td><code>game:</code></td><td>A game: matches the start of any name of a track's game — for a retro tune the names its file header, Modland, Demozoo, the song database, a Modland file name, its archive's name and its folder name give it, or an album you set; for any other music file its GAME tag; or a game you typed — and, for a C64 SID or Atari ST tune whose game is unknown or only taken from its folder name or a Modland file name — not one you typed or cleared — the start of its title; case, accents, extra spaces and a leading “The” are ignored — <code>game:uridium</code> finds the game “Uridium” and a SID titled “Uridium 2”, <code>game:"last ninja"</code> also finds “The Last Ninja”, <code>game:"the last ninja"</code> also finds “Last Ninja 2”, and <code>game:pokemon</code> also finds “Pokémon Gold”.</td></tr>
+        <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;1990</code> · <code>year:1985-1990</code></td><td>Exact year, after / before a year, or a range.</td></tr>
         <tr><td><code>format:FLAC</code> · <code>format:SID</code></td><td>Restrict to one format.</td></tr>
-        <tr><td><code>genre:</code> <code>composer:</code> <code>title:</code></td><td>Match those fields.</td></tr>
         <tr><td><code>artist:"The Ghost Inside"</code></td><td>Quote any value containing spaces.</td></tr>
       </tbody>
     </table>
@@ -451,9 +451,17 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        portrait, with a link to the full article — whenever the artist has one. The artist is matched
        through MusicBrainz using the album and track you're viewing, and the bio comes from the matched
        artist's Wikipedia page: "Ghost" on an Impera track is the Swedish band, not the apparition.
-       Below it, <b>✏️ Edit tags</b> opens an inline form for title, artist, album, album artist, genre and
-       year: <b>Save tags</b> writes the changes into the audio file itself and updates the library at the
-       same time. Editing works on local files; tracks on network shares show the button disabled.</p>
+       Below it, <b>✏️ Edit tags</b> opens an inline form for title, artist, album, album artist, game, genre
+       and year: <b>Save tags</b> writes the changes into the audio file itself (the game as a GAME tag) and
+       updates the library at the same time. This works on local MP3, FLAC, M4A, Ogg, Opus, WavPack and Musepack files; every
+       other track — network shares, archive members, modules and chip formats — gets <b>✏️ Edit info</b>,
+       which changes the library only. The <em>Game</em> row shows the game the music belongs to: a retro
+       tune's game (usually the same name as its album, and an album you set is its game), with a note saying where it
+       came from, or the GAME tag of a remix. When the file header, Modland, Demozoo, the song database, the archive name or the folder name call
+       the game something else, those names follow on an <em>also</em> line (a name that is only the start of another
+       one is not repeated) — <code>game:</code> finds the track by any of them. The folder name counts only while <em>Album from folder name for retro formats</em> is on, a Modland
+       file-name guess only while <em>Guess game from Modland file names</em> is on, and the archive name only while
+       <em>Game from archive names</em> is on.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/22-tagedit.png" alt="The Track Info panel showing the About-the-artist card with a Wikipedia bio and portrait, and the open tag-editing form with Save tags and Cancel buttons"></div>
@@ -461,11 +469,105 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     </figure>
 
     <h3>Scene origins</h3>
-    <p>Retro module files rarely carry proper tags — but the scene has spent decades cataloguing them. Turn on
-       <strong>gear → Scene metadata (Modland)</strong> and SoniqBoom fingerprints each module and matches it against
+    <p>Retro module files rarely carry proper tags — but the scene has spent decades cataloguing them. In
+       <strong>gear → Metadata → Scene origin (Modland)</strong> SoniqBoom fingerprints each module and matches it against
        the <a href="https://modland.com/" target="_blank" rel="noopener">Modland</a> index, filling in the original
        author and adding a <em>Scene origin</em> row to Track Info that shows exactly where the tune sits in the
        archive — <code>Modland: &lt;format&gt;/&lt;author&gt;/…</code>. Refresh the index and apply it from the same panel.</p>
+    <p>Chip-music files that store their game's name (SPC, NSF/NSFe, GBS, VGM/VGZ, and PSF-family rips such as PSF,
+       USF, GSF, 2SF or SSF) show it as the album and the game;
+       other music files (MP3, FLAC, M4A, Ogg, Opus …) can carry a GAME tag. To read them again — the chip-music files
+       whose game has not been read from the file yet, and every other music file's GAME tag — use
+       <strong>gear → Metadata → Game names from file tags → Read game names</strong> (the other details read from those
+       chip-music files, such as titles, are refreshed too); untick <em>Include network shares</em> to read only local
+       files. From an FTP or SMB share, an MP3, FLAC or M4A file is read only as far as
+       its tags where the file allows it (files inside archives are read whole), and <strong>Cancel</strong> stops
+       the run after the current file. A Modland
+       match also fills an empty album with the game the tune belongs to. With <em>Guess game from Modland file
+       names</em> (on by default), Amiga and tracker modules with an exact Modland match can take the game from the
+       Modland file name such as <code>gold of the aztecs-intro</code> when the track's title matches the part after
+       the dash and either other files in the same Modland folder share the game prefix, or the part starts with a
+       usual tune-part word such as <code>intro</code>, <code>title</code>, <code>ingame</code>, <code>level</code> or
+       <code>gameover</code> (an Amiga custom-format tune, whose title is its file name, needs other files in the
+       same Modland folder to share the game prefix). Such a game is spelled as the game title lists spell it when
+       they know it on the track's platform — <code>backtothefuture3-intro</code> gives “Back to the Future III”,
+       <code>chuckrock 2</code> “Chuck Rock II” — and as the file name has it otherwise; these
+       guessed albums carry a small “guessed from Modland file name” note in Track Info. An album you typed is
+       never replaced. An album from the file itself is kept too, except that an exact Modland match completes an
+       SPC game name that the file's tag cut off at 32 characters. Turning the option off removes only the albums
+       it guessed.</p>
+    <p>In <strong>gear → Metadata → Song database (audacious-uade-tools)</strong>, <strong>Download</strong> fetches
+       the song database of the audacious-uade player (about 27&nbsp;MB) from GitHub and <strong>Apply to
+       library</strong> matches your modules against it by checksum. An exact match fills what is still empty: the
+       artist, the label (the publisher or group), the album (the game or production — it also replaces an album
+       guessed from a folder or a Modland file name), the year and — for many Amiga modules not played yet —
+       the length. A production name that several groups used carries the group, e.g. “Megademo (The Silents)”. While
+       <em>Re-apply automatically after each library scan</em> is on (the default), a download and every scan
+       apply it too. <strong>Reset enrichment</strong> removes the artists, labels, albums and years it filled and
+       turns the automatic re-apply off; lengths stay. Tags in your files and anything you typed are never
+       replaced, and a year from the database is marked in Track Info. The database is
+       <a href="https://github.com/mvtiaine/audacious-uade-tools" target="_blank" rel="noopener">audacious-uade-tools</a>
+       by Matti Tiainen, compiled from about 400 scene sources and licensed
+       <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank" rel="noopener">CC BY-NC-SA 4.0</a>.</p>
+
+    <h3>Where a game's name comes from</h3>
+    <p>A game you typed, or an album you set on a retro track, is always its game. Otherwise a retro track's game is
+       the first name these sources give it, in this order:</p>
+    <ol>
+      <li><strong>The file itself</strong> — the game in an SPC, NSF/NSFe, GBS, VGM/VGZ or PSF-family header, or a
+          GAME tag.</li>
+      <li><strong>Modland</strong> — the game folder of the tune's exact Modland match.</li>
+      <li><strong>Demozoo</strong> — the game Demozoo lists the tune as the soundtrack of, when the tune's composer
+          and title match and the tune is named after that game (“Rick Dangerous”, “High Technique (tune 3)”);
+          from the Demozoo index under <strong>gear → Metadata</strong> (an index downloaded by an earlier
+          version needs a refresh for this).</li>
+      <li><strong>The song database</strong> (audacious-uade-tools) — the game of an exact checksum match.</li>
+      <li><strong>A Modland file name</strong> such as <code>gold of the aztecs-intro</code>, while <em>Guess game
+          from Modland file names</em> is on — spelled as the game title lists spell it when they know it.</li>
+      <li><strong>The archive's name</strong>, when it is the name of a known game of the track's platform, while
+          <em>Game from archive names</em> is on.</li>
+      <li><strong>The folder or archive name</strong>, while <em>Album from folder name for retro formats</em> is
+          on.</li>
+    </ol>
+    <p>The names the other sources give are the game's other names: Track Info lists them on the <em>also</em> line,
+       and <code>game:</code> finds the track by any of them.</p>
+
+    <h3>Game names from archive names</h3>
+    <p>A retro track inside an archive takes the archive's name as its game when that name is a known game of the
+       track's platform — <code>Turrican.lha</code> for Amiga TFMX tunes, <code>Super_Mario_World.zip</code> for SNES SPC rips.
+       The name is compared with the game titles of the platform only: a SID with C64 games, an Amiga module with
+       Amiga games, a YM or SNDH tune or an Atari ST player's tune with Atari ST games, an AdLib or Sierra AGI tune
+       with DOS games, an SPC with SNES games, a PSF with PlayStation games, and so on; case, accents, punctuation, a
+       leading “The”, Roman numerals, dots between letters and region tags such as “(Europe)” are ignored, a name
+       written without the spaces a title has matches it (<code>Megaman2.zip</code> is “Mega Man 2”), and the
+       game is shown as the title list spells it. Skipped are generic names (music, intro, disk 1 …), names of a part of a game's music,
+       pure numbers, any name the archive's own tunes credit as their composer, artist, group, label or releaser,
+       and an archive that holds a single tracker module or SID named like it (such as <code>axelf.mod.zip</code>); the
+       next archive out is looked at instead. A one-word name shorter than eight letters needs two title lists of
+       the track's platform to agree, and a tracker module (MOD, XM, S3M, IT, MED, AHX …) needs a name of two or
+       more words that two lists of its platform agree on and that is not the title of a module in that
+       archive.</p>
+    <p>The option is in <strong>gear → Metadata → Game names from archive names</strong> (on by default); it applies
+       right away and after each scan, Track Info notes such a game as “from the archive name”, and turning it off
+       removes only the names it added. The game titles of Wikidata (CC0), No-Intro, the MAME software lists (CC0)
+       and ZXDB (ODbL) are included, and the C64 tunes in the <code>GAMES</code> folder of your own HVSC copy count
+       as C64 games. <strong>Download TOSEC</strong> (home computers such as the C64, Amiga, Atari ST, ZX Spectrum,
+       Amstrad CPC and MSX, about 100&nbsp;MB) and <strong>Download Redump</strong> (disc consoles such as the
+       PlayStation, Saturn and Dreamcast, about 10&nbsp;MB) add their titles; each is fetched only when you click
+       it, shows its progress, can be stopped with <strong>Stop</strong> and can be removed again. The downloaded
+       files are kept in SoniqBoom's data folder: after <strong>Remove</strong>, <strong>Add … from the downloaded
+       pack</strong> (or <strong>lists</strong>) puts the list back without downloading; <strong>Update</strong>
+       downloads the TOSEC pack only when tosecdev.org has a newer release (and uses the kept pack when the site
+       can't be reached), and says so when nothing changed; a Redump download that was stopped — or interrupted by
+       stopping SoniqBoom — is continued with <strong>Continue the Redump download</strong>, which fetches only the
+       systems still missing, while a stopped TOSEC download starts again; a Redump system that can't be reached
+       keeps the titles of its kept list, and the next <strong>Update</strong> that reaches every system clears the
+       note about it. A kept file that turns out to be damaged is removed (the next download fetches it again); one
+       that can't be read for another reason — a disk error, a missing permission — is kept.
+       <strong>Delete the downloaded pack</strong> (or <strong>lists</strong>) frees the space; the title list stays. Wikidata data is used under
+       <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener">CC0</a>; ZXDB
+       contains information from ZXDB, made available under the
+       <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL</a>.</p>
   </section>
 
   <!-- ── MAKE IT YOURS ────────────────────────────────────────────── -->
@@ -474,7 +576,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <p class="sec-sub">Rate, queue and build playlists — and drive the whole player from the keyboard.</p>
     <div class="grid cols-3">
       <div class="card"><span class="ico">⭐</span><h4>Ratings</h4><p>Star tracks to score them; your ratings feed the <em>Top Rated</em> smart view.</p></div>
-      <div class="card"><span class="ico">📜</span><h4>Play queue</h4><p>Toggle the queue with <span class="kbd">Q</span>, reorder what's coming up, and queue tracks from any list.</p></div>
+      <div class="card"><span class="ico">📜</span><h4>Play queue</h4><p>Toggle the queue with <span class="kbd">Q</span>, reorder what's coming up, and queue tracks from any list. Your queue is also kept on the server, where Subsonic apps can resume it; when another device or app saved a newer queue, SoniqBoom offers to resume it when you open it — the offer also waits in the Queue panel until you play something, and a resumed queue shows its track and position in the player, ready for Play. <em>Sync the play queue across devices</em> (on by default; <strong>gear → System → Settings</strong>, or <strong>gear → Preferences</strong> for accounts without admin rights, and Settings on the mobile page) turns this off for one browser.</p></div>
       <div class="card"><span class="ico">🎶</span><h4>Playlists</h4><p>Build and edit your own playlists from the sidebar — add single tracks, whole folders, or search results.</p></div>
     </div>
 
@@ -625,7 +727,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
   <section id="apps">
     <h2 class="sec"><span class="num">12</span>Listen anywhere</h2>
     <div class="grid cols-3">
-      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>SoniqBoom speaks the OpenSubsonic API. Point Amperfy, Symfonium, DSub or Feishin at your server's address and sign in with your SoniqBoom username and password.</p></div>
+      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>SoniqBoom speaks the OpenSubsonic API. Point Amperfy, Symfonium, DSub or Feishin at your server's address and sign in with your SoniqBoom username and password — apps that sign in with a token work with it too — or with a Subsonic app password or an OpenSubsonic API key from <a href="#settings">Settings</a>. Subsonic apps that run in a web browser, such as Airsonic-refix or Feishin's web version, can connect from another address with the same server URL and sign-in.</p></div>
       <div class="card"><span class="ico">🔁</span><h4>Multi-room</h4><p>Play the same track in lockstep across your devices — see <a href="#multiroom">Multi-room sync</a>.</p></div>
       <div class="card"><span class="ico">⬇️</span><h4>Installable PWA</h4><p>Add SoniqBoom to your home screen or dock for a full-screen, app-like experience, online or off.</p></div>
     </div>
@@ -677,8 +779,11 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        SoniqBoom attaches the share with no operating-system mount required and scans it straight away.</p>
 
     <h3>Keep your library fresh</h3>
-    <p>Local folders are <strong>watched automatically</strong> — files you add, change or remove are picked up within
-       a couple of seconds. Network shares are re-checked on a periodic background poll, and you can force one with the
+    <p>Local folders are <strong>watched automatically</strong> — files you add, change or remove are picked up a few
+       seconds after the changes settle, and a file that is still being copied or downloaded is picked up once it is
+       complete. Changes made while SoniqBoom was stopped are picked up by a rescan of the local folders a few minutes
+       after it starts (<strong>Rescan local folders after startup</strong> in Settings). Network shares are re-checked
+       on a periodic background poll, and you can force one with the
        <strong>Check now</strong> button on a remote folder. To rebuild everything by hand, use
        <strong>↻ Rebuild Index</strong>; to re-scan a single folder, use its <strong>Re-Index</strong> button.
        While a scan is running you can <strong>Pause</strong> it and later <strong>Resume</strong> from where it left
@@ -689,8 +794,13 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        (<code>soniqboom-YYYY-MM-DD.sbz</code>) — a compressed snapshot of your track index and metadata, waveforms,
        star ratings, play counts, playlists, listening history, your scan-folder list and library settings.
        <strong>Import .sbz</strong> restores it; it replaces the current library data and asks you to confirm first.</p>
-    <div class="note">The backup holds your <em>library database</em>, not the audio files themselves, and it does not
-       include user accounts — keep those, and your music, backed up separately.</div>
+    <div class="note">The backup holds your <em>library database</em>, not the audio files themselves. User accounts,
+       saved play queues, and the favourites, album / artist ratings and bookmarks from Subsonic apps are kept in
+       SoniqBoom's data folder (<code>users.json</code>, <code>subsonic_state.json</code> and <code>secret.key</code>),
+       not in the <code>.sbz</code> — back up that whole folder too, keeping those files together, along with your music.
+       It is <code>~/Library/Application Support/SoniqBoom</code> on macOS, <code>~/.local/share/soniqboom</code> on
+       Linux (or <code>$XDG_DATA_HOME/soniqboom</code>), <code>/data</code> in Docker, or the <code>data_dir</code> /
+       <code>SONIQBOOM_DATA_DIR</code> you set.</div>
 
     <h3>User accounts &amp; roles</h3>
     <p>Manage people in the admin panel's <strong>Users</strong> tab — add a user, set their role, enable or disable
@@ -731,15 +841,19 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
     <div class="grid cols-2">
       <div class="card"><span class="ico">🎹</span><h4>SoundFonts for MIDI</h4><p>Open <strong>gear → Renderers → Soundfonts</strong>. Click <strong>↑ Upload .sf2/.sf3</strong> to add your own bank, or pick one from <strong>Download Known Soundfonts</strong> for a one-click install. Select an installed bank to make it the active MIDI voice.</p></div>
       <div class="card"><span class="ico">🧬</span><h4>HVSC for SID</h4><p>Download the <a href="https://www.hvsc.de/" target="_blank" rel="noopener">High Voltage SID Collection</a>, then in <strong>gear → Renderers → HVSC SID database</strong> paste the path to its <code>DOCUMENTS</code> folder and click <strong>Save &amp; reload</strong> — every SID gains its exact per-tune length and STIL credits.</p></div>
-      <div class="card"><span class="ico">🎛️</span><h4>SID fidelity</h4><p>In <strong>gear → Renderers → SID fidelity</strong>, dial in how the C64 chip is voiced: pick the <strong>6581</strong> or <strong>8580</strong> model (or <em>Auto</em>), and toggle filter emulation, filter curve and digiboost. The fallback tune length for SIDs without an HVSC entry lives under <strong>System → Settings</strong> as <em>SID Duration</em>.</p></div>
+      <div class="card"><span class="ico">🎛️</span><h4>SID fidelity</h4><p>In <strong>gear → Renderers → SID fidelity</strong>, dial in how the C64 chip is voiced: pick the <strong>6581</strong> or <strong>8580</strong> model (or <em>Auto</em>), and toggle filter emulation, filter curve and digiboost. The fallback tune length for SIDs without an HVSC entry lives under <strong>System → Settings</strong> as <em>SID duration</em>.</p></div>
       <div class="card"><span class="ico">📈</span><h4>Scrobbling</h4><p>In <strong>gear → System → My Account</strong>, paste your <strong>ListenBrainz user token</strong> (from <a href="https://listenbrainz.org/profile" target="_blank" rel="noopener">listenbrainz.org/profile</a>) and/or your <strong>last.fm session key</strong>. Plays are logged automatically once a token is saved.</p></div>
-      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Subsonic apps sign in with your <strong>SoniqBoom username and password</strong> — there's no separate Subsonic password. Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong>, then see <a href="#apps">Listen anywhere</a>.</p></div>
+      <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong> and sign in with your <strong>SoniqBoom username and password</strong>. Apps that sign in with a token (salt + hash) work with your SoniqBoom password too. You can optionally give them a separate <strong>Subsonic app password</strong>: click <em>Generate new password</em> under <strong>gear → System → My Account</strong> (or <strong>gear → Preferences</strong> for accounts without admin rights) and copy it into the app — it is shown once, and from then on token apps must use it. Apps that support OpenSubsonic API keys can sign in with a key instead: <em>Create key</em> in the same place, copy it into the app (also shown once), and <em>Revoke</em> it to sign that app out. In Subsonic apps, tracks that have no album are listed as albums named after their folder (<em>Group album-less tracks into folder albums</em> in the Subsonic panel, on by default); a folder shared by many artists, such as a compo pack, becomes one album per artist, and letter folders (<em>A</em>, <em>B</em> … or <em>A-F</em>) are grouped per artist under their parent folder and named after it, so an artist gets one album for the whole archive rather than one per letter. Turn the option off to reach those tracks only by browsing folders. Then see <a href="#apps">Listen anywhere</a>.</p></div>
+      <div class="card"><span class="ico">🧩</span><h4>What Subsonic apps see</h4><p>Apps list one music folder for each scan folder in your library. A file that holds several tunes (SID, NSF and similar) also lists its other tunes in album and folder views as “Title (Tune n/N)”; each of those entries plays that tune. Downloading the original file from an app needs an admin or edit account. For app developers: apps can report what is playing with OpenSubsonic <code>reportPlayback</code> and find similar tracks with <code>sonicSimilarity</code>; <code>f=jsonp</code> requests must send their own credentials (<code>u</code> with <code>p</code> or with <code>t</code> and <code>s</code>, an API key, or HTTP Basic) and never use the browser session; a request with no credentials gets Subsonic error 10.</p></div>
       <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart.</p></div>
+      <div class="card"><span class="ico">📦</span><h4>Game names from archive names</h4><p>In <strong>gear → Metadata → Game names from archive names</strong>, <em>Game from archive names</em> (on by default) names a retro track's game after its archive when the archive's name is a known game of the track's platform, from the included title lists (Wikidata, No-Intro, the MAME software lists, ZXDB) and your HVSC copy. <strong>Download TOSEC</strong> and <strong>Download Redump</strong> add more titles on request. It applies right away and after each scan; turning it off removes only the names it added.</p></div>
       <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), hide empty folders, choose which filenames count as folder art, and toggle ZIP-archive scanning.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Switch between dark and light under <strong>gear → System → Settings → Theme</strong>; your choice is saved in the browser and applies instantly. (You can also change your own password here.)</p></div>
+      <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
+      <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and those tracks show their length once they have played. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. Adjust the size from 256 MB to 100 GB in <strong>gear → Renderers → Transcode &amp; render cache</strong>.</p></div>
       <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing.</p></div>
-      <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — settings, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later by uploading the file.</p></div>
+      <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — settings, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later by uploading the file. Back up the data folder too, for user accounts and Subsonic app state.</p></div>
     </div>
   </section>
 
@@ -760,6 +874,13 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
        <code>bash setup-admin.sh -user &lt;name&gt; -passwd '&lt;new password&gt;'</code>
        (add <code>-role admin</code> to restore admin rights) — it takes effect immediately.
        See <a href="#manage">Manage your library &amp; users</a>.</p>
+    <h3>A scan reports files it didn't index</h3>
+    <p>A file whose metadata can't be read within about 90 seconds is skipped and counted as a scan error, and the
+       scan goes on with the next one. When five files inside the same archive are skipped this way in a row, the rest
+       of that archive is skipped too. If a network share stops answering during a scan, the scan shows
+       <em>Waiting for … to answer</em> and waits up to about three minutes; if the share is still silent, the rest
+       of that library folder is left for later. Tracks already in your library stay. Once the files or the share are
+       readable again, use the folder's <strong>Re-Index</strong> button.</p>
     <h3>A network share won't connect</h3>
     <p>In the admin panel's <strong>Music Folders → Network Share</strong> form, use <strong>Test</strong> before
        connecting — it reports the exact connection error. Check the host, share name / path and credentials, and that

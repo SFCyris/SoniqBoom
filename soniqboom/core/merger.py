@@ -73,7 +73,9 @@ def _apply_entry(state: dict, entry: dict) -> None:
         existing = stats.get(tid)
         if existing:
             existing["count"] = existing.get("count", 0) + 1
-            existing["last_played"] = ts
+            # Same rule as TrackStore.record_play: a back-dated play (an
+            # offline client's scrobble) never moves last_played backwards.
+            existing["last_played"] = max(existing.get("last_played", 0) or 0, ts)
         else:
             stats[tid] = {"count": 1, "last_played": ts}
 
@@ -85,7 +87,14 @@ def _apply_entry(state: dict, entry: dict) -> None:
 
     elif op == "push_history":
         history = state.setdefault("history", [])
-        history.append(entry["data"])
+        # Play order, not arrival order (same rule as TrackStore.push_history).
+        data = entry["data"]
+        ts = (data or {}).get("ts") or 0
+        if history and ts < (history[-1].get("ts") or 0):
+            import bisect
+            history.insert(bisect.bisect_right([e.get("ts") or 0 for e in history], ts), data)
+        else:
+            history.append(data)
         max_h = 500
         if len(history) > max_h:
             state["history"] = history[-max_h:]
@@ -101,6 +110,14 @@ def _apply_entry(state: dict, entry: dict) -> None:
 
 
 def _do_merge(data_dir: Path) -> int:
+    """``_do_merge_locked`` under ``persistence.library_files_lock`` — a
+    merge never interleaves with a snapshot write or a start's load."""
+    from soniqboom.core.persistence import library_files_lock
+    with library_files_lock:
+        return _do_merge_locked(data_dir)
+
+
+def _do_merge_locked(data_dir: Path) -> int:
     """Run one merge cycle.  Returns number of entries applied.
 
     Robust against network-volume quirks:
@@ -361,13 +378,17 @@ async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None
             except Exception:
                 log.exception("Merger (async) error")
     finally:
-        # Final merge on shutdown so we don't leave AOF entries unmerged.
-        try:
-            n = await _aio.to_thread(_do_merge, data_dir)
-            if n:
-                log.info("Merger (async) final: applied %d AOF entries", n)
-        except Exception:
-            log.exception("Merger (async) final merge error")
+        # Final merge so no AOF entries are left unmerged — unless the stop
+        # asked for none (``stop_merger(final=False)``: the server's stop,
+        # whose AOF flush the next start replays anyway).
+        me = _aio.current_task()
+        if me is None or getattr(me, "_sb_final_merge", True):
+            try:
+                n = await _aio.to_thread(_do_merge, data_dir)
+                if n:
+                    log.info("Merger (async) final: applied %d AOF entries", n)
+            except Exception:
+                log.exception("Merger (async) final merge error")
         log.info("Merger (async) stopped")
 
 
@@ -410,14 +431,17 @@ def start_merger(data_dir: Path, interval: int = 120):
     return proc
 
 
-async def stop_merger(handle) -> None:
-    """Stop a merger handle returned by ``start_merger`` cooperatively."""
+async def stop_merger(handle, final: bool = True) -> None:
+    """Stop a merger handle returned by ``start_merger`` cooperatively.  The
+    asyncio-task merger (bundled app) runs one last merge first unless
+    ``final`` is False."""
     import asyncio as _aio
 
     if handle is None:
         return
     # asyncio.Task path
     if isinstance(handle, _aio.Task):
+        handle._sb_final_merge = final  # type: ignore[attr-defined]
         stop_event = getattr(handle, "_sb_stop_event", None)
         if stop_event is not None:
             stop_event.set()

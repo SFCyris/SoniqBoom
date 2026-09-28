@@ -57,17 +57,87 @@ def is_disk_image(path) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
-def list_members(path) -> list[str]:
+class NotListable(ValueError):
+    """No playable members and not a whole image this reader can list — a
+    truncated copy, or a disk without a filesystem (an AmigaDOS-booting game
+    disk with its own trackloader).  The two can't be told apart: the scanner
+    keeps such an image's indexed members, logs it at debug level and, after
+    discovery, warns once per scan for the ones that hold indexed tracks."""
+
+
+def list_members(path, *, strict: bool = False) -> list[str]:
     """Return the names of playable members inside the disk image at *path*.
 
     Names already carry a renderer-friendly extension (``.sid``/``.mod``/…).
-    Returns ``[]`` for a non-image, unreadable, or empty/unsupported image.
+    Returns ``[]`` for a non-image, unreadable, or empty/unsupported image —
+    or, with ``strict``, raises on a read / parse failure (the scanner keeps
+    an unreadable image's indexed members).
     """
     try:
-        return list(_enumerate(path).keys())
+        members = list(_enumerate(path).keys())
+        if strict and not members and not _looks_like_an_image(path):
+            # truncated / damaged: "unreadable", not "an image with no music"
+            raise NotListable(f"not a disk image this reader can list (size / root block): {path}")
+        return members
     except Exception as exc:  # never let one bad disk abort a scan
+        if strict:
+            raise
         log.debug("disk-image enumerate failed for %s: %s", path, exc)
         return []
+
+
+# The sizes a whole image of each type has: 1541 35 / 40 / 42 tracks, 1571,
+# 1581 — each with or without error bytes.  A file of any other size is cut
+# short (a copy in progress, a damaged download).
+_CBM_IMAGE_SIZES = {
+    ".d64": frozenset({174848, 175531, 196608, 197376, 205312, 206114}),
+    ".d71": frozenset({349696, 351062}),
+    ".d81": frozenset({819200, 822400}),
+}
+
+
+def _adf_whole(size: int) -> bool:
+    """A whole number of Amiga cylinders (2 heads x 11 sectors DD, 22 HD) for
+    80-84 cylinders — standard, NDOS/KICK and extended-cylinder images alike;
+    an image cut short almost never lands on one."""
+    blocks, rest = divmod(size, _BSIZE)
+    if rest:
+        return False
+    return ((blocks % 22 == 0 and 1760 <= blocks <= 1848)
+            or (blocks % 44 == 0 and 3520 <= blocks <= 3696))
+
+
+def _looks_like_an_image(path) -> bool:
+    """Not truncated: the file has the size of a whole image of its type (an
+    extended ADF is sized by its own track table) and, for an AmigaDOS ADF,
+    its root block where that size puts it.  A whole image with no playable
+    members is simply empty."""
+    low = str(path).lower()
+    ext = low[low.rfind("."):]
+    size = os.path.getsize(path)
+    if ext == ".adf":
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+            if head in (b"UAE-1ADF", b"UAE--ADF"):
+                return True               # extended ADF: sized by its own track table
+            if not _adf_whole(size):
+                return False
+            blocks = size // _BSIZE
+            if head[:3] == b"DOS":
+                # An AmigaDOS disk this reader can list (DD / HD) has its root
+                # block in the middle: an HD image cut at exactly a DD size
+                # doesn't (its middle is data), and any other size isn't one
+                # it can list.
+                if blocks not in (1760, 3520):
+                    return False
+                fh.seek((blocks // 2) * _BSIZE)
+                root = fh.read(_BSIZE)
+                return (len(root) == _BSIZE
+                        and struct.unpack(">I", root[0:4])[0] == 2          # T_HEADER
+                        and struct.unpack(">i", root[_BSIZE - 4:])[0] == 1)  # ST_ROOT
+        return True
+    sizes = _CBM_IMAGE_SIZES.get(ext)
+    return sizes is None or size in sizes
 
 
 def read_member(path, member: str) -> bytes:

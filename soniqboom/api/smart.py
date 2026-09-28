@@ -175,16 +175,26 @@ async def instant_mix(
 #  LISTENING HISTORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def push_history(track_id: str, title: str = "", artist: str = "") -> None:
+async def push_history(track_id: str, title: str = "", artist: str = "",
+                       at: int | None = None) -> None:
     """Append a play event to the listening history.
 
-    Called from the mark_played() endpoint in tracks.py.
+    Called from the mark_played() endpoint in tracks.py and from Subsonic
+    scrobbles.  ``at`` (epoch seconds) is when the play happened — an offline
+    client's back-dated submission — clamped to ``[0, now]``.
     """
+    now = int(time.time())
+    ts = now
+    if at is not None:
+        try:
+            ts = max(0, min(int(at), now))
+        except (TypeError, ValueError):
+            ts = now
     get_store().push_history({
         "track_id": track_id,
         "title": title,
         "artist": artist,
-        "ts": int(time.time()),
+        "ts": ts,
     })
 
 
@@ -211,7 +221,14 @@ async def listening_history(limit: int = Query(50, ge=1, le=200)):
 # diffs against the current annotations and persists just the changed tracks in a
 # single batched AOF record, off the event loop.
 
-_dup_seq: int = -1                          # _mutation_seq as of the last completed recompute
+_dup_seq = None                             # _seq_of(store) as of the last completed recompute
+
+
+def _seq_of(store) -> tuple:
+    """Duplicate groups key on title/artist/DURATION, and a render/probe
+    duration backfill bumps only ``_duration_seq`` — so both counters decide
+    whether the groups are stale."""
+    return (store._mutation_seq, getattr(store, "_duration_seq", 0))
 _dup_task: "asyncio.Task | None" = None     # single-flight recompute task
 _PUBLIC_META_FIELDS = set(TrackMeta.model_fields)
 
@@ -242,13 +259,19 @@ def _compute_dup_changes(raw_tracks: list[dict]) -> list[tuple[str, dict]]:
 
 
 async def _do_dup_recompute() -> int:
+    from soniqboom.core.scanner import _dup_lock
+    async with _dup_lock():         # never land an older snapshot over a newer re-group
+        return await _do_dup_recompute_locked()
+
+
+async def _do_dup_recompute_locked() -> int:
     """Recompute + persist duplicate annotations.  Snapshot on the loop, compute +
     diff OFF the loop, then persist the (minimal) changed set in ONE batched AOF
     record — which also updates the store's ``_tag_dup_group`` index.  Returns the
     number of tracks whose annotation changed."""
     global _dup_seq
     store = get_store()
-    snap_seq = store._mutation_seq
+    snap_seq = _seq_of(store)
     try:
         # Snapshot only the fields the grouping + diff + primary tiebreak need
         # (incl. ``added_at`` — _pick_primary's final tiebreaker), not the full
@@ -266,13 +289,13 @@ async def _do_dup_recompute() -> int:
         changes = await asyncio.to_thread(_compute_dup_changes, raw_snapshot)
         # Did a REAL mutation interleave during the off-loop compute?  (Our own
         # batch write below is synchronous, so it's excluded from this check.)
-        interleaved = store._mutation_seq != snap_seq
+        interleaved = _seq_of(store) != snap_seq
         if changes:
             store.update_track_fields_batch(changes)
         # Mark fresh as of the snapshot.  If a real change interleaved during the
         # compute, leave _dup_seq at snap_seq so the next request recomputes once
         # and converges — never silently dropping that change.
-        _dup_seq = snap_seq if interleaved else store._mutation_seq
+        _dup_seq = snap_seq if interleaved else _seq_of(store)
         return len(changes)
     except Exception:
         # Never let a failed recompute storm every request: mark fresh-as-of-now
@@ -280,7 +303,7 @@ async def _do_dup_recompute() -> int:
         # also avoids an unretrieved-exception warning on the detached task.
         log.warning("duplicate-group recompute failed; retrying on next mutation",
                     exc_info=True)
-        _dup_seq = store._mutation_seq
+        _dup_seq = _seq_of(store)
         return 0
 
 
@@ -290,7 +313,7 @@ async def _ensure_dup_fresh(*, await_if_empty: bool = True) -> None:
     consistent); only blocks when there's nothing to show yet."""
     global _dup_task
     store = get_store()
-    if _dup_seq == store._mutation_seq:
+    if _dup_seq == _seq_of(store):
         return
     if _dup_task is None or _dup_task.done():
         _dup_task = asyncio.create_task(_do_dup_recompute())
@@ -403,7 +426,7 @@ async def set_group_primary(group_id: str, track_id: str, _user=Depends(require_
     )
     # Keep _dup_seq in lock-step with the write we just made so the staleness
     # check doesn't immediately recompute the manual override away.
-    _dup_seq = store._mutation_seq
+    _dup_seq = _seq_of(store)
     return {"group_id": group_id, "primary_id": track_id}
 
 

@@ -165,7 +165,7 @@ export function mountLibrary(root, ctx) {
       if (!r.ok) throw new Error();
       ctx.toast(`Created "${name}"`);
       render();
-    } catch { ctx.toast('Could not create playlist'); }
+    } catch { ctx.toast('Could not create playlist', 'error'); }
   }
 
   async function renamePlaylist(p) {
@@ -179,7 +179,7 @@ export function mountLibrary(root, ctx) {
       if (!r.ok) throw new Error();
       ctx.toast('Renamed');
       render();
-    } catch { ctx.toast('Could not rename'); }
+    } catch { ctx.toast('Could not rename', 'error'); }
   }
 
   async function deletePlaylist(p) {
@@ -190,7 +190,7 @@ export function mountLibrary(root, ctx) {
       ctx.toast('Deleted');
       crumb = null;
       render();
-    } catch { ctx.toast('Could not delete'); }
+    } catch { ctx.toast('Could not delete', 'error'); }
   }
 
   async function loadPlaylistTracks() {
@@ -260,7 +260,7 @@ export function mountLibrary(root, ctx) {
         body: JSON.stringify({ track_ids: tracks.map(playlistEntry) }),
       });
       if (!r.ok) throw new Error();
-    } catch { ctx.toast('Could not save order'); render(); }   // revert from server
+    } catch { ctx.toast('Could not save order', 'error'); render(); }   // revert from server
   }
 
   async function removeFromPlaylist(idx) {
@@ -275,7 +275,7 @@ export function mountLibrary(root, ctx) {
       if (!r.ok) throw new Error();
       ctx.toast('Removed');
       render();
-    } catch { ctx.toast('Could not remove'); }
+    } catch { ctx.toast('Could not remove', 'error'); }
   }
 
   // ── Track list (flat or filtered) ─────────────────────────────────────
@@ -324,20 +324,30 @@ export function mountLibrary(root, ctx) {
   // the track's GLOBAL position, so playback continues past the pages the user
   // happened to scroll in.  Was setQueue(tracks, idx) — only the loaded rows,
   // so "play from here" stopped at the last paged-in page (correctness bug).
-  const QUEUE_WINDOW = 500;
+  //
+  // The window is only the player's STARTING rows: it carries a queue source, so
+  // the shared Player extends it on its own — forwards through this list, or,
+  // with shuffle on, through a seeded shuffle of EVERY track matching the filter
+  // (a fixed 500-row window made shuffle pick only among those 500).
+  const QUEUE_WINDOW = 100;
   async function playFrom(startIdx) {
-    let url;
+    const filter = {};
     if (crumb) {
-      const params = new URLSearchParams({ limit: String(QUEUE_WINDOW), offset: String(startIdx) });
-      params.set(crumb.field, crumb.value);
-      if (crumb.extraField) params.set(crumb.extraField, crumb.extraValue);
-      url = `/api/search/filter?${params}`;
-    } else {
-      url = `/api/tracks?limit=${QUEUE_WINDOW}&offset=${startIdx}`;
+      filter[crumb.field] = crumb.value;
+      if (crumb.extraField) filter[crumb.extraField] = crumb.extraValue;
     }
+    const orderedUrl = crumb ? '/api/search/filter' : '/api/tracks';
+    const source = {
+      ordered: { url: orderedUrl, params: filter },
+      shuffle: { url: '/api/tracks/shuffled', params: filter },
+      total: null,
+      offset: startIdx,
+      label: crumb ? crumb.label : 'All Tracks',
+    };
+    const params = new URLSearchParams({ ...filter, limit: String(QUEUE_WINDOW), offset: String(startIdx) });
     try {
-      const win = await fetch(url).then(r => (r.ok ? r.json() : null));
-      if (Array.isArray(win) && win.length) { Player.setQueue(win, 0); return; }
+      const win = await fetch(`${orderedUrl}?${params}`).then(r => (r.ok ? r.json() : null));
+      if (Array.isArray(win) && win.length) { Player.setQueue(win, 0, { source }); return; }
     } catch { /* fall through to the loaded slice */ }
     Player.setQueue(tracks, startIdx);   // fallback — never worse than before
   }

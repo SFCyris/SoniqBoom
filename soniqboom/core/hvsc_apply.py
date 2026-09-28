@@ -48,10 +48,12 @@ def _durations_equal(a, b) -> bool:
     return all(abs(float(x) - float(y)) < 0.01 for x, y in zip(a, b))
 
 
-async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
+async def apply_hvsc_to_library(*, reload: bool = False,
+                                ids: "set[str] | None" = None) -> dict:
     """Join HVSC durations (by cached MD5) + STIL (by HVSC-relative path) onto
-    every SID track.  Returns a stats dict.  No-op (``updated: 0``) when HVSC
-    isn't configured."""
+    every SID track — or only the SID tracks in ``ids`` (a scan's own changed
+    tracks).  Returns a stats dict.  No-op (``updated: 0``) when HVSC isn't
+    configured."""
     from soniqboom.core.store import get_store
     from soniqboom.core.hvsc import get_hvsc, _file_md5
     hvsc = get_hvsc()
@@ -64,7 +66,11 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
 
     # Reuse the maintained _tag_format index (keyed lowercase) instead of
     # materializing + scanning all 270k metas — O(|SID bucket|).
-    sids = store.tracks_for_format("SID")
+    if ids is not None:
+        bucket = store._tag_format.get("sid", ())
+        sids = [store._meta_dict(tid) for tid in ids if tid in bucket and tid in store._tracks]
+    else:
+        sids = store.tracks_for_format("SID")
     scanned = len(sids)
     sid_track_ids = [t["id"] for t in sids]
 
@@ -136,8 +142,13 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
             patch["sid_md5"] = md5           # cache for next time (one-time backfill)
         durations = hvsc.lookup_durations_by_md5(md5) if md5 else []
         if durations:
-            if abs(float(t.get("duration") or 0) - durations[0]) > 0.01:
-                patch["duration"] = durations[0]
+            # The track's duration is its DEFAULT tune's (what the bare id
+            # plays): tune 1's unless the scan recorded another start song.
+            s = t.get("start_subsong")
+            want = (durations[s] if isinstance(s, int) and not isinstance(s, bool)
+                    and 0 < s < len(durations) and durations[s] else durations[0])
+            if abs(float(t.get("duration") or 0) - want) > 0.01:
+                patch["duration"] = want
             if not _durations_equal(t.get("hvsc_lengths"), durations):
                 patch["hvsc_lengths"] = durations
             if len(durations) > 1 and t.get("subsongs") != len(durations):
@@ -159,24 +170,22 @@ async def apply_hvsc_to_library(*, reload: bool = False) -> dict:
             updates.append((t["id"], patch))
 
     if updates:
-        await loop.run_in_executor(
-            None, store.update_track_fields_batch, updates,
-        )
+        # On the loop thread (the store has no lock — a write from a worker
+        # thread could race a scan's index maintenance), in chunks with yields
+        # and batch mode for a bulk change: the shared chunked writer.
+        from soniqboom.core.folder_album import commit_album_updates, refresh_album_caches
+        written: list[str] = []
+        await commit_album_updates([(tid, patch, None) for tid, patch in updates],
+                                   written=written)
         # Durations are baked into the folder-browse + aggregation caches,
         # which are validated by track COUNT — a field-only update like this
         # won't invalidate them, so the UI would keep showing the old (default)
-        # lengths.  Invalidate both explicitly (works for the scan auto-fire
-        # AND the admin re-extract endpoint).
+        # lengths.  Refresh the patched tracks' rows and drop the aggregation
+        # cache (works for the scan auto-fire AND the admin re-extract endpoint).
         try:
-            from soniqboom.api.library import invalidate_agg_cache
-            invalidate_agg_cache()
+            await refresh_album_caches(written)
         except Exception:
-            pass
-        try:
-            from soniqboom.api.fstree import invalidate_browse_cache
-            invalidate_browse_cache()
-        except Exception:
-            pass
+            log.debug("HVSC apply: cache refresh failed", exc_info=True)
 
     # Reconcile the SID conversion cache against the post-apply durations.
     from soniqboom.core.conversion_cache import purge_sid_entries_for

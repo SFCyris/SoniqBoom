@@ -1030,7 +1030,10 @@ body::before {
   flex-shrink: 0;
   backdrop-filter: blur(8px);
 }
-#browse-crumb { color: var(--text1); font-size: 13px; }
+/* The crumb carries long strings now ("Search: … — listing first 200 matches ·
+   Shuffle covers all matches"): it ellipsises (full text in its title) instead of growing the
+   header or pushing Back out of the clipped content area. */
+#browse-crumb { color: var(--text1); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #browse-back {
   background: none;
   border: none;
@@ -1038,6 +1041,8 @@ body::before {
   cursor: pointer;
   font-size: 12px;
   margin-left: auto;
+  flex-shrink: 0;
+  min-height: 24px;
 }
 .btn-export-csv {
   background: rgba(107,200,240,0.10);
@@ -1064,6 +1069,8 @@ body::before {
   padding: 4px 11px;
   white-space: nowrap;
   transition: background 0.12s;
+  flex-shrink: 0;
+  min-height: 24px;               /* WCAG 2.5.8 target size */
 }
 .browse-play-btn[hidden] { display: none; }
 .browse-play-btn:hover { background: rgba(107,200,240,0.22); }
@@ -2980,6 +2987,15 @@ input[type="range"]:hover::-moz-range-thumb {
   pointer-events: none;
 }
 .dir-unavailable .admin-dir-path { opacity: 0.5; }
+.admin-dir-note {
+  flex: 0 1 auto;
+  min-width: 0;          /* shrinks (with an ellipsis) before the row overflows */
+  font-size: 11px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .btn-reconnect {
   background: rgba(76,175,80,0.15);
   border: 1px solid rgba(76,175,80,0.3);
@@ -3099,6 +3115,9 @@ input[type="range"]:hover::-moz-range-thumb {
 .admin-msg.ok   { background: rgba(76,175,122,0.14); color: #4caf7a; border: 1px solid rgba(76,175,122,0.2); }
 .admin-msg.warn { background: rgba(230,180,60,0.14); color: #e6b43c; border: 1px solid rgba(230,180,60,0.25); }
 .admin-msg.err  { background: rgba(220,80,80,0.14);  color: #e06060; border: 1px solid rgba(220,80,80,0.2); }
+/* Work in progress ("Saving…", "Clearing…"): neutral, no ✓ — nothing has
+   succeeded yet.  The text's own trailing "…" is the cue. */
+.admin-msg.info { background: rgba(107,200,240,0.08); color: var(--text0); border: 1px solid var(--border-bright); }
 
 /* Renderer status grid */
 .renderer-grid {
@@ -4016,6 +4035,34 @@ body.ti-open {
   transition: color 0.12s, background 0.12s;
 }
 #btn-queue-close:hover { color: var(--text0); background: rgba(255,255,255,0.09); }
+
+/* A queue saved on another device, on offer until something plays. */
+.queue-offer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text1);
+  flex-shrink: 0;
+}
+.queue-offer[hidden] { display: none; }
+.queue-offer-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#btn-queue-offer {
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  font: 600 11px system-ui, sans-serif;
+  padding: 4px 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+#btn-queue-offer:hover { filter: brightness(1.1); }
+
+/* Nothing loaded yet: the bar shows the queued track Play starts, dimmed. */
+#player-bar.is-cued .player-art-info { opacity: 0.72; }
 
 .queue-list[hidden] { display: none; }
 .queue-list {
@@ -5828,13 +5875,25 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   color: var(--text);
   line-height: 1.6;
 }
-.sp-hint-ops code {
+.sp-hint-op {
   display: inline-block;
   padding: 1px 6px;
   margin: 0 4px 2px 0;
+  font: inherit;
+  color: inherit;
+  line-height: inherit;
   background: rgba(255,255,255,0.06);
   border: 1px solid var(--border);
   border-radius: 4px;
+  cursor: pointer;
+}
+.sp-hint-op:hover {
+  background: rgba(255,255,255,0.12);
+  border-color: var(--accent);
+}
+.sp-hint-op:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 /* Red flag bar when the user typed an unparseable field operator. */
 .sp-bad-ops {
@@ -5879,6 +5938,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 /* All right-rail box controls share one styled appearance so the column
    reads as a single aligned unit (the bare OS <select> was the odd one out). */
 .admin-setting input[type="number"],
+.admin-setting input[type="text"],
 .admin-setting select {
   flex: 0 0 auto;
   width: 72px;
@@ -5894,6 +5954,13 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   width: auto;           /* selects size to their options unless a section pins a width */
   min-width: 120px;
   cursor: pointer;
+}
+/* Text fields hold lists / paths — wider than the number boxes, and allowed to
+   shrink in a narrow grid cell instead of overflowing it. */
+.admin-setting input[type="text"] {
+  flex: 0 1 220px;
+  width: 220px;
+  min-width: 0;
 }
 /* Custom checkbox — fully CSS-drawn (appearance:none) so its box size and
    position are identical across Chromium/WebKit/Gecko/Edge.  The native
@@ -5938,6 +6005,11 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .admin-setting input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+/* Not loaded yet / unavailable (disabled) or saving (aria-disabled). */
+.admin-setting input[type="checkbox"]:disabled,
+.admin-setting input[type="checkbox"][aria-disabled="true"] {
+  opacity: 0.45;
 }
 /* SID fidelity: pin the select + number to one width so their left AND right
    edges line up into a clean column (checkboxes stay right-aligned to the same
@@ -5990,6 +6062,9 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .setting-info:hover::after,
 .setting-info:focus::after,
 .setting-info:focus-within::after { opacity: 1; }
+/* Drawn below the ⓘ when the row is too close to the top of the panel's
+   scroll box for the tip to fit above (admin.js _placeSettingTip). */
+.setting-info.tip-below::after { bottom: auto; top: calc(100% + 6px); }
 
 /* ── About section (System tab) ───────────────────────────────────────── */
 .about-section { }
@@ -6459,6 +6534,16 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   line-height: 1.45;
   max-width: 480px;
 }
+.admin-hint a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.admin-hint a:hover { text-decoration-thickness: 2px; }
+/* The light admin panel: hint text on --text2 (4.5:1 on every light
+   surface) and links in a darker orange (5.1:1 on --bg2 and lighter). */
+:root[data-theme="light"] .admin-hint { color: var(--text2); }
+:root[data-theme="light"] .admin-hint a { color: #a8480c; }
 
 /* ── Cross-platform shims ──────────────────────────────────────────────── */
 
@@ -8488,3 +8573,24 @@ body.auth-blocked > #app {
 .st-info-nosup { color: var(--text2, #888); font-size: 11px; }
 .st-info-actions { display: flex; gap: 10px; }
 .st-info-actions .st-btn { flex: 1; padding: 9px; font-size: 13px; }
+
+/* Light theme: the accent orange on the pale header measured 2.6:1 — darken the
+   text of the header's buttons (Play all / Shuffle / Back). */
+:root[data-theme="light"] .browse-play-btn,
+:root[data-theme="light"] #browse-back { color: #8a3a08; }
+:root[data-theme="light"] .browse-play-btn { background: rgba(107, 200, 240, 0.22); }
+
+/* Shuffle while Radio Mode owns the order: visibly unavailable, still clickable
+   so the refusal can explain itself. */
+#btn-shuffle.is-unavailable { opacity: 0.85; }   /* ≥4.8:1 in both themes, on and off */
+
+/* Light theme: the player bar's toggle buttons used the dark theme's pale blue
+   (#6bc8f0 on near-white = 1.9:1; the orange "on" state 2.9:1). */
+:root[data-theme="light"] .ctrl-toggle { color: #1f5f80; }
+:root[data-theme="light"] .ctrl-toggle.on { color: #8a3a08; }
+:root[data-theme="light"] .browse-play-btn { border: 1px solid rgba(20, 90, 130, 0.7); }   /* ≥3:1 boundary */
+
+/* A short window (half-height browser, phone in landscape) must still reach Save. */
+.pl-modal-dialog { max-height: 86vh; overflow-y: auto; }
+
+.browse-play-btn[aria-busy="true"] { opacity: 0.92; cursor: progress; }   /* label stays ≥4.5:1 in both themes */

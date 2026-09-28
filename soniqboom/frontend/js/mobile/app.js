@@ -11,6 +11,10 @@ import { artPlaceholderEmoji, Toast } from '../utils.js';
 // classic-script cast_picker.js can read currentTrackId + emit toasts.
 window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
+// Names this client in the synced play queue ("Resume the queue from …").
+window.__sbClientLabel = 'SoniqBoom Mobile';
+// …and where its Play control is, for "Queue resumed — … ".
+window.__sbPlayHint = 'Tap \u25B6 in the mini player.';
 window.Toast = Toast;
 
 // Codec capability handshake (WIN 5) — same as desktop app.js: probe what this
@@ -58,7 +62,6 @@ const sheetTitle  = document.getElementById('m-sheet-title');
 const sheetList   = document.getElementById('m-sheet-actions');
 const sheetCancel = document.getElementById('m-sheet-cancel');
 
-const toast       = document.getElementById('m-toast');
 
 // ── View routing ──────────────────────────────────────────────────────────
 const VIEWS = {
@@ -117,9 +120,20 @@ function renderMini(track) {
   // element (src cleared) so ``track`` is no longer resumable — otherwise the
   // mini would show a dead ▶ that playPause() ignores after radio stops.
   const resumable = track && (Player.playing || (Player.audio && Player.audio.getAttribute('src')));
-  if (!resumable) {
+  // Nothing loaded, but a queue waits (restored after a reload, or resumed from
+  // another device): show the track ▶ starts — playPause starts exactly this
+  // one (Player.cuedTrack is null in the radio-takeover case above).
+  const cued = resumable ? null : (Player.cuedTrack || null);
+  _miniCuedKey = cued ? `${cued.id}~${cued.subsong ?? ''}` : null;
+  if (!resumable && !cued) {
     mini.classList.add('hidden');
     return;
+  }
+  if (cued) {
+    track = cued;
+    miniPlay.textContent = '▶';
+    const dur = Number(cued.duration) || 0;
+    miniProg.style.width = `${dur > 0 ? Math.min(100, ((Player.cuedSec || 0) / dur) * 100) : 0}%`;
   }
   mini.classList.remove('hidden');
   miniTitle.textContent  = track.title  || '—';
@@ -166,9 +180,27 @@ function renderMiniStation(st) {
 }
 
 Player.on('trackchange', renderMini);
+// A queue cued for ▶ (see renderMini): repaint when the cued entry changes —
+// the resume / restore itself, a queue edit or a clear.  While a track is
+// loaded this is one test and nothing else.
+let _miniCuedKey = null;
+function _renderMiniCued() {
+  if (MobileRadio.active) return;
+  if (Player.playing || (Player.audio && Player.audio.getAttribute('src'))) return;
+  const c = Player.cuedTrack || null;
+  const key = c ? `${c.id}~${c.subsong ?? ''}` : null;
+  if (key === _miniCuedKey) return;
+  renderMini(Player.currentTrack);
+}
+Player.on('cue', _renderMiniCued);
+Player.on('queuechange', _renderMiniCued);
 Player.on('statechange', ({ playing }) => {
   if (MobileRadio.active) return;         // radio owns the transport while active
   miniPlay.textContent = playing ? '⏸' : '▶';
+  // 'trackchange' fires before the source is on the element, so the very first
+  // play of a session found nothing resumable and left the mini hidden: show
+  // it once playback has actually started.
+  if (playing && mini.classList.contains('hidden') && Player.currentTrack) renderMini(Player.currentTrack);
 });
 Player.on('timeupdate', ({ pct }) => {
   if (MobileRadio.active) return;
@@ -190,7 +222,11 @@ miniNext.addEventListener('click', (e) => {
   if (MobileRadio.active) return;         // a single live station has no "next"
   Player.next();
 });
-mini.addEventListener('click',     ()  => activate('nowplaying'));
+// The cast button (#btn-cast, cast_picker.js) opens its picker in place.
+mini.addEventListener('click', (e) => {
+  if (e.target && e.target.closest && e.target.closest('#btn-cast')) return;
+  activate('nowplaying');
+});
 
 // ── Action sheet ──────────────────────────────────────────────────────────
 function showSheet({ title = 'Actions', actions = [] }) {
@@ -200,19 +236,33 @@ function showSheet({ title = 'Actions', actions = [] }) {
   actions.forEach(a => {
     const li = document.createElement('li');
     li.textContent = a.label;
+    li.setAttribute('role', 'button');       // it IS one: announce it, focus it, Enter/Space it
+    li.tabIndex = 0;
     if (a.danger) li.classList.add('danger');
-    li.addEventListener('click', () => {
+    const choose = () => {
       hideSheet();
       try { a.onSelect(); } catch (err) { console.error(err); }
+    };
+    li.addEventListener('click', choose);
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); }
     });
     sheetList.appendChild(li);
   });
 
+  _sheetOpener = document.activeElement;     // focus goes back here when the sheet closes
   sheet.classList.remove('hidden');
   sheetBg.classList.remove('hidden');
+  (sheetList.firstElementChild || sheet.querySelector('#m-sheet-cancel'))?.focus?.();
 }
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !sheet.classList.contains('hidden')) hideSheet();
+});
 
+let _sheetOpener = null;
 function hideSheet() {
+  const was = !sheet.classList.contains('hidden');
+  if (was) { try { _sheetOpener?.focus?.({ preventScroll: true }); } catch (_) {} _sheetOpener = null; }
   sheet.classList.add('hidden');
   sheetBg.classList.add('hidden');
 }
@@ -221,13 +271,18 @@ sheetBg.addEventListener('click',     hideSheet);
 sheetCancel.addEventListener('click', hideSheet);
 
 // ── Toast ─────────────────────────────────────────────────────────────────
-let _toastTimer = null;
-function showToast(message) {
-  toast.textContent = message;
-  toast.classList.remove('hidden');
-  clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => toast.classList.add('hidden'), 2000);
+// ONE toast surface on the phone: the shared Toast (docked under the top bar by
+// mobile.css, taps pass through, identical messages coalesce, screen readers hear
+// it).  The old bottom pill put "Shuffle on" over the shuffle button it confirmed
+// while errors appeared at the other end of the screen.
+function showToast(message, kind = 'info') {
+  (Toast[kind] || Toast.info)(String(message));   // 'error' → red, announced at once, stays 5 s
 }
+// The play queue ran dry because the next page could not be fetched — mobile
+// queues are view-backed too, and silence here reads as a crash.
+Player.on('queuestall', () => {
+  Toast.error('Couldn\u2019t load the next tracks \u2014 check the connection, then press Next.');
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 window.addEventListener('hashchange', () => {

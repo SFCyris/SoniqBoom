@@ -73,7 +73,23 @@ _PATH_EXTS = {"mp3", "flac", "wav", "ogg", "opus", "m4a", "aac"}
 
 # ── Signing secret ──────────────────────────────────────────────────────────
 
+_SECRET_CACHE: bytes | None = None
+_FALLBACK_SECRET = b"sb-cast-fallback-secret-do-not-use-in-prod-32b"
+
+
 def _server_secret() -> bytes:
+    """Cached: deriving the key is a 100k-iteration KDF (~11 ms) and every
+    token sign/verify needs it."""
+    global _SECRET_CACHE
+    if _SECRET_CACHE is not None:
+        return _SECRET_CACHE
+    key = _derive_server_secret()
+    if key != _FALLBACK_SECRET:          # never pin the early-boot fallback
+        _SECRET_CACHE = key
+    return key
+
+
+def _derive_server_secret() -> bytes:
     """Server-local HMAC key.
 
     Reuses the same machine-identity-derived key the credential store
@@ -93,7 +109,7 @@ def _server_secret() -> bytes:
         # Bootstrap-stage / very-early-boot only.  Tokens issued
         # under this key only work locally and don't survive any
         # cross-host migration — intentional.
-        return b"sb-cast-fallback-secret-do-not-use-in-prod-32b"
+        return _FALLBACK_SECRET
     except Exception:
         log.exception("cast_tokens: credential derivation failed unexpectedly")
         raise
@@ -233,13 +249,17 @@ def _replay_key(claims: dict[str, Any]) -> str:
     return f"{claims.get('uid','-')}:{claims.get('jti','-')}"
 
 
-def replay_ok(claims: dict[str, Any], remote_ip: str | None) -> bool:
+def replay_ok(claims: dict[str, Any], remote_ip: str | None, *, bind: bool = True) -> bool:
     """Return True if this (jti, ip) is the same IP that first claimed
     the token (or first claim ever).  Return False on cross-IP replay.
 
     Renderers that follow Range / pause-resume re-fetch the URL from
     the SAME IP — those calls are fine.  A different IP grabbing the
     URL is the threat we block.
+
+    ``bind=False`` checks without claiming: a HEAD probe from a DLNA control
+    point (a phone app that then tells the TV to play the link) must not tie
+    the link to the phone's IP and lock the TV's GET out.
     """
     if not claims.get("jti"):
         return True  # no nonce — best-effort (legacy)
@@ -248,6 +268,8 @@ def replay_ok(claims: dict[str, Any], remote_ip: str | None) -> bool:
     with _replay_lock:
         seen = _replay_lru.get(key)
         if seen is None:
+            if not bind:
+                return True
             _replay_lru[key] = ip
             # LRU eviction
             while len(_replay_lru) > _REPLAY_LRU_MAX:

@@ -125,6 +125,8 @@ def _cache_key(
     duration: int | None = None,
     codec: str | None = None,
     target_rate: int | None = None,
+    bitrate: int | None = None,
+    variant: str | None = None,
 ) -> str:
     """Build the cache key.  ``duration`` overrides the SID default so a
     HVSC-supplied per-tune length yields a distinct key — without this
@@ -135,7 +137,12 @@ def _cache_key(
     (typically ``settings.transcode_format`` — flac/mp3/ogg) and
     ``target_rate`` is an optional resample target.  Distinct codec or
     rate yields distinct entries so a user changing transcode_format from
-    flac to mp3 doesn't accidentally serve a stale flac WAV."""
+    flac to mp3 doesn't accidentally serve a stale flac WAV.  ``bitrate``
+    (a client's bitrate cap, kbps) and ``variant`` (a tag for a transcode of
+    a RENDERED WAV — which subsong / length it came from) also yield
+    distinct entries; both append nothing when unset, so existing keys are
+    unchanged.  For the subsong-carrying render types ``variant`` marks
+    another render of the same tune index (uade's subsong base)."""
     parts = [track_id]
     if format_type == "sid":
         parts.append(f"sub{subsong}")
@@ -172,12 +179,22 @@ def _cache_key(
         # them here fixes that at the cost of a one-time lazy re-render of
         # existing AdLib cache entries.
         parts.append(f"sub{subsong}")
+        if variant:
+            # A distinct render of the same tune index — uade modules whose
+            # subsongs are numbered from 1 (``b1``): an older key for that
+            # index holds the wrong tune.  Unset for everything else, so
+            # existing keys are unchanged.
+            parts.append(f"v{variant}")
     elif format_type == "transcoded":
         parts.append(f"c{codec or 'flac'}")
         # ar=0 means "preserve source sample rate" — distinct from a literal
         # 96 kHz target (used for DSD) so we never reuse a DSD-downsampled
         # 96 kHz FLAC when serving a native-rate ALAC source.
         parts.append(f"ar{int(target_rate or 0)}")
+        if bitrate:
+            parts.append(f"br{int(bitrate)}")
+        if variant:
+            parts.append(f"v{variant}")
     return "__".join(parts)
 
 
@@ -210,7 +227,8 @@ def sid_warm_eligible() -> bool:
     return True
 
 
-def _find_orphan_sidecar(track_id: str, subsong: int) -> Path | None:
+def _find_orphan_sidecar(track_id: str, subsong: int,
+                         uade_variant: str | None = None) -> Path | None:
     """Find a VU sidecar whose WAV is absent — evicted, never cached, or written
     ahead of the audio.
 
@@ -227,6 +245,11 @@ def _find_orphan_sidecar(track_id: str, subsong: int) -> Path | None:
     base = get_conversion_cache_dir()
     exact = f"{track_id}__sub{int(subsong)}"
     shard = track_id[:2]
+    if uade_variant:
+        # Only the variant's own sidecar is right for this tune — the plain
+        # ``__sub<N>`` one (or the glob below) could be another tune's.
+        p = base / "uade" / shard / f"{exact}__v{uade_variant}.vu"
+        return p if p.exists() else None
     for fmt in FORMAT_TYPES:
         d = base / fmt / shard
         if not d.is_dir():
@@ -242,7 +265,8 @@ def _find_orphan_sidecar(track_id: str, subsong: int) -> Path | None:
     return None
 
 
-def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
+def get_vu_sidecar_path(track_id: str, subsong: int = 0,
+                        uade_variant: str | None = None) -> Path | None:
     """Return the on-disk path to the VU sidecar for *track_id* at
     *subsong* (0-based wire index), or None if that subsong hasn't been
     rendered yet.
@@ -259,17 +283,21 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
     A miss (subsong never rendered) returns None → the endpoint attempts a
     lazy backfill for that subsong, else 404 → the frontend falls back to
     its FFT-spectrum visualiser.
+
+    ``uade_variant`` (a uade module whose tunes are numbered from 1, see
+    ``_cache_key``): the uade key is ``<track_id>__sub<N>__v<variant>``.
     """
     want = f"{track_id}__sub{int(subsong)}"
     want_sid_prefix = want + "__"      # SID keys append __dur{D}[+fidelity parts]
+    want_uade = f"{want}__v{uade_variant}" if uade_variant else want
     with _state_lock:
         for cache_key, entry in _meta.items():
             fmt = entry.get("format_type")
             if fmt in ("tracker", "uade"):
                 # tracker renders get VU from libopenmpt; uade renders from the
                 # Paula --write-audio dump (uade_vu.py).  Their keys are exactly
-                # "<track_id>__sub<N>" → match by equality.
-                if cache_key != want:
+                # "<track_id>__sub<N>" (uade: plus the variant) → equality.
+                if cache_key != (want_uade if fmt == "uade" else want):
                     continue
             elif fmt == "sid":
                 # SID renders get VU from 3 sidplayfp voice-isolation passes
@@ -287,7 +315,7 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0) -> Path | None:
     # No cached WAV to hang the sidecar off — but one may still exist on disk:
     # eviction now KEEPS sidecars, and the VU pass can write one before (or
     # without) the audio ever being cached.  Look it up by its deterministic path.
-    return _find_orphan_sidecar(track_id, subsong)
+    return _find_orphan_sidecar(track_id, subsong, uade_variant)
 
 
 def get_sid_wav_path_for_upload(track_id: str, subsong: int = 0) -> Path | None:
@@ -350,11 +378,18 @@ async def store_cached(
     cache_key: str,
     format_type: str,
     source_path: Path,
+    *,
+    cold: bool = False,
 ) -> Path:
     """Move a rendered temp WAV into the cache and register it.
 
     Uses os.replace() for atomic placement when possible, falling back to
     shutil.move() across filesystems.  Triggers LRU eviction if over quota.
+
+    ``cold``: a speculative render nobody has played yet (a duration probe)
+    — a NEW entry goes in at the eviction end of the LRU, so browsing never
+    pushes out renders people actually played.  Its first real read
+    (``get_cached``) moves it to the recent end like any other entry.
 
     Sidecar handling
     ----------------
@@ -390,6 +425,7 @@ async def store_cached(
 
     size_bytes = await asyncio.to_thread(_place_and_size)
     now = time.time()
+    _clear_render_failure(cache_key)
 
     with _state_lock:
         # Idempotent accounting: if this key already had an entry (e.g. two
@@ -412,7 +448,7 @@ async def store_cached(
             "created_at": now,
         }
         _lru[cache_key] = now
-        _lru.move_to_end(cache_key)
+        _lru.move_to_end(cache_key, last=not (cold and not prev))
         _total_bytes += size_bytes
 
     # Eviction may unlink several files; do it off the event loop.
@@ -627,7 +663,61 @@ def unpin(cache_key: str) -> int:
     return n
 
 
+# ── Recent render failures ──────────────────────────────────────────────────
+# key → (monotonic time, HTTP status, detail) of a render that just failed, so
+# /render-status can say "failed" (and why) for a while instead of "idle" —
+# the player then reports the server's reason instead of probing the stream
+# (which would only run the failing render again).  Cleared when a render of
+# the key starts or is stored; expires after _FAILURE_TTL_S; bounded.  Never a
+# negative cache: a new play of the tune always renders again.
+_recent_failures: "OrderedDict[str, tuple[float, int, str]]" = OrderedDict()
+_FAILURE_TTL_S = 60.0
+_FAILURE_MAX = 256
+
+
+def note_render_failure(cache_key: str, status: int, detail: str) -> None:
+    """Remember that the render of ``cache_key`` just failed (see above)."""
+    _recent_failures[cache_key] = (time.monotonic(), int(status), str(detail or ""))
+    _recent_failures.move_to_end(cache_key)
+    while len(_recent_failures) > _FAILURE_MAX:
+        _recent_failures.popitem(last=False)
+
+
+def _clear_render_failure(cache_key: str) -> None:
+    _recent_failures.pop(cache_key, None)
+
+
+def recent_failure(track_id: str, subsong: int | None = None) -> dict | None:
+    """``{"status", "detail"}`` of a render of ``track_id`` (its ``subsong``
+    when given — see ``key_matches``) that failed within ``_FAILURE_TTL_S``,
+    else None.  Expired entries are dropped on the way."""
+    now = time.monotonic()
+    found = None
+    for k, (t, status, detail) in list(_recent_failures.items()):
+        if now - t >= _FAILURE_TTL_S:
+            _recent_failures.pop(k, None)
+        elif found is None and key_matches(k, track_id, subsong):
+            found = {"status": status, "detail": detail}
+    return found
+
+
+def _note_failure_from(cache_key: str, exc: BaseException) -> None:
+    """Record ``exc`` as the render failure of ``cache_key`` — an HTTP error
+    with its status and detail, anything else as a 502.  A cancellation (a
+    client that left, a retired prewarm) is not a failure."""
+    if isinstance(exc, asyncio.CancelledError):
+        return
+    if isinstance(exc, HTTPException):
+        note_render_failure(cache_key, exc.status_code, exc.detail)
+    else:
+        note_render_failure(cache_key, 502, "The render failed")
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
+
+# How often a waiter whose render was cancelled (not failed) goes round again.
+_WAITER_REENTRIES = 2
+
 
 async def get_or_render(
     track_id: str,
@@ -638,6 +728,10 @@ async def get_or_render(
     duration: int | None = None,
     codec: str | None = None,
     target_rate: int | None = None,
+    bitrate: int | None = None,
+    variant: str | None = None,
+    *,
+    cold: bool = False,
 ) -> tuple[Path, bool]:
     """Look up cache; on miss, render and store.  Returns (path, cache_hit).
 
@@ -648,11 +742,14 @@ async def get_or_render(
     per-tune lengths produce distinct cache entries instead of colliding
     with the global-default render).  ``codec`` and ``target_rate`` are
     used by the ``transcoded`` format type so a DSD-as-96 kHz-FLAC entry
-    doesn't collide with an ALAC-as-source-rate-FLAC entry.
+    doesn't collide with an ALAC-as-source-rate-FLAC entry.  ``bitrate`` and
+    ``variant`` likewise separate transcodes (see ``_cache_key``).  ``cold``
+    registers a new render at the eviction end of the LRU (``store_cached``).
     """
     key = _cache_key(
         track_id, format_type, subsong, soundfont_path,
         duration=duration, codec=codec, target_rate=target_rate,
+        bitrate=bitrate, variant=variant,
     )
 
     # Fast path: cache hit without acquiring the per-key lock.
@@ -666,25 +763,28 @@ async def get_or_render(
     # arriving cold can't both decide "no one else is rendering" and both
     # kick off ffmpeg.
     lock = _lock_for(key)
-    is_renderer = False
-    async with lock:
-        # Re-check now we hold the lock — the cache may have filled while
-        # we awaited acquisition.
-        cached = await get_cached(key)
-        if cached:
-            _cstats.hit("conversion")
-            return cached, True
-        event = _inflight.get(key)
-        if event is None:
-            event = asyncio.Event()
-            _inflight[key] = event
-            is_renderer = True
-            # Cold path — this caller will actually render.  Count one miss
-            # per logical render (the waiters below served from cache are
-            # separate requests counted as hits when they wake).
-            _cstats.miss("conversion")
-
-    if not is_renderer:
+    reentries = 0
+    while True:
+        is_renderer = False
+        async with lock:
+            # Re-check now we hold the lock — the cache may have filled while
+            # we awaited acquisition.
+            cached = await get_cached(key)
+            if cached:
+                _cstats.hit("conversion")
+                return cached, True
+            event = _inflight.get(key)
+            if event is None:
+                event = asyncio.Event()
+                _inflight[key] = event
+                _clear_render_failure(key)
+                is_renderer = True
+                # Cold path — this caller will actually render.  Count one miss
+                # per logical render (the waiters below served from cache are
+                # separate requests counted as hits when they wake).
+                _cstats.miss("conversion")
+        if is_renderer:
+            break
         # Another coroutine is already rendering — wait for its event and
         # serve from cache when it completes.
         await event.wait()
@@ -692,12 +792,16 @@ async def get_or_render(
         if cached:
             _cstats.hit("conversion")
             return cached, True
-        # The renderer failed (event set without storing).  We don't retry
-        # — surface the error to the caller so the original render's
-        # HTTPException propagates as expected.
-        raise HTTPException(
-            502, "Cache fill failed in a concurrent render — try again",
-        )
+        # Event set with nothing stored.  A FAILED render recorded why
+        # (``_recent_failures``, cleared when it started): surface it, don't
+        # retry.  No record means it was cancelled (a prewarm retired for a
+        # progressive play of the same tune) — go round again: attach to the
+        # render that replaced it, or render ourselves.  Bounded.
+        if key in _recent_failures or reentries >= _WAITER_REENTRIES:
+            raise HTTPException(
+                502, "Cache fill failed in a concurrent render — try again",
+            )
+        reentries += 1
 
     # Run the render + store in a DETACHED, shield-protected task so a client
     # disconnect (which cancels THIS caller) doesn't abort a mostly-done render.
@@ -711,7 +815,10 @@ async def get_or_render(
     async def _render_and_store() -> Path:
         try:
             tmp_path = await render_fn()
-            return await store_cached(key, format_type, tmp_path)
+            return await store_cached(key, format_type, tmp_path, cold=cold)
+        except BaseException as exc:
+            _note_failure_from(key, exc)
+            raise
         finally:
             event.set()
             _inflight.pop(key, None)
@@ -805,11 +912,13 @@ async def start_background_render(
     async def _do():
         event = asyncio.Event()
         _inflight[cache_key] = event
+        _clear_render_failure(cache_key)
         try:
             tmp_path = await render_fn()
             await store_cached(cache_key, format_type, tmp_path)
             log.info("Background render complete: %s", cache_key)
         except Exception as exc:
+            _note_failure_from(cache_key, exc)
             log.error("Background render failed for %s: %s", cache_key, exc)
         finally:
             event.set()
@@ -821,6 +930,58 @@ async def start_background_render(
     _bg_render_strong.add(task)
     _bg_renders[cache_key] = task
     task.add_done_callback(_bg_render_strong.discard)
+
+
+def inflight_event(cache_key: str) -> "asyncio.Event | None":
+    """The Event a render in progress for ``cache_key`` sets when it finishes
+    (stored or failed), or ``None`` when nothing is rendering that key.
+
+    Lets a caller ATTACH to a render someone else started without ever
+    starting one itself (the waveform endpoint: it must never own a render —
+    it is aborted on every track change, and a render it owned could be
+    prepared differently from the audio request's)."""
+    return _inflight.get(cache_key)
+
+
+def key_matches(key: str, track_id: str, subsong: int | None = None) -> bool:
+    """Does cache key ``key`` belong to ``track_id`` (and, when given, to its
+    ``subsong``)?
+
+    Keys start with ``<track_id>__`` (see ``_cache_key``).  Formats that carry
+    subsongs key them as the next segment (``<id>__sub<N>`` — uade/tracker/…
+    exactly, SID with a ``__dur…`` tail), so ``sub1`` must not match ``sub10``;
+    keys whose next segment is not ``sub…`` (MIDI, transcodes, PSF) have no
+    subsong and match any.  ``subsong=None`` matches every key of the track."""
+    if key == track_id:
+        return True
+    prefix = f"{track_id}__"
+    if not key.startswith(prefix):
+        return False
+    if subsong is None:
+        return True
+    rest = key[len(prefix):]
+    if not rest.startswith("sub"):
+        return True
+    want = f"sub{int(subsong)}"
+    return rest == want or rest.startswith(want + "__")
+
+
+def render_state(track_id: str, subsong: int | None = None) -> str:
+    """Coarse render state of any cached render of ``track_id`` (of one
+    ``subsong`` when given — see ``key_matches``):
+    ``"rendering"`` (a render or background render is under way),
+    ``"complete"`` (a rendered WAV is cached) or ``"idle"``.
+
+    The in-flight maps are tiny and the metadata map is a few thousand
+    entries, so a prefix scan per status poll is cheap."""
+    for k in list(_inflight) + list(_bg_renders.keys()):
+        if key_matches(k, track_id, subsong):
+            return "rendering"
+    with _state_lock:
+        for k in _meta:
+            if key_matches(k, track_id, subsong):
+                return "complete"
+    return "idle"
 
 
 async def is_cache_ready(cache_key: str) -> bool:
@@ -860,18 +1021,95 @@ async def cache_stats() -> dict:
         }
 
 
+def rendered_transcode_variant(source_key: str) -> str:
+    """The ``variant`` of a transcode made from the rendered WAV cached under
+    ``source_key`` (see ``stream._serve_rendered``): a render's transcodes are
+    keyed on the render's own key, so subsongs / SID lengths never share one."""
+    return hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:10]
+
+
+# Renders whose ``sub<N>`` (N > 0) used to hold the wrong tune: SID / SNDH /
+# SC68 renderers read the 0-based wire index as their 1-based track number, so
+# ``sub1`` held tune 1 (the tune ``sub0`` plays by default) instead of tune 2;
+# and for a file whose default tune isn't tune 1, wire ``start-1`` now plays
+# tune 1 (``stream.sid_wire_tune``).  Their keys are unchanged by the fix, so a
+# cache directory written before it is swept once — the WAVs, their VU
+# sidecars and the transcodes made from them — and then carries this marker.
+_SUBSONG_BASE_FORMATS = ("sid", "sndh", "sc68")
+_SUBSONG_BASE_MARKER = ".subsong-wire-index-v3"
+
+
+def _stale_subsong_key(key: str) -> bool:
+    """Is ``key`` (a cache file's stem) ``<track_id>__sub<N>[__…]`` with N > 0?"""
+    parts = key.split("__")
+    if len(parts) < 2 or not parts[1].startswith("sub"):
+        return False
+    try:
+        return int(parts[1][3:]) > 0
+    except ValueError:
+        return False
+
+
+def _sweep_stale_subsong_renders(base: Path) -> int:
+    """One-time sweep of the pre-fix multi-tune renders (see
+    ``_SUBSONG_BASE_MARKER``) — before warmup adopts anything, so none of them
+    is ever served.  Idempotent; returns the number of files removed.  The
+    marker is written only after a complete sweep, so an interrupted one
+    simply runs again on the next start."""
+    marker = base / _SUBSONG_BASE_MARKER
+    if marker.exists():
+        return 0
+    removed = 0
+    stale_variants: set[str] = set()
+    for fmt in _SUBSONG_BASE_FORMATS:
+        sub = base / fmt
+        if not sub.is_dir():
+            continue
+        for f in sub.rglob("*"):
+            if f.suffix not in (".wav", ".vu") or not _stale_subsong_key(f.stem):
+                continue
+            if f.suffix == ".wav":
+                stale_variants.add(rendered_transcode_variant(f.stem))
+            try:
+                f.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    tdir = base / "transcoded"
+    if stale_variants and tdir.is_dir():
+        for f in tdir.rglob("*.wav"):
+            _, sep, tail = f.stem.rpartition("__v")
+            if sep and tail in stale_variants:
+                try:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+    try:
+        marker.write_text("sub<N> = wire index N (stream.sid_wire_tune)\n")
+    except OSError:
+        log.warning("Conversion cache: could not write %s", marker)
+    if removed:
+        log.info("Conversion cache: removed %d pre-fix multi-tune SID/SNDH/SC68 "
+                 "render file(s)", removed)
+    return removed
+
+
 def warmup_from_disk() -> int:
     """Rebuild ``_meta`` / ``_lru`` / ``_total_bytes`` from on-disk WAVs.
 
     The cache state is in-memory; without this, every server restart leaves
     previously-rendered WAVs orphaned on disk, so the next play re-renders
-    even though the file already exists.  Run once at startup.
+    even though the file already exists.  Run once at startup.  Renders from
+    before the multi-tune index fix are swept first (once per cache dir —
+    ``_sweep_stale_subsong_renders``).
 
     Returns the number of entries adopted."""
     global _total_bytes
     base = get_conversion_cache_dir()
     if not base.exists():
         return 0
+    _sweep_stale_subsong_renders(base)
     adopted = 0
     with _state_lock:
         for fmt in FORMAT_TYPES:
@@ -940,23 +1178,24 @@ async def purge_sid_entries_for(
             keep[tid] = {int(v)}
         else:
             keep[tid] = {int(x) for x in v if isinstance(x, (int, float))}
-    prefixes = {tid: f"{tid}__sub" for tid in track_ids}
+    # One pass over the cache keys, each parsed once (``<tid>__sub…``) —
+    # not every key against every id.
+    ids = set(track_ids)
     victims: list[str] = []
     with _state_lock:
         for key in list(_meta.keys()):
-            for tid, prefix in prefixes.items():
-                if not key.startswith(prefix):
-                    continue
-                # Preserve entries whose embedded duration is still valid.
-                if tid in keep:
-                    try:
-                        dur_str = key.rsplit("__dur", 1)[-1]
-                        if int(dur_str) in keep[tid]:
-                            break  # keep this entry; stop matching tids
-                    except (ValueError, IndexError):
-                        pass
-                victims.append(key)
-                break
+            tid, sep, _rest = key.partition("__sub")
+            if not sep or tid not in ids:
+                continue
+            # Preserve entries whose embedded duration is still valid.
+            if tid in keep:
+                try:
+                    dur_str = key.rsplit("__dur", 1)[-1]
+                    if int(dur_str) in keep[tid]:
+                        continue  # keep this entry
+                except (ValueError, IndexError):
+                    pass
+            victims.append(key)
     for key in victims:
         await asyncio.to_thread(_purge_entry, key)
     return len(victims)

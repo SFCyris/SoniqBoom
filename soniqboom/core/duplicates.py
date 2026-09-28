@@ -23,6 +23,7 @@ Format quality hierarchy (higher = better):
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import unicodedata
 from typing import Any
@@ -100,6 +101,8 @@ def _duration_bucket(duration: float) -> int:
     typically differ by at most 1–2 seconds (codec padding, etc.).
     A 5-second bucket handles this reliably.
     """
+    if not math.isfinite(duration):
+        return 0                       # NaN / inf from a broken probe: never raise
     return int(duration // 5)
 
 
@@ -113,6 +116,22 @@ def _group_key(title: str, artist: str, duration: float) -> str:
     norm_artist = _normalise(artist)
     bucket      = _duration_bucket(duration)
     return f"{norm_title}|{norm_artist}|{bucket}"
+
+
+def group_key_for(t: dict[str, Any]) -> str:
+    """The duplicate-group key of a track dict, or ``""`` for an untitled track
+    (never grouped).  The single definition both the full pass and the
+    scanner's incremental re-grouping use."""
+    title = t.get("title", "")
+    if not _normalise(title):
+        return ""
+    artist = t.get("artist") or t.get("album_artist") or ""
+    return _group_key(title, artist, float(t.get("duration", 0) or 0))
+
+
+def key_duration_bucket(key: str) -> int:
+    """The 5-second duration bucket a (non-empty) group key was built with."""
+    return int(key.rsplit("|", 1)[1])
 
 
 def _group_id(key: str) -> str:
@@ -149,21 +168,11 @@ def compute_duplicate_groups(
     key_for_track: dict[str, str] = {}  # track_id → group_key
 
     for t in tracks:
-        tid      = t.get("id", "")
-        title    = t.get("title", "")
-        artist   = t.get("artist") or t.get("album_artist") or ""
-        duration = float(t.get("duration", 0) or 0)
-        fmt      = t.get("format", "")
-        bitrate  = t.get("bitrate")
-
-        # Skip tracks with no title (untagged files)
-        if not _normalise(title):
-            key_for_track[tid] = ""
-            continue
-
-        key = _group_key(title, artist, duration)
+        tid = t.get("id", "")
+        key = group_key_for(t)           # "" = untitled (untagged file): never grouped
         key_for_track[tid] = key
-        groups.setdefault(key, []).append(t)
+        if key:
+            groups.setdefault(key, []).append(t)
 
     # Step 2: for each group, score formats and pick primary.  Hoist the
     # ``_pick_primary`` + best-score computation out of the per-track loop
@@ -216,12 +225,14 @@ def compute_duplicate_groups(
 def _pick_primary(group: list[dict]) -> dict:
     """Among a group of duplicate tracks, pick the best one as primary.
 
-    Tie-breaking order: highest format_score → highest bitrate → earliest added.
+    Tie-breaking order: highest format_score → highest bitrate → earliest added
+    → track id (a total order: the pick never depends on the order the group's
+    tracks were listed in, so the full and the incremental pass agree).
     """
     def _sort_key(t: dict) -> tuple:
         score   = format_quality_score(t.get("format", ""), t.get("bitrate"))
         bitrate = t.get("bitrate") or 0
         added   = t.get("added_at") or 0
-        return (-score, -bitrate, added)  # negative for descending
+        return (-score, -bitrate, added, t.get("id") or "")  # negative for descending
 
     return sorted(group, key=_sort_key)[0]

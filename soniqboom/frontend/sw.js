@@ -636,7 +636,96 @@
 // v199: settings-toggle QA fixes — removed the inert "hide empty folders" toggle;
 // use-folder-art now busts art (art_refresh WS event) on change so it's live.
 // Bump re-fetches app.js + admin.js + index.html.
-const SHELL_VERSION = 'v199';   // v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v200: shuffle covers the WHOLE result set (server-side seeded order paged by a
+// small self-extending play queue) instead of random-picking inside the loaded
+// window; sequential play continues past the window; shuffle button follows the
+// player's state.  Bump re-fetches player.js + library.js + app.js + search.js +
+// the mobile shell.
+// v201: mobile Buffering…/Converting… pill no longer sits on Now Playing's
+// transport row swallowing the taps meant for shuffle/repeat — on that view it
+// docks under the top bar and its body passes taps through; Cancel × stays
+// tappable (mobile.css).  mobile.html's mobile.css?v=14 is what fetches the new
+// sheet (versioned assets are cache-first per URL); the bump reaps the old cache.
+// v202: first play of cold Amiga / rendered tracks (waits for the render
+// instead of failing, earlier next-track prewarm, waveform re-ask), game:
+// search operator, album-source note in track info, new Settings toggles.
+// index.html app.js?v=169 and mobile.html mobile/app.js?v=16 fetch the new
+// entry points; the bump reaps the old cache.
+// v203: rendered-track UX round — the badge × really cancels the start ("Cancel
+// rendering"), render recovery resumes where playback was and names the server's
+// reason on failure, prewarm / render-status carry the subsong, an unknown-length
+// render moves onto the finished file for an exact length; waveform re-asks stop
+// on a failed track, the Amiga VU poll stops when none is coming; Settings: ⓘ no
+// longer flips its checkbox, tips read by screen readers, server toggles save on
+// change in their own sections (Playback preparation, Subsonic), Subsonic app
+// password + API keys in My Account / Preferences, "Read game names" on the
+// Metadata tab, viz options in Preferences, unmounted drives marked; search box
+// readonly only in Edge.  index.html app.js?v=170 + app.css?v=99, mobile.html
+// mobile/app.js?v=17.
+// v204: rendered-track round 2 — an unknown-length render's provisional header
+// never shows as the length or lands on the library row (subsongs and long
+// tunes included), a tune's waveform is that tune's, prewarms carry a per-page
+// tag; Amiga VU pass asked for only after 3 s of play, "meters loading…" label
+// while one may come; clickable search operator chips (game:), library view
+// refreshes after an album toggle / "Read game names", guessed-album note,
+// Enter activates a keyboard-focused button (the global "play focused track"
+// shortcut no longer swallows it; J/K releases a clicked button's focus),
+// Settings copy (Subsonic token sign-in, folder albums on, Metadata guesses).
+// index.html app.js?v=171 + app.css?v=100, mobile.html mobile/app.js?v=18.
+// v205: round 3 — Track Info's tune list labels, plays and orders tunes by
+// number when a file's default tune is not tune 1 (the in-browser SID worker
+// renders the same tune, vu-sid-worker.js?v=5); a failed render names the
+// server's reason without a probe; a stale stored length is corrected once
+// the render completes; "–:––" for an unknown length; queue sync across
+// devices (offer to resume, per-browser toggle); Player.on() reaches every
+// event (waveform refresh after a transcode, history refresh, in-browser SID
+// meters were never delivered); search: Escape keeps the query, Enter no
+// longer reopens the preview, combobox/listbox semantics; Settings: control
+// names without "Info", tips flip below near the top, neutral "Saving…",
+// focus kept after the badge × and "Generate new password", listeners no
+// longer sent to the sign-in screen by the repair-status sync; Modland /
+// Demozoo apply refresh the open view; mobile mini-player shows on the first
+// play; Amiga VU re-asks within the server's 20 s window.  index.html
+// app.js?v=172 + app.css?v=101, mobile.html mobile/app.js?v=19.
+// v206: the "Resume the queue from …?" offer's buttons are tappable on the
+// phone (mobile.css let no toast take a tap); the queue-sync setting hides in
+// an already-open Settings / Preferences / mobile Settings once the server
+// turns out to keep no queue.  index.html app.js?v=173, mobile.html
+// mobile/app.js?v=20 + mobile.css?v=15.
+// v207: round 4 — the "Resume the queue from …?" offer waits while hovered or
+// focused, closes on Escape and gives focus back, goes once anything plays,
+// stays reachable as a Resume row in the Queue panel (desktop + phone), and
+// names the browser ("SoniqBoom Web · Firefox on Mac", "another browser");
+// a restored / resumed queue shows its track and position in the player bar,
+// the phone's mini player and Now Playing before Play; failure toasts keep the
+// server's format name; in-browser SID uploads name the tune they hold
+// (vu-sid-worker.js?v=6); the spectrum label says why meters are missing (off
+// / not on this server / not for this tune); an empty API-key list is no list;
+// group views, drills and searches refresh in place after an admin tag change;
+// the phone's mini player gives the cast button its own column (it wrapped and
+// pushed the progress bar out of sight) and a tap on it no longer also opens
+// Now Playing.  index.html app.js?v=174 + app.css?v=102, mobile.html
+// mobile/app.js?v=21 + mobile.css?v=16.
+// v208: Metadata → Game names hint says network shares are read after their
+// next completed scan (index.html only).
+// v209: Track Info Game row (source note, Game in both editors, clearing it
+// removes the GAME tag); Metadata → Game names: network-share option, Cancel,
+// follows a run already going; the Garbled repair waits for a game-name run.
+// v210: Track Info shows a game's other names ("also …"); Garbled-repair error
+// examples are escaped; the game-names 409 shows the server's reason.
+// v211: the Folders view's empty-branch message escapes the folder name.
+// v213: a Track Info save (tags / info / year) updates the track's row in
+// the open view in place (library.js patchTrack via a soniqboom:track-edited
+// event).  index.html app.js?v=175.
+// v214: Metadata → Game names from archive names (toggle, TOSEC / Redump
+// downloads); Track Info names the archive as a game's source.
+// v215: the game-names status line follows the toggle and a running pass.
+// v216: the status line says when a pass waits for a scan (aria-busy while it
+// polls) and when Redump systems could not be fetched.
+// v217: TOSEC / Redump downloaded files are kept — "Add … from the downloaded
+// pack/lists", "Continue the … download", "Delete the downloaded …", a Stop
+// button; a stopped download shows as stopped; polling survives a restart.
+const SHELL_VERSION = 'v217';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.

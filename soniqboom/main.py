@@ -10,6 +10,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from soniqboom import __version__
 from soniqboom.api import art, artist, cast, fstree, library, multiroom, playlist, search, smart, stream, subsonic, tracks, users as users_api
 from soniqboom.config import settings, get_data_dir, _CONF_PATH
+from soniqboom.core import forksafe
 from soniqboom.plugins import load_all
 from soniqboom.plugins.base import registry
 
@@ -80,6 +82,16 @@ def _find_docs_dir() -> Path:
 
 DOCS_DIR = _find_docs_dir()
 
+# ── Interpreter tuning ────────────────────────────────────────────────────────
+# The event loop shares the GIL with every ``asyncio.to_thread`` worker.  With
+# CPython's default 5 ms switch interval a pure-Python job in a worker (the
+# shuffle-order sort, a big JSON build) holds the loop's median tick at ~15 ms and
+# opens 100–600 ms holes under concurrency; at 0.5 ms the loop's p95 lag measured
+# 1.8 ms (synthetic 263 K-track store).  Cost: ~+4–6 % on CPU-bound work that runs
+# in several threads at once; blocking pipe reads got ~8× more responsive.  Streams,
+# art and list chunks all ride this loop — latency there beats raw throughput.
+sys.setswitchinterval(0.0005)
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -108,13 +120,23 @@ app = FastAPI(
 # CPU + latency and breaks Range without giving up any meaningful bytes.
 _GZIP_SKIP_PREFIXES = (
     "/api/stream",
-    "/api/rest/stream",
-    "/api/rest/download",
-    "/api/rest/getCoverArt",
+    # Subsonic is mounted at /rest (not /api/rest): audio, art and the radio
+    # relay must never be gzipped — it breaks Range and stalls live streams.
+    "/rest/stream",
+    "/rest/download",
+    "/rest/getCoverArt",
+    "/rest/getAvatar",
+    "/rest/getTranscodeStream",
+    "/rest/radioStream",
+    "/rest/hls",
     "/api/art",
     # Live radio relay — an infinite audio stream; gzip buffering would
     # stall it and the bytes are already compressed audio.
     "/api/stations/relay",
+    # The anonymous Cast / DLNA / AirPlay byte server (/cast/{token}/{file}):
+    # ranged audio a renderer seeks in — never gzipped.  (The /api/cast JSON
+    # control API is a different prefix and stays compressible.)
+    "/cast/",
 )
 
 
@@ -161,7 +183,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_origins=_extra_cors,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -300,6 +322,77 @@ async def watchdog_track(request: Request, call_next):
         deadlock_watchdog.end_request(token)
 
 
+class _SubsonicCORSMiddleware:
+    """Open CORS for the Subsonic API (``/rest``) only.
+
+    Browser-based Subsonic clients (Airsonic-refix, Feishin web …) run on
+    their own origin and call ``/rest/*`` with credentials in the query
+    string / headers, so the app-wide localhost-only CORS policy blocked
+    them.  For ``/rest`` requests that carry an ``Origin``: a preflight is
+    answered here with 204; every other response gets
+    ``Access-Control-Allow-Origin: *`` (never ``Allow-Credentials``, so a
+    cookie-authenticated response stays unreadable cross-origin) plus the
+    headers range-seeking players need to read.  ``/api``, ``/ws`` and the
+    SPA keep the localhost-only policy.  Registered LAST, so it is the
+    outermost layer.  ``SONIQBOOM_SUBSONIC_CORS=0`` turns it off."""
+
+    _EXPOSE = b"Content-Length, Content-Range, Accept-Ranges, Content-Type"
+    _ALLOW_METHODS = b"GET, POST, HEAD, OPTIONS"
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.enabled = os.environ.get("SONIQBOOM_SUBSONIC_CORS", "1").strip().lower() \
+            not in ("0", "false", "no", "off")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if not (self.enabled and (path == "/rest" or path.startswith("/rest/"))):
+            await self.app(scope, receive, send)
+            return
+        origin = req_method = req_headers = None
+        for k, v in scope.get("headers") or ():
+            if k == b"origin":
+                origin = v
+            elif k == b"access-control-request-method":
+                req_method = v
+            elif k == b"access-control-request-headers":
+                req_headers = v
+        if origin is None:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("method") == "OPTIONS" and req_method is not None:
+            allow_headers = b"*"
+            if req_headers and len(req_headers) <= 1024 and all(
+                    c in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_, "
+                    for c in req_headers):
+                allow_headers = req_headers
+            await send({"type": "http.response.start", "status": 204, "headers": [
+                (b"access-control-allow-origin", b"*"),
+                (b"access-control-allow-methods", self._ALLOW_METHODS),
+                (b"access-control-allow-headers", allow_headers),
+                (b"access-control-max-age", b"600"),
+                (b"content-length", b"0"),
+            ]})
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        async def _send(message) -> None:
+            if message["type"] == "http.response.start":
+                hdrs = [(k, v) for k, v in message.get("headers") or ()
+                        if k.lower() not in (b"access-control-allow-origin",
+                                             b"access-control-allow-credentials",
+                                             b"access-control-expose-headers")]
+                hdrs.append((b"access-control-allow-origin", b"*"))
+                hdrs.append((b"access-control-expose-headers", self._EXPOSE))
+                message = {**message, "headers": hdrs}
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
+app.add_middleware(_SubsonicCORSMiddleware)
+
+
 # ── API routes ────────────────────────────────────────────────────────────────
 
 app.include_router(tracks.router,    prefix="/api")
@@ -347,7 +440,7 @@ else:
     @app.post("/api/cast/{rest:path}", include_in_schema=False)
     async def _cast_disabled(rest: str = ""):
         raise HTTPException(404, "Cast service is disabled — enable it in Settings → Services.")
-    @app.get("/cast/{rest:path}", include_in_schema=False)
+    @app.api_route("/cast/{rest:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def _cast_stream_disabled(rest: str = ""):
         # Mirrors the disabled-service handler so a stale signed URL
         # produces a clean 404 instead of falling through to the SPA.
@@ -411,7 +504,7 @@ async def _subsonic_validation_handler(request: Request, exc: _ReqValErr):
             msg = f"Required parameter '{pname}' is missing or invalid."
         except Exception:
             msg = "A required parameter is missing or invalid."
-        return subsonic._err(10, msg, fmt=fmt)
+        return subsonic._maybe_jsonp(request, subsonic._err(10, msg, fmt=fmt))
     return await _default_val_handler(request, exc)
 
 
@@ -574,8 +667,15 @@ async def ui_config():
 
 _aof_writer = None
 _merger_proc = None
+_run_epoch = 0                  # this server run (scanner.begin_run)
+_reap_later_task = None
 _health_task = None
 _cast_reaper_task = None
+# Seconds after startup before the one-time upgrade enrichment is scheduled
+# (scanner.schedule_startup_enrichment).
+_STARTUP_ENRICHMENT_DELAY_S = 30.0
+_STARTUP_RECONCILE_DELAY_S = 180.0
+_reconcile_handle: "asyncio.TimerHandle | None" = None
 
 
 def _setup_logging(data_dir: Path) -> None:
@@ -649,7 +749,162 @@ def _install_sighup_handler() -> None:
         pass
 
 
-def _reap_orphaned_forkservers() -> int:
+def _proc_cmdline(pid: int) -> str:
+    """``procinfo.cmdline`` (a process's command line, read without forking)."""
+    from soniqboom.core import procinfo
+    return procinfo.cmdline(pid)
+
+
+def _is_our_forkserver_child(pid: int) -> bool:
+    """``procinfo.is_our_forkserver_child``."""
+    from soniqboom.core import procinfo
+    return procinfo.is_our_forkserver_child(pid)
+
+
+def _orphan_tree_targets(procs: "dict[int, tuple[int, str]]", me: int,
+                         own_leftovers: bool = False) -> list[int]:
+    """The processes ``_reap_orphaned_forkservers`` kills, from ``{pid: (ppid,
+    command line)}``: every SoniqBoom forkserver whose parent is gone (PPID
+    1) — its command line (and, forked from it, its workers' and the
+    merger's) carries the preload ``['soniqboom']`` and the app's sys_path
+    (``scanner.prepare_worker_forkserver``) — and every process below it.  A
+    forkserver whose parent lives belongs to that process and is left
+    alone, as is everything else."""
+    def _ours(cmd: str) -> bool:
+        return "multiprocessing.forkserver" in cmd and (
+            "SoniqBoom" in cmd or "'soniqboom'" in cmd)
+
+    parents = (1, me) if own_leftovers else (1,)
+    roots = [pid for pid, (ppid, cmd) in procs.items()
+             if pid != me and ppid in parents and _ours(cmd)]
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _cmd) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+    targets: list[int] = []
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        if pid == me or pid in targets:
+            continue
+        targets.append(pid)
+        stack.extend(children.get(pid, ()))
+    return targets
+
+
+_started_in_this_image = False
+
+# The thread whose server run holds this process's server state (the store,
+# the scan pools and their run epoch, the AOF writer, the merger, downloads —
+# all process-wide): one run at a time (``_claim_server``).
+_server_owner: "threading.Thread | None" = None
+_server_owner_lock = threading.Lock()
+
+
+def _claim_server() -> None:
+    """A server run starts in this thread — refused (``RuntimeError``, before
+    anything is touched) while another thread's run is still on: a second
+    start in the same process (the bundled app's Start clicked again during a
+    start-up) would take over the running server's state, and its stop would
+    stop that server's scans.  A run whose thread ended without its shutdown
+    (a failed start-up) no longer counts."""
+    global _server_owner
+    me = threading.current_thread()
+    with _server_owner_lock:
+        owner = _server_owner
+        if owner is not None and owner is not me and owner.is_alive():
+            raise RuntimeError(f"a SoniqBoom server already runs in this process "
+                               f"(thread {owner.name}) — this one is not started")
+        _server_owner = me
+
+
+def _owns_server() -> bool:
+    """This thread's server run holds the server state (``_claim_server``)."""
+    return _server_owner is threading.current_thread()
+
+
+def _release_server() -> None:
+    global _server_owner
+    with _server_owner_lock:
+        if _server_owner is threading.current_thread():
+            _server_owner = None
+
+
+# Shutdown steps whose to_thread job writes the library's files: one that
+# timed out may still be writing (``_release_thread_pool``).
+_WRITING_STEPS = frozenset({"aof-flush", "snapshot", "browse-cache", "remote-freshness", "merger"})
+
+
+# The server run's thread pool (``asyncio.to_thread`` / ``run_in_executor``),
+# set as the loop's default at start-up so the stop can see its jobs on both
+# loops (uvloop keeps its own default executor private).
+_thread_pool = None
+# How long a stop the process exits after (the bundled app's Quit or a
+# signal: its exit kills running threads) lets the pool's running jobs — a tag
+# or lyrics write, a playlist save — finish.  Set by the app before that stop.
+_POOL_GRACE_S = 5.0
+_process_exiting = False
+
+
+def _install_thread_pool() -> None:
+    global _thread_pool
+    from concurrent.futures import ThreadPoolExecutor
+    _thread_pool = ThreadPoolExecutor(thread_name_prefix="sb-pool")
+    asyncio.get_running_loop().set_default_executor(_thread_pool)
+
+
+async def _release_thread_pool(results: dict) -> bool:
+    """At the end of the stop: the loop gets a fresh thread pool FIRST (a
+    task still ending can go on using ``asyncio.to_thread``), then the run's
+    pool is shut down (queued jobs cancelled) without waiting for its running
+    jobs — the loop's close (``asyncio.Runner``, uvloop alike) would otherwise
+    wait up to 300 s for a job stuck on a share that stopped answering (a
+    folder listing, a stat, the scan's walk), and the bundled app waits for
+    this server's thread before it starts the server again.  Such a job goes
+    on until the share answers; its result is dropped.  When the process
+    exits after this stop (``_process_exiting``: the app's Quit or a signal —
+    its exit kills running threads) the running jobs get ``_POOL_GRACE_S`` to
+    finish (a tag write).  (A command-line server's exit waits for pool
+    threads by itself.)  Not released when one of the stop's own writing
+    steps timed out or failed (``_WRITING_STEPS``): its job may still write,
+    and the close waits for it as before.  (A merge of this run still running
+    can't overlap the next run's load either: ``persistence.library_files_lock``.)
+    True when released."""
+    late = sorted(k for k, v in results.items() if v in ("TIMEOUT", "FAIL") and k in _WRITING_STEPS)
+    if late:
+        log.warning("Shutdown: waiting for %s to finish before the server's thread ends", ", ".join(late))
+        return False
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(thread_name_prefix="sb-after-stop"))
+    pool = _thread_pool
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+        if _process_exiting:
+            deadline = time.monotonic() + _POOL_GRACE_S
+            while (any(t.is_alive() for t in list(getattr(pool, "_threads", ())))
+                   and time.monotonic() < deadline):
+                await asyncio.sleep(0.05)
+        busy = sum(t.is_alive() for t in list(getattr(pool, "_threads", ())))
+        if busy:
+            log.warning("Shutdown: %d thread-pool job(s) still running (a share that doesn't "
+                        "answer?) — not waited for", busy)
+    return True
+
+
+def _reap_at_start() -> int:
+    """The orphan reaper (``_reap_orphaned_forkservers``) at a start.  It
+    runs at every start — it doesn't fork (``forksafe``) — and the first
+    start of this process image also takes the SoniqBoom forkservers that
+    are this process's own children: a restart by ``os.execv`` keeps the
+    pid, so the image before it left them here, parent still "alive".
+    Later starts in the same image (the bundled app's Stop/Start/Restart)
+    leave this process's own forkserver alone — it is kept and reused."""
+    global _started_in_this_image
+    first = not _started_in_this_image
+    _started_in_this_image = True
+    return _reap_orphaned_forkservers(own_leftovers=first)
+
+
+def _reap_orphaned_forkservers(own_leftovers: bool = False) -> int:
     """Kill multiprocessing.forkserver children left over from a
     previously-killed soniqboom instance.
 
@@ -678,52 +933,42 @@ def _reap_orphaned_forkservers() -> int:
 
     Returns the number of processes signalled.  Silent on permission
     errors (signalling someone else's process) since we filter to
-    matching-cmdline-only.
+    matching-cmdline-only.  ``ps`` runs through ``forksafe`` (posix_spawn —
+    this server must not fork once it used the network).  With
+    ``own_leftovers``, this process's own SoniqBoom forkservers are taken
+    too (``_reap_at_start``).
     """
-    import subprocess
+    from soniqboom.core import forksafe
     me = os.getpid()
     try:
-        out = subprocess.run(
-            ["pgrep", "-f", "multiprocessing.forkserver.*SoniqBoom"],
-            capture_output=True, text=True, timeout=3,
-        )
+        out = forksafe.run(["ps", "-A", "-o", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=3).stdout
     except Exception:
         return 0
-    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    procs: dict[int, tuple[int, str]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+
+    targets = _orphan_tree_targets(procs, me, own_leftovers=own_leftovers)
     reaped = 0
-    for pid in pids:
-        if pid == me:
-            continue
-        # Look up the parent.  Only orphans (PPID==1) are safe to kill
-        # — a forkserver with a live non-1 parent belongs to that
-        # process and we shouldn't touch it.
-        try:
-            ppid_str = subprocess.run(
-                ["ps", "-o", "ppid=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=1,
-            ).stdout.strip()
-            ppid = int(ppid_str or 0)
-        except (subprocess.SubprocessError, ValueError):
-            continue
-        if ppid != 1:
-            continue
+    for pid in targets:
         try:
             os.kill(pid, signal.SIGTERM)
             reaped += 1
-            log.info("reap: SIGTERM orphaned forkserver pid=%d", pid)
+            log.info("reap: SIGTERM orphaned forkserver-tree pid=%d", pid)
         except OSError:
             pass
     # Give them a beat to exit cleanly, then SIGKILL the survivors.
     if reaped:
         import time as _t
         _t.sleep(0.5)
-        for pid in pids:
-            if pid == me:
-                continue
+        for pid in targets:
             try:
                 os.kill(pid, 0)  # check alive
                 os.kill(pid, signal.SIGKILL)
-                log.info("reap: SIGKILL stubborn forkserver pid=%d", pid)
+                log.info("reap: SIGKILL stubborn forkserver-tree pid=%d", pid)
             except OSError:
                 pass  # already dead — good
     return reaped
@@ -733,11 +978,33 @@ def _reap_orphaned_forkservers() -> int:
 # asyncio may garbage-collect a bare create_task() mid-flight (CPython docs).
 _BG_TASKS: "set" = set()
 
+# Seconds after startup the Subsonic catalogue prewarm starts — past the
+# startup phases, so it never competes with them.
+_SUBSONIC_PREWARM_DELAY_SEC = 5.0
+
+
+def _prewarm_subsonic_catalogue() -> None:
+    """One background, time-sliced build of the Subsonic catalogue (the same
+    single rebuild task a request would start — a request arriving mid-build
+    joins it), then its artist index (``subsonic.prewarm_catalogue``).
+    Skipped for an empty library or when a client already triggered the
+    build.  Runs on the event loop (store access)."""
+    try:
+        from soniqboom.core.store import get_store
+        t = subsonic.prewarm_catalogue(get_store())
+        if t is not None:
+            _BG_TASKS.add(t)
+            t.add_done_callback(_BG_TASKS.discard)
+    except Exception:
+        log.debug("Subsonic catalogue prewarm failed", exc_info=True)
+
 
 @app.on_event("startup")
 async def startup():
     global _aof_writer, _merger_proc
 
+    _claim_server()                     # one server run per process, first of all
+    _install_thread_pool()
     data_dir = get_data_dir()
     _setup_logging(data_dir)
     # Attach the access-log filter + set default verbosity dials so ordinary
@@ -752,9 +1019,31 @@ async def startup():
     # was SIGKILL'd (or whose SIGTERM handler timed out).  Must run
     # BEFORE the first ProcessPoolExecutor() in scanner.py creates our
     # OWN forkserver, otherwise we'd risk reaping fresh children.
-    reaped = _reap_orphaned_forkservers()
+    reaped = _reap_at_start()
     if reaped:
         log.info("reaped %d orphaned forkserver process(es) from prior session", reaped)
+    # A new server run: the scan state a previous run in this process left is
+    # reset, and (macOS) the forkserver the scan pools fork from is ready —
+    # started before the server uses the network (scanner._process_pool).
+    global _run_epoch, _reap_later_task
+    from soniqboom.core.scanner import begin_run
+    _run_epoch = begin_run()
+
+    # Once more a little later: the instance an in-app Restart replaced may
+    # still have been ending at this start (its forkserver's parent alive).
+    async def _reap_later() -> None:
+        await asyncio.sleep(30)
+        n = await asyncio.to_thread(_reap_orphaned_forkservers)
+        if n:
+            log.info("reaped %d orphaned forkserver process(es) of the replaced instance", n)
+    _reap_later_task = asyncio.create_task(_reap_later())
+    # A TOSEC / Redump download a restart interrupted — removed before any
+    # request can start a new one.
+    try:
+        from soniqboom.core import game_titles as _gt
+        _gt.clean_leftovers()
+    except Exception:                                       # noqa: BLE001
+        log.debug("game-title download leftovers not removed", exc_info=True)
 
     # Begin emitting structured phase markers (stderr + status file).
     # The misleading "ready" banner from cli() already printed before
@@ -768,6 +1057,14 @@ async def startup():
     _ss_phase("loading_library", "Loading library snapshot")
     from soniqboom.core.persistence import init_persistence
     init_persistence(data_dir)
+
+    # Duplicate groups follow every duplicate-relevant write from here on
+    # (tag edits, duration backfills, scans local and remote).
+    try:
+        from soniqboom.core.scanner import install_dup_regroup
+        install_dup_regroup()
+    except Exception:
+        log.debug("duplicate re-group hook failed", exc_info=True)
 
     # Now that config is loaded, apply the persisted log-verbosity dials
     # (app level + access-log mode).  See core/log_control.py.
@@ -900,7 +1197,7 @@ async def startup():
 
         def _probe_dsd(binary: str) -> set[str]:
             try:
-                r = _sub.run([binary, "-hide_banner", "-formats"],
+                r = forksafe.run([binary, "-hide_banner", "-formats"],
                              capture_output=True, text=True, timeout=10, check=False)
             except (FileNotFoundError, _sub.SubprocessError):
                 return set()
@@ -924,7 +1221,7 @@ async def startup():
             bundled binary when the system one is missing any.
             """
             try:
-                r = _sub.run([binary, "-hide_banner", "-encoders"],
+                r = forksafe.run([binary, "-hide_banner", "-encoders"],
                              capture_output=True, text=True, timeout=10, check=False)
                 e_out = (r.stdout or "") + (r.stderr or "")
             except (FileNotFoundError, _sub.SubprocessError):
@@ -948,7 +1245,7 @@ async def startup():
             """
             for _ in range(2):
                 try:
-                    r = _sub.run([binary, "-version"], capture_output=True,
+                    r = forksafe.run([binary, "-version"], capture_output=True,
                                  text=True, timeout=20, check=False)
                     if r.returncode == 0 and "ffmpeg version" in (r.stdout or "").lower():
                         return True
@@ -1060,7 +1357,7 @@ async def startup():
     # The probe is informational only — actual transcode failures surface
     # at stream time with a clear "Invalid data" from ffmpeg.
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await forksafe.spawn(
             settings.ffmpeg_path or "ffmpeg", "-hide_banner", "-formats",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1104,7 +1401,9 @@ async def startup():
             d["path"] for d in dirs
             if not str(d.get("path", "")).startswith(("smb://", "ftp://", "http://", "https://"))
         ]
-        if watcher.is_supported() and local_roots:
+        if watcher.is_supported():
+            # Started even with no local roots yet: a root added later is
+            # armed by ``watcher.add_root``, which needs a running observer.
             await watcher.start(local_roots)
     except Exception:
         log.exception("watcher start failed (non-fatal — manual scan still works)")
@@ -1193,10 +1492,44 @@ async def startup():
     # NOTE: run.sh greps this line's "<n> tracks loaded" for its banner count.
     log.info("Library loaded — %d tracks loaded", get_store().track_count())
 
+    # The loaded library is ~1M long-lived GC-tracked objects; move them out
+    # of the cyclic GC's generations once, so a full collection — triggered by
+    # any allocation-heavy request (a Subsonic catalogue build, a big JSON
+    # page) — no longer walks them on the event loop.  See the helper.
+    try:
+        from soniqboom.core.store import freeze_long_lived_heap
+        freeze_long_lived_heap("the startup load")
+    except Exception:
+        log.debug("heap freeze after startup load failed", exc_info=True)
+
     _ss_phase("network_shares", "Connecting network shares")
     await _init_network_shares()
     global _health_task
     _health_task = asyncio.create_task(_share_health_monitor())
+
+    # One-time enrichment an upgrade needs (a newer Modland apply, the
+    # header-game album backfill): schedule the coalescing scene runner —
+    # it only marks work pending and waits out any scan.  Deferred so the
+    # Modland join / re-extracts don't compete with the first page loads
+    # right after boot.  Best-effort; a later scan re-triggers it anyway.
+    try:
+        from soniqboom.core.scanner import schedule_startup_enrichment
+        asyncio.get_running_loop().call_later(_STARTUP_ENRICHMENT_DELAY_S,
+                                              schedule_startup_enrichment)
+    except Exception:
+        log.debug("startup enrichment scheduling failed", exc_info=True)
+
+    # Changes made while the server was stopped: the watcher only sees what
+    # happens while it runs.  One incremental rescan of the local folders,
+    # deferred past the first page loads (Settings → "Rescan local folders
+    # after startup").
+    try:
+        from soniqboom.core.scanner import schedule_startup_reconcile
+        global _reconcile_handle
+        _reconcile_handle = asyncio.get_running_loop().call_later(
+            _STARTUP_RECONCILE_DELAY_S, schedule_startup_reconcile)
+    except Exception:
+        log.debug("startup reconcile scheduling failed", exc_info=True)
 
     # DLNA Media Server (incoming) — only spin up the SSDP socket when
     # the service is enabled.  We deliberately defer this until after
@@ -1254,6 +1587,13 @@ async def startup():
     # stderr line answers "what was loaded?" at a glance.
     from soniqboom.core.startup_status import mark_ready as _ss_mark_ready, get_status as _ss_status
     _ss_mark_ready(f"{get_store().track_count():,} tracks at http://{settings.host}:{settings.port}")
+
+    # Subsonic: build the catalogue once in the background a few seconds
+    # after startup, so the first client request after a restart is served
+    # warm instead of waiting out the whole build (~0.6 s at 263k tracks).
+    if _svc_on("subsonic"):
+        asyncio.get_running_loop().call_later(_SUBSONIC_PREWARM_DELAY_SEC,
+                                              _prewarm_subsonic_catalogue)
 
     # Consolidated startup-health line — one greppable record carrying the bind
     # address and the up/down state of every optional service, so an operator
@@ -1550,8 +1890,16 @@ async def shutdown():
 
     Total worst-case budget:  3 + 2 + 10 + 3 + 3 = 21 s.  Each step logs
     its elapsed time so a future hang can be diagnosed without strace.
+
+    Only the run that holds the server state (``_claim_server``) stops it;
+    its run epoch is read once, here — a start after this stop (the bundled
+    app's Restart) can't redirect it.
     """
     global _aof_writer, _merger_proc
+    if not _owns_server():
+        log.warning("Shutdown of a server run that doesn't hold the server state — nothing stopped")
+        return
+    run_epoch = _run_epoch
     t_total = time.monotonic()
 
     # Per-step health, collected for the single consolidated "stopped" line at
@@ -1620,6 +1968,33 @@ async def shutdown():
         index_health.stop()
     except Exception:
         log.debug("index_health.stop() failed (non-fatal)", exc_info=True)
+
+    # Pending startup reconcile / duplicate re-group runner: don't start work
+    # during shutdown (the re-group's pending state is persisted).
+    if _reconcile_handle is not None:
+        _reconcile_handle.cancel()
+    try:
+        from soniqboom.core.scanner import cancel_background_tasks
+        cancel_background_tasks()
+    except Exception:
+        log.debug("scanner background cancel failed", exc_info=True)
+    # TOSEC / Redump downloads: stopped now (their jobs end as "interrupted",
+    # a transfer is cut off, no list is written after this point; the files
+    # they finished stay kept).  Their threads are waited for below.
+    try:
+        from soniqboom.core import game_titles as _gt_stop
+        stopped = _gt_stop.cancel_downloads(run_epoch)
+        if stopped:
+            log.info("Shutdown: stopped the %s download(s)", ", ".join(stopped))
+    except Exception:
+        log.debug("download cancel failed", exc_info=True)
+    # (``finalize_dup_pending`` runs right before the journal flush, below)
+
+    # Stop the folder watcher (observer thread + pending debounce).
+    async def _stop_watcher():
+        from soniqboom.core import watcher
+        await watcher.stop()
+    await _step("watcher", _stop_watcher(), 3.0)
 
     # Stop the remote-freshness loops — each share has its own asyncio
     # task that sleeps for the adaptive interval.  Without explicit
@@ -1697,10 +2072,17 @@ async def shutdown():
 
     await _step("websockets", _close_all_ws(), timeout=3.0)
 
+
     # ── Step 2: AOF flush + close fd (2 s budget) ─────────────────────────
     # Cancel the periodic flush task ON the loop first (Task.cancel is
     # loop-bound), then do the blocking flush_sync + fd close off the loop
     # so a contended flock can't freeze the async runtime.
+    # A duplicate-relevant write after the shutdown save → full pass next start.
+    try:
+        from soniqboom.core.scanner import finalize_dup_pending
+        finalize_dup_pending()
+    except Exception:
+        log.debug("finalize_dup_pending failed", exc_info=True)
     aof_ok = False
     if _aof_writer:
         _aof_writer.cancel_flush_task()
@@ -1743,16 +2125,76 @@ async def shutdown():
         log.info("Shutdown: writing the full snapshot (%s).", reason)
         await _step("snapshot", _write_snap(), timeout=10.0)
 
+    # Re-persist the folder-browse cache when an enrichment pass refreshed its
+    # rows in memory this run (it deleted the stale disk copy then): the next
+    # boot restores it (~0.6 s) instead of rebuilding every root (~6 s).  AFTER
+    # the AOF flush + snapshot (library data first, a stop timeout may be
+    # short) and off the loop, so its timeout actually applies.
+    async def _persist_browse_cache():
+        from soniqboom.core import folder_album
+        if not folder_album.browse_disk_stale():
+            return
+        from soniqboom.api.fstree import _save_browse_cache
+        from soniqboom.config import get_data_dir
+        n = await asyncio.to_thread(_save_browse_cache, get_data_dir())
+        log.info("Browse cache: re-persisted %d root(s) at shutdown", n)
+    await _step("browse-cache", _persist_browse_cache(), timeout=10.0)
+
     # ── Step 4: Merger (3 s budget — interruptible since merger.py fix) ───
     async def _stop_merger() -> None:
+        if isinstance(_merger_proc, asyncio.Task):
+            # The bundled app's merger is a task of this loop (it has no
+            # ``is_alive``): stopped cooperatively, without a final merge —
+            # the AOF was just flushed and the next start replays it (a full
+            # snapshot was written above when it isn't lean).  A merge in
+            # progress is waited for (``_WRITING_STEPS``).
+            from soniqboom.core import merger as _merger
+            await _merger.stop_merger(_merger_proc, final=False)
+            return
         if _merger_proc and _merger_proc.is_alive():
             _merger_proc.terminate()
             await asyncio.to_thread(_merger_proc.join, 3)
             if _merger_proc.is_alive():
                 log.warning("Merger ignored SIGTERM — escalating to SIGKILL")
                 _merger_proc.kill()
+        elif _merger_proc is not None and getattr(_merger_proc, "pid", None):
+            # Its forkserver died: ``is_alive`` can't tell any more, but the
+            # merger itself may still run — stop it by pid (only while that
+            # pid is still a process forked from our forkserver).
+            pid = _merger_proc.pid
+            if not _is_our_forkserver_child(pid):
+                return
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                return                                  # gone
+            for _ in range(30):
+                await asyncio.sleep(0.1)
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     await _step("merger", _stop_merger(), timeout=3.5)
+
+    # ── Step 4b: scan worker pools + their forkserver (a stop during a scan
+    # would otherwise leave them running) ───────────────────────────────────
+    async def _stop_scan_workers() -> None:
+        from soniqboom.core.scanner import shutdown_worker_pools
+        await asyncio.to_thread(shutdown_worker_pools, run_epoch)
+
+    await _step("scan-workers", _stop_scan_workers(), timeout=3.0)
+
+    async def _wait_downloads() -> None:
+        from soniqboom.core import game_titles as _gt_wait
+        if not await asyncio.to_thread(_gt_wait.wait_for_downloads, 2.0):
+            log.warning("a stopped download's thread is still ending")
+
+    await _step("downloads", _wait_downloads(), timeout=2.5)
 
     # ── Step 5: File sources (1 s budget — force_close is near-instant) ───
     # We only do reads against remote shares, so the protocol-graceful
@@ -1788,6 +2230,8 @@ async def shutdown():
         settings.host, settings.port, _clean, len(_results), _detail,
         (time.monotonic() - t_total) * 1000,
     )
+    await _release_thread_pool(_results)
+    _release_server()
 
 
 # ── Frontend static files ─────────────────────────────────────────────────────
@@ -1798,11 +2242,13 @@ if FRONTEND_DIR.exists():
 
 # Bundled HTML user manual — served at /manual (html=True → /manual/ serves
 # index.html).  Best-effort: mounted only when the docs shipped.  The header's
-# docs button links here.
+# docs button links here.  Mounted before the SPA routes below: their
+# ``{full_path:path}`` catch-all would otherwise answer /manual too.
 if DOCS_DIR.is_dir():
     log.info("Serving user manual from %s", DOCS_DIR)
     app.mount("/manual", StaticFiles(directory=DOCS_DIR, html=True), name="manual")
 
+if FRONTEND_DIR.exists():
     # Service Worker for the offline shell (PERC-6).  Must be served from
     # a top-level path AND carry ``Service-Worker-Allowed: /`` so the
     # default-scope rule doesn't restrict it to ``/assets/`` only.  The
@@ -1890,6 +2336,11 @@ if DOCS_DIR.is_dir():
     # (mobile redirect + cookie pinning) would never run.
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
+        # An unknown /api path is a JSON 404, not the SPA page — a JSON
+        # client must be able to tell "endpoint missing" from success.
+        # (Unknown /rest paths get a Subsonic envelope from api/subsonic.)
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
         return FileResponse(FRONTEND_DIR / "index.html")
 else:
     log.error(
@@ -2161,7 +2612,6 @@ def cli():
         # Locate the standalone helper script.  In a source checkout it sits
         # at ``<repo>/scripts/fetch_ffmpeg.py``; in a wheel install we ship
         # it alongside the package under ``soniqboom/scripts/``.
-        import subprocess as _sub
         from pathlib import Path as _P
         candidates = [
             _P(__file__).resolve().parent.parent / "scripts" / "fetch_ffmpeg.py",
@@ -2176,7 +2626,7 @@ def cli():
         if args.force:      cmd.append("--force")
         if args.print_only: cmd.append("--print")
         if args.check:      cmd.append("--check")
-        sys.exit(_sub.call(cmd))
+        sys.exit(forksafe.run(cmd).returncode)
 
     # Serve (default, with or without 'serve' subcommand)
     host = (

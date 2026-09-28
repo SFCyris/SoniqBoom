@@ -14,17 +14,30 @@ let _toastHost = null;
 function _ensureToastHost() {
   if (_toastHost) return _toastHost;
   _toastHost = document.createElement('div');
-  _toastHost.setAttribute('role', 'status');
-  _toastHost.setAttribute('aria-live', 'polite');
+  _toastHost.className = 'sb-toast-host';      // mobile.css re-docks it (see there)
+  // Two PERSISTENT live regions inside a plain container.  A region has to be in
+  // the page before its content changes, or screen readers tend to miss it — so
+  // the toasts themselves carry no ARIA and are simply appended to the polite or
+  // the assertive region.  (Regions are siblings, never nested.)
   _toastHost.style.cssText = (
     'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);'
-    + 'display:flex;flex-direction:column;gap:8px;align-items:center;'
+    + 'display:flex;flex-direction:column;gap:0;align-items:center;'   // spacing lives on the toasts (an empty live region must not add a gap)
     // z-index 100000 puts Toast above the playlist/restart modals
     // (10000) and admin overlay (8000) — Visual-Test #1 caught the
     // inversion where Toast.error during a playlist-rename was invisible
     // because the modal backdrop sat on top.
     + 'z-index:100000;pointer-events:none;'
   );
+  const region = (role, live) => {
+    const r = document.createElement('div');
+    r.setAttribute('role', role);
+    r.setAttribute('aria-live', live);
+    r.style.cssText = 'display:flex;flex-direction:column;gap:0;align-items:center;max-width:100%;';
+    _toastHost.appendChild(r);
+    return r;
+  };
+  _toastHost._polite = region('status', 'polite');
+  _toastHost._alert  = region('alert', 'assertive');
   document.body.appendChild(_toastHost);
   return _toastHost;
 }
@@ -37,6 +50,7 @@ function _ensureToastHost() {
 // with overlapping rectangles on mobile.
 const _COALESCE_WINDOW_MS = 2000;
 const _MAX_VISIBLE_TOASTS = 3;
+let _toastSeq = 0;            // arrival order, for the visible-toast cap
 const _recent = new Map();   // "kind\0msg" → { el, count, expiresAt }
 
 function _toastKey(kind, msg) { return `${kind}\0${msg}`; }
@@ -69,10 +83,15 @@ function _emitToast(kind, msg) {
   }
   // Cap concurrent toasts: if we already show N, push the oldest out
   // first so the new one is visible.
-  while (host.childElementCount >= _MAX_VISIBLE_TOASTS) {
-    _dismissToast(host.firstElementChild);
-  }
+  // (Oldest by ARRIVAL: the two live regions are siblings, so document order is
+  // not age; a toast already fading out no longer counts.)
+  const shown = [...host.querySelectorAll('.sb-toast')]
+    .filter(t => !t._sbLeaving)
+    .sort((x, y) => (x._sbSeq || 0) - (y._sbSeq || 0));
+  for (let i = 0; i <= shown.length - _MAX_VISIBLE_TOASTS; i++) _dismissToast(shown[i]);
   const el = document.createElement('div');
+  el.className = 'sb-toast';
+  el._sbSeq = ++_toastSeq;
   el.textContent = msg;
   const bg = kind === 'error' ? '#7a1f1f'
     : kind === 'warn' ? '#6b5310'
@@ -81,13 +100,11 @@ function _emitToast(kind, msg) {
   el.style.cssText = (
     `background:${bg};color:#fff;padding:10px 16px;border-radius:6px;`
     + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);font:13px/1.4 system-ui,sans-serif;'
-    + 'max-width:520px;pointer-events:auto;opacity:0;transition:opacity 180ms;'
-    + 'display:flex;align-items:center;gap:6px;'
+    + 'max-width:520px;overflow-wrap:anywhere;pointer-events:auto;opacity:0;transition:opacity 180ms;'
+    + 'display:flex;align-items:center;gap:6px;margin-top:8px;'
   );
-  // ARIA: errors are assertive (announced immediately); info/warn polite.
-  el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
-  el.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
-  host.appendChild(el);
+  // Errors are announced immediately (assertive region); everything else politely.
+  (kind === 'error' ? host._alert : host._polite).appendChild(el);
   requestAnimationFrame(() => { el.style.opacity = '1'; });
   const dismissTimer = setTimeout(() => _dismissToast(el), kind === 'error' ? 5000 : 3500);
   _recent.set(key, {
@@ -99,13 +116,97 @@ function _emitToast(kind, msg) {
 }
 
 function _dismissToast(el) {
-  if (!el) return;
+  if (!el || el._sbLeaving) return;
+  // An offer toast stops its timer and hands focus back first (whoever closes it).
+  if (el._sbOnLeave) { try { el._sbOnLeave(); } catch (_) {} }
+  el._sbLeaving = true;
   el.style.opacity = '0';
   setTimeout(() => el.remove(), 220);
   // Purge from the coalesce map.
   for (const [k, rec] of _recent) {
     if (rec.el === el) { _recent.delete(k); break; }
   }
+}
+
+// An offer the listener can take or leave: an info toast with one action
+// button and a ×, shown longer than a plain toast (``ms``), never coalesced.
+// ``onAction`` runs once, on the button; the toast then goes.  The countdown
+// pauses while the pointer is over the toast or focus is in it (and gives at
+// least 3 s more after), Escape closes it, and closing it while it holds focus
+// puts focus back where it was before.  ``Toast.dismiss(el)`` closes it early.
+function _emitActionToast(msg, label, onAction, ms = 15000) {
+  if (!msg || !label) return;
+  const host = _ensureToastHost();
+  const ae = document.activeElement;
+  let returnTo = (ae && ae !== document.body) ? ae : null;
+  const el = document.createElement('div');
+  el.className = 'sb-toast sb-toast-action';
+  el._sbSeq = ++_toastSeq;
+  el.style.cssText = (
+    'background:#1f3f7a;color:#fff;padding:8px 10px 8px 16px;border-radius:6px;'
+    + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);font:13px/1.4 system-ui,sans-serif;'
+    + 'max-width:520px;overflow-wrap:anywhere;pointer-events:auto;opacity:0;transition:opacity 180ms;'
+    + 'display:flex;align-items:center;gap:10px;margin-top:8px;'
+  );
+  const text = document.createElement('span');
+  text.textContent = msg;
+  const btnCss = 'font:600 12px system-ui,sans-serif;border-radius:4px;cursor:pointer;padding:4px 10px;';
+  const act = document.createElement('button');
+  act.type = 'button';
+  act.textContent = label;
+  act.style.cssText = btnCss + 'background:#fff;color:#1f3f7a;border:0;';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.textContent = '\u00d7';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.style.cssText = btnCss + 'background:none;color:#fff;border:0;font-size:16px;padding:0 6px;';
+  let left = ms, t0 = 0, timer = null, hover = false, focus = false;
+  const arm = () => { t0 = Date.now(); timer = setTimeout(() => _dismissToast(el), left); };
+  const pause = () => {
+    if (!timer) return;
+    clearTimeout(timer); timer = null;
+    left -= Date.now() - t0;
+  };
+  const resume = () => {
+    if (hover || focus || timer || el._sbLeaving) return;
+    left = Math.max(left, 3000);
+    arm();
+  };
+  el._sbOnLeave = () => {
+    clearTimeout(timer); timer = null;
+    if (!el.contains(document.activeElement)) return;
+    const back = (returnTo && returnTo.isConnected) ? returnTo
+      : document.querySelector('#btn-play, #m-mp-play');
+    try { if (back) back.focus({ preventScroll: true }); } catch (_) {}
+    if (el.contains(document.activeElement)) { try { document.activeElement.blur(); } catch (_) {} }
+  };
+  el.addEventListener('mouseenter', () => { hover = true; pause(); });
+  el.addEventListener('mouseleave', () => { hover = false; resume(); });
+  el.addEventListener('focusin', (e) => {
+    if (!focus && e.relatedTarget && !el.contains(e.relatedTarget)) returnTo = e.relatedTarget;
+    focus = true; pause();
+  });
+  el.addEventListener('focusout', (e) => {
+    if (e.relatedTarget && el.contains(e.relatedTarget)) return;   // moving between its buttons
+    focus = false; resume();
+  });
+  el.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    _dismissToast(el);
+  });
+  // Once: a second click while it fades out lands on a closing toast.
+  act.addEventListener('click', () => {
+    if (el._sbLeaving) return;
+    _dismissToast(el);
+    try { onAction(); } catch (_) {}
+  });
+  close.addEventListener('click', () => _dismissToast(el));
+  el.append(text, act, close);
+  host._polite.appendChild(el);
+  requestAnimationFrame(() => { el.style.opacity = '1'; });
+  arm();
+  return el;
 }
 
 export const Toast = {
@@ -117,6 +218,9 @@ export const Toast = {
   // without this) and auth's password-update called ``Toast.ok`` directly
   // (a hard TypeError without this).
   ok:    (msg) => _emitToast('ok',    msg),
+  action: (msg, label, onAction, ms) => _emitActionToast(msg, label, onAction, ms),
+  // Close a toast early (e.g. an offer that no longer applies).
+  dismiss: (el) => _dismissToast(el),
 };
 
 
@@ -198,6 +302,46 @@ export function isUadeAmigaTrack(t) {
   const g = t && t.genre;
   if (!Array.isArray(g)) return false;
   return g.includes('Amiga') && g.includes('Module');
+}
+
+// ── Multi-tune files: wire index ↔ tune number ──────────────────────────────
+// ``?subsong=`` (the "wire" index a queue entry carries in ``subsong``) is not
+// the tune's number minus one when the file's default tune — its header's start
+// song, 1-based — is not tune 1: wire 0 is ALWAYS the default tune, so the bare
+// id (no ?subsong) plays it.  With start song s of N tunes:
+//   s == 1  → wire w is tune w+1;
+//   s != 1  → wire 0 is tune s, wire s-1 is tune 1 (the swap), and every other
+//             wire w is tune w+1.
+// Every tune has exactly one wire.  The server (renderers, Subsonic tune ids)
+// uses the same mapping; a start song outside 1..N counts as 1.
+export function subsongStart(start, count) {
+  const s = Math.floor(Number(start));
+  return (s >= 1 && (!(Number(count) > 0) || s <= Number(count))) ? s : 1;
+}
+// The 1-based start song a track object carries: the picker's
+// ``subsongStart``, the extended info's ``default_track`` (1-based), or a
+// scan's ``start_subsong`` (the default tune's 0-based index); else 1.
+export function subsongStartOf(t) {
+  if (!t) return 1;
+  for (const v of [t.subsongStart, t.default_track]) {
+    if (Number(v) >= 1) return Math.floor(Number(v));
+  }
+  const z = t.start_subsong;
+  return (Number.isInteger(z) && z >= 0) ? z + 1 : 1;
+}
+export function subsongWireToTune(wire, start, count) {
+  const s = subsongStart(start, count);
+  const w = Math.max(0, Math.floor(Number(wire) || 0));
+  if (w === 0) return s;
+  if (s !== 1 && w === s - 1) return 1;
+  return w + 1;
+}
+export function subsongTuneToWire(tune, start, count) {
+  const s = subsongStart(start, count);
+  const t = Math.floor(Number(tune));
+  if (t === s) return 0;
+  if (s !== 1 && t === 1) return s - 1;
+  return t - 1;
 }
 
 /** Render-only duration semantics, name-based OR genre-based (uade). */

@@ -114,7 +114,11 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     if e in _HVL_EXTS:
         return _cache_key(track_id, "hvl", subsong=subsong)
     if e in _UADE_EXTS:
-        return _cache_key(track_id, "uade", subsong=subsong)
+        # The subsong base ``prepare_source_for_stream`` resolved (and
+        # remembered) for this track — part of the key for tune N > 0 of a
+        # module numbered from 1.
+        from soniqboom.api.stream import uade_cache_key_known
+        return uade_cache_key_known(track_id, subsong)
     if e in _TRACKER_EXTS:
         return _cache_key(track_id, "tracker", subsong=subsong)
     if e in _GME_EXTS:
@@ -286,10 +290,14 @@ async def prepare_source_for_stream(
         # AHX → uade123.  Must be checked BEFORE the tracker branch — the
         # extension also appears in the broader tracker set used by the
         # library scanner, but openmpt123 can't decode it.
-        from soniqboom.api.stream import _render_uade
+        from soniqboom.api.stream import (
+            _render_uade, _uade_resolve_base, uade_cache_variant,
+        )
+        base = await _uade_resolve_base(track_id, None, path_obj, subsong)
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="uade", subsong=subsong,
-            render_fn=lambda: _render_uade(path_obj, subsong=subsong),
+            render_fn=lambda: _render_uade(path_obj, subsong=subsong, subsong_base=base),
+            variant=uade_cache_variant(subsong, base),
         )
         return cached_path, "wav"
 

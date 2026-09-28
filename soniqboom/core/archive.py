@@ -256,15 +256,18 @@ def _members(local_path) -> dict[str, str]:
         return out
 
 
-def list_members(local_path) -> list[str]:
+def list_members(local_path, *, strict: bool = False) -> list[str]:
     """Playable member display-names inside *local_path* (.zip/.lha/.lzh).
 
     Returns ``[]`` (with a warning) on a broken/unsupported archive so one bad
-    file never aborts a scan.
+    file never aborts a scan — or, with ``strict``, raises, so the scanner
+    can tell "unreadable" (keep its indexed members) from "empty".
     """
     try:
         return list(_members(local_path).keys())
     except Exception as exc:
+        if strict:
+            raise
         log.warning("Cannot read archive %s: %s", local_path, exc)
         return []
 

@@ -34,9 +34,59 @@ function _ensureDropdown() {
   dd.id = 'search-preview';
   dd.className = 'search-preview';
   dd.addEventListener('mousedown', (e) => e.preventDefault()); // prevent blur
+  // Keyboard focus inside the dropdown (a hint chip) keeps it open; leaving
+  // both it and the search box hides it, like the box's own blur.
+  dd.addEventListener('focusout', (e) => {
+    const to = e.relatedTarget;
+    if (to && (to === input || dd.contains(to))) return;
+    setTimeout(_hidePreview, 200);
+  });
   input.parentElement.appendChild(dd);
   _previewDropdown = dd;
   return dd;
+}
+
+// ── Combobox semantics ───────────────────────────────────────────────────────
+// The search box is a combobox; the result rows are options of a listbox
+// (#search-preview-list) inside the dropdown — the warning, hint footer and
+// operator chips sit OUTSIDE it (controls inside a listbox are invalid ARIA).
+// ↓/↑ move ``aria-activedescendant`` so a screen reader announces the row that
+// Enter will play.  The passive top-result anchor is NOT a selection (Enter then
+// opens full results), so it is never marked selected.
+let _optSeq = 0;                       // ids stay unique across re-renders
+function _optionize(row) {
+  row.id = `sp-opt-${++_optSeq}`;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', 'false');
+}
+// A labelled group of options (Stations / Music) inside the listbox; ``hdr``
+// is the visual header row, named for assistive tech by the group itself.
+function _optGroup(listbox, hdr, labelEl) {
+  const grp = document.createElement('div');
+  grp.setAttribute('role', 'group');
+  labelEl.id = `sp-grp-${++_optSeq}`;
+  labelEl.setAttribute('aria-hidden', 'true');
+  grp.setAttribute('aria-labelledby', labelEl.id);
+  hdr.setAttribute('role', 'presentation');
+  grp.appendChild(hdr);
+  listbox.appendChild(grp);
+  return grp;
+}
+function _setExpanded(on) {
+  const list = on && _previewDropdown ? _previewDropdown.querySelector('#search-preview-list') : null;
+  input.setAttribute('aria-expanded', list ? 'true' : 'false');
+  if (!list) input.removeAttribute('aria-activedescendant');
+}
+function _markActive(row) {
+  if (!_previewDropdown) return;
+  _previewDropdown.querySelectorAll('[role="option"][aria-selected="true"]')
+    .forEach(r => r.setAttribute('aria-selected', 'false'));
+  if (row && row.id) {
+    row.setAttribute('aria-selected', 'true');
+    input.setAttribute('aria-activedescendant', row.id);
+  } else {
+    input.removeAttribute('aria-activedescendant');
+  }
 }
 
 function _cancelInflightArt() {
@@ -54,7 +104,7 @@ function _cancelInflightArt() {
   _previewArtImgs = [];
 }
 
-function _renderStationGroup(dd, stations) {
+function _renderStationGroup(listbox, stations) {
   if (!stations || !stations.length) return;
   const hdr = document.createElement('div');
   hdr.className = 'sp-group-hdr sp-group-hdr-row';
@@ -68,17 +118,23 @@ function _renderStationGroup(dd, stations) {
   all.textContent = 'Show all →';
   all.addEventListener('click', (e) => {
     e.stopPropagation();
+    _cancelPreviewSearch();
     _hidePreview();
     import('./stations.js')
       .then(m => m.Stations.showSearchResults(input.value))
       .catch(() => Toast.error('Could not open station results.'));
   });
+  // A clickable entry inside the listbox is an option too (Tab still reaches it).
+  all.setAttribute('role', 'option');
+  all.setAttribute('aria-selected', 'false');
+  all.setAttribute('aria-label', 'Show all station results');
   hdr.appendChild(label);
   hdr.appendChild(all);
-  dd.appendChild(hdr);
+  const grp = _optGroup(listbox, hdr, label);
   stations.slice(0, 4).forEach((st) => {
     const row = document.createElement('div');
     row.className = 'sp-row sp-station-row';
+    _optionize(row);
     const best = (st.streams || [])[0];
     row.innerHTML = `
       <div class="sp-art"><span class="sp-art-ph">${st.favorite ? '★' : '📻'}</span></div>
@@ -98,10 +154,11 @@ function _renderStationGroup(dd, stations) {
       img.src = st.favicon;
     }
     row.addEventListener('click', () => {
+      _cancelPreviewSearch();
       _hidePreview();
       import('./stations.js').then(m => m.Stations.play(st)).catch(() => {});
     });
-    dd.appendChild(row);
+    grp.appendChild(row);
   });
 }
 
@@ -132,13 +189,20 @@ function _showPreview(tracks, stations = []) {
   const badOps = _detectBadOperators(input.value);
   _renderBadOpsWarning(dd, badOps);
 
+  // The rows live in the listbox; everything else in the dropdown sits outside it.
+  const listbox = document.createElement('div');
+  listbox.id = 'search-preview-list';
+  listbox.setAttribute('role', 'listbox');
+  listbox.setAttribute('aria-label', 'Search suggestions');
+  dd.appendChild(listbox);
+
   // While the Stations view is open the header IS a station search, so put
   // stations first; otherwise tracks lead and stations follow as a group.
   const stationsFirst = !document.getElementById('stations-view')?.hidden;
-  if (stationsFirst) _renderStationGroup(dd, stations);
+  if (stationsFirst) _renderStationGroup(listbox, stations);
 
   if (!tracks.length) {
-    if (!stationsFirst && stations.length) _renderStationGroup(dd, stations);
+    if (!stationsFirst && stations.length) _renderStationGroup(listbox, stations);
     if (!tracks.length && !stations.length) {
       const empty = document.createElement('div');
       empty.className = 'sp-empty';
@@ -147,20 +211,25 @@ function _showPreview(tracks, stations = []) {
     }
     dd.classList.add('visible');
     _previewVisible = true;
+    _setExpanded(true);
     return;
   }
 
+  let trackBox = listbox;
   if (tracks.length && stations.length && stationsFirst) {
     const hdr = document.createElement('div');
     hdr.className = 'sp-group-hdr';
-    hdr.textContent = 'Music';
-    dd.appendChild(hdr);
+    const lbl = document.createElement('span');
+    lbl.textContent = 'Music';
+    hdr.appendChild(lbl);
+    trackBox = _optGroup(listbox, hdr, lbl);
   }
 
   tracks.slice(0, 8).forEach((t, i) => {
     const row = document.createElement('div');
     row.className = 'sp-row';
     row.dataset.idx = i;
+    _optionize(row);
 
     // Always show emoji placeholder immediately; swap to real art async if available
     row.innerHTML = `
@@ -204,11 +273,11 @@ function _showPreview(tracks, stations = []) {
       // Also do a full search to populate the library
       query(input.value);
     });
-    dd.appendChild(row);
+    trackBox.appendChild(row);
   });
 
   // In library mode, stations follow the tracks as a labelled group.
-  if (!stationsFirst) _renderStationGroup(dd, stations);
+  if (!stationsFirst) _renderStationGroup(listbox, stations);
 
   // Always show "press Enter" hint so behaviour is discoverable.  In the
   // Stations view Enter opens the full station list, not the song search, so
@@ -228,15 +297,17 @@ function _showPreview(tracks, stations = []) {
   // >= 0); the anchor uses a distinct, subtler class so it never reads as an
   // actionable selection.
   const _restore = (_priorIdx != null) ? dd.querySelector(`.sp-row[data-idx="${_priorIdx}"]`) : null;
+  dd.classList.add('visible');
+  _previewVisible = true;
+  _setExpanded(true);
   if (_restore) {
     _selectedPreview = Array.from(dd.querySelectorAll('.sp-row')).indexOf(_restore);
     _restore.classList.add('sp-highlighted');
+    _markActive(_restore);               // rebuilt rows carry new ids
   } else {
     _anchorFirstRow();
+    _markActive(null);
   }
-
-  dd.classList.add('visible');
-  _previewVisible = true;
 }
 
 function _hidePreview() {
@@ -245,6 +316,7 @@ function _hidePreview() {
     _previewVisible = false;
     _selectedPreview = -1;
   }
+  _setExpanded(false);
   // Cancel any pending art loads — the rows they were targeting are about
   // to be replaced or removed.
   _cancelInflightArt();
@@ -268,8 +340,13 @@ function _navigatePreview(delta) {
   // navigating supersedes the anchor.
   rows.forEach(r => r.classList.remove('sp-highlighted', 'sp-anchored'));
   _selectedPreview = Math.max(-1, Math.min(rows.length - 1, _selectedPreview + delta));
-  if (_selectedPreview >= 0) rows[_selectedPreview].classList.add('sp-highlighted');
-  else _anchorFirstRow();   // arrowed back above the top → restore the passive top-result cue
+  if (_selectedPreview >= 0) {
+    rows[_selectedPreview].classList.add('sp-highlighted');
+    _markActive(rows[_selectedPreview]);
+  } else {
+    _anchorFirstRow();   // arrowed back above the top → restore the passive top-result cue
+    _markActive(null);
+  }
 }
 
 function _playHighlighted() {
@@ -302,8 +379,9 @@ function _fmtDur(sec) {
 // about, we highlight that token red so the user understands why the
 // preview is empty.
 // EXACTLY the operators the backend advanced-query parser implements
-// (api/search.py _parse_advanced_query: artist, album_artist, album, genre,
-// year, format).  title:/composer:/albumartist: used to be listed here too but
+// (api/search.py _parse_advanced_query: artist, album_artist, album, game —
+// a case-insensitive prefix match on the game or its other names, or on the
+// title of a SID / Atari ST tune without a sure game — genre, year, format).  title:/composer:/albumartist: used to be listed here too but
 // the backend silently discards them — a query like `artist:Metallica title:One`
 // returned all Metallica tracks, ignoring the title.  Keeping this in lockstep
 // with the backend means unsupported fields now surface an honest "Unknown
@@ -311,7 +389,7 @@ function _fmtDur(sec) {
 // title/composer text, so nothing is lost.  If the backend gains a field, add
 // it here in the same change.
 const _SUPPORTED_OPS = new Set([
-  'artist', 'album_artist', 'album',
+  'artist', 'album_artist', 'album', 'game',
   'year', 'genre', 'format',
 ]);
 let _syntaxHintShown = false;
@@ -330,14 +408,51 @@ function _detectBadOperators(text) {
   return [...new Set(bad)];
 }
 
+// Each chip adds its operator at the caret (``data-op``; the label may show an
+// example value).  The dropdown's mousedown preventDefault keeps focus in the
+// search box, so the hint stays open for the next chip or the value.
+const _HINT_OPS = [
+  ['artist:', 'artist:'], ['album:', 'album:'], ['game:', 'game:'],
+  ['year:>', 'year:>2020'], ['format:', 'format:FLAC'],
+];
+
+function _insertOperator(op) {
+  const v = input.value;
+  const start = input.selectionStart ?? v.length;
+  const end = input.selectionEnd ?? v.length;
+  const before = v.slice(0, start);
+  const sep = before && !/\s$/.test(before) ? ' ' : '';
+  input.value = before + sep + op + v.slice(end);
+  const caret = start + sep.length + op.length;
+  input.focus();
+  try { input.setSelectionRange(caret, caret); } catch { /* not a text field */ }
+  // No search for a bare operator — the value typed next runs it (the
+  // 'input' handler).  Only the clear button follows the new value.
+  clear.hidden = !input.value;
+}
+
 function _renderSyntaxHint(container) {
   const hint = document.createElement('div');
   hint.className = 'sp-syntax-hint';
-  hint.innerHTML = `
-    <div class="sp-hint-title">Try field operators:</div>
-    <div class="sp-hint-ops">
-      <code>artist:</code> <code>album:</code> <code>year:&gt;2020</code> <code>format:FLAC</code>
-    </div>`;
+  const title = document.createElement('div');
+  title.className = 'sp-hint-title';
+  title.textContent = 'Try field operators:';
+  const ops = document.createElement('div');
+  ops.className = 'sp-hint-ops';
+  for (const [op, label] of _HINT_OPS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sp-hint-op';
+    b.dataset.op = op;
+    b.textContent = label;
+    b.setAttribute('aria-label', `Add ${op} to the search`);
+    ops.append(b, ' ');
+  }
+  ops.addEventListener('click', (e) => {
+    const b = e.target.closest('.sp-hint-op');
+    if (b) _insertOperator(b.dataset.op);
+  });
+  hint.append(title, ops);
   container.appendChild(hint);
 }
 
@@ -362,6 +477,7 @@ function _renderBadOpsWarning(container, badOps) {
 
 // ── Main search ─────────────────────────────────────────────────────────────
 async function query(text) {
+  _cancelPreviewSearch();
   _hidePreview();
   if (!text.trim()) { Library.showAll(); return; }
   // A full search is a view change: claim the cross-view nav token so that if the
@@ -379,7 +495,8 @@ async function query(text) {
     // proper sortable track list with the group header/filter chrome cleared —
     // otherwise a search launched from a group view (Genres, Scene groups, …)
     // shows the results under that view's stale header + live filter bar.
-    Library.showSearchResults(tracks);
+    // The third argument re-runs this search when an admin action changes tags.
+    Library.showSearchResults(tracks, text, () => query(text));
   } catch (err) {
     console.error('Search failed:', err);
     Toast.error('Search failed — check the server log.');
@@ -393,6 +510,22 @@ let _quickAbort = null;
 let _searchGen = 0;        // monotonic — guards two independent async sources
 let _lastTracks = [];
 let _curStations = [];
+
+// The quick preview is no longer wanted (Enter ran the full search, a row was
+// picked, Escape, focus left): drop the pending keystroke timer, retire the
+// in-flight track + station lookups (their ``gen`` checks then discard late
+// replies) and abort them — otherwise a reply landing after the full results
+// reopens the dropdown over them, and costs a search nobody reads.  Rows
+// already rendered stay, so a highlighted row can still be played.
+function _cancelPreviewSearch() {
+  clearTimeout(previewTimer);
+  previewTimer = null;
+  _searchGen++;
+  if (_quickAbort) {
+    try { _quickAbort.abort(); } catch {}
+    _quickAbort = null;
+  }
+}
 async function _quickSearch(text) {
   if (!text.trim()) { _hidePreview(); return; }
   const gen = ++_searchGen;
@@ -466,6 +599,7 @@ input.addEventListener('keydown', (e) => {
     _navigatePreview(-1);
   } else if (e.key === 'Enter') {
     e.preventDefault();
+    _cancelPreviewSearch();
     if (!_playHighlighted()) {
       _hidePreview();
       // Full results for the ACTIVE category: while the Stations view is open,
@@ -481,6 +615,11 @@ input.addEventListener('keydown', (e) => {
       }
     }
   } else if (e.key === 'Escape') {
+    // type=search clears itself on Escape in Chromium and Firefox — and the
+    // 'input' that follows would throw the results away for All Tracks.
+    // Escape closes the dropdown (or leaves the box); the × clears.
+    e.preventDefault();
+    _cancelPreviewSearch();
     if (_previewVisible) {
       e.stopPropagation();
       _hidePreview();
@@ -490,18 +629,28 @@ input.addEventListener('keydown', (e) => {
   }
 });
 
-input.addEventListener('blur', () => {
-  // Small delay to allow click on preview items
-  setTimeout(_hidePreview, 200);
+input.addEventListener('blur', (e) => {
+  // Tabbing into the dropdown (a hint chip) keeps it open.
+  if (_previewDropdown && e.relatedTarget && _previewDropdown.contains(e.relatedTarget)) return;
+  // Small delay to allow click on preview items; a lookup still running when
+  // focus has gone must not bring the dropdown back.
+  setTimeout(() => {
+    if (document.activeElement === input) return;       // focus came back meanwhile
+    if (_previewDropdown && _previewDropdown.contains(document.activeElement)) return;
+    _cancelPreviewSearch();
+    _hidePreview();
+  }, 200);
 });
 
 input.addEventListener('focus', () => {
   if (input.value.trim() && _previewDropdown?.children.length) {
     _previewDropdown.classList.add('visible');
     _previewVisible = true;
+    _setExpanded(true);
     return;
   }
-  // Empty input + first focus this session → show the operator hint.
+  // Empty input + first focus this session → show the operator hint (no
+  // listbox: aria-expanded stays false; its chips are reached with Tab).
   if (!input.value.trim() && !_syntaxHintShown) {
     const dd = _ensureDropdown();
     dd.innerHTML = '';
@@ -509,6 +658,7 @@ input.addEventListener('focus', () => {
     dd.classList.add('visible');
     _previewVisible  = true;
     _syntaxHintShown = true;
+    _setExpanded(false);
   }
 });
 
@@ -517,18 +667,27 @@ input.addEventListener('focus', () => {
 // classifies as a username — which, only in Edge, includes this search box: it
 // ignores the type="search" + autocomplete="off" hints that keep Safari/Firefox
 // (and Chrome) out of the way, because a logged-in SPA has no visible login form
-// for it to target.  Autofill never fires on a READONLY field, so the box starts
-// readonly (see index.html) and we drop that the instant the user actually acts —
+// for it to target.  Autofill never fires on a READONLY field, so in desktop Edge
+// only (UA token "Edg/"; every other browser gets a plain editable box, which
+// screen readers, touch keyboards and dictation need) the box is made readonly
+// while it is not focused, and that is dropped the instant the user acts:
 // keydown fires BEFORE the character is inserted, so the first keystroke is not
-// lost, and contextmenu covers right-click → Paste.  Re-armed on blur so the box
-// is readonly again at every focus (the moment Edge decides whether to offer).
+// lost; contextmenu covers right-click → Paste; a touch or pen pointerdown fires
+// before focus lands, so the on-screen keyboard opens on a normal field.  Mouse
+// clicks keep the protection until the first key.  Re-armed on blur so the box is
+// readonly again at every focus (the moment Edge decides whether to offer).
 // Programmatic changes (the clear button, search restore) set .value directly and
 // are unaffected — readonly only blocks USER text entry, not scripted writes.
-const _armSearchReadonly  = () => input.setAttribute('readonly', '');
-const _dropSearchReadonly = () => input.removeAttribute('readonly');
-input.addEventListener('keydown', _dropSearchReadonly);
-input.addEventListener('contextmenu', _dropSearchReadonly);
-input.addEventListener('blur', _armSearchReadonly);
+const _isEdge = /\bEdg\//.test(navigator.userAgent || '');
+if (_isEdge) {
+  const _armSearchReadonly  = () => input.setAttribute('readonly', '');
+  const _dropSearchReadonly = () => input.removeAttribute('readonly');
+  if (document.activeElement !== input) _armSearchReadonly();
+  input.addEventListener('keydown', _dropSearchReadonly);
+  input.addEventListener('contextmenu', _dropSearchReadonly);
+  input.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse') _dropSearchReadonly(); });
+  input.addEventListener('blur', _armSearchReadonly);
+}
 
 clear.addEventListener('click', () => {
   input.value = '';

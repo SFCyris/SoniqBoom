@@ -47,9 +47,10 @@ from soniqboom.core.data import get_track
 # Mirror the player.js lookahead (Spotify-research-derived: N+3 only pays
 # off on uninterrupted queue listening; N+1 + N+2 covers the realistic
 # zap pattern with the smallest cache-budget cost).  Each prewarm fires
-# in the background via conversion_cache.start_background_render — so
-# the user-facing /play returns immediately and the renderer's GET on
-# track N+1 hits a warm cache.
+# in the background via conversion_cache.start_background_render, under the
+# web prewarm's background gate (``_start_gated_render``) — so the
+# user-facing /play returns immediately and the renderer's GET on track N+1
+# hits a warm cache.
 _PREWARM_WINDOW = 2
 
 log = logging.getLogger(__name__)
@@ -192,6 +193,42 @@ class SessionState:
             "queue_index":     self.queue_index,
             "user_pref":       self.user_pref,
         }
+
+
+async def _start_gated_render(priority: int, cache_key: str, format_type: str,
+                              render_fn) -> None:
+    """``conversion_cache.start_background_render`` under the web prewarm's
+    background gate (``stream._bg_render_sem``).
+
+    The slot is taken BEFORE the render registers as in flight: a foreground
+    play of the same track that arrives meanwhile renders it itself instead of
+    waiting on a render still queued behind background work.  The render task
+    releases the slot when it ends; nothing is started (and the slot is handed
+    straight back) when the entry is already cached or being rendered."""
+    from soniqboom.api import stream as _stream
+    from soniqboom.core import conversion_cache as _cc
+    gate = _stream._bg_render_sem
+    await gate.acquire(priority)
+    handed_off = False
+    try:
+        if cache_key in _cc._bg_renders or cache_key in _cc._inflight:
+            return
+        if await _cc.get_cached(cache_key) is not None:
+            return
+        if cache_key in _cc._bg_renders or cache_key in _cc._inflight:
+            return                      # started while the cache lookup ran
+
+        async def _gated():
+            try:
+                return await render_fn()
+            finally:
+                gate.release()
+        # No await between the check above and the registration inside.
+        await _cc.start_background_render(cache_key, format_type, _gated)
+        handed_off = True
+    finally:
+        if not handed_off:
+            gate.release()
 
 
 class CastSession:
@@ -415,7 +452,13 @@ class CastSession:
 
         No-op when the queue is empty or has a single item; bounded
         by ``_PREWARM_WINDOW`` so a 200-track queue load doesn't
-        spawn 200 simultaneous renders.
+        spawn 200 simultaneous renders.  With "Prepare upcoming tracks"
+        (``render_prewarm``) off, rendered formats (retro, Amiga) are
+        skipped and conversions still prepared, like the web player's
+        lookahead.  Each render runs under the web prewarm's background gate
+        (``stream._bg_render_sem``: the next track at ``PRIO_NEXT``, the
+        rest at ``PRIO_AHEAD``), so cast lookahead never takes the render
+        slot a live play needs; a source download happens before the gate.
         """
         if not self.state.queue:
             return
@@ -441,10 +484,11 @@ class CastSession:
                 _GME_EXTS_STREAM, _DSD_EXTS, NATIVE,
                 _render_sid, _render_midi, _render_tracker, _render_uade,
                 _render_hvl, _render_gme, _render_to_transcoded_flac,
+                PRIO_NEXT, PRIO_AHEAD,
+                _prewarm_enabled, _render_ident, _is_rendered_ext,
             )
             from soniqboom.core.conversion_cache import (
                 _cache_key as _ck,
-                start_background_render,
                 is_cache_ready,
             )
             from soniqboom.core.cast_render import materialize_source
@@ -452,8 +496,11 @@ class CastSession:
         except Exception:
             log.exception("cast prewarm: import of render helpers failed")
             return
+        # "Prepare upcoming tracks" gates the rendered formats only.
+        render_ok = _prewarm_enabled()
 
-        for item in upcoming:
+        for pos, item in enumerate(upcoming):
+            prio = PRIO_NEXT if pos == 0 else PRIO_AHEAD
             try:
                 track = await get_track(item.track_id)
                 if not track:
@@ -473,6 +520,8 @@ class CastSession:
                 )
                 if not needs_transcode and src_ext in NATIVE:
                     continue
+                if not render_ok and _is_rendered_ext(*_render_ident(track.path, track)):
+                    continue
 
                 # NOTE: each branch below resolves the source to a LOCAL path via
                 # ``_local_src()`` ONLY after its ``is_cache_ready`` check passes
@@ -491,8 +540,8 @@ class CastSession:
 
                 # Build the cache-key matching what cast_stream / the
                 # main stream handler use.  If the entry is already
-                # cached (or in-flight), start_background_render is
-                # a fast no-op.
+                # cached (or in-flight), _start_gated_render is a fast
+                # no-op.
                 if src_ext in _SID_EXTS:
                     target_dur = int(getattr(_settings, "sid_default_duration", 180))
                     ck = _ck(
@@ -504,8 +553,8 @@ class CastSession:
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "sid",
+                    await _start_gated_render(
+                        prio, ck, "sid",
                         lambda p=path, ss=int(item.subsong or 0), d=target_dur:
                             _render_sid(p, subsong=ss, duration=d),
                     )
@@ -520,8 +569,8 @@ class CastSession:
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "midi",
+                    await _start_gated_render(
+                        prio, ck, "midi",
                         lambda p=path: _render_midi(p),
                     )
                 elif src_ext in _HVL_EXTS:
@@ -536,8 +585,8 @@ class CastSession:
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "hvl",
+                    await _start_gated_render(
+                        prio, ck, "hvl",
                         lambda p=path, ss=int(item.subsong or 0):
                             _render_hvl(p, subsong=ss),
                     )
@@ -545,19 +594,26 @@ class CastSession:
                     # AHX — uade123, not openmpt123.  Checked before the
                     # tracker branch (same priority as the foreground path
                     # in stream.py).
-                    ck = _ck(
-                        track_id=item.track_id, format_type="uade",
-                        subsong=int(item.subsong or 0),
+                    # Tune N > 0 of a module numbered from 1 renders under
+                    # its own key (see stream.uade_cache_variant).
+                    from soniqboom.api.stream import (
+                        _uade_resolve_base, uade_cache_key, uade_cache_key_known,
                     )
+                    _ss = int(item.subsong or 0)
+                    ck = uade_cache_key_known(item.track_id, _ss, track)
                     if await is_cache_ready(ck):
                         continue
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "uade",
-                        lambda p=path, ss=int(item.subsong or 0):
-                            _render_uade(p, subsong=ss),
+                    _base = await _uade_resolve_base(item.track_id, track, path, _ss)
+                    ck = uade_cache_key(item.track_id, _ss, _base)
+                    if await is_cache_ready(ck):
+                        continue
+                    await _start_gated_render(
+                        prio, ck, "uade",
+                        lambda p=path, ss=_ss, b=_base:
+                            _render_uade(p, subsong=ss, subsong_base=b),
                     )
                 elif src_ext in _TRACKER_EXTS:
                     ck = _ck(
@@ -569,8 +625,8 @@ class CastSession:
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "tracker",
+                    await _start_gated_render(
+                        prio, ck, "tracker",
                         lambda p=path, ss=int(item.subsong or 0):
                             _render_tracker(p, subsong=ss),
                     )
@@ -584,8 +640,8 @@ class CastSession:
                     path = await _local_src()
                     if path is None:
                         continue
-                    await start_background_render(
-                        ck, "gme",
+                    await _start_gated_render(
+                        prio, ck, "gme",
                         lambda p=path, ss=int(item.subsong or 0):
                             _render_gme(p, subsong=ss),
                     )
@@ -619,8 +675,8 @@ class CastSession:
                     if path is None:
                         continue
                     src_dur = float(getattr(track, "duration", 0) or 0) or None
-                    await start_background_render(
-                        ck, "transcoded",
+                    await _start_gated_render(
+                        prio, ck, "transcoded",
                         lambda p=path, c=target_codec, d=src_dur, sr=_prewarm_forced_sr:
                             _render_to_transcoded_flac(
                                 p, codec=c, source_duration=d, target_rate=sr,

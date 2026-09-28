@@ -167,7 +167,7 @@ export async function addToPlaylistSheet(track, ctx) {
         });
         if (!r.ok) throw new Error();
         ctx.toast(`Created "${name}"`);
-      } catch { ctx.toast('Could not create playlist'); }
+      } catch { ctx.toast('Could not create playlist', 'error'); }
     }},
     ...pls.map(p => ({
       label: `${p.name}${p.track_count ? `  ·  ${p.track_count}` : ''}`,
@@ -179,7 +179,7 @@ export async function addToPlaylistSheet(track, ctx) {
           });
           if (!r.ok) throw new Error();
           ctx.toast(`Added to "${p.name}"`);
-        } catch { ctx.toast('Could not add to playlist'); }
+        } catch { ctx.toast('Could not add to playlist', 'error'); }
       },
     })),
   ];

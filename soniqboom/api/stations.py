@@ -35,7 +35,7 @@ from fastapi.responses import Response, StreamingResponse
 from soniqboom.api.users import require_edit
 from pydantic import BaseModel
 
-from soniqboom.core import radiodir
+from soniqboom.core import forksafe, radiodir
 from soniqboom.core.station_hub import StationHub, registry as _hub_registry
 
 log = logging.getLogger("soniqboom.stations")
@@ -286,7 +286,7 @@ async def _hls_encode_fallback() -> tuple:
         ff = settings.ffmpeg_path or "ffmpeg"
         encs: set[str] = set()
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await forksafe.spawn(
                 ff, "-hide_banner", "-encoders",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL)
@@ -522,7 +522,7 @@ async def _hls_metadata_pump(url: str, st: dict) -> None:
         "-i", url, "-map", "0:d:0", "-c", "copy", "-f", "data", "pipe:1",
     ]
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await forksafe.spawn(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except Exception:                       # noqa: BLE001 — ffmpeg missing etc.
         return
@@ -635,7 +635,7 @@ async def _hls_producer(stream: dict, st: dict, set_info):
         *out_args,
         "-",
     ]
-    proc = await asyncio.create_subprocess_exec(
+    proc = await forksafe.spawn(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1020,8 +1020,10 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
         return hub
 
     hub = await _hub_registry.get_or_create(key, _build)
+    # A live, endless stream: tell a buffering reverse proxy (nginx) to pass
+    # bytes through as they arrive instead of holding them in its buffer.
     return StreamingResponse(hub.stream(), media_type=hub.media_type,
-                             headers=hub.headers)
+                             headers={**hub.headers, "X-Accel-Buffering": "no"})
 
 
 @router.get("/hubs")

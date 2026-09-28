@@ -280,15 +280,24 @@ async def submit_now_playing(user: User, track: dict) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def submit_play(user: User, track: dict) -> None:
-    """Submit a completed play.  Queues + retries on failure."""
+async def submit_play(user: User, track: dict, ts: int | None = None) -> None:
+    """Submit a completed play.  Queues + retries on failure.  ``ts`` (epoch
+    seconds) is when it was played — a Subsonic client's back-dated scrobble —
+    clamped to ``[0, now]``."""
     if not user:
         return
     info = _track_payload(track)
     if not info["artist"] or not info["track"]:
         return
 
-    ts = int(time.time())
+    now = int(time.time())
+    if ts is None:
+        ts = now
+    else:
+        try:
+            ts = max(0, min(int(ts), now))
+        except (TypeError, ValueError):
+            ts = now
 
     # last.fm — permanent errors drop the submission; transient errors queue.
     if user.lastfm_session_key:

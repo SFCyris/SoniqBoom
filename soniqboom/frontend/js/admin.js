@@ -7,6 +7,7 @@
 
 import { runRestartFlow } from './restart.js';
 import { Auth }           from './auth.js';
+import { Player }         from './player.js';
 import { Toast, trapFocus } from './utils.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
 // Experimental in-browser SID playback toggle (see sid-wasm-player.js).
@@ -54,19 +55,95 @@ function _initVizSettingsUI() {
   if (adm) adm.addEventListener('change', () => { setVizSettings({ admin: adm.checked }); if (adm.checked) _ensureAdminViz(); });
   if (vu)  vu.addEventListener('change',  () => {
     setVizSettings({ vuStyle: vu.value });
-    // Live-apply to a currently-playing VUMR meter so the change is visible
-    // immediately rather than only on the next track.  The circuit skin is
-    // VUMR-only and gated on the now-playing group, mirroring app.js.
-    const vc = document.getElementById('vu-meters');
-    if (vc && vc.dataset.source === 'vumr') {
-      vc.dataset.style = (vu.value === 'circuit' && vizGroupEnabled('nowPlaying')) ? 'circuit' : 'bars';
-    }
+    _applyVuStyleLive(vu.value);
   });
+}
+// Live-apply a VU style to a currently-playing VUMR meter so the change is
+// visible immediately rather than only on the next track.  The circuit skin is
+// VUMR-only and gated on the now-playing group, mirroring app.js.
+function _applyVuStyleLive(style) {
+  const vc = document.getElementById('vu-meters');
+  if (vc && vc.dataset.source === 'vumr') {
+    vc.dataset.style = (style === 'circuit' && vizGroupEnabled('nowPlaying')) ? 'circuit' : 'bars';
+  }
 }
 
 const overlay        = document.getElementById('admin-overlay');
 const aliasDialog    = document.getElementById('admin-alias-dialog');
 const adminPanel     = document.getElementById('admin-panel');
+
+// ⓘ icons sit inside their row's <label for=…>, so a click or tap on one (touch
+// users tap it to read the tip) would activate the label and flip the setting —
+// and the next Save would commit that.  One delegated handler blocks label
+// activation from any ⓘ in the panel, current rows and future ones alike; a click
+// on the label TEXT still toggles its control, and focusing the ⓘ still shows the
+// tip (``.setting-info:focus::after``).
+adminPanel?.addEventListener('click', (e) => {
+  if (e.target instanceof Element && e.target.closest('label .setting-info')) e.preventDefault();
+});
+
+// The ⓘ tips are drawn by CSS (``::after { content: attr(data-tip) }``), which
+// assistive tech does not read.  Mirror each tip into a visually-hidden element
+// and point the row's control at it with aria-describedby, so a screen reader
+// announces the tip with the setting (the mirror sits outside the <label>).
+// The control is named by its label's text WITHOUT the ⓘ: the icon
+// (role=img "Info") sits inside the <label>, so the computed name would end in
+// "Info" — and a <label> with no ``for`` names nothing at all.  A control that
+// already carries its own name keeps it.  The ⓘ itself stays focusable for
+// sighted keyboard users and is described by the same text.  Runs once: the
+// markup is static in index.html.
+(function _wireSettingTips() {
+  document.querySelectorAll('.setting-info[data-tip]').forEach((icon, n) => {
+    const row = icon.closest('.admin-setting');
+    const lbl = icon.closest('label');
+    const ctl = (lbl && lbl.htmlFor && document.getElementById(lbl.htmlFor))
+             || (row && row.querySelector('input, select, textarea'));
+    const host = row || (lbl && lbl.parentNode) || icon.parentNode;
+    if (!ctl || !host) return;
+    const id = `setting-tip-${n}`;
+    const mirror = document.createElement('span');
+    mirror.id = id;
+    mirror.className = 'sr-only';
+    mirror.textContent = icon.dataset.tip;
+    host.appendChild(mirror);
+    const prev = ctl.getAttribute('aria-describedby');
+    ctl.setAttribute('aria-describedby', prev ? `${prev} ${id}` : id);
+    icon.setAttribute('aria-describedby', id);
+    if (lbl && !ctl.hasAttribute('aria-label') && !ctl.hasAttribute('aria-labelledby')) {
+      const copy = lbl.cloneNode(true);
+      copy.querySelectorAll('.setting-info').forEach(el => el.remove());
+      const name = copy.textContent.replace(/\s+/g, ' ').trim();
+      if (name) ctl.setAttribute('aria-label', name);
+    }
+  });
+})();
+
+// A tip is drawn ABOVE its ⓘ; one whose row sits near the top of the panel's
+// scroll box would be cut off there (the box cannot scroll above its top), so
+// it is drawn below instead when there is less room above than the tip needs
+// and more room below.  Decided as the tip is about to show (hover / focus) —
+// the row's position depends on scrolling.
+function _placeSettingTip(e) {
+  const icon = e.target instanceof Element ? e.target.closest('.setting-info[data-tip]') : null;
+  if (!icon) return;
+  let box = icon.parentElement;
+  while (box && box !== document.body) {
+    const oy = getComputedStyle(box).overflowY;
+    if (oy === 'auto' || oy === 'scroll' || oy === 'hidden') break;
+    box = box.parentElement;
+  }
+  const b = (box && box !== document.body) ? box.getBoundingClientRect()
+                                           : { top: 0, bottom: window.innerHeight };
+  const r = icon.getBoundingClientRect();
+  // The tip's own height (the pseudo-element is laid out even while invisible);
+  // an estimate from its length where the engine reports none.
+  let h = parseFloat(getComputedStyle(icon, '::after').height);
+  if (!(h > 0)) h = Math.ceil(icon.dataset.tip.length / 32) * 15 + 12;
+  const above = r.top - b.top, below = b.bottom - r.bottom;
+  icon.classList.toggle('tip-below', above < h + 8 && below > above);
+}
+adminPanel?.addEventListener('pointerover', _placeSettingTip, { passive: true });
+adminPanel?.addEventListener('focusin', _placeSettingTip);
 
 let _isOpen = false;
 // WCAG 2.4.3: when a modal closes, focus should return to whatever the
@@ -172,9 +249,10 @@ async function open() {
   // (they manage their own scrobble tokens via System tab instead).
   if (Auth.user) {
     if (!Auth.isAdmin) {
+      // No admin panel for this account — but crossfade, the shuffle option and the
+      // theme are the LISTENER's own, stored in this browser, so the gear opens those.
       _isOpen = false;
-      const { Toast } = await import('./utils.js');
-      Toast.error?.('Admin access required.');
+      _openDevicePrefs();
       return;
     }
     adminPanel.classList.remove('hidden');
@@ -186,6 +264,8 @@ async function open() {
     loadRendererStatus();
     loadSoundfonts();
     startScanPoller();
+    _syncRepairStatus?.();
+    _syncGameTagStatus?.();
     _showAdminOnlyTabs();
     // If the Log tab is the active one when admin opens (e.g. it was the
     // last-active tab in this session, or the panel was opened directly
@@ -208,6 +288,7 @@ async function open() {
 
 function close() {
   _isOpen = false;
+  _clearRevealedSecrets();         // a just-generated Subsonic password is shown once
   _hideAllDialogs();
   overlay.classList.add('hidden');
   stopScanPoller();
@@ -275,6 +356,7 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
     if (tab.dataset.tab === 'tab-system') {
       loadDiskUsage();
       loadSettings();
+      _apiKeyRefreshers.forEach(r => r());   // "last used" moves on as apps sign in
     } else if (tab.dataset.tab === 'tab-log') {
       loadLogs();
     } else if (tab.dataset.tab === 'tab-users') {
@@ -286,6 +368,8 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
       loadSettings();
     } else if (tab.dataset.tab === 'tab-metadata') {
       loadSceneStatus();
+      loadSongdbStatus();
+      loadGameTitlesStatus();
       loadDemozooStatus();
       loadMdHvscStatus();
     } else if (tab.dataset.tab === 'tab-backup') {
@@ -733,7 +817,9 @@ function _renderFtpPoolCard(srv) {
 function renderDirRow(list, d, scanActive = false) {
   const alreadyIndexed = (d.track_count ?? 0) > 0;
   const isNetwork = !!d.network_share_id;
-  const isUnavailable = isNetwork && d.status === 'unavailable';
+  // Unavailable = an offline share OR a local drive that is not mounted.  Either
+  // way the row is marked, not hidden, and its library data is kept.
+  const isUnavailable = d.status === 'unavailable';
   const row = document.createElement('div');
   row.className = 'admin-dir-row' + (isUnavailable ? ' dir-unavailable' : '');
   row.dataset.path = d.path;
@@ -745,18 +831,23 @@ function renderDirRow(list, d, scanActive = false) {
   const alias = aliases[d.path] || '';
   const aliasStr = alias ? ` [${alias}]` : '';
 
-  const statusDot = isNetwork
-    ? `<span class="dir-status-dot ${isUnavailable ? 'dot-red' : 'dot-green'}" title="${isUnavailable ? 'Unavailable' : 'Connected'}"></span>`
+  const statusDot = (isNetwork || isUnavailable)
+    ? `<span class="dir-status-dot ${isUnavailable ? 'dot-red' : 'dot-green'}" title="${isUnavailable ? (isNetwork ? 'Unavailable' : 'Drive not connected') : 'Connected'}"></span>`
+    : '';
+  // Reconnect needs a network share; a local drive just has to be plugged in.
+  const localNote = (isUnavailable && !isNetwork)
+    ? '<span class="admin-dir-note" title="Drive not connected \u2014 library data kept">Drive not connected \u2014 library data kept</span>'
     : '';
 
   row.innerHTML = `
     ${statusDot}
     <span class="admin-dir-path" title="${esc(d.path)}">${esc(d.path)}${esc(aliasStr)}</span>
+    ${localNote}
     <span class="admin-dir-count">${d.track_count ?? 0} tracks</span>
     <button class="btn-alias-edit" data-path="${esc(d.path)}">Alias</button>
-    ${isUnavailable ? `<button class="btn-reconnect" data-share="${esc(d.network_share_id)}">Reconnect</button>` : ''}
+    ${(isUnavailable && isNetwork) ? `<button class="btn-reconnect" data-share="${esc(d.network_share_id)}">Reconnect</button>` : ''}
     <button class="btn-index ${btnClass}"
-            data-path="${esc(d.path)}"${isUnavailable ? ' disabled' : ''}>
+            data-path="${esc(d.path)}"${isUnavailable ? ` disabled title="${isNetwork ? 'Reconnect the share to re-index' : 'Connect the drive to re-index'}"` : ''}>
       ${btnLabel}
     </button>
     <button class="btn-danger" data-path="${esc(d.path)}">${isNetwork ? 'Disconnect' : 'Remove'}</button>`;
@@ -788,7 +879,7 @@ async function scanDir(path, row) {
   const btn = row.querySelector('.btn-index');
   btn.textContent = 'Scanning\u2026';
   btn.disabled = true;
-  showMsg('admin-dir-msg', `Scanning ${path}\u2026`, 'ok');
+  showMsg('admin-dir-msg', `Scanning ${path}\u2026`, 'info');
 
   try {
     const res = await api('/admin/scan', {
@@ -1140,7 +1231,7 @@ document.getElementById('btn-admin-reindex').addEventListener('click', async () 
   const btn = document.getElementById('btn-admin-reindex');
   btn.textContent = 'Rebuilding...';
   btn.disabled = true;
-  showMsg('admin-index-msg', 'Rebuilding schema and scanning all folders\u2026', 'ok');
+  showMsg('admin-index-msg', 'Rebuilding schema and scanning all folders\u2026', 'info');
   try {
     const res = await api('/admin/reindex', { method: 'POST' });
     if (!res.ok) {
@@ -1152,7 +1243,7 @@ document.getElementById('btn-admin-reindex').addEventListener('click', async () 
     }
     const data = await res.json();
     if (data.scanning) {
-      showMsg('admin-index-msg', `Schema rebuilt. Scanning ${data.dirs.length} folder(s)\u2026`, 'ok');
+      showMsg('admin-index-msg', `Schema rebuilt. Scanning ${data.dirs.length} folder(s)\u2026`, 'info');
       _reindexActive = true;
       // Scroll the Scan Progress section into view so the user can
       // actually see the file count / current-file feedback while the
@@ -1217,6 +1308,8 @@ function _formatRebuildCompleteMsg(status) {
 // (dispatched by app.js when the WS repair_progress message arrives).
 // We also fall back to a 3 s poll in case the WS is down.
 
+let _syncRepairStatus = null;   // set by setupRepairControls; open() calls it for admins
+
 (function setupRepairControls() {
   const btnScan   = document.getElementById('btn-repair-scan');
   const btnStart  = document.getElementById('btn-repair-start');
@@ -1232,8 +1325,10 @@ function _formatRebuildCompleteMsg(status) {
 
   let lastScanCount = 0;
   let pollHandle = null;
+  let gameNamesRunning = false;     // a game-name run holds the shared task
 
   function showStatus(text, type = 'ok') {
+    statusEl.dataset.gameNames = '';
     statusEl.textContent = text;
     statusEl.className   = `admin-msg ${type}`;
     statusEl.style.display = '';
@@ -1262,14 +1357,16 @@ function _formatRebuildCompleteMsg(status) {
     const parts = [];
     // Sort reasons by count desc so the dominant cause leads.
     const entries = Object.entries(reasons).sort((a, b) => b[1] - a[1]);
+    // Escaped: reasons and file names come from the library (a file may be
+    // NAMED like markup) and this is set as innerHTML.
     for (const [reason, count] of entries) {
-      parts.push(`${count}× ${reason}`);
+      parts.push(`${count}× ${_escAttr(reason)}`);
     }
     let html = ` — ${parts.join(', ')}`;
     if (samples.length) {
       const shown = samples.slice(0, 3).map(s => {
         const base = (s.path || '').split('/').pop() || s.path;
-        return `<code>${base}</code>`;
+        return `<code>${_escAttr(base)}</code>`;
       }).join(', ');
       const more = samples.length > 3 ? ` (+${samples.length - 3})` : '';
       html += `. Examples: ${shown}${more}`;
@@ -1279,6 +1376,27 @@ function _formatRebuildCompleteMsg(status) {
 
   function renderProgress(p) {
     if (!p) return;
+    // A game-name run (Metadata tab) shares the task: it only holds this
+    // section's Repair back while it runs — its progress is shown there.
+    if (p.kind === 'game-names') {
+      gameNamesRunning = !!p.running;
+      progWrap.style.display = 'none';
+      btnCancel.style.display = 'none';
+      btnStart.disabled = gameNamesRunning || lastScanCount === 0;
+      // The waiting note never covers a Scan result shown meanwhile.
+      const ours = statusEl.dataset.gameNames === '1';
+      if (p.running && (ours || statusEl.style.display === 'none')) {
+        showStatus('Game names are being read (Metadata tab) \u2014 Repair can start when that has finished.', 'info');
+        statusEl.dataset.gameNames = '1';
+      } else if (!p.running && ours) {
+        statusEl.style.display = 'none';
+        statusEl.dataset.gameNames = '';
+      }
+      if (!p.running && pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+      return;
+    }
+    gameNamesRunning = false;
+    statusEl.dataset.gameNames = '';
     if (p.running) {
       progWrap.style.display = '';
       progFill.style.width = `${p.pct || 0}%`;
@@ -1316,7 +1434,7 @@ function _formatRebuildCompleteMsg(status) {
 
   btnScan.addEventListener('click', async () => {
     btnScan.disabled = true;
-    showStatus('Scanning index for garbled titles…', 'ok');
+    showStatus('Scanning index for garbled titles…', 'info');
     try {
       const res = await api('/admin/metadata/repair-scan', {
         method: 'POST',
@@ -1336,7 +1454,7 @@ function _formatRebuildCompleteMsg(status) {
           + ` (e.g. ${sample}${more}). Click “Repair Now” to re-extract.`,
           'ok',
         );
-        btnStart.disabled = false;
+        btnStart.disabled = gameNamesRunning;
       }
     } catch (e) {
       showStatus(`Scan failed: ${e.message || e}`, 'err');
@@ -1352,7 +1470,7 @@ function _formatRebuildCompleteMsg(status) {
       + 'on the scan lane — this can take a while if many are on a slow share.'
     )) return;
     btnStart.disabled = true;
-    showStatus('Starting…', 'ok');
+    showStatus('Starting…', 'info');
     try {
       const res = await api('/admin/metadata/repair-start', {
         method: 'POST',
@@ -1385,11 +1503,12 @@ function _formatRebuildCompleteMsg(status) {
     renderProgress(ev.detail);
   });
 
-  // One-shot sync on script load — picks up a repair started in
-  // another tab / by another admin, so the controls correctly
-  // disable themselves and show progress.  Cheap (one GET; the
-  // endpoint is in-memory) so it's safe to do unconditionally.
-  fetchStatus();
+  // Synced each time an admin opens the panel (open()) — picks up a repair
+  // started in another tab / by another admin, so the controls correctly
+  // disable themselves and show progress.  Cheap (one GET; the endpoint is
+  // in-memory).  Admins only: the endpoint is admin-only, and a listener's
+  // 401 would put the sign-in screen over their Preferences.
+  _syncRepairStatus = fetchStatus;
 })();
 
 
@@ -1417,7 +1536,7 @@ async function loadBackupStatus() {
 // ── Export / Import ───────────────────────────────────────────────────────────
 
 document.getElementById('btn-admin-export').addEventListener('click', async () => {
-  showMsg('admin-io-msg', 'Exporting...', 'ok');
+  showMsg('admin-io-msg', 'Exporting...', 'info');
   try {
     const res = await fetch('/api/admin/export', {
       credentials: 'same-origin',
@@ -1451,7 +1570,7 @@ document.getElementById('admin-import-file').addEventListener('change', async (e
   );
   if (!ok) return;
 
-  showMsg('admin-io-msg', 'Importing...', 'ok');
+  showMsg('admin-io-msg', 'Importing...', 'info');
   const formData = new FormData();
   formData.append('file', file);
 
@@ -2132,7 +2251,7 @@ async function uploadSoundfont(file) {
   } catch {
     // List check is best-effort — proceed with the upload either way.
   }
-  showMsg('admin-sf-msg', `Uploading ${file.name}...`, 'ok');
+  showMsg('admin-sf-msg', `Uploading ${file.name}...`, 'info');
   const formData = new FormData();
   formData.append('file', file);
   try {
@@ -2156,7 +2275,7 @@ async function downloadKnownSoundfont(name, url, btn) {
   const orig = btn.textContent;
   btn.textContent = 'Downloading\u2026';
   btn.disabled = true;
-  showMsg('admin-sf-msg', `Downloading ${name}... This may take a while.`, 'ok');
+  showMsg('admin-sf-msg', `Downloading ${name}... This may take a while.`, 'info');
 
   try {
     const res = await api('/admin/soundfonts/download', {
@@ -2308,7 +2427,7 @@ document.getElementById('btn-clear-art-cache')?.addEventListener('click', async 
     { title: 'Clear Art Cache', okLabel: 'Clear' }
   );
   if (!ok) return;
-  showMsg('admin-cache-msg', 'Clearing art cache...', 'ok');
+  showMsg('admin-cache-msg', 'Clearing art cache...', 'info');
   try {
     const res = await api('/admin/cache/clear-art', { method: 'POST' });
     const d = await res.json();
@@ -2335,7 +2454,7 @@ document.getElementById('btn-clear-waveforms')?.addEventListener('click', async 
     { title: 'Clear Waveforms', okLabel: 'Clear' }
   );
   if (!ok) return;
-  showMsg('admin-cache-msg', 'Clearing waveforms...', 'ok');
+  showMsg('admin-cache-msg', 'Clearing waveforms...', 'info');
   try {
     const res = await api('/admin/cache/clear-waveforms', { method: 'POST' });
     const d = await res.json();
@@ -2357,7 +2476,7 @@ document.getElementById('btn-clear-remote-cache')?.addEventListener('click', asy
     { title: 'Clear Remote Cache', okLabel: 'Clear' }
   );
   if (!ok) return;
-  showMsg('admin-cache-msg', 'Clearing remote cache...', 'ok');
+  showMsg('admin-cache-msg', 'Clearing remote cache...', 'info');
   try {
     const res = await api('/admin/cache/clear-remote', { method: 'POST' });
     const d = await res.json();
@@ -2372,7 +2491,7 @@ document.getElementById('btn-clear-zip-extract')?.addEventListener('click', asyn
     { title: 'Clear ZIP Extract Cache', okLabel: 'Clear' }
   );
   if (!ok) return;
-  showMsg('admin-cache-msg', 'Clearing ZIP extract cache...', 'ok');
+  showMsg('admin-cache-msg', 'Clearing ZIP extract cache...', 'info');
   try {
     const res = await api('/admin/cache/clear-zip-extract', { method: 'POST' });
     const d = await res.json();
@@ -2384,7 +2503,7 @@ document.getElementById('btn-clear-zip-extract')?.addEventListener('click', asyn
 });
 
 document.getElementById('btn-clear-lyrics-cache')?.addEventListener('click', async () => {
-  showMsg('admin-cache-msg', 'Clearing lyrics cache...', 'ok');
+  showMsg('admin-cache-msg', 'Clearing lyrics cache...', 'info');
   try {
     const res = await api('/admin/cache/clear-lyrics', { method: 'POST' });
     const d = await res.json();
@@ -2409,6 +2528,231 @@ document.getElementById('setting-lyrics-writeback')?.addEventListener('change', 
     showMsg('md-lyrics-msg', 'Could not save the setting.', 'err');
   }
 });
+
+// Server toggles that save as soon as they change (they sit away from the
+// Settings grid's Save button).  Each checkbox ships ``disabled`` and is enabled
+// by loadSettings only once the server has told us its real value, so a failed
+// load can never post the HTML default.  ``pending``: message while the request
+// runs (default "Saving…"); ``describe(on, r)``: the success message, from the
+// PUT's JSON result; ``done()``: called after the request, whatever its outcome
+// (e.g. to re-read a status line).  While one request is in flight further clicks are undone
+// (``aria-disabled`` dims the box but keeps focus on it).  If the request fails,
+// the stored value is read back rather than assumed: the server may have saved
+// the choice and only lost contact during a long album pass.
+function _bindServerToggle(id, key, msgId, { describe, pending, done } = {}) {
+  const cb = document.getElementById(id);
+  if (!cb) return;
+  let inFlight = false;
+  cb.addEventListener('change', async () => {
+    const on = cb.checked;
+    if (inFlight) { cb.checked = !on; return; }   // one request at a time; keeps focus
+    inFlight = true;
+    cb.setAttribute('aria-busy', 'true');
+    cb.setAttribute('aria-disabled', 'true');
+    showMsg(msgId, pending ? pending(on) : 'Saving\u2026', 'info');
+    try {
+      const res = await api('/admin/settings', {
+        method: 'PUT', body: JSON.stringify({ [key]: on }),
+      });
+      const r = await res.json().catch(() => ({}));
+      if (r.album_pass_error) {
+        // The choice itself was saved; only the pass failed.
+        showMsg(msgId, `${on ? 'On' : 'Off'} \u2014 saved, but applying it failed: ${r.album_pass_error}`, 'err');
+      } else if (r.started === true) {
+        // The server runs the album pass in the background.
+        showMsg(msgId, `${on ? 'On' : 'Off'} \u2014 saved; updating albums in the background\u2026`, 'info');
+      } else {
+        showMsg(msgId, describe ? describe(on, r) : `${on ? 'On' : 'Off'} \u2014 saved.`, 'ok');
+      }
+      // Albums changed on the server: the open library view refreshes (app.js).
+      // Every track written — albums and game names alike.
+      const changed = (Number(r.folder_tracks_updated) || 0) + (Number(r.modland_tracks_updated) || 0)
+        + (Number(r.archive_tracks_updated) || 0);
+      if (changed > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    } catch (err) {
+      // Show what the server actually stored, not what we hoped.
+      let stored = null;
+      try {
+        const st = await (await api('/admin/settings')).json();
+        if (typeof st[key] === 'boolean') stored = st[key];
+      } catch { /* still unreachable */ }
+      cb.checked = stored === null ? !on : stored;
+      if (stored === on) {
+        showMsg(msgId, `${on ? 'On' : 'Off'} \u2014 saved, but the page lost contact while the server was applying it. Reopen Settings later to see the result.`, 'err');
+      } else {
+        showMsg(msgId, `Could not save the setting: ${err.message}`, 'err');
+      }
+    } finally {
+      inFlight = false;
+      cb.removeAttribute('aria-busy');
+      cb.removeAttribute('aria-disabled');
+      if (done) done();
+    }
+  });
+}
+const _fmtCount = v => Number(v || 0).toLocaleString();
+// Metadata tab — the retro-album options.  The server acts on a change at once:
+// ON fills empty albums now, OFF removes only the albums that option added
+// (never a tag or a hand edit).
+_bindServerToggle('setting-retro-album-folder', 'retro_album_from_folder', 'md-retro-album-msg', {
+  pending: on => on ? 'Saving \u2014 filling albums\u2026' : 'Saving \u2014 removing the albums it added\u2026',
+  describe: (on, r) => {
+    if (on && 'folder_albums_filled' in r) return `On \u2014 ${_fmtCount(r.folder_albums_filled)} retro track(s) got an album from their folder name.`;
+    if (!on && 'folder_albums_reverted' in r) return `Off \u2014 removed ${_fmtCount(r.folder_albums_reverted)} folder-name album(s).`;
+    return on ? 'On.' : 'Off.';                      // value was already set
+  },
+});
+_bindServerToggle('setting-modland-filename-game', 'modland_filename_game', 'admin-scene-msg', {
+  pending: on => on ? 'Saving \u2014 filling albums\u2026' : 'Saving \u2014 removing the albums it added\u2026',
+  describe: (on, r) => {
+    if (!on) return 'modland_albums_reverted' in r
+      ? `Off \u2014 removed ${_fmtCount(r.modland_albums_reverted)} album(s) guessed from Modland file names.`
+      : 'Off.';
+    if ('modland_albums_filled' in r) return `On \u2014 Modland index applied: ${_fmtCount(r.modland_albums_filled)} album(s) filled or updated.`;
+    return 'On \u2014 used the next time you apply the Modland index.';
+  },
+});
+_bindServerToggle('setting-game-from-archive', 'game_from_archive_name', 'md-game-titles-msg', {
+  pending: on => on ? 'Saving \u2014 naming games from archive names\u2026' : 'Saving \u2014 removing the names it added\u2026',
+  describe: (on, r) => {
+    if ('archive_tracks_updated' in r) {
+      return on
+        ? `On \u2014 ${_gtNamedText(r.archive_games_primary, r.archive_games_named)}.`
+        : `Off \u2014 removed ${_fmtCount(r.archive_tracks_updated)} game name(s) taken from archive names.`;
+    }
+    return on ? 'On.' : 'Off.';                      // value was already set
+  },
+  done: () => loadGameTitlesStatus(),
+});
+// Renderers tab — Playback preparation.
+_bindServerToggle('setting-render-prewarm', 'render_prewarm', 'admin-playprep-msg', {
+  describe: on => on
+    ? 'On \u2014 the next retro or Amiga track is prepared while the current one plays.'
+    : 'Off \u2014 retro and Amiga tracks are rendered when they start; Amiga, HVL, SC68 and PSF tracks show their length once they have played.',
+});
+_bindServerToggle('setting-uade-vu-meters', 'uade_vu_meters', 'admin-playprep-msg', {
+  describe: on => on
+    ? 'On \u2014 new Amiga tracks get per-voice meters shortly after they start.'
+    : 'Off \u2014 new Amiga tracks show the spectrum meter.',
+});
+// System tab — Subsonic card.
+_bindServerToggle('setting-subsonic-folder-albums', 'subsonic_folder_albums', 'subsonic-folder-albums-msg', {
+  describe: on => on
+    ? 'On \u2014 Subsonic apps list album-less tracks as albums named after their folder.'
+    : 'Off \u2014 album-less tracks are reached by browsing folders in Subsonic apps.',
+});
+
+// Metadata tab — re-read the game name from SPC / NSF / GBS / VGM headers into
+// the album, and the GAME tag of other music files into the game
+// (POST /admin/metadata/backfill-game-albums).  It runs on the shared repair
+// task (progress ``kind: "game-names"``): progress arrives as
+// ``soniqboom:repair-progress`` (app.js, from the WebSocket), with a slow
+// repair-status poll in case the socket is down; a game-name run already going
+// (started automatically, in another tab, or before a reload) is picked up
+// when the panel opens (_syncGameTagStatus) or its progress arrives.  Cancel
+// stops it after the current file (POST /admin/metadata/repair-cancel).
+let _syncGameTagStatus = null;
+(function _wireGameTagBackfill() {
+  const btn = document.getElementById('btn-md-game-tags');
+  if (!btn) return;
+  const btnCancel = document.getElementById('btn-md-game-tags-cancel');
+  const chkRemote = document.getElementById('md-game-tags-remote');
+  const MSG = 'md-game-tags-msg';
+  let watching = false, poll = null, deferred = 0, refused = false;
+  const skipped = () => deferred
+    ? ` ${_fmtCount(deferred)} file(s) in a music folder that is offline were skipped.` : '';
+  const setRunning = (on) => {
+    btn.disabled = on;
+    if (btnCancel) { btnCancel.style.display = on ? '' : 'none'; btnCancel.disabled = !on; }
+  };
+  const finish = (p) => {
+    watching = false;
+    clearInterval(poll); poll = null;
+    setRunning(false);
+    if (p && p.finished_at) {
+      if (Number(p.repaired) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+      const errs = p.errors ? `; ${_fmtCount(p.errors)} could not be read` : '';
+      showMsg(MSG, `${p.cancelled ? 'Cancelled' : 'Done'} \u2014 updated ${_fmtCount(p.repaired)} of ${_fmtCount(p.processed)} file(s)${errs}.${skipped()}`,
+              p.errors || deferred ? 'warn' : 'ok');
+    } else {
+      showMsg(MSG, '');
+    }
+  };
+  const onProgress = (p) => {
+    if (!watching || !p) return;
+    // Another kind of run on the shared task: the one followed has ended
+    // (its last event was missed) — stop, never show or cancel that one.
+    if (p.kind && p.kind !== 'game-names') { finish(null); return; }
+    if (p.running) showMsg(MSG, `Reading ${_fmtCount(p.processed)} / ${_fmtCount(p.total)} file(s)\u2026`, 'info');
+    else finish(p);
+  };
+  // Follow the running game-name task (idempotent; admins only — the status
+  // endpoint is admin-only).  A refused poll (signed out, role changed) ends
+  // the watch instead of polling until a reload.
+  const adopt = () => {
+    if (watching || refused || !Auth.isAdmin) return;
+    watching = true;
+    setRunning(true);
+    poll = setInterval(async () => {
+      try { onProgress(await (await api('/admin/metadata/repair-status')).json()); }
+      catch (err) {
+        if (err.status === 401 || err.status === 403) { refused = true; finish(null); }
+      }
+    }, 3000);
+  };
+  window.addEventListener('soniqboom:repair-progress', (ev) => {
+    const p = ev.detail;
+    if (p && p.running && p.kind === 'game-names' && !watching) { deferred = 0; adopt(); }
+    onProgress(p);
+  });
+  _syncGameTagStatus = async () => {
+    if (!Auth.isAdmin) return;
+    refused = false;                                // opening the panel re-checks
+    try {
+      const p = await (await api('/admin/metadata/repair-status')).json();
+      if (p && p.running && p.kind === 'game-names') {
+        if (!watching) { deferred = 0; adopt(); }
+        onProgress(p);
+      }
+    } catch { /* the panel still works; the next progress event adopts the run */ }
+  };
+  btn.addEventListener('click', async () => {
+    refused = false;                                // the admin is here, clicking
+    setRunning(true);
+    if (btnCancel) btnCancel.disabled = true;      // enabled once the run started
+    try {
+      const r = await (await api('/admin/metadata/backfill-game-albums', {
+        method: 'POST',
+        body: JSON.stringify({ include_remote: chkRemote ? chkRemote.checked : true }),
+      })).json();
+      deferred = Number(r.deferred) || 0;
+      if (!r.total) {
+        setRunning(false);
+        showMsg(MSG, `Nothing to read.${skipped()}`, deferred ? 'warn' : 'ok');
+        return;
+      }
+      adopt();
+      if (btnCancel) btnCancel.disabled = false;
+      showMsg(MSG, `Reading ${_fmtCount(r.total)} file(s)\u2026`, 'info');
+    } catch (err) {
+      if (!watching) setRunning(false);          // (a run it already follows stays shown)
+      // A 409 names its cause (a run going, or the last one still finishing).
+      showMsg(MSG, err.status === 409
+        ? (err.message || 'Another repair or backfill is running \u2014 try again when it has finished.')
+        : `Could not start: ${err.message}`, 'err');
+    }
+  });
+  if (btnCancel) btnCancel.addEventListener('click', async () => {
+    btnCancel.disabled = true;
+    try {
+      await api('/admin/metadata/repair-cancel', { method: 'POST' });
+      showMsg(MSG, 'Cancelling \u2014 finishing the current file\u2026', 'warn');
+    } catch (err) {
+      btnCancel.disabled = false;
+      showMsg(MSG, `Could not cancel: ${err.message}`, 'err');
+    }
+  });
+})();
 
 // ── Services panel ──────────────────────────────────────────────────────────
 // PhD-UX rationale: a service toggle is a high-stakes UX (turning subsonic
@@ -2641,14 +2985,173 @@ function _showRestartBanner() {
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
+// The player's own defaults — what applies when nothing was ever saved.  The forms
+// must show THESE (they used to show 5 s / 300 ms, so one press of Save added a
+// 5-second pre-roll to every track start).
+const _PREF_DEFAULTS = { sb_crossfade: 0, sb_preload_buffer: 0, sb_convert_delay: 6000 };
+function _prefValue(key) {
+  const v = parseFloat(localStorage.getItem(key));
+  return Number.isFinite(v) ? v : _PREF_DEFAULTS[key];
+}
+// Read a number field: blank / unreadable keeps the stored value (never silently
+// 0), out of range is clamped — and either way ``notes`` says so.
+function _readNumPref(el, key, lo, hi, name, notes) {
+  const v = parseFloat(el?.value);
+  if (!Number.isFinite(v)) { notes.push(`${name} was left unchanged.`); return _prefValue(key); }
+  const c = Math.max(lo, Math.min(hi, v));
+  if (c !== v) notes.push(`${name} was set to ${c} (${lo}\u2013${hi} allowed).`);
+  return c;
+}
+
+// ── Preferences for non-admin users (this browser only) ──────────────────────
+// Same localStorage keys the admin Settings grid edits; nothing here touches the
+// server.  Built on the shared pl-modal styles.
+function _openDevicePrefs() {
+  const open_ = document.getElementById('device-prefs');
+  if (open_) { open_._close?.(); return; }         // the gear toggles, like the admin panel
+  const backdrop = document.createElement('div');
+  backdrop.className = 'pl-modal-backdrop';
+  backdrop.id = 'device-prefs';
+  const dialog = document.createElement('div');
+  dialog.className = 'pl-modal-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'device-prefs-title');
+  const row = 'display:flex;align-items:center;justify-content:space-between;gap:16px;margin:10px 0 0;font-size:13px';
+  const hint = 'color:var(--text2,#bbb);font-size:12px;margin:2px 0 8px';
+  dialog.innerHTML = `
+    <div class="pl-modal-title" id="device-prefs-title">Preferences</div>
+    <div style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 12px">These preferences are saved in this browser only.</div>
+    <label style="${row}" for="dp-crossfade">Crossfade (seconds)
+      <input id="dp-crossfade" aria-describedby="dp-crossfade-hint" class="pl-modal-input" type="number" min="0" max="12" step="0.5" style="width:80px;margin:0"></label>
+    <div id="dp-crossfade-hint" style="${hint}">Overlap between one track and the next. 0 = off.</div>
+    <label style="${row}" for="dp-preload">Preload buffer (seconds)
+      <input id="dp-preload" aria-describedby="dp-preload-hint" class="pl-modal-input" type="number" min="0" max="30" step="1" style="width:80px;margin:0"></label>
+    <div id="dp-preload-hint" style="${hint}">Wait until this much audio is buffered before starting. 0 = off.</div>
+    <label style="${row}" for="dp-delay">\u201cConverting\u2026\u201d notice delay (ms)
+      <input id="dp-delay" aria-describedby="dp-delay-hint" class="pl-modal-input" type="number" min="0" max="30000" step="100" style="width:80px;margin:0"></label>
+    <div id="dp-delay-hint" style="${hint}">How long a slow conversion (formats your browser can\u2019t play directly, such as DSD or ALAC) may take before the \u201cConverting\u2026\u201d notice appears. Retro and Amiga tracks show \u201cRendering\u2026\u201d after 1 second instead.</div>
+    <label style="${row}" for="dp-shuffle-replay">Let shuffle repeat tracks you’ve heard
+      <input id="dp-shuffle-replay" aria-describedby="dp-shuffle-replay-hint" type="checkbox"></label>
+    <div id="dp-shuffle-replay-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Off: a shuffle plays each track once before anything repeats. Takes effect the next time you turn shuffle on.</div>
+    <div id="dp-queue-sync-row"${Player.queueSyncSupported === false ? ' hidden' : ''}>
+    <label style="${row}" for="dp-queue-sync">Sync the play queue across devices
+      <input id="dp-queue-sync" aria-describedby="dp-queue-sync-hint" type="checkbox"></label>
+    <div id="dp-queue-sync-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Keeps this browser’s queue on the server for your other devices and Subsonic apps, and offers to resume a newer queue saved elsewhere.</div>
+    </div>
+    <label style="${row}" for="dp-viz-enabled">Visualizations
+      <input id="dp-viz-enabled" aria-describedby="dp-viz-enabled-hint" type="checkbox"></label>
+    <div id="dp-viz-enabled-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Master switch for every animated visualization.</div>
+    <label style="${row}" for="dp-viz-nowplaying">Now-playing visualizations
+      <input id="dp-viz-nowplaying" aria-describedby="dp-viz-nowplaying-hint" type="checkbox"></label>
+    <div id="dp-viz-nowplaying-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Decode signal-chain, CRT oscilloscope mode and the VU meter skin on the player screen.</div>
+    <label style="${row}" for="dp-viz-vustyle">VU meter style
+      <select id="dp-viz-vustyle" class="pl-modal-input" style="width:120px;margin:0"><option value="bars">Bars</option><option value="circuit">Circuit board</option></select></label>
+    <label style="${row}" for="dp-sid-wasm">Play SID in browser (experimental)
+      <input id="dp-sid-wasm" aria-describedby="dp-sid-wasm-hint" type="checkbox"></label>
+    <div id="dp-sid-wasm-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Also renders C64 SID tunes in this browser to drive the per-voice VU meter. Playback still streams from the server.</div>
+    <label style="${row}" for="dp-theme">Theme
+      <select id="dp-theme" class="pl-modal-input" style="width:120px;margin:0"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+    <div style="border-top:1px solid var(--glass-border,rgba(255,255,255,.12));margin:14px 0 0;padding-top:10px">
+      <div style="color:var(--text2,#bbb);font-size:12px;margin:0 0 8px">Your account (saved on the server):</div>
+      <div id="dp-sspw" style="font-size:13px"></div>
+      <div id="dp-apikeys" style="font-size:13px;margin-top:14px"></div>
+    </div>
+    <div class="pl-modal-actions">
+      <button class="pl-modal-btn pl-modal-cancel" type="button">Cancel</button>
+      <button class="pl-modal-btn pl-modal-ok" type="button">Save</button>
+    </div>`;
+  backdrop.appendChild(dialog);
+  document.body.appendChild(backdrop);
+  const $ = (id) => dialog.querySelector('#' + id);
+  $('dp-crossfade').value = _prefValue('sb_crossfade');
+  $('dp-preload').value = _prefValue('sb_preload_buffer');
+  $('dp-delay').value = _prefValue('sb_convert_delay');
+  $('dp-shuffle-replay').checked = localStorage.getItem('sb_shuffle_replay') === '1';
+  $('dp-queue-sync').checked = Player.queueSync;
+  $('dp-theme').value = localStorage.getItem('sb_theme') || 'dark';
+  const viz = getVizSettings();
+  $('dp-viz-enabled').checked = viz.enabled !== false;
+  $('dp-viz-nowplaying').checked = viz.nowPlaying !== false;
+  $('dp-viz-vustyle').value = viz.vuStyle === 'circuit' ? 'circuit' : 'bars';
+  $('dp-sid-wasm').checked = sidWasmPlaybackEnabled();
+  // Safari does not focus a <button> on click, so activeElement would be <body>.
+  const opener = document.getElementById('btn-admin') || document.activeElement;
+  const close = () => { backdrop.remove(); _clearRevealedSecrets(); try { opener?.focus?.(); } catch (_) {} };
+  backdrop._close = close;
+  _mountSubsonicPassword($('dp-sspw'), 'dp');
+  _mountApiKeys($('dp-apikeys'), 'dp');
+  dialog.querySelector('.pl-modal-cancel').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+  // A modal: Escape closes, Enter saves, and Tab stays inside it (the page behind
+  // is neither inert nor hidden from assistive tech, so focus must not wander out).
+  dialog.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); return; }
+    if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); dialog.querySelector('.pl-modal-ok').click(); return; }
+    if (e.key !== 'Tab') return;
+    const f = [...dialog.querySelectorAll('input, select, button')];
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+  dialog.querySelector('.pl-modal-ok').addEventListener('click', async () => {
+    // A blank / unreadable field keeps the stored value; out of range is clamped.
+    const notes = [];
+    localStorage.setItem('sb_crossfade', String(_readNumPref($('dp-crossfade'), 'sb_crossfade', 0, 12, 'Crossfade', notes)));
+    localStorage.setItem('sb_preload_buffer', String(_readNumPref($('dp-preload'), 'sb_preload_buffer', 0, 30, 'Preload buffer', notes)));
+    localStorage.setItem('sb_convert_delay', String(Math.round(_readNumPref($('dp-delay'), 'sb_convert_delay', 0, 30000, '\u201cConverting\u2026\u201d notice delay', notes))));
+    localStorage.setItem('sb_shuffle_replay', $('dp-shuffle-replay').checked ? '1' : '0');
+    Player.setQueueSync($('dp-queue-sync').checked);
+    const theme = $('dp-theme').value === 'light' ? 'light' : 'dark';
+    localStorage.setItem('sb_theme', theme);
+    if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    else document.documentElement.removeAttribute('data-theme');
+    // Visualization preferences (localStorage, applied live like the admin grid's).
+    const vuStyle = $('dp-viz-vustyle').value === 'circuit' ? 'circuit' : 'bars';
+    setVizSettings({ enabled: $('dp-viz-enabled').checked, nowPlaying: $('dp-viz-nowplaying').checked, vuStyle });
+    _applyVuStyleLive(vuStyle);
+    setSidWasmPlayback($('dp-sid-wasm').checked);
+    close();
+    try { (await import('./utils.js')).Toast.ok(['Preferences saved for this browser.', ...notes].join(' ')); } catch (_) {}
+  });
+  $('dp-crossfade').focus();
+}
+
+let _loadedDedupFolders = null;   // value the form was loaded with → Save knows if it changed
+// Server toggles that save on change (see _bindServerToggle): filled — and only
+// then enabled — from the server's settings.
+const _SAVE_ON_CHANGE_TOGGLES = [
+  ['setting-render-prewarm',         'render_prewarm'],
+  ['setting-uade-vu-meters',         'uade_vu_meters'],
+  ['setting-subsonic-folder-albums', 'subsonic_folder_albums'],
+  ['setting-modland-filename-game',  'modland_filename_game'],
+  ['setting-game-from-archive',      'game_from_archive_name'],
+  ['setting-retro-album-folder',     'retro_album_from_folder'],
+];
+
+// The player learns whether the server keeps a play queue a few seconds after
+// load; Settings or Preferences may already be open by then.
+Player.on('queuesync', ({ supported }) => {
+  for (const id of ['setting-queue-sync-row', 'dp-queue-sync-row']) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = supported === false;
+  }
+});
+
 async function loadSettings() {
   const xfadeEl   = document.getElementById('setting-crossfade');
   const preloadEl = document.getElementById('setting-preload-buffer');
   const delayEl   = document.getElementById('setting-convert-delay');
   const themeEl   = document.getElementById('setting-theme');
-  if (xfadeEl)   xfadeEl.value   = localStorage.getItem('sb_crossfade')      || '0';
-  if (preloadEl) preloadEl.value = localStorage.getItem('sb_preload_buffer') || '5';
-  if (delayEl)   delayEl.value   = localStorage.getItem('sb_convert_delay')  || '300';
+  if (xfadeEl)   xfadeEl.value   = _prefValue('sb_crossfade');
+  if (preloadEl) preloadEl.value = _prefValue('sb_preload_buffer');
+  if (delayEl)   delayEl.value   = _prefValue('sb_convert_delay');
+  const shufReplayEl = document.getElementById('setting-shuffle-replay');
+  if (shufReplayEl) shufReplayEl.checked = localStorage.getItem('sb_shuffle_replay') === '1';
+  const qsyncEl = document.getElementById('setting-queue-sync');
+  if (qsyncEl) qsyncEl.checked = Player.queueSync;
+  const qsyncRow = document.getElementById('setting-queue-sync-row');
+  if (qsyncRow) qsyncRow.hidden = Player.queueSyncSupported === false;   // the server has no queue to sync with
   if (themeEl)   themeEl.value   = localStorage.getItem('sb_theme') || 'dark';
   // Visualization preference controls (client-side, applies live).
   _initVizSettingsUI();
@@ -2661,6 +3164,8 @@ async function loadSettings() {
     if (zipEl) zipEl.checked = s.scan_zips !== false;
     const remoteZipEl = document.getElementById('setting-scan-remote-zips');
     if (remoteZipEl) remoteZipEl.checked = s.scan_remote_zips !== false;
+    const reconcileEl = document.getElementById('setting-startup-reconcile-scan');
+    if (reconcileEl) reconcileEl.checked = s.startup_reconcile_scan !== false;
     // Keep the add-dir form checkbox in sync with the global setting
     const addZipEl = document.getElementById('admin-scan-zips');
     if (addZipEl) addZipEl.checked = s.scan_zips !== false;
@@ -2670,6 +3175,13 @@ async function loadSettings() {
     if (dupEl) dupEl.checked = !!s.filter_duplicates;
     const dedupFoldersEl = document.getElementById('setting-dedup-folders');
     if (dedupFoldersEl) dedupFoldersEl.checked = !!s.dedup_folders;
+    _loadedDedupFolders = !!s.dedup_folders;
+    for (const [id, key] of _SAVE_ON_CHANGE_TOGGLES) {
+      const el = document.getElementById(id);
+      if (!el || typeof s[key] !== 'boolean' || el.getAttribute('aria-busy')) continue;
+      el.checked = s[key];
+      el.disabled = false;
+    }
     const folderArtEl = document.getElementById('setting-use-folder-art');
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
     const lyricsWbEl = document.getElementById('setting-lyrics-writeback');
@@ -2737,13 +3249,19 @@ async function loadAbout() {
 }
 
 document.getElementById('btn-save-settings')?.addEventListener('click', async () => {
-  const xfade   = parseFloat(document.getElementById('setting-crossfade')?.value      || '0');
-  const preload = parseFloat(document.getElementById('setting-preload-buffer')?.value || '5');
-  const delay   = parseInt(  document.getElementById('setting-convert-delay')?.value  || '300');
+  const _notes = [];
+  const xfade   = _readNumPref(document.getElementById('setting-crossfade'),      'sb_crossfade',      0, 12,    'Crossfade', _notes);
+  const preload = _readNumPref(document.getElementById('setting-preload-buffer'), 'sb_preload_buffer', 0, 30,    'Preload buffer', _notes);
+  const delay   = Math.round(_readNumPref(document.getElementById('setting-convert-delay'), 'sb_convert_delay', 0, 30000, '\u201cConverting\u2026\u201d notice delay', _notes));
   const theme    = document.getElementById('setting-theme')?.value || 'dark';
   localStorage.setItem('sb_crossfade',      String(xfade));
   localStorage.setItem('sb_preload_buffer', String(Math.max(0, preload))); // takes effect on next track
   localStorage.setItem('sb_convert_delay',  String(delay));
+  // Read by the player at the next shuffle deal (player.js ``sb_shuffle_replay``).
+  localStorage.setItem('sb_shuffle_replay',
+    document.getElementById('setting-shuffle-replay')?.checked ? '1' : '0');
+  const _qsyncEl = document.getElementById('setting-queue-sync');
+  if (_qsyncEl) Player.setQueueSync(_qsyncEl.checked);
   localStorage.setItem('sb_theme', theme);
   // Apply the theme immediately so the user sees the flip without reload.
   if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
@@ -2751,6 +3269,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   try {
     const scanZips = document.getElementById('setting-scan-zips')?.checked ?? true;
     const scanRemoteZips = document.getElementById('setting-scan-remote-zips')?.checked ?? true;
+    const startupReconcile = document.getElementById('setting-startup-reconcile-scan')?.checked ?? true;
     const sidDur = parseInt(document.getElementById('setting-sid-duration')?.value || '180');
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
     const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
@@ -2769,6 +3288,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       body: JSON.stringify({
         scan_zips: scanZips,
         scan_remote_zips: scanRemoteZips,
+        startup_reconcile_scan: startupReconcile,
         renderers: { sid_default_duration: sidDur },
         filter_duplicates: filterDups,
         dedup_folders: dedupFolders,
@@ -2789,9 +3309,17 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       const mod = await import('./foldertree.js');
       mod.FolderTree?.refresh?.();
     } catch { /* non-fatal — next page reload picks it up anyway */ }
-    showMsg('admin-settings-msg', 'Settings saved.', 'ok');
+    // A folder that is open behind this panel lists by the folder-duplicates
+    // setting — redraw it in place so the change is visible without re-navigating.
+    if (dedupFolders !== _loadedDedupFolders) {
+      _loadedDedupFolders = dedupFolders;
+      try { (await import('./library.js')).Library?.refreshCurrentFolderInPlace?.(); } catch { /* non-fatal */ }
+    }
+    showMsg('admin-settings-msg', ['Settings saved.', ..._notes].join(' '), 'ok');
   } catch {
-    showMsg('admin-settings-msg', 'Error saving server settings.', 'err');
+    // The browser-local half (crossfade, preload, convert delay, shuffle, theme)
+    // was written before the request — say so, or the user re-does it for nothing.
+    showMsg('admin-settings-msg', 'Saved for this browser. The server settings could not be saved \u2014 check the connection and try again.', 'err');
   }
 });
 
@@ -3042,7 +3570,7 @@ document.getElementById('btn-restart-app')?.addEventListener('click', async () =
     { title: 'Restart Server', okLabel: 'Restart' }
   );
   if (!ok) return;
-  showMsg('admin-restart-msg', 'Sending restart request…', 'ok');
+  showMsg('admin-restart-msg', 'Sending restart request…', 'info');
   try {
     const res = await api('/admin/restart', { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -3272,7 +3800,7 @@ document.getElementById('btn-save-hvsc')?.addEventListener('click', async () => 
       showMsg('admin-hvsc-msg', `Failed: ${data.detail || res.status}`, 'err');
       return;
     }
-    showMsg('admin-hvsc-msg', 'Saved. Reloading database…', 'ok');
+    showMsg('admin-hvsc-msg', 'Saved. Reloading database…', 'info');
     await loadHvscStatus();
   } catch (err) {
     showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
@@ -3376,7 +3904,7 @@ document.getElementById('btn-save-renderer-paths')?.addEventListener('click', as
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ renderers }),
     });
-    showMsg('admin-rpaths-msg', 'Saved — re-checking renderer status…', 'ok');
+    showMsg('admin-rpaths-msg', 'Saved — re-checking renderer status…', 'info');
     loadRendererStatus();   // reflect the new paths in the chips above
   } catch (err) {
     showMsg('admin-rpaths-msg', `Save failed: ${err.message}`, 'err');
@@ -3444,9 +3972,13 @@ document.getElementById('btn-scene-apply')?.addEventListener('click', async (e) 
     _renderSceneStatus(s);
     if (s && !s.error) {
       const la = s.last_apply || {};
+      const albums = typeof la.albums === 'number'
+        ? ` (${la.albums.toLocaleString()} album change${la.albums === 1 ? '' : 's'})` : '';
       showMsg('admin-scene-msg',
               `Applied: ${(la.matched ?? 0).toLocaleString()} matched, `
-              + `${(la.updated ?? 0).toLocaleString()} tracks updated.`, 'ok');
+              + `${(la.updated ?? 0).toLocaleString()} tracks updated${albums}.`, 'ok');
+      // Artists, albums and scene paths changed: the open library view refreshes (app.js).
+      if ((Number(la.updated) || 0) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
     } else {
       showMsg('admin-scene-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
     }
@@ -3456,6 +3988,332 @@ document.getElementById('btn-scene-apply')?.addEventListener('click', async (e) 
   } finally {
     btn.disabled = false;
   }
+});
+
+// ── Metadata tab: game names from archive names (game-title lists) ───────────
+
+const _GT_NAMES = { tosec: 'TOSEC', redump: 'Redump' };
+const _GT_FILES = { tosec: 'pack', redump: 'lists' };   // what its kept files are called
+let _gtPoll = null;
+let _gtLastBusy = false;
+let _gtFailedPolls = 0;
+const _gtWasBusy = {};
+
+function _gtBusy(job) {
+  return !!job && !['done', 'error', 'interrupted', undefined].includes(job.state);
+}
+
+// "N retro tracks take their game from their archive's name" (+ how many more
+// carry it only as another name, below a higher-ranked source).
+function _gtNamedText(primary, named) {
+  const p = Number(primary) || 0, n = Number(named) || 0;
+  let txt = `${_fmtCount(p)} retro track(s) take their game from their archive's name`;
+  if (n > p) txt += ` (${_fmtCount(n - p)} more list it as another name)`;
+  return txt;
+}
+
+function _renderGameTitlesStatus(s) {
+  const line = document.getElementById('md-game-titles-status');
+  if (!line || !s || typeof s !== 'object') return;
+  const parts = [];
+  if (Number(s.titles) > 0) parts.push(`${_fmtCount(s.titles)} distinct titles`);
+  let busy = !!s.pass_busy;
+  for (const [src, d] of Object.entries(s.downloads || {})) {
+    const name = _GT_NAMES[src] || src;
+    const kind = _GT_FILES[src] || 'files';
+    const dl = document.getElementById(`md-gt-dl-${src}`);
+    const rm = document.getElementById(`md-gt-rm-${src}`);
+    const del = document.getElementById(`md-gt-del-${src}`);
+    const stop = document.getElementById(`md-gt-stop-${src}`);
+    const files = d.files && typeof d.files === 'object' ? d.files : null;
+    const resumable = !!(files && files.resumable);
+    const size = files ? _fmtBytes(Number(files.bytes)) : '';
+    const running = _gtBusy(d);
+    busy = busy || running;
+    if (running) {
+      let txt = `${name}: ${d.message || 'working'}`;
+      if (d.state === 'downloading' && Number(d.total) > 1e6) {
+        txt += ` (${(Number(d.bytes || 0) / 1e6).toFixed(0)} of ${(Number(d.total) / 1e6).toFixed(0)} MB)`;
+      }
+      parts.push(txt + '…');
+    } else if (d.state === 'error' || d.state === 'interrupted') {
+      parts.push(`${name}: ${d.message}${d.present ? ' (the earlier list is kept)' : ''}`);
+    } else if (d.present) {
+      let txt = `${name} downloaded ${d.downloaded || ''}`.trim();
+      const missing = Array.isArray(d.systems_failed) ? d.systems_failed.length : 0;
+      if (resumable) txt += ' (a stopped update can be continued)';
+      else if (missing) txt += ` (${missing} system${missing === 1 ? '' : 's'} could not be fetched — Update to retry)`;
+      if (files) txt += `, the downloaded ${kind} kept (${size})`;
+      parts.push(txt);
+    } else if (resumable) {
+      parts.push(`${name}: ${files.done} of ${files.of} systems downloaded — continue the download for the rest`);
+    } else if (files) {
+      parts.push(`${name} not in use — the downloaded ${kind}${files.release ? ` of ${files.release}` : ''} kept (${size})`);
+    }
+    if (dl) {
+      if (!dl.dataset.label) dl.dataset.label = dl.textContent;      // "Download X (~N MB)"
+      dl.disabled = running;
+      let label = dl.dataset.label;
+      let local = false;
+      if (resumable) label = `Continue the ${name} download`;
+      else if (d.present) label = `Update ${name}`;
+      else if (files) { label = `Add ${name} from the downloaded ${kind}`; local = true; }
+      dl.textContent = label;
+      dl.dataset.gtLocal = local ? '1' : '';
+    }
+    if (rm) rm.hidden = !d.present || running;
+    if (del) {
+      del.hidden = !files || running;
+      del.textContent = `Delete the downloaded ${kind}`;
+      del.setAttribute('aria-label', `Delete the downloaded ${name} ${kind}${files ? ` (${size})` : ''}`);
+    }
+    if (stop) stop.hidden = !running;
+    // A download that just finished: the game names update in the background.
+    if (_gtWasBusy[src] && !running) {
+      if (d.state === 'done') {
+        const changed = d.changed !== false;
+        const partial = Array.isArray(d.systems_failed) && d.systems_failed.length;
+        const said = d.message && d.message !== 'Downloaded';
+        let msg = said ? `${name}: ${d.message}` : `${name} titles downloaded`;
+        if (changed) msg += said ? '. Game names are being updated.' : '; game names are being updated.';
+        else msg += '.';
+        showMsg('md-game-titles-msg', msg, partial ? 'info' : 'ok');
+        if (changed) setTimeout(() => document.dispatchEvent(new CustomEvent('soniqboom:library-changed')), 4000);
+      } else if (d.state === 'error') {
+        showMsg('md-game-titles-msg', `${name}: ${d.message}`, 'err');
+      } else if (d.state === 'interrupted') {
+        showMsg('md-game-titles-msg', `${name}: ${d.message}`, 'info');
+      }
+    }
+    _gtWasBusy[src] = running;
+  }
+  const lp = s.last_pass;
+  if (s.pass_waiting_for_scan) parts.push('game names update when the scan finishes');
+  else if (s.pass_busy) parts.push('updating game names…');
+  else if (lp && typeof lp.named === 'number') parts.push(_gtNamedText(lp.primary, lp.named));
+  if (s.enabled === false) parts.push('off');
+  line.textContent = `Game title lists: ${parts.join(' · ') || '—'}`;
+  // A live region: while it changes every poll, screen readers wait (aria-busy)
+  // and announce the settled line.
+  line.setAttribute('aria-busy', busy ? 'true' : 'false');
+  _gtLastBusy = busy;
+  _gtFailedPolls = 0;
+  clearTimeout(_gtPoll);
+  if (busy) _gtPoll = setTimeout(loadGameTitlesStatus, 1500);
+}
+
+async function loadGameTitlesStatus() {
+  try {
+    const res = await api('/admin/game-titles/status');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    _renderGameTitlesStatus(await res.json());
+  } catch (_) {
+    // The server may be restarting mid-download: keep asking while something
+    // was running (backing off), so the line doesn't freeze on old progress.
+    if (_gtLastBusy) {
+      _gtFailedPolls += 1;
+      const line = document.getElementById('md-game-titles-status');
+      if (line && _gtFailedPolls === 1) line.textContent = 'Game title lists: waiting for the server…';
+      clearTimeout(_gtPoll);
+      _gtPoll = setTimeout(loadGameTitlesStatus, Math.min(15000, 1500 * 2 ** _gtFailedPolls));
+    }
+  }
+}
+
+function _gtFocusMain(src) {
+  const dl = document.getElementById(`md-gt-dl-${src}`);
+  if (dl && !dl.hidden) dl.focus();
+}
+
+document.querySelectorAll('[data-gt-source]').forEach(btn => btn.addEventListener('click', async () => {
+  const src = btn.dataset.gtSource;
+  const local = btn.dataset.gtLocal === '1';
+  const name = _GT_NAMES[src] || src;
+  btn.disabled = true;
+  showMsg('md-game-titles-msg', local
+    ? `Adding the ${name} title list from the downloaded ${_GT_FILES[src] || 'files'}…`
+    : `Downloading the ${name} title list…`, 'info');
+  try {
+    const res = await api(`/admin/game-titles/download/${src}${local ? '?local=true' : ''}`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    await loadGameTitlesStatus();
+  } catch (err) {
+    btn.disabled = false;
+    showMsg('md-game-titles-msg', `Could not start the download: ${err.message}`, 'err');
+  }
+}));
+
+document.querySelectorAll('[data-gt-stop]').forEach(btn => btn.addEventListener('click', async () => {
+  const src = btn.dataset.gtStop;
+  btn.disabled = true;
+  try {
+    const res = await api(`/admin/game-titles/download/${src}/stop`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    _renderGameTitlesStatus(await res.json());
+    _gtFocusMain(src);
+  } catch (err) {
+    showMsg('md-game-titles-msg', `Could not stop the download: ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}));
+
+document.querySelectorAll('[data-gt-remove]').forEach(btn => btn.addEventListener('click', async () => {
+  const src = btn.dataset.gtRemove;
+  const name = _GT_NAMES[src] || src;
+  btn.disabled = true;
+  try {
+    const res = await api(`/admin/game-titles/download/${src}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const st = await res.json();
+    _renderGameTitlesStatus(st);
+    const kept = st && st.downloads && st.downloads[src] && st.downloads[src].files;
+    showMsg('md-game-titles-msg', `Removed the ${name} title list; game names are being updated.`
+      + (kept ? ` The downloaded ${_GT_FILES[src] || 'files'} ${src === 'tosec' ? 'is' : 'are'} kept — Add ${name} puts the list back without downloading.` : ''), 'ok');
+    document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    _gtFocusMain(src);
+  } catch (err) {
+    showMsg('md-game-titles-msg', `Could not remove the list: ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}));
+
+document.querySelectorAll('[data-gt-delete]').forEach(btn => btn.addEventListener('click', async () => {
+  const src = btn.dataset.gtDelete;
+  const name = _GT_NAMES[src] || src;
+  const kind = _GT_FILES[src] || 'files';
+  const ok = await styledConfirm(
+    `The downloaded ${name} ${kind} ${src === 'tosec' ? 'is' : 'are'} deleted from SoniqBoom's data folder; `
+    + 'your title list stays and your music files are not touched. The next download fetches '
+    + `${src === 'tosec' ? 'it' : 'them'} again.`,
+    { title: `Delete the downloaded ${name} ${kind}?`, okLabel: 'Delete' });
+  if (!ok) return;
+  btn.disabled = true;
+  try {
+    const res = await api(`/admin/game-titles/files/${src}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    _renderGameTitlesStatus(await res.json());
+    showMsg('md-game-titles-msg', `Deleted the downloaded ${name} ${kind}.`, 'ok');
+    _gtFocusMain(src);
+  } catch (err) {
+    showMsg('md-game-titles-msg', `Could not delete the files: ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}));
+
+// ── Metadata tab: UADE song database (audacious-uade-tools) ──────────────────
+
+function _renderSongdbStatus(s) {
+  const line = document.getElementById('md-songdb-status');
+  if (!line) return;
+  if (!s || typeof s !== 'object') { line.textContent = 'Index: —'; return; }
+  let txt;
+  if (s.refreshing)                     txt = 'Index: downloading…';
+  else if (!s.exists || !s.meta_rows)   txt = 'Index: not downloaded yet';
+  else {
+    const built = s.built_at ? new Date(s.built_at * 1000).toLocaleDateString() : 'unknown date';
+    txt = `Index: ${Number(s.meta_rows).toLocaleString()} songs with metadata, `
+        + `${Number(s.length_rows || 0).toLocaleString()} with lengths (built ${built})`;
+  }
+  if (s.applying) txt += ' · applying…';
+  else if (s.last_apply) {
+    txt += ` · last apply: ${Number(s.last_apply.matched || 0).toLocaleString()} matched, `
+         + `${Number(s.last_apply.updated || 0).toLocaleString()} updated`;
+  }
+  if (s.error) txt += ` · ${s.error}`;
+  line.textContent = txt;
+  const cb = document.getElementById('md-songdb-autoapply');
+  if (cb && typeof s.auto_apply === 'boolean') cb.checked = s.auto_apply;
+}
+
+async function loadSongdbStatus() {
+  try {
+    const res = await api('/admin/songdb/status');
+    if (res.ok) _renderSongdbStatus(await res.json());
+  } catch (_) { /* non-critical */ }
+}
+
+document.getElementById('md-songdb-autoapply')?.addEventListener('change', async (e) => {
+  const cb = e.currentTarget; const enabled = cb.checked; cb.disabled = true;
+  try {
+    const res = await api('/admin/songdb/auto-apply',
+                          { method: 'POST', body: JSON.stringify({ enabled }) });
+    const s = await res.json().catch(() => null);
+    if (s && !s.error) _renderSongdbStatus(s);
+    else { cb.checked = !enabled; showMsg('md-songdb-msg', (s && s.error) || `Failed: ${res.status}`, 'err'); }
+  } catch (err) {
+    cb.checked = !enabled; showMsg('md-songdb-msg', `Failed: ${err.message}`, 'err');
+  } finally { cb.disabled = false; }
+});
+
+document.getElementById('md-songdb-refresh')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  const line = document.getElementById('md-songdb-status');
+  if (line) line.textContent = 'Index: downloading (~27 MB — can take a minute)…';
+  try {
+    const res = await api('/admin/songdb/refresh-index', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderSongdbStatus(s);
+    if (s && !s.error) {
+      showMsg('md-songdb-msg', s.auto_apply
+        ? 'Index refreshed — applying it to the library in the background.'
+        : 'Index refreshed.', 'ok');
+    } else {
+      showMsg('md-songdb-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    showMsg('md-songdb-msg', `Refresh failed: ${err.message}`, 'err');
+    loadSongdbStatus();
+  } finally { btn.disabled = false; }
+});
+
+document.getElementById('md-songdb-apply')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const res = await api('/admin/songdb/apply', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderSongdbStatus(s);
+    if (s && !s.error) {
+      const la = s.last_apply || {};
+      const albums = typeof la.albums === 'number'
+        ? ` (${la.albums.toLocaleString()} album change${la.albums === 1 ? '' : 's'})` : '';
+      showMsg('md-songdb-msg',
+              `Applied: ${Number(la.matched || 0).toLocaleString()} matched, `
+              + `${Number(la.updated || 0).toLocaleString()} tracks updated${albums}.`, 'ok');
+      if ((Number(la.updated) || 0) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    } else {
+      showMsg('md-songdb-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    showMsg('md-songdb-msg', `Apply failed: ${err.message}`, 'err');
+  } finally { btn.disabled = false; }
+});
+
+document.getElementById('md-songdb-reset')?.addEventListener('click', async (e) => {
+  if (!confirm(
+        'Remove the song database enrichment from your library?\n\n'
+        + '• Artists, labels, albums and years it filled are cleared\n'
+        + '• Song lengths stay (a track is re-measured when it is played)\n\n'
+        + 'Your own edits are kept. This also turns OFF auto-apply after '
+        + 'scans, so it stays reset until you click Apply (or re-enable the toggle).')) return;
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const res = await api('/admin/songdb/reset', { method: 'POST' });
+    const s = await res.json().catch(() => null);
+    _renderSongdbStatus(s);
+    if (s && !s.error) {
+      showMsg('md-songdb-msg',
+              `Reset: ${Number(s.cleared || 0).toLocaleString()} tracks restored. `
+              + `Auto-apply after scans turned off.`, 'ok');
+      if ((Number(s.cleared) || 0) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    } else {
+      showMsg('md-songdb-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
+    }
+  } catch (err) {
+    showMsg('md-songdb-msg', `Reset failed: ${err.message}`, 'err');
+  } finally { btn.disabled = false; }
 });
 
 // ── Metadata tab: Demozoo scene groups + HVSC status/rescan ───────────────────
@@ -3470,6 +4328,8 @@ function _renderDemozooStatus(s) {
   else {
     const built = s.built_at ? new Date(s.built_at * 1000).toLocaleDateString() : 'unknown date';
     txt = `Index: ${Number(s.names).toLocaleString()} name→group entries (built ${built})`;
+    if (s.games === null) txt += ' \u00b7 refresh the index to add game names';
+    else if (Number(s.games) > 0) txt += ` \u00b7 ${Number(s.games).toLocaleString()} game soundtracks`;
   }
   if (s.applying) txt += ' · applying…';
   else if (s.last_apply) {
@@ -3528,6 +4388,7 @@ document.getElementById('md-demozoo-apply')?.addEventListener('click', async (e)
       showMsg('md-demozoo-msg',
               `Applied: ${Number(s.matched || 0).toLocaleString()} matched, `
               + `${Number(s.updated || 0).toLocaleString()} tracks tagged with scene groups.`, 'ok');
+      if ((Number(s.updated) || 0) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
     } else {
       showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
     }
@@ -3553,6 +4414,7 @@ document.getElementById('md-demozoo-reset')?.addEventListener('click', async (e)
       showMsg('md-demozoo-msg',
               `Reset: ${Number(s.cleared || 0).toLocaleString()} tracks restored to file metadata. `
               + `Auto-apply after scans turned off.`, 'ok');
+      if ((Number(s.cleared) || 0) > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
     } else {
       showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
     }
@@ -3653,6 +4515,292 @@ document.getElementById('md-hvsc-rescan')?.addEventListener('click', async (e) =
     }
   });
 })();
+
+// ── Subsonic app password (My Account, and the non-admin Preferences dialog) ──
+// Subsonic apps that sign in with a token (``t = md5(password + salt)``) cannot
+// use the scrypt-hashed login password, so each user may set a separate Subsonic
+// app password (PUT /api/me/subsonic-password; the server only ever reports
+// WHETHER one is set).  We generate a random one here and show it once, with
+// Copy; the revealed value is wiped when the panel or dialog closes.  Replacing
+// or removing one takes a second click within a few seconds (no modal, so this
+// works inside the Preferences dialog too).
+const _subsonicPwReveals = new Set();
+function _clearRevealedSecrets() {
+  for (const el of _subsonicPwReveals) {
+    el.textContent = '';
+    el.closest('.subsonic-pw-reveal')?.setAttribute('hidden', '');
+    if (!el.isConnected) _subsonicPwReveals.delete(el);     // a closed dialog's copy
+  }
+}
+function _randomSubsonicPassword(len = 24) {
+  // Unambiguous alphabet (no 0/O, 1/l/I); rejection sampling keeps it unbiased.
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const limit = 256 - (256 % abc.length);
+  let out = '';
+  while (out.length < len) {
+    const bytes = crypto.getRandomValues(new Uint8Array(len * 2));
+    for (const b of bytes) {
+      if (b < limit && out.length < len) out += abc[b % abc.length];
+    }
+  }
+  return out;
+}
+function _mountSubsonicPassword(host, idPrefix) {
+  if (!host) return;
+  const msgId = `${idPrefix}-sspw-msg`;
+  host.innerHTML = `
+    <div style="font-size:13px;font-weight:600;margin-bottom:4px">Subsonic app password</div>
+    <div class="admin-hint sspw-status" role="status" aria-live="polite" style="margin-bottom:4px"></div>
+    <div class="admin-hint" style="font-size:11px;margin-bottom:8px">Apps that sign in with a token (salt + hash) work with your SoniqBoom password. Optionally generate a separate app password so apps never hold your login password; once you do, token apps must use it. It is shown once &mdash; copy it into the app.</div>
+    <div class="admin-io-row">
+      <button type="button" class="sspw-generate">Generate new password</button>
+      <button type="button" class="btn-secondary sspw-remove">Remove</button>
+    </div>
+    <div class="subsonic-pw-reveal subsonic-card-row" style="margin-top:8px" hidden>
+      <code class="sspw-value" aria-label="New Subsonic app password"></code>
+      <button type="button" class="sspw-copy">Copy</button>
+    </div>
+    <div id="${msgId}" class="admin-msg" style="display:none"></div>`;
+  const status = host.querySelector('.sspw-status');
+  const gen    = host.querySelector('.sspw-generate');
+  const rem    = host.querySelector('.sspw-remove');
+  const reveal = host.querySelector('.subsonic-pw-reveal');
+  const value  = host.querySelector('.sspw-value');
+  const copy   = host.querySelector('.sspw-copy');
+  _subsonicPwReveals.add(value);
+  let has = !!(Auth.user && Auth.user.subsonic_password);
+  // true: a generated app password is in use; false: token apps use the
+  // SoniqBoom password; undefined: the server does not say which.
+  let custom = (Auth.user && typeof Auth.user.subsonic_password_custom === 'boolean')
+    ? Auth.user.subsonic_password_custom : undefined;
+  let armed = null, armTimer = null;       // 'generate' | 'remove' awaiting its second click
+  const paint = () => {
+    status.textContent = !has
+      ? 'Token sign-in is off \u2014 generate an app password to let apps that sign in with a token connect.'
+      : custom === true ? 'A generated Subsonic app password is in use \u2014 token apps must use it.'
+      : custom === false ? 'Token apps can sign in with your SoniqBoom password.'
+      : 'Token sign-in is on \u2014 with your SoniqBoom password, or with your generated app password if you created one.';
+    rem.hidden = !has || custom === false;   // nothing generated to remove
+  };
+  const disarm = () => { armed = null; clearTimeout(armTimer); armTimer = null; };
+  const arm = (what, text) => {
+    armed = what;
+    showMsg(msgId, text, 'warn');
+    clearTimeout(armTimer);
+    armTimer = setTimeout(() => { if (armed === what) { disarm(); showMsg(msgId, ''); } }, 8000);
+  };
+  const put = async (password) => {
+    // Disabling the clicked button drops keyboard focus to <body>: put it back
+    // (on Generate if Remove has just hidden itself).
+    const had = document.activeElement;
+    gen.disabled = rem.disabled = true;
+    try {
+      await api('/me/subsonic-password', { method: 'PUT', body: JSON.stringify({ password }) });
+      has = !!password;
+      custom = has;
+      if (Auth.user) {
+        Auth.user.subsonic_password = has;
+        Auth.user.subsonic_password_custom = has;
+      }
+      return true;
+    } catch (err) {
+      showMsg(msgId, `Could not save: ${err.message}`, 'err');
+      return false;
+    } finally {
+      gen.disabled = rem.disabled = false;
+      paint();
+      if ((had === gen || had === rem) && !host.contains(document.activeElement)) {
+        (had === rem && !rem.hidden ? rem : gen).focus();
+      }
+    }
+  };
+  gen.addEventListener('click', async () => {
+    if (has && armed !== 'generate') {
+      arm('generate', custom === false
+        ? 'After this, apps that sign in with a token must use the new app password instead of your SoniqBoom password. Click \u201cGenerate new password\u201d again to confirm.'
+        : 'This replaces your current Subsonic app password \u2014 apps using it will need the new one. Click \u201cGenerate new password\u201d again to confirm.');
+      return;
+    }
+    disarm();
+    const pw = _randomSubsonicPassword();
+    if (!(await put(pw))) return;
+    value.textContent = pw;
+    reveal.hidden = false;
+    copy.focus();                            // the next step: copy it
+    showMsg(msgId, 'Saved. Copy it into your Subsonic app now \u2014 it is not shown again.', 'ok');
+  });
+  rem.addEventListener('click', async () => {
+    if (armed !== 'remove') {
+      arm('remove', 'Apps that sign in with a token will stop connecting. Click \u201cRemove\u201d again to confirm.');
+      return;
+    }
+    disarm();
+    if (!(await put(''))) return;
+    _clearRevealedSecrets();
+    showMsg(msgId, 'Removed.', 'ok');
+  });
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(value.textContent);
+      copy.textContent = 'Copied!';
+      setTimeout(() => { copy.textContent = 'Copy'; }, 1300);
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(value);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+  paint();
+}
+_mountSubsonicPassword(document.getElementById('my-subsonic-password'), 'acct');
+
+// ── Subsonic API keys (OpenSubsonic apiKeyAuthentication) ────────────────────
+// Per-user keys an app sends as ``apiKey=`` instead of a username + password
+// (/api/me/api-keys).  A new key is shown once, with Copy — the server keeps only
+// its hash — and wiped with the other revealed secrets; revoking one signs that
+// app out.  The list is read when the block mounts and each time the System tab
+// is shown again; a server without key support hides the block.
+const _apiKeyRefreshers = [];
+function _fmtWhen(sec) {
+  return sec ? new Date(sec * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'never';
+}
+function _mountApiKeys(host, idPrefix) {
+  if (!host) return null;
+  const msgId = `${idPrefix}-apikey-msg`;
+  host.innerHTML = `
+    <div style="font-size:13px;font-weight:600;margin-bottom:4px">API keys for Subsonic apps</div>
+    <div class="admin-hint" style="font-size:11px;margin-bottom:8px">Apps that support OpenSubsonic API keys can sign in with a key instead of a password. A new key is shown once &mdash; copy it into the app. Revoke a key to sign that app out.</div>
+    <div class="apikey-list" role="list" style="display:none;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+    <div class="admin-hint apikey-empty" style="font-size:11px;margin-bottom:8px;display:none">No API keys yet.</div>
+    <div class="admin-io-row" style="flex-wrap:wrap">
+      <input type="text" class="apikey-name pl-modal-input" maxlength="64" autocomplete="off" spellcheck="false"
+             placeholder="Label, e.g. Symfonium on my phone" aria-label="Label for the new API key"
+             style="flex:1 1 160px;min-width:0;width:auto;margin:0">
+      <button type="button" class="apikey-create">Create key</button>
+    </div>
+    <div class="subsonic-pw-reveal subsonic-card-row" style="margin-top:8px" hidden>
+      <code class="apikey-value" aria-label="New API key" style="word-break:break-all"></code>
+      <button type="button" class="apikey-copy">Copy</button>
+    </div>
+    <div id="${msgId}" class="admin-msg" style="display:none"></div>`;
+  const list   = host.querySelector('.apikey-list');
+  const empty  = host.querySelector('.apikey-empty');
+  const name   = host.querySelector('.apikey-name');
+  const create = host.querySelector('.apikey-create');
+  const reveal = host.querySelector('.subsonic-pw-reveal');
+  const value  = host.querySelector('.apikey-value');
+  const copy   = host.querySelector('.apikey-copy');
+  _subsonicPwReveals.add(value);
+  let armedId = null, armTimer = null;
+  const render = (keys) => {
+    list.replaceChildren();
+    // The empty note sits OUTSIDE the list (a list holds only list items) and
+    // the empty list is hidden with it (its inline flex beats [hidden]).
+    empty.style.display = keys.length ? 'none' : '';
+    list.style.display = keys.length ? 'flex' : 'none';
+    if (!keys.length) return;
+    for (const k of keys) {
+      const row = document.createElement('div');
+      row.setAttribute('role', 'listitem');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12px';
+      const txt = document.createElement('div');
+      txt.style.cssText = 'flex:1 1 auto;min-width:0;overflow-wrap:anywhere';
+      const nm = document.createElement('strong');
+      nm.textContent = k.name || 'Unnamed key';
+      const meta = document.createElement('div');
+      meta.className = 'admin-hint';
+      meta.style.fontSize = '11px';
+      meta.textContent = `Created ${_fmtWhen(k.created)} · last used ${_fmtWhen(k.last_used)}`;
+      txt.append(nm, meta);
+      const rv = document.createElement('button');
+      rv.type = 'button';
+      rv.className = 'btn-secondary';
+      rv.textContent = 'Revoke';
+      rv.setAttribute('aria-label', `Revoke API key ${k.name || 'Unnamed key'}`);
+      rv.addEventListener('click', async () => {
+        if (armedId !== k.id) {
+          armedId = k.id;
+          clearTimeout(armTimer);
+          armTimer = setTimeout(() => { if (armedId === k.id) { armedId = null; showMsg(msgId, ''); } }, 8000);
+          showMsg(msgId, `The app using \u201c${k.name || 'Unnamed key'}\u201d will be signed out. Click \u201cRevoke\u201d again to confirm.`, 'warn');
+          return;
+        }
+        armedId = null; clearTimeout(armTimer);
+        rv.disabled = true;
+        try {
+          await api(`/me/api-keys/${encodeURIComponent(k.id)}`, { method: 'DELETE' });
+          showMsg(msgId, 'Revoked.', 'ok');
+        } catch (err) {
+          showMsg(msgId, `Could not revoke: ${err.message}`, 'err');
+        }
+        refresh();
+      });
+      row.append(txt, rv);
+      list.appendChild(row);
+    }
+  };
+  let loading = null;
+  const refresh = () => (loading ||= (async () => {
+    try {
+      const res = await api('/me/api-keys', { allowNonOK: true });
+      // A server without API keys answers 404 — or, behind an older build's SPA
+      // fallback, a page of HTML: either way there is nothing to manage here.
+      if (res.status === 404 || !/json/i.test(res.headers.get('Content-Type') || '')) {
+        host.hidden = true;
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      host.hidden = false;
+      render(((await res.json()) || {}).keys || []);
+    } catch (err) {
+      showMsg(msgId, `Could not load API keys: ${err.message}`, 'err');
+    } finally { loading = null; }
+  })());
+  create.addEventListener('click', async () => {
+    create.disabled = true;
+    try {
+      const res = await api('/me/api-keys', { method: 'POST', body: JSON.stringify({ name: name.value.trim() }) });
+      const j = await res.json();
+      value.textContent = j.key || '';
+      reveal.hidden = !j.key;
+      name.value = '';
+      showMsg(msgId, 'Key created. Copy it into your Subsonic app now \u2014 it is not shown again.', 'ok');
+    } catch (err) {
+      showMsg(msgId, `Could not create a key: ${err.message}`, 'err');
+    } finally {
+      create.disabled = false;
+      refresh();
+    }
+  });
+  // Enter in the label field creates the key (and must not submit a dialog around it).
+  name.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    e.stopPropagation();
+    create.click();
+  });
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(value.textContent);
+      copy.textContent = 'Copied!';
+      setTimeout(() => { copy.textContent = 'Copy'; }, 1300);
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(value);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+  refresh();
+  return refresh;
+}
+{
+  const r = _mountApiKeys(document.getElementById('my-api-keys'), 'acct');
+  if (r) _apiKeyRefreshers.push(r);
+}
 
 // ── Users tab (admin-only) ───────────────────────────────────────────────────
 

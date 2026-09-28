@@ -252,15 +252,26 @@ async def reindex(_admin=Depends(require_admin)):
     Existing track documents are preserved; the index is rebuilt automatically.
     """
     report = await rebuild_indexes()   # diagnoses drift + heals it (atomic swap)
+    # A store write landing during the build makes it skip its swap
+    # (``skipped``) rather than install indexes that miss the write; retry a
+    # couple of times, then report the skip (admin_reindex does the same).
+    for _ in range(2):
+        # Only a write that raced the build is worth another try; a running
+        # scan keeps the batch for minutes.
+        if report.get("skipped") != "concurrent-mutation":
+            break
+        report = await rebuild_indexes()
     from soniqboom.core import index_health
-    index_health.record(report, kind="reindex", healed=True)
+    if not report.get("skipped"):
+        index_health.record(report, kind="reindex", healed=True)
     # The HTTP aggregation cache (/library/formats etc.) is NOT keyed on the
     # store mutation seq, so a rebuild alone would leave it serving pre-reindex
     # counts — e.g. the Galaxy legend showing "Ken's AdLib · 41" while the
     # freshly-rebuilt live index is queried by the filter.  Invalidate it here.
     invalidate_agg_cache()
     return {
-        "reindexed": True,
+        "reindexed": not report.get("skipped"),
+        "reindex_skipped": report.get("skipped"),
         "drift_detected": not report.get("index_ok", True),
         "drift": report.get("mismatches", []),
     }
@@ -303,6 +314,11 @@ async def add_library_dir(body: dict, _admin=Depends(require_admin)):
         await _broadcast({"event": "scan_progress", **p.to_dict()})
 
     await start_scan([path], on_progress=_progress_cb)
+    try:
+        from soniqboom.core import watcher
+        await watcher.add_root(path)
+    except Exception:
+        __import__("logging").getLogger(__name__).exception("watcher.add_root failed for %s", path)
 
     return {"dirs": await list_scan_dirs()}
 
@@ -315,6 +331,13 @@ async def remove_library_dir(body: dict, _admin=Depends(require_admin)):
         raise HTTPException(400, "path is required")
     path = str(Path(raw).expanduser().resolve())
     await delete_scan_dir(path)
+    try:
+        from soniqboom.core import watcher
+        from soniqboom.core.scanner import forget_root
+        forget_root(path)
+        await watcher.remove_root(path)
+    except Exception:
+        __import__("logging").getLogger(__name__).exception("watcher.remove_root failed for %s", path)
     return {"dirs": await list_scan_dirs()}
 
 

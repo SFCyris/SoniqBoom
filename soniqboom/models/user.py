@@ -40,14 +40,16 @@ class User:
     # with the user record on backup/restore.
     listenbrainz_token: str | None = None
     lastfm_session_key: str | None = None
-    # Optional Subsonic-API password.  Stored in plaintext because the
-    # Subsonic spec's token auth (``?u&s&t``) requires the server to
-    # compute ``md5(password + salt)`` to verify — that's incompatible
-    # with the scrypt hash used for browser login.  Letting users opt
-    # into a separate password (the convention every Subsonic-compatible
-    # server uses: Navidrome, Airsonic, Funkwhale, Gonic) means we never
-    # need to keep the *main* password plaintext.  Empty/None → token
-    # auth disabled for this user; they can still browser-login normally.
+    # Subsonic token secret.  Token auth (``?u&s&t``) needs the server to
+    # compute ``md5(secret + salt)``, so it must be recoverable as plaintext in
+    # memory; on disk it is encrypted (``enc:v2:``, key ``<data>/secret.key`` —
+    # see core/users.py).  Three states:
+    #   None — never set: seeded with the login password at creation or at
+    #          the next browser sign-in;
+    #   ""   — explicitly removed: token sign-in is off, never re-seeded;
+    #   text — the secret: a copy of the login password, or a generated app
+    #          password (whether it is custom lives in UserStore._ss_custom,
+    #          persisted as ``subsonic_password_custom``).
     subsonic_password: str | None = None
 
     def to_public(self) -> dict:
@@ -58,9 +60,8 @@ class User:
         d["listenbrainz_token"] = bool(d.get("listenbrainz_token"))
         d["lastfm_session_key"] = bool(d.get("lastfm_session_key"))
         # Don't leak the Subsonic plaintext password over the API — just
-        # whether one is configured.  The user can rotate via the
-        # ``PUT /api/users/{id}/subsonic-password`` endpoint if they
-        # forget it.
+        # whether one is configured.  The user can rotate it via
+        # ``PUT /api/me/subsonic-password`` if they forget it.
         d["subsonic_password"] = bool(d.pop("subsonic_password", None))
         return d
 
