@@ -26,16 +26,23 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from soniqboom.api.tracks import json_route, public_track
 from soniqboom.api.users import require_edit
 
 from soniqboom.core.data import (
     get_all_play_stats, get_all_ratings, get_track,
 )
 from soniqboom.core.store import get_store
-from soniqboom.models.track import TrackMeta
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["smart"])
+
+# The track-list views below register through ``tracks.json_route``: their
+# result is encoded with orjson instead of ``jsonable_encoder`` + ``json.dumps``
+# (~40 ms → a few ms for a 500-row view, on the event loop), the handlers still
+# return plain lists.  Same JSON as before — except that one non-finite float
+# (a truncated file's ``nan`` length) or undecodable filename byte no longer
+# 500s the whole view (``tracks.json_bytes``).
 
 # ── History settings ──────────────────────────────────────────────────────────
 HISTORY_MAX = 500                       # cap to avoid unbounded growth
@@ -53,7 +60,7 @@ _MOST_PLAYED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
 _TOP_RATED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
 
 
-@router.get("/smart/most-played")
+@json_route(router, "/smart/most-played")
 async def most_played(limit: int = Query(100, ge=1, le=500)):
     """Return tracks sorted by play count (most → least)."""
     seq = get_store()._play_seq
@@ -72,13 +79,13 @@ async def most_played(limit: int = Query(100, ge=1, le=500)):
     return await _enrich_tracks(ranked_ids, stats=all_stats)
 
 
-@router.get("/smart/recently-added")
+@json_route(router, "/smart/recently-added")
 async def recently_added(limit: int = Query(100, ge=1, le=500)):
     """Return the most recently added tracks (by added_at timestamp)."""
     return get_store().recently_added(limit)
 
 
-@router.get("/smart/unplayed")
+@json_route(router, "/smart/unplayed")
 async def unplayed(limit: int = Query(100, ge=1, le=500)):
     """Return tracks that have never been played.
 
@@ -90,7 +97,7 @@ async def unplayed(limit: int = Query(100, ge=1, le=500)):
     return get_store().list_unplayed(limit)
 
 
-@router.get("/smart/top-rated")
+@json_route(router, "/smart/top-rated")
 async def top_rated(limit: int = Query(100, ge=1, le=500)):
     """Return tracks sorted by star rating (highest first)."""
     seq = get_store()._rating_seq
@@ -120,7 +127,7 @@ def _as_dict(t) -> dict | None:
     return dict(t)
 
 
-@router.get("/smart/radio")
+@json_route(router, "/smart/radio")
 async def instant_mix(
     seed: str = Query(..., description="Seed track id to build the mix around"),
     limit: int = Query(60, ge=5, le=200),
@@ -198,7 +205,7 @@ async def push_history(track_id: str, title: str = "", artist: str = "",
     })
 
 
-@router.get("/smart/history")
+@json_route(router, "/smart/history")
 async def listening_history(limit: int = Query(50, ge=1, le=200)):
     """Return recent listening history (newest first)."""
     return get_store().get_history(limit)
@@ -230,7 +237,6 @@ def _seq_of(store) -> tuple:
     whether the groups are stale."""
     return (store._mutation_seq, getattr(store, "_duration_seq", 0))
 _dup_task: "asyncio.Task | None" = None     # single-flight recompute task
-_PUBLIC_META_FIELDS = set(TrackMeta.model_fields)
 
 
 def _compute_dup_changes(raw_tracks: list[dict]) -> list[tuple[str, dict]]:
@@ -326,22 +332,11 @@ async def _ensure_dup_fresh(*, await_if_empty: bool = True) -> None:
 
 def _public_meta(store, tid: str) -> dict | None:
     """TrackMeta-shaped dict (every public field present + defaults coerced, incl.
-    the persisted dup annotations) for a track id.  Shaped through ``TrackMeta`` so
-    the response matches the old ``model_dump()`` contract even for tracks
-    persisted before a newer field was added — only the few-hundred members of the
-    returned groups are shaped, so the per-track cost is negligible.  ``embedding``
-    is excluded from the input so it round-trips as the model default (not the
-    stored vector), exactly as the old path did."""
-    t = store.get_track(tid)
-    if not t:
-        return None
-    try:
-        return TrackMeta(**{
-            k: v for k, v in t.items()
-            if k in _PUBLIC_META_FIELDS and k != "embedding"
-        }).model_dump()
-    except Exception:
-        return None
+    the persisted dup annotations) for a track id — ``tracks.public_track``: the
+    old ``TrackMeta(**d).model_dump()`` contract even for tracks persisted before
+    a newer field was added, ``embedding`` never included, a row the model
+    rejects → None.  May be the store's own dict: read-only."""
+    return public_track(store.get_track(tid))
 
 
 def _shape_group(store, gid: str, tids: list[str]) -> dict | None:
@@ -361,7 +356,7 @@ def _shape_group(store, gid: str, tids: list[str]) -> dict | None:
     }
 
 
-@router.get("/smart/duplicates")
+@json_route(router, "/smart/duplicates")
 async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
     """Return duplicate groups (largest first) with their member tracks.
 
@@ -381,7 +376,7 @@ async def list_duplicate_groups(limit: int = Query(100, ge=1, le=500)):
     return result
 
 
-@router.get("/smart/duplicates/{group_id}")
+@json_route(router, "/smart/duplicates/{group_id}")
 async def get_duplicate_group(group_id: str):
     """Return all tracks in a specific duplicate group."""
     store = get_store()
@@ -437,15 +432,21 @@ async def _enrich_tracks(
     stats: dict | None = None,
     ratings: dict | None = None,
 ) -> list[dict]:
-    """Fetch full TrackMeta for a list of IDs and optionally merge stats/ratings."""
-    from soniqboom.core.data import get_tracks_batch
-    tracks = await get_tracks_batch(track_ids)
+    """Fetch full TrackMeta for a list of IDs and optionally merge stats/ratings.
+
+    Rows are shaped by ``tracks.public_track`` — the ``TrackMeta`` field set and
+    values a ``Track(**d).model_dump()`` gave, without building a model per row;
+    a track that's gone, or whose stored row ``TrackMeta`` rejects, is skipped
+    as before (``Track`` also rejected a malformed embedding; such a row now
+    lists).  Copied before the stats land on it — the shaped row may be the
+    store's own dict."""
+    rows = get_store().get_tracks_batch(track_ids)
     result = []
-    for tid, t in zip(track_ids, tracks):
+    for tid, row in zip(track_ids, rows):
+        t = public_track(row)
         if t is None:
             continue
-        d = t.model_dump()
-        d.pop("embedding", None)
+        d = dict(t)
         if stats and tid in stats:
             d["play_count"] = stats[tid].get("count", 0)
             d["last_played"] = stats[tid].get("last_played")

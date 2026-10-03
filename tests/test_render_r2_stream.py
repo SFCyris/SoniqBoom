@@ -49,8 +49,9 @@ HIPC = UADE / "Hippel COSO/dragonflight (town).hipc"
 
 def _wav(path: Path, seconds: float) -> Path:
     frames = int(seconds * 44100)
+    # Audible (a ±8000 square wave): the cache refuses a silent render.
     path.write_bytes(stream._build_wav_header(44100, 2, frames, bits_per_sample=16)
-                     + b"\0" * (frames * 4))
+                     + (b"\x40\x1f\x40\x1f\xc0\xe0\xc0\xe0" * frames)[:frames * 4])
     return path
 
 
@@ -103,7 +104,8 @@ async def test_render_status_reports_provisional_and_the_exact_length(monkeypatc
     app, _ = _app(monkeypatch, tmp_path, {"rsp": _T("rsp", "/x/a.dw", 0.0)})
     ev = asyncio.Event()
     stream._UADE_LIVE["rsp__sub0"] = {"complete": ev, "expected_size": 0,
-                                      "bytes": stream._UADE_BYTES_PER_SEC * 2}
+                                      "bytes": stream._UADE_BYTES_PER_SEC * 2,
+                                      "audible": True}
     try:
         async with _client(app) as c:
             j = (await c.get("/api/stream/rsp/render-status")).json()

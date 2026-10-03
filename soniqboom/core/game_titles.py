@@ -29,7 +29,11 @@ two lists to agree; a PC/Amiga tracker-style module (MOD, XM, S3M, IT, MED,
 AHX …) needs a name of two or more words that two lists agree on and that is
 no module's own title in that archive.  The pass (``apply_archive_games``)
 writes the slot of every archive member and withdraws it where the name no
-longer matches or the setting (``CONFIG_KEY``) is off.
+longer matches or the setting (``CONFIG_KEY``) is off.  After its first run it
+judges only the tracks written since (``enrich_delta``) together with every
+other member of their outermost archives (whose credits, song titles and
+member counts the verdict reads) — the whole library again when the lists, the
+setting or the library's HVSC ``GAMES`` names changed.
 """
 from __future__ import annotations
 
@@ -685,9 +689,13 @@ def _gc_paused():
             gc.enable()
 
 
-def desired_slots(tracks, *, on: bool | None = None) -> dict[str, str | None]:
+def desired_slots(tracks, *, on: bool | None = None,
+                  extra: dict | None = None) -> dict[str, str | None]:
     """``{track id: game_by_archive}`` for every track of ``tracks`` whose slot
-    should change (None = withdraw).  Blocking — run it in a thread."""
+    should change (None = withdraw).  ``tracks`` holds every member of each
+    archive it touches; ``extra``: the library's HVSC ``GAMES`` names
+    (``_hvsc_games``) when ``tracks`` is not the whole library (default: taken
+    from ``tracks``).  Blocking — run it in a thread."""
     on = enabled() if on is None else on
     out: dict[str, str | None] = {}
     if not on:
@@ -698,7 +706,8 @@ def desired_slots(tracks, *, on: bool | None = None) -> dict[str, str | None]:
     from soniqboom.core.folder_album import multi_member_archives
     index = get_index()
     with _gc_paused():
-        extra = _hvsc_games(tracks)
+        if extra is None:
+            extra = _hvsc_games(tracks)
         credits = _archive_credits(tracks)
         tune_titles = _tracker_titles(tracks)
         multi = multi_member_archives(tracks)
@@ -720,14 +729,15 @@ def _get_pass_lock() -> asyncio.Lock:
     return _pass_lock
 
 
-def _counts(store, tracks) -> tuple[int, int]:
-    """Of ``tracks`` as the store now holds them: how many show their
-    archive's name — as their game or as another name of it (an alias another
-    name starts with, or one of a game the user cleared, is not shown) — and
-    how many of those take their game from it.  Safe off the event loop (one
-    ``dict.get`` per track)."""
+def _count_ids(store, tracks) -> tuple[set[str], set[str]]:
+    """Of ``tracks`` as the store now holds them: the ids of those that show
+    their archive's name — as their game or as another name of it (an alias
+    another name starts with, or one of a game the user cleared, is not shown)
+    — and of those that take their game from it.  Safe off the event loop
+    (one ``dict.get`` per track)."""
     from soniqboom.core.store import _game_key
-    named = primary = 0
+    named: set[str] = set()
+    primary: set[str] = set()
     get = store._tracks.get
     for old in tracks:
         t = get(old["id"])
@@ -735,55 +745,172 @@ def _counts(store, tracks) -> tuple[int, int]:
         if not v:
             continue
         if t.get("game_source") == SOURCE:
-            named += 1
-            primary += 1
+            named.add(t["id"])
+            primary.add(t["id"])
         elif _game_key(v) in {_game_key(a) for a in (t.get("game_aliases") or ()) if isinstance(a, str)}:
-            named += 1
+            named.add(t["id"])
     return named, primary
 
 
+# Delta bookkeeping, as of the last pass (rebuilt by a full one): each archive
+# member's outermost archive and the members of each — a member's verdict
+# reads its archives' credits, song titles and member count, so a change
+# re-judges every member of its outermost archive —, the tracks named like an
+# HVSC GAMES tune (``_HVSC_GAME_RE``) and those names (``_hvsc_games``), and
+# the ids the counts (``_count_ids``) are made of.  Members are kept as tuples
+# of ids, which the cyclic GC does not track (a set per archive did).
+_outer: dict[str, str] = {}
+_members: dict[str, tuple] = {}
+_hvsc_ids: set[str] = set()
+_extra: dict = {}
+_named_ids: set[str] = set()
+_primary_ids: set[str] = set()
+
+
+def _outer_of(path: str) -> str | None:
+    return path.split("::", 1)[0] if "::" in path else None
+
+
+def _bookkeeping(tracks) -> tuple:
+    """``(_outer, _members, _hvsc_ids, _extra)`` of the whole library
+    ``tracks``.  Blocking — run it in a thread."""
+    outer: dict[str, str] = {}
+    members: dict[str, list] = {}
+    hvsc: list = []
+    for t in tracks:
+        path = t.get("path") or ""
+        o = _outer_of(path)
+        if o is not None:
+            outer[t["id"]] = o
+            members.setdefault(o, []).append(t["id"])
+        if "/GAMES/" in path and _HVSC_GAME_RE.search(path):
+            hvsc.append(t)
+    return (outer, {o: tuple(ids) for o, ids in members.items()},
+            {t["id"] for t in hvsc}, _hvsc_games(hvsc))
+
+
+def _widen(changed: dict[str, str | None]) -> tuple[set[str], bool]:
+    """Bring the bookkeeping up to date with the changed tracks (``changed``:
+    id → its path now, None when deleted) and return ``(the ids to judge,
+    whether an HVSC GAMES tune came or went)`` — the changed tracks plus every
+    member of the outermost archives they were or are in.  Reads no store:
+    run it in a thread (under the pass lock)."""
+    from soniqboom.core.folder_album import _Edits
+    outers: set[str] = set()
+    edits = _Edits()
+    hvsc = False
+    for tid, path in changed.items():
+        old = _outer.pop(tid, None)
+        if old is not None:
+            outers.add(old)
+            edits.pop(old, tid)
+        if tid in _hvsc_ids:
+            _hvsc_ids.discard(tid)
+            hvsc = True
+        if path is None:
+            continue
+        o = _outer_of(path)
+        if o is not None:
+            _outer[tid] = o
+            edits.put(o, tid)
+            outers.add(o)
+        if "/GAMES/" in path and _HVSC_GAME_RE.search(path):
+            _hvsc_ids.add(tid)
+            hvsc = True
+    edits.apply(_members)
+    ids = set(changed)
+    for o in outers:
+        ids.update(_members.get(o, ()))
+    return ids, hvsc
+
+
 async def apply_archive_games(force: bool = False) -> dict:
-    """Write every track's ``game_by_archive`` (see ``desired_slots``).  One
-    pass at a time; skipped (``{"skipped": "unchanged"}``) when neither the
-    library, the lists nor the setting changed since a pass
-    that saw no other write while it ran — unless ``force``.  A pass that
-    another write overlapped schedules one more.  Returns ``{"updated": n,
-    "named": m, "primary": k, "seconds": s}`` (``named``: tracks that show
+    """Write the ``game_by_archive`` slots (see ``desired_slots``).  One pass
+    at a time.  After its first run a pass judges only the tracks written
+    since the last one with every other member of their outermost archives
+    (``enrich_delta``, ``_widen``) — ``{"skipped": "unchanged"}`` when there
+    are none — and the whole library when ``force``d, when the lists or the
+    setting changed or the library's HVSC GAMES names did.  A pass that
+    another write overlapped schedules one more (which re-reads what was
+    written since its snapshot).  Returns ``{"updated": n, "named": m,
+    "primary": k, "seconds": s}`` (``named``: tracks of the library that show
     their archive's name; ``primary``: those whose game it is)."""
-    global _last_result, _last_sig
+    global _last_result, _last_sig, _outer, _members, _hvsc_ids, _extra
+    global _named_ids, _primary_ids
+    from soniqboom.core import enrich_delta
     from soniqboom.core.store import get_store
     async with _get_pass_lock():
         store = get_store()
         on = enabled()
-        seq0 = getattr(store, "_mutation_seq", None)
         lsig = _lists_sig()
-        if not force and (id(store), seq0, lsig, on) == _last_sig:
+        inputs = (lsig, on)
+        changed = enrich_delta.changes(store, _last_sig, inputs, force=force)
+        if changed is not None and not changed:
             return {"skipped": "unchanged"}
-        tracks = store.all_tracks()
-        t0 = time.perf_counter()
-        changes = await asyncio.to_thread(desired_slots, tracks, on=on)
-        items = [(tid, {SLOT: v}) for tid, v in changes.items()]
-        updated = own = 0
-        stale = False
-        for i in range(0, len(items), _CHUNK):
-            if enabled() != on:
-                stale = True                     # switched meanwhile: the next pass decides
-                break
-            before = getattr(store, "_mutation_seq", 0)
-            updated += store.update_track_fields_batch(items[i:i + _CHUNK])
-            own += getattr(store, "_mutation_seq", 0) - before
-            await asyncio.sleep(0)
-        named, primary = await asyncio.to_thread(_counts, store, tracks)
-        _last_result = {"updated": updated, "named": named, "primary": primary,
-                        "seconds": round(time.perf_counter() - t0, 2)}
-        seq1 = getattr(store, "_mutation_seq", None)
-        if not stale and seq0 is not None and seq1 == seq0 + own and _lists_sig() == lsig:
-            _last_sig = (id(store), seq1, lsig, on)
+        try:
+            t0 = time.perf_counter()
+            snap = store.enrich_cursor()                 # taken with the snapshot
+            ids: set[str] | None = None
+            if changed is not None:
+                paths = {}
+                for tid in changed:                      # as of the snapshot
+                    t = store.get_track(tid)
+                    paths[tid] = None if t is None else (t.get("path") or "")
+                ids, hvsc = await asyncio.to_thread(_widen, paths)
+                if len(ids) > enrich_delta.limit(store):
+                    ids = None                           # no cheaper than all of it
+                elif hvsc:
+                    # A GAMES tune came or went: another C64 archive anywhere
+                    # may match now — only when the names really changed.
+                    every, hv = store.all_tracks(), set(_hvsc_ids)
+                    names = await asyncio.to_thread(
+                        lambda: _hvsc_games([t for t in every if t["id"] in hv]))
+                    if names != _extra:
+                        ids = None
+            if ids is None:
+                tracks = store.all_tracks()
+
+                def full():
+                    book = _bookkeeping(tracks)
+                    return desired_slots(tracks, on=on, extra=book[3]), book
+                changes, book = await asyncio.to_thread(full)
+                _outer, _members, _hvsc_ids, _extra = book
+            else:
+                tracks = enrich_delta.tracks_of(store, ids)
+                changes = await asyncio.to_thread(desired_slots, tracks, on=on, extra=_extra)
+            items = [(tid, {SLOT: v}) for tid, v in changes.items()]
+            updated = own = 0
+            stale = False
+            for i in range(0, len(items), _CHUNK):
+                if enabled() != on:
+                    stale = True                     # switched meanwhile: the next pass decides
+                    break
+                before = store._enrich_seq
+                updated += store.update_track_fields_batch(items[i:i + _CHUNK])
+                own += store._enrich_seq - before
+                await asyncio.sleep(0)
+            named, primary = await asyncio.to_thread(_count_ids, store, tracks)
+        except BaseException:
+            _last_sig = None                         # the bookkeeping may be half done
+            raise
+        if ids is None:
+            _named_ids, _primary_ids = named, primary
         else:
+            _named_ids = (_named_ids - ids) | named
+            _primary_ids = (_primary_ids - ids) | primary
+        _last_result = {"updated": updated, "named": len(_named_ids),
+                        "primary": len(_primary_ids),
+                        "seconds": round(time.perf_counter() - t0, 2)}
+        if stale or _lists_sig() != lsig:
             _last_sig = None
-            schedule()                           # something changed while it ran
+            schedule()                               # something changed while it ran
+        else:
+            if enrich_delta.foreign_writes(store, snap, own):
+                schedule()                           # another write landed meanwhile
+            _last_sig = enrich_delta.record(store, snap, own, inputs)
     if updated:
-        log.info("Game from archive name: %d track(s) updated, %d named", updated, named)
+        log.info("Game from archive name: %d track(s) updated, %d named", updated,
+                 _last_result["named"])
         try:
             from soniqboom.core.folder_album import refresh_album_caches
             await refresh_album_caches([tid for tid, _ in items])

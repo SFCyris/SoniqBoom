@@ -386,9 +386,10 @@ function _drawWaveform(pct = 0) {
 }
 
 // ``subsong``: the tune that is playing (a multi-tune SID / Amiga file renders
-// each tune on its own) — the waveform is that tune's.
-async function _fetchWaveform(trackId, subsong = 0, attempt = 0) {
-  const ss = Number(subsong) > 0 ? Number(subsong) : 0;
+// each tune on its own) — the waveform is that tune's.  No subsong (a plain
+// play of the file): the tune the server plays for it, its default.
+async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
+  const ss = Number.isInteger(subsong) ? subsong : null;
   const progressEl = document.querySelector('.player-progress');
   // Clear the OLD track's waveform immediately so the canvas blanks the
   // moment the user clicks a new song — otherwise the prior song's bars
@@ -426,7 +427,7 @@ async function _fetchWaveform(trackId, subsong = 0, attempt = 0) {
   const isStillCurrent = () => {
     const cur = Player.currentTrack || (Player.queue && Player.queue[Player.queueIdx]);
     // Same file, same tune: a switch to another tune of it drops a late reply.
-    return !!cur && cur.id === fetchedFor && (Number(cur.subsong) > 0 ? Number(cur.subsong) : 0) === ss;
+    return !!cur && cur.id === fetchedFor && (Number.isInteger(cur.subsong) ? cur.subsong : null) === ss;
   };
 
   const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
@@ -447,7 +448,7 @@ async function _fetchWaveform(trackId, subsong = 0, attempt = 0) {
     // gets reused varies per session).  ``no-cache`` forces a
     // revalidation hit; combined with the backend's ``Cache-Control:
     // no-store`` header on this endpoint the body is always fresh.
-    const res  = await fetch(`/api/tracks/${trackId}/waveform${ss > 0 ? `?subsong=${ss}` : ''}`,
+    const res  = await fetch(`/api/tracks/${trackId}/waveform${ss !== null ? `?subsong=${ss}` : ''}`,
                              ctrl ? { cache: 'no-cache', signal: ctrl.signal }
                                   : { cache: 'no-cache' });
     if (!isStillCurrent()) return;  // user advanced; discard late response
@@ -1012,11 +1013,11 @@ async function _fetchVUMR(trackId, subsong, { start = true } = {}) {
   _vuFetchAbort = ctrl;
   try {
     // A multi-subsong module renders a distinct VU sidecar per tune; pass the
-    // playing subsong so the meters match it.  Append only for N>0 — subsong 0
-    // and "no subsong" both map to the default render, so keeping the URL param
-    // out for 0 avoids caching the same bytes under two URLs.
+    // playing subsong (a picked tune, 0 included) so the meters match it.  No
+    // subsong — a plain play of the file — is the tune the server plays for
+    // it, its default (not always tune 1).
     const qs = new URLSearchParams();
-    if (Number.isInteger(subsong) && subsong > 0) qs.set('subsong', String(subsong));
+    if (Number.isInteger(subsong)) qs.set('subsong', String(subsong));
     // ``start=0``: answer from the cache only — a miss must not start the
     // Amiga per-voice pass (a second full uade render).  The re-ask ladder
     // asks for it once the track has played a few seconds, so a track skipped
@@ -2623,7 +2624,7 @@ const _CHECK_NOW_DEBOUNCE_MS = 30_000;
 const _checkNowLastFired = new Map();
 
 async function _maybeFireFreshnessCheck(scanRoot, source) {
-  if (!scanRoot || !/^(ftp|smb|webdav):/i.test(scanRoot)) return;
+  if (!scanRoot || !/^(ftp|smb|https?|webdavs?):\/\//i.test(scanRoot)) return;
   const now = Date.now();
   const last = _checkNowLastFired.get(scanRoot) || 0;
   if (now - last < _CHECK_NOW_DEBOUNCE_MS) return;
@@ -2688,7 +2689,7 @@ FolderTree.onSelect(async (path) => {
   _cancelAncillaryFetches();
   _deactivateAllNav();
   const share = _resolveRemoteShareFromPath(path);
-  if (share && /^(ftp|smb|webdav):/i.test(share)) {
+  if (share && /^(ftp|smb|https?|webdavs?):\/\//i.test(share)) {
     // Track the last-viewed remote share so the visibility-change
     // handler above knows what to poll on app re-focus.
     _lastViewedShare = share;

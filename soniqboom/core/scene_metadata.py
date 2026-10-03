@@ -678,13 +678,15 @@ def _legacy_credit(p: str, fmt_name: str) -> str | None:
 
 def collect_updates(*, use_filename: bool | None = None,
                     tracks: list[dict] | None = None,
+                    matched_ids: set | None = None,
                     ) -> tuple[int, list[tuple[str, dict]], dict]:
     """Join every ``file_md5``-carrying track against the index; return
     ``(matched, batch, expect)`` WITHOUT touching the store.
 
     ``tracks`` is the snapshot to join (default: the store's tracks, taken
     here).  The md5s are looked up in chunked ``IN (…)`` queries, then the
-    per-track logic runs against that dict.
+    per-track logic runs against that dict.  ``matched_ids`` (optional)
+    collects the ids of the matched tracks.
 
     ``expect`` maps a track id to the values (``album``/``album_source``/
     ``artist``) its guarded patch fields were computed from, plus the
@@ -749,6 +751,8 @@ def collect_updates(*, use_filename: bool | None = None,
                 _withdraw_stale(t, batch, expect)
             continue
         matched += 1
+        if matched_ids is not None:
+            matched_ids.add(t["id"])
         updates: dict = {}
         # Scene provenance — always stored on an exact match; the
         # track-info modal shows it as "Scene origin".
@@ -827,10 +831,14 @@ def _withdraw_stale(t: dict, batch: list, expect: dict) -> None:
         expect[t["id"]] = exp
 
 
-# Auto-apply skip: (store seq after the last auto apply, index signature,
-# file-name option, game-title lists) — an unchanged library + index needs no
-# new join.
+# The last auto apply's position in the store's enrichment change log and its
+# inputs (index signature, file-name option, game-title lists) —
+# ``enrich_delta.record``: the next auto apply joins only the tracks written
+# since, all of them when an input changed (None: join everything).
 _last_auto_sig: tuple | None = None
+# The ids of the tracks the index matches, as of the last apply (a delta apply
+# updates its own tracks), so the status counts the whole library.
+_matched_ids: set[str] = set()
 
 
 def _index_sig() -> tuple | None:
@@ -861,32 +869,42 @@ async def apply_to_library(*, auto: bool = False) -> dict:
     a switch-on mid-join also queues one more (auto) apply, which writes the
     guesses this join did not compute.
 
-    ``auto`` (the post-scan / post-upgrade runner) skips the join when neither
-    the library, the index nor the file-name option changed since the last
-    auto apply; the Admin button always runs.  A successful apply records
-    ``MODLAND_APPLY_VERSION``.  When albums were withdrawn, the folder-album
-    pass (if enabled) runs so the freed albums can take a folder name."""
+    ``auto`` (the post-scan / post-upgrade runner) joins only the tracks
+    written since the last auto apply (``enrich_delta``: the join is per
+    track — the sibling evidence comes from the index) and skips the join
+    when there are none; it joins every track when the index, the file-name
+    option or the title lists changed, or ``MODLAND_APPLY_VERSION`` is not
+    applied yet.  The Admin button always joins every track.  A successful
+    apply records ``MODLAND_APPLY_VERSION``.  When albums were withdrawn, the
+    folder-album pass (if enabled) runs so the freed albums can take a folder
+    name."""
     import asyncio
-    global _last_auto_sig
+    global _last_auto_sig, _matched_ids
     if _status["applying"]:
         return {**status(), "error": "apply already running"}
+    from soniqboom.core import enrich_delta
     from soniqboom.core.store import get_store
     store = get_store()
     use_filename = filename_game_enabled()              # read on the loop
     from soniqboom.core import game_titles
     lists = game_titles._lists_sig()                    # file-name guesses take their spelling
-    sig = (store._mutation_seq, _index_sig(), use_filename, lists)
-    if auto and sig == _last_auto_sig and apply_version_current():
+    inputs = (_index_sig(), use_filename, lists)
+    changed = (enrich_delta.changes(store, _last_auto_sig, inputs)
+               if auto and apply_version_current() else None)
+    if changed is not None and not changed:
         return {**status(), "skipped": "unchanged"}
     _status.update(applying=True, error=None)
     freed = False
     rerun = False
     try:
         loop = asyncio.get_running_loop()
-        seq0 = store._mutation_seq
-        tracks = store.all_tracks()                     # snapshot, with seq0
+        snap = store.enrich_cursor()                    # taken with the snapshot
+        tracks = (store.all_tracks() if changed is None
+                  else enrich_delta.tracks_of(store, changed))
+        found: set[str] = set()
         matched, batch, expect = await loop.run_in_executor(
-            None, lambda: collect_updates(use_filename=use_filename, tracks=tracks))
+            None, lambda: collect_updates(use_filename=use_filename, tracks=tracks,
+                                          matched_ids=found))
         async with fa._get_lock():
             now_filename = filename_game_enabled()
             if now_filename != use_filename:
@@ -900,16 +918,19 @@ async def apply_to_library(*, auto: bool = False) -> dict:
             await fa.refresh_album_caches(written)
         if store.get_config(APPLY_VERSION_CONFIG_KEY) != MODLAND_APPLY_VERSION:
             store.set_config(APPLY_VERSION_CONFIG_KEY, MODLAND_APPLY_VERSION)
-        # Only our own writes moved the seq since the snapshot → the next auto
-        # apply has nothing new to join.  Anything else forces it to run.
-        _last_auto_sig = ((store._mutation_seq, _index_sig(), now_filename, lists)
-                          if store._mutation_seq == seq0 + own_bumps
-                          and game_titles._lists_sig() == lists else None)
+        # Past our own writes when nothing else wrote meanwhile; else the next
+        # auto apply re-joins what was written since the snapshot.
+        _last_auto_sig = enrich_delta.record(store, snap, own_bumps, inputs)
+        if changed is None:
+            _matched_ids = found
+        else:
+            _matched_ids -= changed
+            _matched_ids |= found
         _status["last_apply"] = {
-            "matched": matched, "updated": updated, "albums": albums,
+            "matched": len(_matched_ids), "updated": updated, "albums": albums,
             "at": time.time()}
-        log.info("Modland enrichment: %d matched, %d tracks updated "
-                 "(%d album changes)", matched, updated, albums)
+        log.info("Modland enrichment: %d matched, %d of %d joined track(s) updated "
+                 "(%d album changes)", len(_matched_ids), updated, len(tracks), albums)
     except Exception as exc:
         _status["error"] = f"apply failed: {exc}"
         log.warning("Modland enrichment failed: %s", exc)
@@ -924,7 +945,7 @@ async def apply_to_library(*, auto: bool = False) -> dict:
             log.debug("could not queue the Modland re-apply", exc_info=True)
     elif freed and fa.enabled():
         try:
-            await fa.apply_folder_albums(force=True)
+            await fa.apply_folder_albums()              # the freed tracks are in its delta
         except Exception:                               # noqa: BLE001
             log.debug("folder-album pass after Modland withdrawals failed",
                       exc_info=True)

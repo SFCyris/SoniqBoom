@@ -137,7 +137,7 @@ export function trackActions(track, ctx) {
  *  specific subsong.  Mobile tracks rarely carry a subsong, but honour it if
  *  present so a queued subsong lands in a playlist as the right tune. */
 export function playlistEntry(track) {
-  return (Number.isInteger(track.subsong) && track.subsong > 0)
+  return (Number.isInteger(track.subsong) && track.subsong >= 0)
     ? { id: track.id, subsong: track.subsong } : track.id;
 }
 

@@ -24,6 +24,7 @@
 import { Player } from './player.js';
 import { Library } from './library.js';
 import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf } from './utils.js';
+import { createVirtualList } from './vlist.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -156,14 +157,19 @@ function _contentKey(t) {
   return `${artist}::${title}::${dur}`;
 }
 
+// Entry identity for the "added twice" badge: the track AND its tune — two
+// tunes of one multi-tune file are different entries, not a duplicate.
+function _dupKey(t) { const s = _plSubKey(t); return s === null ? t.id : `${t.id}#${s}`; }
+
 function _buildDupMaps(tracks) {
-  const idCount    = new Map();     // id → times it appears
-  const idFirstAt  = new Map();     // id → first index
+  const idCount    = new Map();     // entry key → times it appears
+  const idFirstAt  = new Map();     // entry key → first index
   const contentMap = new Map();     // contentKey → [{id, path, idx}]
 
   tracks.forEach((t, i) => {
-    idCount.set(t.id, (idCount.get(t.id) || 0) + 1);
-    if (!idFirstAt.has(t.id)) idFirstAt.set(t.id, i);
+    const key = _dupKey(t);
+    idCount.set(key, (idCount.get(key) || 0) + 1);
+    if (!idFirstAt.has(key)) idFirstAt.set(key, i);
     const k = _contentKey(t);
     if (!contentMap.has(k)) contentMap.set(k, []);
     contentMap.get(k).push({ id: t.id, path: t.path, idx: i });
@@ -314,7 +320,7 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   dropZone.classList.remove('drop-zone-disabled');
   dropZone.textContent = 'Drop tracks here to add';
 
-  _renderTracks();
+  _renderTracks({ toTop: true });
   _updateSidebarActive();
 }
 
@@ -325,250 +331,350 @@ async function _openPlaylist(id, name, _focusPanel = true) {
 function _plEntry(t) {
   return Number.isInteger(t.subsong) ? { id: t.id, subsong: t.subsong } : t.id;
 }
-// Normalised subsong key (0/undefined == default) for local (id, subsong) matches.
-function _plSubKey(t) { const s = t && t.subsong; return (Number.isInteger(s) && s > 0) ? s : null; }
+// Subsong key for local (id, subsong) matches: null = the default tune; an
+// explicit 0 is tune 1, which need not be the default.
+function _plSubKey(t) { const s = t && t.subsong; return (Number.isInteger(s) && s >= 0) ? s : null; }
 
-function _renderTracks() {
-  tracksEl.innerHTML = '';
+// ── Track rows: a pooled virtual list (vlist.js) ──────────────────────────────
+// Only the rows around the viewport exist; every event is delegated to
+// ``tracksEl`` (below), and a track change only moves the now-playing marker
+// (_paintPlaying) instead of rebuilding the list.
+let _dup = { idCount: new Map(), idFirstAt: new Map(), contentMap: new Map() };
+let _dragIdxs = null;            // indices being dragged (reorder), for rows filled mid-drag
+
+function _makePlRow() {
+  const row = document.createElement('div');
+  row.className = 'queue-row';
+  // Drag begins from the handle only — see the touch long-press below.  The
+  // row itself becomes transiently draggable during a touch long-press.
+  row.draggable = false;
+  row.innerHTML = `
+      <span class="queue-drag-handle" draggable="true" title="Drag to reorder">&#10783;</span>
+      <span class="queue-playing-icon"></span>
+      <div class="queue-row-art"><span class="qr-art-ph"></span><img class="qr-art-img" decoding="async" alt=""></div>
+      <div class="queue-track-info">
+        <div class="queue-track-titlerow"><span class="queue-track-title"></span></div>
+        <span class="queue-track-artist"></span>
+      </div>
+      <span class="queue-track-dur"></span>
+      <button class="queue-remove-btn" title="Remove from playlist">&times;</button>`;
+  // The cover fades in on a successful decode; on error the <img> STAYS (it's
+  // opacity:0, so the placeholder shows through and no broken glyph renders)
+  // and just drops ``loaded``.  Keeping it in the DOM is what lets remote
+  // (FTP/SMB) covers recover: the first request 404s and fires a background
+  // art-backfill, which broadcasts ``art_ready`` → app.js's _bustArtImg re-busts
+  // every in-DOM /api/art/ <img> for that track.  Mirrors the library rows.
+  const img = row.querySelector('.qr-art-img');
+  img.onload  = () => img.classList.add('loaded');
+  img.onerror = () => img.classList.remove('loaded');
+  return row;
+}
+
+function _isCurrentEntry(track) {
+  return Player.currentTrack?.id === track.id
+    && _plSubKey(Player.currentTrack || {}) === _plSubKey(track);   // 0/undefined == default
+}
+
+// Pool callback: paint row ``i`` (text, badges, state); the cover is re-asked
+// only when the row shows another track than before.
+function _fillPlRow(row, i) {
+  const track = _activeTracks[i];
+  if (!track) return;
+  const { idCount, idFirstAt, contentMap } = _dup;
+  // ── Duplicate classification ────────────────────────────────────────────
+  const dupKey       = _dupKey(track);
+  const isIdDup      = idCount.get(dupKey) > 1 && idFirstAt.get(dupKey) !== i;
+  const contentPeers = contentMap.get(_contentKey(track)) || [];
+  const contentDups  = contentPeers.filter(p => p.id !== track.id);
+  const isContentDup = contentDups.length > 0;
+  const isCurrent  = _isCurrentEntry(track);
+
+  row.className = 'queue-row'
+    + (isCurrent  ? ' playing'  : '')
+    + (_selectedIdxs.has(i) ? ' selected' : '')
+    + (isIdDup    ? ' dup-id'   : '')
+    + (_dragIdxs && _dragIdxs.has(i) ? ' dragging' : '');
+  row.dataset.idx = i;
+  row.querySelector('.queue-playing-icon').textContent = isCurrent ? '▶' : '';
+
+  // ── Title row: title + "Tune n" + duplicate badge ───────────────────────
+  let dupBadge = '';
+  if (isIdDup) {
+    dupBadge = `<span class="dup-badge dup-id-badge" title="This track appears more than once in this playlist — likely added by mistake">2×</span>`;
+  } else if (isContentDup) {
+    const others = contentDups.map(p => p.path || p.id).join('\n');
+    dupBadge = `<span class="dup-badge dup-loc-badge" title="Same song also found at:\n${esc(others)}">⧉</span>`;
+  }
+  const tune = Number.isInteger(track.subsong)
+    ? (() => { const n = subsongWireToTune(track.subsong, subsongStartOf(track), track.subsongs); return `<span class="qr-subsong" title="Tune ${n}">Tune ${n}</span>`; })()
+    : '';
+  const titleHtml = `<span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${tune}${dupBadge}`;
+  const titleRow = row.querySelector('.queue-track-titlerow');
+  if (row.__titleHtml !== titleHtml) { titleRow.innerHTML = titleHtml; row.__titleHtml = titleHtml; }
+  row.querySelector('.queue-track-artist').textContent = track.artist || track.album_artist || '';
+  row.querySelector('.queue-track-dur').textContent = fmtDur(track.duration);
+
+  // ── Cover: always ask /api/art (``track.cover_art`` is only set when art was
+  // extracted at scan time; the endpoint extracts on demand).  ``fallback=404``
+  // so an art-less track 404s and the format-emoji placeholder shows instead of
+  // the endpoint's generic ♪ JPEG.
+  if (row.__artId !== track.id) {
+    row.__artId = track.id;
+    row.querySelector('.qr-art-ph').textContent = artPlaceholderEmoji(track);
+    const img = row.querySelector('.qr-art-img');
+    img.classList.remove('loaded');
+    if (track.id) {
+      const ep = window.__sbArtEpoch ? `&_t=${window.__sbArtEpoch}` : '';
+      img.src = `/api/art/${track.id}?size=sm&fallback=404${ep}`;
+    } else {
+      img.removeAttribute('src');
+    }
+  }
+}
+
+const _plVL = createVirtualList({
+  scroller: tracksEl, host: tracksEl, buffer: 8, rowHeight: 47, autoScroll: true,
+  make: _makePlRow,
+  fill: _fillPlRow,
+  keyOf: (i) => _activeTracks[i],
+  spacer: () => { const d = document.createElement('div'); d.className = 'vl-spacer'; d.style.flex = 'none'; return d; },
+  setSpacer: (el, px) => { el.style.height = px + 'px'; },
+});
+
+// Move the now-playing marker on the rendered rows (a track change), and show
+// a length the player has learnt meanwhile (rendered formats).
+function _paintPlaying() {
+  if (!_plVL.active) return;
+  for (const row of _plVL.rows()) {
+    const track = _activeTracks[+row.dataset.idx];
+    const dur = row.querySelector('.queue-track-dur');
+    if (track && dur) { const txt = fmtDur(track.duration); if (dur.textContent !== txt) dur.textContent = txt; }
+    const on = !!track && _isCurrentEntry(track);
+    if (row.classList.contains('playing') === on) continue;
+    row.classList.toggle('playing', on);
+    row.querySelector('.queue-playing-icon').textContent = on ? '▶' : '';
+  }
+}
+
+// (Re)paint the open playlist after its tracks changed.  ``toTop``: a playlist
+// that was just opened starts at its first row; edits keep the scroll position.
+function _renderTracks(opts = {}) {
   _updateSelBar();
 
   if (!_activeTracks.length) {
+    _plVL.reset();
     tracksEl.innerHTML = '<div class="queue-empty">No tracks yet.<br>Drag from library or use "Add to Playlist".</div>';
     return;
   }
 
-  const { idCount, idFirstAt, contentMap } = _buildDupMaps(_activeTracks);
-
-  _activeTracks.forEach((track, i) => {
-    // ── Duplicate classification ────────────────────────────────────────────
-    const isIdDup      = idCount.get(track.id) > 1 && idFirstAt.get(track.id) !== i;
-    const contentPeers = contentMap.get(_contentKey(track)) || [];
-    const contentDups  = contentPeers.filter(p => p.id !== track.id);
-    const isContentDup = contentDups.length > 0;
-
-    const isCurrent  = Player.currentTrack?.id === track.id
-      && _plSubKey(Player.currentTrack || {}) === _plSubKey(track);   // 0/undefined == default
-    const isSelected = _selectedIdxs.has(i);
-
-    const row = document.createElement('div');
-    row.className = 'queue-row'
-      + (isCurrent  ? ' playing'  : '')
-      + (isSelected ? ' selected' : '')
-      + (isIdDup    ? ' dup-id'   : '');
-    // Drag begins from the handle only — see _enableHandleDrag below.  The
-    // row itself becomes transiently draggable during a touch long-press.
-    row.draggable  = false;
-    row.dataset.idx = i;
-
-    // ── Duplicate badge ─────────────────────────────────────────────────────
-    let dupBadge = '';
-    if (isIdDup) {
-      dupBadge = `<span class="dup-badge dup-id-badge" title="This track appears more than once in this playlist — likely added by mistake">2×</span>`;
-    } else if (isContentDup) {
-      const others = contentDups.map(p => p.path || p.id).join('\n');
-      dupBadge = `<span class="dup-badge dup-loc-badge" title="Same song also found at:\n${others}">⧉</span>`;
-    }
-
-    // Always render both placeholder and <img>.  ``track.cover_art`` is
-    // only set when mutagen extracted art at scan time — many FTP/SMB
-    // tracks scan with ``cover_art: null`` even though ``/api/art/{id}``
-    // would happily extract on-demand, so we ask for that endpoint
-    // unconditionally and let the img stay transparent (placeholder
-    // shows through) when the request 404s.
-    // ``fallback=404`` so an art-less track 404s (→ <img> onerror removes it)
-    // and the format-emoji placeholder shows, instead of the endpoint's
-    // generic ♪ placeholder JPEG painting over it.
-    const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
-    const artHtml = `<div class="queue-row-art">
-      <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
-      ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" decoding="async" alt="">` : ''}
-    </div>`;
-
-    row.innerHTML = `
-      <span class="queue-drag-handle" draggable="true" title="Drag to reorder">&#10783;</span>
-      <span class="queue-playing-icon">${isCurrent ? '&#9654;' : ''}</span>
-      ${artHtml}
-      <div class="queue-track-info">
-        <div class="queue-track-titlerow">
-          <span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>
-          ${Number.isInteger(track.subsong) ? (() => { const n = subsongWireToTune(track.subsong, subsongStartOf(track), track.subsongs); return `<span class="qr-subsong" title="Tune ${n}">Tune ${n}</span>`; })() : ''}
-          ${dupBadge}
-        </div>
-        <span class="queue-track-artist">${esc(track.artist || track.album_artist || '')}</span>
-      </div>
-      <span class="queue-track-dur">${fmtDur(track.duration)}</span>
-      <button class="queue-remove-btn" title="Remove from playlist">&times;</button>
-    `;
-
-    // Wire the cover thumbnail: fade in on successful decode; on error KEEP the
-    // <img> (it's opacity:0, so the placeholder shows through and no broken
-    // glyph renders) and just drop ``loaded``.  Keeping it in the DOM is what
-    // lets remote (FTP/SMB) covers recover: the first request 404s and fires a
-    // background art-backfill, which broadcasts ``art_ready`` → app.js's
-    // _bustArtImg re-busts every in-DOM /api/art/ <img> for that track.  The
-    // old ``.remove()`` deleted the <img>, so there was nothing left to
-    // refresh and the row stayed on the placeholder forever (it only filled in
-    // once the track was actually played).  Mirrors the library-row pattern.
-    const _artImg = row.querySelector('.qr-art-img');
-    if (_artImg) {
-      _artImg.onload  = () => _artImg.classList.add('loaded');
-      _artImg.onerror = () => _artImg.classList.remove('loaded');
-    }
-
-    // ── Touch long-press to begin drag ────────────────────────────────────
-    // Mirror queue.js: drag starts only after a 350 ms hold on the handle,
-    // and only after the finger hasn't moved more than 8 px.  Movement
-    // before the timer fires cancels — protects against accidental swipe
-    // drags during scroll on touch screens.
-    const handleEl = row.querySelector('.queue-drag-handle');
-    let _lpTimer = null, _lpStartX = 0, _lpStartY = 0;
-    handleEl.addEventListener('touchstart', (e) => {
-      if (e.touches.length !== 1) return;
-      _lpStartX = e.touches[0].clientX;
-      _lpStartY = e.touches[0].clientY;
-      _lpTimer = setTimeout(() => {
-        row.draggable = true;
-        try { navigator.vibrate?.(8); } catch (_) {}
-      }, 350);
-    }, { passive: true });
-    handleEl.addEventListener('touchmove', (e) => {
-      if (!_lpTimer) return;
-      const t = e.touches[0];
-      if (!t) return;
-      if (Math.hypot(t.clientX - _lpStartX, t.clientY - _lpStartY) > 8) {
-        clearTimeout(_lpTimer);
-        _lpTimer = null;
-      }
-    }, { passive: true });
-    handleEl.addEventListener('touchend', () => {
-      if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-      setTimeout(() => { row.draggable = false; }, 0);
-    });
-    handleEl.addEventListener('touchcancel', () => {
-      if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-      row.draggable = false;
-    });
-
-    // ── Click: play / select ────────────────────────────────────────────────
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.queue-remove-btn')) return;
-
-      if (e.metaKey || e.ctrlKey) {
-        // Toggle this row
-        if (_selectedIdxs.has(i)) _selectedIdxs.delete(i);
-        else { _selectedIdxs.add(i); _anchorIdx = i; }
-        _updateSelBar();
-        _refreshRowClasses();
-      } else if (e.shiftKey && _anchorIdx !== null) {
-        // Range select from anchor to here
-        const lo = Math.min(_anchorIdx, i), hi = Math.max(_anchorIdx, i);
-        for (let j = lo; j <= hi; j++) _selectedIdxs.add(j);
-        _updateSelBar();
-        _refreshRowClasses();
-      } else if (_selectedIdxs.size > 0) {
-        // Plain click while selection active → clear selection (don't play)
-        _clearSelection(false);
-        _refreshRowClasses();
-      } else {
-        // Plain click, nothing selected → play
-        _anchorIdx = i;
-        Player.setQueue(_activeTracks, i);
-      }
-    });
-
-    // ── Remove button ───────────────────────────────────────────────────────
-    row.querySelector('.queue-remove-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      await _removeTrack(_activeId, track);
-    });
-
-    // ── Drag start ──────────────────────────────────────────────────────────
-    row.addEventListener('dragstart', (e) => {
-      e.dataTransfer.effectAllowed = 'move';
-      // If this row is in the selection drag all selected; otherwise drag just this row
-      const dragging = _selectedIdxs.has(i)
-        ? [..._selectedIdxs].sort((a, b) => a - b)
-        : [i];
-      e.dataTransfer.setData('application/x-soniqboom-pl-idx', JSON.stringify(dragging));
-      dragging.forEach(idx => {
-        tracksEl.querySelector(`[data-idx="${idx}"]`)?.classList.add('dragging');
-      });
-    });
-
-    // ── Drag end ────────────────────────────────────────────────────────────
-    row.addEventListener('dragend', () => {
-      tracksEl.querySelectorAll('.queue-row.dragging, .queue-row.dragging-over')
-        .forEach(r => r.classList.remove('dragging', 'dragging-over'));
-      // Drop the transient draggable flag (set during a touch long-press) so
-      // the next tap on the row isn't treated as a drag-handle gesture.
-      row.draggable = false;
-    });
-
-    // ── Drag over ───────────────────────────────────────────────────────────
-    row.addEventListener('dragover', (e) => {
-      if (e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) {
-        e.preventDefault();
-        tracksEl.querySelectorAll('.queue-row.dragging-over')
-          .forEach(r => r.classList.remove('dragging-over'));
-        row.classList.add('dragging-over');
-      }
-    });
-    row.addEventListener('dragleave', (e) => {
-      if (!row.contains(e.relatedTarget)) row.classList.remove('dragging-over');
-    });
-
-    // ── Drop: reorder ───────────────────────────────────────────────────────
-    row.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      row.classList.remove('dragging-over');
-      const raw = e.dataTransfer.getData('application/x-soniqboom-pl-idx');
-      if (!raw) return;
-
-      let fromIndices;
-      try { fromIndices = JSON.parse(raw); }
-      catch { return; }
-      if (!Array.isArray(fromIndices)) fromIndices = [fromIndices];
-
-      const fromSet = new Set(fromIndices);
-      if (fromSet.has(i)) return; // dropped onto a dragged row — no-op
-
-      // Keep a snapshot for rollback so we can revert the local order if
-      // the server PUT fails — the optimistic UI shouldn't lie to the user
-      // about what was persisted.
-      const previousOrder = _activeTracks.slice();
-
-      // Extract items being moved and the rest
-      const toInsert = fromIndices.map(idx => _activeTracks[idx]);
-      const rest     = _activeTracks.filter((_, idx) => !fromSet.has(idx));
-      // Adjust insertion point: each dragged item before `i` shifts the target left
-      const shift    = fromIndices.filter(idx => idx < i).length;
-      const insertAt = Math.max(0, Math.min(rest.length, i - shift));
-      rest.splice(insertAt, 0, ...toInsert);
-      _activeTracks = rest;
-
-      _clearSelection();
-      try {
-        await _api(`/playlists/${_activeId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ track_ids: _activeTracks.map(_plEntry) }),
-        });
-      } catch (err) {
-        // Revert the optimistic local order and re-render so the displayed
-        // state matches what's actually on the server.
-        _activeTracks = previousOrder;
-        console.warn('Drag-reorder save failed:', err);
-        Toast.error("Reorder couldn't be saved — order reverted.");
-      }
-      _renderTracks();
-    });
-
-    tracksEl.appendChild(row);
-  });
+  _dup = _buildDupMaps(_activeTracks);
+  _dragIdxs = null;                // indices changed: no drag carries over
+  if (opts.toTop) tracksEl.scrollTop = 0;
+  _plVL.setCount(_activeTracks.length);
+  _plVL.render(true);
 
   // Fill real AdLib/IMF lengths for rows still showing the 180s placeholder.
   _probePlaylistDurations();
 }
+
+// ── Delegated row events ───────────────────────────────────────────────────────
+function _plRowOf(e) {
+  const row = e.target.closest('.queue-row');
+  return row && tracksEl.contains(row) && row.dataset.idx != null ? row : null;
+}
+
+// ── Touch long-press to begin drag ────────────────────────────────────────
+// Mirror queue.js: drag starts only after a 350 ms hold on the handle, and
+// only after the finger hasn't moved more than 8 px.  Movement before the
+// timer fires cancels — protects against accidental swipe drags during
+// scroll on touch screens.
+let _lpTimer = null, _lpStartX = 0, _lpStartY = 0, _lpRow = null;
+tracksEl.addEventListener('touchstart', (e) => {
+  if (e.touches.length !== 1 || !e.target.closest('.queue-drag-handle')) return;
+  const row = _plRowOf(e);
+  if (!row) return;
+  _lpRow = row;
+  _lpStartX = e.touches[0].clientX;
+  _lpStartY = e.touches[0].clientY;
+  clearTimeout(_lpTimer);
+  _lpTimer = setTimeout(() => {
+    _lpTimer = null;
+    row.draggable = true;
+    try { navigator.vibrate?.(8); } catch (_) {}
+  }, 350);
+}, { passive: true });
+tracksEl.addEventListener('touchmove', (e) => {
+  if (!_lpTimer) return;
+  const t = e.touches[0];
+  if (!t) return;
+  if (Math.hypot(t.clientX - _lpStartX, t.clientY - _lpStartY) > 8) {
+    clearTimeout(_lpTimer);
+    _lpTimer = null;
+  }
+}, { passive: true });
+tracksEl.addEventListener('touchend', () => {
+  if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+  const row = _lpRow;
+  _lpRow = null;
+  if (row) setTimeout(() => { row.draggable = false; }, 0);
+});
+tracksEl.addEventListener('touchcancel', () => {
+  if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+  if (_lpRow) _lpRow.draggable = false;
+  _lpRow = null;
+});
+
+// ── Click: play / select / remove ───────────────────────────────────────────
+tracksEl.addEventListener('click', async (e) => {
+  const row = _plRowOf(e);
+  if (!row) return;
+  const i = parseInt(row.dataset.idx, 10);
+  const track = _activeTracks[i];
+  if (!track) return;
+
+  if (e.target.closest('.queue-remove-btn')) {
+    e.stopPropagation();
+    await _removeTrack(_activeId, track);
+    return;
+  }
+
+  if (e.metaKey || e.ctrlKey) {
+    // Toggle this row
+    if (_selectedIdxs.has(i)) _selectedIdxs.delete(i);
+    else { _selectedIdxs.add(i); _anchorIdx = i; }
+    _updateSelBar();
+    _refreshRowClasses();
+  } else if (e.shiftKey && _anchorIdx !== null) {
+    // Range select from anchor to here
+    const lo = Math.min(_anchorIdx, i), hi = Math.max(_anchorIdx, i);
+    for (let j = lo; j <= hi; j++) _selectedIdxs.add(j);
+    _updateSelBar();
+    _refreshRowClasses();
+  } else if (_selectedIdxs.size > 0) {
+    // Plain click while selection active → clear selection (don't play)
+    _clearSelection(false);
+    _refreshRowClasses();
+  } else {
+    // Plain click, nothing selected → play
+    _anchorIdx = i;
+    Player.setQueue(_activeTracks, i);
+  }
+});
+
+// ── Drag start / end (reorder) ─────────────────────────────────────────────
+tracksEl.addEventListener('dragstart', (e) => {
+  const row = _plRowOf(e);
+  if (!row) return;
+  const i = parseInt(row.dataset.idx, 10);
+  e.dataTransfer.effectAllowed = 'move';
+  // If this row is in the selection drag all selected; otherwise drag just this row
+  const dragging = _selectedIdxs.has(i)
+    ? [..._selectedIdxs].sort((a, b) => a - b)
+    : [i];
+  e.dataTransfer.setData('application/x-soniqboom-pl-idx', JSON.stringify(dragging));
+  _dragIdxs = new Set(dragging);
+  for (const r of _plVL.rows()) {
+    if (_dragIdxs.has(+r.dataset.idx)) r.classList.add('dragging');
+  }
+});
+
+function _endPlDrag() {
+  _dragIdxs = null;
+  tracksEl.querySelectorAll('.queue-row.dragging, .queue-row.dragging-over')
+    .forEach(r => r.classList.remove('dragging', 'dragging-over'));
+  // Drop the transient draggable flag (set during a touch long-press) so the
+  // next tap on the row isn't treated as a drag-handle gesture.
+  tracksEl.querySelectorAll('.queue-row[draggable="true"]').forEach(r => { r.draggable = false; });
+}
+tracksEl.addEventListener('dragend', _endPlDrag);
+
+// Library tracks dropped on the list add them; playlist rows dropped on a row
+// reorder.  (The list may have scrolled — and recycled the dragged row — while
+// dragging, so the drop goes by the indices carried in the drag data.)
+tracksEl.addEventListener('dragover', (e) => {
+  const types = e.dataTransfer.types;
+  if (types.includes('application/x-soniqboom-pl-idx')) {
+    const row = _plRowOf(e);
+    if (!row) return;
+    e.preventDefault();
+    if (!row.classList.contains('dragging-over')) {
+      tracksEl.querySelectorAll('.queue-row.dragging-over')
+        .forEach(r => r.classList.remove('dragging-over'));
+      row.classList.add('dragging-over');
+    }
+    return;
+  }
+  if (_activeId && types.includes('application/x-soniqboom-track')) {
+    e.preventDefault();
+    dropZone.classList.add('drag-active');
+  }
+});
+tracksEl.addEventListener('dragleave', (e) => {
+  const row = _plRowOf(e);
+  if (row && !row.contains(e.relatedTarget)) row.classList.remove('dragging-over');
+  if (!tracksEl.contains(e.relatedTarget)) dropZone.classList.remove('drag-active');
+});
+tracksEl.addEventListener('drop', async (e) => {
+  const raw = e.dataTransfer.getData('application/x-soniqboom-pl-idx');
+  if (raw || e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) {
+    // ── Drop: reorder ──────────────────────────────────────────────────────
+    e.preventDefault();
+    const row = _plRowOf(e);
+    if (row) row.classList.remove('dragging-over');
+    if (!row || !raw || !_activeId) { _endPlDrag(); return; }
+    const i = parseInt(row.dataset.idx, 10);
+
+    let fromIndices;
+    try { fromIndices = JSON.parse(raw); }
+    catch { _endPlDrag(); return; }
+    if (!Array.isArray(fromIndices)) fromIndices = [fromIndices];
+
+    const fromSet = new Set(fromIndices);
+    if (fromSet.has(i)) { _endPlDrag(); return; }   // dropped onto a dragged row — no-op
+
+    // Keep a snapshot for rollback so we can revert the local order if
+    // the server PUT fails — the optimistic UI shouldn't lie to the user
+    // about what was persisted.
+    const previousOrder = _activeTracks.slice();
+
+    // Extract items being moved and the rest
+    const toInsert = fromIndices.map(idx => _activeTracks[idx]);
+    const rest     = _activeTracks.filter((_, idx) => !fromSet.has(idx));
+    // Adjust insertion point: each dragged item before `i` shifts the target left
+    const shift    = fromIndices.filter(idx => idx < i).length;
+    const insertAt = Math.max(0, Math.min(rest.length, i - shift));
+    rest.splice(insertAt, 0, ...toInsert);
+    _activeTracks = rest;
+
+    _clearSelection();
+    _endPlDrag();
+    try {
+      await _api(`/playlists/${_activeId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track_ids: _activeTracks.map(_plEntry) }),
+      });
+    } catch (err) {
+      // Revert the optimistic local order and re-render so the displayed
+      // state matches what's actually on the server.
+      _activeTracks = previousOrder;
+      console.warn('Drag-reorder save failed:', err);
+      Toast.error("Reorder couldn't be saved — order reverted.");
+    }
+    _renderTracks();
+    return;
+  }
+  // ── Drop: library tracks onto the list → add ───────────────────────────
+  if (!e.dataTransfer.types.includes('application/x-soniqboom-track')) return;
+  e.preventDefault();
+  dropZone.classList.remove('drag-active');
+  try {
+    const data = JSON.parse(e.dataTransfer.getData('application/x-soniqboom-track'));
+    const tracks = Array.isArray(data) ? data : [data];
+    const ids = tracks.map(t => t?.id).filter(Boolean);
+    if (ids.length && _activeId) await _addTracks(_activeId, ids);
+  } catch (_) {}
+});
 
 // Background-fill AdLib/IMF durations for the rendered rows (one-time per track;
 // shared dedup with the library + mobile via probeAdlibDurations).
@@ -580,7 +686,7 @@ async function _probePlaylistDurations() {
     const idx = _activeTracks.findIndex(t => t && t.id === id);
     if (idx < 0) continue;
     _activeTracks[idx].duration = sec;
-    const span = tracksEl.querySelector(`.queue-row[data-idx="${idx}"] .queue-track-dur`);
+    const span = _plVL.rowFor(idx)?.querySelector('.queue-track-dur');
     if (span) span.textContent = fmtDur(sec);
   }
 }
@@ -761,30 +867,8 @@ dropZone.addEventListener('drop', async (e) => {
   } catch (_) {}
 });
 
-// Allow drop on the tracks area too (not just the zone banner)
-tracksEl.addEventListener('dragover', (e) => {
-  if (_activeId
-      && e.dataTransfer.types.includes('application/x-soniqboom-track')
-      && !e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) {
-    e.preventDefault();
-    dropZone.classList.add('drag-active');
-  }
-});
-tracksEl.addEventListener('dragleave', (e) => {
-  if (!tracksEl.contains(e.relatedTarget)) dropZone.classList.remove('drag-active');
-});
-tracksEl.addEventListener('drop', async (e) => {
-  if (!e.dataTransfer.types.includes('application/x-soniqboom-track')) return;
-  if ( e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) return;
-  e.preventDefault();
-  dropZone.classList.remove('drag-active');
-  try {
-    const data = JSON.parse(e.dataTransfer.getData('application/x-soniqboom-track'));
-    const tracks = Array.isArray(data) ? data : [data];
-    const ids = tracks.map(t => t?.id).filter(Boolean);
-    if (ids.length && _activeId) await _addTracks(_activeId, ids);
-  } catch (_) {}
-});
+// (Drops on the tracks area itself — reorder or add — are handled by the
+// delegated listeners next to _renderTracks.)
 
 // ── Keyboard: Delete/⌫ removes selected tracks ────────────────────────────────
 panel.addEventListener('keydown', (e) => {
@@ -904,8 +988,7 @@ function _closeAddDropdown() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 refresh();
 
-Player.on('trackchange', () => {
-  if (_activeId && !tracksEl.hidden) _renderTracks();
-});
+// A track change only moves the now-playing marker on the rows shown.
+Player.on('trackchange', () => _paintPlaying());
 
 export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist };

@@ -10,7 +10,7 @@ computing history with its own sound, scene, and stories.
 
 | Format | Origin | Claim to fame | Notable |
 |---|---|---|---|
-| **SID** (`.sid`, `.psid`) | Commodore 64, 1982 — named for its sound chip, the MOS 6581/8580 *Sound Interface Device* | The most collected chiptune format on Earth: the High Voltage SID Collection (HVSC) curates 50,000+ tunes | Three voices + one filter, yet composers like Rob Hubbard, Martin Galway and Chris Hülsbeck coaxed whole orchestras out of it. The 6581 vs 8580 chip revisions sound audibly different — endless scene debate. RSID variants are recognised by content. SoniqBoom reads HVSC's Songlengths + STIL commentary, and lets you force either chip model. |
+| **SID** (`.sid`, `.psid`, `.rsid`) | Commodore 64, 1982 — named for its sound chip, the MOS 6581/8580 *Sound Interface Device* | The most collected chiptune format on Earth: the High Voltage SID Collection (HVSC) curates 50,000+ tunes | Three voices + one filter, yet composers like Rob Hubbard, Martin Galway and Chris Hülsbeck coaxed whole orchestras out of it. The 6581 vs 8580 chip revisions sound audibly different — endless scene debate. RSID variants are recognised by content. SoniqBoom reads HVSC's Songlengths + STIL commentary, and lets you force either chip model. |
 
 ## Amiga trackers
 

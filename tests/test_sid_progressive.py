@@ -15,11 +15,12 @@ fragile:
   2. ``_synth_wav_header`` — the synthesised 44-byte header the stream ships
      before sidplayfp's own header exists must be a valid RIFF/WAVE PCM header
      declaring exactly the expected length.
-  3. ``_await_first_sid_output`` — the first-byte probe that decides
-     stream-vs-fallback: True once PCM appears, False when the process dies
-     without output, True (stream anyway) on timeout with the proc alive.
+  3. ``_await_sid_audible`` — the probe that decides stream-vs-fallback:
+     "audible" once audible PCM appears, "failed" when the process dies
+     without output, "silent" when it ends having rendered only silence,
+     "stream" (stream anyway) on a timeout with the proc alive.
   4. End-to-end ``_render_sid`` on a real .sid (guarded by sidplayfp) — the
-     renderer produces a full-length, non-truncated PCM WAV.
+     renderer produces a WAV of exactly the requested duration.
 """
 from __future__ import annotations
 
@@ -119,45 +120,73 @@ def test_parse_audio_range():
     assert _parse_audio_range("bytes=-0", T) is None             # zero-length suffix → 416
 
 
-# ── 3) _await_first_sid_output ─────────────────────────────────────────────
+# ── 3) _await_sid_audible ──────────────────────────────────────────────────
 
 class _FakeProc:
     def __init__(self, returncode=None):
         self.returncode = returncode
 
 
-async def test_await_first_output_true_when_pcm_present():
-    from soniqboom.api.stream import _await_first_sid_output, _WAV_HEADER_LEN
+def _square(frames: int) -> bytes:
+    """Mono 16-bit PCM: a ±8000 square wave (audible)."""
+    return (b"\x40\x1f" * 50 + b"\xc0\xe0" * 50) * (frames // 100)
+
+
+async def test_await_audible_when_sound_present():
+    from soniqboom.api.stream import _await_sid_audible, _WAV_HEADER_LEN
 
     tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="fbtest-")[1])
     try:
-        tmp.write_bytes(b"\x00" * (_WAV_HEADER_LEN + 100))   # header + real PCM
-        assert await _await_first_sid_output(_FakeProc(returncode=None), tmp, 1.0) is True
+        tmp.write_bytes(b"\x00" * _WAV_HEADER_LEN + _square(4410))
+        assert await _await_sid_audible(_FakeProc(returncode=None), tmp) == "audible"
     finally:
         tmp.unlink(missing_ok=True)
 
 
-async def test_await_first_output_false_on_dead_proc_no_data():
-    from soniqboom.api.stream import _await_first_sid_output, _WAV_HEADER_LEN
+async def test_await_audible_failed_on_dead_proc_no_data():
+    from soniqboom.api.stream import _await_sid_audible, _WAV_HEADER_LEN
 
     tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="fbtest-")[1])
     try:
-        # Header-only (== 44 bytes): not > _WAV_HEADER_LEN, and proc already
-        # exited non-zero → treated as an immediate failure → fall back.
+        # Header-only (== 44 bytes) and the proc already exited non-zero →
+        # an immediate failure → fall back to the blocking render.
         tmp.write_bytes(b"\x00" * _WAV_HEADER_LEN)
-        assert await _await_first_sid_output(_FakeProc(returncode=1), tmp, 1.0) is False
+        assert await _await_sid_audible(_FakeProc(returncode=1), tmp) == "failed"
+        # PCM but a failed exit is a failure too, never "silent".
+        tmp.write_bytes(b"\x00" * (_WAV_HEADER_LEN + 8820))
+        assert await _await_sid_audible(_FakeProc(returncode=1), tmp) == "failed"
     finally:
         tmp.unlink(missing_ok=True)
 
 
-async def test_await_first_output_true_on_timeout_with_live_proc():
-    from soniqboom.api.stream import _await_first_sid_output
+async def test_await_audible_silent_on_clean_exit_with_only_silence():
+    from soniqboom.api.stream import _await_sid_audible, _WAV_HEADER_LEN
 
     tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="fbtest-")[1])
     try:
-        # Empty file, proc still alive, tiny timeout → stream anyway (the
-        # generator's own idle-timeout handles a genuinely stuck render).
-        assert await _await_first_sid_output(_FakeProc(returncode=None), tmp, 0.2) is True
+        # A decaying DC offset is not sound (``core.silence``).
+        dc = b"".join(int(-1500 * (1 - i / 44100)).to_bytes(2, "little", signed=True)
+                      for i in range(44100))
+        tmp.write_bytes(b"\x00" * _WAV_HEADER_LEN + dc)
+        assert await _await_sid_audible(_FakeProc(returncode=0), tmp) == "silent"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def test_await_audible_streams_on_timeout_with_live_proc():
+    from soniqboom.api.stream import _await_sid_audible, _WAV_HEADER_LEN
+
+    tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="fbtest-")[1])
+    try:
+        # Empty file, proc still alive, tiny first-byte timeout → stream
+        # anyway (the generator's own idle-timeout handles a stuck render).
+        assert await _await_sid_audible(_FakeProc(returncode=None), tmp,
+                                        first_byte_timeout=0.2) == "stream"
+        # Silent PCM so far, proc alive: stream once the audible wait is spent
+        # (a long silent intro is judged at the end, as before).
+        tmp.write_bytes(b"\x00" * (_WAV_HEADER_LEN + 8820))
+        assert await _await_sid_audible(_FakeProc(returncode=None), tmp,
+                                        audible_timeout=0.2) == "stream"
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -187,8 +216,9 @@ async def test_render_sid_produces_full_length_wav(have_sidplayfp: bool):
             rendered = w.getnframes() / w.getframerate()
         finally:
             w.close()
-        # Full length, not truncated — sidplayfp renders the whole -t window
-        # (allow a small tolerance for rounding).
-        assert rendered >= dur - 1.0, f"render truncated: {rendered:.2f}s < {dur}s"
+        # Exactly the -t window: sidplayfp renders a few ms past it, and the
+        # render is cut to the length a progressive stream / HEAD promise.
+        assert w.getnframes() == dur * 44100, f"render is {rendered:.4f}s, not {dur}s"
+        assert out.stat().st_size == 44 + dur * 44100 * 2
     finally:
         out.unlink(missing_ok=True)

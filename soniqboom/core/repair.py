@@ -240,7 +240,7 @@ def _has_bad_tracker_title(track: dict) -> bool:
     return False
 
 
-_SID_EXTS = (".sid", ".psid", ".rsid")
+from soniqboom.core.metadata import SID_EXTS as _SID_EXTS   # the one SID list (incl. .rsid)
 
 
 def _has_cp437_corruption(track: dict) -> bool:
@@ -834,6 +834,9 @@ _REPAIRABLE_FIELDS: tuple[str, ...] = (
     # A multi-tune file's default tune (SID header start song, SNDH ``!#``),
     # which older scans didn't record.
     "start_subsong",
+    # A multi-tune file's tune count — libgme rips (NSF / NSFe / GBS / AY /
+    # SAP) carry it in the header, which older scans didn't read.
+    "subsongs",
 )
 
 
@@ -894,6 +897,12 @@ def _changed_fields(old: dict, new: dict) -> dict:
             # existing defect to None — only set or upgrade one.  (A full
             # re-scan, which has the archive, is what clears a stale defect.)
             if k in ("defect", "defect_detail") and new[k] is None:
+                continue
+            # A tune count / default tune the re-extract doesn't know is no
+            # reason to drop the stored one: a probed default tune (the first
+            # one that isn't empty, ``stream.ensure_default_tune``) is never
+            # read from the file at all.
+            if k in ("subsongs", "start_subsong") and new[k] is None:
                 continue
             # A game derived from the album (``game_source`` set) stays when
             # the file carries no GAME tag of its own.
@@ -1304,8 +1313,8 @@ async def _tag_window_extract(source, remote_subpath: str, path_str: str,
 
 
 def _is_remote(path: str) -> bool:
-    return path.startswith(("ftp://", "ftps://", "smb://", "webdav://",
-                            "webdavs://", "http://", "https://"))
+    from soniqboom.core.filesource import is_remote_path
+    return is_remote_path(path)
 
 
 async def _run_repair(

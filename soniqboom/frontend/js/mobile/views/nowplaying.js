@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * nowplaying.js — Mobile Now Playing view: artwork, scrubber, transport.
+ * nowplaying.js — Mobile Now Playing view: artwork, scrubber, transport, and
+ * the tune list of a multi-tune file (SID, Amiga modules, console rips …).
  */
 import { Player } from '../../player.js';
 import { MobileRadio } from '../radio-player.js';
-import { artPlaceholderEmoji } from '../../utils.js';
+import { artPlaceholderEmoji, subsongStart, subsongStartOf, subsongWireToTune,
+         subsongTuneToWire } from '../../utils.js';
+import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur } from './_common.js';
 
 export function mountNowPlaying(root, ctx) {
@@ -33,6 +36,10 @@ export function mountNowPlaying(root, ctx) {
         <button class="m-np-btn" id="m-np-shuffle" aria-label="Shuffle">⇄</button>
         <button class="m-np-btn" id="m-np-repeat"  aria-label="Repeat">↻</button>
       </div>
+      <section class="m-np-tunes" id="m-np-tunes" aria-labelledby="m-np-tunes-hdr" hidden>
+        <div class="m-np-tunes-hdr" id="m-np-tunes-hdr">Tunes <span class="m-np-tunes-count" id="m-np-tunes-count"></span></div>
+        <div class="m-np-tune-list" id="m-np-tune-list" role="list"></div>
+      </section>
     </div>
   `;
 
@@ -47,6 +54,9 @@ export function mountNowPlaying(root, ctx) {
   const nextBtn  = root.querySelector('#m-np-next');
   const shufBtn  = root.querySelector('#m-np-shuffle');
   const repBtn   = root.querySelector('#m-np-repeat');
+  const tunesEl  = root.querySelector('#m-np-tunes');
+  const tuneCountEl = root.querySelector('#m-np-tunes-count');
+  const tuneList = root.querySelector('#m-np-tune-list');
 
   let _scrubbing = false;
 
@@ -92,7 +102,12 @@ export function mountNowPlaying(root, ctx) {
       scrub.value = '0'; curEl.textContent = '0:00'; durEl.textContent = '0:00';
       return;
     }
-    titleEl.textContent  = t.title  || '—';   // wipes any prior badge
+    // A picked tune of a multi-tune file: its number after the title (the
+    // wire maps to it with the file's start song — utils.js).
+    const _subTotal = t.subsongTotal || t.subsongs;
+    const _tune = (Number.isInteger(t.subsong) && _subTotal > 1)
+      ? ` · Tune ${subsongWireToTune(t.subsong, subsongStartOf(t), _subTotal)} / ${_subTotal}` : '';
+    titleEl.textContent  = (t.title  || '—') + _tune;   // wipes any prior badge
     if (t.defect === 'partial' || t.defect === 'corrupt') {
       const badge = document.createElement('span');
       badge.className = `track-defect-badge track-defect-${t.defect}`;
@@ -121,7 +136,124 @@ export function mountNowPlaying(root, ctx) {
     }
   }
 
+  // ── Tunes of a multi-tune file ─────────────────────────────────────────
+  // The playing file's tunes, in tune order; a tap plays that tune (the
+  // queue becomes that one tune, like the desktop Track Info picker).  The
+  // count, the start song (SID / SNDH: it moves the wires) and the default
+  // tune — the one a plain play plays, marked "default" — come from
+  // /extended.  For an Amiga module or a console rip the server learns the
+  // default on the first play (its first tune that isn't empty): while it is
+  // unknown, or /extended failed, the list asks again a few times.
+  let _tunes = null;          // { id, count, start, def, lengths, base, settled }
+  let _tunesAbort = null;
+  let _tunesRetry = null;
+  const _TUNES_RETRY_MS = [1500, 4000, 10000];
+
+  function _tuneRows() {
+    const st = _tunes;
+    const rows = [];
+    for (let n = 1; n <= st.count; n++) {
+      const wire = subsongTuneToWire(n, st.start, st.count);
+      const isDef = n === st.def;
+      const len = Array.isArray(st.lengths) ? fmtDur(Number(st.lengths[n - 1]) || 0) : '';
+      rows.push(`<div class="m-np-tune-item" role="listitem">`
+        + `<button type="button" class="m-np-tune" data-wire="${wire}"`
+        + ` aria-label="Play tune ${n}${isDef ? ' (default)' : ''}">`
+        + `<span class="m-np-tune-name">Tune ${n}</span>`
+        + (isDef ? '<span class="m-np-tune-def">default</span>' : '')
+        + `<span class="m-np-tune-len">${len}</span></button></div>`);
+    }
+    tuneList.innerHTML = rows.join('');
+  }
+
+  function _markPlayingTune() {
+    const st = _tunes;
+    if (!st) return;
+    const cur = Player.currentTrack;
+    // A plain play of the file (no ``subsong``) plays its default tune.
+    const wire = (cur && cur.id === st.id)
+      ? (Number.isInteger(cur.subsong) ? cur.subsong : subsongTuneToWire(st.def, st.start, st.count))
+      : -1;
+    for (const b of tuneList.querySelectorAll('.m-np-tune')) {
+      const on = Number(b.dataset.wire) === wire;
+      b.classList.toggle('playing', on);
+      if (on) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
+    }
+  }
+
+  function _hideTunes() {
+    _tunes = null;
+    if (_tunesRetry) { clearTimeout(_tunesRetry); _tunesRetry = null; }
+    tunesEl.hidden = true;
+    tuneList.innerHTML = '';
+  }
+
+  async function renderTunes(t, attempt = 0) {
+    if (MobileRadio.active || !t || !t.id) { _hideTunes(); return; }
+    if (_tunes && _tunes.id === t.id && (_tunes.settled || attempt === 0)) {
+      _markPlayingTune();
+      return;
+    }
+    const known = Number(t.subsongTotal || t.subsongs) || 0;
+    if (!(known > 1) && !TUNE_CHIP_FORMAT_NAMES.has(t.format)) { _hideTunes(); return; }
+    if (_tunesRetry) { clearTimeout(_tunesRetry); _tunesRetry = null; }
+    if (_tunesAbort) { try { _tunesAbort.abort(); } catch (_) {} }
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    _tunesAbort = ctl;
+    let data = null;
+    try {
+      const res = await fetch(`/api/tracks/${encodeURIComponent(t.id)}/extended`,
+                              ctl ? { signal: ctl.signal } : undefined);
+      if (res.ok) data = await res.json();
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;      // a newer track owns the list
+    } finally {
+      if (_tunesAbort === ctl) _tunesAbort = null;
+    }
+    const cur = Player.currentTrack;
+    if (!cur || cur.id !== t.id || MobileRadio.active) return;
+    const count = (data && Number(data.subsongs) > 1) ? Number(data.subsongs) : known;
+    if (!(count > 1)) {
+      if (data || attempt >= _TUNES_RETRY_MS.length) { _hideTunes(); return; }
+    } else {
+      // The file itself (a picked tune's entry carries that tune's length).
+      const base = { ...t };
+      if (Number.isInteger(t.subsong)) base.duration = 0;
+      for (const k of ['subsong', 'subsongTotal', 'subsongStart', 'subsongLabel']) delete base[k];
+      const start = subsongStart((data && data.default_track) ?? subsongStartOf(t), count);
+      const defTune = data && data.default_tune;
+      _tunes = { id: t.id, count, start,
+                 def: subsongStart(defTune ?? start, count),
+                 lengths: (data && Array.isArray(data.hvsc_lengths)) ? data.hvsc_lengths : null,
+                 base, settled: !!data && defTune != null && !data.default_tune_pending };
+      tuneCountEl.textContent = `· ${count}`;
+      _tuneRows();
+      tunesEl.hidden = false;
+      _markPlayingTune();
+      if (_tunes.settled) return;
+    }
+    // Not known yet (or the request failed): ask again while this track plays.
+    if (attempt < _TUNES_RETRY_MS.length) {
+      _tunesRetry = setTimeout(() => {
+        _tunesRetry = null;
+        const now = Player.currentTrack;
+        if (now && now.id === t.id) renderTunes(now, attempt + 1);
+      }, _TUNES_RETRY_MS[attempt]);
+    }
+  }
+
+  tuneList.addEventListener('click', (e) => {
+    const b = e.target.closest('.m-np-tune');
+    const st = _tunes;
+    if (!b || !st) return;
+    const wire = parseInt(b.dataset.wire, 10);
+    if (!(wire >= 0)) return;
+    Player.setQueue([subsongVirtualTrack(st.base, wire,
+                     { count: st.count, start: st.start, lengths: st.lengths, def: st.def })], 0);
+  });
+
   Player.on('trackchange', renderTrack);
+  Player.on('trackchange', (t) => { renderTunes(t); });
   // The cued track (see renderTrack) appears, changes or goes: the resume /
   // restore, a queue edit, a clear.  Nothing to do while a track is loaded.
   let _shownCuedKey = null;
@@ -149,7 +281,7 @@ export function mountNowPlaying(root, ctx) {
   });
 
   // Radio drives the view + play button while a station is the active source.
-  MobileRadio.on('change', () => renderTrack(Player.currentTrack));
+  MobileRadio.on('change', () => { renderTrack(Player.currentTrack); renderTunes(Player.currentTrack); });
   MobileRadio.on('state',  () => {
     if (MobileRadio.active) playBtn.textContent = MobileRadio.playing ? '⏸' : '▶';
   });
@@ -196,5 +328,6 @@ export function mountNowPlaying(root, ctx) {
 
   // Initial paint
   renderTrack(Player.currentTrack);
+  renderTunes(Player.currentTrack);
   playBtn.textContent = (MobileRadio.active ? MobileRadio.playing : Player.playing) ? '⏸' : '▶';
 }

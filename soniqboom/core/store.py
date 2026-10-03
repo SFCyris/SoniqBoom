@@ -280,8 +280,9 @@ _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
 # folder-album pass, the index-health sweep).  An ALLOWLIST, deliberately: a
 # change to any other field bumps the seq.  ``cover_art`` is written on the
 # first art extraction of every track, so bumping for it re-cooled every
-# library-wide cache on normal browsing.
-_SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size"))
+# library-wide cache on normal browsing; ``default_subsong`` (a multi-tune
+# file's probed default tune) on its first play.
+_SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subsong"))
 
 # Inputs of the duplicate grouping (``duplicates.group_key_for`` + the primary
 # pick) and its output.  A write that changes an input — or loses the output —
@@ -292,6 +293,17 @@ _DUP_FIELDS = frozenset(("title", "artist", "album_artist", "duration",
                          "format", "bitrate", "added_at"))
 _DUP_OUTPUT_FIELDS = frozenset(("duplicate_group_id", "is_duplicate_primary", "format_score"))
 _DUP_DIRTY_MAX = 20_000     # more pending changes than this → one full pass instead
+
+# The post-scan enrichment passes (Modland, song database, Demozoo, game from
+# archive name, album from folder name) re-join only the tracks written since
+# their own last run (``core/enrich_delta.py``): every upsert, delete and field
+# update records the track id in ``_enrich_log`` — except a change confined to
+# fields no pass reads (these; a field a pass starts to read must leave this
+# list).  More ids than ``_ENRICH_LOG_MAX`` → the oldest half is dropped, and a
+# pass whose last run is older runs over everything.
+_ENRICH_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "duplicate_group_id",
+                                   "is_duplicate_primary", "format_score", "default_subsong"))
+_ENRICH_LOG_MAX = 100_000
 
 # Fields the Subsonic catalogue (core/subsonic_index.py) groups/sorts/counts on
 # — including a multi-tune file's tune count, default tune and per-tune
@@ -722,7 +734,39 @@ def _carry_enrichment(old: dict, new: dict) -> None:
                     ("game_by_songdb", same_md5)):
         if keep and old.get(f) and not new.get(f):
             new[f] = old[f]
+    _carry_default_tune(old, new)
     new.update(game_follow(new))                # the game follows the carried album
+
+
+def same_file_version(old: dict, new: dict) -> bool:
+    """Is the freshly extracted ``new`` the same file as stored ``old`` — the
+    same size, and no content hash (``file_md5`` / ``sid_md5``) that differs
+    where both have one?  (A touch, or a field the extractor now reads
+    differently, changes neither.)"""
+    return (old.get("file_size") == new.get("file_size")
+            and not any(old.get(h) and new.get(h) and old[h] != new[h]
+                        for h in ("file_md5", "sid_md5")))
+
+
+def _carry_default_tune(old: dict, new: dict) -> None:
+    """A multi-tune file's probed default tune (``default_subsong``, written at
+    its first bare play — no extract ever produces it; 0 is a value) carried
+    onto a fresh extract of the SAME file (``same_file_version``) whose tune
+    count still covers it: dropped, a re-extract that changed another field
+    (a title the extractor now reads better) made the next bare play probe
+    again.  A default past the first tune keeps the length stored with it —
+    that tune's (or the placeholder its first render measures), where the
+    extract has the first tune's."""
+    z = old.get("default_subsong")
+    if (not isinstance(z, int) or isinstance(z, bool) or z < 0
+            or new.get("default_subsong") is not None or not same_file_version(old, new)):
+        return
+    n = new.get("subsongs")
+    if not (isinstance(n, int) and not isinstance(n, bool) and 1 < n and z < n):
+        return                          # the fresh extract knows no tune count that covers it
+    new["default_subsong"] = z
+    if z and "duration" in old:
+        new["duration"] = old["duration"]
 
 
 class TrackStore:
@@ -759,6 +803,11 @@ class TrackStore:
         # Duration-only field writes (``_duration_only``), which bump neither
         # sequence above.
         self._duration_seq: int = 0
+        # Per-track write counter: bumped by every upsert and every in-place
+        # field write, whatever the field (seq-exempt ones included), so a
+        # per-track memo (the Subsonic song memo) validates an entry with one
+        # lookup.  Never reset — an id that comes back counts on.
+        self._track_rev: dict[str, int] = {}
         # Tracks upserted since the heap was last frozen (``FREEZE_AFTER_UPSERTS``).
         self._upserts_since_freeze: int = 0
 
@@ -778,6 +827,14 @@ class TrackStore:
         self._dup_dirty: dict[str, dict | None] = {}
         self._dup_dirty_overflow = False
         self._on_dup_dirty = None           # callback: the pending set became non-empty
+        # Enrichment change log (see _ENRICH_EXEMPT_FIELDS): track id → the
+        # number of its latest change, oldest first.  Changes up to
+        # ``_enrich_floor`` are no longer listed (dropped at the cap); a new
+        # ``_enrich_epoch`` (every load) invalidates every pass's position.
+        self._enrich_seq = 0
+        self._enrich_log: dict[str, int] = {}
+        self._enrich_floor = 0
+        self._enrich_epoch = object()
         self._tag_scan_root_hash: dict[str, set[str]] = {}
         self._tag_dup_group: dict[str, set[str]] = {}
         # Scene-group (Demozoo) index: each collective a retro composer belonged
@@ -1255,12 +1312,17 @@ class TrackStore:
         stored track ``t`` and maintain the derived indexes."""
         if not _DUP_FIELDS.isdisjoint(changed):
             self._note_dup_dirty(tid, t)
+        if not changed.keys() <= _ENRICH_EXEMPT_FIELDS:
+            self._note_enrich(tid)
         if _INDEXED_FIELDS.isdisjoint(changed):
             t.update(changed)                   # e.g. cover_art, file_md5, defect
-            return
-        old = dict(t)
-        t.update(changed)
-        self._reindex_changed(tid, old, t, changed)
+        else:
+            old = dict(t)
+            t.update(changed)
+            self._reindex_changed(tid, old, t, changed)
+        # Counted once the fields are written: whatever a per-track memo built
+        # from ``t`` before is keyed to the old count.
+        self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
 
     # ── Bulk load (used on startup — indexes rebuilt after all data loaded) ──
 
@@ -1294,6 +1356,7 @@ class TrackStore:
         self._scan_dirs = scan_dirs
         self._hash_lookups = hash_lookups
         self._config = config
+        self._reset_enrich_log()
 
     def rebuild_indexes(self) -> None:
         """Rebuild all indexes from current data.
@@ -1566,9 +1629,11 @@ class TrackStore:
         old = self._tracks.get(tid)
         track.update(game_follow(track))
         self._note_dup_upsert(tid, old, track)
+        self._note_enrich(tid)
         if old:
             self._unindex_track(tid, old)
         self._tracks[tid] = track
+        self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
         self._index_track(tid, track)
         self._mutation_seq += 1
         self._catalog_seq += 1
@@ -1585,7 +1650,9 @@ class TrackStore:
             else:
                 t.update(game_follow(t))
             self._note_dup_upsert(tid, old, t)
+            self._note_enrich(tid)
             self._tracks[tid] = t
+            self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
             self._index_track(tid, t)
         self._mutation_seq += 1
         self._catalog_seq += 1
@@ -1750,6 +1817,7 @@ class TrackStore:
         if t is None:
             return False
         self._note_dup_dirty(track_id, t)
+        self._note_enrich(track_id)
         self._unindex_track(track_id, t)
         self._waveforms.pop(track_id, None)
         self._mutation_seq += 1
@@ -1764,6 +1832,7 @@ class TrackStore:
             t = self._tracks.pop(tid, None)
             if t:
                 self._note_dup_dirty(tid, t)
+                self._note_enrich(tid)
                 self._unindex_track(tid, t)
                 self._waveforms.pop(tid, None)
                 deleted += 1
@@ -1811,6 +1880,53 @@ class TrackStore:
         self._dup_dirty = {}
         self._dup_dirty_overflow = False
         return out, over
+
+    # ── Enrichment change log (``core/enrich_delta.py``) ─────────────────
+
+    def _note_enrich(self, tid: str) -> None:
+        """Record a change to track ``tid`` (an insert, a delete, or a field
+        a pass reads) as the newest entry of the enrichment change log."""
+        self._enrich_seq += 1
+        log_ = self._enrich_log
+        log_.pop(tid, None)
+        log_[tid] = self._enrich_seq
+        if len(log_) > _ENRICH_LOG_MAX:
+            items = list(log_.items())
+            cut = len(items) // 2
+            self._enrich_floor = items[cut - 1][1]
+            self._enrich_log = dict(items[cut:])
+
+    def _reset_enrich_log(self) -> None:
+        """A load replaced the tracks: no earlier position is valid any more
+        (every pass's next run covers the whole library)."""
+        self._enrich_log = {}
+        self._enrich_floor = self._enrich_seq
+        self._enrich_epoch = object()
+
+    def enrich_cursor(self) -> tuple:
+        """The current position in the enrichment change log — what a pass
+        records with the snapshot it reads (``enrich_changes``)."""
+        return (self._enrich_epoch, self._enrich_seq)
+
+    def enrich_changes(self, cursor, limit: int | None = None) -> "set[str] | None":
+        """The ids of the tracks inserted, deleted or changed after ``cursor``
+        (an ``enrich_cursor()`` value) — None when that is not known (no
+        cursor, a load since, the entries were dropped at the cap) or there
+        are more than ``limit``.  Newest first: O(changes)."""
+        if cursor is None:
+            return None
+        epoch, seq = cursor
+        if epoch is not self._enrich_epoch or seq < self._enrich_floor:
+            return None
+        out: set[str] = set()
+        log_ = self._enrich_log
+        for tid in reversed(log_):
+            if log_[tid] <= seq:
+                break
+            out.add(tid)
+            if limit is not None and len(out) > limit:
+                return None
+        return out
 
     def all_tracks(self) -> list[dict]:
         return list(self._tracks.values())
@@ -3211,6 +3327,12 @@ class TrackStore:
     def set_config(self, key: str, value: Any) -> None:
         self._config[key] = value
         self._aof("set_config", key=key, value=value)
+
+    def delete_config(self, key: str) -> None:
+        """Remove config ``key`` (``set_config(key, None)`` keeps the key)."""
+        if key in self._config:
+            del self._config[key]
+            self._aof("delete_config", key=key)
 
     def get_config(self, key: str, default: Any = None) -> Any:
         return self._config.get(key, default)

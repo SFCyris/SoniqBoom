@@ -103,16 +103,24 @@ class _LhaCliArchive:
     """A zipfile-style reader backed by the ``lha`` (lhasa) CLI, for LHA
     archives ``lhafile`` can't decode (e.g. ``-lh1-``).  Extracts the whole
     archive to a temp directory once; ``namelist``/``read`` then serve from
-    disk.  ``close`` removes the temp tree (called on cache eviction)."""
+    disk.  ``close`` removes the temp tree (called on cache eviction) — only in
+    the process that extracted it: a forked scan worker reads the server's
+    tree (it holds no open descriptor) and extracts its own copy only if the
+    server has removed it meanwhile."""
 
     def __init__(self, path: str):
+        self._path = path
+        self._extract()
+
+    def _extract(self) -> None:
+        self._owner = os.getpid()
         self._dir = tempfile.mkdtemp(prefix="sb_lha_")
         try:
             # forksafe: this runs from scanner/stream worker THREADS of the
             # CF-initialised server — a plain subprocess.run fork here
             # segfaulted the child (8 dumps in the 2026-07-02 scan).
             forksafe.run(
-                [_LHA_BIN, f"xw={self._dir}", path],
+                [_LHA_BIN, f"xw={self._dir}", self._path],
                 check=True, capture_output=True, timeout=120,
             )
         except Exception:
@@ -127,15 +135,25 @@ class _LhaCliArchive:
     def namelist(self):
         return list(self._files.keys())
 
-    def read(self, member: str) -> bytes:
+    def _read(self, member: str) -> bytes:
         full = self._files.get(member) or self._files.get(member.replace("\\", "/"))
         if full is None:
             raise KeyError(member)
         with open(full, "rb") as fh:
             return fh.read()
 
+    def read(self, member: str) -> bytes:
+        try:
+            return self._read(member)
+        except FileNotFoundError:
+            if self._owner == os.getpid():
+                raise
+            self._extract()        # the server removed the tree we shared
+            return self._read(member)
+
     def close(self):
-        shutil.rmtree(self._dir, ignore_errors=True)
+        if self._owner == os.getpid():
+            shutil.rmtree(self._dir, ignore_errors=True)
 
 
 def _open(local_path):
@@ -193,8 +211,42 @@ from collections import OrderedDict as _OrderedDict
 _OPEN_CACHE: "_OrderedDict[tuple, object]" = _OrderedDict()
 _MAP_CACHE: "_OrderedDict[tuple, dict]" = _OrderedDict()
 _CACHE_LOCK = _threading.RLock()
+_CACHE_PID = os.getpid()       # the process whose descriptors _OPEN_CACHE holds
 _OPEN_MAX = 8
 _MAP_MAX = 256
+
+
+# An open archive object belongs to the process that opened it.  On Linux the
+# scan pool FORKS its workers from the server (``scanner._process_pool`` uses
+# the platform default there), so without this every worker inherited the
+# server's open archives — and their file descriptors, which share ONE file
+# offset with the server and with each other.  lhafile and zipfile read a
+# member as seek + read (two system calls), so parallel workers read one
+# another's bytes: in one Linux (Docker) scan 274 of AHXSONGS.LHA's 513
+# members failed "crc is not matched", while macOS (workers forked from a
+# clean forkserver) indexed all 513.  A forked child therefore forgets the
+# inherited lhafile / zipfile objects and opens its own.  They are dropped,
+# not closed explicitly (collecting them closes only the child's copies of the
+# descriptors; nothing seeks).  ``_LhaCliArchive`` entries stay: they hold no
+# descriptor, and only their creator removes their temp tree.  The lock is
+# replaced too — another thread may have held it at the fork, and a held lock
+# would deadlock the child's first archive read.  ``_MAP_CACHE`` holds plain
+# name maps and stays valid.
+def _drop_inherited_archives() -> None:
+    global _CACHE_PID
+    for key in [k for k, a in _OPEN_CACHE.items() if not isinstance(a, _LhaCliArchive)]:
+        del _OPEN_CACHE[key]
+    _CACHE_PID = os.getpid()
+
+
+def _forget_inherited_archives() -> None:
+    global _CACHE_LOCK
+    _CACHE_LOCK = _threading.RLock()
+    _drop_inherited_archives()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_inherited_archives)
 
 
 def _cache_key(local_path) -> tuple:
@@ -208,6 +260,10 @@ def _cache_key(local_path) -> tuple:
 
 def _cached_open(key, local_path):
     """Get-or-open the archive for *key* (parsed once).  Hold ``_CACHE_LOCK``."""
+    if _CACHE_PID != os.getpid():
+        # A fork that bypassed ``os.register_at_fork`` (a C-level fork):
+        # same rule — never use another process's open archives.
+        _drop_inherited_archives()
     a = _OPEN_CACHE.get(key)
     if a is not None:
         _OPEN_CACHE.move_to_end(key)

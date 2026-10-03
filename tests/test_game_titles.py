@@ -482,15 +482,15 @@ async def test_a_track_that_arrives_during_the_pass_is_named_by_one_more(store, 
     real = gt.desired_slots
     calls = []
 
-    def desired_then_scan(tracks, *, on=None):
-        out = real(tracks, on=on)
+    def desired_then_scan(tracks, *, on=None, **kw):
+        out = real(tracks, on=on, **kw)
         if not calls:                                # a scan lands while the first pass works
             store.upsert_tracks_batch([_t("b", "/m/Turrican.lha::b.hip")])
         calls.append(len(tracks))
         return out
     monkeypatch.setattr(gt, "desired_slots", desired_then_scan)
     await gt.apply_archive_games(force=True)
-    assert gt._last_sig is None                      # not recorded: it missed a track
+    assert gt._last_sig[0] != store.enrich_cursor()  # not past the scan: it missed a track
     await _drain()
     assert calls == [1, 2]
     assert store.get_track("b")["game"] == "Turrican"
@@ -523,12 +523,12 @@ async def test_two_passes_never_overlap(store, small_index, monkeypatch):
     active = []
     peak = []
 
-    def slow(tracks, *, on=None):
+    def slow(tracks, *, on=None, **kw):
         active.append(1)
         peak.append(len(active))
         time.sleep(0.05)
         try:
-            return real(tracks, on=on)
+            return real(tracks, on=on, **kw)
         finally:
             active.pop()
     monkeypatch.setattr(gt, "desired_slots", slow)

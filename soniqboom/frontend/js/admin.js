@@ -423,6 +423,13 @@ async function api(path, opts = {}) {
   return res;
 }
 
+// The text for a failed api() call: the server's reason when it answered
+// (api() throws on non-2xx with the response's detail as the message), else
+// "Network error." — a fetch that never reached the server has no status.
+function _apiErrText(e, fallback = 'Network error.') {
+  return (e && e.status) ? (e.message || fallback) : 'Network error.';
+}
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 async function loadStats() {
@@ -837,7 +844,13 @@ function renderDirRow(list, d, scanActive = false) {
   // Reconnect needs a network share; a local drive just has to be plugged in.
   const localNote = (isUnavailable && !isNetwork)
     ? '<span class="admin-dir-note" title="Drive not connected \u2014 library data kept">Drive not connected \u2014 library data kept</span>'
-    : '';
+    : (isNetwork && d.auth_refused)
+      ? (() => {
+          const mins = Math.max(1, Math.round((d.auth_retry_in_s || 0) / 60));
+          const txt = `Sign-in refused \u2014 next try in ${mins} min (Reconnect tries now)`;
+          return `<span class="admin-dir-note" title="${esc(txt)}">${esc(txt)}</span>`;
+        })()
+      : '';
 
   row.innerHTML = `
     ${statusDot}
@@ -3411,8 +3424,8 @@ document.getElementById('btn-net-test')?.addEventListener('click', async () => {
       msg.textContent = d.detail || 'Connection failed.';
       msg.className = 'net-status-msg net-err';
     }
-  } catch {
-    msg.textContent = 'Network error.';
+  } catch (e) {
+    msg.textContent = _apiErrText(e);
     msg.className = 'net-status-msg net-err';
   }
   btn.disabled = false;
@@ -3435,6 +3448,8 @@ document.getElementById('btn-net-connect')?.addEventListener('click', async () =
       msg.className = 'net-status-msg net-ok';
       document.getElementById('net-host').value = '';
       document.getElementById('net-share').value = '';
+      const davUrl = document.getElementById('net-webdav-url');
+      if (davUrl) davUrl.value = '';
       document.getElementById('net-user').value = '';
       document.getElementById('net-pass').value = '';
       document.getElementById('net-alias').value = '';
@@ -3450,8 +3465,8 @@ document.getElementById('btn-net-connect')?.addEventListener('click', async () =
       msg.textContent = d.detail || 'Failed to connect.';
       msg.className = 'net-status-msg net-err';
     }
-  } catch {
-    msg.textContent = 'Network error.';
+  } catch (e) {
+    msg.textContent = _apiErrText(e);
     msg.className = 'net-status-msg net-err';
   }
   btn.disabled = false;
@@ -3508,8 +3523,8 @@ async function reconnectShare(shareId, btn) {
       btn.textContent = 'Reconnect';
       btn.disabled = false;
     }
-  } catch {
-    showMsg('admin-dir-msg', 'Network error.', 'err');
+  } catch (e) {
+    showMsg('admin-dir-msg', _apiErrText(e), 'err');
     btn.textContent = 'Reconnect';
     btn.disabled = false;
   }

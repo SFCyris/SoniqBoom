@@ -38,7 +38,9 @@ DW = REPO / "internal/testdata/uade/David Whittaker/carrier command.dw"
 
 def _wav(path: Path, seconds: float) -> Path:
     frames = int(seconds * 44100)
-    path.write_bytes(stream._build_wav_header(44100, 2, frames, 16) + b"\0" * frames * 4)
+    # Audible (a ±8000 square wave): the cache refuses a silent render.
+    path.write_bytes(stream._build_wav_header(44100, 2, frames, 16)
+                     + (b"\x40\x1f\x40\x1f\xc0\xe0\xc0\xe0" * frames)[:frames * 4])
     return path
 
 
@@ -170,7 +172,8 @@ async def test_uade_probe_is_the_plays_render_when_the_cache_has_room(monkeypatc
     monkeypatch.setattr(stream, "_resolve_adlib_local_path", resolve)
     calls = []
 
-    async def slow_render(path, subsong=0, with_vu=True, *, live_key=None, expected_seconds=0.0):
+    async def slow_render(path, subsong=0, with_vu=True, *, live_key=None, expected_seconds=0.0,
+                          subsong_base=0):
         calls.append(live_key)
         await asyncio.sleep(0.3)
         return _wav(tmp_path / f"u{len(calls)}.wav", 9)
@@ -207,7 +210,8 @@ async def test_uade_probe_throws_its_render_away_without_headroom(monkeypatch, t
     monkeypatch.setattr(stream, "_resolve_adlib_local_path", resolve)
     made = []
 
-    async def render(path, subsong=0, with_vu=True, *, live_key=None, expected_seconds=0.0):
+    async def render(path, subsong=0, with_vu=True, *, live_key=None, expected_seconds=0.0,
+                     subsong_base=0):
         made.append(_wav(tmp_path / "throw.wav", 5))
         return made[-1]
     monkeypatch.setattr(stream, "_render_uade", render)

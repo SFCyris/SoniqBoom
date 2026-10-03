@@ -14,6 +14,7 @@
 import { Player }              from './player.js';
 import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
          subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
+import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from './tunes.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -1106,13 +1107,17 @@ function _reorderSections(track) {
 // file's start song in ``subsongStart`` — the player forwards ``subsong`` to the
 // stream URL (see player.js _streamUrlFor) and shows "Tune N / total".  DISPLAY
 // is the tune's number ("Tune 1".."Tune N", in that order); the wire index is
-// NOT always the number minus one — wire 0 is the file's default tune (its
-// start song).  utils.js subsongWireToTune / subsongTuneToWire hold the one
-// mapping; never persist/forward a tune number as a wire.
+// NOT always the number minus one — for a SID / SNDH wire 0 is the file's
+// start song.  utils.js subsongWireToTune / subsongTuneToWire hold the one
+// mapping; never persist/forward a tune number as a wire.  The row marked
+// "default" is the tune a plain play of the file plays (/extended
+// ``default_tune``: the start song, or for an Amiga module / console rip its
+// first tune that isn't empty).
 const _subSection = document.getElementById('ti-section-subsongs');
 const _subListEl  = document.getElementById('ti-sub-list');
 const SUB_CAP     = 60;                 // rows rendered up-front; "jump to #" reaches the tail
-let   _subState   = null;               // { track, count, start, lengths, stilTitles }
+let   _subState   = null;               // { track, count, start, def, lengths, stilTitles }
+let   _extendedFor = null;              // the track id whose /extended reply may still render
 
 function _subFmtLen(sec) {
   if (!(sec > 0)) return '';
@@ -1124,18 +1129,11 @@ const _subWire = (tune) => subsongTuneToWire(tune, _subState ? _subState.start :
 const _subTune = (wire) => subsongWireToTune(wire, _subState ? _subState.start : 1, _subState ? _subState.count : 0);
 
 function _subVirtual(base, wire) {
-  // Carry only what playback needs; ``subsong`` is the wire index.
-  // ``duration``: the row's stored length is the default tune's (wire 0), so
-  // another tune carries its own (HVSC Songlengths, in tune order) or none
-  // until it plays.
-  const tune = _subTune(wire);
-  const lens = _subState && Array.isArray(_subState.lengths) ? _subState.lengths : null;
-  const own = lens ? Number(lens[tune - 1]) : 0;
-  return { ...base, subsong: wire,
-           duration: own > 0 ? own : (wire === 0 ? base.duration : 0),
-           subsongTotal: _subState ? _subState.count : 0,
-           subsongStart: _subState ? _subState.start : 1,
-           subsongLabel: `Tune ${tune}` };
+  // Carry only what playback needs; ``subsong`` is the wire index (utils.js).
+  const st = _subState;
+  return subsongVirtualTrack(base, wire, st ? { count: st.count, start: st.start,
+                                                lengths: st.lengths, def: st.def }
+                                            : {});
 }
 
 // HVSC STIL: parse the raw blob's ``(#N)`` subtune markers into a
@@ -1161,7 +1159,7 @@ function _parseStilTitles(blob) {
 function _subRowHtml(tune) {
   const st = _subState;
   const wire = _subWire(tune);
-  const isDef = st && tune === st.start;
+  const isDef = st && tune === st.def;
   const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[tune - 1]) : '';
   const title = (st && st.stilTitles) ? st.stilTitles[tune - 1] : '';
   const titleHtml = title
@@ -1178,15 +1176,19 @@ function _subRowHtml(tune) {
     + `</span></div>`;
 }
 
-function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles) {
+function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles, defaultTune1) {
   if (!_subSection || !_subListEl) return;
+  if (_extendedFor !== track.id) return;             // a reply for an earlier track
   if (!(count > 1)) { _subSection.hidden = true; _subState = null; return; }
+  const start = subsongStart(defaultTrack1, count);
   _subState = {
     track,
     count,
     // default_track is the 1-based start song (PSID/SNDH header); the first
     // tune when the file doesn't record one (or records one out of range).
-    start: subsongStart(defaultTrack1, count),
+    start,
+    // The tune a plain play of the file plays (marked "default").
+    def: subsongStart(defaultTune1 ?? start, count),
     // Per-tune lengths / HVSC STIL titles, both in tune order (index = tune-1),
     // or null — the rows then show bare "Tune N".
     lengths: Array.isArray(lengths) ? lengths : null,
@@ -1242,8 +1244,9 @@ function _highlightPlayingSubsong() {
   _subListEl.querySelectorAll('.ti-sub-row.playing').forEach(r => r.classList.remove('playing'));
   const st = _subState, cur = Player.currentTrack;
   if (st && cur && cur.id === st.track.id) {
-    // A plain play of the file (no ``subsong``) is its default tune: wire 0.
-    const wire = Number.isInteger(cur.subsong) ? cur.subsong : 0;
+    // A plain play of the file (no ``subsong``) plays its default tune.
+    const wire = Number.isInteger(cur.subsong) ? cur.subsong
+      : subsongTuneToWire(st.def, st.start, st.count);
     const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${wire}"]`);
     if (row) row.classList.add('playing');
   }
@@ -1339,9 +1342,36 @@ function _renderDefect(defect, detail) {
   _defectField.style.display = '';
 }
 
+// /extended answers before a slow default-tune probe has finished
+// (``default_tune_pending``): ask again a few times while this track's panel
+// is open, and re-mark the picker's default tune once it is known.
+const _DEFAULT_TUNE_RETRY_MS = [1500, 3000, 6000];
+function _followPendingDefault(track, picker, attempt = 0) {
+  if (attempt >= _DEFAULT_TUNE_RETRY_MS.length) return;
+  setTimeout(async () => {
+    if (_extendedFor !== track.id) return;
+    let data = null;
+    try {
+      const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`);
+      if (res.ok) data = await res.json();
+    } catch (_) { /* offline for a moment: ask again */ }
+    if (_extendedFor !== track.id) return;
+    if (data && data.default_tune != null) {
+      // A pick that is still provisional is shown, and followed further.
+      _renderSubsongPicker(track, picker.count, picker.defaultTrack, picker.lengths,
+                           picker.stilTitles, data.default_tune);
+    }
+    if (!data || data.default_tune_pending) _followPendingDefault(track, picker, attempt + 1);
+  }, _DEFAULT_TUNE_RETRY_MS[attempt]);
+}
+
 async function _loadExtendedInfo(track) {
     const section = document.getElementById('ti-section-module');
     if (!section) return;
+    // A reply still on its way for the previous track must not render into
+    // this one (aborted here; checked again before the picker renders).
+    if (_extendedAbort) { try { _extendedAbort.abort(); } catch (_) {} _extendedAbort = null; }
+    _extendedFor = track.id;
     // Reset the subsong picker for the new track — re-shown below only when the
     // file has >1 tune, so an early-return (non-module track) leaves it hidden
     // instead of showing the previous track's tunes.
@@ -1360,6 +1390,9 @@ async function _loadExtendedInfo(track) {
         || PSF_FORMAT_NAMES.has(track.format);
     if (!_MODULE_FORMATS.has(track.format) && !_isScene) {
         section.style.display = 'none';
+        // Multi-tune console rips (NSF, GBS, …) have no module details, but
+        // their tunes are listed (count + default tune from /extended).
+        if (TUNE_CHIP_FORMAT_NAMES.has(track.format)) _loadChipTunes(track);
         return;
     }
 
@@ -1417,7 +1450,13 @@ async function _loadExtendedInfo(track) {
         // (older servers omit them → picker falls back to first-tune-default, no
         // times, bare tune numbers).
         const stilTitles = _parseStilTitles(data.stil);
-        _renderSubsongPicker(track, subCount, data.default_track ?? subsongStartOf(track), data.hvsc_lengths, stilTitles);
+        const defaultTrack = data.default_track ?? subsongStartOf(track);
+        _renderSubsongPicker(track, subCount, defaultTrack, data.hvsc_lengths, stilTitles,
+                             data.default_tune);
+        if (data.default_tune_pending && subCount > 1) {
+            _followPendingDefault(track, { count: subCount, defaultTrack,
+                                           lengths: data.hvsc_lengths, stilTitles });
+        }
         _renderStil(data.stil);
         _renderSidChip(data.sid_model);
 
@@ -1435,6 +1474,31 @@ async function _loadExtendedInfo(track) {
     } catch (e) {
         if (e && e.name === 'AbortError') return;   // track switched; new load owns the UI
         section.style.display = 'none';
+    } finally {
+        if (_extendedAbort === _c) _extendedAbort = null;
+    }
+}
+
+// The tune picker alone, for a console rip (no Module Details section).
+async function _loadChipTunes(track) {
+    if (_extendedAbort) { try { _extendedAbort.abort(); } catch (_) {} }
+    const _c = (typeof AbortController === 'function') ? new AbortController() : null;
+    _extendedAbort = _c;
+    try {
+        const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`,
+                                _c ? { signal: _c.signal } : undefined);
+        if (!res.ok) return;
+        const data = await res.json();
+        const count = (data.subsongs > 1) ? data.subsongs
+            : (track.subsongs > 1 ? track.subsongs : 0);
+        const defaultTrack = data.default_track ?? subsongStartOf(track);
+        _renderSubsongPicker(track, count, defaultTrack, data.hvsc_lengths, null, data.default_tune);
+        if (data.default_tune_pending && count > 1) {
+            _followPendingDefault(track, { count, defaultTrack, lengths: data.hvsc_lengths,
+                                           stilTitles: null });
+        }
+    } catch (e) {
+        /* aborted (track switched) or offline: the picker stays hidden */
     } finally {
         if (_extendedAbort === _c) _extendedAbort = null;
     }

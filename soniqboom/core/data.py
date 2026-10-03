@@ -628,15 +628,12 @@ _avail_lock = _asyncio.Lock()
 # and streaming run on — a wedged mount can't starve persistence/playback.
 _probe_executor = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="availprobe")
 
-# The same remote-scheme set the rest of the app uses (admin._is_remote): SMB/FTP
-# plus WebDAV, whose scan roots are http(s):// URLs.  Without WebDAV here, a
-# connected DAV share would fall into the LOCAL branch and Path("http://…").is_dir()
-# would always be False → falsely reported "unavailable".
-_REMOTE_SCHEMES = ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")
-
-
 def _is_remote_root(path: str) -> bool:
-    return path.startswith(_REMOTE_SCHEMES)
+    # The shared scheme set (SMB / FTP / WebDAV http(s)://): without WebDAV, a
+    # connected DAV share would fall into the LOCAL branch and
+    # Path("http://…").is_dir() would always be False → falsely "unavailable".
+    from soniqboom.core.filesource import is_remote_path
+    return is_remote_path(path)
 
 
 async def _probe_scan_dir(sd: dict) -> tuple[str, bool]:

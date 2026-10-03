@@ -51,7 +51,7 @@ from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable, Iterable
 
 from soniqboom.core.metadata import (
-    SUPPORTED_EXTENSIONS, extract, is_supported_music_name,
+    SID_EXTS, SUPPORTED_EXTENSIONS, extract, is_supported_music_name,
 )
 
 
@@ -125,11 +125,24 @@ def _worker_init() -> None:
     it; and no descriptor above stderr left inheritable — the forkserver's
     "alive" pipe and the pool's pipes would otherwise pass to every decoder
     the worker starts, and one that outlives a killed worker would keep the
-    forkserver from ever exiting."""
+    forkserver from ever exiting.  It also keeps the inner archives of
+    nested zips it reads (``_NestedZips``) until it exits, and reads tracker
+    durations with libopenmpt in-process (a decoder crash costs this worker
+    — the scan's pool survives it — never the server)."""
+    global _NESTED
     try:
         os.setpgid(0, 0)
     except OSError:
         pass
+    from soniqboom.core import metadata as _metadata
+    _metadata._LIBOPENMPT_IN_PROCESS = True
+    try:
+        from multiprocessing import util as _mp_util
+        _NESTED = _NestedZips()
+        # (a worker leaves through ``os._exit``: ``atexit`` would not run)
+        _mp_util.Finalize(None, _NESTED.clear, exitpriority=10)
+    except Exception:                                       # noqa: BLE001
+        _NESTED = None
     try:
         fds = [int(n) for n in os.listdir("/dev/fd")]
     except (OSError, ValueError):
@@ -518,8 +531,488 @@ def _process_pool(max_workers: int) -> ProcessPoolExecutor:
     return pool
 
 
+class _PoolGone(BrokenExecutor):
+    """A ``_PoolRunner`` gave its work up (pools that kept dying, a stop):
+    what a caller awaiting one of its jobs gets instead of a result."""
+
+
+class _Group(list):
+    """Suspects that run alone TOGETHER: the items of a job whose pool
+    crashed.  One that runs through settles them all at once; one that
+    kills its worker alone is halved — down to ``_GROUP_SPLIT`` items, which
+    then run alone one by one — so a crash in a batch costs a few new pools
+    and runs, not one run per file of every job in flight."""
+
+
+_GROUP_SPLIT = 16
+
+
+def _units_items(units) -> list:
+    """The items of suspects (single items and ``_Group`` s), flattened."""
+    out: list = []
+    for u in units:
+        if isinstance(u, _Group):
+            out.extend(u)
+        else:
+            out.append(u)
+    return out
+
+
+class _PoolRunner:
+    """Runs scan jobs in a process pool (``_process_pool``) that outlives its
+    workers crashing or hanging — one machinery for every scan pool: the
+    local and the remote extraction, the unchanged-file check, duplicate
+    grouping.
+
+    A job runs ``fn(*args)`` over one or more ITEMS (files, chunks of paths
+    …; ``job`` turns the items into the call).  When the pool dies — its
+    workers crashed (at start, or on an item that kills them) or hung — the
+    items of its jobs become SUSPECTS (after a hang: those of the jobs a
+    worker ran; the ones only queued behind them go back in line,
+    ``requeue``).  Every new pool first runs a no-op canary
+    (``_pool_canary``); once that works, each suspect runs ALONE in it, so
+    one that kills or hangs its worker there is the culprit (``culprit``)
+    and the others go on.  Failures that reach the runner from an
+    already-replaced pool (one ``asyncio.wait`` round late) become suspects,
+    never count against the new pool.  The items of a job that crashed
+    run alone together first (``_Group``; halved while they keep killing
+    their worker); after a hang they run alone one by one.  A pool a stop
+    killed blames nothing.  Three pools in a row that die
+    without settling a job (``settled``: a job done or failed, or its
+    culprit found — never the canary alone) end the run, as does a pool
+    that can't be made (a stop) or ``stalled``: everything left goes to
+    ``lost`` — never silently, never an endless run of new pools, and no
+    executor error escapes.  A pool that was killed is never touched again
+    (``_pool_stopped``: its lock may be held for good).
+
+    Subclasses supply the items and take the outcomes: ``take`` (the next
+    job's items, None when there are none now), ``job`` (``alone``: the
+    items run alone — the call may then play safe), ``done`` (a job
+    that finished — re-raises its pool's failure; returns the items it left
+    undone, which go back in line first), ``failed`` (a job that raised),
+    ``culprit`` (an item that crashed — ``kind`` "crash" — or hung its
+    worker alone), ``solo_hung`` (after a suspect hung alone and its pool
+    was killed; may set ``stalled``), ``after_round``, ``lost`` (items
+    given up: "stopping", "stalled", "died", or "late" — failures that
+    arrived after the run ended), ``drain`` (what ``take`` would still
+    have given) and ``hung_split`` (of a job in flight when the workers
+    hung, the items that run again alone and those that go back in line —
+    its job's progress slot, ``progress_slot``, tells which item it was on).  ``stuck_s``: seconds with no job finishing before the
+    workers count as hung — ``_EXTRACT_STUCK_S`` by default, None for jobs
+    that may run for minutes.  Without ``feed`` the run ends once ``take``
+    has nothing left; with it, items may still arrive (``wake``) until
+    ``close``."""
+
+    name = "Extraction"
+    noun = "file(s)"
+
+    def __init__(self, size: int, executor=None, *, where: str = "",
+                 stuck_s: "float | None | bool" = True, feed: bool = False) -> None:
+        self.size = max(1, int(size))
+        self.executor = executor
+        self.where = where
+        self._stuck_s = stuck_s
+        self.loop = asyncio.get_running_loop()
+        self.gen = 0                # the current pool's generation
+        self.ok = False             # the current pool's canary (or a job) worked
+        self.settled = False        # the current pool settled a job
+        self.dead = False           # a new pool is needed before the next submit
+        self.gone = False           # gave up: no more pools
+        self.stalled = False        # end the run (a source that stopped answering)
+        self.bad = 0                # pools in a row that died without settling a job
+        self.solo = None            # the suspect (an item or a ``_Group``) running alone in this pool
+        self._solo_items = None     # … the items list of its job
+        self.active: dict = {}      # future → (items, or None for a canary; generation)
+        self.cfs: dict = {}         # … its pool (concurrent) future
+        self.suspects: deque = deque()
+        self.requeue: deque = deque()
+        self._live = 0              # jobs (not canaries) in flight in the current pool
+        self.closed = not feed
+        self._wake = asyncio.Event()
+        self._last = time.monotonic()
+        self._progress_path: "str | None" = None
+        self._progress_n = 0
+
+    # ── what a user supplies ────────────────────────────────────────────────
+    def window(self) -> int:
+        return 2 * self.size + 2
+
+    async def take(self) -> "list | None":
+        return [self.requeue.popleft()] if self.requeue else None
+
+    def job(self, items: list, alone: bool = False) -> tuple:
+        raise NotImplementedError
+
+    async def done(self, items: list, fut) -> list:
+        fut.result()
+        return []
+
+    async def failed(self, items: list, exc: BaseException) -> None:
+        pass
+
+    async def culprit(self, item, kind: str, exc: "BaseException | None") -> None:
+        pass
+
+    async def solo_hung(self, item) -> None:
+        pass
+
+    async def after_round(self) -> None:
+        await asyncio.sleep(0)
+
+    async def lost(self, items: list, why: str) -> None:
+        pass
+
+    def drain(self) -> list:
+        return []
+
+    def hung_split(self, items: list) -> "tuple[list, list] | None":
+        """A job whose worker hung (``_stuck``, not running alone): its items
+        that run again ALONE and those that go back in line — None when that
+        can't be told (then every item runs alone)."""
+        return None
+
+    # ── job progress (``_extract_batch``'s ``progress``) ────────────────────
+    def progress_slot(self) -> "tuple[str, int] | None":
+        """A new slot in this run's progress file (made on first use) for a
+        job to write its position to; None when no file can be made."""
+        if self._progress_path is None:
+            if self._progress_n < 0:
+                return None                     # no file could be made: not tried again
+            try:
+                import tempfile
+                fd, self._progress_path = tempfile.mkstemp(prefix="soniqboom-scan-",
+                                                           suffix=".progress")
+                os.close(fd)
+            except OSError:
+                self._progress_n = -1
+                return None
+        self._progress_n += 1
+        return self._progress_path, self._progress_n - 1
+
+    def progress_of(self, slot: "tuple[str, int]") -> "int | None":
+        """What the job of ``slot`` wrote last: the 1-based position of the
+        item it was on, 0 when it never started; None when unreadable."""
+        try:
+            with open(slot[0], "rb") as f:
+                f.seek(4 * slot[1])
+                raw = f.read(4)
+        except OSError:
+            return None
+        return int.from_bytes(raw, "little") if len(raw) == 4 else 0
+
+    def close_progress(self) -> None:
+        path, self._progress_path = self._progress_path, None
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    # ── the machinery ───────────────────────────────────────────────────────
+    def wake(self) -> None:
+        self._wake.set()
+
+    def close(self) -> None:
+        self.closed = True
+        self._wake.set()
+
+    def live(self) -> int:
+        return self._live
+
+    def drop_suspects(self, pred) -> list:
+        """Take the suspects (also out of ``_Group`` s) ``pred`` picks."""
+        dropped: list = []
+        kept: deque = deque()
+        for u in self.suspects:
+            if isinstance(u, _Group):
+                rest = _Group(x for x in u if not pred(x))
+                dropped.extend(x for x in u if pred(x))
+                if len(rest) > 1:
+                    kept.append(rest)
+                elif rest:
+                    kept.append(rest[0])
+            elif pred(u):
+                dropped.append(u)
+            else:
+                kept.append(u)
+        self.suspects = kept
+        return dropped
+
+    def _suspect(self, items: list, front: bool = False) -> None:
+        """The items of a job that crashed: a ``_Group`` (or the one item)."""
+        unit = _Group(items) if len(items) > 1 else items[0]
+        self.suspects.appendleft(unit) if front else self.suspects.append(unit)
+
+    def stuck_s(self) -> "float | None":
+        return _EXTRACT_STUCK_S if self._stuck_s is True else self._stuck_s
+
+    def _submit(self, fn, args, items) -> None:
+        if _pool_stopped(self.executor):
+            raise RuntimeError("the pool was stopped")
+        cf = self.executor.submit(fn, *args)
+        fut = asyncio.wrap_future(cf, loop=self.loop)
+        self.cfs[fut] = cf
+        self.active[fut] = (items, self.gen)
+        if items is not None:
+            self._live += 1
+
+    def _canary(self) -> None:
+        self._submit(_pool_canary, (), None)
+
+    def _pop(self, fut):
+        items, g = self.active.pop(fut)
+        self.cfs.pop(fut, None)
+        if items is not None and g == self.gen:
+            self._live -= 1
+        return items, g
+
+    async def _replace(self) -> None:
+        self.bad = 0 if self.settled else self.bad + 1
+        await _kill_pool_async(self.executor)
+        new = None
+        if self.bad < 3 and not self.stalled:
+            try:
+                new = _process_pool(self.size)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("No new %s pool%s: %s", self.name.lower(), self.where, exc)
+        if new is None:
+            self.gone = True
+            left = _units_items(self.suspects) + list(self.requeue) + self.drain()
+            self.suspects.clear()
+            self.requeue.clear()
+            await self.lost(left, "stopping" if _pools_closed
+                            else "stalled" if self.stalled else "died")
+            return
+        log.warning("%s pool died%s — starting a new one", self.name, self.where)
+        self.executor = new
+        self.gen += 1
+        self.ok = self.settled = self.dead = False
+        self.solo = self._solo_items = None
+        self._live = 0
+        self._last = time.monotonic()
+        try:
+            self._canary()
+        except (BrokenExecutor, RuntimeError, OSError):
+            self.dead = True
+
+    def _alone(self) -> None:
+        """Run the next suspect alone (once the pool works and is idle)."""
+        if not (self.suspects and self.ok and not self._live):
+            return
+        unit = self.suspects.popleft()
+        items = list(unit) if isinstance(unit, _Group) else [unit]
+        try:
+            self._submit(*self.job(items, True), items)
+        except BaseException:
+            self.suspects.appendleft(unit)
+            raise
+        self.solo, self._solo_items = unit, items
+
+    async def _fill(self) -> None:
+        idle = not self.active
+        items = None
+        try:
+            if self.suspects:
+                self._alone()
+            elif self.ok or self.gen == 0:
+                while self._live < self.window():
+                    items = None
+                    items = await self.take()           # (its own errors are bugs: they rise)
+                    if not items:
+                        break
+                    try:
+                        self._submit(*self.job(items), items)
+                    except (BrokenExecutor, RuntimeError, OSError):
+                        self._suspect(items, front=True)
+                        raise
+                self._alone()                   # ``take`` may hand suspects over last
+        except (BrokenExecutor, RuntimeError, OSError) as exc:
+            # The pool can't take work: dead, or its forkserver gone.
+            log.debug("%s pool refused work: %s", self.name, exc)
+            self.dead = True
+        if idle and self.active:
+            self._last = time.monotonic()       # the hang clock runs from the first job
+
+    async def _wait(self) -> "set | None":
+        """Jobs that finished — an empty set when only new items arrived;
+        None when none finished for ``stuck_s`` (the workers hang)."""
+        stuck = self.stuck_s()
+        if self.closed:
+            done, _ = await asyncio.wait(self.active.keys(), return_when=asyncio.FIRST_COMPLETED,
+                                         timeout=stuck)
+            return done or None
+        timeout = None if stuck is None else max(0.0, self._last + stuck - time.monotonic())
+        woken = asyncio.ensure_future(self._wake.wait())
+        try:
+            done, _ = await asyncio.wait({*self.active, woken},
+                                         return_when=asyncio.FIRST_COMPLETED, timeout=timeout)
+        finally:
+            if not woken.done():
+                woken.cancel()
+        done.discard(woken)
+        if woken.done() and not woken.cancelled():
+            self._wake.clear()
+            return done
+        return done or None
+
+    async def _stuck(self) -> None:
+        """Nothing finished for ``stuck_s``: the workers hang.  A suspect
+        running alone is the culprit; otherwise, of each job a worker ran,
+        the item it was on runs again alone in a new pool and the rest goes
+        back in line (``hung_split`` — every item alone when the job can't
+        tell), and the jobs only queued behind them go back in line."""
+        stuck = [(f, it, g) for f, (it, g) in self.active.items() if it is not None]
+        cur = [it for _f, it, g in stuck if g == self.gen]
+        solo_stuck = (self.ok and self.solo is not None
+                      and len(cur) == 1 and cur[0] is self._solo_items)
+        ran = [(it, g) for f, it, g in stuck if f in self.cfs and self.cfs[f].running()]
+        if ran:
+            queued = [it for f, it, g in stuck if not (f in self.cfs and self.cfs[f].running())]
+        else:                                   # can't tell: every one is a suspect
+            ran, queued = [(it, g) for _f, it, g in stuck], []
+        for fut in list(self.active):
+            fut.cancel()
+        self.active.clear()
+        self.cfs.clear()
+        self._live = 0
+        group_hung = solo_stuck and isinstance(self.solo, _Group)
+        alone: list = []                        # items that run again alone
+        for it, g in ran:
+            if solo_stuck and g == self.gen and not group_hung:
+                await self.culprit(it[0], "hang", None)
+                self.settled = True
+            elif group_hung:
+                # (a group that hung alone: one by one — progress too)
+                self.suspects.extendleft(reversed(it))
+                alone.extend(it)
+                self.settled = True
+            else:
+                # A job in flight when the workers hung: only the item it was
+                # on runs alone (when the job tells — ``hung_split``); the
+                # rest goes back in line, batched again.
+                split = self.hung_split(it)
+                lone, again = split if split is not None else (list(it), [])
+                self.suspects.extend(lone)
+                alone.extend(lone)
+                self.requeue.extend(again)
+        for it in queued:
+            self.requeue.extend(it)
+        self.dead = True
+        if solo_stuck and not group_hung:
+            await _kill_pool_async(self.executor)   # the hung worker goes before anything is probed
+            await self.solo_hung(self.solo)
+        else:
+            n = sum(len(it) for it, _g in ran)
+            log.error("%s timed out: %d %s ran — %d tried alone, one at a time: %s", self.name, n,
+                      self.noun, len(alone), [str(x) for x in alone][:5])
+
+    async def _settle(self, fut) -> None:
+        items, g = self._pop(fut)
+        was_solo = items is not None and items is self._solo_items and g == self.gen
+        solo = self.solo
+        if was_solo:
+            self.solo = self._solo_items = None
+        if fut.cancelled():                             # its pool was killed
+            if items is not None:
+                self._suspect(items)
+            elif g == self.gen:
+                self.dead = True                        # (a canary: the pool is gone)
+            return
+        if items is None:                               # a canary
+            if fut.exception() is None:
+                if g == self.gen:
+                    self.ok = True
+            elif g == self.gen:
+                self.dead = True
+            return
+        try:
+            left = await self.done(items, fut)
+            if g == self.gen:
+                self.ok = self.settled = True
+            if left:
+                self.requeue.extendleft(reversed(left))
+        except BrokenExecutor as exc:
+            if g != self.gen:
+                self._suspect(items)                    # late news from a replaced pool
+                return
+            self.dead = True
+            if _pools_closed or self.executor in _pool_killers:
+                # A stop (or a start) killed the pool: nothing to blame.
+                self._suspect(items, front=True)
+            elif self.ok and was_solo and isinstance(solo, _Group):
+                # A crashed batch, alone: the culprit is in one half — and,
+                # down to ``_GROUP_SPLIT`` files, each runs alone (every
+                # halving costs a new pool; a lone run, a round trip).
+                if len(items) > _GROUP_SPLIT:
+                    half = len(items) // 2
+                    self._suspect(items[half:], front=True)
+                    self._suspect(items[:half], front=True)
+                else:
+                    self.suspects.extendleft(reversed(items))
+                self.settled = True
+            elif self.ok and was_solo:
+                # Alone in a pool that worked: it killed its worker.
+                await self.culprit(items[0], "crash", exc)
+                self.settled = True
+            else:
+                self._suspect(items)
+        except Exception as exc:                        # noqa: BLE001
+            await self.failed(items, exc)
+            if g == self.gen:
+                self.settled = True
+
+    async def run(self) -> None:
+        try:
+            await self._run()
+        finally:
+            self.close_progress()
+
+    async def _run(self) -> None:
+        self._last = time.monotonic()
+        try:
+            if self.executor is None or _pool_stopped(self.executor):
+                # An earlier user gave its pool up (or a stop killed it): a
+                # new one, never a submit to the old one.
+                self.executor = None
+                self.executor = _process_pool(self.size)
+            self._canary()
+        except (BrokenExecutor, RuntimeError, OSError):
+            self.dead = True
+        while True:
+            if self.dead and not self.gone:
+                await self._replace()
+            if not self.gone and not self.dead:
+                await self._fill()
+            if not self.active:
+                if self.dead and not self.gone:
+                    continue                            # a new pool, then submit again
+                if self.gone or self.closed:
+                    break
+                await self._wake.wait()                 # an async feed: wait for more
+                self._wake.clear()
+                self._last = time.monotonic()
+                continue
+            done = await self._wait()
+            if done is None:
+                await self._stuck()
+                continue
+            if done:
+                self._last = time.monotonic()
+            for fut in done:
+                await self._settle(fut)
+            await self.after_round()
+        if self.suspects or self.requeue:
+            # Failures that reached the runner after it gave up (late news
+            # from a replaced pool): not done either — handed on, not lost.
+            late = _units_items(self.suspects) + list(self.requeue)
+            self.suspects.clear()
+            self.requeue.clear()
+            await self.lost(late, "late")
+
+
 from soniqboom.core import diskimage
 from soniqboom.core import archive
+from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.art_cache import store_full_art_batch, store_thumbs_batch
 from soniqboom.core.data import (
     delete_track_ids,
@@ -548,12 +1041,22 @@ WRITE_BATCH    = 500     # tracks buffered before a store flush
 WRITE_CHUNK    = 25      # sub-batch size within a flush (yield between chunks)
 INFLIGHT       = 200     # max futures in the asyncio.wait window (keeps wait() O(200) not O(n))
 PROGRESS_EVERY = 100     # broadcast WS update every N files
+_BATCH_MAX      = 64     # files per extraction job (``_extract_batch``)
+_BATCH_TARGET_S = 0.25   # … about this much work, at the pace measured so far
+_BATCH_BUDGET_S = 5.0    # a worker stops a batch after this long (the rest is sent again)
+
+
+def _batch_key(path) -> str:
+    """Files that may share an extraction batch have the same key: an
+    archive member's archive, a plain file's folder."""
+    s = str(path)
+    return s.split("::", 1)[0] if "::" in s else os.path.dirname(s)
 
 # Formats where ffmpeg can't directly decode the source file.
 # Waveforms for these are computed from the conversion cache WAV instead
 # (see tracks.py waveform endpoint).
 _SKIP_WAVEFORM_EXTS = {
-    ".sid", ".psid",
+    ".sid", ".psid", ".rsid",
     ".mid", ".midi",
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
@@ -797,7 +1300,7 @@ def _member_stem(path_str: str) -> str:
 # the HVSC root, a sibling of MUSICIANS/DEMOS/GAMES — so walking UP from where
 # SID files live always passes through it).  Works for local and remote roots.
 
-_SID_DETECT_EXTS = (".sid", ".psid")
+_SID_DETECT_EXTS = tuple(sorted(SID_EXTS))
 
 # Scan roots we've already probed for an HVSC DOCUMENTS folder this process —
 # so a root that has SID files but NO HVSC tree isn't re-probed (which, on a
@@ -1182,7 +1685,9 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                 if _is_audio(fn):
                     files.append(Path(full))
 
-        result[str(p)] = sorted(set(files))
+        # Sorted by the path string: comparing Path objects (part by part,
+        # in Python) cost ~2.5x as much at 500K files.
+        result[str(p)] = sorted(set(files), key=str)
         if skipped_junk:
             log.info("Discovered %d audio files in %s (skipped %d OS junk file(s))",
                      len(files), p, skipped_junk)
@@ -1290,7 +1795,7 @@ async def purge_junk_tracks() -> dict:
 
 def _extract_one_remote(
     file_data: bytes, remote_path: str, track_id: str,
-    pc_program_archive: bool = False,
+    pc_program_archive: bool = False, isolate: bool = False,
 ) -> tuple[str, TrackMeta | str, None, None]:
     """Extract metadata from an already-downloaded file buffer.
 
@@ -1301,7 +1806,12 @@ def _extract_one_remote(
     re-opened cheaply here in the worker) — True when *remote_path* is a member
     of an archive that also holds a DOS ``MZ`` executable, which vetoes the
     uade lenient fallback (see :func:`soniqboom.core.metadata.extract`).
+    ``isolate``: ``_Isolated`` (the file runs alone after its job's pool
+    died).
     """
+    if isolate:
+        with _Isolated():
+            return _extract_one_remote(file_data, remote_path, track_id, pc_program_archive)
     import shutil
     import tempfile
     try:
@@ -1345,6 +1855,104 @@ def _extract_one_remote(
         return remote_path, f"{type(exc).__name__}: {exc}", None, None
 
 
+class _Culprit(str):
+    """The error text of a file that killed or hung its worker alone: the
+    remote fetch ladder stops there (a bigger fetch would only do it again)."""
+
+
+class _RemoteExtractRun(_PoolRunner):
+    """A remote scan's extraction (``_extract_one_remote``) on the scan
+    pools' recovery machinery: each download awaits its file's result
+    (``call``) as it finishes — the runner starts with the first one (a scan
+    with nothing to extract starts no worker).  A file that kills or hangs
+    its worker alone gets an error text as its result; once the runner
+    gives up (pools that keep dying, a stop), every caller still waiting —
+    and every later one — gets ``_PoolGone``."""
+
+    def __init__(self, size: int, executor, where: str) -> None:
+        super().__init__(size, executor, where=where, feed=True)
+        self.pending: deque = deque()           # (args, the caller's future)
+        self._task: "asyncio.Task | None" = None
+
+    async def call(self, *args):
+        if self.gone:
+            raise _PoolGone("the extraction pool was given up")
+        fut = self.loop.create_future()
+        self.pending.append((args, fut))
+        if self._task is None:
+            self._task = self.loop.create_task(self.run(), name="scan.remote_extract")
+        else:
+            self.wake()
+        return await fut
+
+    async def take(self):
+        if self.requeue:
+            return [self.requeue.popleft()]
+        return [self.pending.popleft()] if self.pending else None
+
+    def job(self, items, alone=False):
+        args = items[0][0]
+        return _extract_one_remote, ((*args, True) if alone else args)
+
+    @staticmethod
+    def _answer(fut, result=None, exc: "BaseException | None" = None) -> None:
+        if not fut.done():
+            fut.set_exception(exc) if exc is not None else fut.set_result(result)
+
+    async def done(self, items, fut):
+        res = fut.result()
+        self._answer(items[0][1], res)
+        return []
+
+    async def failed(self, items, exc):
+        for _args, f in items:
+            self._answer(f, exc=exc)
+
+    async def culprit(self, item, kind, exc):
+        args, f = item
+        why = ("extraction hung (> 90 s) — skipped" if kind == "hang"
+               else f"{exc} — the file kills its worker; skipped")
+        self._answer(f, (args[1], _Culprit(why), None, None))
+
+    async def lost(self, items, why):
+        for _args, f in items:
+            self._answer(f, exc=_PoolGone(f"the extraction pool was given up ({why})"))
+
+    def drain(self):
+        left = list(self.pending)
+        self.pending.clear()
+        return left
+
+    async def run(self) -> None:
+        try:
+            await super().run()
+        except BaseException as exc:
+            # Never leave a download waiting for good on a runner that died
+            # — nor a later one queueing for it.
+            self.gone = True
+            err = exc if isinstance(exc, Exception) else _PoolGone("the extraction was stopped")
+            waiting = [*self.pending, *_units_items(self.suspects), *self.requeue,
+                       *(i for items, _g in self.active.values() if items for i in items)]
+            for _args, f in waiting:
+                self._answer(f, exc=err)
+            raise
+
+    async def finish(self) -> None:
+        """No more files: let the runner end once its jobs are done."""
+        self.close()
+        if self._task is not None:
+            await self._task
+
+    def abort(self) -> None:
+        """The scan ended abnormally: stop the runner (its callers are gone)."""
+        self.close()
+        if self._task is not None:
+            if not self._task.done():
+                self._task.cancel()
+            elif not self._task.cancelled():
+                self._task.exception()          # (retrieved: its callers had it)
+
+
 def _pc_memo_key(remote_path: str) -> tuple[str, str]:
     """``(archive_rel, member_dir)`` key for the PC-program-archive memo.
 
@@ -1362,6 +1970,105 @@ def _pc_memo_key(remote_path: str) -> tuple[str, str]:
 
 
 # ── Phase 1 helpers ───────────────────────────────────────────────────────────
+
+class _NestedZips:
+    """A scan worker's inner archives, read out of their outer archive
+    once: ``outer.zip::inner.zip::member`` used to re-open the outer zip and
+    spill ``inner.zip`` to a temp file for EVERY member (~7 ms each in a
+    4,000-entry outer zip) — members of one archive arrive together (one
+    extraction batch), so the spilled inner archive is kept open for the
+    next.  Keyed by the outer file, its mtime and the chain of inner
+    archives; beyond ``size`` archives or ``max_bytes`` spilled the least
+    recently used one is closed.  Each spill is a temp file deleted as soon
+    as it is open (nothing is left behind should the worker be killed),
+    written in chunks, never held in memory whole.  The outer archive is
+    read through ``archive``'s open-archive cache."""
+
+    def __init__(self, size: int = 4, max_bytes: int = 1 << 30) -> None:
+        from collections import OrderedDict
+        self.size = size
+        self.max_bytes = max_bytes
+        self._open: "OrderedDict[tuple, tuple[int, object]]" = OrderedDict()   # key → (bytes, zip)
+        self._lock = threading.Lock()
+
+    def read(self, parts: list[str]) -> bytes:
+        """The bytes of ``parts[-1]`` inside ``parts[0]::…::parts[-2]``."""
+        outer, chain, member = parts[0], tuple(parts[1:-1]), parts[-1]
+        mtime = os.stat(outer).st_mtime
+        with self._lock:
+            return self._inner(outer, mtime, chain).read(member)
+
+    def _inner(self, outer: str, mtime: float, chain: tuple):
+        import tempfile
+        import zipfile
+        parent = None
+        for i in range(1, len(chain) + 1):
+            key = (outer, mtime, chain[:i])
+            hit = self._open.get(key)
+            if hit is not None:
+                self._open.move_to_end(key)
+                parent = hit[1]
+                continue
+            tmp = tempfile.NamedTemporaryFile(prefix="sb_nested_", suffix=".zip", delete=False)
+            try:
+                with tmp:
+                    if parent is None:
+                        with archive._CACHE_LOCK:
+                            arc = archive._cached_open(archive._cache_key(outer), outer)
+                            with arc.open(chain[0], "r") as src:
+                                size = _copy_stream(src, tmp)
+                    else:
+                        with parent.open(chain[i - 1], "r") as src:
+                            size = _copy_stream(src, tmp)
+                zf = zipfile.ZipFile(tmp.name, "r")
+            finally:
+                _unlink_quietly(tmp.name)               # (an open file reads on)
+            self._open[key] = (size, zf)
+            parent = zf
+            total = sum(n for n, _z in self._open.values())
+            while len(self._open) > 1 and (len(self._open) > self.size or total > self.max_bytes):
+                _k, (n, old) = self._open.popitem(last=False)
+                total -= n
+                _close_quietly(old)
+        return parent
+
+    def clear(self) -> None:
+        with self._lock:
+            while self._open:
+                _k, (_n, zf) = self._open.popitem()
+                _close_quietly(zf)
+
+
+def _copy_stream(src, dst, chunk: int = 1024 * 1024) -> int:
+    """Copy in chunks, so peak RAM is one chunk, not the whole member;
+    returns the bytes copied."""
+    n = 0
+    while True:
+        buf = src.read(chunk)
+        if not buf:
+            return n
+        dst.write(buf)
+        n += len(buf)
+
+
+def _close_quietly(obj) -> None:
+    try:
+        obj.close()
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# Set in each scan worker (``_worker_init``); None in the server, whose
+# reads (playback, art) keep the plain per-read path.
+_NESTED: "_NestedZips | None" = None
+
 
 def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
     """Read raw file bytes from a (possibly nested) ZIP virtual path.
@@ -1407,6 +2114,9 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
         # so a huge LOCAL zip doesn't re-open per member (the same O(n^2) the
         # FTP path hit on a 4491-member archive).
         return archive.read_member(parts[0], parts[1]), parts[-1]
+    if _NESTED is not None:
+        # A scan worker: each inner archive is read out once, not per member.
+        return _NESTED.read(parts), parts[-1]
 
     # Deeper nesting: pass through tempfiles.
     current_zip_path = parts[0]
@@ -1577,13 +2287,34 @@ def _dir_has_dos_executable(directory: Path) -> bool:
     return False
 
 
-def _extract_one(path: Path) -> tuple[Path, TrackMeta | str, bytes | None, bytes | None]:
-    """Run in a **worker process** — extract metadata for a single file.
+class _Isolated:
+    """In a scan worker, for a file that runs alone after its job's pool
+    died: no decoder library in-process (tracker durations from the
+    ``openmpt123`` CLI) — a module that only crashes libopenmpt still
+    indexes."""
+
+    def __enter__(self):
+        from soniqboom.core import metadata as _md
+        self._was = _md._LIBOPENMPT_IN_PROCESS
+        _md._LIBOPENMPT_IN_PROCESS = False
+
+    def __exit__(self, *exc):
+        from soniqboom.core import metadata as _md
+        _md._LIBOPENMPT_IN_PROCESS = self._was
+        return False
+
+
+def _extract_one(path: Path, isolate: bool = False) -> tuple[Path, TrackMeta | str, bytes | None, bytes | None]:
+    """Run in a **worker process** — extract metadata for a single file
+    (``isolate``: ``_Isolated``).
 
     Returns (path, meta_or_error_string, sm_thumb, lg_thumb).
     Errors are returned as strings (not Exception objects) because they must
     survive pickle serialization across process boundaries.
     """
+    if isolate:
+        with _Isolated():
+            return _extract_one(path)
     try:
         path_str = str(path)
         track_id = str(uuid.uuid5(uuid.NAMESPACE_URL, path_str))
@@ -1606,6 +2337,94 @@ def _extract_one(path: Path) -> tuple[Path, TrackMeta | str, bytes | None, bytes
         return path, meta, None, None
     except Exception as exc:
         return path, f"{type(exc).__name__}: {exc}", None, None
+
+
+def _mark_progress(progress: "tuple[str, int] | None", position: int) -> None:
+    """Write ``position`` (1-based) to a job's progress slot ``(file, slot)``
+    (``_PoolRunner.progress_slot``) — best effort."""
+    if progress is None:
+        return
+    try:
+        fd = os.open(progress[0], os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.pwrite(fd, position.to_bytes(4, "little"), 4 * progress[1])
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _extract_one_tracked(path: Path, progress: "tuple[str, int] | None") -> tuple:
+    """Run in a **worker process** — ``_extract_one`` for a single-file job,
+    its progress slot marked first: after a hang the file counts as run, not
+    as only queued behind the workers (``_PoolRunner.hung_split``)."""
+    _mark_progress(progress, 1)
+    return _extract_one(path)
+
+
+def _extract_batch(paths: "tuple[str, ...]", budget: float, isolate: bool = False,
+                   progress: "tuple[str, int] | None" = None,
+                   one=None) -> tuple[list, float]:
+    """Run in a **worker process** — ``_extract_one`` for several files of a
+    local scan in one job (one round trip, not one per file).  Returns
+    ``(results, seconds)``: ``results[i]`` is the i-th file's metadata as a
+    plain dict (``TrackMeta.model_dump()``, embedded art reduced to its
+    ``/api/art`` URL — a local scan stores no art, and the bytes would
+    cross the process boundary for nothing) or its error text.  Once
+    ``budget`` seconds have passed the files left are not extracted (no
+    result: the caller sends them again), so a batch of slow files stays far
+    below ``_EXTRACT_STUCK_S``.  ``isolate``: ``_Isolated`` (the files run
+    alone together after their job's pool died).  ``progress`` (file, slot):
+    before each file its 1-based position is written there
+    (``_PoolRunner.progress_slot``) — after a hang, the file the batch hung
+    on.  ``one`` replaces ``_extract_one`` (tests)."""
+    if isolate:
+        with _Isolated():
+            return _extract_batch(paths, budget, False, progress, one)
+    one = one or _extract_one
+    t0 = time.monotonic()
+    out: list = []
+    fd = None
+    if progress is not None:
+        try:
+            fd = os.open(progress[0], os.O_WRONLY)
+        except OSError:
+            fd = None
+    try:
+        for i, s in enumerate(paths):
+            if fd is not None:
+                try:
+                    os.pwrite(fd, (i + 1).to_bytes(4, "little"), 4 * progress[1])
+                except OSError:
+                    pass
+            _p, res, _sm, _lg = one(Path(s))
+            if not isinstance(res, str):
+                res = res.model_dump()
+                if res.get("cover_art"):
+                    res["cover_art"] = f"/api/art/{res['id']}"
+            out.append(res)
+            if time.monotonic() - t0 >= budget:
+                break
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return out, time.monotonic() - t0
+
+
+def _scan_row(meta: "dict | TrackMeta", dir_h: str, root_h: str) -> dict:
+    """The store row of a local scan's extracted file: what
+    ``_build_track(...)`` + ``Track.model_dump()`` (less the empty
+    embedding) give, without validating again what ``extract`` validated —
+    the dir/root hashes set and embedded art replaced by its ``/api/art``
+    URL (a local track's art is read from the file when asked for)."""
+    d = meta if isinstance(meta, dict) else meta.model_dump()
+    d["dir_hash"] = dir_h
+    d["scan_root_hash"] = root_h
+    d["cover_art"] = f"/api/art/{d['id']}" if d.get("cover_art") else None
+    d.pop("embedding", None)
+    return d
 
 
 def _build_track(
@@ -1643,7 +2462,7 @@ def _build_track(
         # — we must persist it now, while we still hold the bytes the scan just
         # fetched.  Without this, embedded-art-only remote tracks (e.g. iTunes
         # ``.m4a``, which carry no folder.jpg) show the placeholder forever.
-        is_remote = (meta.path or "").startswith(("ftp://", "smb://"))
+        is_remote = is_remote_path(meta.path)
         return track, (raw_art if is_remote else None)
     except Exception as exc:
         log.error("Failed to build track %s: %s", meta.path, exc)
@@ -1656,29 +2475,30 @@ def _build_track(
 
 def _compute_incremental(
     files_strs: list[str],
-    mtime_size_map: dict[str, tuple[float | None, int | None]],
+    mtime_size_map: dict,
+    by_path: bool = False,
 ) -> tuple[set[str], dict[str, str]]:
     """Determine which files need scanning.  **Runs in a worker process.**
 
     Receives only primitive data (strings, dicts of tuples) so it can be
     pickled across the process boundary.  Returns (fresh_path_strs,
     track_ids_for_files) where track_ids_for_files maps path_str → track_id.
+    ``mtime_size_map``: track id → (mtime, file_size) of the indexed
+    tracks; ``by_path``: path → (mtime, file_size, track id) instead — only
+    the files of this call need be in it (the scan sends each chunk its own
+    entries, never the whole root's), and a file is unchanged only when its
+    track is the one its path names (``uuid5``), as with an id-keyed map.
     """
     # Cache stat results by the real filesystem path so that virtual paths
     # sharing the same outer ZIP (e.g. "archive.zip::inner.zip::track.mod")
     # only trigger ONE os.stat() call per unique outer file.  For a library
     # with 122K virtual paths across ~60K ZIPs on a network mount, this can
     # cut stat() calls by half and avoids minutes of blocking.
-    _stat_cache: dict[str, os.stat_result | None] = {}
+    outers = list(dict.fromkeys(ps.split("::", 1)[0] for ps in files_strs))
+    _stat_cache = dict(zip(outers, _stat_all(outers)))
     path_stats: dict[str, tuple[float, int]] = {}
     for ps in files_strs:
-        actual = ps.split("::")[0] if "::" in ps else ps
-        if actual not in _stat_cache:
-            try:
-                _stat_cache[actual] = os.stat(actual)
-            except OSError:
-                _stat_cache[actual] = None
-        st = _stat_cache[actual]
+        st = _stat_cache[ps.split("::", 1)[0]]
         if st is not None:
             path_stats[ps] = (st.st_mtime, st.st_size)
 
@@ -1690,10 +2510,15 @@ def _compute_incremental(
     for ps, tid in track_ids_for_files.items():
         if ps not in path_stats:
             continue
-        existing = mtime_size_map.get(tid)
-        if not existing:
-            continue
-        stored_mtime, stored_size = existing
+        if by_path:
+            existing = mtime_size_map.get(ps)
+            if not existing or existing[2] != tid:
+                continue
+        else:
+            existing = mtime_size_map.get(tid)
+            if not existing:
+                continue
+        stored_mtime, stored_size = existing[0], existing[1]
         actual_mtime, actual_size = path_stats[ps]
         if stored_mtime is None or abs(stored_mtime - actual_mtime) >= 1.0:
             continue
@@ -1705,6 +2530,120 @@ def _compute_incremental(
             fresh.add(ps)
 
     return fresh, track_ids_for_files
+
+
+_STAT_CHUNK = 1024          # files per job of the unchanged-file check
+_STAT_POOL_MIN = 2000       # … which runs in a thread up to this many files
+
+
+class _CheckRun(_PoolRunner):
+    """The unchanged-file check of a big root (``_check_unchanged``) on the
+    scan pools' recovery machinery: each item is a chunk of paths."""
+
+    name = "Unchanged-file check"
+    noun = "chunk(s)"
+
+    def __init__(self, files_strs: list[str], known: dict, size: int, root: str) -> None:
+        super().__init__(size, where=f" for {root}")
+        self.root = root
+        self.chunks = deque(files_strs[i : i + _STAT_CHUNK]
+                            for i in range(0, len(files_strs), _STAT_CHUNK))
+        self.known = known
+        self.fresh: set[str] = set()
+        self.tids: dict[str, str] = {}
+        self.unchecked: list[list[str]] = []
+
+    async def take(self):
+        if self.requeue:
+            return [self.requeue.popleft()]
+        return [self.chunks.popleft()] if self.chunks else None
+
+    def job(self, items, alone=False):
+        chunk, known = items[0], self.known
+        return _compute_incremental, (chunk, {p: known[p] for p in chunk if p in known}, True)
+
+    async def done(self, items, fut):
+        fresh, tids = fut.result()
+        self.fresh |= fresh
+        self.tids.update(tids)
+        return []
+
+    async def failed(self, items, exc):
+        log.warning("Unchanged-file check failed for %d file(s)%s: %s",
+                    sum(map(len, items)), self.where, exc)
+        self.unchecked.extend(items)
+
+    async def culprit(self, item, kind, exc):
+        log.warning("Unchanged-file check %s its worker on %d file(s)%s — they are extracted "
+                    "again", "hung" if kind == "hang" else "crashed", len(item), self.where)
+        self.unchecked.append(item)
+
+    async def solo_hung(self, item):
+        """A chunk hung alone: when the root (its listing, a file of a chunk
+        not checked yet read past the cache) doesn't answer either, the
+        share stopped answering — the rest of the check is given up at once
+        (its files are extracted, where a stalled share is waited for and
+        given up as a whole), instead of ~2 × 90 s for every chunk."""
+        nxt = next((c[0] for c in (*self.requeue, *self.chunks) if c), None)
+        if not await asyncio.to_thread(_source_answers, None, _PROBE_S, self.root, fresh=nxt):
+            log.warning("%s doesn't answer — the rest of its unchanged-file check is "
+                        "given up", self.root)
+            self.stalled = True
+
+    async def lost(self, items, why):
+        self.unchecked.extend(items)
+
+    def drain(self):
+        left = list(self.chunks)
+        self.chunks.clear()
+        return left
+
+
+async def _check_unchanged(files_strs: list[str], known: dict,
+                           scan_root: str) -> tuple[set[str], dict[str, str]]:
+    """``_compute_incremental`` (``by_path``) over a big root, in chunks in a
+    scan pool that outlives its workers (``_PoolRunner``) — a worker that
+    crashes, or hangs on a share that stopped answering, used to fail or
+    wedge the whole scan.  Files whose check was given up count as changed:
+    the extraction reads them again (and finds a hung share itself)."""
+    run = _CheckRun(files_strs, known, min(4, max(1, len(files_strs) // 5000)), scan_root)
+    try:
+        await run.run()
+    finally:
+        _release_pool(run.executor)
+    if run.unchecked:
+        left = [p for chunk in run.unchecked for p in chunk]
+        run.tids.update(await asyncio.to_thread(
+            lambda: {p: str(uuid.uuid5(uuid.NAMESPACE_URL, p)) for p in left}))
+    return run.fresh, run.tids
+
+
+_SLOW_STAT_S = 200e-6       # stats slower than this on average: a network mount
+_STAT_THREADS = 16
+
+
+def _stat_all(paths: list[str]) -> list:
+    """``os.stat`` of each of ``paths`` (None where it fails), in order.  The
+    first few run one after another; when they are slow (a network mount,
+    where each stat waits on a round trip) the rest run in threads — a stat
+    releases the GIL."""
+    def _st(p: str):
+        try:
+            return os.stat(p)
+        except OSError:
+            return None
+    head = paths[:32]
+    t0 = time.perf_counter()
+    out = [_st(p) for p in head]
+    rest = paths[32:]
+    if not rest:
+        return out
+    if len(rest) > 64 and (time.perf_counter() - t0) / max(1, len(head)) > _SLOW_STAT_S:
+        with ThreadPoolExecutor(_STAT_THREADS, thread_name_prefix="scan-stat") as tp:
+            out.extend(tp.map(_st, rest))
+    else:
+        out.extend(_st(p) for p in rest)
+    return out
 
 
 # ── Phase 3 helper ────────────────────────────────────────────────────────────
@@ -2055,6 +2994,48 @@ def _compute_duplicates_in_process(all_tracks: list[dict]) -> dict:
     return compute_duplicate_groups(all_tracks)
 
 
+class _DupRun(_PoolRunner):
+    """The full duplicate grouping (one job) in a pool that outlives its
+    worker crashing: run again alone in a new pool; a job that kills its
+    worker there, or pools that keep dying, leave ``error`` set."""
+
+    name = "Duplicate-grouping"
+    noun = "job(s)"
+
+    def __init__(self, all_tracks: list[dict]) -> None:
+        super().__init__(1, stuck_s=None)
+        self._job: list | None = [all_tracks]
+        self.annotations: dict = {}
+        self.error: "BaseException | str | None" = None
+
+    async def take(self):
+        if self.requeue:
+            return [self.requeue.popleft()]
+        job, self._job = self._job, None
+        return job
+
+    def job(self, items, alone=False):
+        return _compute_duplicates_in_process, (items[0],)
+
+    async def done(self, items, fut):
+        self.annotations = fut.result()
+        return []
+
+    async def failed(self, items, exc):
+        self.error = exc
+
+    async def culprit(self, item, kind, exc):
+        self.error = ("it hung its worker" if kind == "hang"
+                      else f"it killed its worker ({exc})")
+
+    async def lost(self, items, why):
+        self.error = f"no worker could run it ({why})"
+
+    def drain(self):
+        job, self._job = self._job, None
+        return job or []
+
+
 async def _run_duplicate_detection_async() -> None:
     """Detect duplicates: heavy compute in a subprocess, apply in batches."""
     store = get_store()
@@ -2069,15 +3050,18 @@ async def _run_duplicate_detection_async() -> None:
         await asyncio.sleep(0)
     del snap
 
-    # Run the CPU-heavy algorithm in its own process (separate GIL)
-    dup_executor = _process_pool(1)
+    # Run the CPU-heavy algorithm in its own process (separate GIL), on the
+    # scan pools' recovery machinery: a worker that crashes is replaced (and
+    # the job run again alone) instead of failing the pass.  No hang limit —
+    # a big library's grouping takes minutes.
+    run = _DupRun(all_tracks)
     try:
-        loop = asyncio.get_event_loop()
-        annotations = await loop.run_in_executor(
-            dup_executor, _compute_duplicates_in_process, all_tracks,
-        )
+        await run.run()
     finally:
-        _release_pool(dup_executor)
+        _release_pool(run.executor)
+    if run.error is not None:
+        raise RuntimeError(f"duplicate grouping failed: {run.error}")
+    annotations = run.annotations
 
     updated = await _apply_duplicate_annotations(annotations)
     dup_count = sum(1 for a in annotations.values() if a["duplicate_group_id"] is not None)
@@ -2302,7 +3286,10 @@ _REEXTRACT_VOLATILE = frozenset(_KEEP_ON_REEXTRACT) | {"mtime", "file_size"}
 # has no value at all and the extract has one (a checksum an older build
 # didn't compute): that is new information and is written.
 _POST_SCAN_FIELDS = frozenset(("cover_art", "duration", "stil", "hvsc_lengths",
-                               "subsongs", "start_subsong", "sid_md5", "file_md5"))
+                               "subsongs", "start_subsong", "default_subsong",
+                               "sid_md5", "file_md5"))
+# Post-scan fields whose 0 is a real value (a tune index), not "unset".
+_POST_SCAN_INDEX_FIELDS = frozenset(("start_subsong", "default_subsong"))
 _SMALL_COMMIT = 2500     # commit deltas up to this size merge into the live sorted indexes
 _DRILL_WRITE_CHUNK = 25  # folder-click refresh: rows per store write (a loop turn after each)
 _DUP_INPUT_FIELDS = ("id", "title", "artist", "album_artist", "duration", "format",
@@ -2316,18 +3303,17 @@ def _same_track_content(old: dict, new: dict) -> bool:
     enrichment carry-over, over the union of both key sets (a field only the
     stored track has would be dropped by the upsert — that is a change; a
     field the stored track predates, extracted empty, is not)."""
-    from soniqboom.core.store import _carry_enrichment
+    from soniqboom.core.store import _carry_enrichment, same_file_version
     cand = dict(new)
     _carry_enrichment(old, cand)
-    same_file = (old.get("file_size") == new.get("file_size")
-                 and not any(old.get(h) and new.get(h) and old[h] != new[h]
-                             for h in ("file_md5", "sid_md5")))
+    same_file = same_file_version(old, new)
     for k in cand.keys() | old.keys():
         if k in _REEXTRACT_VOLATILE or old.get(k) == cand.get(k):
             continue
         if k not in old and cand[k] in (None, ""):
             continue
-        if same_file and k in _POST_SCAN_FIELDS and old.get(k):
+        if same_file and k in _POST_SCAN_FIELDS and (
+                old.get(k) or (k in _POST_SCAN_INDEX_FIELDS and old.get(k) is not None)):
             continue
         return False
     return True
@@ -2409,7 +3395,10 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
 
 
 _FP_KEY = "archive_listing_fp:"
-_ARCHIVE_LISTING_VERSION = 1      # bump when archive discovery rules change
+_ARCHIVE_LISTING_VERSION = 2      # bump when archive discovery rules change
+# 2: re-list every archive once — Linux scans lost members to forked workers
+#    sharing the server's open archive (archive._forget_inherited_archives),
+#    and an automatic scan lists only the members already indexed.
 
 
 def _listing_fingerprint() -> str:
@@ -2456,6 +3445,215 @@ async def _known_archive_members(store, roots: list[str]) -> "dict[str, tuple[fl
     return {k: (v[0], v[1]) for k, v in out.items()}
 
 
+_GIVEUP_KEY = "scan_giveups:"     # + path_hash(root) → {path: [mtime, size, kind, count, time]}
+_GIVEUP_BASE_S = 3600.0           # first wait before an automatic scan tries a given-up file again
+_GIVEUP_MAX_S = 7 * 86400.0       # … growing ×4 per give-up in a row, up to this
+_GIVEUP_MAX = 2000                # records kept per root (the most recent)
+_GIVEUP_RETRY_CRASHES = 200       # given-up files tried again per root and scan: crashes …
+_GIVEUP_RETRY_HANGS = 20          # … and hangs (each may cost ~2 × _EXTRACT_STUCK_S)
+
+
+async def _in_daemon_thread(fn, *args, timeout: float):
+    """``fn(*args)`` in a daemon thread, awaited for up to ``timeout``
+    seconds (``asyncio.TimeoutError`` after) — a call blocked for good on a
+    hung share holds a daemon thread, never the loop or the default
+    executor (``asyncio.to_thread``'s threads are joined at exit)."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def _settle(res, exc) -> None:
+        if not fut.done():
+            fut.set_exception(exc) if exc is not None else fut.set_result(res)
+
+    def _work() -> None:
+        try:
+            res, exc = fn(*args), None
+        except BaseException as e:                          # noqa: BLE001
+            res, exc = None, e
+        try:
+            loop.call_soon_threadsafe(_settle, res, exc)
+        except RuntimeError:
+            pass                                            # the loop is gone
+    threading.Thread(target=_work, daemon=True, name="scan-daemon-call").start()
+    return await asyncio.wait_for(fut, timeout)
+
+
+# Daemon threads ``_stats_quick`` may have reading at once: on a share that
+# stopped answering each stays blocked — a few at most, never one per scan.
+_QUICK_STATS = threading.BoundedSemaphore(4)
+
+
+def _stats_quick(paths, timeout: float = _PROBE_S) -> "dict[str, tuple[float, int] | None]":
+    """(mtime, size) of each of ``paths`` — None for one that is gone (not
+    found, or a path through a file); left out when its stat failed
+    otherwise (it can't tell) — read in a daemon thread: a hung share must
+    not block the scan for good.  {} when the reads don't finish within
+    ``timeout``, or when ``_QUICK_STATS`` daemon threads are still blocked
+    on earlier reads."""
+    if not _QUICK_STATS.acquire(blocking=False):
+        return {}
+    out: dict = {}
+    done = threading.Event()
+
+    def _read() -> None:
+        try:
+            for p in paths:
+                try:
+                    st = os.stat(p)
+                    out[p] = (st.st_mtime, st.st_size)
+                except (FileNotFoundError, NotADirectoryError):
+                    out[p] = None
+                except OSError:
+                    pass
+        finally:
+            done.set()
+            _QUICK_STATS.release()
+    try:
+        threading.Thread(target=_read, daemon=True, name="scan-giveup-stat").start()
+    except BaseException:                               # (no thread: its slot back)
+        _QUICK_STATS.release()
+        raise
+    return dict(out) if done.wait(timeout) else {}
+
+
+def _giveup_wait(n) -> float:
+    """Seconds an automatic scan waits before it tries a file given up
+    ``n`` times in a row again: ``_GIVEUP_BASE_S`` × 4ⁿ⁻¹, at most
+    ``_GIVEUP_MAX_S``."""
+    return min(_GIVEUP_MAX_S, _GIVEUP_BASE_S * 4 ** min(max(0, int(n) - 1), 8))
+
+
+class _GiveUps:
+    """What an earlier scan of one root gave up: files that crashed or hung
+    their worker ALONE (kind "crash" / "hang" — a hang only while the
+    source answered) and archives whose other members were skipped after
+    ``_MAX_ARCHIVE_HANGS`` hangs ("skip").  An automatic scan (light or
+    watcher-scoped) tries them again only after a growing wait
+    (``_giveup_wait``: ``_GIVEUP_BASE_S`` × 4 per give-up in a row, at most
+    ``_GIVEUP_MAX_S``) — a file that crashes for good no longer costs a new
+    pool on every watcher scan — while a manual scan doesn't wait, and a
+    file that changed (mtime, size) is tried at once.  Tried again, a file
+    that crashed runs ALONE first (a suspect, ``_PoolRunner``: a repeat
+    crash costs one pool, not its batch), one that hung runs alone after
+    the rest of the root, and a skipped archive's members after the rest of
+    the root in the normal stream; at most ``_GIVEUP_RETRY_CRASHES`` /
+    ``_GIVEUP_RETRY_HANGS`` a scan.  Persisted per root in the store's
+    config (``_GIVEUP_KEY``; dropped with the root, ``forget_root``); a
+    record goes once its file settles (indexed, or an error that no longer
+    takes its worker down) or is found unchanged since it was indexed."""
+
+    def __init__(self, root: str, records: dict) -> None:
+        self.root = root
+        self.records: dict[str, list] = {}
+        for p, rec in (records.items() if isinstance(records, dict) else ()):
+            if isinstance(p, str) and isinstance(rec, list) and len(rec) == 5:
+                self.records[p] = rec
+        self.wait: set[str] = set()         # recorded and still waiting
+        self.due: set[str] = set()          # recorded, waited long enough
+        self.void: set[str] = set()         # the file changed or is gone: forget it
+        self.found: dict[str, str] = {}     # given up in this scan → kind
+        self.settled: set[str] = set()      # recorded, and settled in this scan
+        self.changed = False
+        self._skips = [p for p, r in self.records.items() if r[2] == "skip"]
+
+    @staticmethod
+    def outer(path: str) -> str:
+        return path.split("::", 1)[0]
+
+    def classify(self, stats: dict, now: float) -> None:
+        for p, (m, s, _kind, n, t) in self.records.items():
+            st = stats.get(self.outer(p), ())   # () — not read: a share that can't tell
+            try:
+                wait_s = _giveup_wait(n)
+                float(t)
+                if st and m is not None:
+                    abs(st[0] - m) + (st[1] != s)
+            except (TypeError, ValueError):
+                self.void.add(p)            # not a record of ours
+                continue
+            if st is None:
+                self.void.add(p)            # gone
+            elif st and m is not None and (abs(st[0] - m) >= 1.0 or st[1] != s):
+                self.void.add(p)            # changed: try it at once
+            elif now >= float(t) + wait_s:
+                self.due.add(p)
+            else:
+                self.wait.add(p)
+
+    def boxes(self, which: set) -> list[str]:
+        return [p for p in self._skips if p in which]
+
+    def holds(self, path: str, boxes: list[str]) -> bool:
+        """Is ``path`` (a file, or a member of a skipped archive) still waiting?"""
+        return path in self.wait or bool(boxes and _in_archives(path, boxes))
+
+    def settle(self, path: str) -> None:
+        """``path`` was extracted (or failed without taking its worker
+        down): its record — or its skipped archive's — goes."""
+        if path in self.records:
+            self.settled.add(path)
+        elif self._skips and "::" in path:
+            box = _in_archives(path, self._skips)
+            if box is not None:
+                self.settled.add(box)
+
+    def give_up(self, path: str, kind: str) -> None:
+        self.found[path] = kind
+
+    async def save(self, store, key: str, wanted=None) -> None:
+        """Fold this scan's outcome in and persist it (only when it changed)
+        — unless ``wanted()`` says no by then (the root was removed: its
+        records went with it, ``forget_root``)."""
+        recs = self.records
+        for p in self.void | (self.settled - set(self.found)):
+            if recs.pop(p, None) is not None:
+                self.changed = True
+        if self.found:
+            now = time.time()
+            stats = await asyncio.to_thread(
+                _stats_quick, sorted({self.outer(p) for p in self.found}))
+            for p, kind in self.found.items():
+                st = stats.get(self.outer(p))
+                old = recs.get(p)
+                try:
+                    n = min(int(old[3]) + 1, 99) if old is not None else 1
+                except (TypeError, ValueError):
+                    n = 1
+                recs[p] = [st[0] if st else None, st[1] if st else None, kind, n, now]
+            self.changed = True
+        if len(recs) > _GIVEUP_MAX:
+            keep = sorted(recs.items(), key=lambda kv: kv[1][4], reverse=True)[:_GIVEUP_MAX]
+            self.records = recs = dict(keep)
+            self.changed = True
+        if self.changed and (wanted is None or wanted()):
+            if recs:
+                store.set_config(key, dict(recs))
+            else:
+                store.delete_config(key)
+
+
+async def _load_giveups(store, roots: list[str]) -> "dict[str, _GiveUps]":
+    """The roots' give-up records (``_GiveUps``), classified against their
+    files as they are now — roots without any are left out, and so are
+    records that can't be read (never a reason for a scan to fail)."""
+    out: dict[str, _GiveUps] = {}
+    for root in roots:
+        try:
+            recs = store.get_config(_GIVEUP_KEY + path_hash(root))
+            if not recs:
+                continue
+            gu = _GiveUps(root, recs)
+            if not gu.records:
+                continue
+            stats = await asyncio.to_thread(
+                _stats_quick, sorted({_GiveUps.outer(p) for p in gu.records}))
+            gu.classify(stats, time.time())
+            out[root] = gu
+        except Exception:                                   # noqa: BLE001
+            log.warning("could not read what earlier scans of %s gave up", root, exc_info=True)
+    return out
+
+
 def _root_is_live(root: str) -> bool:
     """A scoped scan may prune tracks under a changed path only while the root
     itself is demonstrably mounted (readable and listing something) — the same
@@ -2479,7 +3677,21 @@ async def _run_scan(
     added, updated or removed).  ``scope`` (root → changed paths, from the
     folder watcher) limits a root to those files/folders: discovery, the
     unchanged-file check and orphan pruning then cost what changed, not the
-    whole library."""
+    whole library.  The scan's extraction pools are released however it
+    ends — done, failed or cancelled (a stop)."""
+    pools: list = []
+    try:
+        return await _run_scan_body(directories, on_progress, scope, light, pools)
+    finally:
+        seen: set = set()
+        for pool in pools:
+            if id(pool) not in seen:
+                seen.add(id(pool))
+                _release_pool(pool)
+
+
+async def _run_scan_body(directories, on_progress, scope, light, pools: list) -> bool:
+    """``_run_scan``'s work; every extraction pool it makes is added to ``pools``."""
     global _progress, _scan_count, _prog_batch_entered
     _changed = False
     _hvsc_new = False          # HVSC auto-configured by THIS scan → apply even if nothing changed
@@ -2524,11 +3736,27 @@ async def _run_scan(
                   if get_store().get_config(_FP_KEY + path_hash(d)) == _fp]
         if _light:
             _known_archives = await _known_archive_members(get_store(), _light)
+    # What earlier scans gave up (``_GiveUps``).  An archive with a member
+    # whose wait is over is enumerated again, not listed from the store
+    # (which never held that member).
+    _giveups = await _load_giveups(get_store(), list(scope) if scope else _full_roots)
+    if _known_archives:
+        for _gu in _giveups.values():
+            for _p in _gu.due:
+                _known_archives.pop(_GiveUps.outer(_p), None)
     _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, directories, _settings.scan_zips, scope, _known_archives,
         _failed_archives,
     )
+    if scope:
+        # A watcher scan also tries the root's given-up files whose wait is
+        # over — the next automatic scan does, wherever they lie.
+        for _root, _gu in _giveups.items():
+            if _root in dir_files:
+                _have = {str(p) for p in dir_files[_root]}
+                dir_files[_root].extend(Path(p) for p in sorted(_gu.due)
+                                        if _gu.records[p][2] != "skip" and p not in _have)
     # Roots enumerated in full now with no read error: their fingerprint is
     # recorded once this scan has committed (an interrupted scan leaves the
     # old one → the next automatic scan enumerates again).
@@ -2541,6 +3769,7 @@ async def _run_scan(
     _fp_record = [d for d in _full_roots
                   if d in dir_files and d not in walk_errors and d not in _light
                   and not any(a.startswith(d.rstrip(os.sep) + os.sep) for a in _protecting)]
+    _gave_up_roots: set[str] = set()     # roots whose extraction was given up
     total = sum(len(v) for v in dir_files.values())
 
     # ProcessPoolExecutor: each worker has its own GIL so metadata
@@ -2548,6 +3777,7 @@ async def _run_scan(
     # Sized to the work: a watcher scan of one file forks one worker, not
     # SCAN_WORKERS copies of the server (workers start on first submit).
     executor = _process_pool(max(1, min(SCAN_WORKERS, total)))
+    pools.append(executor)
 
     # Additive progress: when a remote scan is already running, add to the
     # existing total instead of overwriting it.
@@ -2679,67 +3909,47 @@ async def _run_scan(
             # touched-but-unchanged file isn't re-extracted and re-written.
             _run_incr_check = True
         if _run_incr_check:
-            # Build a small {track_id: (mtime, file_size)} lookup — only
-            # existing tracks matter, so bounded by store size, not file count.
-            mtime_size_map: dict[str, tuple[float | None, int | None]] = {}
+            # {path: (mtime, file_size, track id)} of the root's indexed
+            # tracks — bounded by store size, not file count; each chunk of
+            # the check gets only its own files' entries.
+            known: dict[str, tuple] = {}
             _eids = list(existing_ids)
             for _ci in range(0, len(_eids), 20_000):
                 for tid in _eids[_ci : _ci + 20_000]:
                     trk = store._tracks.get(tid)
                     if trk:
-                        mtime_size_map[tid] = (trk.get("mtime"), trk.get("file_size"))
+                        known[trk.get("path") or ""] = (trk.get("mtime"), trk.get("file_size"), tid)
                 await asyncio.sleep(0)
 
             log.info(
                 "Incremental check for %s: stat-checking %d files (%d existing tracks) …",
-                scan_root, len(files_strs), len(mtime_size_map),
+                scan_root, len(files_strs), len(known),
             )
             _progress.current_file = f"Checking {len(files_strs):,} files for changes…"
             if on_progress:
                 await on_progress(_progress)
 
-            # Use multiple workers for the stat check to saturate network I/O
-            INCR_WORKERS = min(4, max(1, len(files_strs) // 5000))
-            # A small (scoped) check runs in a thread: spawning a process pool
-            # costs more than stat-ing a handful of files.
-            _small = len(files_strs) <= 2000
-            incr_executor = None if _small else _process_pool(INCR_WORKERS)
-            try:
-                t0 = time.time()
-                if _small:
-                    fresh_strs, tid_map_strs = await asyncio.to_thread(
-                        _compute_incremental, files_strs, mtime_size_map,
-                    )
-                elif INCR_WORKERS == 1:
-                    fresh_strs, tid_map_strs = await loop.run_in_executor(
-                        incr_executor, _compute_incremental, files_strs, mtime_size_map,
-                    )
-                else:
-                    # Split file list into chunks and run in parallel
-                    chunk_size = math.ceil(len(files_strs) / INCR_WORKERS)
-                    chunks = [
-                        files_strs[i : i + chunk_size]
-                        for i in range(0, len(files_strs), chunk_size)
-                    ]
-                    chunk_futs = [
-                        loop.run_in_executor(
-                            incr_executor, _compute_incremental, chunk, mtime_size_map,
-                        )
-                        for chunk in chunks
-                    ]
-                    results = await asyncio.gather(*chunk_futs)
-                    # Merge results from all chunks
-                    fresh_strs: set[str] = set()
-                    tid_map_strs: dict[str, str] = {}
-                    for chunk_fresh, chunk_tids in results:
-                        fresh_strs |= chunk_fresh
-                        tid_map_strs.update(chunk_tids)
-                log.info(
-                    "Incremental check done for %s in %.1fs: %d fresh, %d total",
-                    scan_root, time.time() - t0, len(fresh_strs), len(files_strs),
-                )
-            finally:
-                _release_pool(incr_executor)
+            t0 = time.time()
+            if len(files_strs) <= _STAT_POOL_MIN:
+                # A small (scoped) check runs in a thread: spawning a process
+                # pool costs more than stat-ing a handful of files.  A daemon
+                # thread with a time limit: on a share that stopped answering
+                # the files count as changed (the extraction finds the stall).
+                try:
+                    fresh_strs, tid_map_strs = await _in_daemon_thread(
+                        _compute_incremental, files_strs, known, True, timeout=_EXTRACT_STUCK_S)
+                except asyncio.TimeoutError:
+                    log.warning("Incremental check for %s did not finish in %d s — its files "
+                                "count as changed", scan_root, _EXTRACT_STUCK_S)
+                    fresh_strs = set()
+                    tid_map_strs = await asyncio.to_thread(
+                        lambda: {p: str(uuid.uuid5(uuid.NAMESPACE_URL, p)) for p in files_strs})
+            else:
+                fresh_strs, tid_map_strs = await _check_unchanged(files_strs, known, scan_root)
+            log.info(
+                "Incremental check done for %s in %.1fs: %d fresh, %d total",
+                scan_root, time.time() - t0, len(fresh_strs), len(files_strs),
+            )
 
             # Map string results back to Path keys (a thread for a big root:
             # these per-file passes were seconds of loop time at 170K files)
@@ -2775,31 +3985,100 @@ async def _run_scan(
             # Still map every discovered file to its uuid5 id so stale cleanup
             # below can prune orphans (deleted files) — previously this was left
             # empty, so a small scan root (≤ the incr-check threshold) NEVER had
-            # its deleted files pruned.  Cheap: this branch only runs when the
-            # root is small enough that the incremental check was skipped.
-            track_ids_for_files = {
-                p: str(uuid.uuid5(uuid.NAMESPACE_URL, str(p))) for p in files
-            }
+            # its deleted files pruned.  (A thread for a big root — a first
+            # scan of one: ~2.5 µs a file was a loop stall of seconds.)
+            def _ids(fl=files):
+                return {p: str(uuid.uuid5(uuid.NAMESPACE_URL, str(p))) for p in fl}
+            track_ids_for_files = (_ids() if len(files) < 20_000
+                                   else await asyncio.to_thread(_ids))
+
+        # Files an earlier scan gave up (``_GiveUps``): an automatic scan
+        # leaves the ones still waiting out.  Of the others, files that
+        # crashed their worker run alone first (cheap), members of an archive
+        # skipped after hangs go after the rest of the root, and files that
+        # hung alone run alone last — at most ``_GIVEUP_RETRY_CRASHES`` /
+        # ``_GIVEUP_RETRY_HANGS`` a scan (the rest wait for the next), so
+        # retries never hold new music up.
+        gu = _giveups.get(scan_root) or _GiveUps(scan_root, {})
+        first: list[Path] = []          # crash records: alone, before everything
+        last: list[Path] = []           # hang records: alone, after everything
+        tail: list[Path] = []           # members of a skipped archive: after the rest
+        kept = 0                        # held files that keep their (older) track
+        if gu.records:
+            if _run_incr_check:
+                for _r in gu.records.keys() & fresh_strs:
+                    gu.settle(_r)       # unchanged since it was indexed: nothing to retry
+            _auto = bool(scope) or light
+            _wait_boxes = gu.boxes(gu.wait) if _auto else []
+            _retry_boxes = [b for b in gu.boxes(set(gu.records)) if b not in _wait_boxes]
+
+            def _split(fl=files_to_scan, gu=gu, auto=_auto, boxes=_wait_boxes, retry=_retry_boxes):
+                keep: list = []
+                first: list = []
+                last: list = []
+                tail: list = []
+                held: list = []
+                for p in fl:
+                    s = str(p)
+                    rec = gu.records.get(s)
+                    if auto and gu.holds(s, boxes):
+                        held.append(p)
+                    elif rec is not None and rec[2] == "hang":
+                        (last if len(last) < _GIVEUP_RETRY_HANGS else held).append(p)
+                    elif rec is not None:
+                        (first if len(first) < _GIVEUP_RETRY_CRASHES else held).append(p)
+                    elif retry and "::" in s and _in_archives(s, retry):
+                        tail.append(p)
+                    else:
+                        keep.append(p)
+                return keep, first, last, tail, held
+            files_to_scan, first, last, tail, _held = (
+                _split() if len(files_to_scan) < 20_000 else await asyncio.to_thread(_split))
+            if _held:
+                kept = sum(1 for p in _held if track_ids_for_files.get(p) in existing_ids)
+                log.info("%d file(s) of %s that crashed or hung their worker in an earlier "
+                         "scan are not tried again yet (Re-Index tries them sooner)",
+                         len(_held), scan_root)
+                _progress.processed += len(_held)
+                if on_progress:
+                    await on_progress(_progress)
 
         log.info(
             "Extraction starting for %s: %d files to scan, %d skipped",
-            scan_root, len(files_to_scan), skipped,
+            scan_root, len(files_to_scan) + len(first) + len(last) + len(tail), skipped,
         )
 
-        # ── Sliding window executor ──────────────────────────────────────────
-        # Submit only INFLIGHT tasks at a time so asyncio.wait() operates on
-        # a small set (~200) instead of all 170K+ futures.  This keeps each
-        # wait() call at O(INFLIGHT) rather than O(total_files), preventing
-        # the event loop from stalling for 700 ms+ per call.
+        # ── Extraction ───────────────────────────────────────────────────────
+        # In a pool that outlives its workers (``_PoolRunner``: a file that
+        # crashes or hangs its worker costs its pool, never the root).  Files
+        # go out in BATCHES (``_extract_batch`` — plain files of one folder,
+        # or members of one archive; up to ``_BATCH_MAX`` and about ``_BATCH_TARGET_S`` of
+        # work at the pace measured so far; a worker stops a batch after
+        # ``_BATCH_BUDGET_S`` and the rest is sent again): one round trip per
+        # batch, not per file.  A root with few files per worker left goes
+        # one file per job.  The culprit hunt stays per FILE: the files of a
+        # batch whose pool crashed run again alone, together, halved while
+        # they keep killing their worker (``_Group``); after a hang, one at a
+        # time, alone.
+        # Only a window of jobs is in flight (``INFLIGHT``; batches: one per
+        # worker and two waiting), so each wait is O(window), never
+        # O(files).  A suspect that hangs alone may be the file — or the
+        # SOURCE stopped answering (a hung share): the hung pool is killed,
+        # then the root, a file already read from it and one not read yet
+        # are tried (``_source_down``); if they don't answer within a grace
+        # period the rest of the root is given up (``stalled``), instead of
+        # 90 s per remaining file — while they answer, only the hung file
+        # is; after ``_MAX_ARCHIVE_HANGS`` members of one archive in a row
+        # hung alone, the rest of that archive's members are skipped (not
+        # indexed, Re-Index to retry).  So is the rest of the root when
+        # ``_MAX_SOURCE_ERRORS`` files in a row failed with a source error
+        # (EIO, a timeout …) and the source doesn't answer.
 
-        track_buffer: list[Track]       = []
-        art_buffer:   dict[str, str]    = {}
-        sm_thumbs:    dict[str, bytes]  = {}
-        lg_thumbs:    dict[str, bytes]  = {}
+        track_buffer: list[dict] = []           # store rows (``_scan_row``)
 
         async def _flush_buffer():
-            """Write buffered tracks in sub-batches, yielding between chunks."""
-            nonlocal track_buffer, art_buffer, sm_thumbs, lg_thumbs
+            """Write buffered rows in sub-batches, yielding between chunks."""
+            nonlocal track_buffer
             if not track_buffer:
                 return
             n = len(track_buffer)
@@ -2808,114 +4087,36 @@ async def _run_scan(
                 for i in range(0, n, WRITE_CHUNK):
                     chunk = track_buffer[i : i + WRITE_CHUNK]
                     if _deferred:
-                        # Accumulate the delta off the live store — mirror the
-                        # exact model_dump + zero-embedding strip that
-                        # upsert_tracks_batch does, so the deferred apply is
-                        # byte-identical to a progressive write.
-                        for _t in chunk:
-                            _td = _t.model_dump()
-                            _emb = _td.get("embedding")
-                            if not _emb or all(v == 0.0 for v in _emb):
-                                _td.pop("embedding", None)
-                            _pending_tracks.append(_td)
+                        # Accumulate the delta off the live store: the rows
+                        # a progressive write stores, byte for byte.
+                        _pending_tracks.extend(chunk)
                     else:
-                        await upsert_tracks_batch(chunk)
+                        store.upsert_tracks_batch(chunk)
                     await asyncio.sleep(0)
-                await store_full_art_batch(art_buffer)
-                await store_thumbs_batch(sm_thumbs, lg_thumbs)
                 log.debug("Flushed %d tracks in %.2fs", n, time.time() - t0)
             except Exception as exc:
                 log.error("Flush error after %.2fs: %s", time.time() - t0, exc, exc_info=True)
             track_buffer = []
-            art_buffer   = {}
-            sm_thumbs    = {}
-            lg_thumbs    = {}
 
-        async def _handle_result(fut):
-            """Process one completed extraction future; returns its result
-            (the metadata, or the error text)."""
-            nonlocal track_buffer
-            path, result, sm_thumb, lg_thumb = await fut
+        taken = [0]                     # files taken from file_iter so far
 
-            if isinstance(result, str):
-                log.error("Metadata error %s: %s", path, result)
-                _progress.errors += 1
-            else:
-                meta: TrackMeta = result
-                track, raw_art = _build_track(
-                    meta, scan_root, _parent_dir(path), hash_map,
-                )
-                if track:
-                    track_buffer.append(track)
-                    if raw_art:
-                        art_buffer[track.id] = raw_art
-                    if sm_thumb:
-                        sm_thumbs[track.id] = sm_thumb
-                    if lg_thumb:
-                        lg_thumbs[track.id] = lg_thumb
-                    dir_counts[scan_root] += 1
-                    all_track_ids.append(meta.id)
-                    if len(track_buffer) >= WRITE_BATCH:
-                        await _flush_buffer()
-                else:
-                    _progress.errors += 1
-
-            _progress.processed    += 1
-            _progress.current_file  = path.name
-
-            if on_progress and (
-                _progress.processed % PROGRESS_EVERY == 0
-                or _progress.processed == total
-            ):
-                await on_progress(_progress)
-            return result
-
-        file_iter = iter(files_to_scan)
-        # future → (file, or None for a pool's canary; the pool generation)
-        active: dict[asyncio.Future, tuple[Path | None, int]] = {}
-        cfs: dict[asyncio.Future, object] = {}   # … its pool (concurrent) future
-        # When the pool dies — its workers crashed (at start, or on a file
-        # that kills them) or hung — the files it was extracting become
-        # SUSPECTS (after a hang: those a worker ran; the ones only queued
-        # behind them go back to the normal stream).  Every new pool first
-        # runs a no-op canary; once that works, each suspect runs ALONE in
-        # it, so one that kills or hangs its worker there is the culprit —
-        # given up as an error — and the others and the rest of the root go
-        # on.  Failures that reach us from an already-replaced pool (one
-        # ``asyncio.wait`` round late) are requeued, never counted against
-        # the new pool.  Three pools in a row that die without settling a
-        # single file (workers that crash at start whatever the file, a
-        # forkserver that can't be reached, a pool that starts but refuses
-        # every file) give the rest of the root up as errors (Re-Index to
-        # retry) — never silently, never an endless run of new pools, and no
-        # executor error escapes (it would bypass this root's flush +
-        # cleanup and leave the scan a zombie).  A suspect that hangs alone
-        # may be the file — or the SOURCE stopped answering (a hung share):
-        # the hung pool is killed, then the root, a file already read from
-        # it and one not read yet are tried (``_source_down``); if they
-        # don't answer within a grace period the rest of the root is given
-        # up the same way, instead of 90 s per remaining file — while they
-        # answer, only the hung file is; after ``_MAX_ARCHIVE_HANGS`` members
-        # of one archive in a row hung alone, the rest of that archive's
-        # members are skipped (not indexed, Re-Index to retry).  So is the rest of the root when
-        # ``_MAX_SOURCE_ERRORS`` files in a row failed with a source error
-        # (EIO, a timeout …) and the source doesn't answer.  A pool that
-        # was killed is never touched again (``_pool_stopped``: its lock
-        # may be held for good); the next root starts a new one.
-        suspects: deque[Path] = deque()
-        requeue: deque[Path] = deque()   # queued behind a hang: run again, normally
-        gen = 0                 # the current pool's generation
-        pool_ok = False         # the current pool's canary (or any file) worked
-        settled = False         # the current pool settled a file (indexed, failed, or its culprit found)
-        pool_dead = False       # a new pool is needed before the next submit
-        pool_gone = False       # gave up: no more pools for this root
-        bad_pools = 0           # pools in a row that died without settling a file
-        source_errors = 0       # files in a row that failed with a source error
-        stalled = False         # the source stopped answering — give the root up
+        def _counted(it):
+            for p in it:
+                taken[0] += 1
+                yield p
+        file_iter = _counted(itertools.chain(files_to_scan, tail))
+        n_files = len(files_to_scan) + len(tail)
+        jobs = [0]                      # jobs formed so far
+        pace: list[float] = []          # seconds per file in batches (moving average)
+        source_errors = 0               # files in a row that failed with a source error
         last_ok: Path | None = None     # a file of this root read fine (probed when one hangs)
-        solo_path: Path | None = None   # the suspect running alone in this pool
         hang_run: list[str] = []        # members of one file on disk in a row that hung alone (nothing extracted since)
         skipped_archives: dict[str, int] = {}   # archive whose other members are skipped → how many
+
+        async def _tick() -> None:
+            if on_progress and (_progress.processed % PROGRESS_EVERY == 0
+                                or _progress.processed == total):
+                await on_progress(_progress)
 
         async def _skip_member(path: Path, archive: str) -> None:
             skipped_archives[archive] += 1
@@ -2923,31 +4124,49 @@ async def _run_scan(
             _progress.processed += 1
             await _tick()
 
-        async def _tick() -> None:
-            if on_progress and (_progress.processed % PROGRESS_EVERY == 0
-                                or _progress.processed == total):
-                await on_progress(_progress)
-
         async def _fail(path: Path, why: str) -> None:
             log.error("Worker error for %s: %s", path, why)
             _progress.errors    += 1
             _progress.processed += 1
             await _tick()
 
-        def _live() -> int:
-            """Files (not canaries) in flight in the current pool."""
-            return sum(1 for p, g in active.values() if g == gen and p is not None)
-
-        def _submit(fn, *args) -> asyncio.Future:
-            if _pool_stopped(executor):
-                raise RuntimeError("the extraction pool was stopped")
-            cf = executor.submit(fn, *args)
-            fut = asyncio.wrap_future(cf, loop=loop)
-            cfs[fut] = cf
-            return fut
-
-        def _submit_canary() -> None:
-            active[_submit(_pool_canary)] = (None, gen)
+        async def _one(path: Path, result) -> None:
+            """One extracted file (its metadata, or the error text): buffered
+            for the store or counted as an error, progress, and what the
+            stall checks read."""
+            nonlocal source_errors, last_ok, hang_run
+            if isinstance(result, str):
+                log.error("Metadata error %s: %s", path, result)
+                _progress.errors += 1
+            else:
+                try:
+                    row = _scan_row(result, hash_map[_parent_dir(path)], hash_map[scan_root])
+                except Exception as exc:                        # noqa: BLE001
+                    log.error("Failed to build track %s: %s", path, exc)
+                    row = None
+                if row is not None:
+                    track_buffer.append(row)
+                    dir_counts[scan_root] += 1
+                    all_track_ids.append(row["id"])
+                    if len(track_buffer) >= WRITE_BATCH:
+                        await _flush_buffer()
+                else:
+                    _progress.errors += 1
+            if gu.records:
+                gu.settle(str(path))            # (an error too: its worker lived)
+            _progress.processed    += 1
+            _progress.current_file  = path.name
+            # ``_tick`` broadcasts on the %PROGRESS_EVERY / ``== total``
+            # condition — every path that counts a file does the same, or
+            # the badge stalls at e.g. "99% (X/Y)".
+            await _tick()
+            if isinstance(result, str) and _is_source_error(result):
+                source_errors += 1
+            else:
+                source_errors = 0                   # the source answers
+                if not isinstance(result, str):
+                    last_ok = path
+                    hang_run = []
 
         async def _source_down(avoid: Path | None = None) -> bool:
             """Whether the source stopped answering: the root's listing, a
@@ -2956,7 +4175,7 @@ async def _run_scan(
             together — again with growing pauses for up to ``_STALL_GRACE_S``
             (a share that wakes up or reconnects) before the answer is
             "down".  A stop answers "down" at once."""
-            fresh = _unread_file(requeue, file_iter, (avoid, last_ok))
+            fresh = _unread_file(runner.requeue, file_iter, (avoid, last_ok))
             waited, pause = 0.0, _STALL_PAUSE_S
             while True:
                 if await asyncio.to_thread(_source_answers, last_ok, _PROBE_S, scan_root,
@@ -2972,215 +4191,205 @@ async def _run_scan(
                 waited += pause + _PROBE_S
                 pause = min(pause * 2, 60.0)
 
-        try:
-            if executor is None or _pool_stopped(executor):
-                # An earlier root gave its pool up (or a stop killed it): a
-                # new one, never a submit to the old one.
-                executor = None
-                executor = _process_pool(max(1, min(SCAN_WORKERS, total)))
-            _submit_canary()
-        except (BrokenExecutor, RuntimeError, OSError):
-            pool_dead = True
+        class _RootRun(_PoolRunner):
+            def batch_n(self) -> int:
+                """Files per job: a few jobs per worker for what is left, at
+                most ``_BATCH_MAX`` and about ``_BATCH_TARGET_S`` of work.
+                While the pace allows single files only, every 16th job is a
+                pair — the pace is measured from batches."""
+                left = n_files - taken[0] + len(self.requeue)
+                most = min(_BATCH_MAX, left // (self.size * 4))
+                n = most
+                if pace:
+                    n = min(n, int(_BATCH_TARGET_S / max(pace[0], 1e-6)))
+                    if n < 2 <= most and jobs[0] % 16 == 15:
+                        n = 2
+                return max(1, n)
 
-        while True:
-            if pool_dead and not pool_gone:
-                bad_pools = 0 if settled else bad_pools + 1
-                await _kill_pool_async(executor)
-                new_pool = None
-                if bad_pools < 3 and not stalled:
-                    try:
-                        new_pool = _process_pool(max(1, min(SCAN_WORKERS, total)))
-                    except Exception as exc:                    # noqa: BLE001
-                        log.warning("No new extraction pool for %s: %s", scan_root, exc)
-                if new_pool is None:
-                    pool_gone = True
-                    lost = len(suspects) + len(requeue) + sum(1 for _ in file_iter)
-                    suspects.clear()
-                    requeue.clear()
-                    _progress.errors += lost
-                    _progress.processed += lost
-                    if _pools_closed:
-                        log.info("Server stopping — %d file(s) of %s not indexed "
-                                 "this time", lost, scan_root)
-                    elif stalled:
-                        log.error("Extraction stalled on %s — %d file(s) not indexed "
-                                  "(Re-Index to retry)", scan_root, lost)
-                    else:
-                        log.error("Extraction pool died again while scanning %s — "
-                                  "%d file(s) not indexed (Re-Index to retry)",
-                                  scan_root, lost)
-                    await _tick()
-                else:
-                    log.warning("Extraction pool died while scanning %s — "
-                                "starting a new one", scan_root)
-                    executor = new_pool
-                    gen += 1
-                    pool_ok = settled = pool_dead = False
-                    solo_path = None
-                    try:
-                        _submit_canary()
-                    except (BrokenExecutor, RuntimeError, OSError):
-                        pool_dead = True
-            if not pool_gone and not pool_dead:
-                path = None
-                try:
-                    if suspects:
-                        if pool_ok and not _live():     # a suspect runs alone
-                            path = suspects.popleft()
-                            active[_submit(_extract_one, path)] = (path, gen)
-                            solo_path = path
-                    elif pool_ok or gen == 0:
-                        while _live() < INFLIGHT:
-                            path = requeue.popleft() if requeue else next(file_iter, None)
-                            if path is None:
-                                break
-                            if skipped_archives and (box := _in_archives(path, skipped_archives)):
-                                await _skip_member(path, box)
-                                path = None
-                                continue
-                            active[_submit(_extract_one, path)] = (path, gen)
-                except (BrokenExecutor, RuntimeError, OSError) as exc:
-                    # The pool can't take work: dead, or its forkserver gone.
-                    log.debug("Extraction pool refused work: %s", exc)
-                    if path is not None:
-                        suspects.appendleft(path)
-                    pool_dead = True
-            if not active:
-                if pool_dead and not pool_gone:
-                    continue                    # a new pool, then submit again
-                break
+            def window(self) -> int:
+                n = self.batch_n()
+                # Batches: one per worker and two waiting — more in flight only
+                # widen what a crash sends back to run alone again.
+                return INFLIGHT if n <= 1 else min(INFLIGHT, max(self.size + 2, INFLIGHT // n))
 
-            done, _ = await asyncio.wait(
-                active.keys(), return_when=asyncio.FIRST_COMPLETED,
-                timeout=_EXTRACT_STUCK_S,
-            )
-            if not done:
-                # Nothing finished for 90 s: the workers hang.  A suspect
-                # running alone is the culprit; otherwise the files a worker
-                # ran run again alone in a new pool, and the ones only queued
-                # behind them go back to the normal stream.
-                stuck = [(f, p, g) for f, (p, g) in active.items() if p is not None]
-                solo_stuck = (pool_ok and solo_path is not None
-                              and [p for _f, p, g in stuck if g == gen] == [solo_path])
-                ran = [(p, g) for f, p, g in stuck if f in cfs and cfs[f].running()]
-                if ran:
-                    queued = [p for f, p, g in stuck if not (f in cfs and cfs[f].running())]
-                else:                           # can't tell: every one is a suspect
-                    ran, queued = [(p, g) for _f, p, g in stuck], []
-                for fut in list(active):
-                    fut.cancel()
-                active.clear()
-                cfs.clear()
-                for p, g in ran:
-                    if solo_stuck and g == gen:
-                        await _fail(p, "extraction hung (> 90 s) — skipped")
-                        settled = True
+            async def take(self):
+                n = self.batch_n()
+                items: list[Path] = []
+                box = None
+                while len(items) < n:
+                    if self.requeue:
+                        p = self.requeue.popleft()
                     else:
-                        suspects.append(p)
-                requeue.extend(queued)
-                pool_dead = True
-                if solo_stuck:
-                    await _kill_pool_async(executor)    # the hung worker goes before the source is probed
-                    if await _source_down(avoid=solo_path):
-                        stalled = True
-                    else:
-                        hung = str(solo_path)
-                        outer = hung.split("::", 1)[0] if "::" in hung else None
-                        if outer is None:
-                            hang_run = []                   # a plain file never counts
-                        elif hang_run and hang_run[0].split("::", 1)[0] == outer:
-                            hang_run.append(hung)
-                        else:
-                            hang_run = [hung]
-                        if len(hang_run) >= _MAX_ARCHIVE_HANGS:
-                            box = _common_archive(hang_run)
-                            skipped_archives.setdefault(box, 0)
-                            for p in [p for p in suspects if _in_archives(p, (box,))]:
-                                suspects.remove(p)
-                                await _skip_member(p, box)
-                            hang_run = []
-                else:
-                    log.error("Extraction timed out: %d file(s) ran — trying them one at a "
-                              "time: %s", len(ran), [str(p) for p, _ in ran[:5]])
-                continue
-
-            for fut in done:
-                fut_path, fut_gen = active.pop(fut)
-                cfs.pop(fut, None)
-                if fut_path is not None and fut_path == solo_path and fut_gen == gen:
-                    solo_path = None
-                    was_solo = True
-                else:
-                    was_solo = False
-                if fut.cancelled():                 # its pool was killed
-                    if fut_path is not None:
-                        suspects.append(fut_path)
-                    continue
-                if fut_path is None:                # a canary
-                    if fut.exception() is None:
-                        if fut_gen == gen:
-                            pool_ok = True
-                    elif fut_gen == gen:
-                        pool_dead = True
-                    continue
-                try:
-                    res = await _handle_result(fut)
-                    if fut_gen == gen:
-                        pool_ok = settled = True
-                    if isinstance(res, str) and _is_source_error(res):
-                        source_errors += 1
-                    else:
-                        source_errors = 0                   # the source answers
-                        if not isinstance(res, str):
-                            last_ok = fut_path
-                            hang_run = []
-                except BrokenExecutor as exc:
-                    if fut_gen != gen:
-                        suspects.append(fut_path)   # late news from a replaced pool
+                        p = next(file_iter, None)
+                        if p is None:
+                            break
+                    if skipped_archives and (sk := _in_archives(p, skipped_archives)):
+                        await _skip_member(p, sk)
                         continue
-                    pool_dead = True
-                    if pool_ok and was_solo:
-                        # Alone in a pool that worked: it killed its worker.
-                        await _fail(fut_path, f"{exc} — the file kills its worker; skipped")
-                        settled = True
-                    else:
-                        suspects.append(fut_path)
-                except Exception as exc:
-                    # ``_handle_result`` broadcasts on the %PROGRESS_EVERY
-                    # /``== total`` condition; the error path does the same
-                    # (``_fail``), or the badge stalls at e.g. "99% (X/Y)".
-                    await _fail(fut_path, str(exc))
-                    if fut_gen == gen:
-                        settled = True
-            if source_errors >= _MAX_SOURCE_ERRORS and not stalled and not pool_gone:
-                if await _source_down():
-                    stalled = pool_dead = True  # the rest of the root is given up
+                    key = _batch_key(p)
+                    if items and key != box:
+                        self.requeue.appendleft(p)      # starts the next job
+                        break
+                    box = key
+                    items.append(p)
+                if items:
+                    jobs[0] += 1
+                    return items
+                if last:
+                    # The main stream is done: the files that hung alone
+                    # before run alone now.
+                    self.suspects.extend(last)
+                    last.clear()
+                return None
+
+            def job(self, items, alone=False):
+                # (alone: a suspect — tracker durations from the CLI, so a
+                # module that only crashes libopenmpt in-process still indexes)
+                slot = None if alone else self.progress_slot()
+                if slot is not None:
+                    self.slots[id(items)] = (items, slot)
+                if len(items) == 1:
+                    if alone:
+                        return _extract_one, (items[0], True)
+                    if slot is None:
+                        return _extract_one, (items[0],)
+                    return _extract_one_tracked, (items[0], slot)
+                return _extract_batch, (tuple(str(p) for p in items), _BATCH_BUDGET_S, alone,
+                                        slot)
+
+            def hung_split(self, items):
+                got = self.slots.pop(id(items), None)
+                if got is None or got[0] is not items:
+                    return None
+                at = self.progress_of(got[1])
+                if at is None or at > len(items):
+                    return None
+                # the item the job was on runs alone; none: it never started
+                # (only queued behind the hung workers)
+                lone = [items[at - 1]] if at else []
+                again = [p for k, p in enumerate(items) if k != at - 1]
+                # … and so does an item in its second hung job: a job that
+                # can't write its progress reads as never started
+                lone += [p for p in again if str(p) in self.hung_before]
+                again = [p for p in again if str(p) not in self.hung_before]
+                self.hung_before.update(str(p) for p in again)
+                return lone, again
+
+            async def done(self, items, fut):
+                self.slots.pop(id(items), None)
+                if len(items) == 1:
+                    path, result, _sm, _lg = await fut
+                    await _one(path, result)
+                    return []
+                results, secs = await fut
+                if results:
+                    per = secs / len(results)
+                    pace[:] = [per if not pace else 0.7 * pace[0] + 0.3 * per]
+                for p, r in zip(items, results):
+                    await _one(p, r)
+                return items[len(results):]
+
+            async def failed(self, items, exc):
+                self.slots.pop(id(items), None)
+                if len(items) > 1:
+                    # The batch failed, not a file (those report their own
+                    # errors): each runs again, alone.
+                    self.suspects.extend(items)
+                    return
+                await _fail(items[0], str(exc))
+
+            async def culprit(self, item, kind, exc):
+                if kind == "hang":
+                    # (recorded once the source answers — ``solo_hung``)
+                    await _fail(item, "extraction hung (> 90 s) — skipped")
                 else:
-                    source_errors = 0           # the source answers: these files fail
+                    await _fail(item, f"{exc} — the file kills its worker; skipped")
+                    gu.give_up(str(item), kind)
 
-            # Honour the pause flag BEFORE submitting new work — paused
-            # scans drain the in-flight window naturally and then idle
-            # at this gate until the user clicks Resume.  In-flight
-            # futures keep running; the gate only blocks new submissions.
-            await _await_resume()
-            await asyncio.sleep(0)  # yield to event loop every iteration
+            async def solo_hung(self, item):
+                nonlocal hang_run
+                if await _source_down(avoid=item):
+                    self.stalled = True             # the share, not the file: nothing recorded
+                    return
+                gu.give_up(str(item), "hang")
+                hung = str(item)
+                outer = hung.split("::", 1)[0] if "::" in hung else None
+                if outer is None:
+                    hang_run = []                   # a plain file never counts
+                elif hang_run and hang_run[0].split("::", 1)[0] == outer:
+                    hang_run.append(hung)
+                else:
+                    hang_run = [hung]
+                if len(hang_run) >= _MAX_ARCHIVE_HANGS:
+                    box = _common_archive(hang_run)
+                    skipped_archives.setdefault(box, 0)
+                    gu.give_up(box, "skip")
+                    for p in self.drop_suspects(lambda p: _in_archives(p, (box,)) is not None):
+                        await _skip_member(p, box)
+                    hang_run = []
 
+            async def after_round(self):
+                nonlocal source_errors
+                if source_errors >= _MAX_SOURCE_ERRORS and not self.stalled and not self.gone:
+                    if await _source_down():
+                        self.stalled = self.dead = True     # the rest of the root is given up
+                    else:
+                        source_errors = 0                   # the source answers: these files fail
+                # Honour the pause flag BEFORE submitting new work — paused
+                # scans drain the in-flight window naturally and then idle
+                # at this gate until the user clicks Resume.  In-flight
+                # jobs keep running; the gate only blocks new submissions.
+                await _await_resume()
+                await asyncio.sleep(0)  # yield to event loop every iteration
+
+            async def lost(self, items, why):
+                n = len(items)
+                if why == "late":
+                    # Failures that reached us after the root was given up
+                    # (late news from a replaced pool): counted, not lost.
+                    log.error("%d more file(s) of %s not indexed (Re-Index to retry)", n, scan_root)
+                elif why == "stopping":
+                    log.info("Server stopping — %d file(s) of %s not indexed "
+                             "this time", n, scan_root)
+                elif why == "stalled":
+                    log.error("Extraction stalled on %s — %d file(s) not indexed "
+                              "(Re-Index to retry)", scan_root, n)
+                else:
+                    log.error("Extraction pool died again while scanning %s — "
+                              "%d file(s) not indexed (Re-Index to retry)", scan_root, n)
+                _progress.errors += n
+                _progress.processed += n
+                await _tick()
+
+            def drain(self):
+                left = list(file_iter) + last
+                last.clear()
+                return left
+
+        runner = _RootRun(max(1, min(SCAN_WORKERS, total)), executor,
+                          where=f" while scanning {scan_root}")
+        runner.slots = {}                   # id(job items) → (items, progress slot)
+        runner.hung_before = set()          # files sent back in line after a hang
+        runner.suspects.extend(first)       # files that crashed their worker before: alone, first
+        try:
+            await runner.run()
+        finally:
+            executor = runner.executor
+            pools.append(executor)
+        stalled = runner.stalled
+        if runner.gone:
+            _gave_up_roots.add(scan_root)
         for box, n in skipped_archives.items():
             log.error("Extraction hung on %d members of %s in a row — its other %d member(s) "
                       "were skipped, not indexed (Re-Index to retry)", _MAX_ARCHIVE_HANGS, box, n)
-        if suspects or requeue:
-            # Failures that reached us after the root was given up (late news
-            # from a replaced pool): not indexed either — counted, not lost.
-            more = len(suspects) + len(requeue)
-            log.error("%d more file(s) of %s not indexed (Re-Index to retry)", more, scan_root)
-            _progress.errors += more
-            _progress.processed += more
-            suspects.clear()
-            requeue.clear()
-            await _tick()
 
         # Flush any remaining tracks for this root
         await _flush_buffer()
+        try:
+            await gu.save(store, _GIVEUP_KEY + path_hash(scan_root),
+                          wanted=lambda r=scan_root: not _removed_now(r))
+        except Exception:                                   # noqa: BLE001 — never fails the scan
+            log.warning("could not save what %s's scan gave up", scan_root, exc_info=True)
 
         # ── Stale track cleanup ──────────────────────────────────────────────
         # ``track_ids_for_files`` maps EVERY discovered file to its uuid5 id (in
@@ -3281,7 +4490,7 @@ async def _run_scan(
         # the store once the delta is committed (below).
         if not _removed_now(scan_root):
             await upsert_scan_dir(scan_root, track_count_val=(
-                None if _scoped is not None else skipped + dir_counts[scan_root]))
+                None if _scoped is not None else skipped + kept + dir_counts[scan_root]))
 
     # Publish the scan result.  Re-scan (deferred) path: apply the accumulated
     # delta to the LIVE store in one batch via its own concurrency-safe
@@ -3423,8 +4632,15 @@ async def _run_scan(
     # aggregations are all still right: skip the (library-wide) passes.  The
     # folder watcher's rescans are usually exactly this.
     for d in _fp_record:
-        if not _removed_now(d) and get_store().get_config(_FP_KEY + path_hash(d)) != _fp:
+        if (d not in _gave_up_roots and not _removed_now(d)
+                and get_store().get_config(_FP_KEY + path_hash(d)) != _fp):
             get_store().set_config(_FP_KEY + path_hash(d), _fp)
+    for d in _gave_up_roots:
+        # Files of the root were given up (a stalled share, pools that kept
+        # dying, a stop): its next automatic scan enumerates it in full, so
+        # archive members never indexed are listed — and tried — again.
+        if get_store().get_config(_FP_KEY + path_hash(d)) is not None:
+            get_store().set_config(_FP_KEY + path_hash(d), None)
 
     if not _changed:
         log.info("Scan: nothing changed — skipping duplicate detection and post-scan passes")
@@ -3475,7 +4691,6 @@ async def _run_scan(
     if on_progress:
         await on_progress(_progress)
 
-    _release_pool(executor)
     return _changed
 
 
@@ -3752,6 +4967,69 @@ def cancel_background_tasks() -> None:
         log.debug("saving the pending duplicate re-group failed", exc_info=True)
 
 
+async def stop_background_writers(extra=(), timeout: float = 3.0) -> int:
+    """Shutdown, before the journal's final flush: cancel this run's scans
+    (the local scan queue — queued scans dropped — the startup reconcile and
+    a folder click's drill-down refresh) and the post-scan passes that write
+    the store (the scene
+    enrichment runner, the duplicate re-group, the folder-album, game-title
+    and art passes, a repair / header-game backfill) plus ``extra`` tasks
+    (the caller's: remote scans, an HVSC apply), the one-shot remote freshness
+    checks and the default-tune probes, and wait up to ``timeout``
+    seconds for them to end.  Their last writes then reach the AOF in its
+    final flush — left running, they wrote after it (into the buffer only
+    the process's exit flushed: after the next instance had loaded the AOF,
+    or in the bundled app after a later run's records).  What a cancelled
+    scan had not committed is found again by the next one; a cancelled pass
+    runs again (its cursor moves only after its own writes).  Returns how
+    many tasks were stopped."""
+    global _scene_autoapply_pending
+    _scan_queue.clear()
+    _scene_autoapply_pending = False
+    tasks: set = set(extra)
+    tasks.add(_scan_task)
+    tasks.add(_dup_runner_task)
+    tasks.update(_scene_autoapply_tasks)
+    try:
+        from soniqboom.core import art_backfill, folder_album, game_titles, repair
+        tasks.update(folder_album._tasks)
+        tasks.update(game_titles._bg_tasks)
+        tasks.update(art_backfill._tasks)
+        tasks.add(repair._task)
+    except Exception:                                   # noqa: BLE001
+        log.debug("listing the enrichment passes failed", exc_info=True)
+    try:
+        from soniqboom.api import fstree                # a folder click's drill-down refresh
+        tasks.update(fstree._DRILL_TASKS)
+    except Exception:                                   # noqa: BLE001
+        log.debug("listing the drill-down refreshes failed", exc_info=True)
+    try:
+        from soniqboom.core import remote_freshness     # one-shot share checks
+        tasks.update(remote_freshness._oneshot_tasks)
+    except Exception:                                   # noqa: BLE001
+        log.debug("listing the one-shot freshness checks failed", exc_info=True)
+    try:
+        from soniqboom.api import stream                # default-tune probes (their
+        tasks.update(stream._DEFAULT_PROBES.values())   # progress stays in memory)
+    except Exception:                                   # noqa: BLE001
+        log.debug("listing the default-tune probes failed", exc_info=True)
+    me = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    live = [t for t in tasks                            # (this run's loop only)
+            if isinstance(t, asyncio.Future) and not t.done() and t is not me
+            and t.get_loop() is loop]
+    for t in live:
+        t.cancel()
+    if live:
+        _done, pending = await asyncio.wait(live, timeout=timeout)
+        if pending:
+            log.warning("Shutdown: %d scan / enrichment task(s) still ending: %s", len(pending),
+                        ", ".join(sorted(t.get_name() for t in pending
+                                         if isinstance(t, asyncio.Task))))
+        log.info("Shutdown: stopped %d scan / enrichment task(s)", len(live))
+    return len(live)
+
+
 def _spawn_scene_autoapply() -> None:
     """Mark the library dirty for scene enrichment — the Modland join (once an
     index is downloaded), the UADE song database and the Demozoo composer
@@ -3788,8 +5066,7 @@ def schedule_startup_reconcile() -> None:
     async def _go() -> None:
         try:
             dirs = [d["path"] for d in get_store().list_scan_dirs()
-                    if not str(d.get("path", "")).startswith(
-                        ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://"))]
+                    if not is_remote_path(str(d.get("path", "")))]
             # (is_dir off the loop: a hung mount must not freeze it)
             live = await asyncio.to_thread(lambda: [d for d in dirs if Path(d).is_dir()])
             if live:
@@ -4043,8 +5320,16 @@ async def _drain_scan_queue() -> None:
 
 def forget_root(path: str) -> None:
     """A scan root was removed: drop it from every queued scan, so a scan
-    queued before the removal doesn't re-register and re-index it."""
+    queued before the removal doesn't re-register and re-index it — and
+    what its scans gave up (``_GiveUps``)."""
     norm = str(Path(path).resolve())
+    try:
+        store = get_store()
+        for p in {path, norm}:
+            if _GIVEUP_KEY + path_hash(p) in store._config:
+                store.delete_config(_GIVEUP_KEY + path_hash(p))
+    except Exception:                                       # noqa: BLE001
+        log.debug("could not drop the give-up records of %s", path, exc_info=True)
     for i in range(len(_scan_queue) - 1, -1, -1):
         dirs, cb, scope, light = _scan_queue[i]
         if norm not in dirs:
@@ -4069,8 +5354,8 @@ def is_scanning(path: str | None = None) -> bool:
     """Check if a path (or any path) is currently being scanned or queued."""
     if path is None:
         return bool(_current_scan_dirs) or bool(_current_remote_dirs) or bool(_scan_queue)
-    # Remote paths (ftp://, smb://) aren't resolved via Path()
-    if path.startswith(("ftp://", "smb://")):
+    # Remote paths (ftp://, smb://, WebDAV http(s)://) aren't resolved via Path()
+    if is_remote_path(path):
         return path in _current_remote_dirs
     norm = str(Path(path).resolve())
     if norm in _current_scan_dirs:
@@ -5313,11 +6598,13 @@ async def _remote_scan_body(
             None, lambda: source.read_file(remote_path, lane="scan"),
         )
 
-    # One-way latch flipped when the extraction pool dies: remaining
+    # One-way latch flipped when the extraction is given up: remaining
     # queued tasks must not keep DOWNLOADING files nobody can extract
     # (pre-fix, ~19K orphaned siblings pulled 22 GB of archives against
     # a broken pool).  List-wrapped so the closure can assign it.
     _pool_dead = [False]
+    # The extraction pool, on the scan pools' recovery machinery.
+    extractor = _RemoteExtractRun(SCAN_WORKERS, executor, f" while scanning {scan_root}")
     # Sidecar bookkeeping: archives that produced at least one indexed
     # track this scan, and archives whose member fetches failed (the
     # latter must never be barren-marked off a transient outage).
@@ -5440,16 +6727,16 @@ async def _remote_scan_body(
                         _arc_pc_exe.get(_pc_memo_key(remote_path), False)
                         if "::" in remote_path else False
                     )
-                    _, result, _, _ = await loop.run_in_executor(
-                        executor, _extract_one_remote,
+                    _, result, _, _ = await extractor.call(
                         file_data, remote_path, track_id, _pc_arc,
                     )
                 except BrokenExecutor:
-                    # Worker processes died (killed / crashed) — the pool
-                    # is unusable for the rest of this scan.  Flip the
-                    # latch so queued siblings stop downloading, count
-                    # this file as errored, and let the scan drain to a
-                    # clean, retriggerable completion.
+                    # The extraction was given up (``_RemoteExtractRun``:
+                    # pools that kept dying, a stop) — a pool that dies is
+                    # replaced, and a file that kills or hangs its worker is
+                    # the only one lost.  Flip the latch so queued siblings
+                    # stop downloading, count this file as errored, and let
+                    # the scan drain to a clean, retriggerable completion.
                     if not _pool_dead[0]:
                         _pool_dead[0] = True
                         log.error(
@@ -5465,8 +6752,10 @@ async def _remote_scan_body(
                         _phase_counts["extract"] -= 1
                 # Was that stage's data enough?  Only escalate on
                 # PARTIAL fetches — a full fetch that returns minimal
-                # data is the source's real metadata, not under-shoot.
-                if not was_partial:
+                # data is the source's real metadata, not under-shoot.  A file
+                # that killed or hung its worker alone (``_Culprit``) stops
+                # here too: more bytes would only run it again.
+                if not was_partial or isinstance(result, _Culprit):
                     break
                 bad = isinstance(result, str) or (
                     not isinstance(result, str)
@@ -5587,7 +6876,11 @@ async def _remote_scan_body(
                 "Remote scan %s: %d file task(s) raised unexpectedly; "
                 "first: %r", scan_root, len(leaked), leaked[0],
             )
+        await extractor.finish()
     finally:
+        extractor.abort()
+        if extractor.executor is not executor:
+            _release_pool(extractor.executor)       # a replacement (the wrapper ends the first)
         _phase_task.cancel()
         try:
             await _phase_task

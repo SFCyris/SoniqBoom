@@ -317,7 +317,7 @@ def test_rendered_format_routing():
     print("== rendered-format routing ==")
     SHOULD_RENDER = [
         # SID
-        ".sid", ".psid",
+        ".sid", ".psid", ".rsid",
         # MIDI
         ".mid", ".midi",
         # Tracker (subset of _TRACKER_EXTS)

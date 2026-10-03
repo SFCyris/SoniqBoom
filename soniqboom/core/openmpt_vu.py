@@ -68,16 +68,23 @@ def _candidate_paths() -> list[str]:
     return []
 
 
+_LOAD_FAILED = False
+
+
 def _load() -> ctypes.CDLL | None:
     """Try every reasonable name + path; return the first that loads.
 
     Cached after the first successful resolution.  A failed load
-    returns ``None`` and is NOT retried — the operator can re-import
-    after fixing their library install.
+    returns ``None`` and is NOT retried (``_LOAD_FAILED``: no
+    ``find_library`` — on Linux an ``ldconfig`` process — and no log line
+    per call) — the operator can re-import after fixing their library
+    install.
     """
-    global _LIB
+    global _LIB, _LOAD_FAILED
     if _LIB is not None:
         return _LIB
+    if _LOAD_FAILED:
+        return None
     # ctypes.util.find_library first — honours LD_LIBRARY_PATH, etc.
     found = ctypes.util.find_library("openmpt")
     candidates = ([found] if found else []) + _candidate_paths()
@@ -98,6 +105,7 @@ def _load() -> ctypes.CDLL | None:
         "openmpt_vu: libopenmpt not found in any candidate path; "
         "per-channel VU disabled — frontend will fall back to FFT spectrum",
     )
+    _LOAD_FAILED = True
     return None
 
 
@@ -333,6 +341,54 @@ def extract_vu(
             lib.openmpt_module_destroy(mod)
         except Exception:
             pass
+
+
+def module_duration(file_bytes: bytes) -> float | None:
+    """The play length of the module in *file_bytes*, in seconds — what
+    ``openmpt123 --info`` reports as its Duration (every subsong played in
+    turn, subsong -1), to the same millisecond (``duration_ms``), without
+    starting a process.
+
+    ``None`` when libopenmpt can't be loaded on this host (the caller falls
+    back to the CLI); ``0.0`` for bytes libopenmpt can't open.  Nothing is
+    logged to stderr (``openmpt_log_func_silent``)."""
+    if not _bind():
+        return None
+    lib = _load()
+    assert lib is not None
+    if not hasattr(lib, "_sb_silent"):
+        try:
+            lib._sb_silent = ctypes.cast(lib.openmpt_log_func_silent, ctypes.c_void_p)
+        except AttributeError:
+            lib._sb_silent = None               # a very old library: its default logging
+        lib.openmpt_free_string.argtypes = [ctypes.c_void_p]
+        lib.openmpt_free_string.restype = None
+    err = ctypes.c_int(0)
+    err_msg = ctypes.c_char_p(None)
+    mod = lib.openmpt_module_create_from_memory2(
+        ctypes.c_char_p(file_bytes), len(file_bytes),
+        lib._sb_silent, None, None, None,
+        ctypes.byref(err), ctypes.byref(err_msg),
+        None,
+    )
+    if not mod:
+        msg = ctypes.cast(err_msg, ctypes.c_void_p).value
+        if msg:
+            lib.openmpt_free_string(msg)
+        return 0.0
+    try:
+        lib.openmpt_module_select_subsong(mod, -1)
+        duration = float(lib.openmpt_module_get_duration_seconds(mod))
+        return duration_ms(duration) / 1000 if duration > 0 else 0.0
+    finally:
+        lib.openmpt_module_destroy(mod)
+
+
+def duration_ms(seconds: float) -> int:
+    """Whole milliseconds of *seconds*, cut as ``openmpt123`` cuts them
+    for its Duration line (``int64(seconds * 1000)``) — so a duration read
+    in-process equals one parsed from the CLI to the last bit."""
+    return int(seconds * 1000)
 
 
 # ── VUMR serialisation ──────────────────────────────────────────────────────

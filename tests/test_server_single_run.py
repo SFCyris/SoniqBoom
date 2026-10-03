@@ -272,7 +272,7 @@ def test_the_bundled_apps_merger_stops_without_a_final_merge(monkeypatch, tmp_pa
     import inspect
     from soniqboom.core import merger
     merges = []
-    monkeypatch.setattr(merger, "_do_merge", lambda d: merges.append(d) or 0)
+    monkeypatch.setattr(merger, "_do_merge_in_child", lambda d: merges.append(d) or 0)
     monkeypatch.setattr(merger, "_is_bundled", lambda: True)
 
     async def go(final):
@@ -412,7 +412,7 @@ def test_a_merge_of_a_stopped_run_finishes_before_the_next_run_loads(tmp_path, m
             persistence.library_files_lock.release()
         return not got[0]
     monkeypatch.setattr(merger, "_do_merge_locked", lambda d: held.append(("merge", taken_elsewhere())) or 0)
-    monkeypatch.setattr(persistence, "_write_snapshot_sync", lambda d: held.append(("snapshot", taken_elsewhere())))
+    monkeypatch.setattr(persistence, "_write_snapshot_sync", lambda d, *a: held.append(("snapshot", taken_elsewhere())))
     merger._do_merge(tmp_path)
     persistence.write_snapshot_sync(tmp_path)
     assert held == [("merge", True), ("snapshot", True)]
@@ -467,7 +467,8 @@ def test_the_status_timer_really_switches_its_interval(app):
 
 
 def test_the_writing_steps_and_the_queued_jobs():
-    assert main._WRITING_STEPS == {"aof-flush", "snapshot", "browse-cache", "remote-freshness", "merger"}
+    assert main._WRITING_STEPS == {"aof-flush", "snapshot", "browse-cache", "remote-freshness", "merger",
+                                   "aof-seal"}
     ran = []
 
     async def run():

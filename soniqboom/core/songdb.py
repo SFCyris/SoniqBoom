@@ -621,10 +621,12 @@ def reset_patch(t: dict) -> dict | None:
     return upd or None
 
 
-def collect(tracks: list[dict]) -> tuple[int, list[tuple[str, object, None]]]:
+def collect(tracks: list[dict], matched_ids: set | None = None
+            ) -> tuple[int, list[tuple[str, object, None]]]:
     """Join the snapshot ``tracks`` against the index (blocking — run in an
     executor).  Returns ``(matched, items)``: one write-time patch callable
-    per track that has a database row or carries this pass's fills."""
+    per track that has a database row or carries this pass's fills.
+    ``matched_ids`` (optional) collects the ids of the matched tracks."""
     if not has_index():
         raise RuntimeError("no song database index — download it first")
     keyed: list[tuple[str, str, bool]] = []
@@ -661,6 +663,8 @@ def collect(tracks: list[dict]) -> tuple[int, list[tuple[str, object, None]]]:
         s = lens.get(k)
         if m is not None or s is not None:
             matched += 1
+            if matched_ids is not None:
+                matched_ids.add(tid)
         elif not (has_ours and withdraw_ok):
             continue
         if not k:
@@ -673,7 +677,13 @@ def collect(tracks: list[dict]) -> tuple[int, list[tuple[str, object, None]]]:
 
 # ── Apply / reset ────────────────────────────────────────────────────────────
 
+# The last apply's position in the store's enrichment change log and the index
+# signature (``enrich_delta.record``): the next post-scan apply joins only the
+# tracks written since, all of them when the index changed (None: all).
 _last_auto_sig: tuple | None = None
+# The ids of the tracks the index matches, as of the last apply (a delta apply
+# updates its own tracks), so the status counts the whole library.
+_matched_ids: set[str] = set()
 
 
 def _index_sig() -> tuple | None:
@@ -686,25 +696,33 @@ def _index_sig() -> tuple | None:
 
 async def apply_to_library(*, force: bool = False) -> dict:
     """Join in an executor, write on the loop (each patch computed from the
-    track as it is at write time).  Without ``force`` (the post-scan runner) the
-    join is skipped when neither the library nor the index changed since the
-    last apply.  Frees albums → the folder-album pass (if enabled) runs."""
+    track as it is at write time).  Without ``force`` (the post-scan runner)
+    only the tracks written since the last apply are joined (``enrich_delta``;
+    the join is per track) and the join is skipped when there are none; every
+    track is joined when the index changed.  Frees albums → the folder-album
+    pass (if enabled) runs."""
     import asyncio
-    global _last_auto_sig
+    global _last_auto_sig, _matched_ids
     if _status["applying"]:
         return {**status(), "error": "apply already running"}
+    from soniqboom.core import enrich_delta
     from soniqboom.core.store import get_store
     store = get_store()
-    sig = (store._mutation_seq, _index_sig())
-    if not force and sig == _last_auto_sig:
+    inputs = (_index_sig(),)
+    changed = enrich_delta.changes(store, _last_auto_sig, inputs, force=force)
+    if changed is not None and not changed:
         return {**status(), "skipped": "unchanged"}
     _status.update(applying=True, error=None)
     freed = False
     try:
         loop = asyncio.get_running_loop()
-        seq0 = store._mutation_seq
-        tracks = store.all_tracks()
-        matched, items = await loop.run_in_executor(None, lambda: collect(tracks))
+        snap = store.enrich_cursor()                    # taken with the snapshot
+        tracks = (store.all_tracks() if changed is None
+                  else enrich_delta.tracks_of(store, changed))
+        joined = len(tracks)
+        found: set[str] = set()
+        matched, items = await loop.run_in_executor(
+            None, lambda: collect(tracks, matched_ids=found))
         tracks = None
         before = {tid: (store.get_track(tid) or {}).get("album_source") for tid, _p, _e in items}
         async with fa._get_lock():
@@ -715,12 +733,16 @@ async def apply_to_library(*, force: bool = False) -> dict:
                     for tid in written)
         if updated:
             await fa.refresh_album_caches(written)
-        _last_auto_sig = ((store._mutation_seq, _index_sig())
-                          if store._mutation_seq == seq0 + own_bumps else None)
-        _status["last_apply"] = {"matched": matched, "updated": updated,
+        _last_auto_sig = enrich_delta.record(store, snap, own_bumps, inputs)
+        if changed is None:
+            _matched_ids = found
+        else:
+            _matched_ids -= changed
+            _matched_ids |= found
+        _status["last_apply"] = {"matched": len(_matched_ids), "updated": updated,
                                  "albums": albums, "at": time.time()}
-        log.info("Song database enrichment: %d matched, %d tracks updated "
-                 "(%d album changes)", matched, updated, albums)
+        log.info("Song database enrichment: %d matched, %d of %d joined track(s) "
+                 "updated (%d album changes)", len(_matched_ids), updated, joined, albums)
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = f"apply failed: {exc}"
         log.warning("Song database enrichment failed: %s", exc)
@@ -728,7 +750,7 @@ async def apply_to_library(*, force: bool = False) -> dict:
         _status["applying"] = False
     if freed and fa.enabled():
         try:
-            await fa.apply_folder_albums(force=True)
+            await fa.apply_folder_albums()              # the freed tracks are in its delta
         except Exception:                               # noqa: BLE001
             log.debug("folder-album pass after song-database withdrawals failed",
                       exc_info=True)

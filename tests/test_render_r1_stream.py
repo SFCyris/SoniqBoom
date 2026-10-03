@@ -293,11 +293,15 @@ async def test_unknown_length_range_request_waits_and_subsonic_gets_a_length(
 
 def test_render_state_reports_unknown_length_live_renders_as_playable():
     ev = asyncio.Event()
-    live = {"complete": ev, "expected_size": 0, "bytes": stream._UADE_BYTES_PER_SEC}
+    live = {"complete": ev, "expected_size": 0, "bytes": stream._UADE_BYTES_PER_SEC,
+            "audible": True}
     stream._UADE_LIVE["rsu__sub0"] = live
     try:
         assert stream._render_state("rsu", 0) == "ready_for_playback"
         live["bytes"] = 10
+        assert stream._render_state("rsu", 0) == "rendering"
+        # Nothing audible yet: no listener would be attached — still rendering.
+        live["bytes"], live["audible"] = stream._UADE_BYTES_PER_SEC * 5, False
         assert stream._render_state("rsu", 0) == "rendering"
     finally:
         stream._UADE_LIVE.pop("rsu__sub0", None)

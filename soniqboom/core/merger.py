@@ -1,22 +1,27 @@
 # SPDX-FileCopyrightText: 2026 S.F. Cyris
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Background merger process — consolidates AOF into snapshot.
+"""Background merger — consolidates the AOF into the snapshot.
 
-Runs as a daemon subprocess.  Periodically:
-  1. Reads new entries from library.aof
+Checks every ``merger_interval`` seconds; a merge runs once the AOF holds
+``merger_max_aof_mb`` MB or its oldest change is ``merger_max_age`` seconds
+old (``_MergeDue``) — not for every play — and (the merger process) once
+more at its stop.  A merge:
+  1. Reads library.aof
   2. Loads library.json (last full snapshot)
-  3. Applies AOF entries to the snapshot
+  3. Applies the AOF entries to the snapshot (skipping any it already holds)
   4. Writes library.json.new
   5. Rotates: library.json → library.json.bak, library.json.new → library.json
-  6. Truncates library.aof
+  6. Drops the merged bytes from library.aof
+
+A daemon process outside the bundled app; inside it, a task of the server
+whose merges each run in a child process (``_do_merge_in_child``).
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
-import os
+import re
 import signal
 import sys
 import time
@@ -108,27 +113,53 @@ def _apply_entry(state: dict, entry: dict) -> None:
     elif op == "set_config":
         state.setdefault("config", {})[entry["key"]] = entry.get("value")
 
+    elif op == "delete_config":
+        state.get("config", {}).pop(entry.get("key"), None)
+
 
 def _do_merge(data_dir: Path) -> int:
-    """``_do_merge_locked`` under ``persistence.library_files_lock`` — a
-    merge never interleaves with a snapshot write or a start's load."""
-    from soniqboom.core.persistence import library_files_lock
-    with library_files_lock:
+    """``_do_merge_locked`` under ``persistence.library_files_locked`` — a
+    merge never interleaves with a snapshot write or a start's load, in this
+    process or another."""
+    from soniqboom.core.persistence import library_files_locked
+    with library_files_locked(data_dir):
         return _do_merge_locked(data_dir)
+
+
+def _parse_aof(data: bytes) -> list[tuple[int, dict]]:
+    """The AOF records in ``data`` as ``(end offset, record)`` — a corrupt
+    line is skipped with a warning."""
+    from soniqboom.core.persistence import loads_json
+    out: list[tuple[int, dict]] = []
+    pos = 0
+    for raw_line in data.split(b"\n"):
+        pos += len(raw_line) + 1
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            out.append((pos, loads_json(line)))
+        except json.JSONDecodeError:
+            log.warning("Skipping corrupt AOF line: %s",
+                        line[:80].decode("utf-8", errors="replace"))
+    return out
 
 
 def _do_merge_locked(data_dir: Path) -> int:
     """Run one merge cycle.  Returns number of entries applied.
 
-    Robust against network-volume quirks:
-      • fsync after writing to ensure bytes reach the server before rename
-      • shutil.copy2 for the backup (copy then delete, not rename) so the
-        snapshot is never absent — a failed copy still leaves the original
-      • os.replace for the final swap (atomic on POSIX, overwrites target)
-      • If the snapshot is missing (e.g. after a prior crash), fall back to
+    Robust against network-volume quirks and against dying half-way:
+      • the new snapshot is written + rotated by
+        ``persistence.write_library_file`` (fsync'd temp, verified, the old
+        snapshot kept as the .bak, atomic ``os.replace``)
+      • if the snapshot is missing (e.g. after a prior crash), fall back to
         the .bak file so we never start from an empty state
+      • the snapshot records the AOF bytes it now holds
+        (``persistence.AOF_MARK``) before they are dropped from the AOF — a
+        merge killed in between leaves a prefix the next merge / start
+        recognises and doesn't apply twice
     """
-    import shutil
+    from soniqboom.core import persistence as _p
 
     snapshot_path = data_dir / "library.json"
     backup_path   = data_dir / "library.json.bak"
@@ -141,23 +172,10 @@ def _do_merge_locked(data_dir: Path) -> int:
     # between our read and the later shift+truncate.  We record the exact
     # byte length we consumed; any bytes the writer appends *after* we
     # release the lock will be preserved verbatim during the truncate step.
-    with open(aof_path, "rb+") as aof_f:
-        fcntl.flock(aof_f.fileno(), fcntl.LOCK_EX)
-        try:
-            initial_data = aof_f.read()
-        finally:
-            fcntl.flock(aof_f.fileno(), fcntl.LOCK_UN)
+    initial_data = _p.read_aof(aof_path)
     size_consumed = len(initial_data)
 
-    entries = []
-    for raw_line in initial_data.decode("utf-8", errors="replace").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            log.warning("Skipping corrupt AOF line: %s", line[:80])
+    entries = _parse_aof(initial_data)
     if not entries:
         return 0
 
@@ -165,31 +183,13 @@ def _do_merge_locked(data_dir: Path) -> int:
     # missing or empty (can happen if a previous merge/shutdown wrote an
     # empty state).  Prefer whichever file has more tracks so we never
     # regress from a populated snapshot to an empty one.
-    state = {}
+    state: dict = {}
     for src in (snapshot_path, backup_path):
-        if not src.exists():
+        candidate = _p._try_load_json(src)
+        if not isinstance(candidate, dict):
+            if src.exists():
+                log.warning("Merger: could not read %s, trying next", src.name)
             continue
-        try:
-            with open(src, "r") as f:
-                candidate = json.load(f)
-        except json.JSONDecodeError as exc:
-            # Handle trailing-garbage corruption (valid JSON + extra bytes)
-            if exc.pos and exc.pos > 2:
-                try:
-                    with open(src, "r") as f:
-                        raw = f.read(exc.pos)
-                    candidate = json.loads(raw)
-                    log.warning("Merger: loaded %s with trailing garbage trimmed", src.name)
-                except Exception:
-                    log.warning("Merger: could not read %s (%s), trying next", src.name, exc)
-                    continue
-            else:
-                log.warning("Merger: could not read %s (%s), trying next", src.name, exc)
-                continue
-        except OSError as exc:
-            log.warning("Merger: could not read %s (%s), trying next", src.name, exc)
-            continue
-
         cand_tracks = len(candidate.get("tracks", {}))
         curr_tracks = len(state.get("tracks", {}))
         if cand_tracks >= curr_tracks:
@@ -197,89 +197,135 @@ def _do_merge_locked(data_dir: Path) -> int:
             if cand_tracks > 0:
                 break  # found a populated snapshot, use it
 
-    for entry in entries:
-        _apply_entry(state, entry)
+    # Entries the snapshot already holds (a merge that died after its
+    # rotation, before dropping them from the AOF) are not applied again.
+    held = _p.aof_merged_prefix(state, initial_data)
+    todo = [e for end, e in entries if end > held]
+    if not todo:
+        _p.drop_aof_prefix(aof_path, held)
+        log.info("Merger: dropped %d AOF bytes the snapshot already held", held)
+        return 0
 
-    # Write the new snapshot and fsync so the data reaches the server
-    # before we touch any other files.
-    tmp_path = data_dir / "library.json.new"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    for entry in todo:
+        _apply_entry(state, entry)
+    state[_p.AOF_MARK] = _p.aof_mark(initial_data)
 
     try:
-        with open(tmp_path, "w") as f:
-            json.dump(state, f)
-            f.flush()
-            os.fsync(f.fileno())
+        if not _p.write_library_file(data_dir, state, "Merger"):
+            return 0
     except Exception as exc:
         log.error("Merger: failed to write temp snapshot: %s", exc)
-        tmp_path.unlink(missing_ok=True)
         return 0
-
-    # Verify the temp file exists and has content before proceeding.
-    # On network volumes (SMB/NFS) fsync may return before the data is
-    # fully committed.  Retry a few times with short delays.
-    _verified = False
-    for _attempt in range(4):
-        try:
-            if tmp_path.exists() and tmp_path.stat().st_size > 0:
-                _verified = True
-                break
-        except OSError:
-            pass
-        time.sleep(0.25)
-    if not _verified:
-        log.error("Merger: temp snapshot missing or empty after write — skipping rotation")
-        tmp_path.unlink(missing_ok=True)
-        return 0
-
-    # Back up the current snapshot (copy, not rename — the original stays
-    # in place until os.replace atomically swaps it).
-    if snapshot_path.exists():
-        try:
-            shutil.copy2(snapshot_path, backup_path)
-        except OSError as exc:
-            log.warning("Merger: backup copy failed (%s), continuing", exc)
-
-    # Atomic replace: tmp → snapshot.  On POSIX this is a single rename()
-    # syscall that overwrites the target.
-    try:
-        os.replace(tmp_path, snapshot_path)
-    except FileNotFoundError:
-        log.error("Merger: temp file vanished before replace — skipping this cycle")
-        return 0
+    del state
 
     # Remove only the prefix we consumed.  Anything the writer appended after
     # our initial read is shifted to the front of the file so it's processed
-    # in the next merge cycle rather than lost.  fsync after truncate so a
-    # power loss between the snapshot rotation above and this point can't
-    # replay already-merged ``record_play`` / ``push_history`` entries.
-    with open(aof_path, "rb+") as aof_f:
-        fcntl.flock(aof_f.fileno(), fcntl.LOCK_EX)
+    # in the next merge cycle rather than lost.
+    _p.drop_aof_prefix(aof_path, size_consumed)
+    return len(todo)
+
+
+# ── When a periodic merge runs ───────────────────────────────────────────────
+# A merge rewrites the whole library (hundreds of MB on a six-figure library:
+# a parse, an encode, an fsync'd write), so it doesn't run for every few plays:
+# only once the AOF holds ``max_aof_mb`` MB (a boot replays it, so that bounds
+# the replay) or its oldest change has waited ``max_age`` seconds.  The stop's
+# final merge (``merger_loop``, ``stop_merger(final=True)``) runs regardless.
+_MERGE_MAX_AOF_MB = 32.0
+_MERGE_MAX_AGE_S = 1800.0
+
+
+def _merge_limits(max_aof_mb: float | None, max_age: float | None) -> tuple[int, float]:
+    """``(max AOF bytes, max age s)`` — the given values, else the settings'
+    (``merger_max_aof_mb`` / ``merger_max_age``), else the defaults."""
+    if max_aof_mb is None or max_age is None:
         try:
-            current_size = os.fstat(aof_f.fileno()).st_size
-            if current_size > size_consumed:
-                aof_f.seek(size_consumed)
-                tail = aof_f.read()
-                aof_f.seek(0)
-                aof_f.write(tail)
-                aof_f.truncate()
-            else:
-                aof_f.truncate(0)
-            aof_f.flush()
-            try:
-                os.fsync(aof_f.fileno())
-            except OSError:
-                pass
-        finally:
-            fcntl.flock(aof_f.fileno(), fcntl.LOCK_UN)
-
-    return len(entries)
+            from soniqboom.config import settings
+            if max_aof_mb is None:
+                max_aof_mb = getattr(settings, "merger_max_aof_mb", None)
+            if max_age is None:
+                max_age = getattr(settings, "merger_max_age", None)
+        except Exception:                                   # noqa: BLE001
+            pass
+    try:
+        mb = max(0.0, float(_MERGE_MAX_AOF_MB if max_aof_mb is None else max_aof_mb))
+    except (TypeError, ValueError):
+        mb = _MERGE_MAX_AOF_MB
+    try:
+        age = max(0.0, float(_MERGE_MAX_AGE_S if max_age is None else max_age))
+    except (TypeError, ValueError):
+        age = _MERGE_MAX_AGE_S
+    return int(mb * 1024 * 1024), age
 
 
-def merger_loop(data_dir_str: str, interval: int = 120) -> None:
+# The head of an AOF record: ``{"op": "<op>", "ts": <epoch seconds>`` (the
+# writer's key order — ``AOFWriter.append``).
+_AOF_HEAD_TS = re.compile(rb'\{"op": "[^"]*", "ts": (-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)')
+
+
+def _aof_first_age(aof_path: Path) -> float:
+    """Seconds since the AOF's first record was written (its ``ts``) — 0 when
+    it can't be read.  (A play's ``ts`` is when it was played: an offline
+    client's back-dated scrobble just makes the next merge come sooner.)"""
+    try:
+        with open(aof_path, "rb") as f:
+            head = f.read(256)
+    except OSError:
+        return 0.0
+    m = _AOF_HEAD_TS.match(head)
+    if not m:
+        return 0.0
+    try:
+        return max(0.0, time.time() - float(m.group(1)))
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+class _MergeDue:
+    """Is a periodic merge due?  Called at every check of the merger loop.
+    The AOF's oldest change is dated by the check that first saw the AOF
+    non-empty (within one interval — no file parse) — except an AOF already
+    there at this run's first check: a previous run left it (the bundled
+    app's stop merges nothing, so it can outlive many short sessions), and it
+    is as old as its first record (``_aof_first_age``), not as this run."""
+
+    def __init__(self, aof_path: Path, max_bytes: int, max_age: float,
+                 clock=time.monotonic, first_age=_aof_first_age) -> None:
+        self.aof_path = aof_path
+        self.max_bytes = max_bytes
+        self.max_age = max_age
+        self.clock = clock
+        self.first_age = first_age
+        self.first_check = True
+        self.pending_since: float | None = None
+
+    def __call__(self) -> bool:
+        first, self.first_check = self.first_check, False
+        try:
+            size = self.aof_path.stat().st_size
+        except OSError:
+            size = 0
+        if size == 0:
+            self.pending_since = None
+            return False
+        now = self.clock()
+        if self.pending_since is None:
+            self.pending_since = now - (self.first_age(self.aof_path) if first else 0.0)
+        return size >= self.max_bytes or now - self.pending_since >= self.max_age
+
+    def merged(self) -> None:
+        """A merge ran — what it left (written meanwhile) is dated from the
+        next check."""
+        self.pending_since = None
+
+
+def merger_loop(data_dir_str: str, interval: int = 120,
+                max_aof_mb: float | None = None, max_age: float | None = None) -> None:
     """Main loop for the background merger process.
 
-    Designed to be the target of ``multiprocessing.Process``.
+    Designed to be the target of ``multiprocessing.Process``.  Checks every
+    ``interval`` seconds and merges when one is due (``_MergeDue``); merges
+    once more at its stop.
 
     Uses a ``threading.Event`` for the wait between merges so SIGTERM /
     SIGINT / SIGHUP can wake us immediately — ``time.sleep()`` is NOT
@@ -305,15 +351,21 @@ def merger_loop(data_dir_str: str, interval: int = 120) -> None:
     # without the final merge running, which left the AOF un-applied.
     signal.signal(signal.SIGHUP, _handle_signal)
 
-    log.info("Merger started (dir=%s, interval=%ds)", data_dir, interval)
+    max_bytes, age = _merge_limits(max_aof_mb, max_age)
+    due = _MergeDue(data_dir / "library.aof", max_bytes, age)
+    log.info("Merger started (dir=%s, interval=%ds, merges at %.0f MB or %.0f s)",
+             data_dir, interval, max_bytes / 1048576, age)
 
     while not stop_event.is_set():
         # ``Event.wait`` returns True the moment the signal handler sets
         # the flag; otherwise it returns False after ``interval`` seconds.
         if stop_event.wait(interval):
             break
+        if not due():
+            continue
         try:
             n = _do_merge(data_dir)
+            due.merged()
             if n:
                 log.info("Merger: applied %d AOF entries", n)
         except Exception:
@@ -332,11 +384,11 @@ def merger_loop(data_dir_str: str, interval: int = 120) -> None:
 def _is_bundled() -> bool:
     """True when running inside the Nuitka-built .app bundle.
 
-    ``spawn`` / ``forkserver`` both bootstrap a fresh interpreter from the
-    sys.executable — in the bundle that re-execs the compiled .app entry
-    point and breaks merging.  ``fork`` from a uvicorn-multithreaded parent
-    can deadlock on inherited locks.  In the bundle we sidestep
-    multiprocessing entirely (see ``start_merger_async`` below).
+    There the merger is a task of the server (``merger_loop_async``) rather
+    than its own long-lived process: its schedule and its stop are the
+    server's (the app stops and starts the server in one process,
+    ``stop_merger(final=False)``).  Each merge still runs in a child process
+    (``_do_merge_in_child``) forked from the scan workers' forkserver.
     """
     import sys
     return (
@@ -346,16 +398,128 @@ def _is_bundled() -> bool:
     )
 
 
-async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None):
+# ── The bundled app's merges, in a child process ─────────────────────────────
+# A merge parses and re-encodes the whole library.json.  Both are single C
+# calls that hold the GIL from start to end, so in a thread of the server they
+# froze its event loop — every request, every stream chunk — for their whole
+# length (a 125 MB library: one 0.6 s stall per merge; ~1.5 s at 280 MB).  A
+# child process has its own GIL.  It is forked from the multiprocessing
+# forkserver the scan pools use (``scanner.prepare_worker_forkserver`` — a
+# small process that never used the network; forking the server itself can
+# crash in Network.framework's fork handler, see ``core/forksafe.py``), one
+# child per merge, gone (with its memory) when the merge is done.  The server
+# holds ``library_files_lock`` throughout, the child the cross-process
+# ``_library_flock``.  Should no child run (the forkserver can't be reached),
+# the merge runs in the server's thread as before.
+
+class _CollectLog(logging.Handler):
+    """The merge child's log records, sent back to the server's log."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.INFO)
+        self.records: list[tuple[str, int, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if record.exc_info:
+            msg += "\n" + logging.Formatter().formatException(record.exc_info)
+        self.records.append((record.name, record.levelno, msg))
+
+
+def _merge_child(data_dir_str: str) -> tuple[int, list[tuple[str, int, str]]]:
+    """The merge child's work: ``_do_merge_locked`` under the cross-process
+    lock.  Returns the entries applied and the log records it made."""
+    from soniqboom.core.persistence import _library_flock
+    data_dir = Path(data_dir_str)
+    handler = _CollectLog()
+    logger = logging.getLogger("soniqboom")
+    logger.addHandler(handler)
+    if logger.getEffectiveLevel() > logging.INFO:
+        logger.setLevel(logging.INFO)
+    n = 0
+    try:
+        with _library_flock(data_dir):
+            n = _do_merge_locked(data_dir)
+    except Exception:                                       # noqa: BLE001
+        log.exception("Merger (child) error")
+    finally:
+        logger.removeHandler(handler)
+    return n, handler.records
+
+
+# A merge child that hasn't finished after this long is stuck (a share that
+# stopped answering, a wedged forkserver): it is killed and the cycle skipped —
+# safe at any point (``persistence.AOF_MARK``, ``drop_aof_prefix``) — rather
+# than holding ``library_files_lock`` (and with it the app's Stop/Start) for
+# good.  A merge of a 125 MB library takes ~1 s.
+_MERGE_CHILD_TIMEOUT_S = 600.0
+
+
+def _run_merge_child(data_dir: Path) -> "tuple[int, list] | None":
+    """``_merge_child`` in a child process forked from the forkserver; None
+    when no child could run it."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, TimeoutError as _Timeout
+    try:
+        pool = ProcessPoolExecutor(max_workers=1,
+                                   mp_context=multiprocessing.get_context("forkserver"))
+    except Exception as exc:                                # noqa: BLE001
+        log.warning("Merger: no child process for the merge (%s) — merging in the server", exc)
+        return None
+    wait = True
+    try:
+        return pool.submit(_merge_child, str(data_dir)).result(timeout=_MERGE_CHILD_TIMEOUT_S)
+    except _Timeout:
+        log.warning("Merger: the merge's child process is stuck after %.0f s — killed, "
+                    "merge skipped", _MERGE_CHILD_TIMEOUT_S)
+        for proc in list((getattr(pool, "_processes", None) or {}).values()):
+            try:
+                proc.kill()
+            except Exception:                               # noqa: BLE001
+                pass
+        wait = False
+        return 0, []
+    except Exception as exc:                                # noqa: BLE001
+        log.warning("Merger: the merge's child process failed (%r) — merging in the server", exc)
+        return None
+    finally:
+        pool.shutdown(wait=wait, cancel_futures=True)
+
+
+def _do_merge_in_child(data_dir: Path) -> int:
+    """One merge of the bundled app's merger (see above).  Returns the
+    entries applied."""
+    from soniqboom.core import persistence as _p
+    try:
+        if (data_dir / "library.aof").stat().st_size == 0:
+            return 0
+    except OSError:
+        return 0
+    with _p.library_files_lock:
+        res = _run_merge_child(data_dir)
+        if res is None:
+            with _p._library_flock(data_dir):
+                return _do_merge_locked(data_dir)
+    n, records = res
+    for name, level, msg in records:
+        logging.getLogger(name).log(level, "%s", msg)
+    return n
+
+
+async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None,
+                            max_aof_mb: float | None = None, max_age: float | None = None):
     """Run the merger inside the parent process as an asyncio task.
 
-    Used in the bundled (Nuitka) deployment where neither ``spawn`` nor
-    ``forkserver`` is safe: spawn re-execs the binary, fork-from-uvicorn
-    can deadlock.  The merge work itself is dispatched via
-    ``asyncio.to_thread`` so the event loop stays responsive.
+    Used in the bundled (Nuitka) deployment (``_is_bundled``).  Checks every
+    ``interval`` seconds and merges when one is due (``_MergeDue``); each
+    merge runs in a child process (``_do_merge_in_child``), waited for in a
+    thread, so the event loop stays responsive.
     """
     import asyncio as _aio
-    log.info("Merger (async) started (dir=%s, interval=%ds)", data_dir, interval)
+    max_bytes, age = _merge_limits(max_aof_mb, max_age)
+    due = _MergeDue(data_dir / "library.aof", max_bytes, age)
+    log.info("Merger (async) started (dir=%s, interval=%ds, merges at %.0f MB or %.0f s)",
+             data_dir, interval, max_bytes / 1048576, age)
 
     async def _sleep_or_stop(secs: float) -> bool:
         if stop_event is None:
@@ -371,8 +535,11 @@ async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None
         while True:
             if await _sleep_or_stop(interval):
                 break
+            if not due():
+                continue
             try:
-                n = await _aio.to_thread(_do_merge, data_dir)
+                n = await _aio.to_thread(_do_merge_in_child, data_dir)
+                due.merged()
                 if n:
                     log.info("Merger (async): applied %d AOF entries", n)
             except Exception:
@@ -384,7 +551,7 @@ async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None
         me = _aio.current_task()
         if me is None or getattr(me, "_sb_final_merge", True):
             try:
-                n = await _aio.to_thread(_do_merge, data_dir)
+                n = await _aio.to_thread(_do_merge_in_child, data_dir)
                 if n:
                     log.info("Merger (async) final: applied %d AOF entries", n)
             except Exception:
@@ -392,19 +559,23 @@ async def merger_loop_async(data_dir: Path, interval: int = 120, stop_event=None
         log.info("Merger (async) stopped")
 
 
-def start_merger(data_dir: Path, interval: int = 120):
+def start_merger(data_dir: Path, interval: int = 120, *,
+                 max_aof_mb: float | None = None, max_age: float | None = None):
     """Spawn the background merger.
 
     Returns either a ``multiprocessing.Process`` (non-bundled) or an
     ``asyncio.Task`` (bundled).  Callers should rely on
     ``stop_merger(handle)`` / inspecting ``.is_alive()`` rather than
-    type-checking.
+    type-checking.  ``max_aof_mb`` / ``max_age``: when a periodic merge runs
+    (``_MergeDue``) — default: the settings.
     """
+    max_bytes, max_age = _merge_limits(max_aof_mb, max_age)
+    max_aof_mb = max_bytes / (1024 * 1024)
     if _is_bundled():
         import asyncio as _aio
         stop_event = _aio.Event()
         task = _aio.create_task(
-            merger_loop_async(data_dir, interval, stop_event),
+            merger_loop_async(data_dir, interval, stop_event, max_aof_mb, max_age),
             name="soniqboom-merger",
         )
         task._sb_stop_event = stop_event  # type: ignore[attr-defined]
@@ -422,7 +593,7 @@ def start_merger(data_dir: Path, interval: int = 120):
         ctx = multiprocessing
     proc = ctx.Process(
         target=merger_loop,
-        args=(str(data_dir), interval),
+        args=(str(data_dir), interval, max_aof_mb, max_age),
         daemon=True,
         name="soniqboom-merger",
     )

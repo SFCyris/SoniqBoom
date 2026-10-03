@@ -716,9 +716,12 @@ def _production_year(prod_rows: list[tuple[frozenset, int | None]],
     return years.pop() if len(years) == 1 else None
 
 
-def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
+def collect_updates(tracks: list[dict] | None = None,
+                    matched_ids: set | None = None) -> tuple[int, list[tuple[str, dict]]]:
     """Join every retro track's ``artist`` against the index; return
     ``(matched, batch)`` WITHOUT touching the store (run in an executor).
+    ``tracks``: the snapshot to join (default: every stored track);
+    ``matched_ids`` (optional) collects the ids of the matched tracks.
 
     Stamps three things per resolved track:
       * ``scene_group`` — the composer's collective(s), as before;
@@ -775,7 +778,7 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prod_year'"
         ).fetchone() is not None
         has_games = _has_table(con, "music_game")
-        for t in store.all_tracks():
+        for t in (store.all_tracks() if tracks is None else tracks):
             if not is_retro_format(t.get("format")):
                 continue
             stamped = t.get("year_source") == "demozoo"
@@ -812,6 +815,8 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
                                               tuple(narrow), credits)
                         if tb and tb.get("_persist"):        # credit-corroborated only
                             matched += 1
+                            if matched_ids is not None:
+                                matched_ids.add(t["id"])
                             upd["composer"] = tb["_persist"]
                             crew = " • ".join(tb.get("groups") or [])
                             if crew and not group:
@@ -866,6 +871,8 @@ def collect_updates() -> tuple[int, list[tuple[str, dict]]]:
                     batch.append((t["id"], upd))
                 continue
             matched += 1
+            if matched_ids is not None:
+                matched_ids.add(t["id"])
             updates: dict = {}
             # Group-less sceners are indexed now — only stamp a scene_group
             # when there IS one.
@@ -1761,11 +1768,21 @@ async def artist_card(name: str, track_title: str | None = None) -> dict | None:
     }
 
 
-# Skip signature (mirrors ``scene_metadata._last_auto_sig``): the store's
-# ``_mutation_seq`` after the last apply that covered the whole library, plus
-# the index file's signature — an unchanged library + index has nothing new to
-# join.  Per process: a restart always joins once.
+# The last apply's position in the store's enrichment change log and the index
+# signature (``enrich_delta.record``, as ``scene_metadata._last_auto_sig``): the
+# next apply joins only the tracks written since, all of them when the index
+# changed (None: all).  Per process: a restart always joins once.
 _last_apply_sig: tuple | None = None
+# The ids of the tracks the last apply resolved (a delta apply updates its own
+# tracks), so the status counts the whole library — as a full apply would: a
+# composer the title-first match stamped (``_stamped_ids``, the last apply's)
+# counts in the apply that stamps it only (with a composer, the track is no
+# title-first candidate any more).
+_matched_ids: set[str] = set()
+_stamped_ids: set[str] = set()
+# Up to this many track writes go straight into the sorted indexes (no batch
+# mode and its rebuild of every list they re-key on exit).
+_SMALL_WRITE = 200
 
 
 def _index_sig() -> tuple | None:
@@ -1780,39 +1797,60 @@ async def apply_to_library(*, force: bool = False) -> dict:
     """Async apply: sqlite JOIN in an executor, store WRITE on the loop thread
     (mirrors ``scene_metadata.apply_to_library``).
 
-    Returns ``skipped: "unchanged"`` without joining when neither the library
-    nor the index changed since the last apply (the post-scan runner calls it
-    after every scan); ``force`` (the Admin Apply button) always joins."""
+    Without ``force`` (the post-scan runner calls it after every scan) only
+    the tracks written since the last apply are joined (``enrich_delta``; the
+    join is per track), and ``skipped: "unchanged"`` is returned without a
+    join when there are none; every track is joined when the index changed.
+    ``force`` (the Admin Apply button) always joins every track."""
     import asyncio
+    from soniqboom.core import enrich_delta
     from soniqboom.core.store import get_store
-    global _last_apply_sig
+    global _last_apply_sig, _matched_ids, _stamped_ids
     if _status["applying"]:
         return {**status(), "error": "apply already running"}
     store = get_store()
-    if not force and (store._mutation_seq, _index_sig()) == _last_apply_sig:
+    inputs = (_index_sig(),)
+    changed = enrich_delta.changes(store, _last_apply_sig, inputs, force=force)
+    if changed is not None and not changed:
         return {**status(), "skipped": "unchanged", "matched": 0, "updated": 0}
     _status.update(applying=True, error=None)
     try:
         loop = asyncio.get_running_loop()
-        seq0 = store._mutation_seq
-        matched, batch = await loop.run_in_executor(None, collect_updates)
+        snap = store.enrich_cursor()                    # taken with the snapshot
+        tracks = (store.all_tracks() if changed is None
+                  else enrich_delta.tracks_of(store, changed))
+        found: set[str] = set()
+        matched, batch = await loop.run_in_executor(
+            None, lambda: collect_updates(tracks, matched_ids=found))
+        tracks = None
         updated = own_bumps = 0
         if batch:
             # Batch mode defers the per-item sorted-index maintenance to ONE
             # O(n log n) rebuild on exit — without it a ~20K-item batch spent
             # ~19 s of loop-thread time on incremental bisect.insort against
-            # 262K-entry lists, stalling every request mid-apply (QA M3).
-            store.enter_batch_mode()
+            # 262K-entry lists, stalling every request mid-apply (QA M3).  A
+            # small one (a scan's delta) is cheaper written in place than a
+            # rebuild of each list it re-keys.
+            big = len(batch) > _SMALL_WRITE
+            if big:
+                store.enter_batch_mode()
             try:
-                s0 = store._mutation_seq
+                s0 = store._enrich_seq
                 updated = store.update_track_fields_batch(batch)
-                own_bumps = store._mutation_seq - s0
+                own_bumps = store._enrich_seq - s0
             finally:
-                store.exit_batch_mode()
-        # Only our own write moved the seq since the join started → the next
-        # call has nothing new to join; anything else makes it run.
-        _last_apply_sig = ((store._mutation_seq, _index_sig())
-                           if store._mutation_seq == seq0 + own_bumps else None)
+                if big:
+                    store.exit_batch_mode()
+        # Past our own write when nothing else wrote meanwhile; else the next
+        # call re-joins what was written since the snapshot.
+        _last_apply_sig = enrich_delta.record(store, snap, own_bumps, inputs)
+        if changed is None:
+            _matched_ids = found
+        else:
+            _matched_ids -= changed | _stamped_ids
+            _matched_ids |= found
+        _stamped_ids = {tid for tid, upd in batch if upd.get("composer")}
+        matched = len(_matched_ids)
         if updated:
             # year / composer / scene_group are shown in the folder listings.
             from soniqboom.core.folder_album import refresh_album_caches

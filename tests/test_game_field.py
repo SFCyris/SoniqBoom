@@ -585,7 +585,13 @@ async def test_no_window_without_real_range_reads_or_when_a_range_read_fails(
     from soniqboom.core import filesource, tag_window
     from soniqboom.core.filesource import FTPFileSource, SMBFileSource
     from soniqboom.core.filesource_webdav import WebDAVFileSource
-    assert not tag_window.supports_ranges(WebDAVFileSource.__new__(WebDAVFileSource))
+    # WebDAV reads ranges with HTTP ``Range``; the base-class defaults read
+    # the whole file.
+    assert tag_window.supports_ranges(WebDAVFileSource.__new__(WebDAVFileSource))
+
+    class _Whole(filesource.FileSource):
+        walk = list_dir = read_file = stat = is_dir = None
+    assert not tag_window.supports_ranges(_Whole.__new__(_Whole))
     assert tag_window.supports_ranges(FTPFileSource.__new__(FTPFileSource))
     assert tag_window.supports_ranges(SMBFileSource.__new__(SMBFileSource))
     f = _tagged_file(tmp_path, ".flac", "flac")

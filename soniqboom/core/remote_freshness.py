@@ -64,6 +64,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from soniqboom.core.filesource import is_remote_path
+
 log = logging.getLogger(__name__)
 
 # ── Tuning knobs ────────────────────────────────────────────────────────────
@@ -525,7 +527,7 @@ async def start(
         dirs = await _list_dirs()
         for d in dirs:
             path = str(d.get("path", ""))
-            if path.startswith(("ftp://", "smb://", "webdav://", "webdavs://")):
+            if is_remote_path(path):
                 await add_share(path)
     except Exception:
         log.exception("freshness: initial share discovery failed")
@@ -570,7 +572,7 @@ async def add_share(scan_root: str) -> None:
         return
     if scan_root in _reg.tasks:
         return
-    if not scan_root.startswith(("ftp://", "smb://", "webdav://", "webdavs://")):
+    if not is_remote_path(scan_root):
         return
     _reg.tasks[scan_root] = asyncio.create_task(
         _share_poll_loop(scan_root),
@@ -591,6 +593,12 @@ async def remove_share(scan_root: str) -> None:
     _save_state()
 
 
+# The one-shot checks running now (``check_now``) — the shutdown's "scans"
+# step cancels them with the other store writers
+# (``scanner.stop_background_writers``).
+_oneshot_tasks: "set[asyncio.Task]" = set()
+
+
 async def check_now(scan_root: str, *, reason: str = "user") -> dict:
     """Fire an immediate freshness scan for *scan_root*.
 
@@ -604,12 +612,19 @@ async def check_now(scan_root: str, *, reason: str = "user") -> dict:
     Unlike the background loop, this BYPASSES the pool-pressure gate —
     the user is actively waiting on the result.
     """
-    if not scan_root.startswith(("ftp://", "smb://", "webdav://", "webdavs://")):
+    if not is_remote_path(scan_root):
         return {}
     # Ensure a state object exists even for shares we haven't auto-armed
     # (e.g. share was added since startup).
     _reg.states.setdefault(scan_root, ShareState(scan_root=scan_root))
-    return await _poll_share(scan_root, reason=reason)
+    me = asyncio.current_task()
+    if me is not None:
+        _oneshot_tasks.add(me)
+    try:
+        return await _poll_share(scan_root, reason=reason)
+    finally:
+        if me is not None:
+            _oneshot_tasks.discard(me)
 
 
 def get_status() -> list[dict]:

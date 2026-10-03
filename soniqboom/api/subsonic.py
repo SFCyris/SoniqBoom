@@ -38,6 +38,7 @@ import contextvars
 import functools
 import hashlib
 import hmac
+import itertools
 import logging
 import math
 import operator
@@ -49,9 +50,10 @@ from itertools import islice
 from typing import Any
 from urllib.parse import unquote
 
+import orjson
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import RedirectResponse, Response
 from fastapi.routing import APIRoute
 
 from soniqboom import __version__
@@ -238,7 +240,15 @@ def _envelope(payload: dict[str, Any] | None = None, *, status: str = "ok") -> d
 #   - list     → repeated child elements under the parent's key
 #   - scalar   → attribute on the enclosing element
 # Top-level emits an ``xmlns="http://subsonic.org/restapi"`` per spec.
-import xml.etree.ElementTree as _ET
+#
+# The document is written straight into a list of string pieces — no
+# ElementTree tree.  Same bytes ``ElementTree.tostring`` produced (attributes
+# in insertion order, ``<a b="c" />`` for an empty element, ElementTree's own
+# attribute / character-data escaping), ~3x faster: a 2,000-song album was
+# ~80 ms of ElementTree.  tests/test_subsonic_pipeline.py holds it to the
+# ElementTree serializer byte for byte over randomized envelopes.  Keys are
+# schema names, written verbatim (ElementTree never escaped a tag or an
+# attribute name either).
 
 
 def _xml_scalar(v: Any) -> str:
@@ -247,52 +257,118 @@ def _xml_scalar(v: Any) -> str:
     return str(v)
 
 
-def _xml_walk(parent: _ET.Element, tag: str, value: Any) -> None:
-    if value is None:
-        return
-    if isinstance(value, dict):
-        elem = _ET.SubElement(parent, tag)
-        # Two passes: attributes first (scalar leaves), then children.
-        # The Subsonic XML schema treats lists/dicts as children and
-        # everything else as attributes on the enclosing element.  The
-        # reserved "_text" key becomes the element's text content (needed by
-        # <lyrics>…text…</lyrics> and any element whose body is character data,
-        # not an attribute).
-        for k, v in value.items():
-            if k == "_text":
-                continue
+# Strings that need any attribute escaping — most need none, so the
+# replacement chain below runs only for those.
+_XML_ATTR_SPECIAL = re.compile(r'[&<>"\r\n\t]')
+
+
+def _xml_attr_escape(s: str) -> str:
+    """ElementTree's ``_escape_attrib``: the same replacements in the same
+    order (``&`` first; tab / LF / CR as character references, so a parser
+    doesn't normalise them to spaces)."""
+    if "&" in s:
+        s = s.replace("&", "&amp;")
+    if "<" in s:
+        s = s.replace("<", "&lt;")
+    if ">" in s:
+        s = s.replace(">", "&gt;")
+    if "\"" in s:
+        s = s.replace("\"", "&quot;")
+    if "\r" in s:
+        s = s.replace("\r", "&#13;")
+    if "\n" in s:
+        s = s.replace("\n", "&#10;")
+    if "\t" in s:
+        s = s.replace("\t", "&#09;")
+    return s
+
+
+def _xml_text_escape(s: str) -> str:
+    """ElementTree's ``_escape_cdata`` (character data: ``& < >`` only)."""
+    if "&" in s:
+        s = s.replace("&", "&amp;")
+    if "<" in s:
+        s = s.replace("<", "&lt;")
+    if ">" in s:
+        s = s.replace(">", "&gt;")
+    return s
+
+
+def _xml_dict(out: list[str], tag: str, value: dict) -> None:
+    """``value`` as element ``tag`` appended to ``out``.
+
+    Scalar leaves become attributes, in order (``None`` skipped); lists and
+    dicts become children, in order, after them.  The Subsonic XML schema
+    treats lists/dicts as children and everything else as attributes on the
+    enclosing element.  The reserved "_text" key becomes the element's text
+    content (needed by <lyrics>…text…</lyrics> and any element whose body is
+    character data, not an attribute) — never an attribute; a dict / list
+    under it still becomes ``<_text>`` children, as it always did."""
+    head = ["<", tag]
+    kids = None
+    for k, v in value.items():
+        if k == "_text":
             if isinstance(v, (dict, list)):
-                continue
-            if v is None:
-                continue
-            elem.set(k, _xml_scalar(v))
-        if value.get("_text") is not None:
-            elem.text = _xml_scalar(value["_text"])
-        for k, v in value.items():
-            if isinstance(v, (dict, list)):
-                _xml_walk(elem, k, v)
-    elif isinstance(value, list):
-        for item in value:
-            if isinstance(item, (dict, list)):
-                _xml_walk(parent, tag, item)
+                kids = kids or []
+                kids.append((k, v))
+            continue
+        tv = type(v)
+        if tv is str:
+            head.append(f' {k}="{_xml_attr_escape(v) if _XML_ATTR_SPECIAL.search(v) else v}"')
+        elif tv is int or tv is float:
+            head.append(f' {k}="{v}"')        # str(): nothing to escape
+        elif tv is dict or tv is list:
+            kids = kids or []
+            kids.append((k, v))
+        elif v is None:
+            continue
+        elif tv is bool:
+            head.append(f' {k}="true"' if v else f' {k}="false"')
+        elif isinstance(v, (dict, list)):     # a dict / list subclass
+            kids = kids or []
+            kids.append((k, v))
+        else:
+            head.append(f' {k}="{_xml_attr_escape(str(v))}"')
+    text = value.get("_text")
+    text = _xml_scalar(text) if text is not None else ""
+    out.append("".join(head))
+    mark = len(out)
+    out.append(">")
+    if text:
+        out.append(_xml_text_escape(text))
+    if kids:
+        for k, v in kids:
+            if isinstance(v, dict):
+                _xml_dict(out, k, v)
             else:
-                # A repeated *scalar* becomes a repeated child element with text
-                # content — Subsonic/OpenSubsonic XML never uses multi-valued
-                # attributes.  e.g. openSubsonicExtensions' ``versions:[1]`` →
-                # ``<versions>1</versions>`` (spec-correct, and discoverable by
-                # strict XML clients).  The previous ``parent.set(tag, …)`` path
-                # flattened the list to a single attribute — silently keeping
-                # only the LAST value of a multi-element list.
-                child = _ET.SubElement(parent, tag)
-                child.text = _xml_scalar(item)
+                _xml_list(out, k, v)
+    if len(out) == mark + 1:
+        out[mark] = " />"                     # no text, no child produced
     else:
-        parent.set(tag, _xml_scalar(value))
+        out.append(f"</{tag}>")
+
+
+def _xml_list(out: list[str], tag: str, value: list) -> None:
+    """A list under ``tag``: each item its own ``tag`` element (a nested
+    list's items too).  A repeated *scalar* becomes a repeated child element
+    with text content — Subsonic/OpenSubsonic XML never uses multi-valued
+    attributes.  e.g. openSubsonicExtensions' ``versions:[1]`` →
+    ``<versions>1</versions>`` (spec-correct, and discoverable by strict XML
+    clients); ``None`` among them is the text "None", as ElementTree wrote it."""
+    for item in value:
+        if isinstance(item, dict):
+            _xml_dict(out, tag, item)
+        elif isinstance(item, list):
+            _xml_list(out, tag, item)
+        else:
+            s = _xml_scalar(item)
+            out.append(f"<{tag}>{_xml_text_escape(s)}</{tag}>" if s else f"<{tag} />")
 
 
 # Characters XML 1.0 forbids outright (escaping doesn't help): C0 controls
-# other than tab / LF / CR, and U+FFFE / U+FFFF.  ElementTree writes them
-# verbatim, so ONE stray control byte in a tag, a client name or a station
-# name made the whole document unparseable for every XML client.  Stripped
+# other than tab / LF / CR, and U+FFFE / U+FFFF.  Written verbatim (as
+# ElementTree did), ONE stray control byte in a tag, a client name or a station
+# name would make the whole document unparseable for every XML client.  Stripped
 # from the UTF-8 output in one C-speed pass (a UTF-8 multi-byte sequence
 # never contains bytes < 0x80, so the byte-level removal is safe).
 _XML_ILLEGAL = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\xef\xbf[\xbe\xbf]")
@@ -310,19 +386,35 @@ def _xml_strip_illegal(xml: bytes) -> bytes:
 
 def _envelope_to_xml(envelope: dict) -> bytes:
     body = envelope.get("subsonic-response", {})
-    root = _ET.Element("subsonic-response",
-                       attrib={"xmlns": "http://subsonic.org/restapi"})
+    # The root's attributes: ``xmlns`` first, then the scalars in order (a
+    # dict, so a body key named ``xmlns`` replaces the value in place, as
+    # ElementTree's ``set`` did); every value here is a top-level scalar.
+    attrs = {"xmlns": "http://subsonic.org/restapi"}
+    kids = []
     for k, v in body.items():
         if isinstance(v, (dict, list)):
-            _xml_walk(root, k, v)
+            kids.append((k, v))
         elif v is not None:
-            root.set(k, _xml_scalar(v))
-    try:
-        xml = _ET.tostring(root, encoding="utf-8")
-    except UnicodeEncodeError:
-        # A lone surrogate (undecodable tag bytes) can't be UTF-8 encoded at
-        # all — degrade those characters instead of failing the response.
-        xml = _ET.tostring(root, encoding="unicode").encode("utf-8", "replace")
+            attrs[k] = _xml_scalar(v)
+    out = ["<subsonic-response"
+           + "".join(f' {k}="{_xml_attr_escape(v)}"' for k, v in attrs.items())]
+    mark = len(out)
+    out.append(">")
+    for k, v in kids:
+        if isinstance(v, dict):
+            _xml_dict(out, k, v)
+        else:
+            _xml_list(out, k, v)
+    if len(out) == mark + 1:
+        out[mark] = " />"
+    else:
+        out.append("</subsonic-response>")
+    # A lone surrogate (undecodable file-name bytes, a broken tag) can't be
+    # UTF-8 encoded at all — degrade those characters to "?" instead of
+    # failing the response.  (ElementTree wrote them as ``&#55296;``-style
+    # references to a surrogate, which XML forbids: the WHOLE document was
+    # unparseable for every XML client.)
+    xml = "".join(out).encode("utf-8", "replace")
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + _xml_strip_illegal(xml)
 
 
@@ -350,6 +442,58 @@ _TEXT_ROOTS = ("lyrics", "lyricsList", "genres")
 
 
 _XML_MEDIA = "text/xml"
+_JSON_MEDIA = "application/json"
+
+
+# ── JSON serialization ──────────────────────────────────────────────────────
+# orjson: compact output (the same ``,`` / ``:`` separators Starlette's
+# JSONResponse used), keys in insertion order, ~4x faster than ``json.dumps``
+# (a 500-song page ~3.2 ms → ~0.8 ms).  Two deliberate differences, both "one
+# bad value never fails the whole listing":
+#   * a non-finite float (NaN / ±inf a mapper didn't sanitise) is ``null`` —
+#     ``json.dumps(allow_nan=False)`` raised, and @_wrap turned the WHOLE
+#     response into a code-0 error envelope;
+#   * a lone surrogate (undecodable file-name bytes in a client path, a broken
+#     tag) is "?" — UTF-8 can't carry it, and the old encode raised the same
+#     way.  (XML degrades it identically, ``_envelope_to_xml``.)
+# Floats keep their value but may be spelled differently (``1e-05`` →
+# ``0.00001``).  orjson refuses what it can't encode (an int beyond 64 bits, a
+# lone surrogate, a non-str key it can't coerce); that rare body goes through
+# the stdlib encoder instead (``_json_bytes_slow``) with the same rules.
+
+def _json_finite(obj: Any) -> Any:
+    """``obj`` with every non-finite float replaced by ``None`` — what orjson
+    writes for one (the stdlib encoder can't).  Copies only containers."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_finite(v) for v in obj]
+    return obj
+
+
+def _json_bytes_slow(obj: Any) -> bytes:
+    """The stdlib fallback for a body orjson refused: the encoder settings
+    Starlette's ``JSONResponse.render`` used, non-finite floats as ``null``
+    and lone surrogates as "?"."""
+    import json as _json
+    return _json.dumps(_json_finite(obj), ensure_ascii=False, allow_nan=False,
+                       indent=None, separators=(",", ":")).encode("utf-8", "replace")
+
+
+def _json_bytes(obj: Any) -> bytes:
+    """``obj`` as compact UTF-8 JSON (see above).  ``OPT_NON_STR_KEYS`` only
+    for a body that needs it — it doubles orjson's time on every body (a
+    2,000-song album: 1.4 → 2.7 ms)."""
+    try:
+        return orjson.dumps(obj)
+    except orjson.JSONEncodeError:
+        pass
+    try:
+        return orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS)
+    except orjson.JSONEncodeError:
+        return _json_bytes_slow(obj)
 
 
 def _ok(payload: dict[str, Any] | None = None, *, fmt: str = "xml") -> Response:
@@ -360,7 +504,7 @@ def _ok(payload: dict[str, Any] | None = None, *, fmt: str = "xml") -> Response:
         # (``_maybe_jsonp``) adds the ``callback(...)`` around them.
         if payload and any(k in payload for k in _TEXT_ROOTS):
             data = _json_normalize(data)
-        return JSONResponse(data)
+        return Response(content=_json_bytes(data), media_type=_JSON_MEDIA)
     # Spec default — XML, as ``text/xml`` (Starlette appends
     # ``; charset=utf-8``): the spec says an error from a binary endpoint
     # (stream, download, getCoverArt, getAvatar) has a content type starting
@@ -369,17 +513,18 @@ def _ok(payload: dict[str, Any] | None = None, *, fmt: str = "xml") -> Response:
     return Response(content=_envelope_to_xml(data), media_type=_XML_MEDIA)
 
 
-# XML listings at least this long are serialised in a worker thread: a
-# 9.7k-song folder was ~280 ms of ElementTree on the event loop, stalling every
-# other request.  ElementTree serialises in Python, so the loop gets the GIL
-# back every switch interval.  Below the threshold the hop (~0.1 ms) isn't
-# worth it.
-_OFFLOAD_MIN_ITEMS = 500
+# XML listings at least this long are serialised in a worker thread: the
+# string builder is Python (~13 µs a song), so the loop gets the GIL back every
+# switch interval — a 9.7k-song folder would otherwise be ~125 ms on the event
+# loop, stalling every other request.  Below the threshold a body is at most
+# ~5 ms, inside the catalogue build's 6 ms time slice (``_sx._SLICE_SEC``), and
+# the thread hop isn't worth it.
+_OFFLOAD_MIN_ITEMS = 400
 # JSON is one C call that holds the GIL throughout — in a thread it would stall
 # the loop just the same — so a big JSON listing is encoded item by item
-# (``_json_spliced``) in a worker thread instead: a 17k-song album was ~96 ms
-# of ``json.dumps`` on the loop.  Smaller bodies (a few ms) stay inline.
-_JSON_OFFLOAD_MIN_ITEMS = 2000
+# (``_json_spliced``) in a worker thread instead: a 17k-song album is ~30 ms of
+# orjson.  Smaller bodies (≤ ~5 ms at ~1.7 µs a song) stay inline.
+_JSON_OFFLOAD_MIN_ITEMS = 3000
 
 
 async def _ok_async(payload: dict[str, Any] | None = None, *, fmt: str = "xml",
@@ -395,7 +540,7 @@ async def _ok_async(payload: dict[str, Any] | None = None, *, fmt: str = "xml",
         if (splice is not None and n_hint >= _JSON_OFFLOAD_MIN_ITEMS and payload
                 and isinstance((payload.get(splice[0]) or {}).get(splice[1]), list)):
             body = await asyncio.to_thread(_json_spliced, payload, *splice)
-            return Response(content=body, media_type="application/json")
+            return Response(content=body, media_type=_JSON_MEDIA)
         return _ok(payload, fmt=fmt)
     if n_hint < _OFFLOAD_MIN_ITEMS:
         return _ok(payload, fmt=fmt)
@@ -408,7 +553,7 @@ def _err(code: int, message: str, *, fmt: str = "xml") -> Response:
     # error code lives in the envelope.
     f = (fmt or "xml").lower()
     if f in ("json", "jsonp"):
-        return JSONResponse(body, status_code=200)
+        return Response(content=_json_bytes(body), media_type=_JSON_MEDIA, status_code=200)
     return Response(content=_envelope_to_xml(body), media_type=_XML_MEDIA,
                     status_code=200)
 
@@ -755,7 +900,8 @@ class _SongCtx:
     lookups, so decorating a 5,000-song listing adds no per-item store work."""
 
     __slots__ = ("folder_on", "ratings", "starred", "store", "folder_names",
-                 "plays", "marks", "fixed_album", "cat", "roots", "artist_ids")
+                 "plays", "marks", "fixed_album", "cat", "roots", "artist_ids",
+                 "revs", "memo_gen")
 
     def __init__(self, store=None, user=None, *,
                  album: tuple[str, str] | None = None) -> None:
@@ -780,6 +926,13 @@ class _SongCtx:
         state = _get_state()
         self.starred = state.starred(uid, "song") if uid else {}
         self.marks = state.bookmarks(uid) if uid else {}
+        # The song memo (``_track_to_song``): the store's per-track write
+        # counters — a stub store without them gets no memo — and what the
+        # memoised fields depend on beyond the track itself.
+        revs = getattr(store, "_track_rev", None)
+        self.revs: dict[str, int] | None = revs if isinstance(revs, dict) else None
+        self.memo_gen = (_song_memo_gen(store, self.folder_on, self.roots)
+                         if self.revs is not None else 0)
 
     def folder_entry(self, t: dict) -> _sx.AlbumEntry | None:
         """The folder album an album-less track belongs to — the whole
@@ -811,7 +964,7 @@ _EXT_MIME = {
     "dsf": "audio/x-dsd", "dff": "audio/x-dsd", "wsd": "audio/x-dsd",
     "mpc": "audio/x-musepack", "wv": "audio/x-wavpack", "ape": "audio/x-ape",
     "wma": "audio/x-ms-wma", "mid": "audio/midi", "midi": "audio/midi", "kar": "audio/midi",
-    "sid": "audio/prs.sid", "psid": "audio/prs.sid",
+    "sid": "audio/prs.sid", "psid": "audio/prs.sid", "rsid": "audio/prs.sid",
     "mod": "audio/x-mod", "xm": "audio/x-mod", "s3m": "audio/x-mod", "it": "audio/x-mod",
 }
 # Delivered unchanged by /rest/stream (no format=): api/stream.NATIVE plus the
@@ -902,22 +1055,129 @@ def _client_path(t: dict, ctx: _SongCtx | None, owner: str, album: str | None) -
     return f"{_path_seg(owner, _sx.UNKNOWN_ARTIST)}/{_path_seg(album or '', 'Unknown')}/{base}"
 
 
-def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
-    """Map a SoniqBoom track dict to a Subsonic ``Child`` (song) object.
+# ── Song memo ────────────────────────────────────────────────────────────────
+# A song Child is ~35 keys and ~8 µs to build, and nearly all of it depends on
+# the track alone — so the static part is built once per track and kept; each
+# request copies it and adds what is the caller's own (``_song_user``):
+# userRating, starred, playCount, played, bookmarkPosition.  An entry is used
+# only while ALL of this still holds — validated per hit, nothing to invalidate:
+#   * it was built from this very track dict (identity) at the track's current
+#     write count — ``store._track_rev``, bumped by every upsert and every
+#     in-place field write (tag edit, duration backfill, cover art …);
+#   * the same store, folder-albums flag and scan roots (``_SongCtx.memo_gen``:
+#     the song's ``path`` is relative to its root, album-less songs point at
+#     their folder album only with the flag on);
+#   * for an album-less song shown in a folder album, the same (albumId,
+#     album) the catalogue resolves now — re-derived per hit (O(1)), since
+#     folder-album membership and names depend on the OTHER tracks in the
+#     folder and on the catalogue snapshot.
+# Skipped without a context, inside a fixed album (fa: getAlbum /
+# getMusicDirectory) and for stub stores without write counters.  Every
+# caller gets its own top-level dict (``_tune_child`` and getNowPlaying add
+# keys) and its own nested lists / dicts (``_song_expand``).  The memo lives
+# on the event loop (all song mapping does).
+#
+# The memo is kept invisible to CPython's cyclic GC: its pieces hold only
+# strings, numbers and tuples of them (nested lists / dicts in memo form —
+# ``_song_expand``), which the GC stops tracking, whereas any container that
+# holds a dict, list or object stays tracked for life.  So the pieces sit in
+# parallel maps instead of one entry tuple, the source dicts all in ONE map,
+# and the store behind a small integer (``_song_memo_gen``).  Built the
+# obvious way (an entry tuple with the song's lists inside), a full collection
+# walked ~7 objects per entry: ~85 ms of pause at 100k entries, against ~5 ms
+# this way.
+_SONG_META: dict[str, tuple] = {}     # id → (rev, gen, folder album or None)
+_SONG_HEAD: dict[str, dict] = {}      # id → keys before the caller's own
+_SONG_TAIL: dict[str, dict] = {}      # id → keys after them
+_SONG_SRC: dict[str, dict] = {}       # id → the track dict it was built from
+# ~2 KB an entry (~200 MB at the cap, measured), plus — for an entry whose
+# track was since replaced and never listed again — the old track dict it
+# pins until the memo is next cleared.
+_SONG_MEMO_MAX = 100_000
 
-    ``artist`` / ``artistId`` are the TRACK artist (a compilation track shows
-    and links its own artist); ``albumArtist`` / ``parent`` follow the owner
-    (album artist, else track artist) the album grouping uses.
 
-    Album-less tracks (retro archives) never get a dangling album id: with
-    folder albums on — and always for a track with no artist at all, which
-    ``[Unknown Artist]`` lists inside its folder — they point at their folder
-    album (``fa:<dir_hash>`` or, in a mixed folder, their owner's share of
-    it; album = the folder album's name); otherwise their parent is their
-    artist, the directory ``getMusicDirectory`` lists them under, and
-    ``albumId`` is omitted.  A placeholder artist tag (``<?>``) is shown as
-    tagged but its ids point at ``[Unknown Artist]``.  ``path`` is relative to
-    the file's scan root (never a server path or share address)."""
+def _song_memo_clear() -> None:
+    for m in (_SONG_META, _SONG_HEAD, _SONG_TAIL, _SONG_SRC):
+        m.clear()
+
+
+# (id(store), folder-albums flag, scan roots) → (gen, the store): the store
+# is pinned while its gen exists, so its id can't be reused meanwhile.
+_SONG_GENS: dict[tuple, tuple[int, Any]] = {}
+_SONG_GENS_MAX = 64
+_SONG_GEN_SEQ = itertools.count(1)
+
+
+def _song_memo_gen(store, folder_on: bool, roots: tuple[str, ...]) -> int:
+    """The memo generation of (store, folder-albums flag, scan roots) — the
+    context a memoised song is valid in."""
+    key = (id(store), folder_on, roots)
+    hit = _SONG_GENS.get(key)
+    if hit is None or hit[1] is not store:
+        if len(_SONG_GENS) >= _SONG_GENS_MAX:
+            _SONG_GENS.clear()                   # (many test stores) — start over
+            _song_memo_clear()
+        hit = _SONG_GENS[key] = (next(_SONG_GEN_SEQ), store)
+    return hit[0]
+
+
+def _song_expand(out: dict) -> dict:
+    """A song in memo form (``_song_static``: artists / albumArtists as
+    ``(id, name)``, isrc as the string or None, genres as a tuple of names,
+    replayGain as ``(trackGain, albumGain, trackPeak, albumPeak)`` with None
+    for an omitted one) → the response's own lists / dicts, fresh per
+    response — nothing nested is shared between responses."""
+    a = out["artists"]
+    out["artists"] = [{"id": a[0], "name": a[1]}]
+    a = out["albumArtists"]
+    out["albumArtists"] = [{"id": a[0], "name": a[1]}]
+    a = out["isrc"]
+    out["isrc"] = [a] if a else []
+    out["genres"] = [{"name": g} for g in out["genres"]]
+    tg, ag, tp, ap = out["replayGain"]
+    rg = out["replayGain"] = {}
+    if tg is not None:
+        rg["trackGain"] = tg
+    if ag is not None:
+        rg["albumGain"] = ag
+    if tp is not None:
+        rg["trackPeak"] = tp
+    if ap is not None:
+        rg["albumPeak"] = ap
+    return out
+
+
+def _song_folder_album(t: dict, ctx: _SongCtx | None, dh: str) -> tuple[str, str]:
+    """``(albumId, album)`` for an album-less track in folder ``dh`` that is
+    listed in a folder album: the fixed album it's listed inside, else (folder
+    albums on) its folder album or its owner's share of a mixed one, else
+    the whole folder's ``fa:<dir_hash>``, named after the directory."""
+    album_id: str | None = None
+    al = ""
+    fixed = ctx.fixed_album if ctx is not None else None
+    if fixed is not None:
+        album_id, al = fixed
+    elif ctx is not None and ctx.folder_on:
+        e = ctx.folder_entry(t)
+        if e is not None:
+            album_id, al = e.id, e.name
+    if album_id is None:
+        album_id = _sx.folder_album_id(dh)
+        names = ctx.folder_names if ctx is not None else None
+        al = names.get(dh) if names is not None else None
+        if al is None:
+            al = _sx.folder_album_name(ctx.store if ctx is not None else None, dh)
+            if names is not None:
+                names[dh] = al
+    return album_id, al
+
+
+def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | None]:
+    """The parts of ``_track_to_song`` that don't depend on the caller:
+    ``(head, tail, folder album)`` — the keys before and after the per-user
+    block, in output order, plus the ``(albumId, album)`` an album-less song
+    got from its folder (``None`` otherwise).  Fresh dicts, in memo form:
+    no list or dict inside (``_song_expand``)."""
     aa = _sx.owner_of(t)
     al = (t.get("album") or "").strip()
     genre_list = t.get("genre") or []
@@ -943,25 +1203,13 @@ def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
             if ids is not None:
                 ids[ar] = artist_id
     album_id: str | None = None
+    folder_album = None
     dh = t.get("dir_hash")
-    fixed = ctx.fixed_album if ctx is not None else None
     if al:
         album_id = _album_id(aa, al)
-    elif dh and (fixed is not None or (ctx is not None and ctx.folder_on) or not aa):
-        if fixed is not None:
-            album_id, al = fixed
-        elif ctx is not None and ctx.folder_on:
-            e = ctx.folder_entry(t)
-            if e is not None:
-                album_id, al = e.id, e.name
-        if album_id is None:
-            album_id = _sx.folder_album_id(dh)
-            names = ctx.folder_names if ctx is not None else None
-            al = names.get(dh) if names is not None else None
-            if al is None:
-                al = _sx.folder_album_name(ctx.store if ctx is not None else None, dh)
-                if names is not None:
-                    names[dh] = al
+    elif dh and ((ctx is not None and (ctx.fixed_album is not None or ctx.folder_on))
+                 or not aa):
+        album_id, al = folder_album = _song_folder_album(t, ctx, dh)
     aa_disp = aa or _sx.UNKNOWN_ARTIST
     dur = t.get("duration")
     if t.get("start_subsong"):
@@ -996,8 +1244,10 @@ def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
     # existing clients).
     out["displayArtist"] = out["artist"]
     out["displayAlbumArtist"] = aa_disp
-    out["artists"] = [{"id": artist_id, "name": ar or aa_disp}]
-    out["albumArtists"] = [{"id": owner_id, "name": aa_disp}]
+    # (``artists`` / ``albumArtists`` / ``isrc`` / ``genres`` / ``replayGain``
+    # in their memo form — ``_song_expand`` makes the response's own.)
+    out["artists"] = (artist_id, ar or aa_disp)
+    out["albumArtists"] = (owner_id, aa_disp)
     if album_id is not None:
         out["albumId"] = album_id
     created = _iso(t.get("added_at"))
@@ -1006,51 +1256,35 @@ def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
     if t_suffix:
         out["transcodedContentType"] = t_mime
         out["transcodedSuffix"] = t_suffix
-    if ctx is not None:
-        tid = t["id"]
-        r = ctx.ratings.get(tid)
-        if r:
-            out["userRating"] = r
-        st = ctx.starred.get(tid)
-        if st:
-            out["starred"] = _iso(st)
-        ps = ctx.plays.get(tid)
-        out["playCount"] = _safe_int(ps.get("count")) if isinstance(ps, dict) else 0
-        if isinstance(ps, dict) and ps.get("last_played"):
-            played = _iso(ps["last_played"])
-            if played:
-                out["played"] = played
-        bm = ctx.marks.get(tid)
-        if bm:
-            out["bookmarkPosition"] = int(_ts_num(bm.get("position")))
     # ── OpenSubsonic optional fields ────────────────────────────────────────
     # Capability-aware clients (Symfonium, Amperfy, Feishin) read these to show
     # bit depth / sample rate, apply ReplayGain themselves, and render
     # multi-valued genres.  Audio-property fields are emitted only when the
     # track carries them (a missing value must never advertise a wrong one);
     # tag fields the spec lists are always present, empty when untagged.
+    tail: dict = {}
     ch = _safe_int(t.get("channels"))
     if ch:
-        out["channelCount"] = ch
+        tail["channelCount"] = ch
     sr = _safe_int(t.get("sample_rate"))
     if sr:
-        out["samplingRate"] = sr
+        tail["samplingRate"] = sr
     bd = _safe_int(t.get("bit_depth"))
     if bd:
-        out["bitDepth"] = bd
-    out["mediaType"] = "song"
-    out["bpm"] = _safe_int(t.get("bpm"), round_=True)
-    out["comment"] = t.get("comment") or ""
-    out["displayComposer"] = t.get("composer") or ""
+        tail["bitDepth"] = bd
+    tail["mediaType"] = "song"
+    tail["bpm"] = _safe_int(t.get("bpm"), round_=True)
+    tail["comment"] = t.get("comment") or ""
+    tail["displayComposer"] = t.get("composer") or ""
     isrc = t.get("isrc")
-    out["isrc"] = [isrc] if isrc and isinstance(isrc, str) else []
+    tail["isrc"] = isrc if isrc and isinstance(isrc, str) else None
     # OpenSubsonic `genres` is a repeated element with a `name` attribute.
-    out["genres"] = [{"name": g} for g in genre_list if g]
+    tail["genres"] = tuple([g for g in genre_list if g])
     # ReplayGain — the exact fields Amperfy/Symfonium look for to level volume
     # server-side-tagged. dB gains + linear peaks; omit any that's absent.
-    # A malformed tag can parse to nan/inf (float("nan") succeeds); Starlette's
-    # JSONResponse serialises with allow_nan=False and would 500 the WHOLE
-    # listing on one bad file, so drop any non-finite value here.
+    # A malformed tag can parse to nan/inf (float("nan") succeeds); the JSON
+    # encoder would write it as null and XML as "nan" — never a usable gain —
+    # so drop any non-finite value here.
     def _fin(v, nd):
         if v is None:
             return None
@@ -1059,16 +1293,85 @@ def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
         except (TypeError, ValueError):
             return None
         return round(fv, nd) if math.isfinite(fv) else None
-    rg: dict = {}
-    for _k, _src, _nd in (("trackGain", "replaygain_track_gain", 2),
-                          ("albumGain", "replaygain_album_gain", 2),
-                          ("trackPeak", "replaygain_track_peak", 6),
-                          ("albumPeak", "replaygain_album_peak", 6)):
-        _v = _fin(t.get(_src), _nd)
-        if _v is not None:
-            rg[_k] = _v
-    out["replayGain"] = rg
-    return out
+    # (trackGain, albumGain, trackPeak, albumPeak), None = omitted.
+    tail["replayGain"] = (_fin(t.get("replaygain_track_gain"), 2),
+                          _fin(t.get("replaygain_album_gain"), 2),
+                          _fin(t.get("replaygain_track_peak"), 6),
+                          _fin(t.get("replaygain_album_peak"), 6))
+    return out, tail, folder_album
+
+
+def _song_user(out: dict, tid: str, ctx: _SongCtx) -> None:
+    """Add the caller's fields for track ``tid`` to ``out`` (in place): the
+    library-wide rating and play stats, the caller's star and bookmark."""
+    r = ctx.ratings.get(tid)
+    if r:
+        out["userRating"] = r
+    st = ctx.starred.get(tid)
+    if st:
+        out["starred"] = _iso(st)
+    ps = ctx.plays.get(tid)
+    out["playCount"] = _safe_int(ps.get("count")) if isinstance(ps, dict) else 0
+    if isinstance(ps, dict) and ps.get("last_played"):
+        played = _iso(ps["last_played"])
+        if played:
+            out["played"] = played
+    bm = ctx.marks.get(tid)
+    if bm:
+        out["bookmarkPosition"] = int(_ts_num(bm.get("position")))
+
+
+def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
+    """Map a SoniqBoom track dict to a Subsonic ``Child`` (song) object.
+
+    ``artist`` / ``artistId`` are the TRACK artist (a compilation track shows
+    and links its own artist); ``albumArtist`` / ``parent`` follow the owner
+    (album artist, else track artist) the album grouping uses.
+
+    Album-less tracks (retro archives) never get a dangling album id: with
+    folder albums on — and always for a track with no artist at all, which
+    ``[Unknown Artist]`` lists inside its folder — they point at their folder
+    album (``fa:<dir_hash>`` or, in a mixed folder, their owner's share of
+    it; album = the folder album's name); otherwise their parent is their
+    artist, the directory ``getMusicDirectory`` lists them under, and
+    ``albumId`` is omitted.  A placeholder artist tag (``<?>``) is shown as
+    tagged but its ids point at ``[Unknown Artist]``.  ``path`` is relative to
+    the file's scan root (never a server path or share address).
+
+    The caller-independent part comes from the song memo (see above) when a
+    context allows it; the result is always the caller's own top-level dict."""
+    if ctx is None:
+        out, tail, _ = _song_static(t, None)
+        out.update(tail)
+        return _song_expand(out)
+    tid = t["id"]
+    revs = ctx.revs
+    if revs is None or ctx.fixed_album is not None:
+        out, tail, _ = _song_static(t, ctx)             # fresh: no copy needed
+    else:
+        rev = revs.get(tid, 0)
+        meta = _SONG_META.get(tid)
+        if (meta is None or meta[0] != rev or meta[1] != ctx.memo_gen
+                or _SONG_SRC.get(tid) is not t
+                or (meta[2] is not None
+                    and meta[2] != _song_folder_album(t, ctx, t.get("dir_hash")))):
+            out, tail, folder_album = _song_static(t, ctx)
+            # Only the store's own dict is kept — a copy (a smart playlist's
+            # search results) would just displace it.
+            if ctx.store.get_track(tid) is t:
+                if len(_SONG_META) >= _SONG_MEMO_MAX:
+                    _song_memo_clear()
+                _SONG_META[tid] = (rev, ctx.memo_gen, folder_album)
+                _SONG_HEAD[tid] = out
+                _SONG_TAIL[tid] = tail
+                _SONG_SRC[tid] = t
+                out = out.copy()
+        else:
+            out = _SONG_HEAD[tid].copy()
+            tail = _SONG_TAIL[tid]
+    _song_user(out, tid, ctx)
+    out.update(tail)
+    return _song_expand(out)
 
 
 # ── Multi-tune files: one Child per tune ─────────────────────────────────────
@@ -1755,10 +2058,9 @@ def _wrap(handler):
                     raise
                 except Exception:  # noqa: BLE001 — last-resort envelope, not a swallow
                     # Any other unexpected failure would otherwise surface as a
-                    # raw HTTP 500 (or, for a non-finite float reaching
-                    # JSONResponse, a 500 from ``allow_nan=False``) — which
-                    # Subsonic clients treat as a transport error, not a
-                    # protocol error, and often show as "server unreachable".
+                    # raw HTTP 500 — which Subsonic clients treat as a
+                    # transport error, not a protocol error, and often show as
+                    # "server unreachable".
                     # Convert it to a generic Subsonic error envelope (code 0)
                     # so the client shows a real message; log the traceback so
                     # the operator can still see it.
@@ -2185,19 +2487,17 @@ _SPLICE = "__sb_splice_list__"
 def _json_spliced(payload: dict, root_key: str, list_key: str) -> bytes:
     """``_ok(payload, fmt="json").body`` byte for byte, encoded piece by
     piece: the envelope with ``payload[root_key][list_key]`` swapped for a
-    marker, and each list item on its own, then spliced.  One ``json.dumps``
-    of a 2.4 MB artist index is a ~20 ms C call that holds the GIL — in a
-    worker thread it still stalls the event loop for all of it; per item the
-    loop gets the GIL back between calls.  Same encoder settings as
-    Starlette's ``JSONResponse.render``."""
-    import json as _json
+    marker, and each list item on its own, then spliced.  One ``orjson.dumps``
+    of a 17k-song album is one ~30 ms C call that holds the GIL — in a worker
+    thread it still stalls the event loop for all of it; per item the loop
+    gets the GIL back between calls.  The same encoder as ``_ok``
+    (``_json_bytes``) for every piece — an item orjson refuses falls back on
+    its own, its values unchanged."""
     inner = payload[root_key]
     items = inner[list_key]
     head = _ok({**payload, root_key: {**inner, list_key: _SPLICE}}, fmt="json").body
-    enc = functools.partial(_json.dumps, ensure_ascii=False, allow_nan=False,
-                            indent=None, separators=(",", ":"))
-    body = b"[" + b",".join(enc(it).encode("utf-8") for it in items) + b"]"
-    return head.replace(enc(_SPLICE).encode("utf-8"), body, 1)
+    body = b"[" + b",".join([_json_bytes(it) for it in items]) + b"]"
+    return head.replace(_json_bytes(_SPLICE), body, 1)
 
 
 async def _cached_render(cat: _sx.Catalogue, slot: tuple, tag: Any, fmt: str, build,
@@ -2229,7 +2529,7 @@ async def _cached_render(cat: _sx.Catalogue, slot: tuple, tag: Any, fmt: str, bu
     if hit is None or hit[0] != tag:
         if is_json and splice is not None:
             body_ = await asyncio.to_thread(lambda: _json_spliced(build(), *splice))
-            media_ = "application/json"
+            media_ = _JSON_MEDIA
         else:
             resp = await asyncio.to_thread(lambda: _ok(build(), fmt=f))
             body_, media_ = resp.body, resp.media_type
@@ -2975,7 +3275,6 @@ def _dead_root_hashes(store) -> frozenset:
         sds = getattr(store, "_scan_dirs", None)
         if not isinstance(sds, dict) or not sds:
             return frozenset()
-        from soniqboom.api.tracks import _REMOTE_PREFIXES
         get_source = None
         dead = set()
         for path, sd in sds.items():
@@ -2984,7 +3283,7 @@ def _dead_root_hashes(store) -> frozenset:
             ph = sd.get("path_hash") or hashlib.sha256(path.encode()).hexdigest()[:16]
             if sd.get("status") == "unavailable":
                 dead.add(ph)
-            elif path.startswith(_REMOTE_PREFIXES):
+            elif _is_remote_path(path):
                 if get_source is None:
                     from soniqboom.core.filesource import get_source
                 if get_source(path) is None:     # a remote root's path IS its source key
@@ -3134,7 +3433,7 @@ async def get_random_songs(
 
 # ── Streaming proxy ──────────────────────────────────────────────────────────
 
-_REMOTE_SCHEMES = ("smb://", "ftp://", "http://", "https://")
+from soniqboom.core.filesource import is_remote_path as _is_remote_path  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -3144,11 +3443,16 @@ def _stream_preauthed():
     (the one the cast byte-server uses): ``stream_track`` then skips its own
     credential check — which re-ran the password check (a scrypt, for
     ``p=``) on every stream request, and can't verify an API key at all.  A
-    rendered format is served as the complete file (exact Content-Length),
-    not the web player's progressive render; a ``format`` / ``maxBitRate``
-    transcode that isn't cached yet streams live (chunked, no
-    Content-Length, no Range) until the cache has it.  A ContextVar, never
-    a parameter: nothing a request carries can set it."""
+    rendered format whose length is exact before it renders (SID, SNDH)
+    streams while it renders, with that exact Content-Length and 206 answers
+    to Range requests against it; the others are served as the complete file
+    (exact Content-Length), not the web player's progressive render.  A
+    ``format`` / ``maxBitRate`` transcode that isn't cached yet streams live
+    (chunked, no Content-Length, no Range) until the cache has it — encoding
+    a rendered format while it renders, except with a ``timeOffset`` or, for
+    a render whose length isn't exact, ``estimateContentLength`` (those wait
+    for the finished render).  A ContextVar, never a parameter: nothing a
+    request carries can set it."""
     from soniqboom.api import stream as _st
     tok = _st._set_cast_internal_bypass(True)
     try:
@@ -3212,7 +3516,7 @@ def _head_response(media_type: str, length: int | None) -> Response:
 
 
 async def _local_size(path: str) -> int | None:
-    if not path or path.startswith(_REMOTE_SCHEMES) or "::" in path:
+    if not path or _is_remote_path(path) or "::" in path:
         return None
     try:
         return (await asyncio.to_thread(os.stat, path)).st_size
@@ -3981,7 +4285,7 @@ async def get_transcode_decision(
         mtime: float = 0.0
         size: int = 0
         path = track.get("path") or ""
-        if not path.startswith(_REMOTE_SCHEMES) and "::" not in path:
+        if not _is_remote_path(path) and "::" not in path:
             try:
                 st = await asyncio.to_thread(os.stat, path)
                 mtime = float(st.st_mtime)
@@ -4079,7 +4383,7 @@ async def get_transcode_stream(
     # Compare both mtime (float, sub-second precision) AND size — defeats the
     # "rename-and-replace preserves mtime" silent-stale window.
     path = track.get("path") or ""
-    if claims.get("mt") and not path.startswith(_REMOTE_SCHEMES) and "::" not in path:
+    if claims.get("mt") and not _is_remote_path(path) and "::" not in path:
         try:
             st = await asyncio.to_thread(os.stat, path)
             claimed_mt = float(claims["mt"])
@@ -4371,7 +4675,7 @@ def _placeholder_ttl(store, track_id: str) -> int:
     if _source_offline(t):
         return _PLACEHOLDER_SHORT_MAX_AGE
     path = t.get("path") or ""
-    if (path.startswith(("ftp://", "smb://")) and t.get("cover_art")
+    if (_is_remote_path(path) and t.get("cover_art")
             and not store.is_art_absent(track_id)):
         return _PLACEHOLDER_SHORT_MAX_AGE           # backfill pending
     return _PLACEHOLDER_MAX_AGE

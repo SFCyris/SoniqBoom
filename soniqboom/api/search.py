@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import re
 
-import orjson
 from fastapi import APIRouter, HTTPException, Query, Response
 
+from soniqboom.api.tracks import json_bytes, json_route, public_tracks
 from soniqboom.core.data import ft_search, ft_search_dicts, get_track
 from soniqboom.models.track import TrackMeta
 
@@ -121,7 +121,7 @@ async def search(
     Also supports advanced syntax: artist:Ghost album:Impera year:>2020
     """
     dicts = await run_search_dicts(q, limit=limit)
-    return Response(content=orjson.dumps(dicts), media_type="application/json")
+    return Response(content=json_bytes(dicts), media_type="application/json")
 
 
 @router.get("/quick", response_model=list[TrackMeta])
@@ -133,7 +133,7 @@ async def quick_search(
     return await run_search(q, limit=limit)
 
 
-@router.get("/filter", response_model=list[TrackMeta])
+@json_route(router, "/filter")
 async def filter_tracks(
     artist: str | None = None,
     album_artist: str | None = None,
@@ -151,6 +151,12 @@ async def filter_tracks(
     Uses *_tag fields (TagField with separator=\\x01) for exact case-insensitive
     matching on artist / album_artist / album.  Genre stays as TagField with
     default comma separator.
+
+    Rows are TrackMeta-shaped (``tracks.public_track``) and encoded with orjson
+    rather than validated against a ``list[TrackMeta]`` response model — the
+    same JSON, minus the per-row model build.  A stored row the model rejects
+    is skipped (the full-text branch always did; the ``scene_group`` branch
+    used to 500 the whole drill-down on one).
     """
     # ``scene_group`` (the Demozoo browse facet) is NOT a full-text field, so
     # resolve it — and any co-filters — straight against the store's maintained
@@ -158,13 +164,13 @@ async def filter_tracks(
     if scene_group:
         from soniqboom.core.store import get_store
         store = get_store()
-        return store.filter_tracks(
+        return public_tracks(store.filter_tracks(
             artist=artist, album_artist=album_artist, album=album, genre=genre,
             scene_group=scene_group, format_=format,
             year_min=year_min, year_max=year_max, limit=limit, offset=offset,
             # Honour the "hide duplicates" config so the drill-down LIST matches
             # the deduped browse COUNT (every FT-routed facet already does this).
-            filter_duplicates=bool(store.get_config("filter_duplicates", False)))
+            filter_duplicates=bool(store.get_config("filter_duplicates", False))))
     parts: list[str] = []
     if artist:
         parts.append(f"@artist_tag:{{{_esc_tag(artist)}}}")
@@ -187,7 +193,7 @@ async def filter_tracks(
     elif year_max is not None:
         parts.append(f"@year:[-inf {year_max}]")
     query = " ".join(parts) if parts else "*"
-    return await ft_search(query, limit=limit, offset=offset)
+    return public_tracks(await ft_search_dicts(query, limit=limit, offset=offset))
 
 
 @router.get("/similar/{track_id}")

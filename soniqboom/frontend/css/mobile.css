@@ -423,7 +423,7 @@ input, select, textarea { touch-action: manipulation; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  height: 100%;
+  min-height: 100%;          /* grows (and the view scrolls) with a tune list */
   padding: 16px 24px 24px;
   gap: 16px;
 }
@@ -482,6 +482,48 @@ input, select, textarea { touch-action: manipulation; }
   color: var(--bg);
   font-size: 28px;
 }
+
+/* Tunes of a multi-tune file (SID, Amiga module, console rip): tap to play. */
+.m-np-tunes { width: 100%; max-width: 480px; }
+.m-np-tunes[hidden] { display: none; }
+.m-np-tunes-hdr {
+  font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 0 4px 6px;
+}
+.m-np-tunes-count { font-weight: 400; }
+.m-np-tune-list {
+  max-height: 44vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.m-np-tune-item { border-bottom: 1px solid var(--border); }
+.m-np-tune-item:last-child { border-bottom: 0; }
+.m-np-tune {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; min-height: 44px;
+  padding: 0 14px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit; font-size: 15px;
+  text-align: left;
+}
+.m-np-tune:active { background: var(--surface-2); }
+.m-np-tune-name { flex: 1 1 auto; }
+.m-np-tune-def {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 5px;
+}
+.m-np-tune-len { color: var(--text-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
+.m-np-tune.playing { color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.m-np-tune.playing .m-np-tune-name { font-weight: 600; }
 
 /* ── Action sheet (long-press menu) ────────────────────────────────────── */
 

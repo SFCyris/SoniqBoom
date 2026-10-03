@@ -426,6 +426,7 @@ async def store_cached(
     size_bytes = await asyncio.to_thread(_place_and_size)
     now = time.time()
     _clear_render_failure(cache_key)
+    _silent_keys.pop(cache_key, None)
 
     with _state_lock:
         # Idempotent accounting: if this key already had an entry (e.g. two
@@ -701,6 +702,65 @@ def recent_failure(track_id: str, subsong: int | None = None) -> dict | None:
     return found
 
 
+# ── Silent renders ──────────────────────────────────────────────────────────
+# A render that finished cleanly but holds nothing audible (``core.silence``)
+# is never cached: the caller gets a 422 saying so instead of minutes of
+# silence.  Every emulator / synth render is judged; a transcode of a real
+# recording is what it is.  ``known_silent`` remembers such a key for a while:
+# ``get_or_render`` then answers the 422 without rendering the silence again,
+# and the progressive paths (which can judge a render only after streaming it)
+# don't stream it again.
+SILENT_RENDER_DETAIL = ("This tune plays only silence — the renderer produced "
+                        "nothing audible for it.")
+_SILENCE_EXEMPT = frozenset({"transcoded"})
+_silent_keys: "OrderedDict[str, float]" = OrderedDict()
+_SILENT_TTL_S = 600.0
+_SILENT_MAX = 512
+
+
+def note_silent(cache_key: str) -> None:
+    """Remember that a render of ``cache_key`` came out silent."""
+    _silent_keys[cache_key] = time.monotonic()
+    _silent_keys.move_to_end(cache_key)
+    while len(_silent_keys) > _SILENT_MAX:
+        _silent_keys.popitem(last=False)
+
+
+def known_silent(cache_key: str) -> bool:
+    """Did a render of ``cache_key`` come out silent within ``_SILENT_TTL_S``?"""
+    t = _silent_keys.get(cache_key)
+    if t is None:
+        return False
+    if time.monotonic() - t >= _SILENT_TTL_S:
+        _silent_keys.pop(cache_key, None)
+        return False
+    return True
+
+
+async def refuse_silent(cache_key: str, format_type: str, wav_path: Path) -> None:
+    """Raise a 422 (and drop ``wav_path`` with any VU sidecar beside it) when
+    the render about to be cached under ``cache_key`` is silent.  A render
+    that can't be judged (another sample format) passes.  The read runs in a
+    thread and stops at the first audible block."""
+    if format_type in _SILENCE_EXEMPT:
+        return
+    from soniqboom.core.silence import wav_audible
+    try:
+        audible = await asyncio.to_thread(wav_audible, Path(wav_path))
+    except Exception:
+        audible = None
+    if audible is not False:
+        return
+    for p in (Path(wav_path), Path(wav_path).with_suffix(".vu")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    note_silent(cache_key)
+    log.info("Render of %s is silent — not cached", cache_key)
+    raise HTTPException(422, SILENT_RENDER_DETAIL)
+
+
 def _note_failure_from(cache_key: str, exc: BaseException) -> None:
     """Record ``exc`` as the render failure of ``cache_key`` — an HTTP error
     with its status and detail, anything else as a 502.  A cancellation (a
@@ -757,6 +817,11 @@ async def get_or_render(
     if cached:
         _cstats.hit("conversion")
         return cached, True
+    # A render of this key came out silent a moment ago: say so again
+    # rather than render the silence again (``_SILENT_TTL_S``).
+    if known_silent(key):
+        note_render_failure(key, 422, SILENT_RENDER_DETAIL)
+        raise HTTPException(422, SILENT_RENDER_DETAIL)
 
     # Slow path: serialise cold callers for this key.  Inside the lock the
     # cache-check + inflight-register sequence is atomic, so two coroutines
@@ -815,6 +880,7 @@ async def get_or_render(
     async def _render_and_store() -> Path:
         try:
             tmp_path = await render_fn()
+            await refuse_silent(key, format_type, tmp_path)
             return await store_cached(key, format_type, tmp_path, cold=cold)
         except BaseException as exc:
             _note_failure_from(key, exc)
@@ -915,6 +981,7 @@ async def start_background_render(
         _clear_render_failure(cache_key)
         try:
             tmp_path = await render_fn()
+            await refuse_silent(cache_key, format_type, tmp_path)
             await store_cached(cache_key, format_type, tmp_path)
             log.info("Background render complete: %s", cache_key)
         except Exception as exc:

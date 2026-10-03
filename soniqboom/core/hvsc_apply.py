@@ -27,6 +27,8 @@ import hashlib
 import logging
 from pathlib import Path
 
+from soniqboom.core.filesource import is_remote_path
+
 log = logging.getLogger(__name__)
 
 
@@ -85,7 +87,7 @@ async def apply_hvsc_to_library(*, reload: bool = False,
         if md5:
             return t, md5, False            # cached — no I/O, nothing to persist
         path_str = t.get("path") or ""
-        if path_str.startswith(("smb://", "ftp://")):
+        if is_remote_path(path_str):
             if "::" in path_str:
                 # SID inside a REMOTE archive ("…/archive.zip::member.sid"):
                 # route through the shared resolver, which splits the "::" tail

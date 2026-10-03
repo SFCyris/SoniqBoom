@@ -241,6 +241,17 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Gate: archive members must read back intact ──────────────────────────────
+# lhafile's decoder was just compiled for THIS architecture, and a scan reads
+# archive members from forked worker processes (Linux).  The self-test builds
+# an LHA archive (stored + -lh5- members) and a ZIP in a temp dir, then checks
+# every member's bytes and CRC through lhafile and through fork-started workers
+# reading via soniqboom.core.archive, as a scan does.  Any mismatch fails the
+# build, so an image that drops archive members can't ship (in one scan 274 of
+# AHXSONGS.LHA's 513 members failed "crc is not matched").  A hung worker fails
+# it too (--deadline, 600 s).  -B: no .pyc in the layer.
+RUN python -B /app/scripts/archive_selftest.py
+
 # The bundled soundfonts/ (~260 MB) is excluded from the image; point the app's
 # SoundFont lookup at the apt-provided GM SoundFont so MIDI plays out of the box.
 # Add richer SoundFonts at runtime via Settings → SoundFonts.

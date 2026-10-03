@@ -45,8 +45,8 @@ GENERIC_FTYP = struct.pack(">I", 32) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" +
 
 def supports_ranges(source) -> bool:
     """Does ``source`` do real range reads?  The ``FileSource`` defaults read
-    the whole file and slice it (WebDAV), so a window there would cost more
-    than one whole read."""
+    the whole file and slice it, so a window there would cost more than one
+    whole read."""
     from soniqboom.core.filesource import FileSource
     cls = type(source)
     return (getattr(cls, "read_partial", None) is not FileSource.read_partial

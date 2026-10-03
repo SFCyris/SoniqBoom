@@ -33,9 +33,6 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_REMOTE_SCHEMES = ("smb://", "ftp://", "http://", "https://",
-                   "webdav://", "webdavs://")
-
 
 def read_source_bytes(path_str: str, *, lane: str = "stream") -> bytes | None:
     """Raw bytes for a local / archive-virtual / remote / composite path.
@@ -51,17 +48,27 @@ def read_source_bytes(path_str: str, *, lane: str = "stream") -> bytes | None:
     reached or extracted; never raises.
     """
     try:
+        from soniqboom.core.filesource import is_remote_path
         outer, sep, rest = path_str.partition("::")
-        if outer.startswith(_REMOTE_SCHEMES):
+        if is_remote_path(outer):
             # Mirror only the OUTER remote file (the module itself, or the
             # archive that contains it) into the local remote-cache first.
             from soniqboom.core.filesource import get_source, parse_remote_path
             from soniqboom.core.remote_cache import get_cache
             scan_root, remote_path = parse_remote_path(outer)
-            source = get_source(scan_root) if remote_path else None
-            if source is None:
+            if not remote_path:
                 return None
-            local = get_cache().fetch(scan_root, remote_path, source, lane=lane)
+            # No source (not connected, or its sign-in refused): what the
+            # remote cache holds still answers.
+            source = get_source(scan_root)
+            if sep:
+                # Only the member's bytes when the archive isn't cached.
+                from soniqboom.core.remote_zip import archive_for_member
+                local = archive_for_member(scan_root, remote_path, rest, source, lane=lane)
+            elif source is not None:
+                local = get_cache().fetch(scan_root, remote_path, source, lane=lane)
+            else:
+                local = get_cache().get_cached(scan_root, remote_path)
             if not local:
                 return None
             outer = str(local)

@@ -725,7 +725,21 @@
 // v217: TOSEC / Redump downloaded files are kept — "Add … from the downloaded
 // pack/lists", "Continue the … download", "Delete the downloaded …", a Stop
 // button; a stopped download shows as stopped; polling survives a restart.
-const SHELL_VERSION = 'v217';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v218: tune lists — the phone's Now Playing lists a multi-tune file's tunes
+// (tap to play one; its number follows the title), and Track Info lists the
+// tunes of console rips (NSF, GBS, AY, SAP, …) too (utils.js
+// subsongVirtualTrack).  index.html app.js?v=176, mobile.html
+// mobile/app.js?v=22 + mobile.css?v=17.
+// v219: long lists render only the rows on screen (new js/vlist.js, precached):
+// the track table repaints only the rows a scroll brings in, the group lists,
+// album grid, playlist panel and the phone's Library lists are virtual; a
+// windowed chunk that fails retries, then shows a Retry row; 500,000-row lists
+// reach their last row in Firefox; the album grid's cards keep their size.
+// index.html app.css?v=103 + a vlist.js modulepreload.  Also admin.js (WebDAV share form) and app.js
+// (http(s) share roots in the freshness triggers).  New js/tunes.js (precached):
+// the tune-list helpers moved out of utils.js so a page still on an older
+// service worker's cached utils.js can't fail to link Track Info / Now Playing.
+const SHELL_VERSION = 'v219';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.
@@ -869,6 +883,8 @@ const SHELL_PRECACHE = [
   '/assets/js/player.js',
   '/assets/js/equalizer.js',
   '/assets/js/library.js',
+  '/assets/js/vlist.js',
+  '/assets/js/tunes.js',
   '/assets/js/utils.js',
   '/assets/js/queue.js',
 ];

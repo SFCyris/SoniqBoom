@@ -1338,6 +1338,29 @@ td.col-empty { color: var(--text2) !important; opacity: 0.4; }
 
 /* ── Skeleton loading rows ────────────────────────────────────────────────── */
 tr.skeleton td { pointer-events: none; }
+/* The cover placeholder sits like the cover frame (middle-aligned, 28 px), so a
+   shimmering row is exactly as tall as the track row that replaces it — the
+   virtual list positions rows by one row height. */
+.skel-bar.skel-cover { width: 28px; height: 28px; border-radius: 4px; vertical-align: middle; }
+
+/* A windowed chunk that couldn't be loaded (after its automatic retries). */
+#track-table tbody tr.vs-load-failed { cursor: default; }
+#track-table tbody tr.vs-load-failed td.col-title { color: var(--text2); font-weight: 400; }
+.vs-fail-frame {
+  display: inline-block; width: 28px; height: 28px; border-radius: 4px;
+  vertical-align: middle; background: var(--bg3);
+}
+.vs-retry {
+  margin-left: 6px; padding: 1px 8px; font: inherit; font-size: 11px; line-height: 1.4;
+  color: var(--accent); background: none; border: 1px solid currentColor; border-radius: 4px;
+  cursor: pointer; vertical-align: middle;
+}
+.vs-retry:hover { background: var(--accent-glow); }
+
+/* Group rows (Artists / Albums / … as a list). */
+#track-table tbody tr.group-row td.col-title { font-weight: 500; }
+#track-table tbody tr.group-row td.col-title.group-untagged { font-style: italic; color: var(--text2); }
+#track-table tbody tr.group-row td.col-dur { color: var(--text2); }
 .skel-bar {
   display: inline-block;
   height: 10px;
@@ -1345,6 +1368,7 @@ tr.skeleton td { pointer-events: none; }
   background: linear-gradient(90deg, var(--bg3) 25%, var(--bg4) 50%, var(--bg3) 75%);
   background-size: 200% 100%;
   animation: skel-shimmer 1.4s ease-in-out infinite;
+  animation-delay: var(--skel-phase, 0ms);
 }
 @keyframes skel-shimmer {
   0%   { background-position: 200% 0; }
@@ -4311,11 +4335,20 @@ tr.dragging { opacity: 0.4; }
 #album-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  /* Rows take their cards' height: without this, rows that don't fit the
+     pane's height were squeezed to the cards' borders (2 px lines). */
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 16px;
   padding: 16px;
   overflow-y: auto;
   flex: 1;
 }
+/* The grid is a virtual list of grid rows: each row's cards sit in a wrapper
+   that takes no box of its own, and the spacers above / below the rendered rows
+   span every column. */
+.album-grid-row { display: contents; }
+.album-grid-spacer { grid-column: 1 / -1; }
 
 .album-card {
   cursor: pointer;
@@ -4757,6 +4790,14 @@ tr.dragging { opacity: 0.4; }
   cursor: default;
   white-space: nowrap;
 }
+/* Every row of the playlist panel is the same height (the list is virtual):
+   the two text lines have fixed line heights — a title in a fallback font
+   (CJK, emoji) made its row taller — and the badges sit in the title line
+   without making it taller. */
+#playlist-tracks .queue-track-titlerow { height: 16px; }
+#playlist-tracks .queue-track-title { line-height: 16px; }
+#playlist-tracks .queue-track-artist { line-height: 14px; }
+#playlist-tracks .dup-badge { line-height: 13px; padding-top: 0; padding-bottom: 0; }
 /* "2×" — same track ID added twice: amber warning */
 .dup-id-badge {
   background: rgba(240,180,42,0.18);

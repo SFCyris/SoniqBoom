@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import os
 import signal
@@ -17,15 +18,19 @@ from pathlib import Path
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.middleware.gzip import GZipResponder, IdentityResponder
+from starlette.requests import cookie_parser as _cookie_parser
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from soniqboom import __version__
 from soniqboom.api import art, artist, cast, fstree, library, multiroom, playlist, search, smart, stream, subsonic, tracks, users as users_api
 from soniqboom.config import settings, get_data_dir, _CONF_PATH
+from soniqboom.core import deadlock_watchdog as _watchdog
 from soniqboom.core import forksafe
+from soniqboom.core import users as _core_users
 from soniqboom.plugins import load_all
 from soniqboom.plugins.base import registry
 
@@ -140,31 +145,81 @@ _GZIP_SKIP_PREFIXES = (
 )
 
 
+# A whole (not streamed) response body at least this big is gzipped in a worker
+# thread: zlib releases the GIL while it deflates, so the event loop serves
+# other requests meanwhile instead of stalling (a 4.7 MB JSON listing is ~25 ms
+# of deflate at level 6).  Smaller bodies — and every chunk of a streamed one —
+# are compressed inline as before; the hop (~0.1 ms) isn't worth it there.
+_GZIP_OFFLOAD_MIN_BYTES = 64 * 1024
+
+
+class _OffloopGZipResponder(GZipResponder):
+    """Starlette's ``GZipResponder`` with the one-shot compression of a big
+    body moved off the event loop (``_GZIP_OFFLOAD_MIN_BYTES``) — the same
+    headers (``Vary: Accept-Encoding``, ``Content-Encoding``, the new
+    ``Content-Length``), and a body that already carries ``Content-Encoding``
+    (or is an event stream) still passes untouched."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int, compresslevel: int) -> None:
+        super().__init__(app, minimum_size, compresslevel=compresslevel)
+        self._level = compresslevel
+
+    async def send_with_compression(self, message) -> None:
+        body = message.get("body", b"") if message["type"] == "http.response.body" else b""
+        if (len(body) >= _GZIP_OFFLOAD_MIN_BYTES and not self.started
+                and not message.get("more_body", False)
+                and not (self.content_encoding_set or self.content_type_is_excluded)):
+            self.started = True
+            gz = await asyncio.to_thread(gzip.compress, body, self._level)
+            headers = MutableHeaders(raw=self.initial_message["headers"])
+            headers.add_vary_header("Accept-Encoding")
+            headers["Content-Encoding"] = self.content_encoding
+            headers["Content-Length"] = str(len(gz))
+            message["body"] = gz
+            await self.send(self.initial_message)
+            await self.send(message)
+            return
+        await super().send_with_compression(message)
+
+
 class _SelectiveGZipMiddleware:
     """GZip middleware that skips compression for audio / art endpoints.
     The stock GZipMiddleware applies to every response over ``minimum_size``,
     which clobbered ranged audio streams and re-encoded already-compressed
-    JPEG/PNG thumbnails for no benefit.
+    JPEG/PNG thumbnails for no benefit.  A big one-shot body is compressed
+    off the event loop (``_OffloopGZipResponder``).
     """
 
     def __init__(self, app: ASGIApp, minimum_size: int = 1000) -> None:
         # compresslevel 6 (not Starlette's default 9): the large /api/tracks +
-        # /api/search JSON pages (~1.8 MB) are gzipped synchronously on the
-        # event loop, and level 9 is markedly slower for a few percent smaller
-        # output.  Level 6 roughly halves that per-page CPU stall while keeping
-        # the ~5-8x compression these highly-repetitive JSON payloads get.
-        self._inner = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=6)
+        # /api/search JSON pages (~1.8 MB) are gzipped per request, and level
+        # 9 is markedly slower for a few percent smaller output.  Level 6
+        # roughly halves that per-page CPU cost while keeping the ~5-8x
+        # compression these highly-repetitive JSON payloads get.
         self._raw = app
+        self._minimum_size = minimum_size
+        self._level = 6
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            path = scope.get("path", "")
-            if any(path.startswith(p) for p in _GZIP_SKIP_PREFIXES):
-                # Bypass GZip entirely — preserves Range headers + avoids
-                # double-encoding already-compressed media.
-                await self._raw(scope, receive, send)
-                return
-        await self._inner(scope, receive, send)
+        if scope["type"] != "http":
+            await self._raw(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        headers = Headers(scope=scope)
+        if any(path.startswith(p) for p in _GZIP_SKIP_PREFIXES) or "range" in headers:
+            # Bypass GZip entirely — preserves Range headers + avoids
+            # double-encoding already-compressed media.  A ranged request
+            # anywhere (a static asset, the manual) gets its bytes as asked:
+            # a gzipped 206 would carry a Content-Range of the uncompressed
+            # bytes over a body that isn't them.
+            await self._raw(scope, receive, send)
+            return
+        # The choice Starlette's GZipMiddleware makes.
+        if "gzip" in headers.get("Accept-Encoding", ""):
+            responder = _OffloopGZipResponder(self._raw, self._minimum_size, self._level)
+        else:
+            responder = IdentityResponder(self._raw, self._minimum_size)
+        await responder(scope, receive, send)
 
 
 app.add_middleware(_SelectiveGZipMiddleware, minimum_size=1000)
@@ -188,12 +243,61 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def require_auth_on_api(request: Request, call_next):
+# ── The request gate: auth, Cache-Control, deadlock watchdog ───────────────
+# One pure-ASGI layer for what were three ``@app.middleware("http")`` functions
+# (``BaseHTTPMiddleware``): each of those ran the rest of the request in a
+# task of its own behind a memory stream — three hops on every request
+# (/api/health in-process: 688 µs with them, 253 µs with this layer).  Here the scope is read
+# directly and the response's ``send`` wrapped; a streamed body (audio, SSE,
+# chunked) goes through chunk by chunk, websockets pass straight through.
+# Same position in the stack as the three (inside ``_SubsonicCORSMiddleware``,
+# outside CORS and GZip), same order among them: the watchdog registration
+# outermost, then the Cache-Control policy, then the session gate.
+
+# Public /api/* allowlist — endpoints the unauthenticated UI needs.
+_PUBLIC_API_PATHS = frozenset({
+    "/api/health",
+    "/api/ui-config",
+    "/api/plugins",
+    "/api/auth/status",
+    "/api/auth/reload",
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/me",
+    "/api/auth/logout",          # idempotent on a missing session
+    "/api/docs",
+    "/api/openapi.json",
+})
+_API_NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
+
+
+def _request_path(scope: Scope) -> str:
+    """The path every rule below judges: the scope's own — the very path the
+    router matches.  (The middlewares before this one judged
+    ``request.url.path``, which Starlette builds from the Host HEADER and the
+    path and parses again: ``Host: x/api/health#`` turned any request into
+    "/api/health" for the allowlist while the router still served the real
+    path — a sign-in bypass for every /api endpoint.)"""
+    return scope["path"]
+
+
+def _session_cookie(scope: Scope) -> "str | None":
+    """``request.cookies.get("sb_session")``: every Cookie header parsed,
+    the last value winning."""
+    value = None
+    for k, v in scope.get("headers") or ():
+        if k == b"cookie":
+            got = _cookie_parser(v.decode("latin-1")).get("sb_session")
+            if got is not None:
+                value = got
+    return value
+
+
+def _api_auth_refused(scope: Scope, path: str) -> bool:
     """Gate every ``/api/*`` endpoint on a valid session, with a small
     public allowlist (login / register / ping / health / SPA shell).
 
-    Before this middleware, individual routers had to remember to add a
+    Before this gate, individual routers had to remember to add a
     ``Depends(require_user)``.  The QA pen-test found that tracks /
     art / library / fstree / search / smart were all anonymous, which
     defeats the point of the stream-auth gate (a network neighbor could
@@ -204,64 +308,38 @@ async def require_auth_on_api(request: Request, call_next):
     bootstrap UI can finish setting up the first admin.  Once any user
     exists, only the explicit public paths slip through.
     """
-    path = request.url.path
     # Anything outside /api passes through unconditionally — static SPA
     # assets, websockets (they have their own gate), and /rest/* (Subsonic
     # has its own auth in every handler).
     if not path.startswith("/api/"):
-        return await call_next(request)
-    # Public /api/* allowlist — endpoints the unauthenticated UI needs.
-    if (
-        path in {
-            "/api/health",
-            "/api/ui-config",
-            "/api/plugins",
-            "/api/auth/status",
-            "/api/auth/reload",
-            "/api/auth/login",
-            "/api/auth/register",
-            "/api/auth/me",
-            "/api/auth/logout",          # idempotent on a missing session
-            "/api/docs",
-            "/api/openapi.json",
-        }
-        or path.startswith("/api/docs/")
-    ):
-        return await call_next(request)
-    # WebSocket endpoints handle their own auth in-handler — the HTTP
-    # layer never sees an Upgrade request as middleware here, but
-    # being defensive about the upgrade prefix is cheap.
-    if path.endswith("/ws"):
-        return await call_next(request)
+        return False
+    if path in _PUBLIC_API_PATHS or path.startswith("/api/docs/"):
+        return False
+    # (WebSocket endpoints handle their own auth in-handler: a websocket
+    # scope never reaches this gate.  The old "path ends in /ws" exemption
+    # also opened any HTTP route whose path parameter ended in "/ws".)
     # Stream + Subsonic stream are auth-gated inside their handlers
     # (they also accept Subsonic-style ?u=&p= which middleware can't
     # easily validate without duplicating that logic), so let them
     # through here and trust the handler.
     if path.startswith(("/api/stream/", "/api/rest/")) or path == "/api/stream":
-        return await call_next(request)
-
-    # Default: require a valid session cookie OR the legacy admin token.
+        return False
+    # Default: require a valid session cookie.
     try:
-        from soniqboom.core.users import get_user_store
-        store = get_user_store()
+        store = _core_users.get_user_store()
     except Exception:
         # User store not initialised yet (very early boot).  Let through
-        # so health/status work, but log so we notice in deployment.
-        return await call_next(request)
+        # so health/status work.
+        return False
     # Pre-bootstrap: no users → allowlist is effectively everything so the
     # operator can finish the first-time setup without auth.
     if not store.has_any():
-        return await call_next(request)
-
-    cookie = request.cookies.get("sb_session")
-    if cookie and store.lookup_session(cookie):
-        return await call_next(request)
-    from fastapi.responses import JSONResponse
-    return JSONResponse({"detail": "Sign in to access this endpoint."}, status_code=401)
+        return False
+    cookie = _session_cookie(scope)
+    return not (cookie and store.lookup_session(cookie))
 
 
-@app.middleware("http")
-async def no_cache_api(request: Request, call_next):
+def _add_cache_headers(message: dict, path: str) -> dict:
     """Attach sensible Cache-Control to each response class.
 
     Rules, in precedence order:
@@ -278,48 +356,73 @@ async def no_cache_api(request: Request, call_next):
         JS forever after code changes.  Re-enable later once ``?v=`` is
         bumped automatically on every build.
     """
-    response = await call_next(request)
-    path = request.url.path
+    raw = message.get("headers") or ()
     # Respect handler-set headers.  This matters for ETag 304s from
     # /api/library/* which choose their own revalidation policy.
-    if "cache-control" in {k.lower() for k in response.headers.keys()}:
-        return response
-
+    if any(k.lower() == b"cache-control" for k, _v in raw):
+        return message
     if path.startswith("/api/stream"):
-        return response  # media pipeline owns its own buffering
-
+        return message  # media pipeline owns its own buffering
+    headers = MutableHeaders(raw=list(raw))
     if path.startswith("/api"):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
+        headers["Cache-Control"] = _API_NO_STORE
+        headers["Pragma"] = "no-cache"
+        headers["Expires"] = "0"
     else:
         # Static JS/CSS/HTML — serve fresh each load.
-        response.headers["Cache-Control"] = "no-store"
-    return response
+        headers["Cache-Control"] = "no-store"
+    return {**message, "headers": headers.raw}
 
 
-@app.middleware("http")
-async def watchdog_track(request: Request, call_next):
-    """Register every HTTP request with the deadlock watchdog.
+class _RequestGateMiddleware:
+    """The session gate (``_api_auth_refused`` → 401), the Cache-Control
+    policy (``_add_cache_headers``) and the deadlock-watchdog registration
+    for every HTTP request.
 
-    A stale entry (request still in-flight after the configured
-    threshold, default 90 s) triggers a full-thread stack dump in the
-    log so the operator can identify the lock-holder instead of
-    resorting to ``kill -9``.
+    The watchdog: a stale entry (request still in-flight after the
+    configured threshold, default 90 s) triggers a full-thread stack dump
+    in the log so the operator can identify the lock-holder instead of
+    resorting to ``kill -9``.  The entry ends when the response starts —
+    when the old middleware's ``call_next`` returned — so a long streamed
+    body never counts as a stuck request; stream + WebSocket paths are
+    skipped inside :mod:`deadlock_watchdog` anyway."""
 
-    Stream + WebSocket paths are skipped inside :mod:`deadlock_watchdog`
-    so legitimate long-lived requests don't false-positive.
-    """
-    from soniqboom.core import deadlock_watchdog
-    token = deadlock_watchdog.begin_request(
-        request.method,
-        request.url.path,
-        client=f"{request.client.host}:{request.client.port}" if request.client else "",
-    )
-    try:
-        return await call_next(request)
-    finally:
-        deadlock_watchdog.end_request(token)
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = _request_path(scope)
+        client = scope.get("client")
+        token = _watchdog.begin_request(
+            scope.get("method", ""), path,
+            client=f"{client[0]}:{client[1]}" if client else "",
+        )
+        ended = False
+
+        async def _send(message) -> None:
+            nonlocal ended
+            if message["type"] == "http.response.start":
+                message = _add_cache_headers(message, path)
+                if not ended:
+                    ended = True
+                    _watchdog.end_request(token)
+            await send(message)
+
+        try:
+            if _api_auth_refused(scope, path):
+                await JSONResponse({"detail": "Sign in to access this endpoint."},
+                                   status_code=401)(scope, receive, _send)
+            else:
+                await self.app(scope, receive, _send)
+        finally:
+            if not ended:
+                _watchdog.end_request(token)
+
+
+app.add_middleware(_RequestGateMiddleware)
 
 
 class _SubsonicCORSMiddleware:
@@ -800,6 +903,25 @@ _server_owner: "threading.Thread | None" = None
 _server_owner_lock = threading.Lock()
 
 
+_LATE_AOF_KEEP_S = 30 * 86400
+
+
+def _prune_late_aof_files(data_dir: Path) -> None:
+    """Delete ``library.aof.late-*`` files older than ``_LATE_AOF_KEEP_S``:
+    records a sealed journal set aside at a stop (``AOFWriter.seal``), kept a
+    while for inspection, never replayed."""
+    cutoff = time.time() - _LATE_AOF_KEEP_S
+    try:
+        for p in data_dir.glob("library.aof.late-*"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _claim_server() -> None:
     """A server run starts in this thread — refused (``RuntimeError``, before
     anything is touched) while another thread's run is still on: a second
@@ -831,7 +953,8 @@ def _release_server() -> None:
 
 # Shutdown steps whose to_thread job writes the library's files: one that
 # timed out may still be writing (``_release_thread_pool``).
-_WRITING_STEPS = frozenset({"aof-flush", "snapshot", "browse-cache", "remote-freshness", "merger"})
+_WRITING_STEPS = frozenset({"aof-flush", "snapshot", "browse-cache", "remote-freshness", "merger",
+                            "aof-seal"})
 
 
 # The server run's thread pool (``asyncio.to_thread`` / ``run_in_executor``),
@@ -1055,7 +1178,22 @@ async def startup():
 
     # Load snapshot + replay AOF → populate in-memory store + rebuild indexes
     _ss_phase("loading_library", "Loading library snapshot")
-    from soniqboom.core.persistence import init_persistence
+    from soniqboom.core.persistence import claim_library, init_persistence
+    # This run becomes THE server of the data directory: an instance still
+    # stopping (the app's Restart) finishes writing the library first.
+    claim_library(data_dir)
+    # The bundled app's previous run in this process: its journal ends before
+    # this run loads (sealed by its stop — again here, idempotent, should that
+    # stop not have got so far: what it still held is written now, before the
+    # load, not at the app's quit after this run's records), and this run's
+    # writes before its own writer starts below are not that run's records.
+    if _aof_writer is not None:
+        try:
+            _aof_writer.seal()
+        except Exception:
+            log.warning("The previous run's journal could not be closed", exc_info=True)
+    from soniqboom.core.store import get_store as _get_store
+    _get_store()._aof_append = None
     init_persistence(data_dir)
 
     # Duplicate groups follow every duplicate-relevant write from here on
@@ -1397,9 +1535,10 @@ async def startup():
         from soniqboom.core import watcher
         from soniqboom.core.data import list_scan_dirs as _list_dirs
         dirs = await _list_dirs()
+        from soniqboom.core.filesource import is_remote_path
         local_roots = [
             d["path"] for d in dirs
-            if not str(d.get("path", "")).startswith(("smb://", "ftp://", "http://", "https://"))
+            if not is_remote_path(str(d.get("path", "")))
         ]
         if watcher.is_supported():
             # Started even with no local roots yet: a root added later is
@@ -1442,6 +1581,7 @@ async def startup():
     # Start AOF writer (appends every mutation to library.aof)
     from soniqboom.core.aof import AOFWriter
     from soniqboom.core.store import get_store
+    _prune_late_aof_files(data_dir)
     _aof_writer = AOFWriter(data_dir / "library.aof", flush_interval=settings.aof_flush_interval)
     get_store()._aof_append = _aof_writer.append
     await _aof_writer.start_auto_flush()
@@ -1632,21 +1772,206 @@ async def startup():
 
 
 
-def _scan_root_for_share(share: dict) -> str:
-    proto = share["protocol"].lower()
-    host = share["host"]
+# Startup / reconnect budget for network shares.  Shares are grouped by the
+# server they live on: ONE quick TCP connect answers for all of a server's
+# shares (an unreachable host costs this, once — not 3 connect attempts with
+# back-off per share in turn), servers are probed concurrently, and the shares
+# of a server that answers connect concurrently, each bounded by the probe
+# timeout.
+_SHARE_REACH_TIMEOUT_S = 3.0
+_SHARE_PROBE_TIMEOUT_S = 10.0
+# Shares of one server connect at most this many at a time: each FTP share's
+# first probe is a fresh login, and six at once (plus the pool's warm-up) trip
+# a per-IP connection cap ("421 Too many connections") on small NAS servers.
+_SHARE_CONNECT_PER_HOST = 2
+
+
+def _tcp_unreachable(host: str, port: int, timeout: float) -> str | None:
+    """None when a TCP connect to ``host:port`` succeeds, else why it failed
+    (a malformed host name is "unreachable" too — never an exception)."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+def _behind_proxy(proto: str, host: str) -> bool:
+    """An http(s) share reached through a proxy (``HTTPS_PROXY`` & co., which
+    the WebDAV client honours): a direct TCP check says nothing about it."""
+    if proto not in ("http", "https"):
+        return False
+    import urllib.request
+    try:
+        return proto in urllib.request.getproxies() and not urllib.request.proxy_bypass(host)
+    except Exception:
+        return False
+
+
+def _auto_connect_groups(shares: dict) -> dict[tuple, list[tuple[str, dict, str]]]:
+    """Configured auto-connect shares grouped by ``(protocol, host, port)``:
+    ``{endpoint: [(share_id, share, scan_root), …]}``."""
+    from soniqboom.core.filesource import scan_root_for_share, share_endpoint
+    groups: dict[tuple, list[tuple[str, dict, str]]] = {}
+    for share_id, share in (shares or {}).items():
+        if not isinstance(share, dict) or not share.get("auto_connect", True):
+            continue
+        try:
+            scan_root = scan_root_for_share(share)
+            endpoint = share_endpoint(share)
+        except (KeyError, ValueError) as exc:
+            log.warning("Share %s: unusable configuration (%s) — skipped", share_id, exc)
+            continue
+        groups.setdefault(endpoint, []).append((share_id, share, scan_root))
+    return groups
+
+
+async def _connect_share(share_id: str, share: dict, scan_root: str, *,
+                         recovering: bool = False) -> bool:
+    """Create, probe and register one share; publish its status (a retry by
+    the health monitor writes only a change: the share is unavailable already)."""
+    from soniqboom.core.credentials import decrypt
+    from soniqboom.core.data import upsert_scan_dir
+    from soniqboom.core.filesource import (
+        create_source, is_auth_failure, note_share_auth_failure, register_source,
+        reset_share_backoff, share_auth_key, share_retry_wait,
+    )
+
+    loop = asyncio.get_running_loop()
+    source = None
+    reason = ""
+    refused = False
+    key = share_auth_key(share)
+    wait = share_retry_wait(key)
+    if wait > 0:
+        # The server refused these credentials (for this share or a sibling
+        # logging in as the same user): no login until the back-off is over.
+        if not recovering:
+            try:
+                await upsert_scan_dir(scan_root, network_share_id=share_id,
+                                      status="unavailable")
+            except Exception:
+                pass
+            log.warning("Share %s: not connected — the server refused its "
+                        "credentials; next try in %.0f min (or press Reconnect)",
+                        share_id, wait / 60)
+        return False
+    try:
+        password = decrypt(share.get("password_enc", "")) or ""
+        source = create_source(share, password=password)
+        # Probe before serving traffic — a share that's dead now is marked
+        # ``unavailable`` at once instead of failing its first plays.
+        try:
+            ok = await asyncio.wait_for(
+                loop.run_in_executor(None, source.is_dir, "/"),
+                timeout=_SHARE_PROBE_TIMEOUT_S,
+            )
+        except (asyncio.TimeoutError, Exception):
+            ok = False
+            reason = "no answer"
+        if not ok:
+            reason = getattr(source, "last_error", None) or reason or "root not accessible"
+            refused = bool(getattr(source, "last_error_auth", False))
+    except Exception as exc:
+        ok = False
+        reason = f"{type(exc).__name__}: {exc}"
+        refused = is_auth_failure(exc)
+    if ok and recovering:
+        # Removed (or reconnected by hand) while we probed: leave it alone.
+        from soniqboom.config import load_local_conf
+        from soniqboom.core.filesource import get_source
+        if (share_id not in (load_local_conf().get("network_shares") or {})
+                or get_source(scan_root) is not None):
+            try:
+                source.close()
+            except Exception:
+                pass
+            return get_source(scan_root) is not None
+    if ok:
+        reset_share_backoff(key)
+        register_source(scan_root, source)
+        await upsert_scan_dir(scan_root, network_share_id=share_id, status="ok")
+        log.info("%s share %s (%s)", "Reconnected" if recovering else "Connected to",
+                 share_id, scan_root)
+        return True
+    if source is not None:
+        # Safe for a share on a server other shares use: closing drops only
+        # this source's claim (an SMB connection is deleted by its last user).
+        try:
+            source.close()
+        except Exception:
+            pass
+    if refused:
+        wait = note_share_auth_failure(key, scan_root)
+        log.warning("Share %s: the server refused the credentials (%s) — not "
+                    "retrying automatically for %.0f min; fix them or press "
+                    "Reconnect", share_id, reason, wait / 60)
+    if not recovering:
+        try:
+            await upsert_scan_dir(scan_root, network_share_id=share_id,
+                                  status="unavailable")
+        except Exception:
+            pass
+        log.warning("Share %s: not accessible at startup (%s) — marked "
+                    "unavailable; the health monitor retries it", share_id, reason)
+    return False
+
+
+async def _connect_share_group(endpoint: tuple, members: list, *,
+                               recovering: bool = False) -> int:
+    """Connect every share of one server: one reachability check for all of
+    them, then the shares — SMB ones in turn, the others at most
+    ``_SHARE_CONNECT_PER_HOST`` at a time, one share per set of credentials
+    first (a refused login then skips its siblings instead of repeating the
+    refusal for each).  Returns how many connected."""
+    from soniqboom.core.data import upsert_scan_dir
+    from soniqboom.core.filesource import share_auth_key
+    proto, host, port = endpoint
+    loop = asyncio.get_running_loop()
+    why = None if _behind_proxy(proto, host) else await loop.run_in_executor(
+        None, _tcp_unreachable, host, port, _SHARE_REACH_TIMEOUT_S)
+    if why is not None:
+        if not recovering:                  # a retry: unavailable already
+            for share_id, _share, scan_root in members:
+                try:
+                    await upsert_scan_dir(scan_root, network_share_id=share_id,
+                                          status="unavailable")
+                except Exception:
+                    pass
+            log.warning(
+                "%s server %s:%s unreachable at startup (%s) — %d share(s) "
+                "marked unavailable; the health monitor retries them",
+                proto.upper(), host, port, why, len(members))
+        return 0
     if proto == "smb":
-        return f"smb://{host}/{share['share']}"
-    if proto == "ftp":
-        return f"ftp://{host}{share.get('remote_path', '/')}"
-    return ""
+        # One SMB session per server, registered by the first share — the
+        # SMB client's session registry isn't safe to fill concurrently.
+        results = [await _connect_share(share_id, share, scan_root, recovering=recovering)
+                   for share_id, share, scan_root in members]
+    else:
+        gate = asyncio.Semaphore(_SHARE_CONNECT_PER_HOST)
+
+        async def _one(share_id: str, share: dict, scan_root: str) -> bool:
+            async with gate:
+                return await _connect_share(share_id, share, scan_root,
+                                            recovering=recovering)
+        by_key: dict[str, list] = {}
+        for m in members:
+            by_key.setdefault(share_auth_key(m[1]), []).append(m)
+
+        async def _chain(ms: list) -> list:
+            # The first share of these credentials alone, then its siblings
+            # (each set of credentials on its own — no wait for another's).
+            first = await _one(*ms[0])
+            return [first, *await asyncio.gather(*[_one(*m) for m in ms[1:]])]
+        results = [r for rs in await asyncio.gather(*[_chain(ms) for ms in by_key.values()])
+                   for r in rs]
+    return sum(1 for r in results if r)
 
 
 async def _init_network_shares():
     """Connect to configured shares that have auto_connect enabled."""
     from soniqboom.config import load_local_conf
-    from soniqboom.core.credentials import decrypt
-    from soniqboom.core.filesource import create_source, register_source
     from soniqboom.core.remote_cache import init_cache
 
     conf = load_local_conf()
@@ -1658,55 +1983,40 @@ async def _init_network_shares():
     cache_root = get_data_dir() / "cache" / "remote"
     init_cache(cache_root, max_mb)
 
-    loop = asyncio.get_running_loop()
-    for share_id, share in shares.items():
-        if not share.get("auto_connect", True):
-            continue
-        scan_root = _scan_root_for_share(share)
-        if not scan_root:
-            continue
-        try:
-            password = decrypt(share.get("password_enc", "")) or ""
-            source = create_source(share, password=password)
-            # Synchronous probe before serving traffic — if a share is dead
-            # at boot, mark it ``unavailable`` immediately so callers see an
-            # accurate status instead of waiting BASE_INTERVAL=60 s for the
-            # background monitor's first probe.
-            try:
-                ok = await asyncio.wait_for(
-                    loop.run_in_executor(None, source.is_dir, "/"),
-                    timeout=10.0,
-                )
-            except (asyncio.TimeoutError, Exception):
-                ok = False
-            if ok:
-                register_source(scan_root, source)
-                from soniqboom.core.data import upsert_scan_dir
-                await upsert_scan_dir(scan_root, network_share_id=share_id, status="ok")
-                log.info("Connected to share %s (%s)", share_id, scan_root)
-            else:
-                try:
-                    source.close()
-                except Exception:
-                    pass
-                from soniqboom.core.data import upsert_scan_dir
-                await upsert_scan_dir(
-                    scan_root, network_share_id=share_id, status="unavailable",
-                )
-                log.warning(
-                    "Share %s: root not accessible at startup — marked "
-                    "unavailable; health monitor will retry",
-                    share_id,
-                )
-        except Exception as exc:
-            log.warning("Share %s connect failed: %s", share_id, exc)
-            try:
-                from soniqboom.core.data import upsert_scan_dir
-                await upsert_scan_dir(
-                    scan_root, network_share_id=share_id, status="unavailable",
-                )
-            except Exception:
-                pass
+    groups = _auto_connect_groups(shares)
+    if groups:
+        await asyncio.gather(*[
+            _connect_share_group(endpoint, members)
+            for endpoint, members in groups.items()
+        ])
+
+
+async def _reconnect_pending_shares() -> bool:
+    """Health-monitor pass for configured auto-connect shares that have NO
+    registered source (down at startup, or a failed connect): try them again,
+    one reachability check per server.  Returns True while any stays down."""
+    from soniqboom.config import load_local_conf
+    from soniqboom.core.filesource import get_source, share_auth_key, share_retry_wait
+
+    groups = _auto_connect_groups(load_local_conf().get("network_shares", {}))
+    pending = {ep: [m for m in members if get_source(m[2]) is None]
+               for ep, members in groups.items()}
+    pending = {ep: m for ep, m in pending.items() if m}
+    if not pending:
+        return False
+    # Shares whose server refused their credentials wait out their back-off
+    # (``note_share_auth_failure``) — they stay down meanwhile.
+    due = {ep: [m for m in members if share_retry_wait(share_auth_key(m[1])) <= 0]
+           for ep, members in pending.items()}
+    due = {ep: m for ep, m in due.items() if m}
+    waiting = sum(len(m) for m in pending.values()) - sum(len(m) for m in due.values())
+    if not due:
+        return True
+    connected = await asyncio.gather(*[
+        _connect_share_group(ep, members, recovering=True)
+        for ep, members in due.items()
+    ])
+    return waiting > 0 or sum(connected) < sum(len(m) for m in due.values())
 
 
 async def _start_dlna_server():
@@ -1779,15 +2089,25 @@ async def _share_health_monitor():
         flip it to ``unavailable`` — absorbs single-probe blips.
       * Once unavailable, we keep probing (via the FileSource's own
         connect-retry logic) so recovery is automatic when the network
-        comes back — no user action required.
+        comes back — no user action required.  That includes shares that
+        never connected (their server was down at startup): each pass
+        tries them again, one reachability check per server.
       * Probe interval is adaptive: 60 s while everything is healthy, up
         to 5 min while any share is down (so a dead host isn't hammered),
         resetting to 60 s as soon as everything is green again.
+      * A probe the server answers by REFUSING the credentials marks the
+        share unavailable at once and arms the credentials' back-off
+        (``filesource.note_share_auth_failure``: 5 min doubling to 6 h):
+        neither the probe nor the reconnect of unconnected shares logs in
+        with them again until it is over or the user presses Reconnect.
       * Only log + upsert the DB when the status actually *changes*, so a
         long outage doesn't spam the log.
     """
     from soniqboom.core.data import upsert_scan_dir
-    from soniqboom.core.filesource import all_sources
+    from soniqboom.core.filesource import (
+        all_sources, note_share_auth_failure, reset_share_backoff, share_retry_wait,
+        source_auth_key,
+    )
     from soniqboom.core.store import get_store
 
     # scan_root → current published status  ("ok" | "unavailable")
@@ -1808,6 +2128,12 @@ async def _share_health_monitor():
         any_down = False
 
         for scan_root, source in list(all_sources().items()):
+            akey = source_auth_key(source)
+            if share_retry_wait(akey) > 0:
+                # The server refused this share's credentials: no probe (a
+                # WebDAV probe is a login) until its back-off is over.
+                any_down = True
+                continue
             try:
                 ok = await asyncio.wait_for(
                     loop.run_in_executor(None, source.is_dir, "/"),
@@ -1818,7 +2144,20 @@ async def _share_health_monitor():
 
             prev = last_status.get(scan_root, "ok")
 
+            if not ok and akey and getattr(source, "last_error_auth", False):
+                wait = note_share_auth_failure(akey, scan_root)
+                log.warning("Share %s: the server refused the credentials — not "
+                            "probing it for %.0f min; fix them or press Reconnect",
+                            scan_root, wait / 60)
+                any_down = True
+                fail_streak[scan_root] = fail_streak.get(scan_root, 0) + 1
+                if prev == "ok":
+                    await _set_share_status(scan_root, "unavailable")
+                    last_status[scan_root] = "unavailable"
+                continue
+
             if ok:
+                reset_share_backoff(akey)
                 fail_streak[scan_root] = 0
                 if prev != "ok":
                     log.info("Share %s is back online", scan_root)
@@ -1856,6 +2195,14 @@ async def _share_health_monitor():
                     log.warning("Share %s became unavailable", scan_root)
                     await _set_share_status(scan_root, "unavailable")
                     last_status[scan_root] = "unavailable"
+
+        # Configured shares with no source at all (their server was down at
+        # startup, or a connect failed): try them again.
+        try:
+            if await _reconnect_pending_shares():
+                any_down = True
+        except Exception:
+            log.warning("Retrying unconnected shares failed", exc_info=True)
 
         # Adaptive cadence: back off while anything is down, snap back when healthy.
         interval = min(interval * 1.5, MAX_INTERVAL) if any_down else BASE_INTERVAL
@@ -2073,10 +2420,31 @@ async def shutdown():
     await _step("websockets", _close_all_ws(), timeout=3.0)
 
 
-    # ── Step 2: AOF flush + close fd (2 s budget) ─────────────────────────
+    # ── Step 1b: scans + enrichment passes (3 s budget) ───────────────────
+    # Stopped BEFORE the journal's final flush: a scan or post-scan pass still
+    # running writes the store after it — records only the process's exit
+    # flushed, after the next instance had loaded the AOF (lost: its shutdown
+    # snapshot drops them) or, in the bundled app, after a later run's own
+    # records (replayed over them).  Remote scans and an HVSC apply are the
+    # admin API's tasks.
+    async def _stop_writers() -> None:
+        from soniqboom.core.scanner import stop_background_writers
+        extra: list = []
+        try:
+            from soniqboom.api import admin as _admin
+            extra = [*_admin._bg_scan_tasks, *_admin._BG_TASKS]
+        except Exception:
+            log.debug("admin background tasks not listed", exc_info=True)
+        await stop_background_writers(extra, timeout=3.0)
+    await _step("scans", _stop_writers(), timeout=4.0)
+
+    # ── Step 2: AOF flush + close fd (flock budget + 1 s) ─────────────────
     # Cancel the periodic flush task ON the loop first (Task.cancel is
     # loop-bound), then do the blocking flush_sync + fd close off the loop
-    # so a contended flock can't freeze the async runtime.
+    # so a contended flock can't freeze the async runtime.  The step outlasts
+    # the writer's flock wait (a merge holding the AOF), so it ends with the
+    # flush — a stop still flushing when the snapshot's own stop starts
+    # duplicated records (``AOFWriter.stop`` also serialises the two).
     # A duplicate-relevant write after the shutdown save → full pass next start.
     try:
         from soniqboom.core.scanner import finalize_dup_pending
@@ -2085,10 +2453,11 @@ async def shutdown():
         log.debug("finalize_dup_pending failed", exc_info=True)
     aof_ok = False
     if _aof_writer:
+        from soniqboom.core.aof import AOFWriter as _AOFWriter
         _aof_writer.cancel_flush_task()
         aof_ok = await _step("aof-flush",
                              asyncio.to_thread(_aof_writer.stop),
-                             timeout=2.0)
+                             timeout=_AOFWriter._FLOCK_BUDGET_SECONDS + 1.0)
 
     # ── Step 3: Snapshot — CONDITIONAL (10 s budget) ──────────────────────
     # The full snapshot (``library.json`` — O(library), hundreds of MB on a
@@ -2099,13 +2468,18 @@ async def shutdown():
     #
     # So skip the expensive write when it's redundant — the AOF flushed
     # cleanly AND is lean, which the background merger keeps it (folds it into
-    # ``library.json`` every ``merger_interval``).  That frees the port sooner
-    # on a restart.  Fall back to a full snapshot only when the AOF flush was
-    # incomplete (durability safety net) or the AOF is large (a big batch like
-    # a Demozoo apply — snapshotting now beats a long replay next boot).
+    # ``library.json`` once it reaches ``merger_max_aof_mb``).  That frees the
+    # port sooner on a restart.  Fall back to a full snapshot only when the AOF
+    # flush was incomplete (durability safety net) or the AOF is large (a big
+    # batch like a Demozoo apply — snapshotting now beats a long replay next
+    # boot).  The snapshot holds the AOF it was written over, so it drops it
+    # (``consume_aof`` — replayed on top of it, every play counted twice).
     async def _write_snap() -> None:
-        from soniqboom.core.persistence import write_snapshot_sync
-        await asyncio.to_thread(write_snapshot_sync, get_data_dir())
+        from soniqboom.core.persistence import owns_library, write_snapshot_sync
+        # (this loop runs the store's encode — at one instant with the count of
+        # the journal records it holds, ``persistence._call_on_loop``)
+        await asyncio.to_thread(write_snapshot_sync, get_data_dir(), owns_library(), _aof_writer,
+                                asyncio.get_running_loop())
 
     try:
         _max_aof_mb = max(0.0, float(os.environ.get("SONIQBOOM_SHUTDOWN_SNAPSHOT_MAX_AOF_MB", "32")))
@@ -2180,6 +2554,24 @@ async def shutdown():
                 pass
 
     await _step("merger", _stop_merger(), timeout=3.5)
+    # The journal ends here: what is still buffered is written, and a store
+    # write still arriving (a task that outlived step 1b, a thread-pool job)
+    # is set aside instead of reaching the AOF at the process's exit — after
+    # the next instance (or run) loaded it (``AOFWriter.seal``).  Intake is
+    # closed on the loop first and the journal ended after the step whatever
+    # it did, so even a seal job that timed out (still waiting for a lock)
+    # writes nothing after ``release_library`` (``AOFWriter.end_journal``).
+    if _aof_writer:
+        from soniqboom.core.aof import AOFWriter as _AOFWriter
+        _seal_budget = _AOFWriter._FLOCK_BUDGET_SECONDS * 2
+        _aof_writer.close_intake()
+        await _step("aof-seal", asyncio.to_thread(_aof_writer.seal, _seal_budget),
+                    timeout=_seal_budget + 1.0)
+        _aof_writer.end_journal()
+    # The library is written: an instance waiting to start may load it now
+    # (``persistence.claim_library``).
+    from soniqboom.core.persistence import release_library
+    release_library()
 
     # ── Step 4b: scan worker pools + their forkserver (a stop during a scan
     # would otherwise leave them running) ───────────────────────────────────

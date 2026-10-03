@@ -136,3 +136,22 @@ test('real renders: with the start song patched to 3, each wire renders its tune
     assert.equal(got, byTune[want[w]], `wire ${w} should render tune ${want[w]}`);
   }
 });
+
+test('a picked tune is the file plus its wire, count, start song and label', async () => {
+  const { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } = await import(resolve(FE, 'js/tunes.js'));
+  const file = { id: 'f', title: 'Song', duration: 19.2, subsongs: 8, start_subsong: 1 };
+  // default tune 2 of 8 (an empty first tune): wire 0 is tune 2, wire 1 tune 1
+  const def = subsongVirtualTrack(file, 0, { count: 8, start: 2 });
+  assert.deepEqual([def.subsong, def.subsongTotal, def.subsongStart, def.subsongLabel, def.duration],
+                   [0, 8, 2, 'Tune 2', 19.2], 'wire 0 keeps the file\'s (default tune\'s) length');
+  const first = subsongVirtualTrack(file, 1, { count: 8, start: 2 });
+  assert.equal(first.subsongLabel, 'Tune 1');
+  assert.equal(first.duration, 0, 'another tune\'s length is unknown until it plays');
+  const third = subsongVirtualTrack(file, 2, { count: 8, start: 2, lengths: [0.3, 19.2, 24.6] });
+  assert.deepEqual([third.subsongLabel, third.duration], ['Tune 3', 24.6]);
+  assert.equal(file.subsong, undefined, 'the file object is not modified');
+  // an out-of-range start song counts as 1
+  assert.equal(subsongVirtualTrack(file, 0, { count: 3, start: 9 }).subsongStart, 1);
+  assert.ok(TUNE_CHIP_FORMAT_NAMES.has('GBS') && TUNE_CHIP_FORMAT_NAMES.has('NSF'));
+  assert.ok(!TUNE_CHIP_FORMAT_NAMES.has('SPC'), 'one tune per file');
+});

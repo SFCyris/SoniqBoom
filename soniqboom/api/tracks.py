@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import re
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -17,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response
 
 from soniqboom.core import forksafe
+from soniqboom.core.filesource import is_remote_path
 
 # Dedicated thread-pool for ``_compute_waveform`` — that helper spawns a
 # 60s-timeout ffmpeg subprocess per call and ties up its worker the whole
@@ -274,17 +277,19 @@ async def _resolve_zip_member_to_local(path_str: str):
     import tempfile
     loop = asyncio.get_event_loop()
     try:
-        if path_str.startswith(("ftp://", "smb://")):
+        if is_remote_path(path_str):
             from soniqboom.core import archive as _archive
             from soniqboom.core.filesource import get_source, parse_remote_path
             from soniqboom.core.remote_cache import get_cache
             scan_root, remote_path = parse_remote_path(path_str)
+            # (no source: the cached subset / archive still answers)
             source = get_source(scan_root)
-            if source is None or "::" not in remote_path:
+            if "::" not in remote_path:
                 return None
             arc_rel, member_name = remote_path.split("::", 1)
+            from soniqboom.core.remote_zip import archive_for_member
             local_archive = await loop.run_in_executor(
-                None, get_cache().fetch, scan_root, arc_rel, source)
+                None, archive_for_member, scan_root, arc_rel, member_name, source)
             data = await loop.run_in_executor(
                 None, _archive.read_member, local_archive, member_name)
         else:
@@ -317,6 +322,278 @@ from soniqboom.core.metadata import extract_lyrics
 from soniqboom.models.track import TrackMeta
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
+
+
+# ── JSON list encoding (shared by every track-list endpoint) ─────────────────
+#
+# A route that returns plain Python data goes through FastAPI's
+# ``jsonable_encoder`` (a recursive Python walk over every value) and then
+# stdlib ``json.dumps`` — on the event loop: ~140 ms for a 2000-row folder page,
+# ~430 ms for a 5000-id ``/meta/batch``.  Rows that a ``response_model`` (or a
+# ``Track(**d)`` per row) shaped first paid a Pydantic model construction per
+# row on top.  These helpers serialize the rows with orjson instead (a few ms)
+# and keep the TrackMeta contract the models gave: every field present (a field
+# missing from an older stored row → its model default), only TrackMeta fields
+# (``embedding`` and any stray key never leak), values of the declared types.
+# The OpenAPI schemas of those routes are the price.
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _json_safe(obj):
+    """``obj`` with every lone surrogate replaced by U+FFFD and every
+    non-finite float by None (what orjson writes for one).
+
+    A filename that is not valid UTF-8 decodes (``os.fsdecode``) with its bad
+    bytes as lone surrogates, and undecodable tag bytes can end up the same
+    way.  No UTF-8 encoder accepts those: orjson refuses the whole payload, and
+    the old ``JSONResponse`` path raised on ``.encode("utf-8")`` — one such
+    file 500'd its entire folder listing.  Degrade the characters instead (the
+    Subsonic XML encoder does the same)."""
+    if isinstance(obj, str):
+        if obj.isascii() or not _LONE_SURROGATE.search(obj):
+            return obj
+        return _LONE_SURROGATE.sub("\ufffd", obj)
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {_json_safe(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def json_bytes(obj) -> bytes:
+    """``obj`` as JSON bytes — orjson, with a fallback for what it refuses.
+
+    For the JSON-native data these routes return, the same JSON values as the
+    ``JSONResponse`` path, except that a non-finite float (mutagen reports
+    ``nan`` for a truncated stream's length) is ``null`` — exactly what the
+    ``response_model`` routes already emitted — instead of a 500 for the whole
+    response.  orjson refuses lone surrogates (see ``_json_safe``), types it
+    doesn't know (a ``set``, a ``Path``…), non-str keys and ints beyond 64
+    bits: see ``_json_bytes_slow``.  Anything still unencodable raises, as it
+    did before."""
+    try:
+        return orjson.dumps(obj)
+    except orjson.JSONEncodeError:
+        return _json_bytes_slow(obj)
+
+
+def _json_bytes_slow(obj) -> bytes:
+    """What :func:`json_bytes` makes of a payload orjson refused — localised.
+
+    A list (or a dict with str keys) is encoded part by part, each part by
+    orjson first, so only the parts it refuses — typically the one row with an
+    undecodable filename in a 2000-row page — take the slow path; the rest stay
+    orjson-fast (one bad row: ~4 ms, not the ~190 ms of re-encoding the whole
+    page through ``jsonable_encoder``; every row bad: ~55 ms).  orjson's compact
+    output composes, so the bytes are the same as encoding the scrubbed payload
+    in one go.  A part that is not a container goes through ``jsonable_encoder``
+    (the conversions FastAPI applied before) + ``_json_safe``, then orjson
+    (stdlib ``json`` for an int beyond 64 bits)."""
+    if isinstance(obj, (list, tuple)):
+        return b"[" + b",".join(map(_json_bytes_part, obj)) + b"]"
+    if isinstance(obj, dict) and all(type(k) is str for k in obj):
+        return b"{" + b",".join(orjson.dumps(_json_safe(k)) + b":" + _json_bytes_part(v)
+                                for k, v in obj.items()) + b"}"
+    from fastapi.encoders import jsonable_encoder
+    safe = _json_safe(jsonable_encoder(obj))
+    try:
+        return orjson.dumps(safe, option=orjson.OPT_NON_STR_KEYS)
+    except orjson.JSONEncodeError:              # an int beyond 64 bits
+        import json
+        return json.dumps(safe, ensure_ascii=False, allow_nan=False,
+                          separators=(",", ":")).encode("utf-8")
+
+
+def _json_bytes_part(obj) -> bytes:
+    try:
+        return orjson.dumps(obj)
+    except orjson.JSONEncodeError:
+        return _json_bytes_slow(obj)
+
+
+def json_response(obj, status_code: int = 200, headers: dict | None = None) -> Response:
+    """``obj`` as an ``application/json`` response encoded by :func:`json_bytes`."""
+    return Response(content=json_bytes(obj), status_code=status_code,
+                    headers=headers, media_type="application/json")
+
+
+def json_route(router_: APIRouter, path: str, *, methods: tuple[str, ...] = ("GET",),
+               **route_kw):
+    """``@router.get(path)``, but the handler's result is encoded by
+    :func:`json_bytes` instead of ``jsonable_encoder`` + ``json.dumps``.
+
+    The decorated function itself is returned UNCHANGED — still a coroutine
+    returning plain Python data — so code and tests that call it directly keep
+    getting the dicts / lists; only the registered endpoint (a wrapper with the
+    same signature, which FastAPI reads through ``__wrapped__``) encodes.  A
+    ``Response`` the handler returns passes through as is; ``HTTPException``
+    propagates as usual.  ``response_model=None``: nothing is re-validated, so
+    the handler must already return the shape it promises.  Async handlers
+    only, and headers set on an injected ``response: Response`` parameter are
+    NOT applied (FastAPI merges those only into a response it builds) — return
+    a ``Response`` for that."""
+    import functools
+    import inspect
+    status_code = route_kw.get("status_code") or 200
+
+    def decorate(fn):
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError(f"json_route needs an async handler, not {fn.__qualname__}")
+
+        @functools.wraps(fn)
+        async def endpoint(*args, **kwargs):
+            out = await fn(*args, **kwargs)
+            return out if isinstance(out, Response) else json_response(out, status_code)
+        router_.add_api_route(path, endpoint, methods=list(methods),
+                              response_model=None, **route_kw)
+        return fn
+    return decorate
+
+
+# TrackMeta-shaped rows without building a TrackMeta per row.  Stored rows are
+# ``Track.model_dump()`` output plus diffed field writes, so nearly every row
+# already holds exactly the values the model would give back: those are served
+# as they are (the store's own dict when it has precisely the TrackMeta keys —
+# callers must copy before adding keys).  A row whose values the model would
+# CHANGE or REJECT (a "1999" year, a float in an int field, a None title…) is
+# shaped by the model itself, so it comes out exactly as the old per-row
+# ``TrackMeta(**d)`` made it — coerced, or rejected → ``None``.
+_META_NAMES: tuple[str, ...] = tuple(TrackMeta.model_fields)
+_META_KEYS = frozenset(_META_NAMES)
+_META_REQUIRED = frozenset(n for n, f in TrackMeta.model_fields.items() if f.is_required())
+_NONE_T = type(None)
+
+
+def _meta_types(annotation) -> "tuple[frozenset, frozenset, frozenset | None]":
+    """``(kept, to_float, elements)`` for a TrackMeta field annotation: the
+    Python types the model passes through unchanged, the types it turns into a
+    float (an int in a float field — same JSON number, re-typed to match), and
+    for a list field the element types it keeps.  An annotation not handled
+    here gets empty sets: any value present takes the model path (correct, just
+    slower — a test pins that no current field does)."""
+    import types
+    import typing
+    args = (typing.get_args(annotation)
+            if typing.get_origin(annotation) in (typing.Union, types.UnionType)
+            else (annotation,))
+    kept: set = set()
+    to_float: set = set()
+    elements = None
+    for a in args:
+        if a is _NONE_T:
+            kept.add(_NONE_T)
+        elif a in (str, int, bool):
+            kept.add(a)
+        elif a is float:
+            kept.add(float)
+            to_float.add(int)
+        elif typing.get_origin(a) is list and typing.get_args(a) in ((str,), (float,)):
+            kept.add(list)
+            elements = frozenset(typing.get_args(a))
+        else:
+            return frozenset(), frozenset(), None
+    return frozenset(kept), frozenset(to_float), elements
+
+
+_META_SPEC = {n: _meta_types(f.annotation) for n, f in TrackMeta.model_fields.items()}
+_FLOAT_ONLY = frozenset({float})
+_STR_LISTS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == {str})
+_FLOAT_LISTS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == _FLOAT_ONLY)
+
+
+class _Absent:
+    """Type of the marker a field missing from a stored row reads back as."""
+
+
+_ABSENT = (_Absent(),) * len(_META_NAMES)     # per-field ``dict.get`` default
+# value-type signature (one type per field, in _META_NAMES order; ``_Absent`` for
+# a missing one) → ``(fields to re-type as float, fields missing)``, or None when
+# the model must shape the row.  A library has a handful of distinct signatures;
+# the bound only guards against pathological churn.
+_SIG_PLANS: dict[tuple, "tuple[tuple[str, ...], tuple[str, ...]] | None"] = {}
+_SIG_PLANS_MAX = 4096
+_NO_PLAN = object()
+
+
+def _sig_plan(sig: tuple):
+    to_fix: list[str] = []
+    missing: list[str] = []
+    plan = None
+    for name, t in zip(_META_NAMES, sig):
+        kept, to_float, _el = _META_SPEC[name]
+        if t is _Absent:
+            if name in _META_REQUIRED:
+                break                       # no id / path: the model rejects the row
+            missing.append(name)
+        elif t in to_float:
+            to_fix.append(name)
+        elif t not in kept:
+            break
+    else:
+        plan = (tuple(to_fix), tuple(missing))
+    if len(_SIG_PLANS) >= _SIG_PLANS_MAX:
+        _SIG_PLANS.clear()
+    _SIG_PLANS[sig] = plan
+    return plan
+
+
+def _model_shaped(d: dict) -> dict | None:
+    try:
+        return TrackMeta(**{k: v for k, v in d.items() if k in _META_KEYS}).model_dump()
+    except Exception:                       # ValidationError: the row was always rejected
+        return None
+
+
+def public_track(d: dict | None) -> dict | None:
+    """Stored track dict → what ``TrackMeta(**d).model_dump()`` returns, or
+    ``None`` where that raised (or ``d`` is empty / None).
+
+    Equal values, without the per-row model construction for the rows that
+    need none (~3 µs a row instead of ~15 µs + the encoder walk).
+    ``embedding`` and non-TrackMeta keys are dropped; missing fields take their
+    model defaults (a row persisted before a newer field existed).  May return
+    ``d`` itself — treat the result as read-only."""
+    if not d:
+        return None
+    sig = tuple(map(type, map(d.get, _META_NAMES, _ABSENT)))
+    plan = _SIG_PLANS.get(sig, _NO_PLAN)
+    if plan is _NO_PLAN:
+        plan = _sig_plan(sig)
+    if plan is None:
+        return _model_shaped(d)
+    try:
+        for name in _STR_LISTS:
+            if v := d.get(name):
+                "".join(v)                  # TypeError on a non-str element
+    except TypeError:
+        return _model_shaped(d)
+    for name in _FLOAT_LISTS:
+        if (v := d.get(name)) and not set(map(type, v)) <= _FLOAT_ONLY:
+            return _model_shaped(d)
+    to_fix, missing = plan
+    if missing or len(d) != len(_META_NAMES):    # → a field to fill, or a stray key
+        fields = TrackMeta.model_fields
+        out = {name: d[name] if name in d
+               else fields[name].get_default(call_default_factory=True)
+               for name in _META_NAMES}
+    elif to_fix:
+        out = dict(d)
+    else:
+        return d
+    try:
+        for name in to_fix:
+            out[name] = float(out[name])
+    except OverflowError:                   # an int too big for a float: model rejects it
+        return _model_shaped(d)
+    return out
+
+
+def public_tracks(rows) -> list[dict]:
+    """:func:`public_track` over ``rows``, skipping the ones it rejects."""
+    return [t for t in map(public_track, rows) if t is not None]
 
 
 # ── Tag editing ───────────────────────────────────────────────────────────────
@@ -357,7 +634,7 @@ async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_ed
     if not t:
         raise HTTPException(404, "Track not found")
     path = t.get("path") or ""
-    if path.startswith(("smb://", "ftp://", "http://", "https://")):
+    if is_remote_path(path):
         raise HTTPException(422, "Tags can only be edited on local files (this track lives on a network share).")
     if "::" in path:
         raise HTTPException(422, "Tags can't be edited on files inside archives.")
@@ -666,7 +943,7 @@ async def _maybe_writeback_lyrics(track, lyrics_text: str) -> None:
         if not await get_config("lyrics_writeback", False):
             return
         path_str = getattr(track, "path", "") or ""
-        if not path_str or path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+        if not path_str or is_remote_path(path_str):
             return                              # only real local files
         if "!" in path_str or "::" in path_str:
             return                              # zip-virtual member — not a writable file
@@ -854,12 +1131,13 @@ async def list_tracks(
     # (~12 ms/page on a 2000-track page).  The dicts are already the TrackMeta
     # field set (``_meta_dict`` strips ``embedding``), so the response bytes are
     # identical to the response_model path — we just trade this endpoint's
-    # OpenAPI schema for the speed.  See data.ft_search_dicts.
+    # OpenAPI schema for the speed.  See data.ft_search_dicts.  (``json_bytes``:
+    # a lone surrogate in one path no longer 500s the page.)
     dicts = await ft_search_dicts(
         query, limit=limit, offset=offset,
         sort_by=sort_by, sort_order=sort_order,
     )
-    return Response(content=orjson.dumps(dicts), media_type="application/json")
+    return Response(content=json_bytes(dicts), media_type="application/json")
 
 
 @router.get("/count")
@@ -952,8 +1230,8 @@ async def shuffled_tracks(
     page_ids = order[offset: offset + limit]
     tracks = [store._meta_dict(tid) for tid in page_ids if tid in store._tracks]
     return Response(
-        content=orjson.dumps({"total": total, "seed": seed, "offset": offset,
-                              "tracks": tracks}),
+        content=json_bytes({"total": total, "seed": seed, "offset": offset,
+                            "tracks": tracks}),
         media_type="application/json",
     )
 
@@ -986,31 +1264,41 @@ async def batch_play_stats(body: dict):
     return await get_play_stats_batch(ids)
 
 
-@router.post("/meta/batch")
+@json_route(router, "/meta/batch", methods=("POST",))
 async def batch_tracks(body: dict):
     """Return full track objects for a list of IDs in ONE request.
 
     Hydrates client-side id lists (e.g. the History Smart view's play-log
     entries) without an N+1 storm of ``GET /api/tracks/{id}`` round-trips —
-    ``get_track`` is an in-memory lookup, so N of them in a single request is
+    each id is an in-memory lookup, so N of them in a single request is
     cheap.  Unknown ids are skipped; order follows the request.  Capped to
     keep a pathological request bounded.
+
+    Rows are TrackMeta-shaped (``public_track``), encoded with orjson: 5000 ids
+    took ~430 ms through ``Track(**d)`` + ``jsonable_encoder`` per row, now
+    ~25 ms.  They used to carry the ``embedding`` vector (every client dropped
+    it).  A row ``TrackMeta`` rejects is still skipped; one the old ``Track``
+    rejected only for a malformed embedding is now served.
     """
     ids = body.get("ids", [])
     if not isinstance(ids, list):
         raise HTTPException(422, "ids must be a list")
-    out = []
-    for tid in ids[:5000]:
-        t = await get_track(tid)
-        if t:
-            out.append(t)
-    return out
+    from soniqboom.core.store import get_store
+    # A non-string id can't name a track — skipped like an unknown one (an
+    # unhashable one used to 500 the whole batch).
+    return public_tracks(get_store().get_tracks_batch(
+        [tid for tid in ids[:5000] if isinstance(tid, str)]))
 
 
-@router.get("/{track_id}", response_model=TrackMeta)
+@json_route(router, "/{track_id}")
 async def read_track(track_id: str):
-    track = await get_track(track_id)
-    if not track:
+    """One track, TrackMeta-shaped (the old ``response_model=TrackMeta``
+    output); 404 when unknown or when ``TrackMeta`` rejects its stored row, as
+    the old ``get_track`` → ``Track(**d)`` did (that one also 404'd a row whose
+    only fault was a malformed embedding, which is now served)."""
+    from soniqboom.core.store import get_store
+    track = public_track(get_store().get_track(track_id))
+    if track is None:
         raise HTTPException(404, "Track not found")
     return track
 
@@ -1030,6 +1318,14 @@ async def get_track_extended(track_id: str):
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
+    if not track.subsongs:
+        # A libgme rip scanned before tune counts were read (plain local file).
+        p = str(track.path or "")
+        if p and "::" not in p and not is_remote_path(p):
+            from soniqboom.api import stream as _stream
+            track = await _stream._gme_backfill_tune_count(track_id, track, Path(p))
+    default_track = await _default_track(track_id, track)
+    default_tune, default_pending = await _default_tune(track_id, track, default_track)
 
     result = {
         "format": track.format,
@@ -1037,11 +1333,20 @@ async def get_track_extended(track_id: str):
         "channels": track.channels,
         "patterns": track.patterns,
         "subsongs": track.subsongs,
-        # The file's default tune (1-based: the PSID start song / SNDH ``!#``
-        # — what the bare id and ``?subsong=0`` play), or ``None`` when
-        # unknown: the client then treats tune 1 as the default.  Wire ↔ tune
-        # mapping: ``stream.sid_wire_tune`` (utils.js ``subsongWireToTune``).
-        "default_track": await _default_track(track_id, track),
+        # The file's own start song (1-based: the PSID start song / SNDH
+        # ``!#`` — what wire 0 plays), or ``None`` (tune 1).  It drives the
+        # wire ↔ tune mapping: ``stream.sid_wire_tune`` (utils.js
+        # ``subsongWireToTune``).
+        "default_track": default_track,
+        # The tune (1-based) a play of the bare id plays: the start song
+        # above for SID / SNDH; for a multi-tune Amiga module, console rip
+        # or SC68 disk the first tune that isn't empty (probed once — here
+        # too, when the file is at hand); else tune 1.  ``None`` while it
+        # isn't known yet (a play finds it out).  Never moves a wire.
+        "default_tune": default_tune,
+        # True while that tune is still being found out (a probe running past
+        # the short wait below): ask again shortly for ``default_tune``.
+        "default_tune_pending": default_pending,
         # Per-tune lengths (seconds, in tune order: index = tune - 1), when
         # an HVSC Songlengths DB is configured; else None — the picker then
         # shows tune numbers without times (graceful degrade).
@@ -1064,20 +1369,120 @@ async def get_track_extended(track_id: str):
     return result
 
 
+_DEFAULT_TUNE_WAIT_S = 5.0     # bound of each background step (extract, probe)
+_DEFAULT_TUNE_REPLY_S = 1.5    # how long /extended waits before answering "pending"
+_DEFAULT_TUNE_LOOKUPS: "dict[str, asyncio.Task]" = {}
+
+
+async def _default_tune(track_id: str, track, default_track: "int | None") -> "tuple[int | None, bool]":
+    """``(tune, pending)``: the 1-based tune a bare play of a multi-tune file
+    plays (see /extended), and whether it is still being found out.  SID /
+    SNDH: their start song.  uade / libgme / sc68: the first tune that isn't
+    empty (``stream.ensure_default_tune``) — probed on the file itself when
+    it is a plain local file, on its extracted / fetched copy when that is
+    local already (an archive member, a cached remote file), else taken from
+    a probe a play is running.  That lookup runs as one background task per
+    track: the reply waits ``_DEFAULT_TUNE_REPLY_S`` for it, then answers
+    ``(None, True)`` while it goes on (its result lands in the probe memo).
+    Other multi-tune files: tune 1.  ``(None, False)`` for single-tune files
+    and when nothing here can find it out."""
+    if not (isinstance(track.subsongs, int) and track.subsongs > 1):
+        return None, False
+    from soniqboom.api import stream as _stream
+    if _stream._header_tuned(track):
+        return (default_track or 1), False
+    decided = _stream._default_tune_decided(track_id, track)
+    if decided is not None:
+        return decided + 1, False
+    # An undecided probe's pick is what a bare play plays now — still
+    # provisional while a probe goes on (the reply says so: ask again).
+    pick = _stream.default_tune_known(track_id, track)
+    if pick is not None:
+        return pick + 1, _stream.default_probe_running(track_id)
+    task = _DEFAULT_TUNE_LOOKUPS.get(track_id)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_find_default_tune(track_id, track))
+        _DEFAULT_TUNE_LOOKUPS[track_id] = task
+
+        def _forget(t, tid=track_id):
+            if _DEFAULT_TUNE_LOOKUPS.get(tid) is t:
+                _DEFAULT_TUNE_LOOKUPS.pop(tid, None)
+        task.add_done_callback(_forget)
+    try:
+        got = await asyncio.wait_for(asyncio.shield(task), _DEFAULT_TUNE_REPLY_S)
+    except asyncio.TimeoutError:
+        got = None
+    except Exception:
+        return None, False
+    # Not decided yet: report the pick so far (if any) and keep the client
+    # asking while the lookup or a probe still runs.
+    if _stream._default_tune_decided(track_id, track) is not None:
+        return _stream._default_tune_decided(track_id, track) + 1, False
+    running = (not task.done()) or _stream.default_probe_running(track_id)
+    if got is None:
+        pick = _stream.default_tune_known(track_id, track)
+        got = pick + 1 if pick is not None else None
+    return got, running
+
+
+async def _find_default_tune(track_id: str, track) -> "int | None":
+    """The background half of ``_default_tune`` (1-based, or None).  Never
+    raises; each step is bounded by ``_DEFAULT_TUNE_WAIT_S``."""
+    from soniqboom.api import stream as _stream
+    p = str(track.path or "")
+    pin = None
+    try:
+        ext, uade_named = _stream._render_ident(p, track)
+        if _stream._probe_family(ext, uade_named) is None and ext not in _stream._SID_EXTS:
+            return 1                              # tracker / HVL: tune 1 plays
+        local = bool(p) and "::" not in p and not is_remote_path(p)
+        if local:
+            path = Path(p)
+        elif _stream.default_probe_running(track_id):
+            got = await _stream.await_default_probe(track_id, _DEFAULT_TUNE_WAIT_S)
+            return got + 1 if got is not None else None
+        elif (("::" in p and not is_remote_path(p))
+              or (is_remote_path(p) and _stream._remote_bytes_local(p))):
+            # An archive member (extracted like a play extracts it) or a
+            # remote file already in the local cache.
+            path, ext, uade_named, pin = await asyncio.wait_for(
+                _stream._resolve_play_source(track_id, track, lane="scan"),
+                timeout=_DEFAULT_TUNE_WAIT_S)
+        else:
+            return None                       # not fetched here just for this
+        fam = _stream._probe_family(ext, uade_named, path)
+        if fam is None:
+            return 1
+        got = await asyncio.wait_for(
+            _stream.ensure_default_tune(track_id, track, path, fam, background=True),
+            timeout=_DEFAULT_TUNE_WAIT_S)
+        return got + 1 if got is not None else None
+    except Exception:
+        return None
+    finally:
+        if pin:
+            try:
+                _stream._zip_unpin(pin)
+            except Exception:
+                pass
+
+
 async def _default_track(track_id: str, track) -> int | None:
-    """The 1-based default tune of a multi-tune SID / SNDH (see /extended):
+    """The 1-based start song of a multi-tune SID / SNDH (see /extended):
     the one the scan recorded, else read from a plain local file's header
     (SID: 18 bytes; SNDH: ``psgplay -i``) — the renderers read the same.
-    None for other formats, single-tune files and sources that aren't local
-    (the picker then assumes tune 1)."""
+    None for other formats (their wires are plain tune numbers), single-tune
+    files and sources that aren't local (the picker then assumes tune 1)."""
     if not (isinstance(track.subsongs, int) and track.subsongs > 1):
         return None
     from soniqboom.api import stream as _stream
+    if not _stream._header_tuned(track):
+        return None
+    p = str(track.path or "")
+    local = bool(p) and "::" not in p and not is_remote_path(p)
     rec = _stream._recorded_start_song(track)
     if rec is not None:
         return rec
-    p = str(track.path or "")
-    local = bool(p) and "::" not in p and not p.startswith(_REMOTE_PREFIXES)
     fam = str(track.format or "").split("/")[0].strip().upper()
     if fam == "SID":
         got = _stream._SID_START_SONG.get(track_id)
@@ -1188,20 +1593,20 @@ async def get_patterns(track_id: str):
 
 
 @router.get("/{track_id}/vu")
-async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024),
-                         start: bool = Query(True)):
+async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, le=1024),
+                         start: bool = Query(True), request: Request = None):
     """Return the binary VUMR sidecar for a rendered tracker module.
 
     ``start=false``: a miss never starts the Amiga per-voice pass (the
     player asks that way when a track loads, and starts the pass once it
     has played a few seconds).
 
-    ``subsong`` (0-based wire index, default 0) selects the tune: a
-    multi-subsong UADE/tracker file renders a distinct sidecar per tune,
-    so the meters match the tune actually playing rather than always
-    showing tune 0.  The frontend passes the current subsong when the
-    playing track carries one (mirroring the ``?subsong=`` it threads onto
-    the stream URL); plain playback omits it → the default tune 0.
+    ``subsong`` (0-based wire index) selects the tune: a multi-subsong
+    UADE/tracker file renders a distinct sidecar per tune, so the meters
+    match the tune actually playing.  The frontend passes the current
+    subsong when the playing track carries one (mirroring the ``?subsong=``
+    it threads onto the stream URL); plain playback omits it → the tune a
+    bare play renders (``stream.tune_index``).
 
     Tracker / chip-format renders produce a per-channel VU sidecar
     alongside the audio cache (see ``docs/vu-cache-format.md``).  The
@@ -1248,6 +1653,11 @@ async def get_vu_sidecar(track_id: str, subsong: int = Query(0, ge=0, le=1024),
         raise HTTPException(404, "Track not found")
 
     from soniqboom.api import stream as _stream
+    # The tune index renders (and their sidecars) are keyed by: the tune
+    # asked for, or the one a bare play renders.
+    subsong = _stream.tune_index(
+        track_id, track,
+        _stream.explicit_wire(subsong if isinstance(subsong, int) else None, request))
     sidecar = get_vu_sidecar_path(
         track_id, subsong,
         uade_variant=_stream.uade_cache_variant(
@@ -1324,8 +1734,7 @@ async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
     # plain local path we can stat cheaply; remote/zip sources fall through to
     # the post-read length check (those members are tiny + fetched anyway).
     _pstr = str(track.path)
-    if "::" not in _pstr and not _pstr.startswith(
-            ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")):
+    if "::" not in _pstr and not is_remote_path(_pstr):
         try:
             if Path(_pstr).stat().st_size > 1024 * 1024:   # SIDs are < 64 KB
                 raise HTTPException(415, "File too large to be a SID")
@@ -1605,6 +2014,10 @@ async def upload_sid_audio(
             async with _lock_for(full_key):
                 if await get_cached(full_key) is not None:
                     return Response(status_code=204)      # already warmed — first-wins
+                # A silent render is never cached, whoever rendered it (422;
+                # the file is dropped).
+                from soniqboom.core.conversion_cache import refuse_silent
+                await refuse_silent(full_key, "sid", Path(tmp))
                 await store_cached(full_key, "sid", Path(tmp))
                 tmp = None                                # moved into the cache
         finally:
@@ -1739,7 +2152,7 @@ async def get_chapters(track_id: str):
     if not track:
         raise HTTPException(404, "Track not found")
     path_str = track.path
-    if path_str.startswith(("smb://", "ftp://", "http://", "https://")):
+    if is_remote_path(path_str):
         # Remote / WebDAV path — only check the locally cached copy.
         from soniqboom.core.filesource import parse_remote_path
         from soniqboom.core.remote_cache import get_cache
@@ -1933,7 +2346,7 @@ async def get_lyrics(track_id: str):
     loop = asyncio.get_event_loop()
     path_str = track.path
     # For remote tracks, try the locally cached copy
-    if path_str.startswith(("smb://", "ftp://")):
+    if is_remote_path(path_str):
         from soniqboom.core.filesource import parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
@@ -2007,9 +2420,6 @@ def _sid_target_duration(track, subsong: int = 0) -> int:
 
 
 _WAVEFORM_PENDING = object()      # "the audio isn't rendered yet — ask again"
-_REMOTE_PREFIXES = ("smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://")
-
-
 def _source_unreachable(path_str: str) -> bool:
     """True when a track's source can't be reached right now: its network
     share isn't connected, or its local scan root is marked ``unavailable``
@@ -2017,7 +2427,7 @@ def _source_unreachable(path_str: str) -> bool:
     never touches the filesystem, so a stalled mount can't block the loop."""
     try:
         outer = (path_str or "").split("::", 1)[0]
-        if outer.startswith(_REMOTE_PREFIXES):
+        if is_remote_path(outer):
             from soniqboom.core.filesource import get_source, parse_remote_path
             scan_root, _rp = parse_remote_path(path_str)
             return bool(scan_root) and get_source(scan_root) is None
@@ -2225,13 +2635,15 @@ def _waveform_is_blank(stored) -> bool:
 
 @router.get("/{track_id}/waveform")
 async def get_track_waveform(track_id: str, response: Response,
-                             subsong: int = Query(default=0, ge=0)):
+                             subsong: int | None = Query(default=None, ge=0),
+                             request: Request = None):
     """Return waveform amplitude data, computing on-demand if not cached.
 
     For converted formats (SID, MIDI, tracker modules) the waveform is
     computed from the conversion-cache WAV rather than the raw source file.
-    ``subsong`` (rendered formats) reads that tune's render; the stored
-    per-track waveform belongs to the default tune, so another tune's is
+    ``subsong`` (rendered formats) reads that tune's render; without it, the
+    render a bare play makes (a multi-tune file's default tune).  The stored
+    per-track waveform belongs to that bare play, so another tune's is
     computed from its render and not stored.
     """
     import asyncio
@@ -2262,15 +2674,24 @@ async def get_track_waveform(track_id: str, response: Response,
     # makes the next call self-heal instead of forever-serving the
     # poisoned zeros, no manual ``/api/admin/cache/waveforms`` clear
     # required.
-    if not isinstance(subsong, int):
-        subsong = 0                       # (a direct call passes the Query default)
-    waveform = await get_waveform(track_id) if subsong == 0 else None
+    from soniqboom.api.stream import explicit_wire, tune_index
+    # (A direct call passes the Query default — a bare play.)
+    wire = explicit_wire(subsong if isinstance(subsong, int) else None, request)
+    waveform = await get_waveform(track_id) if wire is None else None
     if waveform is not None and not _waveform_is_blank(waveform):
         return {"waveform": waveform}
 
     track = await get_track(track_id)
     if track is None:
         raise HTTPException(404, "Track not found")
+    # The stored waveform is the bare play's: it serves (and is written by)
+    # a request for the same tune too.
+    bare = wire is None or tune_index(track_id, track, None) == wire
+    if wire is not None and bare:
+        waveform = await get_waveform(track_id)
+        if waveform is not None and not _waveform_is_blank(waveform):
+            return {"waveform": waveform}
+    subsong = wire or 0                   # SID: the wire (wire 0 = its default)
 
     path_str = track.path
     # Route the scrubber waveform render exactly like playback: an AdLib
@@ -2308,7 +2729,8 @@ async def get_track_waveform(track_id: str, response: Response,
         from soniqboom.api.stream import _uade_base_known
         wav_path = await _waveform_from_conversion_cache(
             track_id, path_str, ext, sid_duration=_sid_dur, dreamcast=_dreamcast,
-            subsong=subsong, uade_base=_uade_base_known(track_id, track) or 0,
+            subsong=tune_index(track_id, track, wire),
+            uade_base=_uade_base_known(track_id, track) or 0,
             uade_named=_uade_named)
         if wav_path is _WAVEFORM_PENDING:
             # The audio isn't rendered yet (and nothing is rendering it): say
@@ -2321,7 +2743,7 @@ async def get_track_waveform(track_id: str, response: Response,
             return {"waveform": None}
         result = await _compute_waveform_safe(str(wav_path))
         stored, response = _normalise_waveform(result)
-        if subsong == 0 and not _waveform_is_blank(stored):
+        if bare and not _waveform_is_blank(stored):
             await store_waveform(track_id, stored)
         return {"waveform": response}
 
@@ -2506,7 +2928,7 @@ async def get_track_waveform(track_id: str, response: Response,
                     local.unlink()
                 except Exception:
                     pass
-        elif path_str.startswith(("smb://", "ftp://")):
+        elif is_remote_path(path_str):
             # Remote transcoded source (e.g. a .m4a/.aac on an FTP/SMB share)
             # with no cached transcode yet: ffmpeg can't open our internal
             # ``ftp://host/scanroot:/rel`` pseudo-URL — it returns all-zeros and
@@ -2519,7 +2941,10 @@ async def get_track_waveform(track_id: str, response: Response,
             if source is None:
                 raise HTTPException(503, "Network share unavailable")
             try:
-                src_for_waveform = str(get_cache().fetch(scan_root, remote_path, source))
+                # In a worker thread: a download on the event loop stalled
+                # every other request for its whole duration.
+                src_for_waveform = str(await asyncio.get_running_loop().run_in_executor(
+                    None, get_cache().fetch, scan_root, remote_path, source))
             except Exception as exc:        # noqa: BLE001 — surface fetch failure
                 raise HTTPException(502, f"Could not fetch remote file: {exc}")
         else:
@@ -2565,7 +2990,7 @@ async def get_track_waveform(track_id: str, response: Response,
                 pass
 
     # ── Remote files: compute from cached local copy ─────────────────────
-    if path_str.startswith(("smb://", "ftp://")):
+    if is_remote_path(path_str):
         from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
@@ -2575,7 +3000,8 @@ async def get_track_waveform(track_id: str, response: Response,
         if source is None:
             raise HTTPException(503, "Network share unavailable")
         try:
-            local_path = get_cache().fetch(scan_root, remote_path, source)
+            local_path = await asyncio.get_running_loop().run_in_executor(
+                None, get_cache().fetch, scan_root, remote_path, source)
         except Exception as exc:
             raise HTTPException(502, f"Could not fetch remote file: {exc}")
         result = await _compute_waveform_safe(str(local_path))

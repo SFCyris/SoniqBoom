@@ -62,6 +62,12 @@ class TrackMeta(BaseModel):
     # and the multi-tune wire mapping (renderers, Subsonic tune ids, the web
     # picker) swaps it with tune 1 (see core/subsonic_index.py ``wire_tune``).
     start_subsong: int | None = None
+    # 0-based index of the tune a BARE play of a multi-tune Amiga (uade),
+    # libgme or sc68 file plays: its first tune that isn't empty, learnt once
+    # by a short probe (api/stream.py ``ensure_default_tune``); None ⇒ not
+    # probed yet (tune 1).  Unlike ``start_subsong`` it never changes the
+    # wire mapping — ``?subsong=N`` / ``<id>~N`` stay tune N.
+    default_subsong: int | None = None
 
     # Track health — a known playback defect detected at scan time, surfaced as
     # a badge in listings + the info panel.  ``defect`` is a coarse class the UI

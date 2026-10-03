@@ -117,12 +117,15 @@ def _build_cmd(
     ffmpeg_path: str | None,
     protocol: str | None = None,
     bit_depth: int | None = None,
+    stdin_wav: bool = False,
 ) -> list[str]:
     """Build the ffmpeg command for a streaming transcode.
 
     ``codec`` is the target codec: mp3 / flac / ogg / opus / aac / wav.
     ``protocol``, when provided, lets us pick the right container per
     protocol family (raw FLAC vs ogg-FLAC; MP4-AAC vs ADTS-AAC).
+    ``stdin_wav``: the input is a WAV stream on stdin (a render still in
+    progress — ``render_stream``'s ``src_feed``), not ``src_path``.
 
     Output goes to ``pipe:1`` (stdout).  We pick a container that's
     streamable from byte zero and that the requesting renderer's
@@ -150,7 +153,7 @@ def _build_cmd(
         bin_,
         "-hide_banner", "-loglevel", "error", "-nostats",
         "-y",
-        "-i", str(src_path),
+        *(("-f", "wav", "-i", "pipe:0") if stdin_wav else ("-i", str(src_path))),
         "-vn",
         "-threads", "0",
     ]
@@ -286,6 +289,7 @@ async def render_stream(
     on_first_byte=None,
     protocol: str | None = None,
     bit_depth: int | None = None,
+    src_feed: "AsyncIterator[bytes] | None" = None,
 ) -> AsyncIterator[bytes]:
     """Yield chunks of transcoded audio as ffmpeg produces them.
 
@@ -319,11 +323,20 @@ async def render_stream(
                                   truncated stream (typically renderer
                                   reports "stream ended early").
       • Server shuts down      → CancelledError as above.
+
+    ``src_feed``: the source is a WAV byte stream (a rendered format still
+    rendering — ``stream.live_wav_feed`` / ``stream.sid_wav_feed``) that is
+    written to ffmpeg's stdin as it arrives, so the first encoded bytes
+    follow the render's first audio instead of its end; ``src_path`` then
+    only names it in logs.  A feed that fails part-way (the render died)
+    ends the stream with an error after ffmpeg's last bytes — never a clean
+    end that would pass the fragment off as the whole track — and nothing
+    is cached.
     """
     cmd = _build_cmd(
         src_path, codec=codec, bitrate_kbps=bitrate_kbps,
         sample_rate=sample_rate, ffmpeg_path=ffmpeg_path,
-        protocol=protocol, bit_depth=bit_depth,
+        protocol=protocol, bit_depth=bit_depth, stdin_wav=src_feed is not None,
     )
     log.debug("stream-as-render spawning: %s", " ".join(cmd))
 
@@ -336,6 +349,7 @@ async def render_stream(
     # concurrent task (below).
     proc = await forksafe.spawn(
         *cmd,
+        **({"stdin": asyncio.subprocess.PIPE} if src_feed is not None else {}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # Put ffmpeg in its own process group so an emergency
@@ -343,6 +357,36 @@ async def render_stream(
         # can't await its return (e.g. shutdown SIGKILL path).
         start_new_session=True,
     )
+
+    # A live source: copy it into ffmpeg's stdin as it arrives.  Closing
+    # stdin at its end is ffmpeg's EOF.  ``feed_state["failed"]``: the
+    # source ended with an error (the render died part-way).
+    feed_state = {"failed": False}
+
+    async def _feed_stdin():
+        try:
+            async for piece in src_feed:
+                proc.stdin.write(piece)
+                await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                      # ffmpeg is gone; its exit code tells
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            feed_state["failed"] = True
+            log.warning("stream-as-render: the live source of %s failed", src_path.name,
+                        exc_info=True)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                await src_feed.aclose()
+            except Exception:
+                pass
+
+    feed_task = (asyncio.create_task(_feed_stdin()) if src_feed is not None else None)
 
     # Drain stderr concurrently so the pipe never backs up.  We collect
     # the tail for the failure-path log message; on success we just
@@ -410,13 +454,23 @@ async def render_stream(
 
         # Drain ffmpeg's exit code.  Non-zero = mid-way failure.
         rc = await proc.wait()
-        if rc == 0:
+        if feed_task is not None:
+            # ffmpeg is gone, so the feeder ends with it — bounded: a source
+            # still waiting on a stuck render is cancelled (and not cached).
+            try:
+                await asyncio.wait_for(asyncio.shield(feed_task), timeout=10)
+            except asyncio.TimeoutError:
+                feed_task.cancel()
+                feed_state["failed"] = True
+        if rc == 0 and not feed_state["failed"]:
             clean_exit = True
-        else:
+        elif rc != 0:
             log.warning(
                 "stream-as-render ffmpeg rc=%d for %s: %s",
                 rc, src_path.name, " | ".join(stderr_tail)[:400],
             )
+        if feed_state["failed"]:
+            raise RuntimeError(f"the render of {src_path.name} failed part-way")
 
     finally:
         # ── Kill ffmpeg if still alive (client cancel / our error).
@@ -428,6 +482,14 @@ async def render_stream(
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except asyncio.TimeoutError:
+                pass
+
+        # ── Stop the live-source feeder (client gone / our error).
+        if feed_task is not None and not feed_task.done():
+            feed_task.cancel()
+            try:
+                await asyncio.wait_for(feed_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
         # ── Stop the stderr drainer.

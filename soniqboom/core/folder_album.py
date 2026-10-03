@@ -33,7 +33,9 @@ result depends on the library alone, not on earlier passes.  It is one O(N)
 pass over the stored path strings — no filesystem calls — whose per-folder
 verdict is memoised, then a sibling vote over the collected folders
 (``finalize_folder_updates``), followed by chunked batch writes and ONE
-album/browse cache invalidation.
+album/browse cache invalidation.  After its first run a pass judges only the
+tracks written since the last one and the tracks whose verdict reads theirs
+(``_FolderBook``) — with the same result as judging every track.
 """
 from __future__ import annotations
 
@@ -359,9 +361,10 @@ async def _commit_album_updates(
     items: list[tuple[str, dict, dict | None]],
     *, written: list[str] | None = None,
 ) -> tuple[int, int, int]:
-    """``commit_album_updates`` plus the number of ``_mutation_seq`` bumps its
-    own writes caused (measured around each synchronous store write), so a
-    caller can tell its own writes from a concurrent mutation."""
+    """``commit_album_updates`` plus the number of enrichment change-log
+    entries its own writes added (``store._enrich_seq``, measured around each
+    synchronous store write), so a caller can tell its own writes from a
+    concurrent mutation (``enrich_delta.record``)."""
     from soniqboom.core.store import get_store
     store = get_store()
     # Up-front pass: only decides "anything to do?" and the write strategy, so
@@ -392,9 +395,9 @@ async def _commit_album_updates(
                 batch.append((tid, patch))
                 albums += album
         if batch:
-            seq0 = store._mutation_seq
+            seq0 = store._enrich_seq
             applied += store.update_track_fields_batch(batch)
-            bumps += store._mutation_seq - seq0
+            bumps += store._enrich_seq - seq0
             if written is not None:
                 written.extend(tid for tid, _patch in batch)
 
@@ -520,7 +523,9 @@ def _root_name(path: str, roots: frozenset[str]) -> str:
     """The name of the scan root holding ``path`` ("" when none)."""
     best = ""
     for r in roots:
-        if (path.startswith(r + "/") or path.startswith(r + ":")) and len(r) > len(best):
+        # A remote root's boundary is ":/" — a bare ":" prefix also matches
+        # another share of a path-less WebDAV root (``https://h:8443/x:/…``).
+        if (path.startswith(r + "/") or path.startswith(r + ":/")) and len(r) > len(best):
             best = r
     return best.rstrip("/").rsplit("/", 1)[-1]
 
@@ -1302,10 +1307,294 @@ def _library_artist_names(store) -> list[str]:
     return [*store._tag_artist, *store._tag_album_artist]
 
 
+# ── Delta bookkeeping (``enrich_delta``) ─────────────────────────────────────
+#
+# A track's verdicts read its container's verdict (the container's chain of
+# names, the scan roots, the archives holding several tunes, the format /
+# Modland author / library person names), the vote of its container's PARENT
+# (the tracks of every container under that parent, plus the members of the
+# parent archive's generic top-level folders, which count as its non-album
+# children) and the other tracks of its own container.  So the tracks are
+# grouped by that parent (the "group" — the container itself when it has no
+# parent), and a delta pass re-judges every group a changed track was or is
+# in, every group of a container whose names a changed person name matches,
+# every track of an archive whose several-tunes status flipped, and — closed
+# over, both ways — the groups of the generic-folder members voting in a
+# re-judged group and the archive groups a re-judged group's members vote in
+# (a member's own verdict decides whether it still votes in a settle round).
+# The verdicts of the other tracks cannot have moved.
+
+def _person_key_counts(names) -> dict[str, int]:
+    """``{person key: how many of the names give it}`` — its keys are
+    ``person_keys(names)``."""
+    counts: dict[str, int] = {}
+    for n in set(names):
+        for k in person_keys((n,)):
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+class _Edits:
+    """Batched edits of a multimap whose values are tuples (``_FolderBook``):
+    one rebuild per touched key, whatever the number of edits to it."""
+
+    def __init__(self) -> None:
+        self.add: dict[str, list] = {}
+        self.drop: dict[str, set] = {}
+
+    def put(self, k, v) -> None:
+        self.add.setdefault(k, []).append(v)
+
+    def pop(self, k, v) -> None:
+        self.drop.setdefault(k, set()).add(v)
+
+    def apply(self, m: dict) -> None:
+        for k in self.add.keys() | self.drop.keys():
+            drop = self.drop.get(k, ())
+            cur = [x for x in m.get(k, ()) if x not in drop]
+            have = set(cur)
+            for x in self.add.get(k, ()):
+                if x not in have:
+                    cur.append(x)
+                    have.add(x)
+            if cur:
+                m[k] = tuple(cur)
+            else:
+                m.pop(k, None)
+        self.add, self.drop = {}, {}
+
+
+class _FolderBook:
+    """The per-track keys of the last pass, kept up to date by delta passes
+    (see above).  ``keys``: track id → ``(group, archive it votes in as a
+    generic top-level folder member | None, the name keys of its container
+    chain)`` for every track the pass judges; ``groups`` / ``voters`` the
+    reverse maps; ``by_name``: container-name key → groups (only grows — an
+    extra group is re-judged for nothing); ``arch``: innermost archive →
+    ``(retro members, members not named like it)`` (``_note_archives``),
+    ``arch_of`` / ``arch_members`` / ``places`` (path, format) per member,
+    ``multi`` the several-tunes archives; ``names`` / ``persons`` the library's artist names and their
+    person-key counts (``_person_key_counts``).  Every value is a tuple of
+    strings / ints, which the cyclic GC stops tracking (a set per group or
+    archive added ~70 ms to every full collection at 270K tracks); the
+    multimaps change through ``_Edits``."""
+
+    def __init__(self, roots: frozenset[str]) -> None:
+        self.roots = roots
+        self.keys: dict[str, tuple] = {}
+        self.groups: dict[str, tuple] = {}
+        self.voters: dict[str, tuple] = {}
+        self.by_name: dict[str, tuple] = {}
+        self.arch: dict[str, tuple[int, int]] = {}
+        self.arch_of: dict[str, tuple[str, int]] = {}
+        self.arch_members: dict[str, tuple] = {}
+        self.places: dict[str, tuple[str, str]] = {}
+        self.multi: set[str] = set()
+        self.names: set[str] = set()
+        self.persons: dict[str, int] = {}
+
+    # archives
+    def add_arch(self, tid: str, path: str, fmt: str, retro: dict,
+                 members: "_Edits") -> str | None:
+        if "::" not in path:
+            return None
+        r = retro.get(fmt)
+        if r is None:
+            from soniqboom.core.retro import is_retro_format
+            r = retro[fmt] = is_retro_format(fmt)
+        if not r:
+            return None
+        k, _, member = path.rpartition("::")
+        other = _other_member(k, member)
+        self.arch_of[tid] = (k, other)
+        self.places[tid] = (path, fmt)
+        members.put(k, tid)
+        n, o = self.arch.get(k, (0, 0))
+        self.arch[k] = (n + 1, o + other)
+        return k
+
+    def drop_arch(self, tid: str, members: "_Edits") -> str | None:
+        old = self.arch_of.pop(tid, None)
+        if old is None:
+            return None
+        k, other = old
+        self.places.pop(tid, None)
+        members.pop(k, tid)
+        n, o = self.arch[k]
+        if n > 1:
+            self.arch[k] = (n - 1, o - other)
+        else:
+            del self.arch[k]
+        return k
+
+    def several(self, k: str) -> bool:
+        n, o = self.arch.get(k, (0, 0))
+        return n >= 2 and o > 0
+
+    # keys
+    def link(self, tid: str, key: tuple, groups: "_Edits", voters: "_Edits",
+             by_name: "_Edits") -> None:
+        self.keys[tid] = key
+        group, voter, names = key
+        groups.put(group, tid)
+        if voter is not None:
+            voters.put(voter, tid)
+        for n in names:
+            by_name.put(n, group)                       # (``apply`` drops repeats)
+
+    def unlink(self, tid: str, groups: "_Edits", voters: "_Edits") -> tuple | None:
+        key = self.keys.pop(tid, None)
+        if key is None:
+            return None
+        groups.pop(key[0], tid)
+        if key[1] is not None:
+            voters.pop(key[1], tid)
+        return key
+
+    def build(self, rows: list[tuple[str, str, str]], retro: dict, memo: dict) -> None:
+        """The keys of every track — ``rows``: ``(id, path, format)`` as of
+        the full pass's snapshot (``multi`` set)."""
+        groups, voters, by_name = _Edits(), _Edits(), _Edits()
+        for tid, path, fmt in rows:
+            key = self.track_keys(path, fmt, retro, memo)
+            if key is not None:
+                self.link(tid, key, groups, voters, by_name)
+        groups.apply(self.groups)
+        voters.apply(self.voters)
+        by_name.apply(self.by_name)
+
+    def track_keys(self, path: str, fmt: str, retro: dict, memo: dict) -> tuple | None:
+        """``(group, voter archive, chain name keys)`` of a track at ``path``
+        in format ``fmt`` as ``collect_folder_updates`` places it, or None
+        when the pass doesn't judge it by its folders (not retro, in the HVSC
+        tree, in a scan root)."""
+        r = retro.get(fmt)
+        if r is None:
+            from soniqboom.core.retro import is_retro_format
+            r = retro[fmt] = is_retro_format(fmt)
+        if not r:
+            return None
+        if _in_hvsc_tree(path, fmt):
+            return None
+        last = path.rsplit("::", 1)[-1].replace("\\", "/")
+        if "::" not in path:
+            ckey = path.rsplit("/", 1)[0]
+        elif "/" not in last:
+            ckey = path
+        else:
+            ckey = path.rsplit("::", 1)[0] + "::" + last.rsplit("/", 1)[0]
+        hit = memo.get(ckey, ...)
+        if hit is ...:
+            hit = None
+            chain = _container_chain(path, self.roots, 3, self.multi)
+            if chain:
+                c_key = chain[0][2]
+                group = chain[1][2] if len(chain) > 1 else "\0" + c_key
+                voter = c_key if chain[0][1] and "::" in path and "/" in last else None
+                hit = (group, voter,
+                       tuple(dict.fromkeys(name_key(clean_folder_name(c[0])) for c in chain)))
+            memo[ckey] = hit
+        return hit
+
+    def delta(self, changed: dict[str, tuple | None], names_now: set[str]) -> set[str]:
+        """Bring the book up to date with the changed tracks (``changed``: id →
+        its ``(path, format)`` now, None when deleted) and the library's
+        artist names ``names_now``; returns the ids to judge again (the
+        changed tracks it holds no keys for among them).  Pure — the caller
+        reads the store; run it in a thread."""
+        retro: dict = {}
+        regroup: set[str] = set()
+        # The several-tunes archives (a flip re-places every member).
+        members = _Edits()
+        touched: set[str] = set()
+        for tid, now in changed.items():
+            k = self.drop_arch(tid, members)
+            if k is not None:
+                touched.add(k)
+            if now is not None:
+                k = self.add_arch(tid, now[0], now[1], retro, members)
+                if k is not None:
+                    touched.add(k)
+        members.apply(self.arch_members)
+        rekey = set(changed)
+        for k in touched:
+            now = self.several(k)
+            if now != (k in self.multi):
+                (self.multi.add if now else self.multi.discard)(k)
+                rekey.update(self.arch_members.get(k, ()))
+        # The library's person names.
+        flipped: set[str] = set()
+        for n, step in [(n, -1) for n in self.names - names_now] + \
+                       [(n, 1) for n in names_now - self.names]:
+            for k in person_keys((n,)):
+                c = self.persons.get(k, 0) + step
+                if c > 0:
+                    self.persons[k] = c
+                else:
+                    self.persons.pop(k, None)
+                if (c > 0) != (c - step > 0):
+                    flipped.add(k)
+        self.names = names_now
+        for k in flipped:
+            regroup.update(self.by_name.get(k, ()))
+        # The changed tracks' places, before and after.
+        groups, voters, by_name = _Edits(), _Edits(), _Edits()
+        loners: set[str] = set()
+        memo: dict = {}
+        for tid in rekey:
+            old = self.unlink(tid, groups, voters)
+            if old is not None:
+                regroup.add(old[0])
+                if old[1] is not None:
+                    regroup.add(old[1])
+            now = changed.get(tid, ...)
+            if now is ...:                              # a several-tunes archive's member
+                now = self.places.get(tid)
+            if now is None:
+                continue
+            new = self.track_keys(now[0], now[1], retro, memo)
+            if new is None:
+                loners.add(tid)
+                continue
+            self.link(tid, new, groups, voters, by_name)
+            regroup.add(new[0])
+            if new[1] is not None:
+                regroup.add(new[1])
+        groups.apply(self.groups)
+        voters.apply(self.voters)
+        by_name.apply(self.by_name)
+        # A generic-folder member votes in its archive's group, and its own
+        # verdict (which reads its own group) decides whether it is skipped
+        # in a settle round there (withdrawn to its header's game): a group
+        # judged again takes along the groups of the members voting in it,
+        # and the archive groups its own members vote in — closed over.
+        frontier = list(regroup)
+        while frontier:
+            g = frontier.pop()
+            for u in self.voters.get(g, ()):
+                gu = self.keys[u][0]
+                if gu not in regroup:
+                    regroup.add(gu)
+                    frontier.append(gu)
+            for u in self.groups.get(g, ()):
+                v = self.keys[u][1]
+                if v is not None and v not in regroup:
+                    regroup.add(v)
+                    frontier.append(v)
+        ids = set(loners)
+        for g in regroup:
+            ids.update(self.groups.get(g, ()))
+        return ids
+
+
 # ── Pass orchestration ───────────────────────────────────────────────────────
 
 _lock: asyncio.Lock | None = None
-_last_seq: int | None = None          # store _mutation_seq our last pass fully covered
+# The last pass's position in the store's enrichment change log and its inputs
+# (scan roots, Modland index) — ``enrich_delta.record``; None: the next pass
+# judges every track.
+_last_seq: tuple | None = None
+_book: _FolderBook | None = None      # its bookkeeping (see ``_FolderBook``)
 _status: dict = {"last_apply": None, "last_revert": None}
 
 
@@ -1329,154 +1618,104 @@ async def apply_folder_albums(*, force: bool = False) -> dict:
     """Fill empty retro albums from folder names (and re-judge the ones an
     earlier pass stamped).  Must run on the loop.
 
-    A no-op unless the setting is on, and skips its scan entirely when the
-    store hasn't mutated since the previous pass.  ``force`` bypasses both
-    checks — the settings toggle uses it right after switching the option on."""
-    global _last_seq
+    A no-op unless the setting is on.  After its first run a pass judges only
+    the tracks written since the last one and the tracks whose verdict reads
+    them (``_FolderBook``, ``enrich_delta``) — skipped when there are none —
+    and every track when the scan roots or the Modland index changed.
+    ``force`` judges every track and bypasses the setting — the settings
+    toggle uses it right after switching the option on."""
+    global _last_seq, _book
     from soniqboom.core.store import get_store
     if not force and not enabled():
         return {"updated": 0, "skipped": "disabled"}
     async with _get_lock():
         store = get_store()
-        if not force and _last_seq is not None and store._mutation_seq == _last_seq:
-            return {"updated": 0, "skipped": "unchanged"}
         loop = asyncio.get_running_loop()
-        from soniqboom.core import scene_metadata
+        from soniqboom.core import enrich_delta, scene_metadata
+        roots = frozenset(sd.get("path", "").rstrip("/")
+                          for sd in store.list_scan_dirs() if sd.get("path"))
+        inputs = (roots, scene_metadata._index_sig())
+        last = _last_seq
+        changed = enrich_delta.changes(store, last, inputs, force=force)
+        if changed is not None and not changed:
+            return {"updated": 0, "skipped": "unchanged"}
+        # The bookkeeping is handed back only when the pass completes: a pass
+        # that ends early leaves the next one to judge every track.
+        book, _book, _last_seq = _book, None, None
+        keys_ok = True
         try:
             fmt_ml, author_ml = await loop.run_in_executor(
                 None, scene_metadata.modland_name_keys)
         except Exception:                               # noqa: BLE001
             fmt_ml, author_ml = frozenset(), frozenset()
-        roots = frozenset(sd.get("path", "").rstrip("/")
-                          for sd in store.list_scan_dirs() if sd.get("path"))
-        # The snapshot and the sequence number it corresponds to are taken
-        # together (no await between): any mutation after this point must
-        # make the NEXT pass run, even though our commit bumps the seq too.
-        seq0 = store._mutation_seq
-        tracks = store.all_tracks()                     # snapshot of refs
-        names = _library_artist_names(store)            # tag-index keys
-        # Pure string work on immutable inputs → off the loop.
-        format_keys, a_keys = await loop.run_in_executor(
-            None, lambda: (_format_keys_static() | fmt_ml, person_keys(names)))
-        # The archives holding several tunes (never single-file wrappers).
-        retro_cache: dict = {}
-        arch_counts: dict[str, list] = {}
-        t0 = time.perf_counter()
-        for i in range(0, len(tracks), _GUARD_CHUNK):
-            _note_archives(tracks[i:i + _GUARD_CHUNK], arch_counts, retro_cache)
-            if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
-                await asyncio.sleep(_YIELD_SEC)
-                t0 = time.perf_counter()
-        multi = _several_tunes(arch_counts)
-        dir_cache: dict = {}                            # one memo across chunks
-
-        async def collect(state: dict, every_track: bool, skip: set[str]) -> None:
+            keys_ok = False                             # no delta may build on this pass
+        # The snapshot, the changes and the change-log position they
+        # correspond to are taken together (no await between): any write
+        # after this point must reach the NEXT pass, even though our commit
+        # writes too.
+        if changed is not None:
+            changed = enrich_delta.changes(store, last, inputs)
+        snap = store.enrich_cursor()
+        tracks: list[dict] | None = None
+        if changed is not None and book is not None and book.roots == roots:
+            # The changed tracks' places and the person names as of the
+            # snapshot; the book follows them off the loop.
+            now: dict = {}
+            for tid in changed:
+                t = store.get_track(tid)
+                now[tid] = None if t is None else (t.get("path") or "", t.get("format") or "")
+            names_now = set(_library_artist_names(store))
+            ids = await loop.run_in_executor(None, book.delta, now, names_now)
+            if len(ids) <= enrich_delta.limit(store):
+                tracks = enrich_delta.tracks_of(store, ids)
+                format_keys = await loop.run_in_executor(
+                    None, lambda: _format_keys_static() | fmt_ml)
+        if tracks is None:
+            book = _FolderBook(roots)
+            tracks = store.all_tracks()                 # snapshot of refs
+            # The places as of the snapshot: an edit in place later (a repair
+            # re-reading the format) is then the next delta's, which re-judges
+            # the place it had here too.
+            rows = [(t["id"], t.get("path") or "", t.get("format") or "") for t in tracks]
+            names = _library_artist_names(store)        # tag-index keys
+            # Pure string work on immutable inputs → off the loop.
+            format_keys, persons = await loop.run_in_executor(
+                None, lambda: (_format_keys_static() | fmt_ml, _person_key_counts(names)))
+            book.names, book.persons = set(names), persons
+            # The archives holding several tunes (never single-file wrappers).
+            retro_cache: dict = {}
+            members = _Edits()
             t0 = time.perf_counter()
-            for i in range(0, len(tracks), _SCAN_CHUNK):
-                chunk = tracks[i:i + _SCAN_CHUNK]
-                if skip:
-                    chunk = [t for t in chunk if t["id"] not in skip]
-                collect_folder_updates(
-                    chunk, roots=roots, format_keys=format_keys,
-                    author_keys=author_ml, artist_keys=a_keys,
-                    retro_cache=retro_cache, dir_cache=dir_cache, state=state,
-                    every_track=every_track, multi=multi)
+            for i in range(0, len(rows), _GUARD_CHUNK):
+                for tid, path, fmt in rows[i:i + _GUARD_CHUNK]:
+                    book.add_arch(tid, path, fmt, retro_cache, members)
                 if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
-                    await asyncio.sleep(_YIELD_SEC)     # keep requests flowing
+                    await asyncio.sleep(_YIELD_SEC)
                     t0 = time.perf_counter()
-            await asyncio.sleep(_YIELD_SEC)             # the vote: ~10 ms at 263K
-
-        # The folder name of EVERY retro track (its per-source game name —
-        # also where the album is another source's or the user's): a collect
-        # of its own, so it can't move the album verdicts below — only a
-        # title tune follows its folder's other tracks (``accepted``).
-        name_state = new_folder_state()
-        await collect(name_state, True, set())
-        named = {tid: upd["album"] for tid, upd, _e in finalize_folder_updates(name_state)}
-        # The albums.  A stamped album withdrawn to the file header's name
-        # takes its track out of the vote next time (it has an album of its
-        # own then), so the vote is taken again without such tracks until
-        # none is left — the result is what the next pass sees.
-        items: list = []
-        skip: set[str] = set()
-        for rnd in range(_SETTLE_ROUNDS):
-            state = new_folder_state()
-            await collect(state, False, skip)
-            got = finalize_folder_updates(state, name_state["accepted"])
-            back = [it for it in got
-                    if "album" in it[1] and it[1].get("album_source") != SOURCE_FOLDER
-                    and (it[1].get("album") or "").strip()]
-            if not back or rnd == _SETTLE_ROUNDS - 1:
-                items.extend(got)
-                break
-            items.extend(back)
-            skip.update(it[0] for it in back)
-        # A track the album pass itself judges (no album of its own, or one it
-        # stamped) takes ITS verdict — the album it gets or keeps, or none when
-        # refused — never the every-track guess (the siblings that vote there
-        # differ); the others (another source's album, the user's — and one
-        # whose withdrawn album gives the header's name back, as the next pass
-        # will see it) take the every-track name.
-        # A folder the album pass refused for its own tracks gives no name to
-        # its other tracks either (the two votes must agree).
-        judged: dict[str, str | None] = {}
-        restored: set[str] = set()
-        for tid, upd, _e in items:
-            if "album" not in upd:
-                continue
-            if upd.get("album_source") == SOURCE_FOLDER:
-                judged[tid] = upd.get("album") or None
-            elif (upd.get("album") or "").strip():
-                restored.add(tid)               # withdrawn: the header's name back
-            else:
-                judged[tid] = None              # withdrawn, no name left
-        own_want: dict[str, str | None] = {}
-        refused: set[str] = set()
-        accepted: set[str] = set()
-        t0 = time.perf_counter()
-        for i in range(0, len(tracks), _SCAN_CHUNK):
-            for t in tracks[i:i + _SCAN_CHUNK]:
-                tid = t["id"]
-                if tid in restored or album_edit_locked(t) or not (
-                        t.get("album_source") == SOURCE_FOLDER
-                        or not (t.get("album") or "").strip()):
-                    continue
-                want = judged[tid] if tid in judged else (
-                    (t.get("album") or None) if t.get("album_source") == SOURCE_FOLDER
-                    else None)
-                own_want[tid] = want
-                if tid in named or want:
-                    (accepted if want else refused).add(_container_key(t, roots, multi))
-            if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
-                await asyncio.sleep(_YIELD_SEC)
-                t0 = time.perf_counter()
-        refused -= accepted
-        for i in range(0, len(tracks), _SCAN_CHUNK):
-            for t in tracks[i:i + _SCAN_CHUNK]:
-                tid = t["id"]
-                if tid in own_want:
-                    want = own_want[tid]
-                else:
-                    want = named.get(tid)
-                    if want and _container_key(t, roots, multi) in refused:
-                        want = None
-                if (t.get("game_by_folder") or None) != want:
-                    items.append((tid, {"game_by_folder": want}, None))
-            if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
-                await asyncio.sleep(_YIELD_SEC)
-                t0 = time.perf_counter()
+            members.apply(book.arch_members)
+            book.multi = {k for k in book.arch if book.several(k)}
+            full = True
+        else:
+            full = False
+        items = await _judge_tracks(tracks, roots=roots, format_keys=format_keys,
+                                    author_keys=author_ml, artist_keys=book.persons.keys(),
+                                    multi=frozenset(book.multi))
+        if full:
+            # Every judged track's place, for the delta passes after this one
+            # (pure string work on the snapshot → off the loop).
+            await loop.run_in_executor(None, book.build, rows, {}, {})
         if not force and not enabled():
             return {"updated": 0, "skipped": "disabled"}   # switched off meanwhile
         written: list[str] = []
         _patches, albums, own_bumps = await _commit_album_updates(items, written=written)
         updated = len(set(written))                     # tracks (an album and a name: one)
+        # Past our own writes when nothing else wrote meanwhile; else (a scan
+        # adding tracks during the collect) the next pass re-reads what was
+        # written since the snapshot.
+        if keys_ok:
+            _book, _last_seq = book, enrich_delta.record(store, snap, own_bumps, inputs)
         if updated:
             await refresh_album_caches(written)
-        # Only our own writes moved the seq → the library is exactly what this
-        # pass saw.  Anything else (a scan adding tracks during the collect)
-        # leaves the pre-snapshot value, so the next pass rescans.
-        _last_seq = (store._mutation_seq if store._mutation_seq == seq0 + own_bumps
-                     else seq0)
         # ``updated`` counts every track written, ``albums`` only the album
         # changes (the rest are per-source game names).
         res = {"updated": updated, "albums": albums, "candidates": len(items)}
@@ -1488,6 +1727,114 @@ async def apply_folder_albums(*, force: bool = False) -> dict:
             log.info("Folder albums: %d retro track(s) got a new folder game name",
                      updated - albums)
         return res
+
+
+async def _judge_tracks(tracks: list[dict], *, roots: frozenset[str],
+                        format_keys, author_keys, artist_keys,
+                        multi: frozenset[str]) -> list:
+    """The patches of the folder pass for ``tracks`` — the whole library, or
+    whole groups of it (``_FolderBook``): albums (``collect_folder_updates``,
+    settled over ``_SETTLE_ROUNDS``) and the per-source game names
+    (``game_by_folder``).  Yields to the loop every ``_YIELD_BUDGET_S``."""
+    retro_cache: dict = {}
+    dir_cache: dict = {}                                # one memo across chunks
+
+    async def collect(state: dict, every_track: bool, skip: set[str]) -> None:
+        t0 = time.perf_counter()
+        for i in range(0, len(tracks), _SCAN_CHUNK):
+            chunk = tracks[i:i + _SCAN_CHUNK]
+            if skip:
+                chunk = [t for t in chunk if t["id"] not in skip]
+            collect_folder_updates(
+                chunk, roots=roots, format_keys=format_keys,
+                author_keys=author_keys, artist_keys=artist_keys,
+                retro_cache=retro_cache, dir_cache=dir_cache, state=state,
+                every_track=every_track, multi=multi)
+            if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
+                await asyncio.sleep(_YIELD_SEC)     # keep requests flowing
+                t0 = time.perf_counter()
+        await asyncio.sleep(_YIELD_SEC)             # the vote: ~10 ms at 263K
+
+    # The folder name of EVERY retro track (its per-source game name —
+    # also where the album is another source's or the user's): a collect
+    # of its own, so it can't move the album verdicts below — only a
+    # title tune follows its folder's other tracks (``accepted``).
+    name_state = new_folder_state()
+    await collect(name_state, True, set())
+    named = {tid: upd["album"] for tid, upd, _e in finalize_folder_updates(name_state)}
+    # The albums.  A stamped album withdrawn to the file header's name
+    # takes its track out of the vote next time (it has an album of its
+    # own then), so the vote is taken again without such tracks until
+    # none is left — the result is what the next pass sees.
+    items: list = []
+    skip: set[str] = set()
+    for rnd in range(_SETTLE_ROUNDS):
+        state = new_folder_state()
+        await collect(state, False, skip)
+        got = finalize_folder_updates(state, name_state["accepted"])
+        back = [it for it in got
+                if "album" in it[1] and it[1].get("album_source") != SOURCE_FOLDER
+                and (it[1].get("album") or "").strip()]
+        if not back or rnd == _SETTLE_ROUNDS - 1:
+            items.extend(got)
+            break
+        items.extend(back)
+        skip.update(it[0] for it in back)
+    # A track the album pass itself judges (no album of its own, or one it
+    # stamped) takes ITS verdict — the album it gets or keeps, or none when
+    # refused — never the every-track guess (the siblings that vote there
+    # differ); the others (another source's album, the user's — and one
+    # whose withdrawn album gives the header's name back, as the next pass
+    # will see it) take the every-track name.
+    # A folder the album pass refused for its own tracks gives no name to
+    # its other tracks either (the two votes must agree).
+    judged: dict[str, str | None] = {}
+    restored: set[str] = set()
+    for tid, upd, _e in items:
+        if "album" not in upd:
+            continue
+        if upd.get("album_source") == SOURCE_FOLDER:
+            judged[tid] = upd.get("album") or None
+        elif (upd.get("album") or "").strip():
+            restored.add(tid)               # withdrawn: the header's name back
+        else:
+            judged[tid] = None              # withdrawn, no name left
+    own_want: dict[str, str | None] = {}
+    refused: set[str] = set()
+    accepted: set[str] = set()
+    t0 = time.perf_counter()
+    for i in range(0, len(tracks), _SCAN_CHUNK):
+        for t in tracks[i:i + _SCAN_CHUNK]:
+            tid = t["id"]
+            if tid in restored or album_edit_locked(t) or not (
+                    t.get("album_source") == SOURCE_FOLDER
+                    or not (t.get("album") or "").strip()):
+                continue
+            want = judged[tid] if tid in judged else (
+                (t.get("album") or None) if t.get("album_source") == SOURCE_FOLDER
+                else None)
+            own_want[tid] = want
+            if tid in named or want:
+                (accepted if want else refused).add(_container_key(t, roots, multi))
+        if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
+            await asyncio.sleep(_YIELD_SEC)
+            t0 = time.perf_counter()
+    refused -= accepted
+    for i in range(0, len(tracks), _SCAN_CHUNK):
+        for t in tracks[i:i + _SCAN_CHUNK]:
+            tid = t["id"]
+            if tid in own_want:
+                want = own_want[tid]
+            else:
+                want = named.get(tid)
+                if want and _container_key(t, roots, multi) in refused:
+                    want = None
+            if (t.get("game_by_folder") or None) != want:
+                items.append((tid, {"game_by_folder": want}, None))
+        if time.perf_counter() - t0 >= _YIELD_BUDGET_S:
+            await asyncio.sleep(_YIELD_SEC)
+            t0 = time.perf_counter()
+    return items
 
 
 async def revert_album_source(source: str) -> int:

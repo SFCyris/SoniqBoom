@@ -196,7 +196,8 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        list. Right-click any track for <strong>Go to artist</strong> or <strong>Go to album</strong> to pivot to
        everything by that artist or on that album. And the <strong>⌾ Locate</strong> button on the player bar —
        or the <span class="kbd">G</span> key — scrolls the list back to whatever's playing, which is marked with
-       a small animated equalizer.</p>
+       a small animated equalizer. If part of a long list can't be loaded from the server, its rows say so and
+       offer <strong>Retry</strong>.</p>
 
     <h3>The Library Galaxy</h3>
     <p>Every track in your collection rendered as a drifting star-field — each format its own glowing
@@ -366,6 +367,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
   <section id="playing">
     <h2 class="sec"><span class="num">07</span>Now playing</h2>
     <p class="sec-sub">Click any track and it plays — even a 1987 SID tune or a 64-channel tracker module, rendered to audio on the fly.</p>
+    <div class="note"><b>First plays start at once.</b> A retro tune that isn't in the render cache yet starts
+      playing within a fraction of a second while the rest of it renders — SID, MIDI, AdLib / OPL, Atari ST SNDH,
+      the PSF family, console chiptunes and Amiga modules alike (a tune that opens with silence starts once its
+      first sound is rendered). Safari starts a first play once its render is complete. Subsonic apps and DLNA
+      players start SID and SNDH tunes while they render; a Subsonic app that asks for MP3 or another format
+      gets that quick start for every one of these formats, unless it asks for a start offset or — for any but
+      SID and SNDH — an estimated file size. Casting (Beta) starts SID, MIDI, AHX and console-chiptune tunes the
+      same way.</div>
 
     <h3>Per-channel VU meters for tracker modules</h3>
     <p>Open any module and SoniqBoom shows a meter for <em>every</em> voice in the song — Paula channels,
@@ -405,15 +414,22 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       their per-voice meters and module details, and SID and MIDI keep their own detail panels.</div>
 
     <h3>Multi-song files — the tune picker</h3>
-    <p>A single SID, SNDH, AHX or tracker file often holds many separate tunes — a game's whole soundtrack in
-       one file. Open <strong>Track Info</strong> on one and a <strong>tune picker</strong> lists every
-       subsong: <b>▶</b> play, <b>+</b> queue or <b>☰</b> add any one to a playlist, or <b>Play all</b>,
+    <p>A single SID, SNDH, AHX, Amiga, tracker or console-rip file (NSF, NSFe, GBS, AY, SAP) often holds many
+       separate tunes — a game's whole soundtrack in one file. Open <strong>Track Info</strong> on one and a
+       <strong>tune picker</strong> lists every subsong: <b>▶</b> play, <b>+</b> queue or <b>☰</b> add any one to a
+       playlist, or <b>Play all</b>,
        <b>Add all</b> and <b>shuffle</b> the whole set at once — and those single-tune picks live happily
        inside playlists alongside ordinary tracks. When a SID is part of the
        <a href="https://hvsc.c64.org/" target="_blank" rel="noopener">HVSC</a> collection, each tune shows its
        real name and length from the <strong>Songlengths</strong> and <strong>STIL</strong> databases — so
        <em>Tune&nbsp;3&nbsp;/&nbsp;6</em> reads <em>"Assembly"</em> rather than a bare number — with the full
        STIL commentary below and the chip model shown as a <strong>6581 / 8580</strong> badge.</p>
+    <p>Playing the file itself starts at its <em>default</em> tune, marked <b>default</b> in the picker: the start
+       song a SID or SNDH file names, and for Amiga player formats (played by UADE), console rips and SC68 disks the
+       first tune that isn't empty (tracker modules start at tune 1); a tune you pick plays that tune. On the
+       phone, <strong>Now Playing</strong> lists the playing file's tunes below the controls; tap one to play it,
+       and its number follows the title. A tune that renders to silence shows “This tune plays only silence”
+       instead of playing — in the web player, a very long C64 tune from its second play on.</p>
 
     <h3>Equalizer &amp; visualizer</h3>
     <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
@@ -625,14 +641,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus, Musepack</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>DSD (1-bit)</strong></td><td>DSF, DFF, WSD</td><td>ffmpeg</td></tr>
-        <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
+        <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID, RSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
         <tr><td><strong>MIDI</strong></td><td>MID, MIDI</td><td>FluidSynth + SoundFonts</td></tr>
-        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, DSM …</td><td>libopenmpt</td></tr>
+        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, DSM …</td><td>libopenmpt (MED 2–4 modules: zxtune123)</td></tr>
         <tr><td><strong>Amiga</strong> (Hively / AHX)</td><td>AHX, HivelyTracker (HVL)</td><td>uade123 / bundled HivelyTracker engine</td></tr>
-        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>175+ custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
+        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>175+ custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
         <tr><td><strong>Atari ST</strong></td><td>SNDH, YM, SC68</td><td>psgplay / StSound / sc68</td></tr>
         <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF</td><td>zxtune123</td></tr>
-        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES</td><td>libgme</td></tr>
+        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme</td></tr>
         <tr><td><strong>AdLib / OPL2 FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX …</td><td>AdPlug (<code>adplay</code>)</td></tr>
       </tbody>
     </table>
@@ -772,11 +788,20 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       <tbody>
         <tr><td><strong>SMB</strong></td><td>Host, share name and path — with a username and password, or tick <em>Guest access</em>.</td></tr>
         <tr><td><strong>FTP</strong></td><td>Host and remote path — with a username and password, or tick <em>Anonymous</em>.</td></tr>
-        <tr><td><strong>WebDAV</strong> (http / https)</td><td>A base URL — with a username and password, or tick <em>Public (no auth)</em>.</td></tr>
+        <tr><td><strong>WebDAV</strong> (http / https)</td><td>A base URL — the server itself (<code>https://dav.example.com</code>) or a folder on it (<code>https://cloud.example.com/remote.php/dav/files/USERNAME/Music</code>) — with a username and password, or tick <em>Public (no auth)</em>.</td></tr>
       </tbody>
     </table>
     <p>Add an optional alias, click <strong>Test</strong> to check the connection, then <strong>+ Connect</strong> —
-       SoniqBoom attaches the share with no operating-system mount required and scans it straight away.</p>
+       SoniqBoom attaches the share with no operating-system mount required and scans it straight away. When the
+       connection fails, the message says why (for example a wrong password or a URL that is not a WebDAV folder).
+       When a server refuses a share's sign-in, SoniqBoom waits before trying that login again (from 5 minutes up to
+       6 hours) and the share's row says so; <strong>Reconnect</strong> tries at once.</p>
+    <p>Tracks on a share start playing while they download: an MP3, WAV, Ogg or Opus file, or a FLAC with a seek
+       table, plays from its first bytes, and a seek far ahead of what has arrived can be read straight from the
+       share.
+       A track inside a large ZIP archive on a share is read on its own, without downloading the whole archive.
+       A share whose server is offline when SoniqBoom starts is marked unavailable and connects by itself once the
+       server is reachable again.</p>
 
     <h3>Keep your library fresh</h3>
     <p>Local folders are <strong>watched automatically</strong> — files you add, change or remove are picked up a few
@@ -875,12 +900,15 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
        (add <code>-role admin</code> to restore admin rights) — it takes effect immediately.
        See <a href="#manage">Manage your library &amp; users</a>.</p>
     <h3>A scan reports files it didn't index</h3>
-    <p>A file whose metadata can't be read within about 90 seconds is skipped and counted as a scan error, and the
-       scan goes on with the next one. When five files inside the same archive are skipped this way in a row, the rest
-       of that archive is skipped too. If a network share stops answering during a scan, the scan shows
-       <em>Waiting for … to answer</em> and waits up to about three minutes; if the share is still silent, the rest
-       of that library folder is left for later. Tracks already in your library stay. Once the files or the share are
-       readable again, use the folder's <strong>Re-Index</strong> button.</p>
+    <p>A file whose metadata can't be read within about 90 seconds, or whose reading crashes the scanner's worker
+       process, is skipped and counted as a scan error, and the scan goes on with the next one. When five files
+       inside the same archive time out in a row, the rest of that archive is skipped too. The automatic rescans
+       (the folder watcher and the rescan after startup) try a skipped file again only after a wait that grows each
+       time it is skipped — an hour, then four, then sixteen, up to a week; a file that has changed is tried at the
+       next scan; each scan tries a limited number of them. If a network share stops answering during a scan, the scan shows <em>Waiting for … to answer</em> and
+       waits up to about three minutes; if the share is still silent, the rest of that library folder is left for
+       the next scan. Tracks already in your library stay. Once the files or the share are readable again, use the
+       folder's <strong>Re-Index</strong> button — it tries skipped files again without the wait.</p>
     <h3>A network share won't connect</h3>
     <p>In the admin panel's <strong>Music Folders → Network Share</strong> form, use <strong>Test</strong> before
        connecting — it reports the exact connection error. Check the host, share name / path and credentials, and that

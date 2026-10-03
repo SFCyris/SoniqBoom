@@ -29,8 +29,9 @@ SID = REPO / "internal/testdata/sid/SX-64_Demo.sid"
 
 def _wav(path: Path, seconds: float) -> Path:
     frames = int(seconds * 44100)
+    # Audible (a ±8000 square wave): the cache refuses a silent render.
     path.write_bytes(stream._build_wav_header(44100, 2, frames, bits_per_sample=16)
-                     + b"\0" * (frames * 4))
+                     + (b"\x40\x1f\x40\x1f\xc0\xe0\xc0\xe0" * frames)[:frames * 4])
     return path
 
 
@@ -209,7 +210,7 @@ with open(out, "wb") as f:
     step, written = rate * 2 // 10, 0
     while written < total:
         n = min(step, total - written)
-        f.write(b"\x01\x00" * (n // 2))
+        f.write(b"\x00\x10\x00\xf0" * (n // 4))     # audible: silence is refused
         f.flush()
         written += n
         time.sleep(0.1 / 30)             # ~30x realtime

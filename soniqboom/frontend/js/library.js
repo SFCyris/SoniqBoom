@@ -7,11 +7,31 @@
  */
 import { Player } from './player.js';
 import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel } from './utils.js';
+import { createVirtualList } from './vlist.js';
 
+// A failed request rejects — an error body (``{detail: …}``) must never pass for
+// data (a windowed chunk stored it and its rows stayed on the shimmer for good).
 const API = (path, q = {}) => {
   const qs = new URLSearchParams(q).toString();
-  return fetch(`/api${path}${qs ? '?' + qs : ''}`).then(r => r.json());
+  return fetch(`/api${path}${qs ? '?' + qs : ''}`).then((r) => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  });
 };
+
+// A browse view's data request: a failure is said in place of the view's
+// loading rows (with a Retry) when that view is still the one asked for, and
+// resolves to null; the caller then stops.  (Without this a failed request left
+// the loading shimmer up for good.)  An in-place reload (reloadCurrentView)
+// that fails keeps the rows already on screen.
+async function _viewData(gen, request, retry) {
+  try {
+    return await request;
+  } catch (_) {
+    if (gen === _browseNavGen && !_reloadingView) _showViewError(retry);
+    return null;
+  }
+}
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const tbody            = document.getElementById('track-tbody');
@@ -159,8 +179,9 @@ async function reloadCurrentView() {
     groupFilterInput.value = filter;
     groupFilterInput.dispatchEvent(new Event('input'));
   }
-  // Group rows stream in over a few frames: keep asking until the list is
-  // tall enough again (or ~0.5 s passed).
+  // The list can reach its full height a frame or two late (rows are
+  // measured on their first paint): keep asking until it is tall enough
+  // again (or ~0.5 s passed).
   scrollers.forEach((el, i) => {
     const y = tops[i];
     if (!(y > 0)) return;
@@ -197,13 +218,6 @@ let currentTracks = [];
 // store), so a post-scan refresh can update All Tracks in place without yanking
 // the user out of any other view.  Read via Library.isInAllTracksView().
 let _viewIsAllTracks = false;
-// Generation tokens for the streamed group-list / album-grid renders (their
-// rows/cards paint across animation frames): bumped by their own renderer AND by
-// renderTracks, so drilling into a track view cancels the outgoing stream's
-// pending batches instead of letting it append onto/behind the new view.
-// Declared here so renderTracks (defined above their renderers) can invalidate.
-let _groupRenderGen = 0;
-let _albumGridGen = 0;
 // Cross-view navigation generation.  Every async view-entry (group lists +
 // All Tracks) bumps this at its start and captures the value; after its fetch
 // resolves it bails if a NEWER view was requested meanwhile, so a slow first
@@ -281,14 +295,20 @@ function _setCappedSource(shown, cap, total, shuffleParams, orderedSpec, label) 
 //     2000 rows of latency, not the full 5000.
 //   * MAX_CHUNKS = 10 — keeps ~20 000 tracks (≈ 10 MB at our row size)
 //     in memory at any time, evicting least-recently-touched chunks.
+// [windowed-store:begin] — tests/js/windowed_store.test.mjs runs this region as is
 const CHUNK_SIZE = 2000;
 const MAX_CHUNKS = 10;
+// A chunk whose fetch fails is asked again after these pauses (its rows keep the
+// loading shimmer meanwhile); once they are used up its rows say so and offer
+// Retry, and scrolling back to them after the last pause asks once more.
+const CHUNK_RETRY_MS = [1000, 3000, 15000];
 
 function createWindowedStore(total, fetcher, opts = {}) {
   const chunks  = new Map();   // chunkIdx → Track[]
   const pending = new Map();   // chunkIdx → Promise (dedup)
+  const failed  = new Map();   // chunkIdx → { tries, retryAt, timer } (fetch failed)
   const lru     = [];          // chunkIdx access order, oldest first
-  let onChunkLoad = null;      // called with chunkIdx when a fetch lands
+  let onChunkLoad = null;      // called with chunkIdx when a fetch lands (or fails)
   // Sort metadata is carried on the store so callers (e.g. column-header
   // click) can read the current key+direction back without re-deriving it
   // from the persisted localStorage state.  Mutation of these fields
@@ -331,7 +351,20 @@ function createWindowedStore(total, fetcher, opts = {}) {
     invalidate() {
       chunks.clear();
       pending.clear();
+      for (const f of failed.values()) clearTimeout(f.timer);
+      failed.clear();
       lru.length = 0;
+    },
+    // Row ``i`` could not be loaded: its chunk failed every automatic attempt
+    // and is not being fetched right now.
+    isFailed(i) {
+      const c = Math.floor(i / CHUNK_SIZE);
+      const f = failed.get(c);
+      return !!f && f.tries >= CHUNK_RETRY_MS.length && !pending.has(c) && !chunks.has(c);
+    },
+    // The Retry button: ask for every failed chunk again as soon as it is shown.
+    retryFailed() {
+      for (const f of failed.values()) { clearTimeout(f.timer); f.timer = null; f.retryAt = 0; }
     },
     // Slice-like helper for cases where the caller needs the currently
     // loaded contiguous window starting at idx (Player.setQueue path).
@@ -367,7 +400,14 @@ function createWindowedStore(total, fetcher, opts = {}) {
     const offset = chunkIdx * CHUNK_SIZE;
     const limit  = Math.min(CHUNK_SIZE, total - offset);
     if (limit <= 0) return;
-    const p = fetcher(offset, limit).then(arr => {
+    const fail = failed.get(chunkIdx);
+    if (fail && Date.now() < fail.retryAt) return;     // backing off
+    const p = Promise.resolve().then(() => fetcher(offset, limit)).then(arr => {
+      if (pending.get(chunkIdx) !== p) return;          // invalidated meanwhile
+      // Only an array is a chunk — anything else (an error body) is a failure.
+      if (!Array.isArray(arr)) throw new Error('not a track list');
+      const f = failed.get(chunkIdx);
+      if (f) { clearTimeout(f.timer); failed.delete(chunkIdx); }
       chunks.set(chunkIdx, arr);
       pending.delete(chunkIdx);
       // LRU bookkeeping — push then trim from the front, skipping the
@@ -384,9 +424,22 @@ function createWindowedStore(total, fetcher, opts = {}) {
         try { onChunkLoad(chunkIdx); } catch (_) { /* listener isolation */ }
       }
     }).catch(() => {
-      // Don't keep the failed chunk in ``pending`` forever — let the
-      // next access retry.
+      // Don't keep the failed chunk in ``pending`` forever, and don't ask again
+      // on every frame either: back off, then repaint so the rows still on
+      // screen ask once more (or, after the last pause, show the failure).
+      if (pending.get(chunkIdx) !== p) return;          // invalidated meanwhile
       pending.delete(chunkIdx);
+      const prev = failed.get(chunkIdx);
+      if (prev) clearTimeout(prev.timer);
+      const tries = (prev ? prev.tries : 0) + 1;
+      const wait = CHUNK_RETRY_MS[Math.min(tries, CHUNK_RETRY_MS.length) - 1];
+      const rec = { tries, retryAt: Date.now() + wait, timer: null };
+      failed.set(chunkIdx, rec);
+      const repaint = () => {
+        if (onChunkLoad) { try { onChunkLoad(chunkIdx); } catch (_) { /* listener isolation */ } }
+      };
+      if (tries < CHUNK_RETRY_MS.length) rec.timer = setTimeout(() => { rec.timer = null; repaint(); }, wait);
+      else repaint();                                    // out of attempts: show it
     });
     pending.set(chunkIdx, p);
   }
@@ -435,6 +488,7 @@ function createWindowedStore(total, fetcher, opts = {}) {
     },
   });
 }
+// [windowed-store:end]
 let _infoCallback = null;
 let _focusedIdx = -1;   // keyboard-navigated row index (J/K navigation)
 let _dupViewActive = false;  // true while in duplicates view (forces Location column visible)
@@ -446,20 +500,13 @@ let _groupLabel     = '';
 let _groupOnClick   = null;
 
 // ── Virtual scroll state ───────────────────────────────────────────────────────
-let ROW_H    = 28;   // px per row (measured after first paint; default matches td padding)
+// The track rows and the group rows (Artists / Albums / …) are pooled virtual
+// lists (vlist.js) sharing #track-list-wrap + tbody — only the one on screen
+// has rows in the tbody.  Row heights are measured from the first real row.
 const VS_BUF = 10;   // rows to render above/below viewport
-let _rowHMeasured = false;  // becomes true after the first measurement
 
 let _vsStart = 0;    // first rendered data index
 let _vsEnd   = 0;    // one past last rendered data index
-
-// Row pool for virtual scroll — pre-built TRs reused across scroll events.
-// Each entry is the same DOM node lifecycle: we mutate text/dataset/classes
-// instead of detaching + recreating, which keeps scroll inexpensive at large
-// row counts (the react-window pattern).
-const _rowPool   = [];
-let   _vsTopSpacer = null;
-let   _vsBotSpacer = null;
 
 // ── Multi-select state ─────────────────────────────────────────────────────────
 let _selected     = new Set();
@@ -493,8 +540,16 @@ let _hiddenCols = new Set(JSON.parse(localStorage.getItem('sb_hidden_cols') || '
 let _aliasMap = {};           // { "/abs/path": "alias", ... }
 let _exposeLocalFiles = true; // true = show full file path, false = show alias-based path
 
-export function setAliasMap(map) { _aliasMap = map || {}; }
-export function setExposeLocalFiles(v) { _exposeLocalFiles = v; }
+export function setAliasMap(map) { _aliasMap = map || {}; _repaintTrackRows(); }
+export function setExposeLocalFiles(v) { _exposeLocalFiles = v; _repaintTrackRows(); }
+
+// The rows on screen were painted under other settings (the Location column's
+// path form): paint them again.
+function _repaintTrackRows() {
+  if (!_trackVL.active) return;
+  for (const row of _trackVL.rows()) row.__tid = undefined;
+  _vsRender(true);
+}
 
 function _displayPath(fullPath) {
   if (!fullPath) return '';
@@ -578,8 +633,7 @@ function _showSkeletonRows(count = 18) {
   // …and no selection: the selection bar's actions index ``currentTracks``, and a
   // bar left over from the previous view queued ``undefined`` rows (→ playback crash).
   _selected.clear(); _lastClickIdx = -1; _focusedIdx = -1; _updateSelectionBar();
-  const albumGrid = document.getElementById('album-grid');
-  if (albumGrid) albumGrid.hidden = true;
+  _hideAlbumGrid();
   // Restore the track-list scroll container in case we're arriving from the
   // Galaxy view (which sets it display:none).  Without this the skeleton —
   // and then the loaded rows — would paint into a hidden wrapper, so clicking
@@ -589,11 +643,11 @@ function _showSkeletonRows(count = 18) {
   const wrap = document.getElementById('track-list-wrap');
   if (wrap) wrap.style.display = '';
   document.getElementById('track-table').style.display = '';
-  // The skeleton view replaces the entire tbody contents, so the pool
-  // detaches.  Clearing it here makes the next _vsRender treat the pool as
-  // empty rather than try to reuse phantom nodes.
-  _vsResetPool();
+  // The skeleton view replaces the entire tbody contents: both virtual lists
+  // let go of their rows (the next render starts a fresh pool).
+  _resetLists();
   tbody.innerHTML = '';
+  _clearViewError();
   emptyEl.hidden = true;
   loadingEl.hidden = true;
   for (let i = 0; i < count; i++) {
@@ -601,7 +655,7 @@ function _showSkeletonRows(count = 18) {
     tr.className = 'skeleton';
     tr.innerHTML = `
       <td class="col-num"><span class="skel-bar" style="width:${16 + Math.random() * 8|0}px"></span></td>
-      <td class="col-cover"><span class="skel-bar" style="width:28px;height:28px;border-radius:4px;display:inline-block"></span></td>
+      <td class="col-cover"><span class="skel-bar skel-cover"></span></td>
       <td class="col-title"><span class="skel-bar" style="width:${80 + Math.random() * 80|0}px"></span></td>
       <td class="col-album-artist"><span class="skel-bar" style="width:${50 + Math.random() * 50|0}px"></span></td>
       <td class="col-artist"><span class="skel-bar" style="width:${40 + Math.random() * 50|0}px"></span></td>
@@ -675,20 +729,34 @@ function _makeRowSkeleton() {
   return tr;
 }
 
-function _fillTrackRow(tr, t, i) {
-  // Windowed-store skeleton path: when the row at global index ``i``
-  // hasn't been fetched yet, ``t`` is undefined.  Render a row-shaped
-  // skeleton (matches _showSkeletonRows visually) so the layout stays
-  // stable while the chunk fetch lands.  Once it does the windowed
-  // store fires its onChunkLoad callback which forces a re-render and
-  // this row gets the real data on the next pass.
+// Pool callback (vlist.js): paint row ``i``.  ``fresh`` = the row showed another
+// index before; a forced render (``fresh`` false: a chunk landed, the row height
+// changed) repaints only a row whose content is out of date — a row that already
+// shows this track keeps its cover, stars, focus and now-playing bars untouched.
+function _fillTrackRowAt(tr, i, fresh) {
+  const moved = !!tr.__vlMoved;
+  tr.__vlMoved = false;
+  const t = currentTracks[i];
   if (!t) {
-    tr.removeAttribute('data-id');
-    tr.dataset.idx = i;
-    tr.className = 'skeleton';
-    tr.innerHTML = `
+    if (currentTracks._isWindowedStore && currentTracks.isFailed(i)) _fillFailedRow(tr, i);
+    else _fillSkeletonRow(tr, i, moved);
+    return;
+  }
+  if (!fresh && tr.__tid === t.id) return;
+  _fillTrackRow(tr, t, i);
+}
+
+// The .skel-bar shimmer's period — keep equal to app.css ``skel-shimmer 1.4s``.
+const SKEL_SHIMMER_MS = 1400;
+
+// Windowed-store skeleton: the row at global index ``i`` hasn't been fetched
+// yet.  A row-shaped shimmer (the same height as a track row, so the layout
+// stays put) holds its place until the chunk lands and the store's onChunkLoad
+// repaints it.  A row that already shimmers only takes the new index — its
+// markup (and the running shimmer) stays.
+const _SKELETON_ROW_HTML = `
       <td class="col-num"><span class="skel-bar" style="width:24px"></span></td>
-      <td class="col-cover"><span class="skel-bar" style="width:28px;height:28px;border-radius:4px;display:inline-block"></span></td>
+      <td class="col-cover"><span class="skel-bar skel-cover"></span></td>
       <td class="col-title"><span class="skel-bar" style="width:120px"></span></td>
       <td class="col-album-artist"><span class="skel-bar" style="width:80px"></span></td>
       <td class="col-artist"><span class="skel-bar" style="width:80px"></span></td>
@@ -699,27 +767,83 @@ function _fillTrackRow(tr, t, i) {
       <td class="col-format"><span class="skel-bar" style="width:36px"></span></td>
       <td class="col-location"><span class="skel-bar" style="width:80px"></span></td>
       <td class="col-rating"><span class="skel-bar" style="width:44px"></span></td>`;
-    return;
+function _fillSkeletonRow(tr, i, moved = false) {
+  tr.removeAttribute('data-id');
+  tr.dataset.idx = i;
+  tr.__tid = '';
+  const shimmering = tr.className === 'skeleton';
+  // A shimmer that (re)starts — new bars, or a row moved in the DOM — starts at
+  // the phase every other shimmer is in, so the rows don't run out of step.
+  // (A row left in place keeps its running shimmer untouched.)
+  if (moved || !shimmering) tr.style.setProperty('--skel-phase', `${-(performance.now() % SKEL_SHIMMER_MS)}ms`);
+  if (shimmering) return;
+  tr.className = 'skeleton';
+  tr.innerHTML = _SKELETON_ROW_HTML;
+}
+
+// The row's chunk failed every automatic attempt (see createWindowedStore).
+function _fillFailedRow(tr, i) {
+  tr.removeAttribute('data-id');
+  tr.dataset.idx = i;
+  tr.__tid = '';
+  if (tr.className === 'vs-load-failed') return;
+  tr.className = 'vs-load-failed';
+  tr.innerHTML = `
+      <td class="col-num"></td>
+      <td class="col-cover"><span class="vs-fail-frame"></span></td>
+      <td class="col-title">Couldn’t load these tracks <button type="button" class="vs-retry">Retry</button></td>
+      <td class="col-album-artist"></td><td class="col-artist"></td><td class="col-album"></td>
+      <td class="col-track"></td><td class="col-year"></td><td class="col-dur"></td>
+      <td class="col-format"></td><td class="col-location"></td><td class="col-rating"></td>`;
+}
+
+// Now-playing marker: the row tint + the animated bars in the number cell.
+// Added / removed only when the state changes, so the bars keep running.
+function _setRowPlaying(tr, on) {
+  if (tr.classList.contains('playing') !== on) tr.classList.toggle('playing', on);
+  const numCell = tr.cells[0];
+  if (!numCell) return;
+  const eq = numCell.querySelector('.row-eq');
+  if (on && !eq) {
+    const bars = document.createElement('span');
+    bars.className = 'row-eq';
+    bars.setAttribute('aria-hidden', 'true');
+    bars.innerHTML = '<i></i><i></i><i></i>';
+    numCell.appendChild(bars);
+  } else if (!on && eq) {
+    eq.remove();
   }
-  // If the row was previously rendered as a skeleton (different cell
-  // structure — shimmer bars instead of row-num / cover-frame / etc.),
+}
+
+// Star cell: repainted only when the rating it shows changes.
+function _paintStars(td, rating) {
+  if (td.__r === rating) return;
+  td.innerHTML = _renderStars(rating);
+  td.__r = rating;
+}
+
+function _fillTrackRow(tr, t, i) {
+  // If the row was previously rendered as a skeleton / failed row (different
+  // cell structure — shimmer bars instead of row-num / cover-frame / etc.),
   // restore the canonical layout so the field assignments below find
   // the elements they ``querySelector`` for.
-  if (tr.classList.contains('skeleton')) {
+  if (tr.classList.contains('skeleton') || tr.classList.contains('vs-load-failed')) {
     tr.innerHTML = _CANONICAL_ROW_HTML;
   }
   tr.dataset.id  = t.id;
   tr.dataset.idx = i;
+  tr.__tid = t.id;
 
-  // Reset class list to base + apply state-dependent classes.  We keep
-  // ``kb-focused`` / ``playing`` / ``dragging`` off the row by default —
-  // the surrounding code re-applies them after a render finishes.
+  // Reset class list to base + apply state-dependent classes.  ``dragging``
+  // stays off; ``kb-focused`` and ``playing`` follow the current state.
   tr.className = '';
   if (_selected.has(i)) tr.classList.add('multi-selected');
+  if (i === _focusedIdx) tr.classList.add('kb-focused');
   if (t._scanned === false) tr.classList.add('unscanned');
   if (t._dupGroupFirst) tr.classList.add('dup-group-first');
   if (t._dupIsPrimary)  tr.classList.add('dup-primary');
   if (t._dupGroupId && !t._dupIsPrimary) tr.classList.add('dup-variant');
+  _setRowPlaying(tr, !!Player.currentTrackId && t.id === Player.currentTrackId);
 
   const disc = t.disc_number != null ? `D${t.disc_number}` : '';
   const trk  = t.track_number != null ? String(t.track_number).padStart(2, '0') : '';
@@ -874,7 +998,7 @@ function _fillTrackRow(tr, t, i) {
   locTd.textContent = _displayPath(t.path || '');
 
   // col-rating — innerHTML required because stars use nested elements
-  cells[11].innerHTML = _renderStars(rating);
+  _paintStars(cells[11], rating);
 }
 
 // Persist rating + bring focus back into the star group after a change.
@@ -895,7 +1019,7 @@ function _setRowRating(trackId, newRating, ratingTd) {
   const finalRating = (prevRating === newRating) ? 0 : newRating;
   _ratingsCache[trackId] = finalRating;
   const gen = (_ratingGen[trackId] = (_ratingGen[trackId] || 0) + 1);
-  ratingTd.innerHTML = _renderStars(finalRating);
+  _paintStars(ratingTd, finalRating);
   const focusTarget = ratingTd.querySelector(`.star[data-val="${Math.max(1, finalRating)}"]`);
   if (focusTarget) {
     ratingTd.querySelectorAll('.star').forEach(s => { s.tabIndex = -1; });
@@ -917,142 +1041,82 @@ function _setRowRating(trackId, newRating, ratingTd) {
     // Only repaint the cell if its row still shows THIS track — the
     // virtual-scroll pool may have recycled the TD to another row mid-fetch.
     const row = ratingTd.closest('tr');
-    if (row && row.dataset.id === trackId) ratingTd.innerHTML = _renderStars(prevRating);
+    if (row && row.dataset.id === trackId) _paintStars(ratingTd, prevRating);
     window.Toast?.error?.('Couldn’t save rating — change reverted.');
   });
 }
 
 // ── Virtual scroll render ──────────────────────────────────────────────────────
 //
-// We keep a row-pool of pre-built TRs (``_rowPool``).  On each scroll we
-// resize the pool to cover the new visible window, mutate each pool row's
-// contents/dataset, and let the top/bottom spacer TRs hold the height of
-// the off-screen ranges.  This avoids the per-scroll
-// ``tbody.innerHTML = ''`` + DOM-build cycle that dominated profiles.
-function _vsResetPool() {
-  _rowPool.length = 0;
-  _vsTopSpacer = null;
-  _vsBotSpacer = null;
-}
+// Two pooled virtual lists (vlist.js) take turns in the tbody: the track rows
+// and the group rows (Artists / Albums / …).  Both keep a row per INDEX — a
+// scroll by one row repaints one row, not the whole window — and two spacer TRs
+// hold the height of the off-screen ranges.  Whoever empties the tbody first
+// hands it over with _resetLists().
+const _listWrap = document.getElementById('track-list-wrap');
+const _trackThead = document.querySelector('#track-table thead');
+// The sticky header covers the first rows; the lists read its height once per
+// view (and on resize) instead of on every frame.
+let _theadH = 0;
+function _measureThead() { _theadH = _trackThead ? _trackThead.offsetHeight : 0; }
 
-function _ensureSpacer(which) {
-  // Lazy-create the top/bottom spacer TRs.  We never destroy them — they
-  // just get their height set to 0 when not needed.
-  const ref = which === 'top' ? _vsTopSpacer : _vsBotSpacer;
-  if (ref) return ref;
+function _makeSpacerRow() {
   const sp = document.createElement('tr');
   sp.className = 'vs-spacer';
   sp.innerHTML = `<td colspan="11" style="height:0;padding:0;border:none"></td>`;
-  if (which === 'top') _vsTopSpacer = sp; else _vsBotSpacer = sp;
   return sp;
 }
+function _setSpacerRow(sp, px) { sp.firstElementChild.style.height = px + 'px'; }
 
+const _trackVL = createVirtualList({
+  scroller: _listWrap, host: tbody, buffer: VS_BUF, rowHeight: 38,
+  make: _makeRowSkeleton,
+  fill: _fillTrackRowAt,
+  keyOf: (i) => { const t = currentTracks[i]; return t ? t.id : undefined; },
+  spacer: _makeSpacerRow, setSpacer: _setSpacerRow,
+  // A shimmer / failed row can be a pixel off a real one: measure a track row.
+  measurable: (tr) => !tr.classList.contains('skeleton') && !tr.classList.contains('vs-load-failed'),
+  offset: () => _theadH, topInset: () => _theadH,
+  observeResize: true, onResize: _measureThead,
+  onRender: (start, end) => {
+    _vsStart = start;
+    _vsEnd = end;
+    // Fetch the chunks the window (and its buffer) reaches into; no-op for a
+    // plain array.
+    if (currentTracks && typeof currentTracks.ensureRange === 'function') {
+      currentTracks.ensureRange(start, end);
+    }
+    // Background-fill real lengths for any AdLib/IMF rows now on screen that
+    // still show the 180s placeholder (debounced; one-time per track; any view).
+    _scheduleDurationProbe();
+    // Ratings of rows that came in without a scroll (a chunk landed, a jump).
+    _fetchVisibleRatings();
+  },
+});
+
+// Hand the tbody over: both lists drop their rows (the caller empties it).
+function _resetLists() {
+  _trackVL.reset();
+  _groupVL.reset();
+  _groupRows = null;
+  _vsStart = _vsEnd = 0;
+  clearTimeout(_browseFilterTimer);   // a filter keystroke still pending belongs to the list that goes
+}
+
+// Render the track window.  ``force``: repaint the rows on screen too (a chunk
+// landed / the data under the same indexes changed) — rows that already show
+// the right track are left alone (see _fillTrackRowAt).
 function _vsRender(force = false) {
   if (!currentTracks.length) return;
-  const wrap    = document.getElementById('track-list-wrap');
-  const scrollY = wrap.scrollTop;
-  const viewH   = wrap.clientHeight;
-
-  const firstVis = Math.floor(scrollY / ROW_H);
-  const lastVis  = Math.ceil((scrollY + viewH) / ROW_H);
-  const newStart = Math.max(0, firstVis - VS_BUF);
-  const newEnd   = Math.min(currentTracks.length, lastVis + VS_BUF);
-
-  if (!force && newStart === _vsStart && newEnd === _vsEnd) return;
-  _vsStart = newStart;
-  _vsEnd   = newEnd;
-
-  const visibleCount = _vsEnd - _vsStart;
-  const topH = _vsStart * ROW_H;
-  const botH = (currentTracks.length - _vsEnd) * ROW_H;
-
-  // If tbody was wiped by a sibling renderer (group view / skeleton),
-  // _rowPool's nodes are detached.  Detect that and reattach.  We compare
-  // by parentNode rather than re-querying because that's O(1).
-  const topSp = _ensureSpacer('top');
-  const botSp = _ensureSpacer('bot');
-  const needsReattach = topSp.parentNode !== tbody;
-
-  if (needsReattach) {
-    tbody.innerHTML = '';
-    tbody.appendChild(topSp);
-    for (const row of _rowPool) tbody.appendChild(row);
-    tbody.appendChild(botSp);
-  }
-
-  // Resize the pool to match the visible window.  Grow by appending new
-  // skeleton rows; shrink by removing trailing rows from the DOM and pool.
-  while (_rowPool.length < visibleCount) {
-    const tr = _makeRowSkeleton();
-    _rowPool.push(tr);
-    tbody.insertBefore(tr, botSp);
-  }
-  while (_rowPool.length > visibleCount) {
-    const tr = _rowPool.pop();
-    if (tr.parentNode) tr.parentNode.removeChild(tr);
-  }
-
-  // Update spacer heights (single style write, no innerHTML).
-  topSp.firstElementChild.style.height = topH + 'px';
-  botSp.firstElementChild.style.height = botH + 'px';
-
-  // Fill the visible rows.  For a WindowedTrackStore, ``currentTracks[i]``
-  // returns ``undefined`` while the chunk fetches; ``_fillTrackRow``
-  // renders a shimmer skeleton for those.  Once the chunk lands the
-  // store's onChunkLoad callback re-fires _vsRender(true) and the
-  // skeleton gets replaced with real data.
-  for (let n = 0; n < visibleCount; n++) {
-    _fillTrackRow(_rowPool[n], currentTracks[_vsStart + n], _vsStart + n);
-  }
-  // Trigger lazy chunk loading for the visible window plus the buffer.
-  // No-op for plain arrays (no ``ensureRange`` method).
-  if (currentTracks && typeof currentTracks.ensureRange === 'function') {
-    currentTracks.ensureRange(_vsStart, _vsEnd);
-  }
-  // Background-fill real lengths for any AdLib/IMF rows now on screen that still
-  // show the 180s placeholder (debounced; one-time per track; any view).
-  _scheduleDurationProbe();
-
-  markPlayingRow();
-  // NOTE: column visibility is now driven by container classes (set once in
-  // _applyColVisibility on load / pref change), so it no longer needs a
-  // per-frame re-apply here — the CSS covers freshly-pooled rows.
-
-  // Restore keyboard focus indicator after a rebuild
-  if (_focusedIdx >= _vsStart && _focusedIdx < _vsEnd) {
-    const focusRow = tbody.querySelector(`tr[data-idx="${_focusedIdx}"]`);
-    if (focusRow) focusRow.classList.add('kb-focused');
-  }
-
-  // Measure row height on the first paint with real data and re-render
-  // once with the corrected ROW_H so the spacer maths matches actual layout.
-  if (!_rowHMeasured && _rowPool.length) {
-    requestAnimationFrame(() => _measureRowHeight());
-  }
+  _trackVL.setCount(currentTracks.length);
+  _trackVL.render(force);
 }
 
-// Measure the rendered height of the first visible row and update ROW_H
-// if it diverges from the current default.  Dispatched once per data load
-// (gated by ``_rowHMeasured``) plus on a ``themechange`` custom event so
-// theme-driven padding changes don't desync the virtual scroll math.
-function _measureRowHeight() {
-  if (!_rowPool.length) return;
-  const rect = _rowPool[0].getBoundingClientRect();
-  const h = Math.round(rect.height);
-  if (h > 0 && Math.abs(h - ROW_H) >= 1) {
-    ROW_H = h;
-    _vsStart = _vsEnd = 0;   // force the next _vsRender to recompute
-    _vsRender(true);
-  }
-  _rowHMeasured = true;
-}
-
-// Optional theme-change hook — if the app dispatches ``themechange`` on
-// document we'll re-measure.  Absent the event we simply rely on the
-// per-load measurement above.
+// The row height (and the header's) can change with the theme / font size.
 document.addEventListener('themechange', () => {
-  _rowHMeasured = false;
-  _vsRender(true);
+  _measureThead();
+  _trackVL.remeasure();
+  _groupVL.remeasure();
 });
 
 // Render full-search results as a flat, sortable track list.  Search used to
@@ -1098,13 +1162,6 @@ function showSearchResults(tracks, query = '', reload = null) {
 async function renderTracks(tracks) {
   _leaveGalaxy();          // switching to a table view exits the galaxy
   currentTracks = tracks;
-  // Cancel any in-flight group-list / album-grid stream (both paint across
-  // animation frames).  Rendering a track list — a group drill, a search, or All
-  // Tracks — means that streamed view is gone, so its pending batches must NOT
-  // keep appending stale rows/cards on top of / behind these tracks.
-  // (Repro: click a genre before its 447-row list finished streaming.)
-  _groupRenderGen++;
-  _albumGridGen++;
   _browseNavGen++;         // a track view is now rendering → cancel any still-loading group list
   // Default: a bare renderTracks (search result, group drill, format filter, a
   // folder view) is NOT the canonical All-Tracks list — showAll() re-asserts the
@@ -1116,9 +1173,6 @@ async function renderTracks(tracks) {
   _selected.clear();
   _lastClickIdx = -1;
   _focusedIdx   = -1;
-  _vsStart = 0;
-  _vsEnd   = 0;
-  _rowHMeasured = false;     // re-measure for the next dataset
 
   // Reset the empty-state markup every time — both ``showDuplicates``
   // ("No duplicate tracks found.") and ``_renderBranchEmpty`` (branch-
@@ -1126,9 +1180,11 @@ async function renderTracks(tracks) {
   // body for their specific cases.  Restoring the default snapshot
   // captured at module load keeps the empty state consistent across
   // view switches.
-  if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML && tracks.length > 0) {
+  if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML
+      && (tracks.length > 0 || emptyEl.querySelector('[data-view-error]'))) {
     // Only restore when we have real tracks to render — keeps the
-    // customised state visible while the empty case persists.
+    // customised state visible while the empty case persists.  (A load error's
+    // message never outlives the view it was about.)
     emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
   } else if (tracks.length > 0) {
     // No-op: default markup is already in place.
@@ -1152,30 +1208,50 @@ async function renderTracks(tracks) {
   loadingEl.hidden = true;
 
   // Hide album grid, show table
-  const albumGrid = document.getElementById('album-grid');
-  if (albumGrid) albumGrid.hidden = true;
+  _hideAlbumGrid();
   document.getElementById('track-table').style.display = '';
 
   // Tear down the pool — switching datasets (and group/track views toggle
   // tbody anyway) so the old DOM nodes don't belong here.
-  _vsResetPool();
+  _resetLists();
   tbody.innerHTML = '';
 
-  if (tracks.length > 0) {
-    _vsRender(true);
-    // Kick off lazy ratings fetch for the initial visible range
-    _fetchVisibleRatings();
-  }
-
-  // Scroll to top — also reset the scroll-throttle cache so the first
-  // post-render scroll event isn't dropped by the same-position guard.
+  // Scroll to top BEFORE the first render (rendering at the previous view's
+  // scroll position would fill — and request covers for — rows nobody sees);
+  // reset the scroll-throttle cache so the first post-render scroll event isn't
+  // dropped by the same-position guard.
   const wrap = document.getElementById('track-list-wrap');
   if (wrap) wrap.scrollTop = 0;
   _scrollLastY = -1;
 
+  if (tracks.length > 0) {
+    _measureThead();
+    _vsRender(true);               // (ratings of the first rows: _trackVL's onRender)
+  }
+
   _updateSelectionBar();
   _applyColVisibility();
   _updateAzRail();
+}
+
+// The load-error message of a view that is gone (see _showViewError).
+function _clearViewError() {
+  if (emptyEl.querySelector('[data-view-error]')) emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
+}
+
+// A view's data could not be loaded (_viewData): an empty list that says so,
+// with a Retry that opens the view again.
+function _showViewError(retry) {
+  renderTracks([]);
+  emptyEl.innerHTML = `
+    <span class="empty-icon" aria-hidden="true">♫</span>
+    <h4 data-view-error>Couldn’t load this view</h4>
+    <p>The server didn’t answer.</p>
+    <p style="margin-top:14px"><button type="button" class="btn-secondary" id="view-error-retry">Retry</button></p>`;
+  emptyEl.hidden = false;
+  const btn = emptyEl.querySelector('#view-error-retry');
+  if (btn && typeof retry === 'function') btn.addEventListener('click', () => { emptyEl.hidden = true; retry(); });
+  else if (btn) btn.remove();
 }
 
 // ── A–Z jump rail ─────────────────────────────────────────────────────────────
@@ -1227,26 +1303,23 @@ function _jumpToLetter(ch) {
       const total = currentTracks._total || currentTracks.length || 0;
       idx = Math.floor((Math.max(0, _AZ.indexOf(ch)) / _AZ.length) * total);
     }
-    if (idx >= 0) wrap.scrollTop = idx * ROW_H;
+    if (idx >= 0) _trackVL.scrollToIndex(idx);
     return;
   }
-  // Group-row list (Artists / Albums / Genres / …).  Scan the RENDERED rows by
-  // their name cell and scroll to the first match's exact position.  This reads
-  // the DOM directly (robust to module state), and since group rows aren't
-  // windowed they're all present once the chunked build finishes; a letter
-  // beyond the built rows (a very long list still rendering) jumps to the end —
-  // the build then fills it.  (Full windowing — deferred #15 — makes it exact.)
-  const rows = [...tbody.querySelectorAll('tr')].filter(r => r.offsetHeight > 0);
-  if (!rows.length) return;
-  const initialOf = (row) => {
-    const s = (row.querySelector('td.col-title')?.textContent || row.textContent || '').trim().toUpperCase();
+  // Group-row list (Artists / Albums / Genres / …): find the first row whose
+  // shown name starts with the letter (or the nearest one after it) in the list
+  // on screen — filtered or not — and scroll its row to the top.
+  const g = _groupRows;
+  if (!g || !g.items.length) return;
+  const initialOf = (item) => {
+    const s = String(_groupRowName(item, g.nameKey)).trim().toUpperCase();
     const c = s[0] || '';
     return (c >= 'A' && c <= 'Z') ? c : '#';
   };
-  let target = rows.find(r => initialOf(r) === ch);
-  if (!target && ch !== '#') target = rows.find(r => initialOf(r) >= ch);
-  if (target) wrap.scrollTop += target.getBoundingClientRect().top - wrap.getBoundingClientRect().top;
-  else if (ch !== '#') wrap.scrollTop = wrap.scrollHeight;
+  let target = g.items.findIndex(it => initialOf(it) === ch);
+  if (target < 0 && ch !== '#') target = g.items.findIndex(it => initialOf(it) >= ch);
+  if (target >= 0) _groupVL.scrollToIndex(target);
+  else if (ch !== '#') _groupVL.scrollToIndex(g.items.length - 1);
 }
 function _updateAzRail() {
   const rail = _ensureAzRail();
@@ -1269,9 +1342,10 @@ function _updateAzRail() {
 
 // ── Lazy ratings: fetch only for visible rows ─────────────────────────────────
 let _ratingsFetchPending = false;
+let _ratingsFetchAgain = false;   // asked while a request ran: ask again for the rows on screen then
 
 async function _fetchVisibleRatings() {
-  if (_ratingsFetchPending) return;
+  if (_ratingsFetchPending) { _ratingsFetchAgain = true; return; }
   const ids = [];
   for (let i = _vsStart; i < _vsEnd && i < currentTracks.length; i++) {
     const t = currentTracks[i];
@@ -1285,6 +1359,7 @@ async function _fetchVisibleRatings() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids }),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);   // an error body is not ratings
     const data = await res.json();
     Object.assign(_ratingsCache, data);
     // Mark fetched IDs that had no rating as 0 so we don't re-fetch
@@ -1294,21 +1369,24 @@ async function _fetchVisibleRatings() {
     // window — any spacer-height or row-pool resize that happened in the
     // forced render could cascade into a scroll-event feedback loop
     // (autoscroll regression).  In-place mutation only touches the cells
-    // whose rating actually changed, so the scroll position never moves
-    // and the listener never re-fires.
-    for (const row of _rowPool) {
+    // whose rating actually changed (_paintStars), so the scroll position
+    // never moves, the listener never re-fires, and a focused star elsewhere
+    // keeps its focus.
+    const fetched = new Set(ids);
+    for (const row of _trackVL.rows()) {
       const id = row.dataset.id;
-      if (!id || !(id in _ratingsCache)) continue;
+      if (!id || !fetched.has(id)) continue;
       const ratingTd = row.children[11];   // col-rating is index 11
-      if (ratingTd) ratingTd.innerHTML = _renderStars(_ratingsCache[id]);
+      if (ratingTd) _paintStars(ratingTd, _ratingsCache[id] || 0);
     }
   } catch { /* non-fatal */ }
   _ratingsFetchPending = false;
+  if (_ratingsFetchAgain) { _ratingsFetchAgain = false; _fetchVisibleRatings(); }
 }
 
 // ── Update multi-selected classes on visible rows without full VS rebuild ─────
 function _refreshSelectionClasses() {
-  tbody.querySelectorAll('tr[data-idx]').forEach(row => {
+  tbody.querySelectorAll('tr[data-idx][data-id]').forEach(row => {
     const idx = parseInt(row.dataset.idx, 10);
     row.classList.toggle('multi-selected', _selected.has(idx));
   });
@@ -1344,8 +1422,11 @@ document.getElementById('track-list-wrap').addEventListener('scroll', () => {
     const y = wrap.scrollTop;
     if (y === _scrollLastY) return;
     _scrollLastY = y;
-    _vsRender();
-    _fetchVisibleRatings();
+    if (currentTracks.length) {
+      _vsRender();                 // (new rows' ratings: _trackVL's onRender)
+    } else if (_groupRows) {
+      _groupVL.render();
+    }
   });
 }, { passive: true });
 
@@ -1359,6 +1440,25 @@ function _rowFromEvent(e) {
 }
 
 tbody.addEventListener('click', (e) => {
+  // A chunk that couldn't be loaded: ask for it again.
+  if (e.target.closest('.vs-retry')) {
+    if (currentTracks && currentTracks._isWindowedStore) {
+      currentTracks.retryFailed();
+      // The first render asks for the failed chunks again; the second shows
+      // their rows loading instead of "Couldn't load" while they're fetched.
+      _vsRender(true);
+      _vsRender(true);
+    }
+    return;
+  }
+  // Group rows (Artists / Albums / …) open their drill-down.
+  const gr = e.target.closest('tr[data-gidx]');
+  if (gr) {
+    const g = _groupRows;
+    const item = g && g.items[parseInt(gr.dataset.gidx, 10)];
+    if (item) g.onClick(item);
+    return;
+  }
   const tr = _rowFromEvent(e);
   if (!tr) return;
   const i = parseInt(tr.dataset.idx, 10);
@@ -1578,7 +1678,7 @@ function _rateTrack(trackId, newRating) {
 function _repaintRatingCell(trackId) {
   const cell = document.querySelector(
     `#track-table tbody tr[data-id="${CSS.escape(trackId)}"] .col-rating`);
-  if (cell) cell.innerHTML = _renderStars(_ratingsCache[trackId] || 0);
+  if (cell) _paintStars(cell, _ratingsCache[trackId] || 0);
 }
 
 // ── Hover-intent prefetch (perceived perf 2.2) ────────────────────────────────
@@ -1647,7 +1747,7 @@ tbody.addEventListener('keydown', (e) => {
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
       e.preventDefault();
       _ratingsCache[t.id] = 0;
-      ratingTd.innerHTML = _renderStars(0);
+      _paintStars(ratingTd, 0);
       fetch(`/api/tracks/${t.id}/rating`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1684,19 +1784,19 @@ const selCount = document.getElementById('sel-count');
 if (document.getElementById('sel-queue')) {
   document.getElementById('sel-queue').addEventListener('click', () => {
     [..._selected].forEach(i => Player.addToQueue(currentTracks[i]));
-    _selected.clear(); _vsRender(); _updateSelectionBar();
+    _selected.clear(); _refreshSelectionClasses(); _updateSelectionBar();
   });
 }
 if (document.getElementById('sel-play')) {
   document.getElementById('sel-play').addEventListener('click', () => {
     const sorted = [..._selected].sort((a, b) => a - b);
     Player.setQueue(sorted.map(i => currentTracks[i]), 0);
-    _selected.clear(); _vsRender(); _updateSelectionBar();
+    _selected.clear(); _refreshSelectionClasses(); _updateSelectionBar();
   });
 }
 if (document.getElementById('sel-clear')) {
   document.getElementById('sel-clear').addEventListener('click', () => {
-    _selected.clear(); _vsRender(); _updateSelectionBar();
+    _selected.clear(); _refreshSelectionClasses(); _updateSelectionBar();
   });
 }
 
@@ -1723,24 +1823,24 @@ function selectRow(tr, idx) {
   simBtn.dataset.id = currentTracks[idx]?.id;
 }
 
+// Move the now-playing marker (row tint + the live equalizer bars in the number
+// cell — CSS hides the digit + the static ▶ when .row-eq is present) to the
+// rows of the current track.  Only rows whose state changes are touched, so the
+// bars of a row that stays the playing one keep running.  Rows filled later
+// take the state in _fillTrackRow.
 function markPlayingRow() {
-  tbody.querySelectorAll('tr.playing').forEach(r => r.classList.remove('playing'));
-  tbody.querySelectorAll('.row-eq').forEach(e => e.remove());
-  if (Player.currentTrackId) {
-    const row = tbody.querySelector(`tr[data-id="${Player.currentTrackId}"]`);
-    if (row) {
-      row.classList.add('playing');
-      // Live "this row is alive" marker: animated equalizer bars in the number
-      // cell (CSS hides the digit + the static ▶ when .row-eq is present).
-      const numCell = row.querySelector('td.col-num');
-      if (numCell && !numCell.querySelector('.row-eq')) {
-        const eq = document.createElement('span');
-        eq.className = 'row-eq';
-        eq.setAttribute('aria-hidden', 'true');
-        eq.innerHTML = '<i></i><i></i><i></i>';
-        numCell.appendChild(eq);
-      }
-    }
+  if (!_trackVL.active) return;
+  const id = Player.currentTrackId;
+  for (const row of _trackVL.rows()) {
+    if (row.classList.contains('skeleton') || row.classList.contains('vs-load-failed')) continue;
+    _setRowPlaying(row, !!id && row.dataset.id === id);
+  }
+}
+
+// Move the keyboard-focus indicator (J/K, locate) to row ``_focusedIdx``.
+function _paintKbFocus() {
+  for (const row of _trackVL.rows()) {
+    row.classList.toggle('kb-focused', _trackVL.indexOf(row) === _focusedIdx && row.dataset.id != null);
   }
 }
 
@@ -1760,17 +1860,14 @@ function locateNowPlaying() {
   }
   if (idx < 0) { window.Toast?.info?.('The playing track isn’t in this list.'); return; }
   _focusedIdx = idx;
-  const wrap = document.getElementById('track-list-wrap');
-  if (!wrap) return;
-  // Center-ish the row in the viewport.
-  wrap.scrollTop = Math.max(0, idx * ROW_H - Math.floor(wrap.clientHeight / 2) + ROW_H);
-  requestAnimationFrame(() => {
-    const r = tbody.querySelector(`tr[data-idx="${idx}"]`);
-    if (r) {
-      r.classList.add('locate-pulse');
-      setTimeout(() => r.classList.remove('locate-pulse'), 1400);
-    }
-  });
+  // Center the row in the viewport (renders the window synchronously).
+  _trackVL.scrollToIndex(idx, 'center');
+  _paintKbFocus();
+  const r = _trackVL.rowFor(idx);
+  if (r) {
+    r.classList.add('locate-pulse');
+    setTimeout(() => r.classList.remove('locate-pulse'), 1400);
+  }
 }
 
 function playFrom(idx, o = {}) {
@@ -2043,11 +2140,21 @@ function _applyColVisibility() {
   // 12 full-subtree querySelectorAll ~60×/s on the fling hot path.)
   const table = document.getElementById('track-table');
   if (!table) return;
+  let changed = false;
   ALL_COLS.forEach(cls => {
     // In duplicates view, force Location column visible regardless of user prefs.
     const hidden = (cls === 'col-location' && _dupViewActive) ? false : _hiddenCols.has(cls);
-    table.classList.toggle('hide-' + cls, hidden);
+    if (table.classList.contains('hide-' + cls) !== hidden) {
+      table.classList.toggle('hide-' + cls, hidden);
+      changed = true;
+    }
   });
+  // A hidden / shown column (the cover above all) changes the row height.
+  if (changed) {
+    _measureThead();
+    _trackVL.remeasure();
+    _groupVL.remeasure();
+  }
 }
 
 // Context menu for column show/hide
@@ -2204,8 +2311,8 @@ async function showAll() {
 
   // Small-library path (≤ 5000): legacy single-fetch array — simpler,
   // no chunking overhead, no skeleton rows for unloaded slots.
-  const tracks = await API('/tracks', { limit });
-  if (_gen !== _browseNavGen) return;   // a newer view was requested while fetching the page
+  const tracks = await _viewData(_gen, API('/tracks', { limit }), () => showAll());
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or a newer view was requested while fetching the page
   _showAddFolderCta = (total === 0);   // genuinely-empty library → offer the add-folder CTA
   // Apply the persisted sort in memory so the header arrow (painted by
   // _restoreSortState inside restoreFullHeader) matches the data.  The small-
@@ -2276,8 +2383,8 @@ async function showArtists() {
   setGroupHeader('Artist');
   _hideGridToggle();
   _showSkeletonRows(12);
-  const artists = await API('/library/artists');
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const artists = await _viewData(_gen, API('/library/artists'), () => showArtists());
+  if (!artists || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('artists', artists.length);
   renderGroupList(artists, 'artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.artist) {
@@ -2295,8 +2402,8 @@ async function showAlbumArtists() {
   setGroupHeader('Album Artist');
   _hideGridToggle();
   _showSkeletonRows(12);
-  const albumArtists = await API('/library/album-artists');
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const albumArtists = await _viewData(_gen, API('/library/album-artists'), () => showAlbumArtists());
+  if (!albumArtists || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('album_artists', albumArtists.length);
   renderGroupList(albumArtists, 'album_artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.album_artist) {
@@ -2316,8 +2423,8 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
   if (albumArtist) params.album_artist = albumArtist;
   setGroupHeader('Album');
   _showSkeletonRows(12);
-  const albums = await API('/library/albums', params);
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const albums = await _viewData(_gen, API('/library/albums', params), () => showAlbums(artist, albumArtist, backView));
+  if (!albums || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   // An artist / album-artist whose tracks carry no album tag yields zero album
   // groups — drilling in would dead-end on an "No tracks found" empty state even
   // though the artist HAS tracks (e.g. loose singles).  Fall back to the flat
@@ -2363,8 +2470,8 @@ async function showUntaggedTracks(field, label, backFn, total = 0) {
   setBrowseHeader(label, backFn);
   _showSkeletonRows();
   // Fetch a large batch and filter client-side (tag index can't query empty fields)
-  const all = await API('/tracks', { limit: 5000 });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const all = await _viewData(_gen, API('/tracks', { limit: 5000 }), () => showUntaggedTracks(field, label, backFn, total));
+  if (!all || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   const filtered = all.filter(t => !t[field] || !t[field].toString().trim());
   renderTracks(filtered);
   // Only the first 5,000 tracks were examined, so the list is partial whenever the
@@ -2395,8 +2502,8 @@ async function showAlbumTracks(artist, albumArtist, album, backFn) {
   if (albumArtist) params.album_artist = albumArtist;
   else if (artist) params.artist = artist;
   if (album) params.album = album;
-  const tracks = await API('/search/filter', params);
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', params), () => showAlbumTracks(artist, albumArtist, album, backFn));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   // Sort by disc number, then track number (album track order)
   tracks.sort((a, b) => {
     const da = a.disc_number ?? 0, db = b.disc_number ?? 0;
@@ -2424,8 +2531,8 @@ async function showArtistTracks(artist, backFn) {
   restoreFullHeader();
   setBrowseHeader(`Artist: ${artist}`, backFn || (() => showArtists()));
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, artist });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', { limit: _DRILL_LIMIT, artist }), () => showArtistTracks(artist, backFn));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { artist },
                    { url: '/api/search/filter', params: { artist } }, `Artist: ${artist}`);
@@ -2443,8 +2550,8 @@ async function showAlbumArtistTracks(albumArtist, backFn) {
   restoreFullHeader();
   setBrowseHeader(`Album Artist: ${albumArtist}`, backFn || (() => showAlbumArtists()));
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { limit: _DRILL_LIMIT, album_artist: albumArtist });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', { limit: _DRILL_LIMIT, album_artist: albumArtist }), () => showAlbumArtistTracks(albumArtist, backFn));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { album_artist: albumArtist },
                    { url: '/api/search/filter', params: { album_artist: albumArtist } },
@@ -2494,8 +2601,8 @@ async function showGenres() {
   setGroupHeader('Genre');
   _hideGridToggle();
   _showSkeletonRows(12);
-  const genres = await API('/library/genres');
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const genres = await _viewData(_gen, API('/library/genres'), () => showGenres());
+  if (!genres || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('genres', genres.length);
   renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => showGenreTracks(item.genre, item.count));
   _setViewReload('genres', () => showGenres());
@@ -2535,8 +2642,8 @@ async function showGenreTracks(genre, total = 0) {
   restoreFullHeader();
   setBrowseHeader(`Genre: ${genre}`, () => showGenres());
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { genre, limit: _DRILL_LIMIT });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', { genre, limit: _DRILL_LIMIT }), () => showGenreTracks(genre, total));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   _setCappedSource(tracks.length, _DRILL_LIMIT, total, { genre },
                    { url: '/api/search/filter', params: { genre } }, `Genre: ${genre}`);
@@ -2550,8 +2657,8 @@ async function showYears() {
   setGroupHeader('Year');
   _hideGridToggle();
   _showSkeletonRows(12);
-  const years = await API('/library/years');
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const years = await _viewData(_gen, API('/library/years'), () => showYears());
+  if (!years || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('years', years.length);
   renderGroupList(years, 'year', 'count', 'Tracks', (item) => showYearTracks(item.year, item.count));
   _setViewReload('years', () => showYears());
@@ -2563,8 +2670,8 @@ async function showSceneGroups() {
   setGroupHeader('Scene group');
   _hideGridToggle();
   _showSkeletonRows(12);
-  const groups = await API('/library/scene-groups');
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const groups = await _viewData(_gen, API('/library/scene-groups'), () => showSceneGroups());
+  if (!groups || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('scene_groups', groups.length);
   renderGroupList(groups, 'scene_group', 'count', 'Tracks',
                   (item) => showSceneGroupTracks(item.scene_group, item.count));
@@ -2581,8 +2688,8 @@ async function showSceneGroupTracks(scene_group, total = 0) {
   // Keeps the drill-down list consistent with the group-row count the user just
   // clicked — the biggest scene groups here run ~1.7K tracks, well under
   // _DRILL_LIMIT, so the whole group renders and _noteDrillCap stays silent.
-  const tracks = await API('/search/filter', { scene_group, limit: _DRILL_LIMIT });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', { scene_group, limit: _DRILL_LIMIT }), () => showSceneGroupTracks(scene_group, total));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   _setCappedSource(tracks.length, _DRILL_LIMIT, total, { scene_group },
                    { url: '/api/search/filter', params: { scene_group } },
@@ -2618,6 +2725,7 @@ async function showGalaxy() {
   const wrap = document.getElementById('track-list-wrap');
   const grid = document.getElementById('album-grid');
   const view = document.getElementById('galaxy-view');
+  _hideAlbumGrid();
   if (wrap) wrap.style.display = 'none';
   if (grid) grid.hidden = true;
   if (view) view.hidden = false;
@@ -2670,8 +2778,8 @@ async function showFormatTracks(format, count = 0) {
   // the persisted sort in memory + paint the arrow, mirroring showAll's small
   // path AND the windowed format branch above — so the same "Format:" view sorts
   // consistently regardless of size.
-  const tracks = await API('/tracks', { format, limit: WINDOW_THRESHOLD });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/tracks', { format, limit: WINDOW_THRESHOLD }), () => showFormatTracks(format, count));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
   renderTracks(rows);
   if (sortKey) _paintSortIndicator();
@@ -2684,8 +2792,8 @@ async function showYearTracks(year, total = 0) {
   restoreFullHeader();
   setBrowseHeader(`Year: ${year}`, () => showYears());
   _showSkeletonRows();
-  const tracks = await API('/search/filter', { year_min: year, year_max: year, limit: _DRILL_LIMIT });
-  if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
+  const tracks = await _viewData(_gen, API('/search/filter', { year_min: year, year_max: year, limit: _DRILL_LIMIT }), () => showYearTracks(year, total));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   _setCappedSource(tracks.length, _DRILL_LIMIT, total, { year_min: year, year_max: year },
                    { url: '/api/search/filter', params: { year_min: year, year_max: year } },
@@ -2710,9 +2818,16 @@ function _hideGridToggle() {
 }
 
 // ── Album grid rendering ───────────────────────────────────────────────────────
-let _albumArtObserver = null;
+// The grid is a pooled virtual list (vlist.js) of GRID ROWS: each pool row is a
+// ``display: contents`` wrapper holding one row's cards, so the CSS grid lays
+// the cards out as before while only the rows around the viewport exist.  The
+// column count comes from the grid's own resolved columns (re-read on resize).
+// Cards are wired via EVENT DELEGATION (one click/keydown listener on the
+// grid); the focus ring is pure CSS (.album-card:focus-visible).
 
-function _loadAlbumCardArt(card, trackId) {
+// Load a card's cover off-DOM and paint it as the art background.  ``tok``
+// guards a recycled card: a late load for its previous album is dropped.
+function _loadAlbumCardArt(card, trackId, tok) {
   const artEl = card.querySelector('.album-card-art');
   if (!artEl) return;
   const img = new Image();
@@ -2725,6 +2840,7 @@ function _loadAlbumCardArt(card, trackId) {
     try {
       if (typeof img.decode === 'function') await img.decode();
     } catch (_) { /* fallback to onload-only timing */ }
+    if (card.__artTok !== tok) return;
     artEl.style.backgroundImage = `url("${img.src}")`;
     artEl.style.backgroundSize = 'cover';
     artEl.style.backgroundPosition = 'center';
@@ -2741,15 +2857,17 @@ function _loadAlbumCardArt(card, trackId) {
   img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404${_e}`;
 }
 
-// Album/group grid state: built in rAF chunks (a generation token cancels a
-// stale build when the user navigates away) and wired via EVENT DELEGATION —
-// one click/keydown listener on the grid instead of 4 listeners per card, so
-// tens of thousands of one-track SID/MOD "albums" no longer freeze the thread
-// on the flip to grid or attach 100k+ listeners.  Focus ring is pure CSS
-// (.album-card:focus-visible), so no per-card focus/blur handlers either.
 let _albumGridItems = [];
 let _albumGridOnClick = null;
+let _albumGridMeta = { nameKey: 'album', countKey: 'count', countLabel: 'Tracks' };
 let _albumGridWired = false;
+const _albumGridEl = document.getElementById('album-grid');
+let _gridCols = 1;
+let _gridGap = 16;
+let _gridPadTop = 16;
+// Album → representative track id, for rows that carry none (one lookup per
+// album per session instead of one per scroll-in).
+const _albumArtIds = new Map();
 
 async function _playAlbumItem(item) {
   const name = item.label || item.album || '—';
@@ -2774,6 +2892,11 @@ async function _playAlbumItem(item) {
   } catch (_) { window.Toast?.error?.('Couldn’t play album.'); }
 }
 
+function _gridCardFor(i) {
+  const row = _gridVL && _gridVL.rowFor(Math.floor(i / _gridCols));
+  return row ? row.children[i % _gridCols] || null : null;
+}
+
 function _wireAlbumGridDelegation(albumGrid) {
   if (_albumGridWired) return;
   _albumGridWired = true;
@@ -2789,6 +2912,19 @@ function _wireAlbumGridDelegation(albumGrid) {
     _albumGridOnClick?.(item);
   });
   albumGrid.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      // Only the cards near the viewport exist: Tab / Shift+Tab past the last /
+      // first one brings the next card in and focuses it, so the keyboard still
+      // walks every card in order (and leaves the grid after the very last).
+      const card = e.target.closest('.album-card');
+      if (!card || card.dataset.idx == null) return;
+      const to = +card.dataset.idx + (e.shiftKey ? -1 : 1);
+      if (to < 0 || to >= _albumGridItems.length || _gridCardFor(to)) return;
+      e.preventDefault();
+      _gridVL.scrollToIndex(Math.floor(to / _gridCols), 'nearest');
+      _gridCardFor(to)?.focus({ preventScroll: true });
+      return;
+    }
     if (e.key !== 'Enter' && e.key !== ' ') return;
     const item = itemOf(e.target);
     if (item) { e.preventDefault(); _albumGridOnClick?.(item); }
@@ -2802,96 +2938,178 @@ function _countText(n, countLabel) {
   return `${n} ${n === 1 ? countLabel.replace(/s$/, '') : countLabel}`;
 }
 
-function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick) {
-  const albumGrid = document.getElementById('album-grid');
-  if (!albumGrid) return;
-  _wireAlbumGridDelegation(albumGrid);
-
-  albumGrid.innerHTML = '';
-  albumGrid.hidden = false;
-  document.getElementById('track-table').style.display = 'none';
-
-  // Disconnect previous observer
-  if (_albumArtObserver) _albumArtObserver.disconnect();
-
-  // Create IntersectionObserver for lazy-loading album art
-  _albumArtObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      const card = entry.target;
-      if (card.classList.contains('album-card-art-loaded')) return;
-      const album  = card.dataset.album;
-      if (!album) return;
-
-      // Aggregation rows carry a representative ``track_id``, so the art
-      // URL is known without a per-card /search/filter round-trip.  Cards
-      // built from rows without one (group views that aren't albums) fall
-      // back to the lookup.
-      if (card.dataset.trackId) {
-        _loadAlbumCardArt(card, card.dataset.trackId);
-      } else {
-        const artist = card.dataset.artist;
-        const params = new URLSearchParams({ album, limit: '1' });
-        if (artist) params.set('artist', artist);
-        fetch(`/api/search/filter?${params}`)
-          .then(r => r.json())
-          .then(tracks => { if (tracks.length) _loadAlbumCardArt(card, tracks[0].id); })
-          .catch(() => {});
-      }
-
-      _albumArtObserver.unobserve(card);
-    });
-  }, { rootMargin: '100px' });
-
-  _albumGridItems = items;
-  _albumGridOnClick = onClick;
-  const isAlbum = nameKey === 'album';
-  const gen = ++_albumGridGen;
-  const CHUNK = 150;
-  let i = 0;
-
-  const step = () => {
-    if (gen !== _albumGridGen) return;   // a newer render superseded this build
-    const frag = document.createDocumentFragment();
-    const end = Math.min(i + CHUNK, items.length);
-    for (; i < end; i++) {
-      const item = items[i];
-      const name = item.label || item[nameKey] || '—';
-      const count = item[countKey] || 0;
-      const artist = item.artist || item.album_artist || '';
-      // Initials from first 2 words (fallback: first 2 chars).
-      const words = name.replace(/[^a-zA-Z0-9 ]/g, '').trim().split(/\s+/);
-      const initials = words.length >= 2
-        ? (words[0][0] + words[words.length - 1][0]).toUpperCase()
-        : name.substring(0, 2).toUpperCase();
-
-      const card = document.createElement('div');
-      card.className = 'album-card';
-      card.dataset.idx = i;                 // delegation key → _albumGridItems[idx]
-      card.dataset.name = name;
-      card.dataset.album = name;
-      card.dataset.artist = artist;
-      if (item.track_id) card.dataset.trackId = item.track_id;
-      // Cards behave like buttons; the focus ring is CSS :focus-visible.
-      card.tabIndex = 0;
-      card.setAttribute('role', 'button');
-      card.setAttribute('aria-label', `${name}, ${_countText(count, countLabel)}`);
-      card.innerHTML = `
+function _makeAlbumCard() {
+  const card = document.createElement('div');
+  card.className = 'album-card';
+  // Cards behave like buttons; the focus ring is CSS :focus-visible.
+  card.tabIndex = 0;
+  card.setAttribute('role', 'button');
+  card.innerHTML = `
         <div class="album-card-art">
-          <span class="album-card-initials">${esc(initials)}</span>
-          ${isAlbum ? `<button class="album-card-play" type="button" tabindex="-1" title="Play album" aria-label="Play ${esc(name)}">▶</button>` : ''}
+          <span class="album-card-initials"></span>
         </div>
         <div class="album-card-info">
-          <div class="album-card-title" title="${esc(name)}">${esc(name)}</div>
-          <div class="album-card-sub">${_countText(count, countLabel)}</div>
+          <div class="album-card-title"></div>
+          <div class="album-card-sub"></div>
         </div>`;
-      frag.appendChild(card);
-      _albumArtObserver.observe(card);      // lazy art; fires once connected + visible
-    }
-    albumGrid.appendChild(frag);
-    if (i < items.length) requestAnimationFrame(step);
-  };
-  step();
+  return card;
+}
+
+function _fillAlbumCard(card, i) {
+  const item = _albumGridItems[i];
+  if (!item) return;
+  if (card.__item === item && card.dataset.idx === String(i)) return;   // already this album
+  card.__item = item;
+  const { nameKey, countKey, countLabel } = _albumGridMeta;
+  const name = item.label || item[nameKey] || '—';
+  const count = item[countKey] || 0;
+  const artist = item.artist || item.album_artist || '';
+  // Initials from first 2 words (fallback: first 2 chars).
+  const words = name.replace(/[^a-zA-Z0-9 ]/g, '').trim().split(/\s+/);
+  const initials = words.length >= 2
+    ? (words[0][0] + words[words.length - 1][0]).toUpperCase()
+    : name.substring(0, 2).toUpperCase();
+  card.dataset.idx = i;                 // delegation key → _albumGridItems[idx]
+  card.dataset.name = name;
+  card.dataset.album = name;
+  card.dataset.artist = artist;
+  if (item.track_id) card.dataset.trackId = item.track_id; else delete card.dataset.trackId;
+  card.setAttribute('aria-label', `${name}, ${_countText(count, countLabel)}`);
+  const artEl = card.firstElementChild;
+  const initialsEl = artEl.firstElementChild;
+  initialsEl.textContent = initials;
+  // Play button: album cards only.
+  let play = artEl.querySelector('.album-card-play');
+  if (nameKey === 'album' && !play) {
+    play = document.createElement('button');
+    play.className = 'album-card-play'; play.type = 'button'; play.tabIndex = -1;
+    play.title = 'Play album'; play.textContent = '▶';
+    artEl.appendChild(play);
+  } else if (nameKey !== 'album' && play) {
+    play.remove(); play = null;
+  }
+  if (play) play.setAttribute('aria-label', `Play ${name}`);
+  const titleEl = card.lastElementChild.firstElementChild;
+  titleEl.textContent = name;
+  titleEl.title = name;
+  card.lastElementChild.lastElementChild.textContent = _countText(count, countLabel);
+  // Cover: the album's representative track (aggregation rows carry one);
+  // otherwise one /search/filter lookup per album, remembered.
+  const key = item.track_id || `${name}\0${artist}`;
+  if (card.__artKey === key) return;
+  card.__artKey = key;
+  const tok = card.__artTok = (card.__artTok || 0) + 1;
+  artEl.style.backgroundImage = '';
+  initialsEl.style.display = '';
+  card.classList.remove('album-card-art-loaded');
+  if (item.track_id) { _loadAlbumCardArt(card, item.track_id, tok); return; }
+  if (_albumArtIds.has(key)) {
+    const id = _albumArtIds.get(key);
+    if (id) _loadAlbumCardArt(card, id, tok);
+    return;
+  }
+  const params = new URLSearchParams({ album: name, limit: '1' });
+  if (artist) params.set('artist', artist);
+  fetch(`/api/search/filter?${params}`)
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(tracks => {
+      const id = Array.isArray(tracks) && tracks.length ? tracks[0].id : null;
+      _albumArtIds.set(key, id);                 // (a failed lookup is asked again next time)
+      if (id && card.__artTok === tok) _loadAlbumCardArt(card, id, tok);
+    })
+    .catch(() => {});
+}
+
+// Pool callback: grid row ``r`` = cards r*cols … r*cols+cols-1.
+function _fillGridRow(rowEl, r) {
+  const first = r * _gridCols;
+  const want = Math.max(0, Math.min(_gridCols, _albumGridItems.length - first));
+  while (rowEl.children.length < want) rowEl.appendChild(_makeAlbumCard());
+  while (rowEl.children.length > want) rowEl.lastElementChild.remove();
+  for (let k = 0; k < want; k++) _fillAlbumCard(rowEl.children[k], first + k);
+}
+
+// Columns + gaps as the grid resolves them (auto-fill → the window width).
+function _gridMeasureCols() {
+  if (!_albumGridEl || _albumGridEl.hidden || !_albumGridEl.clientWidth) return false;   // not laid out
+  const cs = getComputedStyle(_albumGridEl);
+  const cols = Math.max(1, (cs.gridTemplateColumns || '').split(' ').filter(Boolean).length);
+  _gridGap = parseFloat(cs.rowGap) || 0;
+  _gridPadTop = parseFloat(cs.paddingTop) || 0;
+  const changed = cols !== _gridCols;
+  _gridCols = cols;
+  if (_gridVL) _gridVL.setCount(Math.ceil(_albumGridItems.length / _gridCols));
+  return changed;
+}
+
+const _gridVL = _albumGridEl && createVirtualList({
+  scroller: _albumGridEl, host: _albumGridEl, buffer: 2, rowHeight: 230,
+  autoScroll: true,
+  make: () => { const d = document.createElement('div'); d.className = 'album-grid-row'; return d; },
+  fill: _fillGridRow,
+  keyOf: (r) => _albumGridItems[r * _gridCols],
+  // A spacer is a full-width grid row; the grid's row gap after it is part of
+  // the height it stands for, and an empty one must not add a gap of its own.
+  spacer: () => {
+    const d = document.createElement('div');
+    d.className = 'album-grid-spacer';
+    d.style.display = 'none';
+    return d;
+  },
+  setSpacer: (el, px) => {
+    if (px < 1) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.style.height = Math.max(0, px - _gridGap) + 'px';
+  },
+  measurable: (row) => !!row.firstElementChild,
+  measure: (row) => row.firstElementChild.getBoundingClientRect().height + _gridGap,
+  offset: () => _gridPadTop,
+  onResize: () => { if (_gridMeasureCols()) _gridVL.remeasure(); },
+});
+
+// The grid takes the whole content pane: the (empty) track-list wrapper beside
+// it would otherwise claim half the height.
+let _gridHidList = false;
+// Leave the grid: hide it and let its pool go (nothing renders into a hidden grid).
+function _hideAlbumGrid() {
+  if (!_albumGridEl) return;
+  _albumGridEl.hidden = true;
+  if (_gridHidList) { _listWrap.style.display = ''; _gridHidList = false; }
+  if (_gridVL && _gridVL.active) {
+    _gridVL.reset();
+    _albumGridEl.replaceChildren();
+  }
+}
+
+// ``keepScroll``: the grid on screen shows a new item list (the filter) at the
+// same scroll position — its cards are repainted in place.
+function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick, keepScroll = false) {
+  const albumGrid = _albumGridEl;
+  if (!albumGrid) return;
+  _wireAlbumGridDelegation(albumGrid);
+  _albumGridItems = items;
+  _albumGridOnClick = onClick;
+  _albumGridMeta = { nameKey, countKey, countLabel };
+  // The empty-list message lives in #track-list-wrap: keep it shown for an
+  // empty grid.
+  _clearViewError();
+  emptyEl.hidden = items.length > 0;
+  _listWrap.style.display = items.length ? 'none' : '';
+  _gridHidList = true;
+  if (keepScroll && _gridVL.active && !albumGrid.hidden) {
+    _gridVL.setCount(Math.ceil(items.length / _gridCols));
+    _gridVL.render(true);
+    return;
+  }
+  _gridVL.reset();
+  albumGrid.replaceChildren();
+  albumGrid.hidden = false;
+  document.getElementById('track-table').style.display = 'none';
+  albumGrid.scrollTop = 0;
+  _gridMeasureCols();                    // the grid is laid out now (not hidden)
+  _gridVL.setCount(Math.ceil(items.length / _gridCols));
+  _gridVL.remeasure();
+  _gridVL.render(true);
 }
 
 // Renders a grouped list (artists/albums/genres/years) into the table
@@ -2908,6 +3126,7 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
   _viewIsAllTracks = false;   // a group list is not the All-Tracks view
   loadingEl.hidden = true;
   emptyEl.hidden = items.length > 0;
+  if (!_reloadingView) _groupFilterQ = '';   // a reload re-applies its filter text (reloadCurrentView)
 
   // Show grid toggle only for album views
   if (nameKey === 'album') {
@@ -2952,54 +3171,73 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
   if (_gridView && nameKey === 'album') {
     // Ensure table is hidden, grid is shown
     document.getElementById('track-table').style.display = 'none';
+    _resetLists();
     tbody.innerHTML = '';
     _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick);
   } else {
     // Ensure grid is hidden, table is shown
-    const albumGrid = document.getElementById('album-grid');
-    if (albumGrid) albumGrid.hidden = true;
+    _hideAlbumGrid();
     document.getElementById('track-table').style.display = '';
     _renderGroupRows(items, nameKey, countKey, countLabel, onClick);
   }
   _updateAzRail();
 }
 
-function _renderGroupRows(items, nameKey, countKey, countLabel, onClick) {
-  // Group rows replace the tbody — drop any pool nodes that were here.
-  _vsResetPool();
-  tbody.innerHTML = '';
-  emptyEl.hidden = items.length > 0;
-  // Chunked render: the first screenful paints synchronously (instant
-  // perceived response on any library size), the rest streams in between
-  // frames. A generation token cancels stale batches when the user
-  // navigates away mid-stream.
-  const gen = ++_groupRenderGen;
-  const FIRST = 150, BATCH = 800;
-  const build = (item) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
+// ── Group rows (Artists / Albums / Genres / … as a list) ───────────────────────
+// A pooled virtual list like the track rows, sharing the tbody with them; one
+// delegated click listener (tbody, ``tr[data-gidx]``) opens a row's drill-down.
+let _groupRows = null;   // { items, nameKey, countKey, countLabel, onClick } on screen
+
+function _groupRowName(item, nameKey) { return item.label || item[nameKey] || '—'; }
+
+function _makeGroupRow() {
+  const tr = document.createElement('tr');
+  tr.className = 'group-row';
+  tr.innerHTML = `
       <td class="col-num"></td>
       <td class="col-cover"></td>
-      <td class="col-title" colspan="7" style="font-weight:500;${item.label ? 'font-style:italic;color:var(--text2)' : ''}">${esc(item.label || item[nameKey] || '—')}</td>
-      <td class="col-dur" style="color:var(--text2)">${_countText(item[countKey] || 0, countLabel)}</td>
+      <td class="col-title" colspan="7"></td>
+      <td class="col-dur"></td>
       <td class="col-rating"></td>`;
-    tr.style.cursor = 'pointer';
-    tr.addEventListener('click', () => onClick(item));
-    return tr;
-  };
-  const frag = document.createDocumentFragment();
-  items.slice(0, FIRST).forEach(item => frag.appendChild(build(item)));
-  tbody.appendChild(frag);
-  let pos = Math.min(FIRST, items.length);
-  const more = () => {
-    if (gen !== _groupRenderGen || pos >= items.length) return;
-    const f = document.createDocumentFragment();
-    items.slice(pos, pos + BATCH).forEach(item => f.appendChild(build(item)));
-    tbody.appendChild(f);
-    pos += BATCH;
-    if (pos < items.length) requestAnimationFrame(more);
-  };
-  if (pos < items.length) requestAnimationFrame(more);
+  return tr;
+}
+
+function _fillGroupRow(tr, i) {
+  const g = _groupRows;
+  const item = g && g.items[i];
+  if (!item) return;
+  tr.dataset.gidx = i;
+  const title = tr.cells[2];
+  title.textContent = _groupRowName(item, g.nameKey);
+  title.classList.toggle('group-untagged', !!item.label);   // "[No Artist]" etc.
+  tr.cells[3].textContent = _countText(item[g.countKey] || 0, g.countLabel);
+}
+
+const _groupVL = createVirtualList({
+  scroller: _listWrap, host: tbody, buffer: VS_BUF, rowHeight: 26,
+  make: _makeGroupRow,
+  fill: _fillGroupRow,
+  keyOf: (i) => (_groupRows ? _groupRows.items[i] : undefined),
+  spacer: _makeSpacerRow, setSpacer: _setSpacerRow,
+  offset: () => _theadH, topInset: () => _theadH,
+  observeResize: true, onResize: _measureThead,
+});
+
+// ``keepScroll``: the group list on screen shows a new item list (the filter)
+// at the same scroll position — its rows are repainted in place.
+function _renderGroupRows(items, nameKey, countKey, countLabel, onClick, keepScroll = false) {
+  _clearViewError();
+  emptyEl.hidden = items.length > 0;
+  if (!(keepScroll && _groupRows && _groupVL.active)) {
+    // Group rows replace the tbody — the track rows (or a previous group list)
+    // let go of it first.
+    _resetLists();
+    tbody.innerHTML = '';
+  }
+  _groupRows = { items, nameKey, countKey, countLabel, onClick };
+  _groupVL.setCount(items.length);
+  _measureThead();
+  _groupVL.render(true);
 }
 
 // ── Grid toggle button handler ─────────────────────────────────────────────────
@@ -3013,36 +3251,42 @@ if (_gridToggleBtn) {
     if (_groupItems.length && _groupOnClick) {
       if (_gridView && _groupNameKey === 'album') {
         document.getElementById('track-table').style.display = 'none';
+        _resetLists();
         tbody.innerHTML = '';
         _renderAlbumGrid(_groupItems, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
       } else {
-        const albumGrid = document.getElementById('album-grid');
-        if (albumGrid) albumGrid.hidden = true;
+        _hideAlbumGrid();
         document.getElementById('track-table').style.display = '';
         _renderGroupRows(_groupItems, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
       }
+      _updateAzRail();   // the A–Z rail belongs to the list, not the grid
     }
   });
 }
 
 // ── Browse filter (live filtering of group lists) ──────────────────────────────
-// Debounced: each render is a full teardown+rebuild of the visible rows, so
-// firing it per keystroke makes fast typing jank on big group lists (~6k
-// artists).  150 ms matches the quick-search debounce — under the threshold
-// where the pause itself reads as lag.
+// Debounced (150 ms, the quick-search debounce — under the threshold where the
+// pause itself reads as lag).  A filtered list re-renders only its window; new
+// filter text starts it from its top, while the same text re-applied (an
+// in-place reload, reloadCurrentView) keeps the scroll position.
 let _browseFilterTimer = null;
+let _groupFilterQ = '';         // the filter text the list on screen was built with
 browseFilter.addEventListener('input', () => {
   clearTimeout(_browseFilterTimer);
   _browseFilterTimer = setTimeout(() => {
     const q = browseFilter.value.trim().toLowerCase();
     if (!_groupItems.length || !_groupOnClick) return;
+    const keepScroll = q === _groupFilterQ;
+    _groupFilterQ = q;
     const filtered = q
       ? _groupItems.filter(item => String(item.label || item[_groupNameKey] || '').toLowerCase().includes(q))
       : _groupItems;
     if (_gridView && _groupNameKey === 'album') {
-      _renderAlbumGrid(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
+      if (!keepScroll && _albumGridEl) _albumGridEl.scrollTop = 0;
+      _renderAlbumGrid(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick, true);
     } else {
-      _renderGroupRows(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick);
+      if (!keepScroll) { _listWrap.scrollTop = 0; _scrollLastY = -1; }
+      _renderGroupRows(filtered, _groupNameKey, _groupCountKey, _groupLabel, _groupOnClick, true);
     }
   }, 150);
 });
@@ -3649,10 +3893,10 @@ async function showFolder(path, recursive = false, opts = {}) {
       first = await fetch(
         `/api/fstree/tracks-with-meta?path=${enc}&recursive=false` +
         `&offset=0&limit=${CHUNK_SIZE}`,       // no filter_duplicates → the server applies the setting
-      ).then(r => r.json());
+      ).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
     } catch {
-      loadingEl.hidden = true;
-      emptyEl.hidden = false;
+      // (A quiet refresh keeps what is on screen.)
+      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive));
       return;
     }
     const windowed   = first && !Array.isArray(first) && typeof first.total === 'number';
@@ -3744,10 +3988,11 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   let firstRes = prefetched;
   if (!firstRes) {
     try {
-      firstRes = await fetch(urlFor(0, CHUNK_SIZE)).then(r => r.json());
+      firstRes = await fetch(urlFor(0, CHUNK_SIZE))
+        .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
     } catch {
-      loadingEl.hidden = true;
-      emptyEl.hidden = false;
+      // (A quiet refresh keeps what is on screen.)
+      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive));
       return;
     }
   }
@@ -3773,13 +4018,15 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
     return;
   }
 
+  // A failed page REJECTS: the store backs off and asks again (and finally
+  // shows the rows as failed with a Retry) — an empty page stored in its place
+  // left those rows on the loading shimmer for good.
   const fetcher = async (offset, lim) => {
-    try {
-      const r = await fetch(urlFor(offset, lim)).then(r => r.json());
-      return Array.isArray(r?.tracks) ? r.tracks : [];
-    } catch {
-      return [];
-    }
+    const r = await fetch(urlFor(offset, lim));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    if (!Array.isArray(j?.tracks)) throw new Error('not a track page');
+    return j.tracks;
   };
   const store = createWindowedStore(total, fetcher);
   // Preload chunk 0 from the first response so ``fetchChunk(0)``
@@ -3861,7 +4108,7 @@ function getSelectedTracks() {
 
 function clearSelection() {
   _selected.clear();
-  _vsRender();
+  _refreshSelectionClasses();
   _updateSelectionBar();
 }
 
@@ -4057,24 +4304,10 @@ function navigateTrack(delta) {
   if (newIdx === _focusedIdx) return;
   _focusedIdx = newIdx;
 
-  // Update visual: remove old focus, add new
-  tbody.querySelectorAll('tr.kb-focused').forEach(r => r.classList.remove('kb-focused'));
-  const row = tbody.querySelector(`tr[data-idx="${_focusedIdx}"]`);
-  if (row) {
-    row.classList.add('kb-focused');
-    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  } else {
-    // Row not in virtual-scroll viewport — scroll to it
-    const wrap = document.getElementById('track-list-wrap');
-    if (wrap) {
-      wrap.scrollTop = _focusedIdx * ROW_H;
-      // After scroll, vsRender will fire and we re-apply focus
-      requestAnimationFrame(() => {
-        const r = tbody.querySelector(`tr[data-idx="${_focusedIdx}"]`);
-        if (r) r.classList.add('kb-focused');
-      });
-    }
-  }
+  // Bring the row into view (clear of the sticky header), then move the
+  // indicator; a row that isn't rendered yet takes it when it is filled.
+  _trackVL.scrollToIndex(_focusedIdx, 'nearest');
+  _paintKbFocus();
 }
 
 /**
@@ -4137,13 +4370,13 @@ async function _probeVisibleAdlibDurations() {
 // the cached track object in place; the server persists the same value via
 // backfill, so a later folder re-fetch stays consistent.  Gated on the 180s
 // placeholder, so it never overwrites a real or duration-capped (SID/GME) value.
-// A row's length is its DEFAULT tune's: a subsong's length (``subsong`` > 0)
-// never lands on it, and nor does anything over 12 h (a growing render's
+// A row's length is its DEFAULT tune's: a picked tune's length (any explicit
+// ``subsong``, 0 included — tune 1 need not be the default) never lands on it, and nor does anything over 12 h (a growing render's
 // provisional header, not a length).
 const _MAX_PATCH_SEC = 12 * 3600;
-function patchTrackDuration(id, seconds, subsong = 0) {
+function patchTrackDuration(id, seconds, subsong = null) {
   if (!id || !isFinite(seconds) || seconds <= 0 || seconds > _MAX_PATCH_SEC || !tbody) return;
-  if (Number(subsong) > 0) return;
+  if (subsong !== null && subsong !== undefined) return;
   const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
   const row = tbody.querySelector(`tr[data-id="${sel}"]`);
   if (!row) return;                       // only a currently-visible row

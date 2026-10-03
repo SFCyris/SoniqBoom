@@ -177,7 +177,12 @@ def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(_SESSION_COOKIE, path="/")
 
 
-def current_user(
+# The auth dependencies are ``async def``: they only read the user store's
+# in-memory maps (no I/O, no lock), and FastAPI runs a plain ``def`` dependency
+# in its thread pool — a thread hop per dependency per request (a signed-in
+# /api/me/api-keys, two of them: 718 → 545 µs in-process).
+
+async def current_user(
     sb_session: str | None = Cookie(default=None),
 ) -> User | None:
     """Resolve the calling user from the ``sb_session`` cookie, or None.
@@ -191,7 +196,7 @@ def current_user(
     return get_user_store().lookup_session(sb_session)
 
 
-def require_user(user: User | None = Depends(current_user)) -> User:
+async def require_user(user: User | None = Depends(current_user)) -> User:
     """Reject if there's no signed-in user."""
     if user is None:
         raise HTTPException(401, "Not signed in.")
@@ -200,14 +205,14 @@ def require_user(user: User | None = Depends(current_user)) -> User:
 
 def require_role(*allowed: Role):
     """Build a FastAPI dependency that lets through only listed roles."""
-    def _dep(user: User = Depends(require_user)) -> User:
+    async def _dep(user: User = Depends(require_user)) -> User:
         if user.role not in allowed:
             raise HTTPException(403, f"Requires role {' or '.join(allowed)}.")
         return user
     return _dep
 
 
-def require_admin(user: User = Depends(require_user)) -> User:
+async def require_admin(user: User = Depends(require_user)) -> User:
     if user.role != "admin":
         raise HTTPException(403, "Admin role required.")
     return user

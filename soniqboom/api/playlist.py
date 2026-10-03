@@ -57,11 +57,12 @@ def _entry_id(e):
 
 
 def _entry_sub(e):
-    """0-based subsong of an entry, or None (default tune).  subsong<=0 collapses
-    to None, so ``{id, subsong: 0}`` is the same audio as the bare default."""
+    """0-based subsong of an entry, or None (the default tune).  An explicit
+    ``{id, subsong: 0}`` is tune 1 and stays distinct from the bare id: a
+    multi-tune file's default can be another tune (its first is empty)."""
     if isinstance(e, dict):
         s = e.get("subsong")
-        if isinstance(s, int) and s > 0:
+        if isinstance(s, int) and not isinstance(s, bool) and s >= 0:
             return s
     return None
 

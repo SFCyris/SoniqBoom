@@ -54,7 +54,8 @@ _sem: asyncio.Semaphore | None = None
 
 
 def _is_remote(path_str: str) -> bool:
-    return path_str.startswith(("ftp://", "smb://"))
+    from soniqboom.core.filesource import is_remote_path
+    return is_remote_path(path_str)
 
 
 def _get_sem() -> asyncio.Semaphore:

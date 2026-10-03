@@ -33,6 +33,7 @@ from soniqboom.core.data import (
     upsert_scan_dir,
 )
 from soniqboom.core import folder_album as _folder_album
+from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
 
@@ -387,7 +388,22 @@ async def admin_verify_indexes(_tok: str = Depends(_require_token)):
 
 @router.get("/dirs")
 async def admin_list_dirs(_tok: str = Depends(_require_token)):
-    return {"dirs": await list_scan_dirs()}
+    dirs = await list_scan_dirs()
+    # A share whose server refused its sign-in is not retried automatically
+    # for ``auth_retry_in_s`` (Reconnect tries at once): say so on its row.
+    try:
+        from soniqboom.config import load_local_conf
+        from soniqboom.core.filesource import share_auth_key, share_retry_wait
+        shares = load_local_conf().get("network_shares", {})
+        for d in dirs:
+            share = shares.get(d.get("network_share_id") or "")
+            if share:
+                retry_in = share_retry_wait(share_auth_key(share))
+                d["auth_refused"] = retry_in > 0
+                d["auth_retry_in_s"] = int(retry_in)
+    except Exception:                                   # noqa: BLE001
+        log.debug("share sign-in status for /admin/dirs failed", exc_info=True)
+    return {"dirs": dirs}
 
 
 @router.post("/dirs")
@@ -433,7 +449,7 @@ async def admin_add_dir(body: dict, _tok: str = Depends(_require_token)):
 
     # Arm the filesystem watcher for the new root so future changes are
     # picked up without a manual rescan.  Remote shares are excluded.
-    if not raw.startswith(("smb://", "ftp://", "http://", "https://")):
+    if not is_remote_path(raw):
         try:
             from soniqboom.core import watcher
             await watcher.add_root(path)
@@ -489,7 +505,7 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
     except Exception:
         log.exception("watcher.remove_root failed for %s", path)
     # Disarm the adaptive-freshness poll loop for the removed remote share.
-    if path.startswith(("smb://", "ftp://", "webdav://", "webdavs://")):
+    if is_remote_path(path):
         try:
             from soniqboom.core import remote_freshness
             await remote_freshness.remove_share(path)
@@ -539,8 +555,7 @@ def _is_remote(path: str) -> bool:
     # WebDAV scan roots start with http:// or https://.  Without these in
     # the match list, reindex / rescan would dispatch them to the LOCAL
     # scanner which then tries Path(http://…).resolve() and fails.
-    return path.startswith(("smb://", "ftp://", "http://", "https://",
-                            "webdav://", "webdavs://"))
+    return is_remote_path(path)
 
 
 async def _scan_dirs_split(dirs: list[str], progress_cb=None) -> dict:
@@ -573,15 +588,29 @@ async def _scan_dirs_split(dirs: list[str], progress_cb=None) -> dict:
 
         conf = load_local_conf()
         shares = conf.get("network_shares", {})
+        from soniqboom.core.filesource import credentials_refused
         for scan_root in remote:
             source = get_source(scan_root)
             share_id = None
             reconnect_err: str | None = None
+            if source is None and credentials_refused(scan_root):
+                # Its server refused the credentials (back-off running): a
+                # scan would only log in with them again.
+                reason = "the server refused the share's credentials — fix them or press Reconnect"
+                skipped.append({"path": scan_root, "reason": reason})
+                log.warning("Scan: skipping %s — %s", scan_root, reason)
+                continue
             if source is None:
                 # Try to reconnect from config
+                from soniqboom.core.filesource import share_auth_key, share_retry_wait
                 for sid, share in shares.items():
                     if _scan_root_for_share(share) == scan_root:
                         share_id = sid
+                        if share_retry_wait(share_auth_key(share)) > 0:
+                            # Refused before it ever connected: no login now.
+                            reconnect_err = ("the server refused the share's "
+                                             "credentials — fix them or press Reconnect")
+                            break
                         password = decrypt(share.get("password_enc", "")) or ""
                         try:
                             source = create_source(share, password=password)
@@ -1098,11 +1127,15 @@ def _detect_app_bundle() -> Path | None:
     return None
 
 
-def _graceful_pre_exec_flush() -> None:
+def _graceful_pre_exec_flush(loop=None) -> None:
     """Run the work FastAPI's shutdown hook would do before ``os.execv``.
 
     ``execv`` replaces the process image, so neither FastAPI's shutdown event
-    nor any ``atexit`` handler fires.  Three things have to happen here:
+    nor any ``atexit`` handler fires.  These things have to happen here:
+
+      0. Stop the scans and post-scan passes (``loop``: the server's event
+         loop, this running in a worker thread) — as the normal stop's step
+         1b, so their last writes reach the journal before it ends.
 
       1. Stop the scan worker pools and the TOSEC / Redump downloads — first,
          so no scan or download writes after the flush.  ``execv`` keeps the
@@ -1111,13 +1144,24 @@ def _graceful_pre_exec_flush() -> None:
          leftover forkserver — ``main._reap_at_start``); a download must not
          write after the stop.  Both are bounded: a pool whose worker can't
          exit is left to that reap.
-      2. Flush the AOF buffer + close its fd.
+      2. Flush the AOF buffer and end the journal (``AOFWriter.seal``): a
+         write arriving after it is set aside (``library.aof.late-*``)
+         instead of being lost unseen at the exec.
       3. Terminate the background merger process.  ``execv`` keeps the
          parent PID alive but loses the daemon-cleanup guarantee — without
          an explicit terminate, the old merger keeps running and the new
          exec'd instance spawns *another* merger, both racing on
          ``library.json.new``.
     """
+    if loop is not None:
+        try:
+            from soniqboom.core import scanner as _scanner
+
+            async def _stop_writers() -> None:
+                await _scanner.stop_background_writers([*_bg_scan_tasks, *_BG_TASKS])
+            asyncio.run_coroutine_threadsafe(_stop_writers(), loop).result(timeout=5.0)
+        except Exception:
+            log.exception("Pre-restart scan / enrichment stop failed — continuing")
     try:
         from soniqboom.core import game_titles, scanner
         game_titles.cancel_downloads()
@@ -1126,9 +1170,12 @@ def _graceful_pre_exec_flush() -> None:
         log.exception("Pre-restart scan-pool / download stop failed — continuing")
     try:
         from soniqboom import main as _main_mod
+        from soniqboom.core.aof import AOFWriter
         writer = getattr(_main_mod, "_aof_writer", None)
         if writer is not None:
             writer.stop()  # flush_sync + close fd
+            writer.close_intake()
+            writer.seal(AOFWriter._FLOCK_BUDGET_SECONDS * 2)
     except Exception:
         log.exception("Pre-restart AOF flush failed — continuing with restart")
     try:
@@ -1144,8 +1191,9 @@ def _graceful_pre_exec_flush() -> None:
         log.exception("Pre-restart merger terminate failed — continuing")
 
 
-def _do_restart() -> None:
-    """Perform the actual process restart — blocking, runs in a worker thread."""
+def _do_restart(loop=None) -> None:
+    """Perform the actual process restart — blocking, runs in a worker thread
+    (``loop``: the server's event loop, for ``_graceful_pre_exec_flush``)."""
     bundle = _detect_app_bundle()
     if bundle is not None:
         # Relaunch the bundle via LaunchServices so the Dock / window wrapper
@@ -1172,7 +1220,7 @@ def _do_restart() -> None:
         # shell keeps its terminal.  execv won't run shutdown hooks, so flush
         # the AOF synchronously first.
         log.info("Restart: exec'ing %s with argv=%r", sys.executable, sys.argv)
-        _graceful_pre_exec_flush()
+        _graceful_pre_exec_flush(loop)
         try:
             os.execv(sys.executable, [sys.executable, *sys.argv])
         except Exception as exc:  # pragma: no cover
@@ -1193,7 +1241,7 @@ async def admin_restart(_tok: str = Depends(_require_token)):
         # Run the blocking restart in a worker thread so the event loop can
         # finish any pending writes.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _do_restart)
+        await loop.run_in_executor(None, _do_restart, loop)
 
     asyncio.create_task(_go())
     in_bundle = _detect_app_bundle() is not None
@@ -1246,12 +1294,12 @@ async def admin_services_set(
 def _normalize_dir_path(raw: str) -> str:
     """Resolve local filesystem paths; pass remote URLs through unchanged.
 
-    Remote scan dirs use protocol URLs (ftp://, smb://) as their canonical
-    path key. Running them through ``Path.resolve()`` mangles them into
-    nonsense like ``/cwd/ftp:/host/...`` which then never matches the keys
-    stored under ``folder_aliases`` or ``scan_dirs``.
+    Remote scan dirs use protocol URLs (ftp://, smb://, WebDAV http(s)://)
+    as their canonical path key. Running them through ``Path.resolve()``
+    mangles them into nonsense like ``/cwd/ftp:/host/...`` which then never
+    matches the keys stored under ``folder_aliases`` or ``scan_dirs``.
     """
-    if raw.startswith(("ftp://", "smb://")):
+    if is_remote_path(raw):
         return raw
     return str(Path(raw).expanduser().resolve())
 
@@ -1286,21 +1334,40 @@ def _auto_share_id(proto: str, host: str, share_name: str,
     return f"{base}-{n}"
 
 
+def _normalize_webdav_url(base_url: str):
+    """``(url, parts, user, password)``: a WebDAV base URL with its scheme and
+    host lowercased (the path is case-sensitive and kept), the scheme's
+    default port dropped, no trailing slash and no ``user:pass@`` — which is
+    returned separately (it would otherwise sit in the scan root, every track
+    path and the logs).  ``Https://Cloud.Example.com/dav`` stored as typed
+    was not even recognised as a URL (``is_remote_path``) — its tracks were
+    looked up on the local disk.  400 for anything but an http(s) URL with a
+    host."""
+    from urllib.parse import unquote, urlsplit, urlunsplit
+    try:
+        parts = urlsplit(base_url)
+        port = parts.port
+    except ValueError:
+        raise HTTPException(400, f"Invalid WebDAV URL: {base_url}")
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise HTTPException(400, "WebDAV URL must use http:// or https://")
+    host = parts.hostname                       # urlsplit lowercases it
+    if ":" in host:
+        host = f"[{host}]"                      # IPv6 literal
+    if port == {"http": 80, "https": 443}[parts.scheme]:
+        port = None
+    netloc = host + (f":{port}" if port else "")
+    url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    url = url.rstrip("/")
+    return (url, urlsplit(url), unquote(parts.username or ""),
+            unquote(parts.password or ""))
+
+
 def _scan_root_for_share(share: dict) -> str:
-    proto = share["protocol"].lower()
-    host = share["host"]
-    if proto == "smb":
-        return f"smb://{host}/{share['share']}"
-    if proto == "ftp":
-        rpath = share.get("remote_path", "/")
-        return f"ftp://{host}{rpath}"
-    if proto in ("webdav", "webdavs"):
-        # Use the original base_url verbatim — that's what users typed
-        # and what the URL scheme expects (preserves trailing /).
-        return share.get("base_url") or (
-            f"{'https' if proto == 'webdavs' else 'http'}://{host}{share.get('remote_path', '/')}"
-        )
-    raise ValueError(f"Unknown protocol: {proto}")
+    # One definition, shared with the startup connect (main.py) — a copy there
+    # without WebDAV left WebDAV shares unconnected after every restart.
+    from soniqboom.core.filesource import scan_root_for_share
+    return scan_root_for_share(share)
 
 
 @router.get("/shares")
@@ -1312,9 +1379,11 @@ async def list_shares(_tok: str = Depends(_require_token)):
     conf = load_local_conf()
     shares = conf.get("network_shares", {})
     result = []
+    from soniqboom.core.filesource import share_auth_key, share_retry_wait
     for share_id, share in shares.items():
         scan_root = _scan_root_for_share(share)
         source = get_source(scan_root)
+        retry_in = share_retry_wait(share_auth_key(share))
         result.append({
             "id": share_id,
             "protocol": share.get("protocol"),
@@ -1326,6 +1395,10 @@ async def list_shares(_tok: str = Depends(_require_token)):
             "auto_connect": share.get("auto_connect", True),
             "scan_root": scan_root,
             "connected": source is not None,
+            # The server refused its credentials: not retried automatically
+            # for ``auth_retry_in_s`` (Reconnect tries at once).
+            "auth_refused": retry_in > 0,
+            "auth_retry_in_s": int(retry_in),
         })
     return {"shares": result}
 
@@ -1356,16 +1429,16 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
         # code (scan_root, share-id) gets a uniform record.
         if not base_url:
             raise HTTPException(400, "base_url is required for WebDAV")
-        from urllib.parse import urlsplit
-        try:
-            parts = urlsplit(base_url)
-        except ValueError:
-            raise HTTPException(400, f"Invalid WebDAV URL: {base_url}")
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            raise HTTPException(400, f"WebDAV URL must use http:// or https://")
+        # The scan root (and every track path ``<root>:<path>``) is the base
+        # URL: stored with a lowercase scheme + host and without a trailing
+        # slash, so the root boundary is always ``…/Music:/x`` rather than
+        # ``…/Music/:/x``.
+        base_url, parts, url_user, url_pass = _normalize_webdav_url(base_url)
         host        = parts.netloc
         remote_path = parts.path or "/"
         share_name  = ""
+        if url_user and not username:           # credentials typed into the URL
+            username, password = url_user, password or url_pass
     else:
         if not host:
             raise HTTPException(400, "host is required")
@@ -1399,10 +1472,14 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
         loop = asyncio.get_running_loop()
         ok = await loop.run_in_executor(None, source.is_dir, "/")
         if not ok:
-            raise Exception("Root directory not accessible")
+            raise Exception(getattr(source, "last_error", None)
+                            or "Root directory not accessible")
     except Exception as exc:
         raise HTTPException(502, f"Could not connect: {exc}")
 
+    # New (or corrected) credentials: any refused-login back-off is over.
+    from soniqboom.core.filesource import reset_share_backoff, share_auth_key
+    reset_share_backoff(share_auth_key(share_conf))
     register_source(scan_root, source)
 
     from soniqboom.config import save_local_conf
@@ -1422,6 +1499,13 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
     # scan_dir may carry a stale `network_share_id` pointing at a share that
     # was overwritten. Update it so Reconnect/Delete in the UI work correctly.
     await upsert_scan_dir(scan_root, network_share_id=share_id, status="ok")
+    # Background freshness polling for the new share (armed at startup for
+    # the others) — without it new files only arrived after a restart.
+    try:
+        from soniqboom.core import remote_freshness
+        await remote_freshness.add_share(scan_root)
+    except Exception:
+        log.exception("freshness.add_share failed for %s", scan_root)
 
     from soniqboom.api.library import _broadcast
 
@@ -1479,6 +1563,11 @@ async def remove_share(body: dict, _tok: str = Depends(_require_token)):
     aliases = conf.get("folder_aliases", {})
     for scan_root in scan_roots:
         remove_source(scan_root)
+        try:
+            from soniqboom.core import remote_freshness
+            await remote_freshness.remove_share(scan_root)
+        except Exception:
+            log.exception("freshness.remove_share failed for %s", scan_root)
         await delete_scan_dir(scan_root)
         try:
             get_cache().invalidate_share(scan_root)
@@ -1507,10 +1596,7 @@ async def test_share(body: dict, _tok: str = Depends(_require_token)):
     if proto in ("webdav", "webdavs"):
         if not base_url:
             raise HTTPException(400, "base_url is required for WebDAV")
-        from urllib.parse import urlsplit
-        parts = urlsplit(base_url)
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            raise HTTPException(400, "WebDAV URL must use http:// or https://")
+        base_url, parts, url_user, url_pass = _normalize_webdav_url(base_url)
         host = parts.netloc
     if not proto or (proto not in ("webdav", "webdavs") and not host):
         raise HTTPException(400, "protocol and host are required")
@@ -1525,6 +1611,8 @@ async def test_share(body: dict, _tok: str = Depends(_require_token)):
     if base_url:
         share_conf["base_url"] = base_url
     password = body.get("password") or ""
+    if proto in ("webdav", "webdavs") and url_user and not share_conf["username"]:
+        share_conf["username"], password = url_user, password or url_pass
 
     try:
         source = create_source(share_conf, password=password)
@@ -1532,7 +1620,8 @@ async def test_share(body: dict, _tok: str = Depends(_require_token)):
         ok = await loop.run_in_executor(None, source.is_dir, "/")
         source.close()
         if not ok:
-            raise Exception("Root directory not accessible")
+            raise Exception(getattr(source, "last_error", None)
+                            or "Root directory not accessible")
     except Exception as exc:
         raise HTTPException(502, f"Connection failed: {exc}")
 
@@ -1558,14 +1647,30 @@ async def reconnect_share(body: dict, _tok: str = Depends(_require_token)):
 
     scan_root = _scan_root_for_share(share)
     password = decrypt(share.get("password_enc", "")) or ""
+    # A manual Reconnect always tries now: it ends any refused-login back-off
+    # of these credentials, and re-arms it when the server refuses again.
+    from soniqboom.core.filesource import (
+        is_auth_failure, note_share_auth_failure, reset_share_backoff, share_auth_key,
+    )
+    akey = share_auth_key(share)
+    reset_share_backoff(akey)
 
+    source = None
     try:
         source = create_source(share, password=password)
         loop = asyncio.get_running_loop()
         ok = await loop.run_in_executor(None, source.is_dir, "/")
         if not ok:
-            raise Exception("Root directory not accessible")
+            raise Exception(getattr(source, "last_error", None)
+                            or "Root directory not accessible")
     except Exception as exc:
+        if is_auth_failure(exc) or getattr(source, "last_error_auth", False):
+            note_share_auth_failure(akey, scan_root)
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
         raise HTTPException(502, f"Reconnect failed: {exc}")
 
     register_source(scan_root, source)
@@ -2894,11 +2999,11 @@ async def hvsc_cleanup_orphans(_tok: str = Depends(_require_token)):
     for t in store.all_track_metas():
         p = t.get("path") or ""
         # Skip remote tracks; they can't live under an HVSC root.
-        if p.startswith(("smb://", "ftp://", "http://", "https://")):
+        if is_remote_path(p):
             continue
         for sd in all_dirs:
             sdp = sd.get("path") or ""
-            if not sdp or sdp.startswith(("smb://", "ftp://", "http://", "https://")):
+            if not sdp or is_remote_path(sdp):
                 continue
             if p == sdp or p.startswith(sdp.rstrip("/") + "/"):
                 formats_by_root.setdefault(sdp, set()).add(
@@ -2910,7 +3015,7 @@ async def hvsc_cleanup_orphans(_tok: str = Depends(_require_token)):
         sdp = sd.get("path") or ""
         if not sdp:
             continue
-        if sdp.startswith(("smb://", "ftp://", "http://", "https://")):
+        if is_remote_path(sdp):
             continue
         try:
             sdp_abs = str(Path(sdp).resolve())

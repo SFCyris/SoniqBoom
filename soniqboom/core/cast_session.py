@@ -507,6 +507,24 @@ class CastSession:
                     continue
                 src_ext = "." + (track.path.rsplit(".", 1)[-1].lower())
                 src_codec = src_ext.lstrip(".")
+                # ``item.subsong`` names a tune; 0 is the bare play — the
+                # file's default tune, which for a multi-tune Amiga / libgme
+                # file is probed once (``stream.ensure_default_tune``) on the
+                # materialised file before its key is known.  Every render
+                # but SID is keyed by the tune index (``stream.tune_index``).
+                from soniqboom.api.stream import (
+                    _bare_play_track, _probe_family, default_tune_known,
+                    tune_index as _tune_index, _tune_count,
+                )
+                if (not item.subsong and _tune_count(track) > 1
+                        and default_tune_known(item.track_id, track) is None
+                        and _probe_family(src_ext, False) is not None):
+                    _src0 = await materialize_source(track.path, item.track_id, lane="scan")
+                    if _src0 is None:
+                        continue
+                    track = await _bare_play_track(item.track_id, track, _src0,
+                                                   _probe_family(src_ext, False, _src0))
+                _idx = _tune_index(item.track_id, track, int(item.subsong or 0) or None)
 
                 # Skip native pass-through formats — they don't need
                 # prewarm (range-served straight off disk).  EXCEPT
@@ -578,7 +596,7 @@ class CastSession:
                     # decode HVL).  Checked before the uade + tracker branches.
                     ck = _ck(
                         track_id=item.track_id, format_type="hvl",
-                        subsong=int(item.subsong or 0),
+                        subsong=_idx,
                     )
                     if await is_cache_ready(ck):
                         continue
@@ -587,7 +605,7 @@ class CastSession:
                         continue
                     await _start_gated_render(
                         prio, ck, "hvl",
-                        lambda p=path, ss=int(item.subsong or 0):
+                        lambda p=path, ss=_idx:
                             _render_hvl(p, subsong=ss),
                     )
                 elif src_ext in _UADE_EXTS:
@@ -599,7 +617,7 @@ class CastSession:
                     from soniqboom.api.stream import (
                         _uade_resolve_base, uade_cache_key, uade_cache_key_known,
                     )
-                    _ss = int(item.subsong or 0)
+                    _ss = _idx
                     ck = uade_cache_key_known(item.track_id, _ss, track)
                     if await is_cache_ready(ck):
                         continue
@@ -618,7 +636,7 @@ class CastSession:
                 elif src_ext in _TRACKER_EXTS:
                     ck = _ck(
                         track_id=item.track_id, format_type="tracker",
-                        subsong=int(item.subsong or 0),
+                        subsong=_idx,
                     )
                     if await is_cache_ready(ck):
                         continue
@@ -627,13 +645,13 @@ class CastSession:
                         continue
                     await _start_gated_render(
                         prio, ck, "tracker",
-                        lambda p=path, ss=int(item.subsong or 0):
+                        lambda p=path, ss=_idx:
                             _render_tracker(p, subsong=ss),
                     )
                 elif src_ext in _GME_EXTS_STREAM:
                     ck = _ck(
                         track_id=item.track_id, format_type="gme",
-                        subsong=int(item.subsong or 0),
+                        subsong=_idx,
                     )
                     if await is_cache_ready(ck):
                         continue
@@ -642,7 +660,7 @@ class CastSession:
                         continue
                     await _start_gated_render(
                         prio, ck, "gme",
-                        lambda p=path, ss=int(item.subsong or 0):
+                        lambda p=path, ss=_idx:
                             _render_gme(p, subsong=ss),
                     )
                 else:

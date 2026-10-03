@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from soniqboom.core import art_cache
+from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.data import get_track, get_config
 from soniqboom.core.metadata import cap_full_cover, id3_picture, resize_cover
 from soniqboom.core.store import get_store
@@ -464,7 +465,7 @@ def _source_mtime_for(path_str: str) -> float | None:
     the file itself.  Returns ``None`` when nothing is on disk yet.
     """
     try:
-        if path_str.startswith(("smb://", "ftp://")):
+        if is_remote_path(path_str):
             from soniqboom.core.remote_cache import get_cache
             from soniqboom.core.filesource import parse_remote_path
             scan_root, remote_path = parse_remote_path(path_str)
@@ -667,7 +668,7 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     source_present = False
     read_failed = False
 
-    if path_str.startswith(("smb://", "ftp://")):
+    if is_remote_path(path_str):
         # Remote track — try to extract from cached local copy
         from soniqboom.core.remote_cache import get_cache
         from soniqboom.core.filesource import get_source, parse_remote_path
@@ -764,7 +765,7 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     # Re-attempts in both cases are cheap: a track that DOES have art is served
     # from the positive art cache after the first resolve, and an absent local
     # file fails ``path.exists()`` in microseconds.
-    is_remote = path_str.startswith(("ftp://", "smb://"))
+    is_remote = is_remote_path(path_str)
     if is_remote:
         # Remote track with no art resolvable from local state.  If the scan
         # recorded an embedded cover (``cover_art`` URL set) but the bytes
@@ -819,7 +820,7 @@ async def _try_folder_art(
     data: bytes | None = None
     mime: str | None = None
 
-    if path_str.startswith(("smb://", "ftp://")):
+    if is_remote_path(path_str):
         # Remote path — directory listing via FileSource
         from soniqboom.core.filesource import get_source, parse_remote_path
         scan_root, remote_path = parse_remote_path(path_str)

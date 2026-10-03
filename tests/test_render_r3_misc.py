@@ -157,7 +157,8 @@ async def test_render_status_says_failed_with_the_reason(monkeypatch, tmp_path):
         if len(calls) == 1:
             raise HTTPException(422, "This file isn't a playable Amiga module")
         out = tmp_path / f"ok{len(calls)}.wav"
-        out.write_bytes(stream._build_wav_header(44100, 2, 44100, 16) + bytes(44100 * 4))
+        out.write_bytes(stream._build_wav_header(44100, 2, 44100, 16)
+                        + b"\x40\x1f\x40\x1f\xc0\xe0\xc0\xe0" * (44100 // 2))
         return out
     monkeypatch.setattr(stream, "_render_uade", render)
     try:
@@ -193,7 +194,8 @@ async def test_a_successful_render_clears_a_recorded_failure(tmp_path, monkeypat
 
     async def ok():
         out = tmp_path / "rf2.wav"
-        out.write_bytes(stream._build_wav_header(44100, 2, 100, 16) + bytes(400))
+        out.write_bytes(stream._build_wav_header(44100, 2, 100, 16)
+                        + b"\x40\x1f\x40\x1f\xc0\xe0\xc0\xe0" * 50)
         return out
     try:
         await conversion_cache.get_or_render(track_id="rf2", format_type="tracker",

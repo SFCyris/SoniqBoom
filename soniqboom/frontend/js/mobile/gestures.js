@@ -27,17 +27,29 @@ const SWIPE_AXIS_LOCK   = 10;      // px before deciding horiz vs vert
 export function attachRowGestures(row, opts = {}) {
   const content = row.querySelector('.m-row-content');
   if (!content) return () => {};
+  return _bindRowGestures(row, () => ({ row, content, opts }));
+}
 
-  // Build the swipe-reveal background once (lazy)
-  let swipeBg = null;
-  function ensureSwipeBg() {
-    if (swipeBg) return;
-    swipeBg = document.createElement('div');
-    swipeBg.className = 'm-row-swipe-bg' + (opts.swipeBgClass ? ` ${opts.swipeBgClass}` : '');
-    swipeBg.textContent = opts.swipeLabel || 'Remove';
-    row.insertBefore(swipeBg, content);
-  }
+/**
+ * The same gestures for every ``.m-row`` in ``container``, with ONE set of
+ * listeners on the container — for virtual lists, whose rows are recycled.
+ * ``optsFor(row)`` returns the row's options (as above) when the gesture starts,
+ * or null for a row without gestures.
+ */
+export function attachListGestures(container, optsFor) {
+  return _bindRowGestures(container, (e) => {
+    const row = e.target.closest('.m-row');
+    if (!row || !container.contains(row)) return null;
+    const content = row.querySelector('.m-row-content');
+    const opts = content ? optsFor(row) : null;
+    return opts ? { row, content, opts } : null;
+  });
+}
 
+// The gesture state machine: ``resolve(e)`` picks the row (and its options) at
+// pointerdown; everything after acts on that row.
+function _bindRowGestures(el, resolve) {
+  let cur         = null;          // { row, content, opts } of the gesture in progress
   let pointerId   = null;
   let startX      = 0;
   let startY      = 0;
@@ -46,10 +58,34 @@ export function attachRowGestures(row, opts = {}) {
   let axis        = null;          // null | 'h' | 'v'
   let longTimer   = null;
   let cancelled   = false;
-  let didSwipe    = false;
+
+  // The swipe-reveal background, built once per row (lazy) and re-labelled for
+  // the gesture's options (a recycled row may have served another action).
+  function ensureSwipeBg() {
+    const { row, content, opts } = cur;
+    let bg = row.querySelector(':scope > .m-row-swipe-bg');
+    if (!bg) {
+      bg = document.createElement('div');
+      row.insertBefore(bg, content);
+    }
+    const cls = 'm-row-swipe-bg' + (opts.swipeBgClass ? ` ${opts.swipeBgClass}` : '');
+    const label = opts.swipeLabel || 'Remove';
+    if (bg.className !== cls) bg.className = cls;
+    if (bg.textContent !== label) bg.textContent = label;
+  }
 
   function onDown(e) {
-    if (pointerId !== null) return;
+    if (pointerId !== null) {
+      if (e.pointerId === pointerId) return;
+      abort();                     // a gesture whose release never reached us
+    }
+    const t = resolve(e);
+    if (!t) return;
+    cur = t;
+    // A release outside ``el`` (mouse let go beside the list, the row removed
+    // under the finger) must still end the gesture: listen on the window too.
+    window.addEventListener('pointerup', onAway, true);
+    window.addEventListener('pointercancel', onAway, true);
     // Allow the long-press timer for any pointer type (touch, pen, mouse)
     pointerId = e.pointerId;
     startX = e.clientX;
@@ -57,8 +93,8 @@ export function attachRowGestures(row, opts = {}) {
     dx = dy = 0;
     axis = null;
     cancelled = false;
-    didSwipe = false;
 
+    const opts = cur.opts;
     if (opts.onLongPress) {
       longTimer = setTimeout(() => {
         if (cancelled) return;
@@ -71,7 +107,7 @@ export function attachRowGestures(row, opts = {}) {
   }
 
   function onMove(e) {
-    if (e.pointerId !== pointerId) return;
+    if (e.pointerId !== pointerId || !cur) return;
     dx = e.clientX - startX;
     dy = e.clientY - startY;
 
@@ -80,7 +116,7 @@ export function attachRowGestures(row, opts = {}) {
       axis = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
       if (axis === 'h') {
         // Capture pointer so the row keeps tracking even if finger leaves bounds
-        try { row.setPointerCapture(pointerId); } catch (_) {}
+        try { cur.row.setPointerCapture(pointerId); } catch (_) {}
       }
     }
 
@@ -93,38 +129,40 @@ export function attachRowGestures(row, opts = {}) {
     if (axis === 'v') return;
 
     // Horizontal swipe: only allow if onSwipeAction is configured, only leftwards
-    if (axis === 'h' && opts.onSwipeAction) {
+    if (axis === 'h' && cur.opts.onSwipeAction) {
       ensureSwipeBg();
       // Clamp to leftwards translation only; resist over-pull
       const tx = Math.min(0, dx);
-      content.style.transform = `translateX(${tx}px)`;
+      cur.content.style.transform = `translateX(${tx}px)`;
       e.preventDefault();
     }
   }
 
   function onUp(e) {
-    if (e.pointerId !== pointerId) return;
+    if (e.pointerId !== pointerId || !cur) return;
+    const { row, content, opts } = cur;
     clearTimeout(longTimer); longTimer = null;
     try { row.releasePointerCapture(pointerId); } catch (_) {}
     pointerId = null;
+    cur = null;
+    unlistenAway();
 
-    if (cancelled) { resetTransform(); return; }
+    if (cancelled) { resetTransform(content); return; }
 
     if (axis === 'h' && opts.onSwipeAction) {
       const width = row.getBoundingClientRect().width;
       if (Math.abs(dx) >= width * SWIPE_TRIGGER_PCT) {
         // Animate fully out, then fire action
-        didSwipe = true;
         content.style.transition = 'transform 0.18s ease-out';
         content.style.transform = `translateX(-${width}px)`;
         setTimeout(() => {
           opts.onSwipeAction();
           // Caller is expected to re-render the list; if not, snap back
-          resetTransform();
+          resetTransform(content);
         }, 180);
         return;
       }
-      resetTransform(true);
+      resetTransform(content, true);
       return;
     }
 
@@ -132,17 +170,37 @@ export function attachRowGestures(row, opts = {}) {
     if (axis === null && opts.onTap) {
       opts.onTap(e);
     }
-    resetTransform();
+    resetTransform(content);
   }
 
   function onCancel(e) {
-    if (e.pointerId !== pointerId) return;
-    clearTimeout(longTimer); longTimer = null;
-    pointerId = null;
-    resetTransform(true);
+    if (e.pointerId !== pointerId || !cur) return;
+    abort();
   }
 
-  function resetTransform(animate = false) {
+  // The gesture's pointer was released / cancelled where ``el`` doesn't hear it:
+  // end it without acting.  (This capture listener runs before ``el``'s own; a
+  // release on the gesture's own row is left to ``el``.)
+  function onAway(e) {
+    if (e.pointerId !== pointerId || !cur) return;
+    if (cur.row.isConnected && cur.row.contains(e.target)) return;   // ``el`` handles it
+    abort();
+  }
+  function unlistenAway() {
+    window.removeEventListener('pointerup', onAway, true);
+    window.removeEventListener('pointercancel', onAway, true);
+  }
+  function abort() {
+    const c = cur;
+    clearTimeout(longTimer); longTimer = null;
+    if (c) { try { c.row.releasePointerCapture(pointerId); } catch (_) {} }
+    pointerId = null;
+    cur = null;
+    unlistenAway();
+    if (c) resetTransform(c.content, true);
+  }
+
+  function resetTransform(content, animate = false) {
     if (!content.style.transform) return;
     if (animate) content.style.transition = 'transform 0.15s ease-out';
     content.style.transform = '';
@@ -150,17 +208,18 @@ export function attachRowGestures(row, opts = {}) {
     else content.style.transition = '';
   }
 
-  row.addEventListener('pointerdown',   onDown);
-  row.addEventListener('pointermove',   onMove);
-  row.addEventListener('pointerup',     onUp);
-  row.addEventListener('pointercancel', onCancel);
+  el.addEventListener('pointerdown',   onDown);
+  el.addEventListener('pointermove',   onMove);
+  el.addEventListener('pointerup',     onUp);
+  el.addEventListener('pointercancel', onCancel);
 
   return function destroy() {
-    row.removeEventListener('pointerdown',   onDown);
-    row.removeEventListener('pointermove',   onMove);
-    row.removeEventListener('pointerup',     onUp);
-    row.removeEventListener('pointercancel', onCancel);
+    el.removeEventListener('pointerdown',   onDown);
+    el.removeEventListener('pointermove',   onMove);
+    el.removeEventListener('pointerup',     onUp);
+    el.removeEventListener('pointercancel', onCancel);
     clearTimeout(longTimer);
+    unlistenAway();
   };
 }
 
@@ -171,6 +230,9 @@ export function attachRowGestures(row, opts = {}) {
  * Options:
  *   onReorder(fromIdx, toIdx) — fired once on commit
  *   getRows()                 — returns the live array of row DOM nodes
+ *   indexOf(row)              — a row's index in the list (default: its
+ *                               position among the rows — a virtual list,
+ *                               whose rows are a window, passes its own)
  */
 export function attachDragReorder(container, opts = {}) {
   let pointerId = null;
@@ -184,7 +246,7 @@ export function attachDragReorder(container, opts = {}) {
   }
 
   function indexOfRow(row) {
-    return rows().indexOf(row);
+    return opts.indexOf ? opts.indexOf(row) : rows().indexOf(row);
   }
 
   function onHandleDown(e) {
@@ -221,7 +283,8 @@ export function attachDragReorder(container, opts = {}) {
       if (e.clientY >= rect.top && e.clientY <= rect.bottom) {
         const above = e.clientY < rect.top + rect.height / 2;
         r.classList.add(above ? 'drop-above' : 'drop-below');
-        toIdx = above ? i : i + 1;
+        const at = opts.indexOf ? opts.indexOf(r) : i;
+        toIdx = above ? at : at + 1;
         // Index correction: removing the dragged row shifts the index when moving down
         if (toIdx > fromIdx) toIdx -= 1;
         return;

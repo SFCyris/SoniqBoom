@@ -20,6 +20,7 @@ import contextvars
 import functools
 import heapq
 import logging
+import math
 import os
 import re
 import shutil
@@ -41,8 +42,10 @@ from starlette.background import BackgroundTask
 # signed token in the URL path, and by the Subsonic byte routes
 # (``subsonic._stream_preauthed``) after their own auth — which spares a
 # ``p=`` client a second scrypt per request.  ``stream_track`` reads this,
-# skips its own _require_stream_auth and never serves the web player's
-# progressive (growing-file) responses.  Critically, this CANNOT be set by any
+# skips its own _require_stream_auth and serves a still-rendering file only
+# when its length is exact up front (SID, SNDH — never the web player's
+# provisional or stored-length ones; another codec asked for is encoded from
+# any growing render).  Critically, this CANNOT be set by any
 # external request — FastAPI does NOT bind module-level ContextVars to
 # query / header / body / cookie inputs, so the previous "bool kwarg"
 # approach (which FastAPI happily exposed as a query parameter, opening
@@ -92,7 +95,10 @@ def _reset_cast_internal_bypass(token) -> None:
 from soniqboom.config import settings
 from soniqboom.core import forksafe
 from soniqboom.core.conversion_cache import _cache_key as _ck
+from soniqboom.core.silence import AudibilityMeter as _AudibilityMeter
 from soniqboom.core.data import get_track
+from soniqboom.core import remote_zip as _remote_zip
+from soniqboom.core.filesource import is_remote_path
 
 log = logging.getLogger(__name__)
 
@@ -258,7 +264,7 @@ TRANSCODE_MIME = {
 # Anything not in NATIVE ends up here automatically.
 
 # ── Rendered format extension sets ────────────────────────────────────────────
-_SID_EXTS = {".sid", ".psid"}
+from soniqboom.core.metadata import SID_EXTS as _SID_EXTS   # .sid / .psid / .rsid
 _MIDI_EXTS = {".mid", ".midi"}
 # Tracker formats decoded by openmpt123.  AHX (.ahx) and Hively (.hvl)
 # used to live here but openmpt123 doesn't decode them — they now route
@@ -694,6 +700,13 @@ _SID_PROG_INFLIGHT: dict[str, int] = {}    # full_key → latest admission id
 # report it, exactly like a blocking render's in-flight event.  Keyed by
 # full_key; the entry is dropped by its finaliser.
 _SID_PROG_DONE: dict[str, asyncio.Event] = {}
+# Progressive SID renders in progress, by full_key: the render's shared state
+# (temp, process, verdict, readers…).  A second GET for the same tune — a DLNA
+# renderer's second connection, a ``Range: bytes=N-`` reconnect after a seek,
+# a cast receiver while the web UI plays it — attaches to it as another reader
+# instead of starting another sidplayfp (or killing an 80 %-done render to
+# start again).  Dropped by the render's finaliser.
+_SID_PROG_RENDERS: dict[str, dict] = {}
 # SID prewarms rendering right now: full_key → the render task
 # (``get_or_render``'s detached one).  A play of that tune retires it before
 # its own progressive render starts (``_retire_sid_prewarm``), so a click
@@ -752,10 +765,14 @@ def _sid_blocking_sem() -> "asyncio.Semaphore":
     return _SID_BLOCKING_SEM
 
 
-# How long to wait for sidplayfp's first PCM bytes before either streaming
-# (bytes appeared) or falling back to the blocking render (proc died first —
-# so an immediate render failure surfaces as a real error, not silent silence).
+# How long a progressive SID for our web UI waits for sidplayfp's first PCM
+# bytes, and then for its first AUDIBLE ones, before it streams anyway
+# (``_await_sid_audible``) — every other caller waits for sound or the end of
+# the render: a render that dies first falls back to the blocking render (so
+# an immediate failure surfaces as a real error), one that ends silent is the
+# cache's 422.
 _SID_PROG_FIRST_BYTE_TIMEOUT = 3.0
+_SID_PROG_AUDIBLE_WAIT = 20.0
 
 
 def _synth_wav_header(rate: int, channels: int, bits: int, data_bytes: int) -> bytes:
@@ -944,6 +961,569 @@ async def sid_start_song(track_id: str, track, path: "Path | None" = None) -> in
     return start
 
 
+# ── Default tune of the other multi-tune files ──────────────────────────────
+# SID and SNDH name their default tune in the header (above) and their
+# renderers map the wire themselves.  Every other renderer takes the tune
+# INDEX, and for them the wire IS the index: ``?subsong=N`` / ``<id>~N`` /
+# a playlist's ``{id, subsong: N}`` always play tune N + 1, so stored ids
+# never change meaning.  Cache keys, VU sidecars and waveforms are keyed by
+# that index (uade: 0 = its default "cur" tune = its first, N = the module's
+# first subsong + N).
+#
+# Only a BARE play — no tune asked for: the bare id on the web, Subsonic or a
+# cast receiver, a prewarm of it — picks a tune itself.  For the families
+# whose first tune is often an empty stub (uade custom players: an init or
+# sound-effect slot; libgme rips; sc68 disks) that is the FIRST TUNE THAT
+# ISN'T EMPTY: at least ``silence.MIN_TUNE_SECONDS`` with audible sound,
+# learnt once by short probe renders (``ensure_default_tune``) and recorded
+# as the track's ``default_subsong`` (0 when the first tune is fine, so
+# "probed" is remembered too).  The track's stored ``duration`` describes
+# that tune.  ``tune_index`` turns what a request named into the index
+# (O(1)); entry points that have the file run ``ensure_default_tune`` first
+# for a bare play.
+
+_PROBE_FAMILIES = frozenset({"uade", "gme", "sc68"})
+# track id → (file version, 0-based default tune) decided in this process — a
+# fallback when the record can't take the write; the version
+# (``_file_version``: the record's mtime and size) ties it to the file it was
+# learnt from.  Bounded, oldest dropped.
+_DEFAULT_TUNE: "OrderedDict[str, tuple[tuple, int]]" = OrderedDict()
+_DEFAULT_TUNE_MAX = 8192
+# track id → an UNDECIDED probe's state for one file version (never written to
+# the record): {"v": version, "next": the first candidate not judged yet —
+# every one before it was judged not to be a tune (a definite verdict, kept:
+# the next probe resumes there), "pick": the tune a bare play plays
+# meanwhile, "retry": monotonic time before which no new probe starts (after
+# a candidate that couldn't be told or no render slot; 0 = go on at once)}.
+# A bare play waits for a file's probe once; while its state stands, later
+# bare plays play the pick at once and the probe goes on in the background
+# (``_start_default_probe``).  Bounded, oldest dropped.
+_DEFAULT_PROBE_STATE: "OrderedDict[str, dict]" = OrderedDict()
+_DEFAULT_TUNE_RETRY_S = 120.0       # after an undecided candidate / no slot
+_DEFAULT_PROBES: "dict[str, asyncio.Future]" = {}
+_DEFAULT_PROBE_MAX_TUNES = 16       # candidates tried, in order
+_DEFAULT_PROBE_BUDGET_S = 8.0       # wall time per probe run, from the render slot on
+_DEFAULT_PROBE_SLOT_WAIT_S = 30.0   # at most this long waiting for that slot
+_PROBE_MAX_AUDIO_S = 30.0           # audio judged per candidate (uade ends silence at 20 s)
+_PROBE_WALL_S = 10.0                # one candidate's renderer run
+
+
+def _tfield(track, name: str):
+    """Field ``name`` of a track model or a store record dict (None if absent)."""
+    if track is None:
+        return None
+    if isinstance(track, dict):
+        return track.get(name)
+    return getattr(track, name, None)
+
+
+def _header_tuned(track) -> bool:
+    """Do this track's renderer and record map the wire with the file's own
+    start song (C64 SID, Atari SNDH)?  Then a request's wire is passed on as
+    it is, and a bare play is wire 0."""
+    fam = str(_tfield(track, "format") or "").split("/")[0].strip().upper()
+    return fam in ("SID", "SNDH")
+
+
+def _tune_count(track) -> int:
+    n = _tfield(track, "subsongs")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 0
+
+
+def _file_version(track) -> tuple:
+    """What ties an in-process default-tune memo to one version of the file:
+    the record's mtime and size (a file replaced keeping its mtime has
+    another size)."""
+    return (_tfield(track, "mtime"), _tfield(track, "file_size"))
+
+
+def explicit_wire(subsong: "int | None", request: "Request | None" = None) -> "int | None":
+    """The tune a request names, or None for a bare play.  ``?subsong=N``
+    names tune N — also ``?subsong=0`` (the web player's pick of the first
+    tune); an in-process caller's 0 (Subsonic's bare id, the cast byte
+    server) is a bare play unless its own request carries ``subsong``."""
+    if subsong is None:
+        return None
+    s = max(0, int(subsong))
+    if s > 0:
+        return s
+    try:
+        named = request is not None and "subsong" in request.query_params
+    except Exception:
+        named = False
+    return 0 if named else None
+
+
+def _default_tune_decided(track_id: str, track) -> "int | None":
+    """The default tune a probe DECIDED for this file version: the record's
+    ``default_subsong``, else this process's memo (``_DEFAULT_TUNE``) — or
+    None.  O(1)."""
+    if track is None or _header_tuned(track):
+        return None
+    n = _tune_count(track)
+    z = _tfield(track, "default_subsong")
+    if isinstance(z, int) and not isinstance(z, bool) and 0 <= z and (not n or z < n):
+        return z
+    got = _DEFAULT_TUNE.get(track_id)
+    if got is not None and got[0] == _file_version(track):
+        return got[1]
+    return None
+
+
+def _probe_state(track_id: str, track) -> "dict | None":
+    """This file version's undecided-probe state (``_DEFAULT_PROBE_STATE``)."""
+    st = _DEFAULT_PROBE_STATE.get(track_id)
+    if st is not None and st["v"] != _file_version(track):
+        return None
+    return st
+
+
+def default_tune_known(track_id: str, track) -> "int | None":
+    """The 0-based tune a bare play of a multi-tune file whose renderer takes
+    a tune index plays, as known without touching the file: the decided
+    default (``_default_tune_decided``), else an undecided probe's pick for
+    this file version (``_DEFAULT_PROBE_STATE``) — or None (not probed yet).
+    O(1)."""
+    got = _default_tune_decided(track_id, track)
+    if got is not None or track is None or _header_tuned(track):
+        return got
+    st = _probe_state(track_id, track)
+    return st["pick"] if st is not None else None
+
+
+def tune_index(track_id: str, track, wire: "int | None") -> int:
+    """The tune index a request plays: the wire it named (SID / SNDH: the
+    wire, which their renderers map), or for a bare play (``None``) the
+    file's default tune — 0 for SID / SNDH and while it isn't known.  O(1)."""
+    if wire is not None:
+        return max(0, int(wire))
+    return default_tune_known(track_id, track) or 0
+
+
+def default_tune_index(track_id: str, track) -> int:
+    """The index of the tune a track's stored ``duration`` describes: the
+    decided default tune (what a bare play renders, ``tune_index(…, None)``)
+    — 0 while undecided: an undecided probe's pick plays, but its length is
+    neither promised from the record nor written to it."""
+    return _default_tune_decided(track_id, track) or 0
+
+
+def _probe_family(ext: str, uade_named: bool, path: "Path | None" = None, *,
+                  c64: "bool | None" = None) -> "str | None":
+    """Which default-tune probe applies to a play routed like this:
+    ``"uade"`` / ``"gme"`` / ``"sc68"``, else None — in the order playback
+    routes (a verified Amiga module goes to uade whatever its suffix).
+    ``c64``: the PSID/RSID verdict for a ``.sid`` when already known (else
+    read from ``path``; with neither, a ``.sid`` is undecided — None)."""
+    if ext in _UADE_EXTS or uade_named:
+        return "uade"
+    if ext in _GME_EXTS_STREAM:
+        return "gme"
+    if ext in _SC68_EXTS:
+        return "sc68"
+    if ext in _SID_EXTS:
+        if c64 is None:
+            if path is None:
+                return None
+            c64 = _is_c64_sid(path)
+        return None if c64 else "uade"
+    return None
+
+
+def _set_probe_state(track_id: str, track, nxt: int, pick: int, retry: float) -> None:
+    _DEFAULT_PROBE_STATE[track_id] = {"v": _file_version(track), "next": int(nxt),
+                                      "pick": int(pick), "retry": float(retry)}
+    _DEFAULT_PROBE_STATE.move_to_end(track_id)
+    while len(_DEFAULT_PROBE_STATE) > _DEFAULT_TUNE_MAX:
+        _DEFAULT_PROBE_STATE.popitem(last=False)
+
+
+def _note_default_tune(track_id: str, track, index: int, family: str) -> None:
+    """Record the probed default tune on the track at once (event loop only).
+    A default past the first tune also resets the stored length — it was the
+    first tune's — to what the scan stores for the family, so the next bare
+    render measures it, and blanks the stored scrubber waveform (recomputed
+    from that render)."""
+    _DEFAULT_PROBE_STATE.pop(track_id, None)
+    _DEFAULT_TUNE[track_id] = (_file_version(track), int(index))
+    _DEFAULT_TUNE.move_to_end(track_id)
+    while len(_DEFAULT_TUNE) > _DEFAULT_TUNE_MAX:
+        _DEFAULT_TUNE.popitem(last=False)
+    fields: dict = {"default_subsong": int(index)}
+    if index:
+        fields["duration"] = (float(settings.sid_default_duration)
+                              if family == "gme" else 0.0)
+    try:
+        from soniqboom.core.store import get_store
+        store = get_store()
+        rec = store.get_track(track_id)
+        if rec is None or _file_version(rec) != _file_version(track):
+            return                       # gone, or another file version by now
+        store.update_track_fields(track_id, fields)
+        if index and store.get_waveform(track_id):
+            store.store_waveform(track_id, [])
+    except Exception:
+        log.debug("default tune write-back skipped for %s", track_id, exc_info=True)
+
+
+async def _pcm_probe(cmd: list[str], *, cwd: "str | None" = None,
+                     env: "dict | None" = None, wav_header: bool) -> "bool | None":
+    """Run a renderer that writes 44.1 kHz stereo s16 PCM to stdout (behind a
+    WAV header when ``wav_header``) and judge the tune: True once it has
+    played ``MIN_TUNE_SECONDS`` and was audible; False when it ended shorter
+    or stayed silent through ``_PROBE_MAX_AUDIO_S``; None when the run
+    failed to start or took longer than ``_PROBE_WALL_S`` (undecided).  The
+    process is killed as soon as the verdict is in."""
+    from soniqboom.core.silence import MIN_TUNE_SECONDS
+    try:
+        proc = await forksafe.spawn(*cmd, stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.DEVNULL, cwd=cwd, env=env)
+    except OSError:
+        return None
+    meter = _AudibilityMeter(2, 44100)
+
+    async def _judge() -> bool:
+        head = b""
+        header_done = not wav_header
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                return meter.audible and meter.seconds >= MIN_TUNE_SECONDS
+            if not header_done:
+                head += chunk
+                i = head.find(b"data")
+                if i < 0 or len(head) < i + 8:
+                    if len(head) > 4096:
+                        return False
+                    continue
+                chunk, header_done = head[i + 8:], True
+            meter.feed(chunk)
+            if meter.audible and meter.seconds >= MIN_TUNE_SECONDS:
+                return True
+            if meter.seconds >= _PROBE_MAX_AUDIO_S:
+                return meter.audible
+
+    try:
+        verdict = await asyncio.wait_for(_judge(), timeout=_PROBE_WALL_S)
+    except asyncio.TimeoutError:
+        verdict = None
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except Exception:
+            pass
+    return verdict
+
+
+async def _tune_audible(family: str, path: Path, index: int, *, base: int = 0,
+                        gme_data: "bytes | None" = None) -> "bool | None":
+    """Is 0-based tune ``index`` of the local file ``path`` a real tune
+    (``_pcm_probe``)?  None when it can't be told (the caller then keeps it)
+    — also when the file is gone by then (a temporary copy a later probe run
+    outlived: the renderer's silence is then no verdict).  The caller holds
+    the render slot (``_probe_default_tune``)."""
+    verdict = await _tune_audible_run(family, path, index, base=base, gme_data=gme_data)
+    if (verdict is False and family != "gme"
+            and not await asyncio.to_thread(os.path.exists, str(path))):
+        return None
+    return verdict
+
+
+async def _tune_audible_run(family: str, path: Path, index: int, *, base: int = 0,
+                            gme_data: "bytes | None" = None) -> "bool | None":
+    if family == "gme":
+        from soniqboom.core import gme_render
+        if not gme_render.is_available() or gme_data is None:
+            return None
+        return await asyncio.to_thread(gme_render.tune_audible, gme_data, index,
+                                       max_seconds=_PROBE_MAX_AUDIO_S)
+    if family == "uade":
+        binary = _find_renderer(settings.uade123_path, "uade123")
+        if not binary:
+            return None
+        try:
+            async with _xpk_unpacked(path) as src:
+                return await _pcm_probe(
+                    [binary, "-1", "-c", *_uade_subsong_arg(index, base), "--", src.name],
+                    cwd=_uade_cwd(src), wav_header=True)
+        except HTTPException:
+            return None
+    if family == "sc68":
+        binary = _find_renderer(settings.sc68_path, "sc68")
+        if not binary:
+            return None
+        home = await asyncio.get_running_loop().run_in_executor(None, _sc68_home)
+        env = dict(os.environ, SC68_HOME=str(home), HOME=str(home))
+        return await _pcm_probe([binary, str(path), f"--track={index + 1}"],
+                                env=env, wav_header=False)
+    return None
+
+
+async def _cached_default_ok(track_id: str, family: str) -> bool:
+    """Is the first tune's render already cached, long enough and audible —
+    a real tune, no probe needed?  (A render cached before silent renders
+    were refused may be silence, so it is judged here too: one read of the
+    file, stopping at its first audible block.)"""
+    from soniqboom.core.conversion_cache import get_cached
+    from soniqboom.core.silence import MIN_TUNE_SECONDS, wav_audible
+    key = (uade_cache_key(track_id, 0) if family == "uade"
+           else _ck(track_id, family, subsong=0))
+    wav = await get_cached(key)
+    if wav is None:
+        return False
+
+    def _judge() -> bool:
+        return (_wav_audio_seconds(wav) >= MIN_TUNE_SECONDS
+                and wav_audible(wav) is not False)
+    try:
+        return await asyncio.to_thread(_judge)
+    except Exception:
+        return False
+
+
+async def _probe_default_tune(track_id: str, track, path: Path, family: str) -> int:
+    """Find (and record) a file's default tune: the first tune, in order,
+    that is a real tune — of the first ``_DEFAULT_PROBE_MAX_TUNES``.  One
+    render slot is held per run (a renderer runs per candidate); the run's
+    budget (``_DEFAULT_PROBE_BUDGET_S``) starts once it holds the slot —
+    waiting for one (all busy rendering) costs no candidate — and that wait
+    is bounded (``_DEFAULT_PROBE_SLOT_WAIT_S``).  Recorded on the track
+    (``_note_default_tune``) once decided: a candidate is a real tune, or
+    every candidate was judged not to be one (then the first tune — a silent
+    file is reported when it renders).  Otherwise the run leaves the file's
+    state (``_DEFAULT_PROBE_STATE``, never the record): candidates judged
+    not to be tunes stay judged — the next run resumes after them (the
+    budget ran out: at once, in the background) — and the pick a bare play
+    plays meanwhile is the first candidate not judged yet; a candidate that
+    can't be told (a renderer that timed out, a file gone meanwhile) or no
+    slot waits ``_DEFAULT_TUNE_RETRY_S`` for the next run.  Returns the tune
+    a bare play plays now."""
+    count = _tune_count(track)
+    end = min(count, _DEFAULT_PROBE_MAX_TUNES)
+    st = _probe_state(track_id, track)
+    start = st["next"] if st is not None else 0
+    base: "int | None" = None           # uade: resolved only for a tune past the first
+    gme_data = None
+    if family == "gme":
+        from soniqboom.core import gme_render
+        try:
+            raw = await asyncio.to_thread(path.read_bytes)
+            gme_data = await asyncio.to_thread(gme_render.unpack_gym, raw)
+        except (OSError, ValueError):
+            gme_data = None
+    nxt = start                         # the first candidate not judged yet
+    chosen: "int | None" = None         # decided
+    unsure: "int | None" = None         # a candidate that can't be told
+    no_slot = False
+    t_wait = time.monotonic()
+    if start == 0 and await _cached_default_ok(track_id, family):
+        chosen = 0                                      # the first tune's render is music
+    else:
+        slot = _render_sem if family != "gme" else None
+        held = False
+        try:
+            if slot is not None:
+                try:
+                    await asyncio.wait_for(slot.acquire(), timeout=_DEFAULT_PROBE_SLOT_WAIT_S)
+                    held = True
+                except asyncio.TimeoutError:
+                    no_slot = True
+            if not no_slot:
+                t0 = time.monotonic()
+                for i in range(start, end):
+                    if time.monotonic() - t0 > _DEFAULT_PROBE_BUDGET_S:
+                        break
+                    if family == "uade" and i and base is None:
+                        base = await _uade_resolve_base(track_id, track, path, i)
+                    verdict = await _tune_audible(family, path, i, base=base or 0,
+                                                  gme_data=gme_data)
+                    if verdict is True:
+                        chosen = i
+                        break
+                    if verdict is None:
+                        unsure = i
+                        break
+                    nxt = i + 1                 # judged: not a tune
+                else:
+                    chosen = 0                  # every candidate: not a tune
+        finally:
+            if held:
+                slot.release()
+    if chosen is not None:
+        log.debug("Default tune of %s (%s, %d tunes): %d — %.0f ms", track_id, family,
+                  count, chosen, (time.monotonic() - t_wait) * 1000)
+        _note_default_tune(track_id, track, chosen, family)
+        return chosen
+    pick = unsure if unsure is not None else nxt
+    stuck = unsure is not None or no_slot
+    log.debug("Default tune of %s (%s, %d tunes): undecided after %d, playing %d%s — %.0f ms",
+              track_id, family, count, nxt, pick, " (retried later)" if stuck else "",
+              (time.monotonic() - t_wait) * 1000)
+    _set_probe_state(track_id, track, nxt, pick,
+                     time.monotonic() + _DEFAULT_TUNE_RETRY_S if stuck else 0.0)
+    return pick
+
+
+def _start_default_probe(track_id: str, track, path: Path, family: str, *,
+                         background: bool) -> "asyncio.Future":
+    """Start a probe run of ``track_id`` (``_probe_default_tune``), shared
+    through ``_DEFAULT_PROBES``; ``background``: behind ``_bg_render_sem`` at
+    ``PRIO_PROBE``, as the other probes.  A run that ends undecided with its
+    budget spent (state ``retry`` 0) is followed by a background run at once,
+    so the file settles without any play waiting for it; one that failed
+    waits ``_DEFAULT_TUNE_RETRY_S``."""
+    async def _run() -> int:
+        if background:
+            async with _bg_render_sem.slot(PRIO_PROBE):
+                return await _probe_default_tune(track_id, track, path, family)
+        return await _probe_default_tune(track_id, track, path, family)
+
+    fut = asyncio.ensure_future(_run())
+    _DEFAULT_PROBES[track_id] = fut
+
+    def _done(f: "asyncio.Future") -> None:
+        if _DEFAULT_PROBES.get(track_id) is f:
+            _DEFAULT_PROBES.pop(track_id, None)
+        if f.cancelled():
+            return
+        if f.exception() is not None:
+            st = _probe_state(track_id, track)
+            _set_probe_state(track_id, track, st["next"] if st else 0,
+                             st["pick"] if st else 0, time.monotonic() + _DEFAULT_TUNE_RETRY_S)
+            return
+        st = _probe_state(track_id, track)
+        if (st is not None and st["retry"] == 0.0 and track_id not in _DEFAULT_PROBES
+                and _default_tune_decided(track_id, track) is None):
+            try:
+                _start_default_probe(track_id, track, path, family, background=True)
+            except RuntimeError:
+                pass                                    # the loop is closing
+    fut.add_done_callback(_done)
+    return fut
+
+
+def default_probe_running(track_id: str) -> bool:
+    """Is a default-tune probe of ``track_id`` under way?"""
+    fut = _DEFAULT_PROBES.get(track_id)
+    return fut is not None and not fut.done()
+
+
+async def await_default_probe(track_id: str, timeout: float) -> "int | None":
+    """Wait (at most ``timeout`` s) for a default-tune probe already under way
+    (started by a play or a prewarm); its result, or None."""
+    fut = _DEFAULT_PROBES.get(track_id)
+    if fut is None:
+        return None
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout)
+    except Exception:
+        return None
+
+
+async def ensure_default_tune(track_id: str, track, path: Path,
+                              family: "str | None", *,
+                              background: bool = False) -> "int | None":
+    """The 0-based tune a bare play of a multi-tune file of a probed family
+    plays: its decided default tune; else, the first time, the outcome of a
+    probe of the local file ``path`` (``_probe_default_tune`` — concurrent
+    callers share one run); once a run ended undecided, the best pick so far
+    at once, while the probe goes on in the background (a bare play waits
+    for a file's probe once).  None for a single-tune file or another family
+    (and SID / SNDH, whose header names it).  ``background``: a first run
+    started here waits behind the background render gate (a Track Info open,
+    not a play)."""
+    if (family not in _PROBE_FAMILIES or track is None or _tune_count(track) <= 1
+            or _header_tuned(track)):
+        return None
+    known = _default_tune_decided(track_id, track)
+    if known is not None:
+        return known
+    fut = _DEFAULT_PROBES.get(track_id)
+    st = _probe_state(track_id, track)
+    if st is not None:
+        if fut is None and time.monotonic() >= st["retry"]:
+            _start_default_probe(track_id, track, path, family, background=True)
+        return st["pick"]
+    if fut is None:
+        fut = _start_default_probe(track_id, track, path, family, background=background)
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("Default-tune probe of %s failed", track_id, exc_info=True)
+        return default_tune_known(track_id, track) or 0
+
+
+async def _bare_play_track(track_id: str, track, path: Path, family: "str | None"):
+    """For a bare play of a multi-tune file: make sure its default tune is
+    known (``ensure_default_tune``) and return the track as the store has it
+    now — the probe may have moved the default and reset the stored length,
+    which the caller's copy predates.  A libgme rip scanned before tune
+    counts were read gets its count first (``_gme_backfill_tune_count``)."""
+    if family == "gme" and not _tune_count(track):
+        track = await _gme_backfill_tune_count(track_id, track, path)
+    if (family is None or _tune_count(track) <= 1 or _header_tuned(track)
+            or _tfield(track, "default_subsong") is not None):
+        return track                     # nothing to probe, or the copy is current
+    if _default_tune_decided(track_id, track) is None:
+        await ensure_default_tune(track_id, track, path, family)
+    return await get_track(track_id) or track
+
+
+_GME_COUNTED_EXTS = (".nsf", ".nsfe", ".gbs", ".ay", ".sap")
+# (track id, mtime) of files whose header was read and holds one tune (or
+# none readable): not read again on every play.  Bounded.
+_GME_COUNT_READ: "OrderedDict[tuple, bool]" = OrderedDict()
+
+
+async def _gme_backfill_tune_count(track_id: str, track, path: "Path | None"):
+    """A libgme rip's tune count read from its header (NSF / NSFe / GBS / AY
+    / SAP) for a record scanned before the count was recorded: written to the
+    record and returned on a copy of ``track`` (unchanged when there is
+    nothing to add or the file can't be read)."""
+    if track is None or _tune_count(track) or path is None:
+        return track
+    if not str(path).lower().endswith(_GME_COUNTED_EXTS):
+        return track
+    seen = (track_id, _tfield(track, "mtime"))
+    if seen in _GME_COUNT_READ:
+        return track
+
+    def _read() -> bytes:
+        with open(path, "rb") as fh:
+            return fh.read(64 * 1024)
+    try:
+        head = await asyncio.wait_for(asyncio.to_thread(_read), timeout=5.0)
+    except Exception:
+        return track
+    from soniqboom.core.gme_render import header_tunes
+    n, _ = header_tunes(head)
+    if not n or n < 2:
+        _GME_COUNT_READ[seen] = True
+        while len(_GME_COUNT_READ) > 4096:
+            _GME_COUNT_READ.popitem(last=False)
+        return track
+    try:
+        from soniqboom.core.store import get_store
+        get_store().update_track_fields(track_id, {"subsongs": n})
+    except Exception:
+        log.debug("tune count write-back skipped for %s", track_id, exc_info=True)
+    if isinstance(track, dict):
+        return {**track, "subsongs": n}
+    if hasattr(track, "model_copy"):
+        return track.model_copy(update={"subsongs": n})
+    import copy
+    out = copy.copy(track)
+    out.subsongs = n
+    return out
+
+
 def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: str,
                     mute: "tuple[int, ...]" = (), start: int = 1) -> list[str]:
     """Build the sidplayfp argv shared by the blocking and progressive renders,
@@ -1011,6 +1591,12 @@ async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None)
         cmd = _sid_render_cmd(binary, path, subsong, dur, tmp_wav.name, start=start)
         try:
             await _await_renderer(cmd, Path(tmp_wav.name), timeout=dur + 30, kind="SID")
+            # Exactly ``dur`` seconds, like a progressive render of the tune
+            # (``_normalize_sid_wav``): one size per cache key, whichever
+            # path rendered it — what HEAD and a progressive answer promise.
+            await asyncio.to_thread(
+                _normalize_sid_wav, Path(tmp_wav.name),
+                dur * _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8))
         except BaseException:
             # Also when cancelled while still waiting for a render slot (a
             # retired prewarm): the temp exists before the renderer does.
@@ -1229,32 +1815,129 @@ async def _retire_sid_prewarm(full_key: str) -> bool:
     return True
 
 
-async def _await_first_sid_output(proc, tmp: Path, timeout: float) -> bool:
-    """Wait until sidplayfp has written its first PCM bytes (→ True) or exited
-    without producing any (→ False).  Lets the caller detect an immediate render
-    failure (bad tune, missing ROM) and fall back to the blocking path — which
-    surfaces a real error — instead of streaming a silent full-length 200.
+async def _progressive_render_silent(key: str, format_type: str, wav: Path) -> bool:
+    """For a render that was streamed while it ran (judged only now): True —
+    having dropped the file and recorded the failure, so ``/render-status``
+    says why and the next play renders blocking and gets the 422 — when it is
+    silent (``conversion_cache.refuse_silent``)."""
+    from soniqboom.core.conversion_cache import refuse_silent, note_render_failure
+    try:
+        await refuse_silent(key, format_type, wav)
+    except HTTPException as exc:
+        note_render_failure(key, exc.status_code, exc.detail)
+        return True
+    return False
 
-    On timeout with the process still alive we return True and stream anyway:
-    the generator's own idle-timeout handles a genuinely stuck render."""
-    waited = 0.0
-    while waited < timeout:
-        try:
-            if os.path.getsize(tmp) > _WAV_HEADER_LEN:
-                return True
-        except OSError:
-            pass
-        if proc.returncode is not None:
-            # Exited already — success only if it left real PCM on disk.
+
+async def _await_sid_audible(proc, tmp: Path, *,
+                             first_byte_timeout: "float | None" = None,
+                             audible_timeout: "float | None" = None,
+                             hard_timeout: "float | None" = None) -> str:
+    """Wait for sidplayfp's first AUDIBLE PCM in ``tmp`` (``core.silence``)
+    before a progressive SID answers — a tune that plays only silence must
+    reach the player as the cache's 422, not as minutes of streamed silence,
+    and an immediate render failure (bad tune, missing ROM) as a real error:
+
+      "audible" — sound is in: stream;
+      "stream"  — only with a timeout given (our web UI): the render is alive
+                  but nothing audible after ``audible_timeout`` s (a long
+                  silent intro — sidplayfp renders ~15x realtime, so that is
+                  minutes of tune), or no byte at all after
+                  ``first_byte_timeout`` s (the generator's idle timeout
+                  handles a stuck render): stream anyway;
+      "failed"  — exited without PCM, or with an error, or still alive after
+                  ``hard_timeout`` s: the caller falls back to the blocking
+                  render, which surfaces the error;
+      "silent"  — exited cleanly having rendered only silence.
+    Without timeouts (every other client) the answer waits for sound or the
+    end of the render: "stream" never comes."""
+    meter = _AudibilityMeter(_SID_WAV_CHANNELS, _SID_WAV_RATE)
+    st = {"fd": -1, "pos": _WAV_HEADER_LEN, "closed": False}
+    read_lock = threading.Lock()         # see ``_tail_render``'s step lock
+
+    def _read() -> bool:
+        with read_lock:
+            return False if st["closed"] else _read_locked()
+
+    def _read_locked() -> bool:
+        # Worker thread: judge the PCM that is new since the last look.
+        if st["fd"] < 0:
             try:
-                return os.path.getsize(tmp) > _WAV_HEADER_LEN
+                st["fd"] = os.open(str(tmp), os.O_RDONLY)
             except OSError:
                 return False
-        await asyncio.sleep(_GROWING_POLL_INTERVAL)
-        waited += _GROWING_POLL_INTERVAL
-    # Timed out.  Fail over only if the proc already died producing nothing;
-    # otherwise let the stream proceed.
-    return proc.returncode is None
+        size = os.fstat(st["fd"]).st_size
+        while st["pos"] < size:
+            buf = os.pread(st["fd"], min(size - st["pos"], 1 << 20), st["pos"])
+            if not buf:
+                break
+            st["pos"] += len(buf)
+            if meter.feed(buf):
+                return True
+        return False
+
+    t0 = time.monotonic()
+    try:
+        while True:
+            exited = proc.returncode is not None
+            if await asyncio.to_thread(_read):
+                return "audible"
+            if exited:
+                if st["pos"] <= _WAV_HEADER_LEN or proc.returncode != 0:
+                    return "failed"
+                return "silent"
+            waited = time.monotonic() - t0
+            if (audible_timeout is not None and waited >= audible_timeout) or (
+                    first_byte_timeout is not None and st["pos"] <= _WAV_HEADER_LEN
+                    and waited >= first_byte_timeout):
+                return "stream"
+            if hard_timeout is not None and waited >= hard_timeout:
+                return "failed"
+            await asyncio.sleep(_TAIL_POLL_S)
+    finally:
+        with read_lock:
+            st["closed"] = True
+            if st["fd"] >= 0:
+                os.close(st["fd"])
+                st["fd"] = -1
+
+
+def _normalize_sid_wav(path: Path, data_bytes: int) -> None:
+    """Make a finished sidplayfp WAV exactly the resource the progressive
+    stream and HEAD promise: ``data_bytes`` of PCM under the synthesized
+    header.  sidplayfp renders a few milliseconds past ``-t``; within a
+    second either way the tail is cut / padded with silence, a bigger
+    difference (or a layout that isn't sidplayfp's 44-byte mono 16-bit
+    header) is left alone.  Blocking."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(_WAV_HEADER_LEN)
+    except OSError:
+        return
+    lay = _tail_fmt(head)
+    if (lay is None or lay[1] != _WAV_HEADER_LEN or lay[0]["tag"] != 1
+            or lay[0]["bits"] != _SID_WAV_BITS or lay[0]["channels"] != _SID_WAV_CHANNELS
+            or lay[0]["rate"] != _SID_WAV_RATE):
+        return
+    pcm = size - _WAV_HEADER_LEN
+    one_sec = _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8)
+    if abs(pcm - data_bytes) > one_sec:
+        return
+    want = _synth_wav_header(_SID_WAV_RATE, _SID_WAV_CHANNELS, _SID_WAV_BITS, data_bytes)
+    if pcm == data_bytes and head == want:
+        return
+    try:
+        with open(path, "r+b") as fh:
+            if pcm > data_bytes:
+                fh.truncate(_WAV_HEADER_LEN + data_bytes)
+            elif pcm < data_bytes:
+                fh.seek(_WAV_HEADER_LEN + pcm)
+                fh.write(b"\x00" * (data_bytes - pcm))
+            fh.seek(0)
+            fh.write(want)
+    except OSError:
+        pass
 
 
 def _parse_audio_range(range_header: "str | None", total: int):
@@ -1298,6 +1981,8 @@ async def _serve_sid_progressive(
     full_key: str,
     base_headers: dict[str, str],
     background,
+    *,
+    web: bool = True,
 ) -> "Response | None":
     """Cold-play a SID with ~instant start: spawn sidplayfp and stream its
     STILL-RENDERING WAV instead of awaiting the whole render.
@@ -1310,15 +1995,28 @@ async def _serve_sid_progressive(
     reading it — so the next play, the waveform and /render-status see it at
     once; ``_SID_PROG_DONE`` lets them attach to it while it renders.
 
-    Returns ``None`` (having cleaned up) when the render fails to start — the
-    caller must then use the blocking path so the error surfaces as a real 5xx
-    rather than a silent full-length-silence 200.
+    Returns ``None`` (having cleaned up) when the render fails to start or the
+    pool is full — the caller must then use the blocking path so the error
+    surfaces as a real 5xx rather than a silent full-length-silence 200.
 
     Answers Range/seek requests with a proper 206 + Content-Range against the
     known full length (``44 + data_bytes``), and serves header-only probes
     (Safari's ``bytes=0-1``) straight from the synthesised header with no render.
-    Used for the local web-UI cold path only; cache hits and non-web clients
-    (Subsonic/DLNA/Cast) stay on the existing blocking render."""
+    That exact length is what lets every GET client take it — the web UI,
+    Subsonic, DLNA and the cast byte-server alike; cache hits are served from
+    the file.  A request for a tune whose render is already running attaches
+    to it as another reader (``_SID_PROG_RENDERS``).
+
+    Nothing is sent before the render is audible (``_await_sid_audible``) —
+    except, for our web UI (``web``), once ~20 s of rendering produced
+    nothing audible (a long silent intro; a tune that turns out silent is
+    then reported from its next play on).  Every other caller waits for sound
+    or the end of the render: a tune that plays only silence is the cache's
+    422 (``HTTPException``), never streamed silence.  ``web`` also decides a
+    render that stops producing output for a minute: the web UI's body is
+    padded to its length with silence (an ``<audio>`` element rejects a short
+    one), anyone else's is aborted.  ``request`` only supplies the Range
+    header (an object with ``headers`` will do; None: the whole file)."""
     from soniqboom.core.conversion_cache import get_cached, store_cached
 
     binary = _find_renderer(settings.sidplayfp_path, "sidplayfp")
@@ -1336,7 +2034,8 @@ async def _serve_sid_progressive(
     # media element with ``Range: bytes=0-1`` and requires a 206 — and lets an
     # early seek stream from the requested offset instead of dropping to a full
     # blocking render.
-    rng = _parse_audio_range(request.headers.get("range"), total)
+    rng = _parse_audio_range(
+        request.headers.get("range") if request is not None else None, total)
     if rng is None:                                   # unsatisfiable range
         return Response(status_code=416, media_type="audio/wav",
                         headers={"Content-Range": f"bytes */{total}",
@@ -1358,14 +2057,35 @@ async def _serve_sid_progressive(
         return Response(content=body, status_code=206, media_type="audio/wav",
                         headers=hdrs, background=background)
 
+    # A render of this tune already running: be another reader of it.
+    rd = _SID_PROG_RENDERS.get(full_key)
+    if rd is not None and rd["data_bytes"] == data_bytes:
+        handle = await _sid_attach(rd, web)
+        if handle is not None:
+            return _sid_reader_response(rd, handle, start, end_excl, is_range,
+                                        base_headers, background, web)
+        if (rd["verdict"] in ("audible", "stream") and not rd["stalled"]
+                and rd["proc"] is not None
+                and (rd["proc"].returncode is None or rd["proc"].returncode == 0)):
+            # A healthy render this caller can't read live (it isn't audible
+            # for it yet, or its file is being cached): never a second
+            # sidplayfp beside it — wait for its result, then the caller's
+            # blocking path finds the cached file (or the silent tune's 422).
+            try:
+                await asyncio.wait_for(rd["done_ev"].wait(),
+                                       timeout=int(duration) + 90)
+            except asyncio.TimeoutError:
+                pass
+            return None
+
     # Data range → we must render.  Concurrency cap: reserve a slot in the SAME
     # synchronous block as the check so a simultaneous burst can't all pass
     # "< cap" before any of them increments (asyncio runs this prefix to the
     # first ``await`` uninterrupted, so the count is authoritative here).
     #
-    # A COMEBACK play first retires its own detached duplicate: the fresh live
-    # render supersedes it (two sidplayfp processes rendering the same tune is
-    # pure waste), and killing it frees a slot before the cap check.
+    # A detached duplicate that could not be attached to (it stalled or
+    # failed) is retired: the fresh live render supersedes it, and killing it
+    # frees a slot before the cap check.
     dup = _SID_DETACHED.pop(full_key, None)
     if dup is not None:
         _kill_detached(dup)
@@ -1387,16 +2107,36 @@ async def _serve_sid_progressive(
             _slot_released["v"] = True
             _SID_PROG_ACTIVE[0] -= 1
 
+    # The render's shared state (see ``_SID_PROG_RENDERS``).  ``readers``:
+    # bodies being iterated now; ``started``: one ever was (else the response
+    # was never sent); ``streamed_all``: one delivered the declared end;
+    # ``stalled``: output stopped for a minute (not cacheable, not worth
+    # finishing); ``detached``: the registry entry of a render left finishing
+    # for the cache after its last reader left; ``fd_open``: a reader holds its
+    # own descriptor (from then on the temp may be moved into the cache under
+    # it); ``promoted``: the cache decision was made; ``verdict``: what
+    # ``_await_sid_audible`` said (None while it is still listening).
+    rd = {"key": full_key, "gen": _my_gen, "data_bytes": data_bytes, "header": header,
+          "total": total, "binary": binary, "tmp": None, "proc": None,
+          "readers": 0, "started": False, "streamed_all": False, "stalled": False,
+          "detached": None, "fd_open": False, "promoted": False,
+          "verdict": None, "verdict_ev": asyncio.Event(), "wake": asyncio.Event(),
+          "release": _release_slot, "done_ev": _done_ev}
+    _SID_PROG_RENDERS[full_key] = rd
+
     def _drop_inflight() -> None:
-        # Identity-guarded so we never remove a newer render's entry.
+        # Identity-guarded so we never remove a newer render's entries.
         if _SID_PROG_INFLIGHT.get(full_key) == _my_gen:
             _SID_PROG_INFLIGHT.pop(full_key, None)
         _done_ev.set()
         if _SID_PROG_DONE.get(full_key) is _done_ev:
             _SID_PROG_DONE.pop(full_key, None)
+        if _SID_PROG_RENDERS.get(full_key) is rd:
+            _SID_PROG_RENDERS.pop(full_key, None)
 
     tmp: "Path | None" = None
     proc = None
+    handle = None
     try:
         # A prewarm of this tune still rendering: stop it first (this render
         # supersedes it — audio now, not after its whole render).
@@ -1406,16 +2146,36 @@ async def _serve_sid_progressive(
         # exhaustion, binary vanished mid-flight) unlink the orphaned temp — the
         # finaliser that normally owns cleanup isn't created until after this.
         tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="sidprog-")[1])
+        rd["tmp"] = tmp
         cmd = _sid_render_cmd(binary, sid_path, subsong, int(duration), str(tmp),
                               start=tune_start)
         proc = await forksafe.spawn(
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
+        rd["proc"] = proc
 
-        # Detect an immediate render failure before committing to the streaming
-        # response.  If sidplayfp dies without writing PCM, reap it, drop the
-        # temp, and signal the caller to fall back to the blocking render.
-        if not await _await_first_sid_output(proc, tmp, _SID_PROG_FIRST_BYTE_TIMEOUT):
+        # Detect an immediate render failure — and a tune that plays only
+        # silence — before committing to the streaming response.  If sidplayfp
+        # dies without writing PCM, reap it, drop the temp, and signal the
+        # caller to fall back to the blocking render.  A clean render that
+        # held nothing audible is judged like the cache judges it: its 422
+        # (raised here, the handler below cleans up), recorded so the next
+        # play answers at once.  Only the web UI ever streams before sound
+        # (``_await_sid_audible``'s "stream"); others wait for sound or the
+        # end, bounded like the blocking render.
+        if web:
+            verdict = await _await_sid_audible(
+                proc, tmp, first_byte_timeout=_SID_PROG_FIRST_BYTE_TIMEOUT,
+                audible_timeout=_SID_PROG_AUDIBLE_WAIT)
+        else:
+            verdict = await _await_sid_audible(proc, tmp, hard_timeout=int(duration) + 30)
+        if verdict == "silent":
+            await asyncio.to_thread(_normalize_sid_wav, tmp, data_bytes)
+            if await _progressive_render_silent(full_key, "sid", tmp):
+                from soniqboom.core.conversion_cache import SILENT_RENDER_DETAIL
+                raise HTTPException(422, SILENT_RENDER_DETAIL)
+            verdict = "audible"       # the whole-file judgement differs: play it
+        if verdict == "failed":
             try:
                 if proc.returncode is None:
                     proc.kill()
@@ -1423,17 +2183,26 @@ async def _serve_sid_progressive(
             except Exception:
                 pass
             tmp.unlink(missing_ok=True)
-            log.info("progressive SID: no first-byte output (rc=%s) for %s — "
+            log.info("progressive SID: no audible output (rc=%s) for %s — "
                      "falling back to blocking render", proc.returncode, full_key)
+            rd["verdict"] = "failed"
+            rd["verdict_ev"].set()
             _drop_inflight()          # finaliser (the usual popper) is never created here
             _release_slot()
             return None
+        # Our own descriptor, opened before anything can move the temp.
+        handle = _FdHandle(os.open(str(tmp), os.O_RDONLY))
+        rd["fd_open"] = True
+        rd["verdict"] = verdict
+        rd["verdict_ev"].set()
     except BaseException:
         # Any failure before the finaliser exists (including CancelledError on
         # server shutdown mid-probe) must clean up itself — the finaliser that
         # normally owns the proc + temp isn't created until below.  ``kill`` is
         # synchronous so it runs even while the task is being cancelled; the
         # asyncio child watcher reaps the killed proc.
+        if handle is not None:
+            handle.close()
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
@@ -1444,27 +2213,15 @@ async def _serve_sid_progressive(
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+        rd["verdict"] = rd["verdict"] or "failed"
+        rd["verdict_ev"].set()        # readers waiting to attach: not to this one
         _drop_inflight()              # finaliser never created on this path
         _release_slot()
         raise
 
-    # Shared flags: the response generator flips ``streamed_all`` once it has
-    # streamed the whole declared length, marks ``stalled`` when the render hung
-    # (padded to length, not cacheable, not worth finishing), and parks the
-    # registry entry in ``detached`` when a disconnect left the render finishing
-    # in the background.  Read by the DETACHED finaliser below.  ``gen_done`` is
-    # set by the generator's finally on EITHER completion or disconnect, so the
-    # finaliser waits for the generator to reach its final state before reading
-    # these (else a fast render whose proc exits before a slow client finishes
-    # would be judged incomplete and its good WAV discarded).  ``fd_open``: the
-    # generator holds its own descriptor (from then on the temp may be moved
-    # into the cache under it); ``promoted``: the cache decision was made.
-    state = {"streamed_all": False, "stalled": False, "detached": None}
-    gen_done = asyncio.Event()
-
     async def _finalise() -> None:
-        # Owns the render's lifecycle INDEPENDENTLY of the response task, so a
-        # client disconnect (which cancels the generator) can't abort the
+        # Owns the render's lifecycle INDEPENDENTLY of the response tasks, so a
+        # client disconnect (which cancels a generator) can't abort the
         # reap/cache: awaiting ``proc.wait()`` inside the generator's finally
         # was being CancelledError'd on disconnect, leaking a zombie sidplayfp.
         _one_sec = _SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8)
@@ -1482,15 +2239,20 @@ async def _serve_sid_progressive(
             # temp unlinked because the listener left at 6% consumed).  Every
             # kill path stays rejected by rc alone: evicted → -9, stalled and
             # terminated → -15, reap-timeout kill → nonzero.  Runs once.
-            if state.get("promoted"):
+            if rd["promoted"]:
                 return
-            state["promoted"] = True
+            rd["promoted"] = True
             try:
                 _tmp_size = os.path.getsize(tmp) if tmp.exists() else 0
             except OSError:
                 _tmp_size = 0
-            good = (proc.returncode == 0 and _tmp_size >= _min_file)
+            good = (proc.returncode == 0 and _tmp_size >= _min_file and not rd["stalled"])
             if good:
+                # Exactly the resource this stream promised (``total``): a
+                # later Range request against the cached file sees the same
+                # size (sidplayfp renders a few ms past ``-t``).  Readers read
+                # below ``total`` only, through their own descriptors.
+                await asyncio.to_thread(_normalize_sid_wav, tmp, data_bytes)
                 # Re-check: a concurrent render (another cold play, or a
                 # blocking Subsonic play) may have cached this key first.  If
                 # so, just drop our temp — store_cached is idempotent now, but
@@ -1499,12 +2261,14 @@ async def _serve_sid_progressive(
                 if existing is not None:
                     tmp.unlink(missing_ok=True)
                     _spawn_sid_vu(full_key, existing, sid_path, subsong, int(duration))
+                elif await _progressive_render_silent(full_key, "sid", tmp):
+                    pass          # streamed once, never cached; the next play reports it
                 else:
                     dest = await store_cached(full_key, "sid", tmp)   # MOVES tmp into cache
                     log.info("progressive SID: cached %s (%d s)%s", full_key,
                              int(duration),
                              " — finished after the listener left"
-                             if state.get("detached") is not None else "")
+                             if rd["detached"] is not None else "")
                     # Kick off the retro per-voice VU meter in the background —
                     # ready for the next play; this one used the FFT fallback.
                     _spawn_sid_vu(full_key, dest, sid_path, subsong, int(duration))
@@ -1513,44 +2277,45 @@ async def _serve_sid_progressive(
             _done_ev.set()          # waveform / render-status: settled
 
         proc_wait = asyncio.ensure_future(proc.wait())
-        gen_wait = asyncio.ensure_future(gen_done.wait())
         try:
-            # Wait for the generator's final state — but cache the render the
-            # moment it has finished cleanly, NOT when the listener has read
-            # it all: a slow reader held a finished tune out of the cache (no
-            # waveform, "idle" render status, a re-render on replay) for the
-            # whole play.  That is safe once the generator holds its open
-            # descriptor (it survives the move into the cache); before that
-            # it still reads by path, so the move waits for it.
+            # Wait until every reader has reached its final state — but cache
+            # the render the moment it has finished cleanly, NOT when the
+            # listeners have read it all: a slow reader held a finished tune
+            # out of the cache (no waveform, "idle" render status, a
+            # re-render on replay) for the whole play.  That is safe: every
+            # reader holds its own open descriptor (it survives the move).
             #
             # A response the SERVER NEVER ITERATES (client vanished before the
-            # body streamed) never sets gen_done, so give the generator a short
-            # window to START; if it hasn't, don't pin a live pool slot for the
-            # whole render — with the pool at 3, three such stuck slots would
-            # disable the progressive path for everyone for ~duration s.  A
-            # generator that HAS started is a genuinely slow client; wait the
-            # rest of the budget for it.
+            # body streamed) never starts a reader, so give it a short window
+            # to START; if none has, don't pin a live pool slot for the whole
+            # render — with the pool at 3, three such stuck slots would disable
+            # the progressive path for everyone for ~duration s.  A reader that
+            # HAS started is a genuinely slow client; wait the rest of the
+            # budget for it.
             t0 = time.monotonic()
             start_by = t0 + 15
             hard_end = start_by + int(duration) + 45
-            while not gen_done.is_set():
-                if (proc.returncode is not None and state.get("fd_open")
-                        and not state.get("promoted")):
+            while not (rd["started"] and rd["readers"] == 0):
+                if proc.returncode is not None and not rd["promoted"]:
                     await _promote()
                     continue
                 now = time.monotonic()
-                if now >= (hard_end if state.get("started") else start_by):
+                if now >= (hard_end if rd["started"] else start_by):
                     break          # never iterated → abandoned; or out of budget
-                waiters = {gen_wait} if proc_wait.done() else {gen_wait, proc_wait}
-                await asyncio.wait(waiters, timeout=0.5,
-                                   return_when=asyncio.FIRST_COMPLETED)
-            # If the client didn't consume the whole stream the render is
-            # normally DETACHED to finish for the cache (see the generator's
-            # finally).  Kill it only when nothing detached it: a stalled
-            # render, an older same-key duplicate, or a response the server
-            # never iterated (client vanished before the body streamed).
-            detached = state.get("detached") is not None
-            if not state["streamed_all"] and not detached and proc.returncode is None:
+                rd["wake"].clear()
+                wake = asyncio.ensure_future(rd["wake"].wait())
+                try:
+                    await asyncio.wait({wake} if proc_wait.done() else {wake, proc_wait},
+                                       timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    wake.cancel()
+            # If no reader consumed the whole stream the render is normally
+            # DETACHED to finish for the cache (see the readers' finally).
+            # Kill it only when nothing detached it: a stalled render, an older
+            # same-key duplicate, or a response the server never iterated
+            # (client vanished before the body streamed).
+            detached = rd["detached"] is not None
+            if not rd["streamed_all"] and not detached and proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
@@ -1560,14 +2325,14 @@ async def _serve_sid_progressive(
             # killed one reaps in seconds.
             _reap_s = int(duration) + 60 if detached else 15
             try:
-                await asyncio.wait_for(proc.wait(), timeout=_reap_s)
+                await asyncio.wait_for(asyncio.shield(proc_wait), timeout=_reap_s)
             except asyncio.TimeoutError:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
                 try:
-                    await proc.wait()
+                    await proc_wait
                 except Exception:
                     pass
             await _promote()
@@ -1591,12 +2356,11 @@ async def _serve_sid_progressive(
             except OSError:
                 pass
         finally:
-            for _w in (proc_wait, gen_wait):
-                if not _w.done():
-                    _w.cancel()
+            if not proc_wait.done():
+                proc_wait.cancel()
             # Drop OUR registry entries (a comeback/eviction/newer render may
             # already have replaced them — never pop someone else's).
-            _ent = state.get("detached")
+            _ent = rd["detached"]
             if _ent is not None and _SID_DETACHED.get(full_key) is _ent:
                 _SID_DETACHED.pop(full_key, None)
             _drop_inflight()
@@ -1605,58 +2369,106 @@ async def _serve_sid_progressive(
 
     fin_task = asyncio.create_task(_finalise())
     _SID_PROG_FINALISERS.add(fin_task)          # strong ref so it isn't GC'd
+    return _sid_reader_response(rd, handle, start, end_excl, is_range,
+                                base_headers, background, web)
 
-    # Map the requested byte range [start, end_excl) onto the virtual file:
-    # header region [h_lo, h_hi) served from the synthesised header; data region
-    # [d_lo, d_hi) read from the growing temp at (pos - 44).  ``streamed_all``
-    # (the range reached the file's end) only matters for the generator's
-    # kill/detach decision — cache admission is decided by RENDER integrity in
-    # the finaliser (rc 0 + full-length temp), so a mid-file range's or an
-    # abandoned stream's completed render is promoted all the same.
+
+async def _sid_attach(rd: dict, web: bool) -> "_FdHandle | None":
+    """Join the progressive SID render ``rd`` as another reader: its open
+    descriptor once the render is audible for this caller, else None.  Waits
+    for the first request's audibility verdict; a render the web UI streams
+    before sound (a long silent intro) is judged again for anyone else, who
+    never streams before sound.  A render that was left finishing for the
+    cache (detached) is taken back — it is not evicted while it has a reader."""
+    secs = rd["data_bytes"] // (_SID_WAV_RATE * _SID_WAV_CHANNELS * (_SID_WAV_BITS // 8))
+    try:
+        await asyncio.wait_for(rd["verdict_ev"].wait(), timeout=secs + 60)
+    except asyncio.TimeoutError:
+        return None
+    proc, tmp = rd["proc"], rd["tmp"]
+    if rd["verdict"] == "stream" and not web:
+        if await _await_sid_audible(proc, tmp, hard_timeout=secs + 30) != "audible":
+            return None
+    elif rd["verdict"] not in ("audible", "stream"):
+        return None
+    # Synchronous from here: nothing can promote / evict in between.
+    if (_SID_PROG_RENDERS.get(rd["key"]) is not rd or rd["promoted"] or rd["stalled"]
+            or (proc.returncode is not None and proc.returncode != 0)):
+        return None
+    try:
+        handle = _FdHandle(os.open(str(tmp), os.O_RDONLY))
+    except OSError:
+        return None
+    ent = rd["detached"]
+    if ent is not None:
+        if _SID_DETACHED.get(rd["key"]) is ent:
+            _SID_DETACHED.pop(rd["key"], None)
+        rd["detached"] = None
+        log.info("progressive SID: a listener came back — %s streams again", rd["key"])
+    return handle
+
+
+def _sid_reader_response(rd: dict, handle: "_FdHandle", start: int, end_excl: int,
+                         is_range: bool, base_headers, background, web: bool) -> Response:
+    """One reader of the progressive SID render ``rd``: the requested byte range
+    ``[start, end_excl)`` of the virtual file — header region served from the
+    synthesised header, data region read through ``handle`` from the growing
+    temp at (pos - 44)."""
+    header, data_bytes, total = rd["header"], rd["data_bytes"], rd["total"]
+    proc, full_key = rd["proc"], rd["key"]
     h_lo, h_hi = start, min(end_excl, _WAV_HEADER_LEN)
     d_lo, d_hi = max(start, _WAV_HEADER_LEN) - _WAV_HEADER_LEN, end_excl - _WAV_HEADER_LEN
 
     async def _gen():
-        state["started"] = True     # the server is iterating us → not an abandoned response
-        fd = None
-        checked_header = False
+        rd["started"] = True        # the server is iterating us → not an abandoned response
+        rd["readers"] += 1
+        ent = rd["detached"]
+        if ent is not None and proc.returncode is None:
+            # Attached while another reader was still here, started after it
+            # left the render finishing for the cache: take it back, so it is
+            # not evicted under us.
+            if _SID_DETACHED.get(full_key) is ent:
+                _SID_DETACHED.pop(full_key, None)
+            rd["detached"] = None
+        streamed_all = False
+        fd = handle.fd
         try:
             if h_lo < h_hi:
                 yield header[h_lo:h_hi]
+            magic = await asyncio.to_thread(os.pread, fd, 4, 0)
+            if magic != b"RIFF":
+                # One-time defensive check: sidplayfp really wrote a RIFF/WAVE
+                # header of the length we skip.  If a future binary emits a
+                # different container the offset-44 skip would desync — log it
+                # rather than ship garbage silently.
+                log.warning("progressive SID: temp header %r not RIFF for %s — "
+                            "streaming anyway", magic, full_key)
             pos = d_lo
             idle = 0.0
             while pos < d_hi:
-                if fd is None:
-                    # Until the descriptor is open the temp is read by PATH,
-                    # so the finaliser won't move it into the cache before
-                    # ``fd_open`` says so (after that the move is harmless).
-                    try:
-                        cur = os.path.getsize(tmp)
-                    except OSError:
-                        cur = 0
-                    if cur > _WAV_HEADER_LEN:
-                        fd = await asyncio.to_thread(os.open, str(tmp), os.O_RDONLY)
-                        state["fd_open"] = True
-                if fd is not None:
-                    if not checked_header:
-                        # One-time defensive check: confirm sidplayfp really
-                        # wrote a RIFF/WAVE header of the length we skip.  If a
-                        # future binary emits a different container the offset-44
-                        # skip would desync — log it rather than ship garbage.
-                        magic = await asyncio.to_thread(os.pread, fd, 4, 0)
-                        if magic != b"RIFF":
-                            log.warning("progressive SID: temp header %r not RIFF "
-                                        "for %s — streaming anyway", magic, full_key)
-                        checked_header = True
-                    want = min(_RANGE_STREAMING_CHUNK, d_hi - pos)
-                    buf = await asyncio.to_thread(os.pread, fd, want, _WAV_HEADER_LEN + pos)
-                    if buf:
-                        yield buf
-                        pos += len(buf)
-                        idle = 0.0
-                        continue
+                want = min(_RANGE_STREAMING_CHUNK, d_hi - pos)
+                buf = await asyncio.to_thread(os.pread, fd, want, _WAV_HEADER_LEN + pos)
+                if buf:
+                    yield buf
+                    pos += len(buf)
+                    idle = 0.0
+                    continue
                 # No new bytes right now.
                 if proc.returncode is not None:
+                    if proc.returncode != 0:
+                        # The render died part-way (crash, kill): abort the
+                        # body — the player gets an error and asks why —
+                        # instead of padding the rest of the tune with silence
+                        # as if it ended normally.  Nothing is cached (the
+                        # finaliser's rc gate).
+                        log.warning("progressive SID: render of %s failed (rc=%s) "
+                                    "at %d/%d bytes — aborting the stream",
+                                    full_key, proc.returncode, pos, d_hi)
+                        # /render-status then says why (the player asks).
+                        from soniqboom.core.conversion_cache import note_render_failure
+                        _exc = _renderer_failure("SID", rd["binary"], proc.returncode, "")
+                        note_render_failure(full_key, _exc.status_code, _exc.detail)
+                        raise _RenderAborted(f"render failed after {pos} bytes")
                     # Render finished: pad any rounding shortfall so the declared
                     # Content-Length is satisfied exactly.
                     pad = d_hi - pos
@@ -1664,68 +2476,75 @@ async def _serve_sid_progressive(
                         n = min(_RANGE_STREAMING_CHUNK, pad)
                         yield b"\x00" * n
                         pad -= n
-                    state["streamed_all"] = (d_hi >= data_bytes)
+                    streamed_all = d_hi >= data_bytes
                     return
                 await asyncio.sleep(_GROWING_POLL_INTERVAL)
                 idle += _GROWING_POLL_INTERVAL
                 if idle >= _GROWING_READ_TIMEOUT:
-                    # Render stalled.  Pad the remainder with silence so the
-                    # client still gets a valid, declared-length WAV rather than
-                    # a short read the <audio> element rejects — but leave
-                    # ``streamed_all`` False so this stalled render is NOT cached.
+                    # Render stalled: not cacheable, not worth finishing.  The
+                    # web UI gets the remainder as silence — a valid,
+                    # declared-length WAV rather than a short read the <audio>
+                    # element rejects; anyone else (Subsonic, DLNA, an encode
+                    # for cast) an aborted body: never silence passed off as
+                    # the tune, never an encode of it cached.
                     log.warning("progressive SID: no new bytes in %.0fs for %s — "
-                                "padding to declared length at %d/%d",
-                                idle, full_key, pos, d_hi)
-                    state["stalled"] = True
+                                "%s at %d/%d", idle, full_key,
+                                "padding to declared length" if web else "aborting",
+                                pos, d_hi)
+                    rd["stalled"] = True
+                    if not web:
+                        raise _RenderAborted(f"render stalled after {pos} bytes")
                     pad = d_hi - pos
                     while pad > 0:
                         n = min(_RANGE_STREAMING_CHUNK, pad)
                         yield b"\x00" * n
                         pad -= n
                     return
-            state["streamed_all"] = (d_hi >= data_bytes)   # delivered the full range
+            streamed_all = d_hi >= data_bytes   # delivered the full range
         finally:
             # Sync-only cleanup (survives task cancellation): close our fd,
-            # then decide the render's fate.  The detached ``_finalise`` reaps
-            # it and decides caching — never blocked here.  (The finaliser may
-            # already have moved a finished temp into the cache while we held
-            # the descriptor open; reads through it are unaffected.)
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+            # then — as the last reader — decide the render's fate.  The
+            # detached finaliser reaps it and decides caching — never blocked
+            # here.  (The finaliser may already have moved a finished temp into
+            # the cache while we held the descriptor open; reads through it are
+            # unaffected.)
+            handle.close()
+            rd["readers"] -= 1
+            if streamed_all:
+                rd["streamed_all"] = True
             # NB: when the render ALREADY exited (returncode set) there is
             # nothing to kill or detach — the finaliser's integrity gate
             # (rc 0 + full-length) caches a finished temp regardless of how
-            # much the client consumed.
-            if not state["streamed_all"] and proc.returncode is None:
-                # The listener skipped away mid-tune.  DETACH the healthy
+            # much the clients consumed.
+            if (rd["readers"] == 0 and not rd["streamed_all"]
+                    and proc.returncode is None and rd["detached"] is None):
+                # The last listener skipped away mid-tune.  DETACH the healthy
                 # render — let it finish and be cached — instead of killing it:
                 # discarding an already-mostly-paid-for render meant a tune you
                 # never played to the end could NEVER become warm (each replay
                 # re-entered the same discard loop).  It keeps holding its pool
                 # slot until its finaliser runs, so total sidplayfp processes
                 # stay bounded by _sid_render_cap(); a live play can reclaim
-                # the slot at admission (oldest-detached eviction).  Exceptions,
-                # all "this render is redundant, don't detach a duplicate": a
-                # STALLED render isn't worth finishing; an older detached render
-                # of this key is already finishing; or a NEWER render for this
-                # key was admitted (a seek superseded us).
-                superseded = _SID_PROG_INFLIGHT.get(full_key) != _my_gen
-                if state["stalled"] or full_key in _SID_DETACHED or superseded:
+                # the slot at admission (oldest-detached eviction), and a
+                # listener coming back takes it back (``_sid_attach``).
+                # Exceptions, all "this render is redundant, don't detach a
+                # duplicate": a STALLED render isn't worth finishing; an older
+                # detached render of this key is already finishing; or a NEWER
+                # render for this key was admitted.
+                superseded = _SID_PROG_INFLIGHT.get(full_key) != rd["gen"]
+                if rd["stalled"] or full_key in _SID_DETACHED or superseded:
                     try:
                         proc.terminate()
                     except ProcessLookupError:
                         pass
                 else:
-                    entry = {"proc": proc, "release": _release_slot,
+                    entry = {"proc": proc, "release": rd["release"],
                              "t": time.monotonic()}
                     _SID_DETACHED[full_key] = entry
-                    state["detached"] = entry
+                    rd["detached"] = entry
                     log.info("progressive SID: listener left — finishing %s in "
                              "the background for the cache", full_key)
-            gen_done.set()          # release the finaliser (both paths)
+            rd["wake"].set()        # the finaliser re-checks
 
     extra = _accel_off(dict(base_headers or {}))
     extra["Accept-Ranges"] = "bytes"
@@ -1737,9 +2556,12 @@ async def _serve_sid_progressive(
     extra["Content-Length"] = str(end_excl - start)
     if is_range:
         extra["Content-Range"] = f"bytes {start}-{end_excl - 1}/{total}"
-    return StreamingResponse(
+    # (A body aborted by a failed render still runs ``background``; the
+    # descriptor of a body that never started is closed by it too.)
+    return _CleanupStreamingResponse(
         _gen(), status_code=206 if is_range else 200, media_type="audio/wav",
-        headers=extra, background=background,
+        headers=extra,
+        background=_compose_backgrounds(BackgroundTask(handle.close), background),
     )
 
 
@@ -1749,14 +2571,41 @@ _GME_EXTS_STREAM = {".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
                     ".ay", ".kss", ".sap", ".gym", ".hes"}
 
 
-async def _render_gme(path: Path, subsong: int = 0) -> Path:
+async def _render_gme(path: Path, subsong: int = 0, *,
+                      live_key: str | None = None,
+                      expected_seconds: float = 0.0) -> Path:
     """Render a libgme chiptune file to a temp WAV.
 
     Prefers an explicit ``gme`` CLI when configured.  Falls back to
     ffmpeg's built-in gme demuxer (``ffmpeg -i file.nsf -t N output.wav``)
     when the helper isn't available — that path works on standard Homebrew
-    ffmpeg builds with libgme."""
+    ffmpeg builds with libgme.
+
+    ``live_key``: the in-process libgme render is a live render
+    (``_LiveWav``), played while it runs — FM chips are slow to emulate (a
+    3-minute Mega Drive VGM takes ~9 s).  ``expected_seconds``: the tune's
+    stored length, when known."""
     duration = settings.sid_default_duration   # shares the chiptune default
+    from soniqboom.core import gme_render
+    loop = asyncio.get_event_loop()
+    data = None
+    unpacked = False                  # ``data`` is an inflated GYMX, not the file
+    if path.suffix.lower() == ".gym":
+        # A packed GYMX is inflated first (libgme refuses it), and a GYM —
+        # a register dump with a known length — renders to its own end: the
+        # cap is its length plus the 8 s fade, so the fade only ever touches
+        # a loop played past the end, never the music.
+        raw = await loop.run_in_executor(None, path.read_bytes)
+        try:
+            data = await loop.run_in_executor(None, gme_render.unpack_gym, raw)
+        except ValueError as exc:
+            log.info("GYM %s can't be unpacked: %s", path.name, exc)
+            raise HTTPException(
+                422, "This GYM file is packed, but its packed data is damaged.") from exc
+        secs = await loop.run_in_executor(None, gme_render.gym_seconds, data)
+        if secs:
+            duration = min(3600, int(secs) + 1 + 8)
+        unpacked = data is not raw
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_wav.close()
     out = Path(tmp_wav.name)
@@ -1765,18 +2614,85 @@ async def _render_gme(path: Path, subsong: int = 0) -> Path:
     # without --enable-libgme and there is no standalone gme CLI, so on a stock
     # macOS/Linux box this is the ONLY working renderer for NSF/SPC/GBS/... —
     # the CLI / ffmpeg branches below stay as fallbacks for hosts that have them.
-    from soniqboom.core import gme_render
     if gme_render.is_available():
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, path.read_bytes)
-        wav = await loop.run_in_executor(
-            None, gme_render.render_wav, data, subsong, int(duration),
-        )
-        if wav:
-            out.write_bytes(wav)
-            return out
+        if data is None:
+            data = await loop.run_in_executor(None, path.read_bytes)
+        if live_key:
+            try:
+                got = await _render_gme_live(data, subsong, int(duration), live_key,
+                                             expected_seconds)
+            except BaseException:
+                out.unlink(missing_ok=True)
+                raise
+            if got is not None:
+                out.unlink(missing_ok=True)
+                return got
+        else:
+            wav = await loop.run_in_executor(
+                None, gme_render.render_wav, data, subsong, int(duration),
+            )
+            if wav:
+                out.write_bytes(wav)
+                return out
         log.info("libgme produced no audio for %s — trying gme CLI / ffmpeg", path.name)
+    # The external renderers get the inflated GYMX too (they refuse a packed one).
+    unpacked_tmp: Path | None = None
+    if unpacked:
+        fd, name = tempfile.mkstemp(suffix=".gym")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        unpacked_tmp = Path(name)
+    try:
+        return await _render_gme_external(unpacked_tmp or path, out, subsong, duration)
+    finally:
+        if unpacked_tmp is not None:
+            unpacked_tmp.unlink(missing_ok=True)
 
+
+async def _render_gme_live(data: bytes, subsong: int, duration: int, live_key: str,
+                           expected_seconds: float) -> "Path | None":
+    """The libgme render of ``_render_gme`` as a live render: ``render_pcm``
+    runs in a worker thread and appends each block to a ``_LiveWav`` (its
+    listeners told on the loop every 128 KB).  The finished file, or None
+    when libgme produced nothing (the caller falls back to the CLI)."""
+    from soniqboom.core import gme_render
+    loop = asyncio.get_running_loop()
+    lw = _LiveWav(live_key, expected_seconds=expected_seconds)
+    stop = threading.Event()
+    st = {"since": 0}
+
+    def _sink(chunk: bytes):
+        if stop.is_set():
+            return False
+        lw.write(chunk)
+        st["since"] += len(chunk)
+        if st["since"] >= 128 * 1024:
+            n, st["since"] = st["since"], 0
+            loop.call_soon_threadsafe(lw.account, n)
+        return True
+
+    fut = loop.run_in_executor(None, gme_render.render_pcm, data, subsong, duration, _sink)
+    try:
+        total = await asyncio.shield(fut)
+        # The thread is done and its queued notices have run: the remainder.
+        lw.account(st["since"])
+        if total <= 0:
+            lw.abandon()
+            return None
+        return lw.finish()
+    except BaseException:
+        # Cancelled: the render stops at its next block — wait for that, so
+        # the file is never closed under the worker thread.
+        stop.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({fut}, timeout=10)
+        raise
+    finally:
+        lw.close()
+
+
+async def _render_gme_external(path: Path, out: Path, subsong: int, duration) -> Path:
+    """The ``gme`` CLI / ffmpeg-with-libgme fallback of ``_render_gme``."""
     gme_bin = _find_renderer(settings.gme_path, "gme")
     if gme_bin:
         # gme CLI signature: ``gme <input> <output.wav> [track=N] [length=Nms]``
@@ -1830,7 +2746,9 @@ def _render_ident(path_str: str, track=None) -> tuple[str, bool]:
       * A uade PREFIX token never overrides an extension another engine owns
         (``One.wav``, ``P10.mp3``, ``UFO.XM``, ``ONE.IT``, C64 ``Fred.sid``)
         — see ``_uade_name_routes``.  ``track`` (optional) lets the scanner's
-        content verdict keep a verified Amiga module on uade.
+        content verdict keep a verified Amiga module on uade — also an Amiga
+        SoundFactory module saved as ``.psf`` (no PSF magic; see
+        ``_psf_has_magic``).
     """
     from soniqboom.core.metadata import _UADE_SUFFIX_EXTS
     member = Path(path_str.split("::")[-1]).name
@@ -1842,7 +2760,84 @@ def _render_ident(path_str: str, track=None) -> tuple[str, bool]:
             ext, member = Path(stem).suffix.lower(), stem
     if ext in _ADLIB_EXTS or ext == ".imf":
         return ext, False
+    if ext == ".psf" and (_track_is_amiga_module(track)
+                          or _local_psf_is_amiga(path_str, track)):
+        return ext, True
     return ext, _uade_name_routes(member, ext, track)
+
+
+# Plain local ``.psf`` path (+ the record's mtime) → "no PSF magic" (an Amiga
+# SoundFactory module), so a record scanned before content routing still
+# routes to uade on the O(1) paths (HEAD, waveform, VU).  Bounded.
+_PSF_AMIGA_MEMO: "OrderedDict[tuple, bool]" = OrderedDict()
+_PSF_AMIGA_MEMO_MAX = 4096
+_PSF_AMIGA_READING: set = set()     # keys whose read runs (in a daemon thread)
+_PSF_AMIGA_LOCK = threading.Lock()
+_PSF_AMIGA_READERS = threading.BoundedSemaphore(4)   # reads blocked on a mount at once
+_PSF_AMIGA_WAIT_S = 0.25            # how long the loop waits for one read
+
+
+def _psf_amiga_read(path_str: str) -> bool:
+    """The file read behind ``_local_psf_is_amiga`` (blocking)."""
+    p = Path(path_str)
+    return p.is_file() and not _psf_has_magic(p)
+
+
+def _psf_amiga_remember(key: tuple, got: bool) -> None:
+    with _PSF_AMIGA_LOCK:
+        _PSF_AMIGA_MEMO[key] = got
+        while len(_PSF_AMIGA_MEMO) > _PSF_AMIGA_MEMO_MAX:
+            _PSF_AMIGA_MEMO.popitem(last=False)
+
+
+def _local_psf_is_amiga(path_str: str, track=None) -> bool:
+    """Is the plain local ``.psf`` file at ``path_str`` without the PSF magic?
+    A 3-byte read, remembered per path and record mtime; False for archive
+    members and remote files (playback sniffs their local copy).  Never read
+    on the event loop (a mount that stopped answering froze it on a HEAD /
+    waveform / VU request): there the read runs in a daemon thread, waited
+    for ``_PSF_AMIGA_WAIT_S`` — a disk that answers routes the first request
+    right; one that doesn't counts as a PSF rip until its read is in (the
+    play itself sniffs its file off the loop, ``stream_track``)."""
+    if not path_str or "::" in path_str or "://" in path_str:
+        return False
+    key = (path_str, _tfield(track, "mtime"))
+    got = _PSF_AMIGA_MEMO.get(key)
+    if got is not None:
+        return got
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:                                # a worker thread: read here
+        got = _psf_amiga_read(path_str)
+        _psf_amiga_remember(key, got)
+        return got
+    with _PSF_AMIGA_LOCK:
+        if key in _PSF_AMIGA_READING:
+            return False                                # read already hanging
+        if not _PSF_AMIGA_READERS.acquire(blocking=False):
+            return False                                # enough reads hang already
+        _PSF_AMIGA_READING.add(key)
+    done = threading.Event()
+
+    def _read() -> None:
+        try:
+            _psf_amiga_remember(key, _psf_amiga_read(path_str))
+        except Exception:                               # noqa: BLE001 — counted as PSF
+            pass
+        finally:
+            with _PSF_AMIGA_LOCK:
+                _PSF_AMIGA_READING.discard(key)
+            _PSF_AMIGA_READERS.release()
+            done.set()
+    try:
+        threading.Thread(target=_read, daemon=True, name="psf-sniff").start()
+    except BaseException:                               # (no thread: nothing read)
+        with _PSF_AMIGA_LOCK:
+            _PSF_AMIGA_READING.discard(key)
+        _PSF_AMIGA_READERS.release()
+        raise
+    done.wait(_PSF_AMIGA_WAIT_S)
+    return _PSF_AMIGA_MEMO.get(key, False)
 
 
 def _track_is_amiga_module(track) -> bool:
@@ -1878,6 +2873,8 @@ def _uade_name_routes(member: str, ext: str, track=None) -> bool:
     return (_uade_formats.owned_ext_can_be_amiga(ext)
             and _track_is_amiga_module(track))
 _ADLIB_DEFAULT_TIMEOUT_S = 8 * 60
+# The length the scan stores for every AdLib tune (it can't know one).
+from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION as _ADLIB_PLACEHOLDER_S
 # AdPlug OPL emulator core.  adplay defaults to "woody" (DOSBox WoodyOPL — fast
 # but approximate); we pin "nuked" (Nuked OPL3, reverse-engineered from the
 # YMF262 die) so the render is cycle-accurate to real OPL3 hardware.  ~3x slower
@@ -1904,8 +2901,13 @@ _ADLIB_MAX_SUBSONG_PROBE = 16
 _ADLIB_BANK_PARENT_LEVELS = 4
 
 
-async def _render_adlib_one(binary: str, path: Path, subsong: int) -> Path:
-    """Render a single AdLib/OPL subsong to a fresh temp WAV (no audio check)."""
+async def _render_adlib_one(binary: str, path: Path, subsong: int,
+                            live_key: str | None = None, *,
+                            expected_seconds: float = 0.0,
+                            min_audible_seconds: float = 0.0) -> Path:
+    """Render a single AdLib/OPL subsong to a fresh temp WAV (no audio check).
+    ``live_key``: as a live render, copied into a live WAV as adplay writes it
+    (``_tail_render``, which takes ``expected_seconds`` / ``min_audible_seconds``)."""
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_wav.close()
     cmd = [binary, "-O", "disk", "-d", tmp_wav.name,
@@ -1913,6 +2915,11 @@ async def _render_adlib_one(binary: str, path: Path, subsong: int) -> Path:
     if subsong > 0:
         cmd += ["-s", str(subsong)]      # multi-song AdLib formats (RAD, .adl, …)
     cmd.append(str(path))
+    if live_key:
+        return await _tail_render(cmd, Path(tmp_wav.name), live_key, kind="adlib",
+                                  timeout=_ADLIB_DEFAULT_TIMEOUT_S, require_audio=False,
+                                  expected_seconds=expected_seconds,
+                                  min_audible_seconds=min_audible_seconds)
     await _await_renderer(
         cmd, Path(tmp_wav.name),
         timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
@@ -2103,7 +3110,9 @@ def _dro_v1_to_v2(data: bytes) -> bytes:
     return bytes(hdr) + bytes(body)
 
 
-async def _render_adlib(path: Path, subsong: int = 0) -> Path:
+async def _render_adlib(path: Path, subsong: int = 0, *,
+                        live_key: str | None = None,
+                        expected_seconds: float = 0.0) -> Path:
     """Render an AdLib / OPL2 FM tune to WAV via AdPlug's ``adplay`` disk writer.
 
     Output: 44.1 kHz / stereo / 16-bit signed LE — matches the other rendered
@@ -2116,6 +3125,13 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
     doesn't pin a subsong we render subsong 0 and, if it's silent, probe the next
     few subsongs for the first that actually produces audio — otherwise the
     server would stream a ~0.01 s silent clip that "plays" but is useless.
+
+    ``live_key``: the asked subsong renders as a live render (``_LiveWav``,
+    the Nuked OPL3 core needs ~2 s for 3 minutes), played while adplay
+    writes it once it proves audible; a subsong that turns out empty stops
+    being offered and the probe of the next ones runs as before (no
+    listener is attached to silence).  ``expected_seconds``: the tune's
+    stored length, when known (the header is then exact from byte 0).
     """
     binary = _find_renderer(settings.adplay_path, "adplay")
     if not binary:
@@ -2151,7 +3167,11 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
         # or when the requested subsong is empty (~2 KB / 0.01 s).  Both used to
         # slip past the old ``size < 1024`` guard or stream as silence; gate on
         # real audio LENGTH + amplitude instead.
-        out = await _render_adlib_one(binary, render_path, subsong)
+        # Unpinned (subsong 0), a split-second stub is not the music: no
+        # listener before ``_ADLIB_MIN_AUDIO_S`` of sound (``_wav_is_audible``).
+        out = await _render_adlib_one(
+            binary, render_path, subsong, live_key, expected_seconds=expected_seconds,
+            min_audible_seconds=_ADLIB_MIN_AUDIO_S if subsong == 0 else 0.0)
         if _wav_is_audible(out):
             return out
 
@@ -2194,7 +3214,9 @@ async def _render_adlib(path: Path, subsong: int = 0) -> Path:
             dro_tmp.unlink(missing_ok=True)
 
 
-async def _render_imf(path: Path, subsong: int = 0) -> Path:
+async def _render_imf(path: Path, subsong: int = 0, *,
+                      live_key: str | None = None,
+                      expected_seconds: float = 0.0) -> Path:
     """Render a ``.imf`` file, disambiguating the overloaded extension.
 
     Two unrelated formats share ``.imf``:
@@ -2204,6 +3226,8 @@ async def _render_imf(path: Path, subsong: int = 0) -> Path:
 
     Imago Orpheus carries an ``IM10`` signature at offset 0x3C (60); id IMF does
     not — so we read that signature and route to the right renderer.
+    ``live_key`` / ``expected_seconds`` go to the AdLib render (openmpt123
+    renders a module in a fraction of a second — never live).
     """
     # Sniff the 64-byte header off the event-loop thread.  _render_imf is
     # awaited inline by the conversion-cache render path (conversion_cache
@@ -2219,7 +3243,8 @@ async def _render_imf(path: Path, subsong: int = 0) -> Path:
     head = await asyncio.get_running_loop().run_in_executor(None, _sniff)
     if len(head) >= 64 and head[60:64] == b"IM10":
         return await _render_tracker(path, subsong=subsong)   # Imago Orpheus
-    return await _render_adlib(path, subsong=subsong)          # id/Apogee AdLib IMF
+    return await _render_adlib(path, subsong=subsong,          # id/Apogee AdLib IMF
+                               live_key=live_key, expected_seconds=expected_seconds)
 
 
 async def _backfill_rendered_duration(track_id: str, track, wav_path,
@@ -2242,8 +3267,9 @@ async def _backfill_rendered_duration(track_id: str, track, wav_path,
     ``placeholder`` defaults to the AdLib 180s.  Gated on it, so the WRITE is a
     no-op once a real duration is stored (``stored<=0`` always backfills).
 
-    ``subsong``: the track's duration describes its DEFAULT tune, so a render of
-    any other subsong is never written (returns None).  ``authoritative`` (uade:
+    ``subsong`` (the tune index rendered): the track's duration describes its
+    DEFAULT tune (``default_tune_index``), so a render of any other tune is
+    never written (returns None).  ``authoritative`` (uade:
     the render is the only length source) also corrects an already-stored value
     that is off by ≥ 0.5 s.  ``sink``: collect ``(track_id, fields)`` instead of
     writing, so a batch caller can write them in one store update.
@@ -2251,7 +3277,7 @@ async def _backfill_rendered_duration(track_id: str, track, wav_path,
     cosmetic must never break playback.
     """
     try:
-        if track is None or subsong:
+        if track is None or subsong != default_tune_index(track_id, track):
             return None
         if placeholder is None:
             from soniqboom.core.metadata import _ADLIB_DEFAULT_DURATION
@@ -2290,7 +3316,7 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str, *,
     Amiga module is fetched with its companion halves); None decides by name.
     """
     loop = asyncio.get_running_loop()
-    is_remote = path_str.startswith(("smb://", "ftp://", "http://", "https://"))
+    is_remote = is_remote_path(path_str)
     if is_remote and "::" in path_str:
         from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
@@ -2298,8 +3324,9 @@ async def _resolve_adlib_local_path(track_id: str, path_str: str, *,
         zip_rel, member = remote_path.split("::", 1)
         source = get_source(scan_root)
         local_zip = await loop.run_in_executor(
-            None, functools.partial(get_cache().fetch, scan_root, zip_rel, source,
-                                    lane=lane),
+            None, functools.partial(
+                _remote_zip.archive_for_member, scan_root, zip_rel, member, source,
+                lane=lane, companion=_archive_companion_filter(member)),
         )
         return await _get_or_extract_zip_member(
             f"{local_zip}::{member}", track_id,
@@ -2674,22 +3701,30 @@ async def _probe_one_rendered_duration(track_id: str, *,
             if not _dsf_is_dreamcast(local):
                 return None       # Sony DSD stream — not render-only
             is_psf = True
+        if is_psf and ext == ".psf" and not _psf_has_magic(local):
+            is_psf, is_uade = False, True     # Amiga SoundFactory module
+        # ``keep``: rendered under the PLAY's key and as a live render — a
+        # click meanwhile attaches (and streams it), the first play after is a
+        # cache hit.  Kept alive, so a cancelled probe request can't fail a
+        # play already waiting on this render — the probe then keeps its slot
+        # until the render ends.  ``cold``: a probe is not a play — the new
+        # entry sits at the eviction end until someone plays it.  Pinned until
+        # its length is read, so that cold slot can't be evicted before the
+        # backfill reads it.
         keep = is_uade and allow_full_render and _uade_probe_can_keep()
-        if keep:
-            # Under the PLAY's key and as a live render: a click meanwhile
-            # attaches (and streams it), the first play after is a cache hit.
-            # Kept alive, so a cancelled probe request can't fail a play
-            # already waiting on this render — the probe then keeps its slot
-            # until the render ends.  ``cold``: a probe is not a play — the
-            # new entry sits at the eviction end until someone plays it.
-            # Pinned until its length is read, so that cold slot can't be
-            # evicted before the backfill reads it.
-            from soniqboom.core.conversion_cache import pin
-            key = _ck(track_id, "uade", subsong=0)
-            pin(key)
         async with _bg_render_sem.slot(PRIO_PROBE):
+            # The length stored is the DEFAULT tune's: a multi-tune file's
+            # first tune that isn't empty (probed once, ``ensure_default_tune``).
+            fam = "gme" if is_gme else "sc68" if is_sc68 else "uade" if is_uade else None
+            track = await _bare_play_track(track_id, track, local, fam)
+            d = default_tune_index(track_id, track)
+            base = await _uade_resolve_base(track_id, track, local, d) if is_uade else 0
+            if keep:
+                from soniqboom.core.conversion_cache import pin
+                key = uade_cache_key(track_id, d, base)
+                pin(key)
             if is_gme:
-                wav = await _render_gme(local)
+                wav = await _render_gme(local, subsong=d)
             elif ext == ".imf":
                 wav = await _render_imf(local)
             elif is_hvl:
@@ -2697,26 +3732,29 @@ async def _probe_one_rendered_duration(track_id: str, *,
             elif is_psf:
                 wav = await _render_psf(local)
             elif is_sc68:
-                wav = await _render_sc68(local)
+                wav = await _render_sc68(local, subsong=d)
             elif keep:
                 from soniqboom.core.conversion_cache import get_or_render
                 task = asyncio.ensure_future(get_or_render(
-                    track_id=track_id, format_type="uade", subsong=0,
-                    render_fn=lambda: _render_uade(local, live_key=key), cold=True))
+                    track_id=track_id, format_type="uade", subsong=d,
+                    render_fn=lambda: _render_uade(local, subsong=d, live_key=key,
+                                                   subsong_base=base),
+                    variant=uade_cache_variant(d, base), cold=True))
                 task.add_done_callback(lambda f: f.cancelled() or f.exception())
                 _bg_keep(task)
                 cached_path, _hit = await _hold_until_done(task)
             elif is_uade:
-                wav = await _render_uade(local, with_vu=False)
+                wav = await _render_uade(local, subsong=d, with_vu=False,
+                                         subsong_base=base)
             else:
                 wav = await _render_adlib(local)
         # Reading the length and the store write happen outside the slot.
         if keep:
             return await _backfill_rendered_duration(
-                track_id, track, cached_path, placeholder, authoritative=True,
-                sink=sink)
+                track_id, track, cached_path, placeholder, subsong=d,
+                authoritative=True, sink=sink)
         return await _backfill_rendered_duration(track_id, track, wav, placeholder,
-                                                 sink=sink)
+                                                 subsong=d, sink=sink)
     except HTTPException:
         return None      # undecodable / missing bank — leave the placeholder
     except Exception:
@@ -2739,8 +3777,13 @@ async def _probe_one_rendered_duration(track_id: str, *,
 
 # ── MIDI rendering ────────────────────────────────────────────────────────────
 
-async def _render_midi(path: Path) -> Path:
-    """Render MIDI file to a temp WAV via FluidSynth and return the path."""
+async def _render_midi(path: Path, *, live_key: str | None = None) -> Path:
+    """Render MIDI file to a temp WAV via FluidSynth and return the path.
+
+    ``live_key``: a live render (``_LiveWav``) — fluidsynth writes its WAV
+    as it renders (first audio ~0.2 s in, a 3-minute song in ~1.5 s), and
+    the growing file plays meanwhile.  Its length is unknown until the end
+    (the song plus the instruments' release tail)."""
     binary = _find_renderer(settings.fluidsynth_path, "fluidsynth")
     if not binary:
         raise HTTPException(501, "FluidSynth not installed")
@@ -2763,14 +3806,34 @@ async def _render_midi(path: Path) -> Path:
         str(path),
     ]
 
+    if live_key:
+        return await _tail_render(cmd, Path(tmp_wav.name), live_key,
+                                  kind="MIDI", timeout=600)
     await _await_renderer(cmd, Path(tmp_wav.name), timeout=600, kind="MIDI")
     return Path(tmp_wav.name)
 
 
 # ── Tracker module rendering ─────────────────────────────────────────────────
 
+def _old_med(head: bytes) -> bool:
+    """MED 2 / 3 / 4 (``MED\\x02``–``MED\\x04``): the pre-OctaMED format
+    libopenmpt can't read (it reads MMD0–MMD3) — zxtune plays it."""
+    return head[:3] == b"MED" and head[3:4] in (b"\x02", b"\x03", b"\x04")
+
+
+# An early Digital Sound Interface Kit module (``DSM\x10``): no installed
+# engine reads it (libopenmpt, uade, zxtune all refuse it).
+_DSM_EARLY_MAGIC = b"DSM\x10"
+_DSM_EARLY_DETAIL = ("This Digital Sound Interface Kit module is an early DSM variant "
+                     "that none of the installed players can read.")
+
+
 async def _render_tracker(path: Path, subsong: int = 0) -> Path:
     """Render tracker module to a temp WAV via openmpt123 and return the path.
+
+    Routed by content first: an old MED module (``_old_med``) renders through
+    zxtune (``_render_zxtune_capped``); an early DSIK module is a 422 naming
+    it (``_DSM_EARLY_DETAIL``).
 
     Side effect: in parallel with the audio render, we kick off a VU
     extraction pass that produces a ``.vu`` sidecar via the in-process
@@ -2783,6 +3846,17 @@ async def _render_tracker(path: Path, subsong: int = 0) -> Path:
     module, unsupported format) are swallowed and the frontend falls
     back to its FFT-spectrum visualiser.
     """
+    def _head() -> bytes:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(4)
+        except OSError:
+            return b""
+    head = await asyncio.to_thread(_head)
+    if head == _DSM_EARLY_MAGIC:
+        raise HTTPException(422, _DSM_EARLY_DETAIL)
+    if _old_med(head):
+        return await _render_zxtune_capped(path, kind="MED")
     binary = _find_renderer(settings.openmpt123_path, "openmpt123")
     if not binary:
         raise HTTPException(501, "openmpt123 not installed")
@@ -2821,6 +3895,106 @@ async def _render_tracker(path: Path, subsong: int = 0) -> Path:
                 vu_task.cancel()
 
     return Path(tmp_wav.name)
+
+
+# zxtune123 has no length option, and its loop detection can run away (an
+# old MED module it renders as 1:03:40 of looping, written at ~360 MB/s):
+# the render is cut at the chiptune default length (``sid_default_duration``)
+# with an 8 s fade, like libgme's capped tunes.  A module that ends earlier
+# keeps its own end.
+_ZXTUNE_POLL_S = 0.02
+_ZXTUNE_FADE_S = 8
+_ZXTUNE_WALL_S = 120.0
+
+
+def _cap_and_fade_wav(wav: Path, data_bytes: int, fade_s: int) -> None:
+    """Cut the 44.1 kHz stereo s16 WAV ``wav`` (a canonical 44-byte header)
+    to ``data_bytes`` of audio, fade its last ``fade_s`` seconds out and
+    rewrite the header sizes.  Blocking."""
+    import array as _array
+    import sys
+    frame = 4
+    data_bytes -= data_bytes % frame
+    with open(wav, "r+b") as fh:
+        fh.truncate(_WAV_HEADER_LEN + data_bytes)
+        n = min(data_bytes, fade_s * 44100 * frame)
+        if n:
+            fh.seek(_WAV_HEADER_LEN + data_bytes - n)
+            a = _array.array("h")
+            a.frombytes(fh.read(n))
+            if sys.byteorder == "big":
+                a.byteswap()
+            frames = len(a) // 2
+            for i in range(frames):
+                g = (frames - i) / frames
+                a[2 * i] = int(a[2 * i] * g)
+                a[2 * i + 1] = int(a[2 * i + 1] * g)
+            if sys.byteorder == "big":
+                a.byteswap()
+            fh.seek(_WAV_HEADER_LEN + data_bytes - n)
+            fh.write(a.tobytes())
+        fh.seek(0)
+        fh.write(_build_wav_header(44100, 2, data_bytes // frame, bits_per_sample=16))
+
+
+async def _render_zxtune_capped(path: Path, *, kind: str) -> Path:
+    """Render ``path`` with zxtune123 to a temp WAV, cut at
+    ``sid_default_duration`` seconds (see above).  zxtune writes the file
+    itself (it refuses an existing one, so the temp name is freed first);
+    the size is watched and the process killed once the cap is reached."""
+    binary = _find_renderer(settings.zxtune123_path, "zxtune123")
+    if not binary:
+        raise HTTPException(501, f"zxtune123 not installed — {kind} modules require it. "
+                                 "Re-run install.sh, or set renderers.zxtune123_path.")
+    cap_s = max(5, min(int(settings.sid_default_duration), 3600))
+    cap_bytes = cap_s * 44100 * 4
+    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_wav.close()
+    out = Path(tmp_wav.name)
+    out.unlink(missing_ok=True)
+    capped = ok = False
+    try:
+        async with _render_sem:
+            proc = await forksafe.spawn(
+                binary, "--silent", "--wav", f"filename={out}", str(path),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + _ZXTUNE_WALL_S
+                while proc.returncode is None:
+                    try:
+                        size = out.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size >= _WAV_HEADER_LEN + cap_bytes:
+                        capped = True
+                        break
+                    if time.monotonic() > deadline:
+                        raise HTTPException(504, f"{kind} render timed out")
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=_ZXTUNE_POLL_S)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except Exception:
+                        pass
+        if capped:
+            await asyncio.to_thread(_cap_and_fade_wav, out, cap_bytes, _ZXTUNE_FADE_S)
+        elif proc.returncode != 0:
+            raise HTTPException(502, f"{kind} renderer exited with status {proc.returncode}")
+        if not _render_has_audio(out):
+            raise HTTPException(422, "The renderer finished but produced no audio for this file.")
+        ok = True
+        return out
+    finally:
+        if not ok:
+            out.unlink(missing_ok=True)
 
 
 async def _extract_vu_sidecar(
@@ -2918,18 +4092,410 @@ def _native_build_lock(name: str) -> asyncio.Lock:
 _UADE_DEFAULT_TIMEOUT_S = 8 * 60
 
 
-# Live (still-rendering) uade WAVs, keyed by conversion-cache key.  uade123
-# writes PCM to a pipe as it renders (first audio ~0.1 s in), so while a render
-# runs its growing temp WAV can already be played — see ``_serve_uade``.
-#   {"path", "expected_size" (0 = length unknown), "complete" Event,
-#    "data" Event (set on the first bytes, then every ~256 KB, and at the
-#    end), "clean_exit" bool|None, "bytes"}
+# Live (still-rendering) WAVs, keyed by conversion-cache key — uade's (PCM
+# from a pipe) and every other renderer ``_LiveWav`` follows (fluidsynth,
+# adplay, psgplay, zxtune, libgme).  Their first audio is on disk ~0.1 s in,
+# so while a render runs its growing temp WAV can already be played — see
+# ``_serve_live``.
+#   {"path", "expected_size" (0 = length unknown), "exact" (the renderer was
+#    told that length and produces it), "complete" Event, "data" Event (set
+#    on the first bytes, the first audible ones, then every ~256 KB, and at
+#    the end), "clean_exit" bool|None, "bytes", "audible", "bytes_per_sec"}
 _UADE_LIVE: dict[str, dict] = {}
-# Set (and dropped) when ``_render_uade`` registers the live entry a waiting
+# Set (and dropped) when a render registers the live entry a waiting
 # ``_await_uade_live`` asked for.
 _UADE_LIVE_REGISTERED: dict[str, asyncio.Event] = {}
 _UADE_RATE, _UADE_CH, _UADE_BPS = 44100, 2, 2          # uade123 -c: s16le stereo 44.1 kHz
 _UADE_BYTES_PER_SEC = _UADE_RATE * _UADE_CH * _UADE_BPS
+# Live renders that finished and were cached, newest last: key → bytes per
+# second of their WAV, so /render-status can give a finished render's exact
+# length (``duration_seconds``).  Bounded.
+_LIVE_FINISHED: "OrderedDict[str, int]" = OrderedDict()
+_LIVE_FINISHED_MAX = 256
+
+
+class _LiveWav:
+    """The canonical WAV a render writes while a listener may already play it.
+
+    Our own 44-byte 16-bit PCM header comes first: exact when a length is
+    known (``expected_seconds``; ``exact`` when the renderer itself was told
+    that length and produces it, so any client may stream it — otherwise a
+    stored length the render normally matches, which only the web player,
+    which corrects a wrong one, is given), else — for a live render — the
+    "read to the end" streaming header.  ``feed`` (or ``write`` from a worker
+    thread, then ``account`` on the loop) appends PCM; with a ``live_key``
+    the file is registered in ``_UADE_LIVE`` and ``audible`` is set once the
+    PCM holds sound (``core.silence``) — a listener is attached only then, so
+    a tune that plays only silence ends as the cache's 422, never streamed.
+    ``finish`` aligns a render that lands within a second of a promised
+    length to it exactly — so the cached file is byte for byte the resource
+    a live reader was told about — and writes the real header; ``close``
+    settles the live entry and, unless the render finished, deletes the
+    file."""
+
+    def __init__(self, live_key: "str | None", *, rate: int = 44100,
+                 channels: int = 2, expected_seconds: float = 0.0,
+                 exact: bool = False, min_audible_seconds: float = 0.0) -> None:
+        self.key = live_key
+        self.rate, self.channels = int(rate), int(channels)
+        self.frame_bytes = 2 * self.channels
+        self.bytes_per_sec = self.rate * self.frame_bytes
+        try:
+            secs = float(expected_seconds or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        if not (math.isfinite(secs) and 0 < secs <= _UADE_MAX_EXPECTED_S):
+            secs = 0.0               # no length (or an absurd one): unknown
+        self.exp_frames = (int(round(secs * self.rate))
+                           if secs > (0 if exact else 1) else 0)
+        self.expected_size = (_WAV_HEADER_LEN + self.exp_frames * self.frame_bytes
+                              if self.exp_frames else 0)
+        # ``min_audible_seconds``: sound counts only once this much audio is
+        # in (an AdLib default subsong of a split second is a stub, not the
+        # music — ``_render_adlib``).
+        self._min_audible_bytes = int(max(0.0, min_audible_seconds) * self.bytes_per_sec)
+        self.written = 0
+        self.clean = False
+        self._since = 0
+        self._heard = False
+        self.live = None
+        self._meter = None
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        self.path = Path(tmp.name)
+        try:
+            with open(self.path, "wb") as hf:
+                if self.exp_frames or not live_key:
+                    hf.write(_build_wav_header(self.rate, self.channels, self.exp_frames,
+                                               bits_per_sample=16))
+                else:
+                    # Length unknown but a listener may stream this file while
+                    # it grows: RIFF and data sizes 0xFFFFFFFF = play to the
+                    # end of the stream (a 0-frame header would say there is
+                    # no audio).
+                    hf.write(_streaming_wav_header(self.rate, self.channels, 16))
+            self._fh = open(self.path, "ab")
+        except BaseException:
+            self.path.unlink(missing_ok=True)
+            raise
+        if live_key:
+            # Registered last: nothing below can fail, so an entry never
+            # outlives a half-made file (the renderer's ``close`` settles it).
+            self._meter = _AudibilityMeter(self.channels, self.rate)
+            self.live = {"path": self.path, "expected_size": self.expected_size,
+                         "exact": bool(exact and self.exp_frames),
+                         "complete": asyncio.Event(), "data": asyncio.Event(),
+                         "clean_exit": None, "bytes": 0, "no_pad_on_failure": True,
+                         "subscribers": 0, "audible": False,
+                         "bytes_per_sec": self.bytes_per_sec,
+                         "rate": self.rate, "channels": self.channels}
+            _UADE_LIVE[live_key] = self.live
+            reg = _UADE_LIVE_REGISTERED.pop(live_key, None)
+            if reg is not None:
+                reg.set()
+
+    def _wake(self) -> None:
+        if self.live is not None:
+            ev = self.live["data"]
+            ev.set()
+            ev.clear()
+
+    def write(self, chunk: bytes) -> None:
+        """Append PCM and judge it (blocking — one thread at a time, any
+        thread; ``account`` it on the loop afterwards)."""
+        self._fh.write(chunk)
+        self._fh.flush()
+        self.written += len(chunk)
+        if self._meter is not None and not self._heard and self._meter.feed(chunk):
+            self._heard = True
+
+    def account(self, nbytes: int) -> None:
+        """Tell listeners about ``nbytes`` of PCM ``write`` appended (event
+        loop only): wake them on the first audio and the first audible audio
+        (a waiting first play answers at once), then every 256 KB."""
+        if self.live is None or nbytes <= 0:
+            return
+        first = self.live["bytes"] == 0
+        self.live["bytes"] += nbytes
+        self._since += nbytes
+        heard = False
+        if (self._heard and not self.live["audible"]
+                and self.live["bytes"] >= self._min_audible_bytes):
+            self.live["audible"] = heard = True
+        if heard or first or self._since >= 256 * 1024:
+            self._since = 0
+            self._wake()
+
+    def feed(self, chunk: bytes) -> None:
+        """``write`` + ``account`` (event loop)."""
+        self.write(chunk)
+        self.account(len(chunk))
+
+    def finish(self) -> Path:
+        """The render ended cleanly: align it to a promised length it lands
+        within a second of, write the real header, and return the file."""
+        self._fh.close()
+        written = self.written
+        fb = self.frame_bytes
+        if self.exp_frames:
+            exp_bytes = self.exp_frames * fb
+            if 0 < abs(written - exp_bytes) <= self.bytes_per_sec:
+                with open(self.path, "r+b") as hf:
+                    if written > exp_bytes:
+                        hf.truncate(_WAV_HEADER_LEN + exp_bytes)
+                    else:
+                        hf.seek(_WAV_HEADER_LEN + written)
+                        hf.write(b"\x00" * (exp_bytes - written))
+                written = exp_bytes
+        frames = written // fb
+        with open(self.path, "r+b") as hf:
+            if frames * fb != written:
+                hf.truncate(_WAV_HEADER_LEN + frames * fb)
+            hf.seek(0)
+            hf.write(_build_wav_header(self.rate, self.channels, frames,
+                                       bits_per_sample=16))
+        self.written = frames * fb
+        if self.live is not None:
+            self.live["bytes"] = self.written
+        self.clean = True
+        return self.path
+
+    def abandon(self) -> None:
+        """Stop offering this file to listeners (nobody is reading it: it
+        never became audible) while the render goes on another way."""
+        if self.live is not None:
+            self.live["clean_exit"] = False
+            self.live["complete"].set()
+            self.live["data"].set()
+            if _UADE_LIVE.get(self.key) is self.live:
+                _UADE_LIVE.pop(self.key, None)
+            self.live = None
+
+    def close(self) -> None:
+        """Settle the live entry (complete; dropped now when the render
+        failed, once the cache holds the file when it finished) and delete
+        the file of a render that didn't finish.  Idempotent."""
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        if self.live is not None:
+            live, self.live = self.live, None
+            live["clean_exit"] = self.clean
+            live["complete"].set()
+            live["data"].set()
+            if not self.clean:
+                if _UADE_LIVE.get(self.key) is live:
+                    _UADE_LIVE.pop(self.key, None)
+            else:
+                _LIVE_FINISHED[self.key] = self.bytes_per_sec
+                _LIVE_FINISHED.move_to_end(self.key)
+                while len(_LIVE_FINISHED) > _LIVE_FINISHED_MAX:
+                    _LIVE_FINISHED.popitem(last=False)
+                _drop_live_after_store(self.key, live)
+        if not self.clean:
+            self.path.unlink(missing_ok=True)
+
+
+# How often ``_tail_render`` looks for new output, and how much of the
+# renderer's growing file it holds back while the renderer runs: a writer may
+# append a trailing chunk (zxtune's 128-byte tag block) as it closes, before
+# it patches its header's data size — one of up to this size is never copied
+# as audio (after the exit the patched data size bounds the copy).
+_TAIL_POLL_S = 0.02
+_TAIL_HOLDBACK = 8192
+
+
+def _tail_fmt(head: bytes) -> "tuple[dict, int] | None":
+    """``({"tag", "channels", "rate", "bits"}, data_offset)`` from the start
+    of a renderer's RIFF/WAVE output, or None until its data chunk header is
+    in (a header may still be being written)."""
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos, fmt = 12, None
+    while pos + 8 <= len(head):
+        cid = head[pos:pos + 4]
+        size = int.from_bytes(head[pos + 4:pos + 8], "little")
+        body = pos + 8
+        if cid == b"fmt " and body + 16 <= len(head):
+            tag = int.from_bytes(head[body:body + 2], "little")
+            if tag == 0xFFFE and size >= 26 and body + 26 <= len(head):
+                tag = int.from_bytes(head[body + 24:body + 26], "little")
+            fmt = {"tag": tag,
+                   "channels": int.from_bytes(head[body + 2:body + 4], "little"),
+                   "rate": int.from_bytes(head[body + 4:body + 8], "little"),
+                   "bits": int.from_bytes(head[body + 14:body + 16], "little")}
+        elif cid == b"data":
+            return (fmt, body) if fmt is not None else None
+        pos = body + size + (size & 1)
+    return None
+
+
+async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
+                       timeout: float, require_audio: bool = True,
+                       env: "dict | None" = None, expected_seconds: float = 0.0,
+                       exact: bool = False, min_audible_seconds: float = 0.0) -> Path:
+    """Run renderer ``cmd``, which writes a 16-bit PCM WAV to ``src`` as it
+    renders, and copy its audio into a live WAV (``_LiveWav`` registered
+    under ``live_key``, made with ``expected_seconds`` / ``exact`` /
+    ``min_audible_seconds``) while it does — polled every ``_TAIL_POLL_S`` —
+    so a listener can play the render before it ends.
+
+    Returns the live WAV's finished file (``src`` is deleted).  A renderer whose
+    output isn't what ``live`` declares (another rate / channel count /
+    sample format) is never offered live: the render completes and its own
+    file is returned, exactly as without a listener.  A non-zero exit is the
+    usual ``_renderer_failure``; an exit 0 without audio a 422 (unless
+    ``require_audio`` is False: the caller judges the empty result).  On any
+    failure ``src`` and the live file are deleted and the live entry says
+    the render failed (a listener's stream is aborted, not padded).
+
+    While the renderer runs, the last ``_TAIL_HOLDBACK`` bytes of its file
+    are not copied: a trailing chunk of up to that size it appends at close
+    (zxtune's tag block), before patching its header's data size, is never
+    taken for audio; at the end the patched data size bounds the copy."""
+    state = {"fd": -1, "pos": None, "fmt": None, "ok": True, "closed": False}
+    live: "_LiveWav | None" = None
+    # Held by a worker-thread step and by the close below: a step still
+    # running when the render is cancelled must never read a descriptor
+    # number that has been closed (and maybe reused) or write a closed file.
+    step_lock = threading.Lock()
+
+    def _step(final: bool) -> int:
+        with step_lock:
+            return 0 if state["closed"] else _step_locked(final)
+
+    def _step_locked(final: bool) -> int:
+        # Worker thread: append what's new in ``src`` to ``live``; returns
+        # the byte count.
+        if state["fd"] < 0:
+            try:
+                state["fd"] = os.open(str(src), os.O_RDONLY)
+            except OSError:
+                return 0
+        fd = state["fd"]
+        size = os.fstat(fd).st_size
+        if state["pos"] is None:
+            parsed = _tail_fmt(os.pread(fd, min(size, 65536), 0))
+            if parsed is None:
+                if size > 65536 or final:
+                    state["ok"] = False      # no header we can follow
+                return 0
+            fmt, off = parsed
+            state["fmt"], state["pos"] = fmt, off
+            if not (fmt["tag"] == 1 and fmt["bits"] == 16
+                    and fmt["channels"] == live.channels and fmt["rate"] == live.rate):
+                state["ok"] = False
+                return 0
+        if not state["ok"]:
+            return 0
+        if final:
+            # The renderer patched its header: its data size bounds the audio
+            # (anything after it — a tag chunk — is not audio).
+            end = size
+            head = os.pread(fd, min(size, 65536), 0)
+            p = _tail_fmt(head)
+            if p is not None:
+                dsize = int.from_bytes(head[p[1] - 4:p[1]], "little")
+                if 0 < dsize < 0xFFFFFFFF and p[1] + dsize <= size:
+                    end = p[1] + dsize
+        else:
+            end = size - _TAIL_HOLDBACK
+        pos = state["pos"]
+        if end <= pos:
+            return 0
+        buf = os.pread(fd, min(end - pos, 4 * 1024 * 1024), pos)
+        if buf:
+            live.write(buf)
+            state["pos"] = pos + len(buf)
+        return len(buf)
+
+    err_ring = bytearray()
+    ok = False
+    try:
+        live = _LiveWav(live_key, expected_seconds=expected_seconds, exact=exact,
+                        min_audible_seconds=min_audible_seconds)
+        async with _render_sem:
+            proc = await forksafe.spawn(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                env=env)
+
+            async def _drain_stderr():
+                try:
+                    while True:
+                        raw = await proc.stderr.read(4096)
+                        if not raw:
+                            return
+                        err_ring.extend(raw)
+                        if len(err_ring) > 8192:
+                            del err_ring[:len(err_ring) - 8192]
+                except Exception:
+                    pass
+
+            err_task = asyncio.create_task(_drain_stderr())
+            # One exit waiter for the whole render (a ``wait_for`` per poll
+            # would leave a cancelled waiter behind every 20 ms).
+            proc_wait = asyncio.ensure_future(proc.wait())
+            try:
+                deadline = time.monotonic() + timeout
+                while True:
+                    final = proc.returncode is not None
+                    while True:
+                        n = await asyncio.to_thread(_step, final)
+                        if not n:
+                            break
+                        live.account(n)
+                        if not final:
+                            break
+                    if final:
+                        break
+                    if time.monotonic() > deadline:
+                        raise HTTPException(504, f"{kind} render timed out after {int(timeout)}s")
+                    await asyncio.wait({proc_wait}, timeout=_TAIL_POLL_S)
+            finally:
+                if not proc_wait.done():
+                    proc_wait.cancel()
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(err_task, timeout=2.0)
+                except Exception:
+                    err_task.cancel()
+                with step_lock:          # a step still in its thread finishes first
+                    state["closed"] = True
+                    if state["fd"] >= 0:
+                        os.close(state["fd"])
+                        state["fd"] = -1
+        if proc.returncode != 0:
+            raise _renderer_failure(kind, cmd[0], proc.returncode,
+                                    bytes(err_ring).decode("utf-8", "replace"))
+        if not state["ok"]:
+            # Not followable live: the renderer's own file is the render.
+            live.abandon()
+            if require_audio and not _render_has_audio(src):
+                raise HTTPException(
+                    422, "The renderer finished but produced no audio for this file.")
+            ok = True
+            return src
+        out = live.finish()
+        if require_audio and live.written <= 0:
+            log.warning("%s renderer exited 0 without audio for %s: %s", kind, cmd[-1],
+                        bytes(err_ring).decode("utf-8", "replace").strip()[:300])
+            live.clean = False
+            raise HTTPException(
+                422, "The renderer finished but produced no audio for this file.")
+        ok = True
+        src.unlink(missing_ok=True)
+        return out
+    finally:
+        if not ok:
+            src.unlink(missing_ok=True)
+        if live is not None:
+            live.close()
 
 
 def _uade_subsong_arg(subsong: int, base: int = 0) -> list[str]:
@@ -3151,10 +4717,6 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
             "uade' (macOS) or 'apt install uade' (Debian/Ubuntu).",
         )
 
-    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_wav.close()
-    wav_path = Path(tmp_wav.name)
-
     # ``--filter=A1200`` picks the Amiga 1200 LED-filter model (the
     # default A500 sounds muffled on modern listeners).  ``--headphones``
     # adds a tiny stereo-widening effect that mimics what AHX players
@@ -3169,38 +4731,13 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
     # Companion halves (smpl.X) are still found — they sit beside it.
     cmd += ["--", path.name]
 
-    exp_frames = int(round(expected_seconds * _UADE_RATE)) if expected_seconds > 1 else 0
-    expected_size = (_WAV_HEADER_LEN + exp_frames * _UADE_CH * _UADE_BPS) if exp_frames else 0
-    with open(wav_path, "wb") as hf:
-        if exp_frames or not live_key:
-            hf.write(_build_wav_header(_UADE_RATE, _UADE_CH, exp_frames, bits_per_sample=16))
-        else:
-            # Length unknown but a listener may stream this file while it
-            # grows: the conventional "streaming WAV" header (RIFF and data
-            # sizes 0xFFFFFFFF = play to the end of the stream).  A 0-frame
-            # header would tell the player there is no audio at all.  The
-            # end-of-render rewrite below replaces it with the real sizes.
-            hf.write(_streaming_wav_header(_UADE_RATE, _UADE_CH, 16))
-
-    live = None
-    if live_key:
-        live = {"path": wav_path, "expected_size": expected_size,
-                "complete": asyncio.Event(), "data": asyncio.Event(),
-                "clean_exit": None, "bytes": 0, "no_pad_on_failure": True,
-                "subscribers": 0}
-        _UADE_LIVE[live_key] = live
-        reg = _UADE_LIVE_REGISTERED.pop(live_key, None)
-        if reg is not None:
-            reg.set()
-
-    def _wake():
-        if live is not None:
-            ev = live["data"]
-            ev.set()
-            ev.clear()
-
-    clean = False
-    written = 0
+    # Our canonical header is in place before the first sample: exact for a
+    # known length, else (live) a streaming one; the end-of-render rewrite
+    # (``_LiveWav.finish``) sets the real sizes.  A listener is attached
+    # only once the render is audible (``_serve_live``): a silent tune ends
+    # without ever being streamed, and the cache refuses it (422).
+    lw = _LiveWav(live_key, rate=_UADE_RATE, channels=_UADE_CH,
+                  expected_seconds=expected_seconds)
     try:
         async with _render_sem:
             proc = await forksafe.spawn(
@@ -3223,40 +4760,27 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
             err_task = asyncio.create_task(_drain_stderr())
 
             async def _pump():
-                nonlocal written
                 head = b""
                 header_done = False
-                since = 0
-                with open(wav_path, "ab") as f:
-                    while True:
-                        chunk = await proc.stdout.read(65536)
+                while True:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
+                        return
+                    if not header_done:
+                        # uade's own WAV header (sizes unknown on a pipe):
+                        # drop everything up to the end of its data chunk
+                        # header; ours is already in place.
+                        head += chunk
+                        i = head.find(b"data")
+                        if i < 0 or len(head) < i + 8:
+                            if len(head) > 4096:
+                                raise HTTPException(502, "uade123 produced no WAV data")
+                            continue
+                        chunk = head[i + 8:]
+                        header_done = True
                         if not chunk:
-                            return
-                        if not header_done:
-                            # uade's own WAV header (sizes unknown on a pipe):
-                            # drop everything up to the end of its data chunk
-                            # header; ours is already in place.
-                            head += chunk
-                            i = head.find(b"data")
-                            if i < 0 or len(head) < i + 8:
-                                if len(head) > 4096:
-                                    raise HTTPException(502, "uade123 produced no WAV data")
-                                continue
-                            chunk = head[i + 8:]
-                            header_done = True
-                            if not chunk:
-                                continue
-                        f.write(chunk)
-                        f.flush()
-                        written += len(chunk)
-                        since += len(chunk)
-                        if live is not None:
-                            live["bytes"] = written
-                        # Wake readers on the FIRST audio (a waiting first
-                        # play answers at once), then every 256 KB.
-                        if since >= 256 * 1024 or written == len(chunk):
-                            since = 0
-                            _wake()
+                            continue
+                    lw.feed(chunk)
 
             try:
                 await asyncio.wait_for(_pump(), timeout=_UADE_DEFAULT_TIMEOUT_S)
@@ -3278,7 +4802,7 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
                 raise _renderer_failure("uade", binary, proc.returncode,
                                         bytes(err_ring).decode("utf-8", "replace"),
                                         module_path=path)
-            if written <= 0:
+            if lw.written <= 0:
                 # uade exited cleanly but its player crashed before the first
                 # sample ("score crashed"): a listener-facing reason, the raw
                 # text in the log.
@@ -3286,44 +4810,18 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
                          bytes(err_ring).decode("utf-8", "replace").strip()[-300:])
                 raise HTTPException(502, "The Amiga player couldn't render this module.")
         # The file is self-consistent whatever the real length turned out to
-        # be: rewrite the header to the bytes that actually landed.  When a
-        # length was promised up front and the render lands within a second
-        # of it (the stored duration is rounded to 10 ms), trim/pad the tail
-        # to EXACTLY the promised size, so the cached file is byte-for-byte
-        # the resource a live reader was told about (same Content-Range
-        # total on the next Range request) and the stored duration stays
-        # stable.  A larger mismatch (a stale stored length) keeps the real
-        # render; the duration backfill then corrects the stored value.
-        frame_bytes = _UADE_CH * _UADE_BPS
-        if exp_frames:
-            exp_bytes = exp_frames * frame_bytes
-            if 0 < abs(written - exp_bytes) <= _UADE_BYTES_PER_SEC:
-                with open(wav_path, "r+b") as hf:
-                    if written > exp_bytes:
-                        hf.truncate(_WAV_HEADER_LEN + exp_bytes)
-                    else:
-                        hf.seek(_WAV_HEADER_LEN + written)
-                        hf.write(b"\x00" * (exp_bytes - written))
-                written = exp_bytes
-                if live is not None:
-                    live["bytes"] = written
-        frames = written // frame_bytes
-        with open(wav_path, "r+b") as hf:
-            hf.seek(0)
-            hf.write(_build_wav_header(_UADE_RATE, _UADE_CH, frames, bits_per_sample=16))
-        clean = True
-        return wav_path
+        # be: the header is rewritten to the bytes that actually landed.  When
+        # a length was promised up front and the render lands within a second
+        # of it (the stored duration is rounded to 10 ms), the tail is
+        # trimmed/padded to EXACTLY the promised size, so the cached file is
+        # byte-for-byte the resource a live reader was told about (same
+        # Content-Range total on the next Range request) and the stored
+        # duration stays stable.  A larger mismatch (a stale stored length)
+        # keeps the real render; the duration backfill then corrects the
+        # stored value.
+        return lw.finish()
     finally:
-        if live is not None:
-            live["clean_exit"] = clean
-            live["complete"].set()
-            live["data"].set()
-            if not clean and _UADE_LIVE.get(live_key) is live:
-                _UADE_LIVE.pop(live_key, None)
-            elif clean:
-                _drop_live_after_store(live_key, live)
-        if not clean:
-            wav_path.unlink(missing_ok=True)
+        lw.close()
 
 
 def _drop_live_after_store(key: str, live: dict) -> None:
@@ -3360,20 +4858,33 @@ def _bg_keep(task: "asyncio.Future") -> None:
 _UADE_MAX_EXPECTED_S = 3600.0
 
 
-def _uade_expected_seconds(track, subsong: int = 0) -> float:
+def _uade_expected_seconds(track, subsong: int = 0, track_id: "str | None" = None) -> float:
     """A uade track's length when one is already known (an earlier render or a
     duration probe stored it); 0 = unknown (the scan stores 0 for uade).
 
-    The stored duration describes the DEFAULT tune only (subsong 0 = no
-    ``--subsong`` flag), so any other subsong is "unknown": trusting it made a
+    The stored duration describes the DEFAULT tune only (tune index
+    ``default_tune_index`` — 0, no ``--subsong`` flag, unless a probe found the
+    first tune empty), so any other tune is "unknown": trusting it made a
     short tune's header claim the default tune's length (seconds of padded
     silence) or cut a longer one short."""
-    if subsong:
+    return _stored_render_seconds(track, subsong, track_id)
+
+
+def _stored_render_seconds(track, subsong: int = 0, track_id: "str | None" = None,
+                           placeholder: "float | None" = None) -> float:
+    """A render-only track's stored length, when it can stand for the render
+    of tune index ``subsong`` (``_uade_expected_seconds`` explains why only
+    the default tune's); 0 = unknown.  ``placeholder``: the value the scan
+    stores for this format when it doesn't know the length (AdLib's 180 s,
+    the chiptune default) — never a length."""
+    if track is None or subsong != (default_tune_index(track_id, track) if track_id else 0):
         return 0.0
     try:
         d = float(getattr(track, "duration", 0) or 0)
     except (TypeError, ValueError):
         d = 0.0
+    if placeholder is not None and abs(d - float(placeholder)) <= 0.01:
+        return 0.0
     return d if 1.0 < d <= _UADE_MAX_EXPECTED_S else 0.0
 
 
@@ -3618,84 +5129,145 @@ def _spawn_uade_vu(key: str, src_path: Path, subsong: int,
 async def _serve_uade(request: Request, track_id: str, track, path: Path,
                       subsong: int, *, web_session: bool, background,
                       zip_pin_id: str | None, xf: "_Xform | None" = None) -> Response:
-    """Serve a uade-rendered track: cache hit → Range file; otherwise attach
-    to (or start) the render and, for our own web UI, play the growing WAV
-    while it renders — first audio in well under a second instead of after
-    the whole render.  With a known length the header is exact from byte 0
-    and every request (no Range, probes, seeks) is served against the final
-    size; with an unknown length a first request (no Range / ``bytes=0-``)
-    streams under a provisional "read to the end" header — except to Safari —
-    and other Range requests wait for the file.
-    Everyone else (Subsonic, DLNA, cast: they need an exact Content-Length)
-    and any request that changes the audio (``xf``: another codec, a bitrate
-    cap, a time offset) waits for the finished file.
-    """
-    from soniqboom.core.conversion_cache import get_or_render, get_cached
+    """Serve a uade-rendered track through ``_serve_live``: uade123 pipes its
+    PCM, so the growing WAV plays while it renders.  The length promised up
+    front is a stored one (``_uade_expected_seconds``) — never exact — so
+    only our web UI gets the growing file; Subsonic, DLNA and cast wait for
+    the finished one."""
     base = await _uade_resolve_base(track_id, track, path, subsong)
-    variant = uade_cache_variant(subsong, base)
     key = uade_cache_key(track_id, subsong, base)
-    expected = _uade_expected_seconds(track, subsong)
-    transform = xf is not None and xf.active
+    expected = _uade_expected_seconds(track, subsong, track_id)
     _note_uade_vu_wanted(_ck(track_id, "uade", subsong=subsong), path, subsong,
                          zip_pin_id, cache_key=key, base=base)
 
-    def _render_fn():
-        return _render_uade(path, subsong=subsong, live_key=key,
-                            expected_seconds=expected, subsong_base=base)
+    async def _after(cached_path):
+        # uade formats are render-only: the scan stored duration 0 — uade123
+        # renders to the tune's natural end, so persist the WAV's real length
+        # (default tune only; the render is the authority, so a stale stored
+        # value is corrected too).
+        await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
+                                          subsong=subsong, authoritative=True)
 
-    def _start():
-        t = asyncio.ensure_future(get_or_render(
-            track_id=track_id, format_type="uade", subsong=subsong,
-            render_fn=_render_fn, variant=variant))
-        t.add_done_callback(lambda f: f.cancelled() or f.exception())
-        _bg_keep(t)
-        return t
+    return await _serve_live(
+        request, track_id=track_id, format_type="uade", subsong=subsong, key=key,
+        render_fn=lambda: _render_uade(path, subsong=subsong, live_key=key,
+                                       expected_seconds=expected, subsong_base=base),
+        cache_kw={"variant": uade_cache_variant(subsong, base)},
+        web_session=web_session, background=background, xf=xf,
+        rendered="uade123", after_render=_after)
 
-    task = None
+
+async def _live_attach(*, track_id: str, format_type: str, subsong: int, key: str,
+                       render_fn, cache_kw: "dict | None" = None
+                       ) -> "tuple[asyncio.Future | None, Path | None, dict | None]":
+    """``(task, cached, live)`` for a live-capable render of ``key``: the
+    cached file, else the live entry of the render in progress — started
+    here (``task``, the ``get_or_render`` future) unless one is running."""
+    from soniqboom.core.conversion_cache import get_or_render, get_cached
     cached = await get_cached(key)
-    live = None if cached is not None else _UADE_LIVE.get(key)
-    if cached is None and (live is None or live["complete"].is_set()):
-        task = _start()
+    if cached is not None:
+        return None, cached, None
+    live = _UADE_LIVE.get(key)
+    task = None
+    if live is None or live["complete"].is_set():
+        task = asyncio.ensure_future(get_or_render(
+            track_id=track_id, format_type=format_type, subsong=subsong,
+            render_fn=render_fn, **(cache_kw or {})))
+        task.add_done_callback(lambda f: f.cancelled() or f.exception())
+        _bg_keep(task)
         # The render registers its live entry before it waits for a slot.
         live = await _await_uade_live(key, task)
+    return task, None, live
+
+
+async def _live_open_audible(live: dict, timeout: float = 45.0) -> "_FdHandle | None":
+    """Wait until the live render ``live`` is audible, then open its growing
+    file — or None when it ended first (failed, silent, or simply short: the
+    cache then has it) or stayed silent for ``timeout`` s.
+
+    Never answer before audible audio is in: a file the renderer rejects, or
+    a tune that plays only silence, must reach the player as an error, not
+    as silence.  The render wakes ``data`` on its first bytes, its first
+    audible ones and when it ends.  The descriptor is opened NOW: it
+    survives the move into the cache, a lazy open did not."""
+    deadline = time.monotonic() + timeout
+    while not live.get("audible") and not live["complete"].is_set():
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        try:
+            await asyncio.wait_for(live["data"].wait(), rem)
+        except asyncio.TimeoutError:
+            break
+    if not live.get("audible") or live["complete"].is_set():
+        return None
+    try:
+        return _FdHandle(os.open(str(live["path"]), os.O_RDONLY))
+    except OSError:
+        return None
+
+
+async def _serve_live(request: Request, *, track_id: str, format_type: str,
+                      subsong: int, key: str, render_fn,
+                      cache_kw: "dict | None" = None, web_session: bool,
+                      background, xf: "_Xform | None", rendered: str,
+                      after_render=None) -> Response:
+    """Serve a track whose render can be played while it runs (a live render:
+    ``_LiveWav``): cache hit → the file with Range; otherwise attach to (or
+    start) the render and, once it is audible, play the growing WAV — first
+    audio in well under a second instead of after the whole render.
+
+    Who gets the growing file:
+      • our web UI (``web_session``): with a known length (``expected_size``
+        — exact, or a stored length the player corrects once the render is
+        complete) every request (no Range, probes, seeks) is served against
+        the final size; with an unknown length an open-ended first request
+        (no Range / ``bytes=0-``) streams under a provisional "read to the
+        end" header — except to Safari, whose media stack needs real
+        byte-range answers: it waits for the finished file.  A range probe
+        (``bytes=0-1`` — any WebKit, including home-screen apps and in-app
+        web views whose UA lacks "Safari") waits for it too, then gets a real
+        206;
+      • any other GET client (Subsonic, DLNA, the cast byte-server) only when
+        the length is EXACT (``live["exact"]``: the renderer was told it and
+        produces it): they need a true Content-Length, and nothing corrects
+        a stored length that turns out wrong for them.
+    A request for another codec / a bitrate cap (``xf.codec``) without a time
+    offset gets a live encode of the growing file (``_transcode_growing_render``;
+    with an estimated Content-Length asked for, only when the length is
+    exact).  Everyone else, and a time offset, waits for the finished file.
+
+    ``render_fn`` renders with ``live_key=key``; ``cache_kw`` are the
+    ``get_or_render`` arguments beyond the subsong that make ``key``
+    (soundfont, variant).  ``after_render(cached_path)`` (a coroutine
+    function: the duration backfill) runs once the render is cached — before
+    the answer on the blocking path, in the background after a progressive
+    start.  ``rendered`` names the renderer (``X-Rendered``)."""
+    from soniqboom.core.conversion_cache import known_silent
+    transform = xf is not None and xf.active
+    task, cached, live = await _live_attach(
+        track_id=track_id, format_type=format_type, subsong=subsong, key=key,
+        render_fn=render_fn, cache_kw=cache_kw)
 
     range_hdr = (request.headers.get("range") or "").strip()
     open_ended = not range_hdr or range_hdr == "bytes=0-"
-    # Unknown length: only an open-ended first request (no Range /
-    # ``bytes=0-``) can stream (chunked, under the provisional header) — and
-    # not to Safari, whose media stack needs real byte-range answers: it
-    # waits for the finished file (~0.7 s for a 2-min tune).  A range probe
-    # (``bytes=0-1`` — any WebKit, including home-screen apps and in-app web
-    # views whose UA lacks "Safari") waits for it too, then gets a real 206.
-    # A known length serves every request against the final size.
-    if (web_session and not transform and cached is None and live is not None
-            and not live["complete"].is_set()
-            and (live["expected_size"] > 0
-                 or (open_ended and not _is_safari(request)))):
-        # Don't answer before the first audio (or the failure) is in: a module
-        # uade rejects must reach the player as an error, not as silence.  The
-        # render wakes ``data`` on its first bytes and when it ends.
-        deadline = time.monotonic() + 45.0
-        while live["bytes"] == 0 and not live["complete"].is_set():
-            rem = deadline - time.monotonic()
-            if rem <= 0:
-                break
-            try:
-                await asyncio.wait_for(live["data"].wait(), rem)
-            except asyncio.TimeoutError:
-                break
-        handle = None
-        # A short tune can finish while we waited — then the cache (below)
-        # serves the complete file.  Otherwise open the growing file NOW: the
-        # descriptor survives the move into the cache, a lazy open did not.
-        if live["bytes"] > 0 and not live["complete"].is_set():
-            try:
-                handle = _FdHandle(os.open(str(live["path"]), os.O_RDONLY))
-            except OSError:
-                handle = None
+    if (not transform and cached is None and live is not None
+            and request.method == "GET"
+            and not live["complete"].is_set() and not known_silent(key)
+            and ((web_session and (live["expected_size"] > 0
+                                   or (open_ended and not _is_safari(request))))
+                 or (not web_session and live.get("exact")
+                     and live["expected_size"] > 0))):
+        handle = await _live_open_audible(live)
+        # None: a short tune finished while we waited (the cache below serves
+        # the complete file), or the render failed / came out silent (the
+        # task below raises its error).
         if handle is not None:
-            _uade_finish_later(task, key, track_id, track, path, subsong, base)
-            headers = {"X-Rendered": "uade123", "X-Cache": "miss-progressive"}
+            _live_finish_later(
+                task, after_render,
+                lambda: _live_attach_task(track_id, format_type, subsong, render_fn,
+                                          cache_kw))
+            headers = {"X-Rendered": rendered, "X-Cache": "miss-progressive"}
             if live["expected_size"] <= 0:
                 headers["X-Render-Length"] = "unknown"
                 return await _chunked_growing_file_response(
@@ -3714,27 +5286,87 @@ async def _serve_uade(request: Request, track_id: str, track, path: Path,
                 unpin_key=None, background_task=background, fd=handle,
             )
 
+    # Another codec (Subsonic ``format=`` / a bitrate cap, no time offset) of
+    # a render still running: a live encode of the growing file, whatever
+    # its length (the encode is chunked) — unless the client wants an
+    # estimated Content-Length, which needs the exact one.
+    if (xf is not None and xf.codec and not xf.seek and request.method == "GET"
+            and cached is None and live is not None
+            and not live["complete"].is_set() and not known_silent(key)
+            and (_estimate_len_ctx.get() is None
+                 or (live.get("exact") and live["expected_size"] > 0))):
+        done = await _cached_rendered_transcode(track_id, xf, key)
+        if done is not None:
+            return await _serve_rendered_transcode_hit(
+                request, done, xf, {"X-Rendered": rendered}, background)
+        feed = await _live_feed_of(live)
+        if feed is not None:
+            attach = (lambda: _live_attach_task(track_id, format_type, subsong,
+                                                render_fn, cache_kw))
+            _live_finish_later(task, after_render, attach)
+            rendered_task = task if task is not None else asyncio.ensure_future(attach())
+            if task is None:
+                rendered_task.add_done_callback(lambda f: f.cancelled() or f.exception())
+            exact_s = ((live["expected_size"] - _WAV_HEADER_LEN)
+                       / live.get("bytes_per_sec", _UADE_BYTES_PER_SEC)
+                       if live.get("exact") and live["expected_size"] > 0 else None)
+            return await _transcode_growing_render(
+                request, track_id=track_id, feed=feed, xf=xf, source_key=key,
+                rendered=lambda: asyncio.shield(rendered_task),
+                headers={"X-Rendered": rendered, "X-Cache": "miss-progressive"},
+                background=background, src_seconds=exact_s)
+
     if task is None:
-        task = _start()
+        task = _live_attach_task(track_id, format_type, subsong, render_fn, cache_kw)
     cached_path, hit = await task
-    # uade formats are render-only: the scan stored duration 0 — uade123
-    # renders to the tune's natural end, so persist the WAV's real length
-    # (default tune only; the render is the authority, so a stale stored
-    # value is corrected too).
-    await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
-                                      subsong=subsong, authoritative=True)
+    if after_render is not None:
+        await after_render(cached_path)
     return await _serve_rendered(
         request, cached_path,
-        headers={"X-Rendered": "uade123", "X-Cache": "hit" if hit else "miss"},
+        headers={"X-Rendered": rendered, "X-Cache": "hit" if hit else "miss"},
         background=background, xf=xf, track_id=track_id, source_key=key,
     )
+
+
+async def _live_feed_of(live: dict):
+    """The growing file of the live render ``live`` as an async iterator of a
+    whole WAV, once it is audible — or None (``_live_open_audible``).  Ends
+    with the render; raises ``_RenderAborted`` when the render fails
+    part-way.  Its header is the file's own only when the length is EXACT;
+    otherwise a "read to the end" one: a consumer (ffmpeg) honours a header's
+    length, and a stored length that turned out wrong must never cut an
+    encode short of the render (or leave it padded)."""
+    handle = await _live_open_audible(live)
+    if handle is None:
+        return None
+    if live.get("exact") and live["expected_size"] > 0:
+        resp = await _chunked_growing_file_response(
+            None, live["path"], live["expected_size"], live["complete"],
+            media_type="audio/wav", data_event=live["data"], inflight=live, fd=handle)
+    else:
+        resp = await _chunked_growing_file_response(
+            None, live["path"], 0, live["complete"], media_type="audio/wav",
+            data_event=live["data"], inflight=live, fd=handle,
+            head=_streaming_wav_header(live.get("rate", _UADE_RATE),
+                                       live.get("channels", _UADE_CH), 16),
+            data_start=_WAV_HEADER_LEN)
+    return resp.body_iterator
+
+
+def _live_attach_task(track_id: str, format_type: str, subsong: int, render_fn,
+                      cache_kw: "dict | None"):
+    """A ``get_or_render`` call for a live-capable render: a cache hit, an
+    attach to the render in progress, or (nothing running) a new render."""
+    from soniqboom.core.conversion_cache import get_or_render
+    return get_or_render(track_id=track_id, format_type=format_type,
+                         subsong=subsong, render_fn=render_fn, **(cache_kw or {}))
 
 
 async def _await_uade_live(key: str, task: "asyncio.Future",
                            timeout: float = 2.0) -> "dict | None":
     """The live entry of the render ``task`` is starting for ``key`` — woken
-    the moment ``_render_uade`` registers it (or the task ends, e.g. it
-    attached to another render), at most ``timeout`` s."""
+    the moment the render registers it (``_LiveWav``; or the task ends, e.g.
+    it attached to another render), at most ``timeout`` s."""
     live = _UADE_LIVE.get(key)
     if (live is not None and not live["complete"].is_set()) or task.done():
         return live
@@ -3750,24 +5382,59 @@ async def _await_uade_live(key: str, task: "asyncio.Future",
     return _UADE_LIVE.get(key)
 
 
-def _uade_finish_later(task, key, track_id, track, path, subsong, base=0) -> None:
-    """After a progressive start: once the render is cached, persist its real
-    length (the response is already streaming)."""
+def _live_finish_later(task, after_render, attach) -> None:
+    """After a progressive start: once the render is cached, run
+    ``after_render`` on it (the response is already streaming).  ``attach()``
+    gives the render's result when this request didn't start it."""
+    if after_render is None:
+        return
 
     async def _after():
         try:
-            from soniqboom.core.conversion_cache import get_or_render
-            t = task if task is not None else get_or_render(
-                track_id=track_id, format_type="uade", subsong=subsong,
-                render_fn=lambda: _render_uade(path, subsong=subsong, live_key=key,
-                                               subsong_base=base),
-                variant=uade_cache_variant(subsong, base))
-            cached_path, _ = await t
-            await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
-                                              subsong=subsong, authoritative=True)
+            cached_path, _ = await (task if task is not None else attach())
+            await after_render(cached_path)
         except Exception:
-            log.debug("uade post-render bookkeeping failed for %s", track_id, exc_info=True)
+            log.debug("post-render bookkeeping failed", exc_info=True)
     _bg_keep(asyncio.ensure_future(_after()))
+
+
+async def live_wav_feed(track_id: str, *, format_type: str, subsong: int, key: str,
+                        render_fn, cache_kw: "dict | None" = None):
+    """For an in-process consumer that reads a rendered WAV from its first byte
+    (the cast pipeline's ffmpeg): an async iterator over the growing file of
+    the live render of ``key`` — attached to, or started with ``render_fn``
+    (as ``_serve_live`` does) — once it is audible; it ends with the render
+    and raises (``_RenderAborted``) when the render fails part-way.  None
+    when there is nothing live to read: already cached, a tune that just
+    rendered silent, or a render that ended (or failed) before it was
+    audible — the caller then takes the cached file or the render's error
+    through ``get_or_render``, which attaches to the same render."""
+    from soniqboom.core.conversion_cache import known_silent
+    if known_silent(key):
+        return None
+    task, cached, live = await _live_attach(
+        track_id=track_id, format_type=format_type, subsong=subsong, key=key,
+        render_fn=render_fn, cache_kw=cache_kw)
+    if cached is not None or live is None or live["complete"].is_set():
+        return None
+    return await _live_feed_of(live)
+
+
+async def sid_wav_feed(sid_path: Path, subsong: int, duration: int, full_key: str):
+    """``live_wav_feed`` for a C64 SID: the progressive render's whole WAV
+    (``_serve_sid_progressive`` as a non-web caller — the same render pool,
+    caching and attach-to-a-running-render as a progressive play) as an async
+    iterator, once the render is audible; it raises (``_RenderAborted``) when
+    the render dies or stalls part-way.  None when it can't start (pool full,
+    the render failed at once, or it ended before this caller could read it
+    live): the caller renders blocking, which surfaces the error or finds the
+    cached file.  A tune that plays only silence raises the cache's 422."""
+    from soniqboom.core.conversion_cache import known_silent
+    if known_silent(full_key):
+        return None
+    resp = await _serve_sid_progressive(None, sid_path, subsong, duration, full_key,
+                                        base_headers={}, background=None, web=False)
+    return resp.body_iterator if resp is not None else None
 
 
 # The Paula dump grows at ~2.5 MB per tune-second (measured).  The VU pass
@@ -4153,6 +5820,18 @@ _PSF_STREAM_EXTS = {
 }
 
 
+def _psf_has_magic(path: Path) -> bool:
+    """Content sniff for the ``.psf`` extension collision: a PSF rip starts
+    with 'PSF' + its version byte; Amiga SoundFactory modules (Modland's
+    ``SoundFactory/*.psf``) don't — uade plays those.  An unreadable file
+    counts as PSF (the PSF path then reports it)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(3) == b"PSF"
+    except OSError:
+        return True
+
+
 def _dsf_is_dreamcast(path: Path) -> bool:
     """Content sniff for the ``.dsf`` extension collision: 'PSF\\x12' =
     Sega Dreamcast rip (sequenced); 'DSD ' = Sony DSD audio stream."""
@@ -4184,11 +5863,10 @@ def _psf_lib_present(folder: Path, name: str) -> bool:
     return False
 
 
-def _psf_missing_libs(path: Path) -> list[str]:
-    """The libraries a PSF-family rip names in its ``[TAG]`` block
-    (``_lib=driver.psflib``, ``_lib2=…``) that aren't there
-    (``_psf_lib_present``); empty when none is missing or the file can't be
-    read.  Reads only the header and the tag block."""
+def _psf_tag_lines(path: Path) -> list[str]:
+    """The lines of a PSF-family rip's ``[TAG]`` block; empty when it has
+    none or the file can't be read.  Reads only the header and the tag
+    block."""
     try:
         with open(path, "rb") as fh:
             head = fh.read(16)
@@ -4202,15 +5880,40 @@ def _psf_missing_libs(path: Path) -> list[str]:
     if tag[:5] != b"[TAG]":
         return []
     from soniqboom.core.metadata import _psf_tag_text
+    return _psf_tag_text(tag[5:]).splitlines()
+
+
+def _psf_missing_libs(path: Path) -> list[str]:
+    """The libraries a PSF-family rip names in its ``[TAG]`` block
+    (``_lib=driver.psflib``, ``_lib2=…``) that aren't there
+    (``_psf_lib_present``); empty when none is missing or the file can't be
+    read.  Reads only the header and the tag block."""
     libs: list[str] = []
-    for line in _psf_tag_text(tag[5:]).splitlines():
+    for line in _psf_tag_lines(path):
         key, sep, val = line.partition("=")
         if sep and _PSF_LIB_TAG_RE.match(key.strip()) and val.strip():
             libs.append(val.strip())
     return [n for n in libs if not _psf_lib_present(path.parent, n)]
 
 
-async def _render_psf(path: Path, subsong: int = 0) -> Path:
+def _psf_render_seconds(path: Path) -> float:
+    """How long zxtune renders a PSF-family rip: its ``length`` tag — the
+    installed zxtune stops there and plays no ``fade`` (measured on PSF,
+    PSF2, USF, GSF, 2SF, NCSF and SSF rips), while the scan stores length +
+    fade as the duration; 0 when untagged, or tagged with something that is
+    no length (not finite, over an hour).  Blocking (header + tag block)."""
+    from soniqboom.core.metadata import _psf_parse_length
+    for line in _psf_tag_lines(path):
+        key, sep, val = line.partition("=")
+        if sep and key.strip().lower() == "length":
+            secs = _psf_parse_length(val)
+            return secs if math.isfinite(secs) and 0 < secs <= _UADE_MAX_EXPECTED_S else 0.0
+    return 0.0
+
+
+async def _render_psf(path: Path, subsong: int = 0, *,
+                      live_key: str | None = None,
+                      expected_seconds: float = 0.0) -> Path:
     """Render a PSF-family file to WAV via zxtune123.
 
     PSF rips are one-track-per-file (minipsf per song, shared *lib beside
@@ -4218,6 +5921,11 @@ async def _render_psf(path: Path, subsong: int = 0) -> Path:
     honours the embedded length/fade tags for the stop point.  A library the
     rip names (``_lib=…``) that isn't beside it is a 422 naming it
     (``_psf_missing_libs``) — zxtune would render nothing, exit 0.
+
+    ``live_key``: a live render (``_LiveWav``) played while zxtune writes it
+    — the console emulators are slow for some systems (a 3-minute Dreamcast
+    rip takes ~9 s, a GBA one ~2 s).  ``expected_seconds``: the length it
+    will render, when tagged (``_psf_render_seconds``).
     """
     binary = _find_renderer(settings.zxtune123_path, "zxtune123")
     if not binary:
@@ -4243,6 +5951,10 @@ async def _render_psf(path: Path, subsong: int = 0) -> Path:
     Path(tmp_wav.name).unlink(missing_ok=True)
     # File-based WAV backend: ``--wav filename=<out>``.  No display needed.
     cmd = [binary, "--silent", "--wav", f"filename={tmp_wav.name}", str(path)]
+    if live_key:
+        return await _tail_render(
+            cmd, Path(tmp_wav.name), live_key, kind="PSF", timeout=600,
+            expected_seconds=expected_seconds)
     await _await_renderer(
         cmd, Path(tmp_wav.name), timeout=600, kind="PSF")
     return Path(tmp_wav.name)
@@ -4413,7 +6125,8 @@ def _sndh_info(path: Path) -> tuple[int, dict[int, int], int]:
 
 
 async def _render_sndh(path: Path, subsong: int = 0, *,
-                       track_id: str | None = None) -> Path:
+                       track_id: str | None = None,
+                       live_key: str | None = None) -> Path:
     """Render an Atari ST SNDH file via psgplay (stereo 16-bit 44.1 kHz).
 
     Subsong semantics mirror SID: the param is the wire index and the
@@ -4424,6 +6137,11 @@ async def _render_sndh(path: Path, subsong: int = 0, *,
     ``--length`` is ALWAYS passed: the tag's duration when present, else
     the Atari default cap.  ``track_id`` (optional) gets the start song
     written back to its record (``_persist_start_song``).
+
+    ``live_key``: a live render (``_LiveWav``) played while psgplay writes
+    it (a 3-minute tune takes ~1.3 s).  psgplay renders exactly the
+    ``--length`` it is given, so the length is EXACT from byte 0 and every
+    client may stream it.
     """
     binary = _find_renderer(settings.psgplay_path, "psgplay")
     if not binary:
@@ -4447,6 +6165,10 @@ async def _render_sndh(path: Path, subsong: int = 0, *,
     tmp_wav.close()
     cmd = [binary, "-t", str(track), "-f", "44100",
            f"--length={length}", "-o", tmp_wav.name, str(path)]
+    if live_key:
+        return await _tail_render(
+            cmd, Path(tmp_wav.name), live_key, kind="SNDH",
+            timeout=max(60, length + 60), expected_seconds=length, exact=True)
     await _await_renderer(
         cmd, Path(tmp_wav.name), timeout=max(60, length + 60), kind="SNDH")
     return Path(tmp_wav.name)
@@ -5456,6 +7178,22 @@ async def _extract_uade_with_companions(
             except Exception:
                 log.exception("UADE companion-extract eviction failed")
         return music
+
+
+def _archive_companion_filter(member_chain: str):
+    """``companion(basename_lower) -> bool`` for an archive member: the
+    sibling files its renderer needs beside it (uade companion halves,
+    AdLib / PSF banks) — what a ranged subset of a remote archive must carry
+    (``core.remote_zip``).  None when the member needs none of these."""
+    import fnmatch
+    base = member_chain.split("::")[-1].replace("\\", "/").rsplit("/", 1)[-1]
+    real = _uade_member_real_name(base)
+    wanted = ({s.lower() for s in _uade_formats.companion_sibling_names(real)}
+              if real else set())
+    globs = tuple(g.lower() for g in _ADLIB_COMPANION_GLOBS.get(Path(base).suffix.lower(), ()))
+    if not wanted and not globs:
+        return None
+    return lambda b: b in wanted or any(fnmatch.fnmatch(b, g) for g in globs)
 
 
 async def _get_or_extract_zip_member(path_str: str, track_id: str, bank_fallback=None) -> Path | None:
@@ -6759,27 +8497,54 @@ async def _growing_file_range_response(
 
     ``fd``: an already open descriptor for ``file_path`` (see ``_FdHandle``)
     the response takes ownership of; otherwise the path is opened lazily.
+
+    A single ``Range`` is answered as ``_parse_audio_range`` reads it against
+    the final size — a suffix range (``bytes=-N``) is the last N bytes, a
+    start past the end is a 416.  A live render (``no_pad_on_failure``) is
+    never padded with more than a second of silence: a body more than that
+    short of its length ends short instead (its promised length was wrong,
+    or the render stopped).
     """
     extra = _accel_off(dict(headers or {}))
     extra["Accept-Ranges"] = "bytes"
 
-    # Parse the Range header (single-range only — same convention as
-    # ``_range_file_response``).
-    range_hdr = request.headers.get("range")
-    if range_hdr and range_hdr.strip().startswith("bytes="):
-        spec = range_hdr.strip()[6:]
-        parts = spec.split("-", 1)
-        try:
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if len(parts) > 1 and parts[1] else expected_size - 1
-        except ValueError:
-            start, end = 0, expected_size - 1
-        start = max(0, min(start, expected_size - 1))
-        end = max(start, min(end, expected_size - 1))
+    async def _drop_subscriber():
+        # Symmetric with whoever counted this response as a subscriber.
+        if inflight is not None:
+            try:
+                async with _INFLIGHT_LOCK:
+                    cur = inflight.get("subscribers", 0)
+                    if cur > 0:
+                        inflight["subscribers"] = cur - 1
+            except Exception:
+                pass
+
+    bg = None
+    if unpin_key is not None:
+        from soniqboom.core.conversion_cache import unpin as _unpin
+
+        def _do_unpin():
+            try:
+                _unpin(unpin_key)
+            except Exception:
+                pass
+        bg = BackgroundTask(_do_unpin)
+
+    rng = _parse_audio_range(request.headers.get("range") if request is not None else None,
+                             expected_size)
+    if rng is None:
+        extra["Content-Range"] = f"bytes */{expected_size}"
+        return Response(
+            status_code=416, media_type=media_type, headers=extra,
+            background=_compose_backgrounds(
+                bg, BackgroundTask(fd.close) if fd is not None else None,
+                BackgroundTask(_drop_subscriber), background_task))
+    start, end_excl, is_range = rng
+    end = end_excl - 1
+    if is_range:
         status_code = 206
         extra["Content-Range"] = f"bytes {start}-{end}/{expected_size}"
     else:
-        start, end = 0, expected_size - 1
         status_code = 200
     length = end - start + 1
     extra["Content-Length"] = str(length)
@@ -6792,6 +8557,15 @@ async def _growing_file_range_response(
     _SILENT_CHUNK = b"\x00" * 65536
 
     async def _yield_silent_padding(pos: int, end: int):
+        if inflight is not None and inflight.get("never_pad"):
+            return      # compressed audio (a remote file): end short, never zeros
+        if (inflight is not None and inflight.get("no_pad_on_failure")
+                and end - pos + 1 > inflight.get("bytes_per_sec", _UADE_BYTES_PER_SEC)):
+            # A live render more than a second short of what was promised:
+            # end short (see the docstring), never seconds of silence.
+            log.info("growing file: render ended %d bytes short of its promised "
+                     "length — ending the body short", end - pos + 1)
+            return
         remaining = end - pos + 1
         while remaining > 0:
             sz = min(len(_SILENT_CHUNK), remaining)
@@ -6900,27 +8674,12 @@ async def _growing_file_range_response(
             # was set at response start so its value stays informational,
             # but the internal counter now stays accurate across the
             # full subscriber lifecycle.
-            if inflight is not None:
-                try:
-                    async with _INFLIGHT_LOCK:
-                        cur = inflight.get("subscribers", 0)
-                        if cur > 0:
-                            inflight["subscribers"] = cur - 1
-                except Exception:
-                    pass
+            await _drop_subscriber()
 
-    # Compose unpin into a BackgroundTask so the cache entry's refcount
-    # drops as soon as the client closes the response — without this every
-    # play would permanently anchor its cache entry and LRU eviction would
-    # silently stop working (R2/R3 finding).
-    bg = None
-    if unpin_key is not None:
-        from soniqboom.core.conversion_cache import unpin as _unpin
-        def _do_unpin():
-            try: _unpin(unpin_key)
-            except Exception: pass
-        bg = BackgroundTask(_do_unpin)
-
+    # The unpin (``bg``, above) runs as a BackgroundTask so the cache entry's
+    # refcount drops as soon as the client closes the response — without this
+    # every play would permanently anchor its cache entry and LRU eviction
+    # would silently stop working (R2/R3 finding).
     return _CleanupStreamingResponse(
         _yield_growing_range(),
         status_code=status_code,
@@ -7295,7 +9054,7 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
                             target_rate: int | None = None, *,
                             codec: str | None = None,
                             bitrate_kbps: int | None = None,
-                            copy: bool = False):
+                            copy: bool = False, src_feed=None):
     """Yield chunks from a live ffmpeg transcode of ``path``.
 
     seek_sec > 0 uses a fast pre-input seek (-ss before -i) so a client can
@@ -7306,19 +9065,29 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
     the cached transcode (shared ``_ffmpeg_encode_args``; the codec defaults
     to ``settings.transcode_format``).  ``copy`` remuxes an input that is
     already in the target codec (a cached transcode) instead of re-encoding.
+
+    ``src_feed``: the input is a rendered WAV still rendering, as an async
+    iterator of its bytes from byte 0 (``sid_wav_feed`` / the growing file
+    of a live render), written to ffmpeg's stdin as it arrives (``path``
+    only names it; no seek).  A feed that fails part-way aborts the body
+    (``_RenderAborted``) after ffmpeg's last bytes, so the client sees an
+    error, not a short track.
     """
     fmt = (codec or settings.transcode_format).lower()
     if fmt not in TRANSCODE_MIME:
         fmt = settings.transcode_format
     cmd = [settings.ffmpeg_path or "ffmpeg", "-hide_banner", "-loglevel", "error",
            "-nostdin"]
-    if seek_sec > 0:
-        # Place -ss before -i for a fast input seek
-        cmd += ["-ss", f"{seek_sec:.3f}"]
-    cmd += [
-        "-i", str(path),
-        "-vn",           # drop video/cover art
-    ]
+    if src_feed is not None:
+        cmd += ["-f", "wav", "-i", "pipe:0", "-vn"]
+    else:
+        if seek_sec > 0:
+            # Place -ss before -i for a fast input seek
+            cmd += ["-ss", f"{seek_sec:.3f}"]
+        cmd += [
+            "-i", str(path),
+            "-vn",           # drop video/cover art
+        ]
     if copy:
         cmd += ["-c:a", "copy"]
     else:
@@ -7328,9 +9097,36 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
     cmd += ["-f", fmt, "pipe:1"]
     proc = await forksafe.spawn(
         *cmd,
+        **({"stdin": asyncio.subprocess.PIPE} if src_feed is not None else {}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    feed_failed = False
+
+    async def _feed_stdin():
+        nonlocal feed_failed
+        try:
+            async for piece in src_feed:
+                proc.stdin.write(piece)
+                await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                      # ffmpeg is gone
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            feed_failed = True
+            log.warning("live transcode: the render of %s failed part-way", Path(path).name)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                await src_feed.aclose()
+            except Exception:
+                pass
+
+    feeder = asyncio.ensure_future(_feed_stdin()) if src_feed is not None else None
     # Per-read timeout — if ffmpeg blocks on a pathological input we don't
     # want the response generator to park indefinitely with the client still
     # holding the connection (the renderer-helper got this fix already; the
@@ -7357,7 +9153,21 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
             if not chunk:
                 break
             yield chunk
+        if feeder is not None:
+            # ffmpeg's output ended (or went idle): the feeder ends with it —
+            # bounded, a source still waiting on a stuck render is cancelled.
+            try:
+                await asyncio.wait_for(asyncio.shield(feeder), timeout=10)
+            except asyncio.TimeoutError:
+                feeder.cancel()
+                feed_failed = True
+            if feed_failed:
+                raise _RenderAborted(f"the render of {Path(path).name} failed part-way")
     finally:
+        if feeder is not None and not feeder.done():
+            feeder.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(feeder, timeout=2.0)
         try:
             proc.kill()
         except ProcessLookupError:
@@ -7371,7 +9181,7 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
 @router.get("/{track_id}/render-status")
 async def render_status(
     track_id: str,
-    subsong: int = Query(default=0, ge=0),
+    subsong: int | None = Query(default=None, ge=0),
     sb_session: str | None = Cookie(default=None),
     u: str | None = Query(default=None),
     p: str | None = Query(default=None),
@@ -7391,10 +9201,10 @@ async def render_status(
     working, never to treat a started prewarm as playable audio, and to report
     a failed render's reason without requesting the stream again.
 
-    Amiga (uade) renders also carry ``provisional`` — true while a render of
-    unknown length is streaming under a "read to the end" header — and, once
-    the render is cached, ``duration_seconds``: the exact length of that
-    subsong's render.
+    Live renders (Amiga / uade, MIDI, AdLib, SNDH, PSF, libgme chiptunes)
+    also carry ``provisional`` — true while a render of unknown length is
+    streaming under a "read to the end" header — and, once the render is
+    cached, ``duration_seconds``: the exact length of that subsong's render.
 
     The SID fields (per-track target duration honouring HVSC Songlengths,
     what's cached, whether the full-duration version is ready) are unchanged.
@@ -7403,12 +9213,15 @@ async def render_status(
     await _require_stream_auth(request, sb_session, u, p, s, t)
     from soniqboom.core.conversion_cache import (
         is_cache_ready, _cache_key, find_shorter_sid_entry, sid_warm_eligible,
+        key_matches,
     )
     # The same per-tune length (and so the same cache key) as the SID stream
     # branch, so the UI never reads a stale global default while playback
     # honours HVSC.  O(1): the start song as already known (never a file read
     # on a status poll).
     track = await get_track(track_id)
+    wire = explicit_wire(subsong, request)
+    subsong = wire or 0                 # SID: the wire (wire 0 = its default)
     target_dur = (_sid_target_seconds(track, subsong) if track is not None
                   else max(5, min(int(settings.sid_default_duration), 3600)))
 
@@ -7424,7 +9237,14 @@ async def render_status(
             cached_dur = shorter[1]
             partial = True
 
-    state = _render_state(track_id, subsong)
+    # The renders are keyed by tune index (SID / SNDH: the wire itself); a
+    # bare play renders the default tune — while its probe runs, that is
+    # "rendering" whatever tune 1's state is.
+    idx = tune_index(track_id, track, wire) if track is not None else subsong
+    if wire is None and default_probe_running(track_id):
+        state = "rendering"
+    else:
+        state = _render_state(track_id, idx, wire=wire)
     out = {
         "state": state,
         "ready": full_ready,
@@ -7436,24 +9256,36 @@ async def render_status(
     }
     if state == "failed":
         from soniqboom.core.conversion_cache import recent_failure
-        fail = recent_failure(track_id, subsong)
+        fail = recent_failure(track_id, idx)
         if fail is not None:
             out["error"] = fail["detail"]
             out["error_status"] = fail["status"]
-    # uade: per-subsong key, so tune N never reports tune 0's length.  O(1).
-    uade_key = uade_cache_key_known(track_id, subsong, track)
-    live = _UADE_LIVE.get(uade_key)
-    out["provisional"] = bool(live is not None and not live["complete"].is_set()
-                              and live["expected_size"] <= 0)
+    # Live renders (uade and the others) are keyed per subsong, so tune N
+    # never reports tune 0's length.  A scan of a tiny map, O(1) lookups.
+    out["provisional"] = any(
+        not lv["complete"].is_set() and lv["expected_size"] <= 0
+        for k, lv in list(_UADE_LIVE.items()) if key_matches(k, track_id, idx))
     if state == "complete":
+        uade_key = uade_cache_key_known(track_id, idx, track)
         size = _peek_cached_size(uade_key)
+        bps = _UADE_BYTES_PER_SEC
+        if not size:
+            # Another live render's finished file (newest first).
+            for k in reversed(list(_LIVE_FINISHED)):
+                if key_matches(k, track_id, idx):
+                    size, bps = _peek_cached_size(k), _LIVE_FINISHED.get(k) or bps
+                    if size:
+                        break
         if size and size > _WAV_HEADER_LEN:
-            out["duration_seconds"] = (size - _WAV_HEADER_LEN) / _UADE_BYTES_PER_SEC
+            out["duration_seconds"] = (size - _WAV_HEADER_LEN) / bps
     return out
 
 
-def _render_state(track_id: str, subsong: int = 0) -> str:
+def _render_state(track_id: str, subsong: int = 0, *, wire: "int | None" = -1) -> str:
     """The ``state`` of /render-status for one track + subsong (see there).
+    ``subsong`` is the tune index renders are keyed by (``tune_index``);
+    ``wire`` what the request named — None for a bare play — which queued
+    prewarms are keyed by (``_prewarm_key``; default: ``subsong``).
 
     Covers every render kind: live uade pipes, progressive SID streams, the
     adaptive in-flight WAV transcodes (DSD / ALAC / AIFF …), conversion-cache
@@ -7464,8 +9296,10 @@ def _render_state(track_id: str, subsong: int = 0) -> str:
     from soniqboom.core.conversion_cache import render_state, key_matches
     for k, live in list(_UADE_LIVE.items()):
         if key_matches(k, track_id, subsong) and not live["complete"].is_set():
-            # Both known- and unknown-length renders stream to the web UI.
-            playable = live["bytes"] >= _UADE_BYTES_PER_SEC
+            # Both known- and unknown-length renders stream to the web UI —
+            # once a second of audio is in and it is audible.
+            playable = (live.get("audible")
+                        and live["bytes"] >= live.get("bytes_per_sec", _UADE_BYTES_PER_SEC))
             return "ready_for_playback" if playable else "rendering"
     # Adaptive in-flight WAV transcode: once set up, the growing file already
     # plays.  Checked before the cache: a ``transcoded`` entry cached at
@@ -7485,9 +9319,10 @@ def _render_state(track_id: str, subsong: int = 0) -> str:
     state = render_state(track_id, subsong)
     if state != "idle":
         return state
+    want = _prewarm_sub(subsong if wire == -1 else wire)
     for k, task in list(_prewarm_tasks.items()):
         tid, _, rest = k.partition("::")
-        if tid == track_id and rest.rpartition("::")[2] == str(subsong) and not task.done():
+        if tid == track_id and rest.rpartition("::")[2] == want and not task.done():
             return "queued"
     from soniqboom.core.conversion_cache import recent_failure
     if recent_failure(track_id, subsong) is not None:
@@ -7560,11 +9395,15 @@ _PREWARM_CAP = 12
 _active_stream_keys: set[str] = set()
 
 
-def _prewarm_key(track_id: str, fmt: str, subsong: int = 0) -> str:
-    return f"{track_id}::{fmt}::{subsong}"
+def _prewarm_sub(subsong: "int | None") -> str:
+    """A prewarm key's tune part: the wire, or ``d`` for a bare play."""
+    return "d" if subsong is None else str(int(subsong))
 
 
-_REMOTE_SCHEMES = ("smb://", "ftp://")
+def _prewarm_key(track_id: str, fmt: str, subsong: "int | None" = None) -> str:
+    return f"{track_id}::{fmt}::{_prewarm_sub(subsong)}"
+
+
 # One prewarm download at a time per remote share (see ``_do_prewarm``).
 _REMOTE_PREWARM_GATES: dict[str, asyncio.Semaphore] = {}
 
@@ -7572,7 +9411,7 @@ _REMOTE_PREWARM_GATES: dict[str, asyncio.Semaphore] = {}
 def _remote_share_and_rel(path_str: str) -> "tuple[str, str] | None":
     """``(share, path of the file to fetch)`` for a remote track — the OUTER
     archive for a ``::member`` path — or None for a local one."""
-    if not path_str.startswith(_REMOTE_SCHEMES):
+    if not is_remote_path(path_str):
         return None
     from soniqboom.core.filesource import parse_remote_path
     scan_root, remote_path = parse_remote_path(path_str)
@@ -7593,13 +9432,19 @@ def _remote_prewarm_gate(path_str: str) -> "asyncio.Semaphore | None":
 
 def _remote_bytes_local(path_str: str) -> bool:
     """A remote track whose file (or outer archive) is already in the local
-    remote cache — a prewarm then fetches nothing over the network."""
+    remote cache — or, for a member of a remote ZIP, the subset a play of it
+    left there (``core.remote_zip``) — a prewarm then fetches nothing over
+    the network."""
     sr = _remote_share_and_rel(path_str)
     if sr is None:
         return True
     try:
         from soniqboom.core.remote_cache import get_cache
-        return get_cache().get_cached(*sr) is not None
+        if get_cache().get_cached(*sr) is not None:
+            return True
+        from soniqboom.core.filesource import parse_remote_path
+        member = parse_remote_path(path_str)[1].partition("::")[2]
+        return bool(member) and _remote_zip.cached_subset(sr[0], sr[1], member) is not None
     except Exception:
         return False
 
@@ -7635,7 +9480,7 @@ async def _resolve_for_prewarm(track_id: str, track) -> tuple[Path, str, bool, s
 
 
 async def _do_prewarm(
-    track_id: str, track, subsong: int, priority: int = PRIO_AHEAD,
+    track_id: str, track, subsong: "int | None", priority: int = PRIO_AHEAD,
 ) -> None:
     """Background-render one track under the low-priority prewarm gate.
 
@@ -7679,15 +9524,26 @@ async def _do_prewarm(
 
 
 async def _do_prewarm_render(
-    track_id: str, file_path: Path, ext: str, subsong: int,
+    track_id: str, file_path: Path, ext: str, subsong: "int | None",
     *, uade_named: bool = False, track=None,
 ) -> None:
     """Run the format-appropriate cached render for one track in the
     background.  Mirrors the routing in ``stream_track`` so the cache key
-    matches exactly what playback will request later."""
+    matches exactly what playback will request later — the tune asked for
+    (``subsong``), or None for the file's default tune, after the same
+    default-tune probe (which a prewarm usually runs first, in the
+    background)."""
     from soniqboom.core.conversion_cache import get_or_render
     try:
-        if ext in _SID_EXTS and _is_c64_sid(file_path):
+        c64 = ext in _SID_EXTS and _is_c64_sid(file_path)
+        if (ext == ".psf" and not uade_named
+                and not await asyncio.to_thread(_psf_has_magic, file_path)):
+            uade_named = True              # Amiga SoundFactory, as in stream_track
+        if subsong is None:              # the file's default tune (probed once)
+            track = await _bare_play_track(
+                track_id, track, file_path, _probe_family(ext, uade_named, file_path, c64=c64))
+        subsong = tune_index(track_id, track, subsong)
+        if c64:
             # Honour HVSC per-tune duration so the prewarm caches under the
             # same key the streaming path uses.
             track = await get_track(track_id)
@@ -7708,31 +9564,39 @@ async def _do_prewarm_render(
                                                       target_dur),
             )
         elif ext in _MIDI_EXTS:
+            # Live renders from here on (MIDI, PSF, SNDH, AdLib, libgme, uade):
+            # a click while one is still running attaches and plays the
+            # growing file.
             from soniqboom.config import get_active_soundfont
             sf = get_active_soundfont()
+            _key = _ck(track_id, "midi", 0, str(sf) if sf else "")
             await get_or_render(
                 track_id=track_id, format_type="midi", subsong=0,
                 soundfont_path=str(sf) if sf else "",
-                render_fn=lambda: _render_midi(file_path),
+                render_fn=lambda: _render_midi(file_path, live_key=_key),
             )
         elif ext in _HVL_EXTS:
             await get_or_render(
                 track_id=track_id, format_type="hvl", subsong=subsong,
                 render_fn=lambda: _render_hvl(file_path, subsong=subsong),
             )
-        elif ext in _PSF_STREAM_EXTS or (
+        elif (ext in _PSF_STREAM_EXTS and not uade_named) or (
                 ext == ".dsf" and _dsf_is_dreamcast(file_path)):
             if not _prewarm_enabled():
                 return      # a Dreamcast rip is a render ("Prepare upcoming" off)
+            _key = _ck(track_id, "psf", subsong=0)
+            _exp = await asyncio.to_thread(_psf_render_seconds, file_path)
             await get_or_render(
                 track_id=track_id, format_type="psf", subsong=0,
-                render_fn=lambda: _render_psf(file_path),
+                render_fn=lambda: _render_psf(file_path, live_key=_key,
+                                              expected_seconds=_exp),
             )
         elif ext in _SNDH_EXTS:
+            _key = _ck(track_id, "sndh", subsong=subsong)
             await get_or_render(
                 track_id=track_id, format_type="sndh", subsong=subsong,
                 render_fn=lambda: _render_sndh(file_path, subsong=subsong,
-                                               track_id=track_id),
+                                               track_id=track_id, live_key=_key),
             )
         elif ext in _YM_EXTS:
             await get_or_render(
@@ -7756,7 +9620,8 @@ async def _do_prewarm_render(
             # attaches and starts playing from the growing file.
             _base = await _uade_resolve_base(track_id, track, file_path, subsong)
             _ukey = uade_cache_key(track_id, subsong, _base)
-            _exp = _uade_expected_seconds(track, subsong) if track is not None else 0.0
+            _exp = (_uade_expected_seconds(track, subsong, track_id)
+                    if track is not None else 0.0)
             await get_or_render(
                 track_id=track_id, format_type="uade", subsong=subsong,
                 render_fn=lambda: _render_uade(file_path, subsong=subsong,
@@ -7764,15 +9629,16 @@ async def _do_prewarm_render(
                                                subsong_base=_base),
                 variant=uade_cache_variant(subsong, _base),
             )
-        elif ext == ".imf":
+        elif ext == ".imf" or ext in _ADLIB_EXTS:
+            _fmt = "imf" if ext == ".imf" else "adlib"
+            _key = _ck(track_id, _fmt, subsong=subsong)
+            _exp = _stored_render_seconds(track, subsong, track_id,
+                                          placeholder=_ADLIB_PLACEHOLDER_S)
+            _rfn = _render_imf if ext == ".imf" else _render_adlib
             await get_or_render(
-                track_id=track_id, format_type="imf", subsong=subsong,
-                render_fn=lambda: _render_imf(file_path, subsong=subsong),
-            )
-        elif ext in _ADLIB_EXTS:
-            await get_or_render(
-                track_id=track_id, format_type="adlib", subsong=subsong,
-                render_fn=lambda: _render_adlib(file_path, subsong=subsong),
+                track_id=track_id, format_type=_fmt, subsong=subsong,
+                render_fn=lambda: _rfn(file_path, subsong=subsong, live_key=_key,
+                                       expected_seconds=_exp),
             )
         elif ext in _TRACKER_EXTS:
             await get_or_render(
@@ -7780,9 +9646,13 @@ async def _do_prewarm_render(
                 render_fn=lambda: _render_tracker(file_path, subsong=subsong),
             )
         elif ext in _GME_EXTS_STREAM:
+            _key = _ck(track_id, "gme", subsong=subsong)
+            _exp = (0.0 if ext == ".gym" else _stored_render_seconds(
+                track, subsong, track_id, placeholder=float(settings.sid_default_duration)))
             await get_or_render(
                 track_id=track_id, format_type="gme", subsong=subsong,
-                render_fn=lambda: _render_gme(file_path, subsong=subsong),
+                render_fn=lambda: _render_gme(file_path, subsong=subsong, live_key=_key,
+                                              expected_seconds=_exp),
             )
         elif ext in _DSD_EXTS:
             # Same in-flight WAV path the foreground stream uses — the
@@ -7873,7 +9743,7 @@ def _prewarm_allowed(ext: str, uade_named: bool = False) -> bool:
 @router.post("/{track_id}/prewarm")
 async def prewarm(
     track_id: str,
-    subsong: int = Query(default=0, ge=0),
+    subsong: int | None = Query(default=None, ge=0),
     priority: str = Query(default="ahead", pattern="^(next|ahead)$"),
     file_path: str | None = Query(default=None, alias="path"),
     pw: str | None = Query(default=None, max_length=64),
@@ -7920,11 +9790,12 @@ async def prewarm(
 
     prio = PRIO_NEXT if priority == "next" else PRIO_AHEAD
     who = _prewarm_requester(request, sb_session, u, pw)
-    return _schedule_prewarm(track_id, track, subsong, prio, who, ext)
+    return _schedule_prewarm(track_id, track, explicit_wire(subsong, request), prio, who,
+                             ext, named=True)
 
 
-def _schedule_prewarm(track_id: str, track, subsong: int, prio: int, who: str,
-                      ext: str | None = None) -> dict:
+def _schedule_prewarm(track_id: str, track, subsong: "int | None", prio: int, who: str,
+                      ext: str | None = None, *, named: bool = False) -> dict:
     """Register one prewarm in the shared registry (the web player's
     ``POST /prewarm`` and Subsonic's next-track prewarm): join a task already
     running for the same (track, format, tune) — refreshing its recency and
@@ -7933,9 +9804,13 @@ def _schedule_prewarm(track_id: str, track, subsong: int, prio: int, who: str,
     isn't pinned (recently played) first.  ``ext`` defaults to
     ``_render_ident``'s.  Callers apply their own gates (setting, native,
     remote lookahead) first.  Plain work on the event loop, no awaits.
-    Returns the endpoint's status summary."""
+    ``subsong``: the tune asked for, None for the file's default; without
+    ``named`` (Subsonic, whose ``<id>~0`` is the bare id) a 0 is the default
+    too.  Returns the endpoint's status summary."""
     if ext is None:
         ext = _render_ident(getattr(track, "path", "") or "", track)[0]
+    if not named:
+        subsong = subsong or None
     key = _prewarm_key(track_id, ext, subsong)
     existing = _prewarm_tasks.get(key)
     if existing is not None and not existing.done():
@@ -8125,9 +10000,7 @@ async def _ingest_on_demand(track_id: str, file_path: str):
         roots = await list_scan_dirs()
         local_roots = [
             r for r in roots
-            if not str(r.get("path", "")).startswith(
-                ("smb://", "ftp://", "http://", "https://"),
-            )
+            if not is_remote_path(str(r.get("path", "")))
         ]
 
         def _resolve_roots() -> list[Path]:
@@ -8354,7 +10227,7 @@ async def _resolve_play_source(track_id: str, track, *,
     # track 500'd on first byte (validation finding 2026-05-21).
     _zip_track_id_for_unpin: str | None = None
 
-    if path_str.startswith(("smb://", "ftp://")) and "::" in path_str:
+    if is_remote_path(path_str) and "::" in path_str:
         # Remote ZIP member — ``ftp://host/share:/path/x.zip::member``.  Fetch
         # the OUTER archive to the local remote-cache, then extract the member
         # with the same machinery a local zip uses.  Handled before the generic
@@ -8366,29 +10239,37 @@ async def _resolve_play_source(track_id: str, track, *,
         if not remote_path or "::" not in remote_path:
             raise HTTPException(400, "Remote archive path is malformed")
         source = get_source(scan_root)
-        if source is None:
-            raise _offline_error(scan_root)
         zip_rel, _member = remote_path.split("::", 1)
+        if source is None and not (
+                get_cache().peek_cached(scan_root, zip_rel)
+                or _remote_zip.cached_subset(scan_root, zip_rel, _member) is not None):
+            raise _offline_error(scan_root)     # (cached bytes play while it's down)
         loop = asyncio.get_running_loop()
         try:
+            # Only the member's bytes (and its companions) when the archive
+            # isn't cached — not the whole archive (``core.remote_zip``).
             _local_zip = await loop.run_in_executor(
-                None, functools.partial(get_cache().fetch, scan_root, zip_rel,
-                                        source, lane=lane),
+                None, functools.partial(
+                    _remote_zip.archive_for_member, scan_root, zip_rel, _member,
+                    source, lane=lane, companion=_archive_companion_filter(_member)),
             )
         except Exception as exc:
+            if source is None:                  # its cached copy went meanwhile
+                raise _offline_error(scan_root)
             if _is_file_not_found(exc):
                 raise HTTPException(404, "Archive missing on source (rescan to refresh)")
             log.warning("Remote archive fetch failed for %s: %s", path_str, exc)
             raise HTTPException(502, "Could not fetch archive from network share")
         path = await _get_or_extract_zip_member(
             f"{_local_zip}::{_member}", track_id,
-            bank_fallback=_make_zip_bank_fallback(remote=(zip_rel, source), lane=lane),
+            bank_fallback=(_make_zip_bank_fallback(remote=(zip_rel, source), lane=lane)
+                           if source is not None else None),
         )
         if path is None:
             raise HTTPException(404, "Track missing inside the archive")
         _zip_pin(track_id)
         _zip_track_id_for_unpin = track_id
-    elif path_str.startswith(("smb://", "ftp://")):
+    elif is_remote_path(path_str):
         from soniqboom.core.filesource import get_source, parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
@@ -8396,98 +10277,105 @@ async def _resolve_play_source(track_id: str, track, *,
             raise HTTPException(400, "Remote path is malformed")
         source = get_source(scan_root)
         if source is None:
-            raise _offline_error(scan_root)
+            # Not connected (down since startup): a copy in the remote cache
+            # still plays.
+            cached = get_cache().get_cached(scan_root, remote_path)
+            if cached is None:
+                raise _offline_error(scan_root)
 
         # Try once; on failure ask the source to rebuild its connection and
         # retry ONE more time.  The source's own _connect already does
         # short inline retries, so this is the second tier: a brand-new
         # TCP session in case the pooled connection has been torn down
         # by the peer (FTP idle timeout, SMB session expire, router NAT flush).
-        loop = asyncio.get_running_loop()
-        try:
-            path = await loop.run_in_executor(
-                None, functools.partial(get_cache().fetch, scan_root, remote_path,
-                                        source, lane=lane),
-            )
-        except Exception as exc:
-            # File-not-found is a different class than "upstream broken":
-            # it means the share is reachable and authenticated but the
-            # specific path no longer exists (file moved/renamed/deleted
-            # since the last scan).  Mapping it to 404 lets the player's
-            # error toast say "Track or file missing on disk (rescan to
-            # refresh)" instead of the misleading generic 502.  Reconnect
-            # would be pointless — the file still won't be there.
-            if _is_file_not_found(exc):
-                log.info("Remote file missing for %s: %s", path_str, exc)
-                # The track exists in our index but is gone on the source —
-                # almost always means files were added/moved/deleted on
-                # the share since the last walk.  Fire a background
-                # freshness poll for this share NOW (the user is actively
-                # trying to listen, they'll appreciate the immediate
-                # refresh).  Fire-and-forget — the 404 response goes
-                # back to the client without waiting on the scan.
+        if source is None:
+            path = cached
+        else:
+            loop = asyncio.get_running_loop()
+            try:
+                path = await loop.run_in_executor(
+                    None, functools.partial(get_cache().fetch, scan_root, remote_path,
+                                            source, lane=lane),
+                )
+            except Exception as exc:
+                # File-not-found is a different class than "upstream broken":
+                # it means the share is reachable and authenticated but the
+                # specific path no longer exists (file moved/renamed/deleted
+                # since the last scan).  Mapping it to 404 lets the player's
+                # error toast say "Track or file missing on disk (rescan to
+                # refresh)" instead of the misleading generic 502.  Reconnect
+                # would be pointless — the file still won't be there.
+                if _is_file_not_found(exc):
+                    log.info("Remote file missing for %s: %s", path_str, exc)
+                    # The track exists in our index but is gone on the source —
+                    # almost always means files were added/moved/deleted on
+                    # the share since the last walk.  Fire a background
+                    # freshness poll for this share NOW (the user is actively
+                    # trying to listen, they'll appreciate the immediate
+                    # refresh).  Fire-and-forget — the 404 response goes
+                    # back to the client without waiting on the scan.
+                    try:
+                        from soniqboom.core import remote_freshness
+                        asyncio.create_task(
+                            remote_freshness.check_now(scan_root, reason="stream_404"),
+                            name=f"freshness.stream_404[{scan_root}]",
+                        )
+                    except Exception:
+                        log.debug("freshness.check_now scheduling failed", exc_info=True)
+                    raise HTTPException(
+                        404,
+                        "File no longer at this path on the source. "
+                        "Rescan the library to refresh.",
+                    )
+                log.info(
+                    "Remote fetch failed for %s (%s: %s) — attempting reconnect",
+                    path_str, type(exc).__name__, exc,
+                )
+                # Cap the reconnect at 10 s so a genuinely-dead host doesn't
+                # hold the request open for the full 46 s worst-case (3 attempts
+                # × 15 s connect timeout + backoff).
                 try:
-                    from soniqboom.core import remote_freshness
-                    asyncio.create_task(
-                        remote_freshness.check_now(scan_root, reason="stream_404"),
-                        name=f"freshness.stream_404[{scan_root}]",
+                    recovered = await asyncio.wait_for(
+                        loop.run_in_executor(None, source.reconnect),
+                        timeout=10.0,
                     )
                 except Exception:
-                    log.debug("freshness.check_now scheduling failed", exc_info=True)
-                raise HTTPException(
-                    404,
-                    "File no longer at this path on the source. "
-                    "Rescan the library to refresh.",
-                )
-            log.info(
-                "Remote fetch failed for %s (%s: %s) — attempting reconnect",
-                path_str, type(exc).__name__, exc,
-            )
-            # Cap the reconnect at 10 s so a genuinely-dead host doesn't
-            # hold the request open for the full 46 s worst-case (3 attempts
-            # × 15 s connect timeout + backoff).
-            try:
-                recovered = await asyncio.wait_for(
-                    loop.run_in_executor(None, source.reconnect),
-                    timeout=10.0,
-                )
-            except Exception:
-                # TimeoutError (3.11+ aliased from asyncio.TimeoutError) plus
-                # anything source.reconnect itself might raise — either way
-                # the retry failed.
-                recovered = False
-            if recovered:
-                try:
-                    path = await loop.run_in_executor(
-                        None, functools.partial(get_cache().fetch, scan_root,
-                                                remote_path, source, lane=lane),
-                    )
-                    log.info("Remote fetch recovered after reconnect for %s", path_str)
-                except Exception as exc2:
-                    log.warning(
-                        "Remote fetch failed after reconnect for %s: %s",
-                        path_str, exc2,
-                    )
-                    if _is_file_not_found(exc2):
-                        # Same trigger as above — second confirmation that the
-                        # file is genuinely gone on the source warrants a poll.
-                        try:
-                            from soniqboom.core import remote_freshness
-                            asyncio.create_task(
-                                remote_freshness.check_now(scan_root, reason="stream_404"),
-                                name=f"freshness.stream_404[{scan_root}]",
-                            )
-                        except Exception:
-                            log.debug("freshness.check_now scheduling failed", exc_info=True)
-                        raise HTTPException(
-                            404,
-                            "File no longer at this path on the source. "
-                            "Rescan the library to refresh.",
+                    # TimeoutError (3.11+ aliased from asyncio.TimeoutError) plus
+                    # anything source.reconnect itself might raise — either way
+                    # the retry failed.
+                    recovered = False
+                if recovered:
+                    try:
+                        path = await loop.run_in_executor(
+                            None, functools.partial(get_cache().fetch, scan_root,
+                                                    remote_path, source, lane=lane),
                         )
-                    raise HTTPException(502, f"Could not fetch remote file: {exc2}")
-            else:
-                log.warning("Remote fetch failed for %s: %s", path_str, exc)
-                raise HTTPException(502, f"Could not fetch remote file: {exc}")
+                        log.info("Remote fetch recovered after reconnect for %s", path_str)
+                    except Exception as exc2:
+                        log.warning(
+                            "Remote fetch failed after reconnect for %s: %s",
+                            path_str, exc2,
+                        )
+                        if _is_file_not_found(exc2):
+                            # Same trigger as above — second confirmation that the
+                            # file is genuinely gone on the source warrants a poll.
+                            try:
+                                from soniqboom.core import remote_freshness
+                                asyncio.create_task(
+                                    remote_freshness.check_now(scan_root, reason="stream_404"),
+                                    name=f"freshness.stream_404[{scan_root}]",
+                                )
+                            except Exception:
+                                log.debug("freshness.check_now scheduling failed", exc_info=True)
+                            raise HTTPException(
+                                404,
+                                "File no longer at this path on the source. "
+                                "Rescan the library to refresh.",
+                            )
+                        raise HTTPException(502, f"Could not fetch remote file: {exc2}")
+                else:
+                    log.warning("Remote fetch failed for %s: %s", path_str, exc)
+                    raise HTTPException(502, f"Could not fetch remote file: {exc}")
     elif '::' in path_str:
         # ZIP-contained file (supports nested zips via outer.zip::inner.zip::track.mod)
         #
@@ -8534,7 +10422,7 @@ async def _resolve_play_source(track_id: str, track, *,
 
     # Loose (non-zip) uade modules on a remote share: materialize module +
     # companion halves (TFMX smpl.X …) into one dir, mirroring AdLib below.
-    if (path_str.startswith(("smb://", "ftp://")) and "::" not in path_str
+    if (is_remote_path(path_str) and "::" not in path_str
             and (_uade_named or ext in _UADE_EXTS) and ext != ".ahx"):
         try:
             from soniqboom.core.filesource import get_source, parse_remote_path
@@ -8553,7 +10441,7 @@ async def _resolve_play_source(track_id: str, track, *,
     # Loose (non-zip) AdLib tunes on a remote share need their companion bank
     # materialized in the same dir; the per-file fetch above split them apart.
     # Re-point ``path`` to a dir holding tune + bank (no-op if no bank sibling).
-    if (path_str.startswith(("smb://", "ftp://")) and "::" not in path_str
+    if (is_remote_path(path_str) and "::" not in path_str
             and ext in _ADLIB_COMPANION_GLOBS):
         try:
             from soniqboom.core.filesource import get_source, parse_remote_path
@@ -8775,7 +10663,8 @@ def _mp3_cbr_kbps(requested: int, out_rate: int | None = None) -> int:
 
 
 def _estimated_transcode_length(src: Path, xf: _Xform, copy: bool,
-                                target_rate: int | None = None) -> int | None:
+                                target_rate: int | None = None,
+                                src_seconds: float | None = None) -> int | None:
     """Content-Length to announce for a live transcode when the client asked
     for an estimate (``_estimate_len_ctx``), else None.  Only for MP3: LAME's
     CBR output is (duration × bitrate) to within ~0.05 % (measured 1.0003-
@@ -8783,13 +10672,18 @@ def _estimated_transcode_length(src: Path, xf: _Xform, copy: bool,
     its target and FLAC is content-dependent, so those stay chunked.  A
     rendered WAV's own header gives the exact length and sample rate.
     Pitched slightly high (+0.5 % and 16 KB): the body is then zero-padded
-    to it, where truncation would cut the end of the track."""
+    to it, where truncation would cut the end of the track.  ``src_seconds``:
+    the exact length of a rendered (44.1 kHz) WAV that is still rendering —
+    its file can't say yet."""
     hint = _estimate_len_ctx.get()
     if hint is None or copy or (xf.codec or "") != "mp3":
         return None
     dur, rate = hint, None
-    layout = _wav_layout(src) if src.suffix.lower() == ".wav" else None
-    if layout is not None and layout["rate"] > 0 and layout["block_align"] > 0:
+    layout = (_wav_layout(src) if src.suffix.lower() == ".wav" and src_seconds is None
+              else None)
+    if src_seconds is not None:
+        dur, rate = float(src_seconds), _SID_WAV_RATE
+    elif layout is not None and layout["rate"] > 0 and layout["block_align"] > 0:
         dur = layout["data_size"] / layout["block_align"] / layout["rate"]
         rate = layout["rate"]
     if target_rate:
@@ -8826,28 +10720,86 @@ async def _exactly(gen, total: int):
 
 def _live_transcode_response(src: Path, xf: _Xform, headers: dict,
                              background, *, copy: bool = False,
-                             target_rate: int | None = None) -> Response:
+                             target_rate: int | None = None, src_feed=None,
+                             src_seconds: float | None = None) -> Response:
     """Stream ``src`` from ``xf.seek`` seconds through a live ffmpeg pipe in
     ``xf.codec`` (``copy``: remux an already-transcoded file without
     re-encoding).  First bytes in well under a second, no Content-Length —
     neither a time-offset start nor a cold transcode waits for a whole
     encode — except for a client that asked for an estimated length
     (``estimated_content_length``): an MP3 then carries one, and exactly that
-    many bytes."""
+    many bytes.  ``src_feed`` / ``src_seconds``: the source is a render still
+    rendering, read as it grows (``_transcode_stream``), and its exact
+    length when known."""
     hdrs = _accel_off(dict(headers or {}))
     hdrs["Accept-Ranges"] = "none"
     if xf.seek > 0:
         hdrs["X-Time-Offset"] = f"{xf.seek:.3f}"
     body = _transcode_stream(src, xf.seek, target_rate, codec=xf.codec,
-                             bitrate_kbps=xf.bitrate or None, copy=copy)
-    est = _estimated_transcode_length(src, xf, copy, target_rate)
+                             bitrate_kbps=xf.bitrate or None, copy=copy,
+                             src_feed=src_feed)
+    est = _estimated_transcode_length(src, xf, copy, target_rate, src_seconds)
     if est is not None:
         hdrs["Content-Length"] = str(est)
         hdrs["X-Content-Length-Estimated"] = "1"
         body = _exactly(body, est)
-    return StreamingResponse(
+    return _CleanupStreamingResponse(
         body, media_type=TRANSCODE_MIME.get(xf.codec or "", "audio/flac"),
         headers=hdrs, background=background)
+
+
+async def _cached_rendered_transcode(track_id: str, xf: _Xform, source_key: str) -> "Path | None":
+    """The cached transcode ``_serve_rendered`` would serve for the render of
+    ``source_key`` in ``xf``'s codec / bitrate, if there is one."""
+    from soniqboom.core.conversion_cache import get_cached, rendered_transcode_variant
+    return await get_cached(_ck(track_id, "transcoded", 0, codec=xf.codec,
+                                bitrate=xf.bitrate or None,
+                                variant=rendered_transcode_variant(source_key)))
+
+
+async def _serve_rendered_transcode_hit(request: Request, path: Path, xf: _Xform,
+                                        headers: dict, background) -> Response:
+    """A cached transcode of a render, with Range — as ``_serve_rendered``
+    answers one."""
+    hdrs = dict(headers or {})
+    hdrs.update({"X-Transcoded": "1", "X-Original-Codec": "wav",
+                 "X-Target-Codec": xf.codec, "X-Transcode-Cache": "hit"})
+    return await _range_file_response(request, path, TRANSCODE_MIME[xf.codec],
+                                      headers=hdrs, background=background)
+
+
+async def _transcode_growing_render(request: Request, *, track_id: str, feed, xf: _Xform,
+                                    source_key: str, rendered, headers: dict,
+                                    background, src_seconds: float | None) -> Response:
+    """A client asked for another codec (``xf.codec``, no time offset) of a
+    render that is still running: answer at once from a live encode of the
+    growing WAV (``feed``, read from byte 0); once the render is cached
+    (``rendered()`` — an awaitable of ``(path, hit)``), the transcode cache
+    entry is filled from it in the background (``_fill_transcode_in_background``),
+    so later requests — seeks, replays — get that file with Range."""
+    from soniqboom.core.conversion_cache import get_or_render, rendered_transcode_variant
+    variant = rendered_transcode_variant(source_key)
+    tkey = _ck(track_id, "transcoded", 0, codec=xf.codec,
+               bitrate=xf.bitrate or None, variant=variant)
+
+    async def _fill_once_rendered():
+        try:
+            wav, _ = await rendered()
+        except Exception:
+            return          # the render failed: the stream has said so
+        _fill_transcode_in_background(
+            tkey, lambda: get_or_render(
+                track_id=track_id, format_type="transcoded", subsong=0,
+                codec=xf.codec, bitrate=xf.bitrate or None, variant=variant,
+                render_fn=lambda: _render_to_transcoded_flac(
+                    wav, codec=xf.codec, bitrate_kbps=xf.bitrate or None)),
+            source_key=source_key)
+    _bg_keep(asyncio.ensure_future(_fill_once_rendered()))
+    hdrs = dict(headers or {})
+    hdrs.update({"X-Transcoded": "1", "X-Original-Codec": "wav",
+                 "X-Target-Codec": xf.codec, "X-Transcode-Cache": "miss"})
+    return _live_transcode_response(Path(f"{track_id}.wav"), xf, hdrs, background,
+                                    src_feed=feed, src_seconds=src_seconds)
 
 
 async def _wav_offset_response(request: Request, wav_path: Path, seek: float,
@@ -9027,19 +10979,19 @@ def _delivered_format_cached(ext: str, uade_named: bool, fam: str,
     return (codec, TRANSCODE_MIME.get(codec, "audio/flac"))
 
 
-def _sid_target_seconds(track, subsong: int) -> int:
+def _sid_target_seconds(track, subsong: int, start: "int | None" = None) -> int:
     """Per-tune SID render length (the HVSC length of the tune wire
     ``subsong`` plays — ``hvsc_lengths`` is in tune order, see
     ``sid_wire_tune`` — else the stored duration, else the default), clamped
     5..3600 — the value every SID path keys its cache on.  The start song is
-    ``sid_start_song_known`` (an async caller holding the file reads it
-    first with ``sid_start_song``)."""
+    ``start`` when given, else ``sid_start_song_known`` (an async caller
+    holding the file reads it first with ``sid_start_song``)."""
     target_dur = settings.sid_default_duration
     meta = (track if isinstance(track, dict)
             else track.__dict__ if hasattr(track, "__dict__") else {})
     hvsc_lengths = meta.get("hvsc_lengths") or []
     tid = meta.get("id") or getattr(track, "id", "") or ""
-    idx = sid_wire_tune(subsong, sid_start_song_known(tid, track),
+    idx = sid_wire_tune(subsong, start if start is not None else sid_start_song_known(tid, track),
                         meta.get("subsongs") or len(hvsc_lengths)) - 1
     if hvsc_lengths and 0 <= idx < len(hvsc_lengths):
         target_dur = int(round(float(hvsc_lengths[idx])))
@@ -9079,7 +11031,344 @@ async def _offline_root_for(track) -> str | None:
     return None if ok else sd["path"]
 
 
+def _ogg_needs_transcode(ext: str, request: Request) -> bool:
+    """Ogg/Opus: some clients (Safari < 18.4) can't decode it — route those to
+    the transcoder (→ WAV, which every browser plays) instead of a native
+    .ogg/.opus that fails silently.  Prefer the client's DECLARED capability
+    (sb_caps), keyed by extension — ``.opus`` is Opus; ``.ogg`` is usually
+    Vorbis but may be Opus, so accept EITHER (uses the vorbis cap too).
+    Fall back to the Safari-version UA heuristic when nothing was declared."""
+    if ext == ".opus":
+        _ogg_sup = _client_supports("opus", request)
+    elif ext == ".ogg":
+        _o = _client_supports("opus", request)
+        _v = _client_supports("vorbis", request)
+        _ogg_sup = None if (_o is None and _v is None) else (bool(_o) or bool(_v))
+    else:
+        return False
+    return (_ogg_sup is False) if _ogg_sup is not None else _safari_lacks_ogg(request)
+
+
+# ── Remote files: play while they download ─────────────────────────────────
+# A remote track served as-is (mp3 / flac / wav / ogg / opus) used to wait
+# for the whole file to land in the remote cache before its first byte.  Now
+# the download streams into the cache and the response reads the growing
+# file (``RemoteCache.open_progressive``): exact Content-Length, 206 answers
+# against the final size, and a seek that lands well past what has arrived is
+# answered straight from the share until the download catches up.
+_FAR_SEEK_MIN_BYTES = 2 * 1024 * 1024   # never go direct for a smaller gap…
+_FAR_SEEK_WAIT_S = 1.0                  # …or one the download closes this fast
+_FAR_SEEK_OPEN_S = 3.0                  # a share that can't open a read this fast: wait
+# Direct share reads run on their own threads: an open stuck waiting for a
+# pooled FTP connection must not tie up the default executor.
+_DIRECT_READ_POOL: "concurrent.futures.ThreadPoolExecutor | None" = None
+
+
+def _direct_read_pool():
+    global _DIRECT_READ_POOL
+    if _DIRECT_READ_POOL is None:
+        import concurrent.futures
+        _DIRECT_READ_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="remote-direct")
+    return _DIRECT_READ_POOL
+
+
+def _share_marked_down(scan_root: str) -> bool:
+    """The health monitor has flagged this share unavailable (it keeps the
+    source registered while it retries)."""
+    try:
+        from soniqboom.core.store import get_store
+        return any(sd.get("path") == scan_root and sd.get("status") == "unavailable"
+                   for sd in get_store().list_scan_dirs())
+    except Exception:
+        return False
+
+
+def _range_bounds(request: Request, size: int) -> tuple[int, int, bool]:
+    """``(start, end, ranged)`` of a single-range request against ``size``
+    bytes — the parse ``_growing_file_range_response`` applies
+    (``_parse_audio_range``); an unsatisfiable range reads as the whole file
+    here (that response answers it with a 416)."""
+    rng = _parse_audio_range(request.headers.get("range"), size)
+    if rng is None:
+        return 0, size - 1, False
+    return rng[0], rng[1] - 1, rng[2]
+
+
+async def _maybe_remote_progressive(request: Request, track, *, target_format: str | None,
+                                    max_bitrate_kbps: int,
+                                    force_transcode: bool) -> Response | None:
+    """Serve a remote track that plays as-is while its download runs — or
+    None for everything else (cached, archive members, rendered / transcoded
+    formats, an unconnected share, a failed start), which the regular
+    ``_resolve_play_source`` path then handles exactly as before."""
+    path_str = track.path or ""
+    if (request.method != "GET" or force_transcode or "::" in path_str
+            or not is_remote_path(path_str)):
+        return None
+    ext, uade_named = _render_ident(path_str, track)
+    if ext not in NATIVE or uade_named:
+        return None
+    want = (target_format or "").strip().lower()
+    if want and want != "raw" and want in TRANSCODE_MIME and want != ext.lstrip("."):
+        return None                     # another codec asked for → transcode
+    if max_bitrate_kbps > 0 and want != "raw":
+        return None                     # a bitrate cap may need a transcode
+    if _ogg_needs_transcode(ext, request):
+        return None
+    from soniqboom.core.filesource import get_source, parse_remote_path
+    from soniqboom.core.remote_cache import ProgressiveRead, get_cache
+    try:
+        scan_root, remote_path = parse_remote_path(path_str)
+    except ValueError:
+        return None
+    source = get_source(scan_root) if remote_path else None
+    if source is None:
+        return None
+    cache = get_cache()
+    if cache.peek_cached(scan_root, remote_path) or _share_marked_down(scan_root):
+        return None                     # cached / known down: the regular path
+    try:
+        got = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(cache.open_progressive, scan_root, remote_path,
+                                    source, lane="stream"))
+    except Exception as exc:
+        # The regular path retries and maps it (404 / reconnect / 502).
+        log.info("Progressive start for %s failed (%s: %s)", path_str,
+                 type(exc).__name__, exc)
+        return None
+    if not isinstance(got, ProgressiveRead):
+        return await _range_file_response(request, got, media_type=NATIVE[ext])
+    if got.size <= 0 or (got.done and not got.ok):
+        os.close(got.fd)                # empty, or failed just now → regular path
+        return None
+    return await _remote_progressive_response(
+        request, got, NATIVE[ext], source, remote_path)
+
+
+async def _remote_progressive_response(request: Request, handle, media_type: str,
+                                       source, remote_path: str) -> Response:
+    loop = asyncio.get_running_loop()
+    size = handle.size
+    fd = _FdHandle(handle.fd)
+    complete = asyncio.Event()
+    data_ev = asyncio.Event()
+    flags = {"no_pad_on_failure": True, "never_pad": True, "clean_exit": None,
+             "subscribers": 1}
+
+    def _wake() -> None:
+        if handle.done:
+            flags["clean_exit"] = handle.ok
+            complete.set()
+        data_ev.set()
+        data_ev.clear()
+
+    def _on_progress() -> None:                 # runs on the download thread
+        try:
+            loop.call_soon_threadsafe(_wake)
+        except RuntimeError:                    # loop closed during shutdown
+            pass
+
+    handle.add_listener(_on_progress)
+    release = BackgroundTask(handle.remove_listener, _on_progress)
+    headers = {"X-Remote-Stream": "progressive"}
+    start, end, ranged = _range_bounds(request, size)
+    if ranged and start > 0 and not handle.done:
+        gap = start - handle.written
+        if gap > max(_FAR_SEEK_MIN_BYTES, handle.rate * _FAR_SEEK_WAIT_S):
+            resp = await _remote_direct_range(
+                handle, size, start, end, media_type, source, remote_path, fd, release)
+            if resp is not None:
+                return resp
+    return await _growing_file_range_response(
+        request, handle.path, size, complete, media_type, headers=headers,
+        data_event=data_ev, inflight=flags, background_task=release, fd=fd,
+    )
+
+
+async def _remote_direct_range(handle, size: int, start: int, end: int, media_type: str,
+                               source, remote_path: str, fd: "_FdHandle",
+                               release) -> Response | None:
+    """Answer a seek far past the downloaded prefix straight from the share,
+    switching to the local copy — for good — once the download has caught
+    up (when the reader then outruns the download it waits for it, it never
+    re-opens the share; only a download that FAILED or stopped moving for
+    ``_GROWING_READ_TIMEOUT`` sends it back to the share, to the end).
+    None when the share can't open a read promptly (e.g. an FTP pool with no
+    free stream connection) — the caller then waits on the download instead.
+
+    Every share stream this opens is closed exactly once, also when the
+    request is cancelled while an open is still running in its thread."""
+    from soniqboom.core.filesource import borrow_wait
+
+    loop = asyncio.get_running_loop()
+    pool = _direct_read_pool()
+
+    def _open(off: int, cap: "float | None"):
+        if cap is None:
+            return source.open_stream(remote_path, offset=off, lane="stream",
+                                      length=end + 1 - off)
+        # A pooled-FTP open gives up with the caller instead of staying
+        # queued as a priority stream-lane waiter (holding back the server's
+        # scan / browse borrows) for the pool's full 60 s.
+        with borrow_wait(cap):
+            return source.open_stream(remote_path, offset=off, lane="stream",
+                                      length=end + 1 - off)
+
+    def _close_late(f) -> None:
+        """Close the stream an abandoned open still produced."""
+        try:
+            if f.cancelled() or f.exception() is not None:
+                return
+            st_late = f.result()
+        except BaseException:
+            return
+        try:
+            pool.submit(st_late.close)
+        except RuntimeError:                    # pool shut down
+            st_late.close()
+
+    fut = loop.run_in_executor(pool, _open, start, _FAR_SEEK_OPEN_S)
+    try:
+        st = await asyncio.wait_for(asyncio.shield(fut), timeout=_FAR_SEEK_OPEN_S)
+    except asyncio.CancelledError:
+        fut.add_done_callback(_close_late)
+        raise
+    except Exception as exc:
+        log.info("Direct read of %s at %d unavailable (%s) — waiting on the download",
+                 remote_path, start, type(exc).__name__)
+        fut.add_done_callback(_close_late)
+        return None
+    if st.size is not None and int(st.size) != size:
+        try:
+            pool.submit(st.close)
+        except RuntimeError:                    # pool shut down
+            st.close()
+        return None
+    # The open share stream, closed by the body — or by the response's
+    # cleanup when the body never runs (client gone before it started).  A
+    # close waits for a read still running in a worker thread (cancelled
+    # request): closing a stream mid-read races the read on its socket.
+    held: dict = {"st": st, "rd": None}
+    held_lock = threading.Lock()      # the body (loop) and the cleanup (a thread)
+
+    def _close_held() -> None:
+        with held_lock:
+            s_, held["st"] = held["st"], None
+            rd = held["rd"]
+        if s_ is None:
+            return
+
+        def _go(_f=None) -> None:
+            try:
+                pool.submit(s_.close)
+            except RuntimeError:
+                s_.close()
+        if rd is not None and not rd.done():
+            rd.add_done_callback(_go)
+        else:
+            _go()
+
+    progressed = asyncio.Event()
+
+    def _on_download() -> None:                 # runs on the download thread
+        try:
+            loop.call_soon_threadsafe(progressed.set)
+        except RuntimeError:                    # loop closed during shutdown
+            pass
+
+    add_listener = getattr(handle, "add_listener", None)
+    if add_listener is not None:
+        add_listener(_on_download)
+
+    async def _share_read(pos: int, n: int) -> bytes:
+        if held["st"] is None:
+            f = loop.run_in_executor(pool, _open, pos, None)
+            try:
+                held["st"] = await asyncio.shield(f)
+            except asyncio.CancelledError:
+                f.add_done_callback(_close_late)
+                raise
+        # A concurrent future, not ``run_in_executor``'s wrapper: a cancelled
+        # request cancels the wrapper at once, while the read keeps running.
+        rd = pool.submit(held["st"].read, n)
+        held["rd"] = rd
+        return await asyncio.wrap_future(rd)
+
+    async def _body():
+        pos = start
+        local = False            # reading the downloaded copy (and staying there)
+        back_to_share = False    # the download failed / stalled: share reads to the end
+        seen, seen_at = -1, time.monotonic()
+        try:
+            while pos <= end:
+                if not local and not back_to_share and pos < handle.written:
+                    local = True
+                    _close_held()
+                if local:
+                    written = handle.written
+                    if pos >= written:
+                        if written != seen:
+                            seen, seen_at = written, time.monotonic()
+                        if ((handle.done and not handle.ok)
+                                or time.monotonic() - seen_at > _GROWING_READ_TIMEOUT):
+                            # The download failed or stopped moving: finish
+                            # from the share (once — no way back).
+                            local, back_to_share = False, True
+                            continue
+                        progressed.clear()
+                        if pos >= handle.written and not handle.done:
+                            try:
+                                await asyncio.wait_for(
+                                    progressed.wait(),
+                                    timeout=1.0 if add_listener is not None else 0.05)
+                            except asyncio.TimeoutError:
+                                pass
+                        continue
+                    n = min(_RANGE_STREAMING_CHUNK, handle.written - pos, end + 1 - pos)
+                    chunk = await asyncio.to_thread(os.pread, fd.fd, n, pos)
+                else:
+                    chunk = await _share_read(pos, min(_RANGE_STREAMING_CHUNK, end + 1 - pos))
+                if not chunk:
+                    log.warning("Direct read of %s ended at %d of %d", remote_path,
+                                pos, end + 1)
+                    return                      # short body → the client retries
+                yield chunk
+                pos += len(chunk)
+        finally:
+            remove = getattr(handle, "remove_listener", None)
+            if remove is not None:
+                remove(_on_download)
+            _close_held()
+            fd.close()
+
+    def _cleanup() -> None:
+        remove = getattr(handle, "remove_listener", None)
+        if remove is not None:
+            remove(_on_download)
+        _close_held()
+
+    headers = _accel_off({
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Length": str(end - start + 1),
+        "X-Remote-Stream": "direct",
+    })
+    return _CleanupStreamingResponse(
+        _body(), status_code=206, media_type=media_type, headers=headers,
+        background=_compose_backgrounds(release, BackgroundTask(fd.close),
+                                        BackgroundTask(_cleanup)),
+    )
+
+
 def _offline_error(root: str) -> HTTPException:
+    from soniqboom.core.filesource import credentials_refused
+    if credentials_refused(root):
+        # ``get_source`` hides a share whose sign-in is backing off: no play
+        # logs in with credentials the server refused (lockout risk).
+        return HTTPException(
+            503, f"Sign-in refused: the server of {root} refused its credentials — "
+                 "update them or press Reconnect to play this track")
     return HTTPException(
         503, f"Source offline: {root} isn't connected — reconnect it to play this track")
 
@@ -9089,7 +11378,9 @@ async def stream_track(
     track_id: str,
     request: Request,
     seek: float = Query(default=0.0, ge=0.0, description="Start position in seconds"),
-    subsong: int = Query(default=0, ge=0, description="Sub-song index (SID/tracker)"),
+    subsong: int | None = Query(default=None, ge=0,
+                                description="Tune (wire index) of a multi-tune file; "
+                                            "absent = the file's default tune"),
     file_path: str | None = Query(default=None, alias="path",
                                   description="File path for on-demand ingestion"),
     # Per-request transcode hints from the OpenSubsonic transcoding extension
@@ -9134,6 +11425,13 @@ async def stream_track(
         if not track:
             raise HTTPException(404, "Track not found")
 
+    # A remote track that plays as-is starts while its download runs.
+    _prog = await _maybe_remote_progressive(
+        request, track, target_format=target_format,
+        max_bitrate_kbps=max_bitrate_kbps, force_transcode=force_transcode)
+    if _prog is not None:
+        return _prog
+
     _zip_tmp: Path | None = None  # temp file to clean up after streaming
     path, ext, _uade_named, _zip_track_id_for_unpin = await _resolve_play_source(track_id, track)
 
@@ -9165,6 +11463,15 @@ async def stream_track(
         # ── Rendered formats: SID / MIDI / Tracker ───────────────────────────────
         # These are cached as WAV files so repeat playback is instant.
         # On cache miss, the renderer runs and the result is stored for next time.
+        #
+        # Which renders play while they run (progressive SID; ``_serve_live``
+        # for the rest) and which are awaited whole was decided by measured
+        # render speed (one 2026-10 Apple-silicon host, a ~3-minute tune each,
+        # whole render): SID 9.7 s, libgme Mega Drive VGM 9.5 s, Dreamcast PSF
+        # 9.1 s, GBA PSF 1.9 s, AdLib (Nuked OPL3) 1.5-2.0 s, MIDI 1.3-1.6 s,
+        # SNDH 1.0-1.3 s, SPC 0.6 s — live.  Awaited, their whole render being
+        # about as quick as a live start: openmpt trackers 0.14 s, HVL 0.31 s,
+        # sc68 0.39 s (6.5 minutes of disk), YM 0.5 s (6.5 minutes).
         from soniqboom.core.conversion_cache import get_or_render
 
         # What a (Subsonic) client asked to change about a rendered track's
@@ -9179,10 +11486,27 @@ async def stream_track(
                         and not (u or s or t)
                         and not _cast_internal_bypass_ctx.get())
 
-        if ext in _SID_EXTS and _is_c64_sid(path):
+        _c64 = ext in _SID_EXTS and _is_c64_sid(path)
+        # ``.psf`` is also Amiga SoundFactory's suffix: without the PSF magic
+        # the file is a module, and uade plays it (like a magic-less .sid).
+        if (ext == ".psf" and not _uade_named
+                and not await asyncio.to_thread(_psf_has_magic, path)):
+            _uade_named = True
+        # The tune: the one the request names (SID / SNDH map that wire with
+        # the file's start song themselves; every other renderer below takes
+        # it as the tune index), or for a bare play the file's default tune —
+        # for a multi-tune Amiga / libgme / sc68 file its first tune that
+        # isn't empty, probed once.
+        _wire = explicit_wire(subsong, request)
+        if _wire is None:
+            track = await _bare_play_track(
+                track_id, track, path, _probe_family(ext, _uade_named, path, c64=_c64))
+        subsong = tune_index(track_id, track, _wire)
+
+        if _c64:
             from soniqboom.core.conversion_cache import (
                 _cache_key, find_shorter_sid_entry,
-                start_background_render, get_cached,
+                start_background_render, get_cached, known_silent,
             )
             # Prefer per-track HVSC duration over the global default.  The
             # track record may carry ``hvsc_lengths`` (a list of per-subsong
@@ -9213,8 +11537,11 @@ async def stream_track(
 
             # 2) Shorter version available — serve it now, render full in background
             # (not when the client asked for another codec / offset: that
-            # needs the full render).
-            shorter = (None if xf.active else
+            # needs the full render).  Our web UI only: the player moves onto
+            # the full render once it is ready, where another client would
+            # play the shorter tune as the whole one — it gets the full-length
+            # progressive render below instead.
+            shorter = (None if xf.active or not _web_session else
                        await find_shorter_sid_entry(track_id, subsong, target_dur))
             if shorter:
                 short_path, short_dur = shorter
@@ -9230,20 +11557,20 @@ async def stream_track(
                     background=_bg,
                 )
 
-            # 3) No cache at all.  For the LOCAL web UI, stream sidplayfp's
-            # still-rendering WAV so playback starts in ~0.2 s instead of blocking
-            # on the full render (~tune_len/15).  ``_serve_sid_progressive`` now
-            # answers Range/seek requests with a proper 206 against the known
-            # full length, so ANY web-session GET (bare, probe, or seek) can take
-            # it — Subsonic/DLNA/Cast still fall through to the blocking path.
-            # The gate:
-            #   • GET only — a HEAD 405s at the router; never spawns a render.
-            #   • a session cookie AND no Subsonic auth params (u/s/t) — a
-            #     Subsonic/DLNA client carrying a stray cookie stays blocking.
-            #   • not the anonymous cast byte-server path.
+            # 3) No cache at all.  Stream sidplayfp's still-rendering WAV so
+            # playback starts in ~0.2 s instead of blocking on the full render
+            # (~tune_len/15).  ``_serve_sid_progressive`` answers with the
+            # exact final length (a Content-Length, and a proper 206 against it
+            # for Range/seek requests), so ANY GET client can take it — the web
+            # UI, Subsonic, DLNA and the cast byte-server.  The gate:
+            #   • GET only — a HEAD has its own route; never spawns a render.
+            #   • no audio change asked (``xf``: another codec, a bitrate cap,
+            #     a time offset — those need the finished WAV).
+            #   • not a tune that just rendered silent (its 422 comes at once).
             # ``_serve_sid_progressive`` returns None (→ fall through to blocking)
             # when over the concurrency cap or on an immediate render failure (so
-            # the error surfaces as a real 5xx, not silent silence).
+            # the error surfaces as a real 5xx, not silent silence), and raises
+            # the cache's 422 for a tune that plays only silence.
             # Retro per-voice VU meter — spawned HERE, before the progressive
             # branch below can return.  Two reasons this must not sit further
             # down (where it used to, after ``get_or_render``):
@@ -9261,17 +11588,46 @@ async def stream_track(
             # (warm or cold) is free once the sidecar exists.
             ensure_sid_vu_sidecar(track_id, path, subsong, target_dur)
 
-            if _web_session and not xf.active:
+            if request.method == "GET" and not xf.active and not known_silent(full_key):
                 _resp = await _serve_sid_progressive(
                     request, path, subsong, target_dur, full_key,
                     base_headers={"X-Rendered": "sidplayfp", "X-Cache": "miss-progressive",
                                   "X-SID-Target-Seconds": str(target_dur)},
-                    background=_bg,
+                    background=_bg, web=_web_session,
                 )
                 if _resp is not None:
                     return _resp
                 # else: over cap or immediate render failure — fall through to
                 # the blocking path.
+            elif (request.method == "GET" and xf.codec and not xf.seek
+                    and not known_silent(full_key)):
+                # Another codec (Subsonic ``format=`` / a bitrate cap, no time
+                # offset): a live encode of the progressive render as it grows
+                # — its length is exact, so an estimated Content-Length works
+                # too.  Over the pool cap / an immediate failure: blocking.
+                _done = await _cached_rendered_transcode(track_id, xf, full_key)
+                _feed = (None if _done is not None else
+                         await sid_wav_feed(path, subsong, target_dur, full_key))
+                if _done is not None:
+                    return await _serve_rendered_transcode_hit(
+                        request, _done, xf, {"X-Rendered": "sidplayfp",
+                                             "X-SID-Target-Seconds": str(target_dur)}, _bg)
+                if _feed is not None:
+                    _settled = _SID_PROG_DONE.get(full_key)
+
+                    async def _sid_rendered():
+                        if _settled is not None:
+                            await _settled.wait()
+                        _p = await get_cached(full_key)
+                        if _p is None:
+                            raise RuntimeError("the progressive render was not cached")
+                        return _p, False
+                    return await _transcode_growing_render(
+                        request, track_id=track_id, feed=_feed, xf=xf, source_key=full_key,
+                        rendered=_sid_rendered,
+                        headers={"X-Rendered": "sidplayfp", "X-Cache": "miss-progressive",
+                                 "X-SID-Target-Seconds": str(target_dur)},
+                        background=_bg, src_seconds=float(target_dur))
 
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="sid", subsong=subsong,
@@ -9287,17 +11643,14 @@ async def stream_track(
         if ext in _MIDI_EXTS:
             from soniqboom.config import get_active_soundfont
             sf = get_active_soundfont()
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="midi", subsong=0,
-                render_fn=lambda: _render_midi(path),
-                soundfont_path=str(sf) if sf else "",
-            )
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "fluidsynth", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "midi", 0, str(sf) if sf else ""),
-            )
+            _sfp = str(sf) if sf else ""
+            _key = _ck(track_id, "midi", 0, _sfp)
+            # Played while fluidsynth renders it (length unknown until the end).
+            return await _serve_live(
+                request, track_id=track_id, format_type="midi", subsong=0, key=_key,
+                render_fn=lambda: _render_midi(path, live_key=_key),
+                cache_kw={"soundfont_path": _sfp}, web_session=_web_session,
+                background=_bg, xf=xf, rendered="fluidsynth")
         # UADE / HVL go BEFORE the tracker branch — .ahx and .hvl appear in
         # the *scanner's* tracker set (metadata.py) for library detection, but
         # openmpt123 silently doesn't decode them.  (This file's own
@@ -9320,36 +11673,40 @@ async def stream_track(
                 background=_bg, xf=xf, track_id=track_id,
                 source_key=_ck(track_id, "hvl", subsong=subsong),
             )
-        if ext in _PSF_STREAM_EXTS or (ext == ".dsf" and _dsf_is_dreamcast(path)):
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="psf", subsong=0,
-                render_fn=lambda: _render_psf(path),
-            )
-            # Duration normally comes from the length/fade tags at scan; rips
-            # without tags stored 0 — persist the rendered WAV's real length.
-            await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
-                                              subsong=subsong)
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "zxtune", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "psf", subsong=0),
-            )
+        if ((ext in _PSF_STREAM_EXTS and not _uade_named)
+                or (ext == ".dsf" and _dsf_is_dreamcast(path))):
+            _key = _ck(track_id, "psf", subsong=0)
+            _exp = await asyncio.to_thread(_psf_render_seconds, path)
+
+            async def _after(cached_path):
+                # Duration normally comes from the length/fade tags at scan;
+                # rips without tags stored 0 — persist the rendered WAV's
+                # real length.
+                await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
+                                                  subsong=subsong)
+            return await _serve_live(
+                request, track_id=track_id, format_type="psf", subsong=0, key=_key,
+                render_fn=lambda: _render_psf(path, live_key=_key, expected_seconds=_exp),
+                web_session=_web_session, background=_bg, xf=xf, rendered="zxtune",
+                after_render=_after)
         if ext in _SNDH_EXTS:
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="sndh", subsong=subsong,
-                render_fn=lambda: _render_sndh(path, subsong=subsong, track_id=track_id),
-            )
-            # SNDH TIME tags are frequently absent; the scan stored the Atari
-            # default cap in that case — backfill only refines a 0 duration.
-            await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
-                                              subsong=subsong)
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "psgplay", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "sndh", subsong=subsong),
-            )
+            _key = _ck(track_id, "sndh", subsong=subsong)
+
+            async def _after(cached_path):
+                # SNDH TIME tags are frequently absent; the scan stored the
+                # Atari default cap in that case — backfill only refines a 0
+                # duration.
+                await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
+                                                  subsong=subsong)
+            # psgplay renders exactly the length it is given: an exact live
+            # render every client may stream.
+            return await _serve_live(
+                request, track_id=track_id, format_type="sndh", subsong=subsong,
+                key=_key,
+                render_fn=lambda: _render_sndh(path, subsong=subsong, track_id=track_id,
+                                               live_key=_key),
+                web_session=_web_session, background=_bg, xf=xf, rendered="psgplay",
+                after_render=_after)
         if ext in _YM_EXTS:
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="ym", subsong=0,
@@ -9388,38 +11745,34 @@ async def stream_track(
         # .imf is overloaded (Imago Orpheus tracker vs id/Apogee AdLib IMF) —
         # _render_imf disambiguates by content.  MUST come before _TRACKER_EXTS,
         # which still lists .imf for scanner-side detection.
-        if ext == ".imf":
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="imf", subsong=subsong,
-                render_fn=lambda: _render_imf(path, subsong=subsong),
-            )
-            # id/Apogee AdLib IMF stores the same 180s placeholder and renders to
-            # natural end via _render_adlib, so backfill its real length too.  The
-            # placeholder gate no-ops for IM10 (Imago Orpheus) .imf, which already
-            # carries a real tracker duration.
-            await _backfill_rendered_duration(track_id, track, cached_path,
-                                              subsong=subsong)
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "adplug/openmpt123", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "imf", subsong=subsong),
-            )
-        if ext in _ADLIB_EXTS:
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="adlib", subsong=subsong,
-                render_fn=lambda: _render_adlib(path, subsong=subsong),
-            )
-            # The scanner stored a 180s placeholder; the WAV we just made/cached
-            # carries the real length — persist it so the list stops showing "3:00".
-            await _backfill_rendered_duration(track_id, track, cached_path,
-                                              subsong=subsong)
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "adplug", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "adlib", subsong=subsong),
-            )
+        if ext == ".imf" or ext in _ADLIB_EXTS:
+            # id/Apogee AdLib IMF stores the same 180s placeholder as the rest
+            # of AdLib and renders to natural end via _render_adlib, so its
+            # real length is backfilled too.  The placeholder gate no-ops for
+            # IM10 (Imago Orpheus) .imf, which already carries a real tracker
+            # duration (and renders through openmpt123 — never live).
+            _fmt = "imf" if ext == ".imf" else "adlib"
+            _key = _ck(track_id, _fmt, subsong=subsong)
+            _exp = _stored_render_seconds(track, subsong, track_id,
+                                          placeholder=_ADLIB_PLACEHOLDER_S)
+            _rfn = _render_imf if ext == ".imf" else _render_adlib
+
+            async def _after(cached_path):
+                # The scanner stored a 180s placeholder; the WAV carries the
+                # real length — persist it so the list stops showing "3:00".
+                # The render is the authority: a stored length it disagrees
+                # with (which a live start promised) is corrected too.
+                await _backfill_rendered_duration(track_id, track, cached_path,
+                                                  subsong=subsong, authoritative=True)
+            # Played while adplay renders it, once it proves audible — an
+            # empty first subsong falls back to the probe of the next ones.
+            return await _serve_live(
+                request, track_id=track_id, format_type=_fmt, subsong=subsong, key=_key,
+                render_fn=lambda: _rfn(path, subsong=subsong, live_key=_key,
+                                       expected_seconds=_exp),
+                web_session=_web_session, background=_bg, xf=xf,
+                rendered="adplug/openmpt123" if ext == ".imf" else "adplug",
+                after_render=_after)
         if ext in _TRACKER_EXTS:
             cached_path, hit = await get_or_render(
                 track_id=track_id, format_type="tracker", subsong=subsong,
@@ -9438,23 +11791,29 @@ async def stream_track(
                 source_key=_ck(track_id, "tracker", subsong=subsong),
             )
         if ext in _GME_EXTS_STREAM:
-            cached_path, hit = await get_or_render(
-                track_id=track_id, format_type="gme", subsong=subsong,
-                render_fn=lambda: _render_gme(path, subsong=subsong),
-            )
-            # GME chiptunes (NSF/SPC/GBS/…) store the sid_default_duration
-            # placeholder; libgme renders to the track's natural end so the WAV
-            # carries the real length — persist it so the list/modal stop showing
-            # the default (e.g. "5:00").
-            await _backfill_rendered_duration(
-                track_id, track, cached_path, float(settings.sid_default_duration),
-                subsong=subsong)
-            return await _serve_rendered(
-                request, cached_path,
-                headers={"X-Rendered": "gme", "X-Cache": "hit" if hit else "miss"},
-                background=_bg, xf=xf, track_id=track_id,
-                source_key=_ck(track_id, "gme", subsong=subsong),
-            )
+            _key = _ck(track_id, "gme", subsong=subsong)
+            # A GYM's stored length is its frame count, not the render's.
+            _exp = (0.0 if ext == ".gym" else _stored_render_seconds(
+                track, subsong, track_id, placeholder=float(settings.sid_default_duration)))
+
+            async def _after(cached_path):
+                # GME chiptunes (NSF/SPC/GBS/…) store the sid_default_duration
+                # placeholder; libgme renders to the track's natural end so the
+                # WAV carries the real length — persist it so the list/modal
+                # stop showing the default (e.g. "5:00").  The render is the
+                # authority: a GYM's scan length is its frame count (libgme
+                # trims trailing silence), and a stored length from before a
+                # change of the chiptune default length — which a live start
+                # promised — is corrected too.
+                await _backfill_rendered_duration(
+                    track_id, track, cached_path, float(settings.sid_default_duration),
+                    subsong=subsong, authoritative=True)
+            return await _serve_live(
+                request, track_id=track_id, format_type="gme", subsong=subsong, key=_key,
+                render_fn=lambda: _render_gme(path, subsong=subsong, live_key=_key,
+                                              expected_seconds=_exp),
+                web_session=_web_session, background=_bg, xf=xf, rendered="gme",
+                after_render=_after)
 
         # ── Native: serve directly with Range support ─────────────────────────────
         # Skipped when:
@@ -9480,22 +11839,7 @@ async def stream_track(
             and target_format.lower() in TRANSCODE_MIME
             and target_format.lower() != _src_codec
         )
-        # Ogg/Opus: some clients (Safari < 18.4) can't decode it — route those to
-        # the transcoder (→ WAV, which every browser plays) instead of a native
-        # .ogg/.opus that fails silently.  Prefer the client's DECLARED capability
-        # (sb_caps), keyed by extension — ``.opus`` is Opus; ``.ogg`` is usually
-        # Vorbis but may be Opus, so accept EITHER (uses the vorbis cap too).
-        # Fall back to the Safari-version UA heuristic when nothing was declared.
-        if ext == ".opus":
-            _ogg_sup = _client_supports("opus", request)
-        elif ext == ".ogg":
-            _o = _client_supports("opus", request)
-            _v = _client_supports("vorbis", request)
-            _ogg_sup = None if (_o is None and _v is None) else (bool(_o) or bool(_v))
-        else:
-            _ogg_sup = None
-        _old_safari_ogg = ext in (".ogg", ".opus") and (
-            (_ogg_sup is False) if _ogg_sup is not None else _safari_lacks_ogg(request))
+        _old_safari_ogg = _ogg_needs_transcode(ext, request)
         # A client bitrate cap (Subsonic ``maxBitRate``) below the source's
         # bitrate also forces a transcode — only Subsonic requests carry one,
         # so a web play never pays for the bitrate lookup.
@@ -9678,6 +12022,31 @@ async def stream_track(
         raise
 
 
+def _head_c64_start_song(track_id: str, track, path_str: str) -> "int | None":
+    """For HEAD: the start song of the plain local C64 SID ``path_str`` as GET
+    will use it (recorded, remembered, else read from its header — not
+    remembered here), or None when it isn't a readable C64 tune.  Blocking."""
+    try:
+        if not os.path.isfile(path_str):
+            return None
+        with open(path_str, "rb") as fh:
+            if fh.read(4) not in (b"PSID", b"RSID"):
+                return None
+    except OSError:
+        return None
+    rec = _recorded_start_song(track) if track is not None else None
+    if rec is not None:
+        return rec
+    got = _SID_START_SONG.get(track_id)
+    if got is not None:
+        return got
+    try:
+        count, start = _psid_count_start(Path(path_str))
+    except Exception:
+        return 1
+    return start if count > 0 else 1
+
+
 def _peek_cached_size(cache_key: str) -> int | None:
     """Size of a finished conversion-cache entry, without touching its LRU
     position or the disk; None when not cached."""
@@ -9696,7 +12065,7 @@ def _peek_cached_size(cache_key: str) -> int | None:
 async def stream_track_head(
     track_id: str,
     request: Request,
-    subsong: int = Query(default=0, ge=0),
+    subsong: int | None = Query(default=None, ge=0),
     target_format: str | None = Query(default=None, alias="format", max_length=16),
     max_bitrate_kbps: int = Query(default=0, alias="maxBitRate", ge=0, le=2_500_000),
     target_sample_rate: int = Query(default=0, alias="sampleRate", ge=0, le=384_000),
@@ -9713,8 +12082,9 @@ async def stream_track_head(
     Same auth as GET.  Never renders, transcodes, extracts an archive member
     or fetches a remote file: Content-Type is predicted from the file name
     (``delivered_format``), and Content-Length is sent only when it is known
-    for free — a local file served as is, or a finished render / transcode
-    already in the conversion cache."""
+    for free — a local file served as is, a finished render / transcode
+    already in the conversion cache, or a local C64 SID's render (GET
+    streams it with its exact length: the tune's target seconds)."""
     if not _cast_internal_bypass_ctx.get():
         await _require_stream_auth(request, sb_session, u, p, s, t)
     track = await get_track(track_id)
@@ -9722,10 +12092,17 @@ async def stream_track_head(
         raise HTTPException(404, "Track not found")
     path_str = track.path or ""
     ext, uade_named = _render_ident(path_str, track)
+    wire = explicit_wire(subsong, request)
+    # A bare play of a multi-tune file whose default tune isn't probed yet:
+    # GET will probe first and may render another tune than tune 1 — so no
+    # cached size is promised for it here.
+    undecided = (wire is None and _tune_count(track) > 1 and not _header_tuned(track)
+                 and default_tune_known(track_id, track) is None
+                 and _probe_family(ext, uade_named) is not None)
+    subsong = tune_index(track_id, track, wire)        # the key's tune
     want = (target_format or "").strip().lower() or None
     headers = {"Accept-Ranges": "bytes"}
-    plain_local = not (path_str.startswith(("smb://", "ftp://", "http://", "https://"))
-                       or "::" in path_str)
+    plain_local = not (is_remote_path(path_str) or "::" in path_str)
     size: int | None = None
     delivered = delivered_format(path_str, getattr(track, "format", "") or "", want)
     constrained = bool(max_bitrate_kbps) or bool(target_sample_rate)
@@ -9749,16 +12126,28 @@ async def stream_track_head(
                 (want if want in TRANSCODE_MIME else "mp3"),
                 TRANSCODE_MIME.get(want or "", "audio/mpeg"))
         mime = delivered[1]
+        c64_dur = 0
         if not constrained and delivered[0] == "wav":
             if ext in _SID_EXTS:
+                # A plain local C64 tune: GET streams its render with the
+                # exact length — the tune's target seconds — so that length is
+                # known for free.  Its start song (which tune a bare play
+                # renders, hence which length) is read as GET reads it — but
+                # not remembered: a HEAD changes nothing.
+                start_song = None
+                if plain_local:
+                    start_song = await asyncio.to_thread(_head_c64_start_song,
+                                                         track_id, track, path_str)
+                    if start_song is not None:
+                        c64_dur = _sid_target_seconds(track, subsong, start_song)
                 keys = [_ck(track_id, "sid", subsong=subsong,
-                            duration=_sid_target_seconds(track, subsong)),
+                            duration=_sid_target_seconds(track, subsong, start_song)),
                         uade_cache_key_known(track_id, subsong, track)]
             elif ext in _MIDI_EXTS:
                 from soniqboom.config import get_active_soundfont
                 _sf = get_active_soundfont()
                 keys = [_ck(track_id, "midi", 0, str(_sf) if _sf else "")]
-            elif ext in _PSF_STREAM_EXTS:
+            elif ext in _PSF_STREAM_EXTS and not uade_named:
                 keys = [_ck(track_id, "psf", 0)]
             elif ext in _YM_EXTS:
                 keys = [_ck(track_id, "ym", 0)]
@@ -9770,10 +12159,19 @@ async def stream_track_head(
                 keys += [_ck(track_id, fmt, subsong=subsong) for fmt in
                          ("tracker", "hvl", "sndh", "sc68", "gme", "adlib", "imf")]
                 keys.append(_inflight_cache_key(track_id, None))
-            for k in keys:
+            for k in ([] if undecided else keys):
                 size = _peek_cached_size(k)
                 if size:
                     break
+            if not size and c64_dur and not undecided:
+                # What GET would answer instead of the stream: the same errors.
+                from soniqboom.core.conversion_cache import known_silent, SILENT_RENDER_DETAIL
+                if not _find_renderer(settings.sidplayfp_path, "sidplayfp"):
+                    raise HTTPException(501, "sidplayfp not installed")
+                if known_silent(keys[0]):
+                    raise HTTPException(422, SILENT_RENDER_DETAIL)
+                size = _WAV_HEADER_LEN + c64_dur * _SID_WAV_RATE * _SID_WAV_CHANNELS * (
+                    _SID_WAV_BITS // 8)
     headers["Content-Type"] = mime
     if size:
         headers["Content-Length"] = str(size)

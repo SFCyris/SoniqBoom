@@ -17,6 +17,7 @@ import os
 import socket
 import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -40,7 +41,94 @@ _CONNECT_ATTEMPTS = 3
 _CONNECT_BACKOFF_BASE = 0.5
 
 
-_REMOTE_SCHEMES = ("smb://", "ftp://")
+# Every scheme a network-share scan root / track path starts with — THE list.
+# WebDAV scan roots are the share's http(s):// base URL.  Callers test paths
+# with ``is_remote_path`` rather than carrying their own copy: a narrower copy
+# (smb/ftp only) sent WebDAV roots down the local-filesystem branch, which
+# answered every browse with 404 (GitHub #18).
+REMOTE_SCHEMES: tuple[str, ...] = (
+    "smb://", "ftp://", "http://", "https://", "webdav://", "webdavs://",
+)
+
+
+def is_remote_path(path) -> bool:
+    """True for a network-share scan root or track path (SMB / FTP / WebDAV),
+    including a composite remote-archive member (``…/a.zip::x.mod``).  The
+    scheme is case-insensitive (``Https://…`` is a URL, not a local path)."""
+    if not path:
+        return False
+    s = str(path)
+    return s.startswith(REMOTE_SCHEMES) or s[:10].lower().startswith(REMOTE_SCHEMES)
+
+
+def scan_root_for_share(share: dict) -> str:
+    """The scan-root URL a configured network share is registered under —
+    the key of ``scan_dirs``, the source registry and every track path
+    (``<scan_root>:<path>``).  WebDAV shares use the base URL exactly as
+    entered."""
+    proto = (share.get("protocol") or "").lower()
+    host = share.get("host", "")
+    if proto == "smb":
+        return f"smb://{host}/{share['share']}"
+    if proto == "ftp":
+        return f"ftp://{host}{share.get('remote_path', '/')}"
+    if proto in ("webdav", "webdavs", "http", "https"):
+        return share.get("base_url") or (
+            f"{'https' if proto in ('webdavs', 'https') else 'http'}://"
+            f"{host}{share.get('remote_path', '/')}"
+        )
+    raise ValueError(f"Unknown protocol: {proto}")
+
+
+_AUTH_KEY_SALT = os.urandom(16)     # per process: the fingerprint never leaves memory
+
+
+def share_auth_key(share: dict, password: str | None = None) -> str:
+    """``scheme://user@host:port#<fingerprint>`` — the shares that log in to
+    the same server with the same credentials (a refused login refuses them
+    all; a share with another password is not held back by it).  The
+    fingerprint is a salted HMAC of the password, never the password; ``password``
+    defaults to the share's stored (encrypted) one."""
+    import hashlib
+    import hmac
+    try:
+        proto, host, port = share_endpoint(share)
+    except Exception:
+        proto, host, port = str(share.get("protocol", "")), str(share.get("host", "")), 0
+    user = share.get("username") or ""
+    if password is None:
+        password = ""
+        if share.get("password_enc"):
+            try:
+                from soniqboom.core.credentials import decrypt
+                password = decrypt(share["password_enc"]) or ""
+            except Exception:
+                password = ""
+    fp = hmac.new(_AUTH_KEY_SALT, f"{user}\0{password}".encode("utf-8", "surrogatepass"),
+                  hashlib.sha256).hexdigest()[:16]
+    return f"{proto}://{user}@{host}:{port}#{fp}"
+
+
+def share_endpoint(share: dict) -> tuple[str, str, int]:
+    """``(protocol, host, port)`` of the server a configured share lives on —
+    shares with the same endpoint share its reachability."""
+    proto = (share.get("protocol") or "").lower()
+    if proto in ("webdav", "webdavs", "http", "https"):
+        from urllib.parse import urlsplit
+        url = scan_root_for_share(share)
+        parts = urlsplit(url)
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        return (parts.scheme, (parts.hostname or "").lower(),
+                port or (443 if parts.scheme == "https" else 80))
+    default = 445 if proto == "smb" else 21
+    try:
+        port = int(share.get("port") or default)
+    except (TypeError, ValueError):
+        port = default
+    return proto, str(share.get("host", "")).lower(), port
 
 # Dedup so a legacy track being hit repeatedly (album view fans out to art,
 # stream, lyrics endpoints) only logs once per unique URL.
@@ -93,11 +181,23 @@ def parse_remote_path(path_str: str) -> tuple[str, str]:
     """
     from urllib.parse import urlsplit
 
-    for scheme in _REMOTE_SCHEMES:
-        if path_str.startswith(scheme):
-            break
-    else:
+    if not is_remote_path(path_str):
         raise ValueError(f"Not a remote URL: {path_str!r}")
+
+    # A registered scan root followed by ``:/`` (or ``:`` at the very end)
+    # is the exact share / path boundary whatever the root looks like — a
+    # WebDAV root without a path (``https://dav.example.com:/Artist/x.flac``)
+    # or a ``:`` inside the share's own path.  The longest matching root wins.
+    # A bare ``root + ":"`` prefix is NOT a boundary: the tracks of
+    # ``https://dav.example.com:8443/dav`` start with the path-less root
+    # ``https://dav.example.com`` + ``:`` too.
+    best = ""
+    for root in list(_active_sources):
+        if len(root) > len(best) and (path_str.startswith(root + ":/")
+                                      or path_str == root + ":"):
+            best = root
+    if best:
+        return best, path_str[len(best) + 1:]
 
     parts = urlsplit(path_str)
     path = parts.path
@@ -109,6 +209,13 @@ def parse_remote_path(path_str: str) -> tuple[str, str]:
         path = f"{path}?{parts.query}"
     if parts.fragment:
         path = f"{path}#{parts.fragment}"
+    # The scheme as written (``urlsplit`` lowercases it) so the root stays
+    # the registry / track-path key of a share entered as ``Https://…``.
+    scheme = path_str.split("://", 1)[0]
+    if parts.netloc.endswith(":"):
+        # A root without a path (WebDAV ``https://dav.example.com``): its
+        # ``:`` separator lands right after the host, as an empty port.
+        return f"{scheme}://{parts.netloc[:-1]}", path
     sep = path.find(":") if path else -1
     if sep == -1:
         # Either the URL targets the share root (no trailing path) or the
@@ -129,7 +236,7 @@ def parse_remote_path(path_str: str) -> tuple[str, str]:
                 )
         return path_str, ""
     share, remote = path[:sep], path[sep + 1:]
-    scan_root = f"{parts.scheme}://{parts.netloc}{share}"
+    scan_root = f"{scheme}://{parts.netloc}{share}"
     return scan_root, remote
 
 
@@ -169,7 +276,16 @@ _TOO_MANY_CLIENTS_PATTERNS = (
     "max number of clients",
     "max clients",
     "max users",
+    "allowed clients",           # ProFTPD MaxClients: "maximum number of allowed clients"
+    "maximum number of hosts",
+    "too many sessions",
 )
+
+
+class FTPLoginRefused(ftplib.error_perm):
+    """The server refused the LOGIN (530 that isn't a too-many-clients reply)
+    — raised by the pool's connection factory only, so a mid-session
+    "530 Not logged in" is never mistaken for bad credentials."""
 
 
 def _is_too_many_clients_error(exc: BaseException) -> bool:
@@ -184,6 +300,52 @@ def _is_too_many_clients_error(exc: BaseException) -> bool:
         return False
     msg = str(exc).lower()
     return any(pat in msg for pat in _TOO_MANY_CLIENTS_PATTERNS)
+
+
+# SMB NTSTATUS codes that mean "these credentials will not log in" — retrying
+# them only feeds a server's failed-login counter (account lockout, fail2ban).
+_SMB_AUTH_STATUSES = frozenset({
+    0xC000006D,   # STATUS_LOGON_FAILURE
+    0xC000006A,   # STATUS_WRONG_PASSWORD
+    0xC0000064,   # STATUS_NO_SUCH_USER
+    0xC000006E,   # STATUS_ACCOUNT_RESTRICTION
+    0xC000006F,   # STATUS_INVALID_LOGON_HOURS
+    0xC0000070,   # STATUS_INVALID_WORKSTATION
+    0xC0000071,   # STATUS_PASSWORD_EXPIRED
+    0xC0000072,   # STATUS_ACCOUNT_DISABLED
+    0xC0000193,   # STATUS_ACCOUNT_EXPIRED
+    0xC0000224,   # STATUS_PASSWORD_MUST_CHANGE
+    0xC0000234,   # STATUS_ACCOUNT_LOCKED_OUT
+})
+
+
+def is_auth_failure(exc: BaseException | None) -> bool:
+    """True when *exc* says the server REFUSED the credentials (an FTP login
+    answered 530 — ``FTPLoginRefused`` —, an SMB logon failure, HTTP 401, or
+    429 from a login throttle) — a failure that retrying can't fix but can
+    turn into a lockout, and that holds for every share logging in with them."""
+    if exc is None:
+        return False
+    if isinstance(exc, ftplib.Error):
+        return isinstance(exc, FTPLoginRefused)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        # 429: a brute-force throttle (Nextcloud) — the same reason to stop.
+        # NOT 403: that is one folder the account may not read, not a refused
+        # login — counting it would take the account's other shares offline.
+        return status in (401, 429)
+    try:
+        from smbprotocol import exceptions as _smbx
+    except Exception:          # smbprotocol not installed
+        return False
+    if isinstance(exc, _smbx.SMBAuthenticationError):
+        return True
+    if isinstance(exc, _smbx.SMBResponseException):
+        try:
+            return exc.status in _SMB_AUTH_STATUSES
+        except Exception:
+            return False
+    return False
 
 
 @dataclass
@@ -202,8 +364,75 @@ class DirEntry:
     mtime: float = 0.0
 
 
+class SourceStream:
+    """A sequential read of one source file, from an offset onward.
+
+    ``size`` is the WHOLE file's size (not the remaining bytes) when the
+    server says, else ``None``.  ``read(n)`` returns up to ``n`` bytes and
+    ``b""`` at the end; ``close()`` releases the connection (a pooled FTP
+    connection goes back to its pool).  Used to download into the remote
+    cache chunk by chunk — a reader can play the head of a file while its
+    tail is still arriving — and to answer a seek past what has arrived
+    straight from the share.
+    """
+
+    size: int | None = None
+
+    def read(self, n: int = 256 * 1024) -> bytes:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "SourceStream":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class _BytesStream(SourceStream):
+    """``SourceStream`` over bytes already in memory (the base-class fallback)."""
+
+    def __init__(self, data: bytes, offset: int = 0) -> None:
+        self.size = len(data)
+        self._view = memoryview(data)[max(0, offset):]
+
+    def read(self, n: int = 256 * 1024) -> bytes:
+        out, self._view = self._view[:n], self._view[n:]
+        return bytes(out)
+
+
+class _FileObjStream(SourceStream):
+    """``SourceStream`` over an open binary file object."""
+
+    def __init__(self, fh, size: int | None) -> None:
+        self.size = size
+        self._fh = fh
+
+    def read(self, n: int = 256 * 1024) -> bytes:
+        return self._fh.read(n) or b""
+
+    def close(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 class FileSource(ABC):
     """Abstract filesystem source."""
+
+    # Why the last ``is_dir`` probe failed (network sources set it) — the
+    # share Test / Connect buttons show it instead of a bare "not accessible".
+    last_error: str | None = None
+    # The last failed ``is_dir`` probe was the server refusing the
+    # credentials (``is_auth_failure``) — the health monitor backs off.
+    last_error_auth: bool = False
+    # ``share_auth_key`` of the share it was created for (``create_source``).
+    auth_key: str | None = None
 
     @abstractmethod
     def walk(self, top: str) -> Iterator[tuple[str, list[str], list[str]]]:
@@ -303,6 +532,18 @@ class FileSource(ABC):
         off = max(0, int(offset))
         return self.read_file(path, lane=lane)[off:off + length]
 
+    def open_stream(self, path: str, *, offset: int = 0, lane: str = "stream",
+                    length: int | None = None) -> SourceStream:
+        """Open a sequential read of *path* from byte ``offset`` (see
+        :class:`SourceStream`).  ``length`` is a hint that the caller reads
+        at most that many bytes (an HTTP backend asks for just that range).
+
+        The default reads the whole file first — correct for every backend;
+        the network backends override it to stream from the wire, holding
+        one connection (on ``lane``) until the stream is closed.
+        """
+        return _BytesStream(self.read_file(path, lane=lane), max(0, int(offset)))
+
     @abstractmethod
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         """Read entire file contents.
@@ -323,7 +564,8 @@ class FileSource(ABC):
 
     @abstractmethod
     def stat(self, path: str) -> FileStat:
-        """Get file/directory metadata."""
+        """Get file/directory metadata.  Built-in backends also take a
+        keyword-only ``lane`` (the priority lane on pooled backends)."""
 
     @abstractmethod
     def is_dir(self, path: str) -> bool:
@@ -392,7 +634,24 @@ class LocalFileSource(FileSource):
         # on source type.
         return Path(path).read_bytes()
 
-    def stat(self, path: str) -> FileStat:
+    def read_at(self, path: str, offset: int, length: int, *, lane: str = "scan") -> bytes:
+        if length <= 0:
+            return b""
+        with open(path, "rb") as fh:
+            return os.pread(fh.fileno(), length, max(0, int(offset)))
+
+    def open_stream(self, path: str, *, offset: int = 0, lane: str = "stream",
+                    length: int | None = None) -> SourceStream:
+        fh = open(path, "rb")
+        try:
+            size = os.fstat(fh.fileno()).st_size
+            fh.seek(max(0, int(offset)))
+        except BaseException:
+            fh.close()
+            raise
+        return _FileObjStream(fh, size)
+
+    def stat(self, path: str, *, lane: str = "scan") -> FileStat:
         st = os.stat(path)
         return FileStat(size=st.st_size, mtime=st.st_mtime, is_dir=os.path.isdir(path))
 
@@ -401,6 +660,114 @@ class LocalFileSource(FileSource):
 
 
 # ── SMB ─────────────────────────────────────────────────────────────────────
+
+
+# smbclient keeps ONE connection per ``server:port`` and every share of that
+# server rides on it — ``smbclient.delete_session`` tears down the connection
+# (all its sessions), not one share's.  So the sources registered on a
+# connection are counted here and only the LAST one to close deletes it: a
+# missing share being retried (its connect succeeds at the host level, its
+# root check fails, its source is closed) used to disconnect the healthy
+# sibling shares of the same server on every health pass.  Every smbclient
+# call passes the share's port and credentials (``_kw``), so a call whose
+# connection or session is gone builds a new one for THIS share's user — it
+# never rides another user's session or a credential-less one (except a guest
+# share whose server took the empty user name: smbclient reads "" as "any
+# session"), and a share on a port other than 445 is reached at all.  A tree / session the server
+# dropped is rebuilt by the call that meets it (``_heal``); a teardown bumps
+# the generation, so the other sources re-register (re-claim) on their next
+# call.
+_SMB_SESSIONS_LOCK = threading.Lock()
+_SMB_SESSION_USERS: "dict[str, weakref.WeakSet]" = {}
+_SMB_SESSION_GEN: dict[str, int] = {}
+_SMB_ECHO_TIMEOUT_S = 5
+_SMB_LOGOFF_TIMEOUT_S = 10
+# One registration at a time per server: smbclient's register_session isn't
+# safe to run concurrently (two callers each create a Connection, one leaks).
+_SMB_REG_LOCKS: dict[str, threading.Lock] = {}
+# host:port → (when, why) of the last registration that failed on the network.
+_SMB_REG_FAILED: dict[str, tuple[float, str]] = {}
+_SMB_REG_FAIL_HOLD_S = 5.0
+# NTSTATUS of a tree connect the server dropped (the share was removed /
+# re-created, a USB disk re-plugged) and of a session it dropped (kicked,
+# expired).  smbclient reuses both from its cache without checking them.
+_SMB_TREE_GONE = frozenset({0xC00000C9})                  # NETWORK_NAME_DELETED
+_SMB_SESSION_GONE = frozenset({0xC0000203, 0xC000035C})   # USER_SESSION_DELETED, NETWORK_SESSION_EXPIRED
+
+
+def _smb_session_key(host: str, port: int) -> str:
+    return f"{str(host).lower()}:{int(port)}"
+
+
+def _smb_status(exc: BaseException | None) -> int | None:
+    """The NTSTATUS an smbclient / smbprotocol error carries, if any — also
+    when it was replaced by an error raised while cleaning up (the close of
+    a handle on a tree another thread dropped meanwhile)."""
+    seen = 0
+    while exc is not None and seen < 5:
+        for attr in ("ntstatus", "status"):
+            try:
+                v = getattr(exc, attr, None)
+            except Exception:
+                v = None
+            if isinstance(v, int):
+                return v
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return None
+
+
+def _smb_force_close(conn) -> None:
+    """Close an smbprotocol connection's socket and wake every request still
+    waiting on it: smbprotocol signals none of them when its socket closes,
+    so their ``receive()`` (no timeout) would wait forever — a playing stream
+    or a download of another share on the same server hung for good."""
+    try:
+        conn.transport.close()
+    except Exception:
+        pass
+    try:
+        for req in list(getattr(conn, "outstanding_requests", {}).values()):
+            req.response_event.set()        # → receive() raises SMBConnectionClosed
+    except Exception:
+        pass
+
+
+def _smb_close_in_background(conn, graceful: bool, fallback=None) -> None:
+    """Close *conn* off the caller's thread (``close()`` runs on the event
+    loop): log the sessions off only when the server still answers an ECHO
+    within 2 s, give that ``_SMB_LOGOFF_TIMEOUT_S`` + a margin (smbprotocol
+    closes opens and trees without any timeout), then force-close."""
+    def _run() -> None:
+        try:
+            if fallback is not None:
+                fallback()
+                return
+            if graceful:
+                ok = False
+                try:
+                    sid = next(iter(list(conn.session_table)), 0)
+                    conn.echo(sid=sid, timeout=2)
+                    ok = True
+                except Exception:
+                    pass
+                if ok:
+                    def _logoff() -> None:
+                        try:
+                            conn.disconnect(close=True, timeout=_SMB_LOGOFF_TIMEOUT_S)
+                        except Exception:
+                            pass
+                    t = threading.Thread(target=_logoff, name="smb-logoff", daemon=True)
+                    t.start()
+                    t.join(_SMB_LOGOFF_TIMEOUT_S + 5)
+        finally:
+            if fallback is None:
+                _smb_force_close(conn)  # (also frees a logoff stuck in receive())
+    try:
+        threading.Thread(target=_run, name="smb-close", daemon=True).start()
+    except Exception:
+        if fallback is None:
+            _smb_force_close(conn)
 
 
 class SMBFileSource(FileSource):
@@ -414,10 +781,62 @@ class SMBFileSource(FileSource):
         self._username = username
         self._password = password
         self._registered = False
+        self._gen = 0                       # _SMB_SESSION_GEN when registered
+        self._skey = _smb_session_key(host, port)
+        # The credentials the server accepted (guest: "Guest" or "") — what
+        # every call passes, so it finds / rebuilds THIS user's session.
+        self._reg_user = username
+        self._reg_pass = password
+
+    def _kw(self) -> dict:
+        return {"port": self._port, "username": self._reg_user,
+                "password": self._reg_pass}
+
+    def _registration_live(self) -> bool:
+        return self._registered and self._gen == _SMB_SESSION_GEN.get(self._skey, 0)
+
+    def _drop_registration(self) -> bool:
+        """Forget this source's claim on the server connection.  True when no
+        other registered source still uses it (the caller may delete it)."""
+        with _SMB_SESSIONS_LOCK:
+            # A claim from before a teardown is gone already: closing such a
+            # source must not delete the connection the others rebuilt.
+            was = self._registration_live()
+            self._registered = False
+            users = _SMB_SESSION_USERS.get(self._skey)
+            if users is not None:
+                users.discard(self)
+            if not was:
+                return False
+            return not users
 
     def _ensure_registered(self) -> None:
-        if self._registered:
+        if self._registration_live():
             return
+        with _SMB_SESSIONS_LOCK:
+            reg_lock = _SMB_REG_LOCKS.setdefault(self._skey, threading.Lock())
+        with reg_lock:
+            if self._registration_live():
+                return
+            # A registration with the server that just failed (another
+            # share's, up to ~3 min of connect retries): fail at once instead
+            # of every sibling repeating the wait in turn.
+            failed = _SMB_REG_FAILED.get(self._skey)
+            if failed is not None and time.monotonic() - failed[0] < _SMB_REG_FAIL_HOLD_S:
+                raise ConnectionError(f"SMB server {self._skey} unreachable: {failed[1]}")
+            try:
+                self._register()
+            except Exception as exc:
+                msg = str(exc).lower()
+                if (isinstance(exc, (OSError, socket.timeout, TimeoutError))
+                        or "timed out" in msg or "no route" in msg
+                        or "connection refused" in msg):
+                    _SMB_REG_FAILED[self._skey] = (time.monotonic(),
+                                                   f"{type(exc).__name__}: {exc}")
+                raise
+            _SMB_REG_FAILED.pop(self._skey, None)
+
+    def _register(self) -> None:
         import smbclient
 
         def _do_register() -> None:
@@ -426,6 +845,7 @@ class SMBFileSource(FileSource):
                     self._host, username=self._username, password=self._password,
                     port=self._port,
                 )
+                self._reg_user, self._reg_pass = self._username, self._password
             else:
                 # Guest / anonymous: try "Guest" first, fall back to empty creds
                 try:
@@ -433,17 +853,23 @@ class SMBFileSource(FileSource):
                         self._host, username="Guest", password="",
                         port=self._port,
                     )
+                    self._reg_user, self._reg_pass = "Guest", ""
                 except Exception:
                     smbclient.register_session(
                         self._host, username="", password="",
                         port=self._port,
                     )
+                    self._reg_user, self._reg_pass = "", ""
 
         last_exc: BaseException | None = None
         for attempt in range(_CONNECT_ATTEMPTS):
             try:
+                gen = _SMB_SESSION_GEN.get(self._skey, 0)
                 _do_register()
-                self._registered = True
+                with _SMB_SESSIONS_LOCK:
+                    _SMB_SESSION_USERS.setdefault(self._skey, weakref.WeakSet()).add(self)
+                    self._gen = gen
+                    self._registered = True
                 if attempt > 0:
                     log.info("SMB reconnected to //%s/%s after %d retries",
                              self._host, self._share, attempt)
@@ -475,12 +901,191 @@ class SMBFileSource(FileSource):
         assert last_exc is not None
         raise last_exc
 
-    def reconnect(self) -> bool:
-        """Force-rebuild the SMB session.  Returns True on success."""
-        self.close()  # closes + clears _registered
+    def _connection(self):
         try:
-            self._ensure_registered()
+            from smbclient._pool import _SMB_CONNECTIONS
+            return _SMB_CONNECTIONS.get(self._skey)
+        except Exception:
+            return None
+
+    def _connection_alive(self) -> bool:
+        """An SMB2 ECHO on the server connection shared by this host:port
+        answers (False when there is none, or it doesn't)."""
+        try:
+            conn = self._connection()
+            if conn is None or not conn.transport.connected:
+                return False
+            # A Windows server closes the socket on an ECHO without a valid
+            # session id; Samba accepts 0.
+            sid = next(iter(list(conn.session_table)), 0)
+            conn.echo(sid=sid, timeout=_SMB_ECHO_TIMEOUT_S)
             return True
+        except Exception:
+            return False
+
+    def _tree_name(self) -> str:
+        # The tree is the share itself — a share field with a sub-folder
+        # ("Music/Classical") still connects \\host\Music.
+        top = self._share.replace("/", "\\").strip("\\").split("\\", 1)[0]
+        return f"\\\\{self._host}\\{top}".lower()
+
+    def _share_trees(self, conn=None) -> list:
+        """The tree connects of THIS share cached on the server connection
+        right now (all sessions) — the objects: holding them keeps their
+        ``id()`` from being reused by a fresh tree."""
+        conn = conn if conn is not None else self._connection()
+        if conn is None:
+            return []
+        want = self._tree_name()
+        out: list = []
+        try:
+            for sess in list(conn.session_table.values()):
+                for tree in list(sess.tree_connect_table.values()):
+                    if str(getattr(tree, "share_name", "")).lower() == want:
+                        out.append(tree)
+        except Exception:
+            pass
+        return out
+
+    def _forget_trees(self, conn, trees: list) -> int:
+        """Drop the given tree connects (the server deleted them) and their
+        open handles from the connection's sessions, so the next call
+        connects the share afresh.  No network.  The tables are REPLACED, not
+        mutated: smbclient iterates them in other threads; a tree another
+        thread connects meanwhile is carried over.  Only trees captured
+        before the failing call are dropped — never a fresh one a concurrent
+        heal's retry just connected."""
+        if conn is None or not trees:
+            return 0
+        doomed = {id(t) for t in trees}       # (``trees`` keeps them alive)
+        n = 0
+        try:
+            for sess in list(conn.session_table.values()):
+                old = sess.tree_connect_table
+                snap = list(old.items())
+                gone = {tid for tid, t in snap if id(t) in doomed}
+                if not gone:
+                    continue
+                new = {tid: t for tid, t in snap if tid not in gone}
+                sess.tree_connect_table = new
+                for tid, t in list(old.items()):          # connected meanwhile
+                    if tid not in gone and tid not in new:
+                        new[tid] = t
+                dead_trees = {id(t) for tid, t in snap if tid in gone}
+                opens = sess.open_table
+                osnap = list(opens.items())
+                new_opens = {fid: o for fid, o in osnap
+                             if id(getattr(o, "tree_connect", None)) not in dead_trees}
+                sess.open_table = new_opens
+                for fid, o in list(opens.items()):        # opened meanwhile
+                    if (fid not in new_opens
+                            and id(getattr(o, "tree_connect", None)) not in dead_trees):
+                        new_opens[fid] = o
+                n += len(gone)
+        except Exception:
+            log.debug("SMB tree cleanup for //%s/%s failed", self._host, self._share,
+                      exc_info=True)
+        return n
+
+    def _drop_connection(self, conn=None, *, graceful: bool = False) -> bool:
+        """Remove the server connection (*conn*, or the current one) from
+        smbclient's cache — only if it is still the cached one — and close
+        it; every share on it re-registers on its next call (generation
+        bump).  Never blocks: ``graceful`` (a healthy last user) logs the
+        sessions off in a background thread (``_smb_close_in_background``);
+        otherwise only the socket is closed, at once — a logoff on a dead
+        session raises before smbprotocol closes the transport, leaking the
+        socket and its receive thread.  Requests still waiting on it are woken
+        (``_smb_force_close``).  True when *conn* was the cached connection
+        (and is gone now)."""
+        try:
+            from smbclient._pool import _SMB_CONNECTIONS
+        except Exception:                   # smbclient internals moved
+            _SMB_CONNECTIONS = None
+        dropped = False
+        with _SMB_SESSIONS_LOCK:
+            if _SMB_CONNECTIONS is not None:
+                cur = _SMB_CONNECTIONS.get(self._skey)
+                if conn is None:
+                    conn = cur
+                if conn is not None and cur is conn:
+                    _SMB_CONNECTIONS.pop(self._skey, None)
+                    dropped = True
+            if dropped or _SMB_CONNECTIONS is None:
+                _SMB_SESSION_GEN[self._skey] = _SMB_SESSION_GEN.get(self._skey, 0) + 1
+                _SMB_SESSION_USERS.pop(self._skey, None)
+            self._registered = False
+        if _SMB_CONNECTIONS is None:
+            def _delete() -> None:
+                try:
+                    from smbclient import delete_session
+                    delete_session(self._host, port=self._port)
+                except Exception:
+                    pass
+            _smb_close_in_background(None, graceful, fallback=_delete)
+            return True
+        if dropped and conn is not None:
+            if graceful:
+                _smb_close_in_background(conn, True)
+            else:
+                _smb_force_close(conn)
+        return dropped
+
+    def _teardown_connection(self) -> None:
+        """Delete the server connection for every share on it (it is dead,
+        or nobody else uses it); each share re-registers on its next call."""
+        self._drop_connection()
+
+    def _heal(self, exc: BaseException, conn0, trees0: list) -> bool:
+        """Rebuild what *exc* says the server dropped; True when the call is
+        worth one retry.  *conn0* / *trees0*: the connection and this share's
+        tree connects as they were before the failing call — only those are
+        dropped, so concurrent calls meeting the same failure rebuild once."""
+        status = _smb_status(exc)
+        if status in _SMB_TREE_GONE:
+            if self._forget_trees(conn0, trees0):
+                log.info("SMB share //%s/%s was dropped by the server — "
+                         "reconnecting it", self._host, self._share)
+            return True
+        if status in _SMB_SESSION_GONE and conn0 is not None:
+            # Responses of a dropped session can't be verified any more (that
+            # is fatal for the connection's receive thread), so the connection
+            # goes: its socket is closed, no logoff.  Other users' calls on it
+            # fail once and come back on a new one (``_kw``).
+            if self._drop_connection(conn0):
+                log.info("SMB session on %s ended by the server — reconnecting",
+                         self._host)
+            return True
+        return False
+
+    def _call(self, fn, *args, **kwargs):
+        """An smbclient call with this share's session; a tree / session the
+        server dropped is rebuilt once and the call retried."""
+        self._ensure_registered()
+        conn0 = self._connection()
+        trees0 = self._share_trees(conn0)
+        try:
+            return fn(*args, **self._kw(), **kwargs)
+        except Exception as exc:
+            if not self._heal(exc, conn0, trees0):
+                raise
+        self._ensure_registered()
+        return fn(*args, **self._kw(), **kwargs)
+
+    def reconnect(self) -> bool:
+        """Rebuild this share's SMB session.  Returns True when the share
+        answers again.
+
+        The server connection is shared with the other shares of the same
+        host:port, so it is rebuilt only when nobody else uses it or it is
+        dead (no ECHO answer) — a failure of THIS share (its folder gone)
+        must not cut a sibling's stream.  The root check heals a tree or
+        session the server dropped (``_call``)."""
+        if self._drop_registration() or not self._connection_alive():
+            self._teardown_connection()
+        try:
+            import smbclient
+            return bool(self._call(smbclient.path.isdir, self._smb_path("/")))
         except Exception as exc:
             log.info("SMB reconnect to //%s/%s failed: %s: %s",
                      self._host, self._share, type(exc).__name__, exc)
@@ -506,36 +1111,45 @@ class SMBFileSource(FileSource):
         import smbclient
         self._ensure_registered()
         smb_top = self._smb_path(top)
-        for dirpath, dirnames, filenames in smbclient.walk(smb_top):
+        for dirpath, dirnames, filenames in smbclient.walk(smb_top, **self._kw()):
             yield self._to_posix(dirpath), dirnames, filenames
 
     def list_dir(self, path: str) -> list[DirEntry]:
         import smbclient
-        self._ensure_registered()
         smb_path = self._smb_path(path)
-        entries: list[DirEntry] = []
-        with smbclient.scandir(smb_path) as it:
-            for e in it:
-                try:
-                    st = e.stat()
-                    entries.append(DirEntry(
-                        name=e.name,
-                        path=self._to_posix(e.path),
-                        is_dir=e.is_dir(),
-                        size=st.st_size,
-                        mtime=st.st_mtime,
-                    ))
-                except OSError:
-                    continue
-        return entries
+
+        def _list(**kw) -> list[DirEntry]:
+            entries: list[DirEntry] = []
+            with smbclient.scandir(smb_path, **kw) as it:
+                for e in it:
+                    try:
+                        st = e.stat()
+                        entries.append(DirEntry(
+                            name=e.name,
+                            path=self._to_posix(e.path),
+                            is_dir=e.is_dir(),
+                            size=st.st_size,
+                            mtime=st.st_mtime,
+                        ))
+                    except OSError:
+                        continue
+            return entries
+        return self._call(_list)
 
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         # SMB has no pooled-connection lane semantics today; ``lane`` is
         # accepted for parity with FTPFileSource so callers don't branch.
+        # Every open shares the file for reading (``share_access="r"``):
+        # smbclient's default is an exclusive open, which made a second
+        # reader of the same file (a seek answered from the share while the
+        # download runs, a scan beside a play) fail with a sharing violation.
         import smbclient
-        self._ensure_registered()
-        with smbclient.open_file(self._smb_path(path), mode="rb") as f:
-            return f.read()
+
+        def _read(**kw) -> bytes:
+            with smbclient.open_file(self._smb_path(path), mode="rb", share_access="r",
+                                     **kw) as f:
+                return f.read()
+        return self._call(_read)
 
     def read_at(self, path: str, offset: int, length: int, *, lane: str = "scan") -> bytes:
         """SMB2 ranged read — open, seek, read ``length`` bytes.
@@ -549,31 +1163,49 @@ class SMBFileSource(FileSource):
         if length <= 0:
             return b""
         import smbclient
-        self._ensure_registered()
-        with smbclient.open_file(self._smb_path(path), mode="rb") as f:
-            off = max(0, int(offset))
-            if off:
-                f.seek(off)
-            return f.read(length)
+
+        def _read(**kw) -> bytes:
+            with smbclient.open_file(self._smb_path(path), mode="rb", share_access="r",
+                                     **kw) as f:
+                off = max(0, int(offset))
+                if off:
+                    f.seek(off)
+                return f.read(length)
+        return self._call(_read)
 
     def read_partial(self, path: str, max_bytes: int, *, lane: str = "scan") -> bytes:
         # Front-only ranged read — same one-shot transfer as read_at(0, n).
         return self.read_at(path, 0, max_bytes, lane=lane)
 
-    def stat(self, path: str) -> FileStat:
+    def open_stream(self, path: str, *, offset: int = 0, lane: str = "stream",
+                    length: int | None = None) -> SourceStream:
         import smbclient
-        self._ensure_registered()
-        st = smbclient.stat(self._smb_path(path))
-        return FileStat(
-            size=st.st_size, mtime=st.st_mtime,
-            is_dir=smbclient.path.isdir(self._smb_path(path)),
-        )
+        fh = self._call(smbclient.open_file, self._smb_path(path), mode="rb",
+                        share_access="r")
+        try:
+            size: int | None
+            try:
+                size = int(fh.seek(0, os.SEEK_END))
+            except Exception:
+                size = None
+            fh.seek(max(0, int(offset)))
+        except BaseException:
+            fh.close()
+            raise
+        return _FileObjStream(fh, size)
+
+    def stat(self, path: str, *, lane: str = "scan") -> FileStat:
+        import smbclient
+        st = self._call(smbclient.stat, self._smb_path(path))
+        import stat as _stat
+        return FileStat(size=st.st_size, mtime=st.st_mtime,
+                        is_dir=_stat.S_ISDIR(st.st_mode))
 
     def is_dir(self, path: str) -> bool:
         import smbclient
+        self.last_error_auth = False
         try:
-            self._ensure_registered()
-            return smbclient.path.isdir(self._smb_path(path))
+            return bool(self._call(smbclient.path.isdir, self._smb_path(path)))
         except Exception as exc:
             # Log at WARNING so share-connection failures surface in the log.
             # Previously this silently returned False, so "Share ... root not
@@ -583,16 +1215,19 @@ class SMBFileSource(FileSource):
                 "SMB is_dir(%s) on //%s/%s failed: %s: %s",
                 path, self._host, self._share, type(exc).__name__, exc,
             )
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_error_auth = is_auth_failure(exc)
             return False
 
     def close(self) -> None:
-        if self._registered:
-            try:
-                from smbclient import delete_session
-                delete_session(self._host, port=self._port)
-            except Exception:
-                pass
-            self._registered = False
+        """Drop this share's claim on the server connection; the connection
+        itself is deleted (logged off, socket closed) only when no other
+        registered share uses it."""
+        if not self._drop_registration():
+            return
+        # (A source that registered meanwhile is made to re-register by the
+        # generation bump.)
+        self._drop_connection(graceful=True)
 
     def force_close(self) -> None:
         """Skip the SMB2_LOGOFF / SMB2_TREE_DISCONNECT handshake — those
@@ -600,7 +1235,7 @@ class SMBFileSource(FileSource):
         is unreachable.  We just drop the registration; the kernel closes
         the underlying TCP socket on process exit (and the server times
         out the session within 10 min regardless)."""
-        self._registered = False
+        self._drop_registration()
 
 
 # ── FTP ─────────────────────────────────────────────────────────────────────
@@ -710,6 +1345,29 @@ _FTP_MAX_PER_CONN = 40
 # absorbs the (rare) timeout case.
 _FTP_BORROW_TIMEOUT_S = 60.0
 
+# Back-off of the keep-alive warm-up after the server refused the login: 5 min,
+# doubling per refusal, at most 6 h (an on-demand borrow still tries at once).
+_FTP_AUTH_BACKOFF_S = 300.0
+_FTP_AUTH_BACKOFF_MAX_S = 6 * 3600.0
+
+# Per-thread override of that wait (``borrow_wait``).
+_BORROW_WAIT = threading.local()
+
+
+@contextmanager
+def borrow_wait(seconds: float) -> Iterator[None]:
+    """Cap how long a pooled-FTP borrow made by THIS thread waits for a free
+    connection.  For a caller that gives up on an open after a few seconds:
+    without the cap its abandoned open stays queued as a (priority) stream-lane
+    waiter for the full ``_FTP_BORROW_TIMEOUT_S``, holding back every scan /
+    browse borrow of the server meanwhile.  Other backends ignore it."""
+    prev = getattr(_BORROW_WAIT, "s", None)
+    _BORROW_WAIT.s = max(0.01, float(seconds))
+    try:
+        yield
+    finally:
+        _BORROW_WAIT.s = prev
+
 
 class _PooledFTP:
     """A pool handle wrapping one ``ftplib.FTP`` plus bookkeeping.
@@ -745,6 +1403,34 @@ class _PooledFTP:
         """Signal the pool to close this connection on return instead of
         putting it back in the idle queue."""
         self._broken = True
+
+    def abort_transfer(self) -> None:
+        """Stop a ``RETR`` the caller quit reading early and leave the control
+        channel in step.
+
+        An ``ABOR`` gets two replies — 426 for the interrupted transfer then
+        226 for the ``ABOR`` (RFC 959), or, when the transfer had already
+        finished, its 226 then the ``ABOR``'s 225/226 — and ``ftplib.abort``
+        reads only the first.  The one left pending shifted every later reply
+        on the connection by one (a ``SIZE`` read the previous command's
+        answer; the next ``REST`` + ``RETR`` failed and burned the
+        connection).  So: ``NOOP`` after the abort and read up to its 200,
+        skipping whatever the abort left behind — no timeout needed, it works
+        with servers that send one reply as well as two."""
+        ftp = self.conn
+        try:
+            ftp.abort()
+            ftp.putcmd("NOOP")
+            for _ in range(4):
+                try:
+                    resp = ftp.getresp()
+                except (ftplib.error_temp, ftplib.error_perm):
+                    continue               # a late 4xx/5xx for the transfer
+                if resp.startswith("200"):
+                    return
+            self.mark_broken()
+        except Exception:
+            self.mark_broken()
 
 
 class _FTPConnectionPool:
@@ -811,6 +1497,15 @@ class _FTPConnectionPool:
         # for a trip that persisted no cap (observed<2 first-connection
         # refusal).  Keeps the never-tripped common pool off the reconcile path.
         self._cap_dirty = False
+        # Credentials the server refused (530): the keep-alive warm-up waits
+        # ``_FTP_AUTH_BACKOFF_S`` × 2^(streak-1) (capped) before it tries
+        # them again — it used to log in with them every keep-alive cycle,
+        # forever, which is how a fail2ban / server lockout gets triggered.
+        self._auth_fail_streak = 0
+        self._auth_retry_at = 0.0
+        # No warm-up before a login has worked once: with wrong credentials
+        # the warm-up's own logins were refused next to the caller's.
+        self._logged_in = False
 
         # Background warm + keep-alive thread.  Runs when there's a warm floor
         # to maintain (min_size > 0) OR whenever the pool has a real server
@@ -854,7 +1549,8 @@ class _FTPConnectionPool:
         """
         if lane not in ("stream", "scan", "browse"):
             lane = "scan"
-        handle = self._acquire(_FTP_BORROW_TIMEOUT_S, lane=lane)
+        handle = self._acquire(getattr(_BORROW_WAIT, "s", None) or _FTP_BORROW_TIMEOUT_S,
+                               lane=lane)
         try:
             yield handle
         except BaseException:
@@ -950,10 +1646,12 @@ class _FTPConnectionPool:
         # back the reserved slot or the pool counter drifts upward forever.
         try:
             conn = self._factory()
+            self._note_login(None)
             handle = _PooledFTP(conn)
             handle.lane = lane
             return handle
         except BaseException as exc:
+            self._note_login(exc)
             # Capture the current in-use count BEFORE giving the slot back
             # so cap-detection records the true peak we hit.  If this
             # ``too many clients`` error came from the factory's LOGIN
@@ -1002,6 +1700,29 @@ class _FTPConnectionPool:
                     log.exception("Failed to record too-many-clients for %s",
                                   self._label)
             raise
+
+    def _note_login(self, exc: BaseException | None) -> None:
+        """Track logins for the warm-up: the first success starts it, a
+        refused one backs it off (None = success)."""
+        if exc is None:
+            with self._lock:
+                first = not self._logged_in
+                self._logged_in = True
+                self._auth_fail_streak = 0
+                self._auth_retry_at = 0.0
+            if first and self._min_size > 0:
+                self._kalive_stop_or_nudge()     # warm up now
+            return
+        if is_auth_failure(exc):
+            with self._lock:
+                self._auth_fail_streak += 1
+                streak = self._auth_fail_streak
+                delay = min(_FTP_AUTH_BACKOFF_MAX_S,
+                            _FTP_AUTH_BACKOFF_S * (2 ** min(streak - 1, 16)))
+                self._auth_retry_at = time.monotonic() + delay
+            if streak == 1:
+                log.warning("FTP %s refused the login (%s) — not retrying it "
+                            "in the background for %.0f s", self._label, exc, delay)
 
     def _release(self, handle: _PooledFTP) -> None:
         need_topup = False
@@ -1400,6 +2121,10 @@ class _FTPConnectionPool:
         unused reservations are returned in a single ``finally`` block so
         a partial failure (server is half-up) doesn't leak budget.
         """
+        if not self._logged_in:
+            return                          # no login has worked yet
+        if self._auth_retry_at and time.monotonic() < self._auth_retry_at:
+            return                          # refused credentials: backing off
         with self._cond:
             if self._closed:
                 return
@@ -1418,8 +2143,10 @@ class _FTPConnectionPool:
                     break
                 try:
                     conn = self._factory()
+                    self._note_login(None)
                     new_handles.append(_PooledFTP(conn))
                 except Exception as exc:
+                    self._note_login(exc)
                     # Stop trying this cycle — if the server's down we
                     # don't want to hammer it.  The next keepalive tick
                     # gives it another chance.
@@ -1514,7 +2241,17 @@ def _build_ftp_factory(host: str, port: int, username: str, password: str,
                 ftp = ftplib.FTP()
                 ftp.encoding = encoding
                 ftp.connect(host, port, timeout=15)
-                ftp.login(username, password)
+                try:
+                    ftp.login(username, password)
+                except ftplib.error_perm as exc:
+                    try:
+                        ftp.close()
+                    except Exception:
+                        pass
+                    if (str(exc).strip()[:3] == "530"
+                            and not _is_too_many_clients_error(exc)):
+                        raise FTPLoginRefused(*exc.args) from exc
+                    raise
                 # Enable UTF-8 mode on servers that support it (e.g. ProFTPD).
                 # Required for CWD/RETR on paths with multi-byte characters
                 # (Japanese, symbols like ☆♥µ).  Combined with latin-1 client
@@ -1749,6 +2486,75 @@ def _mlsd_unsupported(exc: Exception) -> bool:
     if not isinstance(exc, ftplib.error_perm):
         return False
     return str(exc).strip()[:3] in _MLSD_UNSUPPORTED_CODES
+
+
+class _FTPStream(SourceStream):
+    """A ``RETR`` (from a ``REST`` offset) read off the data socket.  Holds
+    its pooled connection until closed — an early close ``ABOR``s the
+    transfer, a desynced control channel retires the connection."""
+
+    def __init__(self, borrow_cm, handle: "_PooledFTP", sock, size: int | None) -> None:
+        self.size = size
+        self._cm = borrow_cm
+        self._handle = handle
+        self._sock = sock
+        self._eof = False
+        self._failed = False
+        self._replied = False             # the end-of-transfer reply was read
+
+    def read(self, n: int = 256 * 1024) -> bytes:
+        if self._eof or self._sock is None:
+            return b""
+        try:
+            chunk = self._sock.recv(n)
+        except BaseException:
+            self._failed = True
+            raise
+        if not chunk:
+            # The data socket closing is not proof the file is complete: a
+            # server that aborts the transfer (426, 451 …) closes it too.  The
+            # control reply decides — an error RAISES, so a download of a file
+            # whose size the server never told (no SIZE) can't be cached cut
+            # short as if it were whole.
+            self._eof = True
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            try:
+                self._handle.conn.voidresp()    # the 226 "transfer complete"
+            except BaseException:
+                self._failed = True
+                raise
+            self._replied = True
+        return chunk
+
+    def close(self) -> None:
+        cm, self._cm = self._cm, None
+        if cm is None:
+            return
+        handle, sock = self._handle, self._sock
+        self._sock = None
+        try:
+            sock.close()
+        except Exception:
+            pass
+        ftp = handle.conn
+        if self._failed:
+            handle.mark_broken()
+        elif self._eof:
+            if not self._replied:
+                try:
+                    ftp.voidresp()        # the 226 "transfer complete"
+                except Exception:
+                    handle.mark_broken()
+        else:
+            handle.abort_transfer()       # stopped early
+        handle.note_transfer()
+        try:
+            cm.__exit__(None, None, None)  # back to the pool (or closed if broken)
+        except Exception:
+            pass
 
 
 class FTPFileSource(FileSource):
@@ -2402,15 +3208,11 @@ class FTPFileSource(FileSource):
                             # handle so the pool replaces it.
                             handle.mark_broken()
                     else:
-                        # We stopped early.  Send ABOR; the server's
-                        # canonical response sequence is 426 then 226
-                        # (per RFC 959).  ``ftp.abort()`` knows the
-                        # quirks of this dance; on failure we burn the
+                        # We stopped early.  Send ABOR and resync the
+                        # control channel (its replies come in pairs — see
+                        # ``abort_transfer``); on failure we burn the
                         # handle and let the pool open a fresh one.
-                        try:
-                            ftp.abort()
-                        except Exception:
-                            handle.mark_broken()
+                        handle.abort_transfer()
 
                     handle.note_transfer()
                 return bytes(buf)
@@ -2466,10 +3268,7 @@ class FTPFileSource(FileSource):
                         except Exception:
                             handle.mark_broken()
                     else:
-                        try:
-                            ftp.abort()
-                        except Exception:
-                            handle.mark_broken()
+                        handle.abort_transfer()
                     handle.note_transfer()
                 return bytes(buf)
             except Exception as exc:
@@ -2478,22 +3277,72 @@ class FTPFileSource(FileSource):
                     time.sleep(0.3)
         raise last_exc  # type: ignore[misc]
 
-    def stat(self, path: str) -> FileStat:
+    def open_stream(self, path: str, *, offset: int = 0, lane: str = "stream",
+                    length: int | None = None) -> SourceStream:
+        """``SIZE`` + ``RETR`` (after ``REST offset``) on ONE pooled connection
+        of ``lane``, held until the stream is closed — the pool's caps count
+        it like any other transfer."""
+        import sys as _sys
+        offset = max(0, int(offset))
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            cm = self._pool.borrow(lane=lane)
+            handle = cm.__enter__()
+            try:
+                ftp = handle.conn
+                ftp.voidcmd("TYPE I")
+                abs_path = self._abs(path)
+                try:
+                    size: int | None = ftp.size(abs_path)
+                except (ftplib.error_perm, ftplib.error_reply, ftplib.error_temp):
+                    size = None        # SIZE unsupported — length unknown
+                sock = ftp.transfercmd(f"RETR {abs_path}", rest=offset or None)
+                return _FTPStream(cm, handle, sock, size)
+            except Exception as exc:
+                cm.__exit__(*_sys.exc_info())   # marks the handle broken, releases it
+                last_exc = exc
+                if isinstance(exc, ftplib.error_perm) or attempt:
+                    raise
+                time.sleep(0.3)
+        raise last_exc  # type: ignore[misc]  # pragma: no cover
+
+    def stat(self, path: str, *, lane: str = "scan", strict: bool = False) -> FileStat:
+        """``SIZE`` (or ``CWD`` for a folder).  Any failure reads as an empty
+        ``FileStat()`` — unless ``strict``: then a failure to ASK (no
+        connection, a refused login, a timeout, a broken control channel)
+        raises, while a server that answers but can't tell — no ``SIZE``, or
+        both ``SIZE`` and ``CWD`` refused (a missing path too) — still gives
+        the empty ``FileStat()`` (size 0 = unknown)."""
         try:
             abs_path = self._abs(path)
-            # ``scan`` lane — SIZE/CWD probes are scan-grade work.
-            with self._pool.borrow(lane="scan") as handle:
+            # ``scan`` lane by default — SIZE/CWD probes are scan-grade work;
+            # playback passes ``lane="stream"``.
+            with self._pool.borrow(lane=lane) as handle:
                 ftp = handle.conn
+                try:
+                    # Binary mode first: vsftpd / ProFTPD answer SIZE in ASCII
+                    # mode (a fresh connection's default) with 550.
+                    ftp.voidcmd("TYPE I")
+                except ftplib.error_perm:
+                    pass
                 try:
                     size = ftp.size(abs_path)
                     return FileStat(size=size or 0, mtime=0.0, is_dir=False)
                 except ftplib.error_perm:
-                    ftp.cwd(abs_path)
+                    try:
+                        ftp.cwd(abs_path)
+                    except ftplib.error_perm:
+                        if strict:
+                            return FileStat()     # the server can't tell
+                        raise
                     return FileStat(size=0, mtime=0.0, is_dir=True)
         except Exception:
+            if strict:
+                raise
             return FileStat()
 
     def is_dir(self, path: str) -> bool:
+        self.last_error_auth = False
         try:
             with self._pool.borrow(lane="scan") as handle:
                 handle.conn.cwd(self._abs(path))
@@ -2508,6 +3357,8 @@ class FTPFileSource(FileSource):
                 "FTP is_dir(%s) on %s:%d failed: %s: %s",
                 path, self._host, self._port, type(exc).__name__, exc,
             )
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_error_auth = is_auth_failure(exc)
             return False
 
     def close(self) -> None:
@@ -2532,30 +3383,34 @@ _active_sources: dict[str, FileSource] = {}
 
 def create_source(share: dict, password: str = "") -> FileSource:
     proto = share.get("protocol", "").lower()
+    src: FileSource
     if proto == "smb":
-        return SMBFileSource(
+        src = SMBFileSource(
             host=share["host"], share=share["share"],
             username=share.get("username", ""), password=password,
             port=share.get("port") or 445,
         )
-    if proto == "ftp":
-        return FTPFileSource(
+    elif proto == "ftp":
+        src = FTPFileSource(
             host=share["host"], username=share.get("username", ""),
             password=password, port=share.get("port") or 21,
             remote_path=share.get("remote_path", "/"),
         )
-    if proto in ("webdav", "webdavs", "http", "https"):
+    elif proto in ("webdav", "webdavs", "http", "https"):
         # WebDAV / Nextcloud / ownCloud / generic HTTP mounts.  Imported
         # lazily so the module doesn't fail to load when httpx isn't
         # installed yet (it's a top-level dep, but tests import filesource
         # before app boot completes).
         from soniqboom.core.filesource_webdav import WebDAVFileSource
-        return WebDAVFileSource(
-            base_url=share["base_url"],
+        src = WebDAVFileSource(
+            base_url=scan_root_for_share(share),
             username=share.get("username", ""), password=password,
             verify_ssl=bool(share.get("verify_ssl", True)),
         )
-    raise ValueError(f"Unsupported protocol: {proto}")
+    else:
+        raise ValueError(f"Unsupported protocol: {proto}")
+    src.auth_key = share_auth_key(share, password)
+    return src
 
 
 def register_source(share_id: str, source: FileSource) -> None:
@@ -2566,7 +3421,26 @@ def register_source(share_id: str, source: FileSource) -> None:
 
 
 def get_source(share_id: str) -> FileSource | None:
-    return _active_sources.get(share_id)
+    """The registered source of a scan root — None when there is none, and
+    while the server's refusal of its credentials is backing off
+    (``note_share_auth_failure``): plays, browsing, background readers and
+    the freshness poller then treat the share as offline (cached bytes still
+    play) instead of logging in again.  ``all_sources`` still lists it."""
+    src = _active_sources.get(share_id)
+    if src is not None and share_retry_wait(getattr(src, "auth_key", None)) > 0:
+        return None
+    return src
+
+
+def credentials_refused(share_id: str) -> bool:
+    """A share whose credentials are backing off (see above) — registered,
+    or refused before it ever connected."""
+    src = _active_sources.get(share_id)
+    key = getattr(src, "auth_key", None) if src is not None else None
+    if key is None:
+        with _share_backoff_lock:
+            key = _share_backoff_roots.get(share_id)
+    return share_retry_wait(key) > 0
 
 
 def remove_source(share_id: str) -> None:
@@ -2579,16 +3453,71 @@ def all_sources() -> dict[str, FileSource]:
     return dict(_active_sources)
 
 
+# ── Retry back-off for credentials the server refused ───────────────────────
+#
+# The health monitor retries configured shares that aren't connected every
+# 60–300 s.  For a share whose server REFUSED the login that is a failed login
+# per pass, forever — exactly what trips fail2ban, a Nextcloud brute-force
+# throttle or an account lockout.  Refused credentials (keyed by
+# ``share_auth_key``: every share logging in to that server as that user)
+# wait 5 min, doubling per refusal, at most 6 h — no connect, no health probe,
+# no play login meanwhile; a manual Reconnect or re-adding the share resets
+# it.
+_SHARE_AUTH_BACKOFF_S = 300.0
+_SHARE_AUTH_BACKOFF_MAX_S = 6 * 3600.0
+_share_backoff: dict[str, tuple[int, float]] = {}   # share_auth_key → (refusals, retry-at)
+_share_backoff_lock = threading.Lock()
+
+
+_share_backoff_roots: dict[str, str] = {}   # scan root → its share_auth_key (refused ones)
+
+
+def note_share_auth_failure(key: str, scan_root: str | None = None) -> float:
+    """Record a refused login for *key* (``share_auth_key``) — seen on
+    *scan_root*; returns the wait (seconds) before anything logs in with
+    those credentials again."""
+    with _share_backoff_lock:
+        n = _share_backoff.get(key, (0, 0.0))[0] + 1
+        delay = min(_SHARE_AUTH_BACKOFF_MAX_S,
+                    _SHARE_AUTH_BACKOFF_S * (2 ** min(n - 1, 16)))
+        _share_backoff[key] = (n, time.monotonic() + delay)
+        if scan_root:
+            _share_backoff_roots[scan_root] = key
+    return delay
+
+
+def share_retry_wait(key: str | None) -> float:
+    """Seconds until credentials *key* may be tried again (0 = now)."""
+    if not key:
+        return 0.0
+    with _share_backoff_lock:
+        got = _share_backoff.get(key)
+    return max(0.0, got[1] - time.monotonic()) if got else 0.0
+
+
+def reset_share_backoff(key: str | None) -> None:
+    with _share_backoff_lock:
+        _share_backoff.pop(key, None)
+
+
+def source_auth_key(source) -> str | None:
+    """The ``share_auth_key`` a source was created with (None: a local or
+    hand-made source)."""
+    return getattr(source, "auth_key", None)
+
+
 def find_source_for_path(path: str) -> tuple[str, str, FileSource] | None:
     """Find the source whose scan_root is a prefix of *path*.
 
-    Returns ``(scan_root, remote_subpath, source)`` or ``None``.
+    Returns ``(scan_root, remote_subpath, source)`` or ``None``.  When roots
+    nest (two WebDAV shares, one inside the other) the longest one wins.
     """
-    for scan_root, source in _active_sources.items():
+    best: tuple[str, str, FileSource] | None = None
+    for scan_root, source in list(_active_sources.items()):
         # Normalise trailing slashes so "ftp://host/dir/" matches
         # "ftp://host/dir/subdir" without producing a double-slash.
         root = scan_root.rstrip("/")
         if path == scan_root or path.rstrip("/") == root or path.startswith(root + "/"):
-            subpath = path[len(root):] or "/"
-            return scan_root, subpath, source
-    return None
+            if best is None or len(root) > len(best[0].rstrip("/")):
+                best = (scan_root, path[len(root):] or "/", source)
+    return best

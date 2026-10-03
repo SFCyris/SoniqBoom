@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=102">
+  <link rel="stylesheet" href="/assets/css/app.css?v=103">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -64,6 +64,7 @@
        modules every page boot will hit synchronously. -->
   <link rel="modulepreload" href="/assets/js/player.js"  fetchpriority="high">
   <link rel="modulepreload" href="/assets/js/library.js" fetchpriority="high">
+  <link rel="modulepreload" href="/assets/js/vlist.js"   fetchpriority="high">
   <link rel="modulepreload" href="/assets/js/utils.js"   fetchpriority="high">
   <link rel="modulepreload" href="/assets/js/queue.js"   fetchpriority="high">
 </head>
@@ -2233,7 +2234,7 @@
                       Commodore 64 .sid archive (~60k tunes).  Pair with
                       Songlengths.md5 for per-tune durations.
                     </span>
-                    <span class="archive-fmt">.sid / .psid</span>
+                    <span class="archive-fmt">.sid / .psid / .rsid</span>
                   </span>
                 </a>
               </li>
@@ -2444,7 +2445,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=175"></script>
+  <script type="module" src="/assets/js/app.js?v=176"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

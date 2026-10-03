@@ -387,7 +387,7 @@ async def test_the_demozoo_apply_freezes_its_memo(tmp_path, monkeypatch):
     froze: list[str] = []
     monkeypatch.setattr("soniqboom.core.store.freeze_long_lived_heap", froze.append)
 
-    def collect():
+    def collect(tracks=None, matched_ids=None):
         memo = demozoo._memos()[1]
         for i in range(demozoo._MEMO_FREEZE_GROWTH + 1):
             memo[f"h{i}"] = [(), None]

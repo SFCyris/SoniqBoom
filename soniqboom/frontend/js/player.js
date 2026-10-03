@@ -580,13 +580,14 @@ export const Player = (() => {
     if (remaining > GAPLESS_WINDOW_S || remaining <= 1) return;
     // Subsong-aware: a multi-tune file preloaded WITHOUT ?subsong= would seam to
     // its DEFAULT tune, so "Play all" of a SID would play tune 1 N times while
-    // the label advanced.  Key + fetch on (id, subsong) — 0-based wire index.
-    const nextSub = Number(next.subsong) > 0 ? Number(next.subsong) : 0;
+    // the label advanced.  Key + fetch on (id, subsong) — 0-based wire index,
+    // null for a plain play of the file (its default tune).
+    const nextSub = Number.isInteger(next.subsong) ? next.subsong : null;
     if (_nextPreload && _nextPreload.id === next.id && _nextPreload.subsong === nextSub) return;
     _dropNextPreload();
     const abort = new AbortController();
     _nextPreload = { id: next.id, subsong: nextSub, url: null, abort };
-    fetch(`/api/stream/${next.id}${nextSub > 0 ? `?subsong=${nextSub}` : ''}`, { signal: abort.signal })
+    fetch(`/api/stream/${next.id}${nextSub !== null ? `?subsong=${nextSub}` : ''}`, { signal: abort.signal })
       .then(res => {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const len = parseInt(res.headers.get('content-length') || '0', 10);
@@ -1528,7 +1529,7 @@ export const Player = (() => {
     if (_activeBlobUrl) { try { URL.revokeObjectURL(_activeBlobUrl); } catch (_) {} _activeBlobUrl = null; }
     // Match on (id, subsong): a preload for the file's default tune must NOT be
     // reused for a specific subsong (it would play the wrong tune at the seam).
-    const _curSub = Number(track.subsong) > 0 ? Number(track.subsong) : 0;
+    const _curSub = Number.isInteger(track.subsong) ? track.subsong : null;
     // ── In-browser SID render → server cache-warm (flag-gated) ─────────────
     // SID audio ALWAYS plays from the server's instant progressive/cached stream
     // (the fall-through below) — NEVER blocked on a render or even the probe.
@@ -1777,11 +1778,12 @@ export const Player = (() => {
     emit('error', { track, error: err });
   }
 
-  // ``?subsong=N`` for an entry that pins a tune (N > 0), '' otherwise: the
-  // server treats 0 and "absent" alike, so 0 stays off the URL.
+  // ``?subsong=N`` for an entry that pins a tune (N = 0 too), '' otherwise:
+  // without it the server plays the file's default tune, which is not always
+  // tune 1 (a multi-tune Amiga module or console rip starts at its first tune
+  // that isn't empty).
   function _subQs(t) {
-    const s = Number(t && t.subsong);
-    return s > 0 ? `?subsong=${s}` : '';
+    return (t && Number.isInteger(t.subsong)) ? `?subsong=${t.subsong}` : '';
   }
   // render-status of track ``id`` — for the tune that is playing when ``id`` is
   // the current track (the waits below only carry the id).
@@ -1814,8 +1816,7 @@ export const Player = (() => {
   function _prewarmUrl(t, next) {
     const params = new URLSearchParams();
     params.set('priority', next ? 'next' : 'ahead');
-    const ss = Number(t.subsong);
-    if (ss > 0) params.set('subsong', String(ss));
+    if (Number.isInteger(t.subsong)) params.set('subsong', String(t.subsong));
     if (t.path) params.set('path', t.path);
     params.set('pw', PREWARM_PAGE_ID);
     return `/api/stream/${t.id}/prewarm?${params}`;
@@ -1969,7 +1970,7 @@ export const Player = (() => {
             // A tune other than the file's default one carries no stored
             // length: its queue entry takes the exact one (the library row
             // keeps the default tune's).
-            if (Number(t.subsong) > 0) t.duration = exact;
+            if (Number.isInteger(t.subsong)) t.duration = exact;
           }
           const wasProvisional = _provisional;
           _provisional = false;
@@ -3504,10 +3505,11 @@ export const Player = (() => {
     // persists it via backfill).  Use raw audio.duration, not _duration()'s
     // metadata fallback — but never a growing render's provisional header
     // (_knownLength).  ``subsong``: the row's length is its default tune's —
-    // another tune's must not land on it.
+    // a picked tune's (any explicit wire, 0 included) must not land on it.
     const known = _knownLength();
     if (trackId && known > 0) {
-      emit('durationknown', { id: trackId, seconds: known, subsong: Number(_track && _track.subsong) || 0 });
+      emit('durationknown', { id: trackId, seconds: known,
+                              subsong: Number.isInteger(_track && _track.subsong) ? _track.subsong : null });
     }
     const dur     = _duration();
     const current = _currentTime();
@@ -3955,11 +3957,12 @@ export const Player = (() => {
     if (_forcedIds.has(id)) params.force_transcode = '1';
     // Subsong is 0-based on the wire (matches the server's ?subsong=).  The
     // current track object carries the wire index in ``subsong``; forward it
-    // verbatim — but only for the track it belongs to, so a stale ``_track``
-    // left by a prefetch can't leak its subsong onto a different id.  0 or
-    // absent means the file's default tune.
-    const ss = (_track && _track.id === id) ? Number(_track.subsong) : 0;
-    if (ss > 0) params.subsong = String(ss);
+    // verbatim (0 included) — but only for the track it belongs to, so a stale
+    // ``_track`` left by a prefetch can't leak its subsong onto a different id.
+    // Absent means the file's default tune.
+    if (_track && _track.id === id && Number.isInteger(_track.subsong)) {
+      params.subsong = String(_track.subsong);
+    }
     return _streamUrl(id, params);
   }
 

@@ -121,6 +121,8 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "conversion_cache_max_bytes": 4294967296,   # 4 GB default — configurable in Settings → Renderers
     "data_dir": "",
     "merger_interval": 120,
+    "merger_max_aof_mb": 32,
+    "merger_max_age": 1800,
     "aof_flush_interval": 0.1,
     "scan_zips": True,
     "scan_remote_zips": True,   # also crack open .zip on remote (FTP/SMB) sources
@@ -236,8 +238,10 @@ _CONF_TEMPLATE = """\
   "conversion_cache_dir": "",
   "conversion_cache_max_bytes": 4294967296,
 
-  "_comment_persistence": "merger_interval: seconds between AOF-to-snapshot merges. aof_flush_interval: seconds between AOF buffer flushes.",
+  "_comment_persistence": "merger_interval: seconds between checks of the change journal (library.aof); it is folded into library.json once it reaches merger_max_aof_mb megabytes or its oldest change is merger_max_age seconds old. aof_flush_interval: seconds between AOF buffer flushes.",
   "merger_interval": 120,
+  "merger_max_aof_mb": 32,
+  "merger_max_age": 1800,
   "aof_flush_interval": 0.1,
 
   "scan_zips": true,
@@ -587,6 +591,10 @@ class Settings(BaseSettings):
     # Persistence (in-memory store → disk)
     data_dir: str = _local_conf.get("data_dir", "")
     merger_interval: int = int(_local_conf.get("merger_interval", 120))
+    # A merge (a full rewrite of library.json) runs once the AOF reaches this
+    # size or its oldest change this age — not at every check (core/merger.py).
+    merger_max_aof_mb: float = float(_local_conf.get("merger_max_aof_mb", 32))
+    merger_max_age: float = float(_local_conf.get("merger_max_age", 1800))
     aof_flush_interval: float = float(_local_conf.get("aof_flush_interval", 0.1))
 
     # ZIP scanning — treat ZIP files as virtual directories

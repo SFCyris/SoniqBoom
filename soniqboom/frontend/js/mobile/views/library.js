@@ -7,11 +7,16 @@
  * Group chips: All / Artists / Album Artists / Albums / Genres / Years.
  * - All:                flat track list (paginated lazily on scroll).
  * - Artists/Albums/etc: group list → tap → filtered track list.
+ *
+ * Track lists, group lists and a playlist's tracks are a pooled virtual list
+ * (../../vlist.js): only the rows around the viewport exist, and one delegated
+ * set of gesture listeners (tap / long-press / swipe) serves every row.
  */
 import { Player } from '../../player.js';
-import { attachRowGestures, attachDragReorder } from '../gestures.js';
-import { buildTrackRow, fmtDur, esc, trackActions, playlistEntry } from './_common.js';
-import { probeAdlibDurations } from '../../utils.js';
+import { attachRowGestures, attachListGestures, attachDragReorder } from '../gestures.js';
+import { fmtDur, esc, trackActions, playlistEntry } from './_common.js';
+import { artPlaceholderEmoji, probeAdlibDurations } from '../../utils.js';
+import { createVirtualList } from '../../vlist.js';
 
 const PAGE_SIZE = 100;
 
@@ -21,12 +26,16 @@ export function mountLibrary(root, ctx) {
   let crumb   = null;         // when set, we're inside a group → showing tracks
   let tracks  = [];
   let groupItems = [];
+  let groupField = '';
   let offset  = 0;
   let exhausted = false;
-  let loading   = false;
+  let loadingGen = -1;        // the view generation whose page is being fetched
+  let viewGen = 0;            // bumped by every render(): late fetches of a left view are dropped
+  // What the virtual list shows: 'tracks' (All / a group's tracks), 'groups',
+  // 'pltracks' (a playlist's tracks), or null (the playlist list / nothing).
+  let mode = null;
   let _gestureCleanups = [];
   let _dragCleanup     = null;
-  let _groupRenderGen  = 0;   // cancels an in-flight chunked group build on view switch
 
   const gctx = { player: Player, toast: ctx.toast, showSheet: ctx.showSheet };
 
@@ -58,6 +67,179 @@ export function mountLibrary(root, ctx) {
   const emptyEl   = root.querySelector('#lib-empty');
   const loadEl    = root.querySelector('#lib-loading');
 
+  // ── Virtual list ─────────────────────────────────────────────────────
+  // The list starts below the (sticky) chip bar and the crumb bar; both are
+  // read once per list shown, not per frame.
+  let listTop = 0, barH = 0;
+  function measureChrome() {
+    listTop = listEl.offsetTop;
+    barH = groupBar.offsetHeight;
+  }
+
+  // One row shell for every kind of row; fillRow shows the parts a kind uses.
+  function makeRow() {
+    const row = document.createElement('div');
+    row.className = 'm-row';
+    row.innerHTML = `
+      <div class="m-row-content">
+        <div class="m-row-art"><span></span><img alt="" decoding="async"></div>
+        <div class="m-row-meta"><div class="m-row-title"></div><div class="m-row-artist"></div></div>
+        <span class="m-row-artist m-row-trail" style="flex-shrink:0;font-size:12px;margin-right:4px"></span>
+        <span class="m-row-chev" style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
+        <div class="m-row-handle">☰</div>
+      </div>`;
+    // No cover (404) / not decoded: the img stays transparent over the glyph.
+    const img = row.querySelector('img');
+    img.onload  = () => img.classList.add('loaded');
+    img.onerror = () => img.classList.remove('loaded');
+    return row;
+  }
+
+  function show(el, on) { el.style.display = on ? '' : 'none'; }
+
+  // A list request failed (and its view is still the one shown): say so.
+  function showLoadError(gen) {
+    if (gen !== viewGen) return;
+    emptyEl.textContent = crumb
+      ? 'Couldn’t load this list — go back and open it again.'
+      : 'Couldn’t load this list — tap its chip again to retry.';
+    emptyEl.classList.remove('hidden');
+  }
+
+  function setArt(row, glyph, src) {
+    const art = row.querySelector('.m-row-art');
+    art.firstElementChild.textContent = glyph;
+    const img = art.lastElementChild;
+    if (row.__artSrc === src) return;
+    row.__artSrc = src;
+    img.classList.remove('loaded');
+    if (src) img.src = src; else img.removeAttribute('src');
+  }
+
+  function setTitle(row, text, defect = '', detail = '') {
+    const title = row.querySelector('.m-row-title');
+    // Health badge for a known playback defect — only defective rows (rare) take
+    // the flex layout so the common path keeps its plain ellipsised text.
+    if (defect) {
+      title.classList.add('m-row-title--badged');
+      const ttlText = document.createElement('span');
+      ttlText.className = 'm-row-title-text';
+      ttlText.textContent = text;
+      const badge = document.createElement('span');
+      badge.className = `track-defect-badge track-defect-${defect}`;
+      badge.textContent = defect;
+      badge.title = detail || '';
+      title.replaceChildren(ttlText, badge);
+    } else {
+      title.classList.remove('m-row-title--badged');
+      title.textContent = text;
+    }
+  }
+
+  // Pool callback: paint row ``idx`` of whatever the list shows.  A forced
+  // render (``fresh`` false) leaves a row that already shows the same item.
+  function fillRow(row, idx, fresh) {
+    const content = row.firstElementChild;
+    if (fresh && content.style.transform) { content.style.transform = ''; content.style.transition = ''; }
+    row.dataset.idx = idx;
+    if (mode === 'groups') {
+      const item = groupItems[idx];
+      if (!item) return;
+      if (!fresh && row.__item === item) return;
+      row.__item = item;
+      const { display } = groupValue(item);
+      delete row.dataset.trackId;
+      row.classList.remove('playing');
+      setArt(row, emojiFor(group), '');
+      setTitle(row, display);
+      const count = item.count ? `${item.count}` : '';
+      row.querySelector('.m-row-meta .m-row-artist').textContent = count + (count ? ' tracks' : '');
+      show(row.querySelector('.m-row-trail'), false);
+      show(row.querySelector('.m-row-chev'), true);
+      show(row.querySelector('.m-row-handle'), false);
+      return;
+    }
+    const t = tracks[idx];
+    if (!t) return;
+    row.classList.toggle('playing', !!t.id && t.id === Player.currentTrackId);
+    if (!fresh && row.__item === t) return;
+    row.__item = t;
+    if (t.id) row.dataset.trackId = t.id; else delete row.dataset.trackId;
+    // Art: the emoji placeholder always paints; the cover fades in over it.
+    setArt(row, artPlaceholderEmoji(t), t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : ''));
+    const defect = (t.defect === 'partial' || t.defect === 'corrupt') ? t.defect : '';
+    setTitle(row, t.title || '—', defect, t.defect_detail);
+    row.querySelector('.m-row-meta .m-row-artist').textContent = t.artist || t.album_artist || '';
+    const trail = row.querySelector('.m-row-trail');
+    trail.textContent = fmtDur(t.duration);
+    show(trail, true);
+    show(row.querySelector('.m-row-chev'), false);
+    // Drag handle to reorder — only for regular (hand-editable) playlists.
+    show(row.querySelector('.m-row-handle'), mode === 'pltracks' && !!crumb && !crumb.smart);
+  }
+
+  const vl = createVirtualList({
+    scroller: root, host: listEl, buffer: 8, rowHeight: 61, autoScroll: true,
+    make: makeRow,
+    fill: fillRow,
+    keyOf: (i) => (mode === 'groups' ? groupItems[i] : tracks[i]),
+    spacer: () => { const d = document.createElement('div'); d.className = 'm-vl-spacer'; return d; },
+    setSpacer: (el, px) => { el.style.height = px + 'px'; },
+    offset: () => listTop,
+    topInset: () => barH,
+    onResize: measureChrome,
+  });
+
+  function showList(kind, count) {
+    mode = kind;
+    measureChrome();
+    vl.setCount(count);
+    vl.render(true);
+  }
+
+  // Gestures for every virtual row, by what the list shows at the time.
+  attachListGestures(listEl, (row) => {
+    const idx = parseInt(row.dataset.idx, 10);
+    if (!Number.isFinite(idx)) return null;
+    if (mode === 'groups') {
+      const item = groupItems[idx];
+      return item ? { onTap: () => openGroup(item) } : null;
+    }
+    const t = tracks[idx];
+    if (!t) return null;
+    if (mode === 'tracks') {
+      return {
+        onTap: () => playFrom(idx),
+        onLongPress: () => {
+          ctx.showSheet({ title: t.title || 'Track', actions: trackActions(t, gctx) });
+        },
+        onSwipeAction: () => {
+          Player.addToQueue(t);
+          ctx.toast('Added to queue');
+        },
+        swipeLabel: '+ Queue',
+        swipeBgClass: 'queue',
+      };
+    }
+    if (mode === 'pltracks') {
+      const smart = !!(crumb && crumb.smart);
+      const actions = trackActions(t, gctx);
+      if (!smart) {
+        actions.push({ label: '✕ Remove from playlist', danger: true,
+                       onSelect: () => removeFromPlaylist(idx) });
+      }
+      return {
+        onTap: () => Player.setQueue(tracks, idx),
+        onLongPress: () => ctx.showSheet({ title: t.title || 'Track', actions }),
+        // Smart (query-driven) playlists can't be hand-edited, so no swipe-remove.
+        onSwipeAction: smart ? undefined : () => removeFromPlaylist(idx),
+        swipeLabel: 'Remove',
+        swipeBgClass: 'danger',
+      };
+    }
+    return null;
+  });
+
   // ── Group chip switching ─────────────────────────────────────────────
   groupBar.addEventListener('click', (e) => {
     const chip = e.target.closest('.m-group-chip');
@@ -76,7 +258,11 @@ export function mountLibrary(root, ctx) {
   // ── Render dispatcher ────────────────────────────────────────────────
   function render() {
     cleanupGestures();
+    viewGen++;
+    vl.reset();
+    mode = null;
     listEl.innerHTML = '';
+    root.scrollTop = 0;
     tracks = [];
     groupItems = [];
     offset = 0;
@@ -106,18 +292,23 @@ export function mountLibrary(root, ctx) {
 
   // ── Playlists (CRUD) ─────────────────────────────────────────────────
   async function loadPlaylistList() {
+    const gen = viewGen;
     loadEl.classList.remove('hidden');
     try {
       const res = await fetch('/api/playlists');
-      const pls = res.ok ? await res.json() : [];
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const pls = await res.json();
+      if (gen !== viewGen) return;
       renderPlaylistList(Array.isArray(pls) ? pls : (pls.playlists || []));
     } catch (err) {
       console.error('Playlist load failed', err);
+      showLoadError(gen);
     } finally {
-      loadEl.classList.add('hidden');
+      if (gen === viewGen) loadEl.classList.add('hidden');
     }
   }
 
+  // The (short) list of playlists is plain rows, not the virtual list.
   function renderPlaylistList(pls) {
     emptyEl.classList.add('hidden');
     // "New playlist" affordance always at the top.
@@ -194,16 +385,20 @@ export function mountLibrary(root, ctx) {
   }
 
   async function loadPlaylistTracks() {
+    const gen = viewGen;
     loadEl.classList.remove('hidden');
     try {
       const res = await fetch(`/api/playlists/${encodeURIComponent(crumb.playlistId)}`);
-      const pl = res.ok ? await res.json() : null;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const pl = await res.json();
+      if (gen !== viewGen) return;
       const plTracks = (pl && (pl.tracks || pl.items)) || [];
       renderPlaylistTracks(plTracks);
     } catch (err) {
       console.error('Playlist tracks load failed', err);
+      showLoadError(gen);
     } finally {
-      loadEl.classList.add('hidden');
+      if (gen === viewGen) loadEl.classList.add('hidden');
     }
   }
 
@@ -215,34 +410,16 @@ export function mountLibrary(root, ctx) {
       return;
     }
     emptyEl.classList.add('hidden');
-    plTracks.forEach((t, idx) => {
-      const dur = document.createElement('span');
-      dur.className = 'm-row-artist';
-      dur.style.flexShrink = '0'; dur.style.fontSize = '12px'; dur.style.marginRight = '4px';
-      dur.textContent = fmtDur(t.duration);
-      // Drag handle to reorder — only for regular (hand-editable) playlists.
-      const row = buildTrackRow(t, { trailing: dur, showHandle: !crumb.smart });
-
-      const actions = trackActions(t, gctx);
-      if (!crumb.smart) {
-        actions.push({ label: '✕ Remove from playlist', danger: true,
-                       onSelect: () => removeFromPlaylist(idx) });
-      }
-      const cleanup = attachRowGestures(row, {
-        onTap: () => Player.setQueue(tracks, idx),
-        onLongPress: () => ctx.showSheet({ title: t.title || 'Track', actions }),
-        // Smart (query-driven) playlists can't be hand-edited, so no swipe-remove.
-        onSwipeAction: crumb.smart ? undefined : () => removeFromPlaylist(idx),
-        swipeLabel: 'Remove',
-        swipeBgClass: 'danger',
-      });
-      _gestureCleanups.push(cleanup);
-      listEl.appendChild(row);
-    });
+    showList('pltracks', tracks.length);
     // Drag-handle reorder (regular playlists only) — the drag snaps the row back,
-    // so onReorder re-renders in the new order and persists it.
-    if (!crumb.smart) {
-      _dragCleanup = attachDragReorder(listEl, { onReorder: reorderPlaylist });
+    // so onReorder re-renders in the new order and persists it.  The rows are a
+    // window of the list, so the indexes come from the rows themselves.
+    if (!crumb.smart && !_dragCleanup) {
+      _dragCleanup = attachDragReorder(listEl, {
+        onReorder: reorderPlaylist,
+        getRows: () => vl.rows(),
+        indexOf: (row) => parseInt(row.dataset.idx, 10),
+      });
     }
   }
 
@@ -251,9 +428,7 @@ export function mountLibrary(root, ctx) {
     const moved = tracks.splice(from, 1)[0];
     tracks.splice(to, 0, moved);
     // Repaint locally in the new order (attachDragReorder only reports indices).
-    cleanupGestures();
-    listEl.innerHTML = '';
-    renderPlaylistTracks(tracks);
+    vl.render(true);
     try {
       const r = await fetch(`/api/playlists/${encodeURIComponent(crumb.playlistId)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -280,8 +455,9 @@ export function mountLibrary(root, ctx) {
 
   // ── Track list (flat or filtered) ─────────────────────────────────────
   async function loadTrackPage() {
-    if (loading || exhausted) return;
-    loading = true;
+    if (loadingGen === viewGen || exhausted) return;
+    const gen = viewGen;
+    loadingGen = gen;
     if (offset === 0) loadEl.classList.remove('hidden');
 
     let url;
@@ -296,8 +472,10 @@ export function mountLibrary(root, ctx) {
 
     try {
       const res = await fetch(url);
-      const page = await res.json();
-      if (!Array.isArray(page) || page.length === 0) {
+      const page = res.ok ? await res.json() : null;
+      if (gen !== viewGen) return;            // the listener moved to another list meanwhile
+      if (!Array.isArray(page)) throw new Error(`HTTP ${res.status}`);
+      if (page.length === 0) {
         exhausted = true;
         if (offset === 0) {
           // Reset the context text — another view (e.g. an empty playlist) may
@@ -314,9 +492,10 @@ export function mountLibrary(root, ctx) {
       }
     } catch (err) {
       console.error('Library load failed', err);
+      if (offset === 0) showLoadError(gen);
     } finally {
-      loading = false;
-      loadEl.classList.add('hidden');
+      if (loadingGen === gen) loadingGen = -1;
+      if (gen === viewGen) loadEl.classList.add('hidden');
     }
   }
 
@@ -353,59 +532,44 @@ export function mountLibrary(root, ctx) {
   }
 
   function appendTracks(page) {
-    const durEls = new Map();          // track id -> its duration <span>, for backfill
-    page.forEach((t, i) => {
-      const idx = tracks.length + i;
-      const dur = document.createElement('span');
-      dur.className = 'm-row-artist';
-      dur.style.flexShrink = '0';
-      dur.style.fontSize = '12px';
-      dur.style.marginRight = '4px';
-      dur.textContent = fmtDur(t.duration);
-      if (t && t.id) durEls.set(t.id, dur);
-
-      const row = buildTrackRow(t, { trailing: dur });
-      const cleanup = attachRowGestures(row, {
-        onTap: () => playFrom(idx),
-        onLongPress: () => {
-          ctx.showSheet({ title: t.title || 'Track', actions: trackActions(t, gctx) });
-        },
-        onSwipeAction: () => {
-          Player.addToQueue(t);
-          ctx.toast('Added to queue');
-        },
-        swipeLabel: '+ Queue',
-        swipeBgClass: 'queue',
-      });
-      _gestureCleanups.push(cleanup);
-      listEl.appendChild(row);
-    });
     tracks.push(...page);
-    markPlaying();   // a just-loaded page may contain the now-playing track
+    if (mode === 'tracks') { vl.setCount(tracks.length); vl.render(true); }
+    else showList('tracks', tracks.length);
     // Background-fill real AdLib/IMF lengths for this page's placeholder rows.
+    const gen = viewGen;
     probeAdlibDurations(page).then(map => {
+      if (gen !== viewGen) return;
       for (const id in map) {
         const sec = map[id];
         if (!(sec > 0)) continue;
-        const el = durEls.get(id);
-        if (el) el.textContent = fmtDur(sec);
         const t = page.find(x => x && x.id === id);
         if (t) t.duration = sec;
+        for (const row of vl.rows()) {
+          if (row.dataset.trackId === id) row.querySelector('.m-row-trail').textContent = fmtDur(sec);
+        }
       }
     });
   }
 
   // Infinite scroll
   root.addEventListener('scroll', () => {
-    if (group === 'playlists') return;   // playlists load in full — no pagination
-    if (exhausted || loading) return;
+    if (mode !== 'tracks') return;       // playlists / groups load in full — no pagination
+    if (exhausted || loadingGen === viewGen) return;
     if (root.scrollTop + root.clientHeight >= root.scrollHeight - 200) {
       loadTrackPage();
     }
-  });
+  }, { passive: true });
 
   // ── Group list (Artists / Albums / Genres / Years) ───────────────────
+  const fieldMap = {
+    artists:       'artist',
+    album_artists: 'album_artist',
+    albums:        'album',
+    genres:        'genre',
+    years:         'year_min',
+  };
   async function loadGroupList() {
+    const gen = viewGen;
     loadEl.classList.remove('hidden');
     const endpointMap = {
       artists:       '/api/library/artists',
@@ -414,86 +578,50 @@ export function mountLibrary(root, ctx) {
       genres:        '/api/library/genres',
       years:         '/api/library/years',
     };
-    const fieldMap = {
-      artists:       'artist',
-      album_artists: 'album_artist',
-      albums:        'album',
-      genres:        'genre',
-      years:         'year_min',
-    };
     try {
       const res = await fetch(endpointMap[group]);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const items = await res.json();
+      if (gen !== viewGen) return;
       groupItems = Array.isArray(items) ? items : [];
-      renderGroupItems(fieldMap[group]);
+      groupField = fieldMap[group];
+      renderGroupItems();
     } catch (err) {
       console.error('Group load failed', err);
+      showLoadError(gen);
     } finally {
-      loadEl.classList.add('hidden');
+      if (gen === viewGen) loadEl.classList.add('hidden');
     }
   }
 
-  function renderGroupItems(field) {
+  // Each aggregation uses a slightly different schema.
+  function groupValue(item) {
+    const value = item[groupField === 'year_min' ? 'year' : groupField] ?? item.label ?? '';
+    return { value, display: item.label || String(value || '[Untagged]') };
+  }
+
+  function renderGroupItems() {
     if (!groupItems.length) {
       emptyEl.classList.remove('hidden');
       emptyEl.textContent = 'Nothing here yet.';
       return;
     }
     emptyEl.classList.add('hidden');
+    showList('groups', groupItems.length);
+  }
 
-    // Build in rAF CHUNKS (a 30k-artist aggregation in one synchronous forEach
-    // freezes the phone for hundreds of ms).  The generation token — bumped by
-    // cleanupGestures() on any view switch — abandons a stale build.
-    const items = groupItems;
-    const gen = ++_groupRenderGen;
-
-    const buildRow = (item) => {
-      // Each aggregation uses a slightly different schema.
-      const value = item[field === 'year_min' ? 'year' : field] ?? item.label ?? '';
-      const display = item.label || String(value || '[Untagged]');
-      const count   = item.count ? `${item.count}` : '';
-
-      const row = document.createElement('div');
-      row.className = 'm-row';
-      row.innerHTML = `
-        <div class="m-row-content">
-          <div class="m-row-art"><span>${esc(emojiFor(group))}</span></div>
-          <div class="m-row-meta">
-            <div class="m-row-title">${esc(display)}</div>
-            <div class="m-row-artist">${esc(count + (count ? ' tracks' : ''))}</div>
-          </div>
-          <span style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
-        </div>
-      `;
-      const cleanup = attachRowGestures(row, {
-        onTap: () => {
-          if (field === 'year_min') {
-            // Exact-year filter via year_min + year_max
-            crumb = {
-              label: String(value), field: 'year_min', value: String(value),
-              extraField: 'year_max', extraValue: String(value),
-            };
-          } else {
-            crumb = { label: display, field, value: String(value) };
-          }
-          render();
-        },
-      });
-      _gestureCleanups.push(cleanup);
-      return row;
-    };
-
-    const CHUNK = 60;
-    let i = 0;
-    const step = () => {
-      if (gen !== _groupRenderGen) return;   // superseded by a view switch
-      const frag = document.createDocumentFragment();
-      const end = Math.min(i + CHUNK, items.length);
-      for (; i < end; i++) frag.appendChild(buildRow(items[i]));
-      listEl.appendChild(frag);
-      if (i < items.length) requestAnimationFrame(step);
-    };
-    step();
+  function openGroup(item) {
+    const { value, display } = groupValue(item);
+    if (groupField === 'year_min') {
+      // Exact-year filter via year_min + year_max
+      crumb = {
+        label: String(value), field: 'year_min', value: String(value),
+        extraField: 'year_max', extraValue: String(value),
+      };
+    } else {
+      crumb = { label: display, field: groupField, value: String(value) };
+    }
+    render();
   }
 
   function emojiFor(g) {
@@ -503,7 +631,6 @@ export function mountLibrary(root, ctx) {
   }
 
   function cleanupGestures() {
-    _groupRenderGen++;            // stop any in-flight chunked group build
     _gestureCleanups.forEach(fn => fn());
     _gestureCleanups = [];
     if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
@@ -511,14 +638,14 @@ export function mountLibrary(root, ctx) {
 
   // Now-playing row highlight.  Mobile library rows subscribed to nothing, so
   // the .m-row.playing style (mobile.css) only ever lit up in the Queue view —
-  // you could stare at the playing track and get zero feedback.  One listener.
+  // you could stare at the playing track and get zero feedback.  One listener;
+  // rows filled later take the state in fillRow.
   function markPlaying() {
+    if (mode !== 'tracks' && mode !== 'pltracks') return;
     const cur = Player.currentTrackId;
-    listEl.querySelectorAll('.m-row.playing').forEach(r => r.classList.remove('playing'));
-    if (!cur) return;
-    const sel = (window.CSS && CSS.escape) ? CSS.escape(cur) : String(cur).replace(/["\\]/g, '\\$&');
-    const row = listEl.querySelector(`.m-row[data-track-id="${sel}"]`);
-    if (row) row.classList.add('playing');
+    for (const row of vl.rows()) {
+      row.classList.toggle('playing', !!cur && row.dataset.trackId === cur);
+    }
   }
   Player.on('trackchange', markPlaying);
 

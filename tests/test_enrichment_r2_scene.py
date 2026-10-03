@@ -202,9 +202,15 @@ async def test_a_file_swapped_in_during_the_join_gets_none_of_the_old_patch(env)
     t = store.get_track("t")
     assert (t["artist"], t["album"], t.get("scene_path")) == ("", "", None)
     # The next apply joins the NEW md5 (no index row → nothing to write).
-    monkeypatch.setattr(sm, "collect_updates", real)
-    assert sm._last_auto_sig is None
+    joined = []
+
+    def spy(**kw):
+        joined.extend(t["id"] for t in kw["tracks"])
+        return real(**kw)
+    monkeypatch.setattr(sm, "collect_updates", spy)
+    assert sm._last_auto_sig[0] != store.enrich_cursor()    # the rescan is still to join
     await sm.apply_to_library(auto=True)
+    assert joined == ["t"]
     assert store.get_track("t")["artist"] == ""
 
 

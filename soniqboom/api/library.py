@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -12,11 +13,12 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from soniqboom.api.tracks import json_route, public_tracks
 from soniqboom.config import settings
 from soniqboom.core.data import (
     delete_scan_dir, rebuild_indexes,
-    list_hash_lookups, list_scan_dirs, resolve_hash,
-    tracks_by_dir, tracks_by_scan_root, upsert_scan_dir,
+    list_hash_lookups, list_scan_dirs, path_hash, resolve_hash,
+    upsert_scan_dir,
 )
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
@@ -104,10 +106,19 @@ async def _broadcast(data: dict) -> None:
 # counts from before a retag / set-primary / metadata backfill and disagree with
 # the (always-fresh) ``/api/tracks?format=X`` drill-down.
 _AGG_CACHE: dict[str, tuple[int, list]] = {}
-# Parallel dict: cache_key → (etag, raw_json_bytes).  Computed lazily on first
-# HTTP hit so we don't pay the hash+serialise cost when the cache is populated
-# only via internal helpers.
-_AGG_ETAGS: dict[str, tuple[str, bytes]] = {}
+# Parallel dict: cache_key → (etag, raw_json_bytes, gzipped_json_bytes | None).
+# Computed lazily on first HTTP hit so we don't pay the hash+serialise cost when
+# the cache is populated only via internal helpers; the gzip member on the first
+# 200 to a gzip-accepting client (see ``_etag_response``).  One tuple per key, so
+# the gzip is dropped in lock-step with the body + ETag it was made from — every
+# invalidation pops the whole entry — and can never be served for another body.
+_AGG_ETAGS: dict[str, tuple[str, bytes, bytes | None]] = {}
+
+# Mirrors main.py's ``_SelectiveGZipMiddleware(minimum_size=1000)`` /
+# ``compresslevel=6``: below the threshold the middleware sends the body as is,
+# so we do too (it adds no Vary there either).
+_GZIP_MIN_BYTES = 1000
+_GZIP_LEVEL = 6
 
 
 def _current_agg_seq() -> int:
@@ -172,6 +183,12 @@ def _tagged_denominator(store) -> int:
     return store.track_count()
 
 
+def _accepts_gzip(request: Request) -> bool:
+    # The exact test Starlette's GZipMiddleware applies, so a client gets the
+    # encoding it got before this body was memoised.
+    return "gzip" in request.headers.get("Accept-Encoding", "")
+
+
 def _etag_response(request: Request, cache_key: str, result: list) -> Response:
     """Return either 304 Not Modified or a JSONResponse with an ETag header.
 
@@ -179,14 +196,21 @@ def _etag_response(request: Request, cache_key: str, result: list) -> Response:
     result and cached in ``_AGG_ETAGS`` keyed by ``cache_key`` so repeated
     hits don't re-hash.  Scan invalidation clears both caches in lock-step
     via :func:`invalidate_agg_cache`.
+
+    The gzipped body is memoised in the same entry: the app's gzip middleware
+    used to re-compress the cached body on EVERY 200 (~4 ms on the loop for an
+    850 KB album list).  A gzip-accepting client now gets the stored gzip with
+    ``Content-Encoding: gzip`` + ``Vary: Accept-Encoding`` — Starlette's
+    GZipMiddleware passes a response that already carries Content-Encoding
+    through untouched — and any other client the plain body, which the
+    middleware sends as before.
     """
     cached = _AGG_ETAGS.get(cache_key)
     if cached is None:
         payload = json.dumps(result, separators=(",", ":"), sort_keys=True).encode()
         etag = hashlib.md5(payload).hexdigest()  # noqa: S324 — non-cryptographic
-        _AGG_ETAGS[cache_key] = (etag, payload)
-    else:
-        etag, payload = cached
+        cached = _AGG_ETAGS[cache_key] = (etag, payload, None)
+    etag, payload, gz = cached
 
     quoted = f'"{etag}"'
     inm = request.headers.get("if-none-match")
@@ -197,6 +221,7 @@ def _etag_response(request: Request, cache_key: str, result: list) -> Response:
         # existing Cache-Control and leaves this alone.
         "Cache-Control": "private, max-age=0, must-revalidate",
     }
+    compressible = len(payload) >= _GZIP_MIN_BYTES
     # Parse the If-None-Match header per RFC 7232 instead of using substring
     # ``etag in inm`` — substring match falsely 304s when one md5 is a prefix
     # of another in a multi-tag header, or when a token happens to appear
@@ -211,13 +236,26 @@ def _etag_response(request: Request, cache_key: str, result: list) -> Response:
     if inm:
         candidates = {_normalise_etag(e) for e in inm.split(",") if e.strip()}
         if etag in candidates or "*" in candidates:
+            if compressible:
+                # A 304 carries the Vary its 200 would have (RFC 9110 §15.4.5).
+                headers["Vary"] = "Accept-Encoding"
             return Response(status_code=304, headers=headers)
+    if compressible and _accepts_gzip(request):
+        if gz is None:
+            gz = gzip.compress(payload, compresslevel=_GZIP_LEVEL, mtime=0)
+            # Stored only into the entry it was made from (never over one an
+            # invalidation dropped or replaced meanwhile).
+            if _AGG_ETAGS.get(cache_key) is cached:
+                _AGG_ETAGS[cache_key] = (etag, payload, gz)
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+        return Response(content=gz, media_type="application/json", headers=headers)
     return Response(content=payload, media_type="application/json", headers=headers)
 
 
 # ── Scan dirs ─────────────────────────────────────────────────────────────────
 
-@router.get("/by-dir")
+@json_route(router, "/by-dir")
 async def tracks_in_directory(
     path: str = Query(..., description="Exact directory path"),
     recursive: bool = Query(False),
@@ -225,10 +263,19 @@ async def tracks_in_directory(
 ):
     """Return all tracks whose parent directory equals *path*.
     If recursive=True, returns all tracks under the scan root that contains this path.
+
+    TrackMeta-shaped rows (``tracks.public_track``) encoded with orjson — the
+    same JSON as the ``TrackMeta`` list ``data.tracks_by_dir`` /
+    ``tracks_by_scan_root`` build, without a model per row (5000 rows: ~550 ms
+    → ~35 ms, half of it the store's own filter).  A stored row the model
+    rejects is skipped instead of failing the whole listing with a 500.
     """
+    store = get_store()
     if recursive:
-        return await tracks_by_scan_root(path, limit=limit)
-    return await tracks_by_dir(path, limit=limit)
+        rows = store.filter_tracks(scan_root_hash=path_hash(path), limit=limit)
+    else:
+        rows = store.filter_tracks(dir_hash=path_hash(path), limit=limit)
+    return public_tracks(rows)
 
 
 @router.get("/hashes")

@@ -188,7 +188,7 @@ SoniqBoom speaks the culture:
   The names the other sources give become the game's other names (Track Info's *also* line; `game:` search finds any of them).
 - **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own — or flip to a sortable, searchable list and browse by format family (trackers, chiptune, lossless, lossy).
 - **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
-- **🗂️ Multi-subtune aware.** SID, NSF, and HVL tunes with multiple subsongs are addressed individually, not flattened into one.
+- **🗂️ Multi-subtune aware.** SID, SNDH, Amiga, NSF / GBS / AY / SAP and HVL files with multiple subsongs are addressed individually, not flattened into one — pick any tune in Track Info or in the phone's Now Playing. Playing the file itself starts at its default tune: the start song it names, or for Amiga player formats (played by UADE), console rips and SC68 disks the first tune that isn't empty.
 - **📼 Bundled HivelyTracker decoder.** `.hvl` modules play out of the box — nothing extra to install.
 
 <p align="center">
@@ -219,7 +219,7 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 - **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN — or send a favourite internet-radio station to a whole room, its live station, artist and cover art updating in place.
 - **📲 Touch-first mobile UI.** A dedicated phone shell — browse and play your library, tune in internet radio streamed straight to the phone, manage playlists, and a tap-to-expand mini-player.
 - **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem — including a **server-owned Jukebox** queue those apps can drive, with the audio playing out through any browser joined to the Jukebox room.
-- **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required.
+- **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required. MP3, WAV, Ogg, Opus and seekable FLAC files on a share start playing while they download, and a track inside a large ZIP on a share is read on its own, without fetching the whole archive.
 - **👥 Multi-user with roles**, **last.fm + ListenBrainz scrobbling**, **time-synced lyrics**, **podcast & audiobook chapters**, **in-browser tag editing**, **field-operator search** (`artist:Ghost year:>2020 format:FLAC`), **dark mode**, **installable PWA**, and **absolutely zero telemetry**.
 
 <p align="center">
@@ -255,14 +255,14 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 | **Lossless / PCM** | FLAC, ALAC (M4A), WAV, AIFF, WavPack | native / ffmpeg |
 | **Lossy** | MP3, AAC, Ogg Vorbis, Opus, Musepack | native / ffmpeg |
 | **DSD (1-bit)** | DSF, DFF, WSD | ffmpeg |
-| **SID** (C64) | `.sid`, `.psid` | sidplayfp + HVSC Songlengths & STIL |
+| **SID** (C64) | `.sid`, `.psid`, `.rsid` | sidplayfp + HVSC Songlengths & STIL |
 | **MIDI** | `.mid`, `.midi` | FluidSynth + SoundFonts |
-| **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF *(Imago Orpheus)*, OKT, SFX, WOW, DSM | libopenmpt |
+| **Tracker / module** | MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, AMF, GDM, IMF *(Imago Orpheus)*, OKT, SFX, WOW, DSM | libopenmpt *(MED 2–4 modules: zxtune123)* |
 | **Amiga** | AHX, HivelyTracker (HVL) | uade123 / bundled HivelyTracker engine |
-| **Amiga exotics** | ~150 custom formats: TFMX *(Turrican)*, Future Composer, SidMon 1/2, David Whittaker, Rob Hubbard, Jochen Hippel (+COSO/ST), Delta Music, SoundMon, JamCracker, Sonic Arranger, ProWizard-packed MODs… — both Amiga prefix naming (`mdat.song`) and suffix naming, companion sample files resolved automatically | uade123 (runs the original Amiga player code) |
+| **Amiga exotics** | ~150 custom formats: TFMX *(Turrican)*, Future Composer, SidMon 1/2, David Whittaker, Rob Hubbard, Jochen Hippel (+COSO/ST), Delta Music, SoundMon, JamCracker, Sonic Arranger, SoundFactory *(also when saved as `.psf`)*, ProWizard-packed MODs… — both Amiga prefix naming (`mdat.song`) and suffix naming, companion sample files resolved automatically | uade123 (runs the original Amiga player code) |
 | **Atari ST** | SNDH *(with per-track TIME/subsong tags)*, YM register dumps, SC68 | psgplay / bundled ST-Sound engine / sc68 |
 | **Console rips (PSF family)** | PSF, PSF2 *(PlayStation)*, USF *(N64)*, GSF *(GBA)*, 2SF + NCSF *(NDS)*, SSF *(Saturn)*, DSF *(Dreamcast)* — mini + shared-lib pairs kept together | zxtune123 (Highly Experimental / lazyusf2 / mGBA / vio2sf reference cores) |
-| **Console chiptune** | NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM, HES | libgme |
+| **Console chiptune** | NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (incl. packed GYMX), HES | libgme |
 | **AdLib / OPL2 FM** | id IMF *(Wolfenstein 3D, Keen…)*, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM | AdPlug (`adplay`) |
 
 ZIP archives are scanned and played **inline** — tracks inside `.zip` files appear in your library without unpacking.

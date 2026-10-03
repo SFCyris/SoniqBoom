@@ -28,9 +28,13 @@ import asyncio
 # accepted refresh.  Bounded by the number of distinct folders browsed
 # per server lifetime.
 _REFRESH_RECENT: dict[str, float] = {}
+# Running drill-down refresh jobs (strong refs; a server stop cancels them
+# before its final journal flush — ``scanner.stop_background_writers``).
+_DRILL_TASKS: set = set()
 
 from fastapi import APIRouter, HTTPException, Query
 
+from soniqboom.api.tracks import json_route
 from soniqboom.core import cache_stats
 from soniqboom.core.metadata import FORMAT_NAMES, SUPPORTED_EXTENSIONS
 from soniqboom.core.scanner import _is_junk_filename
@@ -57,7 +61,10 @@ _BROWSE_CACHE_VERSION = 2          # 2: rows carry the game fields (game, game_a
 
 
 def _is_remote(path: str) -> bool:
-    return path.startswith(("smb://", "ftp://"))
+    # The shared scheme set — WebDAV roots are http(s):// (GitHub #18: an
+    # smb/ftp-only copy sent them down the local branch → 404 on every browse).
+    from soniqboom.core.filesource import is_remote_path
+    return is_remote_path(path)
 
 
 def _has_audio(path: Path) -> bool:
@@ -545,7 +552,9 @@ async def refresh_subtree(body: dict):
         except Exception:
             log.exception("Drill-down refresh failed for %s", sub_str)
 
-    asyncio.create_task(_job())
+    task = asyncio.create_task(_job(), name="drill-down-refresh")
+    _DRILL_TASKS.add(task)
+    task.add_done_callback(_DRILL_TASKS.discard)
     return {"queued": True}
 
 
@@ -1043,7 +1052,7 @@ def _store_recursive_tracks_under(store, p: Path) -> list[dict] | None:
     p_str = str(p)
 
     # Collect every local scan root that contains ``p``.  Skip remote
-    # roots (smb://, ftp://) — their tracks have a different path
+    # roots (smb://, ftp://, WebDAV) — their tracks have a different path
     # encoding and are handled by ``_remote_tracks_with_meta``.
     ancestor_hashes: list[str] = []
     for sd in store.list_scan_dirs():
@@ -1405,7 +1414,11 @@ def _get_or_build_scan_root_sorted(
     return paths, dicts
 
 
-@router.get("/tracks-with-meta")
+# Encoded with orjson (``tracks.json_route``), not ``jsonable_encoder`` +
+# ``json.dumps``: the rows are already TrackMeta-shaped dicts (or stubs), and the
+# old walk cost ~140 ms on the event loop for one 2000-row page.  The function
+# still returns the plain list / ``{"total", "tracks"}`` dict to direct callers.
+@json_route(router, "/tracks-with-meta")
 async def tracks_with_meta(
     path: str = Query(..., description="Absolute directory path"),
     recursive: bool = Query(False),

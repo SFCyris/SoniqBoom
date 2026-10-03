@@ -51,8 +51,6 @@ SONGLENGTHS_NAMES = ("Songlengths.md5", "Songlengths.txt")
 STIL_NAME = "STIL.txt"
 DOCS_DIR_NAME = "DOCUMENTS"
 
-_REMOTE_PREFIXES = ("ftp://", "smb://")
-
 # Regex for a Songlengths.md5 entry:
 #   <md5-hex>=M:SS M:SS M:SS ...
 # Older releases use ``M:SS.ms``; newer ones add subsong duration only.
@@ -105,7 +103,8 @@ def is_songlengths_basename(name: str) -> bool:
 
 
 def _is_remote(path_str: str) -> bool:
-    return path_str.startswith(_REMOTE_PREFIXES)
+    from soniqboom.core.filesource import is_remote_path
+    return is_remote_path(path_str)
 
 
 class HVSC:

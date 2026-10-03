@@ -36,6 +36,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from soniqboom.core import cast_telemetry, cast_tokens
+from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.cast_codecs import CODECS, dlna_response_headers
 from soniqboom.core.cast_pipe import render_stream
 from soniqboom.core.conversion_cache import (
@@ -346,7 +347,7 @@ async def cast_stream(
         # downstream.  Without this, ``path_obj.exists()`` returns
         # False for any ZIP-contained track and the cast call 410s.
         _zip_track_id_for_unpin: str | None = None
-        if track.path.startswith(("smb://", "ftp://")) and "::" in track.path:
+        if is_remote_path(track.path) and "::" in track.path:
             # COMPOSITE remote archive member — ``ftp://host/share:/a.zip::x.mod``.
             # Partition the ``::`` tail FIRST, fetch only the OUTER archive into
             # the local remote-cache, THEN extract the member with the same
@@ -357,22 +358,29 @@ async def cast_stream(
             # which requires a LOCAL outer zip → None → 410.  This is the
             # "remote scheme checked before the archive member" bug for cast.
             from soniqboom.core.filesource import get_source, parse_remote_path
-            from soniqboom.core.remote_cache import get_cache
             from soniqboom.api.stream import _get_or_extract_zip_member, _zip_pin
             scan_root, remote_path = parse_remote_path(track.path)
             if not remote_path or "::" not in remote_path:
                 raise HTTPException(400, "Remote archive path is malformed.")
             source = get_source(scan_root)
-            if source is None:
-                raise HTTPException(503, "Network share unavailable.")
             zip_rel, _member = remote_path.split("::", 1)
+            from soniqboom.core.remote_cache import get_cache as _get_cache
+            from soniqboom.core.remote_zip import archive_for_member, cached_subset
+            if source is None and not (_get_cache().peek_cached(scan_root, zip_rel)
+                                       or cached_subset(scan_root, zip_rel, _member)):
+                raise HTTPException(503, "Network share unavailable.")
             import asyncio
             loop = asyncio.get_running_loop()
             try:
+                from soniqboom.api.stream import _archive_companion_filter
                 _local_zip = await loop.run_in_executor(
-                    None, get_cache().fetch, scan_root, zip_rel, source,
+                    None, lambda: archive_for_member(
+                        scan_root, zip_rel, _member, source,
+                        companion=_archive_companion_filter(_member)),
                 )
             except Exception as exc:
+                if source is None:              # its cached copy went meanwhile
+                    raise HTTPException(503, "Network share unavailable.")
                 log.warning("cast: remote archive fetch failed for %s: %s", track.path, exc)
                 raise HTTPException(502, "Could not fetch archive from network share.")
             extracted = await _get_or_extract_zip_member(
@@ -407,7 +415,7 @@ async def cast_stream(
             # on early-raise; the success path defers to _counting_gen.
             _zip_pin(track_id)
             _zip_track_id_for_unpin = track_id
-        elif track.path.startswith(("smb://", "ftp://")):
+        elif is_remote_path(track.path):
             # Remote source — pull through cache first (blocking, but
             # the existing remote_cache.fetch already handles streaming
             # the FTP/SMB pull in a thread).
@@ -451,30 +459,39 @@ async def cast_stream(
         # under cache pressure unlinks the WAV ffmpeg is reading from
         # — Linux/macOS survive via open-fd semantics; Windows breaks.
         _rendered_ck: str | None = None
+        # A rendered source still rendering: its WAV as it grows, fed to
+        # ffmpeg (``render_stream``'s ``src_feed``) so the first bytes follow
+        # the render's first audio, not its end.
+        live_feed = None
         try:
             from soniqboom.core.cast_render import (
-                prepare_source_for_stream, is_rendered_format,
+                prepare_source_for_stream, prepare_live_source, is_rendered_format,
             )
             target_subsong = int(claims.get("sn") or 0)
             was_rendered = is_rendered_format(_ext_for(track.path))
             if was_rendered:
                 try:
-                    path_obj, _eff_src = await prepare_source_for_stream(
-                        track_id   = track_id,
-                        # ALWAYS the RESOLVED LOCAL path — path_obj has already
-                        # been materialized to a local file for every shape
-                        # above (composite-remote-zip → extracted member,
-                        # local-zip → extracted member, plain-remote → fetched
-                        # copy, plain-local → itself).  The old code passed the
-                        # raw ``track.path`` (an ftp:// URL) for remote sources,
-                        # which _render_* can't read → cold remote render + VU
-                        # sidecar both failed.
-                        track_path = str(path_obj),
-                        subsong    = target_subsong,
-                    )
-                    # Phase mark — render done, transcode about to start.
-                    # Audio-2 P1: dashboard now splits renderer slowness
-                    # from ffmpeg slowness.
+                    # ALWAYS the RESOLVED LOCAL path — path_obj has already
+                    # been materialized to a local file for every shape
+                    # above (composite-remote-zip → extracted member,
+                    # local-zip → extracted member, plain-remote → fetched
+                    # copy, plain-local → itself).  The old code passed the
+                    # raw ``track.path`` (an ftp:// URL) for remote sources,
+                    # which _render_* can't read → cold remote render + VU
+                    # sidecar both failed.
+                    live_feed = await prepare_live_source(
+                        track_id=track_id, track_path=str(path_obj),
+                        subsong=target_subsong)
+                    if live_feed is None:
+                        path_obj, _eff_src = await prepare_source_for_stream(
+                            track_id   = track_id,
+                            track_path = str(path_obj),
+                            subsong    = target_subsong,
+                        )
+                    # Phase mark — render done (or, live, its first audible
+                    # audio in), transcode about to start.  Audio-2 P1:
+                    # dashboard now splits renderer slowness from ffmpeg
+                    # slowness.
                     t.mark_render_done()
                 except FileNotFoundError:
                     raise HTTPException(410, "Source file no longer on disk.")
@@ -565,6 +582,7 @@ async def cast_stream(
                 cache_register=_on_cache_written if cache_sink is not None else None,
                 ffmpeg_path=settings.ffmpeg_path,
                 on_first_byte=_mark_first_byte,
+                src_feed=live_feed,
             )
 
             # Count bytes for telemetry without buffering — wrap the generator.
@@ -611,7 +629,14 @@ async def cast_stream(
             )
         except BaseException:
             # Any early-raise BEFORE the response is returned must
-            # release the pins; ``_counting_gen`` won't run.
+            # release the pins; ``_counting_gen`` won't run — nor will
+            # anything read the live feed (closing it lets a progressive
+            # SID render detach / its file descriptor go).
+            if live_feed is not None:
+                try:
+                    await live_feed.aclose()
+                except Exception:
+                    pass
             if _rendered_ck is not None:
                 try:
                     _conv_unpin(_rendered_ck)

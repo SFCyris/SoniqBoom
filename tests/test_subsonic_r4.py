@@ -983,7 +983,8 @@ def test_subsonic_prewarm_shares_the_stream_registry(env, monkeypatch):
             tk.cancel()
         await asyncio.sleep(0)
     asyncio.run(_run())
-    assert started[0] == ("pw0", 0, stream_mod.PRIO_AHEAD)
+    # the bare id: the file's default tune (None), as the stream plays it
+    assert started[0] == ("pw0", None, stream_mod.PRIO_AHEAD)
     stream_mod._prewarm_tasks.clear()
     stream_mod._prewarm_owner.clear()
 

@@ -98,7 +98,7 @@ async def test_demozoo_apply_skips_when_nothing_changed(tmp_path, monkeypatch):
     s.upsert_track({"id": "t", "path": "/m/t.mod", "artist": "Dalezy", "format": "ProTracker"})
     joins = []
 
-    def collect():
+    def collect(tracks=None, matched_ids=None):
         joins.append(1)
         return 1, ([("t", {"scene_group": "Fairlight"})] if len(joins) == 1 else [])
     monkeypatch.setattr(demozoo, "collect_updates", collect)
@@ -127,15 +127,16 @@ async def test_demozoo_apply_reruns_after_a_concurrent_mutation(tmp_path, monkey
     s.upsert_track({"id": "t", "path": "/m/t.mod", "artist": "A"})
     joins = []
 
-    def collect():
-        joins.append(1)
+    def collect(tracks=None, matched_ids=None):
+        joins.append([t["id"] for t in tracks])
         s.upsert_track({"id": "u", "path": "/m/u.mod", "artist": "B"})  # a scan meanwhile
         return 0, []
     monkeypatch.setattr(demozoo, "collect_updates", collect)
     await demozoo.apply_to_library()
-    assert demozoo._last_apply_sig is None
+    # not recorded past the scan's write: the next apply joins it
+    assert demozoo._last_apply_sig[0] != s.enrich_cursor()
     await demozoo.apply_to_library()
-    assert len(joins) == 2
+    assert joins == [["t"], ["u"]]
 
 
 # ── r2-enr-18 / r2-enr-7: settings save ─────────────────────────────────────

@@ -364,7 +364,8 @@ async def test_withdrawn_album_runs_the_folder_pass(env, monkeypatch):
     m, s = _tsvs(sub, [(B, "Jon Hare", "", "", "")], LENS[:1])
     songdb.build_index(m, s, db)
     await songdb.apply_to_library(force=True)
-    assert store.get_track("b")["album"] == "" and ran == [True]
+    # not forced: the withdrawn track is in the folder pass's change log delta
+    assert store.get_track("b")["album"] == "" and ran == [False]
 
 
 async def test_reset_withdraws_exactly_the_fills(env):

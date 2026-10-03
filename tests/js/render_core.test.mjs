@@ -18,7 +18,11 @@ test('prewarm asks for the queued tune, not the file default', () => {
   assert.equal(u2.searchParams.get('subsong'), '2');
   assert.equal(u2.searchParams.get('priority'), 'next');
   assert.equal(u2.searchParams.get('path'), '/m/a.sid');
-  for (const subsong of [0, undefined, null, '0']) {
+  // a picked first tune is named (0); a plain play of the file names none —
+  // the server then warms its default tune
+  const u0 = new URL(c._prewarmUrl({ id: 'x', subsong: 0 }, false), 'http://h');
+  assert.equal(u0.searchParams.get('subsong'), '0');
+  for (const subsong of [undefined, null, '0']) {
     const u = new URL(c._prewarmUrl({ id: 'x', subsong }, false), 'http://h');
     assert.equal(u.searchParams.has('subsong'), false, `subsong=${subsong}`);
     assert.equal(u.searchParams.get('priority'), 'ahead');
@@ -39,7 +43,9 @@ test('render-status of the current track names its tune', () => {
   c.start(sid({ subsong: 3 }));
   assert.equal(c._renderStatusUrl('s1'), '/api/stream/s1/render-status?subsong=3');
   assert.equal(c._renderStatusUrl('other'), '/api/stream/other/render-status');   // not the current track
-  c.start(sid({ subsong: 0 }));
+  c.start(sid({ subsong: 0 }));                       // a picked first tune
+  assert.equal(c._renderStatusUrl('s1'), '/api/stream/s1/render-status?subsong=0');
+  c.start(sid({}));                                   // a plain play: the default tune
   assert.equal(c._renderStatusUrl('s1'), '/api/stream/s1/render-status');
 });
 

@@ -8,7 +8,7 @@ source file directly.  That works for every codec ffmpeg can demux —
 MP3 / FLAC / WAV / OGG / OPUS / AAC / ALAC / AIFF / WavPack / Musepack
 / DSD — but NOT for the rendered formats SoniqBoom supports:
 
-  • SID (.sid, .psid) — requires sidplayfp
+  • SID (.sid, .psid, .rsid) — requires sidplayfp
   • MIDI (.mid, .midi) — requires FluidSynth + a SoundFont
   • Tracker (.mod, .s3m, .xm, .it, …) — requires openmpt123
   • GME (.nsf, .spc, .gbs, .vgm, …) — requires libgme
@@ -38,17 +38,9 @@ import logging
 from pathlib import Path
 
 from soniqboom.core.conversion_cache import get_or_render
+from soniqboom.core.filesource import is_remote_path
 
 log = logging.getLogger(__name__)
-
-# Remote-source schemes the cast render path resolves.  Deliberately limited to
-# the schemes ``filesource.parse_remote_path`` actually accepts (it RAISES
-# ValueError on http/webdav) — matching the effective handled set keeps the
-# tuple honest and lets a webdav/http path degrade to a clean ``None`` miss
-# instead of a caught-ValueError traceback.  Same set as cast_stream's inline
-# composite-remote branch.  (``core.source_bytes`` lists the broader aspirational
-# set, but its resolution funnels through the same smb/ftp-only parse_remote_path.)
-_REMOTE_SCHEMES = ("smb://", "ftp://")
 
 
 # ── Extension sets ─────────────────────────────────────────────────────────
@@ -56,7 +48,7 @@ _REMOTE_SCHEMES = ("smb://", "ftp://")
 # importing stream.py at module-load time (circular-import risk through
 # the FastAPI router registration in main.py).
 
-_SID_EXTS = {".sid", ".psid"}
+from soniqboom.core.metadata import SID_EXTS as _SID_EXTS   # .sid / .psid / .rsid
 _MIDI_EXTS = {".mid", ".midi"}
 # AHX needs uade123, NOT openmpt123.  HVL (HivelyTracker) needs the bundled
 # hvl2wav (neither uade nor openmpt decodes it).  Both kept separate from the
@@ -103,6 +95,13 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     if not e.startswith("."):
         e = "." + e
     from soniqboom.core.conversion_cache import _cache_key
+    # ``subsong`` 0 is the bare play: the file's default tune, which for a
+    # multi-tune Amiga / libgme file may not be its first (``stream.tune_index``).
+    # SID maps the wire itself.
+    if e not in _SID_EXTS:
+        from soniqboom.api.stream import tune_index
+        from soniqboom.core.store import get_store
+        subsong = tune_index(track_id, get_store().get_track(track_id), subsong or None)
     if e in _SID_EXTS:
         from soniqboom.config import settings
         dur = int(getattr(settings, "sid_default_duration", 180))
@@ -162,22 +161,31 @@ async def materialize_source(
     """
     try:
         outer, sep, member = track_path.partition("::")
-        if outer.startswith(_REMOTE_SCHEMES):
+        if is_remote_path(outer):
             # Mirror ONLY the OUTER remote file (the module itself, or the
             # archive that contains it) into the local remote-cache first.
             from soniqboom.core.filesource import get_source, parse_remote_path
             from soniqboom.core.remote_cache import get_cache
             scan_root, remote_path = parse_remote_path(outer)
-            source = get_source(scan_root) if remote_path else None
-            if source is None:
+            if not remote_path:
                 return None
+            # No source (not connected, or its sign-in refused): what the
+            # remote cache holds still plays.
+            source = get_source(scan_root)
             loop = asyncio.get_running_loop()
-            local_outer = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    get_cache().fetch, scan_root, remote_path, source, lane=lane,
-                ),
-            )
+            if sep:
+                # Only the member (+ companions) when the archive isn't cached.
+                from soniqboom.api.stream import _archive_companion_filter
+                from soniqboom.core.remote_zip import archive_for_member
+                fetch = functools.partial(
+                    archive_for_member, scan_root, remote_path, member, source,
+                    lane=lane, companion=_archive_companion_filter(member))
+            elif source is not None:
+                fetch = functools.partial(
+                    get_cache().fetch, scan_root, remote_path, source, lane=lane)
+            else:
+                fetch = functools.partial(get_cache().get_cached, scan_root, remote_path)
+            local_outer = await loop.run_in_executor(None, fetch)
             if not local_outer:
                 return None
             outer = str(local_outer)
@@ -194,6 +202,115 @@ async def materialize_source(
         # remote/archive fetch failure stays diagnosable.
         log.warning("cast: materialize_source failed for %s", track_path, exc_info=True)
         return None
+
+
+async def _render_input(track_id: str, track_path: str,
+                        subsong: int) -> "tuple[Path, str, int]":
+    """``(path, ext, subsong)`` a render of this source takes: the LOCAL file
+    (an archive member or a remote source materialized), its extension, and
+    the tune — the index every renderer but SID takes (a bare play's being
+    the file's default tune), the wire for SID."""
+    # Strip ``outer.zip::inner.mod`` to the inner filename for the
+    # extension test, but feed the renderer the FULL path — the
+    # rendering helpers know how to extract from ZIP themselves.
+    visible_path = track_path.split("::")[-1] if "::" in track_path else track_path
+    src_ext = Path(visible_path).suffix.lower()
+    path_obj = Path(track_path)
+
+    # Archive- or remote-contained rendered sources: resolve to the real LOCAL
+    # file the renderers (sidplayfp / fluidsynth / openmpt123 / uade123 /
+    # hvl2wav) can read — they take a filesystem path and can't read a
+    # ``zip::member`` virtual path OR a ``ftp://…`` remote URL.  ``materialize_
+    # source`` partitions the ``::`` archive tail FIRST, so a COMPOSITE
+    # remote-archive path (``ftp://…album.zip::inner.mod``) fetches only the
+    # OUTER container then extracts the member — the "remote scheme checked
+    # before the archive member" bug this call closes.  Without it, a COLD cast
+    # render of any remote / remote-zip / zip-contained tracker/SID/HVL fails
+    # (both the audio render AND the render-time VU sidecar).  Local archive
+    # members reuse the same stable extraction cache the foreground stream uses
+    # ⇒ no temp churn and no double-extraction.  cast_stream normally
+    # pre-resolves to a local path, so for that caller this is a no-op; it keeps
+    # the function correct in isolation for any other caller.
+    if is_rendered_format(src_ext) and (
+            "::" in track_path or is_remote_path(track_path)):
+        resolved = await materialize_source(track_path, track_id)
+        if resolved is not None:
+            path_obj = resolved
+
+    # ``subsong`` 0 is the bare play: the file's default tune — for a
+    # multi-tune Amiga / libgme file its first tune that isn't empty, probed
+    # once (``stream.ensure_default_tune``, the probe a web play runs).  The
+    # renderers below except SID take the tune index.
+    if src_ext not in _SID_EXTS and is_rendered_format(src_ext):
+        from soniqboom.api.stream import _bare_play_track, _probe_family, tune_index
+        from soniqboom.core.data import get_track
+        _track = await get_track(track_id)
+        if not subsong and path_obj.exists():
+            _track = await _bare_play_track(track_id, _track, path_obj,
+                                            _probe_family(src_ext, False, path_obj))
+        subsong = tune_index(track_id, _track, subsong or None)
+    return path_obj, src_ext, subsong
+
+
+async def prepare_live_source(
+    *,
+    track_id: str,
+    track_path: str,
+    subsong: int = 0,
+):
+    """A WAV byte stream of a rendered source's render AS IT RENDERS, for the
+    cast / DLNA / AirPlay transcode pipeline (``cast_pipe.render_stream``'s
+    ``src_feed``): ffmpeg then starts on the render's first audio instead of
+    its end.  For the formats whose render is slow enough to wait on and can
+    be read while it grows — SID (sidplayfp), MIDI (fluidsynth), AHX
+    (uade123) and the libgme chiptunes — under the same cache keys
+    ``prepare_source_for_stream`` renders them to (the render is cached as
+    usual).  None when there is nothing live to offer: another format, the
+    render is already cached, or it ended before it was audible (failed,
+    silent, or simply short) — the caller then uses
+    ``prepare_source_for_stream``, which serves the cached file or attaches
+    to the render and raises its error.  A SID that plays only silence
+    raises the cache's 422."""
+    visible_path = track_path.split("::")[-1] if "::" in track_path else track_path
+    ext = Path(visible_path).suffix.lower()
+    if not (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _UADE_EXTS
+            or ext in _GME_EXTS):
+        return None
+    path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
+    if not path_obj.exists():
+        return None
+    from soniqboom.api import stream as _st
+    from soniqboom.core.conversion_cache import _cache_key, get_cached
+    if src_ext in _SID_EXTS:
+        if not _st._is_c64_sid(path_obj):
+            return None
+        from soniqboom.config import settings
+        target_dur = int(getattr(settings, "sid_default_duration", 180))
+        key = _cache_key(track_id, "sid", subsong=subsong, duration=target_dur)
+        if await get_cached(key) is not None:
+            return None
+        return await _st.sid_wav_feed(path_obj, subsong, target_dur, key)
+    if src_ext in _MIDI_EXTS:
+        from soniqboom.config import get_active_soundfont
+        sf = get_active_soundfont()
+        sfp = str(sf) if sf else ""
+        key = _cache_key(track_id, "midi", soundfont_path=sfp)
+        return await _st.live_wav_feed(
+            track_id, format_type="midi", subsong=0, key=key,
+            render_fn=lambda: _st._render_midi(path_obj, live_key=key),
+            cache_kw={"soundfont_path": sfp})
+    if src_ext in _UADE_EXTS:
+        base = await _st._uade_resolve_base(track_id, None, path_obj, subsong)
+        key = _st.uade_cache_key(track_id, subsong, base)
+        return await _st.live_wav_feed(
+            track_id, format_type="uade", subsong=subsong, key=key,
+            render_fn=lambda: _st._render_uade(path_obj, subsong=subsong, live_key=key,
+                                               subsong_base=base),
+            cache_kw={"variant": _st.uade_cache_variant(subsong, base)})
+    key = _cache_key(track_id, "gme", subsong=subsong)
+    return await _st.live_wav_feed(
+        track_id, format_type="gme", subsong=subsong, key=key,
+        render_fn=lambda: _st._render_gme(path_obj, subsong=subsong, live_key=key))
 
 
 async def prepare_source_for_stream(
@@ -221,32 +338,7 @@ async def prepare_source_for_stream(
     ``HTTPException(501, "<binary> not installed")`` when the required renderer
     binary is missing, which cast_stream re-raises unchanged.
     """
-    # Strip ``outer.zip::inner.mod`` to the inner filename for the
-    # extension test, but feed the renderer the FULL path — the
-    # rendering helpers know how to extract from ZIP themselves.
-    visible_path = track_path.split("::")[-1] if "::" in track_path else track_path
-    src_ext = Path(visible_path).suffix.lower()
-    path_obj = Path(track_path)
-
-    # Archive- or remote-contained rendered sources: resolve to the real LOCAL
-    # file the renderers (sidplayfp / fluidsynth / openmpt123 / uade123 /
-    # hvl2wav) can read — they take a filesystem path and can't read a
-    # ``zip::member`` virtual path OR a ``ftp://…`` remote URL.  ``materialize_
-    # source`` partitions the ``::`` archive tail FIRST, so a COMPOSITE
-    # remote-archive path (``ftp://…album.zip::inner.mod``) fetches only the
-    # OUTER container then extracts the member — the "remote scheme checked
-    # before the archive member" bug this call closes.  Without it, a COLD cast
-    # render of any remote / remote-zip / zip-contained tracker/SID/HVL fails
-    # (both the audio render AND the render-time VU sidecar).  Local archive
-    # members reuse the same stable extraction cache the foreground stream uses
-    # ⇒ no temp churn and no double-extraction.  cast_stream normally
-    # pre-resolves to a local path, so for that caller this is a no-op; it keeps
-    # the function correct in isolation for any other caller.
-    if is_rendered_format(src_ext) and (
-            "::" in track_path or track_path.startswith(_REMOTE_SCHEMES)):
-        resolved = await materialize_source(track_path, track_id)
-        if resolved is not None:
-            path_obj = resolved
+    path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
 
     if src_ext in _SID_EXTS:
         # Late import — keeps the cast modules independently loadable

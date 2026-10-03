@@ -59,8 +59,8 @@ register_easy_game_key()
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus",
     ".aiff", ".aif", ".wav", ".wv", ".mpc",
-    # SID (C64)
-    ".sid", ".psid",
+    # SID (C64): PSID / RSID files, whatever the suffix (``SID_EXTS``)
+    ".sid", ".psid", ".rsid",
     # MIDI
     ".mid", ".midi",
     # Tracker modules
@@ -109,7 +109,7 @@ FORMAT_NAMES = {
     ".ogg": "Ogg Vorbis", ".opus": "Opus", ".aiff": "AIFF", ".aif": "AIFF",
     ".wav": "WAV", ".wv": "WavPack", ".mpc": "Musepack",
     # SID
-    ".sid": "SID", ".psid": "SID",
+    ".sid": "SID", ".psid": "SID", ".rsid": "SID",
     # MIDI
     ".mid": "MIDI", ".midi": "MIDI",
     # Tracker modules
@@ -160,7 +160,11 @@ _PSF_VERSION_NAMES = {
 
 _DSD_EXTS = {".dsf", ".dff", ".wsd"}
 
-_SID_EXTS = {".sid", ".psid"}
+# C64 SID tunes (sidplayfp): THE one list of their file extensions — the
+# scanner, the stream router, cast and the HVSC detection all use it.  A
+# RealSID tune (``RSID`` header) is often saved as ``.rsid``.
+SID_EXTS = frozenset({".sid", ".psid", ".rsid"})
+_SID_EXTS = SID_EXTS
 _MIDI_EXTS = {".mid", ".midi"}
 _TRACKER_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
@@ -1180,36 +1184,42 @@ def _mp4(path: Path, track_id: str) -> dict:
     trkn = _pair(tags.get("trkn") or [(None, None)])
     disk = _pair(tags.get("disk") or [(None, None)])
 
-    # Codec detection — prefer ffprobe over mutagen's heuristic.  Mutagen
-    # reads the codec name from the atom table; for files written by
-    # certain encoders (notably older iTunes Match exports) that token
-    # reads "mp4a" without disambiguating ALAC vs AAC.  ffprobe always
-    # returns the real codec name from the elementary-stream header, so
-    # we end up with the right format label even on those edge cases.
+    # Codec detection.  Mutagen reads the codec from the sample entry:
+    # "alac", or "mp4a.<object type>[.<audio object type>]" ("mp4a.40.2" —
+    # AAC), "ac-3" … — the same answer ffprobe gives, without a ~20 ms
+    # process per file.  Only a bare "mp4a" (or no codec at all: an entry
+    # mutagen couldn't read further, as some older iTunes Match exports
+    # write) is ambiguous; ffprobe reads the elementary-stream header then.
+    codec = (getattr(audio.info, "codec", "") or "").lower()
     fmt: str | None = None
-    try:
-        probed = forksafe.run(
-            ["ffprobe", "-v", "quiet",
-             "-select_streams", "a:0",
-             "-show_entries", "stream=codec_name",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             str(path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if probed.returncode == 0:
-            codec_name = (probed.stdout or "").strip().lower()
-            if codec_name == "alac":
-                fmt = "ALAC"
-            elif codec_name == "aac":
-                fmt = "AAC"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
+    if codec.startswith("alac"):
+        fmt = "ALAC"
+    elif codec not in ("", "mp4a"):
+        fmt = "AAC"
+    else:
+        try:
+            probed = forksafe.run(
+                ["ffprobe", "-v", "quiet",
+                 "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if probed.returncode == 0:
+                codec_name = (probed.stdout or "").strip().lower()
+                if codec_name == "alac":
+                    fmt = "ALAC"
+                elif codec_name == "aac":
+                    fmt = "AAC"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
 
     if fmt is None:
-        # Fallback to mutagen heuristic when ffprobe unavailable.  Note we
-        # never produce the old "ALAC/AAC" combo string — we pick one
-        # side and commit, so the column stays canonical.
-        fmt = "ALAC" if getattr(audio.info, "codec", "").startswith("alac") else "AAC"
+        # Neither says ALAC: AAC.  Note we never produce the old "ALAC/AAC"
+        # combo string — we pick one side and commit, so the column stays
+        # canonical.
+        fmt = "ALAC" if codec.startswith("alac") else "AAC"
 
     d: dict = {
         "id": track_id,
@@ -1642,9 +1652,15 @@ def _extract_gme(path: Path, track_id: str) -> dict:
     artist = ""
     game = ""
     duration = float(getattr(settings, "sid_default_duration", 180))
+    subsongs = None
     try:
         with open(path, "rb") as f:
             hdr = f.read(256)
+            # The tune count: NSF / NSFe / GBS / AY / SAP state it (NSFe and
+            # SAP a little further in) — what the tune picker lists.
+            if ext in (".nsf", ".nsfe", ".gbs", ".ay", ".sap"):
+                from soniqboom.core.gme_render import header_tunes
+                subsongs, _ = header_tunes(hdr + f.read(64 * 1024 - 256))
     except OSError as exc:
         _swallow_io(exc)
         hdr = b""
@@ -1684,6 +1700,12 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         if gd3.get("author"):
             artist = gd3["author"]
         game = _game_name(gd3.get("game", ""))
+    # GYM (Mega Drive register dump): a GYMX header names the song and the
+    # game; its length is its frame count (60 per second) — read off the
+    # unpacked dump (a packed GYMX is zlib inside), plus the 8 s fade a looped
+    # one is rendered with (``stream._render_gme``).
+    elif ext == ".gym":
+        title, game, duration = _gym_meta(path, title, duration)
     # Other formats fall back to filename; gme renderer will surface
     # the proper metadata when streaming.
 
@@ -1704,7 +1726,38 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         d["album"] = game
         d["album_source"] = "tag"
         d["game_by_tag"] = game                # the header's own game name
+    if subsongs and subsongs > 1:
+        d["subsongs"] = subsongs
     return d
+
+
+_GYM_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _gym_meta(path: Path, title: str, duration: float) -> tuple[str, str, float]:
+    """``(title, game, duration)`` of a GYM file — the GYMX header's song and
+    game names, the dump's own length — falling back to the given title /
+    duration (and no game) for whatever can't be read."""
+    from soniqboom.core import gme_render
+    try:
+        if path.stat().st_size > _GYM_MAX_BYTES:
+            return title, "", duration
+        data = path.read_bytes()
+    except OSError as exc:
+        _swallow_io(exc)
+        return title, "", duration
+    game = ""
+    head = gme_render.gymx_fields(data)
+    if head is not None:
+        title = _decode_tracker_str(data[4:36]) or title
+        game = _game_name(_decode_tracker_str(data[36:68]))
+    try:
+        secs = gme_render.gym_seconds(gme_render.unpack_gym(data))
+    except ValueError:
+        secs = None
+    if secs:
+        duration = round(secs + (8.0 if head and head["loop_start"] else 0.0), 2)
+    return title, game, duration
 
 
 # ── DSD (.dsf / .dff / .wsd) ────────────────────────────────────────────────
@@ -1917,10 +1970,12 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     instruments: list[str] = []
     channels: int | None = None
     patterns: int | None = None
+    file_bytes: bytes | None = None     # the file as read: duration + scene MD5 use it too
 
     try:
         with open(path, "rb") as f:
             raw = f.read()  # read full file for instrument headers
+        file_bytes = raw
         if raw[:4] == b"XPKF":
             # An XPK-packed module: parse the unpacked one (uade plays one
             # unpacked too — ``api.stream._xpk_unpacked``; openmpt unpacks
@@ -2096,12 +2151,28 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     except Exception as exc:
         log.debug("Tracker header parse failed for %s: %s", path, exc)
 
-    # Try to get duration via openmpt123 --info
+    # Duration: in a scan worker, libopenmpt in-process
+    # (``openmpt_vu.module_duration`` — the value ``openmpt123 --info``
+    # prints, to the millisecond, at ~0.2 ms instead of a ~11 ms process; a
+    # decoder crash there costs the worker, which the scan's pool survives);
+    # elsewhere — the server's own threads — and without the library, the
+    # CLI, its "mm:ss.mmm" read in full (the old parse dropped the fraction:
+    # 30.72 s → 30).
     duration = 0.0
+    lib_duration = None
+    if file_bytes is not None and _LIBOPENMPT_IN_PROCESS:
+        try:
+            from soniqboom.core import openmpt_vu
+            lib_duration = openmpt_vu.module_duration(file_bytes)
+        except Exception:                                   # noqa: BLE001
+            lib_duration = None
+    if lib_duration is not None:
+        duration = lib_duration
     try:
         from soniqboom.config import settings
         import shutil
-        binary = settings.openmpt123_path or shutil.which("openmpt123")
+        binary = (None if lib_duration is not None
+                  else settings.openmpt123_path or shutil.which("openmpt123"))
         if binary:
             # forksafe: this is THE hot fork site — it runs from scan and
             # drill-down worker threads (206 of the 219 segfault dumps on
@@ -2114,9 +2185,12 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             for line in result.stdout.splitlines():
                 if "duration" in line.lower():
                     # Try to find seconds value — formats vary
-                    m = re.search(r"(\d+):(\d+)", line)
+                    m = re.search(r"(?:(\d+):)?(\d+):(\d+)(?:\.(\d+))?", line)
                     if m:
-                        duration = int(m.group(1)) * 60 + int(m.group(2))
+                        # whole ms, as ``openmpt_vu.module_duration`` gives them
+                        ms = ((int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60
+                               + int(m.group(3))) * 1000 + int((m.group(4) or "").ljust(3, "0")[:3]))
+                        duration = ms / 1000
                         break
                     m = re.search(r"([\d.]+)\s*s", line, re.IGNORECASE)
                     if m:
@@ -2143,6 +2217,9 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         d["channels"] = channels
     if patterns is not None:
         d["patterns"] = patterns
+    if file_bytes is not None and len(file_bytes) <= _SCENE_MD5_MAX:
+        # The scene MD5 ``extract`` would otherwise read the file again for.
+        d["file_md5"] = hashlib.md5(file_bytes).hexdigest()
     return d
 
 
@@ -2584,6 +2661,12 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     return d
 
 
+_SCENE_MD5_MAX = 8 * 1024 * 1024    # no bigger file is hashed for the scene joins
+# Set in scan worker processes (``scanner._worker_init``): tracker durations
+# come from libopenmpt in-process there — never in the server itself.
+_LIBOPENMPT_IN_PROCESS = False
+
+
 def _wants_scene_md5(ext: str, name: str, d: dict) -> bool:
     """Should this file's MD5 be cached for the scene joins (Modland, the
     UADE song database)?
@@ -2900,6 +2983,19 @@ def _extract(
         _owned_prefix = False
         if _is_c64:
             _uade_cls = None
+    elif ext == ".psf":
+        # ``.psf`` is Amiga SoundFactory's suffix too (Modland
+        # ``SoundFactory/*.psf``): without the 'PSF' magic of a console rip
+        # the file must pass uade's strict check (``stream._psf_has_magic``
+        # routes playback the same way).
+        try:
+            with open(path, "rb") as _fh:
+                _psf_magic = _fh.read(3)
+        except OSError:
+            _psf_magic = b"PSF"
+        if _psf_magic != b"PSF":
+            _is_uade = True
+            _owned_prefix = False
     if _is_uade:
         # Cheap binary sniff first (QA M1): Amiga modules are binary; a file
         # whose head is pure printable text (README.md next to the music,
@@ -3070,7 +3166,7 @@ def _extract(
     # HVSC ``sid_md5`` pattern; costs one small read at scan time.
     if "file_md5" not in d and _wants_scene_md5(ext, path.name, d):
         try:
-            if path.stat().st_size <= 8 * 1024 * 1024:
+            if path.stat().st_size <= _SCENE_MD5_MAX:
                 import hashlib as _hashlib
                 d["file_md5"] = _hashlib.md5(path.read_bytes()).hexdigest()
         except OSError:

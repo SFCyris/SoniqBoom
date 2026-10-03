@@ -78,7 +78,8 @@ def _write_wav(path: Path, seconds: float = 0.2) -> Path:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(8000)
-        w.writeframes(b"\x00\x10" * int(8000 * seconds))
+        # Audible (±4096): the cache refuses a silent (or DC-only) render.
+        w.writeframes(b"\x00\x10\x00\xf0" * int(4000 * seconds))
     return path
 
 
@@ -750,22 +751,23 @@ async def test_schedule_prewarm_joins_owners_and_evicts_unpinned_first(monkeypat
     monkeypatch.setattr(stream, "_do_prewarm", fake_do_prewarm)
     sched = stream._schedule_prewarm
     try:
+        # an unnamed 0 (Subsonic's bare id) is the file's default tune: ``d``
         r = sched("sp1", _T("sp1", "/x/sp1.mod"), 0, stream.PRIO_AHEAD, "alice", ".mod")
-        assert r == {"status": "queued", "key": "sp1::.mod::0", "in_flight": 1}
+        assert r == {"status": "queued", "key": "sp1::.mod::d", "in_flight": 1}
         r = sched("sp1", _T("sp1", "/x/sp1.mod"), 0, stream.PRIO_NEXT, "bob", ".mod")
-        assert r == {"status": "already_running", "key": "sp1::.mod::0"}
-        assert stream._prewarm_owner["sp1::.mod::0"] == {"alice", "bob"}
+        assert r == {"status": "already_running", "key": "sp1::.mod::d"}
+        assert stream._prewarm_owner["sp1::.mod::d"] == {"alice", "bob"}
         # Subsonic's call shape: no ext — derived from the path
         r = sched("sp2", _T("sp2", "/x/sp2.xm"), 0, stream.PRIO_AHEAD, "carol")
-        assert r["key"] == "sp2::.xm::0"
-        t2 = stream._prewarm_tasks["sp2::.xm::0"]
+        assert r["key"] == "sp2::.xm::d"
+        t2 = stream._prewarm_tasks["sp2::.xm::d"]
         sched("sp3", _T("sp3", "/x/sp3.it"), 0, stream.PRIO_AHEAD, "carol")
         r = sched("sp4", _T("sp4", "/x/sp4.s3m"), 0, stream.PRIO_AHEAD, "carol")
         assert r["in_flight"] == 3
         await asyncio.sleep(0)
         # over the cap: the oldest UNPINNED task goes, the pinned sp1 stays
-        assert t2.cancelled() and "sp2::.xm::0" not in stream._prewarm_owner
-        assert list(stream._prewarm_tasks) == ["sp1::.mod::0", "sp3::.it::0", "sp4::.s3m::0"]
+        assert t2.cancelled() and "sp2::.xm::d" not in stream._prewarm_owner
+        assert list(stream._prewarm_tasks) == ["sp1::.mod::d", "sp3::.it::d", "sp4::.s3m::d"]
     finally:
         hold.set()
         for t in list(stream._prewarm_tasks.values()):
