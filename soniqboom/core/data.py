@@ -266,8 +266,8 @@ async def list_playlists(user_id: str | None = None) -> list[dict]:
     return get_store().list_playlists_for_user(user_id)
 
 
-async def update_playlist(playlist_id: str, updates: dict) -> dict | None:
-    return get_store().update_playlist(playlist_id, updates)
+async def update_playlist(playlist_id: str, updates: dict, *, keep_ids=None) -> dict | None:
+    return get_store().update_playlist(playlist_id, updates, keep_ids=keep_ids)
 
 
 async def delete_playlist(playlist_id: str) -> bool:
@@ -455,6 +455,9 @@ async def ft_search_dicts(
     offset: int = 0,
     sort_by: str | None = None,
     sort_order: str | None = None,
+    exclude: "frozenset[str] | set[str] | None" = None,
+    untagged: str | None = None,
+    swap=None,
 ) -> list[dict]:
     """Like :func:`ft_search`, but returns the store's plain dicts directly —
     no ``TrackMeta`` round-trip.
@@ -466,13 +469,24 @@ async def ft_search_dicts(
     (~12 ms/page saved on a 2000-track page).  Values are JSON-native
     (str/int/float/bool/None/list) so orjson serializes without a default
     hook.  Callers that need validated models still use ``ft_search``.
+
+    ``exclude``: ids no page may contain — the web lists pass the tracks
+    "Tracks on unavailable drives: Hide" leaves out (``core.availability``);
+    pagination counts only the rest.  ``swap``: with duplicates hidden, the
+    groups listed by another member while their primary can't play
+    (``core.availability.primary_swap``).
+
+    ``untagged``: only tracks whose tag of that name is blank (the
+    "[No Artist]"-style drill-down — ``TrackStore.filter_tracks``).
     """
     store = get_store()
     parsed = _parse_tag_query(query)
     hide_dups = bool(store.get_config("filter_duplicates", False))
     return store.filter_tracks(**parsed, limit=limit, offset=offset,
                                filter_duplicates=hide_dups,
-                               sort_by=sort_by, sort_order=sort_order)
+                               sort_by=sort_by, sort_order=sort_order,
+                               exclude=exclude or None, untagged=untagged,
+                               swap=swap)
 
 
 # A tag value runs to the first UNESCAPED "}": search._esc_tag backslash-escapes
@@ -492,6 +506,8 @@ def _parse_tag_query(query: str) -> dict:
     Handles:
       @artist_tag:{value}        -> artist="value"
       @album_artist_tag:{value}  -> album_artist="value"
+      @artist_match:{value}      -> artist_match="value"   (search box artist:)
+      @album_artist_match:{value} -> album_artist_match="value"
       @album_tag:{value}         -> album="value"
       @game_tag:{value}          -> game="value"
       @genre:{value}             -> genre="value"
@@ -514,6 +530,8 @@ def _parse_tag_query(query: str) -> dict:
     _FIELD_MAP = {
         "artist_tag": "artist",
         "album_artist_tag": "album_artist",
+        "artist_match": "artist_match",          # search box artist: → a word start in the name
+        "album_artist_match": "album_artist_match",
         "album_tag": "album",
         "game_tag": "game",          # search box game: → game (SID/Atari: title) prefix
         "genre": "genre",
@@ -626,7 +644,112 @@ _avail_lock = _asyncio.Lock()
 # mount leaves its worker blocked until the OS returns, so we isolate these from
 # the shared default executor that the AOF writer, snapshot writer, art cache,
 # and streaming run on — a wedged mount can't starve persistence/playback.
-_probe_executor = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="availprobe")
+_probe_executor = _ThreadPoolExecutor(max_workers=8, thread_name_prefix="availprobe")
+# A LOCAL root's probe runs on a thread of its own (a daemon: a probe stuck on
+# a hung mount never holds up a shutdown), one per root at a time — the next
+# check of a root whose probe still runs waits on that one instead of starting
+# another.  So any number of hung mounts hold one thread each and never delay
+# another root's probe.  A root is unavailable once its probe has been stuck
+# for ``_AVAIL_STALLED_S`` (two probe timeouts — one slow answer is not
+# enough).  (``_probe_executor`` stays for callers that bound other work.)
+_AVAIL_STALLED_S = 2 * _AVAIL_PROBE_TIMEOUT
+_AVAIL_QUEUE_WAIT = 2.0
+_local_probes: dict = {}
+
+
+class _LocalProbe:
+    """One run of ``_local_root_state`` on its own daemon thread; ``t0`` is
+    when it actually started."""
+
+    def __init__(self, loop, path: str):
+        import threading as _threading
+        self.loop = loop
+        self.started = _asyncio.Event()
+        self.t0 = 0.0
+        self.fut = loop.create_future()
+
+        def _begin():
+            self.t0 = _time.monotonic()
+            self.started.set()
+
+        def _done(result=None, exc=None):
+            if self.fut.done():
+                return
+            if exc is not None:
+                self.fut.set_exception(exc)
+            else:
+                self.fut.set_result(result)
+
+        def _run():
+            try:
+                loop.call_soon_threadsafe(_begin)
+                res = _local_root_state(path)
+            except BaseException as exc:                # noqa: BLE001
+                try:
+                    loop.call_soon_threadsafe(_done, None, exc)
+                except RuntimeError:                    # (its loop is gone)
+                    pass
+                return
+            try:
+                loop.call_soon_threadsafe(_done, res, None)
+            except RuntimeError:
+                pass
+
+        _threading.Thread(target=_run, name="availprobe", daemon=True).start()
+
+
+def _local_root_state(path: str) -> str:
+    """``"ok"`` (a directory with something in it), ``"empty"`` (a directory
+    with nothing in it — what an unplugged drive's mount point, or a
+    container's bind mount of one, leaves behind) or ``"missing"``."""
+    import os as _os
+    try:
+        with _os.scandir(path) as it:
+            return "ok" if next(it, None) is not None else "empty"
+    except NotADirectoryError:
+        return "missing"
+    except OSError:
+        return "missing"
+
+
+async def _probe_local_root(path: str) -> "bool | None":
+    """Is local root ``path`` there?  True / False, or None when this check
+    can't tell yet (its probe is slow but not yet ``_AVAIL_STALLED_S`` stuck,
+    or the pool is busy).  An EMPTY root counts as gone while the library has
+    tracks under it."""
+    loop = _asyncio.get_running_loop()
+    ent = _local_probes.get(path)
+    if ent is None or ent.fut.done() or ent.loop is not loop:
+        ent = _LocalProbe(loop, path)
+        _local_probes[path] = ent
+    if not ent.started.is_set():
+        try:
+            await _asyncio.wait_for(ent.started.wait(), timeout=_AVAIL_QUEUE_WAIT)
+        except _asyncio.TimeoutError:
+            return None
+    state = None
+    age = _time.monotonic() - ent.t0
+    if age < _AVAIL_PROBE_TIMEOUT:
+        try:
+            state = await _asyncio.wait_for(_asyncio.shield(ent.fut),
+                                            timeout=_AVAIL_PROBE_TIMEOUT - age)
+        except _asyncio.TimeoutError:
+            state = None
+        except Exception:
+            state = "missing"
+    elif ent.fut.done():
+        try:
+            state = ent.fut.result()
+        except Exception:
+            state = "missing"
+    if state is None:                                   # still running
+        return False if _time.monotonic() - ent.t0 >= _AVAIL_STALLED_S else None
+    if state == "empty":
+        try:
+            return not get_store().get_track_ids_for_scan_root(path_hash(path))
+        except Exception:
+            return True
+    return state == "ok"
 
 def _is_remote_root(path: str) -> bool:
     # The shared scheme set (SMB / FTP / WebDAV http(s)://): without WebDAV, a
@@ -636,9 +759,10 @@ def _is_remote_root(path: str) -> bool:
     return is_remote_path(path)
 
 
-async def _probe_scan_dir(sd: dict) -> tuple[str, bool]:
+async def _probe_scan_dir(sd: dict) -> "tuple[str, bool | None]":
     """Return ``(path, reachable)`` for one scan dir, bounded so a hung mount
-    can never block the caller."""
+    can never block the caller; ``reachable`` is None when a local root's
+    check can't tell yet (``_probe_local_root``) — leave its status as is."""
     path = sd.get("path", "")
     if not path:
         return path, False
@@ -654,31 +778,27 @@ async def _probe_scan_dir(sd: dict) -> tuple[str, bool]:
         except Exception:
             log.warning("Availability probe failed for remote root %s", path, exc_info=True)
             return path, False
-    # Local (including a network drive mounted into the local namespace):
-    # is_dir() on a stalled mount can block, so run it on the dedicated pool with
-    # a hard timeout.
-    from pathlib import Path as _Path
-    loop = _asyncio.get_running_loop()
+    # Local (including a network drive mounted into the local namespace): a
+    # stalled mount can block, so the probe runs on the dedicated pool, bounded.
     try:
-        ok = await _asyncio.wait_for(
-            loop.run_in_executor(_probe_executor, lambda: _Path(path).is_dir()),
-            timeout=_AVAIL_PROBE_TIMEOUT,
-        )
-        return path, bool(ok)
-    except _asyncio.TimeoutError:
-        return path, False           # stalled mount → treat as unavailable
-    except OSError:
-        return path, False           # ENOENT / ESTALE / EIO … → unavailable
+        return path, await _probe_local_root(path)
     except Exception:
         log.warning("Availability probe failed for local root %s", path, exc_info=True)
-        return path, False
+        return path, None
 
 
 async def refresh_scan_dir_availability(force: bool = False) -> list[dict]:
     """Probe every registered scan dir's reachability and update its ``status``
     to 'ok'/'unavailable' (only writing on an actual change).  Cached for a few
     seconds so rapid UI polls don't re-stat a slow mount every time.  Returns
-    the fresh scan-dir list."""
+    the fresh scan-dir list.
+
+    A NETWORK root is only ever marked unavailable here (no connected
+    source); marking it reachable again belongs to whoever watches the share
+    itself — its connect, the share health monitor, a catalogue's own offline
+    hold — since a registered source says nothing about whether the share
+    answers (a share the monitor found down kept its source and was flipped
+    back to 'ok' by every folder-tree refresh)."""
     global _avail_last_probe
     store = get_store()
     now = _time.monotonic()
@@ -694,11 +814,40 @@ async def refresh_scan_dir_availability(force: bool = False) -> list[dict]:
         reachable = dict(results)
         for sd in dirs:
             p = sd.get("path", "")
+            if p in reachable and reachable[p] is None:
+                continue                    # (can't tell yet: as is)
             want = "ok" if reachable.get(p) else "unavailable"
+            if want == "ok" and _is_remote_root(p):
+                continue                    # (see the docstring)
             if store.set_scan_dir_status(p, want):
                 log.info("Scan dir %s is now %s", p, want)
         _avail_last_probe = _time.monotonic()
         return store.list_scan_dirs()
+
+
+async def refresh_local_root_availability() -> int:
+    """Re-probe the LOCAL scan roots only (an ejected drive or a dropped
+    mount has no event of its own — ``core.availability`` calls this every
+    30 s).  Bounded like ``refresh_scan_dir_availability``; returns how many
+    roots changed status."""
+    store = get_store()
+    dirs = [sd for sd in store.list_scan_dirs()
+            if sd.get("path") and not _is_remote_root(sd["path"])]
+    if not dirs:
+        return 0
+    results = await _asyncio.gather(*[_probe_scan_dir(sd) for sd in dirs])
+    roots = {sd["path"] for sd in dirs}
+    for gone in [p for p, ent in _local_probes.items() if p not in roots and ent.fut.done()]:
+        _local_probes.pop(gone, None)       # (a root removed since)
+    changed = 0
+    for p, ok in results:
+        if ok is None:
+            continue                        # (can't tell yet: as is)
+        want = "ok" if ok else "unavailable"
+        if store.set_scan_dir_status(p, want):
+            changed += 1
+            log.info("Scan dir %s is now %s", p, want)
+    return changed
 
 
 async def delete_tracks_by_scan_root(root_path: str) -> int:

@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=103">
+  <link rel="stylesheet" href="/assets/css/app.css?v=109">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -631,6 +631,54 @@
             <div id="admin-dir-msg" class="admin-msg" style="display:none"></div>
           </div>
 
+          <!-- ── External sources ───────────────────────────────────────
+               Public archives listed in the library from their index,
+               fetched only when a tune is played — one switch per source
+               (admin.js loadExternalSources). -->
+          <div class="admin-section" id="admin-external-section">
+            <h3>&#127760; External sources</h3>
+            <p class="admin-hint ext-intro">Add a public music archive to the library without copying it: its tunes are listed from the archive&rsquo;s index and fetched only when you play them.</p>
+            <div class="ext-source" id="ext-source-modland">
+              <div class="admin-setting ext-source-head">
+                <label for="setting-modland-catalog">Modland catalogue</label>
+                <input id="setting-modland-catalog" type="checkbox" disabled
+                       aria-describedby="modland-about modland-status">
+              </div>
+              <p class="admin-hint" id="modland-about">Lists <a href="https://ftp.modland.com/" target="_blank" rel="noopener noreferrer">Modland</a>&rsquo;s module archive &mdash; <span id="modland-about-count">over 300,000</span> tunes of Amiga, C64, Atari&nbsp;ST, console and tracker music &mdash; in a &ldquo;Modland&rdquo; folder, browsable and searchable at once. Nothing is copied: a tune is fetched from Modland when you play it and then plays from the cache. The index is updated daily, weekly, every 2&nbsp;weeks or monthly &mdash; pick how often next to <em>Refresh now</em>. An update downloads only the changes since the last one, usually a few kilobytes; the full index (about 6&nbsp;MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check. The catalogue needs about 1&nbsp;GB of server memory. Thanks to Modland and its maintainers.</p>
+              <div class="ext-source-options" id="modland-options">
+                <div class="admin-setting">
+                  <label for="setting-modland-scope">Tunes</label>
+                  <select id="setting-modland-scope" disabled>
+                    <option value="standard">Everything except the large PC tracker folders</option>
+                    <option value="all">Everything</option>
+                  </select>
+                </div>
+                <div class="admin-setting">
+                  <label for="setting-modland-subsonic">Show catalogue tunes to Subsonic apps <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: Subsonic and DLNA apps don't see the catalogue. Apps that sync or cache a whole library for offline use would download all of it from Modland.">&#9432;</span></label>
+                  <input id="setting-modland-subsonic" type="checkbox" disabled>
+                </div>
+              </div>
+              <div id="modland-status" class="admin-hint ext-status" role="status" aria-live="polite">Off.</div>
+              <progress id="modland-progress" class="ext-progress" max="1" value="0" hidden
+                        aria-label="Building the Modland catalogue"></progress>
+              <div class="admin-io-row ext-refresh-row">
+                <button id="btn-modland-refresh" class="btn-secondary" disabled>Refresh now</button>
+                <select id="setting-modland-interval" class="ext-interval" aria-label="How often to update the index"
+                        aria-describedby="modland-interval-tip" title="How often the index is updated" disabled>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="biweekly">Every 2 weeks</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+                <span class="setting-info ext-interval-info" tabindex="0" role="img"
+                      aria-label="About index updates" aria-describedby="modland-interval-tip"
+                      data-tip="An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.">&#9432;</span>
+                <span id="modland-interval-tip" hidden>An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.</span>
+              </div>
+              <div id="modland-msg" class="admin-msg" style="display:none"></div>
+            </div>
+          </div>
+
           <!-- ── FTP Connection Pools ──────────────────────────────────
                Per-share scan / stream worker budget + auto-detected
                server cap.  Hidden when there are no FTP shares
@@ -1178,6 +1226,14 @@
                 <input id="setting-dedup-folders" type="checkbox" checked>
               </div>
               <div class="admin-setting">
+                <label for="setting-offline-tracks">Tracks on unavailable drives <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When a drive or share isn’t connected, its tracks can’t play (a copy already in the cache still does). Mark: list them dimmed with an “offline” badge. Hide: leave them out of searches, track lists and their counts — playlists, the queue, the duplicates view and any folder you can still open list them, marked. Show: list them as usual. In Mark and Hide, shuffle, radio and the next track skip them; a track you click still tries and says why it can’t play.">&#9432;</span></label>
+                <select id="setting-offline-tracks">
+                  <option value="mark">Mark them</option>
+                  <option value="hide">Hide them</option>
+                  <option value="show">Show them as usual</option>
+                </select>
+              </div>
+              <div class="admin-setting">
                 <label for="setting-use-folder-art">Use folder art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
                 <input id="setting-use-folder-art" type="checkbox" checked>
               </div>
@@ -1528,7 +1584,7 @@
               track has none embedded, and shown in the track's Lyrics tab.
             </p>
             <div class="admin-setting">
-              <label>Save fetched lyrics to files <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When lyrics are found online for a local track that has none embedded, write them into the file's tags so they travel with the file. Files that already contain lyrics are never modified. Local files only. Off by default — it modifies your files.">&#9432;</span></label>
+              <label>Save fetched lyrics to files <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When lyrics are found online for a local track that has none embedded, write them into the file's tags so they travel with the file. Files that already contain lyrics are never modified. Local files only, and only when an edit or admin account opens the lyrics in SoniqBoom&rsquo;s own player &mdash; a lookup from a Subsonic app or a read-only account never writes to a file. Off by default — it modifies your files.">&#9432;</span></label>
               <input id="setting-lyrics-writeback" type="checkbox">
             </div>
             <div id="md-lyrics-msg" class="admin-msg" style="display:none"></div>
@@ -1590,7 +1646,7 @@
               by Matti Tiainen, compiled from about 400 scene sources, licensed
               <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"
                  target="_blank" rel="noopener noreferrer">CC&nbsp;BY-NC-SA&nbsp;4.0</a>.
-              It is downloaded from GitHub when you click Download.
+              It is downloaded from GitHub, at a fixed reviewed commit, when you click Download.
             </p>
             <div id="md-songdb-status" class="admin-hint" style="margin-bottom:8px"
                  role="status" aria-live="polite">Index: &mdash;</div>
@@ -1599,6 +1655,10 @@
               <button id="md-songdb-apply">Apply to library</button>
               <button id="md-songdb-reset" class="btn-secondary"
                       title="Remove the artists, labels, albums and years the song database filled. Your own edits are kept.">Reset enrichment</button>
+              <a id="md-songdb-validated" class="btn-secondary" role="button"
+                 href="https://github.com/mvtiaine/audacious-uade-tools/tree/95b3eaba14968097ed8702b9ba79bd03a2c0aaf5/tsv/pretty/md5"
+                 target="_blank" rel="noopener noreferrer"
+                 title="The song database files on GitHub at the commit SoniqBoom downloads (95b3eab)">Validated set&nbsp;&#8599;</a>
             </div>
             <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
               <input type="checkbox" id="md-songdb-autoapply">
@@ -1656,6 +1716,25 @@
               <button id="md-gt-del-redump" class="btn-secondary" data-gt-delete="redump" hidden>Delete the downloaded lists</button>
             </div>
             <div id="md-game-titles-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Genres for retro tracks -->
+          <div class="admin-section">
+            <h3>&#127991;&#65039; Retro genres</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              A retro track whose file names no genre is listed under the genres SoniqBoom knows
+              for it: what it is &mdash; Game, Demo, Cracktro, Music Disk, Diskmag, Scene &mdash;
+              and its platform &mdash; SID, Amiga, Atari ST, NES, Game Boy, AdLib, MIDI &hellip;
+              They come from its game, Demozoo, HVSC and folder names such as
+              &ldquo;GAMES&rdquo;, &ldquo;DEMOS&rdquo; or &ldquo;cracktros&rdquo;. A genre of the
+              track&rsquo;s own, or one you type, replaces them. The Genres view and Subsonic apps
+              list them.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-genre-names">Game and group names as genres <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Adds a retro track&rsquo;s game, its composer&rsquo;s scene groups and its demo party to those genres, so a Subsonic app can browse a game&rsquo;s or a group&rsquo;s tunes by genre. A large library then lists many more genres. Saved as soon as you change it.">&#9432;</span></label>
+              <input id="setting-genre-names" type="checkbox" checked disabled>
+            </div>
+            <div id="md-genre-names-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- Retro albums from folder names -->
@@ -2445,7 +2524,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=176"></script>
+  <script type="module" src="/assets/js/app.js?v=181"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

@@ -8,7 +8,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from soniqboom.api.tracks import json_bytes, json_route, public_tracks
+from soniqboom.api.tracks import json_bytes, json_route, public_track, public_tracks
 from soniqboom.core.data import ft_search, ft_search_dicts, get_track
 from soniqboom.models.track import TrackMeta
 
@@ -55,10 +55,12 @@ def _parse_advanced_query(q: str) -> str | None:
         if not value:
             continue
 
+        # artist: / album_artist: match a word start in the name ("Marcin"
+        # finds "Marcin Romanowski (Sidder)"); an artist's page stays exact.
         if field == 'artist':
-            parts.append(f"@artist_tag:{{{_esc_tag(value)}}}")
+            parts.append(f"@artist_match:{{{_esc_tag(value)}}}")
         elif field == 'album_artist':
-            parts.append(f"@album_artist_tag:{{{_esc_tag(value)}}}")
+            parts.append(f"@album_artist_match:{{{_esc_tag(value)}}}")
         elif field == 'album':
             parts.append(f"@album_tag:{{{_esc_tag(value)}}}")
         elif field == 'game':
@@ -100,16 +102,18 @@ async def run_search(q: str, limit: int = 50) -> list[TrackMeta]:
     return await ft_search(safe, limit=limit)
 
 
-async def run_search_dicts(q: str, limit: int = 50) -> list[dict]:
+async def run_search_dicts(q: str, limit: int = 50, exclude=None, swap=None) -> list[dict]:
     """Dict-returning twin of :func:`run_search` for the ``/search`` endpoint —
     serializes with orjson and skips the TrackMeta round-trip (see
     ``data.ft_search_dicts``).  ``run_search`` (models) stays for smart-playlist
-    evaluation so the two never drift on query parsing."""
+    evaluation so the two never drift on query parsing.  ``exclude``: ids the
+    result leaves out (``core.availability.hidden``); ``swap``: the duplicate
+    groups listed by another member (``core.availability.primary_swap``)."""
     advanced = _parse_advanced_query(q)
     if advanced:
-        return await ft_search_dicts(advanced, limit=limit)
+        return await ft_search_dicts(advanced, limit=limit, exclude=exclude, swap=swap)
     safe = q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
-    return await ft_search_dicts(safe, limit=limit)
+    return await ft_search_dicts(safe, limit=limit, exclude=exclude, swap=swap)
 
 
 @router.get("")
@@ -119,18 +123,31 @@ async def search(
 ):
     """Full-text search across artist, album, and title.
     Also supports advanced syntax: artist:Ghost album:Impera year:>2020
+
+    Tracks that can't play right now are flagged (``offline``) or, with
+    "Tracks on unavailable drives: Hide", left out (``core.availability``);
+    with duplicates hidden, a group whose primary can't play is listed by its
+    best playable member.
     """
-    dicts = await run_search_dicts(q, limit=limit)
+    from soniqboom.core import availability
+    dicts = await run_search_dicts(q, limit=limit, exclude=availability.hidden(),
+                                   swap=availability.primary_swap())
+    dicts = availability.mark_rows(dicts)
     return Response(content=json_bytes(dicts), media_type="application/json")
 
 
-@router.get("/quick", response_model=list[TrackMeta])
+@json_route(router, "/quick")
 async def quick_search(
     q: str = Query(..., min_length=1),
     limit: int = Query(8, ge=1, le=20),
 ):
-    """Lightweight search for autocomplete preview — returns minimal results."""
-    return await run_search(q, limit=limit)
+    """Lightweight search for autocomplete preview — TrackMeta-shaped rows
+    (``tracks.public_track``), offline ones flagged or hidden as in ``/search``."""
+    from soniqboom.core import availability
+    rows = public_tracks(await run_search_dicts(q, limit=limit,
+                                                exclude=availability.hidden(),
+                                                swap=availability.primary_swap()))
+    return availability.mark_rows(rows)
 
 
 @json_route(router, "/filter")
@@ -145,6 +162,8 @@ async def filter_tracks(
     year_max: int | None = None,
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
+    playable: bool = False,
+    after: str | None = None,
 ):
     """Structured filter — combine any fields.
 
@@ -157,20 +176,45 @@ async def filter_tracks(
     same JSON, minus the per-row model build.  A stored row the model rejects
     is skipped (the full-text branch always did; the ``scene_group`` branch
     used to 500 the whole drill-down on one).
+
+    Tracks that can't play right now are flagged (``offline``) or, with
+    "Tracks on unavailable drives: Hide", left out — the browse counts agree.
+    ``playable=1`` (the play queue's pages): ``{tracks, next_offset, ended}``
+    without those tracks in Mark / Hide mode, each row with its ``_pos``;
+    ``after=<track id>`` starts right after that track (``player_page``).
     """
+    from soniqboom.core import availability
+    from soniqboom.core.store import get_store
+    store = get_store()
+    excl = availability.hidden(store)
+    # (Duplicates hidden: a group whose primary can't play is listed by its
+    # best playable member — the browse counts agree.)
+    swap = availability.primary_swap(store)
+
+    async def _reply(fetch):
+        if playable:
+            page = await availability.player_page_async(fetch, offset, limit, store, after=after)
+            out = []
+            for r in page["tracks"]:
+                t = public_track(r)                 # (drops non-TrackMeta keys:
+                if t is not None:                   #  ``_pos`` is put back)
+                    out.append({**t, "_pos": r["_pos"]})
+            page["tracks"] = out
+            return page
+        return availability.mark_rows(public_tracks(fetch(offset, limit)), store)
+
     # ``scene_group`` (the Demozoo browse facet) is NOT a full-text field, so
     # resolve it — and any co-filters — straight against the store's maintained
     # ``_tag_scene_group`` index rather than the FT engine.
     if scene_group:
-        from soniqboom.core.store import get_store
-        store = get_store()
-        return public_tracks(store.filter_tracks(
+        return await _reply(lambda off, lim: store.filter_tracks(
             artist=artist, album_artist=album_artist, album=album, genre=genre,
             scene_group=scene_group, format_=format,
-            year_min=year_min, year_max=year_max, limit=limit, offset=offset,
+            year_min=year_min, year_max=year_max, limit=lim, offset=off,
             # Honour the "hide duplicates" config so the drill-down LIST matches
             # the deduped browse COUNT (every FT-routed facet already does this).
-            filter_duplicates=bool(store.get_config("filter_duplicates", False))))
+            filter_duplicates=bool(store.get_config("filter_duplicates", False)),
+            exclude=excl, swap=swap))
     parts: list[str] = []
     if artist:
         parts.append(f"@artist_tag:{{{_esc_tag(artist)}}}")
@@ -193,7 +237,12 @@ async def filter_tracks(
     elif year_max is not None:
         parts.append(f"@year:[-inf {year_max}]")
     query = " ".join(parts) if parts else "*"
-    return public_tracks(await ft_search_dicts(query, limit=limit, offset=offset))
+    from soniqboom.core.data import _parse_tag_query
+    parsed = _parse_tag_query(query)
+    hide_dups = bool(store.get_config("filter_duplicates", False))
+    return await _reply(lambda off, lim: store.filter_tracks(
+        **parsed, limit=lim, offset=off, filter_duplicates=hide_dups, exclude=excl,
+        swap=swap))
 
 
 @router.get("/similar/{track_id}")
@@ -223,6 +272,12 @@ async def similar_tracks(track_id: str, k: int = Query(10, ge=1, le=50)):
     # w.r.t. the scanner; cheaper than the old all_tracks() copy), then score
     # off-thread.  waveforms_view() is a snapshot, also safe to hand to the thread.
     candidates = store.similar_candidates(seed)
+    # Suggestions are something to play: leave out what can't play right now
+    # ("Tracks on unavailable drives": Mark / Hide).
+    from soniqboom.core import availability
+    skip = availability.unplayable(store)
+    if skip:
+        candidates = [c for c in candidates if c.get("id") not in skip]
     sample_jaccard = store.retro_sample_jaccard(seed, candidates)   # cheap inverted-index walk
     result = await _asyncio.to_thread(
         find_similar, seed, candidates, store.waveforms_view(),

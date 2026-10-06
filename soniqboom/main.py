@@ -743,6 +743,14 @@ async def admin_metrics(_admin=Depends(_require_admin_session)):
     return metrics
 
 
+def _availability_mode() -> str:
+    try:
+        from soniqboom.core import availability
+        return availability.mode()
+    except Exception:
+        return "mark"
+
+
 @app.get("/api/ui-config")
 async def ui_config():
     """Public UI configuration — no auth required.  Safe subset only.
@@ -757,11 +765,17 @@ async def ui_config():
     from soniqboom.core.data import get_config
     from soniqboom.api.art import _PLACEHOLDER_JPEG
     placeholder_b64 = base64.b64encode(_PLACEHOLDER_JPEG).decode("ascii")
+    from soniqboom.core import catalogue as _catalogue
+    aliases = dict(settings.folder_aliases or {})
+    for r in _catalogue.roots():                # catalogue roots show their label
+        aliases.setdefault(r["root"], r["label"])
     return {
         "display_startup_logo": settings.display_startup_logo,
         "expose_local_files": settings.expose_local_files,
-        "folder_aliases": settings.folder_aliases,
+        "folder_aliases": aliases,
         "filter_duplicates": await get_config("filter_duplicates", False),
+        # Settings → "Tracks on unavailable drives": mark / hide / show.
+        "offline_tracks": _availability_mode(),
         "placeholder_art_data_uri": f"data:image/jpeg;base64,{placeholder_b64}",
     }
 
@@ -971,7 +985,10 @@ _process_exiting = False
 def _install_thread_pool() -> None:
     global _thread_pool
     from concurrent.futures import ThreadPoolExecutor
-    _thread_pool = ThreadPoolExecutor(thread_name_prefix="sb-pool")
+    from soniqboom.core import procinfo
+    # The library default (CPUs + 4, max 32) counted the host's CPUs (GitHub #21).
+    _thread_pool = ThreadPoolExecutor(max_workers=min(32, procinfo.usable_cpus() + 4),
+                                      thread_name_prefix="sb-pool")
     asyncio.get_running_loop().set_default_executor(_thread_pool)
 
 
@@ -1113,8 +1130,9 @@ def _prewarm_subsonic_catalogue() -> None:
     Skipped for an empty library or when a client already triggered the
     build.  Runs on the event loop (store access)."""
     try:
-        from soniqboom.core.store import get_store
-        t = subsonic.prewarm_catalogue(get_store())
+        # The store as Subsonic clients see it (catalogue tunes hidden from
+        # them — ``subsonic.get_store``): the catalogue cache is keyed on it.
+        t = subsonic.prewarm_catalogue(subsonic.get_store())
         if t is not None:
             _BG_TASKS.add(t)
             t.add_done_callback(_BG_TASKS.discard)
@@ -1203,6 +1221,14 @@ async def startup():
         install_dup_regroup()
     except Exception:
         log.debug("duplicate re-group hook failed", exc_info=True)
+
+    # The Modland catalogue's root is known before anything that walks or
+    # polls remote roots starts (no network, no store write).
+    try:
+        from soniqboom.core import modland_catalog
+        modland_catalog.register_at_startup()
+    except Exception:
+        log.warning("Modland catalogue registration failed", exc_info=True)
 
     # Now that config is loaded, apply the persisted log-verbosity dials
     # (app level + access-log mode).  See core/log_control.py.
@@ -1646,6 +1672,24 @@ async def startup():
     await _init_network_shares()
     global _health_task
     _health_task = asyncio.create_task(_share_health_monitor())
+
+    # External sources: the Modland catalogue (heals / arms its daily index
+    # refresh; never touches the network at startup).
+    try:
+        from soniqboom.core import modland_catalog
+        await modland_catalog.startup()
+    except Exception:
+        log.warning("Modland catalogue startup failed", exc_info=True)
+
+    # Which tracks can play right now (Settings → "Tracks on unavailable
+    # drives"): follow scan-root status changes, re-probe local roots, and
+    # tell the web clients when that changes.
+    try:
+        from soniqboom.core import availability
+        from soniqboom.core.store import get_store as _avail_store
+        availability.install(_avail_store())
+    except Exception:
+        log.warning("Availability watcher failed to start", exc_info=True)
 
     # One-time enrichment an upgrade needs (a newer Modland apply, the
     # header-game album backfill): schedule the coalescing scene runner —
@@ -2143,6 +2187,12 @@ async def _share_health_monitor():
                 ok = False
 
             prev = last_status.get(scan_root, "ok")
+            if ok and prev == "ok" and _stored_unavailable(scan_root):
+                # Marked down by someone else (a refused sign-in, the folder
+                # availability probe while the source was missing) — and it
+                # answers: say so.  Catalogue roots keep their own offline
+                # hold (their source answers from the index, never the net).
+                prev = "unavailable"
 
             if not ok and akey and getattr(source, "last_error_auth", False):
                 wait = note_share_auth_failure(akey, scan_root)
@@ -2206,6 +2256,19 @@ async def _share_health_monitor():
 
         # Adaptive cadence: back off while anything is down, snap back when healthy.
         interval = min(interval * 1.5, MAX_INTERVAL) if any_down else BASE_INTERVAL
+
+
+def _stored_unavailable(scan_root: str) -> bool:
+    """The store has this (non-catalogue) share marked unavailable."""
+    try:
+        from soniqboom.core import catalogue
+        from soniqboom.core.store import get_store
+        if catalogue.is_catalogue_root(scan_root):
+            return False
+        sd = get_store()._scan_dirs.get(scan_root)
+        return bool(sd) and sd.get("status") == "unavailable"
+    except Exception:
+        return False
 
 
 async def _set_share_status(scan_root: str, status: str) -> None:
@@ -2391,6 +2454,11 @@ async def shutdown():
             await asyncio.wait_for(_health_task, timeout=1.0)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
+    try:
+        from soniqboom.core import availability
+        availability.uninstall()
+    except Exception:
+        pass
 
     # ── Step 1: WebSocket close (3 s budget total) ────────────────────────
     async def _close_one(ws_obj) -> None:
@@ -2435,6 +2503,11 @@ async def shutdown():
             extra = [*_admin._bg_scan_tasks, *_admin._BG_TASKS]
         except Exception:
             log.debug("admin background tasks not listed", exc_info=True)
+        try:
+            from soniqboom.core import modland_catalog
+            extra.extend(modland_catalog._tasks)       # catalogue builds / merges
+        except Exception:
+            log.debug("catalogue tasks not listed", exc_info=True)
         await stop_background_writers(extra, timeout=3.0)
     await _step("scans", _stop_writers(), timeout=4.0)
 

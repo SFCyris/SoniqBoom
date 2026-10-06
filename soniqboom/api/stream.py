@@ -350,8 +350,17 @@ def _cache_key_for(
 # storm + several user-driven plays can't stack ffmpeg/sidplayfp/fluidsynth/
 # openmpt123 to CPU saturation on a 4-core box.  Sized at half the CPU
 # count, min 2 — Perf #1 flagged the stacking risk under the 5-user load.
-import os as _os_for_render
-_RENDER_SLOTS = max(2, (_os_for_render.cpu_count() or 4) // 2)
+# The usable CPUs (a container's limit, GitHub #21); SONIQBOOM_RENDER_SLOTS sets
+# the count outright (min 2: background renders are capped one below it).
+from soniqboom.core import procinfo as _procinfo
+
+
+def _default_render_slots() -> int:
+    return _procinfo.env_count("SONIQBOOM_RENDER_SLOTS", max(2, _procinfo.usable_cpus() // 2),
+                               minimum=2, maximum=64)
+
+
+_RENDER_SLOTS = _default_render_slots()
 _render_sem = asyncio.Semaphore(_RENDER_SLOTS)
 
 # ALL speculative/background renders — web N+1/N+2 prewarm AND the AdLib
@@ -1167,17 +1176,24 @@ def _note_default_tune(track_id: str, track, index: int, family: str) -> None:
 
 
 async def _pcm_probe(cmd: list[str], *, cwd: "str | None" = None,
-                     env: "dict | None" = None, wav_header: bool) -> "bool | None":
+                     env: "dict | None" = None, wav_header: bool,
+                     os_pipe: bool = False) -> "bool | None":
     """Run a renderer that writes 44.1 kHz stereo s16 PCM to stdout (behind a
     WAV header when ``wav_header``) and judge the tune: True once it has
     played ``MIN_TUNE_SECONDS`` and was audible; False when it ended shorter
     or stayed silent through ``_PROBE_MAX_AUDIO_S``; None when the run
     failed to start or took longer than ``_PROBE_WALL_S`` (undecided).  The
-    process is killed as soon as the verdict is in."""
+    process is killed as soon as the verdict is in.  ``os_pipe``: stdout is
+    a real pipe (``forksafe.spawn_pipe_stdout``), for a renderer that
+    reopens ``/dev/stdout`` (``uade123 -c``)."""
     from soniqboom.core.silence import MIN_TUNE_SECONDS
     try:
-        proc = await forksafe.spawn(*cmd, stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.DEVNULL, cwd=cwd, env=env)
+        if os_pipe:
+            proc = await forksafe.spawn_pipe_stdout(
+                *cmd, stderr=asyncio.subprocess.DEVNULL, cwd=cwd, env=env)
+        else:
+            proc = await forksafe.spawn(*cmd, stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.DEVNULL, cwd=cwd, env=env)
     except OSError:
         return None
     meter = _AudibilityMeter(2, 44100)
@@ -1208,15 +1224,18 @@ async def _pcm_probe(cmd: list[str], *, cwd: "str | None" = None,
     except asyncio.TimeoutError:
         verdict = None
     finally:
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
         try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except Exception:
-            pass
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+        finally:
+            forksafe.close_stdout(proc)
     return verdict
 
 
@@ -1250,7 +1269,7 @@ async def _tune_audible_run(family: str, path: Path, index: int, *, base: int = 
             async with _xpk_unpacked(path) as src:
                 return await _pcm_probe(
                     [binary, "-1", "-c", *_uade_subsong_arg(index, base), "--", src.name],
-                    cwd=_uade_cwd(src), wav_header=True)
+                    cwd=_uade_cwd(src), wav_header=True, os_pipe=True)
         except HTTPException:
             return None
     if family == "sc68":
@@ -2145,7 +2164,9 @@ async def _serve_sid_progressive(
         # Create the temp + spawn together; if the spawn itself raises (FD
         # exhaustion, binary vanished mid-flight) unlink the orphaned temp — the
         # finaliser that normally owns cleanup isn't created until after this.
-        tmp = Path(tempfile.mkstemp(suffix=".wav", prefix="sidprog-")[1])
+        fd, name = tempfile.mkstemp(suffix=".wav", prefix="sidprog-")
+        os.close(fd)                         # sidplayfp opens the file itself (GitHub #20)
+        tmp = Path(name)
         rd["tmp"] = tmp
         cmd = _sid_render_cmd(binary, sid_path, subsong, int(duration), str(tmp),
                               start=tune_start)
@@ -2574,7 +2595,8 @@ _GME_EXTS_STREAM = {".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
 async def _render_gme(path: Path, subsong: int = 0, *,
                       live_key: str | None = None,
                       expected_seconds: float = 0.0) -> Path:
-    """Render a libgme chiptune file to a temp WAV.
+    """Render a libgme chiptune file to a temp WAV (a VGM using a chip libgme
+    can't play goes to ZXTune instead).
 
     Prefers an explicit ``gme`` CLI when configured.  Falls back to
     ffmpeg's built-in gme demuxer (``ffmpeg -i file.nsf -t N output.wav``)
@@ -2588,6 +2610,10 @@ async def _render_gme(path: Path, subsong: int = 0, *,
     duration = settings.sid_default_duration   # shares the chiptune default
     from soniqboom.core import gme_render
     loop = asyncio.get_event_loop()
+    if (path.suffix.lower() in (".vgm", ".vgz")
+            and await loop.run_in_executor(None, gme_render.vgm_needs_other_engine, path)):
+        # A chip libgme can't play would render silence (GitHub #27).
+        return await _render_zxtune_capped(path, kind="VGM")
     data = None
     unpacked = False                  # ``data`` is an inflated GYMX, not the file
     if path.suffix.lower() == ".gym":
@@ -3543,11 +3569,18 @@ async def _materialize_loose_remote_adlib(
                     break
         if not sibs:
             return None
-        tune_bytes = source.read_file(remote_path, lane=lane)
+        # Through the remote cache: a bank / PSF lib shared by a whole game's
+        # tunes is downloaded once, and a replay whose extract dir was evicted
+        # needs no network (a catalogue tune — core/catalogue.py — may be read
+        # only from the cache outside a play).
+        from soniqboom.core.remote_cache import get_cache
+        tune_bytes = Path(get_cache().fetch(scan_root, remote_path, source,
+                                            lane=lane)).read_bytes()
         got = []
         for base, sib_remote in sibs:
             try:
-                got.append((base, source.read_file(sib_remote, lane=lane)))
+                got.append((base, Path(get_cache().fetch(scan_root, sib_remote, source,
+                                                         lane=lane)).read_bytes()))
             except Exception:
                 continue
         return tune_bytes, got
@@ -3672,6 +3705,9 @@ async def _probe_one_rendered_duration(track_id: str, *,
     share_gate = _remote_prewarm_gate(path_str)
     if share_gate is not None and "::" in path_str and not _remote_bytes_local(path_str):
         return None           # never fetch a whole remote archive for one length
+    from soniqboom.core import catalogue
+    if not catalogue.fetch_ok(path_str, "scan"):
+        return None           # a catalogue tune is fetched only when played
     wav = None
     key = None
     pinned = False
@@ -4740,9 +4776,10 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
                   expected_seconds=expected_seconds)
     try:
         async with _render_sem:
-            proc = await forksafe.spawn(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                cwd=_uade_cwd(path))
+            # A real pipe: ``-c`` reopens /dev/stdout, which fails on
+            # uvloop's socketpair on Linux (GitHub #22).
+            proc = await forksafe.spawn_pipe_stdout(
+                *cmd, stderr=asyncio.subprocess.PIPE, cwd=_uade_cwd(path))
             err_ring = bytearray()
 
             async def _drain_stderr():
@@ -4788,16 +4825,19 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
             except asyncio.TimeoutError:
                 raise HTTPException(504, f"uade render timed out after {int(_UADE_DEFAULT_TIMEOUT_S)}s")
             finally:
-                if proc.returncode is None:
-                    try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
                 try:
-                    await asyncio.wait_for(err_task, timeout=2.0)
-                except Exception:
-                    err_task.cancel()
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except Exception:
+                            pass
+                    try:
+                        await asyncio.wait_for(err_task, timeout=2.0)
+                    except Exception:
+                        err_task.cancel()
+                finally:
+                    forksafe.close_stdout(proc)
             if proc.returncode != 0:
                 raise _renderer_failure("uade", binary, proc.returncode,
                                         bytes(err_ring).decode("utf-8", "replace"),
@@ -9790,6 +9830,17 @@ async def prewarm(
 
     prio = PRIO_NEXT if priority == "next" else PRIO_AHEAD
     who = _prewarm_requester(request, sb_session, u, pw)
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_path(track.path) and not catalogue.is_cached(track.path):
+        # A catalogue tune is fetched for ONE next-track prewarm per listener
+        # (a newer one replaces it) — never for further lookahead, nor while
+        # its archive is unreachable.
+        from soniqboom.core.filesource import get_source as _get_source
+        _croot = catalogue.root_of(track.path)
+        if _croot and _get_source(_croot) is None:
+            return {"status": "skipped", "reason": "source offline"}
+        if not catalogue.permit_prewarm(track.path, who):
+            return {"status": "skipped", "reason": "catalogue download limit"}
     return _schedule_prewarm(track_id, track, explicit_wire(subsong, request), prio, who,
                              ext, named=True)
 
@@ -10227,6 +10278,28 @@ async def _resolve_play_source(track_id: str, track, *,
     # track 500'd on first byte (validation finding 2026-05-21).
     _zip_track_id_for_unpin: str | None = None
 
+    # A catalogue tune (core/catalogue.py): a PLAY (the stream lane) opens the
+    # fetch window for its file + companions; any other lane (prewarm — which
+    # opens its own budgeted window —, /extended) reads only what is cached.
+    from soniqboom.core import catalogue as _catalogue
+    _is_catalogue = _catalogue.is_catalogue_path(path_str)
+    if _is_catalogue:
+        if lane == "stream":
+            if not _catalogue.is_cached(path_str):
+                # Unreachable archive: answer before the play spends a slot of
+                # the download budget.
+                from soniqboom.core.filesource import get_source as _get_source
+                _croot = _catalogue.root_of(path_str)
+                if _croot and _get_source(_croot) is None:
+                    raise _offline_error(_croot)
+            if not _catalogue.permit_play(path_str):
+                raise HTTPException(
+                    429, "Too many new Modland downloads in the last minutes — "
+                         "try again shortly.")
+        elif not _catalogue.fetch_ok(path_str, "scan") and not _catalogue.allowed(
+                *(_catalogue_split(path_str))):
+            raise HTTPException(409, "Not fetched from the catalogue yet")
+
     if is_remote_path(path_str) and "::" in path_str:
         # Remote ZIP member — ``ftp://host/share:/path/x.zip::member``.  Fetch
         # the OUTER archive to the local remote-cache, then extract the member
@@ -10322,11 +10395,14 @@ async def _resolve_play_source(track_id: str, track, *,
                         )
                     except Exception:
                         log.debug("freshness.check_now scheduling failed", exc_info=True)
-                    raise HTTPException(
-                        404,
-                        "File no longer at this path on the source. "
-                        "Rescan the library to refresh.",
-                    )
+                    raise HTTPException(404, _missing_on_source(path_str))
+                _offline = getattr(source, "is_offline", None)
+                if _offline is not None and _offline():
+                    # A source that holds itself offline after this failure (a
+                    # catalogue's archive): no reconnect-and-retry against it.
+                    log.info("Remote fetch failed for %s (%s: %s) — source offline",
+                             path_str, type(exc).__name__, exc)
+                    raise _offline_error(scan_root)
                 log.info(
                     "Remote fetch failed for %s (%s: %s) — attempting reconnect",
                     path_str, type(exc).__name__, exc,
@@ -10367,11 +10443,7 @@ async def _resolve_play_source(track_id: str, track, *,
                                 )
                             except Exception:
                                 log.debug("freshness.check_now scheduling failed", exc_info=True)
-                            raise HTTPException(
-                                404,
-                                "File no longer at this path on the source. "
-                                "Rescan the library to refresh.",
-                            )
+                            raise HTTPException(404, _missing_on_source(path_str))
                         raise HTTPException(502, f"Could not fetch remote file: {exc2}")
                 else:
                     log.warning("Remote fetch failed for %s: %s", path_str, exc)
@@ -10390,6 +10462,11 @@ async def _resolve_play_source(track_id: str, track, *,
         # invalidate via the outer-zip mtime so a ZIP rebuild forces a
         # fresh extract.  Reused across every Range request for the
         # lifetime of the on-disk archive.
+        # (An archive on a local drive known to be offline: answered at once,
+        # never a stat on the event loop — see _known_offline_local_root.)
+        root = await _known_offline_local_root(track)
+        if root:
+            raise _offline_error(root)
         path = await _get_or_extract_zip_member(
             path_str, track_id,
             bank_fallback=_make_zip_bank_fallback(local_zip=path_str.split("::")[0]),
@@ -10407,6 +10484,9 @@ async def _resolve_play_source(track_id: str, track, *,
         _zip_track_id_for_unpin = track_id
     else:
         path = Path(path_str)
+        root = await _known_offline_local_root(track)
+        if root:
+            raise _offline_error(root)
         if not path.exists():
             # An ejected drive / dropped mount is not a missing file: say the
             # source is offline (checked only on this failure path).
@@ -10460,7 +10540,33 @@ async def _resolve_play_source(track_id: str, track, *,
         except Exception as exc:
             log.info("Loose AdLib companion materialize failed for %s: %s", path_str, exc)
 
+    if _is_catalogue:
+        # First play of a catalogue tune: read its own metadata (length,
+        # checksum, tags) from the local copy into the library row.
+        try:
+            from soniqboom.core import modland_catalog
+            modland_catalog.merge_after_play(track_id, path)
+        except Exception:                               # noqa: BLE001
+            log.debug("catalogue merge scheduling failed", exc_info=True)
     return path, ext, _uade_named, _zip_track_id_for_unpin
+
+
+def _missing_on_source(path_str: str) -> str:
+    """The 404 text of a remote file that is gone from its share."""
+    from soniqboom.core import catalogue as _catalogue
+    root = _catalogue.root_of(path_str)
+    if root:
+        name = _catalogue.label_of(root) or "the archive"
+        return (f"This tune is no longer on {name} — the next refresh of the "
+                f"catalogue's index removes it.")
+    return "File no longer at this path on the source. Rescan the library to refresh."
+
+
+def _catalogue_split(path_str: str) -> tuple[str, str]:
+    """``(root, rel)`` of a catalogue track path, for ``catalogue.allowed``."""
+    from soniqboom.core import catalogue as _catalogue
+    root = _catalogue.root_of(path_str) or ""
+    return root, path_str[len(root) + 2:] if root else ""
 
 
 # ── Client-requested delivery changes (format= / maxBitRate= / time offset) ──
@@ -11000,10 +11106,55 @@ def _sid_target_seconds(track, subsong: int, start: "int | None" = None) -> int:
     return max(5, min(int(target_dur), 3600))
 
 
+def _scan_dir_of(track) -> dict | None:
+    """The scan dir ``track`` lives under, or None."""
+    try:
+        from soniqboom.core.store import get_store
+        dirs = get_store().list_scan_dirs()
+    except Exception:
+        return None
+    outer = (getattr(track, "path", "") or "").split("::", 1)[0]
+    rh = getattr(track, "scan_root_hash", "") or ""
+    sd = None
+    if rh:
+        sd = next((d for d in dirs if d.get("path_hash") == rh), None)
+    if sd is None:
+        cands = [d for d in dirs if d.get("path")
+                 and (outer == d["path"] or outer.startswith(d["path"].rstrip("/") + "/"))]
+        sd = max(cands, key=lambda d: len(d["path"]), default=None)
+    return sd
+
+
+async def _known_offline_local_root(track) -> str | None:
+    """A LOCAL root already marked unavailable that still doesn't answer (a
+    bounded probe on its own thread): the play is answered "offline" at once
+    instead of touching the file on the event loop — a hung mount would stall
+    the whole server there.  A root that answers again is marked available
+    and None is returned (the play goes on)."""
+    sd = _scan_dir_of(track)
+    if sd is None or sd.get("status") != "unavailable":
+        return None
+    try:
+        from soniqboom.core import data as _data
+        if _data._is_remote_root(sd["path"]):
+            return None
+        ok = await _data._probe_local_root(sd["path"])
+    except Exception:
+        return None
+    if ok:
+        try:
+            from soniqboom.core.store import get_store
+            get_store().set_scan_dir_status(sd["path"], "ok")
+        except Exception:
+            pass
+        return None
+    return sd["path"]
+
+
 async def _offline_root_for(track) -> str | None:
     """The scan root ``track`` lives under when that root is OFFLINE — its
     cached status says so, or a bounded reachability probe (≤ 4 s, on its own
-    pool) fails; else None.  Only called once a file turned out missing, so a
+    thread) fails; else None.  Only called once a file turned out missing, so a
     successful play never pays for it."""
     try:
         from soniqboom.core import data as _data
@@ -11028,6 +11179,15 @@ async def _offline_root_for(track) -> str | None:
         _p, ok = await _data._probe_scan_dir(sd)
     except Exception:
         return None
+    if ok is None:
+        return None                 # (a slow probe: can't tell yet)
+    if not ok and not _data._is_remote_root(sd["path"]):
+        # A local drive that went away since the last probe: mark it now, so
+        # the lists mark (or hide) its tracks and auto-play skips them.
+        try:
+            get_store().set_scan_dir_status(sd["path"], "unavailable")
+        except Exception:
+            pass
     return None if ok else sd["path"]
 
 
@@ -11106,6 +11266,9 @@ async def _maybe_remote_progressive(request: Request, track, *, target_format: s
     if (request.method != "GET" or force_transcode or "::" in path_str
             or not is_remote_path(path_str)):
         return None
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_path(path_str):
+        return None                     # catalogue tunes: small, fetched whole (permit + merge)
     ext, uade_named = _render_ident(path_str, track)
     if ext not in NATIVE or uade_named:
         return None
@@ -11363,6 +11526,12 @@ async def _remote_direct_range(handle, size: int, start: int, end: int, media_ty
 
 def _offline_error(root: str) -> HTTPException:
     from soniqboom.core.filesource import credentials_refused
+    from soniqboom.core import catalogue as _catalogue
+    if _catalogue.is_catalogue_root(root):
+        name = _catalogue.label_of(root) or root
+        return HTTPException(
+            503, f"{name} can't be reached right now — tunes played before still play; "
+                 "try this one again later")
     if credentials_refused(root):
         # ``get_source`` hides a share whose sign-in is backing off: no play
         # logs in with credentials the server refused (lockout risk).

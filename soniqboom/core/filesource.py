@@ -1466,6 +1466,10 @@ class _FTPConnectionPool:
         # to exercise the loop, and we don't want to override that.
         self._keepalive_s = max(0.0, float(keepalive_s))
         self._label       = label  # for logs only, e.g. "host:port"
+        # A hard ceiling no resize may pass (``ensure_fixed_ftp_pool``: a
+        # volunteer archive that must never see more than a few logins);
+        # None = no ceiling beyond the configured budget.
+        self._size_ceiling: int | None = None
         # Server identification for the persistent cap-detection store.
         # Both can be empty in unit tests; cap-detection is then a no-op.
         self._host        = host
@@ -1799,6 +1803,8 @@ class _FTPConnectionPool:
         connection up to it.
         """
         new_max = max(1, int(new_max))
+        if self._size_ceiling is not None:
+            new_max = min(new_max, self._size_ceiling)
         with self._cond:
             if new_max == self._max_size:
                 return
@@ -2409,6 +2415,36 @@ def _get_or_create_ftp_pool(host: str, port: int, username: str,
             )
             _FTP_POOLS[key] = pool
         return pool
+
+
+def ensure_fixed_ftp_pool(host: str, port: int, username: str, password: str,
+                          encoding: str, max_size: int) -> _FTPConnectionPool:
+    """The pool for these credentials, created ON DEMAND ONLY (no warm idle
+    connections, no keep-alive NOOPs, no growth probe) and never larger than
+    ``max_size`` — whatever the per-server budget, a settings reload or the
+    cap recovery say.  For a public archive that serves many people from one
+    volunteer server (the Modland catalogue).  An existing pool for the same
+    key is clamped to the ceiling."""
+    key = (host, port, username, password, encoding)
+    max_size = max(1, int(max_size))
+    with _FTP_POOLS_LOCK:
+        pool = _FTP_POOLS.get(key)
+        if pool is None:
+            pool = _FTPConnectionPool(
+                factory=_build_ftp_factory(host, port, username, password, encoding),
+                max_size=max_size,
+                min_size=0,
+                keepalive_s=_FTP_KEEPALIVE_S,
+                label=f"{host}:{port}",
+                host=host,
+                port=port,
+            )
+            _FTP_POOLS[key] = pool
+    pool._size_ceiling = max_size
+    pool._min_size = 0
+    if pool._max_size > max_size:
+        pool.resize(max_size)
+    return pool
 
 
 def reload_ftp_pool_sizes() -> list[dict]:
@@ -3428,6 +3464,11 @@ def get_source(share_id: str) -> FileSource | None:
     play) instead of logging in again.  ``all_sources`` still lists it."""
     src = _active_sources.get(share_id)
     if src is not None and share_retry_wait(getattr(src, "auth_key", None)) > 0:
+        return None
+    offline = getattr(src, "is_offline", None)
+    if offline is not None and offline():
+        # A source holding itself offline after a network failure (the
+        # Modland catalogue's: ``modland_catalog.CatalogueFTPSource``).
         return None
     return src
 

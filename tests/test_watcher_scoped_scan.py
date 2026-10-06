@@ -190,15 +190,20 @@ async def test_debounce_waits_for_quiet_then_queues_one_scoped_scan(armed):
 @pytest.mark.asyncio
 async def test_cap_scans_quiet_paths_and_holds_one_still_being_written(armed, monkeypatch):
     root, calls = armed
-    monkeypatch.setattr(watcher, "_MAX_WAIT_SEC", 0.5)
+    # Wide margins: the writer's 50 ms events stay far inside the 0.6 s quiet
+    # window, so a loaded machine's stalls can't make the hot path look quiet.
+    monkeypatch.setattr(watcher, "_QUIET_SEC", 0.6)
+    monkeypatch.setattr(watcher, "_MAX_WAIT_SEC", 1.0)
     cold, hot = f"{root}/B/done.mod", f"{root}/A/downloading.flac"
     watcher._note_change(root, [cold])
-    t_end = time.monotonic() + 0.9
+    t_end = time.monotonic() + 1.8
     while time.monotonic() < t_end:                        # a writer: an event every 50 ms
         watcher._note_change(root, [hot])
         await asyncio.sleep(0.05)
     assert calls == [([root], {root: [cold]}, False)], "the cap must scan the quiet path only"
-    await asyncio.sleep(0.4)                               # writer stopped → quiet → scanned
+    deadline = time.monotonic() + 4.0                      # writer stopped → quiet → scanned
+    while len(calls) < 2 and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
     assert calls[1:] == [([root], {root: [hot]}, False)]
 
 
@@ -1068,12 +1073,14 @@ async def test_losing_the_annotation_on_upsert_marks_the_group_dirty(monkeypatch
     assert "a" in st._dup_dirty
 
 
-def test_nan_durations_stay_out_of_the_sorted_duration_index(tmp_data_dir):
-    from soniqboom.core.store import TrackStore
+def test_nan_durations_never_key_the_sorted_duration_index(tmp_data_dir):
+    # A NaN duration is a missing one: keyed after every real duration (the
+    # duration sort still reaches the track), never by the NaN itself.
+    from soniqboom.core.store import TrackStore, _NO_VALUE_KEY
     st = TrackStore()
     st.upsert_tracks_batch([{"id": "n", "path": "/m/n.mod", "title": "N", "duration": float("nan")},
                             {"id": "k", "path": "/m/k.mod", "title": "K", "duration": 120.0}])
-    assert [tid for _d, tid in st._sorted_duration] == ["k"]
+    assert st._sorted_duration == [(120.0, "k"), (_NO_VALUE_KEY, "n")]
     st.delete_track_ids(["n", "k"])
     assert st._sorted_duration == []
 
@@ -1462,14 +1469,14 @@ async def test_background_regroup_waits_for_a_running_scan(library, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_the_batch_exit_rebuild_keeps_nan_out_of_the_duration_index(tmp_data_dir):
-    from soniqboom.core.store import TrackStore
+async def test_the_batch_exit_rebuild_never_keys_the_duration_index_by_nan(tmp_data_dir):
+    from soniqboom.core.store import TrackStore, _NO_VALUE_KEY
     st = TrackStore()
     st.enter_batch_mode()
     st.upsert_tracks_batch([{"id": "n", "path": "/m/n.mod", "title": "N", "duration": float("nan")},
                             {"id": "k", "path": "/m/k.mod", "title": "K", "duration": 120.0}])
     await scanner._async_exit_batch_mode(st)
-    assert [tid for _d, tid in st._sorted_duration] == ["k"]
+    assert st._sorted_duration == [(120.0, "k"), (_NO_VALUE_KEY, "n")]
 
 
 def test_remote_walker_treats_archive_names_as_archives():

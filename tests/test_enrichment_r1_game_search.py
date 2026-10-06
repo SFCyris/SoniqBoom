@@ -71,8 +71,8 @@ async def test_search_endpoints_resolve_game_prefix(store):
     assert _ids(await search_api.run_search_dicts("album:zombie")) == set()
     models = await search_api.run_search("game:uridium")          # smart playlists
     assert {m.id for m in models} == {"u2", "u2l", "ualb"}
-    quick = await search_api.quick_search(q="game:zombie", limit=8)
-    assert {m.id for m in quick} == {"za1", "za2"}
+    quick = await search_api.quick_search(q="game:zombie", limit=8)   # TrackMeta-shaped dicts
+    assert {m["id"] for m in quick} == {"za1", "za2"}
     # free text after the operator still narrows
     assert _ids(await search_api.run_search_dicts("game:uridium loader")) == {"u2l"}
 

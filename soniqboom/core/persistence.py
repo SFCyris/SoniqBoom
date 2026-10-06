@@ -484,6 +484,13 @@ def _entry_undo(state: dict, entry: dict):
         return [kv("config", [entry.get("key")])]
     if op == "push_history":
         return [whole("history")]
+    if op == "remap_track_ids":
+        m = entry.get("mapping") or {}
+        keys = [*m.keys(), *m.values()] if isinstance(m, dict) else []
+        pls = state.get("playlists")
+        return [kv("ratings", keys), kv("play_stats", keys), kv("waveforms", keys),
+                whole("history"),
+                kv("playlists", list(pls.keys()) if isinstance(pls, dict) else [])]
     return None
 
 

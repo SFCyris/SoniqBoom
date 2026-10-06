@@ -75,7 +75,7 @@ from typing import Any, Iterator
 
 from soniqboom.core import folder_album as _fa
 from soniqboom.core import retro as _retro
-from soniqboom.core.store import normalise_year
+from soniqboom.core.store import name_display, track_genres, year_number
 
 FOLDER_PREFIX = "fa:"
 _NO_GENRES: frozenset = frozenset()
@@ -98,6 +98,26 @@ ARTIST_PLACEHOLDERS = frozenset({
     "<unknown artist>", "<no artist>", "no artist", "n/a", "-",
 })
 
+# The separator ``core/metadata.py`` joins a tag's several artists with
+# (``metadata.NAME_SEP``; kept equal — not imported, this module stays light).
+NAME_SEP = " \u2022 "
+NAME_SEP_L = NAME_SEP.lower()
+_PARTS: dict[str, tuple] = {}
+
+
+def name_parts(name: str) -> tuple:
+    """The artists of a multi-artist name ("A • B" → ("A", "B")); ``()`` for
+    a single name.  Memoised."""
+    if not name or NAME_SEP not in name:
+        return ()
+    hit = _PARTS.get(name)
+    if hit is None:
+        if len(_PARTS) >= _NORM_MAX:
+            _PARTS.clear()
+        hit = _PARTS[name] = tuple(p.strip() for p in name.split(NAME_SEP) if p.strip())
+    return hit
+
+
 # raw tag string → stripped name, "" for a placeholder.  Keyed by the tag
 # string itself (its hash is cached on the str object), so the catalogue
 # pass pays one dict lookup per field instead of strip + casefold.
@@ -106,12 +126,18 @@ _NORM_MAX = 400_000
 
 
 def norm_owner(s: Any) -> str:
-    """A tag's artist name, stripped; ``""`` when empty or a placeholder."""
+    """A tag's artist name, stripped; ``""`` when empty or a placeholder.  A
+    multi-artist tag ("A • B", ``NAME_SEP``) names its FIRST artist (its first
+    one that is no placeholder): ids, owners and album grouping key on it, so
+    a tag that gains a second value ("A" → "A • B") keeps the artist id of A
+    and the album id it had (``artist_id`` / ``album_id``)."""
     if not s or not isinstance(s, str):
         return ""
     hit = _NORM.get(s)
     if hit is None:
         v = s.strip()
+        if NAME_SEP in v:
+            v = next((p for p in name_parts(v) if p.casefold() not in ARTIST_PLACEHOLDERS), "")
         if v.casefold() in ARTIST_PLACEHOLDERS:
             v = ""
         if len(_NORM) >= _NORM_MAX:
@@ -139,8 +165,29 @@ def norm_owner_l(s: Any) -> str:
 
 def owner_of(t: dict) -> str:
     """The artist a track files under: album artist, else track artist
-    (placeholders ignored — ``""`` means [Unknown Artist])."""
+    (placeholders ignored — ``""`` means [Unknown Artist]; a multi-artist tag:
+    its first artist, ``norm_owner``)."""
     return norm_owner(t.get("album_artist")) or norm_owner(t.get("artist"))
+
+
+def name_parts_l(s: Any) -> tuple:
+    """The lower-cased artists of a multi-artist tag ("A • B" → ("a", "b")),
+    placeholders dropped; ``()`` for a single name."""
+    if not s or not isinstance(s, str) or NAME_SEP not in s:
+        return ()
+    return tuple(p.lower() for p in name_parts(s.strip()) if p.casefold() not in ARTIST_PLACEHOLDERS)
+
+
+def artist_names_l(t: dict) -> set:
+    """Every artist track ``t`` is listed under (lower-cased): its owner, its
+    track artist and each artist of a multi-artist tag."""
+    out = {owner_of(t).lower()}
+    a = norm_owner(t.get("artist")).lower()
+    if a:
+        out.add(a)
+    out.update(name_parts_l(t.get("album_artist")))
+    out.update(name_parts_l(t.get("artist")))
+    return out
 
 
 # ── Stable ids ───────────────────────────────────────────────────────────────
@@ -772,6 +819,11 @@ def _union_steps(store, display: dict[str, str], *, chunk: int) -> Iterator[None
     a yield.  Each name's bucket is read at the moment it is processed.
     Placeholder names (``norm_owner`` → "") are skipped."""
     tracks = store._tracks
+    # A multi-artist tag ("A • B" — ``NAME_SEP``, how the extractor joins a
+    # tag's several artists) is no artist itself: the store counts it under
+    # each of its artists (``store._name_counts``), so each is a name here,
+    # keyed on its own name — "A" keeps its id when its tag gains a second
+    # value — and spelled as in the tag (``store.name_display``).
     # Album-artist casing first so it wins for names that are both.
     for idx, counter, field in ((store._tag_album_artist, store._agg_album_artists, "album_artist"),
                                 (store._tag_artist, store._agg_artists, "artist")):
@@ -784,7 +836,7 @@ def _union_steps(store, display: dict[str, str], *, chunk: int) -> Iterator[None
                 if not tids:
                     continue
                 t = tracks.get(min(tids)) or {}
-                display[key] = (t.get(field) or "").strip() or key
+                display[key] = name_display(t.get(field), key) or key
             yield
 
 
@@ -1006,7 +1058,7 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                     d = t.get("duration")
                     if d and d - d == 0 and d > 0:   # skip 0 / NaN / ±inf (corrupt decode)
                         a[1] += d
-                gs = t.get("genre")
+                gs = track_genres(t)
                 if gs:
                     if a[4] is None:
                         a[4] = set(gs)
@@ -1017,6 +1069,12 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                     if s_ is None:
                         s_ = appears[ar] = set()
                     s_.add(key)
+                ra, rr = t.get("album_artist"), t.get("artist")
+                if (ra.__class__ is str and NAME_SEP in ra) or (rr.__class__ is str and NAME_SEP in rr):
+                    # Each artist of a multi-artist tag appears on the album.
+                    for p_ in {*name_parts_l(ra), *name_parts_l(rr)}:
+                        if p_ != owner_l:
+                            appears.setdefault(p_, set()).add(key)
             elif folder_on:
                 ok = aa or ar or ""
                 if not ok:
@@ -1045,7 +1103,7 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                     d = t.get("duration")
                     if d and d - d == 0 and d > 0:
                         s[1] += d
-                gs = t.get("genre")
+                gs = track_genres(t)
                 if gs:
                     if s[4] is None:
                         s[4] = set(gs)
@@ -1058,6 +1116,14 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                         s[5] = {ar}
                     else:
                         s[5].add(ar)
+                ra, rr = t.get("album_artist"), t.get("artist")
+                if (ra.__class__ is str and NAME_SEP in ra) or (rr.__class__ is str and NAME_SEP in rr):
+                    for p_ in {*name_parts_l(ra), *name_parts_l(rr)}:
+                        if p_ != ok:
+                            if s[5] is None:
+                                s[5] = {p_}
+                            else:
+                                s[5].add(p_)
             elif not (aa or ar):
                 unknown_loose.append(t["id"])       # same owner rule as owner_of()
         yield
@@ -1103,12 +1169,12 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
         try:
             yr = years.get(y)
         except TypeError:                 # an unhashable junk value
-            yr = normalise_year(y) or 0
+            yr = year_number(y) or 0
         else:
             if yr is None:
-                yr = years[y] = normalise_year(y) or 0
+                yr = years[y] = year_number(y) or 0
         e.year = yr
-        sg = sample.get("genre") or []
+        sg = track_genres(sample)
         e.genre = (sg[0] if sg else "") or ""
         e.genres_l = _genres_l(gs) if gs else _NO_GENRES
         e.added = added if isinstance(added, (int, float)) else 0
@@ -1475,7 +1541,7 @@ def folder_entry_from_tracks(store, union: ArtistUnion, dir_hash: str,
     added = sample.get("added_at") or 0
     gs: set = set()
     for t in tracks:
-        gs.update(t.get("genre") or ())
+        gs.update(track_genres(t))
     e = AlbumEntry()
     e.kind = "folder"
     e.dir_hash = dir_hash
@@ -1507,8 +1573,8 @@ def folder_entry_from_tracks(store, union: ArtistUnion, dir_hash: str,
     e.song_count = cnt
     e.duration = _finite_int(dur)     # same raw-sum-then-round as build_catalogue
     e.sample = sample
-    e.year = normalise_year(sample.get("year")) or 0
-    sg = sample.get("genre") or []
+    e.year = year_number(sample.get("year")) or 0
+    sg = track_genres(sample)
     e.genre = (sg[0] if sg else "") or ""
     e.genres_l = frozenset(g.strip().lower() for g in gs if isinstance(g, str) and g.strip())
     e.added = added if isinstance(added, (int, float)) else 0

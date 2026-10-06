@@ -822,6 +822,9 @@ async def _try_folder_art(
 
     if is_remote_path(path_str):
         # Remote path — directory listing via FileSource
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_path(path_str):
+            return None, None       # a catalogue's folders hold no art we may fetch
         from soniqboom.core.filesource import get_source, parse_remote_path
         scan_root, remote_path = parse_remote_path(path_str)
         if not remote_path:

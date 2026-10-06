@@ -186,6 +186,7 @@ SoniqBoom speaks the culture:
   7. **The folder or archive name**, while *Album from folder name for retro formats* is on
 
   The names the other sources give become the game's other names (Track Info's *also* line; `game:` search finds any of them).
+- **🏷️ Retro genres.** Chip tunes and modules with no genre tag are listed under what SoniqBoom knows about them: **Game**, **Demo**, **Cracktro**, **Music Disk**, **Diskmag** or **Scene** — from the track's game, console-rip formats, Demozoo (the production released the same year that uses the tune, and the party competition the tune entered), the composer's Demozoo group, HVSC's `GAMES` / `DEMOS` folders and folders named `games`, `demos`, `cracktros`, `musicdisks` … — plus its platform: **SID**, **Amiga**, **Atari ST**, **NES**, **Game Boy**, **AdLib**, **MIDI** and more. With *Game and group names as genres* (on by default) the game, scene group and party are genres too, so Subsonic apps can browse a game's or a group's tunes. A genre in the file's own tags (other than the format words SoniqBoom adds, such as *Chiptune* or *C64*), or one you type, replaces them.
 - **🛰️ The Library Galaxy.** Your entire collection rendered as a drifting star field, every format its own glowing constellation, sized by how much of it you own — or flip to a sortable, searchable list and browse by format family (trackers, chiptune, lossless, lossy).
 - **🔌 Live signal-chain visualization.** See the exact decode path of the playing track — `HVL → hvl2wav → PCM → ReplayGain → WebAudio` — laid out and lit up. Honest, nerdy, and weirdly mesmerizing.
 - **🗂️ Multi-subtune aware.** SID, SNDH, Amiga, NSF / GBS / AY / SAP and HVL files with multiple subsongs are addressed individually, not flattened into one — pick any tune in Track Info or in the phone's Now Playing. Playing the file itself starts at its default tune: the start song it names, or for Amiga player formats (played by UADE), console rips and SC68 disks the first tune that isn't empty.
@@ -211,7 +212,7 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 - **⚡ Entire library held in RAM.** Browse and search a six-figure collection as fast as a ten-song playlist.
 - **📻 Internet radio — with the scene built in.** A curated demoscene & chiptune station pack — **SceneSat**, **Nectarine**, **SLAY Radio**, **Kohina**, **Radio PARALAX**, **CVGM** and **Rainwave** — alongside the worldwide [Radio Browser](https://www.radio-browser.info/) directory (browse by continent and country), with live now-playing titles and one-click favourites. Stations turn up in the main search too, with a **Show all** view for the full list.
 - **🎲 Instant Mix radio.** Press the radio button on any track and SoniqBoom builds an endless, self-refilling queue around it — picked by genre, artist, era, tempo and format — in a focused radio view with a live oscilloscope over the cover. A SID radio stays chiptune; a FLAC radio follows the genre.
-- **🔎 More like this & smart playlists.** Surface the closest-sounding tracks to any song (scored by audio similarity), and save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
+- **🔎 More like this & smart playlists.** Surface the closest matches to any song, ranked by what the tracks have in common — artist, genre, era, tempo and format, or for chip tunes and modules the composer, sound chip, replayer, samples and scene group — and, when both have been played, by how their loudness rises and falls. Save any search — say `format:SID year:>1988` — as a playlist that keeps itself up to date.
 - **🎚️ 10-band graphic equalizer.** Ten bands from 32 Hz to 16 kHz, seven presets (Rock, Jazz, Vocal…) and clip-safe pre-gain — right in the browser. Press **E** or hit the **EQ** button.
 - **🔊 ReplayGain volume levelling.** Even out loudness across the library — choose off, per-track, or per-album, applied live at playback from the file's ReplayGain tags.
 - **📡 Cast / AirPlay / DLNA (Beta).** Send anything — yes, even a SID tune, transcoded on the fly — to Chromecast, Apple TV, HomePod, or UPnP receivers.
@@ -219,7 +220,8 @@ Every retro format is rendered to standard audio on the fly — a 1987 SID tune 
 - **🔁 Multi-room sync.** The same track, in lockstep, across every browser on your LAN — or send a favourite internet-radio station to a whole room, its live station, artist and cover art updating in place.
 - **📲 Touch-first mobile UI.** A dedicated phone shell — browse and play your library, tune in internet radio streamed straight to the phone, manage playlists, and a tap-to-expand mini-player.
 - **📱 OpenSubsonic API.** Works with Amperfy, Symfonium, DSub, and the rest of the Subsonic app ecosystem — including a **server-owned Jukebox** queue those apps can drive, with the audio playing out through any browser joined to the Jukebox room.
-- **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required. MP3, WAV, Ogg, Opus and seekable FLAC files on a share start playing while they download, and a track inside a large ZIP on a share is read on its own, without fetching the whole archive.
+- **🗄️ Network shares without mounting.** Attach FTP, SMB, and WebDAV libraries straight from the admin UI — no OS mount required. MP3, WAV, Ogg, Opus and seekable FLAC files on a share start playing while they download, and a track inside a large ZIP on a share is read on its own, without fetching the whole archive. When a drive or share isn't connected, its tracks stay in the library and are marked **offline** in lists and search results — or hidden, or listed as usual (gear → **System → Settings → Tracks on unavailable drives**). Marked or hidden tracks are skipped by shuffle, Instant Mix and the next track. A track on a share whose file is already in the cache still plays.
+- **🌐 The Modland catalogue.** One switch (gear → **Library → External sources**) lists [Modland](https://ftp.modland.com/)'s module archive in your library — about 330,000 tunes of Amiga, C64, Atari ST, console and tracker music, or about 415,000 with the big PC tracker folders — under a **Modland** folder, browsable and searchable right away. Nothing is copied: a tune is downloaded from Modland when you play it (with the sample or library files its format needs) and then plays from SoniqBoom's remote cache; its first play fills in its length and its own tags (the composer stays Modland's credit). The index is refreshed daily, weekly, every 2 weeks or monthly (your choice) or on demand, and a refresh usually downloads only Modland's changelogs since the last one — a few kilobytes. A moved or renamed tune keeps its ratings, play counts and playlist entries. Subsonic apps and the DLNA Media Server (Beta) don't see the catalogue unless you switch that on.
 - **👥 Multi-user with roles**, **last.fm + ListenBrainz scrobbling**, **time-synced lyrics**, **podcast & audiobook chapters**, **in-browser tag editing**, **field-operator search** (`artist:Ghost year:>2020 format:FLAC`), **dark mode**, **installable PWA**, and **absolutely zero telemetry**.
 
 <p align="center">
@@ -291,7 +293,7 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 | **In-browser tag editing** (writes real tags) | ✅ | ❌ read-only | ⚠ database only | ⚠ database only | ❌ | ❌ |
 | **Graphic equalizer in the web player** | ✅ 10-band | ❌ | ❌ | 💰 Plex Pass | ❌ | ❌ |
 | **Tracker visualization** (per-channel VU · live pattern view) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Smart playlists &amp; audio similarity** | ✅ + Instant Mix radio | ⚠ similarity via plugin | ⚠ via plugins | 💰 Plex Pass | ✅ | ⚠ via plugin |
+| **Smart playlists &amp; similar-track suggestions** | ✅ + Instant Mix radio | ⚠ similarity via plugin | ⚠ via plugins | 💰 Plex Pass | ✅ | ⚠ via plugin |
 
 ### Where SoniqBoom reigns supreme
 
@@ -301,7 +303,7 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 - **Multi-room that needs nothing extra.** Lockstep playback across any browsers on your LAN — no Squeezebox hardware, no Home Assistant hub.
 - **Your files where they already are.** Attach FTP, SMB, and WebDAV shares straight from the admin UI with no OS mount - only Music Assistant comes close.
 - **Real tag editing, in the browser.** It writes actual tags; Navidrome is read-only by design, and Jellyfin and Plexamp only edit their own database.
-- **A full listening toolkit, free.** A 10-band EQ, ReplayGain, Instant Mix radio, audio-similarity "more like this," and self-updating smart playlists — with no paid tier, no account, and no telemetry.
+- **A full listening toolkit, free.** A 10-band EQ, ReplayGain, Instant Mix radio, "more like this" ranked by what tracks have in common and how their loudness moves, and self-updating smart playlists — with no paid tier, no account, and no telemetry.
 - **Channel-by-channel visualization.** Per-channel VU meters, a live pattern view for tracker modules, and the Library Galaxy — a view of your collection no other server offers.
 
 ---
@@ -331,6 +333,7 @@ Honest, measured numbers (idle, on the ARM64 image):
 | **Docker image** | ~1.3 GB on disk, **~400 MB compressed** to pull. Most of it is the bundled retro-format players and a General-MIDI SoundFont — that breadth is the point. |
 | **CPU** | Idle is near-zero. Retro formats are rendered to audio server-side on play; a SID or tracker module decodes comfortably on a Pi-class core. Large first-time library scans are the main CPU spike. |
 | **Disk** | Your music (untouched, read-only) + the `/data` volume (index, conversion cache, config, logs). The conversion cache grows as you play transcoded/retro formats and can be cleared any time. |
+| **Modland catalogue** (optional) | About 1 GB more memory with the default *Tunes* selection (about 330,000 tunes), about 1.2 GB with *Everything*; about 200–250 MB more disk for the library index (measured natively on an Apple-silicon Mac). |
 
 **Building the Docker image** and don't need the Amiga "exotica" family or native `.sc68` disks? Pass `--build-arg SLIM=1` to skip the two players the *image* compiles from source (`uade` and `sc68`). Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console chiptune, PSF, AdLib, all modern codecs — still ships. This mainly saves *build time* (and dodges the qemu compile flakiness when you cross-build on an Apple-Silicon Mac); it trims only ~12 MB off the image, since the bulk is ffmpeg and the bundled SoundFont, not the retro players. The **default** image ships everything — that breadth is the point.
 
@@ -415,6 +418,8 @@ Data / assets:
 - [MAME software lists](https://github.com/mamedev/mame/tree/master/hash) titles, CC0 1.0 — game titles per retro platform
 - [ZXDB](https://github.com/zxdb/ZXDB) ZX Spectrum game titles, [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) — contains information from ZXDB, made available under the ODbL
 - [TOSEC](https://www.tosecdev.org) and [Redump](http://redump.org) DAT game titles — downloaded by the user under gear → Metadata, not included with SoniqBoom
+- [Modland](https://ftp.modland.com/) — Scene origin matches your modules against Modland's checksum list (`allmods_md5.zip`), and the Modland catalogue lists Modland's archive from its index (`allmods.zip`) and downloads a tune from Modland when it is played; downloaded by the user under gear → Metadata → Scene origin (Modland) and gear → Library → External sources, not included with SoniqBoom
+- [Demozoo](https://demozoo.org) — composers' scene groups, release years, game soundtracks and the productions and party competitions behind retro genres, from Demozoo's database export; downloaded by the user under gear → Metadata, not included with SoniqBoom
 
 The full per-component license texts are recorded in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 

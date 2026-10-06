@@ -116,6 +116,16 @@ def _apply_entry(state: dict, entry: dict) -> None:
     elif op == "delete_config":
         state.get("config", {}).pop(entry.get("key"), None)
 
+    elif op == "remap_track_ids":
+        # A moved / renamed file's user data follows its new id (TrackStore.remap_track_ids).
+        from soniqboom.core.id_remap import remap_user_data
+        remap_user_data(entry.get("mapping") or {},
+                        ratings=state.setdefault("ratings", {}),
+                        play_stats=state.setdefault("play_stats", {}),
+                        history=state.get("history"),
+                        playlists=state.get("playlists"),
+                        waveforms=state.get("waveforms"))
+
 
 def _do_merge(data_dir: Path) -> int:
     """``_do_merge_locked`` under ``persistence.library_files_locked`` — a

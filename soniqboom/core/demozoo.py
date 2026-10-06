@@ -49,6 +49,33 @@ _PROD_TABLE = "public.productions_production"                 # production→tit
 _PROD_SOUNDTRACK = "public.productions_soundtracklink"        # demo↔the music it uses
 _PROD_TYPES = "public.productions_production_types"           # M2M production↔type
 _PROD_TYPE = "public.productions_productiontype"              # type id→name ("Game" …)
+_PROD_PACK = "public.productions_packmember"                  # pack (music disk …)↔member
+_PARTY = "public.parties_party"                               # party id→name ("Revision 2019")
+_COMPETITION = "public.parties_competition"                   # competition→party
+_PLACING = "public.parties_competitionplacing"                # production↔competition
+_USE_TABLES = (_PROD_PACK, _PARTY, _COMPETITION, _PLACING)
+
+
+def use_kind(type_name: object) -> str | None:
+    """The derived-genre category of a Demozoo production type
+    (core/genre_derive.py): "Game", "Demo" (demos, intros of every size,
+    invitations, trackmos), "Cracktro" (cracktros, BBStros), "Music Disk"
+    (music disks, music packs), "Diskmag" (disk / text mags); None for the
+    rest (music, graphics, tools …)."""
+    n = (type_name or "").strip().casefold() if isinstance(type_name, str) else ""
+    if not n:
+        return None
+    if n == "game":
+        return "Game"
+    if "cracktro" in n or n == "bbstro":
+        return "Cracktro"
+    if "music disk" in n or "musicdisk" in n or "music pack" in n:
+        return "Music Disk"
+    if "diskmag" in n or "textmag" in n:
+        return "Diskmag"
+    if "demo" in n or "intro" in n or n in ("trackmo", "invitation"):
+        return "Demo"
+    return None
 
 _STOP = frozenset(
     "a an and at by de el for from in la le of on or the to with".split())
@@ -232,6 +259,7 @@ def status() -> dict:
             names = _status["names"]
     return {**_status, "names": names, "exists": exists,
             "games": _game_rows(db) if exists else None,
+            "uses": _use_rows(db) if exists else None,
             "auto_apply": auto_apply_enabled(),
             "size": db.stat().st_size if exists else 0}
 
@@ -245,6 +273,23 @@ def _game_rows(db: Path) -> int | None:
             if not _has_table(con, "music_game"):
                 return None
             return con.execute("SELECT COUNT(*) FROM music_game").fetchone()[0]
+        finally:
+            con.close()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _use_rows(db: Path) -> int | None:
+    """Music productions with a known use (a same-year demo, cracktro, game,
+    music disk, diskmag, or a party competition); None for an index built
+    before they were (refreshing it adds them)."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if not _has_table(con, "music_use"):
+                return None
+            return con.execute("SELECT COUNT(*) FROM music_use "
+                               "WHERE kinds != '' OR party != ''").fetchone()[0]
         finally:
             con.close()
     except Exception:                                       # noqa: BLE001
@@ -298,6 +343,26 @@ def _demozoo_game(rows: list[tuple[frozenset, str]], ytoks: frozenset,
     return name if tk == key or tk.startswith(key + " ") else None
 
 
+def _demozoo_use(rows: list[tuple[frozenset, str, str]], ytoks: frozenset
+                 ) -> tuple[list[str] | None, str | None]:
+    """``(scene_use, scene_party)`` of a track whose composer's music
+    productions are ``rows`` (``(title _year_toks, kinds csv, party)``,
+    table ``music_use``): from the productions with EXACTLY the track's
+    title tokens — the kinds all of them share, the party all of them name.
+    ``(None, None)`` when no production has that title."""
+    if not ytoks:
+        return None, None
+    hits = [(k, p) for ptoks, k, p in rows if ptoks == ytoks]
+    if not hits:
+        return None, None
+    kinds = set((hits[0][0] or "").split(",")) - {""}
+    for k, _p in hits[1:]:
+        kinds &= set((k or "").split(",")) - {""}
+    parties = {p or "" for _k, p in hits}
+    party = parties.pop() if len(parties) == 1 else ""
+    return (sorted(kinds) or None), (party or None)
+
+
 def _norm(s: object) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split()) if isinstance(s, str) else ""
 
@@ -340,6 +405,10 @@ def _parse_dump(path: Path):
     soundtrack_of: dict[str, list[str]] = {}    # music_prod_id → [demo_prod_id]
     prod_types: dict[str, set[str]] = {}        # production_id → {productiontype_id}
     type_name: dict[str, str] = {}              # productiontype_id → name
+    packs_of: dict[str, list[str]] = {}         # member production_id → [pack production_id]
+    party_name: dict[str, str] = {}             # party id → name
+    comp_party: dict[str, str] = {}             # competition id → party id
+    placed_in: dict[str, list[str]] = {}        # production_id → [competition id]
     cur: str | None = None
     cols: list[str] | None = None
     idx: dict[str, int] = {}
@@ -351,7 +420,7 @@ def _parse_dump(path: Path):
                     if m and (m.group(1) in _TABLES
                               or m.group(1) in (_PROD_AUTHOR, _PROD_TABLE,
                                                 _PROD_SOUNDTRACK, _PROD_TYPES,
-                                                _PROD_TYPE)):
+                                                _PROD_TYPE, *_USE_TABLES)):
                         cur = m.group(1)
                         cols = [c.strip() for c in m.group(2).split(",")]
                         idx = {c: i for i, c in enumerate(cols)}
@@ -377,6 +446,22 @@ def _parse_dump(path: Path):
                 ii, ni = idx.get("id"), idx.get("name")
                 if ii is not None and ni is not None:
                     type_name[parts[ii]] = _unesc(parts[ni]) or ""
+            elif cur == _PROD_PACK:
+                pi, mi = idx.get("pack_id"), idx.get("member_id")
+                if pi is not None and mi is not None:
+                    packs_of.setdefault(parts[mi], []).append(parts[pi])
+            elif cur == _PARTY:
+                ii, ni = idx.get("id"), idx.get("name")
+                if ii is not None and ni is not None:
+                    party_name[parts[ii]] = _unesc(parts[ni]) or ""
+            elif cur == _COMPETITION:
+                ii, pi = idx.get("id"), idx.get("party_id")
+                if ii is not None and pi is not None:
+                    comp_party[parts[ii]] = parts[pi]
+            elif cur == _PLACING:
+                pi, ci = idx.get("production_id"), idx.get("competition_id")
+                if pi is not None and ci is not None:
+                    placed_in.setdefault(parts[pi], []).append(parts[ci])
             elif cur == _PROD_SOUNDTRACK:
                 # ``production_id`` = the DEMO/intro; ``soundtrack_id`` = the
                 # MUSIC it uses.  Invert to music→[demos] for the "featured in"
@@ -558,7 +643,42 @@ def _parse_dump(path: Path):
         for rid in sorted(rids):
             if not _isgroup(rel.get(rid, {})):
                 music_games.extend((rid, ytoks_str, g) for g in titles)
-    return unique, ambig, prod_years, prod_soundtrack, music_games
+
+    # How each MUSIC production was used (the derived genres' Demozoo
+    # evidence, ``collect_updates`` → ``scene_use`` / ``scene_party``): the
+    # kinds (``use_kind``) of the productions released the SAME year that use
+    # it as their soundtrack or hold it in their pack — made for them; a
+    # famous game tune a later cracktro reused is no cracktro tune — and the
+    # party whose competition it entered (one party only).  One row per
+    # composer × music production, kinds "" when none, so a lookup can tell
+    # one production from several of the same title.
+    kind_of: dict[str, str] = {}
+    for pid, tids in prod_types.items():
+        ks = sorted({k for k in (use_kind(type_name.get(t)) for t in tids) if k})
+        if ks:
+            kind_of[pid] = ",".join(ks)
+    music_uses: list[tuple[str, str, str, str]] = []
+    for music_id, nicks in prod_nicks.items():
+        if prod_super and prod_super.get(music_id, "music") != "music":
+            continue
+        ytoks = _year_toks(prod_title.get(music_id))
+        if not ytoks:
+            continue
+        yr = prod_yr.get(music_id)
+        kinds: set[str] = set()
+        if yr is not None:
+            for user in (*soundtrack_of.get(music_id, ()), *packs_of.get(music_id, ())):
+                if prod_yr.get(user) == yr and user in kind_of:
+                    kinds.update(kind_of[user].split(","))
+        parties = {party_name.get(comp_party.get(c, ""), "")
+                   for c in placed_in.get(music_id, ())} - {""}
+        party = next(iter(parties)) if len(parties) == 1 else ""
+        ytoks_str = " ".join(sorted(ytoks))
+        rids = {nick_rel.get(n) for n in nicks} - {None}
+        for rid in sorted(rids):
+            if not _isgroup(rel.get(rid, {})):
+                music_uses.append((rid, ytoks_str, ",".join(sorted(kinds)), party))
+    return unique, ambig, prod_years, prod_soundtrack, music_games, music_uses
 
 
 def refresh_index(dump_path: Path | None = None) -> dict:
@@ -589,7 +709,7 @@ def refresh_index(dump_path: Path | None = None) -> dict:
             src = tmp
         else:
             src = dump_path
-        unique, ambig, prod_years, prod_soundtrack, music_games = _parse_dump(src)
+        unique, ambig, prod_years, prod_soundtrack, music_games, music_uses = _parse_dump(src)
         db = _db_path()
         con = sqlite3.connect(db)
         try:
@@ -648,15 +768,26 @@ def refresh_index(dump_path: Path | None = None) -> dict:
                 except (TypeError, ValueError):
                     continue
             con.executemany("INSERT INTO music_game VALUES (?,?,?)", _mg_rows)
+            con.execute("DROP TABLE IF EXISTS music_use")
+            con.execute("CREATE TABLE music_use "
+                        "(releaser_id INTEGER, ptoks TEXT, kinds TEXT, party TEXT)")
+            con.execute("CREATE INDEX ix_music_use_rid ON music_use(releaser_id)")
+            _mu_rows = []
+            for rid, ptoks, kinds, party in music_uses:
+                try:
+                    _mu_rows.append((int(rid), ptoks, kinds, party))
+                except (TypeError, ValueError):
+                    continue
+            con.executemany("INSERT INTO music_use VALUES (?,?,?,?)", _mu_rows)
             con.commit()
         finally:
             con.close()
         _status.update(built_at=int(time.time()), names=len(unique))
         log.info("Demozoo index built: %d unique names + %d shared-handle "
                  "production rows + %d dated music productions + %d soundtrack links "
-                 "+ %d game soundtracks",
+                 "+ %d game soundtracks + %d music uses",
                  len(unique), len(ambig), len(prod_years), len(prod_soundtrack),
-                 len(music_games))
+                 len(music_games), sum(1 for r in music_uses if r[2] or r[3]))
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = f"refresh failed: {exc}"
         log.warning("Demozoo refresh failed: %s", exc)
@@ -759,6 +890,14 @@ def collect_updates(tracks: list[dict] | None = None,
     # rows (parsed once per releaser) instead of re-querying per track.
     prod_cache: dict[int, list[tuple[frozenset, int | None]]] = {}
     game_cache: dict[int, list[tuple[frozenset, str]]] = {}
+    use_cache: dict[int, list[tuple[frozenset, str, str]]] = {}
+
+    def _drop_use(t: dict, upd: dict) -> None:
+        """Withdraw the Demozoo use / party (only a resolved composer names one)."""
+        if t.get("scene_use"):
+            upd["scene_use"] = None
+        if t.get("scene_party"):
+            upd["scene_party"] = None
     # Handle lookups depend only on the artist string and the index: memoised
     # across applies (``_memos``), so a re-join after a scan re-queries only
     # artists it has not seen.
@@ -778,6 +917,7 @@ def collect_updates(tracks: list[dict] | None = None,
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prod_year'"
         ).fetchone() is not None
         has_games = _has_table(con, "music_game")
+        has_uses = _has_table(con, "music_use")
         for t in (store.all_tracks() if tracks is None else tracks):
             if not is_retro_format(t.get("format")):
                 continue
@@ -798,6 +938,7 @@ def collect_updates(tracks: list[dict] | None = None,
                     upd.update(_revert(t))
                 if t.get("game_by_demozoo"):
                     upd["game_by_demozoo"] = None       # only a resolved composer names one
+                _drop_use(t, upd)
                 group = (t.get("scene_group") or "").strip()
                 if (group and not (t.get("composer") or "").strip()
                         and "scene_group" not in (t.get("user_edited") or [])):
@@ -867,6 +1008,7 @@ def collect_updates(tracks: list[dict] | None = None,
                 upd = _revert(t) if stamped else {}
                 if t.get("game_by_demozoo"):
                     upd["game_by_demozoo"] = None
+                _drop_use(t, upd)
                 if upd:
                     batch.append((t["id"], upd))
                 continue
@@ -919,6 +1061,24 @@ def collect_updates(tracks: list[dict] | None = None,
                     game = _demozoo_game(grows, gtoks, t.get("title"))
             if (t.get("game_by_demozoo") or None) != game:
                 updates["game_by_demozoo"] = game
+            # How the tune was used (``_demozoo_use``) — an index built before
+            # the ``music_use`` table leaves the fields as they are.
+            if has_uses:
+                use = party = None
+                utoks = _year_toks(t.get("title"))
+                if utoks:
+                    urows = use_cache.get(rid)
+                    if urows is None:
+                        urows = [(frozenset((p or "").split()), k or "", pa or "")
+                                 for p, k, pa in con.execute(
+                                     "SELECT ptoks, kinds, party FROM music_use "
+                                     "WHERE releaser_id = ?", (rid,))]
+                        use_cache[rid] = urows
+                    use, party = _demozoo_use(urows, utoks)
+                if (t.get("scene_use") or None) != use:
+                    updates["scene_use"] = use
+                if (t.get("scene_party") or None) != party:
+                    updates["scene_party"] = party
             if updates:
                 batch.append((t["id"], updates))
     finally:
@@ -1885,7 +2045,8 @@ def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
         (ProTracker, ScreamTracker, …) carry no composer tag, so such a value
         is always the title-first enrichment.  (A composer on an artist-tagged
         or non-retro track may be a real file/user tag and is left alone.)
-      * ``game_by_demozoo`` → cleared (the game follows, ``store.game_follow``).
+      * ``game_by_demozoo`` → cleared (the game follows, ``store.game_follow``);
+      * ``scene_use`` / ``scene_party`` → cleared (the derived genres follow).
 
     Reads the store snapshot only; the caller writes the batch on the loop
     thread (see ``reset_to_file_state``).  Idempotent — a clean library yields
@@ -1903,6 +2064,10 @@ def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
             upd["scene_group"] = None
         if t.get("game_by_demozoo"):
             upd["game_by_demozoo"] = None
+        if t.get("scene_use"):
+            upd["scene_use"] = None
+        if t.get("scene_party"):
+            upd["scene_party"] = None
         if ((t.get("composer") or "").strip()
                 and not (t.get("artist") or "").strip()
                 and is_retro_format(t.get("format"))

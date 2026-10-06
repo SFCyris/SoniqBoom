@@ -11,6 +11,7 @@
 import { Library }             from './library.js';
 import { Player }              from './player.js';
 import { artPlaceholderEmoji, Toast } from './utils.js';
+import { offlineKind, offlineBadgeHTML } from './offline.js';
 
 const input  = document.getElementById('search-input');
 const clear  = document.getElementById('search-clear');
@@ -227,7 +228,10 @@ function _showPreview(tracks, stations = []) {
 
   tracks.slice(0, 8).forEach((t, i) => {
     const row = document.createElement('div');
-    row.className = 'sp-row';
+    // A track that can't play right now (its drive / share is offline) is
+    // dimmed and badged, like the library rows.
+    const offKind = offlineKind(t);
+    row.className = 'sp-row' + (offKind ? ' track-offline' : '');
     row.dataset.idx = i;
     _optionize(row);
 
@@ -235,7 +239,9 @@ function _showPreview(tracks, stations = []) {
     row.innerHTML = `
       <div class="sp-art"><span class="sp-art-ph">${artPlaceholderEmoji(t)}</span></div>
       <div class="sp-info">
-        <div class="sp-title">${_esc(t.title || '—')}</div>
+        <div class="sp-title${offKind ? ' sp-title--badged' : ''}">${offKind
+          ? `<span class="sp-title-text">${_esc(t.title || '—')}</span>${offlineBadgeHTML(offKind)}`
+          : _esc(t.title || '—')}</div>
         <div class="sp-sub">${_esc(t.artist || t.album_artist || '')}${t.album ? ' — ' + _esc(t.album) : ''}</div>
       </div>
       <div class="sp-dur">${_fmtDur(t.duration)}</div>`;

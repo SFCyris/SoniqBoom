@@ -49,6 +49,7 @@ import { Equalizer }  from './equalizer.js';
 import { Queue }      from './queue.js';
 import { Playlist }   from './playlist.js';
 import { RadioMode }  from './radio.js';
+import { Offline }    from './offline.js';
 
 // ── Lazily-loaded modules ─────────────────────────────────────────────────────
 // admin.js (~150 KB), visualizer.js (~108 KB) and trackinfo.js (+ its viz
@@ -236,6 +237,7 @@ function _showUpdatePrompt(worker) {
   if (_updatePromptShown || !worker) return;
   _updatePromptShown = true;
   const bar = document.createElement('div');
+  bar.id = 'sb-update-prompt';   // utils.js docks toasts above it while it is up
   bar.setAttribute('role', 'status');
   bar.style.cssText = (
     'position:fixed;left:50%;transform:translateX(-50%);'
@@ -264,9 +266,12 @@ function _showUpdatePrompt(worker) {
     refresh.textContent = 'Updating…';
     _applyUpdate(worker);
   });
-  dismiss.addEventListener('click', () => { bar.remove(); _updatePromptShown = false; });
+  // Toasts already up move above the banner, and back down once it goes.
+  // (``?.``: an older cached utils.js has no redock.)
+  dismiss.addEventListener('click', () => { bar.remove(); _updatePromptShown = false; Toast.redock?.(); });
   bar.append(msg, refresh, dismiss);
   document.body.appendChild(bar);
+  Toast.redock?.();
 }
 
 // Gate the rest of app boot on the auth overlay: if there's no valid
@@ -1787,6 +1792,21 @@ Player.on('trackchange', () => { try { _clearPlayWatchdog(); } catch (_) {} });
 Player.on('queuestall', () => {
   window.Toast?.error?.('Couldn’t load the next tracks — check the connection, then press Next.');
 });
+// Settings → "Tracks on unavailable drives" (Mark / Hide): everything left to
+// play is on a drive or share that isn't connected — say so instead of silence.
+Player.on('offlinequeue', () => {
+  window.Toast?.info?.('None of these tracks can play right now — their drive or share isn’t connected.');
+});
+// Which tracks can play changed (a drive / share went or came back, or the
+// setting changed): the folder tree repaints its badges, the open view and the
+// track count re-read (offline.js has re-flagged the queue already).
+document.addEventListener('soniqboom:availability-changed', (e) => {
+  const d = (e && e.detail) || {};
+  try { window.__sbConfig = { ...window.__sbConfig, offline_tracks: d.mode }; } catch (_) {}
+  try { FolderTree.refresh(); } catch (_) {}
+  try { Library.refreshAvailability(d); } catch (_) {}
+  try { Library.refreshBadges(); } catch (_) {}
+});
 _paintShuffleBtn();
 // Per-mode glyph + label so the user can read the repeat state at a
 // glance.  Previously the icon stayed identical for all three modes and
@@ -2921,8 +2941,9 @@ if (savedW) sidebar.style.width = `${savedW}px`;
  * @param {string}  aboveId     – ID of the section above the splitter
  * @param {string}  belowId     – ID of the section below the splitter
  * @param {string}  storageKey  – localStorage key for persisting the above-section height
- * @param {number}  minAbove    – minimum height (px) for the section above
- * @param {number}  minBelow    – minimum height (px) for the section below
+ * @param {number}  minAbove    – minimum height (px) for the section above; a larger CSS
+ *                                min-height on the section wins (read when a drag starts)
+ * @param {number}  minBelow    – minimum height (px) for the section below; same rule
  * @param {boolean} pinBelow    – when false, only the above section gets an explicit height;
  *                                the below section stays flex:1 and fills remaining space.
  *                                Use false for the bottom-most splitter so the last panel
@@ -2936,12 +2957,19 @@ function _initHSplitter(splitterId, aboveId, belowId, storageKey,
   if (!splitter || !above || !below) return;
 
   let dragging = false, startY = 0, startAboveH = 0, startBelowH = 0;
+  let loAbove = minAbove, loBelow = minBelow;
+  // Folders/Playlists keep a CSS min-height above 40 px (header + a sliver of
+  // rows); clamping the drag to less would let CSS hold the section at its
+  // floor while the other one still grows, squeezing a third section instead.
+  const cssMin = (el, floor) => Math.max(floor, parseFloat(getComputedStyle(el).minHeight) || 0);
 
   splitter.addEventListener('mousedown', (e) => {
     dragging    = true;
     startY      = e.clientY;
     startAboveH = above.offsetHeight;
     startBelowH = below.offsetHeight;
+    loAbove     = cssMin(above, minAbove);
+    loBelow     = cssMin(below, minBelow);
     splitter.classList.add('dragging');
     document.body.style.cursor     = 'row-resize';
     document.body.style.userSelect = 'none';
@@ -2952,7 +2980,7 @@ function _initHSplitter(splitterId, aboveId, belowId, storageKey,
     if (!dragging) return;
     const delta  = e.clientY - startY;
     const totalH = startAboveH + startBelowH;
-    let newAbove = Math.max(minAbove, Math.min(totalH - minBelow, startAboveH + delta));
+    let newAbove = Math.max(loAbove, Math.min(totalH - loBelow, startAboveH + delta));
 
     above.style.height = `${newAbove}px`;
     above.style.flex   = 'none';
@@ -3007,14 +3035,18 @@ _initHSplitter('sidebar-splitter',         'section-smart',   'section-playlists
 
 // Post-restore sanity check: if the three persisted splitter heights still
 // sum to more than the sidebar can display, the last (flex:1) section —
-// Playlists — gets clipped to 0 px and users see an empty strip instead of
-// the playlist list.  This happens when localStorage carries over heights
+// Playlists — is pushed off the bottom and users see an empty strip instead
+// of the playlist list.  This happens when localStorage carries over heights
 // from a session with a taller sidebar (external monitor, resized window).
 // Detect and reset once; the user gets the default flex layout back.
+// Tested against the sidebar's bottom edge, not Playlists' own height: its
+// CSS min-height keeps that up while it is pushed out of view (and a
+// Playlists sitting at its floor in a short window is not a stale layout).
 requestAnimationFrame(() => {
   const plSec = document.getElementById('section-playlists');
   if (!plSec) return;
-  if (plSec.offsetHeight < 60) {
+  const plBottom = plSec.getBoundingClientRect().bottom;
+  if (plBottom > plSec.parentElement.getBoundingClientRect().bottom + 0.5) {
     ['sb_split_lib', 'sb_split_lib_b',
      'sb_split_fold', 'sb_split_fold_b',
      'sb_split_smart', 'sb_split_smart_b',
@@ -3258,6 +3290,17 @@ function connectWS() {
         // bug).  refresh() itself now preserves expansion as a backstop.
         if (!msg.silent) FolderTree.refresh();
       }
+    } else if (msg.event === 'availability_changed') {
+      // A drive / share went offline or came back (or the setting changed):
+      // offline.js re-reads the state and fires soniqboom:availability-changed.
+      Offline.refresh();
+    } else if (msg.event === 'catalogue_changed') {
+      // A catalogue (Admin → External sources) was built, refreshed or
+      // removed: the folder tree gains / loses its root, the open view
+      // re-reads in place.
+      document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
+      document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+      Library.refreshBadges();
     } else if (msg.event === 'repair_progress') {
       // The metadata repair task (admin > Library > Repair Garbled
       // Metadata) emits progress via the same WS.  We don't render
@@ -3705,6 +3748,8 @@ document.addEventListener('keydown', (e) => {
     Library.setAliasMap(cfg.folder_aliases || {});
     Library.setExposeLocalFiles(cfg.expose_local_files !== false);
   } catch (_) { /* Store not ready — ignore */ }
+  // "Tracks on unavailable drives": the player skips from the first track.
+  Offline.init({ mode: (window.__sbConfig || {}).offline_tracks });
 })();
 
 // ── Startup intro animation ───────────────────────────────────────────────────

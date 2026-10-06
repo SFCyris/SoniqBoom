@@ -699,7 +699,14 @@ body::before {
 /* `flex: 0 1 auto` lets library/smart shrink when the sidebar is short
    (otherwise they keep their content height and squash folders/playlists). */
 #sidebar #section-library  { min-height: 40px; overflow-y: auto; flex: 0 1 auto; }
-#sidebar #section-folders  { min-height: 40px; display: flex; flex-direction: column; flex: 1; }
+/* Folders and Playlists (`flex: 1`, basis 0) only get the space the other
+   sections leave, so their min-height is all they keep in a short sidebar.
+   55 px = 12 px padding + the header (26–28 px, by the engine's font
+   metrics) + ~15 px of body: the first row's chevron centre is on screen
+   (clickable) and the rest scrolls.  At 40 px the header alone filled it (Firefox, with its
+   taller text, got a 5.5 px tree body at 900 px tall; every engine 0–2 px
+   at 800).  Where a section's share is already larger this changes nothing. */
+#sidebar #section-folders  { min-height: 55px; display: flex; flex-direction: column; flex: 1; }
 #sidebar #section-smart    { min-height: 40px; overflow-y: auto; flex: 0 1 auto; }
 
 #sidebar h3 {
@@ -921,7 +928,7 @@ body::before {
    the generic `#sidebar section` rule (0,1,1) on the `flex` property. */
 #sidebar #section-playlists {
   flex: 1;
-  min-height: 40px;
+  min-height: 55px;     /* header + ~15 px of list — see #section-folders */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -2571,6 +2578,8 @@ input[type="range"]:hover::-moz-range-thumb {
   transition: background 0.12s;
 }
 .btn-secondary:hover { background: rgba(255,255,255,0.12); }
+/* A link styled as a secondary button (e.g. Settings → "Validated set ↗"). */
+a.btn-secondary { display: inline-flex; align-items: center; text-decoration: none; box-sizing: border-box; }
 
 /* Admin panel (shown after auth) */
 #admin-panel {
@@ -3069,7 +3078,8 @@ input[type="range"]:hover::-moz-range-thumb {
   gap: 10px;
   flex-wrap: wrap;
 }
-.admin-io-row button {
+.admin-io-row button,
+.admin-io-row a.btn-secondary {
   background: rgba(255,255,255,0.06);
   border: 1px solid var(--glass-border);
   border-radius: 8px;
@@ -3079,7 +3089,8 @@ input[type="range"]:hover::-moz-range-thumb {
   padding: 7px 16px;
   transition: background 0.12s;
 }
-.admin-io-row button:hover { background: rgba(255,255,255,0.12); color: var(--text0); }
+.admin-io-row button:hover,
+.admin-io-row a.btn-secondary:hover { background: rgba(255,255,255,0.12); color: var(--text0); }
 
 /* Reindex button */
 .btn-reindex {
@@ -6396,6 +6407,59 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 }
 .track-defect-corrupt::before { content: '⚠'; }
 
+/* A track that can't play right now — its drive or share is offline and no
+   cached copy can serve it (Settings → "Tracks on unavailable drives": Mark;
+   playlists and folders in Hide mode too).  The row is dimmed and its title
+   carries an "offline" badge: a glyph + a word (never colour alone, WCAG
+   1.4.1) whose tooltip says why and whose screen-reader text is part of the
+   title.  The row stays clickable — a click tries and reports the reason. */
+#track-tbody tr.track-offline > td:not(.col-title),
+.queue-row.track-offline .queue-track-artist,
+.queue-row.track-offline .queue-track-dur,
+.sp-row.track-offline .sp-sub,
+.sp-row.track-offline .sp-dur { opacity: 0.75; }    /* (text stays ≥ 4.5:1 in both themes) */
+.queue-row.track-offline .queue-row-art,
+.sp-row.track-offline .sp-art { opacity: 0.5; }
+#track-tbody tr.track-offline > td.col-title,
+.queue-row.track-offline .queue-track-title,
+.sp-row.track-offline .sp-title-text { color: var(--text2); }
+.track-offline-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 7px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  vertical-align: middle;
+  white-space: nowrap;
+  text-transform: uppercase;
+  color: var(--text0);
+  background: color-mix(in srgb, var(--text1) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text1) 55%, transparent);
+  cursor: help;
+  flex-shrink: 0;
+}
+.track-offline-icon { font-size: 10px; line-height: 1; }
+/* The queue / playlist / search-preview title lines host the badge beside an
+   ellipsised title. */
+.queue-row .queue-track-titlerow { display: flex; align-items: center; min-width: 0; }
+.queue-row .queue-track-titlerow > .queue-track-title { flex: 0 1 auto; min-width: 0; }
+.queue-row .track-offline-badge,
+#playlist-tracks .track-offline-badge { margin-left: 5px; line-height: 13px; }
+#track-table td.col-title .title-badged { display: flex; align-items: center; min-width: 0; max-width: 100%; }
+/* (white-space follows the cell: one ellipsised line on a desktop row, wrapped
+   in the stacked ≤900 px rows — a forced nowrap there made one long badged
+   title widen the whole table) */
+#track-table td.col-title .title-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#track-table td.col-title .title-badged > .track-defect-badge,
+#track-table td.col-title .title-badged > .track-offline-badge { flex-shrink: 0; }
+.sp-title.sp-title--badged { display: flex; align-items: center; min-width: 0; }
+.sp-title--badged .sp-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Shape-based codability so format isn't conveyed by colour alone (WCAG
    1.4.1).  Filled dot = lossless, hollow ring = lossy.  Tracker/SID/MIDI
    keep no glyph — they're already shape-unique formats. */
@@ -6585,6 +6649,57 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
    surface) and links in a darker orange (5.1:1 on --bg2 and lighter). */
 :root[data-theme="light"] .admin-hint { color: var(--text2); }
 :root[data-theme="light"] .admin-hint a { color: #a8480c; }
+
+/* ── External sources (Admin → Library): one card per archive ───────────── */
+.ext-intro { margin-top: 0; }
+.ext-source {
+  margin-top: 10px;
+  padding: 10px 12px 12px;
+  max-width: 560px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.02);
+}
+.ext-source-head label { font-size: 13px; font-weight: 600; color: var(--text0); }
+.ext-source .admin-hint { max-width: none; }
+.ext-source-options { display: grid; gap: 4px; margin-top: 8px; }
+.ext-source-options.ext-off label { color: var(--text2); }
+#setting-modland-scope { flex: 0 1 auto; min-width: 0; max-width: 72%; }
+.ext-status { margin-top: 8px; }
+.ext-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 6px;
+  accent-color: var(--accent);
+}
+.ext-progress[hidden] { display: none; }
+.ext-source .admin-io-row { margin-top: 8px; }
+/* "Refresh now" and, right beside it, how often the index is updated: the
+   select takes the button's box (height, border, radius, type). */
+.ext-refresh-row { align-items: stretch; }
+.ext-interval {
+  -webkit-appearance: none;
+  appearance: none;              /* the same box in every engine (WebKit drew its own) */
+  background-color: rgba(255,255,255,0.06);
+  /* the drop-down chevron, drawn in the text colour */
+  background-image: linear-gradient(45deg, transparent 50%, var(--text1) 50%),
+                    linear-gradient(135deg, var(--text1) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 55%, calc(100% - 9px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  color: var(--text1);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 0 28px 0 12px;
+}
+.ext-interval:hover:not(:disabled) { background-color: rgba(255,255,255,0.12); color: var(--text0); }
+.ext-interval:disabled { cursor: default; opacity: 0.6; }
+.ext-interval-info { align-self: center; font-size: 13px; margin-left: -2px; }
+.admin-dir-catalogue .admin-dir-path { font-weight: 600; }
 
 /* ── Cross-platform shims ──────────────────────────────────────────────── */
 
@@ -7464,6 +7579,10 @@ body.auth-blocked > #app {
     min-width: 44px;
     min-height: 44px;
   }
+  /* The 44 px header buttons make the Folders/Playlists header 54 px, so
+     their floor grows by the same amount (see #section-folders). */
+  #sidebar #section-folders,
+  #sidebar #section-playlists { min-height: 83px; }
   /* Hide bitrate column first — meta-info, rarely actionable on the go. */
   #track-table th.col-bitrate,
   #track-table td.col-bitrate { display: none; }

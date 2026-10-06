@@ -58,6 +58,11 @@ def read_source_bytes(path_str: str, *, lane: str = "stream") -> bytes | None:
             scan_root, remote_path = parse_remote_path(outer)
             if not remote_path:
                 return None
+            # A catalogue tune (core/catalogue.py) is read only from the cache
+            # — or, on the stream lane, by joining its play's running download.
+            from soniqboom.core import catalogue
+            if not catalogue.fetch_ok(outer, "stream" if lane == "stream" else "scan"):
+                return None
             # No source (not connected, or its sign-in refused): what the
             # remote cache holds still answers.
             source = get_source(scan_root)

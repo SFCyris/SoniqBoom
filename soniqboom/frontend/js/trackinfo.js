@@ -953,8 +953,25 @@ function _render(track) {
   _show('ti-disc',  discStr);
 
   // ── DETAILS ──
-  const genre = Array.isArray(track.genre) ? track.genre.join(', ') : track.genre;
-  _show('ti-genre',    genre);
+  // The genres the library lists the track under: genres SoniqBoom derived
+  // for a retro track whose file names none (category, platform, game /
+  // group names — ``genre_derived``) first, then the file's own, each once.
+  const _own = Array.isArray(track.genre) ? track.genre : (track.genre ? [track.genre] : []);
+  const _derived = Array.isArray(track.genre_derived) ? track.genre_derived : [];
+  const _gSeen = new Set();
+  const _gAll = [..._derived, ..._own].filter(g => {
+    const k = String(g || '').trim().toLowerCase();
+    if (!k || _gSeen.has(k)) return false;
+    _gSeen.add(k);
+    return true;
+  });
+  _show('ti-genre', _gAll.length ? _gAll.join(', ') : null);
+  const _gEl = document.getElementById('ti-genre');
+  if (_gEl) {
+    _gEl.title = _derived.length
+      ? `${_derived.join(', ')}: derived by SoniqBoom (the file names no genre)`
+      : '';
+  }
   _show('ti-duration', track.duration, _fmt);
   _show('ti-bpm',      track.bpm);
   _show('ti-comment',  track.comment);
@@ -981,7 +998,9 @@ function _render(track) {
   _show('ti-channels',    track.channels,    v => _fmtChannels(v, track));
   _show('ti-bitrate',     track.bitrate,     _fmtBitrate);
   _show('ti-file-size',   track.file_size,   _fmtSize);
-  _show('ti-added',       track.added_at,    _fmtDate);
+  // (A catalogue tune listed by the first build carries added_at 1 — it sorts
+  // as the oldest — and has no meaningful "added" date: the row is hidden.)
+  _show('ti-added',       (track.added_at || 0) > 86400 ? track.added_at : null, _fmtDate);
   _show('ti-path',        track.path);
 
   // ── Chapters (podcast/audiobook) — appended after the regular tags
@@ -1220,8 +1239,22 @@ function _subAllVirtual() {
   return _subAllWires().map(w => _subVirtual(st.track, w));
 }
 
+// The wire of this file's tune now loaded in the player, else null.
+function _currentSubWire() {
+  const st = _subState, cur = Player.currentTrack;
+  if (!st || !cur || cur.id !== st.track.id) return null;
+  // A plain play of the file (no ``subsong``) plays its default tune.
+  return Number.isInteger(cur.subsong) ? cur.subsong
+    : subsongTuneToWire(st.def, st.start, st.count);
+}
+
 function _subAction(act, wire, anchor) {
   const st = _subState; if (!st || !(wire >= 0)) return;
+  // The loaded tune: pause / resume — unless it failed (then ▶ tries it again).
+  if (act === 'play' && wire === _currentSubWire() && !Player.audio?.error) {
+    Player.playPause();
+    return;
+  }
   if (act === 'queue') {
     Player.addToQueue(_subVirtual(st.track, wire));
     window.Toast?.ok?.(`Added tune ${_subTune(wire)} to the queue`);
@@ -1239,17 +1272,25 @@ async function _subToPlaylist(entries, anchor) {
   } catch (_) { window.Toast?.error?.('Could not open playlists.'); }
 }
 
+// The loaded tune's row is highlighted and its ▶ is a pause / resume button.
 function _highlightPlayingSubsong() {
   if (!_subListEl) return;
-  _subListEl.querySelectorAll('.ti-sub-row.playing').forEach(r => r.classList.remove('playing'));
-  const st = _subState, cur = Player.currentTrack;
-  if (st && cur && cur.id === st.track.id) {
-    // A plain play of the file (no ``subsong``) plays its default tune.
-    const wire = Number.isInteger(cur.subsong) ? cur.subsong
-      : subsongTuneToWire(st.def, st.start, st.count);
-    const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${wire}"]`);
-    if (row) row.classList.add('playing');
-  }
+  _subListEl.querySelectorAll('.ti-sub-row.playing').forEach(r => {
+    r.classList.remove('playing');
+    _paintSubPlayBtn(r, false);
+  });
+  const wire = _currentSubWire();
+  if (wire === null) return;
+  const row = _subListEl.querySelector(`.ti-sub-row[data-wire="${wire}"]`);
+  if (row) { row.classList.add('playing'); _paintSubPlayBtn(row, Player.playing); }
+}
+
+function _paintSubPlayBtn(row, playing) {
+  const b = row.querySelector('.ti-sub-rbtn[data-act="play"]'); if (!b) return;
+  const tune = b.getAttribute('aria-label').replace(/^(Play|Pause) /, '');
+  b.innerHTML = playing ? '&#9646;&#9646;' : '&#9654;';
+  b.title = playing ? 'Pause' : 'Play';
+  b.setAttribute('aria-label', `${playing ? 'Pause' : 'Play'} ${tune}`);
 }
 
 // One delegated handler covers any tune count (even 256) — no per-row listeners.
@@ -1263,6 +1304,7 @@ if (_subListEl) {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     const row = e.target.closest('.ti-sub-row'); if (!row) return;
     e.preventDefault();
+    e.stopPropagation();                  // not the page's Space play/pause as well
     _subAction('play', parseInt(row.dataset.wire, 10));
   });
 }
@@ -1288,9 +1330,10 @@ document.getElementById('ti-sub-addall-pl')?.addEventListener('click', (e) => {
 document.getElementById('ti-sub-jump-in')?.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   const n = parseInt(e.target.value, 10);           // the TUNE number, as displayed
-  if (_subState && n >= 1 && n <= _subState.count) { _subAction('play', _subWire(n)); e.target.value = ''; }
+  if (_subState && n >= 1 && n <= _subState.count) { _subAction('start', _subWire(n)); e.target.value = ''; }
 });
 Player.on?.('trackchange', () => _highlightPlayingSubsong());
+Player.on?.('statechange', () => _highlightPlayingSubsong());
 
 // ── HVSC STIL commentary + SID chip badge ─────────────────────────────────────
 // STIL is the SID Tune Information List — per-file (and per-subtune) trivia.

@@ -17,6 +17,7 @@ import { attachRowGestures, attachListGestures, attachDragReorder } from '../ges
 import { fmtDur, esc, trackActions, playlistEntry } from './_common.js';
 import { artPlaceholderEmoji, probeAdlibDurations } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
+import { offlineKind, offlineBadge, Offline } from '../../offline.js';
 
 const PAGE_SIZE = 100;
 
@@ -116,20 +117,27 @@ export function mountLibrary(root, ctx) {
     if (src) img.src = src; else img.removeAttribute('src');
   }
 
-  function setTitle(row, text, defect = '', detail = '') {
+  function setTitle(row, text, defect = '', detail = '', offline = '') {
     const title = row.querySelector('.m-row-title');
-    // Health badge for a known playback defect — only defective rows (rare) take
-    // the flex layout so the common path keeps its plain ellipsised text.
-    if (defect) {
+    row.classList.toggle('track-offline', !!offline);
+    // Health badge for a known playback defect, "offline" for a track that
+    // can't play right now — only badged rows (rare) take the flex layout so the
+    // common path keeps its plain ellipsised text.
+    if (defect || offline) {
       title.classList.add('m-row-title--badged');
       const ttlText = document.createElement('span');
       ttlText.className = 'm-row-title-text';
       ttlText.textContent = text;
-      const badge = document.createElement('span');
-      badge.className = `track-defect-badge track-defect-${defect}`;
-      badge.textContent = defect;
-      badge.title = detail || '';
-      title.replaceChildren(ttlText, badge);
+      const parts = [ttlText];
+      if (defect) {
+        const badge = document.createElement('span');
+        badge.className = `track-defect-badge track-defect-${defect}`;
+        badge.textContent = defect;
+        badge.title = detail || '';
+        parts.push(badge);
+      }
+      if (offline) parts.push(offlineBadge(offline));
+      title.replaceChildren(...parts);
     } else {
       title.classList.remove('m-row-title--badged');
       title.textContent = text;
@@ -149,7 +157,7 @@ export function mountLibrary(root, ctx) {
       row.__item = item;
       const { display } = groupValue(item);
       delete row.dataset.trackId;
-      row.classList.remove('playing');
+      row.classList.remove('playing', 'track-offline');
       setArt(row, emojiFor(group), '');
       setTitle(row, display);
       const count = item.count ? `${item.count}` : '';
@@ -168,7 +176,7 @@ export function mountLibrary(root, ctx) {
     // Art: the emoji placeholder always paints; the cover fades in over it.
     setArt(row, artPlaceholderEmoji(t), t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : ''));
     const defect = (t.defect === 'partial' || t.defect === 'corrupt') ? t.defect : '';
-    setTitle(row, t.title || '—', defect, t.defect_detail);
+    setTitle(row, t.title || '—', defect, t.defect_detail, offlineKind(t));
     row.querySelector('.m-row-meta .m-row-artist').textContent = t.artist || t.album_artist || '';
     const trail = row.querySelector('.m-row-trail');
     trail.textContent = fmtDur(t.duration);
@@ -253,6 +261,22 @@ export function mountLibrary(root, ctx) {
   backBtn.addEventListener('click', () => {
     crumb = null;
     render();
+  });
+
+  // Which tracks can play changed (a drive came back / went away, or the
+  // "Tracks on unavailable drives" setting).  Hide (now or before): the lists
+  // change length — re-read the open one.  Mark / Show: the same rows — their
+  // flags are re-read in place, the scroll position kept.
+  document.addEventListener('soniqboom:availability-changed', (e) => {
+    const d = (e && e.detail) || {};
+    if (d.mode === 'hide' || d.prevMode === 'hide') { render(); return; }
+    if (mode !== 'tracks' && mode !== 'pltracks') return;
+    const list = tracks;
+    Promise.resolve(Offline.recheckRows?.(list)).then(() => {
+      if (tracks !== list) return;
+      for (const row of vl.rows()) row.__item = null;      // (repaint rows showing the same track)
+      vl.render(true);
+    }).catch(() => {});
   });
 
   // ── Render dispatcher ────────────────────────────────────────────────
@@ -465,7 +489,7 @@ export function mountLibrary(root, ctx) {
       const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
       params.set(crumb.field, crumb.value);
       if (crumb.extraField) params.set(crumb.extraField, crumb.extraValue);
-      url = `/api/search/filter?${params}`;
+      url = `${crumb.url || '/api/search/filter'}?${params}`;
     } else {
       url = `/api/tracks?limit=${PAGE_SIZE}&offset=${offset}`;
     }
@@ -515,7 +539,7 @@ export function mountLibrary(root, ctx) {
       filter[crumb.field] = crumb.value;
       if (crumb.extraField) filter[crumb.extraField] = crumb.extraValue;
     }
-    const orderedUrl = crumb ? '/api/search/filter' : '/api/tracks';
+    const orderedUrl = crumb ? (crumb.url || '/api/search/filter') : '/api/tracks';
     const source = {
       ordered: { url: orderedUrl, params: filter },
       shuffle: { url: '/api/tracks/shuffled', params: filter },
@@ -618,6 +642,11 @@ export function mountLibrary(root, ctx) {
         label: String(value), field: 'year_min', value: String(value),
         extraField: 'year_max', extraValue: String(value),
       };
+    } else if (item.label && !String(value).trim()) {
+      // "[No Artist]" / "[No Album Artist]": the tracks whose tag is blank — the
+      // rows the bucket counts.  (``artist=`` with no value is no filter at all:
+      // it listed, played and shuffled the whole library.)
+      crumb = { label: display, field: 'untagged', value: groupField, url: '/api/tracks' };
     } else {
       crumb = { label: display, field: groupField, value: String(value) };
     }

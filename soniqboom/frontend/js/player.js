@@ -541,6 +541,34 @@ export const Player = (() => {
   // and say why) — a shuffled "next" would re-seed the radio from an unrelated
   // track.  Set by RadioMode.start/stop via setRadioActive().
   let _radioActive  = false;
+  // Settings → "Tracks on unavailable drives": in Mark / Hide mode the server
+  // flags a track that can't play right now (its drive or share is offline, no
+  // cached copy) with ``offline``, and the queue passes such tracks by whenever
+  // it moves on by itself — the next track, the first track of Play all /
+  // Shuffle all, ordered paging (``playable=1`` pages leave them out).  A track
+  // the listener clicks still plays (and says why it can't).  Show mode: off.
+  // Set by offline.js (setOfflineSkip) from the server's setting.
+  let _offlineSkip  = false;
+  // The last playSource found nothing to start because every track of the list
+  // is offline (UIs say so instead of "try again").
+  let _startAllOffline = false;
+  // A drive went away or came back under the queue: list positions moved
+  // (Hide mode's list changed length; with duplicates hidden, a copy stands in
+  // for an offline primary at its own place, Mark too), so the next ordered
+  // page starts right after the last queued list row (``after=<id>``), not at
+  // the old offset.
+  let _ordReanchor = false;
+  function _skipsOffline(t) { return _offlineSkip && !!t && typeof t === 'object' && !!t.offline; }
+  // Index of the first track at or after ``from`` the queue may move on to.
+  function _nextPlayable(from) {
+    for (let i = Math.max(0, from); i < queue.length; i++) if (!_skipsOffline(queue[i])) return i;
+    return -1;
+  }
+  // …and the last one at or before ``from`` (Prev).
+  function _prevPlayable(from) {
+    for (let i = Math.min(from, queue.length - 1); i >= 0; i--) if (!_skipsOffline(queue[i])) return i;
+    return -1;
+  }
   // [queue-core:end]
 
   // ── Crossfade / gapless ────────────────────────────────────────────────
@@ -2188,18 +2216,31 @@ export const Player = (() => {
 
   // One page of the source's order.  ``kind`` = 'ordered' (the view's own list
   // endpoint + params) | 'shuffled' (the seeded permutation of the same filter).
-  // Both answer either a bare array or ``{total, tracks}``.
+  // Both answer either a bare array or ``{total, tracks}``.  ``playable`` (an
+  // ordered page the queue moves into by itself, while offline tracks are
+  // skipped): ``playable=1`` — the list without the tracks that can't play,
+  // each row with its list position ``_pos``, plus ``next_offset`` (where the
+  // list goes on) and ``ended``.  A shuffled order never holds those tracks.
   const PAGE_TIMEOUT_MS = 20000;
-  async function _fetchPage(src, kind, offset, limit, seed) {
+  async function _fetchPage(src, kind, offset, limit, seed, playable = false, after = null) {
     const spec = src && (kind === 'shuffled' ? src.shuffle : src.ordered);
-    if (!spec || !spec.url) return { tracks: [], total: null, ended: true };
+    if (!spec || !spec.url) return { tracks: [], total: null, ended: true, next: null };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(spec.params || {})) {
       if (v !== null && v !== undefined && v !== '') p.set(k, String(v));
     }
     p.set('offset', String(offset));
     p.set('limit', String(limit));
-    if (kind === 'shuffled') p.set(spec.seedParam || 'seed', String(seed));
+    if (kind === 'shuffled') {
+      p.set(spec.seedParam || 'seed', String(seed));
+      // (A folder's shuffle reads on past the tracks that can't play and says
+      // where it got to — ``next_offset`` / ``ended``; the library's shuffle
+      // never deals them and ignores this.)
+      if (playable && _offlineSkip) p.set('playable', '1');
+    } else if (playable && _offlineSkip) {
+      p.set('playable', '1');
+      if (after) p.set('after', String(after));
+    }
     // A request that never answers (half-open connection, laptop woken on a dead
     // network) must FAIL, not hang: a pending page would park the lookahead — and
     // "Shuffle all" — for the rest of the session.  A cold deal takes ~0.2 s.
@@ -2210,10 +2251,15 @@ export const Player = (() => {
     const j = await r.json();
     const tracks = Array.isArray(j) ? j : (Array.isArray(j?.tracks) ? j.tracks : []);
     const total  = (!Array.isArray(j) && typeof j?.total === 'number') ? j.total : null;
-    return { tracks, total };
+    const next   = (!Array.isArray(j) && typeof j?.next_offset === 'number') ? j.next_offset : null;
+    const ended  = (!Array.isArray(j) && typeof j?.ended === 'boolean') ? j.ended : null;
+    return { tracks, total, next, ended };
   }
 
-  function _pageWasLast(tracks, total, offset, limit, mode) {
+  // ``ended``: a playable page says itself whether the list ended (it may come
+  // back empty in the middle of a long run of offline tracks).
+  function _pageWasLast(tracks, total, offset, limit, mode, ended = null) {
+    if (typeof ended === 'boolean') return ended;     // (a playable page says so itself)
     // A shuffled order reports its own exact length, so only that decides: an
     // empty page inside it just means those ids were deleted since it was dealt.
     if (mode === 'shuffled' && total != null) return offset + limit >= total;
@@ -2236,13 +2282,18 @@ export const Player = (() => {
   // The track "next" will play, or null.  A pageable window never wraps to its
   // own first row (that is not the list's first track); a plain array wraps
   // only under repeat-all, as before.
+  // (Tracks that can't play right now are passed by — see _offlineSkip.)
   function _peekNext() {
-    if (queueIdx < queue.length - 1) return queue[queueIdx + 1];
-    if (!_srcPageable() && repeatMode === 'all' && queue.length > 1) return queue[0];
+    const i = _nextPlayable(queueIdx + 1);
+    if (i >= 0) return queue[i];
+    if (!_srcPageable() && repeatMode === 'all' && queue.length > 1) {
+      const j = _nextPlayable(0);
+      return j >= 0 && j !== queueIdx ? queue[j] : null;
+    }
     return null;
   }
   function _hasNextTrack() {
-    return queueIdx < queue.length - 1 || _srcHasMore();
+    return _nextPlayable(queueIdx + 1) >= 0 || _srcHasMore();
   }
 
   function _trimBehind() {
@@ -2253,8 +2304,12 @@ export const Player = (() => {
     queueIdx -= drop;
   }
 
+  // A playable page's rows say their own list position (``_pos``): offline
+  // tracks were left out between them.
   function _notePositions(tracks, firstPos) {
-    tracks.forEach((t, i) => { if (t && typeof t === 'object') _ordPos.set(t, firstPos + i); });
+    tracks.forEach((t, i) => {
+      if (t && typeof t === 'object') _ordPos.set(t, typeof t._pos === 'number' ? t._pos : firstPos + i);
+    });
   }
 
   // The list row that would play next in list order: the first upcoming track
@@ -2274,16 +2329,18 @@ export const Player = (() => {
   // every advance.
   function _ensureLookahead() {
     if (!_srcHasMore() || _extendP) return;
-    if (queue.length - 1 - queueIdx >= Q_LOOKAHEAD) return;
+    if (_aheadCount() >= Q_LOOKAHEAD) return;
     const gen = _srcGen, mode = _srcMode, src = _src, seed = _seed;
     const off = mode === 'shuffled' ? _shufNext : _ordNext;
-    if (_srcTotal != null && off >= _srcTotal) { _srcEnded = true; return; }
-    const p = _fetchPage(src, mode, off, Q_PAGE, seed).then(({ tracks, total }) => {
+    const after = (mode === 'ordered' && _ordReanchor) ? _anchorId() : null;
+    if (!after && _srcTotal != null && off >= _srcTotal) { _srcEnded = true; return; }
+    const p = _fetchPage(src, mode, off, Q_PAGE, seed, true, after).then(({ tracks, total, next, ended }) => {
       if (gen !== _srcGen || mode !== _srcMode) return;      // queue was replaced meanwhile
+      if (after) _ordReanchor = false;
       if (total != null) _srcTotal = total;
-      if (mode === 'shuffled') _shufNext = off + Q_PAGE;
-      else { _ordNext = off + Q_PAGE; _notePositions(tracks, off); }
-      if (_pageWasLast(tracks, _srcTotal, off, Q_PAGE, mode)) _srcEnded = true;
+      if (mode === 'shuffled') _shufNext = next != null ? Math.max(next, off + 1) : off + Q_PAGE;
+      else { _ordNext = next != null ? Math.max(next, off) : off + Q_PAGE; _notePositions(tracks, off); }
+      if (_pageWasLast(tracks, _srcTotal, off, Q_PAGE, mode, ended)) _srcEnded = true;
       // Ordered: skip anything already queued.  Shuffled: skip what is current /
       // still ahead, and whatever already PLAYED outside this order (the pinned
       // track reappears once in the permutation).  Rows left behind the current
@@ -2306,6 +2363,50 @@ export const Player = (() => {
       // pull the next one.  Never on failure, or a dead server would hot-loop.
       if (ok && gen === _srcGen) _ensureLookahead();
     });
+  }
+
+  // The ids of the last queued rows that came from the ordered list, newest
+  // first (comma-joined; the server starts after the newest it still lists —
+  // the newest may be hidden now), or null.
+  function _anchorId() {
+    const ids = [];
+    for (let i = queue.length - 1; i >= 0 && ids.length < 8; i--) {
+      const t = queue[i];
+      if (t && typeof t === 'object' && t.id && _ordPos.has(t)) ids.push(t.id);
+    }
+    return ids.length ? ids.join(',') : null;
+  }
+
+  // Tracks queued after the current one that the queue may still move on to.
+  function _aheadCount() {
+    if (!_offlineSkip) return queue.length - 1 - queueIdx;
+    let n = 0;
+    for (let i = queueIdx + 1; i < queue.length; i++) if (!_skipsOffline(queue[i])) n++;
+    return n;
+  }
+
+  // The first page of an order the queue starts by itself (a restart, Play
+  // all): for a playable ordered page that came back empty in the middle of a
+  // long run of offline tracks — or a shuffled page whose tracks are all
+  // offline (a folder's shuffle skips them page by page) — read on (bounded)
+  // until something can play.
+  const FIRST_PAGE_HOPS = 200;
+  async function _firstPage(desc, mode, offset, seed, playable) {
+    let off = offset;
+    let page = await _fetchPage(desc, mode, off, Q_PAGE, seed, playable);
+    for (let hops = 0; playable && !page.tracks.length && hops < FIRST_PAGE_HOPS; hops++) {
+      if (page.ended === false && page.next != null && page.next > off) {
+        off = page.next;                      // (a playable page: where it got to)
+      } else if (mode === 'shuffled' && page.ended == null && page.total != null
+                 && off + Q_PAGE < page.total) {
+        off += Q_PAGE;                        // (a plain shuffled page with a gap)
+      } else {
+        break;
+      }
+      page = await _fetchPage(desc, mode, off, Q_PAGE, seed, playable);
+    }
+    page.offset = off;
+    return page;
   }
 
   function _startTrack(t) {
@@ -2333,28 +2434,33 @@ export const Player = (() => {
     // were, so the next attempt restarts cleanly instead of resuming a half-reset
     // order (which skipped the rows still sitting in the window).
     let page, failed = false;
-    try { page = await _fetchPage(_src, mode, 0, Q_PAGE, seed); }
+    try { page = await _firstPage(_src, mode, 0, seed, true); }
     catch (_) { page = { tracks: [] }; failed = true; }
     if (gen !== _srcGen || mode !== _srcMode) return;
     if (!page.tracks.length) {
       emit('statechange', { playing: false });
       if (failed) emit('queuestall', {});
+      // (Read to its end with nothing to start: every track is offline now.)
+      else if (_offlineSkip && (page.ended === true || page.total === 0)) emit('offlinequeue', {});
       return;
     }
     if (page.total != null) _srcTotal = page.total;
     if (_srcMode === 'shuffled') {
       _seed = seed;
-      _shufNext = Q_PAGE;
+      _shufNext = page.next != null ? page.next : (page.offset || 0) + Q_PAGE;   // (past what was read on)
       _shufExtras = new Set();                    // a new pass: everything may play again
       _played = new WeakSet();
       // …but not the track that just ended, back to back.
       if (page.tracks.length > 1 && last && page.tracks[0].id === last.id) {
         page.tracks.push(page.tracks.shift());
       }
-    } else { _ordNext = Q_PAGE; _notePositions(page.tracks, 0); }
-    _srcEnded = _pageWasLast(page.tracks, _srcTotal, 0, Q_PAGE, _srcMode);
+    } else {
+      _ordNext = page.next != null ? page.next : page.offset + Q_PAGE;
+      _notePositions(page.tracks, page.offset);
+    }
+    _srcEnded = _pageWasLast(page.tracks, _srcTotal, page.offset, Q_PAGE, _srcMode, page.ended);
     queue = page.tracks;
-    queueIdx = 0;
+    queueIdx = Math.max(0, _nextPlayable(0));
     _playCurrent();
   }
 
@@ -2363,8 +2469,11 @@ export const Player = (() => {
   function _advance() {
     if (!queue.length) return;
     _explicitPick = false;
-    if (queueIdx < queue.length - 1) {
-      queueIdx++;
+    // The next track the queue may move on to: tracks that can't play right now
+    // are passed by (Mark / Hide — see _offlineSkip), never started.
+    const nextIdx = _nextPlayable(queueIdx + 1);
+    if (nextIdx >= 0) {
+      queueIdx = nextIdx;
       _playCurrent();
       return;
     }
@@ -2377,7 +2486,8 @@ export const Player = (() => {
         const gen = _srcGen;
         pending.then((ok) => {
           if (gen !== _srcGen) return;
-          if (queueIdx < queue.length - 1) { queueIdx++; _playCurrent(); }
+          const at = _nextPlayable(queueIdx + 1);
+          if (at >= 0) { queueIdx = at; _playCurrent(); }
           else if (ok) _advance();     // page added nothing new → keep going / wrap
           else {
             // The next page could not be fetched and nothing is left to play.  Stay
@@ -2397,6 +2507,13 @@ export const Player = (() => {
 
   function _wrapToStart() {
     if (_srcPageable() && !_radioActive) { _restartSource(); return; }
+    if (_nextPlayable(0) < 0) {
+      // Nothing in this queue can play right now (every track's drive or share
+      // is offline): stop rather than go round failing.
+      emit('statechange', { playing: false });
+      emit('offlinequeue', {});
+      return;
+    }
     _played = new WeakSet();                    // a new pass, shuffled or not: everything may play again
     if (shuffle && !_radioActive && queue.length > 1) {
       // A full pass of a shuffled plain queue is done — deal a new order rather
@@ -2405,7 +2522,7 @@ export const Player = (() => {
       queue = _shuffleInPlace(queue.slice());   // own copy — never reorder a caller's array
       if (queue[0] === last) [queue[0], queue[queue.length - 1]] = [queue[queue.length - 1], queue[0]];
     }
-    queueIdx = 0;
+    queueIdx = _nextPlayable(0);
     _playCurrent();
   }
 
@@ -2445,39 +2562,56 @@ export const Player = (() => {
     _explicitPick = true;     // the listener asked for THIS track: report a failure, don't bounce them forward
     // The queue is in play order, so "previous" is simply the entry before —
     // under shuffle that is the track that actually played before this one.
-    if (queueIdx > 0) {
-      queueIdx--;
+    // (Tracks that can't play right now are passed by, as Next does.)
+    const before = _prevPlayable(queueIdx - 1);
+    if (before >= 0) {
+      queueIdx = before;
       _playCurrent();
       return;
     }
     if (_srcPageable()) {
-      // First row of a pageable window: page BACKWARDS through the ordered
-      // list from that row's list position; a dealt / hand-queued first row has
-      // none, so there is no "before".
-      const first = _srcMode === 'ordered' ? _ordPos.get(queue[0]) : undefined;
-      if (first > 0 && !_backP) {                 // one backward page at a time
-        const gen = _srcGen, src = _src;
-        const start = Math.max(0, first - Q_PAGE);
-        const p = _fetchPage(src, 'ordered', start, first - start, 0).then(({ tracks }) => {
-          if (gen !== _srcGen || !tracks.length) return;
-          _notePositions(tracks, start);
-          // The row right before queue[0] is where Prev must land, so it always
-          // goes in; older rows that are already queued elsewhere are left out.
-          const have = new Set(queue.map(t => t && t.id));
-          const lastI = tracks.length - 1;
-          const fresh = tracks.filter((t, i) => t && t.id && (i === lastI || !have.has(t.id)));
-          if (!fresh.length) return;
-          queue = fresh.concat(queue);
-          queueIdx = fresh.length - 1;
-          _playCurrent();
-        }).catch(() => {});
-        _backP = p;
-        p.then(() => { if (_backP === p) _backP = null; });
-      }
+      _pageBack(0);
       return;
     }
-    queueIdx = queue.length - 1;          // plain array: wrap, as before
+    const last = _prevPlayable(queue.length - 1);   // plain array: wrap, as before
+    if (last < 0) return;
+    queueIdx = last;
     _playCurrent();
+  }
+
+  // First playable row of a pageable window reached going back: page BACKWARDS
+  // through the ordered list from the window's first list position (a dealt /
+  // hand-queued first row has none, so there is no "before"), and land on the
+  // last row of that page that can play — reading further back over a run of
+  // offline tracks (bounded).
+  function _pageBack(hops) {
+    const first = _srcMode === 'ordered' ? _ordPos.get(queue[0]) : undefined;
+    if (!(first > 0) || (_backP && hops === 0)) return;     // one backward walk at a time
+    const gen = _srcGen, src = _src;
+    const start = Math.max(0, first - Q_PAGE);
+    const p = _fetchPage(src, 'ordered', start, first - start, 0).then(({ tracks }) => {
+      if (gen !== _srcGen || !tracks.length) return;
+      _notePositions(tracks, start);
+      // The row right before queue[0] always goes in (Prev lands at or before
+      // it); older rows that are already queued elsewhere are left out.
+      const have = new Set(queue.map(t => t && t.id));
+      const lastI = tracks.length - 1;
+      const fresh = tracks.filter((t, i) => t && t.id && (i === lastI || !have.has(t.id)));
+      if (!fresh.length) return;
+      const shift = fresh.length;
+      queue = fresh.concat(queue);
+      const at = _prevPlayable(shift - 1);
+      if (at >= 0) {
+        queueIdx = at;
+        _playCurrent();
+        return;
+      }
+      queueIdx += shift;                      // (the current track, where it moved to)
+      emit('queuechange', { queue, queueIdx });
+      if (hops < 20) return _pageBack(hops + 1);
+    }).catch(() => {});
+    _backP = p;
+    p.then(() => { if (_backP === p) _backP = null; });
   }
 
   // Queue persistence across reloads — Apple Music / Spotify / Plexamp /
@@ -3077,9 +3211,31 @@ export const Player = (() => {
     // panel click).  Keep the source / play order intact.
     if (tracks === queue && !opts.source && !opts.shuffle) {
       queueIdx = Math.max(0, Math.min(queue.length - 1, startIdx | 0));
+      _explicitPick = opts.explicit !== false;   // (a row the listener clicked: a failure is reported, not skipped)
       _playCurrent();
-      return;
+      return true;
     }
+
+    // "Play all" / "Shuffle all" of rows none of which can play right now
+    // (Mark / Hide — see _offlineSkip): read on from the server past them when
+    // the list can be paged, else say so and leave the current queue alone.
+    const _srcOpt = opts.source && typeof opts.source === 'object' ? opts.source : null;
+    if (_offlineSkip && (opts.shuffle || opts.explicit === false)
+        && !(opts.shuffle && _srcOpt && _srcOpt.shuffle)) {
+      const arr = Array.isArray(tracks) ? tracks : Array.from(tracks);
+      const from = opts.shuffle ? 0 : Math.max(0, Math.min(arr.length - 1, startIdx | 0));
+      let any = false;
+      for (let i = from; i < arr.length && !any; i++) any = !_skipsOffline(arr[i]);
+      if (!any) {
+        if (!opts.shuffle && _srcOpt && _srcOpt.ordered) {
+          return playSource(_srcOpt, { offset: (Number(_srcOpt.offset) || 0) + arr.length, explicit: false });
+        }
+        _startAllOffline = true;
+        emit('offlinequeue', {});
+        return false;
+      }
+    }
+    _startAllOffline = false;
 
     _clearSource();
     const src = opts.source && typeof opts.source === 'object' ? opts.source : null;
@@ -3090,13 +3246,22 @@ export const Player = (() => {
     if (opts.shuffle && src && src.shuffle) {
       // "Shuffle all" on a view-backed list: even the FIRST track must come
       // from the whole result set, so don't start from the rows at hand.
-      playSource(src, { shuffle: true });
-      return;
+      return playSource(src, { shuffle: true });
     }
 
     queue    = Array.isArray(tracks) ? tracks.slice() : Array.from(tracks);
     queueIdx = Math.max(0, Math.min(queue.length - 1, startIdx | 0));
-    if (opts.shuffle) queueIdx = Math.floor(Math.random() * queue.length);
+    if (opts.shuffle) {
+      // A random first track — one that can play right now (see _offlineSkip).
+      const ok = [];
+      queue.forEach((t, i) => { if (!_skipsOffline(t)) ok.push(i); });
+      queueIdx = ok.length ? ok[Math.floor(Math.random() * ok.length)]
+                           : Math.floor(Math.random() * queue.length);
+    } else if (!_explicitPick && _skipsOffline(queue[queueIdx])) {
+      // "Play all" from a row whose drive is offline: start at the next one that plays.
+      const j = _nextPlayable(queueIdx);
+      if (j >= 0) queueIdx = j;
+    }
 
     if (src) {
       const base = Number(src.offset) || 0;
@@ -3119,6 +3284,7 @@ export const Player = (() => {
       _saveQueueSoon();
       _ensureLookahead();
     }
+    return true;
   }
 
   // Start playing a view-backed list WITHOUT having its rows at hand (a windowed
@@ -3147,10 +3313,27 @@ export const Player = (() => {
                    label: source.label || '' };
     const seed = _newSeed();
     let page;
-    try { page = await _fetchPage(desc, mode, startOff, Q_PAGE, seed); }
-    catch (_) { return gen !== _srcGen ? null : false; }   // a superseded request that ALSO failed is still not a failure
+    // (A row the listener picked plays even when it can't — and says why; Play
+    // all / Shuffle all start with a track that can play right now.)
+    try { page = await _firstPage(desc, mode, startOff, seed, !_explicitPick); }
+    catch (_) {
+      if (gen !== _srcGen) return null;   // a superseded request that ALSO failed is still not a failure
+      _startAllOffline = false;           // (a failure, not "everything is offline")
+      return false;
+    }
     if (gen !== _srcGen) return null;              // superseded by a newer request — not a failure
-    if (!page.tracks.length) return false;
+    if (!page.tracks.length) {
+      // Every track of the list is on a drive / share that is offline right now
+      // (an ordered list read to its end, or a shuffle that dealt nothing).
+      // (Or nothing could play as far as the first page read on.)
+      _startAllOffline = !_explicitPick && _offlineSkip
+        && (page.ended === true || page.ended === false
+            || (mode === 'shuffled' && page.total != null
+                && (page.offset || 0) + Q_PAGE >= page.total));
+      if (_startAllOffline) emit('offlinequeue', {});
+      return false;
+    }
+    _startAllOffline = false;
     if (opts.shuffle) _setShuffleFlag(true);       // only now: a failed start must not light the button
     // A list with no ordered endpoint gets its list order back (shuffle off)
     // from the rows the view had — which only the caller can supply.
@@ -3163,11 +3346,13 @@ export const Player = (() => {
     _srcMode = mode;
     _seed = seed;
     _srcTotal = page.total != null ? page.total : desc.total;
-    _ordResume = mode === 'ordered'  ? startOff + 1 : 0;
-    _ordNext   = mode === 'ordered'  ? startOff + Q_PAGE : 0;
-    _shufNext  = mode === 'shuffled' ? Q_PAGE : 0;
-    if (mode === 'ordered') _notePositions(page.tracks, startOff);
-    _srcEnded = _pageWasLast(page.tracks, _srcTotal, startOff, Q_PAGE, mode);
+    const first = page.offset != null ? page.offset : startOff;
+    _ordNext   = mode === 'ordered'  ? (page.next != null ? page.next : first + Q_PAGE) : 0;
+    _shufNext  = mode === 'shuffled' ? (page.next != null ? page.next : first + Q_PAGE) : 0;
+    if (mode === 'ordered') _notePositions(page.tracks, first);
+    const firstPos = mode === 'ordered' ? _ordPos.get(page.tracks[0]) : undefined;
+    _ordResume = mode === 'ordered'  ? (firstPos != null ? firstPos : first) + 1 : 0;
+    _srcEnded = _pageWasLast(page.tracks, _srcTotal, first, Q_PAGE, mode, page.ended);
     queue = page.tracks;
     queueIdx = 0;
     _startTrack(queue[0]);
@@ -4185,6 +4370,15 @@ export const Player = (() => {
     get convertDelay()       { return _getConvertDelay(); },
     setConvertDelay(ms)      { localStorage.setItem(CONVERT_DELAY_KEY, String(ms)); },
     get shuffleReplaysPlayed() { return _shuffleReplaysPlayed(); },
+    // Settings → "Tracks on unavailable drives" (offline.js): Mark / Hide → the
+    // queue passes tracks flagged ``offline`` by when it moves on by itself.
+    get offlineSkip()        { return _offlineSkip; },
+    get lastStartAllOffline() { return _startAllOffline; },
+    setOfflineSkip(on)       { _offlineSkip = !!on; },
+    reanchorOrdered()        { _ordReanchor = true; if (_srcMode === 'ordered') _srcEnded = false; },
+    // Rows of the queue changed in place (offline.js re-flagged them): repaint
+    // the queue views and keep the saved copy in step.
+    refreshQueueView()       { emit('queuechange', { queue, queueIdx }); _saveQueueSoon(); },
     // Takes effect at the next deal (shuffle switched on, or a new queue).
     setShuffleReplaysPlayed(on) {
       try { localStorage.setItem(SHUFFLE_REPLAY_KEY, on ? '1' : '0'); } catch (_) {}

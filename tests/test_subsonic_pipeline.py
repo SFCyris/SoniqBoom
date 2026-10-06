@@ -36,7 +36,7 @@ import pytest
 from soniqboom.api import subsonic as S
 from soniqboom.core import subsonic_index as sx
 from soniqboom.core import subsonic_state
-from soniqboom.core.store import TrackStore
+from soniqboom.core.store import TrackStore, track_genres
 
 from test_subsonic_parity import env  # noqa: F401 — fixture
 
@@ -125,7 +125,7 @@ _ts_num = S._ts_num
 def _ref_track_to_song(t: dict, ctx=None) -> dict:
     aa = _sx.owner_of(t)
     al = (t.get("album") or "").strip()
-    genre_list = t.get("genre") or []
+    genre_list = track_genres(t)
     genre = genre_list[0] if genre_list else ""
     suffix, content_type, t_suffix, t_mime = _delivery(t)
     ar_tag = t.get("artist")
@@ -196,8 +196,23 @@ def _ref_track_to_song(t: dict, ctx=None) -> dict:
         del out["year"]
     out["displayArtist"] = out["artist"]
     out["displayAlbumArtist"] = aa_disp
-    out["artists"] = [{"id": artist_id, "name": ar or aa_disp}]
-    out["albumArtists"] = [{"id": owner_id, "name": aa_disp}]
+    def _pairs_of(name, name_id):
+        parts = [p.strip() for p in name.split(" \u2022 ") if p.strip()] \
+            if " \u2022 " in name else []
+        if not parts:
+            return [{"id": name_id, "name": name}]
+        parts = [p for p in parts if _sx.norm_owner(p)]
+        if not parts:
+            return [{"id": name_id, "name": name}]
+        return [{"id": _artist_id(p.lower()), "name": p} for p in parts]
+    aa_tag = (t.get("album_artist") or "").strip() if isinstance(t.get("album_artist"), str) else ""
+    ar_multi = ar_tag if (ar and " \u2022 " in ar_tag and _sx.norm_owner(ar_tag) == ar) else ""
+    aa_multi = (" \u2022 ".join(p.strip() for p in aa_tag.split(" \u2022 ")
+                               if p.strip() and _sx.norm_owner(p.strip()))
+                if (aa and " \u2022 " in aa_tag and _sx.norm_owner(aa_tag) == aa) else "")
+    out["displayAlbumArtist"] = aa_multi or aa_disp
+    out["artists"] = _pairs_of(ar_multi or ar or aa_disp, artist_id)
+    out["albumArtists"] = _pairs_of(aa_multi or aa_disp, owner_id)
     if album_id is not None:
         out["albumId"] = album_id
     created = _iso(t.get("added_at"))
@@ -236,6 +251,9 @@ def _ref_track_to_song(t: dict, ctx=None) -> dict:
     out["bpm"] = _safe_int(t.get("bpm"), round_=True)
     out["comment"] = t.get("comment") or ""
     out["displayComposer"] = t.get("composer") or ""
+    from soniqboom.core.retro import is_retro_format
+    out["contributors"] = ([{"role": "composer", "artist": a} for a in out["artists"]]
+                           if ar and is_retro_format(t.get("format")) else [])
     isrc = t.get("isrc")
     out["isrc"] = [isrc] if isrc and isinstance(isrc, str) else []
     out["genres"] = [{"name": g} for g in genre_list if g]
@@ -456,9 +474,25 @@ def _pairs(raw: bytes):
     return json.loads(raw, object_pairs_hook=list, parse_constant=_reject_constant)
 
 
+_XML_ILLEGAL_CHARS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _xml_safe(obj):
+    """``obj`` with every string (keys too) stripped of the characters XML
+    can't carry — what the JSON body drops so it says what the XML body does."""
+    if isinstance(obj, str):
+        return _XML_ILLEGAL_CHARS.sub("", obj)
+    if isinstance(obj, dict):
+        return {_xml_safe(k): _xml_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_xml_safe(v) for v in obj]
+    return obj
+
+
 def _stdlib(obj) -> bytes:
-    """What Starlette's JSONResponse rendered (it raised on non-finite)."""
-    return json.dumps(obj, ensure_ascii=False, allow_nan=False, indent=None,
+    """What Starlette's JSONResponse rendered (it raised on non-finite), less
+    the characters XML can't carry (``_xml_safe``)."""
+    return json.dumps(_xml_safe(obj), ensure_ascii=False, allow_nan=False, indent=None,
                       separators=(",", ":")).encode("utf-8")
 
 

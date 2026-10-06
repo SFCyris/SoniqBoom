@@ -7,6 +7,7 @@
 import { Player } from '../player.js';
 import { Auth }   from '../auth.js';
 import { artPlaceholderEmoji, Toast } from '../utils.js';
+import { Offline } from '../offline.js';
 // UX-3 P0: mobile shell exposes the same globals desktop does so the
 // classic-script cast_picker.js can read currentTrackId + emit toasts.
 window.SoniqBoom = window.SoniqBoom || {};
@@ -283,6 +284,10 @@ function showToast(message, kind = 'info') {
 Player.on('queuestall', () => {
   Toast.error('Couldn\u2019t load the next tracks \u2014 check the connection, then press Next.');
 });
+// Settings → "Tracks on unavailable drives": nothing left to play can play now.
+Player.on('offlinequeue', () => {
+  Toast.info('None of these tracks can play right now \u2014 their drive or share isn\u2019t connected.');
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 window.addEventListener('hashchange', () => {
@@ -309,3 +314,6 @@ while (!Auth.user) {
 
 activate(initialView());
 renderMini(Player.currentTrack);
+// Follow "Tracks on unavailable drives" (marks, auto-play skipping); the views
+// re-read their lists on 'soniqboom:availability-changed'.
+Offline.init();

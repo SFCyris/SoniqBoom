@@ -56,6 +56,9 @@ const FACTORY = new Function('env', `
     setQueue, playSource, next, prev, _advance, toggleShuffle, toggleRepeat,
     addToQueue, playNext, removeFromQueue, moveInQueue, setRadioActive,
     snapshotQueue, restoreQueue, clearAutoUpcoming,
+    setOfflineSkip: (on) => { _offlineSkip = !!on; },
+    get lastStartAllOffline() { return _startAllOffline; },
+    reanchorOrdered: () => { _ordReanchor = true; if (_srcMode === 'ordered') _srcEnded = false; },
     // The <audio> element's side of things, for the auto-skip tests:
     failCurrent: () => _skipUnplayable(),                       // what the 'error' handler ends with
     nowPlaying: () => (audioListeners.playing || []).forEach((fn) => fn()),
@@ -103,7 +106,15 @@ function seededPerm(n, seed) {               // deterministic per seed, like the
 export function makeServer(n) {
   // ``place``: Map(trackIndex → permutation position) forced into EVERY seed's
   // order, so a test can put a given track at a known place in the shuffle.
-  const srv = { n, requests: [], down: false, perms: new Map(), place: new Map(), deleted: new Set() };
+  // ``offline``: track indexes that can't play right now — rows carry
+  // ``offline: 'drive'``; ``playable=1`` ordered pages leave them out (with
+  // ``_pos`` / ``next_offset`` / ``ended``) and shuffled orders never hold them,
+  // like the API in Mark / Hide mode.
+  // ``hidden``: track indexes Hide mode leaves out of the ordered list
+  // altogether (positions shift when it changes); ``after=<id>`` starts a
+  // playable page right after that track, like the API.
+  const srv = { n, requests: [], down: false, perms: new Map(), place: new Map(), deleted: new Set(),
+                offline: new Set(), hidden: new Set() };
   srv.fetch = async (url, opts = {}) => {
     srv.requests.push(url);
     if (srv.down) throw new Error('network down');
@@ -117,7 +128,8 @@ export function makeServer(n) {
     const u = new URL(url, 'http://x');
     const off = Number(u.searchParams.get('offset') || 0);
     const lim = Number(u.searchParams.get('limit') || 50);
-    const row = (i) => ({ id: tid(i), title: 'T' + i });      // NEW objects every time
+    const row = (i) => (srv.offline.has(i) ? { id: tid(i), title: 'T' + i, offline: 'drive' }
+                                           : { id: tid(i), title: 'T' + i });   // NEW objects every time
     let body;
     if (u.pathname.endsWith('/meta/batch')) {
       if (srv.failBatch) return { ok: false, status: 500, json: async () => ({}) };
@@ -134,12 +146,49 @@ export function makeServer(n) {
         }
         srv.perms.set(seed, perm);
       }
-      const order = srv.perms.get(seed);
+      let order = srv.perms.get(seed);
+      // ``shuffleGaps``: a folder's shuffle — dealt over everything, offline
+      // tracks left out page by page (total unchanged); else dealt without them.
+      if (srv.offline.size && !srv.shuffleGaps) order = order.filter((i) => !srv.offline.has(i));
       // ``deleted``: ids gone since the order was dealt — skipped, total unchanged (like the API).
-      body = { total: srv.n, tracks: order.slice(off, off + lim).filter((i) => !srv.deleted.has(i)).map(row) };
+      if (srv.shuffleGaps && u.searchParams.get('playable') === '1') {
+        // a folder's playable shuffled page: read on (bounded) past offline tracks
+        const tracks = [];
+        let pos = off, read = 0;
+        const budget = srv.playableBudget || 5000;
+        while (tracks.length < lim && read < budget && pos < order.length) {
+          const i = order[pos];
+          if (!srv.offline.has(i) && !srv.deleted.has(i)) tracks.push({ ...row(i), _pos: pos });
+          pos++; read++;
+        }
+        body = { total: order.length, tracks, next_offset: pos, ended: pos >= order.length };
+      } else {
+        body = { total: order.length,
+                 tracks: order.slice(off, off + lim)
+                   .filter((i) => !srv.deleted.has(i) && !(srv.shuffleGaps && srv.offline.has(i))).map(row) };
+      }
+    } else if (u.searchParams.get('playable') === '1') {
+      const list = Array.from({ length: srv.n }, (_, i) => i).filter((i) => !srv.hidden.has(i));
+      const tracks = [];
+      let pos = off, read = 0, ended = false;
+      const after = u.searchParams.get('after');
+      if (after) {
+        for (const id of after.split(',')) {               // newest first: the first one listed
+          const at = list.indexOf(Number(id.slice(1)));
+          if (at >= 0) { pos = at + 1; break; }
+        }
+      }
+      const budget = srv.playableBudget || 5000;
+      while (tracks.length < lim && read < budget) {
+        if (pos >= list.length) { ended = true; break; }
+        if (!srv.offline.has(list[pos])) tracks.push({ ...row(list[pos]), _pos: pos });
+        pos++; read++;
+      }
+      if (pos >= list.length) ended = true;
+      body = { tracks, next_offset: pos, ended };
     } else {
-      body = [];
-      for (let i = off; i < Math.min(srv.n, off + lim); i++) body.push(row(i));
+      const list = Array.from({ length: srv.n }, (_, i) => i).filter((i) => !srv.hidden.has(i));
+      body = list.slice(off, off + lim).map(row);
     }
     return { ok: true, status: 200, json: async () => body };
   };

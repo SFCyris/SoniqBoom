@@ -214,6 +214,24 @@ def _isolate_game_title_downloads(tmp_path_factory: pytest.TempPathFactory,
     monkeypatch.setattr(game_titles, "_lists_changed", game_titles.schedule)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_derived_genres(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The derived-genre pass (core/genre_derive.py) is scheduled after scans
+    and enrichment passes in the app; in tests it runs only when a test calls
+    it (``apply_derived_genres`` / ``rederive_now``, or the real ``schedule``
+    kept as ``schedule_unpatched``) — so other tests' tracks are what they
+    wrote — and no pass state leaks between tests."""
+    from soniqboom.core import genre_derive
+    monkeypatch.setattr(genre_derive, "schedule_unpatched", genre_derive.schedule,
+                        raising=False)
+    monkeypatch.setattr(genre_derive, "schedule", lambda: None)
+    monkeypatch.setattr(genre_derive, "_last_sig", None)
+    monkeypatch.setattr(genre_derive, "_last_result", None)
+    monkeypatch.setattr(genre_derive, "_pending", False)
+    monkeypatch.setattr(genre_derive, "_running", False)
+    monkeypatch.setattr(genre_derive, "_poke_handle", None)
+
+
 @pytest.fixture(scope="session")
 def event_loop_policy():
     """Force the default asyncio policy on macOS — uvloop integration
@@ -221,3 +239,35 @@ def event_loop_policy():
     matrix against."""
     import asyncio
     return asyncio.DefaultEventLoopPolicy()
+
+
+@pytest.fixture(autouse=True)
+def _no_songdb_upstream_check(monkeypatch):
+    """A song-database refresh asks GitHub for newer upstream TSV commits;
+    tests never reach the network (patch ``songdb._latest_upstream`` in a
+    test to exercise it)."""
+    from soniqboom.core import songdb
+    monkeypatch.setattr(songdb, "_latest_upstream", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_modland_catalogue_network(monkeypatch):
+    """The Modland catalogue (core/modland_catalog.py) never downloads its
+    index in tests (pass ``local_zip=`` to ``enable`` / ``refresh``, or patch
+    ``_download_index``), and every test starts with no catalogue root
+    registered and clean fetch counters."""
+    from soniqboom.core import catalogue, modland_catalog
+
+    def _refuse(dest):
+        raise RuntimeError("tests never download the Modland index")
+    monkeypatch.setattr(modland_catalog, "_download_index", _refuse)
+
+    def _no_changelogs():
+        # (A test that wants the changelog path patches this back to an FTP
+        # session on its own local server.)
+        raise modland_catalog.NeedFullIndex("tests read no changelogs")
+    monkeypatch.setattr(modland_catalog, "_delta_connect", _no_changelogs)
+    yield
+    for r in catalogue.roots():
+        catalogue.unregister_root(r["root"])
+    catalogue.reset_stats()

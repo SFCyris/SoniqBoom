@@ -41,6 +41,7 @@ import concurrent.futures
 import errno
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -69,6 +70,8 @@ TRACKER_LIKE_EXTS: frozenset[str] = frozenset({
     # AHX / HivelyTracker — header parsed by _extract_tracker; .hvl/.ahx
     # were previously mis-titled with the offset-0 format magic.
     ".ahx", ".hvl",
+    # OctaMED — the MMD0–MMD3 magic was the title (GitHub #24).
+    ".oct",
 })
 
 # Tracker formats whose offset-0 magic was mis-read as the title by the
@@ -81,6 +84,8 @@ TRACKER_LIKE_EXTS: frozenset[str] = frozenset({
 _MAGIC_TITLE_BUG: dict[str, frozenset[str]] = {
     ".hvl": frozenset({"HVL"}),
     ".ahx": frozenset({"THX", "AHX"}),
+    ".med": frozenset({"MMD0", "MMD1", "MMD2", "MMD3"}),
+    ".oct": frozenset({"MMD0", "MMD1", "MMD2", "MMD3"}),
 }
 
 
@@ -215,7 +220,7 @@ def _has_replacement_char(track: dict) -> bool:
 
 
 def _has_bad_tracker_title(track: dict) -> bool:
-    """True for an AHX/HVL track whose stored title is a known mis-extraction
+    """True for an AHX/HVL/OctaMED track whose stored title is a known mis-extraction
     artifact from the pre-fix ``_extract_tracker``:
 
       * the bare format MAGIC ("HVL" / "THX" / "AHX") — offset-0 read,
@@ -226,7 +231,9 @@ def _has_bad_tracker_title(track: dict) -> bool:
     Re-extracting with the corrected parser yields the real embedded name.
     """
     ext = os.path.splitext((track.get("path") or "").lower())[1]
-    if ext not in (".hvl", ".ahx"):
+    if (track.get("title") or "").strip() in ("<no songtitle>", "<unnamed>"):
+        return True                         # a player's stand-in, not a name (any Amiga format, #24)
+    if ext not in _MAGIC_TITLE_BUG:
         return False
     title = (track.get("title") or "").strip()
     if not title:
@@ -1353,7 +1360,10 @@ async def _run_repair(
             _progress.current_file = os.path.basename(path_str) or path_str
 
             try:
-                if _is_remote(path_str):
+                from soniqboom.core.catalogue import is_catalogue_path
+                if is_catalogue_path(path_str):
+                    ok, applied, err = True, False, None        # never re-read
+                elif _is_remote(path_str):
                     ok, applied, err = await _process_remote(t, find_source_for_path)
                 else:
                     ok, applied, err = await _process_local(t)
@@ -1495,6 +1505,10 @@ async def start_repair(candidates: list[dict], *, game_only_ids=frozenset(),
     if _busy():                     # also while the last run is still finishing
         return False
     _game_only_ids = frozenset(game_only_ids)
+    # Catalogue tunes (core/catalogue.py) are never re-read here: their file is
+    # fetched only when played, and their first play reads its metadata.
+    from soniqboom.core.catalogue import is_catalogue_path
+    candidates = [t for t in candidates if not is_catalogue_path(t.get("path"))]
 
     _progress = RepairProgress(
         running=True,
@@ -1513,3 +1527,193 @@ async def start_repair(candidates: list[dict], *, game_only_ids=frozenset(),
         name="soniqboom.repair",
     )
     return True
+
+
+# ── NUL-joined multi-value tags (stored before the extractor split them) ─────
+# Builds up to 1.11.0 stored an ID3v2.4 multi-value text frame NUL-joined
+# ("Rock\x00Indie", "A\x00B").  The extractor now splits them
+# (``metadata.normalise_multi_values``); the stored rows are repaired once,
+# in memory — the stored value holds every value the frame had, so no file is
+# read — through the store's batch update (AOF, indexes, ``_track_rev``).
+
+MULTIVALUE_REPAIR_KEY = "multivalue_repair_version"
+MULTIVALUE_REPAIR_VERSION = 2
+_MV_FIELDS = ("artist", "album_artist", "composer", "title", "album")
+# Further text frames the old extractor stored NUL-joined, with the separator
+# their values are joined with now.
+_MV_EXTRA = {"label": " / ", "isrc": " / ", "comment": "\n"}
+_MV_CHUNK = 500
+# An ID3v1 genre reference the extractor now decodes ("(17)", "17",
+# "(17)Rock", "(RX)") — stored raw by older builds for ID3-tagged formats.
+_ID3_GENRE_REF_RE = re.compile(r"^\s*(\(\d+\)|\d+\s*$|\((RX|CR)\))")
+_ID3_FORMATS = ("MP3", "AIFF", "DSD", "DSF", "DFF")
+
+
+def _id3_format(fmt) -> bool:
+    return isinstance(fmt, str) and fmt.upper().startswith(_ID3_FORMATS)
+
+
+def _has_nul(t: dict) -> bool:
+    """Does ``t`` hold a value the repair rewrites: a NUL-joined value, or
+    (an ID3-tagged format) a raw ID3v1 genre reference?"""
+    g = t.get("genre")
+    if g:
+        id3 = None
+        for x in g:
+            if isinstance(x, str):
+                if "\x00" in x:
+                    return True
+                if _ID3_GENRE_REF_RE.match(x):
+                    if id3 is None:
+                        id3 = _id3_format(t.get("format"))
+                    if id3:
+                        return True
+    for f in (*_MV_FIELDS, *_MV_EXTRA):
+        v = t.get(f)
+        if v and isinstance(v, str) and "\x00" in v:
+            return True
+    return False
+
+
+def _mv_fix(t: dict) -> dict:
+    """The field update that makes ``t``'s NUL-joined values readable: a
+    genre list one entry per genre (numeric ID3v1 references decoded, as the
+    extractor reads ``TCON``), the names / titles joined
+    (``metadata.MULTI_TEXT_FIELDS``)."""
+    from soniqboom.core import metadata as md
+    view = {f: t.get(f) for f in ("genre", *_MV_FIELDS)}
+    upd = md.normalise_multi_values(view)
+    for f, sep in _MV_EXTRA.items():
+        v = t.get(f)
+        if isinstance(v, str) and "\x00" in v:
+            upd[f] = md.join_values(v, sep)
+    genres = upd.get("genre", t.get("genre"))
+    if genres and ("genre" in upd or _id3_format(t.get("format"))):
+        try:
+            from mutagen.id3 import TCON
+            g2 = md.split_genres(TCON(encoding=3, text=list(genres)).genres)
+        except Exception:                               # noqa: BLE001
+            g2 = None
+        if g2 is not None and g2 != list(t.get("genre") or []):
+            upd["genre"] = g2
+    return upd
+
+
+_ID_FIELDS = ("artist", "album_artist", "album", "dir_hash")
+
+
+def _old_owner(v) -> str:
+    """How builds up to 1.11.0 normalised an artist tag for Subsonic ids:
+    stripped, "" for a placeholder — a NUL-joined value whole."""
+    from soniqboom.core.subsonic_index import ARTIST_PLACEHOLDERS
+    v = v.strip() if isinstance(v, str) else ""
+    return "" if v.casefold() in ARTIST_PLACEHOLDERS else v
+
+
+def _id_remap(old: dict, new: dict) -> dict[str, str]:
+    """``{old Subsonic id: new id}`` for the artist / album / folder-album ids
+    of a track whose names the repair rewrote (old: its fields before)."""
+    from soniqboom.core import subsonic_index as sx
+    out: dict[str, str] = {}
+    for f in ("artist", "album_artist"):
+        o = _old_owner(old.get(f)).lower()
+        n = sx.norm_owner(new.get(f)).lower()
+        if o and n and o != n:
+            out[sx.artist_id(o)] = sx.artist_id(n)
+    o_own = (_old_owner(old.get("album_artist")) or _old_owner(old.get("artist"))).lower()
+    n_own = sx.owner_of(new).lower()
+    o_al = (old.get("album") or "").strip() if isinstance(old.get("album"), str) else ""
+    n_al = (new.get("album") or "").strip() if isinstance(new.get("album"), str) else ""
+    if o_al and n_al and (o_own, o_al.lower()) != (n_own, n_al.lower()):
+        out[sx.album_id(o_own, o_al)] = sx.album_id(n_own, n_al)
+    dh = old.get("dir_hash")
+    if dh and o_own != n_own:
+        out[sx.folder_album_id(dh, o_own)] = sx.folder_album_id(dh, n_own)
+    return out
+
+
+MULTIVALUE_PENDING_REMAP_KEY = "multivalue_pending_remap"
+
+
+async def _apply_pending_remap(store) -> int:
+    """Move the Subsonic stars / ratings of a remap the repair recorded
+    (``MULTIVALUE_PENDING_REMAP_KEY``) and clear it once moved.  Kept until
+    then, so a repair cut off between a chunk's write and its move — or a
+    move that failed — is finished at the next start."""
+    pending = store.get_config(MULTIVALUE_PENDING_REMAP_KEY)
+    if not isinstance(pending, dict) or not pending:
+        return 0
+    from soniqboom.core.subsonic_state import get_state
+    n = await get_state().remap_ids(dict(pending))
+    store.set_config(MULTIVALUE_PENDING_REMAP_KEY, {})
+    if n:
+        log.info("Multi-value tags: moved %d Subsonic star(s) / rating(s) to the "
+                 "repaired artist / album ids", n)
+    return n
+
+
+async def repair_multi_values_once(store=None, *, force: bool = False) -> dict:
+    """Repair every stored NUL-joined value (``_mv_fix``) once per
+    ``MULTIVALUE_REPAIR_VERSION`` (config ``MULTIVALUE_REPAIR_KEY``).  Scans
+    the library on the loop in ~20k-track steps (a yield between), writes in
+    ``_MV_CHUNK`` batches.  The Subsonic artist / album ids hash the names it
+    changes: each chunk's id moves are recorded (``MULTIVALUE_PENDING_REMAP_KEY``,
+    journaled) BEFORE its write and applied right after, so an interrupted
+    repair never strands stars and ratings on the old ids (a leftover is
+    applied first thing at the next start, even once the repair is done).
+    Returns ``{"repaired": n, "seconds": s}`` or ``{"skipped": True}``."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    try:
+        await _apply_pending_remap(store)
+    except Exception:                                   # noqa: BLE001
+        log.warning("moving Subsonic stars left by an earlier multi-value repair failed",
+                    exc_info=True)
+    if not force and store.get_config(MULTIVALUE_REPAIR_KEY) == MULTIVALUE_REPAIR_VERSION:
+        return {"skipped": True}
+    t0 = time.perf_counter()
+    ids = list(store._tracks)
+    get = store._tracks.get
+    found: list[str] = []
+    for i in range(0, len(ids), 20_000):
+        found.extend(tid for tid in ids[i:i + 20_000]
+                     if (t := get(tid)) is not None and _has_nul(t))
+        await asyncio.sleep(0)
+    repaired = 0
+    for i in range(0, len(found), _MV_CHUNK):
+        items = []
+        remap: dict[str, str] = {}
+        for tid in found[i:i + _MV_CHUNK]:
+            t = get(tid)                                # live, right before the write
+            if t is not None and _has_nul(t):
+                upd = _mv_fix(t)
+                if upd:
+                    items.append((tid, upd))
+                    old = {f: t.get(f) for f in _ID_FIELDS}
+                    remap.update(_id_remap(old, {**t, **upd}))
+        if items:
+            if remap:
+                pending = store.get_config(MULTIVALUE_PENDING_REMAP_KEY)
+                pending = dict(pending) if isinstance(pending, dict) else {}
+                pending.update(remap)
+                store.set_config(MULTIVALUE_PENDING_REMAP_KEY, pending)
+            repaired += store.update_track_fields_batch(items)
+            if remap:
+                try:
+                    await _apply_pending_remap(store)
+                except Exception:                       # noqa: BLE001
+                    log.warning("moving Subsonic stars after the multi-value repair failed "
+                                "(retried at the next start)", exc_info=True)
+        await asyncio.sleep(0)
+    store.set_config(MULTIVALUE_REPAIR_KEY, MULTIVALUE_REPAIR_VERSION)
+    secs = round(time.perf_counter() - t0, 3)
+    if repaired:
+        log.info("Multi-value tags: repaired %d track(s) stored NUL-joined in %.2fs",
+                 repaired, secs)
+        try:
+            from soniqboom.core.folder_album import refresh_album_caches
+            await refresh_album_caches([tid for tid in found])
+        except Exception:                               # noqa: BLE001
+            log.debug("cache refresh after the multi-value repair failed", exc_info=True)
+    return {"repaired": repaired, "seconds": secs}

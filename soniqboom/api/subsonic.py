@@ -60,12 +60,22 @@ from soniqboom import __version__
 from soniqboom.core import folder_album as _fa
 from soniqboom.core import subsonic_index as _sx
 from soniqboom.core import store as _store_mod
-from soniqboom.core.store import _SPLIT_RE, get_store
+from soniqboom.core.store import _SPLIT_RE, track_genres
+from soniqboom.core.store import get_store as _library_store
 from soniqboom.core.subsonic_state import get_state as _get_state
 from soniqboom.core.users import get_user_store
 from soniqboom.models.user import User
 
 log = logging.getLogger(__name__)
+
+
+def get_store():
+    """The library as Subsonic clients see it: catalogue tunes
+    (``core/catalogue.py``) are hidden unless the catalogue's "Show to
+    Subsonic apps" switch is on (``core/catalogue_view.py``)."""
+    from soniqboom.core.catalogue_view import subsonic_store
+    return subsonic_store(_library_store())
+
 
 
 # ── OpenSubsonic formPost: every route also accepts POST form bodies ─────────
@@ -483,17 +493,42 @@ def _json_bytes_slow(obj: Any) -> bytes:
 
 
 def _json_bytes(obj: Any) -> bytes:
-    """``obj`` as compact UTF-8 JSON (see above).  ``OPT_NON_STR_KEYS`` only
-    for a body that needs it — it doubles orjson's time on every body (a
+    """``obj`` as compact UTF-8 JSON (see above), with the characters XML
+    can't carry removed as the XML body removes them (``_json_strip_illegal``)
+    — an XML and a JSON client see the same strings.  ``OPT_NON_STR_KEYS``
+    only for a body that needs it — it doubles orjson's time on every body (a
     2,000-song album: 1.4 → 2.7 ms)."""
     try:
-        return orjson.dumps(obj)
+        return _json_strip_illegal(orjson.dumps(obj))
     except orjson.JSONEncodeError:
         pass
     try:
-        return orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS)
+        return _json_strip_illegal(orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS))
     except orjson.JSONEncodeError:
-        return _json_bytes_slow(obj)
+        return _json_strip_illegal(_json_bytes_slow(obj))
+
+
+# A JSON string escape of a C0 control XML can't carry (all but \t \n \r:
+# orjson writes \b and \f short, the rest as \u00XX, either hex case from
+# the stdlib fallback), or an escaped backslash — matched first, so an
+# escape's own backslash is never mistaken for the start of one.
+_JSON_C0_ESC = re.compile(rb"\\\\|\\(?:[bf]|u00(?:0[0-8bBcCeEfF]|1[0-9a-fA-F]))")
+
+
+def _json_c0_sub(m: "re.Match[bytes]") -> bytes:
+    return m.group(0) if m.group(0) == b"\\\\" else b""
+
+
+def _json_strip_illegal(body: bytes) -> bytes:
+    """Drop from a JSON body exactly what ``_xml_strip_illegal`` drops from
+    an XML one: the C0 controls but tab / newline / return (a NUL left in an
+    old multi-value tag, a PETSCII-derived title) and U+FFFE / U+FFFF.  The
+    common body has none: two substring scans."""
+    if b"\\u00" in body or b"\\b" in body or b"\\f" in body:
+        body = _JSON_C0_ESC.sub(_json_c0_sub, body)
+    if b"\xef\xbf\xbe" in body or b"\xef\xbf\xbf" in body:
+        body = body.replace(b"\xef\xbf\xbe", b"").replace(b"\xef\xbf\xbf", b"")
+    return body
 
 
 def _ok(payload: dict[str, Any] | None = None, *, fmt: str = "xml") -> Response:
@@ -1125,12 +1160,13 @@ def _song_expand(out: dict) -> dict:
     """A song in memo form (``_song_static``: artists / albumArtists as
     ``(id, name)``, isrc as the string or None, genres as a tuple of names,
     replayGain as ``(trackGain, albumGain, trackPeak, albumPeak)`` with None
-    for an omitted one) → the response's own lists / dicts, fresh per
+    for an omitted one, artists / albumArtists as tuples of ``(id, name)``,
+    contributors as ``(role, id, name)``) → the response's own lists / dicts, fresh per
     response — nothing nested is shared between responses."""
-    a = out["artists"]
-    out["artists"] = [{"id": a[0], "name": a[1]}]
-    a = out["albumArtists"]
-    out["albumArtists"] = [{"id": a[0], "name": a[1]}]
+    out["artists"] = [{"id": i, "name": n} for i, n in out["artists"]]
+    out["albumArtists"] = [{"id": i, "name": n} for i, n in out["albumArtists"]]
+    out["contributors"] = [{"role": r, "artist": {"id": i, "name": n}}
+                           for r, i, n in out["contributors"]]
     a = out["isrc"]
     out["isrc"] = [a] if a else []
     out["genres"] = [{"name": g} for g in out["genres"]]
@@ -1180,7 +1216,9 @@ def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | Non
     no list or dict inside (``_song_expand``)."""
     aa = _sx.owner_of(t)
     al = (t.get("album") or "").strip()
-    genre_list = t.get("genre") or []
+    # The genres the track is browsed under — derived ones first
+    # (``store.track_genres``, core/genre_derive.py): ``genre`` is the first.
+    genre_list = track_genres(t)
     genre = genre_list[0] if genre_list else ""
     suffix, content_type, t_suffix, t_mime = _delivery(t)
     ar_tag = t.get("artist")
@@ -1243,11 +1281,21 @@ def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | Non
     # OpenSubsonic artist fields (the plain ``albumArtist`` above is kept for
     # existing clients).
     out["displayArtist"] = out["artist"]
-    out["displayAlbumArtist"] = aa_disp
+    # A multi-artist tag ("A • B", ``metadata.NAME_SEP``) lists each artist
+    # (the catalogue lists each as an artist of its own); its ids and the
+    # album's owner are its FIRST artist's (``_sx.norm_owner``), so a tag
+    # that gains a second value keeps the artist and album ids it had.
+    aa_tag = t.get("album_artist")
+    aa_tag = aa_tag.strip() if isinstance(aa_tag, str) else ""
+    aa_multi = ""
+    if aa and _sx.name_parts(aa_tag) and _sx.norm_owner(aa_tag) == aa:
+        aa_multi = _sx.NAME_SEP.join(p for p in _sx.name_parts(aa_tag) if _sx.norm_owner(p))
+    out["displayAlbumArtist"] = aa_multi or aa_disp
     # (``artists`` / ``albumArtists`` / ``isrc`` / ``genres`` / ``replayGain``
     # in their memo form — ``_song_expand`` makes the response's own.)
-    out["artists"] = (artist_id, ar or aa_disp)
-    out["albumArtists"] = (owner_id, aa_disp)
+    ar_multi = ar_tag if (ar and _sx.name_parts(ar_tag) and _sx.norm_owner(ar_tag) == ar) else ""
+    out["artists"] = _artist_pairs(ar_multi or ar or aa_disp, artist_id, ids)
+    out["albumArtists"] = _artist_pairs(aa_multi or aa_disp, owner_id, ids)
     if album_id is not None:
         out["albumId"] = album_id
     created = _iso(t.get("added_at"))
@@ -1276,6 +1324,13 @@ def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | Non
     tail["bpm"] = _safe_int(t.get("bpm"), round_=True)
     tail["comment"] = t.get("comment") or ""
     tail["displayComposer"] = t.get("composer") or ""
+    # A retro tune's artist IS its composer (SID, modules, chip rips): listed
+    # as a ``composer`` contributor too, which clients show with that role.
+    # Other tracks' composers are no artists the server lists — none.
+    contrib: tuple = ()
+    if ar and _composer_is_artist(t.get("format")):
+        contrib = tuple(("composer", i, n) for i, n in out["artists"])
+    tail["contributors"] = contrib
     isrc = t.get("isrc")
     tail["isrc"] = isrc if isrc and isinstance(isrc, str) else None
     # OpenSubsonic `genres` is a repeated element with a `name` attribute.
@@ -1299,6 +1354,34 @@ def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | Non
                           _fin(t.get("replaygain_track_peak"), 6),
                           _fin(t.get("replaygain_album_peak"), 6))
     return out, tail, folder_album
+
+
+def _artist_pairs(name: str, name_id: str, ids: dict | None) -> tuple:
+    """``((id, name), …)`` of a song's artist field: one pair, or one per
+    artist of a multi-artist name (``_sx.name_parts``)."""
+    parts = [p for p in _sx.name_parts(name) if _sx.norm_owner(p)]
+    if not parts:
+        return ((name_id, name),)
+    out = []
+    for p in parts:
+        pl = p.lower()
+        i = ids.get(pl) if ids is not None else None
+        if i is None:
+            i = _artist_id(pl)
+            if ids is not None:
+                ids[pl] = i
+        out.append((i, p))
+    return tuple(out)
+
+
+# Retro families whose artist field credits the composer (a console rip's
+# often names the developer or publisher instead).
+_COMPOSER_FAMILIES = frozenset({"sid", "tracker", "ahx", "atari", "paula", "adlib"})
+
+
+def _composer_is_artist(fmt) -> bool:
+    from soniqboom.core.retro import chip_family
+    return chip_family(fmt) in _COMPOSER_FAMILIES
 
 
 def _song_user(out: dict, tid: str, ctx: _SongCtx) -> None:
@@ -1543,6 +1626,7 @@ def _album_id3(e: _sx.AlbumEntry, starred: dict | None = None,
         out["coverArt"] = cover
     if e.genre:
         out["genre"] = e.genre
+    out["recordLabels"] = _record_labels(sample)
     st = (starred or {}).get(e.id)
     if st:
         out["starred"] = _iso(st)
@@ -1550,6 +1634,28 @@ def _album_id3(e: _sx.AlbumEntry, starred: dict | None = None,
     if r:
         out["userRating"] = r
     return out
+
+
+def _record_labels(t: dict) -> list[dict]:
+    """OpenSubsonic ``recordLabels`` of an album from its sample track's
+    label (a TPUB / LABEL tag, a song-database publisher): one entry per
+    label — the tag's several values (``metadata.TEXT_SEP``), the song
+    database's ", "-joined publishers."""
+    lab = t.get("label")
+    if not lab or not isinstance(lab, str) or not lab.strip():
+        return []
+    seps = [" / "]
+    if "label" in (t.get("songdb_fields") or ()):
+        seps.append(", ")
+    parts = [lab]
+    for sep in seps:
+        parts = [q for p in parts for q in p.split(sep)]
+    seen: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.append(p)
+    return [{"name": p} for p in seen]
 
 
 def _album_child(e: _sx.AlbumEntry, starred: dict | None = None,
@@ -1596,6 +1702,7 @@ def _artist_track_ids(store, name_l: str) -> set[str]:
     O(artist size) set union over the tag indexes."""
     a = store._tag_album_artist.get(name_l) or set()
     b = store._tag_artist.get(name_l) or set()
+    # (A multi-artist tag "A • B" is indexed under "a" and "b" too.)
     return a | b if (a and b) else set(a or b)
 
 
@@ -1685,7 +1792,7 @@ def _unknown_folder_entries(store, cat: _sx.Catalogue) -> tuple[list, list[dict]
             e.duration = 0
             e.sample = newest
             e.year = _normalise_year(newest.get("year"))
-            e.genre = ((newest.get("genre") or [""])[0]) or ""
+            e.genre = ((track_genres(newest) or [""])[0]) or ""
             e.genres_l = frozenset()
             e.added = newest.get("added_at") or 0
         entries.append(e)
@@ -2166,6 +2273,10 @@ _MUSIC_FOLDERS: dict = {"sig": None, "rows": [], "by_id": {}}
 def _folder_label(path: str) -> str:
     """A root's display name: its last path segment — never a share URL's
     scheme, credentials or host (unless the root IS the host)."""
+    from soniqboom.core import catalogue
+    label = catalogue.label_of(path)
+    if label:
+        return label                             # a catalogue root ("Modland")
     segs = [x for x in re.split(r"[\\/]", path) if x.strip()]
     name = segs[-1] if segs else path
     if "@" in name:
@@ -2235,11 +2346,7 @@ def _folder_view(store, cat: _sx.Catalogue, root_hash: str) -> tuple[frozenset, 
         e = cat.track_entry(t)
         if e is not None:
             albums.add(e.id)
-        o = _sx.owner_of(t).lower()
-        artists.add(o)
-        a = _sx.norm_owner(t.get("artist")).lower()
-        if a:
-            artists.add(a)
+        artists.update(_sx.artist_names_l(t))
     hit = cat.memo[key] = (frozenset(albums), frozenset(artists))
     return hit
 
@@ -2267,10 +2374,7 @@ async def _prepare_folder_view(store, cat: _sx.Catalogue, root_hash: str | None)
         e = cat.track_entry(t)
         if e is not None:
             albums.add(e.id)
-        artists.add(_sx.owner_of(t).lower())
-        a = _sx.norm_owner(t.get("artist")).lower()
-        if a:
-            artists.add(a)
+        artists.update(_sx.artist_names_l(t))
     cat.memo.setdefault(("folder_view", root_hash), (frozenset(albums), frozenset(artists)))
 
 
@@ -2802,9 +2906,10 @@ def _album_and_tracks(store, raw: str) -> tuple[dict | None, list[dict]]:
         album["created"] = created
     if sample.get("id"):
         album["coverArt"] = sample["id"]
-    g = (sample.get("genre") or [""])[0]
+    g = (track_genres(sample) or [""])[0]
     if g:
         album["genre"] = g
+    album["recordLabels"] = _record_labels(sample)
     return album, tracks
 
 
@@ -5151,7 +5256,10 @@ async def get_playlist(
         from soniqboom.api.search import run_search
         _results = await run_search(pl["query"], limit=500)
         entry_tracks = [r.model_dump() if hasattr(r, "model_dump") else r for r in _results]
-        entries = [_track_to_song(t_, ctx) for t_ in entry_tracks if t_]
+        from soniqboom.core.catalogue_view import hidden_ids
+        _hid = hidden_ids(store)
+        entries = [_track_to_song(t_, ctx) for t_ in entry_tracks
+                   if t_ and t_.get("id") not in _hid]
     else:
         # Entries pinned to one tune ({id, subsong}) come back as tune ids.
         entries = []
@@ -5200,11 +5308,13 @@ async def create_playlist(
         owner_id = existing.get("owner_user_id")
         if owner_id is not None and owner_id != user.id and user.role != "admin":
             raise _SubsonicError(50, "You can only edit your own playlists.")
-        # Spec: with a playlistId the songs REPLACE the playlist's.
+        # Spec: with a playlistId the songs REPLACE the playlist's (entries
+        # of tracks hidden from Subsonic apps stay — the app never saw them).
         upd: dict = {"track_ids": [_playlist_entry(store, x) for x in songId]}
         if name:
             upd["name"] = name
-        await _update(playlistId, upd)
+        from soniqboom.core.catalogue_view import hidden_ids
+        await _update(playlistId, upd, keep_ids=hidden_ids(store))
         pl = store._playlists.get(playlistId)
     else:
         # Subsonic spec: createPlaylist needs either playlistId (update) or a
@@ -5406,22 +5516,36 @@ async def get_genres(
 ):
     _require_user(request, sb_session, u, p, s, t)
     store = get_store()
-    rows = store.aggregate_genres()
+    rows = store.aggregate_genres()          # memoised on the store's mutation seq
     # albumCount = albums with ≥1 track carrying the genre (catalogue
     # membership, incl. folder albums when on) — the same set byGenre lists.
-    ga = _catalogue(store).genre_albums
-    return _ok({
-        "genres": {
-            "genre": [
-                # ``_text``: the spec puts the genre name in the element BODY in
-                # XML (<genre songCount=".." albumCount="..">Rock</genre> —
-                # DSub / Amperfy read it there) and in ``value`` in JSON.
-                {"_text": r["genre"], "songCount": r["count"],
-                 "albumCount": len(ga.get(r["genre"].strip().lower(), ()))}
-                for r in rows
-            ],
-        },
-    }, fmt=f)
+    cat = _catalogue(store)
+    ga = cat.genre_albums
+
+    def _payload() -> dict:
+        return {
+            "genres": {
+                "genre": [
+                    # ``_text``: the spec puts the genre name in the element BODY in
+                    # XML (<genre songCount=".." albumCount="..">Rock</genre> —
+                    # DSub / Amperfy read it there) and in ``value`` in JSON.
+                    {"_text": r["genre"], "songCount": r["count"],
+                     "albumCount": len(ga.get(r["genre"].strip().lower(), ()))}
+                    for r in rows
+                ],
+            },
+        }
+    if len(rows) < _OFFLOAD_MIN_ITEMS:
+        return _ok(_payload(), fmt=f)
+    # A long list (game / group names as genres: tens of thousands) is
+    # serialised once per library state, off the event loop, and reused.
+    # Genre counts change only with a catalogue change (inserts / deletes,
+    # genre writes): not rebuilt on every unrelated write.
+    tag = getattr(store, "_catalog_seq", None)
+    if tag is None:
+        tag = (getattr(store, "_mutation_seq", None), id(rows))
+    return await _cached_render(cat, ("genres",), tag, f, _payload,
+                                gzip_ok=_accepts_gzip(request))
 
 
 # ── Lyrics (OpenSubsonic songLyrics extension) ───────────────────────────────
@@ -5496,8 +5620,11 @@ async def _lyrics_for_track_id(track_id: str) -> dict | None:
     if is_retro_format(fmt) and chip_family(fmt) != "midi":
         return None
     try:
-        from soniqboom.api.tracks import get_lyrics as _impl
-        res = await _impl(track_id)
+        # Never a tag write from a Subsonic lookup (whatever the
+        # ``lyrics_writeback`` setting says): a client syncing its library
+        # asks for every track's lyrics.
+        from soniqboom.api.tracks import resolve_lyrics as _impl
+        res = await _impl(track_id, writeback=False)
     except Exception:
         res = None
     text = (res or {}).get("lyrics")
@@ -5554,7 +5681,8 @@ async def get_lyrics_ss(
                 continue
             if ti and (cand.get("title") or "").strip().lower() != ti:
                 continue
-            if a and (cand.get("artist") or cand.get("album_artist") or "").strip().lower() != a:
+            ca = (cand.get("artist") or cand.get("album_artist") or "").strip()
+            if a and ca.lower() != a and a not in _sx.name_parts_l(ca):
                 continue
             hits.append(cid)
         tid = min(hits) if hits else None        # deterministic pick
@@ -6153,8 +6281,8 @@ async def _build_genre_ids(store, genre: str, root_hash: str | None) -> list[str
         ordered.extend(tid for _a, tid in reversed(snap[max(0, hi - _GENRE_STEP):hi])
                        if tid in gset)
     if len(ordered) < len(gset):
-        # Tracks with no added_at (or indexed after a deferred batch rebuild)
-        # aren't in the sort index — append them, stably.
+        # Tracks indexed while a batch section defers the sort index aren't in
+        # it yet — append them, stably.  (One with no added_at is: keyed 0.)
         seen = set(ordered)
         ordered.extend(sorted((t for t in gset if t not in seen), reverse=True))
     return ordered

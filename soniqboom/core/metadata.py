@@ -12,6 +12,7 @@ import base64
 import contextvars
 import hashlib
 import logging
+import os
 import re
 import struct
 import subprocess
@@ -450,6 +451,84 @@ def _str(v) -> str:
     return str(v).strip() if v is not None else ""
 
 
+# ── Multi-valued text tags ───────────────────────────────────────────────────
+# A tag can hold several values: an ID3v2.4 text frame (its values are NUL-
+# separated in the file — ``str(frame)`` joins them with "\x00"), repeated
+# Vorbis comments (FLAC, Ogg, Opus) or MP4 atoms.  Genres are a list on the
+# track, one entry per value.  The single-string fields join their values for
+# display: names (artist, album artist, composer) with ``NAME_SEP`` — the
+# separator the Subsonic API splits back into ``artists[]`` — and titles
+# (title, album, label …) with ``TEXT_SEP``.  No value the extractor returns
+# carries a NUL (rows stored by older builds: ``repair.repair_multi_values_once``).
+NAME_SEP = " \u2022 "
+TEXT_SEP = " / "
+# Track fields written as one display string; the value is the separator.
+MULTI_TEXT_FIELDS = {"artist": NAME_SEP, "album_artist": NAME_SEP,
+                     "composer": NAME_SEP, "title": TEXT_SEP, "album": TEXT_SEP}
+
+
+def _values(v) -> list[str]:
+    """The non-empty values of a tag — a frame's ``text`` list, a list, a
+    string — each split at NULs and stripped; duplicates dropped, order
+    kept."""
+    if v is None:
+        return []
+    raw = getattr(v, "text", None)
+    if not isinstance(raw, (list, tuple)):
+        raw = v if isinstance(v, (list, tuple)) else [v]
+    out: list[str] = []
+    for item in raw:
+        if item is None:
+            continue
+        for part in str(item).split("\x00"):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def join_values(v, sep: str = TEXT_SEP) -> str:
+    """A multi-valued tag as one display string (see ``_values``)."""
+    return sep.join(_values(v))
+
+
+def split_genres(v) -> list[str]:
+    """A genre tag (or a stored genre list) as one entry per genre: NUL-joined
+    values split, blanks and exact duplicates dropped."""
+    return _values(v)
+
+
+def _id3_genres(frame) -> list[str]:
+    """An ID3 ``TCON`` frame's genres: mutagen's ``genres`` reading (numeric
+    ID3v1 references such as "(17)" or "17" become "Rock"), one per value."""
+    if frame is None:
+        return []
+    try:
+        return _values(list(frame.genres))
+    except Exception:                                   # noqa: BLE001
+        return _values(frame)
+
+
+def normalise_multi_values(d: dict) -> dict:
+    """``d`` (an extract, or a stored track's fields) with every NUL-joined
+    value made readable: ``genre`` split into one entry per genre, the
+    ``MULTI_TEXT_FIELDS`` joined with their separator.  Only fields that hold
+    a NUL (or a genre list that splits differently) are changed; returns the
+    changed fields (in place on ``d`` too)."""
+    changed: dict = {}
+    g = d.get("genre")
+    if isinstance(g, (list, tuple)) and any(isinstance(x, str) and "\x00" in x for x in g):
+        changed["genre"] = split_genres(g)
+    elif isinstance(g, str) and g:
+        changed["genre"] = split_genres(g)
+    for f, sep in MULTI_TEXT_FIELDS.items():
+        v = d.get(f)
+        if isinstance(v, str) and "\x00" in v:
+            changed[f] = join_values(v, sep)
+    d.update(changed)
+    return changed
+
+
 def _psf_tag_text(blob: bytes) -> str:
     """A PSF ``[TAG]`` block's text: UTF-8 when it decodes as such (the spec's
     ``utf8=1`` sets) — unless, without ``utf8=1``, it reads as legacy bytes
@@ -761,12 +840,8 @@ def _id3_game(tags) -> str:
 
 
 def _list(v) -> list[str]:
-    if v is None:
-        return []
-    if isinstance(v, (list, tuple)):
-        return [str(x).strip() for x in v if str(x).strip()]
-    s = str(v).strip()
-    return [s] if s else []
+    """A tag's values as a list (NUL-joined values split — ``_values``)."""
+    return _values(v)
 
 
 def _int(v, default=None) -> int | None:
@@ -1028,18 +1103,19 @@ def _id3_fields(tags) -> dict:
         tags = ID3()
     trck = str(tags.get("TRCK", ""))
     tpos = str(tags.get("TPOS", ""))
+    # ID3v2.4 text frames may hold several values (``join_values``).
     d: dict = {
-        "title": _str(tags.get("TIT2")),
-        "artist": _str(tags.get("TPE1")),
-        "album_artist": _str(tags.get("TPE2")),
-        "album": _str(tags.get("TALB")),
-        "composer": _str(tags.get("TCOM")),
-        "comment": _str(next(iter(tags.getall("COMM") or []), "")),
-        "label": _str(tags.get("TPUB")),
-        "isrc": _str(tags.get("TSRC")),
+        "title": join_values(tags.get("TIT2"), TEXT_SEP),
+        "artist": join_values(tags.get("TPE1"), NAME_SEP),
+        "album_artist": join_values(tags.get("TPE2"), NAME_SEP),
+        "album": join_values(tags.get("TALB"), TEXT_SEP),
+        "composer": join_values(tags.get("TCOM"), NAME_SEP),
+        "comment": join_values(next(iter(tags.getall("COMM") or []), None), "\n"),
+        "label": join_values(tags.get("TPUB"), TEXT_SEP),
+        "isrc": join_values(tags.get("TSRC"), TEXT_SEP),
         "game": _id3_game(tags),
         "bpm": _float(tags.get("TBPM")),
-        "genre": _list(tags.get("TCON")),
+        "genre": _id3_genres(tags.get("TCON")),
         "year": _year(tags.get("TDRC") or tags.get("TYER")),
         "track_number": _int(trck),
         "total_tracks": _total(trck),
@@ -1108,6 +1184,10 @@ def _flac(path: Path, track_id: str) -> dict:
         vals = audio.get(key.lower(), [])
         return vals[0] if vals else default
 
+    def gm(key, sep):
+        """Every value of a repeated comment, joined (``join_values``)."""
+        return join_values(audio.get(key.lower(), []), sep)
+
     trck = g("tracknumber")
     tpos = g("discnumber")
     # Bitrate: the uncompressed PCM bps figure mutagen advertises is
@@ -1132,17 +1212,17 @@ def _flac(path: Path, track_id: str) -> dict:
         "channels": audio.info.channels,
         "sample_rate": audio.info.sample_rate,
         "bit_depth": audio.info.bits_per_sample,
-        "title": g("title", path.stem),
-        "artist": g("artist"),
-        "album_artist": g("albumartist") or g("album artist"),
-        "album": g("album"),
-        "composer": g("composer"),
+        "title": gm("title", TEXT_SEP) or path.stem,
+        "artist": gm("artist", NAME_SEP),
+        "album_artist": gm("albumartist", NAME_SEP) or gm("album artist", NAME_SEP),
+        "album": gm("album", TEXT_SEP),
+        "composer": gm("composer", NAME_SEP),
         "comment": g("comment"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
         "game": (g("game") or "").strip(),
         "bpm": _float(g("bpm", None)),
-        "genre": audio.get("genre", []),
+        "genre": split_genres(audio.get("genre", [])),
         "year": _year(g("date", None)),
         "track_number": _int(trck),
         "total_tracks": _total(trck),
@@ -1168,6 +1248,10 @@ def _mp4(path: Path, track_id: str) -> dict:
             return default
         # A freeform ``----:`` atom holds bytes (``str()`` would give "b'…'").
         return v[0].decode("utf-8", "replace") if isinstance(v[0], bytes) else str(v[0])
+
+    def gm(key, sep):
+        """Every value of a repeated text atom, joined (``join_values``)."""
+        return join_values([x for x in (tags.get(key) or []) if not isinstance(x, bytes)], sep)
 
     # ``tags.get("trkn", default)`` returns the default only when the key is
     # absent — an explicit empty list, or a 1-element tuple from a malformed
@@ -1230,11 +1314,11 @@ def _mp4(path: Path, track_id: str) -> dict:
         "channels": audio.info.channels,
         "sample_rate": audio.info.sample_rate,
         "bit_depth": getattr(audio.info, "bits_per_sample", None),
-        "title": g("\xa9nam", path.stem),
-        "artist": g("\xa9ART"),
-        "album_artist": g("aART"),
-        "album": g("\xa9alb"),
-        "composer": g("\xa9wrt"),
+        "title": gm("\xa9nam", TEXT_SEP) or path.stem,
+        "artist": gm("\xa9ART", NAME_SEP),
+        "album_artist": gm("aART", NAME_SEP),
+        "album": gm("\xa9alb", TEXT_SEP),
+        "composer": gm("\xa9wrt", NAME_SEP),
         "comment": g("\xa9cmt"),
         "label": g("----:com.apple.iTunes:LABEL", "") or g("\xa9grp", ""),
         "isrc": g("----:com.apple.iTunes:ISRC", ""),
@@ -1262,6 +1346,10 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         v = tags.get(key.lower(), [])
         return v[0] if v else default
 
+    def gm(key, sep):
+        """Every value of a repeated comment, joined (``join_values``)."""
+        return join_values(tags.get(key.lower(), []), sep)
+
     trck = g("tracknumber")
     tpos = g("discnumber")
     out: dict = {
@@ -1274,17 +1362,17 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         # (Opus has no sample-rate field: it always decodes at 48 kHz —
         # reading ``info.sample_rate`` raised and dropped every tag)
         "sample_rate": getattr(audio.info, "sample_rate", None) or (48000 if fmt == "Opus" else None),
-        "title": g("title", path.stem),
-        "artist": g("artist"),
-        "album_artist": g("albumartist") or g("album_artist"),
-        "album": g("album"),
-        "composer": g("composer"),
+        "title": gm("title", TEXT_SEP) or path.stem,
+        "artist": gm("artist", NAME_SEP),
+        "album_artist": gm("albumartist", NAME_SEP) or gm("album_artist", NAME_SEP),
+        "album": gm("album", TEXT_SEP),
+        "composer": gm("composer", NAME_SEP),
         "comment": g("comment"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
         "game": (g("game") or "").strip(),
         "bpm": _float(g("bpm", None)),
-        "genre": tags.get("genre", []),
+        "genre": split_genres(tags.get("genre", [])),
         "year": _year(g("date", None)),
         "track_number": _int(trck),
         "total_tracks": _total(trck),
@@ -1906,10 +1994,16 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
                     txt = getattr(frame, "text", None)
                     if txt is None:
                         continue
-                    val = txt[0] if isinstance(txt, list) and txt else txt
+                    if dst == "genre":
+                        val = _id3_genres(frame)        # one entry per genre
+                    elif dst in MULTI_TEXT_FIELDS:
+                        val = join_values(frame, MULTI_TEXT_FIELDS[dst])
+                    else:
+                        val = txt[0] if isinstance(txt, list) and txt else txt
+                        val = str(val) if val else ""
                     if not val:
                         continue
-                    mutagen_tags[dst] = str(val)
+                    mutagen_tags[dst] = val
         except Exception as exc:
             log.debug("DSD mutagen tag read failed for %s: %s", path, exc)
 
@@ -1949,7 +2043,7 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
                 d[dst] = _int(v)
                 d["total_discs"] = _total(v)
             elif dst == "genre":
-                d[dst] = [v] if isinstance(v, str) else list(v)
+                d[dst] = split_genres(v)
             else:
                 d[dst] = v
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
@@ -1958,6 +2052,52 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
 
 
 # ── Tracker modules (MOD / S3M / XM / IT / …) ──────────────────────────────
+
+# A player's / editor's stand-in for a missing song name — uade's MED player
+# reports "<no songtitle>", OctaMED stores "<unnamed>" — is no title.
+_PLACEHOLDER_TITLE_RE = re.compile(r"^<[a-z ]+>$")
+
+# Tracker formats (of the ones without a parser of their own) whose title is
+# the first bytes of the file: Scream Tracker 2, Grave's MOD, Imago Orpheus.
+_TITLE_AT_ZERO_EXTS = frozenset({".stm", ".wow", ".imf"})
+
+
+def _mmd_song_name(raw: bytes) -> str:
+    """An OctaMED MMD0–MMD3 module's song name: the MMD0exp block (header
+    offset 32) holds its offset (+44) and length (+48); "" when absent."""
+    try:
+        exp = struct.unpack_from(">I", raw, 32)[0]
+        if not exp or exp + 52 > len(raw):
+            return ""
+        off, n = struct.unpack_from(">II", raw, exp + 44)
+        if not off or not n or n > 1024 or off + n > len(raw):
+            return ""
+        name = _decode_tracker_str(raw[off:off + n])
+        return "" if _PLACEHOLDER_TITLE_RE.match(name) else name
+    except struct.error:
+        return ""
+
+
+def title_from_filename(name: str) -> str:
+    """A track's title from its file name, when the file holds none: the stem,
+    except for Amiga prefix naming — ``MOD.Space_Debris`` (and the
+    ``MOD.Space_Debris.mod`` an archive member is listed as) → ``Space_Debris``.
+    Only a known format prefix is stripped (``Dr.Awesome.mod`` →
+    ``Dr.Awesome``, ``Fred.mod`` → ``Fred``).  Archive paths (``a.zip::b``,
+    ``SUB\\b``) give the member's own name."""
+    base = re.split(r"[\\/]", name.split("::")[-1])[-1]
+    stem, ext = os.path.splitext(base)
+    prefix, sep, rest = base.partition(".")
+    if sep and rest:
+        from soniqboom.core.archive import _AMIGA_PREFIX_EXT   # archive imports this module
+        amap = _AMIGA_PREFIX_EXT.get(prefix.lower())
+        ext = ext.lower()
+        if amap and ext == amap:
+            return os.path.splitext(rest)[0] or stem          # MOD.x.mod → x
+        if amap and ext not in SUPPORTED_EXTENSIONS:
+            return rest                                     # mdat.x → x
+    return stem
+
 
 def _extract_tracker(path: Path, track_id: str) -> dict:
     """Extract tracker module metadata by parsing binary headers.
@@ -2141,12 +2281,18 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                     end = min(name_off + 128, len(raw))
                 title = _decode_tracker_str(raw[name_off:end])
 
-        else:
-            # Other tracker formats — try reading first 20 bytes as title
-            if len(raw) >= 20:
-                candidate = _decode_tracker_str(raw[0:20])
-                if candidate and candidate.isprintable():
-                    title = candidate
+        elif raw[:3] == b"MMD" and raw[3:4] in (b"0", b"1", b"2", b"3"):
+            # OctaMED: offset 0 is the magic "MMD0" — the song name is in the
+            # MMD0exp block (GitHub #24).
+            title = _mmd_song_name(raw)
+
+        elif ext in _TITLE_AT_ZERO_EXTS and len(raw) >= 20:
+            # Other formats keep their title at offset 0 only in these; the
+            # rest start with format magic ("OKTASONG", "if", "FAR\xfe" …),
+            # which must never become a title — they fall back to the name.
+            candidate = _decode_tracker_str(raw[0:20])
+            if candidate and candidate.isprintable():
+                title = candidate
 
     except Exception as exc:
         log.debug("Tracker header parse failed for %s: %s", path, exc)
@@ -2202,7 +2348,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     # Fallback title from the INNER filename for zip-virtual paths
     # ("a.zip::b.zip::song.hvl" → "song"); plain path.stem would otherwise
     # yield the mangled "a.zip::b.zip::song" string as the title.
-    fallback = Path(str(path).split("::")[-1]).stem
+    fallback = title_from_filename(str(path))
     d: dict = {
         "id": track_id,
         "path": str(path),
@@ -2329,12 +2475,10 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
     # Title: embedded modulename when the format stores one, else the name
     # BODY (``mdat.acieed1`` → "acieed1"; ``legendcrack.fc`` → "legendcrack").
     title = (info.get("modulename") or "").strip()
+    if _PLACEHOLDER_TITLE_RE.match(title):        # "<no songtitle>": none stored (GitHub #24)
+        title = ""
     if not title:
-        first, _, rest = name.partition(".")
-        if cls and cls[1] == first.lower() and rest:
-            title = rest
-        else:
-            title = name.rsplit(".", 1)[0]
+        title = title_from_filename(name)
     d: dict = {
         "id": track_id,
         "path": str(path),
@@ -3130,12 +3274,12 @@ def _extract(
                 "bitrate": getattr(audio.info, "bitrate", None),
                 "channels": getattr(audio.info, "channels", None),
                 "sample_rate": getattr(audio.info, "sample_rate", None),
-                "title": (audio.get("title") or [path.stem])[0],
-                "artist": (audio.get("artist") or [""])[0],
-                "album_artist": (audio.get("albumartist") or [""])[0],
-                "album": (audio.get("album") or [""])[0],
+                "title": join_values(audio.get("title"), TEXT_SEP) or path.stem,
+                "artist": join_values(audio.get("artist"), NAME_SEP),
+                "album_artist": join_values(audio.get("albumartist"), NAME_SEP),
+                "album": join_values(audio.get("album"), TEXT_SEP),
                 "game": str((audio.get("game") or [""])[0] or "").strip(),
-                "genre": audio.get("genre") or [],
+                "genre": split_genres(audio.get("genre") or []),
                 "year": _year((audio.get("date") or [None])[0]),
                 "track_number": _int(trck),
                 "total_tracks": _total(trck),
@@ -3143,7 +3287,7 @@ def _extract(
     except Exception as exc:
         if strict_io and _is_io_error(exc):
             raise
-        d = {"id": track_id, "path": str(path), "title": path.stem,
+        d = {"id": track_id, "path": str(path), "title": title_from_filename(path.name),
              "format": FORMAT_NAMES.get(ext, ""), "duration": 0.0}
 
     # Fill common fields
@@ -3157,9 +3301,13 @@ def _extract(
     # "lossless only" smart-search filter.
     d.setdefault("is_lossless", _is_lossless_format(d.get("format")))
 
+    # No NUL-joined multi-value reaches the store, whatever the extractor
+    # (``normalise_multi_values``).
+    normalise_multi_values(d)
+
     # Normalise title fallback
     if not d.get("title"):
-        d["title"] = path.stem
+        d["title"] = title_from_filename(path.name)
 
     # Scene-enrichment MD5 (Modland join key) — chiptune/tracker-family
     # files only, capped so no big PCM file is ever hashed.  Mirrors the

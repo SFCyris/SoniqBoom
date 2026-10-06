@@ -164,7 +164,7 @@ async def read_playlist(playlist_id: str, user = Depends(current_user)):
         from soniqboom.api.search import run_search
         results = await run_search(q, limit=500)
         tracks = [t.model_dump() if hasattr(t, "model_dump") else t for t in results]
-        return {**playlist, "smart": True, "tracks": tracks}
+        return {**playlist, "smart": True, "tracks": _mark_offline(tracks)}
 
     entries = playlist.get("track_ids", [])
     ids = [_entry_id(e) for e in entries]
@@ -186,7 +186,38 @@ async def read_playlist(playlist_id: str, user = Depends(current_user)):
             td.pop("embedding", None)
             td["subsong"] = sub
             tracks.append(td)
-    return {**playlist, "tracks": tracks}
+    return {**playlist, "tracks": _mark_offline(tracks)}
+
+
+def _mark_offline(tracks: list) -> list:
+    """A playlist lists every entry — "Tracks on unavailable drives: Hide"
+    never drops one — but marks the ones that can't play right now
+    (``offline``, Mark and Hide modes; ``core.availability``)."""
+    from soniqboom.core import availability
+    from soniqboom.core.store import get_store
+    store = get_store()
+    if availability.mode(store) == "show":
+        return tracks
+    snap = availability.snapshot(store)
+    if not snap.dead:
+        return tracks
+    out = []
+    for t in tracks:
+        d = t if isinstance(t, dict) else None
+        if d is None and hasattr(t, "model_dump"):
+            kind = snap.kind_of({"id": getattr(t, "id", None),
+                                 "scan_root_hash": getattr(t, "scan_root_hash", None)})
+            if kind:
+                d = t.model_dump()
+                d.pop("embedding", None)
+                d["offline"] = kind
+                out.append(d)
+            else:
+                out.append(t)
+            continue
+        kind = snap.kind_of(d) if d is not None else None
+        out.append({**d, "offline": kind} if kind else t)
+    return out
 
 
 @router.put("/{playlist_id}")

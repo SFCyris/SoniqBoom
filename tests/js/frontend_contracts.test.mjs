@@ -175,3 +175,41 @@ test('every control in the phone\'s mini player has a column of its own, so the 
   assert.ok(h && padTop >= 0 && rowGap >= 0, 'mini height / padding / row-gap not found');
   assert.ok(padTop + 48 + rowGap + 2 <= h, `the progress bar sits ${padTop + 48 + rowGap + 2 - h} px below the mini player`);
 });
+
+test('the queue re-anchors after an availability change in Mark mode too', () => {
+  // With duplicates hidden, a copy stands in for an offline primary at its own
+  // list position (core/availability.primary_swap) in Mark mode as well as in
+  // Hide, so an ordered queue resumes after its last list row, not at the old
+  // offset; only Show → Show leaves list positions where they were.
+  const src = read('soniqboom/frontend/js/offline.js');
+  const m = src.match(/if \(([^\n{}]*)\) \{\s*try \{ Player\.reanchorOrdered/);
+  assert.ok(m, 'the reanchorOrdered call (and its condition) not found');
+  const cond = new Function('j', 'prevMode', `return (${m[1]});`);
+  for (const prev of ['mark', 'hide', 'show']) {
+    for (const mode of ['mark', 'hide', 'show']) {
+      assert.equal(cond({ mode }, prev), !(prev === 'show' && mode === 'show'), `${prev} → ${mode}`);
+    }
+  }
+});
+
+test('the sidebar browse counts are fetched at page load and after a scan (GitHub #26)', () => {
+  const lib = read('soniqboom/frontend/js/library.js');
+  assert.match(lib, /refreshBadges: _refreshBadges,/);
+  assert.match(lib, /function _refreshBadges\(\) \{\s*_refreshTrackCount\(\);\s*_refreshNavCounts\(\);/);
+  assert.match(lib, /setTimeout\(_refreshNavCounts, \d+\);/);
+  for (const v of ['artists', 'album_artists', 'albums', 'genres', 'years']) {
+    assert.ok(lib.includes(`['${v}', '/library/`), `${v} is not refreshed at load`);
+  }
+  // the "[No Artist]" bucket rows are not artists, in the views or at load
+  assert.match(lib, /_updateNavBadge\('artists', _navCount\(artists\)\)/);
+  assert.match(lib, /_updateNavBadge\('album_artists', _navCount\(albumArtists\)\)/);
+  assert.match(lib, /const _navCount = \(rows\) => rows\.filter\(r => !r\.label\)\.length;/);
+});
+
+test("the Track Info tune list's play button pauses the loaded tune (GitHub #28)", () => {
+  const ti = read('soniqboom/frontend/js/trackinfo.js');
+  assert.match(ti, /if \(act === 'play' && wire === _currentSubWire\(\) && !Player\.audio\?\.error\) \{\s*Player\.playPause\(\);/);
+  assert.match(ti, /Player\.on\?\.\('statechange', \(\) => _highlightPlayingSubsong\(\)\);/);
+  // Space on a row is handled there only — not also by the page's play/pause
+  assert.match(ti, /e\.preventDefault\(\);\s*e\.stopPropagation\(\);[^\n]*\n\s*_subAction\('play'/);
+});

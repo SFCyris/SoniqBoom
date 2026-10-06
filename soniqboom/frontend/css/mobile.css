@@ -340,6 +340,36 @@ input, select, textarea { touch-action: manipulation; }
 }
 .track-defect-corrupt::before { content: '⚠'; }
 
+/* A track that can't play right now — its drive or share is offline and no
+   cached copy can serve it (shared class names with desktop app.css): the row
+   is dimmed and its title carries an "offline" badge, a glyph + a word whose
+   screen-reader text says why.  Tapping still tries and reports the reason. */
+.m-row.track-offline .m-row-art { opacity: 0.5; }
+.m-row.track-offline .m-row-meta .m-row-artist,
+.m-row.track-offline .m-row-content > .m-row-artist { opacity: 0.75; }  /* (text stays legible) */
+.m-row.track-offline .m-row-title-text { color: var(--text-dim); }
+.track-offline-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.7;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text-dim) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-dim) 55%, transparent);
+}
+.track-offline-icon { line-height: 1; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
 .m-row-handle {
   width: 32px; height: 44px;
   display: flex; align-items: center; justify-content: center;
@@ -740,6 +770,27 @@ label.m-settings-row .label small { display: block; margin-top: 3px; font-size: 
   accent-color: var(--accent);
 }
 .m-settings-row.column .value { text-align: left; width: 100%; }
+.m-settings-select {
+  flex-shrink: 0;
+  margin-left: 12px;
+  min-height: 36px;
+  padding: 4px 28px 4px 10px;
+  font-size: 15px;
+  color: var(--text);
+  /* (the engine's own select ignores min-height in WebKit: drawn here, with
+     a chevron, so the touch target is really 36 px tall) */
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: var(--surface-2);
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+                    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.m-settings-select:disabled { opacity: 0.6; }
 
 /* ── Library group nav ─────────────────────────────────────────────────── */
 

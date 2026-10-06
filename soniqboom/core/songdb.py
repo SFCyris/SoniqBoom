@@ -61,8 +61,26 @@ from soniqboom.core import folder_album as fa
 log = logging.getLogger(__name__)
 
 SOURCE = "songdb"
+# Pinned to the commit whose TSVs this build was validated against (the
+# upstream author asks third parties to link a specific commit rather than a
+# moving branch, so a reformatted file can't surprise a running install).
+# Bump COMMIT only after re-validating a newer set.
+COMMIT = "95b3eaba14968097ed8702b9ba79bd03a2c0aaf5"
 BASE_URL = ("https://raw.githubusercontent.com/mvtiaine/audacious-uade-tools/"
-            "master/tsv/pretty/md5/")
+            f"{COMMIT}/tsv/pretty/md5/")
+# The upstream commit date of COMMIT (newer upstream TSV commits are reported
+# as "newer data available", never installed on their own).
+COMMIT_DATE = "2026-08-18T21:44:23Z"
+# Only used when the pinned commit is gone upstream (HTTP 404, e.g. a history
+# rewrite): the moving branch, still subject to the plausibility checks, and
+# labelled "latest (not validated)" in the status.
+LATEST_URL = ("https://raw.githubusercontent.com/mvtiaine/audacious-uade-tools/"
+              "master/tsv/pretty/md5/")
+_UPSTREAM_COMMITS_API = ("https://api.github.com/repos/mvtiaine/audacious-uade-tools/"
+                         "commits?path=tsv/pretty/md5&per_page=1")
+# The same files on GitHub, for the settings' "Validated set" link.
+VALIDATED_URL = ("https://github.com/mvtiaine/audacious-uade-tools/tree/"
+                 f"{COMMIT}/tsv/pretty/md5")
 FILES = ("metadata.tsv", "songlengths.tsv")
 AUTO_APPLY_PREF = "songdb_auto_apply"
 
@@ -168,8 +186,14 @@ def _index_info() -> dict:
 def status() -> dict:
     out = dict(_status)
     exists = has_index()
+    info = _index_info() if exists else {}
+    out["source_set"] = info.get("source_set") or ("validated" if
+                        info.get("source") == BASE_URL else ("unknown" if info else None))
+    out["source_commit"] = info.get("source_commit") or None
+    out["validated_commit"] = COMMIT
+    out["newer_upstream"] = ({"sha": info["newer_sha"], "date": info.get("newer_date")}
+                             if info.get("newer_sha") else None)
     if exists and not out["meta_rows"]:
-        info = _index_info()
         try:
             out["meta_rows"] = int(info.get("meta_rows") or 0)
             out["length_rows"] = int(info.get("length_rows") or 0)
@@ -187,15 +211,23 @@ def status() -> dict:
 
 # ── Index build ──────────────────────────────────────────────────────────────
 
-def _download(name: str, dest: Path) -> None:
-    """Stream ``BASE_URL + name`` to ``dest`` (3 attempts, size-capped)."""
+class _PinnedGone(RuntimeError):
+    """The pinned commit's file answered 404 — not a transient error."""
+
+
+def _download(name: str, dest: Path, base: str | None = None) -> None:
+    """Stream ``base + name`` (default ``BASE_URL``, the pinned commit) to
+    ``dest`` (3 attempts, size-capped).  A 404 raises ``_PinnedGone`` at once
+    (no retries)."""
     import httpx
-    url = BASE_URL + name
+    url = (base or BASE_URL) + name
     last: Exception | None = None
     for attempt in range(3):
         try:
             with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=True) as client:
                 with client.stream("GET", url) as resp:
+                    if resp.status_code == 404:
+                        raise _PinnedGone(f"{name}: 404 at {url}")
                     resp.raise_for_status()
                     got = 0
                     with open(dest, "wb") as fh:
@@ -205,6 +237,9 @@ def _download(name: str, dest: Path) -> None:
                                 raise RuntimeError(f"{name} is larger than expected")
                             fh.write(chunk)
             return
+        except _PinnedGone:
+            dest.unlink(missing_ok=True)
+            raise
         except Exception as exc:                        # noqa: BLE001
             last = exc
             dest.unlink(missing_ok=True)
@@ -379,7 +414,33 @@ def _album_qualifiers(rows) -> dict[str, dict[str, str]]:
     return out
 
 
-def build_index(meta_tsv: Path, lengths_tsv: Path, dest: Path) -> tuple[int, int]:
+def _latest_upstream() -> dict | None:
+    """The newest upstream commit touching the TSVs — ``{"sha", "date"}`` —
+    or None (offline, rate-limited, anything unexpected).  Best effort, one
+    short request."""
+    import httpx
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.get(_UPSTREAM_COMMITS_API,
+                              headers={"Accept": "application/vnd.github+json"})
+            if resp.status_code != 200:
+                return None
+            items = resp.json()
+        c = items[0]
+        return {"sha": str(c["sha"]), "date": str(c["commit"]["committer"]["date"])}
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _newer_than_pinned(latest: dict | None) -> dict | None:
+    """``latest`` when it is a different commit, newer than ``COMMIT``."""
+    if not latest or latest.get("sha") == COMMIT:
+        return None
+    return latest if str(latest.get("date") or "") > COMMIT_DATE else None
+
+
+def build_index(meta_tsv: Path, lengths_tsv: Path, dest: Path,
+                source: str | None = None, extra: dict | None = None) -> tuple[int, int]:
     """Build the sqlite index at ``dest`` from the two pretty TSVs; returns
     ``(meta_rows, length_rows)``.  Raises when the input doesn't look like the
     song database (the caller discards ``dest`` then).  The display values are
@@ -429,7 +490,8 @@ def build_index(meta_tsv: Path, lengths_tsv: Path, dest: Path) -> tuple[int, int
         n_len = con.execute("SELECT COUNT(*) FROM lengths").fetchone()[0]
         con.executemany("INSERT INTO info VALUES (?,?)", [
             ("built_at", str(time.time())), ("meta_rows", str(n_meta)),
-            ("length_rows", str(n_len)), ("source", BASE_URL)])
+            ("length_rows", str(n_len)), ("source", source or BASE_URL),
+            *((str(k), str(v)) for k, v in (extra or {}).items())])
         con.commit()
     finally:
         con.close()
@@ -447,10 +509,28 @@ def refresh_index() -> dict:
     tmp = {n: db.with_name(f"songdb-{n}.part") for n in FILES}
     building = db.with_suffix(".building")
     try:
-        for name, path in tmp.items():
-            log.info("Song database: downloading %s", BASE_URL + name)
-            _download(name, path)
-        n_meta, n_len = build_index(tmp["metadata.tsv"], tmp["songlengths.tsv"], building)
+        base, source_set = BASE_URL, "validated"
+        try:
+            for name, path in tmp.items():
+                log.info("Song database: downloading %s", BASE_URL + name)
+                _download(name, path)
+        except _PinnedGone as gone:
+            # The pinned commit is gone upstream: the moving branch instead,
+            # still plausibility-checked, and shown as not validated.
+            log.warning("Song database: pinned commit unavailable (%s) — "
+                        "downloading the latest files instead", gone)
+            base, source_set = LATEST_URL, "latest"
+            for name, path in tmp.items():
+                path.unlink(missing_ok=True)
+                log.info("Song database: downloading %s", LATEST_URL + name)
+                _download(name, path, base=LATEST_URL)
+        newer = _newer_than_pinned(_latest_upstream())
+        extra = {"source_set": source_set,
+                 "source_commit": COMMIT if source_set == "validated" else "master"}
+        if newer:
+            extra.update(newer_sha=newer["sha"], newer_date=newer["date"])
+        n_meta, n_len = build_index(tmp["metadata.tsv"], tmp["songlengths.tsv"], building,
+                                    source=base, extra=extra)
         building.replace(db)
         _status.update(meta_rows=n_meta, length_rows=n_len, built_at=time.time())
         log.info("Song database index built: %d metadata, %d song-length entries",

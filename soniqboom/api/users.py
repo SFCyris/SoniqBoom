@@ -222,7 +222,15 @@ async def require_admin(user: User = Depends(require_user)) -> User:
 # duplicate recompute, server-local station favorites) — allowed for admin or
 # edit, blocked for readonly.  Per-user data (own playlists) and playback stay
 # on ``require_user``.
-require_edit = require_role("admin", "edit")
+EDIT_ROLES = ("admin", "edit")
+require_edit = require_role(*EDIT_ROLES)
+
+
+def has_edit_role(user: User | None) -> bool:
+    """Does ``user`` hold the ``require_edit`` roles?  For an endpoint any
+    signed-in user may call that writes shared data only for edit users
+    (the web lyrics lookup's tag write-back)."""
+    return getattr(user, "role", None) in EDIT_ROLES
 
 
 # ── Public endpoints ─────────────────────────────────────────────────────────

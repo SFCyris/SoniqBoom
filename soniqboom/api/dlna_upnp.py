@@ -59,6 +59,16 @@ from fastapi.responses import PlainTextResponse, Response as FResponse
 
 log = logging.getLogger(__name__)
 
+
+def _dlna_store():
+    """The library as DLNA control points see it: catalogue tunes
+    (``core/catalogue.py``) are hidden unless the catalogue's "Show to
+    Subsonic apps" switch is on (``core/catalogue_view.py``)."""
+    from soniqboom.core.catalogue_view import subsonic_store
+    from soniqboom.core.store import get_store
+    return subsonic_store(get_store())
+
+
 # Mounted at app root in main.py
 router = APIRouter(tags=["dlna"])
 
@@ -503,7 +513,7 @@ def _parse_search_criteria(crit: str):
 
 async def _do_search(args: dict[str, str], request: Request) -> FResponse:
     """ContentDirectory:1 Search — returns matching track items as DIDL-Lite."""
-    from soniqboom.core.store import get_store
+    get_store = _dlna_store
     try:
         start = max(0, int(args.get("StartingIndex", "0") or 0))
         req_cnt = int(args.get("RequestedCount", "0") or 0)
@@ -683,7 +693,7 @@ async def _browse_children(
     obj_id: str, start: int, count: int, base_url: str,
 ) -> dict[str, str]:
     """Return paginated children of ``obj_id`` as DIDL-Lite."""
-    from soniqboom.core.store import get_store
+    get_store = _dlna_store
 
     didl_parts: list[str] = ["<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">"]
     total = 0

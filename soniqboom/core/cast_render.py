@@ -169,6 +169,12 @@ async def materialize_source(
             scan_root, remote_path = parse_remote_path(outer)
             if not remote_path:
                 return None
+            # A catalogue tune (core/catalogue.py): background callers (the
+            # cast lookahead, ``lane="scan"``) read only what is cached; the
+            # cast play itself opened its fetch window (cast_stream).
+            from soniqboom.core import catalogue
+            if lane != "stream" and not catalogue.fetch_ok(outer, "scan"):
+                return None
             # No source (not connected, or its sign-in refused): what the
             # remote cache holds still plays.
             source = get_source(scan_root)

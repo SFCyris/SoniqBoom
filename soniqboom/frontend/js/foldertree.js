@@ -43,9 +43,12 @@ function basename(p) {
  * @param {boolean} hasAudio — show accent dot
  * @param {boolean} hasChildren — whether children may exist
  */
-function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = true, alias = '', unavailable = false } = {}) {
+function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = true, alias = '', unavailable = false, catalogue = '' } = {}) {
   const li = document.createElement('li');
   li.className = (isRoot ? 'tree-root' : '') + (unavailable ? ' tree-unavailable' : '');
+  // A catalogue root browses from its index, so it stays browsable while its
+  // archive is unreachable (only uncached tunes can't play then).
+  const blocked = unavailable && !catalogue;
   li.dataset.path = path;
   li.dataset.root = root;
 
@@ -80,12 +83,26 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
   label.textContent = isRoot ? (alias || path) : basename(path);
   label.title = path;
   row.appendChild(label);
+  if (isRoot && catalogue) {
+    // A catalogue root (Admin → Library → External sources): listed from the
+    // archive's index; a tune is fetched from the archive when it is played.
+    li.classList.add('tree-catalogue');
+    label.title = `${alias || path} catalogue \u2014 tunes are fetched from ${alias || 'the archive'} when you play them`;
+  }
 
   // Unavailable indicator — the backend reachability probe flagged this root's
   // drive/share as offline (ejected, disconnected, or stalled).  Its tracks
   // stay in the library (the scanner never prunes an unreachable root); this
   // badge just explains why the folder is greyed and won't browse.
-  if (unavailable) {
+  if (unavailable && catalogue) {
+    const badge = document.createElement('span');
+    badge.className = 'tree-unavail-badge';
+    badge.textContent = 'offline';
+    badge.title = `${alias || path} can't be reached right now. Tunes played before still `
+                + 'play; the others play once it is reachable again.';
+    row.appendChild(badge);
+    row.title = `${alias || path} — unreachable right now`;
+  } else if (unavailable) {
     const badge = document.createElement('span');
     badge.className = 'tree-unavail-badge';
     badge.textContent = 'unavailable';
@@ -115,7 +132,7 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
     // Never fire a browse request against an offline mount — it would hit the
     // same stalled/erroring path the backend probe flagged.  Silent here (this
     // also runs on tree-rebuild restore); the click handler shows the toast.
-    if (unavailable) return;
+    if (blocked) return;
     const isOpen = children.classList.contains('open');
     if (isOpen) {
       children.classList.remove('open');
@@ -171,7 +188,7 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
 
   // Click label → show tracks in this directory
   function selectAndExpand() {
-    if (unavailable) {
+    if (blocked) {
       // Offline mount: don't browse it (would hit the dead share) and don't
       // load its track list.  The tracks are kept in the library; tell the user
       // to reconnect.
@@ -266,7 +283,8 @@ async function _doRefresh() {
       // drives (e.g. an ejected/stalled /Volumes/… mount).  Previously this was
       // gated to network shares only, so a dropped local mount looked normal.
       const unavail = d.status === 'unavailable';
-      const li = makeNode(d.path, d.path, { isRoot: true, hasAudio: true, alias, unavailable: unavail });
+      const li = makeNode(d.path, d.path, { isRoot: true, hasAudio: true, alias, unavailable: unavail,
+                                            catalogue: d.catalogue || '' });
       treeEl.appendChild(li);
     });
   } catch {

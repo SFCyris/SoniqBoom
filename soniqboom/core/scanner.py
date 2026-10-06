@@ -51,7 +51,7 @@ from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable, Iterable
 
 from soniqboom.core.metadata import (
-    SID_EXTS, SUPPORTED_EXTENSIONS, extract, is_supported_music_name,
+    SID_EXTS, SUPPORTED_EXTENSIONS, extract, is_supported_music_name, title_from_filename,
 )
 
 
@@ -1030,11 +1030,15 @@ from soniqboom.models.track import Track, TrackMeta
 log = logging.getLogger(__name__)
 
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
-# Default to half the available cores (rounded up, min 2, max 16) — a fixed 8
+# Default to half the usable cores (rounded up, min 2, max 16) — a fixed 8
 # over-subscribed 2-core Macs and under-utilised 10+-core M-series machines.
+# "Usable" honours a container's CPU limit (GitHub #21); SONIQBOOM_SCAN_WORKERS
+# sets the count outright.
 def _default_scan_workers() -> int:
-    cores = os.cpu_count() or 4
-    return max(2, min(16, (cores + 1) // 2))
+    from soniqboom.core import procinfo
+    cores = procinfo.usable_cpus()
+    return procinfo.env_count("SONIQBOOM_SCAN_WORKERS", max(2, min(16, (cores + 1) // 2)),
+                              maximum=64)
 
 SCAN_WORKERS   = _default_scan_workers()
 WRITE_BATCH    = 500     # tracks buffered before a store flush
@@ -1290,8 +1294,9 @@ def _member_basename(path_str: str) -> str:
 
 
 def _member_stem(path_str: str) -> str:
-    """Stem of :func:`_member_basename` — the title fallback."""
-    return Path(_member_basename(path_str)).stem
+    """The title fallback from :func:`_member_basename` (Amiga prefix
+    naming understood — ``metadata.title_from_filename``)."""
+    return title_from_filename(_member_basename(path_str))
 
 
 # ── HVSC auto-detection ──────────────────────────────────────────────────────
@@ -1845,7 +1850,7 @@ def _extract_one_remote(
             # Title fallback inside extract() used the temp file's basename
             # (e.g. ``tmpXXXXXXXX``) when the source had no title tag.  Replace
             # it with the real remote basename so the UI doesn't show garbage.
-            real_stem = Path(real_base).stem
+            real_stem = title_from_filename(real_base)
             if real_stem and meta.title == tmp_path.stem:
                 meta.title = real_stem
             return remote_path, meta, None, None
@@ -2255,7 +2260,7 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
         # Title fallback inside extract() used the temp file's basename when the
         # source had no title tag.  Substitute the real ZIP member name so the
         # UI doesn't show ``tmpXXXXXXXX``.
-        real_stem = Path(real_base).stem
+        real_stem = title_from_filename(real_base)
         if real_stem and meta.title == tmp_path.stem:
             meta.title = real_stem
         return meta
@@ -2832,11 +2837,13 @@ async def _async_exit_batch_mode(store) -> None:
         store._batch_mode = False
         return
 
-    # Single source of truth for the year-collapse rule — keeps this
-    # async/yielding rebuild aligned with TrackStore._index_track and the
-    # in-line _rebuild_sorted_indexes path.
-    from soniqboom.core.store import (normalise_year, SORTED_LISTS, _game_fold_value,
-                                      _sortable_duration)
+    # The numeric lists' value functions are the single source of truth for
+    # their keys (year collapse, no-value key) — keeps this async/yielding
+    # rebuild aligned with TrackStore._index_track and the in-line
+    # _rebuild_sorted_indexes path.
+    from soniqboom.core.store import (SORTED_LISTS, _game_fold_value, _lex_key_shared,
+                                      _year_value, _added_value, _duration_value,
+                                      _bpm_value)
     from soniqboom.core.data import _rebuild_lock_for_loop
 
     EMPTY_SORT_KEY = "\uffff"
@@ -2886,25 +2893,18 @@ async def _async_exit_batch_mode(store) -> None:
                         _gc.disable()
                         try:
                             for tid, t in _snap[_ci:_ci + 5_000]:
-                                y = normalise_year(t.get("year"))
-                                if y is not None:
-                                    year.append((y, tid))
-                                a = t.get("added_at", 0)
-                                if a:
-                                    added.append((a, tid))
-                                    if t.get("is_duplicate_primary", True):
-                                        added_primary.append((a, tid))
-                                d = t.get("duration", 0.0)
-                                if _sortable_duration(d):
-                                    dur.append((d, tid))
-                                b = t.get("bpm")
-                                if b is not None:
-                                    bpm.append((b, tid))
+                                year.append((_year_value(t), tid))
+                                a = _added_value(t)
+                                added.append((a, tid))
+                                if t.get("is_duplicate_primary", True):
+                                    added_primary.append((a, tid))
+                                dur.append((_duration_value(t), tid))
+                                bpm.append((_bpm_value(t), tid))
                                 title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                                artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                                album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                                album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-                                fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+                                artist_s.append(      (_lex_key_shared(t.get("artist")),       tid))
+                                album_artist_s.append((_lex_key_shared(t.get("album_artist")), tid))
+                                album_s.append(       (_lex_key_shared(t.get("album")),        tid))
+                                fmt.append(           (_lex_key_shared(t.get("format")),       tid))
                                 tf = _game_fold_value(t.get("title"))
                                 if tf is not None:
                                     title_fold.append((tf, tid))
@@ -2937,7 +2937,7 @@ async def _async_exit_batch_mode(store) -> None:
                             for i, (val, tid) in enumerate(lst):
                                 try:
                                     lst[i] = (float(val), tid)
-                                except (ValueError, TypeError):
+                                except (ValueError, TypeError, OverflowError):
                                     lst[i] = (0.0, tid)
                             lst.sort()
                         else:
@@ -3045,8 +3045,11 @@ async def _run_duplicate_detection_async() -> None:
     if not snap:
         return
     all_tracks: list[dict] = []
+    from soniqboom.core.catalogue import is_catalogue_path
     for i in range(0, len(snap), 20_000):
-        all_tracks.extend({k: t.get(k) for k in _DUP_INPUT_FIELDS} for t in snap[i : i + 20_000])
+        # Catalogue tracks (core/catalogue.py) are never grouped: left out.
+        all_tracks.extend({k: t.get(k) for k in _DUP_INPUT_FIELDS} for t in snap[i : i + 20_000]
+                          if not is_catalogue_path(t.get("path")))
         await asyncio.sleep(0)
     del snap
 
@@ -3337,7 +3340,8 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
     groups whose membership can change are the old and new keys of the
     changed / removed tracks.  Their members are found in the maintained
     duration index (one bucket each; tracks under 5 s or of unknown length —
-    not in that index — by one pass over the library) and re-annotated with
+    bucket 0, which that index can't bisect: unknown lengths are keyed past
+    every bucket — by one pass over the library) and re-annotated with
     the same ``compute_duplicate_groups`` the full pass uses.  Returns False
     (caller runs the full pass) when the duration index is mid-rebuild."""
     import bisect
@@ -4991,9 +4995,14 @@ async def stop_background_writers(extra=(), timeout: float = 3.0) -> int:
     tasks.add(_dup_runner_task)
     tasks.update(_scene_autoapply_tasks)
     try:
-        from soniqboom.core import art_backfill, folder_album, game_titles, repair
+        from soniqboom.core import art_backfill, folder_album, game_titles, genre_derive, repair
         tasks.update(folder_album._tasks)
         tasks.update(game_titles._bg_tasks)
+        tasks.update(genre_derive._bg_tasks)
+        get_store().set_enrich_listener(None)      # no pass after the writers stop
+        if genre_derive._poke_handle is not None:
+            genre_derive._poke_handle.cancel()
+            genre_derive._poke_handle = None
         tasks.update(art_backfill._tasks)
         tasks.add(repair._task)
     except Exception:                                   # noqa: BLE001
@@ -5099,6 +5108,25 @@ def schedule_startup_enrichment() -> None:
         game_titles.schedule()
     except Exception:                               # noqa: BLE001
         log.debug("game-title startup pass failed", exc_info=True)
+    try:
+        # Multi-value tags stored NUL-joined by older builds are repaired
+        # once; then the derived genres follow every write they read and get
+        # one full pass now (core/genre_derive.py).
+        from soniqboom.core import genre_derive
+
+        async def _genres() -> None:
+            from soniqboom.core import repair
+            try:
+                await repair.repair_multi_values_once()
+            except Exception:                       # noqa: BLE001
+                log.exception("multi-value tag repair failed")
+            genre_derive.install()
+            genre_derive.schedule()
+        t = asyncio.get_running_loop().create_task(_genres(), name="derived-genres-startup")
+        _scene_autoapply_tasks.add(t)
+        t.add_done_callback(_scene_autoapply_tasks.discard)
+    except Exception:                               # noqa: BLE001
+        log.debug("derived-genre startup pass failed", exc_info=True)
     try:
         from soniqboom.core import scene_metadata, repair
         from soniqboom.core.store import get_store
@@ -5260,6 +5288,11 @@ def _schedule_folder_album_pass() -> None:
         game_titles.schedule()
     except Exception:                                   # noqa: BLE001
         log.debug("game-title post-scan hook failed", exc_info=True)
+    try:
+        from soniqboom.core import genre_derive      # derived genres (after the scan)
+        genre_derive.schedule()
+    except Exception:                                   # noqa: BLE001
+        log.debug("derived-genre post-scan hook failed", exc_info=True)
 
 
 async def _drain_scan_queue() -> None:
@@ -5384,6 +5417,11 @@ async def start_scan(
     full scan: archives unchanged since their members were indexed are listed
     from the store instead of re-read (a manual request clears it)."""
     global _scan_task
+    from soniqboom.core import catalogue as _catalogue
+    # A catalogue root (core/catalogue.py) is never scanned: its index is.
+    directories = [d for d in directories if not _catalogue.is_catalogue_root(d)]
+    if not directories and not scope:
+        return _scan_task
     norm_dirs = frozenset(str(Path(d).resolve()) for d in directories)
 
     if scope:
@@ -6008,6 +6046,13 @@ async def start_remote_scan(
          remote) and gets purged.
     """
     global _progress, _scan_count
+    from soniqboom.core import catalogue as _catalogue
+    if _catalogue.is_catalogue_root(scan_root):
+        # A catalogue root is NEVER walked or scanned (core/catalogue.py):
+        # its index refresh replaces scanning, and nothing but a play may
+        # fetch one of its files.
+        log.info("Remote scan of catalogue root %s refused (index-managed)", scan_root)
+        return {}
 
     # Dedupe: drop if this scan_root is already being scanned.  The
     # in-flight task will broadcast its own completion event when

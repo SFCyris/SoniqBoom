@@ -1081,6 +1081,11 @@ def collect_folder_updates(
     ``finalize_folder_updates(state)``, so a folder is judged once and the
     vote sees every sibling.  Without ``state`` the call is single-shot."""
     from soniqboom.core.retro import is_retro_format
+    from soniqboom.core.catalogue import is_catalogue_path
+    # Catalogue tunes (core/catalogue.py) take their album from their Modland
+    # path (core/modland_catalog.py), never from a folder name.
+    if any(is_catalogue_path(t.get("path")) for t in tracks):
+        tracks = [t for t in tracks if not is_catalogue_path(t.get("path"))]
     single = state is None
     if single:
         state = new_folder_state()

@@ -914,11 +914,12 @@ def test_lyrics_skip_online_lookup_for_retro(env, monkeypatch):
     from soniqboom.api import tracks as tracks_mod
     calls = []
 
-    async def _impl(tid):
+    async def _impl(tid, *, writeback):
+        assert writeback is False               # a Subsonic lookup never writes tags
         calls.append(tid)
         return {"lyrics": None}
 
-    monkeypatch.setattr(tracks_mod, "get_lyrics", _impl)
+    monkeypatch.setattr(tracks_mod, "resolve_lyrics", _impl)
     assert env.ok("getLyricsBySongId.view", id="h1")["lyricsList"] == {"structuredLyrics": []}
     assert calls == []
     env.ok("getLyricsBySongId.view", id="q1")
@@ -967,6 +968,14 @@ def _ffprobe_seconds(path) -> float:
 
 
 @pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="ffmpeg missing")
+def _decoded_pcm(path) -> bytes:
+    """The audio of an MP3 as 16-bit stereo PCM (ffmpeg)."""
+    import subprocess
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "s16le",
+                           "-ac", "2", "-ar", "44100", "-"],
+                          check=True, capture_output=True).stdout
+
+
 def test_time_offset_starts_a_transcode_later(env, monkeypatch, tmp_path):
     import subprocess
     from soniqboom.api import stream as stream_mod
@@ -995,7 +1004,14 @@ def test_time_offset_starts_a_transcode_later(env, monkeypatch, tmp_path):
     d_full = _ffprobe_seconds(tmp_path / "full.mp3")
     d_late = _ffprobe_seconds(tmp_path / "late.mp3")
     assert abs(d_full - 10.0) < 0.3 and abs(d_late - 6.0) < 0.3, (d_full, d_late)
-    assert zero.content == full.content                      # 0 = no offset
+    # 0 = no offset: the whole tune, not a later start.  Compared by decoded
+    # length, not byte for byte — a piped encode and a cached file differ in
+    # the Xing/Info header ffmpeg writes (frame counts, gapless padding), so
+    # their bytes and decoded lengths can differ by about one frame.
+    (tmp_path / "zero.mp3").write_bytes(zero.content)
+    secs = lambda p: len(_decoded_pcm(p)) / (4 * 44100)          # noqa: E731
+    s_full, s_zero = secs(tmp_path / "full.mp3"), secs(tmp_path / "zero.mp3")
+    assert abs(s_zero - s_full) < 0.1 and abs(s_zero - 10.0) < 0.3, (s_full, s_zero)
     # A native file with no transcode: timeOffset is ignored (clients seek by Range).
     plain = env.client.get("/rest/stream.view", params={"id": "tx1", "timeOffset": 4})
     assert plain.content == src.read_bytes()

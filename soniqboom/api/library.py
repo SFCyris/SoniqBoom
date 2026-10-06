@@ -97,6 +97,12 @@ async def _broadcast(data: dict) -> None:
             _ws_user_id.pop(ws, None)
 
 
+async def broadcast_catalogue_changed(root: str) -> None:
+    """Tell every open page a catalogue root's tracks changed (built, refreshed,
+    removed): the folder tree and the open view refresh."""
+    await _broadcast({"event": "catalogue_changed", "root": root})
+
+
 # ── Aggregation cache (event-driven: cached until scan invalidates) ───────────
 
 # Entry is ``(mutation_seq, data)`` — the HTTP cache is gated on the store's
@@ -121,11 +127,23 @@ _GZIP_MIN_BYTES = 1000
 _GZIP_LEVEL = 6
 
 
-def _current_agg_seq() -> int:
+def _current_agg_seq():
+    """What an aggregate cache entry is valid for: the store's mutation
+    sequence, plus — while "Tracks on unavailable drives: Hide" leaves tracks
+    out, or a duplicate's copy stands in for a primary that can't play — the
+    availability generation (the counts follow both)."""
     try:
-        return int(getattr(get_store(), "_mutation_seq", 0))
+        store = get_store()
+        seq = int(getattr(store, "_mutation_seq", 0))
     except Exception:
         return 0
+    try:
+        from soniqboom.core import availability
+        tok = availability.hide_token(store)
+        swap_tok = availability.swap_token(store)
+    except Exception:
+        tok = swap_tok = None
+    return seq if tok is None and swap_tok is None else (seq, tok, swap_tok)
 
 
 def _cache_get(key: str) -> list | None:
@@ -168,19 +186,30 @@ def _dedup_on(store) -> bool:
     return bool(store.get_config("filter_duplicates", False))
 
 
-def _tagged_denominator(store) -> int:
-    """Total-track count to subtract the tagged buckets from when sizing the
-    "[No Artist]" / "[No Album Artist]" catch-all.
+def _hidden(store):
+    """The ids the web lists leave out ("Tracks on unavailable drives: Hide"),
+    or None — the browse counts leave them out too."""
+    from soniqboom.core import availability
+    return availability.hidden(store)
 
-    Must match the mode the aggregate was computed in: with ``filter_duplicates``
-    on, ``aggregate_artists`` counts only primaries, so the untagged remainder
-    has to be measured against the primary-only total too — otherwise the
-    hidden duplicate copies (which have artists) would inflate the untagged
-    bucket and it would list tracks the drill-down never shows.
-    """
-    if _dedup_on(store):
-        return store.primary_track_count()
-    return store.track_count()
+
+def _swap(store):
+    """The duplicate groups the deduped web lists show by another member while
+    their primary can't play (``core.availability.primary_swap``), or None —
+    the browse counts count those members instead."""
+    from soniqboom.core import availability
+    return availability.primary_swap(store, dedup=_dedup_on(store))
+
+
+def _untagged_count(store, field: str) -> int:
+    """Size of the "[No Artist]" / "[No Album Artist]" catch-all: the rows its
+    drill-down (``GET /api/tracks?untagged=<field>``) lists, in the same mode —
+    duplicates hidden or not, "Tracks on unavailable drives: Hide" or not.
+    Counted directly, not as "all tracks minus the tagged buckets": a track
+    tagged "A • B" sits in two artist buckets, so that subtraction came out
+    short and the bucket vanished while its drill-down still listed tracks."""
+    return store.untagged_count(field, primary_only=_dedup_on(store),
+                                exclude=_hidden(store), swap=_swap(store))
 
 
 def _accepts_gzip(request: Request) -> bool:
@@ -322,6 +351,18 @@ async def reindex(_admin=Depends(require_admin)):
         "drift_detected": not report.get("index_ok", True),
         "drift": report.get("mismatches", []),
     }
+
+
+@router.get("/availability")
+async def get_availability():
+    """Settings → "Tracks on unavailable drives" and what it acts on: ``mode``
+    (mark / hide / show), ``token`` (changes whenever the set of tracks that
+    can't play right now, or the mode, changes — clients re-read their lists
+    then; also pushed as the ``availability_changed`` WebSocket event),
+    ``unavailable`` (how many tracks can't play right now) and the offline
+    ``roots`` (path, kind drive / share / catalogue, tracks, unavailable)."""
+    from soniqboom.core import availability
+    return availability.state()
 
 
 @router.get("/dirs")
@@ -512,8 +553,9 @@ async def list_artists(request: Request):
         # the synthetic "[No Artist]" bucket — appending to the returned list
         # in place would corrupt the store's cache (the same object is served
         # to Subsonic / DLNA) until the next mutation.
-        cached = list(store.aggregate_artists(primary_only=_dedup_on(store)))
-        untagged = _tagged_denominator(store) - sum(d["count"] for d in cached)
+        cached = list(store.aggregate_artists(primary_only=_dedup_on(store),
+                                              exclude=_hidden(store), swap=_swap(store)))
+        untagged = _untagged_count(store, "artist")
         if untagged > 0:
             cached.append({"artist": "", "count": untagged, "label": "[No Artist]"})
         _cache_set("artists", cached)
@@ -525,8 +567,10 @@ async def list_album_artists(request: Request):
     cached = _cache_get("album_artists")
     if cached is None:
         store = get_store()
-        cached = list(store.aggregate_album_artists(primary_only=_dedup_on(store)))
-        untagged = _tagged_denominator(store) - sum(d["count"] for d in cached)
+        cached = list(store.aggregate_album_artists(primary_only=_dedup_on(store),
+                                                    exclude=_hidden(store),
+                                                    swap=_swap(store)))
+        untagged = _untagged_count(store, "album_artist")
         if untagged > 0:
             cached.append({"album_artist": "", "count": untagged, "label": "[No Album Artist]"})
         _cache_set("album_artists", cached)
@@ -545,7 +589,7 @@ async def list_albums(
         store = get_store()
         rows = store.aggregate_albums(
             artist=artist, album_artist=album_artist,
-            primary_only=_dedup_on(store),
+            primary_only=_dedup_on(store), exclude=_hidden(store), swap=_swap(store),
         )
         # New dicts (don't mutate the store's memoised album rows in place).
         cached = [
@@ -561,7 +605,8 @@ async def list_genres(request: Request):
     cached = _cache_get("genres")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_genres(primary_only=_dedup_on(store))
+        cached = store.aggregate_genres(primary_only=_dedup_on(store),
+                                        exclude=_hidden(store), swap=_swap(store))
         _cache_set("genres", cached)
     return _etag_response(request, "genres", cached)
 
@@ -571,7 +616,8 @@ async def list_years(request: Request):
     cached = _cache_get("years")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_years(primary_only=_dedup_on(store))
+        cached = store.aggregate_years(primary_only=_dedup_on(store),
+                                       exclude=_hidden(store), swap=_swap(store))
         _cache_set("years", cached)
     return _etag_response(request, "years", cached)
 
@@ -587,7 +633,8 @@ async def list_formats(request: Request):
     cached = _cache_get("formats")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_formats(primary_only=_dedup_on(store))
+        cached = store.aggregate_formats(primary_only=_dedup_on(store),
+                                         exclude=_hidden(store), swap=_swap(store))
         _cache_set("formats", cached)
     return _etag_response(request, "formats", cached)
 
@@ -599,6 +646,7 @@ async def list_scene_groups(request: Request):
     cached = _cache_get("scene_groups")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_scene_group(primary_only=_dedup_on(store))
+        cached = store.aggregate_scene_group(primary_only=_dedup_on(store),
+                                             exclude=_hidden(store), swap=_swap(store))
         _cache_set("scene_groups", cached)
     return _etag_response(request, "scene_groups", cached)

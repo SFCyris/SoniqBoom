@@ -135,12 +135,31 @@ def test_large_candidate_sets_keep_walking_the_index(monkeypatch):
     assert min(sizes) <= thr < max(sizes)               # both paths exercised
 
 
-def test_mixed_type_keys_fall_back_to_the_walk():
+def test_a_raw_non_numeric_value_is_keyed_as_no_value():
+    # A raw value no number can be read from (bpm "fast") is keyed like a
+    # missing one: every numeric-list key is a number, so the insert, the
+    # candidate sort and the index walk all accept it and agree.
     s = TrackStore()
     s.upsert_tracks_batch([
         {"id": "a", "title": "x", "bpm": 120.0, "added_at": 1},
         {"id": "b", "title": "x", "bpm": 90.0, "added_at": 2},
     ])
-    s._tracks["b"]["bpm"] = "fast"          # a raw value no index insert accepts
+    s.update_track_fields("b", {"bpm": "fast"})
+    assert s._sorted_bpm == [(120.0, "a"), (store_mod._NO_VALUE_KEY, "b")]
+    assert s._sort_candidates({"a", "b"}, "_sorted_bpm", False) == ["a", "b"]
+    assert [t["id"] for t in s.filter_tracks(query="x", sort_by="bpm")] == ["a", "b"]
+
+
+def test_mixed_type_keys_fall_back_to_the_walk(monkeypatch):
+    # Keys that don't compare (no value function yields them today) make the
+    # candidate sort give up for the index walk instead of raising.
+    s = TrackStore()
+    s.upsert_tracks_batch([
+        {"id": "a", "title": "x", "bpm": 120.0, "added_at": 1},
+        {"id": "b", "title": "x", "bpm": 90.0, "added_at": 2},
+    ])
+    fields, _value = store_mod._SORTED_SPECS["_sorted_bpm"]
+    monkeypatch.setitem(store_mod._SORTED_SPECS, "_sorted_bpm",
+                        (fields, lambda t: "fast" if t["id"] == "b" else t.get("bpm")))
     assert s._sort_candidates({"a", "b"}, "_sorted_bpm", False) is None
     assert [t["id"] for t in s.filter_tracks(query="x", sort_by="bpm")] == ["b", "a"]

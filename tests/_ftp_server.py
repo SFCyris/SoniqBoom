@@ -24,7 +24,8 @@ class FtpServer:
     def __init__(self, root: Path, *, rate: float | None = None, port: int = 0,
                  host: str = "127.0.0.1", abor_replies: int = 2, size: bool = True,
                  abort_after: int | None = None, abort_retrs: int = 1,
-                 password: str | None = None, max_conns: int | None = None) -> None:
+                 password: str | None = None, max_conns: int | None = None,
+                 welcome: str | None = None) -> None:
         self.root = Path(root).resolve()
         self.rate = rate                 # bytes / s per transfer, None = unthrottled
         # 2: an interrupted RETR answers 426, then ABOR answers 226 (RFC 959);
@@ -35,11 +36,13 @@ class FtpServer:
         self.abort_retrs = abort_retrs
         self.password = password
         self.max_conns = max_conns
+        self.welcome = welcome           # extra greeting lines (a multi-line 220)
         self.conns = 0
         self.peak_conns = 0
         self.refused_logins = 0
         self.bytes_sent = 0
         self.retrs: list[tuple[str, int]] = []
+        self.listed: list[str] = []      # folders listed (MLSD / LIST / NLST)
         self.logins = 0
         self._lock = threading.Lock()
         server = self
@@ -91,6 +94,8 @@ class FtpServer:
                         server.conns -= 1
 
             def _session(self):
+                for extra in (server.welcome or "").splitlines():
+                    self.reply(f"220-{extra}")
                 self.reply("220 test ftp ready")
                 aborted = False
                 while True:
@@ -222,6 +227,7 @@ class FtpServer:
                             self.reply("550 No such file or directory")
                             continue
                         self.reply("150 listing")
+                        server.listed.append(arg if arg and not arg.startswith("-") else self.cwd)
                         conn = self.data_conn()
                         out = []
                         for c in sorted(p.iterdir()):

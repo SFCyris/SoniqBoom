@@ -161,6 +161,22 @@ class TrackMeta(BaseModel):
     game_by_archive: str | None = None
     game_by_folder: str | None = None
     game_aliases: list[str] | None = None
+    # How the Demozoo index says the tune was used (core/demozoo.py): the
+    # kinds of the productions released the SAME year as the music production
+    # this tune is (composer + exact title) and using it as their soundtrack —
+    # "Demo", "Cracktro", "Game", "Music Disk", "Diskmag" — and the party
+    # whose competition it entered ("Revision 2019").  Written and withdrawn
+    # by the Demozoo apply only; read by the derived genres below.
+    scene_use: list[str] | None = None
+    scene_party: str | None = None
+    # Genres SoniqBoom derives for a retro track whose file names no genre
+    # (core/genre_derive.py): category ("Game", "Demo", "Cracktro", "Scene"
+    # …), platform ("SID", "Amiga", "Atari ST", "NES" …) and — with the
+    # "Game and group names as genres" setting — the game, scene group(s) and
+    # party.  Never written into ``genre``: a real genre tag (or one the user
+    # typed) withdraws them.  Browsing and the Subsonic API show the two
+    # together (``store.track_genres``).
+    genre_derived: list[str] | None = None
     # Fields the UADE song database (core/songdb.py) filled that have no
     # provenance field of their own — "artist", "label" — so a rescan keeps
     # them while the file is unchanged (store._carry_enrichment), a refreshed

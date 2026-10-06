@@ -7,6 +7,13 @@
  */
 import { esc } from './_common.js';
 import { Player } from '../../player.js';
+import { Auth } from '../../auth.js';
+import { Offline } from '../../offline.js';
+
+// One availability listener for whichever settings view is mounted now (a
+// view mounted again replaces it, never adds another).
+let _paintOffline = null;
+document.addEventListener('soniqboom:availability-changed', () => { if (_paintOffline) _paintOffline(); });
 
 export function mountSettings(root, ctx) {
   root.innerHTML = `
@@ -24,6 +31,22 @@ export function mountSettings(root, ctx) {
         <h3>Music Folders</h3>
         <div class="m-settings-card" id="m-set-dirs">
           <div class="m-settings-row"><span class="label">Loading…</span></div>
+        </div>
+      </div>
+
+      <div class="m-settings-section">
+        <h3>Library</h3>
+        <div class="m-settings-card">
+          <label class="m-settings-row" for="set-offline-tracks">
+            <span class="label"><span id="set-offline-name">Tracks on unavailable drives</span>
+              <small id="set-offline-hint">Tracks whose drive or share isn’t connected. Mark: dimmed, with an “offline” badge. Hide: left out of searches and lists (playlists still show them). Show: as usual. Shuffle and the next track skip them in Mark and Hide.</small></span>
+            <select id="set-offline-tracks" class="m-settings-select"
+                    aria-labelledby="set-offline-name" aria-describedby="set-offline-hint">
+              <option value="mark">Mark</option>
+              <option value="hide">Hide</option>
+              <option value="show">Show</option>
+            </select>
+          </label>
         </div>
       </div>
 
@@ -76,6 +99,39 @@ export function mountSettings(root, ctx) {
   const qsyncRow = root.querySelector('#set-queue-sync-row');
   qsync.checked = Player.queueSync;
   qsync.addEventListener('change', () => Player.setQueueSync(qsync.checked));
+  // "Tracks on unavailable drives" — a server setting (every user, like "Hide
+  // duplicates"): an admin changes it here or in the desktop Settings; anyone
+  // else sees what it is.
+  const offSel  = root.querySelector('#set-offline-tracks');
+  const offHint = root.querySelector('#set-offline-hint');
+  const offHintText = offHint.textContent;
+  function paintOffline() {
+    const admin = !!Auth.isAdmin;
+    if (Offline.mode) offSel.value = Offline.mode;
+    offSel.disabled = !admin;
+    offHint.textContent = admin ? offHintText : `${offHintText} Set by an admin for every user.`;
+  }
+  offSel.addEventListener('change', async () => {
+    const want = offSel.value;
+    try {
+      const r = await fetch('/api/admin/settings', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offline_tracks: want }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await Offline.refresh();
+      ctx.toast(want === 'hide' ? 'Tracks on unavailable drives are hidden.'
+        : want === 'show' ? 'Tracks on unavailable drives are listed as usual.'
+        : 'Tracks on unavailable drives are marked.');
+    } catch (_) {
+      ctx.toast('Couldn’t save the setting.', 'error');
+    }
+    paintOffline();
+  });
+  _paintOffline = paintOffline;
+  paintOffline();
+  Offline.refresh().finally(paintOffline);
+
   // The player learns whether the server keeps a queue a few seconds after load:
   // this view may already be up by then.
   Player.on('queuesync', ({ supported }) => { qsyncRow.style.display = supported === false ? 'none' : ''; });
@@ -100,7 +156,8 @@ export function mountSettings(root, ctx) {
         dirsCard.innerHTML = `<div class="m-settings-row"><span class="label">No folders configured</span></div>`;
       } else {
         dirsCard.innerHTML = dirs.map(dir => {
-          const path  = dir.path || '';
+          // A catalogue root (Admin → External sources) shows its name.
+          const path  = dir.catalogue ? `${dir.label || dir.catalogue} catalogue` : (dir.path || '');
           const stat  = dir.status || 'ok';
           const color = stat === 'ok' ? 'var(--accent)' : 'var(--danger)';
           return `
@@ -118,6 +175,7 @@ export function mountSettings(root, ctx) {
   }
 
   root.addEventListener('viewactive', () => {
+    Offline.refresh().finally(paintOffline);
     shufReplay.checked = Player.shuffleReplaysPlayed;
     qsync.checked = Player.queueSync;
     // The server has no queue to sync with: no row (mobile.css has no [hidden] rule).

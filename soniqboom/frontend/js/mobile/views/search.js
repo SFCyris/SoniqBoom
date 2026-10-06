@@ -40,6 +40,11 @@ export function mountSearch(root, ctx) {
     _timer = setTimeout(runQuery, DEBOUNCE_MS);
   });
 
+  // Which tracks can play changed: run the search again (marks / hidden rows).
+  document.addEventListener('soniqboom:availability-changed', () => {
+    if (input.value.trim()) runQuery();
+  });
+
   // Re-focus the input when the view becomes active again
   root.addEventListener('viewactive', () => {
     // Don't auto-focus on mobile (would pop the keyboard) — just leave the input ready

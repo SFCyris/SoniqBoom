@@ -398,6 +398,25 @@ def author_credit(mp: ModlandPath) -> str | None:
     return " & ".join([mp.author, *mp.partners])
 
 
+def modland_credit(mp: ModlandPath, fmt: str | None) -> str | None:
+    """The artist credit Modland path ``mp`` gives a track of format
+    ``fmt`` — ``author_credit`` behind the tree-artefact guard: an "author"
+    that merely repeats a SUB-format level, or the track's format when that
+    format is not itself named after the author, is no credit.
+    (Composer-named replayers — "David Whittaker/David Whittaker/…", "Rob
+    Hubbard/Rob Hubbard/…" — ARE credits.)  Shared by the md5-join apply and
+    the Modland catalogue (``core/modland_catalog.py``)."""
+    author = author_credit(mp)
+    if not author:
+        return None
+    fmt_name = (fmt or "").strip().lower()
+    a_low = (mp.author or "").strip().lower()
+    artefact = (a_low in {d.strip().lower() for d in mp.fmt_dirs[1:]}
+                or (a_low == fmt_name
+                    and bool(mp.fmt_dirs) and a_low != mp.fmt_dirs[0].strip().lower()))
+    return None if artefact else author
+
+
 def smart_title(s: str) -> str:
     """Title-case an ALL-LOWERCASE Modland name (``gold of the aztecs`` →
     ``Gold of the Aztecs``); a name with any capital is Modland's own casing and
@@ -741,9 +760,14 @@ def collect_updates(*, use_filename: bool | None = None,
     matched = 0
     batch: list[tuple[str, dict]] = []
     expect: dict[str, dict] = {}
+    from soniqboom.core.catalogue import is_catalogue_path
     for t in tracks:
         md5 = t.get("file_md5")
         if not isinstance(md5, str) or not md5:
+            continue
+        if is_catalogue_path(t.get("path")):
+            # A Modland CATALOGUE track carries its Modland data from its own
+            # path (core/modland_catalog.py) — never joined, never withdrawn.
             continue
         path = rows.get(md5.lower())
         if path is None:
@@ -759,17 +783,8 @@ def collect_updates(*, use_filename: bool | None = None,
         if t.get("scene_path") != path:
             updates["scene_path"] = path
         mp = parse_modland_path(path)
-        author = author_credit(mp)
-        # Tree-artefact guard: an "author" that merely repeats a SUB-format
-        # level, or the track's format when that format is not itself named
-        # after the author.  (Composer-named replayers — "David Whittaker/
-        # David Whittaker/…", "Rob Hubbard/Rob Hubbard/…" — ARE credits.)
         fmt_name = (t.get("format") or "").strip().lower()
-        a_low = (mp.author or "").strip().lower()
-        artefact = (a_low in {d.strip().lower() for d in mp.fmt_dirs[1:]}
-                    or (a_low == fmt_name
-                        and a_low != mp.fmt_dirs[0].strip().lower()))
-        credit = author if author and not artefact else None
+        credit = modland_credit(mp, t.get("format"))
         cur_artist = (t.get("artist") or "").strip()
         if cur_artist.lower() in fa._ARTIST_PLACEHOLDERS:
             cur_artist = ""             # a ripper placeholder ("<?>") names nobody
@@ -1040,25 +1055,31 @@ def modland_filename_siblings() -> dict[str, bool]:
     cached = _siblings_cache
     if cached is not None and cached[0] == sig:
         return cached[1]
-    groups: dict[str, list] = {}                # key → [count, first word | None]
     con = _connect_ro(db)
     try:
-        for (p,) in con.execute("SELECT path FROM mods"):
-            d, _, fn = p.rpartition("/")
-            split = _game_part(fn)
-            if split is None:
-                continue
-            key = _sibling_key(d, split[0])
-            fw = _first_word(split[1])
-            g = groups.get(key)
-            if g is None:
-                groups[key] = [1, fw]
-            else:
-                g[0] += 1
-                if g[1] != fw:
-                    g[1] = None
+        out = siblings_from_paths(p for (p,) in con.execute("SELECT path FROM mods"))
     finally:
         con.close()
-    out = {k: g[1] is not None for k, g in groups.items() if g[0] >= 2}
     _siblings_cache = (sig, out)
     return out
+
+
+def siblings_from_paths(paths) -> dict[str, bool]:
+    """``modland_filename_siblings``' map built from any iterable of Modland
+    tree paths (the md5 index, or the catalogue's own index)."""
+    groups: dict[str, list] = {}                # key → [count, first word | None]
+    for p in paths:
+        d, _, fn = p.rpartition("/")
+        split = _game_part(fn)
+        if split is None:
+            continue
+        key = _sibling_key(d, split[0])
+        fw = _first_word(split[1])
+        g = groups.get(key)
+        if g is None:
+            groups[key] = [1, fw]
+        else:
+            g[0] += 1
+            if g[1] != fw:
+                g[1] = None
+    return {k: g[1] is not None for k, g in groups.items() if g[0] >= 2}

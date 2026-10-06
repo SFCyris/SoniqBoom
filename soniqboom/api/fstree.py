@@ -168,7 +168,7 @@ def _remote_subtree_has_indexed_audio(store, scan_root: str, child_rel: str) -> 
     from bisect import bisect_left
     from soniqboom.core.data import path_hash
 
-    sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, path_hash(scan_root))
+    sorted_paths = _sorted_paths_for(store, scan_root)
     if not sorted_paths:
         return False
     prefix = f"{scan_root}:/{child_rel.strip('/')}/"
@@ -308,7 +308,7 @@ def _remote_children_from_store(store, scan_root: str, remote_path: str) -> list
     from bisect import bisect_left
     from soniqboom.core.data import path_hash
 
-    sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, path_hash(scan_root))
+    sorted_paths = _sorted_paths_for(store, scan_root)
     if not sorted_paths:
         return None
     rel = remote_path.strip("/")
@@ -406,6 +406,11 @@ async def get_children(
         )
         if children is not None:
             return {"path": path, "children": children}
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_root(scan_root):
+            # A catalogue's folders are its tracks' folders (the index lists
+            # more — companions, formats out of scope — that are no tracks).
+            return {"path": path, "children": []}
         children = await loop.run_in_executor(
             None, _remote_list_children, scan_root, remote_path, source,
         )
@@ -1376,6 +1381,11 @@ def _get_or_build_scan_root_sorted(
 
     Returns ``([], [])`` when the bucket is empty.
     """
+    from soniqboom.core import catalogue
+    if scan_root_hash in catalogue.root_hashes():
+        # Hundreds of thousands of rows: catalogue roots browse through the
+        # lean (path, id) cache (``_catalogue_sorted``), never this one.
+        return [], []
     current_size = len(store._tag_scan_root_hash.get(scan_root_hash, ()))
     cached = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
     if cached is not None and (cached.get("size") == current_size
@@ -1414,6 +1424,143 @@ def _get_or_build_scan_root_sorted(
     return paths, dicts
 
 
+# ── Catalogue roots (core/catalogue.py) ─────────────────────────────────
+#
+# A catalogue root (the Modland catalogue) holds hundreds of thousands of
+# tracks: the shaped per-root cache above would cost seconds of CPU and
+# hundreds of MB for it.  Its cache keeps only the (path, id) pairs in path
+# order; a listing bisects it and shapes just the rows a page returns.
+_CAT_SORTED: dict[str, dict] = {}
+_CAT_LOCK = threading.Lock()
+# Beyond this many rows an un-windowed (``limit=0``) catalogue listing is cut.
+_CAT_UNWINDOWED_MAX = 20_000
+
+
+def _catalogue_sorted(store, scan_root_hash: str) -> tuple[list[str], list[str]]:
+    """``(paths, ids)`` of a catalogue root's tracks in path order — cached
+    until the root's track count changes (or ``invalidate_scan_root_cache``).
+    Blocking (a sort of the whole root) — call it from a worker thread."""
+    ids_set = store._tag_scan_root_hash.get(scan_root_hash) or ()
+    size = len(ids_set)
+    e = _CAT_SORTED.get(scan_root_hash)
+    if e is not None and e["size"] == size:
+        return e["paths"], e["ids"]
+    with _CAT_LOCK:
+        e = _CAT_SORTED.get(scan_root_hash)
+        if e is not None and e["size"] == size:
+            return e["paths"], e["ids"]
+        snap: list[str] = []
+        for _ in range(5):
+            try:
+                snap = list(ids_set)
+                break
+            except RuntimeError:                  # written meanwhile — again
+                continue
+        tracks = store._tracks
+        pairs = [(t.get("path") or "", tid) for tid in snap
+                 if (t := tracks.get(tid)) is not None]
+        pairs.sort()
+        e = {"size": size, "paths": [p for p, _ in pairs], "ids": [i for _, i in pairs]}
+        _CAT_SORTED[scan_root_hash] = e
+        return e["paths"], e["ids"]
+
+
+def _sorted_paths_for(store, scan_root: str) -> list[str]:
+    """The sorted track paths of remote root ``scan_root``: the lean cache for
+    a catalogue root, the shaped root cache for any other."""
+    from soniqboom.core import catalogue
+    from soniqboom.core.data import path_hash
+    h = path_hash(scan_root)
+    if catalogue.is_catalogue_root(scan_root):
+        return _catalogue_sorted(store, h)[0]
+    return _get_or_build_scan_root_sorted(store, h)[0]
+
+
+def invalidate_scan_root_cache(scan_root: str) -> None:
+    """Drop every browse cache of ``scan_root`` (the catalogue after a build)."""
+    from soniqboom.core.data import path_hash
+    h = path_hash(scan_root)
+    with _CAT_LOCK:
+        _CAT_SORTED.pop(h, None)
+    invalidate_scan_root(h)
+
+
+def _catalogue_selection(store, scan_root: str, remote_path: str,
+                         recursive: bool) -> list[str]:
+    """Ids of the catalogue tracks a folder listing shows, in path order.
+    Blocking."""
+    from bisect import bisect_left
+    from soniqboom.core.data import path_hash
+    rh = path_hash(scan_root)
+    if recursive:
+        paths, ids = _catalogue_sorted(store, rh)
+        rel = remote_path.strip("/")
+        prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
+        lo = bisect_left(paths, prefix)
+        hi = bisect_left(paths, prefix + "\U0010FFFF", lo)
+        return ids[lo:hi]
+    # Direct files of the folder: its dir hash within this root.
+    dh = path_hash("/" + remote_path.strip("/") if remote_path.strip("/") else "/")
+    tids = store.filter_track_ids(dir_hash=dh, scan_root_hash=rh)
+    tracks = store._tracks
+    rows = sorted(((tracks[t].get("path") or "", t) for t in tids if t in tracks))
+    return [t for _p, t in rows]
+
+
+async def _catalogue_tracks_with_meta(path: str, recursive: bool, offset: int,
+                                      limit: int, shuffle_seed: int | None,
+                                      playable: bool = False):
+    """``tracks-with-meta`` for a catalogue folder: the same response shapes,
+    built from the lean cache — only the page's rows are shaped.  Tunes that
+    can't play right now are flagged; a shuffle never deals them and a
+    ``playable`` page skips them (``core.availability``)."""
+    from soniqboom.core import availability
+    from soniqboom.core.filesource import find_source_for_path
+    from soniqboom.core.store import get_store
+    result = find_source_for_path(path)
+    if not result:
+        raise HTTPException(503, "Network share not connected")
+    scan_root, remote_path, _source = result
+    store = get_store()
+    sel = await asyncio.to_thread(_catalogue_selection, store, scan_root, remote_path,
+                                  recursive)
+    tracks = store._tracks
+    if playable and shuffle_seed is None and limit > 0:
+        def _fetch(off: int, lim: int) -> list[dict]:
+            return [r for r in (_shape_row(tracks[t]) for t in sel[off:off + lim]
+                                if t in tracks) if r]
+        return availability.player_page(_fetch, offset, limit, store)
+    total = len(sel)
+    if shuffle_seed is not None and sel:
+        from soniqboom.core import shuffle_order
+        seed = shuffle_order.normalize_seed(shuffle_seed)
+        key = ("folder", path.rstrip("/") or path, bool(recursive), False, seed, total)
+        order = await asyncio.to_thread(shuffle_order.cached_order, key, lambda: list(sel), seed)
+        sel = order
+    # A shuffle's order is dealt over the whole listing (an availability change
+    # never re-deals it mid-session); the tracks that can't play right now are
+    # left out page by page — the queue reads on past an empty page.
+    skip = availability.unplayable(store) if shuffle_seed is not None else None
+    if shuffle_seed is not None and playable and skip and limit > 0:
+        # (The queue's page: read on through the order, bounded — see ``_page``.)
+        def _fetch_order(off: int, lim: int) -> list[dict]:
+            return [r for r in (_shape_row(tracks[t]) for t in sel[off:off + lim]
+                                if t in tracks) if r]
+        page = availability.playable_page(_fetch_order, offset, limit,
+                                          availability.snapshot(store))
+        return {"total": total, **page}
+    if limit > 0:
+        page_ids = sel[offset:offset + limit] if offset < total else []
+    else:
+        page_ids = sel[:_CAT_UNWINDOWED_MAX]
+    rows = [r for r in (_shape_row(tracks[t]) for t in page_ids
+                        if t in tracks and not (skip and t in skip)) if r]
+    rows = availability.mark_rows(rows, store)
+    if limit > 0:
+        return {"total": total, "tracks": rows}
+    return rows
+
+
 # Encoded with orjson (``tracks.json_route``), not ``jsonable_encoder`` +
 # ``json.dumps``: the rows are already TrackMeta-shaped dicts (or stubs), and the
 # old walk cost ~140 ms on the event loop for one 2000-row page.  The function
@@ -1433,6 +1580,7 @@ async def tracks_with_meta(
             "through it with offset/limit, so shuffle covers the whole folder."
         ),
     ),
+    playable: bool = False,
 ):
     """Hybrid listing: filesystem for file discovery, store for metadata.
 
@@ -1459,7 +1607,15 @@ async def tracks_with_meta(
     config.  Resolving the value server-side keeps the windowed total and
     its chunks consistent — every request reads the same setting, so the
     count can't disagree with the rows.
+
+    Tracks that can't play right now (their drive / share is offline) are
+    listed with ``offline`` — a folder view lists every file, so "Tracks on
+    unavailable drives: Hide" marks them here too — a shuffle (``shuffle_seed``)
+    never deals them, and ``playable=1`` (the play queue's ordered pages, with
+    ``limit``) answers ``{tracks, next_offset, ended}`` without them, each row
+    carrying its listing position as ``_pos`` (Mark / Hide; ``core.availability``).
     """
+    from soniqboom.core import availability
     if filter_duplicates is None:
         from soniqboom.core.data import folder_dedup_enabled
         filter_duplicates = await folder_dedup_enabled()
@@ -1471,20 +1627,50 @@ async def tracks_with_meta(
         a seed), so it runs in a worker thread; ``res`` is a finished list that
         nothing mutates.
         """
+        if playable and shuffle_seed is None and limit > 0:
+            return availability.player_page(
+                lambda off, lim: res[off:off + lim], offset, limit)
         if shuffle_seed is not None and res:
+            # The order is dealt over the whole listing (never re-dealt when a
+            # drive comes or goes mid-session); the tracks that can't play right
+            # now are left out page by page (the queue reads on past a gap).
+            skip = availability.unplayable()
+            if limit > 0 and playable and skip:
+                # The queue's page (``playable=1``): read on through the order
+                # (bounded, like an ordered list's) until ``limit`` tracks that
+                # can play are found — one request, not one per 50 rows.
+                snap = availability.snapshot()
+                box = {"total": 0}
+
+                def _fetch(off: int, lim: int) -> list[dict]:
+                    box["total"], rows = _shuffled_page(
+                        res, path, recursive, bool(filter_duplicates), shuffle_seed,
+                        off, lim, stable)
+                    return rows
+                page = await asyncio.to_thread(
+                    lambda: availability.playable_page(_fetch, offset, limit, snap))
+                return {"total": box["total"] or len(res), **page}
             if limit > 0:
                 # One page: only ITS rows are materialised (O(limit) once the
                 # order and the id→row map are cached), not the whole listing.
                 total, rows = await asyncio.to_thread(
                     _shuffled_page, res, path, recursive,
                     bool(filter_duplicates), shuffle_seed, offset, limit, stable)
-                return {"total": total, "tracks": rows}
+                if skip:
+                    rows = [r for r in rows if r.get("id") not in skip]
+                return {"total": total, "tracks": availability.mark_rows(rows)}
             res = await asyncio.to_thread(
                 _shuffled_listing, res, path, recursive,
                 bool(filter_duplicates), shuffle_seed, stable)
-        return _maybe_paginate(res, offset, limit, recursive)
+            if skip:
+                res = [r for r in res if r.get("id") not in skip]
+        return _marked(_maybe_paginate(res, offset, limit, recursive))
 
     if _is_remote(path):
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_path(path):
+            return await _catalogue_tracks_with_meta(path, recursive, offset, limit,
+                                                     shuffle_seed, playable)
         result = await _remote_tracks_with_meta(path, recursive)
         if filter_duplicates:
             result = _drop_duplicate_alternates(result)   # a fresh list per request: nothing to memoise on
@@ -1693,6 +1879,21 @@ def _memo(memo: dict, src: list, build):
             memo.pop(next(iter(memo)))
         memo[id(src)] = (src, value)
     return value
+
+
+def _marked(out):
+    """A listing / page with the tracks that can't play right now flagged
+    (``offline``) — copies of those rows only; the cached listing is never
+    touched."""
+    from soniqboom.core import availability
+    if isinstance(out, dict):
+        rows = out.get("tracks")
+        if isinstance(rows, list):
+            return {**out, "tracks": availability.mark_rows(rows)}
+        return out
+    if isinstance(out, list):
+        return availability.mark_rows(out)
+    return out
 
 
 def _deduped(results: list[dict]) -> list[dict]:

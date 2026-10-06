@@ -289,6 +289,10 @@ player cancels that request when you skip to another track.
 | `SONIQBOOM_DATA_DIR` | `/data` | Where all state is written (set in the image). |
 | `TZ` | container default | Set e.g. `Europe/Berlin` for correct log/scan timestamps. |
 | `SONIQBOOM_SUBSONIC_CORS` | `1` | Set to `0` to stop web-based Subsonic players hosted on other sites from calling `/rest`. Native apps are not affected. |
+| `SONIQBOOM_SCAN_WORKERS` | half the usable CPUs (2–16) | Number of parallel scan processes (1–64). |
+| `SONIQBOOM_RENDER_SLOTS` | half the usable CPUs (at least 2) | Number of retro-format renders that can run at once (2–64). |
+
+"Usable CPUs" respects a container's CPU limit (`--cpuset-cpus`, `--cpus`, an LXC core limit, a systemd `CPUQuota=`).
 
 To change the **host** port, edit the mapping in `docker-compose.yml` (`"9000:8080"`
 publishes on 9000) rather than the in-container port.
@@ -316,6 +320,10 @@ docker compose exec soniqboom soniqboom-setadm -user bob -passwd 'pw-1234' -role
   everything else keeps working.
 - **Memory** scales with library size (the whole index is held in RAM). Budget accordingly
   for six-figure collections.
+- **Modland catalogue** (optional, off by default — **Settings → Library → External
+  sources**): the container reaches `ftp.modland.com` over HTTPS for the index and over FTP
+  (port 21, passive mode) for index updates and the tunes you play, so a firewall in front of
+  it must allow both. With the catalogue on, plan for about 1 GB more memory.
 - **MIDI** plays with a bundled General-MIDI SoundFont out of the box; add richer
   SoundFonts later under **Settings → Renderers → Soundfonts**.
 - **Backups & recovery**: see the [section above](#backups--recovery) — copy the

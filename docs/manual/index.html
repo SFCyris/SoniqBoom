@@ -102,6 +102,7 @@
       <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Per-channel VU meters, a live spectrum fallback, an animated decode signal-chain, and the Library Galaxy star-field.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Scene origins</h4><p>Retro modules matched by fingerprint against Modland fill in the original scene author and the tune's provenance path.</p></div>
       <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares straight from the admin panel — no operating-system mount required.</p></div>
+      <div class="card"><span class="ico">🌐</span><h4>Modland catalogue</h4><p>One switch lists Modland's module archive — hundreds of thousands of tunes — in your library; a tune is downloaded only when you play it.</p></div>
       <div class="card"><span class="ico">📱</span><h4>OpenSubsonic API</h4><p>Connect Amperfy, Symfonium, DSub, Feishin and the wider Subsonic app ecosystem to your server.</p></div>
       <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide directory — HLS and classic streams alike, with live now-playing titles and cover art.</p></div>
       <div class="card"><span class="ico">📡</span><h4>Casting <span class="badge beta">Beta</span></h4><p>Send playback to Chromecast, AirPlay and DLNA receivers — even rendered SID and tracker tunes.</p></div>
@@ -199,6 +200,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        a small animated equalizer. If part of a long list can't be loaded from the server, its rows say so and
        offer <strong>Retry</strong>.</p>
 
+    <h3>Several artists or genres in one tag</h3>
+    <p>When a tag holds several values — several artists, album artists, composers or genres in an MP3, AIFF, FLAC,
+       Ogg, Opus, M4A, DSD or other tagged file — SoniqBoom keeps them all. The artists are shown together, as
+       “Artist A • Artist B”, and each of them has its own entry in the Artists and Album Artists views with the
+       track listed under each; every genre is listed in the Genres view. Subsonic apps get each artist and genre
+       on its own too. A library indexed by an earlier version is updated at its first start; a FLAC, Ogg, Opus or
+       M4A file indexed before shows its other values once it changes and is read again.</p>
+
     <h3>The Library Galaxy</h3>
     <p>Every track in your collection rendered as a drifting star-field — each format its own glowing
        constellation, sized by how much of it you own. The legend doubles as a census of your library.</p>
@@ -221,7 +230,8 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <table>
       <thead><tr><th>Operator</th><th>Matches</th></tr></thead>
       <tbody>
-        <tr><td><code>artist:</code> <code>album:</code> <code>album_artist:</code> <code>genre:</code></td><td>That field only.</td></tr>
+        <tr><td><code>artist:</code> <code>album_artist:</code></td><td>The start of any word of an artist's name; case, accents and extra spaces are ignored — <code>artist:marcin</code> and <code>artist:sidder</code> both find “Marcin Romanowski (Sidder)”.</td></tr>
+        <tr><td><code>album:</code> <code>genre:</code></td><td>That field only.</td></tr>
         <tr><td><code>game:</code></td><td>A game: matches the start of any name of a track's game — for a retro tune the names its file header, Modland, Demozoo, the song database, a Modland file name, its archive's name and its folder name give it, or an album you set; for any other music file its GAME tag; or a game you typed — and, for a C64 SID or Atari ST tune whose game is unknown or only taken from its folder name or a Modland file name — not one you typed or cleared — the start of its title; case, accents, extra spaces and a leading “The” are ignored — <code>game:uridium</code> finds the game “Uridium” and a SID titled “Uridium 2”, <code>game:"last ninja"</code> also finds “The Last Ninja”, <code>game:"the last ninja"</code> also finds “Last Ninja 2”, and <code>game:pokemon</code> also finds “Pokémon Gold”.</td></tr>
         <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;1990</code> · <code>year:1985-1990</code></td><td>Exact year, after / before a year, or a range.</td></tr>
         <tr><td><code>format:FLAC</code> · <code>format:SID</code></td><td>Restrict to one format.</td></tr>
@@ -450,7 +460,10 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
 
     <h3>Time-synced lyrics</h3>
     <p>Lyrics scroll line-by-line with playback — read from the file's own tags, or fetched from LRCLib
-       when the file has none embedded.</p>
+       when the file has none embedded. With <em>Save fetched lyrics to files</em> (gear → Metadata → Lyrics,
+       off by default) lyrics opened in SoniqBoom's own player by an edit or admin account are written into a
+       local file that has none; a lookup from a Subsonic app or a read-only account never writes
+       to a file.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/09-lyrics.jpg" alt="Time-synced lyrics scrolling with the track"></div>
@@ -513,8 +526,11 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        SPC game name that the file's tag cut off at 32 characters. Turning the option off removes only the albums
        it guessed.</p>
     <p>In <strong>gear → Metadata → Song database (audacious-uade-tools)</strong>, <strong>Download</strong> fetches
-       the song database of the audacious-uade player (about 27&nbsp;MB) from GitHub and <strong>Apply to
-       library</strong> matches your modules against it by checksum. An exact match fills what is still empty: the
+       the song database of the audacious-uade player (about 27&nbsp;MB) from GitHub, always at the same reviewed
+       commit (<strong>Validated set</strong> opens it on GitHub), and <strong>Apply to library</strong> matches your
+       modules against it by checksum. If that commit is no longer available, the latest files are used and the
+       status line marks them as not validated; the status line also notes when newer data exists upstream.
+       An exact match fills what is still empty: the
        artist, the label (the publisher or group), the album (the game or production — it also replaces an album
        guessed from a folder or a Modland file name), the year and — for many Amiga modules not played yet —
        the length. A production name that several groups used carries the group, e.g. “Megademo (The Silents)”. While
@@ -664,8 +680,8 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
   <section id="cast">
     <h2 class="sec"><span class="num">10</span>Casting <span class="badge beta">Beta</span></h2>
     <p class="sec-sub">Send what you're playing to a TV, speaker or receiver on your network.</p>
-    <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported and
-      under active testing; behaviour can vary by device.</div>
+    <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported;
+      behaviour can vary by device.</div>
     <ol class="steps">
       <li>Press the <b>cast button</b> in the player toolbar.</li>
       <li>Pick a device from the list — discovered Chromecast, Apple TV / HomePod (AirPlay), and DLNA receivers appear together.</li>
@@ -801,7 +817,75 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        share.
        A track inside a large ZIP archive on a share is read on its own, without downloading the whole archive.
        A share whose server is offline when SoniqBoom starts is marked unavailable and connects by itself once the
-       server is reachable again.</p>
+       server is reachable again.
+       While a drive or share is not connected, its tracks stay in the library and are marked <em>offline</em> in
+       lists (see <em>Library display</em> under <a href="#settings">Settings &amp; integrations</a>). A track on a
+       share whose file is already in SoniqBoom's cache still plays; a track on a local drive plays again once the
+       drive is back.</p>
+
+    <h3 id="modland">External sources — the Modland catalogue</h3>
+    <p>The admin panel's <strong>External sources</strong> section (Library tab, below Music Folders) adds a public
+       music archive to your library without copying it. Switch on <strong>Modland catalogue</strong> and SoniqBoom
+       downloads the index of <a href="https://ftp.modland.com/" target="_blank" rel="noopener">Modland</a>'s module
+       archive (about 6&nbsp;MB) and lists the tunes it can play — about 330,000 tunes of Amiga, C64, Atari&nbsp;ST,
+       console and tracker music — under a <strong>Modland</strong> folder in the folder tree. Switched on again
+       later, it updates a recent index it kept instead of downloading it again. The status line shows the progress
+       while it is built and then the number of tunes, the date of the index and when it was last refreshed.</p>
+    <ul>
+      <li>The folders follow Modland's own layout: format, composer, and for console rips the game. Each tune shows its
+          title (the file name), its composer, its format, the game it belongs to where Modland's folders or file name
+          say so, and its retro genres — browsable, searchable and playable right away. Its length shows once it has
+          been played.</li>
+      <li>Nothing is copied ahead of time: a tune is downloaded from Modland when you <strong>play</strong> it,
+          together with the files its format needs beside it (a TFMX tune's sample file, a PSF rip's library files),
+          and plays from SoniqBoom's remote cache while it is kept there (its size is <em>Remote cache (MB)</em> under
+          <strong>System → Settings</strong>). Its first play reads the file itself — its length, number of tunes,
+          its own title and tags (the composer stays Modland's credit). The player also prepares the one track that
+          plays next, and a Chromecast (casting is in <span class="badge beta">Beta</span>) loads the next tune of
+          its queue shortly before it starts. Folder views, searches, artwork, waveforms, VU meters and background
+          passes never download a catalogue tune. At most 120 new tunes are downloaded within ten minutes; a play
+          beyond that says to try again shortly.</li>
+      <li><strong>Tunes</strong>: <em>Everything except the large PC tracker folders</em> (the default) leaves out
+          Fasttracker&nbsp;2, Impulsetracker, Screamtracker&nbsp;3, Fasttracker and Multitracker; <em>Everything</em>
+          lists about 415,000 tunes.</li>
+      <li><strong>Show catalogue tunes to Subsonic apps</strong> is off by default: Subsonic apps and the DLNA Media
+          Server <span class="badge beta">Beta</span> then see your library without the catalogue, and a catalogue
+          tune answers &ldquo;not found&rdquo; to them. Switched on, an app that syncs or caches a whole library for
+          offline use tries to download the whole catalogue from Modland.</li>
+      <li>The index is refreshed on the schedule picked in the menu right of <strong>Refresh now</strong> —
+          <em>Daily</em> (the default), <em>Weekly</em>, <em>Every 2 weeks</em> or <em>Monthly</em>, counted from
+          the last successful refresh — or at once with <strong>Refresh now</strong>; the status line shows when the
+          next refresh is due. Tunes Modland added appear, removed ones go, a tune Modland moved or renamed keeps its
+          ratings, play counts, favourites, history and playlist entries, and a changed file is downloaded again on
+          its next play.</li>
+      <li>A refresh downloads only the changes since the last one — Modland's daily changelogs, usually a few
+          kilobytes in all. The full index (about 6&nbsp;MB) is downloaded only when needed: the first time the
+          catalogue is switched on, after a large reorganisation at Modland, when the changelogs can't be read or
+          don't add up to Modland's own file count, after about six weeks without an update, and about once a month
+          as a check. The status line says what the last update downloaded (&ldquo;updated from 3 changelogs
+          (2.1&nbsp;KB)&rdquo;, or &ldquo;full index (5.5&nbsp;MB: …)&rdquo; with the reason), up to which day the
+          index holds Modland's changes, and how much the index updates have downloaded in all.</li>
+      <li>A failed or incomplete download keeps the catalogue as it was and is tried again an hour later (an index
+          that doesn't look like Modland's, a day later), whatever the schedule; a new index that lists far fewer
+          files than the current one is taken only when you press <strong>Refresh now</strong> after the status line
+          reports it.</li>
+      <li>When Modland can't be reached, tunes played before still play from the cache; the others report that
+          Modland can't be reached right now and count as unavailable under <em>Tracks on unavailable drives</em>
+          (see <em>Library display</em> under <a href="#settings">Settings &amp; integrations</a>) — marked
+          <em>offline</em> by default, or left out of searches and lists with <em>Hide them</em>. The Modland folder
+          shows <em>offline</em> for a while and stays browsable; the next play after that tries Modland again.</li>
+      <li>Switching the catalogue off removes its tunes and the Modland folder. Ratings, play counts, favourites,
+          playlist entries and what the plays read (lengths, tags) are kept and come back when you switch it on
+          again; a playlist edited meanwhile keeps its catalogue entries. The same holds for the tunes a narrower
+          <strong>Tunes</strong> selection leaves out.</li>
+      <li>Under <em>Date added</em>, the tunes of the first build — and those a wider <strong>Tunes</strong>
+          selection adds later — sort as the oldest; tunes added by a later refresh show the day that refresh added
+          them.</li>
+      <li>The catalogue needs about 1&nbsp;GB of server memory (about 1.2&nbsp;GB with <em>Everything</em>).</li>
+    </ul>
+    <div class="note">SoniqBoom connects to Modland to update the index on the schedule you pick (or when you press
+       <strong>Refresh now</strong>) and to download the tunes that are played or about to play, over at most three
+       connections at a time. Thanks to Modland and its maintainers.</div>
 
     <h3>Keep your library fresh</h3>
     <p>Local folders are <strong>watched automatically</strong> — files you add, change or remove are picked up a few
@@ -853,7 +937,8 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
 
     <h3>System notes</h3>
     <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory, so browsing and search
-       stay instant even at six-figure track counts — plan for RAM that grows with the size of your collection. The
+       stay instant even at six-figure track counts — plan for RAM that grows with the size of your collection; the
+       optional <a href="#modland">Modland catalogue</a> needs about 1&nbsp;GB more. The
        initial scan runs at roughly two minutes per 50,000 tracks. On disk, SoniqBoom keeps a snapshot of the library
        plus a render / transcode cache for instant replay — 4 GB by default, adjustable from 256 MB to 100 GB in
        <a href="#settings">Settings → Renderers</a>.</div>
@@ -869,10 +954,11 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
       <div class="card"><span class="ico">🎛️</span><h4>SID fidelity</h4><p>In <strong>gear → Renderers → SID fidelity</strong>, dial in how the C64 chip is voiced: pick the <strong>6581</strong> or <strong>8580</strong> model (or <em>Auto</em>), and toggle filter emulation, filter curve and digiboost. The fallback tune length for SIDs without an HVSC entry lives under <strong>System → Settings</strong> as <em>SID duration</em>.</p></div>
       <div class="card"><span class="ico">📈</span><h4>Scrobbling</h4><p>In <strong>gear → System → My Account</strong>, paste your <strong>ListenBrainz user token</strong> (from <a href="https://listenbrainz.org/profile" target="_blank" rel="noopener">listenbrainz.org/profile</a>) and/or your <strong>last.fm session key</strong>. Plays are logged automatically once a token is saved.</p></div>
       <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong> and sign in with your <strong>SoniqBoom username and password</strong>. Apps that sign in with a token (salt + hash) work with your SoniqBoom password too. You can optionally give them a separate <strong>Subsonic app password</strong>: click <em>Generate new password</em> under <strong>gear → System → My Account</strong> (or <strong>gear → Preferences</strong> for accounts without admin rights) and copy it into the app — it is shown once, and from then on token apps must use it. Apps that support OpenSubsonic API keys can sign in with a key instead: <em>Create key</em> in the same place, copy it into the app (also shown once), and <em>Revoke</em> it to sign that app out. In Subsonic apps, tracks that have no album are listed as albums named after their folder (<em>Group album-less tracks into folder albums</em> in the Subsonic panel, on by default); a folder shared by many artists, such as a compo pack, becomes one album per artist, and letter folders (<em>A</em>, <em>B</em> … or <em>A-F</em>) are grouped per artist under their parent folder and named after it, so an artist gets one album for the whole archive rather than one per letter. Turn the option off to reach those tracks only by browsing folders. Then see <a href="#apps">Listen anywhere</a>.</p></div>
-      <div class="card"><span class="ico">🧩</span><h4>What Subsonic apps see</h4><p>Apps list one music folder for each scan folder in your library. A file that holds several tunes (SID, NSF and similar) also lists its other tunes in album and folder views as “Title (Tune n/N)”; each of those entries plays that tune. Downloading the original file from an app needs an admin or edit account. For app developers: apps can report what is playing with OpenSubsonic <code>reportPlayback</code> and find similar tracks with <code>sonicSimilarity</code>; <code>f=jsonp</code> requests must send their own credentials (<code>u</code> with <code>p</code> or with <code>t</code> and <code>s</code>, an API key, or HTTP Basic) and never use the browser session; a request with no credentials gets Subsonic error 10.</p></div>
+      <div class="card"><span class="ico">🧩</span><h4>What Subsonic apps see</h4><p>Apps list one music folder for each scan folder in your library. A file that holds several tunes (SID, NSF and similar) also lists its other tunes in album and folder views as “Title (Tune n/N)”; each of those entries plays that tune. Downloading the original file from an app needs an admin or edit account. Apps also see the artist of a SID, tracker, Amiga, Atari&nbsp;ST or AdLib tune as its composer, and an album's label as its record label. For app developers: apps can report what is playing with OpenSubsonic <code>reportPlayback</code> and find similar tracks with <code>sonicSimilarity</code>; <code>f=jsonp</code> requests must send their own credentials (<code>u</code> with <code>p</code> or with <code>t</code> and <code>s</code>, an API key, or HTTP Basic) and never use the browser session; a request with no credentials gets Subsonic error 10.</p></div>
       <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart.</p></div>
       <div class="card"><span class="ico">📦</span><h4>Game names from archive names</h4><p>In <strong>gear → Metadata → Game names from archive names</strong>, <em>Game from archive names</em> (on by default) names a retro track's game after its archive when the archive's name is a known game of the track's platform, from the included title lists (Wikidata, No-Intro, the MAME software lists, ZXDB) and your HVSC copy. <strong>Download TOSEC</strong> and <strong>Download Redump</strong> add more titles on request. It applies right away and after each scan; turning it off removes only the names it added.</p></div>
-      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), hide empty folders, choose which filenames count as folder art, and toggle ZIP-archive scanning.</p></div>
+      <div class="card"><span class="ico">🏷️</span><h4>Retro genres</h4><p>A retro track whose file names no genre is listed under the genres SoniqBoom knows for it: what it is — <em>Game</em>, <em>Demo</em>, <em>Cracktro</em>, <em>Music Disk</em>, <em>Diskmag</em> or <em>Scene</em> — and its platform — <em>SID</em>, <em>Amiga</em>, <em>Atari ST</em>, <em>NES</em>, <em>SNES</em>, <em>Game Boy</em>, <em>Mega Drive</em>, <em>PlayStation</em>, <em>ZX Spectrum</em>, <em>AdLib</em>, <em>MIDI</em> and more. They come from the track's game (from any of its game sources), console-rip formats, Demozoo (the demo, cracktro, music disk, diskmag or game released the same year that uses the tune, and the party competition it entered — to add these, use <strong>Download / refresh index</strong> and then <strong>Apply to library</strong> in <strong>gear → Metadata → Scene groups (Demozoo)</strong>), its composer's Demozoo group, HVSC's <em>GAMES</em> and <em>DEMOS</em> folders and folder names such as <em>games</em>, <em>demos</em>, <em>intros</em>, <em>cracktros</em>, <em>musicdisks</em> or <em>parties</em> inside a music folder. In <strong>gear → Metadata → Retro genres</strong>, <em>Game and group names as genres</em> (on by default) also adds the game, the composer's scene groups and the party, so a Subsonic app can browse a game's or a group's tunes by genre; a large library then lists many more genres. A genre in the file's own tags (other than the format words SoniqBoom adds, such as <em>Chiptune</em> or <em>C64</em>), or one you type in Track Info, replaces them. Track Info, the Genres view, genre search (<code>genre:Cracktro</code>) and Subsonic apps list them: an app shows the first one as the song's genre and all of them where it shows several.</p></div>
+      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), choose which filenames count as folder art, and toggle ZIP-archive scanning.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Switch between dark and light under <strong>gear → System → Settings → Theme</strong>; your choice is saved in the browser and applies instantly. (You can also change your own password here.)</p></div>
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and those tracks show their length once they have played. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
@@ -890,6 +976,14 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
     <p>Its renderer isn't installed. Re-run <code>bash install.sh</code> (it installs them all), or install the one
        package SoniqBoom names in the error — <code>sidplayfp</code>, <code>fluidsynth</code>, <code>libopenmpt</code>,
        <code>uade</code>, <code>libgme</code> or <code>adplay</code>. Everything else keeps working in the meantime.</p>
+    <h3>A track shows an “offline” badge</h3>
+    <p>Its drive or share isn't connected right now — or, for a <a href="#modland">Modland catalogue</a> tune,
+       Modland can't be reached — and it can't play from SoniqBoom's cache. Reconnect the drive, or wait for the
+       share or Modland to come back: nothing was removed from the library, and the badge goes once SoniqBoom
+       reaches it again. Meanwhile the folder tree marks the drive or share <em>unavailable</em> (the Modland folder
+       shows <em>offline</em>). A drive folder that is still there but empty counts as not connected while the
+       library has tracks in it. To leave such tracks out of searches and lists instead, choose <em>Hide them</em>
+       under <strong>System → Settings → Tracks on unavailable drives</strong>.</p>
     <h3>A SID tune shows the wrong length</h3>
     <p>Configure HVSC in <a href="#settings">Settings</a> — without it, SID durations fall back to an estimate.</p>
     <h3>MIDI sounds thin or silent</h3>

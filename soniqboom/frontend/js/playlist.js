@@ -25,6 +25,7 @@ import { Player } from './player.js';
 import { Library } from './library.js';
 import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf } from './utils.js';
 import { createVirtualList } from './vlist.js';
+import { offlineKind, offlineBadgeHTML } from './offline.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -324,6 +325,21 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   _updateSidebarActive();
 }
 
+// Which tracks can play changed (a drive / share went offline or came back):
+// the open playlist re-reads its entries for their offline marks, keeping its
+// scroll position (the entries themselves are the same).
+document.addEventListener('soniqboom:availability-changed', async () => {
+  const id = _activeId;
+  if (!id || tracksEl.hidden) return;
+  try {
+    const data = await _api(`/playlists/${id}`);
+    if (_activeId !== id || !Array.isArray(data.tracks)
+        || data.tracks.length !== _activeTracks.length) return;
+    _activeTracks = data.tracks;
+    _renderTracks();
+  } catch (_) { /* keep what is shown */ }
+});
+
 // Playlist entry for a rendered track row: a bare id (default tune) OR
 // {id, subsong} for a specific subsong.  Reorder / remove MUST round-trip this
 // — sending a bare id for a subsong entry would flatten it to the default tune
@@ -389,10 +405,14 @@ function _fillPlRow(row, i) {
   const isContentDup = contentDups.length > 0;
   const isCurrent  = _isCurrentEntry(track);
 
+  // A playlist lists every entry ("Tracks on unavailable drives: Hide" never
+  // drops one): an entry that can't play right now is marked instead.
+  const offKind = offlineKind(track);
   row.className = 'queue-row'
     + (isCurrent  ? ' playing'  : '')
     + (_selectedIdxs.has(i) ? ' selected' : '')
     + (isIdDup    ? ' dup-id'   : '')
+    + (offKind    ? ' track-offline' : '')
     + (_dragIdxs && _dragIdxs.has(i) ? ' dragging' : '');
   row.dataset.idx = i;
   row.querySelector('.queue-playing-icon').textContent = isCurrent ? '▶' : '';
@@ -408,7 +428,7 @@ function _fillPlRow(row, i) {
   const tune = Number.isInteger(track.subsong)
     ? (() => { const n = subsongWireToTune(track.subsong, subsongStartOf(track), track.subsongs); return `<span class="qr-subsong" title="Tune ${n}">Tune ${n}</span>`; })()
     : '';
-  const titleHtml = `<span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${tune}${dupBadge}`;
+  const titleHtml = `<span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${tune}${dupBadge}${offKind ? offlineBadgeHTML(offKind) : ''}`;
   const titleRow = row.querySelector('.queue-track-titlerow');
   if (row.__titleHtml !== titleHtml) { titleRow.innerHTML = titleHtml; row.__titleHtml = titleHtml; }
   row.querySelector('.queue-track-artist').textContent = track.artist || track.album_artist || '';

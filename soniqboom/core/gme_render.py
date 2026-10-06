@@ -157,6 +157,48 @@ def gym_seconds(data: bytes) -> "float | None":
 _MAX_TUNES = 256
 
 
+# VGM header fields from 0x30 on that are NOT chip clocks (data offset, flags,
+# volume / loop modifiers, the extra-header offset, channel counts).  Every
+# other non-zero field there is a chip libgme's VGM player lacks — it plays
+# only the SN76489 (0x0C) and YM2612 (0x2C); its YM2413 (0x10) is a stub that
+# refuses the file ("YM2413 FM sound isn't supported").
+_VGM_NOT_CLOCKS = {0x34, 0x3C, 0x78, 0x7C, 0x94, 0xBC, 0xD4}
+_VGM_LAST_CLOCK = 0xE0                    # GA20; reserved after it
+
+
+def vgm_needs_other_engine(path) -> bool:
+    """Does the VGM / VGZ file ``path`` use a sound chip libgme can't play
+    (YM2413, YM2151, NES APU, AY-3-8910, …)?  libgme renders those as silence, so the
+    file goes to another engine.  False when the header can't be read."""
+    import gzip
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2)
+            fh.seek(0)
+            if head == b"\x1f\x8b":
+                with gzip.GzipFile(fileobj=fh) as gz:
+                    hdr = gz.read(0x100)
+            else:
+                hdr = fh.read(0x100)
+    except (OSError, EOFError, zlib.error):
+        return False
+    if len(hdr) < 0x40 or hdr[:4] != b"Vgm ":
+        return False
+    version = struct.unpack_from("<I", hdr, 0x08)[0]
+    end = 0x40
+    if version >= 0x150:
+        rel = struct.unpack_from("<I", hdr, 0x34)[0]
+        if rel:
+            end = 0x34 + rel
+    if version >= 0x110 and struct.unpack_from("<I", hdr, 0x10)[0] & 0x3FFFFFFF:
+        return True                       # YM2413 (before 1.10 the field was shared)
+    end = min(end, len(hdr), _VGM_LAST_CLOCK + 4)
+    for off in range(0x30, end - 3, 4):
+        if off not in _VGM_NOT_CLOCKS and struct.unpack_from("<I", hdr, off)[0] & 0x3FFFFFFF:
+            return True
+    return False
+
+
 def header_tunes(data: bytes) -> "tuple[int | None, int | None]":
     """``(tune count, 0-based default tune)`` the header of GME ``data``
     states — NSF, NSFe, GBS, AY, SAP — each None when it states none."""

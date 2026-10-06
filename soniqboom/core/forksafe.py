@@ -48,6 +48,9 @@ in between (CPython sets close-on-exec just after creating a pipe or socket
 on macOS) can still pass.
 
 On non-darwin platforms both are plain passthroughs.
+
+``spawn_pipe_stdout()`` — ``spawn()`` with stdout on a real pipe, for a
+program that reopens ``/dev/stdout`` (uvloop's ``PIPE`` is a socketpair).
 """
 
 from __future__ import annotations
@@ -380,3 +383,109 @@ async def spawn(program, *args, **kwargs):
                     "before it runs the program) — starting it again (%d of %d)",
                     os.path.basename(os.fspath(program)), -proc.returncode, attempt + 1, FORK_RETRIES)
     return proc
+
+
+
+# Write ends of ``spawn_pipe_stdout`` pipes not yet closed in this process.
+# A Python ``os.fork`` in that window (the scanner's process pool on Linux)
+# would hand the child a copy that is never exec'd away, and the reader would
+# not see the end of the pipe until that child exits — the child closes them.
+_PIPE_WRITE_ENDS: set[int] = set()
+_pipe_lock = threading.Lock()
+
+
+def _pipe_lock_acquire() -> None:
+    _pipe_lock.acquire()
+
+
+def _pipe_lock_release() -> None:
+    _pipe_lock.release()
+
+
+def _close_pipe_write_ends_in_child() -> None:
+    global _pipe_lock
+    for fd in _PIPE_WRITE_ENDS:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _PIPE_WRITE_ENDS.clear()
+    _pipe_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_pipe_lock_acquire, after_in_parent=_pipe_lock_release,
+                        after_in_child=_close_pipe_write_ends_in_child)
+
+
+class _BorrowedFd:
+    """A pipe end handed to uvloop's ``connect_read_pipe``, which closes the
+    descriptor itself (libuv owns it once opened, also when the connect
+    fails or is cancelled): ``close()`` must not close it a second time."""
+
+    def __init__(self, fd: int):
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def close(self) -> None:
+        pass
+
+
+async def spawn_pipe_stdout(program, *args, limit: int = 2 ** 16, **kwargs):
+    """``spawn()`` whose ``proc.stdout`` reads from a real pipe (``os.pipe``).
+
+    uvloop's ``stdout=PIPE`` is a Unix socketpair, and a program that opens
+    ``/dev/stdout`` by name gets ``ENXIO`` on Linux, where that name reopens
+    ``/proc/self/fd/1`` and a socket can't be reopened.  ``uade123 -c``
+    does that through libao ("Can not open ao device: 6").  ``proc.stdout``
+    is an ``asyncio.StreamReader`` (``limit`` is its buffer limit, also
+    passed to ``spawn``); read it, ``wait()`` — not ``communicate()``,
+    which needs the loop's own stdout pipe.  The caller must call
+    ``close_stdout(proc)`` when done with the process, in every case: uvloop
+    keeps the descriptor open after the end of the pipe, and a reader that
+    stopped early never reaches it."""
+    if "stdout" in kwargs:
+        raise ValueError("spawn_pipe_stdout() makes the stdout pipe itself")
+    with _pipe_lock:
+        r, w = os.pipe()                     # both close-on-exec (PEP 446)
+        _PIPE_WRITE_ENDS.add(w)
+    try:
+        proc = await spawn(program, *args, stdout=w, limit=limit, **kwargs)
+    except BaseException:
+        os.close(r)
+        raise
+    finally:
+        with _pipe_lock:                     # the child holds its own copy
+            _PIPE_WRITE_ENDS.discard(w)
+            os.close(w)
+    loop = asyncio.get_running_loop()
+    pipe = None
+    try:
+        reader = asyncio.StreamReader(limit=limit, loop=loop)
+        pipe = _BorrowedFd(r) if _on_uvloop() else os.fdopen(r, "rb", buffering=0)
+        transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader, loop=loop), pipe)
+    except BaseException:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        if pipe is None:
+            os.close(r)
+        elif not isinstance(pipe, _BorrowedFd):
+            pipe.close()                     # a no-op when the transport closed it
+        raise
+    proc.stdout = reader
+    proc._sb_stdout_transport = transport
+    return proc
+
+
+def close_stdout(proc) -> None:
+    """Close the stdout pipe ``spawn_pipe_stdout`` opened for ``proc`` (a
+    no-op for any other process, and when called again)."""
+    transport = getattr(proc, "_sb_stdout_transport", None)
+    if transport is not None:
+        proc._sb_stdout_transport = None
+        transport.close()

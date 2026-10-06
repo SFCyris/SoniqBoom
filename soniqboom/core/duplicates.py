@@ -125,6 +125,9 @@ def group_key_for(t: dict[str, Any]) -> str:
     title = t.get("title", "")
     if not _normalise(title):
         return ""
+    from soniqboom.core.catalogue import is_catalogue_path
+    if is_catalogue_path(t.get("path")):
+        return ""                    # catalogue tracks are never grouped
     artist = t.get("artist") or t.get("album_artist") or ""
     return _group_key(title, artist, float(t.get("duration", 0) or 0))
 
@@ -222,17 +225,20 @@ def compute_duplicate_groups(
     return result
 
 
+def primary_sort_key(t: dict) -> tuple:
+    """The order a duplicate group's primary is picked by — the smallest key
+    wins: highest format_score → highest bitrate → earliest added → track id
+    (a total order: the pick never depends on the order the group's tracks
+    were listed in, so the full and the incremental pass agree).  Also picks
+    the copy that stands in for a primary that can't play right now
+    (``TrackStore.primary_swap``)."""
+    score   = format_quality_score(t.get("format", ""), t.get("bitrate"))
+    bitrate = t.get("bitrate") or 0
+    added   = t.get("added_at") or 0
+    return (-score, -bitrate, added, t.get("id") or "")  # negative for descending
+
+
 def _pick_primary(group: list[dict]) -> dict:
-    """Among a group of duplicate tracks, pick the best one as primary.
-
-    Tie-breaking order: highest format_score → highest bitrate → earliest added
-    → track id (a total order: the pick never depends on the order the group's
-    tracks were listed in, so the full and the incremental pass agree).
-    """
-    def _sort_key(t: dict) -> tuple:
-        score   = format_quality_score(t.get("format", ""), t.get("bitrate"))
-        bitrate = t.get("bitrate") or 0
-        added   = t.get("added_at") or 0
-        return (-score, -bitrate, added, t.get("id") or "")  # negative for descending
-
-    return sorted(group, key=_sort_key)[0]
+    """Among a group of duplicate tracks, pick the best one as primary
+    (``primary_sort_key``)."""
+    return sorted(group, key=primary_sort_key)[0]

@@ -18,6 +18,7 @@ import heapq
 import logging
 import math
 import re
+import sys
 import time
 import unicodedata
 from collections import Counter
@@ -35,6 +36,7 @@ def normalise_year(y):
         return y // 10000
     return y
 
+from soniqboom.core import catalogue as _catalogue
 from soniqboom.core.folder_album import spc_name_completes as _spc_name_completes
 from soniqboom.core.folder_album import _ARTIST_PLACEHOLDERS
 from soniqboom.core.retro import chip_family as _chip_family
@@ -144,22 +146,118 @@ def _sorted_tail(lst: list[tuple], n: int) -> list[str]:
 
 _MISSING = object()
 _EMPTY_SORT_KEY = "￿"
+# The numeric lists' counterpart of ``_EMPTY_SORT_KEY``: a track with no year /
+# duration / bpm is keyed after every real value (last ascending, first
+# descending) instead of being left out, so a sorted page walk reaches every
+# track the list's count includes.  Outside every year range and duration
+# bucket the year filter and the duplicate grouping bisect.  A float, so the
+# lists' tuples stay plain numbers the GC does not track (``_num_key`` makes
+# every key in them a number).
+_NO_VALUE_KEY = math.inf
 
 # Word-index tokens (``_tokenize_track``).
 _TOKEN_FIELDS = frozenset(("title", "artist", "album_artist", "album", "composer",
                            "scene_group", "game", "game_aliases"))
 # Scalar tag indexes: field → attribute (``_tag_set(idx, t.get(field, ""))``).
 _SCALAR_TAG_INDEXES = (
-    ("artist", "_tag_artist"), ("album_artist", "_tag_album_artist"),
     ("album", "_tag_album"), ("format", "_tag_format"),
     ("dir_hash", "_tag_dir_hash"), ("scan_root_hash", "_tag_scan_root_hash"),
 )
+# Name tag indexes (``_name_keys``): a multi-artist tag is indexed under its
+# whole value AND each of its artists.
+_NAME_TAG_INDEXES = (("artist", "_tag_artist"), ("album_artist", "_tag_album_artist"))
+# The separator ``core/metadata.py`` joins a tag's several artists with
+# (``metadata.NAME_SEP``; equal to ``subsonic_index.NAME_SEP``).
+NAME_SEP = " \u2022 "
+
+
+def _name_parts_l(v) -> list:
+    """The lower-cased artists of a multi-artist tag ("A • B" → ["a", "b"]),
+    [] for a single name."""
+    if not isinstance(v, str) or NAME_SEP not in v:
+        return []
+    out: list = []
+    for p in v.split(NAME_SEP):
+        p = p.strip().lower()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _name_keys(v) -> list:
+    """The ``_tag_artist`` / ``_tag_album_artist`` keys of a tag value: the
+    whole value, and — a multi-artist tag ("A • B") — each of its artists,
+    so browsing artist "A" finds the tracks tagged "A • B" and a tag that
+    gains a second value stays under "A"."""
+    if not isinstance(v, str):
+        v = "" if v is None else str(v)
+    full = v.strip().lower()
+    if not full:
+        return []
+    parts = _name_parts_l(full)
+    return [full, *(p for p in parts if p != full)] if parts else [full]
+
+
+def _name_counts(v) -> list:
+    """The ``_agg_artists`` / ``_agg_album_artists`` keys a tag value counts
+    under: each artist of a multi-artist tag (never the joined value — the
+    Artists views list A and B, not "A • B"), else the value itself."""
+    if not isinstance(v, str):
+        return []
+    full = v.strip().lower()
+    if not full:
+        return []
+    return _name_parts_l(full) or [full]
+
+
+def name_display(v, key: str) -> str:
+    """The display spelling of artist ``key`` (lower-cased) in tag value
+    ``v``: the matching artist of a multi-artist tag, else ``v`` stripped."""
+    v = (v or "").strip() if isinstance(v, str) else ""
+    if NAME_SEP in v and v.lower() != key:
+        for p in v.split(NAME_SEP):
+            if p.strip().lower() == key:
+                return p.strip()
+    return v
+
+
 # ``_agg_*`` counters.
-_AGG_FIELDS = frozenset(("artist", "album_artist", "album", "genre", "year"))
+_AGG_FIELDS = frozenset(("artist", "album_artist", "album", "genre", "genre_derived", "year"))
+
+
+def track_genres(t: dict) -> list:
+    """The genres track ``t`` is browsed and listed under: its derived genres
+    (``genre_derived`` — core/genre_derive.py; set only for a retro track
+    whose file names no genre) first, then its own ``genre`` list, each name
+    once (case-insensitively).  Without derived genres: ``genre`` as stored.
+    Every genre index, count and listing reads this — the tag index, the
+    aggregates, the Subsonic catalogue and songs — so a genre a track shows
+    can always be browsed."""
+    g = t.get("genre") or []
+    d = t.get("genre_derived")
+    if not d:
+        return g
+    out: list = []
+    seen: set = set()
+    for x in (*d, *g):
+        if not isinstance(x, str):
+            continue
+        k = x.strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(x.strip())
+    return out
 
 
 def _lex_key(v) -> str:
     return (v or "").strip().lower() or _EMPTY_SORT_KEY
+
+
+def _lex_key_shared(v) -> str:
+    """``_lex_key`` interned — for the low-cardinality sort keys (artist,
+    album artist, album, format): one key object per distinct value, not one
+    per track (~60 B a track and list)."""
+    return sys.intern((v or "").strip().lower()) or _EMPTY_SORT_KEY
 
 
 def _game_key(v) -> str:
@@ -169,6 +267,26 @@ def _game_key(v) -> str:
     180s")."""
     s = " ".join((v or "").split()).lower()
     return s if s.isascii() else _fold_text(s)
+
+
+def _name_word_hits(index: dict, value) -> set[str]:
+    """The ids of every name in ``index`` (``_tag_artist`` / ``_tag_album_artist``)
+    in which ``value`` starts a word — the search box's ``artist:Marcin`` finds
+    "Marcin Romanowski (Sidder)", ``artist:sidder`` too; case, accents and runs
+    of whitespace ignored, as in plain search (GitHub #25)."""
+    q = _game_key(value)
+    hits: set[str] = set()
+    if not q:
+        return hits
+    for key, tids in index.items():
+        k = _game_key(key)
+        i = k.find(q)
+        while i != -1:
+            if i == 0 or not k[i - 1].isalnum():
+                hits.update(tids)
+                break
+            i = k.find(q, i + 1)
+    return hits
 
 
 def _game_keys(t: dict) -> set[str]:
@@ -218,19 +336,66 @@ def _game_title_hit(t: dict | None) -> bool:
     return _is_retro_format(fmt) and _chip_family(fmt) in _GAME_TITLE_FAMILIES
 
 
+def _num_key(v):
+    """Raw field value ``v`` as a numeric-list key: an int / float as it is, a
+    numeric string (a legacy raw ``"1999"`` year) as its number, anything else
+    — None, NaN, ±inf, a non-numeric string — ``_NO_VALUE_KEY``.  Every key of
+    a numeric list is then a number, so no raw value can make its keys
+    incomparable (a ``TypeError`` out of an insert, a sort or a year range)."""
+    if isinstance(v, int):                      # (a bool is an int)
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else _NO_VALUE_KEY
+    if isinstance(v, str):
+        try:
+            f = float(v)
+        except ValueError:
+            return _NO_VALUE_KEY
+        if not math.isfinite(f):
+            return _NO_VALUE_KEY
+        return int(f) if f.is_integer() else f
+    return _NO_VALUE_KEY
+
+
+# The numeric lists' value functions — the ONLY derivation of their keys:
+# ``_index_track`` / ``_unindex_track``, the full rebuilds (here and the
+# scanner's yielding one) and ``_SORTED_SPECS`` all call them.
+
+def _year_value(t: dict):
+    return normalise_year(_num_key(t.get("year")))
+
+
+def year_number(v):
+    """A raw ``year`` field as the number every year surface uses — keyed
+    exactly like ``_sorted_year`` (a legacy string or YYYYMMDD year collapses
+    to its year; an integral float becomes an int), None for no year."""
+    y = normalise_year(_num_key(v))
+    if y == _NO_VALUE_KEY:
+        return None
+    return int(y) if isinstance(y, float) and y.is_integer() else y
+
+
+def _agg_year(t: dict):
+    """The year the Years legend / ``_agg_years`` count ``t`` under."""
+    return year_number(t.get("year"))
+
+
 def _added_value(t: dict):
-    a = t.get("added_at", 0)
-    return a if a else None
+    # No ``added_at`` sorts as the oldest (0), as the Subsonic genre lists
+    # order it — not as the newest, which the default newest-first list and
+    # Recently Added would show first.
+    a = _num_key(t.get("added_at"))
+    return a if a and a != _NO_VALUE_KEY else 0
 
 
 def _added_primary_value(t: dict):
-    a = t.get("added_at", 0)
-    return a if a and t.get("is_duplicate_primary", True) else None
+    return _added_value(t) if t.get("is_duplicate_primary", True) else None
 
 
 def _sortable_duration(d) -> bool:
-    """A duration that belongs in ``_sorted_duration``: non-zero and, when
-    numeric, finite (a NaN from a broken probe breaks the list's order)."""
+    """A duration ``_sorted_duration`` is keyed on: non-zero and, when
+    numeric, finite (a NaN from a broken probe breaks the list's order).  Any
+    other track is keyed ``_NO_VALUE_KEY``."""
     if not d:
         return False
     try:
@@ -240,25 +405,31 @@ def _sortable_duration(d) -> bool:
 
 
 def _duration_value(t: dict):
-    d = t.get("duration", 0.0)
-    return d if _sortable_duration(d) else None
+    d = _num_key(t.get("duration"))
+    return d if _sortable_duration(d) else _NO_VALUE_KEY
+
+
+def _bpm_value(t: dict):
+    return _num_key(t.get("bpm"))
 
 
 # Sorted list → (input fields, value function).  The value function returns the
-# list key for a track, or None when the track is not in that list.
+# list key for a track, or None when the track is not in that list (only the
+# primary-only and ``game:`` side lists leave tracks out: every other list holds
+# every track, its sort pages reaching every row its count includes).
 _SORTED_SPECS: dict[str, tuple[frozenset[str], Callable[[dict], Any]]] = {
-    "_sorted_year":             (frozenset(("year",)), lambda t: normalise_year(t.get("year"))),
+    "_sorted_year":             (frozenset(("year",)), _year_value),
     "_sorted_added_at":         (frozenset(("added_at",)), _added_value),
     "_sorted_added_at_primary": (frozenset(("added_at", "is_duplicate_primary")),
                                  _added_primary_value),
     "_sorted_duration":         (frozenset(("duration",)), _duration_value),
-    "_sorted_bpm":              (frozenset(("bpm",)), lambda t: t.get("bpm")),
+    "_sorted_bpm":              (frozenset(("bpm",)), _bpm_value),
     "_sorted_title":            (frozenset(("title",)), lambda t: _lex_key(t.get("title"))),
-    "_sorted_artist":           (frozenset(("artist",)), lambda t: _lex_key(t.get("artist"))),
+    "_sorted_artist":           (frozenset(("artist",)), lambda t: _lex_key_shared(t.get("artist"))),
     "_sorted_album_artist":     (frozenset(("album_artist",)),
-                                 lambda t: _lex_key(t.get("album_artist"))),
-    "_sorted_album":            (frozenset(("album",)), lambda t: _lex_key(t.get("album"))),
-    "_sorted_format":           (frozenset(("format",)), lambda t: _lex_key(t.get("format"))),
+                                 lambda t: _lex_key_shared(t.get("album_artist"))),
+    "_sorted_album":            (frozenset(("album",)), lambda t: _lex_key_shared(t.get("album"))),
+    "_sorted_format":           (frozenset(("format",)), lambda t: _lex_key_shared(t.get("format"))),
     # ``game:`` title side list (``_game_fold_value``).  Appended LAST: the
     # scanner's full rebuild relies on the order above (numeric lists first).
     "_sorted_title_fold":       (frozenset(("title",)),
@@ -272,7 +443,9 @@ _N_SORTED = len(SORTED_LISTS)
 # plain dict update (+ AOF record) — no index work at all.
 _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
                    | frozenset(f for f, _ in _SCALAR_TAG_INDEXES)
-                   | frozenset(("duplicate_group_id", "genre", "scene_group", "game"))
+                   | frozenset(f for f, _ in _NAME_TAG_INDEXES)
+                   | frozenset(("duplicate_group_id", "genre", "genre_derived",
+                                "scene_group", "game"))
                    | frozenset().union(*(f for f, _ in _SORTED_SPECS.values())))
 
 # Fields NO ``_mutation_seq``-keyed consumer reads (store ``_agg_cache``, the
@@ -302,7 +475,10 @@ _DUP_DIRTY_MAX = 20_000     # more pending changes than this → one full pass i
 # list).  More ids than ``_ENRICH_LOG_MAX`` → the oldest half is dropped, and a
 # pass whose last run is older runs over everything.
 _ENRICH_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "duplicate_group_id",
-                                   "is_duplicate_primary", "format_score", "default_subsong"))
+                                   "is_duplicate_primary", "format_score", "default_subsong",
+                                   # the derived-genre pass's own output: no
+                                   # pass reads it (core/genre_derive.py)
+                                   "genre_derived"))
 _ENRICH_LOG_MAX = 100_000
 
 # Fields the Subsonic catalogue (core/subsonic_index.py) groups/sorts/counts on
@@ -310,7 +486,7 @@ _ENRICH_LOG_MAX = 100_000
 # lengths, from which it expands the tunes and sums album song counts.
 # ``_catalog_seq`` bumps on inserts/deletes and on a change to one of these, so
 # the catalogue can key on it instead of the (much hotter) ``_mutation_seq``.
-_CATALOG_FIELDS = frozenset(("title", "artist", "album_artist", "album", "genre",
+_CATALOG_FIELDS = frozenset(("title", "artist", "album_artist", "album", "genre", "genre_derived",
                              "year", "duration", "added_at", "dir_hash", "path",
                              "track_number", "disc_number",
                              "subsongs", "start_subsong", "hvsc_lengths"))
@@ -366,6 +542,71 @@ def freeze_long_lived_heap(reason: str) -> None:
     gc.freeze()
     log.info("GC: froze the long-lived heap after %s in %.0f ms (%d objects frozen)",
              reason, (time.monotonic() - t0) * 1000, gc.get_freeze_count())
+
+
+# Track fields whose values repeat across many tracks (a format, a folder's
+# hash, a composer, a provenance word, the genre words): ``share_values``
+# makes equal values one string object.  A snapshot load parses every value
+# into a string of its own — ~60 B each, per field, per track (a 330k-track
+# Modland catalogue loaded ~0.3 GB more than it was built with).
+_SHARED_STR_FIELDS = ("format", "dir_hash", "scan_root_hash", "album_source", "game_source",
+                      "year_source", "defect", "sid_model", "artist", "album_artist", "album",
+                      "composer", "label", "game", "scene_group", "game_by_modland",
+                      "game_by_modland_filename", "game_by_tag")
+_SHARED_LIST_FIELDS = ("genre", "genre_derived", "songdb_fields", "user_edited", "scene_use",
+                       "game_aliases")
+
+
+# Store config key: catalogue track ids that playlists list while the tracks
+# are out of the library (``modland_catalog._park_user_refs``).
+PARKED_PLAYLIST_IDS = "catalogue_parked_playlist_ids"
+
+
+def _entry_tid(e):
+    return e.get("id") if isinstance(e, dict) else e
+
+
+def _merge_unseen_entries(old: list, new: list, keep) -> list:
+    """``new`` (a client's playlist save) plus the entries of ``old`` whose
+    id is in ``keep`` (tracks that client can't see) and that ``new`` lacks —
+    each re-inserted after the visible entry it followed before (at the
+    front when none)."""
+    new_ids = {_entry_tid(e) for e in new}
+    pos: dict = {}
+    for i, e in enumerate(new):
+        pos.setdefault(_entry_tid(e), i)
+    inserts: dict = {}
+    anchor = -1
+    for e in old:
+        tid = _entry_tid(e)
+        if tid in keep:
+            if tid not in new_ids:
+                inserts.setdefault(anchor, []).append(e)
+            continue
+        if tid in pos:
+            anchor = pos[tid]
+    if not inserts:
+        return new
+    out = list(inserts.get(-1, ()))
+    for i, e in enumerate(new):
+        out.append(e)
+        out.extend(inserts.get(i, ()))
+    return out
+
+
+def share_values(t: dict) -> dict:
+    """Intern ``t``'s repeating string values in place (equal values, one
+    object; interned strings are freed with their last user).  Returns ``t``."""
+    intern = sys.intern
+    for f in _SHARED_STR_FIELDS:
+        v = t.get(f)
+        if v.__class__ is str and v:
+            t[f] = intern(v)
+    for f in _SHARED_LIST_FIELDS:
+        v = t.get(f)
+        if v.__class__ is list and v:
+            t[f] = [intern(x) if x.__class__ is str else x for x in v]
+    return t
 
 
 def _diff_updates(t: dict, updates: dict) -> dict:
@@ -727,8 +968,16 @@ def _carry_enrichment(old: dict, new: dict) -> None:
     # fresh extract): the folder / archive name's always (the track id is keyed
     # on the path), the Modland / song-database ones while ``file_md5`` is
     # unchanged.
+    same_title = old.get("title") == new.get("title")
     for f, keep in (("game_by_folder", True), ("game_by_archive", True),
-                    ("game_by_demozoo", same_artist and old.get("title") == new.get("title")),
+                    ("game_by_demozoo", same_artist and same_title),
+                    # the Demozoo use / party: keyed on composer + title too
+                    ("scene_use", same_artist and same_title),
+                    ("scene_party", same_artist and same_title),
+                    # derived genres: the next derived-genre pass recomputes
+                    # them from the rescanned track (core/genre_derive.py) —
+                    # carried so an unchanged file is no change
+                    ("genre_derived", True),
                     ("game_by_modland", same_md5),
                     ("game_by_modland_filename", same_md5),
                     ("game_by_songdb", same_md5)):
@@ -767,6 +1016,31 @@ def _carry_default_tune(old: dict, new: dict) -> None:
     new["default_subsong"] = z
     if z and "duration" in old:
         new["duration"] = old["duration"]
+
+
+class PrimarySwap:
+    """The duplicate groups whose primary can't play right now while another
+    member can — what a list that hides duplicate copies shows instead: that
+    group's best playable member (by ``duplicates.primary_sort_key``, the
+    order the primary itself was picked by).  Built by
+    ``TrackStore.primary_swap`` from the stored primaries, never written to a
+    track: when the primary's drive is back, the next swap leaves it out.
+    Immutable; callers compare it by identity (memo keys)."""
+
+    __slots__ = ("demoted", "promoted", "changed", "stand_in")
+
+    def __init__(self, stand_in: dict[str, str]) -> None:
+        self.stand_in = stand_in                        # primary that can't play → its stand-in
+        self.demoted = frozenset(stand_in)
+        self.promoted = frozenset(stand_in.values())
+        self.changed = self.demoted | self.promoted
+
+    def is_primary(self, tid: str, t: dict) -> bool:
+        """Whether the track ``tid`` (its dict ``t``) is the one a deduped list
+        shows of its group: a stand-in, or a primary that is not stood in for."""
+        if tid in self.promoted:
+            return True
+        return t.get("is_duplicate_primary", True) and tid not in self.demoted
 
 
 class TrackStore:
@@ -835,7 +1109,15 @@ class TrackStore:
         self._enrich_log: dict[str, int] = {}
         self._enrich_floor = 0
         self._enrich_epoch = object()
+        # Called after every new change-log entry (``set_enrich_listener``).
+        self._enrich_listener: Callable[[], None] | None = None
         self._tag_scan_root_hash: dict[str, set[str]] = {}
+        # Per scan root: bumped whenever a track is added to, removed from or
+        # moved within it (its path changed) — the availability snapshot keys
+        # on it (``core/availability._signature``), so an add + a delete that
+        # leave the root's count unchanged still re-snapshot.  A version, not
+        # an index: monotonic, never cleared, not in ``INDEX_ATTRS``.
+        self._root_rev: dict[str, int] = {}
         self._tag_dup_group: dict[str, set[str]] = {}
         # Scene-group (Demozoo) index: each collective a retro composer belonged
         # to → the track ids by that composer.  Lets ``similar_candidates`` pool
@@ -872,7 +1154,7 @@ class TrackStore:
         self._sim_tok_count: dict[str, int] = {}            # retro-with-samples track id → |tokens|
 
         # ── Sorted indexes: list of (value, track_id) ───────────────────
-        self._sorted_year: list[tuple[int, str]] = []
+        self._sorted_year: list[tuple[int | float, str]] = []      # (float: _NO_VALUE_KEY)
         self._sorted_added_at: list[tuple[int, str]] = []
         # Parallel index tracking only primary (non-secondary-dup) tracks so
         # ``filter_tracks(filter_duplicates=True)`` and ``_paginate_all`` can
@@ -880,7 +1162,7 @@ class TrackStore:
         # ``is_duplicate_primary`` flag per request.
         self._sorted_added_at_primary: list[tuple[int, str]] = []
         self._sorted_duration: list[tuple[float, str]] = []
-        self._sorted_bpm: list[tuple[float, str]] = []
+        self._sorted_bpm: list[tuple[int | float, str]] = []
         # Lexical sort indexes for column-header sort in the All Tracks
         # windowed view.  Keys are lower-cased so the order is locale-
         # agnostic case-insensitive — matches the user's expectation that
@@ -916,6 +1198,24 @@ class TrackStore:
         # ``_primary_order`` memo: sorted-index name → (the list it was built
         # from, ``_primary_order_key``, primary-only ids in list order).
         self._primary_order_memo: dict[str, tuple[list, tuple, list[str]]] = {}
+        # ``_excluded_order`` memo: (sorted-index name, duplicates hidden,
+        # exclude set, primary swap) → (the list, ``_primary_order_key``, the
+        # ``exclude`` set, ids in list order without the excluded ones — with
+        # duplicates hidden, the effective primaries' — the ``swap``).  For the
+        # sets in use (``core.availability``: the tracks hidden while their
+        # drive is offline, the copies standing in for primaries that can't
+        # play): a stale entry is dropped on the next build.
+        self._excluded_order_memo: dict[tuple, tuple] = {}
+        # Exclude-aware aggregate memo: key → (``_mutation_seq``, the exclude
+        # set it was computed without, value, the primary swap it used) — see
+        # ``_agg_x_get``.
+        self._agg_x_cache: dict[str, tuple[int, Any, Any, Any]] = {}
+        # ``primary_swap`` memo: (the unplayable set, ``_mutation_seq``, the
+        # swap or None).
+        self._primary_swap_memo: tuple | None = None
+        # Called (no arguments) after a scan dir was added or removed or its
+        # reachability ``status`` changed — ``core.availability`` listens.
+        self._on_scan_dirs_changed: Callable[[], None] | None = None
 
         # ── Track IDs that have never been played ────────────────────────
         # Mirrors `play_stats` keys; updated on every track upsert / delete
@@ -981,6 +1281,7 @@ class TrackStore:
             self._dirty_sorted.discard(n)
             self._dirty_sorted_tids.pop(n, None)
             self._primary_order_memo.pop(n, None)
+        self._excluded_order_memo.clear()
 
     # ── AOF helper ───────────────────────────────────────────────────────
 
@@ -996,16 +1297,19 @@ class TrackStore:
             self._word_index.setdefault(token, set()).add(tid)
         self._word_list_dirty = True
 
-        self._tag_set(self._tag_artist, t.get("artist", ""), tid)
-        self._tag_set(self._tag_album_artist, t.get("album_artist", ""), tid)
+        for k in _name_keys(t.get("artist")):
+            self._tag_set(self._tag_artist, k, tid)
+        for k in _name_keys(t.get("album_artist")):
+            self._tag_set(self._tag_album_artist, k, tid)
         self._tag_set(self._tag_album, t.get("album", ""), tid)
         self._tag_set(self._tag_format, t.get("format", ""), tid)
         self._tag_set(self._tag_dir_hash, t.get("dir_hash", ""), tid)
         self._tag_set(self._tag_scan_root_hash, t.get("scan_root_hash", ""), tid)
+        self._bump_root_rev(t.get("scan_root_hash", ""))
         gid = t.get("duplicate_group_id")
         if gid:
             self._tag_set(self._tag_dup_group, gid, tid)
-        for g in t.get("genre", []):
+        for g in track_genres(t):
             self._tag_set(self._tag_genre, g, tid)
         for grp in _scene_group_keys(t.get("scene_group")):
             self._tag_set(self._tag_scene_group, grp, tid)
@@ -1016,35 +1320,31 @@ class TrackStore:
         # ``normalise_year`` collapses YYYYMMDD-form ints down to YYYY so the
         # sorted index agrees with the aggregation Counter — the same rule
         # is reused by scanner._async_exit_batch_mode via the module helper.
-        year = normalise_year(t.get("year"))
-        added = t.get("added_at", 0)
-        dur = t.get("duration", 0.0)
-        bpm = t.get("bpm")
+        year = _agg_year(t)
 
         # Lexical sort keys for the column-header sort (windowed view).
         # Lower-cased so ABBA and abba sort adjacent; empty values fall
         # to the end of asc / start of desc — we use the ``￿``
         # sentinel for empties to keep that behaviour without a separate
         # filter pass at query time.  Using a high-BMP unicode codepoint
-        # not present in real metadata.
+        # not present in real metadata.  (The numeric keys come from their
+        # value functions: a missing year / duration / bpm likewise keys
+        # ``_NO_VALUE_KEY``, a missing ``added_at`` 0.)
         EMPTY_SORT_KEY = "￿"
         title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
-        artist_key       = (t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY
-        album_artist_key = (t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY
-        album_key        = (t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY
-        fmt_key          = (t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY
+        artist_key       = _lex_key_shared(t.get("artist"))
+        album_artist_key = _lex_key_shared(t.get("album_artist"))
+        album_key        = _lex_key_shared(t.get("album"))
+        fmt_key          = _lex_key_shared(t.get("format"))
 
         if not self._batch_mode:
-            if year is not None:
-                _sorted_insert(self._sorted_year, (year, tid))
-            if added:
-                _sorted_insert(self._sorted_added_at, (added, tid))
-                if t.get("is_duplicate_primary", True):
-                    _sorted_insert(self._sorted_added_at_primary, (added, tid))
-            if _sortable_duration(dur):
-                _sorted_insert(self._sorted_duration, (dur, tid))
-            if bpm is not None:
-                _sorted_insert(self._sorted_bpm, (bpm, tid))
+            _sorted_insert(self._sorted_year, (_year_value(t), tid))
+            added = _added_value(t)
+            _sorted_insert(self._sorted_added_at, (added, tid))
+            if t.get("is_duplicate_primary", True):
+                _sorted_insert(self._sorted_added_at_primary, (added, tid))
+            _sorted_insert(self._sorted_duration, (_duration_value(t), tid))
+            _sorted_insert(self._sorted_bpm, (_bpm_value(t), tid))
             _sorted_insert(self._sorted_title,        (title_key,        tid))
             _sorted_insert(self._sorted_artist,       (artist_key,       tid))
             _sorted_insert(self._sorted_album_artist, (album_artist_key, tid))
@@ -1068,20 +1368,18 @@ class TrackStore:
     def _agg_add(self, t: dict, year) -> None:
         """Count ``t`` into the ``_agg_*`` counters (``year`` already
         normalised).  Shared by ``_index_track`` and the partial reindex."""
-        artist = (t.get("artist") or "").strip()
-        album_artist = (t.get("album_artist") or "").strip()
         album = (t.get("album") or "").strip()
-        if artist:
-            self._agg_artists[artist.lower()] += 1
+        for a in _name_counts(t.get("artist")):
+            self._agg_artists[a] += 1
             if album:
-                self._agg_albums_by_artist.setdefault(artist.lower(), Counter())[album.lower()] += 1
-        if album_artist:
-            self._agg_album_artists[album_artist.lower()] += 1
+                self._agg_albums_by_artist.setdefault(a, Counter())[album.lower()] += 1
+        for a in _name_counts(t.get("album_artist")):
+            self._agg_album_artists[a] += 1
             if album:
-                self._agg_albums_by_album_artist.setdefault(album_artist.lower(), Counter())[album.lower()] += 1
+                self._agg_albums_by_album_artist.setdefault(a, Counter())[album.lower()] += 1
         if album:
             self._agg_albums[album.lower()] += 1
-        for g in t.get("genre", []):
+        for g in track_genres(t):
             gl = g.strip().lower()
             if gl:
                 self._agg_genres[gl] += 1
@@ -1098,16 +1396,19 @@ class TrackStore:
                     del self._word_index[token]
         self._word_list_dirty = True
 
-        self._tag_del(self._tag_artist, t.get("artist", ""), tid)
-        self._tag_del(self._tag_album_artist, t.get("album_artist", ""), tid)
+        for k in _name_keys(t.get("artist")):
+            self._tag_del(self._tag_artist, k, tid)
+        for k in _name_keys(t.get("album_artist")):
+            self._tag_del(self._tag_album_artist, k, tid)
         self._tag_del(self._tag_album, t.get("album", ""), tid)
         self._tag_del(self._tag_format, t.get("format", ""), tid)
         self._tag_del(self._tag_dir_hash, t.get("dir_hash", ""), tid)
         self._tag_del(self._tag_scan_root_hash, t.get("scan_root_hash", ""), tid)
+        self._bump_root_rev(t.get("scan_root_hash", ""))
         gid = t.get("duplicate_group_id")
         if gid:
             self._tag_del(self._tag_dup_group, gid, tid)
-        for g in t.get("genre", []):
+        for g in track_genres(t):
             self._tag_del(self._tag_genre, g, tid)
         for grp in _scene_group_keys(t.get("scene_group")):
             self._tag_del(self._tag_scene_group, grp, tid)
@@ -1116,31 +1417,25 @@ class TrackStore:
 
         # Extract numeric fields used by both sorted indexes and aggregations.
         # ``normalise_year`` keeps insert/remove in agreement.
-        year = normalise_year(t.get("year"))
-        added = t.get("added_at", 0)
-        dur = t.get("duration", 0.0)
-        bpm = t.get("bpm")
+        year = _agg_year(t)
 
         # Same lexical key derivation as ``_index_track`` — must match
         # exactly or the remove turns into a no-op and the index drifts.
         EMPTY_SORT_KEY = "￿"
         title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
-        artist_key       = (t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY
-        album_artist_key = (t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY
-        album_key        = (t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY
-        fmt_key          = (t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY
+        artist_key       = _lex_key_shared(t.get("artist"))
+        album_artist_key = _lex_key_shared(t.get("album_artist"))
+        album_key        = _lex_key_shared(t.get("album"))
+        fmt_key          = _lex_key_shared(t.get("format"))
 
         if not self._batch_mode:
-            if year is not None:
-                _sorted_remove(self._sorted_year, (year, tid))
-            if added:
-                _sorted_remove(self._sorted_added_at, (added, tid))
-                if t.get("is_duplicate_primary", True):
-                    _sorted_remove(self._sorted_added_at_primary, (added, tid))
-            if _sortable_duration(dur):
-                _sorted_remove(self._sorted_duration, (dur, tid))
-            if bpm is not None:
-                _sorted_remove(self._sorted_bpm, (bpm, tid))
+            _sorted_remove(self._sorted_year, (_year_value(t), tid))
+            added = _added_value(t)
+            _sorted_remove(self._sorted_added_at, (added, tid))
+            if t.get("is_duplicate_primary", True):
+                _sorted_remove(self._sorted_added_at_primary, (added, tid))
+            _sorted_remove(self._sorted_duration, (_duration_value(t), tid))
+            _sorted_remove(self._sorted_bpm, (_bpm_value(t), tid))
             _sorted_remove(self._sorted_title,        (title_key,        tid))
             _sorted_remove(self._sorted_artist,       (artist_key,       tid))
             _sorted_remove(self._sorted_album_artist, (album_artist_key, tid))
@@ -1160,14 +1455,12 @@ class TrackStore:
 
     def _agg_remove(self, t: dict, year) -> None:
         """Inverse of ``_agg_add``."""
-        artist = (t.get("artist") or "").strip()
-        album_artist = (t.get("album_artist") or "").strip()
         album = (t.get("album") or "").strip()
-        if artist:
-            self._agg_artists[artist.lower()] -= 1
-            if self._agg_artists[artist.lower()] <= 0:
-                del self._agg_artists[artist.lower()]
-            by_art = self._agg_albums_by_artist.get(artist.lower())
+        for a in _name_counts(t.get("artist")):
+            self._agg_artists[a] -= 1
+            if self._agg_artists[a] <= 0:
+                del self._agg_artists[a]
+            by_art = self._agg_albums_by_artist.get(a)
             if by_art and album:
                 by_art[album.lower()] -= 1
                 if by_art[album.lower()] <= 0:
@@ -1175,23 +1468,23 @@ class TrackStore:
                 if not by_art:
                     # An empty per-artist counter is not "no entry" to
                     # verify_indexes (a fresh build never creates one).
-                    del self._agg_albums_by_artist[artist.lower()]
-        if album_artist:
-            self._agg_album_artists[album_artist.lower()] -= 1
-            if self._agg_album_artists[album_artist.lower()] <= 0:
-                del self._agg_album_artists[album_artist.lower()]
-            by_aa = self._agg_albums_by_album_artist.get(album_artist.lower())
+                    del self._agg_albums_by_artist[a]
+        for a in _name_counts(t.get("album_artist")):
+            self._agg_album_artists[a] -= 1
+            if self._agg_album_artists[a] <= 0:
+                del self._agg_album_artists[a]
+            by_aa = self._agg_albums_by_album_artist.get(a)
             if by_aa and album:
                 by_aa[album.lower()] -= 1
                 if by_aa[album.lower()] <= 0:
                     del by_aa[album.lower()]
                 if not by_aa:
-                    del self._agg_albums_by_album_artist[album_artist.lower()]
+                    del self._agg_albums_by_album_artist[a]
         if album:
             self._agg_albums[album.lower()] -= 1
             if self._agg_albums[album.lower()] <= 0:
                 del self._agg_albums[album.lower()]
-        for g in t.get("genre", []):
+        for g in track_genres(t):
             gl = g.strip().lower()
             if gl:
                 self._agg_genres[gl] -= 1
@@ -1201,6 +1494,12 @@ class TrackStore:
             self._agg_years[year] -= 1
             if self._agg_years[year] <= 0:
                 del self._agg_years[year]
+
+    @staticmethod
+    def _tag_key(value) -> str:
+        """The key a scalar tag index files ``value`` under — the rule
+        ``_tag_set`` / ``_tag_del`` inline (a hot path)."""
+        return value.strip().lower() if isinstance(value, str) else str(value)
 
     @staticmethod
     def _tag_set(idx: dict[str, set[str]], value: str, tid: str) -> None:
@@ -1223,6 +1522,14 @@ class TrackStore:
             self._word_list = sorted(self._word_index.keys())
             self._word_list_dirty = False
 
+    def _bump_root_rev(self, root_hash) -> None:
+        if root_hash:
+            self._root_rev[root_hash] = self._root_rev.get(root_hash, 0) + 1
+
+    def root_rev(self, root_hash: str) -> int:
+        """``_root_rev`` of one scan root (0 for one never written)."""
+        return self._root_rev.get(root_hash, 0)
+
     def _reindex_changed(self, tid: str, old: dict, t: dict, changed) -> None:
         """Move track ``tid`` from its ``old`` field values to ``t``'s in only
         the derived indexes that read a field in ``changed`` — the diff-based
@@ -1234,6 +1541,9 @@ class TrackStore:
         Sorted lists: a list is re-keyed only when its key changed (in batch
         mode the list is marked for the deferred rebuild instead).
         ``_unplayed_ids`` is not field-derived, so it is left alone."""
+        if "scan_root_hash" in changed or "path" in changed:
+            self._bump_root_rev(old.get("scan_root_hash", ""))
+            self._bump_root_rev(t.get("scan_root_hash", ""))
         if not _TOKEN_FIELDS.isdisjoint(changed):
             old_tok = _tokenize_track(old)
             new_tok = _tokenize_track(t)
@@ -1259,15 +1569,22 @@ class TrackStore:
                 idx = getattr(self, attr)
                 self._tag_del(idx, old.get(field, ""), tid)
                 self._tag_set(idx, t.get(field, ""), tid)
+        for field, attr in _NAME_TAG_INDEXES:
+            if field in changed:
+                idx = getattr(self, attr)
+                for k in _name_keys(old.get(field)):
+                    self._tag_del(idx, k, tid)
+                for k in _name_keys(t.get(field)):
+                    self._tag_set(idx, k, tid)
         if "duplicate_group_id" in changed:
             if old.get("duplicate_group_id"):
                 self._tag_del(self._tag_dup_group, old["duplicate_group_id"], tid)
             if t.get("duplicate_group_id"):
                 self._tag_set(self._tag_dup_group, t["duplicate_group_id"], tid)
-        if "genre" in changed:
-            for g in old.get("genre", []):
+        if "genre" in changed or "genre_derived" in changed:
+            for g in track_genres(old):
                 self._tag_del(self._tag_genre, g, tid)
-            for g in t.get("genre", []):
+            for g in track_genres(t):
                 self._tag_set(self._tag_genre, g, tid)
         if "scene_group" in changed:
             for grp in _scene_group_keys(old.get("scene_group")):
@@ -1304,8 +1621,8 @@ class TrackStore:
                 _sorted_insert(lst, (nv, tid))
 
         if not _AGG_FIELDS.isdisjoint(changed):
-            self._agg_remove(old, normalise_year(old.get("year")))
-            self._agg_add(t, normalise_year(t.get("year")))
+            self._agg_remove(old, _agg_year(old))
+            self._agg_add(t, _agg_year(t))
 
     def _apply_field_changes(self, tid: str, t: dict, changed: dict) -> None:
         """Write the (already diffed, non-empty) ``changed`` fields onto
@@ -1347,6 +1664,7 @@ class TrackStore:
             extra = game_follow(t)
             if extra:
                 t.update(extra)
+            share_values(t)
         self._tracks = tracks
         self._waveforms = waveforms
         self._ratings = ratings
@@ -1357,6 +1675,7 @@ class TrackStore:
         self._hash_lookups = hash_lookups
         self._config = config
         self._reset_enrich_log()
+        self._scan_dirs_changed()
 
     def rebuild_indexes(self) -> None:
         """Rebuild all indexes from current data.
@@ -1460,6 +1779,8 @@ class TrackStore:
         self._word_index.clear()
         self._word_list_dirty = True
         self._primary_order_memo.clear()        # built from the lists emptied below
+        self._excluded_order_memo.clear()
+        self._primary_swap_memo = None          # built from the duplicate groups emptied below
         for tag_idx in (
             self._tag_artist, self._tag_album_artist, self._tag_album,
             self._tag_genre, self._tag_format, self._tag_dir_hash,
@@ -1753,6 +2074,7 @@ class TrackStore:
         duplicates at all).  Callers clear the pending state themselves.
         """
         self._primary_order_memo.clear()        # it would pin the replaced lists
+        self._excluded_order_memo.clear()
         if names is not None and not _ALL_SORTED <= set(names):
             for name in list(names):
                 lst = self.build_sorted_list(name)
@@ -1765,29 +2087,24 @@ class TrackStore:
         title, artist_s, album_artist_s, album_s, fmt = [], [], [], [], []
         title_fold = []
         for tid, t in self._tracks.items():
-            y = normalise_year(t.get("year"))
-            if y is not None:
-                year.append((y, tid))
-            a = t.get("added_at", 0)
-            if a:
-                added.append((a, tid))
-                if t.get("is_duplicate_primary", True):
-                    added_primary.append((a, tid))
-            d = t.get("duration", 0.0)
-            if _sortable_duration(d):
-                dur.append((d, tid))
-            b = t.get("bpm")
-            if b is not None:
-                bpm.append((b, tid))
+            # Every track in every numeric list, keyed by its value function
+            # (no year / duration / bpm → ``_NO_VALUE_KEY``, no ``added_at`` → 0).
+            year.append((_year_value(t), tid))
+            a = _added_value(t)
+            added.append((a, tid))
+            if t.get("is_duplicate_primary", True):
+                added_primary.append((a, tid))
+            dur.append((_duration_value(t), tid))
+            bpm.append((_bpm_value(t), tid))
             # Lexical keys mirror ``_index_track`` exactly — same
             # ``.strip().lower()`` + EMPTY sentinel — so per-track
             # incremental insert/remove and the full rebuild produce
             # byte-identical index contents.
             title.append(         ((t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-            artist_s.append(      ((t.get("artist")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
-            album_artist_s.append(((t.get("album_artist") or "").strip().lower() or EMPTY_SORT_KEY, tid))
-            album_s.append(       ((t.get("album")        or "").strip().lower() or EMPTY_SORT_KEY, tid))
-            fmt.append(           ((t.get("format")       or "").strip().lower() or EMPTY_SORT_KEY, tid))
+            artist_s.append(      (_lex_key_shared(t.get("artist")),       tid))
+            album_artist_s.append((_lex_key_shared(t.get("album_artist")), tid))
+            album_s.append(       (_lex_key_shared(t.get("album")),        tid))
+            fmt.append(           (_lex_key_shared(t.get("format")),       tid))
             tf = _game_fold_value(t.get("title"))
             if tf is not None:
                 title_fold.append((tf, tid))
@@ -1850,8 +2167,11 @@ class TrackStore:
 
     def _note_dup_dirty(self, tid: str, old: "dict | None") -> None:
         """Record ``tid``'s duplicate-relevant values BEFORE a change (None =
-        a new track).  The first record per track wins until it is taken."""
+        a new track).  The first record per track wins until it is taken.
+        Catalogue tracks (``core/catalogue.py``) are never grouped."""
         if self._dup_dirty_overflow or tid in self._dup_dirty:
+            return
+        if old is not None and _catalogue.is_catalogue_path(old.get("path")):
             return
         first = not self._dup_dirty
         if len(self._dup_dirty) >= _DUP_DIRTY_MAX:
@@ -1868,6 +2188,9 @@ class TrackStore:
                 log.debug("dup-dirty callback failed", exc_info=True)
 
     def _note_dup_upsert(self, tid: str, old: "dict | None", new: dict) -> None:
+        if _catalogue.is_catalogue_path(new.get("path")) and (
+                old is None or _catalogue.is_catalogue_path(old.get("path"))):
+            return
         if (old is None
                 or any(old.get(k) != new.get(k) for k in _DUP_FIELDS)
                 or any(old.get(k) != new.get(k) for k in _DUP_OUTPUT_FIELDS)):
@@ -1883,9 +2206,22 @@ class TrackStore:
 
     # ── Enrichment change log (``core/enrich_delta.py``) ─────────────────
 
+    def set_enrich_listener(self, fn: Callable[[], None] | None) -> None:
+        """Call ``fn()`` (cheap, non-blocking — it may only schedule work)
+        after every new enrichment change-log entry; None removes it.  The
+        derived-genre pass uses it to follow every write it reads
+        (core/genre_derive.py ``poke``)."""
+        self._enrich_listener = fn
+
     def _note_enrich(self, tid: str) -> None:
         """Record a change to track ``tid`` (an insert, a delete, or a field
         a pass reads) as the newest entry of the enrichment change log."""
+        fn = self._enrich_listener
+        if fn is not None:
+            try:
+                fn()
+            except Exception:                   # noqa: BLE001 — never fail a write
+                pass
         self._enrich_seq += 1
         log_ = self._enrich_log
         log_.pop(tid, None)
@@ -2052,6 +2388,81 @@ class TrackStore:
         """Cheap O(1)-ish count of maintained duplicate groups (no snapshot)."""
         return sum(1 for tids in self._tag_dup_group.values() if tids)
 
+    def primary_swap(self, unplayable) -> PrimarySwap | None:
+        """The duplicate groups whose primary is in ``unplayable`` (the tracks
+        that can't play right now — ``core.availability``) while another member
+        is not, each with its stand-in: the best member that can play.  None
+        when there is no such group.  A group whose members all can't play
+        keeps its primary.
+
+        Memoised until the next track write or another ``unplayable`` set
+        (compared by identity — callers hand the same frozenset back until it
+        changes); a result equal to the previous one keeps the previous object,
+        so memos keyed on it stay valid.  A build reads the unplayable ids or
+        the duplicate groups, whichever are fewer, then the found groups'
+        members."""
+        if not unplayable or not self._tag_dup_group:
+            return None
+        memo = self._primary_swap_memo
+        if memo is not None and memo[0] is unplayable and memo[1] == self._mutation_seq:
+            return memo[2]
+        from soniqboom.core.duplicates import primary_sort_key
+        tracks = self._tracks
+        groups = self._tag_dup_group
+        if len(unplayable) <= len(groups):
+            gids = set()
+            for tid in unplayable:
+                t = tracks.get(tid)
+                if t is not None and t.get("is_duplicate_primary", True):
+                    gid = t.get("duplicate_group_id")
+                    if gid:
+                        gids.add(self._tag_key(gid))
+        else:
+            gids = {gid for gid, members in groups.items()
+                    if members and not members.isdisjoint(unplayable)}
+        stand_in: dict[str, str] = {}
+        for gid in gids:
+            members = groups.get(gid)
+            if not members or len(members) < 2:
+                continue
+            prims = [m for m in members
+                     if (t := tracks.get(m)) is not None and t.get("is_duplicate_primary", True)]
+            if not prims or not unplayable.issuperset(prims):
+                continue                # no primary (a group being re-picked), or one plays
+            alts = [m for m in members if m not in unplayable and m in tracks]
+            if not alts:
+                continue                # no member plays: the primary stays
+            best = min(alts, key=lambda m: primary_sort_key(tracks[m]))
+            for p in prims:
+                stand_in[p] = best
+        swap = None
+        if stand_in:
+            prev = memo[2] if memo is not None else None
+            swap = prev if prev is not None and prev.stand_in == stand_in else PrimarySwap(stand_in)
+        self._primary_swap_memo = (unplayable, self._mutation_seq, swap)
+        return swap
+
+    def shown_member(self, tid: str, swap: PrimarySwap | None = None) -> str:
+        """The member of ``tid``'s duplicate group a deduped list shows now:
+        its primary — or, with ``swap``, the stand-in for a primary that can't
+        play.  ``tid`` itself when that is the one, when it is in no group, or
+        when its group has no primary."""
+        if swap is not None:
+            if tid in swap.promoted:
+                return tid
+            hit = swap.stand_in.get(tid)
+            if hit is not None:
+                return hit
+        tracks = self._tracks
+        t = tracks.get(tid)
+        if t is None or t.get("is_duplicate_primary", True):
+            return tid
+        for m in self._tag_dup_group.get(self._tag_key(t.get("duplicate_group_id") or ""), ()):
+            mt = tracks.get(m)
+            if mt is not None and mt.get("is_duplicate_primary", True):
+                return swap.stand_in.get(m, m) if swap is not None else m
+        return tid
+
     def tracks_for_format(self, fmt: str) -> list[dict]:
         """All track meta-dicts (no embedding) for one format, via the maintained
         ``_tag_format`` index — O(|format bucket|), not a full-library scan.  The
@@ -2206,13 +2617,32 @@ class TrackStore:
         scan_root_hash: str | None = None,
         query: str | None = None,
         game: str | None = None,
+        artist_match: str | None = None,
+        album_artist_match: str | None = None,
         limit: int = 200,
         offset: int = 0,
         filter_duplicates: bool = False,
         sort_by: str | None = None,
         sort_order: str | None = None,
+        exclude: "set[str] | frozenset[str] | None" = None,
+        untagged: str | None = None,
+        swap: PrimarySwap | None = None,
     ) -> list[dict]:
         """Filter tracks by tag and/or range criteria, intersecting results.
+
+        ``exclude``: ids no page may contain (the catalogue tracks Subsonic
+        clients must not see — ``core/catalogue_view.py``; the tracks
+        "Tracks on unavailable drives: Hide" leaves out — ``core/availability``);
+        pagination counts only the remaining tracks.
+
+        ``swap`` (with ``filter_duplicates``): the duplicate groups whose
+        primary can't play right now — their stand-in is listed instead of the
+        primary (``primary_swap``; the web lists pass
+        ``core.availability.primary_swap``).
+
+        ``untagged``: only tracks whose ``artist`` / ``album_artist`` / ``album``
+        / ``genre`` tag is blank — the "[No Artist]"-style drill-down, which
+        :meth:`untagged_count` sizes.
 
         ``sort_by`` selects which pre-computed sorted index drives the page
         walk: one of ``title``, ``artist``, ``album``, ``format``, ``year``,
@@ -2221,23 +2651,39 @@ class TrackStore:
         for ``added`` (newest first, historical) and ``asc`` for everything
         else (the natural reading order for a column header click).
         """
+        if not filter_duplicates:
+            swap = None
         result = self._candidate_ids(
             artist=artist, album_artist=album_artist, album=album, genre=genre,
             scene_group=scene_group, format_=format_,
             year_min=year_min, year_max=year_max,
             dir_hash=dir_hash, scan_root_hash=scan_root_hash, query=query,
-            game=game, filter_duplicates=filter_duplicates,
+            game=game, artist_match=artist_match, album_artist_match=album_artist_match,
+            untagged=untagged, filter_duplicates=filter_duplicates,
+            swap=swap,
         )
+        if result is None and (exclude or swap is not None):
+            return self._paginate_excluding(limit, offset, exclude,
+                                            filter_duplicates=filter_duplicates,
+                                            sort_by=sort_by, sort_order=sort_order,
+                                            swap=swap)
         if result is None:
             return self._paginate_all(
                 limit, offset,
                 filter_duplicates=filter_duplicates,
                 sort_by=sort_by, sort_order=sort_order,
             )
+        if exclude and result:
+            result = result - exclude if len(result) <= len(exclude) * 4 else (
+                {t for t in result if t not in exclude})
         if not result:
             return []
 
-        attr = self._sort_index_attr(sort_by, filter_duplicates=filter_duplicates)
+        # (With a swap the candidates are already the effective primaries:
+        # ordered by the full list, which holds the stand-ins too — the
+        # primary-only side list doesn't.)
+        attr = self._sort_index_attr(sort_by,
+                                     filter_duplicates=filter_duplicates and swap is None)
         idx = getattr(self, attr)
         descending = self._is_descending(sort_by, sort_order)
         if len(result) <= max(_SMALL_CANDIDATE_SET, len(idx) // 64):
@@ -2268,8 +2714,9 @@ class TrackStore:
     def _sort_candidates(self, ids, attr: str, descending: bool) -> list[str] | None:
         """``ids`` in the order of sorted index ``attr`` (``descending`` = the
         reversed index), built from the same ``_SORTED_SPECS`` value function:
-        ids the index leaves out (no value) are left out, and ties break on the
-        id in the same direction as the index walk.
+        ids the index leaves out (None: the primary-only and ``game:`` side
+        lists) are left out, and ties break on the id in the same direction as
+        the index walk.
         None when the keys don't compare (mixed types) — the caller then walks
         the index instead."""
         value = _SORTED_SPECS[attr][1]
@@ -2291,6 +2738,24 @@ class TrackStore:
     # Fields the ``untagged`` predicate accepts (the "[No Artist]"-style views).
     _UNTAGGED_FIELDS = ("artist", "album_artist", "album", "genre")
 
+    @classmethod
+    def _untagged_test(cls, field: str):
+        """THE "``field`` tag is missing/blank" test (``t`` → bool): what the
+        ``untagged`` predicate lists and :meth:`untagged_count` counts, so a
+        "[No Artist]" bucket and its drill-down cannot disagree.  Genre reads the
+        genres the track is listed under (``track_genres``, derived ones too)."""
+        if field not in cls._UNTAGGED_FIELDS:
+            # An unknown field must not quietly mean "no predicate" (= everything).
+            raise ValueError(f"untagged must be one of {cls._UNTAGGED_FIELDS}, got {field!r}")
+
+        def _blank(v) -> bool:
+            if isinstance(v, (list, tuple)):
+                return not any(str(x).strip() for x in v)
+            return not (str(v).strip() if v is not None else "")
+        if field == "genre":
+            return lambda t: _blank(track_genres(t))
+        return lambda t: _blank(t.get(field))
+
     def _candidate_ids(
         self,
         *,
@@ -2307,7 +2772,10 @@ class TrackStore:
         query: str | None = None,
         untagged: str | None = None,
         game: str | None = None,
+        artist_match: str | None = None,
+        album_artist_match: str | None = None,
         filter_duplicates: bool = False,
+        swap: PrimarySwap | None = None,
     ) -> set[str] | None:
         """THE predicate → candidate-id-set resolver (single source of truth).
 
@@ -2319,8 +2787,13 @@ class TrackStore:
 
         Returns ``None`` when NO predicate was given (= every track; callers take
         their all-tracks fast path), otherwise the intersected set — already
-        reduced to duplicate-group primaries when ``filter_duplicates`` is set.
+        reduced to duplicate-group primaries when ``filter_duplicates`` is set
+        (with ``swap``: the stand-ins instead of the primaries that can't play).
 
+        ``artist`` / ``album_artist`` are exact (case-insensitive) names (an
+        artist's page); ``artist_match`` / ``album_artist_match`` (the search
+        box's ``artist:`` / ``album_artist:``) match a word start in a name
+        (``_name_word_hits``).
         ``album`` is an exact (case-insensitive) match; ``game`` (the search
         box's ``game:`` operator) is a case-insensitive PREFIX match on the
         ``game`` field — any format: a retro track's game (header, Modland,
@@ -2341,6 +2814,10 @@ class TrackStore:
             sets.append(self._tag_artist.get(artist.lower(), set()))
         if album_artist:
             sets.append(self._tag_album_artist.get(album_artist.lower(), set()))
+        if artist_match is not None:
+            sets.append(_name_word_hits(self._tag_artist, artist_match))
+        if album_artist_match is not None:
+            sets.append(_name_word_hits(self._tag_album_artist, album_artist_match))
         if album:
             sets.append(self._tag_album.get(album.lower(), set()))
         if genre:
@@ -2396,18 +2873,11 @@ class TrackStore:
                                     if _game_title_hit(tracks.get(tid)))
                 hits &= tracks.keys()
                 sets.append(hits)
-        if untagged and untagged not in self._UNTAGGED_FIELDS:
-            # An unknown field must not quietly mean "no predicate" (= everything).
-            raise ValueError(f"untagged must be one of {self._UNTAGGED_FIELDS}, got {untagged!r}")
         if untagged:
             # Tracks whose tag is missing/blank — the tag indexes can't express
-            # "empty", so this is one O(N) pass (callers cache the result).
-            def _blank(v) -> bool:
-                if isinstance(v, (list, tuple)):
-                    return not any(str(x).strip() for x in v)
-                return not (str(v).strip() if v is not None else "")
-            sets.append({tid for tid, t in self._tracks.items()
-                         if _blank(t.get(untagged))})
+            # "empty", so this is one O(N) pass (~60 ms at 260 K tracks).
+            blank = self._untagged_test(untagged)
+            sets.append({tid for tid, t in self._tracks.items() if blank(t)})
 
         if not sets:
             return None
@@ -2419,11 +2889,112 @@ class TrackStore:
                 return set()
 
         if filter_duplicates:
-            result = {tid for tid in result
-                      if self._tracks.get(tid, {}).get("is_duplicate_primary", True)}
+            tracks = self._tracks
+            if swap is None:
+                result = {tid for tid in result
+                          if tracks.get(tid, {}).get("is_duplicate_primary", True)}
+            else:
+                result = {tid for tid in result if swap.is_primary(tid, tracks.get(tid, {}))}
         return result
 
+    def _paginate_excluding(self, limit: int, offset: int, exclude, *,
+                            filter_duplicates: bool = False,
+                            sort_by: str | None = None,
+                            sort_order: str | None = None,
+                            swap: PrimarySwap | None = None) -> list[dict]:
+        """``_paginate_all`` without the ``exclude`` ids (and, with
+        ``filter_duplicates`` and a ``swap``, with the stand-ins in place of the
+        primaries that can't play): a walk of the sort index skipping the rest
+        (O(offset + limit + skipped)) — or, for a page at an offset of at least
+        ``_PRIMARY_ORDER_MIN_OFFSET``, a slice of the memoised order of what is
+        listed (``_excluded_order``)."""
+        if not filter_duplicates:
+            swap = None
+        # A swap walks the full list: the primary-only side list of the default
+        # sort lacks the stand-ins (same keys, so the same order).
+        attr = self._sort_index_attr(sort_by,
+                                     filter_duplicates=filter_duplicates and swap is None)
+        idx = getattr(self, attr)
+        descending = self._is_descending(sort_by, sort_order)
+        if offset >= _PRIMARY_ORDER_MIN_OFFSET:
+            order = self._excluded_order(attr, idx, exclude, filter_duplicates, swap)
+            n = len(order)
+            if descending:
+                page = order[max(0, n - offset - limit):max(0, n - offset)][::-1]
+            else:
+                page = order[offset:offset + limit]
+            return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+        walk_iter = reversed(idx) if descending else iter(idx)
+        skipped = 0
+        collected: list[str] = []
+        tracks = self._tracks
+        ex = exclude or ()
+        for _, tid in walk_iter:
+            if tid in ex:
+                continue
+            if filter_duplicates:
+                t = tracks.get(tid)
+                if not t:
+                    continue
+                if swap is None:
+                    if not t.get("is_duplicate_primary", True):
+                        continue
+                elif not swap.is_primary(tid, t):
+                    continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            collected.append(tid)
+            if len(collected) >= limit:
+                break
+        return [self._meta_dict(tid) for tid in collected if tid in tracks]
+
+    _EXCLUDED_ORDER_MEMO_MAX = 6
+
+    def _excluded_order(self, attr: str, idx: list[tuple], exclude,
+                        filter_duplicates: bool,
+                        swap: PrimarySwap | None = None) -> list[str]:
+        """The ids of sorted index ``attr`` (``idx``) that are not in
+        ``exclude`` (and, with ``filter_duplicates``, are duplicate-group
+        primaries — with a ``swap``, the effective ones), in index order.
+        Memoised like ``_primary_order`` — until the next track write or the
+        list is replaced — and only for the exclude set and swap it was built
+        with (compared by identity: callers hand the same objects back until
+        they change).  O(N) to build, then a deep page is a slice."""
+        # (Keyed by the exclude set too: two callers with their own sets — the
+        # web's Hide set, the Subsonic API's catalogue exclusion — must not
+        # throw each other's orders away on every page.)
+        mkey = (attr, bool(filter_duplicates), id(exclude), id(swap))
+        key = self._primary_order_key(attr)
+        memo = self._excluded_order_memo
+        hit = memo.get(mkey)
+        if (hit is not None and hit[0] is idx and hit[1] == key and hit[2] is exclude
+                and hit[4] is swap):
+            return hit[3]
+        # Drop what can't be hit again (written since, or for the same id slot
+        # of a replaced set) — each holds a full-length order — and keep a few.
+        for k in [k for k, e in memo.items()
+                  if e[1] != self._primary_order_key(k[0]) or k == mkey]:
+            memo.pop(k, None)
+        while len(memo) >= self._EXCLUDED_ORDER_MEMO_MAX:
+            memo.pop(next(iter(memo)))
+        tracks = self._tracks
+        ex = exclude or ()
+        if filter_duplicates and swap is not None:
+            order = [tid for _v, tid in idx
+                     if tid not in ex and (t := tracks.get(tid)) is not None
+                     and swap.is_primary(tid, t)]
+        elif filter_duplicates:
+            order = [tid for _v, tid in idx
+                     if tid not in ex and (t := tracks.get(tid)) is not None
+                     and t.get("is_duplicate_primary", True)]
+        else:
+            order = [tid for _v, tid in idx if tid not in ex]
+        memo[mkey] = (idx, key, exclude, order, swap)
+        return order
+
     def filter_track_ids(self, *, filter_duplicates: bool = False,
+                         swap: PrimarySwap | None = None,
                          **predicates) -> list[str]:
         """Eligible track ids for the given filters — without sorting or
         paginating.  For callers that need the candidate SET to sample or order
@@ -2433,14 +3004,19 @@ class TrackStore:
         identical to :meth:`filter_tracks` by construction.  With no predicate it
         returns every id — or every duplicate-group PRIMARY when
         ``filter_duplicates`` is set, matching what the deduped All-Tracks list
-        shows."""
-        result = self._candidate_ids(filter_duplicates=filter_duplicates, **predicates)
+        shows (with ``swap``: the stand-ins instead of the primaries that can't
+        play)."""
+        if not filter_duplicates:
+            swap = None
+        result = self._candidate_ids(filter_duplicates=filter_duplicates, swap=swap,
+                                     **predicates)
         if result is not None:
             return list(result)
         if filter_duplicates:
             # The same test ``_candidate_ids`` and ``primary_track_count`` use.  NOT
-            # ``_sorted_added_at_primary``: that is a sort index and leaves out
-            # tracks with no ``added_at``, so it cannot stand in for the set.
+            # ``_sorted_added_at_primary``: that is a sort index, behind the live
+            # tracks while a batch section defers its rebuild, so it cannot stand
+            # in for the set.
             # Memoised on ``_mutation_seq`` like the aggregates: this O(N) pass runs
             # on the event loop for every cold "shuffle all" (25 ms at 263 K).
             cached = self._agg_cache_get("primary_track_ids")
@@ -2448,7 +3024,11 @@ class TrackStore:
                 cached = [tid for tid, t in self._tracks.items()
                           if t.get("is_duplicate_primary", True)]
                 self._agg_cache_set("primary_track_ids", cached)
-            return list(cached)
+            if swap is None:
+                return list(cached)
+            demoted = swap.demoted
+            return ([tid for tid in cached if tid not in demoted]
+                    + [tid for tid in swap.promoted if tid in self._tracks])
         return list(self._tracks.keys())
 
     @staticmethod
@@ -2660,14 +3240,129 @@ class TrackStore:
         self._agg_cache[key] = (self._mutation_seq, value)
         return value
 
-    def _count_primaries(self, tids: set[str]) -> int:
-        """Number of ``tids`` that are duplicate-group primaries.
+    def _agg_x_get(self, key: str, exclude, swap: PrimarySwap | None = None) -> Any | None:
+        """``_agg_cache_get`` for a result computed WITHOUT the ids of
+        ``exclude`` (the tracks the web UI hides while their drive is
+        offline) and with the stand-ins of ``swap`` (``primary_swap``): valid
+        until the next track write or another exclude set / swap (compared by
+        identity — callers hand the same objects back until they change).  One
+        entry per key, so a new set replaces the old results instead of piling
+        up."""
+        entry = self._agg_x_cache.get(key)
+        if (entry is not None and entry[0] == self._mutation_seq and entry[1] is exclude
+                and entry[3] is swap):
+            return entry[2]
+        return None
+
+    def _agg_x_set(self, key: str, exclude, value: Any, swap: PrimarySwap | None = None) -> Any:
+        self._agg_x_cache[key] = (self._mutation_seq, exclude, value, swap)
+        return value
+
+    def _count_visible(self, tids, primary_only: bool, exclude,
+                       swap: PrimarySwap | None = None) -> int:
+        """How many of ``tids`` a list shows that leaves out ``exclude`` (and,
+        with ``primary_only``, non-primary duplicates — with a ``swap``, the
+        effective ones) — the count the matching ``filter_tracks(...,
+        exclude=…, swap=…)`` drill-down returns."""
+        if not primary_only:
+            return len(tids) - len(exclude.intersection(tids))   # set ops, in C
+        tracks = self._tracks
+        shown = tids.difference(exclude) if exclude else tids
+        if swap is None:
+            return sum(1 for tid in shown
+                       if tracks.get(tid, {}).get("is_duplicate_primary", True))
+        return sum(1 for tid in shown if swap.is_primary(tid, tracks.get(tid, {})))
+
+    def _bucket_count(self, tids, primary_only: bool, exclude,
+                      swap: PrimarySwap | None) -> int | None:
+        """A browse bucket's count when ``exclude`` or ``swap`` touches it
+        (``_count_visible``), else None — the caller's own count holds."""
+        if exclude and not exclude.isdisjoint(tids):
+            return self._count_visible(tids, primary_only, exclude, swap)
+        if swap is not None and not swap.changed.isdisjoint(tids):
+            return self._count_visible(tids, True, exclude, swap)
+        return None
+
+    def visible_track_count(self, primary_only: bool = False, exclude=None,
+                            swap: PrimarySwap | None = None) -> int:
+        """The length of the All-Tracks list: every track (``primary_only``:
+        duplicate-group primaries only — with a ``swap``, the stand-ins in place
+        of the primaries that can't play) minus the ``exclude`` ids — what
+        ``filter_tracks(filter_duplicates=primary_only, exclude=exclude,
+        swap=swap)`` pages through."""
+        base = self.primary_track_count() if primary_only else len(self._tracks)
+        if not primary_only:
+            if not exclude:
+                return base
+            # (Set operations in C, ~13 ms at 270K ids: no memo — one would be
+            # dropped by every track write; the Python loop cost ~90 ms.)
+            ex = exclude if isinstance(exclude, (set, frozenset)) else set(exclude)
+            return max(0, base - (len(ex) - len(ex.difference(self._tracks))))
+        n = base
+        if exclude:
+            key = "visible:1"
+            gone = self._agg_x_get(key, exclude)
+            if gone is None:
+                tracks = self._tracks
+                gone = 0
+                for tid in exclude:
+                    t = tracks.get(tid)
+                    if t is not None and t.get("is_duplicate_primary", True):
+                        gone += 1
+                self._agg_x_set(key, exclude, gone)
+            n -= gone
+        if swap is not None:
+            # The stand-ins come in, the primaries they stand in for go — each
+            # counted only where ``exclude`` didn't already leave it out.
+            if exclude:
+                n += (len(swap.promoted.difference(exclude))
+                      - len(swap.demoted.difference(exclude)))
+            else:
+                n += len(swap.promoted) - len(swap.demoted)
+        return max(0, n)
+
+    def untagged_count(self, field: str, primary_only: bool = False, exclude=None,
+                       swap: PrimarySwap | None = None) -> int:
+        """The size of the "[No Artist]"-style bucket for ``field``: how many rows
+        ``filter_tracks(untagged=field, filter_duplicates=primary_only,
+        exclude=exclude, swap=swap)`` lists.  Counted from the same blank-tag
+        test, never as "all tracks minus the tagged buckets" — a multi-artist
+        track ("A • B") sits in two artist buckets, so that subtraction comes
+        out short (or negative) and the bucket vanished while its drill-down
+        still listed tracks.  One O(N) pass, memoised until the next track write
+        (or another ``exclude`` set / swap)."""
+        blank = self._untagged_test(field)
+        if not primary_only:
+            swap = None
+        key = f"untagged:{field}:{int(bool(primary_only))}"
+        cached = (self._agg_x_get(key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(key))
+        if cached is not None:
+            return cached
+        n = 0
+        for tid, t in self._tracks.items():
+            if not blank(t) or (exclude and tid in exclude):
+                continue
+            if primary_only and not (swap.is_primary(tid, t) if swap is not None
+                                     else t.get("is_duplicate_primary", True)):
+                continue
+            n += 1
+        if exclude or swap is not None:
+            return self._agg_x_set(key, exclude, n, swap)
+        return self._agg_cache_set(key, n)
+
+    def _count_primaries(self, tids: set[str], swap: PrimarySwap | None = None) -> int:
+        """Number of ``tids`` that are duplicate-group primaries (with a
+        ``swap``: effective primaries — ``PrimarySwap.is_primary``).
 
         Uses the exact same predicate as ``filter_tracks(filter_duplicates=
         True)`` — ``is_duplicate_primary`` defaulting to True for any track not
         in a duplicate group — so an aggregate legend count computed with this
         helper agrees with what the corresponding drill-down actually returns.
         """
+        if swap is not None:
+            tracks = self._tracks
+            return sum(1 for tid in tids if swap.is_primary(tid, tracks.get(tid, {})))
         return sum(
             1 for tid in tids
             if self._tracks.get(tid, {}).get("is_duplicate_primary", True)
@@ -2676,10 +3371,8 @@ class TrackStore:
     def primary_track_count(self) -> int:
         """Total tracks excluding non-primary duplicates.
 
-        The deduped analogue of ``track_count`` — the denominator the library
-        API uses for the "[No Artist]" / "[No Album Artist]" bucket when
-        ``filter_duplicates`` is on, so that bucket counts only the primaries
-        the drill-down would surface (never the hidden duplicate copies).
+        The deduped analogue of ``track_count`` — the length of the deduped
+        All-Tracks list (``visible_track_count(primary_only=True)``).
         Memoised on ``_mutation_seq`` like the other aggregate views.
         """
         cached = self._agg_cache_get("primary_track_count")
@@ -2691,7 +3384,8 @@ class TrackStore:
         )
         return self._agg_cache_set("primary_track_count", n)
 
-    def aggregate_artists(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_artists(self, primary_only: bool = False, exclude=None,
+                          swap: PrimarySwap | None = None) -> list[dict]:
         """All artists with track counts, sorted alphabetically.
 
         With ``primary_only`` the count excludes non-primary duplicates so the
@@ -2711,8 +3405,11 @@ class TrackStore:
         the other mode.
         """
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         cache_key = "artists:primary" if hide_dups else "artists"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -2720,26 +3417,37 @@ class TrackStore:
             tids = self._tag_artist.get(key)
             if not tids:
                 continue
-            if hide_dups:
+            touched = self._bucket_count(tids, hide_dups, exclude, swap)
+            if touched is not None:
+                count = touched
+                if count == 0:
+                    continue
+            elif hide_dups:
                 count = self._count_primaries(tids)
                 if count == 0:
                     continue
-            tid = next(iter(tids))
+            tid = min(tids)                  # deterministic display spelling
             t = self._tracks.get(tid)
-            name = (t.get("artist") or "").strip() if t else key
+            name = name_display(t.get("artist"), key) if t else key
             results.append({"artist": name or key, "count": count})
         results.sort(key=lambda x: x["artist"].lower())
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_album_artists(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_album_artists(self, primary_only: bool = False, exclude=None,
+                                swap: PrimarySwap | None = None) -> list[dict]:
         """Album-artists with track counts.  Mirrors ``aggregate_artists``'s
         ``primary_only`` handling — caller-controlled primary-only counts, drop
         0-count entries, distinct ``:primary`` cache key — so the web Album
         Artists browse legend stays consistent with its deduped drill-down
         while Subsonic / DLNA keep raw counts."""
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         cache_key = "album_artists:primary" if hide_dups else "album_artists"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -2747,20 +3455,27 @@ class TrackStore:
             tids = self._tag_album_artist.get(key)
             if not tids:
                 continue
-            if hide_dups:
+            touched = self._bucket_count(tids, hide_dups, exclude, swap)
+            if touched is not None:
+                count = touched
+                if count == 0:
+                    continue
+            elif hide_dups:
                 count = self._count_primaries(tids)
                 if count == 0:
                     continue
-            tid = next(iter(tids))
+            tid = min(tids)                  # deterministic display spelling
             t = self._tracks.get(tid)
-            name = (t.get("album_artist") or "").strip() if t else key
+            name = name_display(t.get("album_artist"), key) if t else key
             results.append({"album_artist": name or key, "count": count})
         results.sort(key=lambda x: x["album_artist"].lower())
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
     def aggregate_albums(
         self, artist: str | None = None, album_artist: str | None = None,
-        primary_only: bool = False,
+        primary_only: bool = False, exclude=None, swap: PrimarySwap | None = None,
     ) -> list[dict]:
         """Albums, optionally filtered by artist/album_artist.
 
@@ -2770,13 +3485,16 @@ class TrackStore:
         album_artist scope, ``filter_duplicates=True``); an album whose members
         are all hidden duplicates is dropped.  Same caller-controlled,
         Subsonic/DLNA-stays-raw contract as the other browse aggregates."""
+        if not primary_only:
+            swap = None
         # Cache key embeds the filter args + dup mode so each combination
         # caches independently.
         suffix = ":primary" if primary_only else ""
         cache_key = (
             f"albums::{(artist or '').lower()}::{(album_artist or '').lower()}{suffix}"
         )
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
 
@@ -2804,7 +3522,27 @@ class TrackStore:
             tids = self._tag_album.get(key)
             if not tids:
                 continue
-            if primary_only:
+            if ((exclude and not exclude.isdisjoint(tids))
+                    or (swap is not None and not swap.changed.isdisjoint(tids))):
+                # Some members are hidden (their drive is offline) or stand in
+                # for a primary that can't play: count and pick the cover from
+                # the ones the drill-down lists.
+                members = tids if scope is None else (tids & scope)
+                ex = exclude or ()
+                if swap is not None:
+                    shown = [x for x in members
+                             if x not in ex and swap.is_primary(x, self._tracks.get(x, {}))]
+                else:
+                    shown = [
+                        x for x in members
+                        if x not in ex and (not primary_only or self._tracks.get(
+                            x, {}).get("is_duplicate_primary", True))
+                    ]
+                count = len(shown)
+                if count == 0:
+                    continue
+                rep = min(shown)
+            elif primary_only:
                 members = tids if scope is None else (tids & scope)
                 # Prefer a PRIMARY representative so the cover-art id points at
                 # a track the drill-down actually returns.
@@ -2825,9 +3563,12 @@ class TrackStore:
             # round-tripping a /search/filter lookup per grid card.
             results.append({"album": name or key, "count": count, "track_id": rep})
         results.sort(key=lambda x: x["album"].lower())
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_genres(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_genres(self, primary_only: bool = False, exclude=None,
+                         swap: PrimarySwap | None = None) -> list[dict]:
         """Genres with track counts.  With ``primary_only`` the count excludes
         non-primary duplicates so the legend agrees with the deduped drill-down
         (``/search/filter?genre=X``); a genre whose members are all hidden
@@ -2836,8 +3577,11 @@ class TrackStore:
         library opts in; Subsonic keeps raw).  Distinct ``:primary`` cache
         key, mirroring the format legend."""
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         cache_key = "genres:primary" if hide_dups else "genres"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         results: list[dict] = []
@@ -2845,7 +3589,12 @@ class TrackStore:
             tids = self._tag_genre.get(key)
             if not tids:
                 continue
-            if hide_dups:
+            touched = self._bucket_count(tids, hide_dups, exclude, swap)
+            if touched is not None:
+                count = touched
+                if count == 0:
+                    continue
+            elif hide_dups:
                 count = self._count_primaries(tids)
                 if count == 0:
                     continue
@@ -2854,30 +3603,38 @@ class TrackStore:
             t = self._tracks.get(tid)
             name = key  # fallback
             if t:
-                for g in t.get("genre", []):
+                for g in track_genres(t):
                     if g.strip().lower() == key:
                         name = g.strip()
                         break
             results.append({"genre": name, "count": count})
         results.sort(key=lambda x: x["genre"].lower())
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_scene_group(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_scene_group(self, primary_only: bool = False, exclude=None,
+                              swap: PrimarySwap | None = None) -> list[dict]:
         """Demoscene groups with track counts — a browse facet over the Demozoo
         ``scene_group`` enrichment (a track credited to "Fairlight • Maniacs of
         Noise" counts under both).  Mirrors ``aggregate_genres``: ``primary_only``
         excludes hidden duplicates (web library opts in, Subsonic keeps raw),
         cached under a distinct ``:primary`` key."""
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         cache_key = "scene_group:primary" if hide_dups else "scene_group"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         results: list[dict] = []
         for key, tids in self._tag_scene_group.items():
             if not tids:
                 continue
-            count = self._count_primaries(tids) if hide_dups else len(tids)
+            count = self._bucket_count(tids, hide_dups, exclude, swap)
+            if count is None:
+                count = self._count_primaries(tids) if hide_dups else len(tids)
             if count == 0:
                 continue
             # Proper-cased display name from one member's scene_group string.
@@ -2890,9 +3647,12 @@ class TrackStore:
                         break
             results.append({"scene_group": name, "count": count})
         results.sort(key=lambda x: x["scene_group"].lower())
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_formats(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_formats(self, primary_only: bool = False, exclude=None,
+                          swap: PrimarySwap | None = None) -> list[dict]:
         """Return ``[{format, count, family}]`` from the format tag index.
 
         ``family`` is the coarse browse-by-family bucket (trackers / chiptune /
@@ -2917,17 +3677,31 @@ class TrackStore:
         """
         from soniqboom.core.retro import coarse_family
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         # Key on the dup-filter state so a runtime toggle can't serve a list
         # computed under the other mode (the cache is also seq-invalidated).
         cache_key = "formats:primary" if hide_dups else "formats"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         results: list[dict] = []
         for key, tids in self._tag_format.items():
             if not key or not tids:
                 continue
-            if hide_dups:
+            touched = self._bucket_count(tids, hide_dups, exclude, swap)
+            if touched is not None:
+                # Some of the format's tracks are hidden (their drive is
+                # offline) or stand in for a primary that can't play: count
+                # what the drill-down lists.
+                count = touched
+                if count == 0:
+                    continue
+                shown = tids.difference(exclude) if exclude else tids
+                t = self._tracks.get(next(iter(shown))) if shown else None
+                name = (t.get("format") if t else None) or key
+            elif hide_dups:
                 # Count only primary tracks; a format that survives ONLY as
                 # non-primary duplicates is dropped (matches the drill-down).
                 count = 0
@@ -2955,9 +3729,12 @@ class TrackStore:
         # differ between scans) — otherwise the Galaxy cluster layout, which is
         # index-positional, would reshuffle equal-count formats each rebuild.
         results.sort(key=lambda x: (-x["count"], x["format"].lower()))
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
-    def aggregate_years(self, primary_only: bool = False) -> list[dict]:
+    def aggregate_years(self, primary_only: bool = False, exclude=None,
+                        swap: PrimarySwap | None = None) -> list[dict]:
         """Years with track counts.  With ``primary_only`` the count excludes
         non-primary duplicates so the legend agrees with the deduped drill-down
         (``/search/filter?year_min=Y&year_max=Y``).
@@ -2970,8 +3747,11 @@ class TrackStore:
         no primaries simply never appears (no "ghost" year).  Caller-controlled
         like the sibling browse aggregates."""
         hide_dups = primary_only
+        if not hide_dups:
+            swap = None
         cache_key = "years:primary" if hide_dups else "years"
-        cached = self._agg_cache_get(cache_key)
+        cached = (self._agg_x_get(cache_key, exclude, swap) if exclude or swap is not None
+                  else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
         # Counter stores raw year values; normalize YYYYMMDD → YYYY.  The
@@ -2979,11 +3759,32 @@ class TrackStore:
         # the first was unreachable because the second matched first for any
         # 5-or-more-digit value.
         merged: dict[int, int] = {}
-        if hide_dups:
+        if swap is not None:
+            # Copies stand in for primaries that can't play (and some tracks
+            # may be hidden): one pass keyed like ``_sorted_year``, as below.
+            ex = exclude or ()
+            for tid, t in self._tracks.items():
+                if tid in ex or not swap.is_primary(tid, t):
+                    continue
+                y = _agg_year(t)
+                if y is None:
+                    continue
+                merged[y] = merged.get(y, 0) + 1
+        elif exclude:
+            # Some tracks are hidden (their drive is offline): one pass keyed
+            # like ``_sorted_year`` (which backs the drill-down), as below.
+            for tid, t in self._tracks.items():
+                if tid in exclude or (hide_dups and not t.get("is_duplicate_primary", True)):
+                    continue
+                y = _agg_year(t)
+                if y is None:
+                    continue
+                merged[y] = merged.get(y, 0) + 1
+        elif hide_dups:
             for t in self._tracks.values():
                 if not t.get("is_duplicate_primary", True):
                     continue
-                y = normalise_year(t.get("year"))
+                y = _agg_year(t)
                 if y is None:
                     continue
                 merged[y] = merged.get(y, 0) + 1
@@ -2996,15 +3797,27 @@ class TrackStore:
             [{"year": y, "count": c} for y, c in merged.items()],
             key=lambda x: -x["year"],
         )
+        if exclude or swap is not None:
+            return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
     # ── Recently added (sorted index) ────────────────────────────────────
 
-    def recently_added(self, limit: int = 100) -> list[dict]:
-        ids = _sorted_tail(self._sorted_added_at, limit)
-        return [self._meta_dict(tid) for tid in ids if tid in self._tracks]
+    def recently_added(self, limit: int = 100, exclude=None) -> list[dict]:
+        """The ``limit`` newest tracks; with ``exclude`` (the tracks the web
+        UI hides while their drive is offline) the newest ``limit`` others."""
+        if not exclude:
+            ids = _sorted_tail(self._sorted_added_at, limit)
+            return [self._meta_dict(tid) for tid in ids if tid in self._tracks]
+        results: list[dict] = []
+        for _, tid in reversed(self._sorted_added_at):
+            if tid not in exclude and tid in self._tracks:
+                results.append(self._meta_dict(tid))
+                if len(results) >= limit:
+                    break
+        return results
 
-    def list_unplayed(self, limit: int = 100) -> list[dict]:
+    def list_unplayed(self, limit: int = 100, exclude=None) -> list[dict]:
         """Return tracks never played, newest-first.
 
         Backed by the incrementally-maintained ``_unplayed_ids`` set — walks
@@ -3014,8 +3827,9 @@ class TrackStore:
         """
         results: list[dict] = []
         unplayed = self._unplayed_ids
+        exclude = exclude or ()
         for _, tid in reversed(self._sorted_added_at):
-            if tid in unplayed and tid in self._tracks:
+            if tid in unplayed and tid in self._tracks and tid not in exclude:
                 results.append(self._meta_dict(tid))
                 if len(results) >= limit:
                     break
@@ -3057,6 +3871,31 @@ class TrackStore:
             self._ratings[track_id] = rating
         self._rating_seq += 1
         self._aof("set_rating", id=track_id, rating=rating)
+
+    def remap_track_ids(self, mapping: dict[str, str]) -> dict:
+        """Move user data from old track ids to new ones (a moved / renamed
+        file: ``core/id_remap.remap_user_data`` — ratings, play stats,
+        history, playlist entries, waveforms).  One AOF record (op
+        ``remap_track_ids``).  Returns the per-container counts."""
+        mapping = {o: n for o, n in (mapping or {}).items()
+                   if isinstance(o, str) and isinstance(n, str) and o and n and o != n}
+        if not mapping:
+            return {}
+        from soniqboom.core.id_remap import remap_user_data
+        counts = remap_user_data(mapping, ratings=self._ratings, play_stats=self._play_stats,
+                                 history=self._history, playlists=self._playlists,
+                                 waveforms=self._waveforms)
+        for tid in {*mapping, *mapping.values()}:
+            if tid in self._tracks and tid not in self._play_stats:
+                self._unplayed_ids.add(tid)
+            else:
+                self._unplayed_ids.discard(tid)
+        if counts.get("ratings"):
+            self._rating_seq += 1
+        if counts.get("play_stats"):
+            self._play_seq += 1
+        self._aof("remap_track_ids", mapping=mapping)
+        return counts
 
     def get_ratings_batch(self, track_ids: list[str]) -> dict[str, int]:
         return {tid: self._ratings[tid] for tid in track_ids if tid in self._ratings}
@@ -3161,7 +4000,7 @@ class TrackStore:
         return [dict(self._migrate_playlist(pl)) for pl in self._playlists.values()]
 
     def update_playlist(
-        self, playlist_id: str, updates: dict,
+        self, playlist_id: str, updates: dict, *, keep_ids=None,
     ) -> dict | None:
         """Apply ``updates`` to a playlist.
 
@@ -3171,6 +4010,12 @@ class TrackStore:
         a stale client clinging to deleted tracks no longer leaves orphan
         ids inside the playlist after a save.  Callers that want strict
         validation can inspect ``dropped_ids`` and 400 the response.
+
+        Stored entries the caller cannot see stay in the list, near their
+        old neighbours: ids in ``keep_ids`` (tracks hidden from that client)
+        and catalogue tracks that are out of the library for now
+        (``PARKED_PLAYLIST_IDS`` — the catalogue switched off, a narrower
+        scope).
         """
         pl = self._playlists.get(playlist_id)
         if not pl:
@@ -3198,6 +4043,15 @@ class TrackStore:
                     kept.append(entry)        # keep the original entry — preserves subsong
                 else:
                     dropped.append(tid)
+            keep = set(keep_ids or ())
+            parked = self.get_config(PARKED_PLAYLIST_IDS) or ()
+            if parked:
+                keep.update(t for t in parked if t not in self._tracks)
+            if keep:
+                kept = _merge_unseen_entries(pl.get("track_ids") or [], kept, keep)
+                if dropped:
+                    back = {_entry_tid(e) for e in kept}
+                    dropped = [t for t in dropped if t not in back]
             cleaned["track_ids"] = kept
         pl.update(cleaned)
         pl["updated_at"] = int(time.time())
@@ -3261,6 +4115,8 @@ class TrackStore:
         }
         self._scan_dirs[path] = sd
         self._aof("upsert_scan_dir", path=path, data=sd)
+        if not existing or existing.get("status") != status:
+            self._scan_dirs_changed()
         return dict(sd)
 
     def list_scan_dirs(self) -> list[dict]:
@@ -3280,14 +4136,31 @@ class TrackStore:
                 sd["path_hash"] = h
                 d["path_hash"] = h
             d["track_count"] = len(self._tag_scan_root_hash.get(h, set()))
+            key = _catalogue.key_of(path)
+            if key:
+                # A catalogue root (core/catalogue.py): managed under Admin →
+                # External sources, never scanned.
+                d["catalogue"] = key
+                d["label"] = _catalogue.label_of(path)
             result.append(d)
         return result
 
     def delete_scan_dir(self, path: str) -> bool:
         if self._scan_dirs.pop(path, None) is not None:
             self._aof("delete_scan_dir", path=path)
+            self._scan_dirs_changed()
             return True
         return False
+
+    def _scan_dirs_changed(self) -> None:
+        """A scan dir came, went, or changed its reachability ``status``:
+        tell the listener (``core.availability`` — which tracks can play)."""
+        cb = self._on_scan_dirs_changed
+        if cb is not None:
+            try:
+                cb()
+            except Exception:                     # noqa: BLE001 — never fail a write
+                log.debug("scan-dir listener failed", exc_info=True)
 
     def set_scan_dir_status(self, path: str, status: str) -> bool:
         """Update ONLY the reachability status of a scan dir, and only when it
@@ -3299,6 +4172,7 @@ class TrackStore:
             return False
         sd["status"] = status
         self._aof("upsert_scan_dir", path=path, data=dict(sd))
+        self._scan_dirs_changed()
         return True
 
     # ── Hash lookups ─────────────────────────────────────────────────────

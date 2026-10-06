@@ -96,6 +96,9 @@ def request_backfill(track) -> None:
         path = getattr(track, "path", "") or ""
         if not tid or not _is_remote(path):
             return
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_path(path):
+            return                                    # fetched only when played
         if not getattr(track, "cover_art", None):     # scan saw no embedded cover
             return
         if tid in _inflight:

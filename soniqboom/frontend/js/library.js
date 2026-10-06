@@ -8,6 +8,7 @@
 import { Player } from './player.js';
 import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel } from './utils.js';
 import { createVirtualList } from './vlist.js';
+import { offlineKind, offlineBadge, Offline } from './offline.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -131,11 +132,13 @@ function currentFolderAffectedBy(dirs) {
 }
 
 // Cheap "did the folder change?" check for the in-place refresh: same length
-// and same track ids in the same order ⇒ nothing to re-render.
+// and same track ids in the same order (and the same offline marks) ⇒ nothing
+// to re-render.
 function _sameTrackList(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
     if ((a[i] && a[i].id) !== (b[i] && b[i].id)) return false;
+    if (offlineKind(a[i]) !== offlineKind(b[i])) return false;
   }
   return true;
 }
@@ -232,6 +235,7 @@ let _browseNavGen = 0;
 // or album that merely happens to share the "Most Played" crumb text.
 let _smartViewToken = -1;
 let _smartViewKey = null;
+let _smartViewLabel = '';
 let sortKey = null;
 let sortAsc = true;
 // Extra query params for the windowed track view (the chunked /tracks fetcher
@@ -701,6 +705,33 @@ async function _refreshTrackCount() {
   } catch {}
 }
 
+// The browse badges (Artists … Years) at page load and after a scan — not only
+// once each view was opened.  A list's "[No Artist]" bucket row (``label``) is
+// not an artist, so it isn't counted (here or in the views).
+const _NAV_COUNT_LISTS = [
+  ['artists', '/library/artists'], ['album_artists', '/library/album-artists'],
+  ['albums', '/library/albums'], ['genres', '/library/genres'], ['years', '/library/years'],
+];
+const _navCount = (rows) => rows.filter(r => !r.label).length;
+
+let _navCountsRun = null, _navCountsAgain = false;
+function _refreshNavCounts() {
+  if (_navCountsRun) { _navCountsAgain = true; return _navCountsRun; }   // one run at a time, one more after
+  _navCountsRun = Promise.allSettled(_NAV_COUNT_LISTS.map(async ([view, url]) => {
+    const rows = await API(url);
+    if (Array.isArray(rows)) _updateNavBadge(view, _navCount(rows));
+  })).finally(() => {
+    _navCountsRun = null;
+    if (_navCountsAgain) { _navCountsAgain = false; _refreshNavCounts(); }
+  });
+  return _navCountsRun;
+}
+
+function _refreshBadges() {
+  _refreshTrackCount();
+  _refreshNavCounts();
+}
+
 // ── Make a single track row element ───────────────────────────────────────────
 //
 // Rows are produced by ``_makeRowSkeleton`` (no data) and filled via
@@ -843,6 +874,9 @@ function _fillTrackRow(tr, t, i) {
   if (t._dupGroupFirst) tr.classList.add('dup-group-first');
   if (t._dupIsPrimary)  tr.classList.add('dup-primary');
   if (t._dupGroupId && !t._dupIsPrimary) tr.classList.add('dup-variant');
+  // Can't play right now (its drive / share is offline): dimmed + badge below.
+  const offKind = offlineKind(t);
+  if (offKind) tr.classList.add('track-offline');
   _setRowPlaying(tr, !!Player.currentTrackId && t.id === Player.currentTrackId);
 
   const disc = t.disc_number != null ? `D${t.disc_number}` : '';
@@ -923,14 +957,28 @@ function _fillTrackRow(tr, t, i) {
   // Health badge — a track with a known playback defect (partial render or
   // undecodable) gets a small tag after the title.  Re-created per fill (rare;
   // only defective tracks) so recycled rows never carry a stale badge.
-  if (t.defect === 'partial' || t.defect === 'corrupt') {
-    const badge = document.createElement('span');
-    badge.className = `track-defect-badge track-defect-${t.defect}`;
-    badge.textContent = t.defect;
-    badge.title = t.defect_detail
-      || (t.defect === 'corrupt' ? 'Cannot be decoded by any engine'
-                                 : 'Plays with substituted content');
-    titleTd.appendChild(badge);
+  const hasDefect = t.defect === 'partial' || t.defect === 'corrupt';
+  if (hasDefect || offKind) {
+    // A badged title: the title text ellipsises, the badges keep their room
+    // (a long title must not push them out of the cell).
+    const line = document.createElement('span');
+    line.className = 'title-badged';
+    const txt = document.createElement('span');
+    txt.className = 'title-text';
+    txt.textContent = t.title || '—';
+    line.appendChild(txt);
+    if (hasDefect) {
+      const badge = document.createElement('span');
+      badge.className = `track-defect-badge track-defect-${t.defect}`;
+      badge.textContent = t.defect;
+      badge.title = t.defect_detail
+        || (t.defect === 'corrupt' ? 'Cannot be decoded by any engine'
+                                   : 'Plays with substituted content');
+      line.appendChild(badge);
+    }
+    if (offKind) line.appendChild(offlineBadge(offKind));
+    titleTd.textContent = '';
+    titleTd.appendChild(line);
   }
 
   // col-album-artist
@@ -1882,35 +1930,40 @@ function playFrom(idx, o = {}) {
   if (currentTracks && currentTracks._isWindowedStore) {
     const slice = currentTracks.loadedSliceFrom(idx, QUEUE_WINDOW);
     if (slice.length) {
-      Player.setQueue(slice, 0, src ? { source: { ...src, offset: idx }, explicit } : { explicit });
-      return true;
+      // (false / a promise: "Play all" over rows that can't play — see Player.setQueue)
+      const r = Player.setQueue(slice, 0, src ? { source: { ...src, offset: idx }, explicit } : { explicit });
+      return r === undefined ? true : r;
     }
     // Row not in memory (chunk evicted, or never scrolled to — e.g. "Play all"
     // after scrolling deep): fetch the window straight from the source instead
     // of silently doing nothing.
     if (src && src.ordered) {
       return Player.playSource(src, { offset: idx, explicit }).then((ok) => {
-        if (ok === false) window.Toast?.error?.('Couldn\u2019t start playback \u2014 try again.');
+        // (Every track from here offline: the player's 'offlinequeue' says so.)
+        if (ok === false && !Player.lastStartAllOffline) {
+          window.Toast?.error?.('Couldn\u2019t start playback \u2014 try again.');
+          return null;                               // (said so: callers stay quiet)
+        }
         return ok;                                   // null = superseded by a newer click: not an error
       });
     } else {
       currentTracks.ensureRange(idx, idx + QUEUE_WINDOW);
       window.Toast?.info?.('Still loading this view \u2014 try again in a moment.');
     }
-    return false;
+    return null;                                     // (said so)
   }
   // Capped list the server can page in this very order (a drill-down as fetched,
   // row index = server offset): same small window as above — not 2,000 rows in the
   // queue panel and in localStorage.
   if (src && src.ordered) {
-    Player.setQueue(currentTracks.slice(idx, idx + QUEUE_WINDOW), 0,
-                    { source: { ...src, offset: idx }, explicit });
-    return true;
+    const r = Player.setQueue(currentTracks.slice(idx, idx + QUEUE_WINDOW), 0,
+                              { source: { ...src, offset: idx }, explicit });
+    return r === undefined ? true : r;
   }
   // Otherwise the queue IS the list.  A capped list without an ordered endpoint
   // (search, client-sorted) still carries its source so SHUFFLE reaches every match.
-  Player.setQueue(currentTracks, idx, src ? { source: { ...src, offset: 0 }, explicit } : { explicit });
-  return true;
+  const r = Player.setQueue(currentTracks, idx, src ? { source: { ...src, offset: 0 }, explicit } : { explicit });
+  return r === undefined ? true : r;
 }
 
 // ── Sort persistence — save/restore sort column + direction ──────────────────
@@ -2385,7 +2438,7 @@ async function showArtists() {
   _showSkeletonRows(12);
   const artists = await _viewData(_gen, API('/library/artists'), () => showArtists());
   if (!artists || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  _updateNavBadge('artists', artists.length);
+  _updateNavBadge('artists', _navCount(artists));
   renderGroupList(artists, 'artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.artist) {
       showUntaggedTracks('artist', '[No Artist]', () => showArtists(), item.count);
@@ -2404,7 +2457,7 @@ async function showAlbumArtists() {
   _showSkeletonRows(12);
   const albumArtists = await _viewData(_gen, API('/library/album-artists'), () => showAlbumArtists());
   if (!albumArtists || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  _updateNavBadge('album_artists', albumArtists.length);
+  _updateNavBadge('album_artists', _navCount(albumArtists));
   renderGroupList(albumArtists, 'album_artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.album_artist) {
       // "[No Album Artist]" — show all untagged tracks directly
@@ -2462,6 +2515,9 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
   _setViewReload(`albums\0${artist || ''}\0${albumArtist || ''}`, () => showAlbums(artist, albumArtist, backView));
 }
 
+// The untagged drill's fetch ceiling (its rows go into the play queue whole).
+const _UNTAGGED_LIMIT = 5000;
+
 async function showUntaggedTracks(field, label, backFn, total = 0) {
   const _gen = ++_browseNavGen;
   _hideGroupFilter();
@@ -2469,22 +2525,24 @@ async function showUntaggedTracks(field, label, backFn, total = 0) {
   restoreFullHeader();
   setBrowseHeader(label, backFn);
   _showSkeletonRows();
-  // Fetch a large batch and filter client-side (tag index can't query empty fields)
-  const all = await _viewData(_gen, API('/tracks', { limit: 5000 }), () => showUntaggedTracks(field, label, backFn, total));
-  if (!all || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  const filtered = all.filter(t => !t[field] || !t[field].toString().trim());
-  renderTracks(filtered);
-  // Only the first 5,000 tracks were examined, so the list is partial whenever the
-  // library is bigger.  SHUFFLE deals from the server's full "tag is blank" set;
-  // list-order play covers the rows shown (no ordered endpoint for a blank tag).
-  _setCappedSource(filtered.length, all.length >= 5000 ? 0 : Infinity, total,
-                   { untagged: field }, null, label);
+  // The server lists exactly the tracks whose tag is blank — the rows the
+  // bucket's count counts (same duplicate / unavailable-drive filtering).
+  const tracks = await _viewData(_gen, API('/tracks', { limit: _UNTAGGED_LIMIT, untagged: field }),
+                                 () => showUntaggedTracks(field, label, backFn, total));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
+  renderTracks(tracks);
+  // A list shorter than the cap is the whole set, so its length is the count —
+  // an in-place reload (a drive going away under "Hide") re-runs this with the
+  // count the bucket had when it was clicked.
+  if (tracks.length < _UNTAGGED_LIMIT) total = tracks.length;
+  // Capped at 5,000 rows: SHUFFLE deals from the server's full "tag is blank" set;
+  // list-order play covers the rows shown.
+  _setCappedSource(tracks.length, _UNTAGGED_LIMIT, total, { untagged: field }, null, label);
   _setViewReload(`untagged\0${field}`, () => showUntaggedTracks(field, label, backFn, total));
-  // This drill fetches only the first 5,000 tracks and filters client-side, so a
-  // large untagged set (e.g. 200k+ mod/SID files with no album-artist) is shown
+  // A large untagged set (e.g. 200k+ mod/SID files with no album-artist) is shown
   // only partially.  Disclose the shortfall in the crumb like every other capped
-  // drill instead of silently implying the (now accurate) badge count is listed.
-  _noteDrillCap(filtered.length, total);
+  // drill instead of silently implying the badge count is listed.
+  _noteDrillCap(tracks.length, total);
 }
 
 async function showAlbumTracks(artist, albumArtist, album, backFn) {
@@ -2772,6 +2830,7 @@ async function showFormatTracks(format, count = 0) {
     // The store fetched server-SORTED chunks, so paint the arrow to match — same
     // as showAll's windowed branch (restoreFullHeader no longer auto-paints it).
     if (sortBy) _paintSortIndicator();
+    _setViewReload(`format\0${format}`, () => showFormatTracks(format, count));
     return;
   }
   // Small format: a single format-filtered fetch (no chunking overhead).  Apply
@@ -2783,6 +2842,7 @@ async function showFormatTracks(format, count = 0) {
   const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
   renderTracks(rows);
   if (sortKey) _paintSortIndicator();
+  _setViewReload(`format\0${format}`, () => showFormatTracks(format, count));
 }
 
 async function showYearTracks(year, total = 0) {
@@ -3342,7 +3402,8 @@ function _playAll(shuffle) {
     }, SHUFFLE_DEAL_BAIL_MS);
     Player.playSource(src, { shuffle: true, rows }).then((ok) => {
       if (ok) window.Toast?.ok?.(_shuffleScopeText(src));
-      else if (ok === false && !reported) window.Toast?.error?.('Couldn\u2019t start shuffle \u2014 try again.');
+      // (Every track here offline: the player's 'offlinequeue' says so instead.)
+      else if (ok === false && !reported && !Player.lastStartAllOffline) window.Toast?.error?.('Couldn\u2019t start shuffle \u2014 try again.');
     }).finally(() => { clearTimeout(bail); release(); });
     return;
   }
@@ -3353,10 +3414,18 @@ function _playAll(shuffle) {
   if (store._isWindowedStore || !shuffle) {
     started = playFrom(0, { explicit: false });               // windows the queue where it can
   } else {
-    Player.setQueue(store, 0, { shuffle: true });             // a complete list: deal all of it
+    const r = Player.setQueue(store, 0, { shuffle: true });   // a complete list: deal all of it
+    started = r === undefined ? true : r;
   }
   Promise.resolve(started).then((ok) => {
-    if (!ok) return;
+    if (!ok) {
+      // false: nothing started and nothing said it yet (a failed first page;
+      // "everything offline" has its own message).  null: said so already.
+      if (ok === false && !Player.lastStartAllOffline) {
+        window.Toast?.error?.('Couldn\u2019t start playback \u2014 try again.');
+      }
+      return;
+    }
     // No shuffle source for this view: deal what is queued — but only once the
     // NEW queue is in place (playFrom may have had to fetch its first rows).
     if (shuffle && !Player.shuffle) Player.toggleShuffle();
@@ -4159,13 +4228,17 @@ async function showSmart(view, label) {
       if (_gen !== _browseNavGen) return;   // superseded during the history hydrate
       const trackMap = Object.fromEntries(allTracks.map(t => [t.id, t]));
       // Maintain history order (newest first)
-      const ordered = data.map(h => trackMap[h.track_id]).filter(Boolean);
+      // ("Tracks on unavailable drives: Hide" leaves the ones that can't play out.)
+      const hide = Offline.mode === 'hide';
+      const ordered = data.map(h => trackMap[h.track_id]).filter(t => t && !(hide && t.offline));
       renderTracks(ordered);
       _smartViewToken = _browseNavGen; _smartViewKey = view;   // this render is the live smart view
+      _smartViewLabel = label;
     } else {
       // All other smart views return track arrays directly
       renderTracks(Array.isArray(data) ? data : []);
       _smartViewToken = _browseNavGen; _smartViewKey = view;
+      _smartViewLabel = label;
     }
   } catch (err) {
     console.error('Smart view fetch failed:', err);
@@ -4331,8 +4404,10 @@ function playFocused() {
 // ── Sort persistence: restore on startup ──────────────────────────────────────
 _restoreSortState();
 
-// Fetch initial sidebar badge counts
+// Fetch initial sidebar badge counts (the browse lists once the page settled:
+// the view being opened fetches its own first).
 _refreshTrackCount();
+setTimeout(_refreshNavCounts, 1500);
 
 // Background duration probe — for AdLib/IMF rows shown in ANY view that still
 // carry the 180s placeholder, ask the server (via the shared probeAdlibDurations
@@ -4444,8 +4519,69 @@ function patchTrack(id, fields) {
   });
 }
 
+// Which tracks can play changed (a drive / share went offline or came back, or
+// Settings → "Tracks on unavailable drives" changed): re-read the open view so
+// its rows carry the new marks.  A list whose length cannot change — every mode
+// but Hide lists the same rows — is re-read IN PLACE: a windowed list refetches
+// the chunks on screen (scroll kept), a folder / group / search / drill
+// reloads keeping its scroll; a smart list re-runs.  When Hide is (or was) on,
+// the lists and totals change, so a windowed list is rebuilt.
+function refreshAvailability({ mode, prevMode } = {}) {
+  const lengthsChange = mode === 'hide' || prevMode === 'hide';
+  if (mode === 'show' && prevMode === 'show') return;   // (nothing is flagged or left out)
+  try {
+    if (_currentBrowsePath != null) {
+      // A folder lists every file whatever the mode (its length never changes),
+      // and the folder of a drive that just went away can't be listed at all:
+      // re-flag the rows it shows in place, then re-read it quietly.
+      const path = _currentBrowsePath;
+      _reflagShownRows().then(() => {
+        if (_currentBrowsePath === path && !(currentTracks && currentTracks._isWindowedStore)) {
+          refreshCurrentFolderInPlace();
+        }
+      });
+      return;
+    }
+    if (currentTracks && currentTracks._isWindowedStore && !lengthsChange) {
+      currentTracks.invalidate();
+      _vsRender(true);
+      return;
+    }
+    if (_viewIsAllTracks) {
+      // (Hide: the list's length changes — rebuilt, near where it was scrolled.)
+      const wrap = document.getElementById('track-list-wrap');
+      const y = wrap ? wrap.scrollTop : 0;
+      Promise.resolve(showAll()).then(() => {
+        if (_viewIsAllTracks && wrap && y > 0) requestAnimationFrame(() => { try { wrap.scrollTop = y; } catch (_) {} });
+      });
+      return;
+    }
+    if (_smartViewToken === _browseNavGen && _smartViewKey && !browseHdr.hidden) {
+      if (_smartViewKey === 'duplicates') return;          // a file view: its marks follow the next visit
+      showSmart(_smartViewKey, _smartViewLabel || '');
+      return;
+    }
+    reloadCurrentView();
+  } catch (_) { /* best-effort */ }
+}
+
+// Re-flag the rows the open list holds (``offline``) from the server and
+// re-paint them — for a list that can't simply be re-read (a folder whose drive
+// went away).  The rows are shared with the queue when it was started here.
+async function _reflagShownRows() {
+  const list = currentTracks;
+  if (!list || !list.length) return;
+  const rows = list._isWindowedStore ? [].concat(...list._chunks.values()) : list;
+  try { await Offline.recheckRows?.(rows); } catch (_) { return; }
+  if (currentTracks !== list) return;
+  // (A forced render skips a row that still shows the same track: let every
+  // row repaint — the flag lives on the row's own track object.)
+  if (tbody) tbody.querySelectorAll('tr').forEach((tr) => { tr.__tid = undefined; });
+  _vsRender(true);
+}
+
 export const Library = {
-  patchTrackDuration, patchTrack,
+  patchTrackDuration, patchTrack, refreshAvailability,
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
   showGenres, showYears, showSceneGroups, showGalaxy, showFolder, renderTracks,
   showSearchResults,
@@ -4466,7 +4602,7 @@ export const Library = {
   isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace, reloadCurrentView,
   isInAllTracksView: () => _viewIsAllTracks,
   setBrowseHeader, hideBrowseHeader, onInfo,
-  getSelectedTracks, clearSelection, refreshBadges: _refreshTrackCount,
+  getSelectedTracks, clearSelection, refreshBadges: _refreshBadges,
   // Smart & duplicates views
   showSmart, showDuplicates, refreshSmartOnPlay,
   // Keyboard navigation

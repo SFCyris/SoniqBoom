@@ -259,6 +259,7 @@ async function open() {
     overlay.classList.remove('hidden');
     loadStats();
     loadDirs();
+    loadModlandStatus();
     loadSettings();
     loadServices();
     loadRendererStatus();
@@ -292,6 +293,7 @@ function close() {
   _hideAllDialogs();
   overlay.classList.add('hidden');
   stopScanPoller();
+  clearTimeout(_mlPoll);
   // Close the conversion-cache SSE stream on EVERY dismissal path —
   // it used to be wired only to the ✕ button, so Escape / Cancel left
   // an EventSource reconnecting forever in the background (QA).
@@ -353,7 +355,9 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
     const pane = document.getElementById(tab.dataset.tab);
     if (pane) pane.classList.add('active');
     // Load tab-specific data on switch
-    if (tab.dataset.tab === 'tab-system') {
+    if (tab.dataset.tab === 'tab-library') {
+      loadModlandStatus();
+    } else if (tab.dataset.tab === 'tab-system') {
       loadDiskUsage();
       loadSettings();
       _apiKeyRefreshers.forEach(r => r());   // "last used" moves on as apps sign in
@@ -822,6 +826,21 @@ function _renderFtpPoolCard(srv) {
 }
 
 function renderDirRow(list, d, scanActive = false) {
+  if (d.catalogue) {
+    // A catalogue root (the Modland catalogue): listed from its index, never
+    // scanned — switched on / off under External sources below.
+    const row = document.createElement('div');
+    const off = d.status === 'unavailable';
+    row.className = 'admin-dir-row admin-dir-catalogue' + (off ? ' dir-unavailable' : '');
+    row.dataset.path = d.path;
+    row.innerHTML = `
+      <span class="dir-status-dot ${off ? 'dot-red' : 'dot-green'}" title="${off ? 'Unreachable — only tunes played before can play' : 'Available'}"></span>
+      <span class="admin-dir-path" title="${esc(d.path)}">${esc(d.label || 'Catalogue')} catalogue</span>
+      <span class="admin-dir-note">Managed under External sources</span>
+      <span class="admin-dir-count">${(d.track_count ?? 0).toLocaleString()} tunes</span>`;
+    list.appendChild(row);
+    return;
+  }
   const alreadyIndexed = (d.track_count ?? 0) > 0;
   const isNetwork = !!d.network_share_id;
   // Unavailable = an offline share OR a local drive that is not mounted.  Either
@@ -1139,6 +1158,261 @@ async function removeDir(path) {
 }
 
 let _removingShare = false;
+
+// ── External sources: the Modland catalogue ──────────────────────────────────
+// One switch per public archive listed in the library from its index (backend:
+// core/modland_catalog.py, /api/admin/catalog/modland).  A build / removal runs
+// in the background; the status line follows it every 1.5 s.
+let _mlPoll = null;
+let _mlWasBusy = false;
+let _mlLastBusy = false;
+let _mlFailedPolls = 0;
+let _mlSaving = false;
+let _mlBound = false;
+
+const _mlBusy = s => !!s && (s.state === 'building' || s.state === 'removing');
+
+function _mlAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now() / 1000 - Number(ts));
+  if (s < 90) return 'just now';
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 48 * 3600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+
+function _mlIn(ts) {
+  const s = Number(ts) - Date.now() / 1000;
+  if (!(s > 0)) return 'soon';
+  if (s < 5400) return `in ${Math.max(1, Math.round(s / 60))} min`;
+  if (s < 48 * 3600) return `in ${Math.round(s / 3600)} h`;
+  return `in ${Math.round(s / 86400)} days`;
+}
+
+function _renderModlandStatus(s) {
+  const tog = document.getElementById('setting-modland-catalog');
+  const scopeSel = document.getElementById('setting-modland-scope');
+  const sub = document.getElementById('setting-modland-subsonic');
+  const refresh = document.getElementById('btn-modland-refresh');
+  const line = document.getElementById('modland-status');
+  const bar = document.getElementById('modland-progress');
+  const opts = document.getElementById('modland-options');
+  if (!line || !tog || !s || typeof s !== 'object') return;
+  const busy = _mlBusy(s);
+  if (!_mlSaving) tog.checked = !!s.enabled;
+  tog.disabled = _mlSaving;
+  if (scopeSel) {
+    const counts = s.scope_counts || {};
+    for (const o of scopeSel.options) {
+      if (!o.dataset.label) o.dataset.label = o.textContent;
+      const n = Number(counts[o.value] || 0);
+      o.textContent = n ? `${o.dataset.label} (${_fmtCount(n)})` : o.dataset.label;
+    }
+    if (document.activeElement !== scopeSel) scopeSel.value = s.scope || 'standard';
+    scopeSel.dataset.saved = s.scope || 'standard';
+    scopeSel.disabled = busy || _mlSaving;
+  }
+  if (sub) { sub.checked = !!s.subsonic; sub.disabled = _mlSaving; }
+  if (refresh) refresh.disabled = busy || !s.enabled || _mlSaving;
+  const ivSel = document.getElementById('setting-modland-interval');
+  if (ivSel) {
+    if (document.activeElement !== ivSel) ivSel.value = s.interval || 'daily';
+    ivSel.dataset.saved = s.interval || 'daily';
+    // Never disabled while a change saves: that would throw keyboard focus out
+    // of the menu mid-choice (each choice is simply sent; the last one wins).
+    ivSel.disabled = false;
+  }
+  if (opts) opts.classList.toggle('ext-off', !s.enabled);
+  const about = document.getElementById('modland-about-count');
+  const scopeN = Number((s.scope_counts || {})[s.scope || 'standard'] || 0);
+  if (about && scopeN) about.textContent = `about ${_fmtCount(Math.round(scopeN / 10000) * 10000)}`;
+
+  const parts = [];
+  if (busy) {
+    const what = s.state === 'removing' ? 'Removing the catalogue' : 'Building the catalogue';
+    const phase = s.phase ? ` — ${s.phase}` : '';
+    const prog = Number(s.total) > 0 ? ` ${_fmtCount(s.done)} of ${_fmtCount(s.total)}` : '';
+    parts.push(`${what}${phase}${prog}…`);
+  } else if (!s.enabled) {
+    parts.push('Off.');
+  } else if (s.state === 'error' && !Number(s.tunes)) {
+    const err = s.error || 'unknown error';
+    parts.push(/Refresh now/.test(err) ? `Not available: ${err}.`
+                                       : `Not available: ${err} — press Refresh now to try again.`);
+  } else {
+    let t = `${_fmtCount(s.tunes)} tunes in the Modland folder`;
+    if (s.index_date) t += ` · index of ${s.index_date}`;
+    // (Up to which day the changelogs brought it — the index's own date is the
+    // last full download's.)
+    if (s.changes_to && String(s.changes_to) > String(s.index_date || '').slice(0, 10)) {
+      t += ` with Modland’s changes to ${s.changes_to}`;
+    }
+    if (s.last_refresh) t += ` · refreshed ${_mlAgo(s.last_refresh)}`;
+    // What the last update downloaded: only the changes (changelogs), or the
+    // full index.
+    const lu = s.last_update || {};
+    if (lu.kind === 'delta') {
+      t += Number(lu.changelogs) > 0
+        ? ` — updated from ${_fmtCount(lu.changelogs)} changelog${Number(lu.changelogs) === 1 ? '' : 's'} (${_fmtBytes(Number(lu.bytes || 0))})`
+        : ' — no new changes';
+    } else if (lu.kind === 'full' && Number(lu.bytes) > 0) {
+      t += ` — full index (${_fmtBytes(Number(lu.bytes))}${lu.reason ? `: ${lu.reason}` : ''})`;
+    }
+    if (s.next_refresh) t += ` · next refresh ${_mlIn(s.next_refresh)}`;
+    if (Number(s.index_bytes) > 0) t += ` · ${_fmtBytes(Number(s.index_bytes))} downloaded for index updates in all`;
+    parts.push(t);
+    if (s.error) parts.push(`the last refresh failed (${s.error}) — the catalogue is kept`);
+  }
+  if (s.enabled && s.offline) parts.push('Modland is unreachable right now: only tunes played before can play');
+  const f = s.fetches || {};
+  if (s.enabled && Number(f.reads) > 0) {
+    parts.push(`${_fmtCount(f.reads)} file${Number(f.reads) === 1 ? '' : 's'} fetched from Modland since the server started (${_fmtBytes(Number(f.bytes || 0))})`);
+  }
+  line.textContent = parts.join(' · ');
+  line.setAttribute('aria-busy', busy ? 'true' : 'false');
+  if (bar) {
+    const showBar = busy && Number(s.total) > 0;
+    bar.hidden = !showBar;
+    if (showBar) { bar.max = Number(s.total); bar.value = Number(s.done || 0); }
+  }
+  // A job that just ended: say how it went, and let the open views refresh.
+  if (_mlWasBusy && !busy) {
+    if (s.error) {
+      showMsg('modland-msg', `Modland catalogue: ${s.error}`, 'err');
+    } else if (s.enabled) {
+      showMsg('modland-msg', `The Modland catalogue is ready — ${_fmtCount(s.tunes)} tunes in the "Modland" folder.`, 'ok');
+    } else {
+      showMsg('modland-msg', 'The Modland catalogue was removed. Ratings, play counts and playlist entries of its tunes are kept for when you switch it on again.', 'ok');
+    }
+    document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
+    document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    loadDirs();
+  }
+  _mlWasBusy = busy;
+  _mlLastBusy = busy;
+  _mlFailedPolls = 0;
+  clearTimeout(_mlPoll);
+  if (busy) _mlPoll = setTimeout(loadModlandStatus, 1500);
+}
+
+async function loadModlandStatus() {
+  _bindModland();
+  try {
+    const res = await api('/admin/catalog/modland');
+    _renderModlandStatus(await res.json());
+  } catch (_) {
+    if (_mlLastBusy) {
+      _mlFailedPolls += 1;
+      const line = document.getElementById('modland-status');
+      if (line && _mlFailedPolls === 1) line.textContent = 'Waiting for the server…';
+      clearTimeout(_mlPoll);
+      _mlPoll = setTimeout(loadModlandStatus, Math.min(15000, 1500 * 2 ** _mlFailedPolls));
+    }
+  }
+}
+
+async function _mlPost(path, body) {
+  const res = await api(path, { method: 'POST', body: JSON.stringify(body || {}) });
+  const s = await res.json();
+  if (_mlBusy(s)) _mlWasBusy = true;
+  return s;
+}
+
+function _bindModland() {
+  if (_mlBound) return;
+  const tog = document.getElementById('setting-modland-catalog');
+  const scopeSel = document.getElementById('setting-modland-scope');
+  const sub = document.getElementById('setting-modland-subsonic');
+  const refresh = document.getElementById('btn-modland-refresh');
+  if (!tog) return;
+  _mlBound = true;
+  tog.addEventListener('change', async () => {
+    const want = tog.checked;
+    if (!want) {
+      const ok = await styledConfirm(
+        'Remove the Modland catalogue from the library?\n\nIts tunes and the Modland folder go; '
+        + 'ratings, play counts and playlist entries are kept for when you switch it on again.',
+        { title: 'Modland catalogue', okLabel: 'Remove' });
+      if (!ok) { tog.checked = true; return; }
+    }
+    _mlSaving = true;
+    tog.setAttribute('aria-busy', 'true');
+    showMsg('modland-msg', '');
+    try {
+      const s = await _mlPost('/admin/catalog/modland', { enabled: want });
+      _mlSaving = false;
+      _renderModlandStatus(s);
+      if (want) showMsg('modland-msg', 'Getting Modland’s index and building the catalogue in the background…', 'info');
+    } catch (e) {
+      tog.checked = !want;
+      showMsg('modland-msg', e.message || 'Could not change the setting.', 'err');
+    } finally {
+      _mlSaving = false;
+      tog.removeAttribute('aria-busy');
+      loadModlandStatus();
+    }
+  });
+  scopeSel?.addEventListener('change', async () => {
+    _mlSaving = true;
+    showMsg('modland-msg', '');
+    try {
+      const s = await _mlPost('/admin/catalog/modland', { scope: scopeSel.value });
+      _mlSaving = false;
+      _renderModlandStatus(s);
+    } catch (e) {
+      scopeSel.value = scopeSel.dataset.saved || 'standard';   // the server kept it
+      showMsg('modland-msg', e.message || 'Could not change the setting.', 'err');
+    } finally {
+      _mlSaving = false;
+      loadModlandStatus();
+    }
+  });
+  sub?.addEventListener('change', async () => {
+    _mlSaving = true;
+    try {
+      const s = await _mlPost('/admin/catalog/modland', { subsonic: sub.checked });
+      _mlSaving = false;
+      _renderModlandStatus(s);
+      showMsg('modland-msg', sub.checked
+        ? 'Subsonic and DLNA apps now see the catalogue (their next sync picks it up).'
+        : 'Subsonic and DLNA apps no longer see the catalogue.', 'ok');
+    } catch (e) {
+      sub.checked = !sub.checked;
+      showMsg('modland-msg', e.message || 'Could not change the setting.', 'err');
+    } finally {
+      _mlSaving = false;
+      loadModlandStatus();
+    }
+  });
+  const ivSel = document.getElementById('setting-modland-interval');
+  ivSel?.addEventListener('change', async () => {
+    showMsg('modland-msg', '');
+    ivSel.setAttribute('aria-busy', 'true');
+    try {
+      const s = await _mlPost('/admin/catalog/modland', { interval: ivSel.value });
+      _renderModlandStatus(s);
+      const label = ivSel.selectedOptions[0]?.textContent || ivSel.value;
+      showMsg('modland-msg', `The index is updated ${label.toLowerCase()}`
+        + (s.enabled && s.next_refresh ? ` — next refresh ${_mlIn(s.next_refresh)}.` : '.'), 'ok');
+    } catch (e) {
+      ivSel.value = ivSel.dataset.saved || 'daily';             // the server kept it
+      showMsg('modland-msg', e.message || 'Could not change the setting.', 'err');
+    } finally {
+      ivSel.removeAttribute('aria-busy');
+    }
+  });
+  refresh?.addEventListener('click', async () => {
+    refresh.disabled = true;
+    showMsg('modland-msg', '');
+    try {
+      _renderModlandStatus(await _mlPost('/admin/catalog/modland/refresh', {}));
+      showMsg('modland-msg', 'Updating Modland’s index…', 'info');
+    } catch (e) {
+      showMsg('modland-msg', e.message || 'Could not refresh.', 'err');
+      refresh.disabled = false;
+    }
+  });
+}
 
 async function removeShare(shareId, path) {
   if (_removingShare) return;  // guard against double-click
@@ -2580,7 +2854,7 @@ function _bindServerToggle(id, key, msgId, { describe, pending, done } = {}) {
       // Albums changed on the server: the open library view refreshes (app.js).
       // Every track written — albums and game names alike.
       const changed = (Number(r.folder_tracks_updated) || 0) + (Number(r.modland_tracks_updated) || 0)
-        + (Number(r.archive_tracks_updated) || 0);
+        + (Number(r.archive_tracks_updated) || 0) + (Number(r.genre_tracks_updated) || 0);
       if (changed > 0) document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
     } catch (err) {
       // Show what the server actually stored, not what we hoped.
@@ -2636,6 +2910,13 @@ _bindServerToggle('setting-game-from-archive', 'game_from_archive_name', 'md-gam
     return on ? 'On.' : 'Off.';                      // value was already set
   },
   done: () => loadGameTitlesStatus(),
+});
+_bindServerToggle('setting-genre-names', 'genre_names_in_genres', 'md-genre-names-msg', {
+  pending: on => on ? 'Saving \u2014 adding game and group names to the genres\u2026'
+                    : 'Saving \u2014 removing game and group names from the genres\u2026',
+  describe: (on, r) => ('genre_tracks_updated' in r)
+    ? `${on ? 'On' : 'Off'} \u2014 genres of ${_fmtCount(r.genre_tracks_updated)} retro track(s) updated.`
+    : (on ? 'On.' : 'Off.'),
 });
 // Renderers tab — Playback preparation.
 _bindServerToggle('setting-render-prewarm', 'render_prewarm', 'admin-playprep-msg', {
@@ -3139,6 +3420,7 @@ const _SAVE_ON_CHANGE_TOGGLES = [
   ['setting-subsonic-folder-albums', 'subsonic_folder_albums'],
   ['setting-modland-filename-game',  'modland_filename_game'],
   ['setting-game-from-archive',      'game_from_archive_name'],
+  ['setting-genre-names',            'genre_names_in_genres'],
   ['setting-retro-album-folder',     'retro_album_from_folder'],
 ];
 
@@ -3189,6 +3471,8 @@ async function loadSettings() {
     const dedupFoldersEl = document.getElementById('setting-dedup-folders');
     if (dedupFoldersEl) dedupFoldersEl.checked = !!s.dedup_folders;
     _loadedDedupFolders = !!s.dedup_folders;
+    const offlineEl = document.getElementById('setting-offline-tracks');
+    if (offlineEl && ['mark', 'hide', 'show'].includes(s.offline_tracks)) offlineEl.value = s.offline_tracks;
     for (const [id, key] of _SAVE_ON_CHANGE_TOGGLES) {
       const el = document.getElementById(id);
       if (!el || typeof s[key] !== 'boolean' || el.getAttribute('aria-busy')) continue;
@@ -3286,6 +3570,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const sidDur = parseInt(document.getElementById('setting-sid-duration')?.value || '180');
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
     const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
+    const offlineTracks = document.getElementById('setting-offline-tracks')?.value || 'mark';
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
@@ -3305,6 +3590,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         renderers: { sid_default_duration: sidDur },
         filter_duplicates: filterDups,
         dedup_folders: dedupFolders,
+        offline_tracks: offlineTracks,
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
@@ -3328,6 +3614,9 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       _loadedDedupFolders = dedupFolders;
       try { (await import('./library.js')).Library?.refreshCurrentFolderInPlace?.(); } catch { /* non-fatal */ }
     }
+    // "Tracks on unavailable drives": re-read the state now (the WebSocket
+    // event follows too) so the open view and the queue re-mark at once.
+    try { (await import('./offline.js')).Offline?.refresh?.(); } catch { /* non-fatal */ }
     showMsg('admin-settings-msg', ['Settings saved.', ..._notes].join(' '), 'ok');
   } catch {
     // The browser-local half (crossfade, preload, convert delay, shuffle, theme)
@@ -4231,6 +4520,14 @@ function _renderSongdbStatus(s) {
     const built = s.built_at ? new Date(s.built_at * 1000).toLocaleDateString() : 'unknown date';
     txt = `Index: ${Number(s.meta_rows).toLocaleString()} songs with metadata, `
         + `${Number(s.length_rows || 0).toLocaleString()} with lengths (built ${built})`;
+    // Which upstream set is installed: the reviewed commit, or — only when that
+    // commit was gone upstream — the latest files, which nobody has checked.
+    if (s.source_set === 'validated') txt += ` \u00b7 validated set (${String(s.validated_commit || '').slice(0, 7)})`;
+    else if (s.source_set === 'latest') txt += ' \u00b7 latest files from GitHub (not validated)';
+    else if (s.source_set === 'unknown') txt += ' \u00b7 refresh to install the validated set';
+    if (s.newer_upstream && s.newer_upstream.date) {
+      txt += ` \u00b7 newer data upstream since ${new Date(s.newer_upstream.date).toLocaleDateString()} (not validated)`;
+    }
   }
   if (s.applying) txt += ' · applying…';
   else if (s.last_apply) {
@@ -4345,6 +4642,8 @@ function _renderDemozooStatus(s) {
     txt = `Index: ${Number(s.names).toLocaleString()} name→group entries (built ${built})`;
     if (s.games === null) txt += ' \u00b7 refresh the index to add game names';
     else if (Number(s.games) > 0) txt += ` \u00b7 ${Number(s.games).toLocaleString()} game soundtracks`;
+    if (s.uses === null && s.games !== null) txt += ' \u00b7 refresh the index to add demo, cracktro and party genres';
+    else if (Number(s.uses) > 0) txt += ` \u00b7 ${Number(s.uses).toLocaleString()} tunes with a known use`;
   }
   if (s.applying) txt += ' · applying…';
   else if (s.last_apply) {

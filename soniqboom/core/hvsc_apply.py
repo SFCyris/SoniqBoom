@@ -79,14 +79,21 @@ async def apply_hvsc_to_library(*, reload: bool = False,
     # ── Resolve each track's whole-file MD5 (cached → compute → fetch) ──
     skipped_missing = 0
     skipped_unreadable = 0
+    skipped_catalogue = 0
     io_sem = asyncio.Semaphore(6)           # bound concurrent file/network reads
 
     async def _resolve(t: dict):
-        nonlocal skipped_missing, skipped_unreadable
+        nonlocal skipped_missing, skipped_unreadable, skipped_catalogue
         md5 = (t.get("sid_md5") or "").strip().lower() or None
         if md5:
             return t, md5, False            # cached — no I/O, nothing to persist
         path_str = t.get("path") or ""
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_path(path_str):
+            # A catalogue SID gets its sid_md5 from its first play's merge
+            # (core/modland_catalog.py) — never read here.
+            skipped_catalogue += 1
+            return t, None, False
         if is_remote_path(path_str):
             if "::" in path_str:
                 # SID inside a REMOTE archive ("…/archive.zip::member.sid"):
@@ -202,10 +209,14 @@ async def apply_hvsc_to_library(*, reload: bool = False,
         msg_parts.append(f"Skipped {skipped_missing} missing file(s).")
     if skipped_unreadable:
         msg_parts.append(f"Skipped {skipped_unreadable} unreadable file(s).")
+    if skipped_catalogue:
+        msg_parts.append(f"{skipped_catalogue} catalogue SID(s) are matched when first "
+                         "played.")
     return {
         "updated": len(updates),
         "scanned": scanned,
         "skipped_missing": skipped_missing,
         "skipped_unreadable": skipped_unreadable,
+        "skipped_catalogue": skipped_catalogue,
         "message": " ".join(msg_parts),
     }

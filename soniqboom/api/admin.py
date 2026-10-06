@@ -190,6 +190,85 @@ async def admin_scene_apply(_tok: str = Depends(_require_token)):
     return await scene_metadata.apply_to_library()
 
 
+# ── External sources: the Modland catalogue (core/modland_catalog.py) ──────────
+
+@router.get("/catalog/modland")
+async def admin_modland_catalog_status(_tok: str = Depends(_require_token)):
+    """The Modland catalogue's state: on/off, scope, Subsonic visibility, the
+    index (date, rows), the tune count, the running job and its progress, the
+    last error, and how many files plays have fetched from Modland."""
+    from soniqboom.core import modland_catalog
+    return modland_catalog.status()
+
+
+@router.post("/catalog/modland")
+async def admin_modland_catalog_set(body: dict, _tok: str = Depends(_require_token)):
+    """Change the Modland catalogue's settings.  ``enabled`` switches it on
+    (download the index when needed, build the catalogue in the background)
+    or off (remove its tunes and root — ratings, plays, stars and playlist
+    entries stay for when it comes back); ``scope`` (``standard`` /
+    ``all``) re-applies the index; ``subsonic`` shows / hides the catalogue
+    to Subsonic and DLNA clients; ``interval`` (``daily`` / ``weekly`` /
+    ``biweekly`` / ``monthly``) sets how often the index is refreshed — the
+    schedule follows at once.  Returns the status at once; a background
+    job's progress is in ``GET /admin/catalog/modland``."""
+    from soniqboom.core import modland_catalog as mc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object expected")
+    if "interval" in body and (not isinstance(body["interval"], str)
+                               or body["interval"] not in mc.INTERVALS):
+        raise HTTPException(400, f"interval must be one of {list(mc.INTERVALS)}")
+    if "interval" in body:
+        mc.set_interval(body["interval"])
+    if "subsonic" in body:
+        mc.set_subsonic(_flag(body["subsonic"]))
+    scope = body.get("scope")
+    if scope is not None and scope not in mc.SCOPES:
+        raise HTTPException(400, f"scope must be one of {list(mc.SCOPES)}")
+    if "enabled" in body:
+        want = _flag(body["enabled"])
+        if want and mc.conflicting_share():
+            raise HTTPException(409, f"Modland's /pub/modules is already added as the "
+                                     f"network share \"{mc.conflicting_share()}\" — "
+                                     f"remove that share first.")
+        if scope is not None and (want != mc.enabled() or not want):
+            get_store().set_config(mc.CONFIG_SCOPE, scope)       # the build takes it
+            scope = None
+        if not want and (mc.enabled() or mc.busy() or mc.status().get("tunes")):
+            mc.start_disable()                  # cancels a build still running
+        elif want and (not mc.enabled() or mc.status().get("state") == "error"):
+            if mc.busy():
+                raise HTTPException(409, "The Modland catalogue is busy — try again when "
+                                         "the current step has finished.")
+            mc.start_job(mc.enable)
+    if scope is not None:
+        if mc.busy():
+            raise HTTPException(409, "The Modland catalogue is busy — try again when "
+                                     "the current step has finished.")
+        if mc.enabled():
+            mc.start_job(mc.set_scope, scope)
+        else:
+            get_store().set_config(mc.CONFIG_SCOPE, scope)
+    await asyncio.sleep(0)
+    return mc.status()
+
+
+@router.post("/catalog/modland/refresh")
+async def admin_modland_catalog_refresh(_tok: str = Depends(_require_token)):
+    """Update Modland's index now — from its changelogs, or the full index
+    when they can't do it — and apply the changes (added, removed, moved and
+    resized files) in the background.  A failed or implausible download keeps
+    the current catalogue."""
+    from soniqboom.core import modland_catalog as mc
+    if not mc.enabled():
+        raise HTTPException(409, "The Modland catalogue is off.")
+    if not mc.start_job(mc.refresh, manual=True):
+        raise HTTPException(409, "The Modland catalogue is busy — try again when "
+                                 "the current step has finished.")
+    await asyncio.sleep(0)
+    return mc.status()
+
+
 @router.get("/demozoo/status")
 async def admin_demozoo_status(_tok: str = Depends(_require_token)):
     """Demozoo scene-group enrichment state (index name→group rows, last apply)."""
@@ -571,6 +650,10 @@ async def _scan_dirs_split(dirs: list[str], progress_cb=None) -> dict:
         work because the badge stayed pinned at the previous scan's
         final broadcast.
     """
+    from soniqboom.core import catalogue as _catalogue
+    # A catalogue root (core/catalogue.py) is never scanned — its index is
+    # refreshed instead (Admin → External sources).
+    dirs = [d for d in dirs if not _catalogue.is_catalogue_root(d)]
     local = [d for d in dirs if not _is_remote(d)]
     remote = [d for d in dirs if _is_remote(d)]
     started: list[str] = []
@@ -1465,6 +1548,15 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
     }
     if proto in ("webdav", "webdavs"):
         share_conf["base_url"] = base_url
+    from soniqboom.core import catalogue as _catalogue
+    from soniqboom.core.filesource import scan_root_for_share as _srfs
+    try:
+        _new_root = _srfs(share_conf).rstrip("/")
+    except Exception:
+        _new_root = ""
+    if _new_root and any(_new_root.lower() == r["root"].lower() for r in _catalogue.roots()):
+        raise HTTPException(409, "This folder is already in the library as a catalogue "
+                                 "(Admin → Library → External sources).")
     scan_root = _scan_root_for_share(share_conf)
 
     try:
@@ -3079,6 +3171,11 @@ async def hvsc_rescan_sids(_tok: str = Depends(_require_token)):
 
 # ── Settings panel ───────────────────────────────────────────────────────────
 
+def _offline_mode() -> str:
+    from soniqboom.core import availability
+    return availability.mode()
+
+
 @router.get("/settings")
 async def get_settings(_tok: str = Depends(_require_token)):
     """Return current application settings (safe subset)."""
@@ -3122,6 +3219,11 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # collapses duplicate alternate encodings while browsing folders;
         # default on (the EFFECTIVE value — see ``data.folder_dedup_enabled``).
         "dedup_folders": await folder_dedup_enabled(),
+        # Tracks whose drive / share is offline and that no cached copy can
+        # serve: "mark" (listed dimmed with an offline badge — the default),
+        # "hide" (left out of searches and track lists) or "show" (as before).
+        # Read by core/availability.py.
+        "offline_tracks": _offline_mode(),
         "use_folder_art": await get_config("use_folder_art", True),
         # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
         # drops subdirectories whose subtree contains zero indexed audio
@@ -3148,6 +3250,10 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # A retro track's game from its archive's name when that is a known
         # game of the track's platform (core/game_titles.py) — on by default.
         "game_from_archive_name": await get_config("game_from_archive_name", True),
+        # Retro tracks with no genre of their own get derived genres (category
+        # and platform, core/genre_derive.py); this adds the game, scene group
+        # and party names to them — on by default.
+        "genre_names_in_genres": await get_config("genre_names_in_genres", True),
         # Subsonic: group album-less tracks into per-folder albums (read by
         # api/subsonic.py; same default as there — on).
         "subsonic_folder_albums": await get_config(
@@ -3299,6 +3405,17 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         except (TypeError, ValueError):
             mb = 2048
         conf["zip_extract_cache_max_mb"] = mb
+
+    if "offline_tracks" in body:
+        from soniqboom.core import availability
+        from soniqboom.core.data import set_config as _set_cfg
+        mode = str(body.get("offline_tracks") or "").strip().lower()
+        # (An unknown value is ignored, like the other coerced settings — a
+        # 422 here would leave the fields applied above half-saved.)
+        if mode in availability.MODES and mode != availability.mode():
+            await _set_cfg(availability.MODE_KEY, mode)
+            # Lists, counts and shuffles key on the mode — tell open pages.
+            availability.notify_changed()
 
     if (
         "filter_duplicates" in body
@@ -3498,6 +3615,23 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 result["archive_games_primary"] = res.get("primary", 0)
             except Exception as exc:                    # noqa: BLE001
                 log.exception("game-from-archive pass failed")
+                result["album_pass_error"] = str(exc)
+
+    # Game and group names as genres: switching it re-derives the genres of
+    # every retro track at once (core/genre_derive.py).
+    if "genre_names_in_genres" in body:
+        from soniqboom.core.data import set_config, get_config
+        from soniqboom.core import genre_derive
+        new_val = _flag(body["genre_names_in_genres"])
+        old_val = bool(await get_config(genre_derive.CONFIG_KEY, True))
+        await set_config(genre_derive.CONFIG_KEY, new_val)
+        if new_val != old_val:
+            try:
+                res = await genre_derive.apply_derived_genres(force=True)
+                result["genre_tracks_updated"] = res.get("updated", 0)
+                result["genre_tracks_derived"] = res.get("derived")
+            except Exception as exc:                    # noqa: BLE001
+                log.exception("derived-genre pass failed")
                 result["album_pass_error"] = str(exc)
 
     return result

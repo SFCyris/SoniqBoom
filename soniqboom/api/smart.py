@@ -32,6 +32,7 @@ from soniqboom.api.users import require_edit
 from soniqboom.core.data import (
     get_all_play_stats, get_all_ratings, get_track,
 )
+from soniqboom.core import availability
 from soniqboom.core.store import get_store
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,12 @@ router = APIRouter(tags=["smart"])
 # return plain lists.  Same JSON as before — except that one non-finite float
 # (a truncated file's ``nan`` length) or undecodable filename byte no longer
 # 500s the whole view (``tracks.json_bytes``).
+
+# "Tracks on unavailable drives" (``core.availability``): the smart lists flag
+# the tracks that can't play right now (``offline``) or, in Hide mode, leave
+# them out — still ``limit`` rows when there are that many others.  The instant
+# mix never deals them (Mark and Hide); the duplicates view always lists them
+# (flagged): it is about files, not about playing.
 
 # ── History settings ──────────────────────────────────────────────────────────
 HISTORY_MAX = 500                       # cap to avoid unbounded growth
@@ -75,14 +82,16 @@ async def most_played(limit: int = Query(100, ge=1, le=500)):
                              -all_stats[tid].get("last_played", 0)),
         )
         _MOST_PLAYED_MEMO["seq"] = seq
-    ranked_ids = _MOST_PLAYED_MEMO["ranked"][:limit]
-    return await _enrich_tracks(ranked_ids, stats=all_stats)
+    ranked_ids = _first_shown(_MOST_PLAYED_MEMO["ranked"], limit)
+    return availability.mark_rows(await _enrich_tracks(ranked_ids, stats=all_stats))
 
 
 @json_route(router, "/smart/recently-added")
 async def recently_added(limit: int = Query(100, ge=1, le=500)):
     """Return the most recently added tracks (by added_at timestamp)."""
-    return get_store().recently_added(limit)
+    store = get_store()
+    return availability.mark_rows(
+        store.recently_added(limit, exclude=availability.hidden(store)), store)
 
 
 @json_route(router, "/smart/unplayed")
@@ -94,7 +103,9 @@ async def unplayed(limit: int = Query(100, ge=1, le=500)):
     rather than scanning every track in the library (previously O(N) per
     call, even for tiny pages).
     """
-    return get_store().list_unplayed(limit)
+    store = get_store()
+    return availability.mark_rows(
+        store.list_unplayed(limit, exclude=availability.hidden(store)), store)
 
 
 @json_route(router, "/smart/top-rated")
@@ -111,8 +122,24 @@ async def top_rated(limit: int = Query(100, ge=1, le=500)):
             key=lambda tid: -all_ratings[tid],
         )
         _TOP_RATED_MEMO["seq"] = seq
-    rated_ids = _TOP_RATED_MEMO["ranked"][:limit]
-    return await _enrich_tracks(rated_ids, ratings=all_ratings)
+    rated_ids = _first_shown(_TOP_RATED_MEMO["ranked"], limit)
+    return availability.mark_rows(await _enrich_tracks(rated_ids, ratings=all_ratings))
+
+
+def _first_shown(ranked: list[str], limit: int) -> list[str]:
+    """The first ``limit`` ids of ``ranked`` a list shows: all of them, or in
+    "Tracks on unavailable drives: Hide" mode the first ``limit`` that can
+    play right now."""
+    hide = availability.hidden()
+    if not hide:
+        return ranked[:limit]
+    out: list[str] = []
+    for tid in ranked:
+        if tid not in hide:
+            out.append(tid)
+            if len(out) >= limit:
+                break
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -157,6 +184,12 @@ async def instant_mix(
 
     from soniqboom.core.radio import build_instant_mix
     candidates = store.similar_candidates(seed_dict)   # on-loop: atomic vs scanner, cheap
+    # Never deal a track that can't play right now (Mark / Hide): an endless mix
+    # would stumble from one "source offline" error to the next.  The seed is the
+    # listener's pick — it stays (flagged when offline).
+    skip = availability.unplayable(store)
+    if skip:
+        candidates = [c for c in candidates if c.get("id") not in skip]
     # Precompute the retro sample-lineage Jaccard on the loop (cheap inverted-
     # index walk) so the off-thread scorer skips re-tokenising every candidate.
     sample_jaccard = store.retro_sample_jaccard(seed_dict, candidates)
@@ -175,7 +208,7 @@ async def instant_mix(
         d.pop("embedding", None)
         return d
 
-    return [_clean(seed_dict), *(_clean(t) for t in mix)]
+    return availability.mark_rows([_clean(seed_dict), *(_clean(t) for t in mix)], store)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,6 +379,7 @@ def _shape_group(store, gid: str, tids: list[str]) -> dict | None:
     members = [m for m in (_public_meta(store, tid) for tid in tids) if m]
     if len(members) < 2:
         return None
+    members = availability.mark_rows(members, store)
     members.sort(key=lambda t: (not t.get("is_duplicate_primary", False),
                                 -(t.get("format_score") or 0)))
     return {

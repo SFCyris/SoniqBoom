@@ -368,11 +368,34 @@ class RemoteCache:
         self._subsets: dict[tuple[str, str], set[str]] = {}
         self._dl_cond = threading.Condition()
         self._dl_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # Change counters of the index: one per share (an entry of it added,
+        # dropped, retired or un-retired) and one for the whole cache (load,
+        # clear) — ``generation(share)``.  ``core.availability`` keys what
+        # still plays from an offline share on them.
+        self._gen_all = 0
+        self._share_gen: dict[str, int] = {}
         self._load_index()
         self._total_bytes = sum(e.get("size", 0) for e in self._index.values())
         for e in self._index.values():
             self._note_subset(e.get("share_id", ""), e.get("remote", ""))
         self._sweep_part_files()
+
+    def _touch(self, share_id: str | None) -> None:
+        """Count a change of *share_id*'s entries (see ``generation``)."""
+        sid = share_id or ""
+        self._share_gen[sid] = self._share_gen.get(sid, 0) + 1
+
+    def generation(self, share_id: str) -> tuple[int, int]:
+        """A value that changes whenever the cached entries of *share_id* (or
+        the whole cache) change — cheap, no lock needed for a read."""
+        return (self._gen_all, self._share_gen.get(share_id, 0))
+
+    def names_for_share(self, share_id: str) -> list[str]:
+        """The remote paths cached for *share_id* (whole files and archive
+        subsets alike), retired subsets left out — a snapshot."""
+        with self._mutex:
+            return [e.get("remote") or "" for e in self._index.values()
+                    if e.get("share_id") == share_id and not e.get("stale")]
 
     def _note_subset(self, share_id: str, remote_path: str) -> None:
         parts = _subset_parts(remote_path) if share_id and remote_path else None
@@ -401,6 +424,7 @@ class RemoteCache:
             # would have crashed the next ``.values()`` call — coerce to
             # an empty dict instead so init can't blow up here.
             self._index = loaded if isinstance(loaded, dict) else {}
+        self._gen_all += 1
 
     def _save_index(self) -> None:
         """Persist the index — best-effort, NEVER raises.
@@ -435,6 +459,7 @@ class RemoteCache:
             with self._mutex:
                 stale = self._index.pop(key, None)
                 if stale:
+                    self._touch(stale.get("share_id"))
                     self._total_bytes = max(
                         0, self._total_bytes - stale.get("size", 0),
                     )
@@ -460,6 +485,18 @@ class RemoteCache:
         with self._mutex:
             return key in self._index
 
+    def downloading(self, share_id: str, remote_path: str) -> bool:
+        """Is a download of *remote_path* running now (a ``fetch`` of the same
+        file then joins it instead of starting another)?"""
+        key = self._cache_key(share_id, remote_path)
+        with self._dl_cond:
+            if key in self._downloads:
+                return True
+            fut = self._bg_fetches.get(key)
+            if fut is not None and not fut.done():
+                return True
+            return any(dl.key == key for dl in self._active_dls)
+
     def validate_size(self, share_id: str, remote_path: str,
                       expected_size: int) -> None:
         """Drop the cached copy of *remote_path* — and the cached subsets of
@@ -484,6 +521,7 @@ class RemoteCache:
             whole = entry is not None and entry.get("size") != expected_size
             if whole:
                 self._index.pop(key)
+                self._touch(share_id)
                 self._total_bytes = max(0, self._total_bytes - entry.get("size", 0))
                 doomed.append(entry.get("local") or "")
             stale = self._mark_subsets_stale_locked(
@@ -516,6 +554,8 @@ class RemoteCache:
                 continue
             entry["stale"] = True
             n += 1
+        if n:
+            self._touch(share_id)
         return n
 
     def find_subset(self, share_id: str, zip_rel: str, first_member: str, *,
@@ -553,6 +593,7 @@ class RemoteCache:
         with self._mutex:
             entry = self._index.get(self._cache_key(share_id, remote_path))
             if entry is not None and entry.pop("stale", None):
+                self._touch(share_id)
                 self._save_index()
 
     def drop_stale_subsets(self, share_id: str, zip_rel: str, size: int,
@@ -735,6 +776,7 @@ class RemoteCache:
                 "fetched": now,
                 "last_access": now,
             }
+            self._touch(share_id)
             self._total_bytes += size - (int(prev.get("size", 0) or 0) if prev else 0)
         self._end_download(dl, final=local)
         return local
@@ -947,6 +989,7 @@ class RemoteCache:
                 "share_id": share_id, "remote": remote_path, "local": str(local),
                 "size": size, "fetched": now, "last_access": now,
             }
+            self._touch(share_id)
             self._total_bytes += size - (int(prev.get("size", 0) or 0) if prev else 0)
             self._note_subset(share_id, remote_path)
         self._evict_if_needed(protect_key=key)
@@ -994,6 +1037,7 @@ class RemoteCache:
                             and now - last_touch < _EVICTION_GRACE_S):
                         continue
                     self._index.pop(k)
+                    self._touch(entry.get("share_id"))
                     claimed += entry.get("size", 0)
                     victims.append((k, entry))
                 self._total_bytes = max(0, self._total_bytes - claimed)
@@ -1060,6 +1104,7 @@ class RemoteCache:
                     entries.append(e)
                     self._total_bytes = max(0, self._total_bytes - e.get("size", 0))
             if keys:
+                self._touch(share_id)
                 self._save_index()
         # Unlink outside the lock — slow filesystem mustn't stall other
         # concurrent fetches.
@@ -1106,6 +1151,7 @@ class RemoteCache:
             entries = list(self._index.values())
             self._index.clear()
             self._subsets.clear()
+            self._gen_all += 1
             # Reset the running counter too — otherwise total_size() keeps
             # reporting the pre-clear size and the next fetch trips eviction
             # immediately because the stale total exceeds _max_bytes.

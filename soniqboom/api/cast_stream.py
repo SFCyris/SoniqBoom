@@ -422,18 +422,36 @@ async def cast_stream(
             from soniqboom.core.filesource import get_source, parse_remote_path
             from soniqboom.core.remote_cache import get_cache
             scan_root, remote_path = parse_remote_path(track.path)
+            from soniqboom.core import catalogue
+            _is_cat = catalogue.is_catalogue_path(track.path)
             source = get_source(scan_root) if scan_root else None
-            if source is None:
+            if source is None and _is_cat:
+                cached = get_cache().get_cached(scan_root, remote_path)
+                if cached is None:
+                    raise HTTPException(
+                        503, f"{catalogue.label_of(scan_root) or scan_root} can't be "
+                             "reached right now — tunes played before still play.")
+                path_obj = cached
+            elif source is None:
                 raise HTTPException(503, "Network share unavailable.")
-            import asyncio
-            loop = asyncio.get_running_loop()
-            try:
-                path_obj = await loop.run_in_executor(
-                    None, get_cache().fetch, scan_root, remote_path, source,
-                )
-            except Exception as exc:
-                log.warning("cast: remote fetch failed for %s: %s", track.path, exc)
-                raise HTTPException(502, "Could not fetch remote source.")
+            else:
+                # The cast device playing a catalogue tune IS its play: open
+                # the tune's fetch window (core/catalogue.py).
+                if _is_cat and not catalogue.permit_play(track.path):
+                    raise HTTPException(429, "Too many new Modland downloads — "
+                                             "try again shortly.")
+                import asyncio
+                loop = asyncio.get_running_loop()
+                try:
+                    path_obj = await loop.run_in_executor(
+                        None, get_cache().fetch, scan_root, remote_path, source,
+                    )
+                except Exception as exc:
+                    log.warning("cast: remote fetch failed for %s: %s", track.path, exc)
+                    raise HTTPException(502, "Could not fetch remote source.")
+            if catalogue.is_catalogue_path(track.path):
+                from soniqboom.core import modland_catalog
+                modland_catalog.merge_after_play(track_id, path_obj)
         elif not path_obj.exists():
             raise HTTPException(410, "Source file no longer on disk.")
 

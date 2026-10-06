@@ -336,6 +336,9 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
     Returns the scan plan dict from the scanner (or an empty dict on
     early-skip / failure).
     """
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_path(scan_root):
+        return {}       # a catalogue root is never walked (core/catalogue.py)
     st = _reg.states.setdefault(scan_root, ShareState(scan_root=scan_root))
     now = time.time()
     # Seed the dry-spell clock so even a never-changing share relaxes toward
@@ -574,6 +577,9 @@ async def add_share(scan_root: str) -> None:
         return
     if not is_remote_path(scan_root):
         return
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_root(scan_root):
+        return          # index-managed: never polled (core/catalogue.py)
     _reg.tasks[scan_root] = asyncio.create_task(
         _share_poll_loop(scan_root),
         name=f"freshness.poll[{scan_root}]",
@@ -614,6 +620,9 @@ async def check_now(scan_root: str, *, reason: str = "user") -> dict:
     """
     if not is_remote_path(scan_root):
         return {}
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_path(scan_root):
+        return {}       # a catalogue root or folder: never walked (core/catalogue.py)
     # Ensure a state object exists even for shares we haven't auto-armed
     # (e.g. share was added since startup).
     _reg.states.setdefault(scan_root, ShareState(scan_root=scan_root))

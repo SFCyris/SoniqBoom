@@ -29,8 +29,8 @@ from test_subsonic_parity import _tr, env  # noqa: F401 — fixture
 
 # Search-box operator → filter_tracks kwarg.
 _OPERATORS = (
-    ("artist", "artist"),
-    ("album_artist", "album_artist"),
+    ("artist", "artist_match"),               # a word start in the name (GitHub #25)
+    ("album_artist", "album_artist_match"),
     ("album", "album"),
     ("game", "game"),
     ("genre", "genre"),
@@ -61,8 +61,8 @@ def test_mixed_operators_with_escapes_and_free_text():
     assert _roundtrip(
         r'artist:"Brace {Band}" album_artist:"Back\Slash" album:"}" game:"{Curly} Quest" '
         r'genre:"R{&}B" format:"x{y}" year:1990-1999 some loader') == {
-        "artist": "Brace {Band}",
-        "album_artist": "Back\\Slash",
+        "artist_match": "Brace {Band}",
+        "album_artist_match": "Back\\Slash",
         "album": "}",
         "game": "{Curly} Quest",
         "genre": "R{&}B",
@@ -72,7 +72,7 @@ def test_mixed_operators_with_escapes_and_free_text():
         "query": "some loader",
     }
     # A value ending in a backslash does not swallow the next term's brace.
-    assert _roundtrip(r'artist:"x\" album:"{y}"') == {"artist": "x\\", "album": "{y}"}
+    assert _roundtrip(r'artist:"x\" album:"{y}"') == {"artist_match": "x\\", "album": "{y}"}
     # Unquoted values escape the same way.
     assert _roundtrip("game:a}b genre:{c") == {"game": "a}b", "genre": "{c"}
 
@@ -91,7 +91,7 @@ def test_every_tag_field_unescapes_the_builder_output(field, kwarg):
 
 
 def test_an_unescaped_brace_still_closes_the_value():
-    assert _roundtrip("artist:x bar}") == {"artist": "x", "query": "bar}"}
+    assert _roundtrip("artist:x bar}") == {"artist_match": "x", "query": "bar}"}
     assert _parse_tag_query(r"@artist_tag:{x} a\-b") == {"artist": "x", "query": "a-b"}
     # Malformed input (unterminated, or a raw "{" _esc_tag never emits) is
     # left as free text rather than parsed as a tag.
@@ -177,7 +177,7 @@ async def test_structured_filter_and_format_list_use_the_same_escapes(store):
     got = await search_api.filter_tracks(**dict(common, album_artist="Back\\Slash"))
     assert _ids(got) == {"brace"}
     resp = await tracks_api.list_tracks(limit=50, offset=0, format="Tracker{X}",
-                                        sort=None, order=None)
+                                        sort=None, order=None, untagged=None)
     assert _ids(json.loads(resp.body)) == {"close"}
 
 

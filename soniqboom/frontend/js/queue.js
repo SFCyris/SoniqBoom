@@ -7,6 +7,11 @@
  */
 import { Player } from './player.js';
 import { artPlaceholderEmoji } from './utils.js';
+import { offlineKind, offlineBadgeHTML } from './offline.js';
+
+// A row's identity for the "nothing changed" check: the track, and whether it
+// is marked offline (offline.js re-flags rows in place).
+const _rowKey = (t) => (t ? `${t.id}${t.offline ? '\u0000o' : ''}` : t);
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel    = document.getElementById('queue-panel');
@@ -220,12 +225,12 @@ function refresh() {
   // Same tracks in the same order as the rows on screen → only the playing
   // marker moved (every track change emits 'queuechange').  The spot-update is
   // ~100× cheaper than a rebuild at 260 rows and re-requests no cover art.
-  if (_renderedIds && _renderedIds.length === q.length && q.every((t, i) => (t && t.id) === _renderedIds[i])
+  if (_renderedIds && _renderedIds.length === q.length && q.every((t, i) => _rowKey(t) === _renderedIds[i])
       && !_statusRowShown) {
     _renumber();
     return;
   }
-  _renderedIds = q.map(t => t && t.id);
+  _renderedIds = q.map(_rowKey);
 
   listEl.innerHTML = '';
 
@@ -240,7 +245,8 @@ function refresh() {
 
   q.forEach((track, i) => {
     const row = document.createElement('div');
-    row.className = 'queue-row' + (i === idx ? ' playing' : '');
+    const offKind = offlineKind(track);
+    row.className = 'queue-row' + (i === idx ? ' playing' : '') + (offKind ? ' track-offline' : '');
     row.dataset.idx = i;
     // Drag is gated to the handle only — see _enableHandleDrag below.  This
     // keeps scroll/select gestures on the row body from accidentally
@@ -268,7 +274,7 @@ function refresh() {
       <span class="queue-playing-icon">${i === idx ? '&#9654;' : ''}</span>
       ${artHtml}
       <div class="queue-track-info">
-        <span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>
+        <span class="queue-track-titlerow"><span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${offKind ? offlineBadgeHTML(offKind) : ''}</span>
         <span class="queue-track-artist">${esc(track.artist || track.album_artist || '')}</span>
       </div>
       <span class="queue-track-dur">${fmtDur(track.duration)}</span>

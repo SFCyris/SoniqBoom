@@ -54,7 +54,7 @@ def _write_dump(tmp_path):
 
 
 def test_the_index_keeps_game_soundtracks_of_composers(tmp_path):
-    *_rest, music_games = demozoo._parse_dump(_write_dump(tmp_path))
+    music_games = demozoo._parse_dump(_write_dump(tmp_path))[4]
     assert sorted(music_games) == [
         ("300", "dangerous rick", "Rick Dangerous"),
         ("300", "dangerous rick", "Rick Dangerous (Playable Demo)"),

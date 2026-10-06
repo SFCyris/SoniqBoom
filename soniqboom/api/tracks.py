@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response
 
-from soniqboom.core import forksafe
+from soniqboom.core import forksafe, procinfo
 from soniqboom.core.filesource import is_remote_path
 
 # Dedicated thread-pool for ``_compute_waveform`` — that helper spawns a
@@ -26,8 +26,12 @@ from soniqboom.core.filesource import is_remote_path
 # time.  Letting it share the default executor with AOF flush + art reads
 # led to flush starvation under 5 concurrent users (Perf #1).  Sized
 # small so a flood of waveform requests can't drown the rest of the app.
+def _waveform_workers() -> int:
+    return max(2, min(4, procinfo.usable_cpus() // 2))
+
+
 _WAVEFORM_POOL = ThreadPoolExecutor(
-    max_workers=max(2, min(4, (os.cpu_count() or 4) // 2)),
+    max_workers=_waveform_workers(),
     thread_name_prefix="sb-waveform",
 )
 
@@ -615,7 +619,8 @@ class _TagUpdate(_BaseModel):
 
 from soniqboom.api.users import (
     require_user as _require_user, require_edit as _require_edit,
-    require_admin as _require_admin,
+    require_admin as _require_admin, current_user as _current_user,
+    has_edit_role as _has_edit_role,
 )
 
 
@@ -670,6 +675,14 @@ async def _refresh_rows(track_id: str) -> None:
     """An edited track's cached folder-browse row (and the album aggregation
     cache) is refreshed like an enrichment pass's — else the Folders view
     shows the old values until its music folder changes."""
+    try:
+        # The derived genres follow the edit at once (a typed genre withdraws
+        # them, a typed game names it) — not a pass later.
+        from soniqboom.core import genre_derive
+        genre_derive.rederive_now([track_id])
+    except Exception:                                   # noqa: BLE001
+        logging.getLogger(__name__).debug("derived-genre refresh after an edit failed",
+                                          exc_info=True)
     try:
         from soniqboom.core.folder_album import refresh_album_caches
         await refresh_album_caches([track_id])
@@ -804,7 +817,7 @@ async def update_meta(track_id: str, body: _MetaUpdate, user=_Depends(_require_e
     sf = t.get("songdb_fields") or []
     if any(f in edited for f in sf):
         updates["songdb_fields"] = [f for f in sf if f not in edited] or None
-    before = {k: t.get(k) for k in ("game", "game_source", "game_aliases")}
+    before = {k: t.get(k) for k in ("game", "game_source", "game_aliases", "genre_derived")}
     store.update_track_fields(track_id, updates)
     await _refresh_rows(track_id)
     # The game (and its other names) a retro album implies
@@ -901,10 +914,19 @@ def _remember_lyrics_miss(track_id: str) -> None:
     _lyrics_miss[track_id] = time.monotonic() + _LYRICS_MISS_TTL_S
 
 
+# Tracks whose cached lyrics were fetched online by a lookup that must not
+# write tags (a Subsonic client — ``resolve_lyrics(writeback=False)``): the
+# next web lookup that is served from the cache still offers them to the
+# ``lyrics_writeback`` step, as a fresh online fetch would have.  A subset of
+# ``_lyrics_cache``'s keys, cleared with it.
+_lyrics_wb_pending: set[str] = set()
+
+
 def _forget_lyrics(track_id: str) -> None:
     """Drop cached lyrics — found or not — for a track whose tags changed."""
     _lyrics_cache.pop(track_id, None)
     _lyrics_miss.pop(track_id, None)
+    _lyrics_wb_pending.discard(track_id)
 
 
 def _remember_lyrics(track_id: str, result: dict) -> dict:
@@ -912,6 +934,7 @@ def _remember_lyrics(track_id: str, result: dict) -> dict:
     if result.get("lyrics"):
         if len(_lyrics_cache) >= _LYRICS_CACHE_MAX:
             _lyrics_cache.clear()          # simple bound — cheap, rare
+            _lyrics_wb_pending.clear()
         _lyrics_cache[track_id] = result
     return result
 
@@ -929,7 +952,17 @@ def clear_lyrics_cache() -> int:
     n = len(_lyrics_cache)
     _lyrics_cache.clear()
     _lyrics_miss.clear()
+    _lyrics_wb_pending.clear()
     return n
+
+
+async def _writeback_on() -> bool:
+    """Is the ``lyrics_writeback`` setting on?"""
+    try:
+        from soniqboom.core.data import get_config
+        return bool(await get_config("lyrics_writeback", False))
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 async def _maybe_writeback_lyrics(track, lyrics_text: str) -> None:
@@ -1104,8 +1137,26 @@ async def list_tracks(
             "asc for every other key."
         ),
     ),
+    playable: bool = False,
+    after: str | None = None,
+    untagged: str | None = Query(
+        None, pattern="^(artist|album_artist|album|genre)$",
+        description=(
+            "Only tracks whose tag of this name is blank — the drill-down of the "
+            "library's \"[No Artist]\" / \"[No Album Artist]\" buckets, whose "
+            "counts are the length of this list."
+        ),
+    ),
 ):
     """Return all tracks (paginated), sorted by added_at desc by default.
+
+    ``playable=1`` is for the play queue: it leaves out the tracks that can't
+    play right now (Settings → Tracks on unavailable drives: Mark / Hide) and
+    answers ``{tracks, next_offset, ended}``, each row carrying its list
+    position as ``_pos``; ``after=<track id>`` starts right after that track
+    (the queue re-anchors so once Hide mode's list changed length).
+    Otherwise rows of such tracks carry ``offline`` (Mark) or are left out
+    (Hide).
 
     The All Tracks windowed view passes ``sort=<col>&order=<asc|desc>`` to
     drive the per-column lexical / numeric sort indexes maintained by the
@@ -1133,10 +1184,32 @@ async def list_tracks(
     # identical to the response_model path — we just trade this endpoint's
     # OpenAPI schema for the speed.  See data.ft_search_dicts.  (``json_bytes``:
     # a lone surrogate in one path no longer 500s the page.)
+    from soniqboom.core import availability
+    from soniqboom.core.store import get_store
+    store = get_store()
+    # "Tracks on unavailable drives": Hide leaves them out of the list (the
+    # count endpoint agrees), Mark flags them (``offline``), Show does neither.
+    # With duplicates hidden, Mark / Hide list a group whose primary can't play
+    # by its best playable member (``swap``).
+    excl = availability.hidden(store)
+    hide_dups = bool(store.get_config("filter_duplicates", False))
+    swap = availability.primary_swap(store, dedup=hide_dups)
+    if playable:
+        from soniqboom.core.data import _parse_tag_query
+        parsed = _parse_tag_query(query)
+        page = await availability.player_page_async(
+            lambda off, lim: store.filter_tracks(
+                **parsed, limit=lim, offset=off, filter_duplicates=hide_dups,
+                sort_by=sort_by, sort_order=sort_order, exclude=excl,
+                untagged=untagged, swap=swap),
+            offset, limit, store, after=after)
+        return Response(content=json_bytes(page), media_type="application/json")
     dicts = await ft_search_dicts(
         query, limit=limit, offset=offset,
-        sort_by=sort_by, sort_order=sort_order,
+        sort_by=sort_by, sort_order=sort_order, exclude=excl, untagged=untagged,
+        swap=swap,
     )
+    dicts = availability.mark_rows(dicts, store)
     return Response(content=json_bytes(dicts), media_type="application/json")
 
 
@@ -1146,16 +1219,48 @@ async def count_tracks():
 
     ``count`` is the raw number of indexed tracks.  ``visible`` is how many rows
     the All-Tracks LIST actually serves: with the "hide duplicates" setting on,
-    ``GET /api/tracks`` returns duplicate-group primaries only, so a list sized
-    from ``count`` would end in rows that never load.  Size lists from
-    ``visible``.
+    ``GET /api/tracks`` returns one track per duplicate group (its primary, or
+    the member standing in for a primary that can't play), and with
+    "Tracks on unavailable drives: Hide" it leaves out the tracks that can't
+    play right now, so a list sized from ``count`` would end in rows that never
+    load.  Size lists from ``visible``.
     """
+    from soniqboom.core import availability
     from soniqboom.core.store import get_store
     store = get_store()
     total = await track_count()
     hide_dups = bool(store.get_config("filter_duplicates", False))
-    return {"count": total,
-            "visible": store.primary_track_count() if hide_dups else total}
+    visible = store.visible_track_count(primary_only=hide_dups,
+                                        exclude=availability.hidden(store),
+                                        swap=availability.primary_swap(store, dedup=hide_dups))
+    return {"count": total, "visible": visible}
+
+
+def _shown_slots(store, page_ids: list[str], swap, preds: dict) -> list[str]:
+    """``page_ids`` — a slice of a shuffle order dealt with duplicates hidden —
+    with each duplicate group's slot holding the member the deduped list
+    shows now (``TrackStore.shown_member``): a primary that can't play hands
+    its slot to its stand-in, and a stand-in whose primary plays again hands
+    it back.  The order itself is never re-dealt.  A member outside the
+    shuffle's filter (an MP3 standing in during a FLAC-only shuffle) takes no
+    slot — the dealt track stays (and is skipped while it can't play)."""
+    shown = {i: m for i, tid in enumerate(page_ids)
+             if (m := store.shown_member(tid, swap)) != tid}
+    if not shown:
+        return page_ids
+    if preds:
+        # (Only for a page with a replacement: an index intersection, like a deal.)
+        allowed = store._candidate_ids(**preds)
+        if allowed is not None:
+            shown = {i: m for i, m in shown.items() if m in allowed}
+    out: list[str] = []
+    seen: set[str] = set()
+    for i, tid in enumerate(page_ids):
+        tid = shown.get(i, tid)
+        if tid not in seen:             # (a group dealt twice across a re-pick: once)
+            seen.add(tid)
+            out.append(tid)
+    return out
 
 
 @router.get("/shuffled")
@@ -1210,6 +1315,18 @@ async def shuffled_tracks(
         if val is not None and val != "":
             preds[name] = val
 
+    # A shuffle deals only what can play right now ("Tracks on unavailable
+    # drives": Mark / Hide): the order is dealt without those tracks.  Like a
+    # track added meanwhile, a drive that comes back mid-session joins the next
+    # shuffle; one that goes away has its tracks skipped page by page (below).
+    # Nothing availability-related is in the key: a re-deal mid-session would
+    # shift every later position (repeats, misses).  With duplicates hidden, a
+    # group whose primary can't play is dealt by its best playable member
+    # (``swap``), and on later pages each dealt group's slot holds the member
+    # the deduped list shows NOW (``_shown_slots``).
+    from soniqboom.core import availability
+    skip = availability.unplayable(store)
+    swap = availability.primary_swap(store, dedup=hide_dups)
     # No store version in the key — see ``shuffle_order``: a seed belongs to one
     # shuffle session, the order is mutation-stable, and ids deleted since are
     # skipped below.
@@ -1222,13 +1339,18 @@ async def shuffled_tracks(
         # O(N) passes — tens of ms on a 260 K library).  The hash+sort of that
         # SNAPSHOT (~150 ms, once per seed+filter) runs in a worker thread so the
         # loop keeps getting slices; later pages are O(limit).
-        ids_snapshot = store.filter_track_ids(filter_duplicates=hide_dups, **preds)
+        ids_snapshot = store.filter_track_ids(filter_duplicates=hide_dups, swap=swap, **preds)
+        if skip:
+            ids_snapshot = [t for t in ids_snapshot if t not in skip]
         order = await asyncio.to_thread(
             shuffle_order.cached_order, cache_key, lambda: ids_snapshot, seed)
 
     total = len(order)
     page_ids = order[offset: offset + limit]
-    tracks = [store._meta_dict(tid) for tid in page_ids if tid in store._tracks]
+    if hide_dups:
+        page_ids = _shown_slots(store, page_ids, swap, preds)
+    tracks = [store._meta_dict(tid) for tid in page_ids
+              if tid in store._tracks and not (skip and tid in skip)]
     return Response(
         content=json_bytes({"total": total, "seed": seed, "offset": offset,
                             "tracks": tracks}),
@@ -1283,11 +1405,32 @@ async def batch_tracks(body: dict):
     ids = body.get("ids", [])
     if not isinstance(ids, list):
         raise HTTPException(422, "ids must be a list")
+    from soniqboom.core import availability
     from soniqboom.core.store import get_store
     # A non-string id can't name a track — skipped like an unknown one (an
-    # unhashable one used to 500 the whole batch).
-    return public_tracks(get_store().get_tracks_batch(
-        [tid for tid in ids[:5000] if isinstance(tid, str)]))
+    # unhashable one used to 500 the whole batch).  Rows of tracks that can't
+    # play right now carry ``offline`` (never left out: the caller asked for them).
+    return availability.mark_rows(public_tracks(get_store().get_tracks_batch(
+        [tid for tid in ids[:5000] if isinstance(tid, str)])))
+
+
+@json_route(router, "/meta/availability", methods=("POST",))
+async def tracks_availability(body: dict):
+    """Which of these track ids can't play right now — for a client to
+    re-check rows it holds (the play queue) after the availability changed.
+
+    Body ``{"ids": [...]}`` (≤ 5000).  Answer ``{"mode", "token", "offline":
+    {id: "drive" | "share" | "catalogue"}}`` — the ids that are offline, in any
+    mode (``mode`` says what the UI does with them)."""
+    from soniqboom.core import availability
+    from soniqboom.core.store import get_store
+    ids = body.get("ids", []) if isinstance(body, dict) else []
+    if not isinstance(ids, list):
+        raise HTTPException(422, "ids must be a list")
+    store = get_store()
+    m = availability.mode(store)
+    return {"mode": m, "token": availability.token(store),
+            "offline": availability.offline_kinds(ids[:5000], store)}
 
 
 @json_route(router, "/{track_id}")
@@ -1296,11 +1439,12 @@ async def read_track(track_id: str):
     output); 404 when unknown or when ``TrackMeta`` rejects its stored row, as
     the old ``get_track`` → ``Track(**d)`` did (that one also 404'd a row whose
     only fault was a malformed embedding, which is now served)."""
+    from soniqboom.core import availability
     from soniqboom.core.store import get_store
     track = public_track(get_store().get_track(track_id))
     if track is None:
         raise HTTPException(404, "Track not found")
-    return track
+    return availability.mark_rows([track])[0]
 
 
 @router.delete("/{track_id}")
@@ -2327,13 +2471,34 @@ async def _resolve_online_lyrics(artist, title, album, duration):
 
 
 @router.get("/{track_id}/lyrics")
-async def get_lyrics(track_id: str):
+async def get_lyrics(track_id: str, user=_Depends(_current_user)):
     """Return lyrics: embedded tags first, then the online providers
-    (LRCLib + lyrics.ovh) tried fastest-first (see ``probe_lyrics_providers``)."""
+    (LRCLib + lyrics.ovh) tried fastest-first (see ``probe_lyrics_providers``).
+    The web player's lookup: lyrics found online may be written into the file
+    (the ``lyrics_writeback`` setting, ``_maybe_writeback_lyrics``) — only for
+    a user with tag-editing rights (``require_edit``'s roles); a read-only
+    user gets the lyrics and no file is written."""
+    return await resolve_lyrics(track_id, writeback=_has_edit_role(user))
+
+
+async def resolve_lyrics(track_id: str, *, writeback: bool) -> dict:
+    """The lyrics lookup behind ``get_lyrics``.  ``writeback`` False (the
+    Subsonic endpoints) never writes a tag into a file, whatever the
+    ``lyrics_writeback`` setting says — a client syncing a whole library
+    would otherwise rewrite thousands of files; its online result is cached
+    and offered to the write-back step by the next web lookup instead
+    (``_lyrics_wb_pending``).  So is an online result fetched while the
+    setting is off: switched on later, the next web lookup offers it."""
     # 0. Serve a previously-resolved result instantly (and independently of
     # LRCLib's current health) — see ``_lyrics_cache``.
     cached = _lyrics_cache.get(track_id)
     if cached is not None:
+        if writeback and track_id in _lyrics_wb_pending and await _writeback_on():
+            if track_id in _lyrics_wb_pending:       # (another lookup may have taken it)
+                _lyrics_wb_pending.discard(track_id)
+                track = await get_track(track_id)
+                if track:
+                    await _maybe_writeback_lyrics(track, cached["lyrics"])
         return cached
     if _lyrics_miss.get(track_id, 0.0) > time.monotonic():
         return {"lyrics": None, "synced": False, "source": None}
@@ -2393,8 +2558,13 @@ async def get_lyrics(track_id: str):
 
     online, clean = await _resolve_online_lyrics(artist, title, album, track.duration)
     if online:
-        await _maybe_writeback_lyrics(track, online["lyrics"])
-        return _remember_lyrics(track_id, online)
+        wrote = writeback and await _writeback_on()
+        if wrote:
+            await _maybe_writeback_lyrics(track, online["lyrics"])
+        result = _remember_lyrics(track_id, online)
+        if not wrote and _lyrics_cache.get(track_id) is result:
+            _lyrics_wb_pending.add(track_id)
+        return result
     if clean and path is not None:
         # Only a full answer is remembered: every provider said "not found"
         # AND the file's own tags were readable (a remote track whose file
@@ -2937,16 +3107,26 @@ async def get_track_waveform(track_id: str, response: Response,
             from soniqboom.core.filesource import get_source, parse_remote_path
             from soniqboom.core.remote_cache import get_cache
             scan_root, remote_path = parse_remote_path(path_str)
+            from soniqboom.core import catalogue
+            if not catalogue.fetch_ok(path_str, "stream"):
+                # A catalogue tune not fetched (by its play) yet: ask again.
+                return {"waveform": None, "pending": True}
             source = get_source(scan_root) if remote_path else None
-            if source is None:
+            _cat_copy = (get_cache().get_cached(scan_root, remote_path)
+                         if source is None and catalogue.is_catalogue_path(path_str)
+                         else None)
+            if _cat_copy is not None:
+                src_for_waveform = str(_cat_copy)     # (its archive is unreachable)
+            elif source is None:
                 raise HTTPException(503, "Network share unavailable")
-            try:
-                # In a worker thread: a download on the event loop stalled
-                # every other request for its whole duration.
-                src_for_waveform = str(await asyncio.get_running_loop().run_in_executor(
-                    None, get_cache().fetch, scan_root, remote_path, source))
-            except Exception as exc:        # noqa: BLE001 — surface fetch failure
-                raise HTTPException(502, f"Could not fetch remote file: {exc}")
+            else:
+                try:
+                    # In a worker thread: a download on the event loop stalled
+                    # every other request for its whole duration.
+                    src_for_waveform = str(await asyncio.get_running_loop().run_in_executor(
+                        None, get_cache().fetch, scan_root, remote_path, source))
+                except Exception as exc:        # noqa: BLE001 — surface fetch failure
+                    raise HTTPException(502, f"Could not fetch remote file: {exc}")
         else:
             src_for_waveform = path_str
         result = await _compute_waveform_safe(src_for_waveform)
@@ -2996,14 +3176,21 @@ async def get_track_waveform(track_id: str, response: Response,
         scan_root, remote_path = parse_remote_path(path_str)
         if not remote_path:
             raise HTTPException(400, "Remote path is malformed")
+        from soniqboom.core import catalogue
+        if not catalogue.fetch_ok(path_str, "stream"):
+            # A catalogue tune not fetched (by its play) yet: ask again.
+            return {"waveform": None, "pending": True}
         source = get_source(scan_root)
-        if source is None:
-            raise HTTPException(503, "Network share unavailable")
-        try:
-            local_path = await asyncio.get_running_loop().run_in_executor(
-                None, get_cache().fetch, scan_root, remote_path, source)
-        except Exception as exc:
-            raise HTTPException(502, f"Could not fetch remote file: {exc}")
+        local_path = (get_cache().get_cached(scan_root, remote_path)
+                      if source is None and catalogue.is_catalogue_path(path_str) else None)
+        if local_path is None:
+            if source is None:
+                raise HTTPException(503, "Network share unavailable")
+            try:
+                local_path = await asyncio.get_running_loop().run_in_executor(
+                    None, get_cache().fetch, scan_root, remote_path, source)
+            except Exception as exc:
+                raise HTTPException(502, f"Could not fetch remote file: {exc}")
         result = await _compute_waveform_safe(str(local_path))
         stored, response = _normalise_waveform(result)
         if not _waveform_is_blank(stored):

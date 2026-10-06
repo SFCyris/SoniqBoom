@@ -461,6 +461,110 @@ class SubsonicState:
         if self._ensure_loaded()["users"].pop(uid, None) is not None:
             await self.save()
 
+    async def remap_ids(self, mapping: dict[str, str]) -> int:
+        """Move every user's album / artist stars and ratings from the old ids
+        in ``mapping`` to their new ids (a library repair that changed the
+        names those ids hash — ``repair.repair_multi_values_once``).  An item
+        starred under both keeps the earlier star; a rating already on the new
+        id is kept.  Returns the number of entries moved."""
+        mapping = {o: n for o, n in (mapping or {}).items() if o and n and o != n}
+        if not mapping:
+            return 0
+        moved = 0
+        for u in list(self._ensure_loaded()["users"].values()):
+            if not isinstance(u, dict):
+                continue
+            for section, kinds, stamp in (("starred", ("album", "artist"), "starred_changed"),
+                                          ("ratings", RATING_KINDS, "ratings_changed")):
+                sec = u.get(section)
+                if not isinstance(sec, dict):
+                    continue
+                for kind in kinds:
+                    b = sec.get(kind)
+                    if not isinstance(b, dict):
+                        continue
+                    olds = [k for k in b if k in mapping]
+                    for old in olds:
+                        v = b.pop(old)
+                        new = mapping[old]
+                        if section == "starred" and new in b:
+                            b[new] = min(_num(b[new]), _num(v))
+                        elif new not in b:
+                            b[new] = v
+                        moved += 1
+                    if olds:
+                        ch = u.get(stamp)
+                        if not isinstance(ch, dict):
+                            ch = u[stamp] = {}
+                        prev = int(_num(ch.get(kind)))
+                        now = int(time.time() * 1000)
+                        ch[kind] = now if now > prev else prev + 1
+        if moved:
+            await self.save()
+        return moved
+
+    async def remap_track_ids(self, mapping: dict[str, str]) -> int:
+        """Move every user's song stars, play-queue entries and bookmarks from
+        the old track ids in ``mapping`` to the new ones (a moved / renamed
+        file — ``core/modland_catalog``'s changelog refresh).  A tune id
+        ``<track>~<n>`` moves with its track.  All the old ids move at once
+        (rename chains, swaps); an old id's star or bookmark replaces the new
+        id's, and nothing else is touched — applying a mapping again (a redone
+        move) changes nothing.  Returns the entries moved."""
+        mapping = {o: n for o, n in (mapping or {}).items()
+                   if isinstance(o, str) and isinstance(n, str) and o and n and o != n}
+        if not mapping:
+            return 0
+
+        def _new(key):
+            if not isinstance(key, str):
+                return None
+            base, sep, tune = key.partition("~")
+            n = mapping.get(base)
+            return (n + sep + tune) if n is not None else None
+
+        def _shift(d: dict) -> int:
+            moving = {k: d.pop(k) for k in list(d) if _new(k)}
+            for k, v in moving.items():
+                d[_new(k)] = v
+            return len(moving)
+
+        moved = 0
+        changed = False
+        for u in list(self._ensure_loaded()["users"].values()):
+            if not isinstance(u, dict):
+                continue
+            st = u.get("starred")
+            songs = st.get("song") if isinstance(st, dict) else None
+            if isinstance(songs, dict):
+                n = _shift(songs)
+                moved += n
+                if n:
+                    ch = u.get("starred_changed")
+                    if not isinstance(ch, dict):
+                        ch = u["starred_changed"] = {}
+                    prev = int(_num(ch.get("song")))
+                    now = int(time.time() * 1000)
+                    ch["song"] = now if now > prev else prev + 1
+            q = u.get("queue")
+            if isinstance(q, dict):
+                ids = q.get("ids")
+                if isinstance(ids, list):
+                    fresh = [_new(i) or i for i in ids]
+                    if fresh != ids:
+                        moved += sum(1 for a, b in zip(ids, fresh) if a != b)
+                        q["ids"] = fresh
+                cur = _new(q.get("current"))
+                if cur:
+                    q["current"] = cur
+                    changed = True
+            b = u.get("bookmarks")
+            if isinstance(b, dict):
+                moved += _shift(b)
+        if moved or changed:
+            await self.save()
+        return moved
+
     async def delete_bookmark(self, uid: str, track_id: str) -> bool:
         u = self._user(uid, create=False)
         b = (u or {}).get("bookmarks")

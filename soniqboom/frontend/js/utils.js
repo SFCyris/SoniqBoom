@@ -12,7 +12,7 @@
 // gives every module a single line of error feedback.
 let _toastHost = null;
 function _ensureToastHost() {
-  if (_toastHost) return _toastHost;
+  if (_toastHost) { _dockToastHost(); return _toastHost; }
   _toastHost = document.createElement('div');
   _toastHost.className = 'sb-toast-host';      // mobile.css re-docks it (see there)
   // Two PERSISTENT live regions inside a plain container.  A region has to be in
@@ -23,7 +23,7 @@ function _ensureToastHost() {
     'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);'
     + 'display:flex;flex-direction:column;gap:0;align-items:center;'   // spacing lives on the toasts (an empty live region must not add a gap)
     // z-index 100000 puts Toast above the playlist/restart modals
-    // (10000) and admin overlay (8000) — Visual-Test #1 caught the
+    // (10000) and admin overlay (999) — Visual-Test #1 caught the
     // inversion where Toast.error during a playlist-rename was invisible
     // because the modal backdrop sat on top.
     + 'z-index:100000;pointer-events:none;'
@@ -39,7 +39,48 @@ function _ensureToastHost() {
   _toastHost._polite = region('status', 'polite');
   _toastHost._alert  = region('alert', 'assertive');
   document.body.appendChild(_toastHost);
+  _dockToastHost();
   return _toastHost;
+}
+
+// Desktop: sit just ABOVE the player bar, not on it.  At bottom:24px the toasts
+// covered the bar's centre — prev / play / next — for the 5 s an error shows
+// (while the error itself says "Press Next to move on").  The bar's height is not
+// a constant (it wraps at ≤900px, grows by the safe-area inset), so measure it,
+// and follow it while it resizes.  The "new version — Refresh" banner (app.js)
+// floats in that same spot while it is up, so then go above the banner.  Only
+// while the bar can be clicked, though: with Settings or a dialog over it there
+// is nothing to keep clear, and low down a toast stays off the dialog's own
+// controls.  Measured again for every toast (and by Toast.redock).  The phone
+// shell has no #player-bar (mobile.css re-docks the host there, !important);
+// with the bar hidden the 24px stays.
+let _toastDockObs = null;
+function _dockToastHost() {
+  const bar = _toastHost && document.getElementById('player-bar');
+  if (!bar) return;
+  if (!_toastDockObs && typeof ResizeObserver === 'function') {
+    _toastDockObs = new ResizeObserver(() => _dockToastHost());
+    _toastDockObs.observe(bar, { box: 'border-box' });   // the safe-area inset is padding
+  }
+  let top = Infinity;
+  const r = bar.getBoundingClientRect();
+  if (r.height > 0 && r.top > 0 && _barTakesClicks(bar, r)) {
+    top = r.top;
+    const p = document.getElementById('sb-update-prompt');
+    const q = p && p.getBoundingClientRect();
+    if (q && q.height > 0 && q.top > 0) top = Math.min(top, q.top);
+  }
+  const above = top < Infinity ? Math.ceil(window.innerHeight - top) + 12 : 0;
+  _toastHost.style.bottom = `${Math.max(24, above)}px`;
+}
+
+// Would a click at the bar's centre reach it?  An offer toast there doesn't
+// count (it is what docking moves away); plain toasts aren't hit at all.
+function _barTakesClicks(bar, r) {
+  if (typeof document.elementsFromPoint !== 'function') return true;
+  const hit = document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+    .find((el) => !_toastHost.contains(el));
+  return !hit || bar.contains(hit);
 }
 
 // Coalesce identical toasts that arrive within a 2s window: a backend
@@ -97,10 +138,13 @@ function _emitToast(kind, msg) {
     : kind === 'warn' ? '#6b5310'
     : kind === 'ok'   ? '#1f5c34'   // success green — matches the info/warn/error dark palette
     : '#1f3f7a';
+  // pointer-events:none — a plain toast has nothing to click, so a click on it
+  // lands on whatever it covers (a track row, a dialog's button).  Only an offer
+  // toast (Toast.action) takes the pointer: its buttons, and hover-to-pause.
   el.style.cssText = (
     `background:${bg};color:#fff;padding:10px 16px;border-radius:6px;`
     + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);font:13px/1.4 system-ui,sans-serif;'
-    + 'max-width:520px;overflow-wrap:anywhere;pointer-events:auto;opacity:0;transition:opacity 180ms;'
+    + 'max-width:520px;overflow-wrap:anywhere;pointer-events:none;opacity:0;transition:opacity 180ms;'
     + 'display:flex;align-items:center;gap:6px;margin-top:8px;'
   );
   // Errors are announced immediately (assertive region); everything else politely.
@@ -221,6 +265,8 @@ export const Toast = {
   action: (msg, label, onAction, ms) => _emitActionToast(msg, label, onAction, ms),
   // Close a toast early (e.g. an offer that no longer applies).
   dismiss: (el) => _dismissToast(el),
+  // Measure again where the toasts sit (the update banner came or went).
+  redock: () => _dockToastHost(),
 };
 
 

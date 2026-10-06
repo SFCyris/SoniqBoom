@@ -5,6 +5,7 @@
  * _common.js — Shared row builder + helpers for mobile views.
  */
 import { artPlaceholderEmoji } from '../../utils.js';
+import { offlineKind, offlineBadge } from '../../offline.js';
 
 export function esc(s) {
   return String(s ?? '')
@@ -72,20 +73,27 @@ export function buildTrackRow(track, opts = {}) {
   meta.className = 'm-row-meta';
   const title  = document.createElement('div');
   title.className = 'm-row-title';
-  // Health badge for a known playback defect — only defective rows (rare) take
-  // the flex layout so the common path keeps its plain ellipsised text.
+  // Health badge for a known playback defect, "offline" for a track that can't
+  // play right now — only badged rows (rare) take the flex layout so the common
+  // path keeps its plain ellipsised text.
   const _dfct = (track.defect === 'partial' || track.defect === 'corrupt')
     ? track.defect : '';
-  if (_dfct) {
+  const _off = offlineKind(track);
+  if (_off) row.classList.add('track-offline');
+  if (_dfct || _off) {
     title.classList.add('m-row-title--badged');
     const ttlText = document.createElement('span');
     ttlText.className = 'm-row-title-text';
     ttlText.textContent = track.title || '—';
-    const badge = document.createElement('span');
-    badge.className = `track-defect-badge track-defect-${_dfct}`;
-    badge.textContent = _dfct;
-    badge.title = track.defect_detail || '';
-    title.append(ttlText, badge);
+    title.append(ttlText);
+    if (_dfct) {
+      const badge = document.createElement('span');
+      badge.className = `track-defect-badge track-defect-${_dfct}`;
+      badge.textContent = _dfct;
+      badge.title = track.defect_detail || '';
+      title.append(badge);
+    }
+    if (_off) title.append(offlineBadge(_off));
   } else {
     title.textContent = track.title || '—';
   }

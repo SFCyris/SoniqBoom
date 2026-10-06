@@ -1223,3 +1223,334 @@ test('a page request that never answers times out: the start fails cleanly, a st
   assert.ok(p.queue.length > len, 'the timed-out lookahead could not be retried');
   assert.notEqual(p.current.id, stuckAt);
 });
+
+// ── "Tracks on unavailable drives" (Mark / Hide): the queue passes offline tracks by ──
+
+const offlineRows = (from, count, offline) =>
+  rows(from, count).map((t, k) => (offline.has(from + k) ? { ...t, offline: 'drive' } : t));
+
+test('offline skip: list-order play passes flagged rows by and never starts one', async () => {
+  const srv = makeServer(400);
+  for (const i of [3, 4, 5, 9, 120, 121]) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(offlineRows(0, 100, srv.offline), 0, { source: { ...SOURCE(400), offset: 0 } });
+  await p.settle();
+  await pressNext(p, 150);
+  const played = p.env.plays;
+  assert.ok(played.every((id) => !srv.offline.has(Number(id.slice(1)))), `an offline track was started: ${played}`);
+  const expect = Array.from({ length: 400 }, (_, i) => i).filter((i) => !srv.offline.has(i)).slice(0, 151).map(tid);
+  assert.deepEqual(played, expect);
+  // list positions stay exact across the gaps (paging went on from the server's next_offset)
+  const t130 = p.queue.find((t) => t.id === tid(130));
+  assert.equal(p.posOf(t130), 130);
+});
+
+test('offline skip: a long run of offline tracks is crossed in a few playable pages, not page by page', async () => {
+  const srv = makeServer(12000);
+  for (let i = 100; i < 11000; i++) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(rows(90, 10), 0, { source: { ...SOURCE(12000), offset: 90 } });
+  await p.settle();
+  await pressNext(p, 12);
+  assert.deepEqual(p.env.plays.slice(0, 13),
+    [...Array.from({ length: 10 }, (_, k) => tid(90 + k)), tid(11000), tid(11001), tid(11002)]);
+  const pageReqs = srv.requests.filter((u) => u.includes('playable=1')).length;
+  assert.ok(pageReqs <= 6, `crossing 10,900 offline tracks took ${pageReqs} page requests`);
+  assert.equal(p.posOf(p.queue.find((t) => t.id === tid(11001))), 11001);
+});
+
+test('offline skip: a clicked offline row still plays (the listener asked for it); Next then skips', async () => {
+  const srv = makeServer(50);
+  for (const i of [10, 11, 12]) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(offlineRows(0, 50, srv.offline), 10);       // a click on row 10
+  await p.settle();
+  assert.equal(p.current.id, tid(10));
+  assert.equal(p.explicitPick, true);
+  p.next(); await p.settle();
+  assert.equal(p.current.id, tid(13));
+});
+
+test('offline skip: Play all / a dealt start begins at the first track that can play', async () => {
+  const srv = makeServer(3000);
+  for (let i = 0; i < 7; i++) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(offlineRows(0, 100, srv.offline), 0, { source: { ...SOURCE(3000), offset: 0 }, explicit: false });
+  await p.settle();
+  assert.equal(p.current.id, tid(7));
+  const q = makePlayer({ server: srv });
+  q.setOfflineSkip(true);
+  assert.equal(await q.playSource(SOURCE(3000), { offset: 0, explicit: false }), true);
+  assert.equal(q.current.id, tid(7));
+  assert.equal(q.posOf(q.current), 7);
+  // …and the whole first 5,000 rows offline: Play all still finds the first playable track
+  const srv2 = makeServer(20000);
+  for (let i = 0; i < 12000; i++) srv2.offline.add(i);
+  const r = makePlayer({ server: srv2 });
+  r.setOfflineSkip(true);
+  assert.equal(await r.playSource(SOURCE(20000), { offset: 0, explicit: false }), true);
+  assert.equal(r.current.id, tid(12000));
+});
+
+test('offline skip: a shuffle never deals an offline track; a random Shuffle-all start picks a playable row', async () => {
+  const srv = makeServer(600);
+  for (let i = 0; i < 600; i += 3) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  await p.playSource(SOURCE(600), { shuffle: true });
+  await p.settle();
+  await pressNext(p, 398);
+  assert.equal(p.env.plays.length, 399);
+  assert.ok(p.env.plays.every((id) => Number(id.slice(1)) % 3 !== 0), 'a shuffle dealt an offline track');
+  assert.equal(new Set(p.env.plays).size, 399);
+  for (let seed = 1; seed <= 20; seed++) {
+    const q = makePlayer({ server: srv, rngSeed: seed });
+    q.setOfflineSkip(true);
+    q.setQueue(offlineRows(0, 30, srv.offline), 0, { shuffle: true });
+    await q.settle();
+    assert.ok(!srv.offline.has(Number(q.current.id.slice(1))), `seed ${seed}: shuffle started on an offline row`);
+  }
+});
+
+test('offline skip: a playlist with nothing playable left stops (offlinequeue) instead of looping', async () => {
+  const p = makePlayer({ server: makeServer(10) });
+  p.setOfflineSkip(true);
+  const off = new Set([1, 2, 3, 4]);
+  p.toggleRepeat();                                      // → repeat all
+  while (p.repeatMode !== 'all') p.toggleRepeat();
+  p.setQueue(offlineRows(0, 5, off), 0);                 // row 0 plays, the rest are offline
+  await p.settle();
+  p.next(); await p.settle();                            // wraps to row 0, the only playable one
+  assert.equal(p.current.id, tid(0));
+  const q = makePlayer({ server: makeServer(10) });
+  q.setOfflineSkip(true);
+  while (q.repeatMode !== 'all') q.toggleRepeat();
+  q.setQueue(offlineRows(0, 4, new Set([0, 1, 2, 3])), 0);   // a click on an offline row
+  await q.settle();
+  const before = q.env.plays.length;
+  q.next(); await q.settle();
+  assert.equal(q.env.plays.length, before, 'an offline track was started');
+  assert.ok(q.env.events.some(([n]) => n === 'offlinequeue'), 'no offlinequeue event');
+});
+
+test('offline skip off (Show): flagged rows play exactly as before', async () => {
+  const srv = makeServer(30);
+  for (const i of [1, 2]) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setQueue(offlineRows(0, 30, srv.offline), 0, { source: { ...SOURCE(30), offset: 0 } });
+  await p.settle();
+  await pressNext(p, 3);
+  assert.deepEqual(p.env.plays, [tid(0), tid(1), tid(2), tid(3)]);
+  assert.ok(!srv.requests.some((u) => u.includes('playable=1')), 'Show mode asked for playable pages');
+});
+
+test('offline skip: Play all over a window with nothing playable reads on from the server past it', async () => {
+  const srv = makeServer(3000);
+  for (let i = 0; i < 150; i++) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  const r = p.setQueue(offlineRows(0, 100, srv.offline), 0,
+                       { source: { ...SOURCE(3000), offset: 0 }, explicit: false });
+  assert.equal(await r, true);
+  await p.settle();
+  assert.equal(p.current.id, tid(150));
+  assert.equal(p.posOf(p.current), 150);
+  assert.ok(p.env.plays.every((id) => !srv.offline.has(Number(id.slice(1)))), 'an offline track was started');
+});
+
+test('offline skip: Play all of a plain list with nothing playable says so and leaves the queue alone', async () => {
+  const p = makePlayer({ server: makeServer(50) });
+  p.setOfflineSkip(true);
+  p.setQueue(rows(20, 5), 0);
+  await p.settle();
+  const before = p.queue.map((t) => t.id);
+  const plays = p.env.plays.length;
+  const off = new Set([0, 1, 2, 3]);
+  assert.equal(p.setQueue(offlineRows(0, 4, off), 0, { explicit: false }), false);
+  assert.equal(p.setQueue(offlineRows(0, 4, off), 0, { shuffle: true }), false);
+  await p.settle();
+  assert.deepEqual(p.queue.map((t) => t.id), before);
+  assert.equal(p.env.plays.length, plays);
+  assert.equal(p.env.events.filter(([n]) => n === 'offlinequeue').length, 2);
+  assert.equal(p.lastStartAllOffline, true);
+  // a list with something playable starts normally and clears the flag
+  assert.equal(p.setQueue(offlineRows(0, 4, new Set([0])), 0, { explicit: false }), true);
+  assert.equal(p.current.id, tid(1));
+  assert.equal(p.lastStartAllOffline, false);
+});
+
+test('offline skip: Prev passes offline rows by, in the window and paging back', async () => {
+  const srv = makeServer(500);
+  for (const i of [3, 4, 5]) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(offlineRows(0, 10, srv.offline), 0, { explicit: false });
+  await p.settle();
+  await pressNext(p, 3);                                  // 0 → 1 → 2 → 6
+  assert.equal(p.current.id, tid(6));
+  p.prev(); await p.settle();
+  assert.equal(p.current.id, tid(2), 'Prev landed on an offline row');
+  // A window that starts after a run of offline rows: Prev pages back over it.
+  const srv2 = makeServer(500);
+  for (let i = 20; i < 100; i++) srv2.offline.add(i);
+  const q = makePlayer({ server: srv2 });
+  q.setOfflineSkip(true);
+  assert.equal(await q.playSource(SOURCE(500), { offset: 100, explicit: false }), true);
+  assert.equal(q.current.id, tid(100));
+  q.prev(); await q.settle();
+  assert.equal(q.current.id, tid(19));
+  assert.equal(q.posOf(q.current), 19);
+});
+
+test('offline skip: repeat-all that finds nothing playable any more says so', async () => {
+  const srv = makeServer(5);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  while (p.repeatMode !== 'all') p.toggleRepeat();
+  p.setQueue(rows(0, 5), 0, { source: { ...SOURCE(5), offset: 0 } });
+  await p.settle();
+  await pressNext(p, 4);
+  assert.equal(p.current.id, tid(4));
+  for (let i = 0; i < 5; i++) srv.offline.add(i);       // the drive went away
+  const plays = p.env.plays.length;
+  p.next(); await p.settle();
+  assert.equal(p.env.plays.length, plays, 'an offline track was started');
+  assert.ok(p.env.events.some(([n]) => n === 'offlinequeue'), 'stopped without saying why');
+});
+
+test('offline skip: "everything offline" is not remembered past a failed start', async () => {
+  const srv = makeServer(30);
+  for (let i = 0; i < 30; i++) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  assert.equal(await p.playSource(SOURCE(30), { offset: 0, explicit: false }), false);
+  assert.equal(p.lastStartAllOffline, true);
+  srv.down = true;
+  assert.equal(await p.playSource(SOURCE(30), { offset: 0, explicit: false }), false);
+  assert.equal(p.lastStartAllOffline, false);
+});
+
+test('offline skip: when the Hide-mode list changes length, the queue re-anchors on its last list row', async () => {
+  for (const change of ['drive back', 'drive gone']) {
+    const srv = makeServer(300);
+    const hiddenAtStart = change === 'drive back' ? [0, 40] : [0, 0];
+    for (let i = hiddenAtStart[0]; i < hiddenAtStart[1]; i++) srv.hidden.add(i);
+    const p = makePlayer({ server: srv });
+    p.setOfflineSkip(true);
+    assert.equal(await p.playSource(SOURCE(null), { offset: 0, explicit: false }), true);
+    await pressNext(p, 60);                                  // well past the first window
+    if (change === 'drive back') srv.hidden.clear();         // list grows at the top
+    else for (let i = 0; i < 40; i++) srv.hidden.add(i);     // list shrinks at the top
+    for (let i = 0; i < 40; i++) if (srv.hidden.has(i)) srv.offline.add(i);
+    p.reanchorOrdered();
+    const before = p.env.plays.slice();
+    await pressNext(p, 120);
+    const after = p.env.plays.slice(before.length);
+    const all = p.env.plays.map((id) => Number(id.slice(1)));
+    assert.equal(new Set(all).size, all.length, `${change}: a track repeated`);
+    // every track after the last one played before the change follows in order, none skipped
+    const lastBefore = Number(before[before.length - 1].slice(1));
+    const want = Array.from({ length: 120 }, (_, k) => lastBefore + 1 + k).map(tid);
+    assert.deepEqual(after, want, change);
+  }
+});
+
+test('offline skip: a shuffle with gaps (a folder) reads on past pages with nothing playable', async () => {
+  const srv = makeServer(1000);
+  srv.shuffleGaps = true;
+  const keep = new Set([3, 517, 998]);
+  for (let i = 0; i < 1000; i++) if (!keep.has(i)) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  assert.equal(await p.playSource(SOURCE(1000), { shuffle: true }), true);
+  await p.settle();
+  await pressNext(p, 2);
+  assert.deepEqual(new Set(p.env.plays), new Set([...keep].map(tid)));
+  // nothing at all playable: said so (not "try again")
+  const srv2 = makeServer(300);
+  srv2.shuffleGaps = true;
+  for (let i = 0; i < 300; i++) srv2.offline.add(i);
+  const q = makePlayer({ server: srv2 });
+  q.setOfflineSkip(true);
+  assert.equal(await q.playSource(SOURCE(300), { shuffle: true }), false);
+  assert.equal(q.lastStartAllOffline, true);
+  assert.ok(q.env.events.some(([n]) => n === 'offlinequeue'));
+});
+
+test('offline skip: the re-anchor falls back to an earlier list row when the newest is hidden', async () => {
+  const srv = makeServer(400);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  assert.equal(await p.playSource(SOURCE(null), { offset: 0, explicit: false }), true);
+  await pressNext(p, 30);
+  const loaded = p.queue.map((t) => Number(t.id.slice(1)));
+  const last = Math.max(...loaded);
+  // the drive holding the last six loaded rows goes away (Hide: they leave the list)
+  for (let i = last - 5; i <= last; i++) { srv.hidden.add(i); srv.offline.add(i); }
+  for (const t of p.queue) if (srv.offline.has(Number(t.id.slice(1)))) t.offline = 'drive';
+  p.reanchorOrdered();
+  const before = p.env.plays.length;
+  await pressNext(p, 80);
+  const after = p.env.plays.slice(before).map((id) => Number(id.slice(1)));
+  const lastPlayed = Number(p.env.plays[before - 1].slice(1));
+  const want = Array.from({ length: 400 }, (_, i) => i)
+    .filter((i) => i > lastPlayed && !srv.hidden.has(i)).slice(0, 80);
+  assert.deepEqual(after, want);
+  const anchorReq = srv.requests.find((u) => u.includes('after='));
+  assert.ok(anchorReq && decodeURIComponent(anchorReq).split('after=')[1].split('&')[0].split(',').length > 1,
+            'only one anchor id was sent');
+});
+
+test('offline skip: a queue-panel click is an explicit pick; a re-anchor reopens an ended list', async () => {
+  const srv = makeServer(30);
+  srv.offline.add(5);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  p.setQueue(rows(0, 30).map((t, i) => (i === 5 ? { ...t, offline: 'drive' } : t)), 0,
+             { source: { ...SOURCE(30), offset: 0 } });
+  await p.settle();
+  p.setQueue(p.queue, 5);                                   // a click on the offline row in the queue panel
+  await p.settle();
+  assert.equal(p.current.id, tid(5));
+  assert.equal(p.explicitPick, true);
+  // a list that had ended may grow (Hide: a drive came back) — the re-anchor reopens it
+  const q = makePlayer({ server: makeServer(12) });
+  q.setOfflineSkip(true);
+  q.setQueue(rows(0, 12), 0, { source: { ...SOURCE(null), offset: 0 } });
+  await q.settle();
+  await pressNext(q, 11);
+  assert.equal(q.st.ended, true);
+  q.reanchorOrdered();
+  assert.equal(q.st.ended, false);
+});
+
+test('offline skip: an ordered start that reads on without finding anything says so', async () => {
+  const srv = makeServer(30000);
+  srv.playableBudget = 100;                                // (each page reads on only a little)
+  for (let i = 0; i < 30000; i++) srv.offline.add(i);
+  srv.offline.delete(29999);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  assert.equal(await p.playSource(SOURCE(30000), { offset: 0, explicit: false }), false);
+  assert.equal(p.lastStartAllOffline, true);
+  assert.ok(p.env.events.some(([n]) => n === 'offlinequeue'));
+});
+
+test('offline skip: a sparse folder shuffle is read on by the server, not 50 rows a request', async () => {
+  const srv = makeServer(20000);
+  srv.shuffleGaps = true;
+  const keep = new Set([7, 12000, 19999]);
+  for (let i = 0; i < 20000; i++) if (!keep.has(i)) srv.offline.add(i);
+  const p = makePlayer({ server: srv });
+  p.setOfflineSkip(true);
+  assert.equal(await p.playSource(SOURCE(20000), { shuffle: true }), true);
+  await p.settle();
+  await pressNext(p, 2);
+  assert.deepEqual(new Set(p.env.plays), new Set([...keep].map(tid)));
+  const reqs = srv.requests.filter((u) => u.includes('/shuffled')).length;
+  assert.ok(reqs <= 12, `${reqs} shuffled page requests for a 20,000-track order`);
+});

@@ -739,7 +739,59 @@
 // (http(s) share roots in the freshness triggers).  New js/tunes.js (precached):
 // the tune-list helpers moved out of utils.js so a page still on an older
 // service worker's cached utils.js can't fail to link Track Info / Now Playing.
-const SHELL_VERSION = 'v219';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v220: Track Info lists derived genres; Settings → Metadata "Game and group names as genres" toggle.
+// v220 (cont.): Settings → Song database gains a "Validated set ↗" link (the
+// pinned upstream commit); index.html app.css?v=104 (a.btn-secondary styling).
+// v221: Admin → Library → External sources (Modland catalogue switch, scope,
+// Subsonic visibility, status + Refresh now); the folder tree marks catalogue
+// roots; a "catalogue_changed" WebSocket event refreshes the tree and view.
+// index.html app.css?v=105, app.js?v=177.
+// v222: the folder tree keeps a catalogue root browsable while its archive is
+// unreachable ("offline" badge); the External sources scope menu reverts a
+// refused change.
+// v223: Settings → "Tracks on unavailable drives" (Mark / Hide / Show): rows of
+// tracks that can't play right now are dimmed + badged "offline" (library,
+// search preview, queue, playlists, phone rows), the queue skips them when it
+// moves on by itself.  New js/offline.js (precached); index.html app.css?v=106,
+// app.js?v=178; mobile.html mobile.css?v=18, mobile/app.js?v=23.  Admin →
+// External sources: how often the Modland index is updated (a menu right of
+// "Refresh now"; admin.js).
+// v224: desktop toasts dock above the player bar instead of over its centre (an
+// error toast hid ◄◄ / ▶ / ►► for 5 s) — above the "new version" banner while
+// it is up, and low as before while Settings or a dialog covers the bar — and a
+// plain toast lets clicks through to what it covers; offer toasts (Toast.action)
+// stay clickable (utils.js).  index.html app.js?v=179 (the banner gets an id
+// and re-docks the toasts as it comes and goes).
+// v225: offline tracks — Play all over a window with nothing playable reads on
+// from the server, Prev passes offline rows by, an open folder (and the
+// phone's list, in Mark / Show) re-flags its rows in place, a long title keeps
+// its badge, a Hide-mode queue re-anchors when its list changes length, a
+// folder shuffle reads on past pages with nothing playable (library.js,
+// player.js, offline.js, mobile views); the Modland card says that updates
+// download only the changes (an info icon beside the interval menu; admin.js
+// shows what the last update downloaded, why a full index was taken and up to
+// which day the changes reach).  index.html app.css?v=107; mobile.html
+// mobile.css?v=19.
+// v226: "[No Artist]" / "[No Album Artist]" list the server's blank-tag set
+// (GET /api/tracks?untagged=…) — the rows their counts count — instead of the
+// blank-tag rows among the first 5,000 tracks (library.js), or, on the phone,
+// the whole library (mobile/views/library.js sent ``artist=`` = no filter).
+// v228 (v227 was an earlier cut of the same change, served under the same
+// ?v= numbers — bumped again so no browser keeps it):
+// sidebar Folders / Playlists keep their header + ~15 px of body
+// (min-height 55 px, 83 px at ≤1024 px with the 44 px header buttons) — in a
+// short sidebar the 40 px floor left the folder tree a 0–5.5 px body, roots
+// clipped and unclickable (Firefox at 900 px tall, every engine at 800); the
+// splitters clamp to those floors and the stale-height reset fires when
+// Playlists is pushed past the sidebar's bottom instead of when it is under
+// 60 px (which wiped a deliberate resize on reload in short windows) (app.js).
+// index.html app.css?v=109, app.js?v=181.
+// v229: the Track Info tune list's ▶ on the loaded tune pauses / resumes it
+// (⏸ while playing; Space on that row too) — the panel covers the player bar
+// (trackinfo.js); the sidebar's Artists … Years counts are filled at page
+// load and after a scan, not only once each view was opened, without the
+// "[No Artist]" bucket rows (library.js).
+const SHELL_VERSION = 'v229';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.
@@ -885,6 +937,7 @@ const SHELL_PRECACHE = [
   '/assets/js/library.js',
   '/assets/js/vlist.js',
   '/assets/js/tunes.js',
+  '/assets/js/offline.js',
   '/assets/js/utils.js',
   '/assets/js/queue.js',
 ];
