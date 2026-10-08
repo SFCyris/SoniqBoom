@@ -12,6 +12,7 @@ import { Library }             from './library.js';
 import { Player }              from './player.js';
 import { artPlaceholderEmoji, Toast } from './utils.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
+import { listTuneCount, tunesBadgeHTML } from './tunes.js';
 
 const input  = document.getElementById('search-input');
 const clear  = document.getElementById('search-clear');
@@ -231,6 +232,7 @@ function _showPreview(tracks, stations = []) {
     // A track that can't play right now (its drive / share is offline) is
     // dimmed and badged, like the library rows.
     const offKind = offlineKind(t);
+    const tunes = listTuneCount(t);
     row.className = 'sp-row' + (offKind ? ' track-offline' : '');
     row.dataset.idx = i;
     _optionize(row);
@@ -239,8 +241,8 @@ function _showPreview(tracks, stations = []) {
     row.innerHTML = `
       <div class="sp-art"><span class="sp-art-ph">${artPlaceholderEmoji(t)}</span></div>
       <div class="sp-info">
-        <div class="sp-title${offKind ? ' sp-title--badged' : ''}">${offKind
-          ? `<span class="sp-title-text">${_esc(t.title || '—')}</span>${offlineBadgeHTML(offKind)}`
+        <div class="sp-title${offKind || tunes ? ' sp-title--badged' : ''}">${offKind || tunes
+          ? `<span class="sp-title-text">${_esc(t.title || '—')}</span>${tunes ? tunesBadgeHTML(tunes) : ''}${offKind ? offlineBadgeHTML(offKind) : ''}`
           : _esc(t.title || '—')}</div>
         <div class="sp-sub">${_esc(t.artist || t.album_artist || '')}${t.album ? ' — ' + _esc(t.album) : ''}</div>
       </div>

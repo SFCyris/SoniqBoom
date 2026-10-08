@@ -15,7 +15,7 @@ ideas are all warmly welcome and all read.
 ## Ways to take part
 
 - **Report a bug.** Open an [Issue](https://github.com/SFCyris/SoniqBoom/issues)
-  with the SoniqBoom version (`Settings → About` or the footer), how you run it
+  with the SoniqBoom version (gear → **System** → **About**, or **Settings** on the phone layout), how you run it
   (Docker / bare-metal, OS, CPU arch), and the exact steps. For a format that
   won't play, include the file's extension and, if you can, a short sample.
 - **Request a format or feature.** Start a thread in

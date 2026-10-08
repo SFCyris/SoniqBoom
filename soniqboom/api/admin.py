@@ -171,7 +171,22 @@ async def admin_scene_refresh(_tok: str = Depends(_require_token)):
     if not st.get("error") and scene_metadata.has_index():
         from soniqboom.core import scanner
         scanner._spawn_scene_autoapply()
+        _spawn_catalogue_tune_counts()
     return st
+
+
+def _spawn_catalogue_tune_counts() -> None:
+    """The Modland catalogue's unplayed tunes take their tune counts from a
+    new checksum list / song database / HVSC (``refill_tune_counts``)."""
+    try:
+        from soniqboom.core import modland_catalog
+        if modland_catalog.enabled():
+            _t = asyncio.create_task(modland_catalog._refill_quietly(),
+                                     name="modland-catalog.tune-counts")
+            _BG_TASKS.add(_t)
+            _t.add_done_callback(_BG_TASKS.discard)
+    except Exception:                                   # noqa: BLE001
+        log.debug("catalogue tune-count refill not started", exc_info=True)
 
 
 @router.post("/scene/apply")
@@ -210,7 +225,9 @@ async def admin_modland_catalog_set(body: dict, _tok: str = Depends(_require_tok
     ``all``) re-applies the index; ``subsonic`` shows / hides the catalogue
     to Subsonic and DLNA clients; ``interval`` (``daily`` / ``weekly`` /
     ``biweekly`` / ``monthly``) sets how often the index is refreshed — the
-    schedule follows at once.  Returns the status at once; a background
+    schedule follows at once; ``tune_details`` (``intent`` / ``lists``) sets
+    when tunes not played yet are read for their details.  Returns the
+    status at once; a background
     job's progress is in ``GET /admin/catalog/modland``."""
     from soniqboom.core import modland_catalog as mc
     if not isinstance(body, dict):
@@ -220,6 +237,10 @@ async def admin_modland_catalog_set(body: dict, _tok: str = Depends(_require_tok
         raise HTTPException(400, f"interval must be one of {list(mc.INTERVALS)}")
     if "interval" in body:
         mc.set_interval(body["interval"])
+    if "tune_details" in body:
+        if body["tune_details"] not in mc.TUNE_DETAILS:
+            raise HTTPException(400, f"tune_details must be one of {list(mc.TUNE_DETAILS)}")
+        mc.set_tune_details(body["tune_details"])
     if "subsonic" in body:
         mc.set_subsonic(_flag(body["subsonic"]))
     scope = body.get("scope")
@@ -346,6 +367,8 @@ async def admin_songdb_refresh(_tok: str = Depends(_require_token)):
     if not st.get("error") and songdb.has_index() and songdb.auto_apply_enabled():
         from soniqboom.core import scanner
         scanner._spawn_scene_autoapply()
+    if not st.get("error") and songdb.has_index():
+        _spawn_catalogue_tune_counts()
     return st
 
 
@@ -3343,6 +3366,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                         except Exception:
                             log.exception("HVSC apply after a path change failed")
                     _t = asyncio.create_task(_apply_new_hvsc(), name="hvsc-apply")
+                    _spawn_catalogue_tune_counts()
                     _BG_TASKS.add(_t)
                     _t.add_done_callback(_BG_TASKS.discard)
             except Exception:

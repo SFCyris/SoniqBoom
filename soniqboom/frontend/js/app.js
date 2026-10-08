@@ -559,6 +559,12 @@ Player.on('error', ({ track, error } = {}) => {
     if (!_waveformData) _waveformStoppedFor = track.id;
   }
 });
+// The "now playing" equaliser icons (the list row, Track Info's tune row)
+// stand still while playback is paused (app.css ``body.sb-paused``).
+Player.on('statechange', ({ playing } = {}) => {
+  document.body.classList.toggle('sb-paused', !playing);
+});
+
 Player.on('statechange', ({ playing } = {}) => {
   if (!playing || !_waveformStoppedFor) return;
   const cur = Player.currentTrack;
@@ -2875,6 +2881,41 @@ document.addEventListener('soniqboom:library-changed', () => {
   } catch (_) {}
 });
 
+// The server re-read one track (a catalogue tune's first play — its genre,
+// length, tunes …): the player, the open list, the bar and the meter take the
+// fields that changed, as if the track had been scanned (parity with local
+// files).  The meter is rebuilt only when what picks it changed — a rebuild
+// mid-play dropped a live per-voice meter for the spectrum.
+async function _refreshTrack(id) {
+  let row = null;
+  try {
+    const r = await fetch('/api/tracks/meta/batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: [id] }), credentials: 'same-origin',
+    });
+    if (r.ok) row = (await r.json()).find((t) => t && t.id === id) || null;
+  } catch (_) { return; }
+  if (!row) return;
+  const fields = { ...row };
+  delete fields.id;
+  const changed = Player.patchTrackFields?.(id, fields);
+  if (changed && !Object.keys(changed).length) return;     // nothing new for this page
+  try { Library.patchTrack(id, changed || fields); } catch (_) {}
+  const cur = Player.currentTrack;
+  if (changed && cur && cur.id === id) {
+    if ('title' in changed || 'subsongs' in changed) {
+      playerTitle.textContent = _barTitle(cur);
+      document.title = `${cur.title || 'SoniqBoom'} — SoniqBoom`;
+    }
+    _ric(() => { _buildMetaTags(cur); _buildPathCrumb(cur); });
+    const vu = document.getElementById('vu-meters');
+    const perVoice = !!vu && vu.dataset.source === 'vumr';
+    if (!perVoice && ('format' in changed || 'genre' in changed)) _handleVU(cur);
+  }
+  document.dispatchEvent(new CustomEvent('soniqboom:track-refreshed',
+    { detail: { id, fields: changed || fields } }));
+}
+
 // A Track Info save (tags / info / year) changed one track: its row in the open
 // track list takes the new values in place — no re-read, so the listener keeps
 // their scroll position, sort and selection — and a group list it may regroup
@@ -3294,6 +3335,8 @@ function connectWS() {
       // A drive / share went offline or came back (or the setting changed):
       // offline.js re-reads the state and fires soniqboom:availability-changed.
       Offline.refresh();
+    } else if (msg.event === 'track_updated' && msg.id) {
+      _refreshTrack(msg.id);
     } else if (msg.event === 'catalogue_changed') {
       // A catalogue (Admin → External sources) was built, refreshed or
       // removed: the folder tree gains / loses its root, the open view

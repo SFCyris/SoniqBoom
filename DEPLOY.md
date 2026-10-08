@@ -122,9 +122,11 @@ uname -m
 **OS/Arch** line, or check Docker Desktop → Settings.)
 
 **Build on the machine you'll run it on** and you never have to think about architecture.
-The niche Atari-ST `.sc68` player only builds cleanly on a native machine — building it
-for a *different* CPU than your own (cross-building) can skip it; every other format is
-unaffected.
+The Amiga `uade123` and Atari-ST `.sc68` players are compiled from source during the
+build, and compiling them for a *different* CPU than your own (cross-building) can fail.
+The build then stops and lists the missing players; build on a machine of the target CPU,
+or pass `--build-arg SLIM=1` to leave those two players out (AHX, the Amiga "exotica"
+formats and `.sc68` disks then don't play).
 
 ### Plain `docker run` (without Compose)
 
@@ -158,6 +160,13 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 Anyone can then `docker pull <your-registry>/soniqboom:latest` and Docker fetches the
 right CPU variant automatically.
 
+The image contains GPL-licensed programs. If you publish it, also make their source code
+available: `scripts/collect_third_party_sources.sh <dir>` downloads the upstream sources
+of the programs the image builds or downloads, at the versions pinned in the Dockerfile,
+and `scripts/collect_debian_sources.sh` downloads the source packages of the Debian packages
+inside it (listed with `docker run --rm --entrypoint dpkg-query <image> -W`).
+See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md#source-code-for-distributed-binaries).
+
 ---
 
 ## What goes where
@@ -178,7 +187,7 @@ Back up the `soniqboom-data` volume (`/data`) and you have everything. Your
 **music files are never touched** — all of this is just the index and settings.
 
 **Portable export.** For a self-contained copy of the library index, use
-**Settings → Backup → Export `.sbz`**; **Import** restores it.
+gear → **Backup → Export .sbz**; **Import .sbz** restores it.
 
 **On-disk snapshots.** The library index is stored as `library.json` under
 `/data`, alongside automatic copies you can fall back to:
@@ -314,18 +323,28 @@ docker compose exec soniqboom soniqboom-setadm -user bob -passwd 'pw-1234' -role
 ## Notes
 
 - **Renderers degrade gracefully.** If a format won't play, the player names the package
-  it needs; everything else keeps working. The image bundles all the common players;
-  `uade123` (Amiga AHX and the ~150 Amiga "exotica" formats) is compiled from source, so
-  it's best-effort — if that build fails, only those Amiga formats are disabled and
-  everything else keeps working.
+  it needs; everything else keeps working. The image includes every player: ffmpeg,
+  sidplayfp, FluidSynth, openmpt123, adplay and libgme from Debian; psgplay, sc68 and
+  `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled from source; the
+  prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and HivelyTracker (`.hvl`) engines.
+  The image build stops if any of them is missing (unless built with
+  `--build-arg ALLOW_MISSING_RENDERERS=1`).
+- **Slim image.** `docker build --build-arg SLIM=1 -t soniqboom .` leaves out `uade123`
+  and `sc68` (AHX, the Amiga "exotica" family and native `.sc68` disks); every other
+  format still plays.
 - **Memory** scales with library size (the whole index is held in RAM). Budget accordingly
   for six-figure collections.
-- **Modland catalogue** (optional, off by default — **Settings → Library → External
+- **Modland catalogue** (optional, off by default — gear → **Library → External
   sources**): the container reaches `ftp.modland.com` over HTTPS for the index and over FTP
-  (port 21, passive mode) for index updates and the tunes you play, so a firewall in front of
-  it must allow both. With the catalogue on, plan for about 1 GB more memory.
-- **MIDI** plays with a bundled General-MIDI SoundFont out of the box; add richer
-  SoundFonts later under **Settings → Renderers → Soundfonts**.
+  (port 21, passive mode) for index updates and for the tunes it downloads — when you play
+  a tune or open its Track Info (for most formats), and, with *For tunes shown in lists*, the
+  SC68, SNDH and console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list.
+  A firewall in front of it must allow both. With the catalogue on, plan for about 1 GB more memory.
+- **MIDI** plays with the General-MIDI SoundFont FluidR3_GM (Debian's `fluid-soundfont-gm`)
+  out of the box; add richer SoundFonts later under gear → **Renderers → Soundfonts**.
+- **Licences and source code**: each [GitHub release](https://github.com/SFCyris/SoniqBoom/releases)
+  includes the source code of the third-party programs in the prebuilt image, a list of its
+  Debian packages and their source packages — see [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md#source-code-for-distributed-binaries).
 - **Backups & recovery**: see the [section above](#backups--recovery) — copy the
   `soniqboom-data` volume, export a portable `.sbz`, or restore from the on-disk
   `library.json.prev` known-good snapshot.

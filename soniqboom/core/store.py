@@ -3050,7 +3050,9 @@ class TrackStore:
         return not sort_by or sort_by == "added"
 
     def _resolve_query(self, query: str) -> set[str] | None:
-        """Resolve a text query to a set of matching track IDs.
+        """Resolve a text query to a set of matching track IDs: every word
+        must start a word of the track (a one-character word: be one, if any
+        track has it).
 
         Query tokens are accent-folded: every non-ASCII word is indexed under
         its folded form too, so "beyonce" and "beyoncé" both find "Beyoncé"
@@ -3062,7 +3064,10 @@ class TrackStore:
         self._rebuild_word_list()
         sets: list[set[str]] = []
         for token in tokens:
-            exact = self._word_index.get(token)
+            # Every word of 2+ characters is a prefix ("var" finds "Varga" even
+            # when some track has the word "var" — GitHub #25); a lone
+            # character matches that word only, unless no track has it.
+            exact = self._word_index.get(token) if len(token) < 2 else None
             if exact:
                 sets.append(exact)
             else:

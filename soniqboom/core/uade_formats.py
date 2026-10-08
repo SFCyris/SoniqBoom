@@ -347,23 +347,34 @@ _SUFFIX_REGISTRATION_DENY = frozenset({
 })
 
 
-def new_suffix_tokens() -> dict[str, str]:
-    """Suffix tokens uade may claim as real file extensions: token -> player.
-
-    Excludes tokens other engines own (``_SUFFIX_OWNED_ELSEWHERE``),
-    companion tags, and the common-file collision denylist above.  These get
-    registered into the scanner's supported-extension set so Modland-style
-    suffix naming (``song.fc13``) flows through every existing
-    extension-keyed gate unchanged.
-    """
+def prefix_tokens() -> dict[str, str]:
+    """Every token uade plays in Amiga PREFIX form (``di.title``, ``md.song``):
+    token -> player.  Companion tags and dotted tokens excluded; the
+    common-file denylist does NOT apply here — it only guards suffixes
+    (``readme.md`` is no module, ``md.mercs`` is)."""
     return {
         tok: player
         for tok, player in player_map().items()
+        if tok not in COMPANION_PREFIXES
+        and tok not in COMPANION_SUFFIXES
+        and "." not in tok
+    }
+
+
+def new_suffix_tokens() -> dict[str, str]:
+    """Suffix tokens uade may claim as real file extensions: token -> player.
+
+    The prefix tokens minus those other engines own
+    (``_SUFFIX_OWNED_ELSEWHERE``) and the common-file collision denylist
+    above.  These get registered into the scanner's supported-extension set
+    so Modland-style suffix naming (``song.fc13``) flows through every
+    existing extension-keyed gate unchanged.
+    """
+    return {
+        tok: player
+        for tok, player in prefix_tokens().items()
         if tok not in _SUFFIX_OWNED_ELSEWHERE
         and tok not in _SUFFIX_REGISTRATION_DENY
-        and tok not in COMPANION_PREFIXES
-        and tok not in COMPANION_SUFFIXES
-        and "." not in tok            # a dotted token can't be an extension
     }
 
 

@@ -4305,7 +4305,45 @@ export const Player = (() => {
   const savedVol = localStorage.getItem('sb_volume');
   if (savedVol !== null) audio.volume = parseFloat(savedVol);
 
+  // The server re-read a track (a catalogue tune's first play): the loaded
+  // track and its queue entries take the stored fields.  A picked tune keeps
+  // what makes it that tune (``subsong`` …, and its own length).
+  const _TUNE_KEYS = ['subsong', 'subsongTotal', 'subsongStart', 'subsongLabel'];
+  // Returns the fields that differed on the first entry found (null: the
+  // track isn't in the player).
+  function patchTrackFields(id, fields) {
+    if (!id || !fields || typeof fields !== 'object') return null;
+    let changed = null;
+    const apply = (t) => {
+      if (!t || typeof t !== 'object' || t.id !== id) return;
+      const keep = {};
+      for (const k of _TUNE_KEYS) if (k in t) keep[k] = t[k];
+      if (Number.isInteger(t.subsong)) keep.duration = t.duration;
+      if (changed === null) {
+        changed = {};
+        for (const [k, v] of Object.entries(fields)) {
+          if (!(k in keep) && JSON.stringify(t[k]) !== JSON.stringify(v)) changed[k] = v;
+        }
+      }
+      Object.assign(t, fields, keep);
+    };
+    queue.forEach(apply);
+    if (_track && !queue.includes(_track)) apply(_track);
+    if (changed && _track && _track.id === id && 'mediaSession' in navigator
+        && ('title' in changed || 'artist' in changed || 'album' in changed)) {
+      try {
+        const m = navigator.mediaSession.metadata;
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: _track.title || '', artist: _track.artist || _track.album_artist || '',
+          album: _track.album || '', artwork: (m && m.artwork) ? [...m.artwork] : [],
+        });
+      } catch (_) {}
+    }
+    return changed;
+  }
+
   return {
+    patchTrackFields,
     get analyser()       { return analyser; },
     get vuAnalyser()     { return vuAnalyser; },
     get ctx()            { return ctx; },

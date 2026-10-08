@@ -1456,12 +1456,33 @@ async def remove_track(track_id: str, _user=_Depends(_require_edit)):
     return {"deleted": track_id}
 
 
+@router.post("/catalogue-reads")
+async def catalogue_reads(body: dict, request: Request, _user=_Depends(_require_user)):
+    """Rows on a listener's screen (``{"ids": [...]}``): while the Modland
+    catalogue's tune details are read "For tunes shown in lists", its
+    unplayed tunes there whose tune count no index has are fetched and read
+    one at a time (``stream.catalogue_read_for_list``).  Returns how many were
+    queued — 0 under the default "When I open Track Info"."""
+    ids = body.get("ids") if isinstance(body, dict) else None
+    if not isinstance(ids, list):
+        raise HTTPException(400, "ids: a list expected")
+    from soniqboom.api import stream as _stream
+    owner = (request.client.host if request.client else "") or "?"
+    return {"queued": _stream.catalogue_read_for_list([str(i) for i in ids], owner)}
+
+
 @router.get("/{track_id}/extended")
-async def get_track_extended(track_id: str):
-    """Return extended metadata for tracker/SID/MIDI files."""
+async def get_track_extended(track_id: str, request: Request):
+    """Return extended metadata for tracker/SID/MIDI files.  For a catalogue
+    tune not read yet (Track Info opened on it) the one file is fetched and
+    read in the background — ``stream.catalogue_read_for_info`` — and the
+    page takes the result when it lands."""
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
+    from soniqboom.api import stream as _stream
+    _stream.catalogue_read_for_info(
+        track_id, track, (request.client.host if request.client else "") or "?")
     if not track.subsongs:
         # A libgme rip scanned before tune counts were read (plain local file).
         p = str(track.path or "")
@@ -1684,6 +1705,14 @@ _PATTERNS_CACHE_MAX = 16
 _PATTERNS_INFLIGHT: "dict[tuple, asyncio.Future]" = {}
 
 
+async def _read_module_bytes_async(path_str: str) -> bytes | None:
+    """:func:`_read_module_bytes` off the loop — for a catalogue tune once the
+    play's download it would join has started (``catalogue.wait_fetchable``)."""
+    from soniqboom.core import catalogue
+    await catalogue.wait_fetchable(path_str)
+    return await asyncio.get_event_loop().run_in_executor(None, _read_module_bytes, path_str)
+
+
 @router.get("/{track_id}/patterns")
 async def get_patterns(track_id: str):
     """Return the tracker pattern grid, order list, row→time map, song
@@ -1714,7 +1743,7 @@ async def get_patterns(track_id: str):
     fut = loop.create_future()
     _PATTERNS_INFLIGHT[cache_key] = fut
     try:
-        data = await loop.run_in_executor(None, _read_module_bytes, track.path)
+        data = await _read_module_bytes_async(track.path)
         if not data:
             payload = {"id": track_id, "available": False, "channels": 0,
                        "order": [], "patterns": []}
@@ -1885,7 +1914,7 @@ async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
         except OSError:
             pass
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, _read_module_bytes, track.path)
+    data = await _read_module_bytes_async(track.path)
     if not data:
         raise HTTPException(404, "SID source unreachable")
     if len(data) > 1024 * 1024:                 # remote/zip belt-and-braces
@@ -2229,9 +2258,7 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     # the bytes are subsong-agnostic and the tune is selected downstream in
     # ``extract_vu``.
     path_str = track.path
-    src_bytes = await asyncio.get_event_loop().run_in_executor(
-        None, _read_module_bytes, path_str,
-    )
+    src_bytes = await _read_module_bytes_async(path_str)
     if not src_bytes:
         log.debug("VU backfill found no bytes for %s", path_str)
         return None

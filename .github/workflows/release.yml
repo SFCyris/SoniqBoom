@@ -1,7 +1,12 @@
 # On every version tag (e.g. `git tag v1.5.1 && git push origin v1.5.1`) this:
-#   1. publishes a source zip as a GitHub release asset, and
+#   1. publishes a source zip as a GitHub release asset, together with the
+#      upstream source code of the third-party programs in the Docker image
+#      (scripts/collect_third_party_sources.sh),
 #   2. builds + pushes a multi-arch Docker image to GHCR:
 #        ghcr.io/sfcyris/soniqboom:{1.5.1, 1.5, latest}
+#      and attaches each architecture's Debian package manifest and the
+#      matching Debian source packages to the release.  The image tags are
+#      published only after every source asset is attached.
 #
 # The two architectures are built on their OWN native runners (x86 on
 # ubuntu-24.04, arm64 on ubuntu-24.04-arm) and stitched into one manifest — NOT
@@ -50,6 +55,18 @@ jobs:
               --title "SoniqBoom ${GITHUB_REF_NAME}" \
               --generate-notes \
             || gh release upload "${GITHUB_REF_NAME}" "$ZIP" soniqboom-latest.zip --clobber
+
+      - name: Attach third-party source code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="soniqboom-${VERSION}-third-party-sources"
+          bash scripts/collect_third_party_sources.sh "$NAME"
+          tar -cf "${NAME}.tar" "$NAME"
+          cp "$NAME/SOURCES.txt" "${NAME}.txt"
+          gh release upload "${GITHUB_REF_NAME}" "${NAME}.tar" "${NAME}.txt" --clobber
 
   # ── 2a. Build each architecture on its own NATIVE runner, push by digest ────
   docker-build:
@@ -111,10 +128,71 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
-  # ── 2b. Combine the per-arch digests into one multi-arch tag set ────────────
+      - name: Debian package manifest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/manifest
+          docker run --rm --entrypoint dpkg-query \
+              "${{ env.IMAGE }}@${{ steps.build.outputs.digest }}" \
+              -W -f '${Package}\t${Version}\t${source:Package}\t${source:Version}\n' \
+            | sort > "/tmp/manifest/debian-packages-${{ env.PSLUG }}.txt"
+          test -s "/tmp/manifest/debian-packages-${{ env.PSLUG }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ env.PSLUG }}
+          path: /tmp/manifest/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # ── 2b. Attach the Debian package manifests and source packages ─────────────
+  release-manifests:
+    needs: [release, docker-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/manifest
+          pattern: manifest-*
+          merge-multiple: true
+
+      - name: Upload manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd /tmp/manifest
+          for f in debian-packages-*.txt; do
+            mv "$f" "soniqboom-${VERSION}-${f}"
+          done
+          gh release upload "${GITHUB_REF_NAME}" soniqboom-${VERSION}-debian-packages-*.txt \
+              --repo "${{ github.repository }}" --clobber
+
+      - name: Attach Debian source packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="soniqboom-${VERSION}-debian-sources"
+          docker run --rm -v "$PWD:/w" -v /tmp/manifest:/m:ro -w /w debian:bookworm \
+              bash -c "bash scripts/collect_debian_sources.sh '$NAME' /m/*.txt && chown -R $(id -u):$(id -g) '$NAME'"
+          tar -cf "${NAME}.tar" "$NAME"
+          cp "$NAME/DEBIAN-SOURCES.txt" "${NAME}.txt"
+          gh release upload "${GITHUB_REF_NAME}" "${NAME}.tar" "${NAME}.txt" --clobber
+
+  # ── 2c. Combine the per-arch digests into one multi-arch tag set ────────────
+  # Only after the release carries the source of everything in the image.
   docker-manifest:
-    needs: docker-build
+    needs: [docker-build, release-manifests]
     runs-on: ubuntu-24.04
     permissions:
       contents: read

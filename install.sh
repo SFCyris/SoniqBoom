@@ -134,19 +134,21 @@ Usage: install.sh [--slim] [--clean | --rebuild | --help]
 
   (no option)   Install/update SoniqBoom and its renderers (idempotent —
                 already-present renderers are left as-is).
-  --slim        Skip the slow zxtune123 build (~10-15 min on macOS).  ONLY the
-                PSF family won't play — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF
-                (PlayStation / N64 / GBA / DS / Saturn / Dreamcast rips).  Every
-                other format is unaffected.  Re-run without --slim to add it.
+  --slim        Skip the slow zxtune123 build (~10-15 min on macOS).  These
+                won't play: the PSF family — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF,
+                DSF (PlayStation / N64 / GBA / DS / Saturn / Dreamcast rips) —
+                MED 2-4 modules and VGM files that use a chip other than the
+                Sega PSG / YM2612.  Re-run without --slim to add them.
   --rebuild     Delete the from-source renderers, then run the install so they
                 are rebuilt from scratch (combine with --slim to skip zxtune).
   --clean       Delete the from-source renderers and exit (no install).
   --help        Show this message.
 
 --clean/--rebuild affect ONLY the renderers install.sh builds from source —
-zxtune123, sidplayfp, psgplay (+ their bundled libraries) and the build-on-first-
-use ym2wav/hvl2wav.  Homebrew-managed players (fluidsynth, openmpt123, adplay,
-sc68, uade123) are left untouched; use `brew reinstall <name>` to rebuild those.
+zxtune123, sidplayfp, psgplay (+ their bundled libraries), on Linux also the
+source-built uade123/sc68, and the build-on-first-use ym2wav/hvl2wav.
+Homebrew-managed players (macOS: fluidsynth, openmpt123, adplay, sc68, uade123)
+are left untouched; use `brew reinstall <name>` to rebuild those.
 EOF
       exit 0 ;;
     *) warn "unknown option: $1 (try --help)" ;;
@@ -675,7 +677,7 @@ ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/
 if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
 elif [ "$SLIM" = "1" ]; then
-  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) won't play.  Re-run without --slim to add it."
+  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF), MED 2-4 modules and VGM files using chips other than the Sega PSG / YM2612 won't play.  Re-run without --slim to add them."
 elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
   if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \

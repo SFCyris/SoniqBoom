@@ -79,7 +79,8 @@ export function mountSettings(root, ctx) {
           </div>
           <div class="m-settings-row column">
             <span class="label">Source</span>
-            <span class="value"><a href="https://github.com/SFCyris/SoniqBoom" target="_blank" rel="noopener noreferrer">github.com/SFCyris/SoniqBoom</a></span>
+            <span class="value"><a href="https://github.com/SFCyris/SoniqBoom" target="_blank" rel="noopener noreferrer">github.com/SFCyris/SoniqBoom</a>
+              <br><a id="set-source" href="https://github.com/SFCyris/SoniqBoom/releases" target="_blank" rel="noopener noreferrer">Source code of this version</a></span>
           </div>
         </div>
       </div>
@@ -149,6 +150,10 @@ export function mountSettings(root, ctx) {
 
       statusEl.textContent  = h.status === 'ok' ? 'Online' : 'Offline';
       versionEl.textContent = h.version || '—';
+      if (h.version) {   // AGPL-3.0 §13: the source of the version that is running
+        root.querySelector('#set-source').href =
+          `https://github.com/SFCyris/SoniqBoom/releases/tag/v${encodeURIComponent(h.version)}`;
+      }
       tracksEl.textContent  = (c.visible ?? c.count ?? 0).toLocaleString();   // same number as the desktop badge
 
       const dirs = (d && Array.isArray(d.dirs)) ? d.dirs : [];

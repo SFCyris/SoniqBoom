@@ -409,9 +409,12 @@ async def test_no_reader_but_a_play_fetches_a_catalogue_file(env, monkeypatch):
         r = await c.post("/api/stream/probe-durations", json={"track_ids": tids})
         assert r.status_code == 200 and r.json() == {}
         for tid in tids:
+            # (``/extended`` is left out: Track Info opening on a tune is a
+            # listener's intent and reads that one file — tests/
+            # test_catalogue_parity.py.)
             for url in (f"/api/tracks/{tid}/waveform", f"/api/tracks/{tid}/vu",
                         f"/api/tracks/{tid}/patterns", f"/api/tracks/{tid}/sid",
-                        f"/api/tracks/{tid}/extended", f"/api/art/{tid}?size=sm",
+                        f"/api/art/{tid}?size=sm",
                         f"/api/tracks/{tid}/lyrics", f"/api/tracks/{tid}/chapters"):
                 await c.get(url)
             await c.post(f"/api/stream/{tid}/prewarm?priority=ahead&pw=p1")

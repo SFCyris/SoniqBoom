@@ -234,7 +234,10 @@ function _isPlaceholderArtist(name) {
   return _PLACEHOLDER_ARTISTS.has(name.trim().toLowerCase());
 }
 
-async function _loadArtistAbout(track) {
+// ``wikiOnly``: a retro / scene track — its Scene tab already shows the
+// Demozoo identity, so the Info pane takes only a Wikipedia article (the bio
+// other artists get, e.g. Ben Daglish), never the same card twice.
+async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
   const host = document.getElementById('ti-artist-about');
   if (!host) return;
   host.hidden = true; host.innerHTML = '';
@@ -273,6 +276,7 @@ async function _loadArtistAbout(track) {
     const info = await r.json();
     if (_queue[_idx]?.id !== reqTrackId) return;
     if (!info || !info.found || !info.bio) return;
+    if (wikiOnly && info.source !== 'Wikipedia') return;
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
     // Allow-list the URL SCHEME on hrefs — esc() blocks attribute breakout but
@@ -1007,15 +1011,10 @@ function _render(track) {
   // when the file has them.  Click jumps the player.
   _loadChapters(track);
   // Scene/retro tracks route the artist identity to the SCENE tab (richer:
-  // discography, release, links), so the INFO-pane bio block is suppressed for
-  // them to avoid showing the same person twice.  Regular audio keeps it.
+  // discography, release, links); the INFO pane shows their bio only when it
+  // is a Wikipedia article (as for regular audio), never the Demozoo card twice.
   const _scene = _isSceneTrack(track);
-  if (_scene) {
-    const _ab = document.getElementById('ti-artist-about');
-    if (_ab) { _ab.hidden = true; _ab.innerHTML = ''; }
-  } else {
-    _loadArtistAbout(track);
-  }
+  _loadArtistAbout(track, { wikiOnly: _scene });
   _renderTagEdit(track);
   _loadPatterns(track);
 
@@ -1514,6 +1513,10 @@ async function _loadExtendedInfo(track) {
         } else {
             instField.style.display = 'none';
         }
+        // No detail known (an Amiga module whose player reports none, a
+        // catalogue tune not read yet): no empty "Module Details" heading.
+        section.style.display = [...section.querySelectorAll('.ti-field')]
+            .some((f) => f.style.display !== 'none') ? '' : 'none';
     } catch (e) {
         if (e && e.name === 'AbortError') return;   // track switched; new load owns the UI
         section.style.display = 'none';
@@ -2188,6 +2191,21 @@ function close() {
 }
 
 function isOpen() { return !overlay.classList.contains('hidden'); }
+
+// The server re-read the track on show (a catalogue tune's first play): the
+// panel shows the stored row — tabs, details, tunes — as for a scanned file.
+document.addEventListener('soniqboom:track-refreshed', (e) => {
+  const d = (e && e.detail) || {};
+  if (!isOpen() || !_queue || !d.id || !d.fields) return;
+  const t = _queue[_idx];
+  if (!t || t.id !== d.id) return;
+  const keep = Number.isInteger(t.subsong) ? { subsong: t.subsong, duration: t.duration } : {};
+  Object.assign(t, d.fields, keep);
+  // An open edit form keeps what is being typed (the next open shows the rest).
+  const wrap = document.getElementById('ti-tagedit-wrap');
+  if (wrap && wrap.querySelector('input, textarea, select')) return;
+  _render(t);
+});
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {

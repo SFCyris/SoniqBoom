@@ -20,7 +20,7 @@
 'use strict';
 
 const VENDOR = '/assets/js/vendor/';
-const WASM_V = '3';                      // cache-bust the glue+wasm on rebuild
+const WASM_V = '4';                      // cache-bust the glue+wasm on rebuild
 importScripts(VENDOR + 'sidwasm.js?v=' + WASM_V);   // defines global createSidModule
 
 const RATE = 44100;

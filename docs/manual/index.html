@@ -95,14 +95,14 @@
     <div class="grid cols-3">
       <div class="card"><span class="ico">🎮</span><h4>Chiptune &amp; console</h4><p>SID, NSF, SPC, GBS, VGM, AY, KSS, SAP, GYM, HES — rendered on the fly, with tunable 6581 / 8580 SID fidelity.</p></div>
       <div class="card"><span class="ico">🎹</span><h4>Tracker modules</h4><p>MOD, XM, IT, S3M, MED and the full libopenmpt family — every voice metered on its own channel.</p></div>
-      <div class="card"><span class="ico">💾</span><h4>Amiga &amp; Atari exotica</h4><p>Over 175 UADE formats — TFMX, Future Composer, Jochen Hippel, SidMon — plus AHX, HivelyTracker and Atari ST SNDH / YM / SC68.</p></div>
+      <div class="card"><span class="ico">💾</span><h4>Amiga &amp; Atari exotica</h4><p>About 175 UADE players — TFMX, Future Composer, Jochen Hippel, SidMon — plus AHX, HivelyTracker and Atari ST SNDH / YM / SC68.</p></div>
       <div class="card"><span class="ico">🕹️</span><h4>Portable &amp; console rips</h4><p>The PSF family in full — PSF, PSF2, GSF, USF, 2SF, SSF, DSF and NCSF — straight from the reference emulation cores.</p></div>
       <div class="card"><span class="ico">🟥</span><h4>AdLib / OPL FM</h4><p>The sound of DOS gaming — id Software IMF, ROL, CMF and more, through an OPL2 synthesiser.</p></div>
       <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD) and every common lossy codec.</p></div>
       <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Per-channel VU meters, a live spectrum fallback, an animated decode signal-chain, and the Library Galaxy star-field.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Scene origins</h4><p>Retro modules matched by fingerprint against Modland fill in the original scene author and the tune's provenance path.</p></div>
       <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares straight from the admin panel — no operating-system mount required.</p></div>
-      <div class="card"><span class="ico">🌐</span><h4>Modland catalogue</h4><p>One switch lists Modland's module archive — hundreds of thousands of tunes — in your library; a tune is downloaded only when you play it.</p></div>
+      <div class="card"><span class="ico">🌐</span><h4>Modland catalogue</h4><p>One switch lists Modland's module archive — hundreds of thousands of tunes — in your library; a tune is downloaded only when it is needed — to play it or to read its details.</p></div>
       <div class="card"><span class="ico">📱</span><h4>OpenSubsonic API</h4><p>Connect Amperfy, Symfonium, DSub, Feishin and the wider Subsonic app ecosystem to your server.</p></div>
       <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide directory — HLS and classic streams alike, with live now-playing titles and cover art.</p></div>
       <div class="card"><span class="ico">📡</span><h4>Casting <span class="badge beta">Beta</span></h4><p>Send playback to Chromecast, AirPlay and DLNA receivers — even rendered SID and tracker tunes.</p></div>
@@ -132,10 +132,12 @@ bash <span class="k">run.sh</span>            <span class="c"># starts the serve
       <code>install.sh</code> installs <code>sidplayfp</code> (SID), <code>fluidsynth</code> (MIDI),
       <code>libopenmpt</code> (trackers), <code>uade</code> (AHX + Amiga exotica), <code>libgme</code> (console
       chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>, with the
-      bundled StSound engine compiled on first play) and <code>zxtune123</code> (the PSF console-rip family) — on macOS via Homebrew, on
-      Linux via your distribution's package manager (apt, dnf, pacman or zypper). The HivelyTracker decoder is
-      bundled with SoniqBoom itself. Nothing to pick, nothing to add later — every format in this
-      guide plays out of the box.</div>
+      bundled StSound engine compiled on first play) and <code>zxtune123</code> (the PSF console-rip family, MED&nbsp;2–4 modules and VGM files that use a chip libgme lacks) — Homebrew packages and source builds on macOS; on
+      Linux your distribution's packages (apt, dnf, pacman or zypper), the prebuilt <code>zxtune123</code> and
+      source builds of <code>psgplay</code>, <code>uade</code> and <code>sc68</code> where the distribution has none, plus
+      <code>lha</code> from lhasa for LHA archives where the distribution packages it. The HivelyTracker decoder is
+      bundled with SoniqBoom itself. MIDI needs a SoundFont: add one under <b>gear → Renderers → Soundfonts</b>.
+      Every other format in this guide plays out of the box.</div>
 
     <h3>Or run it in Docker</h3>
     <p>One container ships ffmpeg and all the renderers. Your music mounts read-only at
@@ -224,8 +226,9 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <p class="sec-sub">A search bar that understands field operators, and smart views that surface your library by listening habit.</p>
 
     <h3>Search with field operators</h3>
-    <p>Type anything to search titles, artists and albums at once. Narrow it with field operators —
-       stack as many as you like:</p>
+    <p>Type anything to search titles, artists, album artists, albums, composers, scene groups and games at once:
+       every word you type must match, and a word of two or more characters matches the start of a word
+       (<code>var</code> finds “Varga”). Narrow it with field operators — stack as many as you like:</p>
     <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC</pre>
     <table>
       <thead><tr><th>Operator</th><th>Matches</th></tr></thead>
@@ -381,14 +384,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       playing within a fraction of a second while the rest of it renders — SID, MIDI, AdLib / OPL, Atari ST SNDH,
       the PSF family, console chiptunes and Amiga modules alike (a tune that opens with silence starts once its
       first sound is rendered). Safari starts a first play once its render is complete. Subsonic apps and DLNA
-      players start SID and SNDH tunes while they render; a Subsonic app that asks for MP3 or another format
+      players (the DLNA Media Server is in Beta) start SID and SNDH tunes while they render; a Subsonic app that asks for MP3 or another format
       gets that quick start for every one of these formats, unless it asks for a start offset or — for any but
       SID and SNDH — an estimated file size. Casting (Beta) starts SID, MIDI, AHX and console-chiptune tunes the
       same way.</div>
 
     <h3>Per-channel VU meters for tracker modules</h3>
     <p>Open any module and SoniqBoom shows a meter for <em>every</em> voice in the song — Paula channels,
-       sample slots, OPL operators — dancing in real time, alongside the module's real metadata: channel
+       sample slots — dancing in real time, alongside the module's real metadata: channel
        and pattern counts, instrument names, and the embedded text messages trackers are famous for.
        A live <strong>signal path</strong> traces the exact decode chain for the playing track.</p>
     <div class="fig-2">
@@ -403,7 +406,10 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <figcaption>A <b>64-channel</b> Impulse Tracker module — every voice metered at once.</figcaption>
       </figure>
     </div>
-    <div class="note">For formats without per-voice data — SID, console chiptunes, AdLib / OPL, Atari ST and the
+    <div class="note">C64 SID tunes of up to ten minutes get a three-voice meter, built in the background the first
+      time a tune plays (the spectrum shows until it is ready), and Amiga player formats played by UADE, AHX included, get per-voice
+      meters from an extra background pass (<a href="#settings">Playback preparation</a>). For formats without
+      per-voice data — HivelyTracker, console chiptunes, AdLib / OPL, Atari ST and the
       PSF family — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled so you always know
       which view you're seeing. Prefer a different look? A <b>circuit-board</b> VU skin, driven by the same live
       per-channel levels, is selectable in Settings.</div>
@@ -420,16 +426,17 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        exactly as written, spacing and all. A <em>Made with</em> row names the tracker software when the
        file records it, and BPM comes straight from the module's own tempo.</p>
     <div class="note"><b>Which formats?</b> The pattern grid covers the classic tracker family — MOD, S3M, XM,
-      IT, MED, 669, MTM, OKT and the rest of the libopenmpt set. AHX, HivelyTracker and the Amiga exotica keep
-      their per-voice meters and module details, and SID and MIDI keep their own detail panels.</div>
+      IT, MED, 669, MTM, OKT and the rest of the libopenmpt set. AHX and the Amiga exotica keep
+      their per-voice meters and module details, HivelyTracker its module details, and SID and MIDI keep their own detail panels.</div>
 
     <h3>Multi-song files — the tune picker</h3>
-    <p>A single SID, SNDH, AHX, Amiga, tracker or console-rip file (NSF, NSFe, GBS, AY, SAP) often holds many
+    <p>A single SID, SNDH, SC68, AHX, Amiga, tracker or console-rip file (NSF, NSFe, GBS, AY, SAP, KSS, HES) often holds many
        separate tunes — a game's whole soundtrack in one file. Open <strong>Track Info</strong> on one and a
        <strong>tune picker</strong> lists every subsong: <b>▶</b> play, <b>+</b> queue or <b>☰</b> add any one to a
        playlist, or <b>Play all</b>,
        <b>Add all</b> and <b>shuffle</b> the whole set at once — and those single-tune picks live happily
-       inside playlists alongside ordinary tracks. When a SID is part of the
+       inside playlists alongside ordinary tracks. In track lists and search results, a file known to hold several
+       tunes carries an <b>N tunes</b> badge. When a SID is part of the
        <a href="https://hvsc.c64.org/" target="_blank" rel="noopener">HVSC</a> collection, each tune shows its
        real name and length from the <strong>Songlengths</strong> and <strong>STIL</strong> databases — so
        <em>Tune&nbsp;3&nbsp;/&nbsp;6</em> reads <em>"Assembly"</em> rather than a bare number — with the full
@@ -480,6 +487,12 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        portrait, with a link to the full article — whenever the artist has one. The artist is matched
        through MusicBrainz using the album and track you're viewing, and the bio comes from the matched
        artist's Wikipedia page: "Ghost" on an Impera track is the Swedish band, not the apparition.
+       A retro track — SID, tracker, Amiga, Atari&nbsp;ST or PSF-family — shows a <b>Scene</b> tab in place of
+       Lyrics: the composer's <a href="https://demozoo.org/" target="_blank" rel="noopener">Demozoo</a>
+       profile (real name, groups, aliases and links), the release the tune comes from and more by the same
+       composer, plus the tune's Modland location and format. Its <em>About the artist</em> card then shows only a Wikipedia
+       article: the one the composer's Demozoo profile links, or, when Demozoo doesn't identify the composer, the
+       artist's Wikipedia page found as for other music.
        Below it, <b>✏️ Edit tags</b> opens an inline form for title, artist, album, album artist, game, genre
        and year: <b>Save tags</b> writes the changes into the audio file itself (the game as a GAME tag) and
        updates the library at the same time. This works on local MP3, FLAC, M4A, Ogg, Opus, WavPack and Musepack files; every
@@ -657,19 +670,21 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
         <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus, Musepack</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>DSD (1-bit)</strong></td><td>DSF, DFF, WSD</td><td>ffmpeg</td></tr>
-        <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID, RSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL</td></tr>
+        <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID, RSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL (a <code>.sid</code> without a PSID/RSID header is Amiga SidMon: uade123)</td></tr>
         <tr><td><strong>MIDI</strong></td><td>MID, MIDI</td><td>FluidSynth + SoundFonts</td></tr>
-        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, DSM …</td><td>libopenmpt (MED 2–4 modules: zxtune123)</td></tr>
+        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, SFX, WOW, AMF, DSM</td><td>libopenmpt (MED 2–4 modules: zxtune123)</td></tr>
         <tr><td><strong>Amiga</strong> (Hively / AHX)</td><td>AHX, HivelyTracker (HVL)</td><td>uade123 / bundled HivelyTracker engine</td></tr>
-        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>175+ custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
+        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>~175 custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
         <tr><td><strong>Atari ST</strong></td><td>SNDH, YM, SC68</td><td>psgplay / StSound / sc68</td></tr>
-        <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF</td><td>zxtune123</td></tr>
-        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme</td></tr>
-        <tr><td><strong>AdLib / OPL2 FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX …</td><td>AdPlug (<code>adplay</code>)</td></tr>
+        <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF</td><td>zxtune123 (a <code>.psf</code> without a PSF header is Amiga SoundFactory: uade123)</td></tr>
+        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme (VGM/VGZ using a chip other than the Sega PSG and YM2612 — YM2413, YM2151, NES APU, AY-3-8910 …: zxtune123)</td></tr>
+        <tr><td><strong>AdLib / OPL2 FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM, AMD</td><td>AdPlug (<code>adplay</code>, Nuked OPL3)</td></tr>
       </tbody>
     </table>
-    <p>ZIP archives are scanned and played <strong>inline</strong> — tracks inside <code>.zip</code> files
-       appear in your library without unpacking.</p>
+    <p>Archives and disk images are scanned and played <strong>inline</strong> — tracks inside <code>.zip</code> files
+       (a ZIP inside a ZIP too), Amiga <code>.lha</code> / <code>.lzh</code> archives, C64 <code>.d64</code> /
+       <code>.d71</code> / <code>.d81</code> disk images and Amiga <code>.adf</code> disks appear in your library
+       without unpacking (on network shares: ZIP and LHA/LZH archives). The <strong>Scan ZIPs</strong> settings switch this on and off.</p>
     <div class="note"><b>DSD &amp; hi-res.</b> One-bit DSD files (<code>.dsf</code>, <code>.dff</code>, <code>.wsd</code>)
        play in any browser — SoniqBoom converts them to high-resolution PCM on the fly, and the library tags each
        one by rate (<code>DSD64</code>, <code>DSD128</code>, <code>DSD256</code>, <code>DSD512</code>). High-resolution
@@ -681,7 +696,8 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <h2 class="sec"><span class="num">10</span>Casting <span class="badge beta">Beta</span></h2>
     <p class="sec-sub">Send what you're playing to a TV, speaker or receiver on your network.</p>
     <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported;
-      behaviour can vary by device.</div>
+      behaviour can vary by device. Each target type needs its Python package in SoniqBoom's environment —
+      <code>pychromecast</code>, <code>pyatv</code> or <code>async-upnp-client</code> (not included in the Docker image).</div>
     <ol class="steps">
       <li>Press the <b>cast button</b> in the player toolbar.</li>
       <li>Pick a device from the list — discovered Chromecast, Apple TV / HomePod (AirPlay), and DLNA receivers appear together.</li>
@@ -697,7 +713,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     <div class="note beta"><b>SoniqBoom as a DLNA server <span class="badge beta">Beta</span> — off by default.</b>
       Besides sending audio out, SoniqBoom can announce itself as a <strong>DLNA Media Server</strong> so UPnP
       controllers on your network (some smart TVs and receivers) can browse and play your library. Turn it on in
-      <a href="#settings">Settings → Services</a>; while it is on, any controller on the same network can browse your
+      <a href="#settings">gear → <b>System → Services</b></a>; while it is on, any controller on the same network can browse your
       whole library.</div>
   </section>
 
@@ -752,7 +768,7 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
       right alongside the room's transport and <b>Listeners</b> panel.</p>
 
     <div class="note">Every device must be able to reach the same SoniqBoom server. Multi-room is one of SoniqBoom's
-      optional services and is on by default — it can be turned off in <a href="#settings">Settings → Services</a>.</div>
+      optional services and is on by default — it can be turned off in <a href="#settings">gear → <b>System → Services</b></a>.</div>
   </section>
 
   <!-- ── LISTEN ANYWHERE ──────────────────────────────────────────── -->
@@ -836,14 +852,20 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
           title (the file name), its composer, its format, the game it belongs to where Modland's folders or file name
           say so, and its retro genres — browsable, searchable and playable right away. Its length shows once it has
           been played.</li>
-      <li>Nothing is copied ahead of time: a tune is downloaded from Modland when you <strong>play</strong> it,
+      <li>Nothing is copied ahead of time: a tune is downloaded from Modland when you <strong>play</strong> it or
+          open its <strong>Track Info</strong> (for tracker, SID, Amiga, Atari&nbsp;ST, PSF-family and multi-tune
+          console chiptune files),
           together with the files its format needs beside it (a TFMX tune's sample file, a PSF rip's library files),
           and plays from SoniqBoom's remote cache while it is kept there (its size is <em>Remote cache (MB)</em> under
-          <strong>System → Settings</strong>). Its first play reads the file itself — its length, number of tunes,
-          its own title and tags (the composer stays Modland's credit). The player also prepares the one track that
+          <strong>System → Settings</strong>). That first download reads the file itself — its length, number of tunes,
+          its own title and tags, including the composer the file names (Modland's credit names one where the
+          file doesn't); an open page shows them at once. With Modland's checksum list installed
+          (<strong>gear → Metadata → Scene origin (Modland)</strong>), Amiga modules show how many tunes they hold
+          before that when the song database is installed too, and HVSC SIDs when your HVSC copy is set up. The player also prepares the one track that
           plays next, and a Chromecast (casting is in <span class="badge beta">Beta</span>) loads the next tune of
           its queue shortly before it starts. Folder views, searches, artwork, waveforms, VU meters and background
-          passes never download a catalogue tune. At most 120 new tunes are downloaded within ten minutes; a play
+          passes never download a catalogue tune on their own (except with <em>For tunes shown in lists</em>,
+          below). At most 120 new tunes are downloaded within ten minutes; a play
           beyond that says to try again shortly.</li>
       <li><strong>Tunes</strong>: <em>Everything except the large PC tracker folders</em> (the default) leaves out
           Fasttracker&nbsp;2, Impulsetracker, Screamtracker&nbsp;3, Fasttracker and Multitracker; <em>Everything</em>
@@ -852,6 +874,12 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
           Server <span class="badge beta">Beta</span> then see your library without the catalogue, and a catalogue
           tune answers &ldquo;not found&rdquo; to them. Switched on, an app that syncs or caches a whole library for
           offline use tries to download the whole catalogue from Modland.</li>
+      <li><strong>Read details of tunes not played yet</strong>: <em>When I open Track Info</em> (the default)
+          downloads a tune's file when you open its Track Info. <em>For tunes shown in lists</em> also downloads, one
+          at a time, the SC68, SNDH and console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list that haven't been read yet, so their number
+          of tunes shows as you browse. These downloads have their own limit, which always leaves room for plays.
+          Amiga modules and HVSC SIDs show their number of tunes either way when Modland's checksum list is
+          installed (with the song database for Amiga modules, and your HVSC copy for SIDs).</li>
       <li>The index is refreshed on the schedule picked in the menu right of <strong>Refresh now</strong> —
           <em>Daily</em> (the default), <em>Weekly</em>, <em>Every 2 weeks</em> or <em>Monthly</em>, counted from
           the last successful refresh — or at once with <strong>Refresh now</strong>; the status line shows when the
@@ -941,7 +969,7 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
        optional <a href="#modland">Modland catalogue</a> needs about 1&nbsp;GB more. The
        initial scan runs at roughly two minutes per 50,000 tracks. On disk, SoniqBoom keeps a snapshot of the library
        plus a render / transcode cache for instant replay — 4 GB by default, adjustable from 256 MB to 100 GB in
-       <a href="#settings">Settings → Renderers</a>.</div>
+       <a href="#settings">gear → <b>Renderers</b></a>.</div>
   </section>
 
   <!-- ── SETTINGS & INTEGRATIONS ──────────────────────────────────── -->

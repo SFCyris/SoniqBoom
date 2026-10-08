@@ -25,7 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pre-create every /out subtree the runtime stage COPYs from — including
 # sc68's share dir — so a SLIM build (which skips sc68/uade) still has empty
 # dirs to copy and the runtime COPYs don't fail on a missing source path.
-RUN mkdir -p /out/bin /out/lib /out/share \
+# /out/share/doc/third-party/<name> → licence and copyright files of each
+# component built or downloaded below (ends up in /usr/local/share/doc/third-party).
+RUN mkdir -p /out/bin /out/lib /out/share /out/share/doc/third-party \
     /out/sc68/usr/local/bin /out/sc68/usr/local/lib /out/sc68/usr/local/share
 
 # SLIM=1 skips the two heavy source-compiled renderers (uade123's Amiga
@@ -57,7 +59,10 @@ RUN set -eux; \
       && git -C /tmp/psgplay checkout "$PSGPLAY_COMMIT" \
       && git -C /tmp/psgplay submodule update --init --recursive \
       && make -C /tmp/psgplay -j"$(nproc)" psgplay \
-      && install -m0755 /tmp/psgplay/psgplay /out/bin/psgplay ) \
+      && install -m0755 /tmp/psgplay/psgplay /out/bin/psgplay \
+      && mkdir -p /out/share/doc/third-party/psgplay \
+      && ( cd /tmp/psgplay && tar cf - licence lib/toslibc/licence lib/*/LICENCE ) \
+         | tar xf - -C /out/share/doc/third-party/psgplay ) \
       || echo "NOTE: psgplay build failed — Atari ST SNDH (.sndh) disabled." ; \
     rm -rf /tmp/psgplay
 
@@ -65,21 +70,34 @@ RUN set -eux; \
 # Official prebuilt; fetch the arch that matches the build — BOTH x86_64 and
 # arm64 are published on storage.zxtune.ru (the arm64 build needs glibc ≤ 2.35,
 # and bookworm ships 2.36, so it runs).
+# The licence files come from the source tree of the same tag (the prebuilt
+# archive has none).
+ARG ZXTUNE_REV=r5100
+ARG ZXTUNE_SHA256_X86_64=fc89c74d86ae313a1f386b4421a74b6cc650bac5271df033ee8b9a96a243b4d8
+ARG ZXTUNE_SHA256_ARM64=102d4947ee0881cbda40dd279140a4a4f1ec83920bc10fe772cbb4ec7ef8c320
 RUN set -eux; \
     case "$(uname -m)" in \
-      x86_64)        ZXARCH=x86_64 ;; \
-      aarch64|arm64) ZXARCH=arm64  ;; \
+      x86_64)        ZXARCH=x86_64; ZXSHA="$ZXTUNE_SHA256_X86_64" ;; \
+      aarch64|arm64) ZXARCH=arm64;  ZXSHA="$ZXTUNE_SHA256_ARM64" ;; \
       *)             ZXARCH="" ;; \
     esac; \
     if [ -n "$ZXARCH" ]; then \
       ( mkdir -p /tmp/zx \
         && curl -sfL --max-time 300 \
-             "https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/zxtune_r5100_linux_${ZXARCH}.tar.gz" \
+             "https://storage.zxtune.ru/builds/public/${ZXTUNE_REV}/linux/${ZXARCH}/zxtune_${ZXTUNE_REV}_linux_${ZXARCH}.tar.gz" \
              -o /tmp/zx.tar.gz \
+        && echo "$ZXSHA  /tmp/zx.tar.gz" | sha256sum -c - \
         && tar xzf /tmp/zx.tar.gz -C /tmp/zx \
-        && install -m0755 "$(find /tmp/zx -name zxtune123 -type f | head -1)" /out/bin/zxtune123 ) \
+        && install -m0755 "$(find /tmp/zx -name zxtune123 -type f | head -1)" /out/bin/zxtune123 \
+        && curl -sfL --max-time 600 \
+             "https://github.com/vitamin-caig/zxtune/archive/refs/tags/${ZXTUNE_REV}.tar.gz" \
+             -o /tmp/zxsrc.tar.gz \
+        && mkdir -p /out/share/doc/third-party/zxtune \
+        && tar tzf /tmp/zxsrc.tar.gz \
+           | grep -E '/(LICEN[CS]E[^/]*|COPYING[^/]*|license\.txt|LICENSES|AUTHORS)$' > /tmp/zxlic \
+        && tar xzf /tmp/zxsrc.tar.gz -C /out/share/doc/third-party/zxtune --strip-components=1 -T /tmp/zxlic ) \
         || echo "NOTE: zxtune123 fetch failed — PSF family (.psf/.usf/.gsf/…) disabled." ; \
-      rm -rf /tmp/zx /tmp/zx.tar.gz ; \
+      rm -rf /tmp/zx /tmp/zx.tar.gz /tmp/zxsrc.tar.gz /tmp/zxlic ; \
     else \
       echo "NOTE: no zxtune123 prebuilt for $(uname -m) — PSF family disabled." ; \
     fi
@@ -100,9 +118,11 @@ RUN set -eux; \
 # make resumes from cached objects, so a retry re-compiles only the crashed file,
 # and the -j1 last resort removes emulation concurrency pressure.  No-op natively.
 ARG SC68_URL=https://downloads.sourceforge.net/project/sc68/sc68/2.2.1/sc68-2.2.1.tar.gz
+ARG SC68_SHA256=d7371f0f406dc925debf50f64df1f0700e1d29a8502bb170883fc41cc733265f
 RUN set -eux; \
     if [ "$SLIM" = "1" ]; then echo "SLIM build — skipping sc68 (.sc68 disabled)"; exit 0; fi; \
     ( curl -sfL --max-time 300 "$SC68_URL" -o /tmp/sc68.tar.gz \
+      && echo "$SC68_SHA256  /tmp/sc68.tar.gz" | sha256sum -c - \
       && tar xzf /tmp/sc68.tar.gz -C /tmp \
       && cd /tmp/sc68-2.2.1 \
       && cp /usr/share/automake-*/config.guess ./config.guess \
@@ -115,7 +135,8 @@ RUN set -eux; \
          ./configure --prefix=/usr/local --build="$(gcc -dumpmachine)" \
       && find . -name Makefile -exec sed -i 's/-O3/-O1/g' {} + \
       && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } \
-      && make install DESTDIR=/out/sc68 ) \
+      && make install DESTDIR=/out/sc68 \
+      && mkdir -p /out/share/doc/third-party/sc68 && cp COPYING AUTHORS /out/share/doc/third-party/sc68/ ) \
       || echo "NOTE: sc68 build failed — Atari ST .sc68 disabled (SNDH/YM unaffected)." ; \
     rm -rf /tmp/sc68.tar.gz /tmp/sc68-2.2.1
 
@@ -130,19 +151,24 @@ RUN set -eux; \
 # uade123 → bin; the two .so + the lib/uade/uadecore m68k engine (uade123 spawns
 # it per render — without it, --version works but playback dies) → lib; the
 # eagleplayer/score/player data → share/uade.
+ARG BENCODETOOLS_REF=v1.0.1
+ARG LIBZAKALWE_REF=v1.0.0
+ARG UADE_URL=https://zakalwe.fi/uade/uade3/uade-3.05.tar.bz2
+ARG UADE_SHA256=1a2dd9fdf8cf47c4587dcc09df16f1bb49374a9e7f8f53cdb4816d50c87e4f4c
 RUN set -eux; \
     if [ "$SLIM" = "1" ]; then echo "SLIM build — skipping uade123 (Amiga exotica disabled)"; exit 0; fi; \
     ( apt-get update \
       && apt-get install -y --no-install-recommends libao-dev bzip2 \
       && git clone https://gitlab.com/heikkiorsila/bencodetools.git /tmp/bt \
-      && ( cd /tmp/bt && (git checkout -q v1.0.1 2>/dev/null || true) \
+      && ( cd /tmp/bt && git checkout -q "$BENCODETOOLS_REF" \
            && ./configure --prefix=/usr/local --without-python \
            && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } && make install ) \
       && git clone https://gitlab.com/hors/libzakalwe.git /tmp/lz \
-      && ( cd /tmp/lz && (git checkout -q v1.0.0 2>/dev/null || true) && ./configure \
+      && ( cd /tmp/lz && git checkout -q "$LIBZAKALWE_REF" && ./configure \
            && { make install PREFIX=/usr/local CC=cc || make install PREFIX=/usr/local CC=cc \
                 || make -j1 install PREFIX=/usr/local CC=cc; } ) \
-      && curl -sfL --max-time 300 https://zakalwe.fi/uade/uade3/uade-3.05.tar.bz2 -o /tmp/uade.tar.bz2 \
+      && curl -sfL --max-time 300 "$UADE_URL" -o /tmp/uade.tar.bz2 \
+      && echo "$UADE_SHA256  /tmp/uade.tar.bz2" | sha256sum -c - \
       && tar xjf /tmp/uade.tar.bz2 -C /tmp \
       && ( cd /tmp/uade-3.05 \
            && ./configure --prefix=/usr/local --libzakalwe-prefix=/usr/local \
@@ -151,9 +177,14 @@ RUN set -eux; \
       && install -m0755 /usr/local/bin/uade123 /out/bin/uade123 \
       && cp -a /usr/local/lib/libzakalwe.so* /usr/local/lib/libbencodetools.so* /out/lib/ \
       && cp -a /usr/local/lib/uade /out/lib/uade \
-      && cp -a /usr/local/share/uade /out/share/uade ) \
+      && cp -a /usr/local/share/uade /out/share/uade \
+      && mkdir -p /out/share/doc/third-party/uade /out/share/doc/third-party/bencodetools /out/share/doc/third-party/libzakalwe \
+      && tar tjf /tmp/uade.tar.bz2 | grep -E '/(COPYING[^/]*|copying|AUTHORS)$' > /tmp/uadelic \
+      && tar xjf /tmp/uade.tar.bz2 -C /out/share/doc/third-party/uade --strip-components=1 -T /tmp/uadelic \
+      && cp /tmp/bt/LICENSE /tmp/bt/LICENSE.bencode /tmp/bt/AUTHORS /out/share/doc/third-party/bencodetools/ \
+      && cp /tmp/lz/COPYING /out/share/doc/third-party/libzakalwe/ ) \
       || echo "NOTE: uade123 build failed — Amiga exotica (TFMX/FC/…) disabled." ; \
-    rm -rf /tmp/bt /tmp/lz /tmp/uade-3.05 /tmp/uade.tar.bz2 /var/lib/apt/lists/*
+    rm -rf /tmp/bt /tmp/lz /tmp/uade-3.05 /tmp/uade.tar.bz2 /tmp/uadelic /var/lib/apt/lists/*
 
 # ── Gate: every renderer must be present before we build the runtime image ──────
 # Each step above is best-effort (|| echo NOTE) so a transient failure prints a
@@ -167,11 +198,15 @@ RUN set -eux; \
 # --build-arg ALLOW_MISSING_RENDERERS=1.
 ARG ALLOW_MISSING_RENDERERS=0
 RUN set -eu; \
-    req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav"; \
+    req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav \
+         /out/share/doc/third-party/zxtune/LICENSE.md /out/share/doc/third-party/zxtune/3rdparty/unrar/license.txt \
+         /out/share/doc/third-party/psgplay/licence/GPL-2.0 /out/share/doc/third-party/psgplay/lib/toslibc/licence/GPL-2.0"; \
     if [ "$SLIM" != "1" ]; then \
       req="$req /out/bin/uade123 /out/lib/uade/uadecore /out/lib/libzakalwe.so \
            /out/lib/libbencodetools.so /out/share/uade/eagleplayer.conf \
-           /out/sc68/usr/local/bin/sc68 /out/sc68/usr/local/share/sc68/Replay/mcoder.bin"; \
+           /out/sc68/usr/local/bin/sc68 /out/sc68/usr/local/share/sc68/Replay/mcoder.bin \
+           /out/share/doc/third-party/sc68/COPYING /out/share/doc/third-party/uade/COPYING /out/share/doc/third-party/uade/COPYING.GPL \
+           /out/share/doc/third-party/bencodetools/LICENSE /out/share/doc/third-party/libzakalwe/COPYING"; \
     fi; \
     missing=""; \
     for f in $req; do [ -e "$f" ] || missing="$missing $f"; done; \

@@ -102,6 +102,61 @@ def test_an_archived_prefix_named_module_gets_a_clean_title(tmp_path):
     assert scanner._member_stem("pack.zip::MED.Dying_Forest.med") == "Dying_Forest"
 
 
+# Prefix-named Amiga modules inside archives whose token is on the SUFFIX
+# denylist (``di`` / ``md`` …: ``readme.md`` is no module, ``md.mercs`` is) —
+# the follow-up report on #24: Pinball_Dreams.lha listed 0 playable members.
+_PINBALL = ["Pinball_Dreams\\di.beatbox", "Pinball_Dreams\\di.ignition",
+            "Pinball_Dreams\\di.menu", "Pinball_Dreams\\di.nightmare",
+            "Pinball_Dreams\\di.steelwheels", "Pinball_Dreams\\di.title"]
+
+
+def test_prefix_tokens_keep_the_suffix_denylisted_ones(monkeypatch):
+    from soniqboom.core import uade_formats as u
+    monkeypatch.setattr(u, "player_map", lambda: {
+        "di": "PTK-Prowiz", "md": "MikeDavies", "mdat": "TFMX", "fc13": "FC",
+        "smpl": "TFMX", "m&k.": "X", "mod": "PTK-Prowiz"})
+    pre, suf = u.prefix_tokens(), u.new_suffix_tokens()
+    assert {"di", "md", "mdat", "fc13", "mod"} <= set(pre)
+    assert "smpl" not in pre and "m&k." not in pre        # companion / dotted
+    assert "di" not in suf and "md" not in suf            # foo.di / readme.md stay out
+    assert {"mdat", "fc13"} <= set(suf) and "mod" not in suf
+
+
+def _needs_uade_prefix(*toks):
+    from soniqboom.core import uade_formats as u
+    missing = [t for t in toks if t not in u.player_map()]
+    return pytest.mark.skipif(bool(missing), reason=f"no eagleplayer.conf token {missing}")
+
+
+@_needs_uade_prefix("di", "md", "ma")
+def test_an_archive_of_suffix_denylisted_prefix_modules_lists_every_one(tmp_path):
+    from soniqboom.core import archive
+    z = tmp_path / "Pinball_Dreams.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        for m in _PINBALL + ["Game\\md.mercs", "Game\\ma.thanatos"]:
+            zf.writestr(m, b"\0" * 64)
+        for m in ("Pinball_Dreams\\readme.md", "Pinball_Dreams\\notes.di",
+                  "Game\\list.ma", "Game\\smpl.title"):
+            zf.writestr(m, b"text")
+    real = set(archive._members(z).values())
+    assert real == set(_PINBALL) | {"Game\\md.mercs", "Game\\ma.thanatos"}
+    for disp in archive._members(z):
+        assert metadata.is_supported_music_name(disp)
+        assert metadata.title_from_filename(disp) in {
+            "beatbox", "ignition", "menu", "nightmare", "steelwheels", "title",
+            "mercs", "thanatos"}
+
+
+@_needs_uade_prefix("di", "md", "mdat")
+def test_uade_gets_the_member_name_without_its_routing_extension():
+    from soniqboom.api import stream
+    assert stream._uade_member_real_name("di.title.di") == "di.title"
+    assert stream._uade_member_real_name("md.mercs.md") == "md.mercs"
+    assert stream._uade_member_real_name("mdat.acieed1.mdat") == "mdat.acieed1"
+    assert stream._uade_member_real_name("di.title") == "di.title"
+    assert stream._uade_member_real_name("readme.md") is None
+
+
 def test_the_metadata_repair_finds_the_magic_titles():
     assert repair._has_bad_tracker_title({"path": "/m/MED.x.med", "title": "MMD0"})
     assert repair._has_bad_tracker_title({"path": "/m/x.oct", "title": "MMD2"})
@@ -161,6 +216,27 @@ async def test_the_search_box_artist_operator(artists, monkeypatch):
     rows = await search_api.run_search_dicts("artist:Marcin", limit=50)
     assert sorted(r["id"] for r in rows) == ["a", "b", "c", "h"]
     assert sorted(artists.filter_track_ids(**_parse_tag_query(adv))) == ["a", "b", "c", "h"]
+
+
+def test_every_typed_word_is_a_prefix_even_when_it_is_also_a_whole_word():
+    """#25 follow-up: "artist:rob var" found nothing because "var" was matched
+    as the whole word of another track ("Var Intro"), never as the start of
+    "Varga"."""
+    s = TrackStore()
+
+    def tr(i, title, artist):
+        return {"id": i, "path": f"/x/{i}.sid", "title": title, "artist": artist,
+                "album": "", "format": "SID", "added_at": 1}
+    s.upsert_tracks_batch([tr("a", "Call me!", "Robert Varga"), tr("b", "Happy Birthday", "Robert Varga"),
+                           tr("c", "Var Intro", "Someone Else"), tr("d", "Rob", "Ro"),
+                           tr("e", "A Song", "X"), tr("f", "Alpha", "Y")])
+    ids = lambda **k: sorted(t["id"] for t in s.filter_tracks(limit=50, **k))  # noqa: E731
+    assert ids(query="var") == ["a", "b", "c"]
+    assert ids(query="rob var") == ["a", "b"]
+    assert ids(query="robert var") == ["a", "b"]
+    assert ids(artist_match="rob", query="var") == ["a", "b"]
+    assert ids(query="a") == ["e"]                    # one character: that word, if any track has it
+    assert ids(query="al") == ["f"]
 
 
 # ── #27 ─────────────────────────────────────────────────────────────────────

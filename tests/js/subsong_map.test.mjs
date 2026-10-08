@@ -155,3 +155,14 @@ test('a picked tune is the file plus its wire, count, start song and label', asy
   assert.ok(TUNE_CHIP_FORMAT_NAMES.has('GBS') && TUNE_CHIP_FORMAT_NAMES.has('NSF'));
   assert.ok(!TUNE_CHIP_FORMAT_NAMES.has('SPC'), 'one tune per file');
 });
+
+test('a multi-tune file shows its tune count in lists, a picked tune does not (GitHub #30)', async () => {
+  const { listTuneCount } = await import('../../soniqboom/frontend/js/tunes.js');
+  assert.equal(listTuneCount({ subsongs: 5 }), 5);
+  assert.equal(listTuneCount({ subsongs: 1 }), 0);
+  assert.equal(listTuneCount({ subsongs: null }), 0);
+  assert.equal(listTuneCount({}), 0);
+  assert.equal(listTuneCount({ subsongs: 5, subsong: 2 }), 0);   // one tune of it (a queue / playlist entry)
+  assert.equal(listTuneCount({ subsongs: 5, subsong: 0 }), 0);
+  assert.equal(listTuneCount(null), 0);
+});

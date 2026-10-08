@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soniqboom"
-version = "1.12.0"
+version = "1.12.1"
 description = "Self-hosted music server for personal libraries — FLAC, MP3, Opus, SID, MIDI, plus 20+ tracker formats"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
@@ -41,7 +41,7 @@ dependencies = [
 Homepage      = "https://github.com/SFCyris/SoniqBoom"
 Source        = "https://github.com/SFCyris/SoniqBoom"
 Issues        = "https://github.com/SFCyris/SoniqBoom/issues"
-Documentation = "https://github.com/SFCyris/SoniqBoom/blob/main/docs/README.md"
+Documentation = "https://github.com/SFCyris/SoniqBoom/blob/main/docs/manual/index.html"
 Changelog     = "https://github.com/SFCyris/SoniqBoom/releases"
 
 [project.optional-dependencies]

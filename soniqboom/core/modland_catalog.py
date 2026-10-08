@@ -125,6 +125,11 @@ CONFIG_SCOPE = "modland_catalog_scope"
 CONFIG_SUBSONIC = "modland_catalog_subsonic"
 CONFIG_RULES = "modland_catalog_rules"
 CONFIG_INTERVAL = "modland_catalog_interval"
+# When a tune not played yet is read for its details (tunes, length, tags):
+# "intent" — when a listener opens its Track Info (the default), "lists" —
+# also when it is shown in a list (more downloads from Modland).
+CONFIG_TUNE_DETAILS = "modland_catalog_tune_details"
+TUNE_DETAILS = ("intent", "lists")
 # Bytes the index refreshes downloaded (full indexes + changelogs), in all.
 CONFIG_INDEX_BYTES = "modland_catalog_index_bytes"
 SCOPE_STANDARD = "standard"
@@ -138,7 +143,8 @@ PC_TRACKER_DIRS = ("Fasttracker 2", "Impulsetracker", "Screamtracker 3", "Fasttr
 # Bump when the derivation of a catalogue track from its index line changes:
 # the next build re-derives every catalogue track (user edits and enrichment
 # carried, ``store._carry_enrichment``).
-RULES_VERSION = 1
+RULES_VERSION = 3          # 2: the format family genre (Amiga / Tracker …); fill-only credit
+                           # 3: denylisted uade suffixes in their player's folder are music
 
 # How often the index is refreshed: the setting's value → seconds, and the
 # wording the settings show.
@@ -255,6 +261,22 @@ def interval() -> str:
     except Exception:                                   # noqa: BLE001
         return DEFAULT_INTERVAL
     return v if v in INTERVALS else DEFAULT_INTERVAL
+
+
+def tune_details() -> str:
+    """When unplayed tunes are read for their details: a ``TUNE_DETAILS``."""
+    try:
+        v = _store().get_config(CONFIG_TUNE_DETAILS, "intent")
+    except Exception:                                   # noqa: BLE001
+        return "intent"
+    return v if v in TUNE_DETAILS else "intent"
+
+
+def set_tune_details(mode: str) -> dict:
+    if mode not in TUNE_DETAILS:
+        raise ValueError(f"tune_details must be one of {list(TUNE_DETAILS)}")
+    _store().set_config(CONFIG_TUNE_DETAILS, mode)
+    return status()
 
 
 def interval_seconds() -> int:
@@ -464,6 +486,26 @@ def _engine(name: str) -> str | None:
     return "uade"
 
 
+def folder_player_token(rel: str) -> str | None:
+    """The uade token of a file whose extension is one of the suffixes the
+    scanner never takes as music on its own (``uade_formats.
+    _SUFFIX_REGISTRATION_DENY``: ``.ma``, ``.md``, ``.ps`` … — ``readme.md``)
+    but which sits in the Modland folder named after that token's player
+    ("Music Assembler/x.ma" → MusicAssembler, "Mike Davies/…/x.md"): a real
+    module uade plays.  None otherwise (an IFF-SMUS instrument ``.ss`` is not
+    Speedy System)."""
+    from soniqboom.core import uade_formats as uf
+    name = rel.rsplit("/", 1)[-1]
+    tok = os.path.splitext(name)[1].lower().lstrip(".")
+    if not tok or tok not in uf._SUFFIX_REGISTRATION_DENY:
+        return None
+    player = uf.player_map().get(tok)
+    if not player:
+        return None
+    norm = lambda s: "".join(c for c in s.lower() if c.isalnum())  # noqa: E731
+    return tok if norm(rel.split("/", 1)[0]) == norm(player) else None
+
+
 def _dir_key(rel: str) -> str:
     parts = rel.split("/")
     if parts[0] in _TWO_LEVEL and len(parts) > 2:
@@ -485,7 +527,7 @@ def _classify(rel: str, majority: dict | None = None) -> int:
         return KIND_OTHER
     eng = _engine(name)
     if eng is None:
-        return KIND_OTHER
+        return KIND_MUSIC if folder_player_token(rel) else KIND_OTHER
     if eng == "uade":
         if rel.split("/", 1)[0] in _UADE_FOREIGN_DIRS:
             return KIND_OTHER
@@ -1690,6 +1732,9 @@ def format_for(rel: str) -> str:
     cls = uf.classify(name)
     if cls:
         return uf.display_name(cls[0])
+    tok = folder_player_token(rel)
+    if tok:
+        return uf.display_name(uf.player_map()[tok])
     return metadata.FORMAT_NAMES.get(ext, "")
 
 
@@ -1769,6 +1814,44 @@ def apply_path_fields(t: dict, rel: str, *, siblings: dict | None,
     return t
 
 
+def family_genre(rel: str) -> list[str] | None:
+    """The format words the scanner's extractor stamps on a file of this kind
+    (``metadata``: SID → Chiptune / C64, tracker → Tracker / Module, uade →
+    Amiga / Module …) — what the web player and the stream route tell a
+    module family by, so a catalogue tune is one before its first play
+    (parity with local files).  None for kinds without one."""
+    from soniqboom.core import metadata
+    from soniqboom.core import uade_formats as uf
+    name = rel.rsplit("/", 1)[-1]
+    top = rel.split("/", 1)[0]
+    ext = os.path.splitext(name)[1].lower()
+    if ext in metadata.SID_EXTS:
+        if ext == ".sid" and top.startswith("SidMon"):
+            return ["Amiga", "Module"]
+        return ["Chiptune", "C64"]
+    if ext == ".psf" and top == "SoundFactory":
+        return ["Amiga", "Module"]
+    if ext == ".dsf":
+        return ["Chiptune", "Game Rip"]                    # Modland's .dsf: Dreamcast rips
+    if ext == ".imf" and top != "Imago Orpheus":
+        return None                                        # AdLib IMF
+    if ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS:
+        if ext in metadata._TRACKER_EXTS:
+            return ["Tracker", "Module"]
+        if ext in metadata._ATARI_EXTS:
+            return ["Chiptune", "Atari ST"]
+        if ext in metadata._PSF_EXTS:
+            return ["Chiptune", "Game Rip"]
+        if ext in metadata._GME_EXTS:
+            return ["Chiptune"]
+        if ext in metadata._MIDI_EXTS:
+            return ["MIDI"]
+        return None
+    if uf.classify(name) or folder_player_token(rel):
+        return ["Amiga", "Module"]
+    return None
+
+
 def _finish_genres(t: dict, names: bool) -> None:
     from soniqboom.core import genre_derive
     from soniqboom.core.store import game_follow
@@ -1797,8 +1880,11 @@ def build_track(rel: str, size: int, *, added_at: int, siblings: dict | None,
         "scan_root_hash": root_h,
         "is_duplicate_primary": True,
     }
-    # (Left out at their defaults: artist "", genre [], duration 0 — length
-    # unknown until the first play — and mtime 0, the "not merged" mark.)
+    fam = family_genre(rel)
+    if fam:
+        t["genre"] = fam
+    # (Left out at their defaults: artist "", duration 0 — length unknown
+    # until the first play — and mtime 0, the "not merged" mark.)
     apply_path_fields(t, rel, siblings=siblings, use_filename=use_filename)
     _finish_genres(t, names)
     from soniqboom.core.store import share_values
@@ -1920,6 +2006,7 @@ async def apply_index() -> dict:
     if not total:
         if store.get_config(CONFIG_RULES) != RULES_VERSION:
             store.set_config(CONFIG_RULES, RULES_VERSION)
+        await _refill_quietly()
         return result
     memo: dict = {}
     big = total >= 20_000
@@ -2021,7 +2108,117 @@ async def apply_index() -> dict:
     await _after_library_change()
     log.info("Modland catalogue: %d added, %d updated, %d removed (%d tunes, scope %s)",
              result["added"], result["changed"], result["removed"], result["tracks"], scope_)
+    await _refill_quietly()
     return result
+
+
+async def _refill_quietly() -> None:
+    try:
+        await refill_tune_counts()
+    except Exception:                                   # noqa: BLE001
+        log.warning("Modland catalogue: tune counts not filled", exc_info=True)
+
+
+def _tune_counts(rels: dict) -> dict:
+    """``rel → (tune count, first tune)`` of the catalogue files ``rels``
+    (rel → is it an Amiga module) holding more than one tune, from what is
+    known WITHOUT fetching them: Modland's checksum list (the scene index,
+    ``scene_metadata``) joined with the song database's tune lengths (Amiga
+    modules) and HVSC's Songlengths (C64 SIDs).  Empty when
+    the checksum list isn't installed.  Blocking."""
+    from soniqboom.core import scene_metadata as sm, songdb
+    out: dict = {}
+    if not rels or not sm.has_index():
+        return out
+    md5s: dict = {}
+    con = sm._connect_ro(sm._db_path())
+    try:
+        for md5, path in con.execute("SELECT md5, path FROM mods"):
+            if path in rels:
+                md5s[path] = (md5 or "").lower()
+    finally:
+        con.close()
+    if not md5s:
+        return out
+    if songdb.has_index():
+        by_key: dict = {}
+        for rel, md5 in md5s.items():
+            if md5 and not rel.startswith("HVSC/"):
+                by_key.setdefault(md5[:12], []).append(rel)
+        keys = list(by_key)
+        scon = songdb._connect_ro(songdb._db_path())
+        try:
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                for key, minsub, subs in scon.execute(
+                        f"SELECT key, minsub, subsongs FROM lengths WHERE key IN "
+                        f"({','.join('?' * len(chunk))})", chunk):
+                    n = len((subs or "").split())
+                    if n > 1:
+                        for rel in by_key.get(key, ()):
+                            out[rel] = (n, int(minsub or 0))
+        finally:
+            scon.close()
+    try:
+        from soniqboom.core.hvsc import get_hvsc
+        hv = get_hvsc()
+        if hv.is_configured():
+            for rel, md5 in md5s.items():
+                if rel.startswith("HVSC/") and md5:
+                    n = len(hv.lookup_durations_by_md5(md5))
+                    if n > 1:
+                        out[rel] = (n, 1)
+    except Exception:                                   # noqa: BLE001
+        log.debug("HVSC tune counts unavailable", exc_info=True)
+    return out
+
+
+async def refill_tune_counts() -> int:
+    """Give the unplayed catalogue tunes their tune count (the list's "N
+    tunes" badge, the Track Info tune list) from ``_tune_counts`` — before
+    a play, as a scanned file has it.  Run after a build / refresh, at start
+    and when the checksum list, song database or HVSC changes.  Returns the
+    number of tunes updated."""
+    store = _store()
+    if not enabled():
+        return 0
+    rh = root_hash()
+    cut = len(ROOT) + 2
+    want: dict = {}
+    for tid in store.get_track_ids_for_scan_root(rh):
+        t = store._tracks.get(tid)
+        if not t or is_merged(t):
+            continue                        # a played tune has what the file says
+        rel = t["path"][cut:]
+        amiga = (t.get("genre") or [None])[0] == "Amiga"
+        # Only kinds a scan counts the tunes of (uade modules, SIDs) — a
+        # tracker's count would vanish on its first play, as a scanned
+        # tracker shows none.
+        if not (amiga or rel.startswith("HVSC/")):
+            continue
+        want[rel] = (amiga, tid, t.get("subsongs"), t.get("subsong_base"))
+    if not want:
+        return 0
+    loop = asyncio.get_running_loop()
+    counts = await loop.run_in_executor(None, _tune_counts, want)
+    items = []
+    for rel, (n, first) in counts.items():
+        amiga, tid, have, base = want[rel]
+        patch = {}
+        if have != n:
+            patch["subsongs"] = n
+        # uade numbers a module's tunes from its first subsong (``-g`` "min").
+        if amiga and first > 0 and base != first:
+            patch["subsong_base"] = first
+        if patch:
+            items.append((tid, patch))
+    for i in range(0, len(items), 2_000):
+        store.update_track_fields_batch(items[i:i + 2_000])
+        await asyncio.sleep(0)
+    if items:
+        log.info("Modland catalogue: tune counts for %d tunes (checksum list, song "
+                 "database, HVSC)", len(items))
+    return len(items)
 
 
 async def _delete_sliced(store, ids: list, on_progress=None) -> int:
@@ -2141,6 +2338,14 @@ def _rederive_merged(old: dict, fresh: dict) -> dict:
     checksums, subsongs, title, tags — stays."""
     d = merged_track(fresh, old, "")
     d["mtime"] = old.get("mtime") or d["mtime"]
+    rel = old["path"][len(ROOT) + 2:]
+    credit = credit_for(rel, old.get("format"))
+    if (rel.startswith("HVSC/") and old.get("sid_md5") and credit
+            and (old.get("artist") or "") == credit):
+        # An HVSC SID merged when HVSC's folder name ("Turner Steve") replaced
+        # the author its header names: read it again on its next play — it
+        # stays a played tune meanwhile (kept on switch-off and rebuilds).
+        d[REREAD] = True
     if old.get("added_at"):
         d["added_at"] = old["added_at"]
     from soniqboom.core.store import share_values
@@ -2554,6 +2759,7 @@ def status() -> dict:
         out["index_bytes"] = 0
     lr = out["last_refresh"]
     out["interval"] = interval()
+    out["tune_details"] = tune_details()
     out["intervals"] = dict(INTERVAL_LABELS)
     out["next_refresh"] = _next_due() if (lr and out["enabled"]) else None
     out["root"] = ROOT
@@ -3067,6 +3273,11 @@ async def startup() -> None:
                     return await _update_then_apply()
                 await _run_job("startup", body)
             _spawn(_heal(), "modland-catalog.startup")
+        else:
+            async def _counts():
+                await asyncio.sleep(30)
+                await _refill_quietly()
+            _spawn(_counts(), "modland-catalog.tune-counts")
         _start_refresh_loop()
     elif _has_tracks() or ROOT in store._scan_dirs:
         log.info("Modland catalogue: finishing an interrupted switch-off")
@@ -3088,12 +3299,21 @@ async def shutdown() -> None:
 # ── First play: merge the file's own metadata ─────────────────────────────────
 
 _merging: set[str] = set()
+_merge_tasks: dict = {}                  # track id → its running merge (``await_merge``)
 _GENERIC_TITLES = frozenset({"untitled", "no name", "noname", "<?>", "?", "??", "???",
                              "unknown", "-", "title", "song", "module", "tune"})
 
 
+# A played tune to read again on its next play (``_rederive_merged``).
+REREAD = "catalogue_reread"
+
+
 def is_merged(t: dict | None) -> bool:
     return bool(t) and (t.get("mtime") or 0) > 0
+
+
+def _needs_merge(t: dict | None) -> bool:
+    return bool(t) and (not is_merged(t) or bool(t.get(REREAD)))
 
 
 def _good_title(s, local_stem: str) -> bool:
@@ -3119,7 +3339,8 @@ def merged_track(old: dict, meta: dict, local_stem: str) -> dict:
         if f in old:
             d[f] = old[f]
     d["mtime"] = time.time()                     # merged marker
-    d.setdefault("genre", [])
+    if not d.get("genre"):
+        d["genre"] = family_genre(rel) or []
     d.setdefault("is_duplicate_primary", True)
     if not _good_title(d.get("title"), local_stem):
         d["title"] = old.get("title") or title_for(rel)
@@ -3131,12 +3352,9 @@ def merged_track(old: dict, meta: dict, local_stem: str) -> dict:
         d["duration"] = old["duration"]
     elif (old.get("duration") or 0) > 0 and (meta.get("duration") or 0) in (180, 180.0):
         d["duration"] = old["duration"]
-    # The catalogue's composer credit stays the artist (one name per composer
-    # across the catalogue); the file's own names one only where Modland
-    # credits nobody.
-    credit = credit_for(rel, d.get("format"))
-    if credit:
-        d["artist"] = credit
+    # The file's own author stays the artist, as for a scanned file
+    # ("Steve Turner", not HVSC's folder "Turner Steve"); Modland's credit
+    # fills an empty / placeholder one (``apply_path_fields``).
     apply_path_fields(d, rel, siblings=_siblings_map(),
                       use_filename=sm.filename_game_enabled())
     _finish_genres(d, genre_derive.names_enabled())
@@ -3153,7 +3371,7 @@ def merge_after_play(track_id: str, local_path) -> None:
     except Exception:                                   # noqa: BLE001
         return
     if (not t or not catalogue.is_catalogue_path(t.get("path"))
-            or is_merged(t) or track_id in _merging or not local_path):
+            or not _needs_merge(t) or track_id in _merging or not local_path):
         return
     try:
         loop = asyncio.get_running_loop()
@@ -3164,6 +3382,23 @@ def merge_after_play(track_id: str, local_path) -> None:
                           name=f"modland-catalog.merge[{track_id}]")
     _tasks.add(t_)
     t_.add_done_callback(_tasks.discard)
+    _merge_tasks[track_id] = t_
+    t_.add_done_callback(lambda _t, k=track_id: _merge_tasks.pop(k, None))
+
+
+async def await_merge(track_id: str, timeout: float) -> bool:
+    """Wait (up to ``timeout`` s) for the first-play merge of ``track_id``
+    that ``merge_after_play`` started; True when one finished.  A SID's
+    first play waits for it: its render length is the HVSC length the merge
+    reads (a local file's is known before it plays), not the default."""
+    t_ = _merge_tasks.get(track_id)
+    if t_ is None:
+        return False
+    try:
+        await asyncio.wait_for(asyncio.shield(t_), timeout)
+    except (asyncio.TimeoutError, Exception):           # noqa: BLE001
+        return t_.done()
+    return True
 
 
 def _extract_copy(local: Path, track_id: str, real_name: str) -> dict | None:
@@ -3195,9 +3430,15 @@ async def _merge(track_id: str, local: Path) -> None:
     try:
         store = _store()
         t = store.get_track(track_id)
-        if not t or is_merged(t):
+        if not _needs_merge(t):
             return
         real_name = t["path"].rsplit("/", 1)[-1]
+        rel = t["path"][len(ROOT) + 2:]
+        tok = folder_player_token(rel)
+        if tok:
+            # ``x.ma`` is no music name to the extractor; ``ma.x`` (Amiga
+            # prefix form, the same module) is.
+            real_name = f"{tok}.{os.path.splitext(real_name)[0]}"
         loop = asyncio.get_running_loop()
         try:
             meta = await loop.run_in_executor(None, _extract_copy, local, track_id, real_name)
@@ -3208,7 +3449,7 @@ async def _merge(track_id: str, local: Path) -> None:
             return
         await loop.run_in_executor(None, _siblings_map)
         cur = store.get_track(track_id)
-        if not cur or is_merged(cur) or cur.get("path") != t.get("path"):
+        if not _needs_merge(cur) or cur.get("path") != t.get("path"):
             return
         new = merged_track(cur, meta, local.stem)
         store.upsert_tracks_batch([new])
@@ -3226,6 +3467,19 @@ async def _merge(track_id: str, local: Path) -> None:
             scanner._spawn_scene_autoapply()
         except Exception:                               # noqa: BLE001
             pass
+        try:
+            # Open pages re-read the track: its genre, length, tunes … (parity
+            # with a scanned file — the player kept the bare index row).  Its
+            # own task: a slow socket must not hold up a play awaiting this
+            # merge (``await_merge``).
+            from soniqboom.api import library
+            b_ = asyncio.get_running_loop().create_task(
+                library.broadcast_track_updated(track_id),
+                name=f"modland-catalog.track-updated[{track_id}]")
+            _tasks.add(b_)
+            b_.add_done_callback(_tasks.discard)
+        except Exception:                               # noqa: BLE001
+            log.debug("track-updated broadcast failed", exc_info=True)
     except Exception:                                   # noqa: BLE001
         log.warning("Modland catalogue merge of %s failed", track_id, exc_info=True)
     finally:

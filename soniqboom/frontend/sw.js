@@ -791,7 +791,33 @@
 // (trackinfo.js); the sidebar's Artists … Years counts are filled at page
 // load and after a scan, not only once each view was opened, without the
 // "[No Artist]" bucket rows (library.js).
-const SHELL_VERSION = 'v229';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v230: a multi-tune file's list row (track table, search preview) shows a
+// "N tunes" badge after the title (library.js, search.js, tunes.js) — index.html
+// app.css?v=110; plain search matches every word of 2+ letters as a word start.
+// v231: a track the server re-read (a catalogue tune's first play) is refreshed
+// in the player, queue, list, meter and an open Track Info (app.js
+// track_updated, player.js patchTrackFields, trackinfo.js) — index.html
+// app.js?v=182.
+// v232: a retro composer's Wikipedia article (linked from Demozoo) shows on
+// the Info tab like any artist's bio; an empty "Module Details" heading is
+// hidden (trackinfo.js).
+// v233: the refresh after a catalogue tune's first play patches only what
+// changed, repaints the player bar, keeps a live per-voice meter and an open
+// edit form (app.js, player.js, trackinfo.js) — index.html app.js?v=183.
+// v234: Modland "Read details of tunes not played yet" setting (admin.js,
+// index.html); with "For tunes shown in lists" the list asks the server to read
+// its unread SC68 / SNDH / console-rip catalogue rows (library.js).
+// v235: the Metadata tab's HVSC hint links to the HVSC folder field (Renderers)
+// and inline tab links can scroll to a target (admin.js, index.html).
+// v236: the "now playing" equaliser icons stand still while paused (app.js
+// .sb-paused, app.css).
+// v237: the Modland card says when a tune is fetched (index.html).
+// v238: Modland card / setting wording (index.html).
+// v239: the in-browser SID engine is rebuilt from soniqboom/native/sidwasm
+// (vendor/sidwasm.js + sidwasm.wasm, vu-sid-worker.js WASM_V 4).
+// v240: the About pages link the source code of the running version (admin.js,
+// mobile settings.js, index.html app.css?v=112).
+const SHELL_VERSION = 'v240';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.

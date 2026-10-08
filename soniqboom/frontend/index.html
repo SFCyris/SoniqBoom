@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=109">
+  <link rel="stylesheet" href="/assets/css/app.css?v=112">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -644,7 +644,7 @@
                 <input id="setting-modland-catalog" type="checkbox" disabled
                        aria-describedby="modland-about modland-status">
               </div>
-              <p class="admin-hint" id="modland-about">Lists <a href="https://ftp.modland.com/" target="_blank" rel="noopener noreferrer">Modland</a>&rsquo;s module archive &mdash; <span id="modland-about-count">over 300,000</span> tunes of Amiga, C64, Atari&nbsp;ST, console and tracker music &mdash; in a &ldquo;Modland&rdquo; folder, browsable and searchable at once. Nothing is copied: a tune is fetched from Modland when you play it and then plays from the cache. The index is updated daily, weekly, every 2&nbsp;weeks or monthly &mdash; pick how often next to <em>Refresh now</em>. An update downloads only the changes since the last one, usually a few kilobytes; the full index (about 6&nbsp;MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check. The catalogue needs about 1&nbsp;GB of server memory. Thanks to Modland and its maintainers.</p>
+              <p class="admin-hint" id="modland-about">Lists <a href="https://ftp.modland.com/" target="_blank" rel="noopener noreferrer">Modland</a>&rsquo;s module archive &mdash; <span id="modland-about-count">over 300,000</span> tunes of Amiga, C64, Atari&nbsp;ST, console and tracker music &mdash; in a &ldquo;Modland&rdquo; folder, browsable and searchable at once. Nothing is copied: a tune is fetched from Modland when you play it or open its Track Info (for most formats) and, with the setting below, when it is shown in a list — and then plays from the cache. The index is updated daily, weekly, every 2&nbsp;weeks or monthly &mdash; pick how often next to <em>Refresh now</em>. An update downloads only the changes since the last one, usually a few kilobytes; the full index (about 6&nbsp;MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check. The catalogue needs about 1&nbsp;GB of server memory. Thanks to Modland and its maintainers.</p>
               <div class="ext-source-options" id="modland-options">
                 <div class="admin-setting">
                   <label for="setting-modland-scope">Tunes</label>
@@ -656,6 +656,13 @@
                 <div class="admin-setting">
                   <label for="setting-modland-subsonic">Show catalogue tunes to Subsonic apps <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: Subsonic and DLNA apps don't see the catalogue. Apps that sync or cache a whole library for offline use would download all of it from Modland.">&#9432;</span></label>
                   <input id="setting-modland-subsonic" type="checkbox" disabled>
+                </div>
+                <div class="admin-setting">
+                  <label for="setting-modland-tune-details">Read details of tunes not played yet <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="A tune's number of tunes, length and tags come from its file. When I open Track Info: that one file is downloaded when you open a tune's Track Info. For tunes shown in lists: SC68, SNDH and console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list are downloaded and read one at a time as well — more downloads from Modland's server, within their own limit that always leaves room for plays. Amiga modules (with the song database) and HVSC SIDs (with HVSC set up) show their number of tunes either way when Modland's checksum list is installed.">&#9432;</span></label>
+                  <select id="setting-modland-tune-details" disabled>
+                    <option value="intent">When I open Track Info</option>
+                    <option value="lists">For tunes shown in lists</option>
+                  </select>
                 </div>
               </div>
               <div id="modland-status" class="admin-hint ext-status" role="status" aria-live="polite">Off.</div>
@@ -1483,6 +1490,7 @@
                   <a href="https://github.com/SFCyris/SoniqBoom" target="_blank" rel="noopener noreferrer">
                     <span aria-hidden="true">&#128279;</span> github.com/SFCyris/SoniqBoom
                   </a>
+                  <a id="about-source" href="https://github.com/SFCyris/SoniqBoom/releases" target="_blank" rel="noopener noreferrer" hidden>Source code of this version</a>
                 </div>
                 <div class="about-license">AGPL-3.0-or-later · &copy; 2026 S.F.&nbsp;Cyris</div>
               </div>
@@ -1595,7 +1603,9 @@
             <h3>&#127925; HVSC (SID)</h3>
             <p class="admin-hint" style="margin-bottom:8px">
               High Voltage SID Collection song-lengths &amp; STIL notes for your SID tunes.
-              (The HVSC documents path is set under Renderers.)
+              The HVSC <code>DOCUMENTS</code> folder is set under
+              <button type="button" class="admin-inline-link" data-tab-target="tab-renderers"
+                      data-scroll-target="setting-hvsc-path">Renderers &rarr; HVSC SID database</button>.
             </p>
             <div id="md-hvsc-status" class="admin-hint" style="margin-bottom:8px"
                  role="status" aria-live="polite">Status: &mdash;</div>
@@ -2524,7 +2534,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=181"></script>
+  <script type="module" src="/assets/js/app.js?v=184"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

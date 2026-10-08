@@ -27,3 +27,23 @@ export function subsongVirtualTrack(base, wire, { count = 0, start = 1, lengths 
 // Console-rip formats that can hold several tunes (libgme): their track-info
 // panel shows the tune list even though they have no module details.
 export const TUNE_CHIP_FORMAT_NAMES = new Set(['NSF', 'NSFe', 'GBS', 'AY', 'SAP', 'KSS', 'HES']);
+
+// A multi-tune file's tune count for the list badge ("5 tunes"), 0 when it
+// has one tune — or when the row IS one tune of it (a picked ``subsong``).
+// GitHub #30: which SIDs hold several tunes wasn't visible in result lists.
+export function listTuneCount(t) {
+  if (!t || Number.isInteger(t.subsong)) return 0;
+  const n = Number(t.subsongs);
+  return n > 1 ? n : 0;
+}
+const _tunesTitle = (n) => `${n} tunes — pick one in Track Info`;
+export function tunesBadge(n) {
+  const b = document.createElement('span');
+  b.className = 'track-tunes-badge';
+  b.textContent = `${n} tunes`;
+  b.title = _tunesTitle(n);
+  return b;
+}
+export function tunesBadgeHTML(n) {
+  return `<span class="track-tunes-badge" title="${_tunesTitle(n)}">${n} tunes</span>`;
+}

@@ -73,8 +73,10 @@ from soniqboom.core import uade_formats as _uade_formats
 
 def _extend_amiga_prefix_map() -> None:
     # Function scope: a module-level ``del`` after a possibly-empty loop
-    # raised NameError on uade-less hosts (QA C1).
-    for tok in _uade_formats.new_suffix_tokens():
+    # raised NameError on uade-less hosts (QA C1).  PREFIX tokens: the suffix
+    # list leaves out tokens like ``di`` / ``md`` (``readme.md``), which are
+    # still real modules in prefix form (``di.title``) — GitHub #24.
+    for tok in _uade_formats.prefix_tokens():
         _AMIGA_PREFIX_EXT.setdefault(tok, f".{tok}")
 
 

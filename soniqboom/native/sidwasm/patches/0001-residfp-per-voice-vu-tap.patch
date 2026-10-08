@@ -1,0 +1,75 @@
+SoniqBoom modification to libsidplayfp 2.16.1 (reSIDfp), 2026-10-07:
+per-voice level tap (sb_vu_tap, sb_vu_peak) in SID::clock().
+
+--- a/src/builders/residfp-builder/residfp/SID.h
++++ b/src/builders/residfp-builder/residfp/SID.h
+@@ -1,4 +1,7 @@
+ /*
++ * Modified by S.F. Cyris for SoniqBoom, 2026-10-07: per-voice level tap (sb_vu_tap, sb_vu_peak).
++ */
++/*
+  * This file is part of libsidplayfp, a SID player engine.
+  *
+  * Copyright 2011-2025 Leandro Nini <drfiemost@users.sourceforge.net>
+@@ -25,6 +28,7 @@
+ 
+ #include <memory>
+ #include <cstdint>
++#include <cmath>
+ 
+ #include "siddefs-fp.h"
+ #include "ExternalFilter.h"
+@@ -33,6 +37,16 @@
+ 
+ #include "sidcxx11.h"
+ 
++/**
++ * Per-voice level tap (SoniqBoom).
++ * While sb_vu_tap is true, SID::clock() keeps the running maximum of
++ * |voice[i].output()| (pre-filter) in sb_vu_peak[i]. The caller resets
++ * sb_vu_peak. Off by default; when off, clock() is unchanged apart from
++ * one predicted-false branch per cycle.
++ */
++extern bool sb_vu_tap;
++extern float sb_vu_peak[3];
++
+ namespace reSIDfp
+ {
+ 
+@@ -340,6 +354,16 @@
+                 voice[1].envelope()->clock();
+                 voice[2].envelope()->clock();
+ 
++                if (unlikely(sb_vu_tap))
++                {
++                    for (int v = 0; v < 3; v++)
++                    {
++                        const float a = std::fabs(voice[v].output());
++                        if (a > sb_vu_peak[v])
++                            sb_vu_peak[v] = a;
++                    }
++                }
++
+                 const int sidOutput = static_cast<int>(filter->clock(voice[0], voice[1], voice[2]));
+                 const int c64Output = externalFilter.clock(sidOutput + INT16_MIN);
+                 if (unlikely(resampler->input(c64Output)))
+--- a/src/builders/residfp-builder/residfp/SID.cpp
++++ b/src/builders/residfp-builder/residfp/SID.cpp
+@@ -1,4 +1,7 @@
+ /*
++ * Modified by S.F. Cyris for SoniqBoom, 2026-10-07: definitions of sb_vu_tap and sb_vu_peak.
++ */
++/*
+  * This file is part of libsidplayfp, a SID player engine.
+  *
+  * Copyright 2011-2025 Leandro Nini <drfiemost@users.sourceforge.net>
+@@ -36,6 +39,9 @@
+ #include "resample/TwoPassSincResampler.h"
+ #include "resample/ZeroOrderResampler.h"
+ 
++bool sb_vu_tap = false;
++float sb_vu_peak[3] = { 0.f, 0.f, 0.f };
++
+ namespace reSIDfp
+ {
+ 

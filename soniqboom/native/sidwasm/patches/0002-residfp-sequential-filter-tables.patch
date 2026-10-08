@@ -1,0 +1,121 @@
+SoniqBoom modification to libsidplayfp 2.16.1 (reSIDfp), 2026-10-07:
+filter lookup tables built sequentially instead of in std::thread workers.
+
+--- a/src/builders/residfp-builder/residfp/FilterModelConfig6581.cpp	2026-10-07 21:18:50.831154308 -0700
++++ b/src/builders/residfp-builder/residfp/FilterModelConfig6581.cpp	2026-10-07 21:18:50.908324110 -0700
+@@ -1,4 +1,7 @@
+ /*
++ * Modified by S.F. Cyris for SoniqBoom, 2026-10-07: lookup tables built sequentially instead of in threads.
++ */
++/*
+  * This file is part of libsidplayfp, a SID player engine.
+  *
+  * Copyright 2011-2024 Leandro Nini <drfiemost@users.sourceforge.net>
+@@ -29,7 +32,6 @@
+ 
+ #include <algorithm>
+ #include <mutex>
+-#include <thread>
+ #include <cmath>
+ #include <cstdint>
+ 
+@@ -147,7 +149,7 @@
+     // Create lookup tables for gains / summers.
+ 
+     //
+-    // We spawn six threads to calculate these tables in parallel
++    // Each table is built by its own function below
+     //
+     auto filterSummer = [this]
+     {
+@@ -249,27 +251,13 @@
+         }
+     };
+ 
+-#if defined(HAVE_CXX20) && defined(__cpp_lib_jthread)
+-    using sidThread = std::jthread;
+-#else
+-    using sidThread = std::thread;
+-#endif
+-
+-    sidThread thdSummer(filterSummer);
+-    sidThread thdMixer(filterMixer);
+-    sidThread thdGain(filterGain);
+-    sidThread thdResonance(filterResonance);
+-    sidThread thdVcrVg(filterVcrVg);
+-    sidThread thdVcrIds(filterVcrIds);
+-
+-#if !defined(HAVE_CXX20) || !defined(__cpp_lib_jthread)
+-    thdSummer.join();
+-    thdMixer.join();
+-    thdGain.join();
+-    thdResonance.join();
+-    thdVcrVg.join();
+-    thdVcrIds.join();
+-#endif
++    // Tables are independent: build them sequentially (no threads).
++    filterSummer();
++    filterMixer();
++    filterGain();
++    filterResonance();
++    filterVcrVg();
++    filterVcrIds();
+ }
+ 
+ unsigned short* FilterModelConfig6581::getDAC(double adjustment) const
+--- a/src/builders/residfp-builder/residfp/FilterModelConfig8580.cpp	2026-10-07 21:18:50.833050930 -0700
++++ b/src/builders/residfp-builder/residfp/FilterModelConfig8580.cpp	2026-10-07 21:18:50.920088009 -0700
+@@ -1,4 +1,7 @@
+ /*
++ * Modified by S.F. Cyris for SoniqBoom, 2026-10-07: lookup tables built sequentially instead of in threads.
++ */
++/*
+  * This file is part of libsidplayfp, a SID player engine.
+  *
+  * Copyright 2011-2023 Leandro Nini <drfiemost@users.sourceforge.net>
+@@ -28,7 +31,6 @@
+ #include "sidcxx11.h"
+ 
+ #include <mutex>
+-#include <thread>
+ 
+ namespace reSIDfp
+ {
+@@ -142,7 +144,7 @@
+     // Create lookup tables for gains / summers.
+ 
+     //
+-    // We spawn four threads to calculate these tables in parallel
++    // Each table is built by its own function below
+     //
+     auto filterSummer = [this]
+     {
+@@ -196,23 +198,11 @@
+         buildResonanceTable(opampModel, resGain);
+     };
+ 
+-#if defined(HAVE_CXX20) && defined(__cpp_lib_jthread)
+-    using sidThread = std::jthread;
+-#else
+-    using sidThread = std::thread;
+-#endif
+-
+-    sidThread thdSummer(filterSummer);
+-    sidThread thdMixer(filterMixer);
+-    sidThread thdGain(filterGain);
+-    sidThread thdResonance(filterResonance);
+-
+-#if !defined(HAVE_CXX20) || !defined(__cpp_lib_jthread)
+-    thdSummer.join();
+-    thdMixer.join();
+-    thdGain.join();
+-    thdResonance.join();
+-#endif
++    // Tables are independent: build them sequentially (no threads).
++    filterSummer();
++    filterMixer();
++    filterGain();
++    filterResonance();
+ }
+ 
+ } // namespace reSIDfp

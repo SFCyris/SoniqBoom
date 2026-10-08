@@ -238,6 +238,51 @@ async def _wiki_summary(title: str) -> dict | None:
     return None
 
 
+_WIKI_LINK_RE = re.compile(r"^https?://([a-z]{2,3})(?:\.m)?\.wikipedia\.org/wiki/([^?#]+)", re.I)
+
+
+async def _with_wikipedia(card: dict) -> dict:
+    """A Demozoo scener ``card`` whose profile links a Wikipedia article
+    (e.g. Ben Daglish) shown with that article's summary, picture and link —
+    the bio other artists get — keeping the card's groups and link chips.
+    English first; cached like any artist's record."""
+    from urllib.parse import unquote
+    found = []
+    for link in card.get("links") or ():
+        m = _WIKI_LINK_RE.match(str((link or {}).get("url") or ""))
+        if m:
+            found.append((m.group(1).lower() != "en", m.group(1).lower(), unquote(m.group(2))))
+    if not found:
+        return card
+    _not_en, lang, title = sorted(found)[0]
+    key = f"wikipedia:{lang}:{title}"
+    rec = _read_cache(key)
+    if rec is None:
+        data = None
+        try:
+            if lang == "en":
+                data = await _wiki_summary(title)
+            else:
+                d = await _get_json(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/"
+                                    + quote(title.replace(" ", "_"), safe=""))
+                data = d if d and d.get("type") != "disambiguation" and d.get("extract") else None
+        except _Unreachable:
+            return card                                     # (not cached: try again later)
+        except Exception:                                   # noqa: BLE001
+            data = None
+        rec = {"found": bool(data), "fetched_at": time.time()}
+        if data:
+            rec.update(title=data.get("title"), bio=data.get("extract"),
+                       image=(data.get("thumbnail") or {}).get("source"),
+                       url=(data.get("content_urls", {}).get("desktop", {}) or {}).get("page"))
+        _write_cache(key, rec)
+    if not rec.get("found"):
+        return card
+    return {**card, "title": rec.get("title") or card.get("title"), "bio": rec.get("bio"),
+            "image": rec.get("image"), "url": rec.get("url") or card.get("url"),
+            "source": "Wikipedia"}
+
+
 def _mb_only_record(name: str, art: dict) -> dict:
     """Describe the artist from MusicBrainz's own fields when no wiki exists."""
     bits = []
@@ -297,7 +342,7 @@ async def get_artist_info(
             from soniqboom.core import demozoo
             card = await demozoo.artist_card(name, track_title=track)
             if card is not None:
-                return card
+                return await _with_wikipedia(card)
         except Exception:                       # noqa: BLE001 — never break the panel
             log.debug("Demozoo artist_card failed for %r", name, exc_info=True)
 

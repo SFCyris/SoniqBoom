@@ -6,4 +6,6 @@ Purpose: decode HivelyTracker (.hvl) modules to WAV — neither the Homebrew
 uade123 build nor libopenmpt can load HVL.  Compiled on first use by
 `soniqboom/api/stream.py:_ensure_hvl2wav()` into `<data_dir>/native/hvl2wav`.
 
-HivelyTracker is distributed under the BSD 3-Clause license.
+HivelyTracker is distributed under the BSD 3-Clause license
+(Copyright (c) 2006-2018, Pete Gordon); the full text is in `LICENSE`
+in this folder.

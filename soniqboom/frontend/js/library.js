@@ -9,6 +9,7 @@ import { Player } from './player.js';
 import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel } from './utils.js';
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadge, Offline } from './offline.js';
+import { listTuneCount, tunesBadge } from './tunes.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -732,6 +733,36 @@ function _refreshBadges() {
   _refreshNavCounts();
 }
 
+// External catalogue tunes on screen whose tune count no index has (SC68,
+// SNDH, console rips): with the Modland setting "Read details of tunes not
+// played yet: For tunes shown in lists", their ids go to the server, which
+// reads them one at a time (POST /api/tracks/catalogue-reads).  Off by
+// default — then only a play, the next-track prewarm or a Track Info open
+// fetches a catalogue file.
+const _CATALOGUE_READ_RE = /\.(sc68|sndh|nsf|nsfe|gbs|hes|kss|ay|sap)$/i;
+const _catalogueReadSent = new Set();
+let _catalogueReadPending = new Set();
+let _catalogueReadTimer = null;
+function _noteCatalogueRow(t) {
+  const cfg = window.__sbConfig || {};
+  if (!cfg.catalogue_list_reads || !t || !t.id || _catalogueReadSent.has(t.id)) return;
+  if ((t.subsongs || 0) > 1 || (t.mtime || 0) > 0) return;
+  const p = String(t.path || '');
+  if (!_CATALOGUE_READ_RE.test(p)) return;
+  if (!(cfg.catalogue_roots || []).some((r) => p.startsWith(r + ':/'))) return;
+  _catalogueReadPending.add(t.id);
+  clearTimeout(_catalogueReadTimer);
+  _catalogueReadTimer = setTimeout(() => {          // the list settled on screen
+    const ids = [..._catalogueReadPending].slice(-40);
+    _catalogueReadPending = new Set();
+    ids.forEach((id) => _catalogueReadSent.add(id));
+    fetch('/api/tracks/catalogue-reads', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }), credentials: 'same-origin',
+    }).catch(() => {});
+  }, 800);
+}
+
 // ── Make a single track row element ───────────────────────────────────────────
 //
 // Rows are produced by ``_makeRowSkeleton`` (no data) and filled via
@@ -957,8 +988,10 @@ function _fillTrackRow(tr, t, i) {
   // Health badge — a track with a known playback defect (partial render or
   // undecodable) gets a small tag after the title.  Re-created per fill (rare;
   // only defective tracks) so recycled rows never carry a stale badge.
+  _noteCatalogueRow(t);
   const hasDefect = t.defect === 'partial' || t.defect === 'corrupt';
-  if (hasDefect || offKind) {
+  const tunes = listTuneCount(t);
+  if (hasDefect || offKind || tunes) {
     // A badged title: the title text ellipsises, the badges keep their room
     // (a long title must not push them out of the cell).
     const line = document.createElement('span');
@@ -967,6 +1000,7 @@ function _fillTrackRow(tr, t, i) {
     txt.className = 'title-text';
     txt.textContent = t.title || '—';
     line.appendChild(txt);
+    if (tunes) line.appendChild(tunesBadge(tunes));
     if (hasDefect) {
       const badge = document.createElement('span');
       badge.className = `track-defect-badge track-defect-${t.defect}`;

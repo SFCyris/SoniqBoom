@@ -328,6 +328,12 @@ class HVSC:
         root = self.hvsc_root()
         if not root or not track_path:
             return None
+        # Modland's mirror of HVSC (the catalogue: ``…/pub/modules:/HVSC/
+        # MUSICIANS/…``) is the same tree — its tunes have STIL entries too.
+        from soniqboom.core import catalogue
+        if catalogue.is_catalogue_path(track_path):
+            i = track_path.find(":/HVSC/")
+            return track_path[i + len(":/HVSC"):] if i >= 0 else None
         track_remote = _is_remote(track_path)
         root_remote = _is_remote(root)
         if track_remote != root_remote:

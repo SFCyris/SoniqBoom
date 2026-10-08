@@ -1214,6 +1214,12 @@ function _renderModlandStatus(s) {
   }
   if (sub) { sub.checked = !!s.subsonic; sub.disabled = _mlSaving; }
   if (refresh) refresh.disabled = busy || !s.enabled || _mlSaving;
+  const tdSel = document.getElementById('setting-modland-tune-details');
+  if (tdSel) {
+    if (document.activeElement !== tdSel) tdSel.value = s.tune_details || 'intent';
+    tdSel.dataset.saved = s.tune_details || 'intent';
+    tdSel.disabled = false;
+  }
   const ivSel = document.getElementById('setting-modland-interval');
   if (ivSel) {
     if (document.activeElement !== ivSel) ivSel.value = s.interval || 'daily';
@@ -1382,6 +1388,26 @@ function _bindModland() {
     } finally {
       _mlSaving = false;
       loadModlandStatus();
+    }
+  });
+  const tdSel = document.getElementById('setting-modland-tune-details');
+  tdSel?.addEventListener('change', async () => {
+    showMsg('modland-msg', '');
+    tdSel.setAttribute('aria-busy', 'true');
+    try {
+      const s = await _mlPost('/admin/catalog/modland', { tune_details: tdSel.value });
+      _renderModlandStatus(s);
+      // The library list reads the choice from the page config.
+      window.__sbConfig = { ...(window.__sbConfig || {}),
+                            catalogue_list_reads: tdSel.value === 'lists' };
+      showMsg('modland-msg', tdSel.value === 'lists'
+        ? 'Tunes shown in lists are read for their details as you browse.'
+        : 'A tune is read for its details when you open its Track Info.', 'ok');
+    } catch (e) {
+      tdSel.value = tdSel.dataset.saved || 'intent';
+      showMsg('modland-msg', e.message || 'Could not change the setting.', 'err');
+    } finally {
+      tdSel.removeAttribute('aria-busy');
     }
   });
   const ivSel = document.getElementById('setting-modland-interval');
@@ -2148,8 +2174,9 @@ document.getElementById('btn-cache-refresh')?.addEventListener(
 );
 
 // Generic inline cross-tab links: any element with [data-tab-target="..."]
-// switches the admin panel to the referenced tab and scrolls to the matching
-// section.  Keeps the cache-section pointer in System -> Renderers cheap.
+// switches the admin panel to the referenced tab; with [data-scroll-target="id"]
+// it also scrolls that element into view and focuses it (the HVSC folder
+// field sits far down the Renderers tab — a bare tab switch left it unseen).
 document.addEventListener('click', (e) => {
   const el = (e.target instanceof HTMLElement) && e.target.closest('[data-tab-target]');
   if (!el) return;
@@ -2157,6 +2184,13 @@ document.addEventListener('click', (e) => {
   const target = el.getAttribute('data-tab-target');
   const tab = document.querySelector(`.admin-tab[data-tab="${target}"]`);
   if (tab instanceof HTMLElement) tab.click();
+  const dest = document.getElementById(el.getAttribute('data-scroll-target') || '');
+  if (dest) {
+    requestAnimationFrame(() => {
+      dest.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      try { dest.focus({ preventScroll: true }); } catch (_) {}
+    });
+  }
 });
 
 document.getElementById('btn-conv-cache-apply')?.addEventListener(
@@ -3540,6 +3574,12 @@ async function loadAbout() {
     const res = await fetch('/api/health');
     const j   = await res.json();
     verEl.textContent = j.version || 'unknown';
+    // AGPL-3.0 §13: link the source of the version that is running.
+    const src = document.getElementById('about-source');
+    if (src && j.version) {
+      src.href = `https://github.com/SFCyris/SoniqBoom/releases/tag/v${encodeURIComponent(j.version)}`;
+      src.hidden = false;
+    }
   } catch {
     verEl.textContent = 'unknown';
   }

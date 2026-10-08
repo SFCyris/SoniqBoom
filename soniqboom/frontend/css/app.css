@@ -1313,6 +1313,9 @@ tr.playing td.col-num:has(.row-eq)::after { content: none; }
 .row-eq i:nth-child(2) { animation-delay: 0.3s; }
 .row-eq i:nth-child(3) { animation-delay: 0.15s; }
 @keyframes row-eq-bar { 0%, 100% { transform: scaleY(0.28); } 50% { transform: scaleY(1); } }
+/* Paused: the "now playing" bars stand still (app.js toggles .sb-paused). */
+body.sb-paused .row-eq i,
+body.sb-paused .ti-sub-eq i { animation-play-state: paused; }
 @media (prefers-reduced-motion: reduce) {
   .row-eq i { animation: none; }
   .row-eq i:nth-child(1) { height: 55%; }
@@ -6183,6 +6186,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   transition: opacity 0.15s;
 }
 .about-links a:hover { opacity: 0.78; text-decoration: underline; }
+.about-links a + a { margin-left: 12px; }
 .about-license {
   margin-top: 6px;
   font-size: 10.5px;
@@ -6456,7 +6460,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
    title widen the whole table) */
 #track-table td.col-title .title-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 #track-table td.col-title .title-badged > .track-defect-badge,
-#track-table td.col-title .title-badged > .track-offline-badge { flex-shrink: 0; }
+#track-table td.col-title .title-badged > .track-offline-badge,
+#track-table td.col-title .title-badged > .track-tunes-badge { flex-shrink: 0; }
 .sp-title.sp-title--badged { display: flex; align-items: center; min-width: 0; }
 .sp-title--badged .sp-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -8754,3 +8759,21 @@ body.auth-blocked > #app {
 .pl-modal-dialog { max-height: 86vh; overflow-y: auto; }
 
 .browse-play-btn[aria-busy="true"] { opacity: 0.92; cursor: progress; }   /* label stays ≥4.5:1 in both themes */
+
+/* A multi-tune file (SID, NSF, a module with subsongs) in a list: "5 tunes"
+   after the title (GitHub #30).  Neutral, unlike the health / offline badges. */
+.track-tunes-badge {
+  display: inline-block;
+  margin-left: 7px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  vertical-align: middle;
+  white-space: nowrap;
+  color: var(--text2);
+  background: color-mix(in srgb, var(--text2) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text2) 28%, transparent);
+  flex-shrink: 0;
+}

@@ -52,6 +52,12 @@ PERMIT_TTL_S = 15 * 60
 # together — protects the archive from a client that walks the catalogue.
 RATE_MAX = 120
 RATE_WINDOW_S = 10 * 60
+# Reads for tunes shown in a list (the opt-in "For tunes shown in lists" tune
+# details): their own, smaller budget inside RATE_MAX, and never the last
+# LIST_PLAY_RESERVE downloads of the window — browsing a list can't make a
+# play wait for the rate limit.
+LIST_RATE_MAX = 60
+LIST_PLAY_RESERVE = 40
 # Companion files may sit up to this many folders above the tune (AdLib banks
 # shared by a collection — ``api/stream._ADLIB_BANK_PARENT_LEVELS``).
 _COMPANION_PARENT_LEVELS = 4
@@ -96,6 +102,7 @@ _root_hashes: frozenset = frozenset()
 _play_grants: dict[tuple[str, str], _Grant] = {}
 _prewarm_grants: dict[str, _Grant] = {}          # owner → its one grant
 _new_fetches: collections.deque = collections.deque()
+_list_fetches: collections.deque = collections.deque()
 _stats = {"reads": 0, "bytes": 0, "refused": 0, "permits": 0,
           "prewarm_permits": 0, "rate_limited": 0}
 _read_log: collections.deque = collections.deque(maxlen=200)
@@ -275,6 +282,29 @@ def fetch_ok(path, lane: str = "scan") -> bool:
     return lane == "stream" and downloading(path)
 
 
+async def wait_fetchable(path, timeout: float = 8.0, grace: float = 1.5) -> bool:
+    """Wait until a reader of the track being played may read catalogue track
+    ``path`` (``fetch_ok(path, "stream")``): its meter, pattern and SID
+    requests arrive before the play's download starts, and a "not there"
+    answer then left a cold catalogue tune without them for the whole play
+    (a local file's are there at once).  Up to ``timeout`` s while a play /
+    prewarm window for it is open; a tune nothing plays answers after
+    ``grace`` s.  True at once for any other path."""
+    import asyncio
+    if fetch_ok(path, "stream"):
+        return True
+    sp = _split(path)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while loop.time() - start < timeout:
+        await asyncio.sleep(0.1)
+        if fetch_ok(path, "stream"):
+            return True
+        if loop.time() - start >= grace and not (sp and allowed(sp[0], sp[1])):
+            return False
+    return False
+
+
 # ── Fetch windows (plays / prewarms) ──────────────────────────────────────────
 
 def _grant_dirs(rel: str) -> frozenset:
@@ -295,6 +325,8 @@ def _prune(now: float) -> None:
         del _prewarm_grants[o]
     while _new_fetches and _new_fetches[0] <= now - RATE_WINDOW_S:
         _new_fetches.popleft()
+    while _list_fetches and _list_fetches[0] <= now - RATE_WINDOW_S:
+        _list_fetches.popleft()
 
 
 def permit_play(path, *, ttl: float = PERMIT_TTL_S) -> bool:
@@ -343,6 +375,32 @@ def permit_prewarm(path, owner: str, *, ttl: float = PERMIT_TTL_S) -> bool:
                 return False
             _new_fetches.append(now)
         _prewarm_grants[owner] = _Grant(sp[0], sp[1], _grant_dirs(sp[1]), now + ttl, owner)
+        _stats["prewarm_permits"] += 1
+    return True
+
+
+def permit_list(path, *, ttl: float = PERMIT_TTL_S) -> bool:
+    """Open a fetch window to read catalogue track ``path`` because it is
+    shown in a list (the opt-in list reads).  False — not read — when its
+    budget (``LIST_RATE_MAX``) is spent or the window has fewer than
+    ``LIST_PLAY_RESERVE`` downloads left for plays.  True (no-op) for a
+    cached file or any non-catalogue path."""
+    sp = _split(path) if path else None
+    if sp is None:
+        return True
+    cached = is_cached(path)
+    now = time.monotonic()
+    with _lock:
+        _prune(now)
+        if not cached:
+            if (len(_list_fetches) >= LIST_RATE_MAX
+                    or len(_new_fetches) >= RATE_MAX - LIST_PLAY_RESERVE):
+                _stats["rate_limited"] += 1
+                return False
+            _new_fetches.append(now)
+            _list_fetches.append(now)
+        _prewarm_grants[f"list:{sp[1]}"] = _Grant(sp[0], sp[1], _grant_dirs(sp[1]),
+                                                  now + ttl, f"list:{sp[1]}")
         _stats["prewarm_permits"] += 1
     return True
 

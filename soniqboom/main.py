@@ -751,6 +751,14 @@ def _availability_mode() -> str:
         return "mark"
 
 
+def _catalogue_list_reads() -> bool:
+    try:
+        from soniqboom.core import modland_catalog
+        return modland_catalog.enabled() and modland_catalog.tune_details() == "lists"
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 @app.get("/api/ui-config")
 async def ui_config():
     """Public UI configuration — no auth required.  Safe subset only.
@@ -776,6 +784,11 @@ async def ui_config():
         "filter_duplicates": await get_config("filter_duplicates", False),
         # Settings → "Tracks on unavailable drives": mark / hide / show.
         "offline_tracks": _availability_mode(),
+        # External catalogues: their roots, and whether their tunes shown in a
+        # list are read for their details (Modland "Read details of tunes not
+        # played yet: For tunes shown in lists").
+        "catalogue_roots": [r["root"] for r in _catalogue.roots()],
+        "catalogue_list_reads": _catalogue_list_reads(),
         "placeholder_art_data_uri": f"data:image/jpeg;base64,{placeholder_b64}",
     }
 

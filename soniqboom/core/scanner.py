@@ -2186,7 +2186,8 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
     if "." in real_base:
         _stem, _, _last = real_base.rpartition(".")
         from soniqboom.core.metadata import _UADE_SUFFIX_EXTS
-        if (f".{_last.lower()}" in _UADE_SUFFIX_EXTS
+        if ((f".{_last.lower()}" in _UADE_SUFFIX_EXTS
+                or _last.lower() == _stem.partition(".")[0].lower())   # md.x.md (#24)
                 and _uade.classify(_stem) is not None):
             uade_name = _stem
     is_uade_member = _uade.classify(uade_name) is not None

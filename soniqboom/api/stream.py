@@ -1632,9 +1632,11 @@ async def _render_sid(path: Path, subsong: int = 0, duration: int | None = None)
 # tracker/uade meters use, so the frontend needs no changes.
 _SID_VU_MAX_DURATION = 600          # don't spend 3× on very long tunes
 _SID_VU_INFLIGHT: set = set()       # full_keys queued or generating (deduped)
-# One tune's VU gen at a time — each now runs its 3 isolation passes CONCURRENTLY
-# (3 cores), so a semaphore of 1 already keeps ~3 sidplayfp busy without starving
-# playback; more tunes queue behind it (bounded by _SID_VU_MAX_QUEUED).
+# One tune's VU gen at a time — each runs its 3 isolation passes concurrently, each
+# behind the background gate at PRIO_VU (``_sid_vu_pass``, GitHub #32): at most
+# ``_RENDER_SLOTS - 1`` background renders in all, playback keeps one slot, the
+# next-track prewarm goes first.  More tunes queue behind it (bounded by
+# _SID_VU_MAX_QUEUED).
 _SID_VU_SEM = asyncio.Semaphore(1)
 _SID_VU_MAX_QUEUED = 8              # bound the TOTAL backlog — a burst of many
                                     # distinct SIDs can't pile up unbounded VU
@@ -1666,6 +1668,16 @@ _SID_VU_MAX_QUEUED = 8              # bound the TOTAL backlog — a burst of man
 _SID_VU_SERVER_DELAY = 8.0
 
 
+async def _sid_vu_pass(cmd: list[str], tmp: Path, dur: int) -> None:
+    """One voice-isolation render of the SID VU pass, behind the background
+    priority gate at ``PRIO_VU`` like the Amiga per-voice pass (GitHub #32):
+    cosmetic work counts toward the background cap (a render slot always
+    left for playback) and yields to the next-track prewarm.  With one
+    background slot (2 render slots) the three passes run one by one."""
+    async with _bg_render_sem.slot(PRIO_VU):
+        await _await_renderer(cmd, tmp, timeout=dur + 30, kind="SID-VU")
+
+
 async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
                          subsong: int, dur: int) -> None:
     """Render the 3 voice-isolation passes and write the per-voice VUMR sidecar
@@ -1681,11 +1693,10 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
             # while we queued.
             if cached_wav.with_suffix(".vu").exists():
                 return
-            # Run the 3 voice-isolation renders CONCURRENTLY (not sequentially)
-            # so total gen time is ~one render, not three — a 6-min tune drops
-            # from ~68 s to ~23 s.  Each sidplayfp is single-threaded (one core),
-            # so 3 in parallel just uses 3 cores; the semaphore bounds how many
-            # tunes generate at once.
+            # Run the 3 voice-isolation renders concurrently when the background
+            # gate has the slots (total gen time ~one render, not three — a 6-min
+            # tune drops from ~68 s to ~23 s); each takes a PRIO_VU background
+            # slot, so they never hold the slot playback needs (GitHub #32).
             voice_wavs: list[Path] = []
             render_coros = []
             start = await _psid_start_song(sid_path) if subsong > 0 else 1
@@ -1696,7 +1707,7 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
                 tmps.append(tp)
                 cmd = _sid_render_cmd(binary, sid_path, subsong, dur, tf.name, mute=mute,
                                       start=start)
-                render_coros.append(_await_renderer(cmd, tp, timeout=dur + 30, kind="SID-VU"))
+                render_coros.append(_sid_vu_pass(cmd, tp, dur))
                 voice_wavs.append(tp)
             await asyncio.gather(*render_coros)
             result = await asyncio.to_thread(sid_vu.build_vu, voice_wavs, float(dur))
@@ -2893,7 +2904,13 @@ def _uade_name_routes(member: str, ext: str, track=None) -> bool:
     ``fred.sid``) — only for a tracker extension or ``.sid``, never plain
     audio.  O(1), no file IO."""
     if _uade_formats.classify(member) is None:
-        return False
+        # A suffix the scanner never takes as music on its own (``.ma``,
+        # ``.md`` …) on a track known to be an Amiga module — a catalogue
+        # tune in its player's folder (``modland_catalog.folder_player_token``).
+        tok = ext.lstrip(".")
+        return (tok in _uade_formats._SUFFIX_REGISTRATION_DENY
+                and tok in _uade_formats.player_map()
+                and _track_is_amiga_module(track))
     if ext in _UADE_EXTS or not _uade_formats.ext_owned_elsewhere(ext):
         return True
     return (_uade_formats.owned_ext_can_be_amiga(ext)
@@ -6988,7 +7005,10 @@ def _uade_member_real_name(member_base: str) -> str | None:
     """
     if "." in member_base:
         stem, _, last = member_base.rpartition(".")
-        if (f".{last.lower()}" in _UADE_EXTS
+        # A routing extension: a uade suffix, or the member's own prefix token
+        # appended again (``md.mercs`` → ``md.mercs.md`` — ``md`` is no suffix).
+        if ((f".{last.lower()}" in _UADE_EXTS
+                or last.lower() == stem.partition(".")[0].lower())
                 and _uade_formats.classify(stem) is not None):
             return stem
     if _uade_formats.classify(member_base) is not None:
@@ -10551,6 +10571,163 @@ async def _resolve_play_source(track_id: str, track, *,
     return path, ext, _uade_named, _zip_track_id_for_unpin
 
 
+_INFO_READS: set[str] = set()
+_INFO_READ_TASKS: set = set()
+
+
+def catalogue_read_for_info(track_id: str, track, owner: str) -> None:
+    """Track Info opened on a catalogue tune not read yet: fetch that ONE
+    file (like a next-track prewarm: its own budgeted window per listener,
+    the download rate limit applies) and read it (``merge_after_play``) in
+    the background — the open page then takes its tune list, length and
+    tags (``track_updated``).
+
+    Why only here, and never for a list on screen: an externally managed
+    collection (the Modland catalogue, or any other ``core/catalogue`` root)
+    is someone else's server.  Its files are fetched only on the listener's
+    intent — a play, the next-track prewarm, opening a tune's Track Info —
+    never to decorate a list being scrolled (that would be one request per
+    row).  What its indexes already tell (``modland_catalog.
+    refill_tune_counts``) is used without any fetch.  No-op for any other
+    path, a tune already read, a read running, an offline archive or a
+    full download budget."""
+    from soniqboom.core import catalogue
+    path_str = str(getattr(track, "path", "") or "")
+    if (track_id in _INFO_READS or not catalogue.is_catalogue_path(path_str)
+            or not _catalogue_unmerged(track)):
+        return
+    if not catalogue.is_cached(path_str):
+        from soniqboom.core.filesource import get_source as _get_source
+        root = catalogue.root_of(path_str)
+        if root and _get_source(root) is None:
+            return
+        if not catalogue.permit_prewarm(path_str, f"info:{owner}"):
+            return
+    _INFO_READS.add(track_id)
+
+    async def _read() -> None:
+        pin = None
+        try:
+            _p, _e, _n, pin = await _resolve_play_source(track_id, track, lane="scan")
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("catalogue read for Track Info of %s failed: %s", track_id, exc)
+        finally:
+            if pin:
+                try:
+                    _zip_unpin(pin)
+                except Exception:                       # noqa: BLE001
+                    pass
+            _INFO_READS.discard(track_id)
+    t_ = asyncio.get_running_loop().create_task(_read(), name=f"catalogue-info-read[{track_id}]")
+    _INFO_READ_TASKS.add(t_)
+    t_.add_done_callback(_INFO_READ_TASKS.discard)
+
+
+# Formats whose tunes no index counts (the song database covers Amiga modules,
+# HVSC Songlengths the SIDs): the opt-in list reads fetch these.  Their files
+# are small (5–63 KB); SC68 and packed SNDH need the whole file anyway.
+_LIST_READ_EXTS = frozenset({".sc68", ".sndh", ".nsf", ".nsfe", ".gbs", ".hes",
+                             ".kss", ".ay", ".sap"})
+_LIST_READ_MAX = 40                     # queued per request (rows on screen)
+_list_read_queue: "dict[str, str]" = {}   # track id → owner, newest request wins
+_list_read_task: "asyncio.Task | None" = None
+
+
+def catalogue_read_for_list(ids, owner: str) -> int:
+    """The opt-in "For tunes shown in lists" tune details: queue the
+    catalogue tunes of ``ids`` (rows on a listener's screen) that are not
+    read yet and whose tune count no index has, to be fetched and read one
+    at a time (``catalogue.permit_list`` — its own budget, never the room
+    left for plays).  The newest request replaces what is still queued (the
+    list scrolled on).  Returns how many were queued; 0 while the setting is
+    "When I open Track Info"."""
+    global _list_read_task
+    from soniqboom.core import catalogue, modland_catalog
+    from soniqboom.core.store import get_store
+    if modland_catalog.tune_details() != "lists":
+        return 0
+    store = get_store()
+    picked: dict = {}
+    for tid in list(ids or ())[:_LIST_READ_MAX]:
+        t = store.get_track(str(tid))
+        if not t or (t.get("subsongs") or 0) > 1 or (t.get("mtime") or 0) > 0:
+            continue
+        p = str(t.get("path") or "")
+        if not catalogue.is_catalogue_path(p) or Path(p).suffix.lower() not in _LIST_READ_EXTS:
+            continue
+        picked[str(tid)] = owner
+    _list_read_queue.clear()
+    _list_read_queue.update(picked)
+    if picked and (_list_read_task is None or _list_read_task.done()):
+        _list_read_task = asyncio.get_running_loop().create_task(
+            _list_read_worker(), name="catalogue-list-reads")
+    return len(picked)
+
+
+async def _list_read_worker() -> None:
+    from soniqboom.core import catalogue, modland_catalog
+    from soniqboom.core.filesource import get_source as _get_source
+    while _list_read_queue:
+        tid = next(iter(_list_read_queue))
+        _list_read_queue.pop(tid, None)
+        track = await get_track(tid)
+        if not track or not _catalogue_unmerged(track) or tid in _INFO_READS:
+            continue
+        path_str = str(track.path or "")
+        root = catalogue.root_of(path_str)
+        if root and _get_source(root) is None:
+            _list_read_queue.clear()                    # the archive is offline
+            return
+        if not catalogue.permit_list(path_str):
+            _list_read_queue.clear()                    # budget spent: stop for now
+            return
+        _INFO_READS.add(tid)
+        pin = None
+        try:
+            _p, _e, _n, pin = await _resolve_play_source(tid, track, lane="scan")
+            await modland_catalog.await_merge(tid, 10.0)
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("catalogue list read of %s failed: %s", tid, exc)
+        finally:
+            if pin:
+                try:
+                    _zip_unpin(pin)
+                except Exception:                       # noqa: BLE001
+                    pass
+            _INFO_READS.discard(tid)
+        await asyncio.sleep(0.2)                        # one at a time, gently
+
+
+async def _catalogue_sid_read(track_id: str, track, ext: str):
+    """``track`` as stored once a catalogue SID's first-play read finished
+    (waited for, up to 4 s): its length (HVSC) comes from that read of the
+    file just fetched — as a local file's is known before it plays — not
+    the default.  ``track`` itself for anything else."""
+    if ext not in _SID_EXTS or not _catalogue_unmerged(track):
+        return track
+    try:
+        from soniqboom.core.hvsc import get_hvsc
+        if not get_hvsc().is_configured():
+            return track                        # no HVSC lengths to wait for
+    except Exception:                                   # noqa: BLE001
+        return track
+    if "Chiptune" not in (getattr(track, "genre", None) or ()):
+        return track                            # an Amiga SidMon ``.sid``
+    from soniqboom.core import modland_catalog
+    if await modland_catalog.await_merge(track_id, 4.0):
+        return await get_track(track_id) or track
+    return track
+
+
+def _catalogue_unmerged(track) -> bool:
+    """A catalogue tune not yet read on a play (``modland_catalog.is_merged``)."""
+    from soniqboom.core import catalogue as _catalogue
+    path_str = str(getattr(track, "path", "") or "")
+    if not _catalogue.is_catalogue_path(path_str):
+        return False
+    return not (getattr(track, "mtime", 0) or 0) > 0
+
+
 def _missing_on_source(path_str: str) -> str:
     """The 404 text of a remote file that is gone from its share."""
     from soniqboom.core import catalogue as _catalogue
@@ -11603,6 +11780,7 @@ async def stream_track(
 
     _zip_tmp: Path | None = None  # temp file to clean up after streaming
     path, ext, _uade_named, _zip_track_id_for_unpin = await _resolve_play_source(track_id, track)
+    track = await _catalogue_sid_read(track_id, track, ext)
 
     def _cleanup_tmp():
         if _zip_tmp is not None:

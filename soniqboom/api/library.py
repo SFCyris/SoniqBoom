@@ -97,6 +97,12 @@ async def _broadcast(data: dict) -> None:
             _ws_user_id.pop(ws, None)
 
 
+async def broadcast_track_updated(track_id: str) -> None:
+    """Tell every open page one track's stored fields changed (a catalogue
+    tune read on its first play): pages holding it re-read it."""
+    await _broadcast({"event": "track_updated", "id": track_id})
+
+
 async def broadcast_catalogue_changed(root: str) -> None:
     """Tell every open page a catalogue root's tracks changed (built, refreshed,
     removed): the folder tree and the open view refresh."""
