@@ -279,15 +279,15 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 
 | | **SoniqBoom** | Navidrome | Jellyfin | Plexamp | Music Assistant | Lyrion |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Retro / tracker / chiptune formats** (SID, MOD, XM, IT, AHX, NSF, SPC, VGM, PSF, AdLib…) | ✅ **40+ families** | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Retro / tracker / chiptune formats** (SID, MOD, XM, IT, AHX, NSF, SPC, VGM, PSF, AdLib…) | ✅ **40+ families** | ❌ | ❌ | ❌ | ❌ | ⚠ via third-party plugin (beta) |
 | **Everyday formats** (FLAC, ALAC, MP3, AAC, Opus, DSD) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Free — no paid tier** | ✅ AGPL | ✅ | ✅ | 💰 Plex Pass gates offline, EQ &amp; remote streaming | ✅ | ✅ |
 | **Zero cloud · no account · no telemetry** | ✅ | ✅ | ✅ | ❌ account required | ✅ | ✅ |
 | **Multi-room sync** (native) | ✅ any browsers on the LAN | ❌ | ⚠ SyncPlay (video-oriented) | ❌ | ✅ via Home Assistant hub | ✅ via Squeezebox players |
 | **Cast — AirPlay · Chromecast · DLNA** | ✅ all three *(Beta)* | ❌ | ⚠ Chromecast; DLNA via plugin | ✅ AirPlay · Chromecast | ✅ all three | ⚠ via bridge plugins |
-| **Subsonic / OpenSubsonic API** (Amperfy, Symfonium, DSub…) | ✅ + server-side Jukebox | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Subsonic / OpenSubsonic API** (Amperfy, Symfonium, DSub…) | ✅ + server-side Jukebox | ✅ | ❌ | ❌ | ❌ | ⚠ via third-party plugin |
 | **Internet radio** (Radio Browser directory) | ✅ + curated scene station pack | ⚠ manual station list | ❌ | ❌ | ✅ | ✅ (plugin) |
-| **Demoscene metadata** (HVSC song lengths &amp; STIL · Demozoo composer, crew, release year &amp; game soundtracks · audacious-uade-tools module credits, games &amp; lengths) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Demoscene metadata** (HVSC song lengths &amp; STIL · Demozoo composer, crew, release year &amp; game soundtracks · audacious-uade-tools module credits, games &amp; lengths) | ✅ | ❌ | ❌ | ❌ | ❌ | ⚠ HVSC song lengths via the retro plugin |
 | **Plays tracks inside ZIP archives** (no unpacking) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Network shares without mounting** (FTP · SMB · WebDAV) | ✅ | ❌ | ❌ | ❌ | ✅ (SMB · NFS · WebDAV) | ❌ |
 | **In-browser tag editing** (writes real tags) | ✅ | ❌ read-only | ⚠ database only | ⚠ database only | ❌ | ❌ |
@@ -297,8 +297,8 @@ How SoniqBoom stacks up against the five self-hosted music servers it's most oft
 
 ### Where SoniqBoom reigns supreme
 
-- **It plays the formats no one else touches.** Forty-plus retro families — SID, ~20 tracker formats, AHX and HivelyTracker, ~175 Amiga player formats, Atari ST, the whole PSF family, console chiptunes, AdLib/OPL2, and MIDI. None of the servers above render *any* of them.
-- **Scene metadata** Correct per-tune SID lengths and STIL credits from HVSC, composer, crew, release year and the game a tune was made for from Demozoo, plus module artists, games, publishers, years and many song lengths from the audacious-uade-tools song database - metadata no other server carries.
+- **It plays the formats the others don't.** Forty-plus retro families — SID, ~20 tracker formats, AHX and HivelyTracker, ~175 Amiga player formats, Atari ST, the whole PSF family, console chiptunes, AdLib/OPL2, and MIDI. Of the servers above, only Lyrion plays some of them, through a third-party plugin in beta.
+- **Scene metadata** Correct per-tune SID lengths and STIL credits from HVSC, composer, crew, release year and the game a tune was made for from Demozoo, plus module artists, games, publishers, years and many song lengths from the audacious-uade-tools song database - a set of metadata no other server carries.
 - **Your ZIP hoards just work.** Tracks inside `.zip` archives appear and play in place; every other server needs them unpacked first.
 - **Multi-room that needs nothing extra.** Lockstep playback across any browsers on your LAN — no Squeezebox hardware, no Home Assistant hub.
 - **Your files where they already are.** Attach FTP, SMB, and WebDAV shares straight from the admin UI with no OS mount - only Music Assistant comes close.
