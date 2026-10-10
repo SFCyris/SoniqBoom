@@ -1,6 +1,9 @@
 /*
 ** HVL2WAV
 **
+** Modified by S.F. Cyris for SoniqBoom, 2026-10-09: the -l option prints the
+** song's length (frames at 50 Hz, and whether the song end was reached)
+** without writing any audio.
 */
 
 #include <stdio.h>
@@ -18,6 +21,7 @@ uint32 subsong = 0, smplen = 0;
 uint32 stereosep = 0;
 BOOL autogain = FALSE;
 BOOL use_songend = TRUE;
+BOOL lengthonly = FALSE;
 char *filename = NULL;
 char *outname = NULL;
 char wavname[1020];
@@ -92,6 +96,10 @@ int main( int argc, char *argv[] )
         case 'a':
           autogain = TRUE;
           break;
+
+        case 'l':
+          lengthonly = TRUE;
+          break;
         
         case 'o':
           outname = &argv[i][2];
@@ -126,6 +134,8 @@ int main( int argc, char *argv[] )
     printf( "  -fn    Set frequency, where n is 8000 to 48000\n" );
     printf( "  -sn    Use subsong n\n" );
     printf( "  -a     Calculate optimal gain before converting\n" );
+    printf( "  -l     Print the length (\"length <frames> <ended>\", 50 frames\n" );
+    printf( "         a second) and write no audio\n" );
     printf( "  -xn    Set stereo seperation (ahx only, no effect on HVL files)\n" );
     printf( "            0 = 0%% (Mono)\n" );
     printf( "            1 = 25%%\n" );
@@ -158,6 +168,20 @@ int main( int argc, char *argv[] )
     hvl_FreeTune( ht );
     free( mixbuf );
     printf( "Unable to initialise subsong %ld\n", subsong );
+    return 0;
+  }
+
+  if( lengthonly )
+  {
+    frm = 0;
+    while( ( frm < max_frames ) && !ht->ht_SongEndReached )
+    {
+      hvl_DecodeFrame( ht, mixbuf, &mixbuf[2], 4 );
+      frm++;
+    }
+    printf( "length %lu %d\n", (unsigned long)frm, ht->ht_SongEndReached ? 1 : 0 );
+    hvl_FreeTune( ht );
+    free( mixbuf );
     return 0;
   }
 

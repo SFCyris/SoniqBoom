@@ -1429,8 +1429,55 @@ async def tracks_availability(body: dict):
         raise HTTPException(422, "ids must be a list")
     store = get_store()
     m = availability.mode(store)
+    ids = ids[:5000]
+    # The playback problems of the same rows (reported marks, undecodable
+    # files — core/skip_rules.py), so a queue held since before a mark follows it.
+    health: dict[str, dict] = {}
+    for tid in ids:
+        t = store.get_track(tid) if isinstance(tid, str) else None
+        if t and (t.get("health") or t.get("defect")):
+            health[tid] = {f: t.get(f) for f in (*_HEALTH_ROW_FIELDS, "defect", "defect_detail")}
     return {"mode": m, "token": availability.token(store),
-            "offline": availability.offline_kinds(ids[:5000], store)}
+            "offline": availability.offline_kinds(ids, store), "health": health}
+
+
+_HEALTH_ROW_FIELDS = ("health", "health_note", "health_by", "health_at", "health_renderer")
+
+
+class _HealthMark(_BaseModel):
+    state: str | None = None            # "broken" | "glitched" | None (clear)
+    note: str | None = None
+
+
+@router.put("/{track_id}/health")
+async def set_health(track_id: str, body: _HealthMark, user=_Depends(_require_edit)):
+    """Report a playback problem with a track, or clear it (GitHub #36 —
+    core/skip_rules.py): ``state`` "broken" (auto-play passes it by; a click
+    still plays it), "glitched" (shown only) or null.  Recorded with who
+    reported it, when, and the renderer + version that plays it now; set on
+    the track's identical copies too.  Answer ``{"ids": [...], "fields":
+    {...}}`` — the ids written and the fields they now carry."""
+    from soniqboom.core import skip_rules
+    from soniqboom.core.store import get_store
+    from soniqboom.api import stream as _stream
+    from soniqboom.api.admin import renderer_label
+    store = get_store()
+    t = store.get_track(track_id)
+    if not t:
+        raise HTTPException(404, "Track not found")
+    state = body.state or None
+    if state is not None and state not in skip_rules.STATES:
+        raise HTTPException(422, "state must be broken, glitched or null")
+    renderer = None
+    if state:
+        try:
+            renderer = await renderer_label(_stream.renderer_key_for(t))
+        except Exception:                               # noqa: BLE001 — a label is a nicety
+            renderer = None
+    by = getattr(user, "display_name", None) or getattr(user, "username", None)
+    ids = skip_rules.set_mark(store, track_id, state, body.note, by, renderer)
+    fresh = store.get_track(track_id) or {}
+    return {"ids": ids, "fields": {f: fresh.get(f) for f in _HEALTH_ROW_FIELDS}}
 
 
 @json_route(router, "/{track_id}")
@@ -1516,6 +1563,9 @@ async def get_track_extended(track_id: str, request: Request):
         # an HVSC Songlengths DB is configured; else None — the picker then
         # shows tune numbers without times (graceful degrade).
         "hvsc_lengths": getattr(track, "hvsc_lengths", None),
+        # …and the lengths a multi-tune SNDH / NSFe / AY states itself
+        # (same shape; 0 = unknown), for the picker and "Skip short tunes".
+        "tune_lengths": getattr(track, "tune_lengths", None),
         # HVSC STIL commentary blob (raw text) for SID files, when configured;
         # else None.  The client parses the ``(#N)`` subtune markers into
         # per-tune titles for the picker and shows the file-level comment as a

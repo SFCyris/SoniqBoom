@@ -15,6 +15,7 @@ import { Player }              from './player.js';
 import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
          subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from './tunes.js';
+import { healthOf, healthBadge, reportedLine, canReport, mark as healthMark } from './health.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -944,7 +945,7 @@ function _render(track) {
       _yEl0.title = '';
     }
   }
-  _renderDefect(track.defect, track.defect_detail);
+  _renderHealth(track);
 
   // ── NUMBERING ──
   const trkStr = track.track_number
@@ -1154,6 +1155,16 @@ function _subVirtual(base, wire) {
                                             : {});
 }
 
+// Per-tune lengths from /extended, in tune order: HVSC's (SID), else the
+// file's own (``tune_lengths``: SNDH, NSFe, AY); null when neither.
+function _mergedLengths(data) {
+  const a = Array.isArray(data && data.hvsc_lengths) ? data.hvsc_lengths : null;
+  const b = Array.isArray(data && data.tune_lengths) ? data.tune_lengths : null;
+  if (!a || !b) return a || b;
+  return Array.from({ length: Math.max(a.length, b.length) },
+    (_, i) => (Number(a[i]) > 0 ? a[i] : (Number(b[i]) || 0)));
+}
+
 // HVSC STIL: parse the raw blob's ``(#N)`` subtune markers into a
 // { N-1 → title } map, keyed by tune (``(#N)`` is tune N, as displayed).  We
 // take the FIRST ``TITLE:`` inside each block; ARTIST/COMMENT are left for the
@@ -1174,18 +1185,41 @@ function _parseStilTitles(blob) {
   return Object.keys(titles).length ? titles : null;
 }
 
+// Settings → "Skip short tunes" (Player.skipShortSecs): is tune ``tune``
+// (1-based) known to be shorter?  Its own length must be known (HVSC).
+function _subShortSecs() { return Number(Player.skipShortSecs) || 0; }
+// (The player's own judgement of the tune entry — the same rule it skips by.)
+function _subLen(tune) {
+  const st = _subState; if (!st) return 0;
+  try { return Number(Player.tuneLength?.(_subVirtual(st.track, _subWire(tune)))) || 0; } catch (_) { return 0; }
+}
+function _subIsShort(tune) {
+  const secs = _subShortSecs();
+  if (!_subState || !secs) return false;
+  const n = _subLen(tune);
+  return n > 0 && n < secs;
+}
+function _subShortCount() {
+  const st = _subState; if (!st) return 0;
+  let n = 0;
+  for (let t = 1; t <= st.count; t++) if (_subIsShort(t)) n++;
+  return n;
+}
+
 function _subRowHtml(tune) {
   const st = _subState;
   const wire = _subWire(tune);
   const isDef = st && tune === st.def;
+  const short = _subIsShort(tune);
   const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[tune - 1]) : '';
   const title = (st && st.stilTitles) ? st.stilTitles[tune - 1] : '';
   const titleHtml = title
     ? ` <span class="ti-sub-title" title="${_escHtml(title)}">· ${_escHtml(title)}</span>`
     : '';
-  return `<div class="ti-sub-row" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${tune}${isDef ? ' (default)' : ''}${title ? ': ' + _escHtml(title) : ''}">`
+  const shortSr = short ? `, ${len}, skipped when playing through (under ${_subShortSecs()} s)` : '';
+  return `<div class="ti-sub-row${short ? ' ti-sub-row--short' : ''}" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${tune}${isDef ? ' (default)' : ''}${title ? ': ' + _escHtml(title) : ''}${shortSr}">`
     + `<span class="ti-sub-eq" aria-hidden="true"><i></i><i></i><i></i></span>`
-    + `<span class="ti-sub-name">Tune ${tune}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${titleHtml}</span>`
+    + `<span class="ti-sub-name">Tune ${tune}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${short ? ` <span class="ti-sub-short" title="Under ${_subShortSecs()} s — skipped when playing through; click to play it">short</span>` : ''}${titleHtml}</span>`
     + `<span class="ti-sub-len">${len}</span>`
     + `<span class="ti-sub-rowacts">`
     +   `<button type="button" class="ti-sub-rbtn" data-act="play" tabindex="-1" aria-label="Play tune ${tune}" title="Play">&#9654;</button>`
@@ -1212,10 +1246,7 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles, 
     lengths: Array.isArray(lengths) ? lengths : null,
     stilTitles: (stilTitles && typeof stilTitles === 'object') ? stilTitles : null,
   };
-  const cntEl = document.getElementById('ti-sub-count');
-  if (cntEl) cntEl.textContent = `· ${count} tunes`;
-  const addLbl = document.getElementById('ti-sub-addall-lbl');
-  if (addLbl) addLbl.textContent = `Add all · ${count}`;
+  _paintSubCounts();
   const shown = Math.min(count, SUB_CAP);
   const rows = [];
   for (let t = 1; t <= shown; t++) rows.push(_subRowHtml(t));
@@ -1226,11 +1257,41 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles, 
   _highlightPlayingSubsong();
 }
 
+// The header's tune count, the "Add all" label and the note under the header,
+// with "Skip short tunes" on: how many tunes are passed by, or — when this
+// file's tune lengths are unknown — that none is.
+function _paintSubCounts() {
+  const st = _subState; if (!st) return;
+  const secs = _subShortSecs();
+  const short = _subShortCount();
+  const cntEl = document.getElementById('ti-sub-count');
+  if (cntEl) cntEl.textContent = `· ${st.count} tunes` + (short ? ` · ${short} under ${secs} s skipped` : '');
+  const addLbl = document.getElementById('ti-sub-addall-lbl');
+  if (addLbl) addLbl.textContent = short ? `Add ${st.count - short} · ${short} short left out` : `Add all · ${st.count}`;
+  const note = document.getElementById('ti-sub-note');
+  if (note) {
+    let known = false;
+    for (let t = 1; t <= st.count && !known; t++) known = _subLen(t) > 0;
+    note.textContent = secs && !known
+      ? 'Tune lengths unknown — no tunes are skipped here.'
+      : (short === st.count ? `All ${st.count} tunes are under ${secs} s — nothing to play through. Click a tune to play it.` : '');
+    note.hidden = !note.textContent;
+  }
+}
+
 // Every tune of the file, in tune order (1..N), as wire indexes.
 function _subAllWires() {
   const st = _subState; if (!st) return [];
   const out = [];
   for (let t = 1; t <= st.count; t++) out.push(_subWire(t));
+  return out;
+}
+// …without the tunes "Skip short tunes" passes by (bulk adds count as playing
+// through: the queue / a playlist would only skip them again).
+function _subPlayableWires() {
+  const st = _subState; if (!st) return [];
+  const out = [];
+  for (let t = 1; t <= st.count; t++) if (!_subIsShort(t)) out.push(_subWire(t));
   return out;
 }
 function _subAllVirtual() {
@@ -1307,29 +1368,47 @@ if (_subListEl) {
     _subAction('play', parseInt(row.dataset.wire, 10));
   });
 }
+function _subNothingToPlay() {
+  const st = _subState;
+  window.Toast?.info?.(`All ${st.count} tunes are under ${_subShortSecs()} s — nothing to play through. Click a tune to play it.`);
+}
 document.getElementById('ti-sub-playall')?.addEventListener('click', () => {
-  const list = _subAllVirtual(); if (list.length) Player.setQueue(list, 0, { explicit: false });   // "Play all": a dead first tune is skipped, like the library's
+  if (_subState && _subShortCount() === _subState.count) { _subNothingToPlay(); return; }
+  const list = _subAllVirtual(); if (list.length) Player.setQueue(list, 0, { explicit: false });   // "Play all": a dead first tune is skipped, like the library's; short tunes too
 });
 document.getElementById('ti-sub-shuffle')?.addEventListener('click', () => {
   // The player owns shuffling: it starts on a random tune, deals the rest, and
   // lights the shuffle button (a local shuffle here played a shuffled order
   // while the button stayed dark).
+  if (_subState && _subShortCount() === _subState.count) { _subNothingToPlay(); return; }
   const list = _subAllVirtual();
   if (list.length) Player.setQueue(list, 0, { shuffle: true });
 });
 document.getElementById('ti-sub-addall')?.addEventListener('click', () => {
-  const list = _subAllVirtual();
-  list.forEach(vt => Player.addToQueue(vt));
-  window.Toast?.ok?.(`Added all ${list.length} tunes to the queue`);
+  const st = _subState; if (!st) return;
+  const wires = _subPlayableWires();
+  if (!wires.length) { _subNothingToPlay(); return; }
+  wires.forEach(w => Player.addToQueue(_subVirtual(st.track, w)));
+  const left = st.count - wires.length;
+  window.Toast?.ok?.(left ? `Added ${wires.length} tunes to the queue — ${left} short left out`
+                          : `Added all ${wires.length} tunes to the queue`);
 });
 document.getElementById('ti-sub-addall-pl')?.addEventListener('click', (e) => {
   const st = _subState; if (!st) return;
-  _subToPlaylist(_subAllWires().map(w => ({ id: st.track.id, subsong: w })), e.currentTarget);
+  const wires = _subPlayableWires();
+  if (!wires.length) { _subNothingToPlay(); return; }
+  _subToPlaylist(wires.map(w => ({ id: st.track.id, subsong: w })), e.currentTarget);
 });
 document.getElementById('ti-sub-jump-in')?.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   const n = parseInt(e.target.value, 10);           // the TUNE number, as displayed
   if (_subState && n >= 1 && n <= _subState.count) { _subAction('start', _subWire(n)); e.target.value = ''; }
+});
+// "Skip short tunes" changed (offline.js has passed it to the player, then
+// fires this): the open picker re-marks its short tunes and counts.
+document.addEventListener('soniqboom:availability-changed', () => {
+  const st = _subState;
+  if (st && isOpen()) _renderSubsongPicker(st.track, st.count, st.start, st.lengths, st.stilTitles, st.def);
 });
 Player.on?.('trackchange', () => _highlightPlayingSubsong());
 Player.on?.('statechange', () => _highlightPlayingSubsong());
@@ -1361,28 +1440,101 @@ function _renderSidChip(model) {
   _sidChipField.style.display = '';
 }
 
-// Track-health badge + detail (a known playback defect flagged at scan) — a
-// "Status" row at the top of Track Info, styled like the row badge.  Hidden
-// for healthy tracks.  Mirrors _renderSidChip's manual show/hide.
+// Playback problems (health.js) — a "Status" row at the top of Track Info with
+// the row's badge and who / when / which renderer (a reported problem) or the
+// detail (one found at scan); hidden for a healthy track.  Below it, for users
+// with edit rights, "Playback": No problem · Glitched · Broken and a note.
 const _defectField  = document.getElementById('ti-field-defect');
 const _defectBadge  = document.getElementById('ti-defect-badge');
 const _defectDetail = document.getElementById('ti-defect-detail');
-function _renderDefect(defect, detail) {
-  if (!_defectField || !_defectBadge) return;
-  const d = (defect === 'partial' || defect === 'corrupt') ? defect : '';
-  if (!d) {
-    _defectField.style.display = 'none';
+const _reportField  = document.getElementById('ti-field-report');
+const _reportGroup  = document.getElementById('ti-report');
+const _reportNote   = document.getElementById('ti-report-note');
+const _reportHelp   = document.getElementById('ti-report-help');
+const _REPORT_HELP  = _reportHelp ? _reportHelp.textContent : '';
+let   _healthTrack  = null;             // the track the Status / Playback rows show
+function _renderHealth(track) {
+  _healthTrack = track || null;
+  if (_defectField && _defectBadge) {
+    const h = healthOf(track);
     _defectBadge.textContent = '';
-    _defectBadge.className = 'track-defect-badge';
-    if (_defectDetail) _defectDetail.textContent = '';
-    return;
+    if (!h) {
+      _defectField.style.display = 'none';
+      if (_defectDetail) _defectDetail.textContent = '';
+    } else {
+      const b = healthBadge(track);
+      if (b) { b.style.marginLeft = '0'; _defectBadge.appendChild(b); }
+      if (_defectDetail) {
+        const reported = h.key === 'broken' || h.key === 'glitched';
+        _defectDetail.textContent = reported
+          ? [reportedLine(track), track.health_note ? `“${track.health_note}”` : ''].filter(Boolean).join(' · ')
+          : (track.defect_detail || '');
+      }
+      _defectField.style.display = '';
+    }
   }
-  _defectBadge.className = `track-defect-badge track-defect-${d}`;
-  _defectBadge.textContent = d;
-  _defectBadge.title = detail || '';
-  if (_defectDetail) _defectDetail.textContent = detail || '';
-  _defectField.style.display = '';
+  if (!_reportField || !_reportGroup) return;
+  const can = !!track && canReport() && !track.isStation;
+  _reportField.hidden = !can;
+  if (!can) return;
+  const cur = track.health === 'broken' || track.health === 'glitched' ? track.health : '';
+  _reportGroup.querySelectorAll('button[data-state]').forEach((b) => {
+    b.setAttribute('aria-pressed', (b.dataset.state || '') === cur ? 'true' : 'false');
+  });
+  if (_reportNote) {
+    _reportNote.hidden = !cur;
+    if (document.activeElement !== _reportNote) _reportNote.value = track.health_note || '';
+  }
+  if (_reportHelp) {
+    const n = Number(track.subsongs) || 0;
+    _reportHelp.textContent = _REPORT_HELP + (n > 1 ? ` Applies to the whole file (all ${n} tunes).` : '');
+  }
 }
+async function _report(state) {
+  const t = _healthTrack;
+  if (!t) return;
+  const note = state && _reportNote ? _reportNote.value.trim() : null;
+  const fields = await healthMark(t, state || null, note);
+  if (fields && _healthTrack && _healthTrack.id === t.id) {
+    Object.assign(_healthTrack, fields);
+    _renderHealth(_healthTrack);
+  }
+}
+if (_reportGroup) {
+  // (Toggle buttons — a choice is made by a click / Enter / Space, never by
+  // moving through them: each choice is saved and shared.)
+  _reportGroup.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-state]');
+    if (!b || b.getAttribute('aria-pressed') === 'true') return;
+    _report(b.dataset.state || '');
+  });
+}
+if (_reportNote) {
+  // The track the note is typed for (not whatever the panel shows by the
+  // time it is saved).
+  let _noteFor = null;
+  _reportNote.addEventListener('focus', () => { _noteFor = _healthTrack; });
+  const saveNote = async () => {
+    const t = _noteFor || _healthTrack;
+    if (!t || !t.health || (_reportNote.value.trim() === (t.health_note || ''))) return;
+    const fields = await healthMark(t, t.health, _reportNote.value.trim(), { quiet: true });
+    if (fields) {
+      Object.assign(t, fields);
+      _renderHealth(t);
+      window.Toast?.ok?.('Note saved.');
+    }
+  };
+  _reportNote.addEventListener('change', saveNote);
+  _reportNote.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _reportNote.blur(); } });
+}
+// A report made elsewhere (the row menu, the queue, another tab's sync): follow it.
+document.addEventListener('soniqboom:health-changed', (e) => {
+  const d = (e && e.detail) || {};
+  if (_healthTrack && Array.isArray(d.ids) && d.ids.includes(_healthTrack.id)) {
+    Object.assign(_healthTrack, d.fields || {});
+    _renderHealth(_healthTrack);
+  }
+});
 
 // /extended answers before a slow default-tune probe has finished
 // (``default_tune_pending``): ask again a few times while this track's panel
@@ -1493,11 +1645,11 @@ async function _loadExtendedInfo(track) {
         // times, bare tune numbers).
         const stilTitles = _parseStilTitles(data.stil);
         const defaultTrack = data.default_track ?? subsongStartOf(track);
-        _renderSubsongPicker(track, subCount, defaultTrack, data.hvsc_lengths, stilTitles,
+        _renderSubsongPicker(track, subCount, defaultTrack, _mergedLengths(data), stilTitles,
                              data.default_tune);
         if (data.default_tune_pending && subCount > 1) {
             _followPendingDefault(track, { count: subCount, defaultTrack,
-                                           lengths: data.hvsc_lengths, stilTitles });
+                                           lengths: _mergedLengths(data), stilTitles });
         }
         _renderStil(data.stil);
         _renderSidChip(data.sid_model);
@@ -2192,25 +2344,101 @@ function close() {
 
 function isOpen() { return !overlay.classList.contains('hidden'); }
 
+// The open panel takes new stored fields of its track in place.  A panel
+// showing one tune keeps that tune's own subsong and length.  It redraws only
+// when something it shows changed, and an open edit form keeps what is being
+// typed (the next open shows the rest).
+function _keptFields(t) {
+  return Number.isInteger(t.subsong) ? { subsong: t.subsong, duration: t.duration } : {};
+}
+function _applyFields(id, fields) {
+  if (!isOpen() || !_queue || !id || !fields) return false;
+  const t = _queue[_idx];
+  if (!t || t.id !== id) return false;
+  const keep = _keptFields(t);
+  const changed = Object.keys(fields).filter((k) => !(k in keep)
+    && JSON.stringify(fields[k] ?? null) !== JSON.stringify(t[k] ?? null));
+  Object.assign(t, fields, keep);
+  if (!changed.length) return true;
+  const wrap = document.getElementById('ti-tagedit-wrap');
+  if (wrap && wrap.querySelector('input, textarea, select')) return true;
+  _render(t);
+  return true;
+}
+
+// What the server adds after it re-read a track — derived genres, scene
+// credits, a length — lands in passes that follow the re-read without a
+// notice of their own: the open panel reads its track again a little later,
+// and the player bar and list rows take the same fields.
+const _FOLLOW_DELAYS_MS = [2500, 6000, 15000];
+let _followTimer = null;
+let _followGen = 0;
+function _followUp(id) {
+  clearTimeout(_followTimer);
+  const gen = ++_followGen;
+  let step = 0;
+  const current = () => {
+    const t = isOpen() && _queue ? _queue[_idx] : null;
+    return gen === _followGen && t && t.id === id ? t : null;
+  };
+  const run = async () => {
+    if (!current()) return;
+    try {
+      const r = await fetch('/api/tracks/meta/batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [id] }), credentials: 'same-origin',
+      });
+      const row = r.ok ? (await r.json()).find((x) => x && x.id === id) : null;
+      const cur = current();
+      if (!cur) return;
+      if (row) {
+        const keep = _keptFields(cur);
+        const changed = {};
+        for (const k of Object.keys(row)) {
+          if (k === 'id' || k in keep) continue;
+          if (JSON.stringify(row[k] ?? null) !== JSON.stringify(cur[k] ?? null)) changed[k] = row[k];
+        }
+        if (Object.keys(changed).length) {
+          try { Player.patchTrackFields?.(id, changed); } catch (_) {}
+          document.dispatchEvent(new CustomEvent('soniqboom:track-edited',
+            { detail: { id, fields: changed } }));       // list rows (app.js)
+          _applyFields(id, changed);
+        }
+      }
+    } catch (_) { /* the next step tries again */ }
+    if (gen === _followGen && ++step < _FOLLOW_DELAYS_MS.length) {
+      _followTimer = setTimeout(run, _FOLLOW_DELAYS_MS[step]);
+    }
+  };
+  _followTimer = setTimeout(run, _FOLLOW_DELAYS_MS[0]);
+}
+
 // The server re-read the track on show (a catalogue tune's first play): the
 // panel shows the stored row — tabs, details, tunes — as for a scanned file.
 document.addEventListener('soniqboom:track-refreshed', (e) => {
   const d = (e && e.detail) || {};
-  if (!isOpen() || !_queue || !d.id || !d.fields) return;
-  const t = _queue[_idx];
-  if (!t || t.id !== d.id) return;
-  const keep = Number.isInteger(t.subsong) ? { subsong: t.subsong, duration: t.duration } : {};
-  Object.assign(t, d.fields, keep);
-  // An open edit form keeps what is being typed (the next open shows the rest).
-  const wrap = document.getElementById('ti-tagedit-wrap');
-  if (wrap && wrap.querySelector('input, textarea, select')) return;
-  _render(t);
+  if (_applyFields(d.id, d.fields)) _followUp(d.id);
+});
+
+// A length the duration probe measured for a row (utils.js) — the open
+// panel's track among them shows it at once.
+document.addEventListener('soniqboom:durations-probed', (e) => {
+  const map = (e && e.detail && e.detail.durations) || {};
+  const t = isOpen() && _queue ? _queue[_idx] : null;
+  if (t && !Number.isInteger(t.subsong) && map[t.id] > 0 && map[t.id] !== t.duration) {
+    _applyFields(t.id, { duration: map[t.id] });
+  }
 });
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
   if (!isOpen()) return;
   if (e.key === 'Escape')     { close(); return; }
+  if (e.defaultPrevented) return;
+  // Arrow keys move between tracks — not while they move a text cursor or
+  // belong to a control (the note field, a select, the report buttons).
+  const tgt = e.target;
+  if (tgt && tgt.closest && tgt.closest('input, textarea, select, [contenteditable="true"], #ti-report')) return;
   if (e.key === 'ArrowLeft')  { _go(-1); e.preventDefault(); }
   if (e.key === 'ArrowRight') { _go(+1); e.preventDefault(); }
 });

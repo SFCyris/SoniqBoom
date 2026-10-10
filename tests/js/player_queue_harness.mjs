@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const { subsongWireToTune, subsongStartOf } =
+  await import(resolve(HERE, '../../soniqboom/frontend/js/utils.js'));
 // SB_PLAYER_JS: point the harness at another copy (mutation-testing the tests).
 const PLAYER_JS = process.env.SB_PLAYER_JS
   || resolve(HERE, '../../soniqboom/frontend/js/player.js');
@@ -27,7 +29,8 @@ function extractCore() {
 
 const FACTORY = new Function('env', `
   'use strict';
-  const { localStorage, fetch, setTimeout, clearTimeout, AbortSignal } = env;
+  const { localStorage, fetch, setTimeout, clearTimeout, AbortSignal,
+          subsongWireToTune, subsongStartOf } = env;
   // Seeded randomness (shuffle seeds, Fisher–Yates) so every run is the same run.
   const Math = Object.create(globalThis.Math);
   Math.random = env.random;
@@ -46,6 +49,10 @@ const FACTORY = new Function('env', `
     trackId = t && t.id; plays.push(t && t.id);
   }
   function emit(name, data) { events.push([name, data]); }
+  // (player.js: formats the server renders — here, anything but plain audio.)
+  function _isRenderedTrack(t) {
+    return !!t && !!t.format && !['MP3', 'FLAC', 'WAV', 'AAC', 'OGG', 'DSD'].includes(String(t.format).toUpperCase());
+  }
   function _currentTime() { return env.currentTime || 0; }
   function _recordAdvance(skip) { env.advances.push(!!skip); }
   function _invalidatePContinue() {}
@@ -57,6 +64,10 @@ const FACTORY = new Function('env', `
     addToQueue, playNext, removeFromQueue, moveInQueue, setRadioActive,
     snapshotQueue, restoreQueue, clearAutoUpcoming,
     setOfflineSkip: (on) => { _offlineSkip = !!on; },
+    setSkipShort: (secs, placeholders) => { _shortSecs = Number(secs) > 0 ? Number(secs) : 0;
+      if (Array.isArray(placeholders)) _placeholderLens = placeholders; },
+    skipReason: (t) => _skipReason(t),
+    tuneLength: (t) => _tuneLen(t),
     get lastStartAllOffline() { return _startAllOffline; },
     reanchorOrdered: () => { _ordReanchor = true; if (_srcMode === 'ordered') _srcEnded = false; },
     // The <audio> element's side of things, for the auto-skip tests:
@@ -228,6 +239,7 @@ export function makePlayer({ server, storage = makeStorage(), rngSeed = 12345 } 
   const timers = [];
   const env = {
     random: mulberry32(rngSeed),
+    subsongWireToTune, subsongStartOf,
     localStorage: storage, fetch: server ? server.fetch : async () => { throw new Error('no server'); },
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
     clearTimeout: (id) => { if (id) timers[id - 1] = null; },

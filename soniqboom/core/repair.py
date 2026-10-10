@@ -1717,3 +1717,371 @@ async def repair_multi_values_once(store=None, *, force: bool = False) -> dict:
         except Exception:                               # noqa: BLE001
             log.debug("cache refresh after the multi-value repair failed", exc_info=True)
     return {"repaired": repaired, "seconds": secs}
+
+
+# ── Render lengths (GitHub #38) ─────────────────────────────────────────────
+# Libraries scanned before SNDH (FRMS), libgme (stated lengths) and AHX (song
+# end) lengths were honoured hold the defaults those tunes were played at: a
+# 180 s SNDH / chiptune and a ~512 s AHX.  An unchanged file is never
+# re-read by a rescan, so this pass corrects them once.
+RENDER_LENGTHS_KEY = "render_lengths_version"
+RENDER_LENGTHS_VERSION = 1
+# Progress of a pass under way ({"version", "next"}): a pass interrupted —
+# a server stopped, or one that crashed in a native library — resumes after
+# the chunk it was on instead of repeating it.
+RENDER_LENGTHS_PROGRESS_KEY = "render_lengths_progress"
+_RENDER_LENGTHS_CHUNK = 200
+from soniqboom.core.metadata import _GME_STATED_EXTS   # (GYM has its own scan length)
+
+
+def _length_kind(t: dict, gme_default: float) -> "str | None":
+    """Which stale default track ``t`` may hold: "sndh", "gme", "ahx" or None.
+    Every AHX track counts (its tunes' cached renders ran to ~512 s); only one
+    stored at that length gets a new length."""
+    path = str(t.get("path") or "")
+    name = os.path.basename(path.rsplit("::", 1)[-1]).lower()
+    dur = float(t.get("duration") or 0)
+    ext = os.path.splitext(name)[1]
+    if (t.get("format") == "SNDH" or ext == ".sndh") and abs(dur - 180.0) < 0.01:
+        return "sndh"
+    if ext in _GME_STATED_EXTS and abs(dur - gme_default) < 0.01:
+        return "gme"
+    if ext == ".ahx" or name.startswith("ahx.") or t.get("format") == "AHX":
+        return "ahx"
+    return None
+
+
+def _stated_length(kind: str, data: bytes, tune: int, gme_default: float,
+                   hvl_bin: "str | None", path_ext: str = "") -> "float | None":
+    """The length the corrected renderer plays ``data`` for (``kind`` as
+    ``_length_kind``, ``tune`` the 0-based tune the stored length describes),
+    or None when the file states none.  Blocking."""
+    if kind == "gme":
+        from soniqboom.core import gme_render
+        if path_ext in (".vgm", ".vgz") and gme_render.vgm_bytes_need_other_engine(data):
+            return None                   # ZXTune plays it, at the default length
+        total, fade = gme_render.render_plan(data, tune, gme_default)
+        return total if fade is not None else None
+    if kind == "ahx" and (not hvl_bin or data[:3] != b"THX"):
+        return None
+    fd, tmp = tempfile.mkstemp(suffix=".sndh" if kind == "sndh" else ".ahx",
+                               prefix="sq_len_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if kind == "sndh":
+            from soniqboom.core.metadata import sndh_info
+            info = sndh_info(Path(tmp))
+            if not info:
+                return None
+            return info["lengths"].get(info["default_track"]) or None
+        if kind == "gme":
+            return None
+        from soniqboom.api.stream import _hvl_length
+        return _hvl_length(hvl_bin, Path(tmp), tune)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+async def fix_render_lengths_once(store=None, *, force: bool = False) -> dict:
+    """Correct, once per ``RENDER_LENGTHS_VERSION``, the stored length of every
+    SNDH / libgme / AHX track still holding the default its old render
+    played (``_length_kind``), re-read from the file; every AHX track's
+    cached renders (and their transcodes) are dropped.
+
+    Read only where no fetch is needed: a local file or archive member, a
+    catalogue tune's local copy (one never fetched is left alone; one played
+    is re-read on its next play), never a network share (its next play
+    corrects it).  A track whose length can't be measured keeps its stored
+    one.  The pass is marked done only when the tools it needs (psgplay,
+    an ``hvl2wav`` with ``-l``) were there.  Background; returns
+    ``{"checked", "updated", "reread", "seconds"}`` or ``{"skipped": True}``."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    if not force and store.get_config(RENDER_LENGTHS_KEY) == RENDER_LENGTHS_VERSION:
+        return {"skipped": True}
+    from soniqboom.config import settings
+    from soniqboom.core import catalogue, conversion_cache
+    from soniqboom.core.filesource import is_remote_path
+    from soniqboom.core.metadata import _find_atari_binary
+    from soniqboom.core.source_bytes import read_source_bytes
+    t0 = time.perf_counter()
+    gme_default = float(getattr(settings, "sid_default_duration", 180))
+    ids = sorted(store._tracks)                         # a stable order to resume in
+    get = store._tracks.get
+    todo: list[tuple[str, str]] = []
+    for i in range(0, len(ids), 20_000):
+        for tid in ids[i:i + 20_000]:
+            t = get(tid)
+            if t is not None:
+                kind = _length_kind(t, gme_default)
+                if kind:
+                    todo.append((tid, kind))
+        await asyncio.sleep(0)
+    kinds = {k for _, k in todo}
+    hvl_bin = None
+    if "ahx" in kinds:
+        from soniqboom.api.stream import _hvl2wav_with_length
+        hvl_bin = await _hvl2wav_with_length()
+    tools_ok = (("sndh" not in kinds or bool(_find_atari_binary("psgplay_path", "psgplay")))
+                and ("ahx" not in kinds or bool(hvl_bin)))
+    prog = store.get_config(RENDER_LENGTHS_PROGRESS_KEY) or {}
+    start = 0
+    if not force and isinstance(prog, dict) and prog.get("version") == RENDER_LENGTHS_VERSION:
+        start = max(0, int(prog.get("next") or 0))
+    from soniqboom.api.stream import default_tune_index
+    loop = asyncio.get_running_loop()
+    updated = reread = 0
+    for i in range(start, len(todo), _RENDER_LENGTHS_CHUNK):
+        # Recorded first: a crash inside this chunk resumes after it.
+        store.set_config(RENDER_LENGTHS_PROGRESS_KEY,
+                         {"version": RENDER_LENGTHS_VERSION, "next": i + _RENDER_LENGTHS_CHUNK})
+        chunk = todo[i:i + _RENDER_LENGTHS_CHUNK]
+        ahx = [tid for tid, k in chunk if k == "ahx"]
+        if ahx:
+            try:
+                await conversion_cache.purge_entries_for(ahx, "uade")
+            except Exception:                           # noqa: BLE001
+                log.debug("dropping cached AHX renders failed", exc_info=True)
+        items: list[tuple[str, dict]] = []
+        for tid, kind in chunk:
+            t = get(tid)
+            if t is None or _length_kind(t, gme_default) != kind:
+                continue                                # changed meanwhile
+            if kind == "ahx" and float(t.get("duration") or 0) < 500:
+                continue                                # its length was right
+            path_str = str(t.get("path") or "")
+            is_cat = catalogue.is_catalogue_path(path_str)
+            if not is_cat and is_remote_path(path_str.split("::", 1)[0]):
+                continue                                # a network share: its next play
+            data = await loop.run_in_executor(
+                None, lambda p=path_str: read_source_bytes(p, lane="scan"))
+            secs = None
+            if data:
+                tune = 0 if kind == "sndh" else default_tune_index(tid, t)
+                ext = os.path.splitext(path_str.rsplit("::", 1)[-1].lower())[1]
+                secs = await loop.run_in_executor(
+                    None, _stated_length, kind, data, tune, gme_default, hvl_bin, ext)
+            if secs:
+                items.append((tid, {"duration": round(float(secs), 2)}))
+            elif is_cat and data is None and (t.get("mtime") or 0) > 0:
+                from soniqboom.core.modland_catalog import REREAD
+                items.append((tid, {REREAD: True}))   # read again on its next play
+                reread += 1
+        if items:
+            updated += store.update_track_fields_batch(items) or 0
+        await asyncio.sleep(0)
+    if tools_ok:
+        store.set_config(RENDER_LENGTHS_KEY, RENDER_LENGTHS_VERSION)
+    store.set_config(RENDER_LENGTHS_PROGRESS_KEY, None)
+    secs = round(time.perf_counter() - t0, 2)
+    if todo:
+        log.info("Render lengths: %d tracks checked, %d updated, %d to re-read on "
+                 "their next play (%.1f s)%s", len(todo), updated, reread, secs,
+                 "" if tools_ok else " — psgplay / hvl2wav missing, will run again")
+    return {"checked": len(todo), "updated": updated, "reread": reread, "seconds": secs}
+
+
+
+# ── Per-tune lengths of multi-tune files, PSF fades (GitHub #37) ────────────
+# "Skip short tunes" judges each tune of a multi-tune file by the length the
+# file states for it (``tune_lengths``), and a PSF rip by its length before
+# its fade (``fade_s``) — both recorded by the scan since.  Tracks scanned
+# before (or whose tune count was learnt at play) get them here: at every
+# start, for the files still missing them, so a file that couldn't be read
+# (a share offline, a tool missing) is tried again next time.
+
+_TUNE_LENGTHS_CHUNK = 100
+_TUNE_LENGTHS_MAX_BYTES = 8 * 1024 * 1024      # (these files are tiny; a cap all the same)
+_PSF_FILE_EXTS = (".psf", ".minipsf", ".psf2", ".minipsf2", ".usf", ".miniusf",
+                  ".gsf", ".minigsf", ".2sf", ".mini2sf", ".ssf", ".minissf",
+                  ".minidsf", ".ncsf", ".minincsf")
+
+
+# libgme lengths stated under a second were read as "none" before; the
+# multi-tune files that recorded such a tune as unknown are read once more.
+GME_REREAD_KEY = "gme_short_stated_rev"
+GME_REREAD_REV = 1
+
+
+def _tune_lengths_kind(t: dict, gme_reread: bool = False,
+                       gme_ok: bool = True) -> "str | None":
+    """"sndh" / "gme" for a multi-tune file whose tunes' lengths aren't
+    recorded yet (with ``gme_reread``: a libgme one holding an unknown tune
+    too), "gme1" for a single-tune libgme rip whose stated length isn't
+    recorded yet, "psf" for a PSF-family rip whose fade isn't recorded, else
+    None.  ``gme_ok``: libgme is there (no libgme file is read without it)."""
+    path = str(t.get("path") or "")
+    ext = os.path.splitext(path.rsplit("::", 1)[-1].lower())[1]
+    if t.get("fade_s") is None and (ext in _PSF_FILE_EXTS or ext == ".dsf" and
+                                    str(t.get("format") or "").upper().startswith("DSF (DREAMCAST")):
+        return "psf"
+    from soniqboom.core.metadata import _GME_STATED_EXTS
+    lens = t.get("tune_lengths")
+    cnt = t.get("subsongs")
+    multi = isinstance(cnt, int) and cnt > 1
+    if ext in _GME_STATED_EXTS:
+        if not gme_ok:
+            return None
+        if not multi:
+            # (a played one's ``duration`` is its render's length — the stated
+            # one is read once for every single-tune file)
+            return "gme1" if lens is None else None
+        if lens is None:
+            return "gme"
+        if gme_reread and isinstance(lens, list) and (not lens or any(not v for v in lens)):
+            return "gme-reread"
+        return None
+    if lens is not None or not multi:
+        return None
+    if t.get("format") == "SNDH" or ext == ".sndh":
+        return "sndh"
+    return None
+
+
+def _read_tune_lengths(kind: str, data: bytes, count: int) -> "dict | None":
+    """The fields ``data`` gives (``tune_lengths`` — ``[]`` when it states
+    none — or a PSF's ``fade_s``); None when it couldn't be read.  Blocking."""
+    if kind == "psf":
+        from soniqboom.core.metadata import psf_play_plan, psf_tags
+        if data[:3] != b"PSF":
+            return {"fade_s": 0.0}
+        return {"fade_s": round(psf_play_plan(psf_tags(data))[1], 2)}
+    if kind in ("gme", "gme1", "gme-reread"):
+        from soniqboom.core import gme_render
+        if not gme_render.is_available():
+            return None
+        if gme_render.vgm_bytes_need_other_engine(data):
+            return {"tune_lengths": []}             # (ZXTune plays it, at the default length)
+        if kind == "gme1":
+            # A single tune: its stated length is its whole length (as played).
+            total, fade = gme_render.render_plan(data, 0, 0.0)
+            return ({"duration": round(total, 2), "tune_lengths": [round(total, 2)]}
+                    if fade is not None else {"tune_lengths": []})
+        return {"tune_lengths": gme_render.tune_lengths(data, count) or []}
+    from soniqboom.core.metadata import sndh_info, sndh_tune_lengths
+    fd, tmp = tempfile.mkstemp(suffix=".sndh", prefix="sq_tl_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        info = sndh_info(Path(tmp))
+        if not info:
+            return None                                 # (psgplay missing / failed: next time)
+        return {"tune_lengths": sndh_tune_lengths(info, count) or []}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _readable_now(path_str: str) -> bool:
+    """Can ``path_str`` be read without waiting on an offline source: a local
+    file, a catalogue tune, or a file of a share that is connected."""
+    from soniqboom.core import catalogue
+    from soniqboom.core.filesource import find_source_for_path, is_remote_path
+    if catalogue.is_catalogue_path(path_str):
+        return True
+    base = path_str.split("::", 1)[0]
+    if not is_remote_path(base):
+        return True
+    try:
+        return find_source_for_path(base) is not None
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+async def fill_tune_lengths(store=None) -> dict:
+    """Record what "Skip short tunes" needs for every file still missing it
+    (``_tune_lengths_kind``) — read where it can be read now
+    (``_readable_now``; a catalogue tune only once it was fetched).  A file
+    that couldn't be read is left for the next start.  Background; returns
+    ``{"checked", "updated", "seconds"}``."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    from soniqboom.core.source_bytes import read_source_bytes
+    t0 = time.perf_counter()
+    get = store._tracks.get
+    reread = store.get_config(GME_REREAD_KEY) != GME_REREAD_REV
+    from soniqboom.core import gme_render, skip_rules
+    gme_ok = gme_render.is_available()
+    ph = tuple(skip_rules.placeholder_seconds(store))
+    todo: list[tuple[str, str]] = []
+    ids = list(store._tracks)
+    for i in range(0, len(ids), 20_000):
+        for tid in ids[i:i + 20_000]:
+            t = get(tid)
+            kind = _tune_lengths_kind(t, reread, gme_ok) if t is not None else None
+            if kind:
+                todo.append((tid, kind))
+        await asyncio.sleep(0)
+    loop = asyncio.get_running_loop()
+    updated = 0
+    changed_total = 0
+    for i in range(0, len(todo), _TUNE_LENGTHS_CHUNK):
+        items: list[tuple[str, dict]] = []
+        changed_gme: list[str] = []
+        for tid, kind in todo[i:i + _TUNE_LENGTHS_CHUNK]:
+            t = get(tid)
+            if t is None or _tune_lengths_kind(t, reread, gme_ok) != kind:
+                continue                                # changed meanwhile
+            size = t.get("file_size")
+            if isinstance(size, int) and size > _TUNE_LENGTHS_MAX_BYTES:
+                continue
+            path_str = str(t.get("path") or "")
+            if not _readable_now(path_str):
+                continue                                # (next start)
+            try:
+                data = await loop.run_in_executor(
+                    None, lambda p=path_str: read_source_bytes(p, lane="scan"))
+            except Exception:                           # noqa: BLE001 — next time
+                data = None
+            if not data:
+                continue
+            fields = await loop.run_in_executor(
+                None, _read_tune_lengths, kind, data, int(t.get("subsongs") or 0))
+            if fields is None:
+                continue
+            d = t.get("duration")
+            stored_default = type(d) in (int, float) and any(abs(d - p) < 0.01 for p in ph)
+            if kind == "gme1" and "duration" in fields and not stored_default:
+                # A played file's duration is its render's length — kept.
+                fields.pop("duration")
+            if kind in ("gme", "gme-reread") and fields.get("tune_lengths") and stored_default:
+                # The default tune's stated length, while the stored one is
+                # still a default (it was under a second).
+                lens = fields["tune_lengths"]
+                k = skip_rules._bare_index(t)
+                if k < len(lens) and lens[k] > 0:
+                    fields["duration"] = lens[k]
+            if ("duration" in fields and fields["duration"] != d) or (
+                    kind == "gme-reread" and fields.get("tune_lengths") != t.get("tune_lengths")):
+                changed_gme.append(tid)                 # (its renders were made at the old length)
+            items.append((tid, fields))
+        if changed_gme:
+            # Before the lengths are written: a stop in between leaves files
+            # still to read again, never renders made at the old length.
+            from soniqboom.core import conversion_cache
+            try:
+                await conversion_cache.purge_entries_for(changed_gme, "gme")
+            except Exception:                           # noqa: BLE001
+                log.debug("dropping cached chiptune renders failed", exc_info=True)
+            changed_total += len(changed_gme)
+        if items:
+            updated += store.update_track_fields_batch(items) or 0
+        await asyncio.sleep(0)
+    if reread and gme_ok:
+        # (Done once; a multi-tune file that couldn't be read now keeps its
+        # recorded lengths.)
+        store.set_config(GME_REREAD_KEY, GME_REREAD_REV)
+    secs = round(time.perf_counter() - t0, 2)
+    if todo:
+        log.info("Tune lengths: %d files checked, %d recorded, %d re-render (%.1f s)",
+                 len(todo), updated, changed_total, secs)
+    return {"checked": len(todo), "updated": updated, "rerender": changed_total,
+            "seconds": secs}

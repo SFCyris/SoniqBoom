@@ -70,7 +70,7 @@ Then open **<http://localhost:8080>** in any browser. That's it. 🎉
 **What each step does:**
 
 1. **Download** — grabs the latest release and unzips it.
-2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. On an interactive terminal it then **asks you to create your admin login** — pick a username and a password (at least 8 characters); this is the account you'll sign in with. (If it doesn't prompt — for example you pasted all three commands at once — just create the login afterward with `bash setup-admin.sh`.)
+2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. On an interactive terminal it then **asks you to create your admin login** — pick a username and a password; this is the account you'll sign in with. (If it doesn't prompt — for example you pasted all three commands at once — just create the login afterward with `bash setup-admin.sh`.)
 3. **`bash run.sh`** — starts the server in the background and prints the address to open. (If port 8080 is already in use, run `bash run.sh --port 9090` to pick another.)
 
 > *Prefer git?* `git clone https://github.com/SFCyris/SoniqBoom.git && cd SoniqBoom`, then run steps 2 and 3.
@@ -93,7 +93,7 @@ docker run -d --name soniqboom -p 8080:8080 \
   --restart unless-stopped \
   ghcr.io/sfcyris/soniqboom:latest
 
-# 2 — Create your admin login (any username + a password of 8+ characters).
+# 2 — Create your admin login (any username + a password).
 #     New users are admins by default; the change goes live with no restart.
 docker exec soniqboom soniqboom-setadm -user me -passwd 'change-this-password'
 
@@ -131,7 +131,7 @@ Run these from inside the SoniqBoom folder:
 | **Create or reset your admin login** | `bash setup-admin.sh` |
 | Set an admin login non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
 
-> Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords are at least 8 characters. Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in. If the server is already running, the change takes effect right away (`setup-admin.sh` tells it to reload).
+> Usernames are 2–64 characters (letters, digits, `.`, `_`, `-`); passwords can be any length unless an admin turns on **Require strong passwords** (gear → Users). Add more people with `bash setup-admin.sh -user bob -passwd '…' -role readonly` (roles: `admin`, `edit`, `readonly`), or invite them from the admin UI once you're signed in. If the server is already running, the change takes effect right away (`setup-admin.sh` tells it to reload).
 
 > **`install.sh` sets up every renderer for you** — `sidplayfp` (SID), `fluidsynth` (MIDI), `libopenmpt` (trackers), `uade` (AHX and the Amiga exotics), `libgme` (console chiptunes), `adplay` (AdLib/OPL), `psgplay` (SNDH), `sc68` (`.sc68`), `zxtune123` (PSF family, MED 2–4 modules, and VGM files that use a chip libgme lacks), `lha` from lhasa (LHA archives), and a static `ffmpeg`. If one ever fails to install, SoniqBoom names the exact missing package and everything else keeps working. (HivelyTracker `.hvl` needs nothing extra — it's bundled and compiled on first run.)
 >
@@ -398,7 +398,7 @@ SoniqBoom stands on the shoulders of these excellent open-source projects.
 External tools (invoked via subprocess) and libraries:
 
 - [FFmpeg](https://ffmpeg.org/) is licensed under [LGPL-2.1-or-later / GPL](https://ffmpeg.org/legal.html) (depending on build configuration)
-- [sidplayfp / libsidplayfp](https://github.com/libsidplayfp/libsidplayfp) is licensed under [GPL-2.0-or-later](https://github.com/libsidplayfp/libsidplayfp/blob/master/COPYING) — renders SID; libsidplayfp 2.16.1 with reSIDfp is also included compiled to WebAssembly, which renders SID tunes in the browser for the per-voice VU meter and the optional *Play SID in browser* setting
+- [sidplayfp / libsidplayfp / libresidfp](https://github.com/libsidplayfp/libsidplayfp) are licensed under [GPL-2.0-or-later](https://github.com/libsidplayfp/libsidplayfp/blob/master/COPYING) — renders SID; libsidplayfp 2.16.1 with reSIDfp is also included compiled to WebAssembly, which renders SID tunes in the browser for the per-voice VU meter and the optional *Play SID in browser* setting
 - [FluidSynth](https://github.com/FluidSynth/fluidsynth) is licensed under [LGPL-2.1](https://github.com/FluidSynth/fluidsynth/blob/master/LICENSE)
 - [libopenmpt](https://lib.openmpt.org/libopenmpt/) by [OpenMPT](https://openmpt.org/) is licensed under [BSD-3-Clause](https://lib.openmpt.org/libopenmpt/license/) — renders tracker modules (`openmpt123`) and drives the per-channel VU meters and pattern view
 - [UADE](https://zakalwe.fi/uade/) (Unix Amiga Delitracker Emulator) is licensed under GPL-2.0 (its Amiga player files carry their own licences) — renders AHX and the other Amiga formats
@@ -415,7 +415,7 @@ External tools (invoked via subprocess) and libraries:
 
 Data / assets:
 
-- [FluidR3_GM SoundFont](https://packages.debian.org/bookworm/fluid-soundfont-gm) (MIT) — the General-MIDI SoundFont in the Docker image; more SoundFonts (GeneralUser GS by S. Christian Collins, MuseScore_General and others, each under its own licence) can be downloaded under gear → Renderers → Soundfonts
+- [FluidR3_GM SoundFont](https://packages.debian.org/trixie/fluid-soundfont-gm) (MIT) — the General-MIDI SoundFont in the Docker image; more SoundFonts (GeneralUser GS by S. Christian Collins, MuseScore_General and others, each under its own licence) can be downloaded under gear → Renderers → Soundfonts
 - [HVSC (High Voltage SID Collection)](https://www.hvsc.c64.org/) (Free archive of SID music) — Songlengths.md5 and STIL metadata from your own HVSC `DOCUMENTS` folder, used for SID playback
 - [audacious-uade-tools](https://github.com/mvtiaine/audacious-uade-tools) song database by Matti Tiainen, licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) — module artists, publishers, albums, years and song lengths; downloaded by the user under gear → Metadata, not included with SoniqBoom
 - [Wikidata](https://www.wikidata.org) video-game titles, [CC0 1.0](https://www.wikidata.org/wiki/Wikidata:Licensing) — game titles per retro platform, matched against archive names

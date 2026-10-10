@@ -6,6 +6,7 @@
  */
 import { artPlaceholderEmoji } from '../../utils.js';
 import { offlineKind, offlineBadge } from '../../offline.js';
+import { healthBadge, canReport, mark as healthMark } from '../../health.js';
 
 export function esc(s) {
   return String(s ?? '')
@@ -31,6 +32,35 @@ export function lazyArt(img, src) {
   img.src = src;
 }
 
+// A playback problem reported / cleared (health.js): rows built here (search
+// results, the queue) repaint their badge in place.
+document.addEventListener('soniqboom:health-changed', (e) => {
+  const d = (e && e.detail) || {};
+  for (const id of Array.isArray(d.ids) ? d.ids : []) {
+    const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+    document.querySelectorAll(`.m-row[data-track-id="${sel}"]`).forEach((row) => {
+      const t = row.__track;
+      if (!t) return;
+      Object.assign(t, d.fields || {});
+      const title = row.querySelector('.m-row-title');
+      if (!title) return;
+      title.querySelector('.track-health-badge')?.remove();
+      const b = healthBadge(t);
+      if (!b) return;
+      if (!title.classList.contains('m-row-title--badged')) {
+        const txt = document.createElement('span');
+        txt.className = 'm-row-title-text';
+        txt.textContent = title.textContent;
+        title.textContent = '';
+        title.classList.add('m-row-title--badged');
+        title.append(txt);
+      }
+      const off = title.querySelector('.track-offline-badge');
+      title.insertBefore(b, off || null);
+    });
+  }
+});
+
 /**
  * Build a track row DOM node.  Caller wires gestures via attachRowGestures().
  *
@@ -42,6 +72,7 @@ export function buildTrackRow(track, opts = {}) {
   const row = document.createElement('div');
   row.className = 'm-row';
   if (track.id) row.dataset.trackId = track.id;
+  row.__track = track;
 
   const content = document.createElement('div');
   content.className = 'm-row-content';
@@ -73,11 +104,10 @@ export function buildTrackRow(track, opts = {}) {
   meta.className = 'm-row-meta';
   const title  = document.createElement('div');
   title.className = 'm-row-title';
-  // Health badge for a known playback defect, "offline" for a track that can't
-  // play right now — only badged rows (rare) take the flex layout so the common
-  // path keeps its plain ellipsised text.
-  const _dfct = (track.defect === 'partial' || track.defect === 'corrupt')
-    ? track.defect : '';
+  // Health badge for a playback problem (health.js), "offline" for a track that
+  // can't play right now — only badged rows (rare) take the flex layout so the
+  // common path keeps its plain ellipsised text.
+  const _dfct = healthBadge(track);
   const _off = offlineKind(track);
   if (_off) row.classList.add('track-offline');
   if (_dfct || _off) {
@@ -86,13 +116,7 @@ export function buildTrackRow(track, opts = {}) {
     ttlText.className = 'm-row-title-text';
     ttlText.textContent = track.title || '—';
     title.append(ttlText);
-    if (_dfct) {
-      const badge = document.createElement('span');
-      badge.className = `track-defect-badge track-defect-${_dfct}`;
-      badge.textContent = _dfct;
-      badge.title = track.defect_detail || '';
-      title.append(badge);
-    }
+    if (_dfct) title.append(_dfct);
     if (_off) title.append(offlineBadge(_off));
   } else {
     title.textContent = track.title || '—';
@@ -125,8 +149,12 @@ export function fmtDur(sec) {
 }
 
 /** Standard long-press action sheet for a track row.
- *  Deliberately NO tag-editing on mobile — playback + playlist actions only. */
+ *  Deliberately NO tag-editing on mobile — playback + playlist actions only,
+ *  and (edit rights) reporting a playback problem, which is no tag edit. */
 export function trackActions(track, ctx) {
+  const report = canReport() ? [
+    { label: '⚠︎ Report a problem…', onSelect: () => reportSheet(track, ctx) },
+  ] : [];
   return [
     { label: '▶ Play Now', onSelect: () => {
       ctx.player.setQueue([track], 0);
@@ -136,7 +164,25 @@ export function trackActions(track, ctx) {
       ctx.toast(`Added "${track.title || 'track'}" to queue`);
     }},
     { label: '♫ Add to Playlist…', onSelect: () => addToPlaylistSheet(track, ctx) },
+    ...report,
   ];
+}
+
+/** "Report a problem": No problem · Glitched · Broken (health.js). */
+export function reportSheet(track, ctx) {
+  const cur = track.health === 'broken' || track.health === 'glitched' ? track.health : '';
+  const tick = (s) => (s === cur ? '✓ ' : '');
+  ctx.showSheet({
+    title: `Playback problem — ${track.title || 'track'}`,
+    actions: [
+      { label: `${tick('glitched')}Glitched — plays, with wrong sounds`,
+        onSelect: () => { if (cur !== 'glitched') healthMark(track, 'glitched'); } },
+      { label: `${tick('broken')}Broken — passed by when a list plays through`,
+        onSelect: () => { if (cur !== 'broken') healthMark(track, 'broken'); } },
+      { label: `${tick('')}No problem`,
+        onSelect: () => { if (cur) healthMark(track, null); } },
+    ],
+  });
 }
 
 // ── Playlists ────────────────────────────────────────────────────────────────

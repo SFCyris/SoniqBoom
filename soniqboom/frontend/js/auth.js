@@ -18,6 +18,7 @@
  */
 
 import { Toast } from './utils.js';
+import { passwordHint, passwordProblem } from './password-rule.js';
 
 const STATE = {
   user: null,                    // { id, username, role, ... } | null
@@ -56,10 +57,10 @@ function _ensureOverlay() {
                  pattern="[A-Za-z0-9._\\-]+">
         </label>
         <label class="auth-field auth-field-password">
-          <span>Password</span>
+          <span>Password <em id="auth-pw-rule" hidden></em></span>
           <input id="auth-password" type="password"
                  autocomplete="current-password"
-                 required minlength="8">
+                 required>
           <button type="button" id="auth-pw-toggle" class="auth-pw-toggle"
                   aria-label="Show password" title="Show password">👁</button>
         </label>
@@ -114,6 +115,11 @@ function _applyMode() {
   err.hidden = true;
   err.textContent = '';
   const canRegister = !!STATE.authStatus?.registration_open;
+  // New accounts: show the password rule ("Require strong passwords").
+  const rule = overlay.querySelector('#auth-pw-rule');
+  const hint = passwordHint(!!STATE.authStatus?.strong_passwords);
+  rule.hidden = _mode === 'login' || !hint;
+  rule.textContent = hint ? `(${hint})` : '';
   if (_mode === 'login') {
     title.textContent  = 'Sign in';
     submit.textContent = 'Sign in';
@@ -144,6 +150,15 @@ async function _handleSubmit(e) {
   const username = overlay.querySelector('#auth-username').value.trim();
   const password = overlay.querySelector('#auth-password').value;
   const display  = overlay.querySelector('#auth-display-name').value.trim();
+  if (_mode !== 'login') {
+    const problem = passwordProblem(password, !!STATE.authStatus?.strong_passwords);
+    if (problem) {
+      err.textContent = problem;
+      err.hidden = false;
+      overlay.querySelector('#auth-password').focus();
+      return;
+    }
+  }
   const endpoint = _mode === 'login' ? '/api/auth/login' : '/api/auth/register';
   const body     = _mode === 'login'
     ? { username, password }

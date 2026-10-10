@@ -23,6 +23,7 @@ local test fixtures are used when present, else those tests skip.
 from __future__ import annotations
 
 import asyncio
+import math
 import shutil
 import struct
 import sys
@@ -196,6 +197,102 @@ async def _live_of(key: str, task) -> dict:
     raise AssertionError("no live entry registered")
 
 
+# A renderer told to play on (zxtune --loop): writes its square wave in odd-
+# sized pieces (not whole frames) until it is killed.
+_ENDLESS_RENDERER = r"""
+import struct, sys, time
+out, chans = sys.argv[1], int(sys.argv[2])
+garbage = len(sys.argv) > 3
+hdr = b"NOPE" * 11 if garbage else (b"RIFF" + struct.pack("<I", 36) + b"WAVE" + b"fmt "
+       + struct.pack("<IHHIIHH", 16, 1, chans, 44100, 44100 * 2 * chans, 2 * chans, 16)
+       + b"data" + struct.pack("<I", 0))
+one, neg = b"\x40\x1f" * chans, b"\xc0\xe0" * chans
+pcm = (one * 50 + neg * 50) * 441              # 1 s
+with open(out, "wb") as f:
+    f.write(hdr); f.flush()
+    pos = 0
+    while True:
+        piece = bytes(pcm[(pos + i) % len(pcm)] for i in range(10007))
+        f.write(piece); f.flush()
+        pos += len(piece)
+        time.sleep(0.002)
+"""
+
+
+def _endless_cmd(tmp_path: Path, out: Path, chans: int = 2,
+                 garbage: bool = False) -> list[str]:
+    script = tmp_path / "endless_renderer.py"
+    script.write_text(_ENDLESS_RENDERER)
+    return [sys.executable, str(script), str(out), str(chans)] + (["x"] if garbage else [])
+
+
+def _faded_square(frames: int, fade_frames: int) -> bytes:
+    sq = _square(frames)
+    return sq[:(frames - fade_frames) * 4] + stream._fade_pcm16(
+        sq[(frames - fade_frames) * 4:], 0, fade_frames)
+
+
+def test_fade_pcm16_in_pieces_is_the_whole_fade():
+    sq = _square(1000)
+    whole = stream._fade_pcm16(sq, 0, 1000)
+    pieces = b"".join(stream._fade_pcm16(sq[a * 4:b * 4], a, 1000)
+                      for a, b in ((0, 1), (1, 333), (333, 1000)))
+    assert pieces == whole
+    s16 = struct.unpack("<2000h", whole)
+    assert s16[0] == struct.unpack("<h", sq[:2])[0]       # gain 1 at the start
+    assert abs(s16[-1]) <= abs(struct.unpack("<h", sq[-2:])[0]) / 999 + 1
+
+
+@pytest.mark.asyncio
+async def test_tail_render_stops_a_renderer_that_plays_on_and_fades_its_end(tmp_path):
+    key = "tail-cap__sub0"
+    src = tmp_path / "cap.wav"
+    t0 = time.monotonic()
+    out = await stream._tail_render(
+        _endless_cmd(tmp_path, src), src, key, kind="FAKE", timeout=30,
+        expected_seconds=1.5, stop_after_s=1.5, fade_s=0.5)
+    try:
+        assert time.monotonic() - t0 < 20                 # stopped, not timed out
+        data = out.read_bytes()
+        assert len(data) == 44 + 66150 * 4                # exactly 1.5 s
+        assert _pcm(data) == _faded_square(66150, 22050)  # full level, then the fade
+        assert not src.exists()
+    finally:
+        out.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_tail_render_with_a_stop_fails_fast_on_output_it_cannot_follow(tmp_path):
+    src = tmp_path / "mono.wav"
+    t0 = time.monotonic()
+    with pytest.raises(stream.HTTPException) as exc:
+        await stream._tail_render(
+            _endless_cmd(tmp_path, src, chans=1), src, "tail-capmono__sub0", kind="FAKE",
+            timeout=30, stop_after_s=1.0, fade_s=0.5)
+    assert exc.value.status_code == 502 and time.monotonic() - t0 < 20
+    assert not src.exists() and "tail-capmono__sub0" not in stream._UADE_LIVE
+    # No WAV header at all: the same, once there is more than a header's worth.
+    src = tmp_path / "junk.wav"
+    t0 = time.monotonic()
+    with pytest.raises(stream.HTTPException) as exc:
+        await stream._tail_render(
+            _endless_cmd(tmp_path, src, garbage=True), src, "tail-capjunk__sub0",
+            kind="FAKE", timeout=30, stop_after_s=1.0, fade_s=0.5)
+    assert exc.value.status_code == 502 and time.monotonic() - t0 < 20
+    assert not src.exists() and "tail-capjunk__sub0" not in stream._UADE_LIVE
+
+
+@pytest.mark.asyncio
+async def test_a_capped_zxtune_run_is_cut_and_faded(tmp_path):
+    out = tmp_path / "c.wav"
+    cap = 44100 * 4
+    assert await stream._run_zxtune_to_cap(_endless_cmd(tmp_path, out), out, cap,
+                                           kind="FAKE", wall_s=30) is True
+    stream._cap_and_fade_wav(out, cap, 0.25)
+    data = out.read_bytes()
+    assert len(data) == 44 + cap
+    assert _pcm(data) == _faded_square(44100, 11025)
+
 @pytest.mark.asyncio
 async def test_tail_render_streams_audible_pcm_and_drops_the_trailer(tmp_path):
     key = "tail-ok__sub0"
@@ -339,9 +436,20 @@ def _psf_with_tags(path: Path, tags: str) -> Path:
     return path
 
 
-def test_psf_render_seconds_is_the_length_tag_without_fade(tmp_path):
-    assert stream._psf_render_seconds(_psf_with_tags(
-        tmp_path / "a.minipsf", "title=x\nlength=2:02.5\nfade=8\n")) == 122.5
+def test_psf_render_plan_is_the_length_tag_plus_its_fade(tmp_path):
+    assert stream._psf_render_plan(_psf_with_tags(
+        tmp_path / "a.minipsf", "title=x\nlength=2:02.5\nfade=8\n")) == (130.5, 8.0)
+    assert stream._psf_render_seconds(tmp_path / "a.minipsf") == 130.5
+    # no fade tag, or fade 0: the length alone, nothing faded here
+    assert stream._psf_render_plan(_psf_with_tags(
+        tmp_path / "d.minipsf", "length=1:00\n")) == (60.0, 0.0)
+    assert stream._psf_render_plan(_psf_with_tags(
+        tmp_path / "e.minipsf", "length=1:00\nfade=0\n")) == (60.0, 0.0)
+    # the fade ends by the hour, and is never over a minute
+    assert stream._psf_render_plan(_psf_with_tags(
+        tmp_path / "f.minipsf", "length=59:59\nfade=10\n")) == (3600.0, 1.0)
+    assert stream._psf_render_plan(_psf_with_tags(
+        tmp_path / "g.minipsf", "length=2:00\nfade=3000\n")) == (180.0, 60.0)
     assert stream._psf_render_seconds(_psf_with_tags(tmp_path / "b.minipsf", "fade=0\n")) == 0.0
     # m1: no length that isn't one — not finite, or over the hour cap
     assert stream._psf_render_seconds(_psf_with_tags(tmp_path / "i.minipsf", "length=inf\n")) == 0.0
@@ -350,6 +458,20 @@ def test_psf_render_seconds_is_the_length_tag_without_fade(tmp_path):
         tmp_path / "h.minipsf", "length=99:00:00\n")) == 0.0
     (tmp_path / "c.minipsf").write_bytes(b"not a psf")
     assert stream._psf_render_seconds(tmp_path / "c.minipsf") == 0.0
+
+
+@pytest.mark.parametrize("tags", [
+    "length=2:02.5\nfade=8\n", "length=1:00\n", "length=1:00\nfade=0\n", "fade=10\n",
+    "length=59:55\nfade=10\n", "length=1:00:01\nfade=5\n", "length=2:00\nfade=inf\n",
+    "length=inf\n", "length=nan\nfade=3\n", "length=2:00\nfade=-4\n",
+    "length=2:00\nfade=3000\n", " LENGTH = 1:30 \nFade=5\nlength=9\n", "length=abc\nfade=2\n",
+])
+def test_the_scan_lists_the_length_the_render_plays(tmp_path, tags):
+    from soniqboom.core import metadata
+    p = _psf_with_tags(tmp_path / "t.minipsf", tags)
+    total, _fade = stream._psf_render_plan(p)
+    dur = metadata._extract_psf(p, "t")["duration"]
+    assert math.isfinite(dur) and dur == round(total, 2)
 
 
 # ── live renders through the stream endpoint ────────────────────────────────
@@ -495,9 +617,9 @@ async def test_adlib_empty_first_subsong_is_never_streamed_and_falls_back_to_the
 
 @_needs("zxtune123", GSF)
 @pytest.mark.asyncio
-async def test_psf_promises_its_length_tag_and_lands_on_it(monkeypatch, tmp_path):
-    secs = stream._psf_render_seconds(GSF)
-    assert secs > 1
+async def test_psf_promises_its_length_and_fade_and_lands_on_it(monkeypatch, tmp_path):
+    secs, fade = stream._psf_render_plan(GSF)
+    assert secs > 1 and fade > 0           # 3:08 + a 10 s fade
     app, _ = _app(monkeypatch, tmp_path, {"ps0": _T("ps0", GSF, secs + 10, fmt="GSF")})
     monkeypatch.setattr(stream, "_backfill_rendered_duration", _noop)
     async with _client(app) as c:
@@ -513,6 +635,18 @@ async def test_psf_promises_its_length_tag_and_lands_on_it(monkeypatch, tmp_path
         cached = await conversion_cache.get_cached(stream._ck("ps0", "psf", subsong=0))
         assert cached is not None and cached.stat().st_size == promised
         assert cached.read_bytes() == r.content
+    # The tune plays on up to its length, then fades out to silence.
+    pcm = _pcm(r.content)
+    s16 = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+
+    def rms(at, span=0.5):
+        a = int(at * 44100) * 2
+        win = s16[a:a + int(span * 44100) * 2]
+        return (sum(v * v for v in win) / len(win)) ** 0.5
+    before = rms(secs - fade - 2)
+    assert before > 1000
+    assert rms(secs - fade / 2 - 0.25) < before * 0.75
+    assert max(abs(v) for v in s16[-200:]) < 200
 
 
 @_needs("ffmpeg", SPC)
@@ -528,7 +662,9 @@ async def test_libgme_live_render_and_a_live_mp3_encode(monkeypatch, tmp_path):
         r = await c.get("/api/stream/gm0", cookies={"sb_session": "x"},
                         headers={"User-Agent": CHROME})
         assert r.headers["x-cache"] == "miss-progressive"
-        ref = gme_render.render_wav(SPC.read_bytes(), 0, 180)
+        data = SPC.read_bytes()
+        dur, fade = gme_render.render_plan(data, 0, 180)     # its stated length (#38)
+        ref = gme_render.render_wav(data, 0, dur, fade_at_s=fade)
         assert _pcm(ref) == r.content[44:]
         # Subsonic format=mp3 of a cold render: a live encode of the growing file
         r = await c.get("/api/stream/gm1?u=a&p=b&format=mp3")
@@ -711,7 +847,9 @@ async def test_cast_prepare_live_source_feeds_a_libgme_render(monkeypatch, tmp_p
     feed = await cast_render.prepare_live_source(track_id="cl0", track_path=str(SPC))
     assert feed is not None
     data = b"".join([c async for c in feed])
-    assert data[:4] == b"RIFF" and _pcm(gme_render.render_wav(SPC.read_bytes(), 0, 180)) == data[44:]
+    _dur, _fade = gme_render.render_plan(SPC.read_bytes(), 0, 180)
+    assert data[:4] == b"RIFF" and _pcm(gme_render.render_wav(
+        SPC.read_bytes(), 0, _dur, fade_at_s=_fade)) == data[44:]
     for _ in range(50):
         cached = await conversion_cache.get_cached(stream._ck("cl0", "gme", subsong=0))
         if cached is not None:

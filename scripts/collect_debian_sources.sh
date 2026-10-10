@@ -4,9 +4,9 @@
 #
 # Download the Debian source packages of the Docker image, at the exact
 # versions listed in its package manifests.  Runs inside a Debian container of
-# the image's release (bookworm):
+# the image's release (trixie):
 #
-#   docker run --rm -v "$PWD:/w" -w /w debian:bookworm \
+#   docker run --rm -v "$PWD:/w" -w /w debian:trixie \
 #       bash scripts/collect_debian_sources.sh <out-dir> <manifest>...
 #
 # A manifest is the output of

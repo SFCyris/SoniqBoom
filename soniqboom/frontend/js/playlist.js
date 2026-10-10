@@ -26,6 +26,7 @@ import { Library } from './library.js';
 import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf } from './utils.js';
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
+import { healthBadgeHTML } from './health.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -428,7 +429,7 @@ function _fillPlRow(row, i) {
   const tune = Number.isInteger(track.subsong)
     ? (() => { const n = subsongWireToTune(track.subsong, subsongStartOf(track), track.subsongs); return `<span class="qr-subsong" title="Tune ${n}">Tune ${n}</span>`; })()
     : '';
-  const titleHtml = `<span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${tune}${dupBadge}${offKind ? offlineBadgeHTML(offKind) : ''}`;
+  const titleHtml = `<span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${tune}${dupBadge}${healthBadgeHTML(track)}${offKind ? offlineBadgeHTML(offKind) : ''}`;
   const titleRow = row.querySelector('.queue-track-titlerow');
   if (row.__titleHtml !== titleHtml) { titleRow.innerHTML = titleHtml; row.__titleHtml = titleHtml; }
   row.querySelector('.queue-track-artist').textContent = track.artist || track.album_artist || '';

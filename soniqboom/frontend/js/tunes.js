@@ -20,6 +20,8 @@ export function subsongVirtualTrack(base, wire, { count = 0, start = 1, lengths 
   const isDef = tune === subsongStart(def ?? start, count);
   return { ...base, subsong: wire,
            duration: own > 0 ? own : (isDef ? base.duration : 0),
+           // (the per-tune lengths the player's "Skip short tunes" reads)
+           ...(Array.isArray(lengths) ? { tune_lengths: lengths } : {}),
            subsongTotal: count,
            subsongStart: subsongStart(start, count),
            subsongLabel: `Tune ${tune}` };

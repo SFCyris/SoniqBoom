@@ -14,11 +14,13 @@
  *    queue, playlists, the phone's rows): a dimmed row + an "offline" badge
  *    whose tooltip and screen-reader text say why;
  *  - keeps the player's skip switch (``Player.setOfflineSkip``) in step with
- *    the setting, so auto-play passes those tracks by;
+ *    the setting, so auto-play passes those tracks by — and the other skip
+ *    rule the server decides, "Skip short tunes" (``Player.setSkipShort``);
  *  - follows the server's availability token (``GET /api/library/availability``;
  *    pushed as the ``availability_changed`` WebSocket event on desktop, polled
  *    while visible on both shells) and, when it changes, re-flags the queue's
- *    rows (``POST /api/tracks/meta/availability``) and fires
+ *    rows (``POST /api/tracks/meta/availability`` — their offline flags and
+ *    their reported playback problems, ``health``) and fires
  *    ``soniqboom:availability-changed`` so the open view re-reads.
  *
  * Its own module (not utils.js / player.js): a page still on an older service
@@ -72,13 +74,21 @@ export function offlineBadgeHTML(kind) {
     + `<span class="sr-only"> — can't play right now, ${SR_TEXT[k] || SR_TEXT.drive}</span></span>`;
 }
 
-const state = { mode: null, token: null, busy: null, again: false, polling: false };
+const state = { mode: null, token: null, marks: null, busy: null, again: false, polling: false };
 const POLL_MS = 60000;
 
 function _apply(mode) {
   state.mode = mode;
   try { Player.setOfflineSkip?.(mode === 'mark' || mode === 'hide'); } catch (_) { /* older cached player.js */ }
 }
+
+function _applyShort(secs, placeholders) {
+  try { Player.setSkipShort?.(Number(secs) || 0, placeholders); } catch (_) { /* older cached player.js */ }
+}
+
+// The fields a reported playback problem / a decode defect puts on a row.
+const HEALTH_FIELDS = ['health', 'health_note', 'health_by', 'health_at', 'health_renderer',
+                       'defect', 'defect_detail'];
 
 /**
  * Re-flag ``rows`` in place from the server (they were flagged when fetched);
@@ -89,6 +99,7 @@ async function recheckRows(rows) {
   if (!rows || !rows.length) return false;
   const ids = [...new Set(rows.map(t => t && t.id).filter(Boolean))];
   const offline = {};
+  const health = {};
   try {
     for (let i = 0; i < ids.length; i += 5000) {
       const r = await fetch('/api/tracks/meta/availability', {
@@ -98,6 +109,7 @@ async function recheckRows(rows) {
       if (!r.ok) return false;
       const j = await r.json();
       Object.assign(offline, (j && j.offline) || {});
+      Object.assign(health, (j && j.health) || {});
       if (j && j.mode && j.mode !== state.mode) _apply(j.mode);
     }
   } catch (_) { return false; }
@@ -109,6 +121,14 @@ async function recheckRows(rows) {
     if ((t.offline || '') !== k) {
       if (k) t.offline = k; else delete t.offline;
       changed = true;
+    }
+    const h = health[t.id] || {};
+    for (const f of HEALTH_FIELDS) {
+      const v = h[f] ?? null;
+      if ((t[f] ?? null) !== v) {
+        if (v === null) delete t[f]; else t[f] = v;
+        changed = true;
+      }
     }
   }
   return changed;
@@ -141,6 +161,15 @@ async function refresh() {
         if (!j || typeof j.token !== 'string') continue;
         const prevMode = state.mode, prevToken = state.token;
         _apply(j.mode || 'mark');
+        if (j.skip_short_tunes !== undefined) _applyShort(j.skip_short_tunes, j.tune_placeholders);
+        // A playback problem reported / cleared (anyone's): only the rows held
+        // here — the queue — re-read their marks; no list changes.
+        const prevMarks = state.marks;
+        state.marks = j.marks ?? null;
+        if (prevMarks !== null && j.marks != null && prevMarks !== j.marks && prevToken === j.token) {
+          await recheckQueue();
+          document.dispatchEvent(new CustomEvent('soniqboom:marks-changed'));
+        }
         state.token = j.token;
         if (prevToken === null || prevToken === j.token) continue;
         // (List positions moved — Hide mode's lists changed length, and with
@@ -168,8 +197,9 @@ async function refresh() {
  * ui-config's ``offline_tracks``), applied at once so the player skips from the
  * first track.  Re-flags a queue restored from the last visit.
  */
-async function init({ mode } = {}) {
+async function init({ mode, skipShort, placeholders } = {}) {
   if (mode) _apply(mode);
+  if (skipShort !== undefined) _applyShort(skipShort, placeholders);
   if (!state.polling) {
     state.polling = true;
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });

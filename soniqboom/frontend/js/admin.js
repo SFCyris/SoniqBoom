@@ -7,6 +7,8 @@
 
 import { runRestartFlow } from './restart.js';
 import { Auth }           from './auth.js';
+import { STRONG_RULE, passwordHint, passwordProblem,
+         strongPasswordsRequired, setStrongPasswordsKnown } from './password-rule.js';
 import { Player }         from './player.js';
 import { Toast, trapFocus } from './utils.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
@@ -1905,6 +1907,44 @@ document.getElementById('admin-import-file').addEventListener('change', async (e
   e.target.value = '';
 });
 
+// ── "Skip short tunes" coverage ─────────────────────────────────────────────
+// Under the setting: how many retro tunes have a known length (only those can
+// be passed by) — with none, where SID lengths come from (the HVSC section).
+let _skipCov = null;                     // the last /admin/skip-short-coverage reply
+async function _paintSkipShortCoverage(refetch = true) {
+  const el = document.getElementById('setting-skip-short-coverage');
+  const sel = document.getElementById('setting-skip-short-tunes');
+  if (!el || !sel) return;
+  if (refetch || !_skipCov) {
+    try {
+      const r = await api('/admin/skip-short-coverage');
+      if (r.ok) _skipCov = await r.json();
+    } catch (_) { /* leave the line as it was */ }
+  }
+  const c = _skipCov;
+  el.textContent = '';
+  if (!c || !c.tunes) return;
+  const nf = (n) => Number(n || 0).toLocaleString();
+  if (!c.known) {
+    el.append('No tune lengths known yet, so no tune is skipped — for SIDs, ');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'link-btn';
+    b.textContent = 'set the HVSC folder under Renderers';
+    b.addEventListener('click', () => {
+      document.querySelector('.admin-tab[data-tab="tab-renderers"]')?.click();
+      setTimeout(() => document.getElementById('hvsc-section')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 60);
+    });
+    el.append(b, '.');
+    return;
+  }
+  const secs = Number(sel.value) || 0;
+  const n = secs ? Number((c.short || {})[String(secs)] || 0) : 0;
+  el.textContent = `Lengths known for ${nf(c.known)} of ${nf(c.tunes)} tunes`
+    + (secs ? ` · ${nf(n)} under ${secs} s.` : '.');
+}
+document.getElementById('setting-skip-short-tunes')?.addEventListener('change', () => _paintSkipShortCoverage(false));
+
 // ── Renderer Status ──────────────────────────────────────────────────────────
 
 async function loadRendererStatus() {
@@ -1926,6 +1966,15 @@ async function loadRendererStatus() {
     el.textContent = '\u2026';
     el.className = 'renderer-icon renderer-loading';
   });
+  // The version each renderer states, at the row's end (full version line
+  // in its tooltip); blank when it states none or isn't there.
+  const setVersion = (n, info) => {
+    const el = document.getElementById(`renderer-version-${n}`);
+    if (!el) return;
+    const v = (info && info.installed && info.runs !== false && info.version) || '';
+    el.textContent = v;
+    el.title = v ? (info.version_detail || v) : '';
+  };
 
   try {
     const res = await api('/admin/renderers');
@@ -1934,6 +1983,7 @@ async function loadRendererStatus() {
       const info = data[n];
       const iconEl = document.getElementById(`renderer-icon-${n}`);
       if (!iconEl) return;
+      setVersion(n, info);
       if (info && info.installed) {
         // File exists but the binary won't actually RUN \u2014 a system library it
         // links was upgraded out from under it (e.g. Homebrew bumped boost under
@@ -1984,6 +2034,7 @@ async function loadRendererStatus() {
     // Replace the loading "..." with a real error state so the user isn't
     // left staring at a frozen ellipsis when the renderer probe fails.
     names.forEach(n => {
+      setVersion(n, null);
       const iconEl = document.getElementById(`renderer-icon-${n}`);
       if (iconEl) {
         iconEl.textContent = '!';
@@ -3507,6 +3558,11 @@ async function loadSettings() {
     _loadedDedupFolders = !!s.dedup_folders;
     const offlineEl = document.getElementById('setting-offline-tracks');
     if (offlineEl && ['mark', 'hide', 'show'].includes(s.offline_tracks)) offlineEl.value = s.offline_tracks;
+    const shortEl = document.getElementById('setting-skip-short-tunes');
+    if (shortEl && [0, 5, 10, 20, 30].includes(Number(s.skip_short_tunes))) {
+      shortEl.value = String(Number(s.skip_short_tunes));
+    }
+    _paintSkipShortCoverage();
     for (const [id, key] of _SAVE_ON_CHANGE_TOGGLES) {
       const el = document.getElementById(id);
       if (!el || typeof s[key] !== 'boolean' || el.getAttribute('aria-busy')) continue;
@@ -3611,6 +3667,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
     const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
     const offlineTracks = document.getElementById('setting-offline-tracks')?.value || 'mark';
+    const skipShort = Number(document.getElementById('setting-skip-short-tunes')?.value || 0);
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
@@ -3631,6 +3688,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         filter_duplicates: filterDups,
         dedup_folders: dedupFolders,
         offline_tracks: offlineTracks,
+        skip_short_tunes: skipShort,
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
@@ -3963,11 +4021,21 @@ let _pwResolve = null;
  */
 let _pwFocusBefore = null;
 
+let _pwStrong = false;
+function _applyPwRule(strong) {
+  _pwStrong = !!strong;
+  document.getElementById('password-dialog-rule').textContent =
+    _pwStrong ? `(${STRONG_RULE.replace(/\.$/, '').toLowerCase()})` : '';
+}
+
 function styledPasswordDialog({
   title = 'Set password',
   message = '',
   requireCurrent = false,
+  strong,          // "Require strong passwords"; asked from the server when omitted
 } = {}) {
+  if (typeof strong === 'boolean') _applyPwRule(strong);
+  else strongPasswordsRequired({ refresh: true }).then(_applyPwRule);
   return new Promise((resolve) => {
     _pwResolve = resolve;
     _pwFocusBefore = document.activeElement;
@@ -4036,8 +4104,9 @@ _pwForm.addEventListener('submit', (e) => {
     _pwError.hidden = false;
     return;
   }
-  if (nw.length < 8) {
-    _pwError.textContent = 'Password must be at least 8 characters.';
+  const problem = passwordProblem(nw, _pwStrong);
+  if (problem) {
+    _pwError.textContent = problem;
     _pwError.hidden = false;
     return;
   }
@@ -5159,65 +5228,172 @@ function _mountApiKeys(host, idPrefix) {
 // ── Users tab (admin-only) ───────────────────────────────────────────────────
 
 async function loadUsers() {
-  const tbody = document.getElementById('users-tbody');
-  if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text2)">Loading…</td></tr>';
+  loadAccountSettings();
+  const list = document.getElementById('users-list');
+  const status = document.getElementById('users-list-status');
+  if (!list || !status) return;
+  status.hidden = false;
+  status.className = 'users-empty';
+  status.textContent = 'Loading…';
   try {
-    const res = await api('/users');
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      tbody.innerHTML = `<tr><td colspan="6" style="color:#ffb0b0">${data.detail || 'Failed to load users.'}</td></tr>`;
-      return;
-    }
-    const { users } = await res.json();
-    tbody.innerHTML = '';
-    for (const u of users) {
-      tbody.appendChild(_renderUserRow(u));
-    }
-    if (!users.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text2)">No users.</td></tr>';
-    }
+    const { users } = await (await api('/users')).json();
+    list.replaceChildren(...users.map(_renderUserRow));
+    status.hidden = users.length > 0;
+    status.textContent = users.length ? '' : 'No users.';
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="6" style="color:#ffb0b0">Network error: ${err.message}</td></tr>`;
+    list.replaceChildren();
+    status.className = 'users-empty users-empty-err';
+    status.textContent = `Couldn't load accounts: ${_apiErrText(err)}`;
   }
 }
 
+// Sign-up & passwords: "Allow self-registration" and "Require strong
+// passwords" (GET/PUT /api/users/settings).
+const _ACCOUNT_SETTINGS = {
+  'setting-self-registration': {
+    key: 'self_registration',
+    describe: (on) => on
+      ? 'Visitors can create a Read-only account from the sign-in page.'
+      : 'The sign-in page no longer offers "Create account".',
+  },
+  'setting-strong-passwords': {
+    key: 'strong_passwords',
+    describe: (on) => on
+      ? `New passwords must meet the rule: ${STRONG_RULE.toLowerCase()} Existing passwords keep working.`
+      : 'Passwords can be any length.',
+  },
+};
+let _accountSettingsBusy = false;
+
+async function loadAccountSettings() {
+  if (_accountSettingsBusy) return;          // a save is running; it sets the boxes itself
+  try {
+    const s = await (await api('/users/settings')).json();
+    _applyAccountSettings(s);
+  } catch (err) {
+    showMsg('users-reg-msg', `Couldn't load these settings: ${_apiErrText(err)}`, 'err');
+  }
+}
+
+function _applyAccountSettings(s) {
+  for (const [id, { key }] of Object.entries(_ACCOUNT_SETTINGS)) {
+    const box = document.getElementById(id);
+    if (box && typeof s[key] === 'boolean') {
+      box.checked = s[key];
+      box.disabled = false;
+    }
+  }
+  if (typeof s.strong_passwords === 'boolean') {
+    setStrongPasswordsKnown(s.strong_passwords);
+    _applyPasswordHints(s.strong_passwords);
+  }
+}
+
+for (const [id, { key, describe }] of Object.entries(_ACCOUNT_SETTINGS)) {
+  document.getElementById(id)?.addEventListener('change', async (e) => {
+    const box = e.target;
+    const on = box.checked;
+    if (_accountSettingsBusy) { box.checked = !on; return; }   // one request at a time
+    _accountSettingsBusy = true;
+    box.setAttribute('aria-busy', 'true');
+    box.setAttribute('aria-disabled', 'true');
+    try {
+      const s = await (await api('/users/settings', {
+        method: 'PUT', body: JSON.stringify({ [key]: on }),
+      })).json();
+      _applyAccountSettings(s);
+      showMsg('users-reg-msg', describe(s[key]), 'ok');
+    } catch (err) {
+      box.checked = !on;
+      showMsg('users-reg-msg', `Could not save the setting: ${_apiErrText(err)}`, 'err');
+    } finally {
+      _accountSettingsBusy = false;
+      box.removeAttribute('aria-busy');
+      box.removeAttribute('aria-disabled');
+    }
+  });
+}
+
+function _applyPasswordHints(strong) {
+  const pw = document.getElementById('users-new-password');
+  if (pw) pw.placeholder = passwordHint(strong);
+}
+
 function _renderUserRow(u) {
-  const tr = document.createElement('tr');
+  const tr = document.createElement('div');
+  tr.setAttribute('role', 'listitem');
   tr.dataset.userId = u.id;
-  const last = u.last_login_at
-    ? new Date(u.last_login_at * 1000).toLocaleString()
-    : '—';
   const isSelf = Auth.user && Auth.user.id === u.id;
+  const shown = u.display_name || u.username;
+  const initial = [...shown][0] || '?';
+  const name = _esc(u.username);
   tr.innerHTML = `
-    <td class="col-username">${_esc(u.username)}${isSelf ? ' <span style="color:var(--text2);font-size:10px">(you)</span>' : ''}</td>
-    <td>${_esc(u.display_name || '')}</td>
-    <td>
-      <select class="role-select" ${isSelf ? 'data-self="1"' : ''}>
-        <option value="admin"${u.role === 'admin' ? ' selected' : ''}>admin</option>
-        <option value="edit"${u.role === 'edit' ? ' selected' : ''}>edit</option>
-        <option value="readonly"${u.role === 'readonly' ? ' selected' : ''}>read-only</option>
-      </select>
-    </td>
-    <td><label style="cursor:pointer"><input type="checkbox" class="enabled-toggle" ${u.enabled ? 'checked' : ''}> ${u.enabled ? 'enabled' : 'disabled'}</label></td>
-    <td style="color:var(--text2);font-size:11px">${last}</td>
-    <td class="users-row-actions">
-      <button class="btn-set-pw">Set password</button>
-      <button class="btn-delete danger" ${isSelf ? 'disabled title="Sign in as another admin to delete this account"' : ''}>Delete</button>
-    </td>
+    <span class="users-avatar" aria-hidden="true">${_esc(initial.toUpperCase())}</span>
+    <div class="users-ident">
+      <div class="users-name"><span class="users-name-text">${_esc(shown)}</span>${isSelf ? '<span class="users-tag users-tag-you">You</span>' : ''}<span class="users-tag users-tag-off">Disabled</span></div>
+      <div class="users-sub"></div>
+    </div>
+    <select class="role-select" aria-label="Role of ${name}">
+      <option value="admin">Admin</option>
+      <option value="edit">Edit</option>
+      <option value="readonly">Read-only</option>
+    </select>
+    <label class="users-enabled">
+      <input type="checkbox" class="enabled-toggle" aria-label="${name} can sign in"> Enabled
+    </label>
+    <div class="users-row-actions">
+      <button type="button" class="btn-alias-edit btn-set-pw" aria-label="${isSelf ? 'Change your password' : `Set a new password for ${name}`}" title="${isSelf ? 'Change your password' : `Set a new password for ${name}`}">Password</button>
+      <button type="button" class="btn-danger btn-delete" ${isSelf
+        ? 'aria-disabled="true" aria-label="Delete your own account (not possible while signed in)" title="You can\'t delete the account you\'re signed in with"'
+        : `aria-label="Delete ${name}"`}>Delete</button>
+    </div>
   `;
-  const roleSel = tr.querySelector('.role-select');
+  const roleSel  = tr.querySelector('.role-select');
   const enToggle = tr.querySelector('.enabled-toggle');
 
-  roleSel.addEventListener('change', async (e) => {
-    const newRole = e.target.value;
+  // Paint the row from ``u`` — after a save, and to undo a refused change.
+  const paint = () => {
+    tr.className = 'users-row' + (u.enabled ? '' : ' users-row-disabled');
+    roleSel.value = u.role;
+    roleSel.className = `role-select role-${u.role}`;
+    tr.querySelector('.users-avatar').className = `users-avatar role-${u.role}`;
+    enToggle.checked = !!u.enabled;
+    const last = u.last_login_at
+      ? new Date(u.last_login_at * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+      : null;
+    tr.querySelector('.users-sub').textContent = [
+      u.display_name ? `@${u.username}` : '',
+      last ? `Last sign-in ${last}` : 'Never signed in',
+    ].filter(Boolean).join(' · ');
+  };
+  paint();
+
+  let busy = false;
+  const save = async (patch) => {
+    busy = true;
+    try {
+      const { user } = await (await api(`/users/${u.id}`, {
+        method: 'PATCH', body: JSON.stringify(patch),
+      })).json();
+      Object.assign(u, user);
+      showMsg('users-list-msg', `Saved ${u.username}.`, 'ok');
+    } catch (err) {
+      showMsg('users-list-msg', `Couldn't update ${u.username}: ${_apiErrText(err)}`, 'err');
+    } finally {
+      busy = false;
+      paint();
+    }
+  };
+
+  roleSel.addEventListener('change', async () => {
+    const newRole = roleSel.value;
     const oldRole = u.role;
-    // Confirm privilege jumps and downgrades — a misclick on an inline
-    // <select> should not silently grant or revoke admin powers.  No-op
-    // re-selection of the same value skips the prompt.
+    if (busy) { paint(); return; }
     if (newRole === oldRole) return;
-    const isPromote = newRole === 'admin' && oldRole !== 'admin';
-    const isDemote  = oldRole === 'admin' && newRole !== 'admin';
+    // Confirm privilege jumps and downgrades — a misclick on an inline
+    // <select> should not silently grant or revoke admin powers.
+    const isPromote = newRole === 'admin';
+    const isDemote  = oldRole === 'admin';
     if (isPromote || isDemote) {
       const ok = await styledConfirm(
         isPromote
@@ -5227,42 +5403,33 @@ function _renderUserRow(u) {
           okLabel: isPromote ? 'Promote' : 'Demote',
           dangerColor: isDemote },
       );
-      if (!ok) {
-        e.target.value = oldRole;          // revert select UI
-        return;
-      }
+      if (!ok) { paint(); return; }
     }
-    await _updateUser(u.id, { role: newRole });
+    await save({ role: newRole });
   });
 
-  enToggle.addEventListener('change', async (e) => {
-    const enabled = e.target.checked;
+  enToggle.addEventListener('change', async () => {
+    const enabled = enToggle.checked;
+    if (busy) { paint(); return; }
     if (!enabled) {
       const ok = await styledConfirm(
         `Disable "${u.username}"? They can't sign in and any open sessions are kicked out.`,
         { title: 'Disable account', okLabel: 'Disable', dangerColor: true },
       );
-      if (!ok) {
-        e.target.checked = true;            // revert toggle UI
-        return;
-      }
+      if (!ok) { paint(); return; }
     }
-    // Update the visible label text in lockstep with the toggle so the row
-    // doesn't read "enabled" while the checkbox is unchecked.
-    const labelTextNode = e.target.parentNode.lastChild;
-    if (labelTextNode && labelTextNode.nodeType === Node.TEXT_NODE) {
-      labelTextNode.nodeValue = ' ' + (enabled ? 'enabled' : 'disabled');
-    }
-    await _updateUser(u.id, { enabled });
+    await save({ enabled });
   });
+
   tr.querySelector('.btn-set-pw').addEventListener('click', async () => {
-    // Own-row: route through the change-password flow that requires
-    // the current password — admin-bypass shouldn't apply to yourself.
+    const strong = await strongPasswordsRequired({ refresh: true });
+    // Own row: the change-password flow that asks for the current password.
     if (isSelf) {
       const r = await styledPasswordDialog({
         title:   'Change my password',
         message: 'You stay signed in on this device.  Other sessions sign out.',
         requireCurrent: true,
+        strong,
       });
       if (!r) return;
       try {
@@ -5273,96 +5440,72 @@ function _renderUserRow(u) {
       }
       return;
     }
-    // Other user: admin reset (no current-password challenge).
-    const res0 = await styledPasswordDialog({
+    const r = await styledPasswordDialog({
       title:   `Set password for ${u.username}`,
       message: 'The user will need to sign back in with the new password.',
       requireCurrent: false,
+      strong,
     });
-    if (!res0) return;
+    if (!r) return;
     try {
-      const res = await api(`/users/${u.id}/password`, {
-        method: 'POST',
-        body:   JSON.stringify({ new_password: res0.password }),
+      await api(`/users/${u.id}/password`, {
+        method: 'POST', body: JSON.stringify({ new_password: r.password }),
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        showMsg('users-list-msg', _passwordErrorFromResponse(res.status, data), 'err');
-        return;
-      }
       showMsg('users-list-msg', `Password updated for ${u.username}.`, 'ok');
     } catch (err) {
-      showMsg('users-list-msg', _networkError(err), 'err');
+      showMsg('users-list-msg', `Couldn't set the password: ${_apiErrText(err)}`, 'err');
     }
   });
+
   tr.querySelector('.btn-delete').addEventListener('click', async () => {
-    if (isSelf) return;
+    if (isSelf) {
+      showMsg('users-list-msg', "You can't delete the account you're signed in with. Sign in as another admin to delete it.", 'warn');
+      return;
+    }
     const ok = await styledConfirm(
       `Delete user "${u.username}"?  Their personal playlists, ratings, and history will be lost.`,
       { title: 'Delete user', okLabel: 'Delete', dangerColor: true },
     );
     if (!ok) return;
     try {
-      const res = await api(`/users/${u.id}`, { method: 'DELETE' });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        showMsg('users-list-msg', `Failed: ${data.detail || res.status}`, 'err');
-        return;
-      }
+      await api(`/users/${u.id}`, { method: 'DELETE' });
       tr.remove();
       showMsg('users-list-msg', `Deleted ${u.username}.`, 'ok');
     } catch (err) {
-      showMsg('users-list-msg', `Network error: ${err.message}`, 'err');
+      showMsg('users-list-msg', `Couldn't delete ${u.username}: ${_apiErrText(err)}`, 'err');
     }
   });
   return tr;
 }
 
-async function _updateUser(id, patch) {
-  try {
-    const res = await api(`/users/${id}`, {
-      method: 'PATCH',
-      body:   JSON.stringify(patch),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      showMsg('users-list-msg', `Update failed: ${data.detail || res.status}`, 'err');
-      // Reload to revert UI to actual server state.
-      loadUsers();
-      return;
-    }
-    showMsg('users-list-msg', 'Saved.', 'ok');
-  } catch (err) {
-    showMsg('users-list-msg', `Network error: ${err.message}`, 'err');
-  }
-}
-
 document.getElementById('users-new-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();
+  const submit   = document.getElementById('users-new-submit');
+  if (submit.disabled) return;
   const username = document.getElementById('users-new-username').value.trim();
   const password = document.getElementById('users-new-password').value;
   const role     = document.getElementById('users-new-role').value;
   const display  = document.getElementById('users-new-display').value.trim();
+  const problem  = passwordProblem(password, await strongPasswordsRequired());
+  if (problem) {
+    showMsg('users-new-msg', problem, 'err');
+    return;
+  }
+  submit.disabled = true;
   try {
-    const res = await api('/users', {
+    await api('/users', {
       method: 'POST',
-      body:   JSON.stringify({
-        username, password, role,
-        display_name: display || null,
-      }),
+      body:   JSON.stringify({ username, password, role, display_name: display || null }),
     });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      showMsg('users-new-msg', `Failed: ${data.detail || res.status}`, 'err');
-      return;
-    }
     showMsg('users-new-msg', `Added user "${username}".`, 'ok');
-    document.getElementById('users-new-username').value = '';
-    document.getElementById('users-new-password').value = '';
-    document.getElementById('users-new-display').value  = '';
+    for (const id of ['users-new-username', 'users-new-password', 'users-new-display']) {
+      document.getElementById(id).value = '';
+    }
     loadUsers();
   } catch (err) {
-    showMsg('users-new-msg', `Network error: ${err.message}`, 'err');
+    showMsg('users-new-msg', `Couldn't add the user: ${_apiErrText(err)}`, 'err');
+  } finally {
+    submit.disabled = false;
   }
 });
 
@@ -5407,7 +5550,7 @@ function _httpStatusError(status, detail) {
 
 function _passwordErrorFromResponse(status, data) {
   // Specialised for password-set failures: the server returns 400 with a
-  // detail like "Password must be at least 8 characters" — pass that
+  // detail like "Password can't be empty" — pass that
   // straight through, otherwise fall back to the generic helper.
   if (status === 400 && data?.detail) return data.detail;
   return _httpStatusError(status, data?.detail);

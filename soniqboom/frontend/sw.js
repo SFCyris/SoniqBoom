@@ -817,7 +817,12 @@
 // (vendor/sidwasm.js + sidwasm.wasm, vu-sid-worker.js WASM_V 4).
 // v240: the About pages link the source code of the running version (admin.js,
 // mobile settings.js, index.html app.css?v=112).
-const SHELL_VERSION = 'v240';   // older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+// v241: Users tab redesign (account cards, add-user form) and the "Allow
+// self-registration" / "Require strong passwords" settings (admin.js,
+// auth.js, password-rule.js, index.html app.css?v=113).
+// v242: an open Track Info takes a measured length and the scene genres that
+// follow a catalogue tune's first read (trackinfo.js, utils.js).
+const SHELL_VERSION = 'v244';   // v244: skip short tunes + reported playback problems (health.js); v243: renderer versions in Settings → Renderers; older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.
@@ -964,6 +969,7 @@ const SHELL_PRECACHE = [
   '/assets/js/vlist.js',
   '/assets/js/tunes.js',
   '/assets/js/offline.js',
+  '/assets/js/health.js',
   '/assets/js/utils.js',
   '/assets/js/queue.js',
 ];

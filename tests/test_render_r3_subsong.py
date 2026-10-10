@@ -459,3 +459,40 @@ async def test_client_sid_audio_upload_for_a_subsong_needs_the_tune(monkeypatch)
     with pytest.raises(HTTPException) as e:
         await tracks_api.upload_sid_audio("t", _Req(), subsong=2, tune=3, **kw)
     assert e.value.status_code == 404                  # past the gate: no such track
+
+
+# ── a tune for two SID chips renders mono, as the stream promises ────────────
+
+def _two_sid_psid(path):
+    import struct
+    def sta(v, reg):
+        return bytes([0xA9, v, 0x8D, reg & 0xFF, reg >> 8])
+    init = b""
+    for base, hi in ((0xD400, 0x10), (0xD420, 0x18)):
+        init += (sta(0x0F, base + 0x18) + sta(0x00, base + 5) + sta(0xF0, base + 6)
+                 + sta(0x00, base) + sta(hi, base + 1) + sta(0x11, base + 4))
+    init += b"\x60"
+    load = 0x1000
+    hdr = b"PSID" + struct.pack(">HHHHHHHI", 3, 0x7C, 0, load, load + len(init), 1, 1, 0)
+    hdr += b"Two SID".ljust(32, b"\0") + b"QA".ljust(32, b"\0") + b"2026".ljust(32, b"\0")
+    hdr += struct.pack(">HBBBB", 0x0014, 0, 0, 0x42, 0)        # second SID at $D420
+    path.write_bytes(hdr + struct.pack("<H", load) + init + b"\x60")
+    return path
+
+
+def test_the_sid_command_forces_mono():
+    cmd = stream._sid_render_cmd("sidplayfp", Path("/x.sid"), 0, 30, "/o.wav")
+    assert "-m" in cmd and cmd.index("-m") < cmd.index("-t30")
+
+
+@pytest.mark.asyncio
+async def test_a_two_sid_tune_renders_mono(tmp_path):
+    import shutil
+    import wave
+    if not shutil.which("sidplayfp"):
+        pytest.skip("sidplayfp missing")
+    out = await stream._render_sid(_two_sid_psid(tmp_path / "two.sid"), 0, duration=5)
+    with wave.open(str(out)) as w:
+        assert w.getnchannels() == stream._SID_WAV_CHANNELS == 1
+        assert w.getframerate() == stream._SID_WAV_RATE
+        assert abs(w.getnframes() / w.getframerate() - 5) < 1.0

@@ -358,9 +358,11 @@ _BOOT = uuid.uuid4().hex[:8]
 
 
 def token(store=None) -> str:
-    """What a web client compares to know its rows are stale: the setting and
-    the snapshot generation (of this server process)."""
-    return f"{mode(store)}:{_BOOT}:{snapshot(store).seq}"
+    """What a web client compares to know its rows are stale: the setting,
+    the snapshot generation (of this server process) and the "Skip short
+    tunes" setting (``core/skip_rules``)."""
+    from soniqboom.core import skip_rules
+    return f"{mode(store)}:{_BOOT}:{snapshot(store).seq}:{skip_rules.token_part(store)}"
 
 
 # ── What the list endpoints use ──────────────────────────────────────────────
@@ -386,12 +388,28 @@ def hidden(store=None) -> frozenset | None:
 
 def unplayable(store=None) -> frozenset | None:
     """The ids auto-play skips (shuffle deals, radio, similar tracks): the
-    tracks that can't play right now in ``mark`` / ``hide`` mode, else None."""
+    tracks that can't play right now in ``mark`` / ``hide`` mode, and in
+    every mode the files the skip rules pass by (``core/skip_rules``:
+    reported broken, undecodable, a short default tune); None when there are
+    none."""
     _touch()
+    from soniqboom.core import skip_rules
+    rules = skip_rules.skip_ids(store)
     if mode(store) == "show":
-        return None
+        return rules or None
     u = snapshot(store).unavailable
-    return u or None
+    if u and rules:
+        # (one union per pair of sets, not per call)
+        hit = _UNION_MEMO.get("pair")
+        if hit is not None and hit[0] is u and hit[1] is rules:
+            return hit[2]
+        both = u | rules
+        _UNION_MEMO["pair"] = (u, rules, both)
+        return both
+    return u or rules or None
+
+
+_UNION_MEMO: dict = {}
 
 
 def hide_token(store=None):
@@ -470,7 +488,8 @@ def offline_kinds(ids: Iterable[str], store=None) -> dict[str, str]:
 
 
 def playable_page(fetch: Callable[[int, int], list], offset: int, limit: int,
-                  snap: Snapshot, *, budget: int | None = None) -> dict:
+                  snap: "Snapshot | None", *, budget: int | None = None,
+                  skip: frozenset = frozenset()) -> dict:
     """One page of a list for the PLAYER, without the tracks that can't play.
 
     ``fetch(offset, limit)`` returns the list's rows at those positions (a
@@ -478,7 +497,9 @@ def playable_page(fetch: Callable[[int, int], list], offset: int, limit: int,
     ``limit`` playable rows are found, the list ends, or ``budget`` rows were
     read.  Every returned row carries ``_pos`` — its position in the list —
     and the reply says where to go on (``next_offset``) and whether the list
-    ended, so a player keeps list positions exact while it skips."""
+    ended, so a player keeps list positions exact while it skips.
+    ``snap`` None: offline tracks are kept; ``skip``: ids also left out (the
+    skip rules' — ``core/skip_rules``)."""
     if budget is None:
         budget = PLAYABLE_SCAN_BUDGET
     out: list[dict] = []
@@ -497,7 +518,8 @@ def playable_page(fetch: Callable[[int, int], list], offset: int, limit: int,
             ended = True
             break
         for i, r in enumerate(rows):
-            if snap.kind_of(r):
+            if (snap is not None and snap.kind_of(r)) or (
+                    skip and isinstance(r, dict) and r.get("id") in skip):
                 continue
             out.append({**r, "_pos": pos + i})
             if len(out) >= limit:
@@ -559,15 +581,20 @@ async def player_page_async(fetch: Callable[[int, int], list], offset: int, limi
 def player_page(fetch: Callable[[int, int], list], offset: int, limit: int,
                 store=None) -> dict:
     """A list endpoint's ``playable=1`` reply (the shape ``playable_page``
-    gives): without the tracks that can't play in ``mark`` / ``hide`` mode,
-    the plain page otherwise (``player_page_async`` re-anchors)."""
+    gives): without the tracks that can't play in ``mark`` / ``hide`` mode
+    and the files the skip rules pass by (``core/skip_rules``), the plain
+    page otherwise (``player_page_async`` re-anchors)."""
+    from soniqboom.core import skip_rules
     snap = snapshot(store)
     if mode(store) == "show" or not snap.dead:
+        snap = None
+    rules = skip_rules.skip_ids(store)
+    if snap is None and not rules:
         off = max(0, int(offset))
         rows = fetch(off, limit)
         return {"tracks": [{**r, "_pos": off + i} for i, r in enumerate(rows)],
                 "next_offset": off + len(rows), "ended": len(rows) < limit}
-    return playable_page(fetch, offset, limit, snap)
+    return playable_page(fetch, offset, limit, snap, skip=rules)
 
 
 def state(store=None) -> dict:
@@ -599,7 +626,11 @@ def state(store=None) -> dict:
                 })
         snap._roots = roots
     roots = [dict(r) for r in roots]
-    return {"mode": m, "token": f"{m}:{_BOOT}:{snap.seq}", "seq": snap.seq,
+    from soniqboom.core import skip_rules
+    return {"mode": m, "token": f"{m}:{_BOOT}:{snap.seq}:{skip_rules.token_part(store)}",
+            "seq": snap.seq, "skip_short_tunes": skip_rules.short_secs(store),
+            "marks": skip_rules.marks_gen(),
+            "tune_placeholders": skip_rules.placeholder_seconds(),
             "unavailable": len(snap.unavailable) if snap.dead else 0,
             "roots": roots}
 

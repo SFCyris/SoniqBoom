@@ -80,6 +80,16 @@ class TrackMeta(BaseModel):
     #               plays return an honest 415.
     defect: str | None = None
     defect_detail: str | None = None
+    # A playback problem a listener reported (GitHub #36 — core/skip_rules.py):
+    # ``health`` "broken" (auto-play passes it by; a click still plays it) or
+    # "glitched" (plays, with wrong sounds — shown only), the optional note,
+    # who reported it and when (epoch seconds), and the renderer (with its
+    # version) that played it then.  Carried over rescans.
+    health: str | None = None
+    health_note: str | None = None
+    health_by: str | None = None
+    health_at: float | None = None
+    health_renderer: str | None = None
 
     # SID (C64) / HVSC enrichment.  ``sid_md5`` is the MD5 of the whole .sid
     # file — the key HVSC's Songlengths database is indexed by — cached at scan
@@ -89,6 +99,16 @@ class TrackMeta(BaseModel):
     sid_md5: str | None = None
     sid_model: str | None = None
     hvsc_lengths: list[float] | None = None
+    # Per-tune lengths a multi-tune file states itself (SNDH FRMS / TIME, the
+    # libgme formats that state one — NSFe, AY), in tune order, seconds
+    # as played (with the fade); 0 = unknown.  A SID's come from HVSC
+    # (``hvsc_lengths``).
+    tune_lengths: list[float] | None = None
+    # Seconds of fade-out included in ``duration`` and ``tune_lengths`` (a PSF
+    # rip's ``fade`` tag) — "Skip short tunes" judges a tune by its length
+    # before the fade.  None: none recorded (a libgme rip's fixed fade is
+    # known by its format).
+    fade_s: float | None = None
     stil: str | None = None
 
     # Scene-metadata enrichment.  MD5 of the whole module file, cached at

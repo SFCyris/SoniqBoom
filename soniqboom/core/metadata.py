@@ -12,6 +12,7 @@ import base64
 import contextvars
 import hashlib
 import logging
+import math
 import os
 import re
 import struct
@@ -1796,6 +1797,17 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         title, game, duration = _gym_meta(path, title, duration)
     # Other formats fall back to filename; gme renderer will surface
     # the proper metadata when streaming.
+    tune_lens = None
+    if ext != ".gym":
+        stated_default = duration
+        duration = _gme_stated_duration(path, duration)
+        if subsongs and subsongs > 1:
+            tune_lens = _gme_tune_lengths(path, subsongs)
+        elif ext in _GME_STATED_EXTS:
+            # One tune: its stated length (as played) recorded as such — a
+            # first play may replace ``duration`` with its render's length —
+            # ``[]`` when it states none ("Skip short tunes").
+            tune_lens = [duration] if duration != stated_default else []
 
     # A ripper placeholder ("<?>") or a garbage field names nobody — left
     # empty, the Modland apply can credit the real composer.
@@ -1816,10 +1828,63 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         d["game_by_tag"] = game                # the header's own game name
     if subsongs and subsongs > 1:
         d["subsongs"] = subsongs
+        if tune_lens:
+            d["tune_lengths"] = tune_lens
+    elif tune_lens is not None and gme_render_available():
+        d["tune_lengths"] = tune_lens
     return d
 
 
+def gme_render_available() -> bool:
+    from soniqboom.core import gme_render
+    return gme_render.is_available()
+
+
+def _gme_tune_lengths(path: Path, count: int) -> "list[float] | None":
+    """Each tune's length as it plays, for a multi-tune file of a format that
+    states lengths (NSFe, AY, SAP — ``gme_render.tune_lengths``); None
+    otherwise."""
+    from soniqboom.core import gme_render
+    if not gme_render.is_available() or path.suffix.lower() not in _GME_STATED_EXTS:
+        return None
+    try:
+        if path.stat().st_size > _GME_LENGTH_MAX_BYTES:
+            return None
+        data = path.read_bytes()
+    except OSError as exc:
+        _swallow_io(exc)
+        return None
+    return gme_render.tune_lengths(data, count)
+
+
 _GYM_MAX_BYTES = 64 * 1024 * 1024
+_GME_LENGTH_MAX_BYTES = 32 * 1024 * 1024
+# libgme formats that can state a length (SPC ID666, VGM, NSFe, AY); plain
+# NSF / GBS / KSS / HES never do, and libgme reads no SAP TIME tag — not
+# worth reading at scan.
+_GME_STATED_EXTS = frozenset({".spc", ".vgm", ".vgz", ".nsfe", ".ay"})
+
+
+def _gme_stated_duration(path: Path, default: float) -> float:
+    """The default tune's length as it will play: the length the file states
+    (SPC ID666, NSFe, VGM intro + loops) plus its fade — exactly what
+    ``stream._render_gme`` renders (``gme_render.render_plan``) — else
+    ``default``."""
+    from soniqboom.core import gme_render
+    ext = path.suffix.lower()
+    if not gme_render.is_available() or ext not in _GME_STATED_EXTS:
+        return default
+    try:
+        if path.stat().st_size > _GME_LENGTH_MAX_BYTES:
+            return default
+        if ext in (".vgm", ".vgz") and gme_render.vgm_needs_other_engine(path):
+            return default            # ZXTune plays it, at the default length
+        data = path.read_bytes()
+    except OSError as exc:
+        _swallow_io(exc)
+        return default
+    total, _fade = gme_render.render_plan(data, 0, default)
+    return total
 
 
 def _gym_meta(path: Path, title: str, duration: float) -> tuple[str, str, float]:
@@ -2501,7 +2566,7 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
 
 # ── Atari ST extraction (SNDH / YM / SC68) ────────────────────────────────────
 
-_ATARI_DEFAULT_DURATION = 180.0   # SNDH without TIME tags renders this long
+_ATARI_DEFAULT_DURATION = 180.0   # SNDH stating no length (FRMS / TIME) renders this long
 
 
 def _find_atari_binary(setting_name: str, binary: str) -> str | None:
@@ -2516,77 +2581,151 @@ def _find_atari_binary(setting_name: str, binary: str) -> str | None:
     return _shutil.which(binary)
 
 
-def _extract_sndh(path: Path, track_id: str) -> dict:
-    """SNDH metadata via ``psgplay -i`` (TITL/COMM/YEAR/##/TIME tags).
+# SNDH replay timers, in the order psgplay looks for them
+# (lib/psgplay/sndh.c ``sndh_tag_timer``): the first one present sets the rate
+# FRMS frames are counted at; none → 50 Hz.
+_SNDH_TIMER_TAGS = frozenset({"TA", "TB", "TC", "TD", "!V"})
+# The longest SNDH length trusted — the renderer's own cap.
+_SNDH_MAX_S = 3600.0
 
-    Output format verified against psgplay (2026-07): lines like
-    ``tag field TITL Funfares``, ``tag field ## 11``, ``tag field TIME 2 95``.
-    Duration = default track's TIME tag; absent/0 → the Atari default cap
-    (that's exactly how long the renderer will play it).
+
+def _int_or_none(v: str):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_sndh_info(text: str) -> dict:
+    """The tags of ``psgplay -i`` output that SoniqBoom uses.
+
+    Returns ``title``, ``artist``, ``year``, ``count`` (``##``, 0 = unknown),
+    ``default_track`` (``!#``, 1-based, default 1) and ``lengths``
+    ({track: seconds}) for every track whose length the file states.
+
+    A track's length follows psgplay's own ``sndh_tag_subtune_time``: the
+    FRMS tag (frames, SNDH 2.2 — what the SNDH archive uses) divided by the
+    replay timer's rate (to the whole second psgplay renders), else the older
+    TIME tag (seconds).  0 means unknown in both.  Both psgplay output styles are read:
+
+        tag field FRMS 18804                    (one line per track, in order)
+        tag field FRMS 1  3071  15.355  00:15   (indexed, newer psgplay)
+        tag field TIME 1 95                     tag field TIME 1 261 04:21
     """
-    import subprocess as _sp
-    name = Path(str(path).split("::")[-1]).stem
     title, artist, year = "", "", None
-    subsongs, default_track = None, 1
-    times: dict[int, int] = {}
-    binary = _find_atari_binary("psgplay_path", "psgplay")
-    if binary:
-        try:
-            r = forksafe.run([binary, "-i", str(path)], capture_output=True,
-                             text=True, timeout=20)
-            for line in r.stdout.splitlines():
-                parts = line.split(None, 3)
-                if parts[:2] != ["tag", "field"] or len(parts) < 3:
-                    continue
-                tag = parts[2]
-                val = parts[3].strip() if len(parts) > 3 else ""
-                if tag == "TITL" and val:
-                    title = val
-                elif tag == "COMM" and val:
-                    artist = val
-                elif tag == "YEAR":
-                    try:
-                        year = int(val[:4])
-                    except ValueError:
-                        pass
-                elif tag == "##":
-                    try:
-                        subsongs = int(val)
-                    except ValueError:
-                        pass
-                elif tag == "!#":
-                    try:
-                        default_track = max(1, int(val))
-                    except ValueError:
-                        pass
-                elif tag == "TIME":
-                    tv = val.split()
-                    if len(tv) >= 2:
-                        try:
-                            times[int(tv[0])] = int(tv[1])
-                        except ValueError:
-                            pass
-        except (_sp.TimeoutExpired, OSError):
-            pass
-    dur = float(times.get(default_track, 0) or 0)
+    count, default_track = 0, 1
+    frames: dict[int, int] = {}
+    seconds: dict[int, int] = {}
+    frms_seen = 0
+    rate = None
+    for line in text.splitlines():
+        parts = line.split(None, 3)
+        if parts[:2] != ["tag", "field"] or len(parts) < 3:
+            continue
+        tag = parts[2]
+        val = parts[3].strip() if len(parts) > 3 else ""
+        toks = val.split()
+        if tag == "TITL" and val:
+            title = val
+        elif tag == "COMM" and val:
+            artist = val
+        elif tag == "YEAR":
+            year = _int_or_none(val[:4]) or year
+        elif tag == "##":
+            n = _int_or_none(toks[0]) if toks else None
+            if n is not None:
+                count = max(0, n)
+        elif tag == "!#":
+            n = _int_or_none(toks[0]) if toks else None
+            if n is not None:
+                default_track = max(1, n)
+        elif tag in _SNDH_TIMER_TAGS and rate is None:
+            rate = (_int_or_none(toks[0]) if toks else None) or 0
+        elif tag == "FRMS" and toks:
+            if len(toks) >= 2:
+                idx, n = _int_or_none(toks[0]), _int_or_none(toks[1])
+            else:
+                frms_seen += 1
+                idx, n = frms_seen, _int_or_none(toks[0])
+            if idx and n is not None:
+                frames[idx] = max(0, n)
+        elif tag == "TIME" and len(toks) >= 2:
+            idx, n = _int_or_none(toks[0]), _int_or_none(toks[1])
+            if idx and n is not None:
+                seconds[idx] = max(0, n)
+    hz = rate or 50
+    lengths: dict[int, float] = {}
+    for t in set(frames) | set(seconds):
+        if frames.get(t, 0) > 0:
+            # Whole seconds, rounded half up: psgplay plays ``--length`` to
+            # the nearest second (268.63 → 269 s), so this is what renders.
+            lengths[t] = float(max(1, int(frames[t] / hz + 0.5)))
+        elif seconds.get(t, 0) > 0:
+            lengths[t] = float(seconds[t])
+        if t in lengths:
+            lengths[t] = min(lengths[t], _SNDH_MAX_S)    # an absurd tag (FRMS 0x7fffffff)
+    return {"title": title, "artist": artist, "year": year, "count": count,
+            "default_track": default_track, "lengths": lengths}
+
+
+def sndh_info(path: Path, binary: str | None = None) -> dict | None:
+    """``parse_sndh_info`` of ``psgplay -i path``; None when psgplay is
+    missing or fails.  Blocking."""
+    import subprocess as _sp
+    binary = binary or _find_atari_binary("psgplay_path", "psgplay")
+    if not binary:
+        return None
+    try:
+        r = forksafe.run([binary, "-i", str(path)], capture_output=True,
+                         timeout=20)
+    except (_sp.TimeoutExpired, OSError):
+        return None
+    # Tag text is UTF-8 from psgplay; a stray byte must not cost the lengths.
+    return parse_sndh_info(r.stdout.decode("utf-8", "replace")
+                           if isinstance(r.stdout, bytes) else (r.stdout or ""))
+
+
+def _extract_sndh(path: Path, track_id: str) -> dict:
+    """SNDH metadata via ``psgplay -i`` (``parse_sndh_info``).
+
+    Duration = the default track's length (FRMS / TIME tag); none →
+    the Atari default (that's exactly how long the renderer will play it).
+    """
+    name = Path(str(path).split("::")[-1]).stem
+    info = sndh_info(path) or parse_sndh_info("")
+    default_track = info["default_track"]
+    subsongs = info["count"]
+    dur = float(info["lengths"].get(default_track, 0) or 0)
     d: dict = {
         "id": track_id,
         "path": str(path),
         "format": "SNDH",
-        "title": title or name,
+        "title": info["title"] or name,
         "duration": dur if dur > 0 else _ATARI_DEFAULT_DURATION,
         "genre": ["Chiptune", "Atari ST"],
     }
-    if artist:
-        d["artist"] = artist   # TrackMeta.artist is str — never None
-    if year:
-        d["year"] = year
+    if info["artist"]:
+        d["artist"] = info["artist"]   # TrackMeta.artist is str — never None
+    if info["year"]:
+        d["year"] = info["year"]
     if subsongs and subsongs > 1:
         d["subsongs"] = subsongs
         start = sid_default_tune(default_track, subsongs)
         if start:
             d["start_subsong"] = start      # the default tune (``!#``), 0-based
+        lens = sndh_tune_lengths(info, subsongs)
+        if lens:
+            d["tune_lengths"] = lens
     return d
+
+
+def sndh_tune_lengths(info: dict, count: int) -> "list[float] | None":
+    """The tunes' lengths an SNDH states (``parse_sndh_info`` ``lengths``,
+    1-based) as a list in tune order, 0 for a tune with none; None when no
+    tune states one."""
+    lens = info.get("lengths") or {}
+    out = [float(lens.get(k + 1, 0) or 0) for k in range(max(0, min(int(count or 0), 1024)))]
+    return out if any(v > 0 for v in out) else None
 
 
 # Raw YM magics StSound's ymDecode accepts (mirrors Ymload.cpp's enum); every
@@ -2750,12 +2889,50 @@ def _psf_parse_length(val: str) -> float:
         return 0.0
 
 
+_PSF_MAX_S = 3600.0         # a length past an hour is no length
+_PSF_MAX_FADE_S = 60.0      # a fade is clamped to this
+
+
+def psf_play_plan(tags: dict) -> "tuple[float, float]":
+    """``(seconds, fade)`` a PSF-family rip plays, from its ``[TAG]`` block
+    (``tags``: lower-case keys): its ``length``, then its ``fade`` (spec
+    v1.4), the fade clamped to ``_PSF_MAX_FADE_S`` and to the hour.
+    ``(0, 0)`` with no length, or one that is not finite or over an hour;
+    fade 0 with no fade, or one that is not finite or not positive.  Both
+    the scan's duration and the render (``api.stream._psf_render_plan``)
+    come from here."""
+    length = _psf_parse_length(tags["length"]) if "length" in tags else 0.0
+    if not (math.isfinite(length) and 0 < length <= _PSF_MAX_S):
+        return 0.0, 0.0
+    fade = _psf_parse_length(tags["fade"]) if "fade" in tags else 0.0
+    if not (math.isfinite(fade) and fade > 0):
+        fade = 0.0
+    fade = min(fade, _PSF_MAX_FADE_S, _PSF_MAX_S - length)
+    return length + fade, fade
+
+
+def psf_tags(raw: bytes) -> "dict[str, str]":
+    """A PSF-family file's ``[TAG]`` block (lower-case keys, first wins).
+    Per the PSF v1.4 spec the block sits at EOF — only the last 64 KB is
+    searched, so '[TAG]' bytes inside the zlib-compressed program can't fake
+    one."""
+    tags: dict[str, str] = {}
+    idx = raw.rfind(b"[TAG]", max(0, len(raw) - 65536))
+    if idx != -1:
+        for line in _psf_tag_text(raw[idx + 5:]).splitlines():
+            k, sep, v = line.partition("=")
+            if sep:
+                tags.setdefault(k.strip().lower(), v.strip())
+    return tags
+
+
 def _extract_psf(path: Path, track_id: str) -> dict:
     """PSF-family metadata from the header version byte + the [TAG] block.
 
     The tag block sits at EOF after the compressed program: ``[TAG]`` then
     ``key=value`` lines (title/artist/game/year/length/fade/_lib...).
-    Duration = length + fade when tagged; else 0 (backfilled from the WAV).
+    Duration = length + fade when tagged (``psf_play_plan``); else 0
+    (backfilled from the WAV).
     """
     name = Path(str(path).split("::")[-1]).stem
     raw = b""
@@ -2766,21 +2943,8 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     version = raw[3] if len(raw) >= 4 and raw[:3] == b"PSF" else None
     fmt = _PSF_VERSION_NAMES.get(version or -1) or FORMAT_NAMES.get(
         path.suffix.lower(), "PSF")
-    tags: dict[str, str] = {}
-    # Per the PSF v1.4 spec the tag block sits at EOF — search only the last
-    # 64 KB so '[TAG]' bytes occurring randomly inside the zlib-compressed
-    # program can't fake a tag block.
-    idx = raw.rfind(b"[TAG]", max(0, len(raw) - 65536))
-    if idx != -1:
-        for line in _psf_tag_text(raw[idx + 5:]).splitlines():
-            k, sep, v = line.partition("=")
-            if sep:
-                tags.setdefault(k.strip().lower(), v.strip())
-    dur = 0.0
-    if "length" in tags:
-        dur = _psf_parse_length(tags["length"])
-        if dur > 0 and "fade" in tags:
-            dur += _psf_parse_length(tags["fade"])
+    tags = psf_tags(raw)
+    dur, fade = psf_play_plan(tags)
     d: dict = {
         "id": track_id,
         "path": str(path),
@@ -2802,6 +2966,8 @@ def _extract_psf(path: Path, track_id: str) -> dict:
         d["year"] = int(year)
     if tags.get("comment"):
         d["comment"] = tags["comment"]
+    if fade > 0:
+        d["fade_s"] = round(fade, 2)        # (the duration includes it — "Skip short tunes")
     return d
 
 

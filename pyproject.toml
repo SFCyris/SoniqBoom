@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soniqboom"
-version = "1.12.1"
+version = "1.13.0"
 description = "Self-hosted music server for personal libraries — FLAC, MP3, Opus, SID, MIDI, plus 20+ tracker formats"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
@@ -17,24 +17,28 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.110.0",
+    "starlette>=1.3.1",   # FastAPI's ASGI toolkit, also used directly — security fixes
     "uvicorn[standard]>=0.27.0",
     "mutagen>=1.47.0",
     "lhafile>=0.3.1",   # Amiga LHA/LZH archive reading (scan inside .lha)
     "aiofiles>=23.2.1",
     "pydantic>=2.6.0",
-    "pydantic-settings>=2.2.0",
-    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.14.2",
+    "python-multipart>=0.0.31",
     "httpx>=0.27.0",
-    "Pillow>=10.0.0",
+    "Pillow>=12.3.0",
     "mido>=1.3.0",
+    # SMB shares.  1.13.0 is the smbprotocol LIBRARY's minimum version, not
+    # SoniqBoom's — leave it alone when bumping SoniqBoom's version.
     "smbprotocol>=1.13.0",
-    "cryptography>=42.0.0",
+    "cryptography>=50.0.0",
     "PyYAML>=6.0",
-    "python-dotenv>=1.0.0",
+    "python-dotenv>=1.2.2",
     "websockets>=11.0",
     "watchdog>=4.0.0",
     "defusedxml>=0.7.1",
-    "orjson>=3.9.0",    # fast JSON serialization for the large track/search list pages
+    "anyio>=4.14.2",       # async I/O helpers (internet-radio relay)
+    "orjson>=3.11.6",    # fast JSON serialization for the large track/search list pages
 ]
 
 [project.urls]

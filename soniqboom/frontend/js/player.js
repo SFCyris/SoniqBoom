@@ -558,16 +558,109 @@ export const Player = (() => {
   // page starts right after the last queued list row (``after=<id>``), not at
   // the old offset.
   let _ordReanchor = false;
-  function _skipsOffline(t) { return _offlineSkip && !!t && typeof t === 'object' && !!t.offline; }
+  // Settings → "Skip short tunes" (GitHub #37) and reported problems (#36) —
+  // the same contract as offline tracks: whenever the queue moves on by itself
+  // it passes by a track reported broken (``health``), one no engine can
+  // decode (``defect`` corrupt) and a tune whose own length is known (HVSC
+  // song lengths) to be shorter than ``_shortSecs``; a track the listener
+  // clicks still plays.  The server's pages and shuffles leave the same files
+  // out (core/skip_rules.py).  Set by offline.js (setSkipShort).
+  let _shortSecs = 0;
+  // Stored lengths that stand for "unknown" (the renderers' defaults) — from
+  // the server with the setting (core/skip_rules.placeholder_seconds).
+  let _placeholderLens = [180];
+  // The own length of the tune entry ``t`` plays (seconds), 0 when unknown —
+  // as the server judges it (core/skip_rules.known_len): HVSC's song lengths
+  // or the lengths the file states (``tune_lengths``), else — for the tune a
+  // plain play plays — the stored length of a retro tune (never ordinary
+  // audio, never a placeholder).
+  const _AUDIO_EXTS = new Set(['.mp3', '.flac', '.m4a', '.mp4', '.m4b', '.aac', '.alac', '.ogg',
+    '.oga', '.opus', '.wav', '.wave', '.aif', '.aiff', '.aifc', '.wma', '.ape', '.wv', '.mpc',
+    '.dff', '.wsd', '.caf', '.mka', '.webm']);
+  const _GME_FADED_EXTS = new Set(['.spc', '.vgm', '.vgz', '.nsfe', '.ay']);
+  function _suffixOf(t) {
+    const tail = String(t.path || '').split('::').pop();
+    const dot = tail.lastIndexOf('.');
+    return dot > tail.lastIndexOf('/') ? tail.slice(dot).toLowerCase() : '';
+  }
+  // Seconds of fade-out a stored length includes (a PSF's ``fade_s``; for a
+  // length the file states — ``stated`` — a libgme rip's fixed 8 s) — a tune
+  // is judged before it.  (A played libgme file's ``duration`` is its render's
+  // length: no fade in it when the tune ended by itself.)
+  function _fadeOf(t, stated = false) {
+    const f = Number(t.fade_s);
+    if (t.fade_s !== null && t.fade_s !== undefined && Number.isFinite(f)) return Math.max(0, f);
+    return stated && _GME_FADED_EXTS.has(_suffixOf(t)) ? 8 : 0;
+  }
+  function _tuneLen(t) {
+    const wire = Number.isInteger(t.subsong) ? t.subsong : 0;
+    const lists = [['hvsc', t.hvsc_lengths], ['file', t.tune_lengths]];
+    let k = -1;
+    for (const [kind, lens] of lists) {
+      if (!Array.isArray(lens) || !lens.length) continue;
+      if (k < 0) {
+        const count = Number(t.subsongTotal) || Number(t.subsongs) || lens.length;
+        if (!Number.isInteger(t.subsong)) {
+          // A plain play: the start song, else the tune a probe found
+          // (default_subsong).  (A picked tune — even wire 0 — is its wire's.)
+          k = 0;
+          for (const f of [t.start_subsong, t.default_subsong]) {
+            if (Number.isInteger(f) && f > 0 && f < count) { k = f; break; }
+          }
+        } else {
+          k = subsongWireToTune(wire, subsongStartOf(t), count) - 1;
+        }
+      }
+      const v = Number(lens[k]);
+      if (v > 0 && v <= 3600) {
+        const own = v - (kind === 'file' ? _fadeOf(t, true) : 0);
+        return own > 0 ? own : 0;
+      }
+    }
+    if (wire === 0 && _isRenderedTrack(t) && !_AUDIO_EXTS.has(_suffixOf(t))) {
+      const d = Number(t.duration);
+      if (d > 0 && d <= 3600 && !_placeholderLens.some((p) => Math.abs(p - d) < 0.01)) {
+        const own = d - _fadeOf(t);
+        return own > 0 ? own : 0;
+      }
+    }
+    return 0;
+  }
+  // Why the queue passes ``t`` by when it moves on by itself: 'offline' |
+  // 'broken' | 'corrupt' | 'short', or '' (it plays).
+  function _skipReason(t) {
+    if (!t || typeof t !== 'object') return '';
+    if (_offlineSkip && t.offline) return 'offline';
+    if (t.health === 'broken') return 'broken';
+    if (t.defect === 'corrupt') return 'corrupt';
+    if (_shortSecs > 0) {
+      const n = _tuneLen(t);
+      if (n > 0 && n < _shortSecs) return 'short';
+    }
+    return '';
+  }
+  function _skipsDealt(t) { return !!_skipReason(t); }
   // Index of the first track at or after ``from`` the queue may move on to.
   function _nextPlayable(from) {
-    for (let i = Math.max(0, from); i < queue.length; i++) if (!_skipsOffline(queue[i])) return i;
+    for (let i = Math.max(0, from); i < queue.length; i++) if (!_skipsDealt(queue[i])) return i;
     return -1;
   }
-  // …and the last one at or before ``from`` (Prev).
+  // …and the last one at or before ``from`` (Prev).  Prev returns to a short
+  // or reported track that already played (the listener heard it); one that
+  // never played, or can't play right now, is passed by.
   function _prevPlayable(from) {
-    for (let i = Math.min(from, queue.length - 1); i >= 0; i--) if (!_skipsOffline(queue[i])) return i;
+    for (let i = Math.min(from, queue.length - 1); i >= 0; i--) {
+      const r = _skipReason(queue[i]);
+      if (!r || (r !== 'offline' && _played.has(queue[i]))) return i;
+    }
     return -1;
+  }
+  // The reasons the tracks of ``arr`` (from ``from``) are passed by — what a
+  // "nothing to play" notice names.
+  function _skipReasons(arr, from = 0) {
+    const out = new Set();
+    for (let i = Math.max(0, from); i < arr.length; i++) { const r = _skipReason(arr[i]); if (r) out.add(r); }
+    return [...out];
   }
   // [queue-core:end]
 
@@ -1705,6 +1798,16 @@ export const Player = (() => {
     const s = String(f || '').trim();
     return /^[a-z0-9]{2,5}$/.test(s) ? s.toUpperCase() : s;
   }
+  // A "couldn't play" toast for ``track``, with the action health.js offers
+  // (``setFailAction`` — "Mark broken" for a listener with edit rights) when
+  // it offers one for that track.
+  let _failAction = null;
+  function _failToast(msg, track) {
+    let a = null;
+    try { a = _failAction && track ? _failAction(track, msg) : null; } catch (_) { a = null; }
+    if (a && a.label && typeof a.run === 'function') Toast.action(msg, a.label, () => a.run(track), 15000);
+    else Toast.error(msg);
+  }
   // The play() rejection report: one diagnostic toast per attempt.
   // ``serverReason``: why the server's render failed (render-status
   // ``state: 'failed'``) — said as is, with no probe.
@@ -1735,7 +1838,7 @@ export const Player = (() => {
       // again must say so again.
       if (_failToastFor === track.id && _failToastSeq === attempt) return;   // the <audio> 'error' handler already reported it
       _failToastFor = track.id; _failToastSeq = attempt;                     // …and it stays quiet if we got here first
-      Toast.error(msg + _nextHint());
+      _failToast(msg + _nextHint(), track);
     };
     const why = typeof serverReason === 'string' ? serverReason.trim().slice(0, 200) : '';
     if (why) {
@@ -2236,10 +2339,10 @@ export const Player = (() => {
       // (A folder's shuffle reads on past the tracks that can't play and says
       // where it got to — ``next_offset`` / ``ended``; the library's shuffle
       // never deals them and ignores this.)
-      if (playable && _offlineSkip) p.set('playable', '1');
-    } else if (playable && _offlineSkip) {
+      if (playable) p.set('playable', '1');
+    } else if (playable) {
       p.set('playable', '1');
-      if (after) p.set('after', String(after));
+      if (after && _offlineSkip) p.set('after', String(after));
     }
     // A request that never answers (half-open connection, laptop woken on a dead
     // network) must FAIL, not hang: a pending page would park the lookahead — and
@@ -2266,6 +2369,14 @@ export const Player = (() => {
     if (!tracks.length) return true;       // (an ordered view's total can overstate its list)
     if (total != null) return offset + limit >= total;
     return tracks.length < limit;          // bare-array endpoints: short page = end
+  }
+
+  // A first page that came back empty because tracks were passed by (not an
+  // empty list): a playable page that read rows (``next`` past its start), or —
+  // offline tracks being skipped — a shuffle that dealt nothing.
+  function _pagePassedBy(page) {
+    if (page.next != null && page.next > (page.offset || 0)) return true;
+    return _offlineSkip && (page.ended === true || page.total === 0);
   }
 
   // Can the ACTIVE order be paged from the server?  A source without a spec for
@@ -2379,9 +2490,8 @@ export const Player = (() => {
 
   // Tracks queued after the current one that the queue may still move on to.
   function _aheadCount() {
-    if (!_offlineSkip) return queue.length - 1 - queueIdx;
     let n = 0;
-    for (let i = queueIdx + 1; i < queue.length; i++) if (!_skipsOffline(queue[i])) n++;
+    for (let i = queueIdx + 1; i < queue.length; i++) if (!_skipsDealt(queue[i])) n++;
     return n;
   }
 
@@ -2441,7 +2551,7 @@ export const Player = (() => {
       emit('statechange', { playing: false });
       if (failed) emit('queuestall', {});
       // (Read to its end with nothing to start: every track is offline now.)
-      else if (_offlineSkip && (page.ended === true || page.total === 0)) emit('offlinequeue', {});
+      else if (_pagePassedBy(page)) emit('offlinequeue', { reasons: [] });
       return;
     }
     if (page.total != null) _srcTotal = page.total;
@@ -2470,11 +2580,15 @@ export const Player = (() => {
     if (!queue.length) return;
     _explicitPick = false;
     // The next track the queue may move on to: tracks that can't play right now
-    // are passed by (Mark / Hide — see _offlineSkip), never started.
+    // (Mark / Hide — see _offlineSkip), reported broken or short tunes are
+    // passed by, never started.
     const nextIdx = _nextPlayable(queueIdx + 1);
     if (nextIdx >= 0) {
+      const passed = queue.slice(queueIdx + 1, nextIdx);
       queueIdx = nextIdx;
       _playCurrent();
+      // (health.js teaches the rule the first time something is passed by.)
+      if (passed.length) emit('dealtskip', { tracks: passed.map(t => ({ track: t, reason: _skipReason(t) })) });
       return;
     }
     if (_srcHasMore()) {
@@ -2508,10 +2622,10 @@ export const Player = (() => {
   function _wrapToStart() {
     if (_srcPageable() && !_radioActive) { _restartSource(); return; }
     if (_nextPlayable(0) < 0) {
-      // Nothing in this queue can play right now (every track's drive or share
-      // is offline): stop rather than go round failing.
+      // Nothing in this queue plays through (every track is offline, reported
+      // broken or a short tune): stop rather than go round failing.
       emit('statechange', { playing: false });
-      emit('offlinequeue', {});
+      emit('offlinequeue', { reasons: _skipReasons(queue) });
       return;
     }
     _played = new WeakSet();                    // a new pass, shuffled or not: everything may play again
@@ -3216,22 +3330,23 @@ export const Player = (() => {
       return true;
     }
 
-    // "Play all" / "Shuffle all" of rows none of which can play right now
-    // (Mark / Hide — see _offlineSkip): read on from the server past them when
-    // the list can be paged, else say so and leave the current queue alone.
+    // "Play all" / "Shuffle all" of rows none of which plays through (offline
+    // — see _offlineSkip —, reported broken, short): read on from the server
+    // past them when the list can be paged, else say so and leave the current
+    // queue alone.
     const _srcOpt = opts.source && typeof opts.source === 'object' ? opts.source : null;
-    if (_offlineSkip && (opts.shuffle || opts.explicit === false)
+    if ((opts.shuffle || opts.explicit === false)
         && !(opts.shuffle && _srcOpt && _srcOpt.shuffle)) {
       const arr = Array.isArray(tracks) ? tracks : Array.from(tracks);
       const from = opts.shuffle ? 0 : Math.max(0, Math.min(arr.length - 1, startIdx | 0));
       let any = false;
-      for (let i = from; i < arr.length && !any; i++) any = !_skipsOffline(arr[i]);
+      for (let i = from; i < arr.length && !any; i++) any = !_skipsDealt(arr[i]);
       if (!any) {
         if (!opts.shuffle && _srcOpt && _srcOpt.ordered) {
           return playSource(_srcOpt, { offset: (Number(_srcOpt.offset) || 0) + arr.length, explicit: false });
         }
         _startAllOffline = true;
-        emit('offlinequeue', {});
+        emit('offlinequeue', { reasons: _skipReasons(arr, from) });
         return false;
       }
     }
@@ -3254,10 +3369,10 @@ export const Player = (() => {
     if (opts.shuffle) {
       // A random first track — one that can play right now (see _offlineSkip).
       const ok = [];
-      queue.forEach((t, i) => { if (!_skipsOffline(t)) ok.push(i); });
+      queue.forEach((t, i) => { if (!_skipsDealt(t)) ok.push(i); });
       queueIdx = ok.length ? ok[Math.floor(Math.random() * ok.length)]
                            : Math.floor(Math.random() * queue.length);
-    } else if (!_explicitPick && _skipsOffline(queue[queueIdx])) {
+    } else if (!_explicitPick && _skipsDealt(queue[queueIdx])) {
       // "Play all" from a row whose drive is offline: start at the next one that plays.
       const j = _nextPlayable(queueIdx);
       if (j >= 0) queueIdx = j;
@@ -3326,11 +3441,11 @@ export const Player = (() => {
       // Every track of the list is on a drive / share that is offline right now
       // (an ordered list read to its end, or a shuffle that dealt nothing).
       // (Or nothing could play as far as the first page read on.)
-      _startAllOffline = !_explicitPick && _offlineSkip
+      _startAllOffline = !_explicitPick && _pagePassedBy(page)
         && (page.ended === true || page.ended === false
             || (mode === 'shuffled' && page.total != null
                 && (page.offset || 0) + Q_PAGE >= page.total));
-      if (_startAllOffline) emit('offlinequeue', {});
+      if (_startAllOffline) emit('offlinequeue', { reasons: [] });
       return false;
     }
     _startAllOffline = false;
@@ -4252,12 +4367,13 @@ export const Player = (() => {
     // ~400 ms — only speak up here if it did not.
     const failedId = trackId, failedSeq = _playSeq;
     const failedFmt = _fmtLabel(_track && _track.format);
+    const failedTrack = _track;
     setTimeout(() => {
       const told = _failToastFor === failedId && _failToastSeq === failedSeq;
       if (!told && trackId === failedId && _playSeq === failedSeq) {
         _failToastFor = failedId; _failToastSeq = failedSeq;
         const why = { NETWORK: 'network error', DECODE: 'unreadable file', SRC_NOT_SUPPORTED: 'unsupported or missing file' }[tag] || tag;
-        Toast.error(`Couldn\u2019t play \u201c${title}\u201d${failedFmt ? ` \u00b7 ${failedFmt}` : ''} (${why}).` + _nextHint());
+        _failToast(`Couldn\u2019t play \u201c${title}\u201d${failedFmt ? ` \u00b7 ${failedFmt}` : ''} (${why}).` + _nextHint(), failedTrack);
       }
     }, 700);
     emit('statechange', { playing: false });
@@ -4413,6 +4529,22 @@ export const Player = (() => {
     get offlineSkip()        { return _offlineSkip; },
     get lastStartAllOffline() { return _startAllOffline; },
     setOfflineSkip(on)       { _offlineSkip = !!on; },
+    // Settings → "Skip short tunes" (seconds, 0 = off) — health.js.
+    setSkipShort(secs, placeholders) {
+      const n = Number(secs); _shortSecs = Number.isFinite(n) && n > 0 ? n : 0;
+      if (Array.isArray(placeholders) && placeholders.length) _placeholderLens = placeholders.map(Number);
+    },
+    get skipShortSecs()      { return _shortSecs; },
+    // The current track was picked by the listener (a click), not dealt.
+    get explicitPick()       { return _explicitPick; },
+    // ``fn(track, message)`` → ``{ label, run(track) }`` | null: an action the
+    // "couldn't play" toast offers for that track (health.js: Mark broken).
+    setFailAction(fn)        { _failAction = typeof fn === 'function' ? fn : null; },
+    // Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' |
+    // 'short' | '') — the queue panel's reasons, the multi-room master's skip.
+    skipReason(t)            { return _skipReason(t); },
+    // The own length of the tune entry ``t`` plays (seconds, 0 = unknown).
+    tuneLength(t)            { return t && typeof t === 'object' ? _tuneLen(t) : 0; },
     reanchorOrdered()        { _ordReanchor = true; if (_srcMode === 'ordered') _srcEnded = false; },
     // Rows of the queue changed in place (offline.js re-flagged them): repaint
     // the queue views and keep the saved copy in step.

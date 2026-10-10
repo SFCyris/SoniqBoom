@@ -312,7 +312,7 @@ async def test_render_gme_routes_by_chip(tmp_path, monkeypatch, clocks, engine):
         out.write_bytes(b"RIFF")
         return out
 
-    def gme(data, subsong, duration):
+    def gme(data, subsong, duration, fade_at_s=None):
         used.append("libgme")
         return b"RIFF"
     monkeypatch.setattr(stream, "_render_zxtune_capped", zx)

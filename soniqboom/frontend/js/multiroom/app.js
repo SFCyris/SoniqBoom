@@ -8,6 +8,7 @@ import { Sync } from './sync.js';
 import { enterMaster, leaveMaster } from './master.js';
 import { enterSlave, leaveSlave } from './slave.js';
 import { Auth } from '../auth.js';
+import { Offline } from '../offline.js';
 
 const $ = (id) => document.getElementById(id);
 const LABEL_KEY = 'sb_mr_label';
@@ -24,6 +25,9 @@ let _roomsPollTimer = null;
 async function _boot() {
   await Auth.boot();
   while (!Auth.user) { await _sleep(120); }
+  // The skip rules a room's queue follows (offline tracks, "Skip short tunes")
+  // — the same server state the main page follows.
+  Offline.init().catch(() => {});
 
   _initLabel();
   _bindLanding();

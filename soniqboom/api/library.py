@@ -400,8 +400,7 @@ async def add_library_dir(body: dict, _admin=Depends(require_admin)):
         aliases = conf.get("folder_aliases", {})
         aliases[path] = alias
         conf["folder_aliases"] = aliases
-        save_local_conf(conf)
-        settings.folder_aliases = aliases
+        settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     # Automatically scan the newly added folder in the background
     async def _progress_cb(p):

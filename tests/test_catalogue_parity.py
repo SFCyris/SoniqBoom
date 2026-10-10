@@ -314,7 +314,8 @@ def test_the_refresh_rebuilds_the_meter_only_when_what_picks_it_changed():
     assert "'channels' in changed" not in body
     assert "Library.patchTrack(id, changed || fields)" in body
     ti = (Path(__file__).resolve().parent.parent / "soniqboom/frontend/js/trackinfo.js").read_text()
-    assert "if (wrap && wrap.querySelector('input, textarea, select')) return;" in ti
+    # An open edit form is never redrawn under the listener's typing.
+    assert "if (wrap && wrap.querySelector('input, textarea, select')) return true;" in ti
 
 
 # ── Tune counts before the first play (the list's "N tunes" badge) ──────────

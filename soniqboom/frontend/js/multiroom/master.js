@@ -539,26 +539,32 @@ async function _onTrackEnded() {
   if (nextIdx !== null) await _playQueueIdx(nextIdx);
 }
 
+// The room's queue moves on past what the web player's auto-play passes by
+// (offline, reported broken, undecodable, a short tune — Player.skipReason);
+// a track picked from the room's list still plays.
+function _skips(t) {
+  try { return !!Player.skipReason?.(t); } catch (_) { return false; }
+}
+
 /** Pick the next queue index based on shuffle + repeat state. */
 function _pickNextIdx({ wrapIfRepeatAll = false } = {}) {
   if (!_queue.length) return null;
 
   if (_shuffle && _queue.length > 1) {
     // Random, but avoid immediately replaying the current track.
-    let idx;
-    do { idx = Math.floor(Math.random() * _queue.length); }
-    while (idx === _queueIdx);
-    return idx;
+    const ok = [];
+    _queue.forEach((t, i) => { if (i !== _queueIdx && !_skips(t)) ok.push(i); });
+    return ok.length ? ok[Math.floor(Math.random() * ok.length)] : null;
   }
 
-  if (_queueIdx < _queue.length - 1) {
-    return _queueIdx + 1;
-  }
+  for (let i = _queueIdx + 1; i < _queue.length; i++) if (!_skips(_queue[i])) return i;
 
   // Sequential end-of-queue. Wrap only when asked to (auto-advance) and
   // repeat-all is on. Explicit Next at end-of-queue also wraps under repeat-all
   // so the user can keep clicking forward indefinitely.
-  if (_repeatMode === 'all') return 0;
+  if (_repeatMode === 'all') {
+    for (let i = 0; i < _queue.length; i++) if (!_skips(_queue[i])) return i;
+  }
 
   return wrapIfRepeatAll ? null : null;
 }

@@ -21,6 +21,7 @@ import array
 import ctypes
 import ctypes.util
 import logging
+import os
 import struct
 import sys
 import zlib
@@ -32,7 +33,9 @@ _SR = 44100  # libgme renders 16-bit stereo at the rate we request
 
 def _load_libgme():
     """Locate and load libgme, or return ``None`` if unavailable."""
-    candidates: list[str] = []
+    # A libgme built into /usr/local (the Docker image's 0.6.5) before the
+    # distribution's copy another package depends on (Debian: 0.6.3 for ffmpeg).
+    candidates: list[str] = ["/usr/local/lib/libgme.so.0"] if sys.platform.startswith("linux") else []
     for name in ("gme",):
         p = ctypes.util.find_library(name)
         if p:
@@ -73,14 +76,122 @@ if _lib is not None:
         _lib = None
 
 
+# ``gme_track_info`` — the lengths a file states (optional: an old libgme
+# without it still renders, at the default length).
+class _GmeInfo(ctypes.Structure):
+    # Leading fields of gme_info_t (gme.h); libgme allocates and frees it, so
+    # only the fields read here need declaring.
+    _fields_ = [("length", ctypes.c_int), ("intro_length", ctypes.c_int),
+                ("loop_length", ctypes.c_int), ("play_length", ctypes.c_int)]
+
+
+_have_info = False
+if _lib is not None:
+    try:
+        _lib.gme_track_info.restype = ctypes.c_char_p
+        _lib.gme_track_info.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_GmeInfo)), ctypes.c_int,
+        ]
+        _lib.gme_free_info.argtypes = [ctypes.POINTER(_GmeInfo)]
+        _have_info = True
+    except AttributeError:               # pragma: no cover - old lib
+        log.info("libgme has no gme_track_info; chiptunes play at the default length")
+
+# Seconds a tune fades out over after its stated length (the fade a capped /
+# looping tune has always had — GYM's own length is extended by it too).
+FADE_S = 8
+# Sanity bounds on a length a file states (ID666 / NSFe / VGM header).
+# (A stated length from 0.1 s: a console sound effect can be shorter than a
+# second; 0 / -1 mean "none stated".)
+_MIN_STATED_S, _MAX_STATED_S = 0.1, 3600.0
+
+
 def is_available() -> bool:
     """True if libgme is loaded and usable."""
     return _lib is not None
 
 
+def play_seconds(data: bytes, subsong: int = 0) -> float | None:
+    """How long track ``subsong`` of GME ``data`` plays before its fade, from
+    the lengths the file states (libgme ``gme_track_info``): its own length
+    (SPC ID666, NSFe, an M3U-tagged rip), else intro + the loop played twice
+    (VGM, as libgme's own ``play_length``).  None when the file states none
+    (most NSF / GBS / AY) — the caller keeps the default.  Never raises;
+    blocking."""
+    if _lib is None or not _have_info or not data:
+        return None
+    emu = ctypes.c_void_p()
+    try:
+        if _lib.gme_open_data(data, len(data), ctypes.byref(emu), _SR) or not emu:
+            return None
+    except Exception:
+        return None
+    info = ctypes.POINTER(_GmeInfo)()
+    try:
+        track = subsong if subsong and subsong > 0 else 0
+        if _lib.gme_track_info(emu, ctypes.byref(info), track) or not info:
+            return None
+        i = info.contents
+        if i.length > 0:
+            ms = i.length
+        elif i.loop_length > 0:
+            ms = max(0, i.intro_length) + 2 * i.loop_length
+        else:
+            return None
+        secs = ms / 1000.0
+        return round(secs, 2) if _MIN_STATED_S <= secs <= _MAX_STATED_S else None
+    except Exception:
+        log.debug("gme_track_info failed", exc_info=True)
+        return None
+    finally:
+        try:
+            if info:
+                _lib.gme_free_info(info)
+            _lib.gme_delete(emu)
+        except Exception:
+            pass
+
+
 def lib_name() -> str:
     """The path/name libgme was loaded from — for the admin status panel."""
     return getattr(_lib, "_name", "libgme") if _lib is not None else ""
+
+
+def lib_path() -> str:
+    """The file libgme was loaded from, symlinks resolved ("" when unknown):
+    the name it was loaded by when that is a path, else the libgme image
+    this process has mapped (Linux ``/proc/self/maps``, macOS dyld)."""
+    if _lib is None:
+        return ""
+    name = getattr(_lib, "_name", "") or ""
+    if os.path.isabs(name) and os.path.exists(name):
+        return os.path.realpath(name)
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    path = line.rstrip("\n").split(" ", 5)[-1].strip()
+                    if "/libgme" in path:
+                        return os.path.realpath(path)
+        elif sys.platform == "darwin":
+            dyld = ctypes.CDLL(None)
+            dyld._dyld_get_image_name.restype = ctypes.c_char_p
+            dyld._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+            for i in range(dyld._dyld_image_count()):
+                img = (dyld._dyld_get_image_name(i) or b"").decode("utf-8", "replace")
+                if "/libgme" in img:
+                    return os.path.realpath(img)
+    except Exception:
+        pass
+    return ""
+
+
+def lib_version() -> str:
+    """libgme's version as its file name states it (``libgme.0.6.5.dylib``,
+    ``libgme.so.0.6.5``), or "" when it states none."""
+    import re
+    m = re.search(r"libgme(?:\.so)?\.(\d+\.\d+\.\d+)", os.path.basename(lib_path()))
+    return m.group(1) if m else ""
 
 
 # ── GYM (Mega Drive register dumps) ───────────────────────────────────────
@@ -170,16 +281,25 @@ def vgm_needs_other_engine(path) -> bool:
     """Does the VGM / VGZ file ``path`` use a sound chip libgme can't play
     (YM2413, YM2151, NES APU, AY-3-8910, …)?  libgme renders those as silence, so the
     file goes to another engine.  False when the header can't be read."""
-    import gzip
     try:
         with open(path, "rb") as fh:
-            head = fh.read(2)
-            fh.seek(0)
-            if head == b"\x1f\x8b":
-                with gzip.GzipFile(fileobj=fh) as gz:
-                    hdr = gz.read(0x100)
-            else:
-                hdr = fh.read(0x100)
+            head = fh.read(64 * 1024)
+    except OSError:
+        return False
+    return vgm_bytes_need_other_engine(head)
+
+
+def vgm_bytes_need_other_engine(data: bytes) -> bool:
+    """``vgm_needs_other_engine`` of a VGM / VGZ file's bytes (its start is
+    enough: the header is in the first 256 bytes, unpacked)."""
+    import gzip
+    import io
+    try:
+        if data[:2] == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
+                hdr = gz.read(0x100)
+        else:
+            hdr = data[:0x100]
     except (OSError, EOFError, zlib.error):
         return False
     if len(hdr) < 0x40 or hdr[:4] != b"Vgm ":
@@ -245,19 +365,44 @@ def header_tunes(data: bytes) -> "tuple[int | None, int | None]":
     return None, None
 
 
-def render_wav(data: bytes, subsong: int = 0, duration_s: int = 180) -> bytes | None:
+def tune_lengths(data: bytes, count: int) -> "list[float] | None":
+    """Each of the ``count`` tunes' length as it plays (``render_plan``: the
+    stated length plus the fade), in tune order, 0 for a tune that states
+    none; None when no tune states one.  Blocking."""
+    out = []
+    for k in range(max(0, min(int(count or 0), _MAX_TUNES))):
+        total, fade = render_plan(data, k, 0.0)
+        out.append(round(total, 2) if fade is not None else 0.0)
+    return out if any(v > 0 for v in out) else None
+
+
+def render_plan(data: bytes, subsong: int, default_s: float) -> tuple[float, float | None]:
+    """``(seconds to render, fade start or None)`` for track ``subsong``: the
+    stated length (``play_seconds``) plus the ``FADE_S`` fade after it, or
+    ``default_s`` with the default fade over its last seconds.  The scan
+    stores the same total (``metadata._extract_gme``), so a list shows what
+    plays.  Blocking."""
+    secs = play_seconds(data, subsong)
+    if secs is None:
+        return float(default_s), None
+    return min(_MAX_STATED_S, secs + FADE_S), secs
+
+
+def render_wav(data: bytes, subsong: int = 0, duration_s: float = 180,
+               fade_at_s: float | None = None) -> bytes | None:
     """Render GME file *data* (raw NSF/SPC/… bytes) to a 44.1 kHz 16-bit
     stereo WAV and return the WAV bytes.
 
     ``subsong`` is the 0-based track index (NSF/GBS/AY can hold many).
     ``duration_s`` caps the render — many chiptunes loop forever, so we stop at
-    the cap (or when the track genuinely ends) and fade out the last ~8 s.
+    the cap (or when the track genuinely ends) and fade out the last ~8 s —
+    or, with ``fade_at_s``, from that point (a stated length; ``play_seconds``).
 
     Returns ``None`` on any failure so the caller can fall back to the CLI /
     ffmpeg path.  Never raises.
     """
     pcm = bytearray()
-    if not render_pcm(data, subsong, duration_s, pcm.extend):
+    if not render_pcm(data, subsong, duration_s, pcm.extend, fade_at_s=fade_at_s):
         return None
     # The canonical 44-byte PCM header (``render_pcm`` already gives
     # little-endian samples, so no ``wave`` module byte swapping).
@@ -267,8 +412,8 @@ def render_wav(data: bytes, subsong: int = 0, duration_s: int = 180) -> bytes | 
             + b"data" + struct.pack("<I", n) + bytes(pcm))
 
 
-def render_pcm(data: bytes, subsong: int = 0, duration_s: int = 180,
-               sink=None) -> int:
+def render_pcm(data: bytes, subsong: int = 0, duration_s: float = 180,
+               sink=None, *, fade_at_s: float | None = None) -> int:
     """``render_wav``'s render, streamed: hand each block of 44.1 kHz 16-bit
     stereo little-endian PCM to ``sink(bytes)`` as libgme produces it (a
     caller can play the render while it runs).  ``sink`` returning False
@@ -293,10 +438,13 @@ def render_pcm(data: bytes, subsong: int = 0, duration_s: int = 180,
         if err:
             log.debug("gme_start_track(%d) failed: %s", track, err)
             return 0
-        dur = max(1, int(duration_s))
-        # Fade out the final ~8 s so capped/looping tunes end cleanly.
-        _lib.gme_set_fade(emu, max(1000, dur * 1000 - 8000))
-        total_frames = _SR * dur
+        dur = max(1.0, float(duration_s))
+        # Fade out the final ~8 s so capped/looping tunes end cleanly — from
+        # the stated length when there is one.
+        fade_ms = (int(fade_at_s * 1000) if fade_at_s is not None
+                   else int(dur * 1000) - FADE_S * 1000)
+        _lib.gme_set_fade(emu, max(1000, fade_ms))
+        total_frames = int(_SR * dur)
         n_shorts = 8192                  # stereo interleaved → n_shorts/2 frames
         frames = 0
         while frames < total_frames and not _lib.gme_track_ended(emu):

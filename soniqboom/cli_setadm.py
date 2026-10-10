@@ -101,7 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-user",   "--user",   required=True, dest="user",
                    help="Username (2-64 chars, letters/digits/._-).")
     p.add_argument("-passwd", "--passwd", dest="passwd",
-                   help="Password (>= 8 chars).  Omit to keep the existing "
+                   help="Password.  Omit to keep the existing "
                         "password on an existing user.")
     p.add_argument("-role",   "--role",   dest="role", choices=ROLES, default=None,
                    help="Role to assign.  Defaults to 'admin' for new users; "
@@ -182,7 +182,7 @@ def _ensure_admin_interactive(verbose: bool = False) -> int:
             except ValueError as e:
                 print(f"    {e}")
         while True:
-            pw1 = getpass.getpass("  Admin password (min 8 chars): ")
+            pw1 = getpass.getpass("  Admin password: ")
             try:
                 validate_password(pw1)
             except ValueError as e:

@@ -135,6 +135,12 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "folder_aliases": {},          # { "/abs/path": "alias", ... }
     "network_shares": {},          # { "share_id": { protocol, host, ... }, ... }
     "remote_cache_max_mb": 2048,   # LRU cache limit for remote audio files
+    # Sign-in page "Create account" link (read-only accounts; needs an admin
+    # to exist first).  Settings → Users.
+    "self_registration": True,
+    # Passwords set from now on must be 10+ characters with upper- and
+    # lowercase letters, a number and a symbol.  Settings → Users.
+    "strong_passwords": False,
     "renderers": {
         "sidplayfp_path": "",
         "fluidsynth_path": "",
@@ -215,6 +221,53 @@ def set_service_enabled(name: str, enabled: bool) -> None:
     svc[name] = bool(enabled)
     conf["services"] = svc
     save_local_conf(conf)
+
+
+def _conf_flag(key: str, default: bool) -> bool:
+    """A boolean setting read strictly: a hand-edited ``"false"`` / ``"off"`` /
+    ``0`` counts as off and ``"true"`` / ``"on"`` / ``1`` as on; anything
+    else (missing, unreadable) is ``default``."""
+    try:
+        val = load_local_conf().get(key)
+    except Exception:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("true", "on", "yes", "1"):
+            return True
+        if v in ("false", "off", "no", "0"):
+            return False
+    return default
+
+
+def is_self_registration_enabled() -> bool:
+    """True when visitors may create their own (read-only) account from the
+    sign-in page.  Defaults to True when the key is missing."""
+    return _conf_flag("self_registration", True)
+
+
+def set_self_registration_enabled(enabled: bool) -> None:
+    """Persist ``self_registration`` to SoniqBoom.conf atomically."""
+    def _set(conf: dict) -> None:
+        conf["self_registration"] = bool(enabled)
+    update_local_conf(_set)
+
+
+def is_strong_passwords_required() -> bool:
+    """True when new passwords must meet the complexity rule
+    (``core.users.validate_password``).  Defaults to False."""
+    return _conf_flag("strong_passwords", False)
+
+
+def set_strong_passwords_required(required: bool) -> None:
+    """Persist ``strong_passwords`` to SoniqBoom.conf atomically."""
+    def _set(conf: dict) -> None:
+        conf["strong_passwords"] = bool(required)
+    update_local_conf(_set)
 
 
 # ── Default config template ──────────────────────────────────────────────────
@@ -303,16 +356,68 @@ def _invalidate_conf_cache(path: Path | None = None) -> None:
         _conf_cache.pop(path, None)
 
 
+class _LoadedConf(dict):
+    """A conf as ``load_local_conf`` returned it, remembering that state
+    (``_base``): ``save_local_conf`` then writes only what the caller changed
+    onto the file as it is when saving — so a save made in between (another
+    request, the CLI) is kept, not overwritten with the caller's stale copy."""
+    __slots__ = ("_base",)
+
+
+def _loaded(conf: dict) -> "_LoadedConf":
+    out = _LoadedConf(json.loads(json.dumps(conf)))
+    out._base = json.loads(json.dumps(conf))
+    return out
+
+
+_MISSING = object()
+
+
+def _merge3(base: dict, ours: dict, theirs: dict) -> dict:
+    """``theirs`` with the changes ``ours`` made to ``base`` applied — key by
+    key, nested sections (shares, aliases, services …) key by key too."""
+    out = dict(theirs)
+    for k in set(base) | set(ours):
+        b, o = base.get(k, _MISSING), ours.get(k, _MISSING)
+        if o == b:
+            continue                                    # not changed by the caller
+        if o is _MISSING:
+            out.pop(k, None)
+            continue
+        t = theirs.get(k, _MISSING)
+        if isinstance(o, dict) and isinstance(t, dict):
+            # A section both sides have: key by key (one neither the defaults
+            # nor the loaded file had — e.g. ftp_pools — from an empty base).
+            out[k] = _merge3(b if isinstance(b, dict) else {}, o, t)
+        else:
+            out[k] = o
+    return out
+
+
+class ConfUnreadable(RuntimeError):
+    """SoniqBoom.conf exists but can't be parsed — saving now would replace
+    what it holds (shares, aliases …) with defaults."""
+
+
 def load_local_conf(path: Path = _CONF_PATH) -> dict[str, Any]:
-    """Load and validate SoniqBoom.conf; return merged-with-defaults dict."""
+    """Load and validate SoniqBoom.conf; return merged-with-defaults dict
+    (a fresh copy the caller may change and hand to ``save_local_conf``)."""
+    return _loaded(_load_conf(path))
+
+
+def _load_conf(path: Path, *, strict: bool = False) -> dict[str, Any]:
+    """The merged-with-defaults conf (the cached object — callers must not
+    change it).  ``strict``: read the file afresh (no cache) and raise
+    ``ConfUnreadable`` when it can't be parsed, instead of returning defaults
+    — what a save under the lock needs."""
     _ensure_conf_file(path)
+    if strict:
+        _invalidate_conf_cache(path)
     try:
         st = path.stat()
         cached = _conf_cache.get(path)
         if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-            # Return a fresh deep-ish copy so callers can mutate without
-            # corrupting the cached representation.
-            return json.loads(json.dumps(cached[2]))
+            return cached[2]
     except OSError:
         st = None
 
@@ -321,6 +426,8 @@ def load_local_conf(path: Path = _CONF_PATH) -> dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8"))
         conf = _deep_merge(conf, raw)
     except Exception as exc:
+        if strict and path.exists():
+            raise ConfUnreadable(f"SoniqBoom.conf ({path}) can't be read: {exc}") from exc
         warnings.warn(f"SoniqBoom.conf: could not load '{path}': {exc}", stacklevel=2)
         return conf
 
@@ -372,8 +479,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _conf_flock(path: Path):
     """Context-manager helper that flocks the sidecar lock for *path*.
 
-    Yields ``(lock_fd, lock_path)`` — caller must close the fd and may
-    unlink the lock file when finished.  Falls through with ``lock_fd=None``
+    Yields ``(lock_fd, lock_path)`` — caller releases it with
+    ``_conf_flock_release`` (the lock file is kept).  Falls through with ``lock_fd=None``
     if fcntl isn't available (Windows) so callers can still proceed
     best-effort.
     """
@@ -409,16 +516,8 @@ def _conf_flock_release(lock_fd, lock_path: Path) -> None:
         os.close(lock_fd)
     except OSError:
         pass
-    # Unlink the sidecar so Application Support doesn't accumulate stale
-    # ``SoniqBoom.conf.lock`` / ``prefs.json.lock`` artifacts.  Best-effort
-    # — if another writer just acquired the lock between our unlock and
-    # unlink, the unlink will quietly fail or remove their lock file (they
-    # still hold their own fd, so the lock semantics are intact; the file
-    # just gets recreated on next save).
-    try:
-        lock_path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # The sidecar is kept: unlinking it let a waiter lock the old file while a
+    # new writer created and locked a fresh one — two "exclusive" holders.
 
 
 def update_local_conf(
@@ -434,20 +533,19 @@ def update_local_conf(
     """
     lock_fd, lock_path = _conf_flock(path)
     try:
-        conf = load_local_conf(path)
+        conf = _loaded(_load_conf(path, strict=True))
         new_conf = updater(conf)
         if new_conf is None:
             new_conf = conf
-        # save_local_conf re-acquires its own flock (re-entrant flock from
-        # the same process is a no-op, so this is fine).  The outer lock
-        # we already hold prevents *other* callers from interleaving.
-        save_local_conf(new_conf, path=path)
+        # Write under the lock already held: flock is per open file, so
+        # save_local_conf taking it again on a new fd would wait forever.
+        _write_local_conf(new_conf, path)
         return new_conf
     finally:
         _conf_flock_release(lock_fd, lock_path)
 
 
-def save_local_conf(data: dict[str, Any], path: Path = _CONF_PATH) -> None:
+def save_local_conf(data: dict[str, Any], path: Path = _CONF_PATH) -> dict[str, Any]:
     """Persist updated conf (round-trips comments as they are stripped by json).
 
     Read-modify-write is serialised via a sidecar ``.lock`` file and
@@ -455,22 +553,41 @@ def save_local_conf(data: dict[str, Any], path: Path = _CONF_PATH) -> None:
     two admin POSTs racing) can't lose each other's update — only the
     tmp-file collision was fixed previously.
     """
-    # Preserve top-level _comment if the file already has one
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_fd, lock_path = _conf_flock(path)
     try:
-        existing: dict = {}
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        merged = {k: v for k, v in existing.items() if k.startswith("_")}
-        merged.update({k: v for k, v in data.items() if not k.startswith("_")})
-        _atomic_write_text(path, json.dumps(merged, indent=2))
-        _invalidate_conf_cache(path)
+        if isinstance(data, _LoadedConf):
+            # Only the caller's own changes, onto the conf as it is now (read
+            # afresh: a same-size write within one mtime tick must not be
+            # merged against a stale cached copy).  An unreadable file is not
+            # overwritten with defaults + this change: ConfUnreadable.
+            ours = json.loads(json.dumps(data))
+            merged = _merge3(data._base, ours, _load_conf(path, strict=True))
+            _write_local_conf(merged, path)
+            # A second save of this conf adds only what changed after this one
+            # (never re-applies what it saved over another writer's change).
+            data._base = ours
+            return merged
+        _write_local_conf(data, path)
+        return data
     finally:
         _conf_flock_release(lock_fd, lock_path)
+
+
+def _write_local_conf(data: dict[str, Any], path: Path) -> None:
+    """Write ``data`` to ``path``; the caller holds the conf lock."""
+    # Preserve top-level _comment if the file already has one
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    merged = {k: v for k, v in existing.items() if k.startswith("_")}
+    merged.update({k: v for k, v in data.items() if not k.startswith("_")})
+    _atomic_write_text(path, json.dumps(merged, indent=2))
+    _invalidate_conf_cache(path)
 
 
 

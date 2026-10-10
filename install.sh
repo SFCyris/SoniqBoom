@@ -626,21 +626,29 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # No package manager ships psgplay.  Plain C, no dependencies, ~10 s build.
 # Pinned to a verified commit (rendered 10/10 SNDH test files, including
-# every file the 2003-era sc68 CLI rejects).  The .ym renderer needs no step
-# here — the BSD StSound engine is vendored and compiled on first use.
+# every file the 2003-era sc68 CLI rejects, and reads unaligned FRMS / TIME
+# length tags).  A psgplay of another commit is rebuilt.  The .ym renderer
+# needs no step here — the BSD StSound engine is vendored and compiled on
+# first use.
 section "psgplay (Atari ST SNDH)"
-PSGPLAY_COMMIT="869992cbbb8488b519149d8c0dd7afafb78aae5e"
-if command -v psgplay &>/dev/null; then
+PSGPLAY_COMMIT="6f1c39ffdacd4e568893c634033a571b2a34a01a"
+if command -v psgplay &>/dev/null \
+    && psgplay --version 2>/dev/null | grep -q "${PSGPLAY_COMMIT:0:7}"; then
   info "psgplay already installed: $(command -v psgplay)"
 else
-  if [ "$PLATFORM" = "macos" ]; then
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
     PSG_DEST="$(brew --prefix)/bin"
   else
     PSG_DEST="/usr/local/bin"
   fi
+  # A psgplay elsewhere on PATH (an older build) would shadow the new one.
+  if command -v psgplay &>/dev/null && [ "$(command -v psgplay)" != "$PSG_DEST/psgplay" ]; then
+    warn "psgplay at $(command -v psgplay) is not the pinned build; installing it to $PSG_DEST"
+  fi
   PSG_TMP="$(mktemp -d)"
   if git clone -q https://github.com/frno7/psgplay.git "$PSG_TMP/psgplay" \
       && git -C "$PSG_TMP/psgplay" checkout -q "$PSGPLAY_COMMIT" \
+      && git -C "$PSG_TMP/psgplay" submodule update -q --init --recursive \
       && make -C "$PSG_TMP/psgplay" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" psgplay >/dev/null 2>&1 \
       && [ -x "$PSG_TMP/psgplay/psgplay" ]; then
     if [ -w "$PSG_DEST" ]; then
@@ -662,18 +670,18 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # The only cross-format CLI bundling the reference cores (Highly Experimental,
 # Highly Theoretical, lazyusf2, mGBA, vio2sf).  Linux: official prebuilt from
-# storage.zxtune.ru.  macOS: built from a pinned revision (verified build,
-# 2026-07-01, arm64) with two small compat patches for modern clang.
+# storage.zxtune.ru.  macOS: built from a pinned revision (r5112, verified
+# build 2026-10-09, arm64) with two small compat patches for modern clang.
 # OPTIONAL — skips gracefully; SoniqBoom 501s PSF files with a clear hint.
 section "zxtune123 (console music rips — optional)"
-ZXTUNE_REV="be510430c54b78f230881ece66b6e2799f92748d"
+ZXTUNE_REV="c94a1d16da4386457a3a6a39a7c3e021669b1c1e"   # r5112
 # Official Linux prebuilts (storage.zxtune.ru) ship for BOTH x86_64 and arm64.
 case "$(uname -m)" in
   x86_64)        ZXARCH="x86_64" ;;
   aarch64|arm64) ZXARCH="arm64"  ;;
   *)             ZXARCH="" ;;
 esac
-ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5100/linux/${ZXARCH}/zxtune_r5100_linux_${ZXARCH}.tar.gz"
+ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5112/linux/${ZXARCH}/zxtune_r5112_linux_${ZXARCH}.tar.gz"
 if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
 elif [ "$SLIM" = "1" ]; then

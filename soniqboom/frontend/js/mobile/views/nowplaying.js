@@ -11,6 +11,7 @@ import { artPlaceholderEmoji, subsongStart, subsongStartOf, subsongWireToTune,
          subsongTuneToWire } from '../../utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur } from './_common.js';
+import { healthBadge } from '../../health.js';
 
 export function mountNowPlaying(root, ctx) {
   root.innerHTML = `
@@ -108,13 +109,8 @@ export function mountNowPlaying(root, ctx) {
     const _tune = (Number.isInteger(t.subsong) && _subTotal > 1)
       ? ` · Tune ${subsongWireToTune(t.subsong, subsongStartOf(t), _subTotal)} / ${_subTotal}` : '';
     titleEl.textContent  = (t.title  || '—') + _tune;   // wipes any prior badge
-    if (t.defect === 'partial' || t.defect === 'corrupt') {
-      const badge = document.createElement('span');
-      badge.className = `track-defect-badge track-defect-${t.defect}`;
-      badge.textContent = t.defect;
-      badge.title = t.defect_detail || '';
-      titleEl.appendChild(badge);
-    }
+    const _health = healthBadge(t);     // a playback problem (health.js)
+    if (_health) titleEl.appendChild(_health);
     artistEl.textContent = [t.artist || t.album_artist, t.album].filter(Boolean).join(' — ');
     // Layered placeholder + cover img (same pattern as mobile mini-player
     // and the desktop row covers).  The img fades in via the ``.loaded``
@@ -254,6 +250,12 @@ export function mountNowPlaying(root, ctx) {
 
   Player.on('trackchange', renderTrack);
   Player.on('trackchange', (t) => { renderTunes(t); });
+  // A playback problem reported / cleared for the playing track: its badge follows.
+  document.addEventListener('soniqboom:health-changed', (e) => {
+    const d = (e && e.detail) || {};
+    const cur = Player.currentTrack;
+    if (cur && Array.isArray(d.ids) && d.ids.includes(cur.id)) renderTrack(cur);
+  });
   // The cued track (see renderTrack) appears, changes or goes: the resume /
   // restore, a queue edit, a clear.  Nothing to do while a track is loaded.
   let _shownCuedKey = null;

@@ -335,23 +335,43 @@ def wire_tune(t: dict, w: int) -> int:
 def listed_tunes(t: dict) -> list[int]:
     """The wires of the file's NON-default tunes the listings add, in tune
     order (tune 1 first), capped so the file contributes at most ``SUB_CAP``
-    entries."""
+    entries.  With "Skip short tunes" on (``core/skip_rules``) the tunes
+    known to be shorter are left out — a Subsonic client queues what it is
+    shown and can't be made to skip — before the cap."""
     cnt = t.get("subsongs")
     if not isinstance(cnt, int) or cnt <= 1:
         return []
+    from soniqboom.core import skip_rules
+    # (Only a file with per-tune lengths can have another tune known to be short.)
+    secs = skip_rules.short_secs() if (t.get("hvsc_lengths") or t.get("tune_lengths")) else 0
     s = start_index(t)
-    ws = [w for w in range(1, min(cnt, SUB_CAP + 1)) if w != s]
+    if not secs:
+        ws = [w for w in range(1, min(cnt, SUB_CAP + 1)) if w != s]
+        if s:
+            ws.insert(0, s)                      # tune 1
+        return ws[:SUB_CAP - 1]
+    ws = [w for w in range(1, cnt) if w != s]
     if s:
         ws.insert(0, s)                          # tune 1
-    return ws[:SUB_CAP - 1]
+    out = []
+    for w in ws:
+        if not skip_rules.tune_is_short(t, w, secs):
+            out.append(w)
+            if len(out) >= SUB_CAP - 1:
+                break
+    return out
 
 
 def tune_length(t: dict, k: int) -> float:
-    """0-based tune ``k``'s own length (HVSC song lengths, indexed by tune),
-    ``0.0`` when unknown."""
-    lengths = t.get("hvsc_lengths")
-    if isinstance(lengths, list) and 0 <= k < len(lengths):
-        return _finite(lengths[k])
+    """0-based tune ``k``'s own length — HVSC song lengths (SID), else the
+    lengths the file states (``tune_lengths``: SNDH, NSFe, AY), indexed
+    by tune — ``0.0`` when unknown."""
+    for f in ("hvsc_lengths", "tune_lengths"):
+        lengths = t.get(f)
+        if isinstance(lengths, list) and 0 <= k < len(lengths):
+            v = _finite(lengths[k])
+            if v > 0:
+                return v
     return 0.0
 
 
@@ -374,22 +394,58 @@ def default_duration(t: dict) -> float:
     return _finite(t.get("duration"))
 
 
+def bare_listed(t: dict, listed: "list[int] | None" = None) -> bool:
+    """Does a listing show the file's own entry (its default tune)?  Not when
+    "Skip short tunes" (``core/skip_rules``) passes that tune by and the file
+    has other tunes listed — a Subsonic client queues what it is shown.  A
+    file all of whose tunes are short keeps its entry (it never vanishes from
+    its album or folder); ``listed``: ``listed_tunes(t)`` when at hand."""
+    cnt = t.get("subsongs")
+    if not isinstance(cnt, int) or cnt <= 1:
+        return True
+    from soniqboom.core import skip_rules
+    secs = skip_rules.short_secs()
+    if not secs or not skip_rules.tune_is_short(t, 0, secs):
+        return True
+    return not (listed if listed is not None else listed_tunes(t))
+
+
+def tune_count_and_sum(t: dict) -> "tuple[int, float]":
+    """``(tune_count(t), tune_duration_sum(t))`` in one pass (the catalogue
+    build: ``listed_tunes`` once per file)."""
+    cnt = t.get("subsongs")
+    if not isinstance(cnt, int) or cnt <= 1:
+        return 1, default_duration(t)
+    ws = listed_tunes(t)
+    bare = bare_listed(t, ws)
+    total = default_duration(t) if bare else 0.0
+    if isinstance(t.get("hvsc_lengths"), list) or isinstance(t.get("tune_lengths"), list):
+        for w in ws:
+            total += wire_length(t, w)
+    return (1 if bare else 0) + len(ws), total
+
+
 def tune_count(t: dict) -> int:
-    """Entries the file contributes to an album listing (1 + listed tunes)."""
+    """Entries the file contributes to an album listing (its own entry when
+    listed — ``bare_listed`` — plus the listed tunes)."""
     cnt = t.get("subsongs")
     if not isinstance(cnt, int) or cnt <= 1:
         return 1
-    return 1 + len(listed_tunes(t))
+    ws = listed_tunes(t)
+    return (1 if bare_listed(t, ws) else 0) + len(ws)
 
 
 def tune_duration_sum(t: dict) -> float:
     """Raw (unrounded) total of the durations the file's entries report: the
-    default tune's plus each listed tune's own HVSC length (a tune with no
-    known length reports 0)."""
-    total = default_duration(t)
+    default tune's (when listed) plus each listed tune's own length (a tune
+    with no known length reports 0)."""
     cnt = t.get("subsongs")
-    if isinstance(cnt, int) and cnt > 1 and isinstance(t.get("hvsc_lengths"), list):
-        for w in listed_tunes(t):
+    if not isinstance(cnt, int) or cnt <= 1:
+        return default_duration(t)
+    ws = listed_tunes(t)
+    total = default_duration(t) if bare_listed(t, ws) else 0.0
+    if isinstance(t.get("hvsc_lengths"), list) or isinstance(t.get("tune_lengths"), list):
+        for w in ws:
             total += wire_length(t, w)
     return total
 
@@ -1051,8 +1107,9 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                 sc = t.get("subsongs")
                 if sc and type(sc) is int and sc > 1:
                     # A multi-tune file: one entry per listed tune.
-                    a[0] += tune_count(t)
-                    a[1] += tune_duration_sum(t)
+                    n_, d_ = tune_count_and_sum(t)
+                    a[0] += n_
+                    a[1] += d_
                 else:
                     a[0] += 1
                     d = t.get("duration")
@@ -1096,8 +1153,9 @@ def _build_steps(store, folder_on: bool, chunk: int, out: list) -> Iterator[None
                     s[3] = added
                 sc = t.get("subsongs")
                 if sc and type(sc) is int and sc > 1:
-                    s[0] += tune_count(t)
-                    s[1] += tune_duration_sum(t)
+                    n_, d_ = tune_count_and_sum(t)
+                    s[0] += n_
+                    s[1] += d_
                 else:
                     s[0] += 1
                     d = t.get("duration")
@@ -1568,8 +1626,9 @@ def folder_entry_from_tracks(store, union: ArtistUnion, dir_hash: str,
     cnt = 0
     dur = 0.0
     for t in tracks:
-        cnt += tune_count(t)
-        dur += tune_duration_sum(t)
+        n_, d_ = tune_count_and_sum(t)
+        cnt += n_
+        dur += d_
     e.song_count = cnt
     e.duration = _finite_int(dur)     # same raw-sum-then-round as build_catalogue
     e.sample = sample

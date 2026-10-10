@@ -6,17 +6,18 @@
 # One image, every format: chiptune · tracker · SID · MIDI · lossless · DSD.
 #
 # Multi-stage: a `builder` stage carries the full toolchain and compiles/fetches
-# the renderers that aren't in Debian's apt archive (psgplay, sc68, uade123;
+# the renderers that aren't in Debian's apt archive, or not in the version
+# SoniqBoom needs (psgplay, sc68, uade123, libgme, the sidplayfp chain;
 # zxtune123 is a prebuilt fetch) AND pre-builds the vendored StSound (.ym) /
 # HivelyTracker (.hvl) engines.  The final runtime stage copies only the results,
 # so it ships NO compiler — smaller, immutable, and quick to start.  Multi-arch:
 #   docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .
 
 # ═══════════════════════════════ Stage 1: builder ═══════════════════════════════
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.12-slim-trixie AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git ca-certificates curl \
+        build-essential git ca-certificates curl cmake \
         autoconf automake libtool pkg-config zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 # /out/bin  → binaries copied onto the final image's PATH
@@ -51,14 +52,37 @@ RUN set -eux; \
           -I /src/native/stsound/StSoundLibrary -I /src/native/stsound/StSoundLibrary/LZH ) \
       || echo "NOTE: ym2wav pre-build failed — .ym falls back to a runtime build (needs a compiler)."
 
+# libgme — console chiptunes (NSF, SPC, GBS, VGM, AY, KSS, SAP, HES, GYM).
+# Built from the upstream release: Debian 12 (and 13) ship 0.6.3; 0.6.5 has
+# crash and security fixes.  The server loads it from /usr/local/lib
+# (core/gme_render.py), ahead of the Debian copy ffmpeg pulls in.
+ARG LIBGME_URL=https://github.com/libgme/game-music-emu/releases/download/0.6.5/libgme-0.6.5-src.tar.gz
+ARG LIBGME_SHA256=a133f19278222136ba0d8c27b64a07987ba05fec9d2e6d293ccd8cabdd97ddbb
+RUN set -eux; \
+    ( curl -sfL --max-time 300 "$LIBGME_URL" -o /tmp/libgme.tar.gz \
+      && echo "$LIBGME_SHA256  /tmp/libgme.tar.gz" | sha256sum -c - \
+      && mkdir -p /tmp/libgme && tar xzf /tmp/libgme.tar.gz -C /tmp/libgme --strip-components=1 \
+      && cmake -S /tmp/libgme -B /tmp/libgme/build -DCMAKE_BUILD_TYPE=Release \
+           -DCMAKE_INSTALL_PREFIX=/usr/local -DGME_BUILD_SHARED=ON -DGME_BUILD_STATIC=OFF \
+           -DGME_BUILD_EXAMPLES=OFF -DGME_BUILD_TESTING=OFF \
+      && cmake --build /tmp/libgme/build -j"$(nproc)" \
+      && cmake --install /tmp/libgme/build \
+      && cp -a /usr/local/lib/libgme.so* /out/lib/ \
+      && mkdir -p /out/share/doc/third-party/libgme \
+      && cp /tmp/libgme/license.txt /tmp/libgme/license.gpl2.txt /tmp/libgme/readme.txt \
+            /out/share/doc/third-party/libgme/ ) \
+      || echo "NOTE: libgme build failed — console chiptunes use the Debian libgme." ; \
+    rm -rf /tmp/libgme /tmp/libgme.tar.gz
+
 # psgplay — Atari ST SNDH (.sndh).  Plain C, pinned commit; the post-checkout
 # submodule sync is a no-op if the pin has no submodules.
-ARG PSGPLAY_COMMIT=869992cbbb8488b519149d8c0dd7afafb78aae5e
+ARG PSGPLAY_COMMIT=6f1c39ffdacd4e568893c634033a571b2a34a01a
 RUN set -eux; \
     ( git clone https://github.com/frno7/psgplay.git /tmp/psgplay \
       && git -C /tmp/psgplay checkout "$PSGPLAY_COMMIT" \
       && git -C /tmp/psgplay submodule update --init --recursive \
-      && make -C /tmp/psgplay -j"$(nproc)" psgplay \
+      && { make -C /tmp/psgplay -j"$(nproc)" psgplay || make -C /tmp/psgplay -j"$(nproc)" psgplay \
+           || make -C /tmp/psgplay -j1 psgplay; } \
       && install -m0755 /tmp/psgplay/psgplay /out/bin/psgplay \
       && mkdir -p /out/share/doc/third-party/psgplay \
       && ( cd /tmp/psgplay && tar cf - licence lib/toslibc/licence lib/*/LICENCE ) \
@@ -68,13 +92,13 @@ RUN set -eux; \
 
 # zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF).
 # Official prebuilt; fetch the arch that matches the build — BOTH x86_64 and
-# arm64 are published on storage.zxtune.ru (the arm64 build needs glibc ≤ 2.35,
-# and bookworm ships 2.36, so it runs).
+# arm64 are published on storage.zxtune.ru (built against glibc 2.35; Debian 13
+# ships 2.41, so it runs).
 # The licence files come from the source tree of the same tag (the prebuilt
 # archive has none).
-ARG ZXTUNE_REV=r5100
-ARG ZXTUNE_SHA256_X86_64=fc89c74d86ae313a1f386b4421a74b6cc650bac5271df033ee8b9a96a243b4d8
-ARG ZXTUNE_SHA256_ARM64=102d4947ee0881cbda40dd279140a4a4f1ec83920bc10fe772cbb4ec7ef8c320
+ARG ZXTUNE_REV=r5112
+ARG ZXTUNE_SHA256_X86_64=7c00cd2b4187fd46c855c7005efe064fec1c7f68ee7effbd243bd7dbed044083
+ARG ZXTUNE_SHA256_ARM64=de3a4ba0b6fc2f5d8631b92ac1ff9522cc3841cda341d2f47d0698c2f00b2ecb
 RUN set -eux; \
     case "$(uname -m)" in \
       x86_64)        ZXARCH=x86_64; ZXSHA="$ZXTUNE_SHA256_X86_64" ;; \
@@ -109,7 +133,9 @@ RUN set -eux; \
 #      config.guess/sub don't recognise aarch64/x86_64);
 #   2. hardcode the six `#if @HAVE_*@` knobs in config_platform68.h.in that this
 #      release's configure leaves UNSUBSTITUTED (bare `#if` → compile error);
-#   3. -fcommon / implicit-decl CFLAGS for gcc-12, and drop the Makefiles' -O3
+#   3. -fcommon / implicit-decl CFLAGS (gcc 14 also makes its mismatched
+#      allocator pointer type an error: back to a warning), and drop the
+#      Makefiles' -O3
 #      to -O1 (emu68 has -O3 aggressive-loop UB; -O3 also crashes gcc under qemu
 #      cross-emulation).  On a native amd64 host this builds cleanly.
 # The `make || make || make -j1` retry absorbs qemu-user's NON-DETERMINISTIC
@@ -131,7 +157,7 @@ RUN set -eux; \
                 -e 's/#if @HAVE_GETENV@/#if 1/'     -e 's/#if @HAVE_ZLIB_H@/#if 1/' \
                 -e 's/#if @HAVE_READLINE_READLINE_H@/#if 0/' \
                 -e 's/#if @HAVE_READLINE_HISTORY_H@/#if 0/' config_platform68.h.in \
-      && CFLAGS="-fcommon -Wno-implicit-function-declaration" \
+      && CFLAGS="-fcommon -Wno-implicit-function-declaration -Wno-error=incompatible-pointer-types" \
          ./configure --prefix=/usr/local --build="$(gcc -dumpmachine)" \
       && find . -name Makefile -exec sed -i 's/-O3/-O1/g' {} + \
       && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } \
@@ -186,6 +212,53 @@ RUN set -eux; \
       || echo "NOTE: uade123 build failed — Amiga exotica (TFMX/FC/…) disabled." ; \
     rm -rf /tmp/bt /tmp/lz /tmp/uade-3.05 /tmp/uade.tar.bz2 /tmp/uadelic /var/lib/apt/lists/*
 
+# C64 SID — the accurate reSIDfp chain, built from the upstream releases:
+# libresidfp (the reSIDfp engine) → libsidplayfp (+reSIDfp) → the sidplayfp
+# CLI, the same versions install.sh builds on macOS.  Debian's sidplayfp (2.x)
+# renders RSID tunes that call the C64 KERNAL as silence and overshoots the
+# requested length; libsidplayfp 3.x's KERNAL stub plays them.  No SIMD flags
+# (the default): one image runs on every x86-64 / arm64 CPU.  Compiled into the
+# binaries under MIT, their notices shipped too: libsidplayfp's hashlib (MD5),
+# sidplayfp's ghc::filesystem.  (Last of the builds: a pin bump here rebuilds
+# nothing else.)
+ARG RESIDFP_VERSION=1.2.2
+ARG RESIDFP_SHA256=2eb0204b76d52fe825c0e1f98826f62a179033a60543032d0e8b90060ecaa50e
+ARG LIBSIDPLAYFP_VERSION=3.1.0
+ARG LIBSIDPLAYFP_SHA256=12a7ba238a6f61a811134a31d494e251eba0dd8f1c03b627d2422d8133a3584b
+ARG SIDPLAYFP_VERSION=3.1.0
+ARG SIDPLAYFP_SHA256=287cc5fe859e242f885f8f2c6da37add62b89b232c8a55d23b74e2c59281f4e7
+# (sid_src <name> <version> <sha256>: fetch, verify and unpack into /tmp/<name>.)
+RUN set -eux; \
+    sid_src() { \
+      curl -sfL --max-time 300 \
+        "https://github.com/libsidplayfp/$1/releases/download/v$2/$1-$2.tar.gz" -o "/tmp/$1.tar.gz" \
+      && echo "$3  /tmp/$1.tar.gz" | sha256sum -c - \
+      && mkdir -p "/tmp/$1" && tar xzf "/tmp/$1.tar.gz" -C "/tmp/$1" --strip-components=1; \
+    }; \
+    ( sid_src libresidfp "$RESIDFP_VERSION" "$RESIDFP_SHA256" \
+      && ( cd /tmp/libresidfp && ./configure --prefix=/usr/local --disable-static \
+           && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } && make install ) \
+      && sid_src libsidplayfp "$LIBSIDPLAYFP_VERSION" "$LIBSIDPLAYFP_SHA256" \
+      && ( cd /tmp/libsidplayfp && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+           ./configure --prefix=/usr/local --disable-static --without-usbsid --without-exsid \
+           && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } && make install ) \
+      && sid_src sidplayfp "$SIDPLAYFP_VERSION" "$SIDPLAYFP_SHA256" \
+      && ( cd /tmp/sidplayfp && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+           ./configure --prefix=/usr/local \
+           && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } ) \
+      && install -m0755 "$(find /tmp/sidplayfp -name sidplayfp -type f -perm -u+x | head -1)" /out/bin/sidplayfp \
+      && cp -a /usr/local/lib/libresidfp.so* /usr/local/lib/libsidplayfp.so* /out/lib/ \
+      && for n in libresidfp libsidplayfp sidplayfp; do \
+           mkdir -p "/out/share/doc/third-party/$n" \
+           && cp /tmp/$n/COPYING /tmp/$n/AUTHORS* "/out/share/doc/third-party/$n/" || exit 1; \
+         done \
+      && cp /tmp/libsidplayfp/src/libs/hashlib/LICENSE \
+            /out/share/doc/third-party/libsidplayfp/hashlib-LICENSE \
+      && sed -n '1,/^\/\/ SOFTWARE\.$/p' /tmp/sidplayfp/libs/filesystem/filesystem.hpp \
+            > /out/share/doc/third-party/sidplayfp/ghc-filesystem-LICENSE ) \
+      || echo "NOTE: sidplayfp chain build failed — C64 SID (.sid) disabled." ; \
+    rm -rf /tmp/libresidfp* /tmp/libsidplayfp* /tmp/sidplayfp*
+
 # ── Gate: every renderer must be present before we build the runtime image ──────
 # Each step above is best-effort (|| echo NOTE) so a transient failure prints a
 # clear reason instead of a cryptic mid-build COPY error.  This gate turns "no
@@ -199,6 +272,13 @@ RUN set -eux; \
 ARG ALLOW_MISSING_RENDERERS=0
 RUN set -eu; \
     req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav \
+         /out/bin/sidplayfp /out/lib/libsidplayfp.so /out/lib/libresidfp.so \
+         /out/share/doc/third-party/libresidfp/COPYING /out/share/doc/third-party/libresidfp/AUTHORS \
+         /out/share/doc/third-party/libsidplayfp/COPYING /out/share/doc/third-party/libsidplayfp/AUTHORS.md \
+         /out/share/doc/third-party/libsidplayfp/hashlib-LICENSE \
+         /out/share/doc/third-party/sidplayfp/COPYING /out/share/doc/third-party/sidplayfp/AUTHORS.md \
+         /out/share/doc/third-party/sidplayfp/ghc-filesystem-LICENSE \
+         /out/lib/libgme.so.0 /out/share/doc/third-party/libgme/license.txt \
          /out/share/doc/third-party/zxtune/LICENSE.md /out/share/doc/third-party/zxtune/3rdparty/unrar/license.txt \
          /out/share/doc/third-party/psgplay/licence/GPL-2.0 /out/share/doc/third-party/psgplay/lib/toslibc/licence/GPL-2.0"; \
     if [ "$SLIM" != "1" ]; then \
@@ -210,6 +290,8 @@ RUN set -eu; \
     fi; \
     missing=""; \
     for f in $req; do [ -e "$f" ] || missing="$missing $f"; done; \
+    readelf -d /out/lib/libsidplayfp.so 2>/dev/null | grep -q 'libresidfp' \
+      || missing="$missing (libsidplayfp-without-reSIDfp)"; \
     if [ -n "$missing" ]; then \
       echo "═══ RENDERER GAP — missing artifacts:$missing" >&2; \
       [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
@@ -220,7 +302,7 @@ RUN set -eu; \
     echo "All required renderers present in /out (SLIM=${SLIM})."
 
 # ═══════════════════════════════ Stage 2: runtime ═══════════════════════════════
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 LABEL org.opencontainers.image.title="SoniqBoom" \
       org.opencontainers.image.description="Self-hosted music server — chiptune, tracker, SID, MIDI, lossless and DSD." \
@@ -232,23 +314,22 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ── Runtime renderers via apt (NO compiler / build tools in the final image) ──
 #   ffmpeg            transcoding + DSD/ALAC/etc.
 #   fluidsynth (+gm)  MIDI, with a General-MIDI SoundFont
-#   sidplayfp         C64 SID          openmpt123  tracker modules
-#   adplay            AdLib / OPL2 FM  libgme0     console chiptunes
-#   libasound2/zlib1g runtime libs for the copied-in renderers (zxtune/sc68)
+#   openmpt123        tracker modules  (C64 SID: the sidplayfp chain built above)
+#   adplay            AdLib / OPL2 FM  libgme0     ffmpeg's (SoniqBoom loads the libgme built above)
+#   libasound2t64/zlib1g runtime libs for the copied-in renderers (zxtune/sc68)
 #   libao4            runtime lib for the source-built uade123
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         fluidsynth fluid-soundfont-gm \
-        sidplayfp \
         openmpt123 \
         adplay \
         libgme0 \
-        libasound2 zlib1g libao4 \
+        libasound2t64 zlib1g libao4 \
         curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123
-# onto PATH (the app finds ym2wav/hvl2wav via shutil.which — no runtime compiler);
+# Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123/
+# sidplayfp onto PATH (libsidplayfp / libresidfp / libstilview into /usr/local/lib) (the app finds ym2wav/hvl2wav via shutil.which — no runtime compiler);
 # uade's libzakalwe/bencodetools .so + its eagleplayer/score data into /usr/local;
 # sc68 + its shared libs into /usr/local.  sc68's share/sc68/Replay/*.bin are the
 # m68k replay drivers it loads at render time (compiled-in path is

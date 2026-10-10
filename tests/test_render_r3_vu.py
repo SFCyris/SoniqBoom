@@ -145,7 +145,7 @@ def _fake_uade(monkeypatch, tmp_path, script: str, data: bytes = b""):
     exe = tmp_path / "fake_uade.py"
     exe.write_text(script)
     monkeypatch.setattr(stream, "_uade_vu_cmd",
-                        lambda binary, path, subsong, base, dump:
+                        lambda binary, path, subsong, base, dump, duration=0.0:
                             [sys.executable, str(exe), str(src), f"--write-audio={dump}"])
 
 

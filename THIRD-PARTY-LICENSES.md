@@ -61,7 +61,7 @@ renderers are built from the upstream sources and versions named in the
 | Tool | License | Usage |
 |------|---------|-------|
 | [FFmpeg](https://ffmpeg.org/) | LGPL-2.1-or-later / GPL (depending on build configuration) | Transcoding, DSD and modern-codec playback. The Docker image uses Debian's `ffmpeg` package; `install.sh` also downloads a static GPL build (macOS: [Martin Riedl's builds](https://ffmpeg.martin-riedl.de/); Linux: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)) into the data directory, which `soniqboom fetch-ffmpeg` refreshes. |
-| [sidplayfp / libsidplayfp / libresidfp](https://github.com/libsidplayfp/sidplayfp) | GPL-2.0-or-later | Commodore 64 SID playback (reSIDfp engine). On macOS `install.sh` builds libresidfp 1.2.2, libsidplayfp 3.1.0 and the sidplayfp 3.1.0 CLI from upstream source; on Linux and in the Docker image it comes from the distribution package. |
+| [sidplayfp / libsidplayfp / libresidfp](https://github.com/libsidplayfp/sidplayfp) | GPL-2.0-or-later | Commodore 64 SID playback (reSIDfp engine). `install.sh` on macOS and the Docker image build libresidfp 1.2.2, libsidplayfp 3.1.0 and the sidplayfp 3.1.0 CLI from upstream source; a native Linux install uses the distribution package. libsidplayfp includes the hashlib MD5 code (MIT, © 2025 Cra3z) and sidplayfp includes [ghc::filesystem](https://github.com/gulrak/filesystem) (MIT, © 2018 Steffen Schümann); in the Docker image these notices are under `/usr/local/share/doc/third-party/libsidplayfp/` and `…/sidplayfp/` with the GPL texts. |
 | [FluidSynth](https://github.com/FluidSynth/fluidsynth) | LGPL-2.1 | MIDI rendering with SoundFonts. |
 | [libopenmpt / openmpt123](https://lib.openmpt.org/libopenmpt/) | BSD-3-Clause | Tracker module playback (MOD, XM, S3M, IT, …) via `openmpt123`; libopenmpt is also loaded as a shared library (ctypes) for the per-channel VU meters and the pattern view. |
 | [UADE / uade123](https://gitlab.com/uade-music-player/uade) | GPL-2.0 (Amiga player files under `players/` carry their own licences; the `score` sound core is LGPL) | AHX and ~175 Amiga "exotica" formats via the original Amiga player code. Homebrew package on macOS; on Linux the distribution package where there is one, otherwise UADE 3.05 built from source, as in the Docker image. |
@@ -70,10 +70,10 @@ renderers are built from the upstream sources and versions named in the
 | [AdPlay](https://github.com/adplug/adplay-unix) with the [AdPlug](https://github.com/adplug/adplug) library | AdPlay: GPL-2.0; AdPlug: LGPL-2.1 | AdLib / OPL2 FM formats (IMF, ROL, CMF, D00, RAD, …). |
 | [psgplay](https://github.com/frno7/psgplay) | GPL-2.0 (some files LGPL-2.1 / MIT; see its `licence/` folder) | Atari ST SNDH playback. Built by `install.sh` and the Docker build from a pinned source revision. |
 | [sc68](https://sourceforge.net/projects/sc68/) | GPL-2.0-or-later (sc68 2.2.1) | Native Atari ST `.sc68` disks. Homebrew package on macOS; sc68 2.2.1 built from source on Linux (when the distribution has no package) and in the Docker image. |
-| [zxtune / zxtune123](https://github.com/vitamin-caig/zxtune) | zxtune's own code: LGPL-3.0. The `zxtune123` binary also contains third-party code under GPL-3.0 (Highly Experimental), GPL-2.0 (DeSmuME in vio2sf, Mupen64Plus in lazyusf2), GPL-2.0-or-later (libsidplayfp), MPL-2.0 (mGBA), LGPL, BSD/MIT-style licences, the Boost Software License (Boost.Program_options, linked statically) and the unRAR licence, whose source may not be used to re-create the RAR compression algorithm. Each licence text is in the image under `/usr/local/share/doc/third-party/zxtune/`. | PSF console-music family (PSF/PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) and MED 2–4 modules. Official prebuilt r5100 on Linux and in the Docker image; built from source on macOS against Homebrew's [Boost](https://www.boost.org) (BSL-1.0), whose libraries are copied next to the binary. |
+| [zxtune / zxtune123](https://github.com/vitamin-caig/zxtune) | zxtune's own code: LGPL-3.0. The `zxtune123` binary also contains third-party code under GPL-3.0 (Highly Experimental), GPL-2.0 (DeSmuME in vio2sf, Mupen64Plus in lazyusf2), GPL-2.0-or-later (libsidplayfp), MPL-2.0 (mGBA), LGPL, BSD/MIT-style licences, the Boost Software License (Boost.Program_options, linked statically) and the unRAR licence, whose source may not be used to re-create the RAR compression algorithm. Each licence text is in the image under `/usr/local/share/doc/third-party/zxtune/`. | PSF console-music family (PSF/PSF2, USF, GSF, 2SF, NCSF, SSF, DSF) and MED 2–4 modules. Official prebuilt r5112 on Linux and in the Docker image; built from source on macOS against Homebrew's [Boost](https://www.boost.org) (BSL-1.0), whose libraries are copied next to the binary. |
 | [lhasa](https://github.com/fragglet/lhasa) (`lha`) | ISC | Reads LHA archive members the in-process reader cannot (e.g. `-lh1-`). Installed by `install.sh`; optional. |
 | [tini](https://github.com/krallin/tini) | MIT | Init process (PID 1) of the Docker image. |
-| [Python](https://www.python.org) (CPython) | PSF-2.0 | Runtime of the Docker image (`python:3.12-slim-bookworm`). |
+| [Python](https://www.python.org) (CPython) | PSF-2.0 | Runtime of the Docker image (`python:3.12-slim-trixie`). |
 | [metaflac](https://xiph.org/flac/) (FLAC tools) | GPL | Used when installed on the host (not installed by SoniqBoom): adds a seek table to FLAC files cached from network shares. |
 
 
@@ -81,7 +81,7 @@ renderers are built from the upstream sources and versions named in the
 
 | Library | License | Usage |
 |---------|---------|-------|
-| [Game_Music_Emu (libgme)](https://github.com/libgme/game-music-emu) | LGPL-2.1 | Console chiptunes (NSF, SPC, GBS, VGM, AY, KSS, SAP, HES, GYM, …). |
+| [Game_Music_Emu (libgme)](https://github.com/libgme/game-music-emu) | LGPL-2.1 | Console chiptunes (NSF, SPC, GBS, VGM, AY, KSS, SAP, HES, GYM, …). The Docker image builds libgme 0.6.5 from its upstream release; native installs use the system or Homebrew package. |
 | [libopenmpt](https://lib.openmpt.org/libopenmpt/) | BSD-3-Clause | Per-channel VU meters and pattern view for tracker modules (see above). |
 
 
@@ -106,7 +106,7 @@ Included with SoniqBoom:
 | [No-Intro](https://no-intro.org) DAT game titles (`soniqboom/data/game_titles/nointro.tsv.gz`) | [DAT-o-MATIC Data Usage License](https://datomatic.no-intro.org/terms.html) | Game titles per retro platform, matched against archive names. |
 | [MAME software lists](https://github.com/mamedev/mame/tree/master/hash) titles (`soniqboom/data/game_titles/mame.tsv.gz`) | CC0 1.0 | Game titles per retro platform, matched against archive names. |
 | [ZXDB](https://github.com/zxdb/ZXDB) ZX Spectrum game titles (`soniqboom/data/game_titles/zxdb.tsv.gz`) | [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) | ZX Spectrum game titles, matched against archive names. Contains information from ZXDB, made available under the ODbL; the derived title file is available under the ODbL. |
-| [FluidR3_GM SoundFont](https://packages.debian.org/bookworm/fluid-soundfont-gm) (Debian `fluid-soundfont-gm`) | MIT | General-MIDI SoundFont in the Docker image. |
+| [FluidR3_GM SoundFont](https://packages.debian.org/trixie/fluid-soundfont-gm) (Debian `fluid-soundfont-gm`) | MIT | General-MIDI SoundFont in the Docker image. |
 
 Downloaded by the user (not included with SoniqBoom):
 
@@ -147,9 +147,10 @@ carries, next to the SoniqBoom source zip:
 
 - `soniqboom-<version>-third-party-sources.tar` — the upstream source code of
   the programs the image builds or downloads (psgplay with its submodules,
-  zxtune, sc68, UADE, bencodetools, libzakalwe) at the exact versions pinned
-  in the [Dockerfile](Dockerfile), and of libsidplayfp at the version pinned in
-  `soniqboom/native/sidwasm/build.sh`, collected by
+  zxtune, libgme, sc68, UADE, bencodetools, libzakalwe, libresidfp, libsidplayfp
+  and sidplayfp) at the exact versions pinned
+  in the [Dockerfile](Dockerfile), and of the libsidplayfp the browser uses at
+  the version pinned in `soniqboom/native/sidwasm/build.sh`, collected by
   [`scripts/collect_third_party_sources.sh`](scripts/collect_third_party_sources.sh).
   The build steps, including the changes applied to sc68's build files, are in
   the Dockerfile.

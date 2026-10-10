@@ -489,7 +489,9 @@ _ENRICH_LOG_MAX = 100_000
 _CATALOG_FIELDS = frozenset(("title", "artist", "album_artist", "album", "genre", "genre_derived",
                              "year", "duration", "added_at", "dir_hash", "path",
                              "track_number", "disc_number",
-                             "subsongs", "start_subsong", "hvsc_lengths"))
+                             "subsongs", "start_subsong", "hvsc_lengths",
+                             # (what "Skip short tunes" lists in a multi-tune file)
+                             "tune_lengths", "fade_s", "default_subsong"))
 
 # A write that changes ``duration`` and nothing else (besides seq-exempt fields)
 # — the render-time / probe backfill of a render-only format's real length,
@@ -503,6 +505,11 @@ _CATALOG_FIELDS = frozenset(("title", "artist", "album_artist", "album", "genre"
 # durations (the duplicate memo, the scanner's sorted-rebuild generation guard,
 # ``_primary_order``) key on both sequences.
 _DURATION_SEQ_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset(("duration",))
+
+
+def _multi_tune(t: dict) -> bool:
+    n = t.get("subsongs")
+    return type(n) is int and n > 1
 
 
 def _duration_only(changed: dict) -> bool:
@@ -983,6 +990,14 @@ def _carry_enrichment(old: dict, new: dict) -> None:
                     ("game_by_songdb", same_md5)):
         if keep and old.get(f) and not new.get(f):
             new[f] = old[f]
+    # A reported playback problem (core/skip_rules.py) is about the file's
+    # bytes: carried while its checksum is unchanged (a fixed file replacing a
+    # broken one at the same path loses the mark) and the fresh extract has none.
+    if (old.get("health") and not new.get("health") and same_md5
+            and old.get("sid_md5") == new.get("sid_md5")):
+        for f in ("health", "health_note", "health_by", "health_at", "health_renderer"):
+            if old.get(f) is not None:
+                new[f] = old[f]
     _carry_default_tune(old, new)
     new.update(game_follow(new))                # the game follows the carried album
 
@@ -1945,9 +1960,19 @@ class TrackStore:
     def get_tracks_batch(self, track_ids: list[str]) -> list[dict | None]:
         return [self._tracks.get(tid) for tid in track_ids]
 
+    def _restore_mark(self, t: dict) -> None:
+        """A track added (again) gets the playback-problem mark the registry
+        keeps for its file (core/skip_rules.restore)."""
+        reg = self._config.get("health_marks")
+        if reg:
+            from soniqboom.core import skip_rules
+            skip_rules.restore(reg, t)
+
     def upsert_track(self, track: dict) -> None:
         tid = track["id"]
         old = self._tracks.get(tid)
+        if not old:
+            self._restore_mark(track)
         track.update(game_follow(track))
         self._note_dup_upsert(tid, old, track)
         self._note_enrich(tid)
@@ -1969,6 +1994,7 @@ class TrackStore:
                 _carry_enrichment(old, t)     # keep post-scan enrichment (+ the game)
                 self._unindex_track(tid, old)
             else:
+                self._restore_mark(t)          # (a file that came back keeps its mark)
                 t.update(game_follow(t))
             self._note_dup_upsert(tid, old, t)
             self._note_enrich(tid)
@@ -2491,6 +2517,10 @@ class TrackStore:
         self._apply_field_changes(track_id, t, changed)
         if _duration_only(changed):
             self._duration_seq += 1
+            if _multi_tune(t):
+                # (a multi-tune file's default-tune length decides whether
+                # Subsonic lists its own entry — core/skip_rules)
+                self._catalog_seq += 1
         else:
             if not changed.keys() <= _SEQ_EXEMPT_FIELDS:
                 self._mutation_seq += 1
@@ -2525,6 +2555,7 @@ class TrackStore:
             applied += 1
             if _duration_only(changed):
                 duration = True
+                catalog = catalog or _multi_tune(t)
             else:
                 bump = bump or not changed.keys() <= _SEQ_EXEMPT_FIELDS
                 catalog = catalog or not _CATALOG_FIELDS.isdisjoint(changed)

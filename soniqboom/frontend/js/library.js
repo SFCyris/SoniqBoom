@@ -10,6 +10,7 @@ import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnl
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadge, Offline } from './offline.js';
 import { listTuneCount, tunesBadge } from './tunes.js';
+import { healthBadge, canReport, mark as healthMark } from './health.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -985,13 +986,14 @@ function _fillTrackRow(tr, t, i) {
   const titleTd = cells[2];
   titleTd.textContent = t.title || '—';   // wipes any badge from a recycled row
   titleTd.title = t.title || '';
-  // Health badge — a track with a known playback defect (partial render or
-  // undecodable) gets a small tag after the title.  Re-created per fill (rare;
-  // only defective tracks) so recycled rows never carry a stale badge.
+  // Health badge — a playback problem a listener reported (broken / glitched)
+  // or one found at scan (corrupt / partial — health.js) gets a small tag after
+  // the title.  Re-created per fill (rare) so recycled rows never carry a stale
+  // badge.
   _noteCatalogueRow(t);
-  const hasDefect = t.defect === 'partial' || t.defect === 'corrupt';
+  const health = healthBadge(t);          // (a reported problem, or a defect found at scan)
   const tunes = listTuneCount(t);
-  if (hasDefect || offKind || tunes) {
+  if (health || offKind || tunes) {
     // A badged title: the title text ellipsises, the badges keep their room
     // (a long title must not push them out of the cell).
     const line = document.createElement('span');
@@ -1001,15 +1003,7 @@ function _fillTrackRow(tr, t, i) {
     txt.textContent = t.title || '—';
     line.appendChild(txt);
     if (tunes) line.appendChild(tunesBadge(tunes));
-    if (hasDefect) {
-      const badge = document.createElement('span');
-      badge.className = `track-defect-badge track-defect-${t.defect}`;
-      badge.textContent = t.defect;
-      badge.title = t.defect_detail
-        || (t.defect === 'corrupt' ? 'Cannot be decoded by any engine'
-                                   : 'Plays with substituted content');
-      line.appendChild(badge);
-    }
+    if (health) line.appendChild(health);
     if (offKind) line.appendChild(offlineBadge(offKind));
     titleTd.textContent = '';
     titleTd.appendChild(line);
@@ -1708,6 +1702,35 @@ function _showTrackContextMenu(x, y, i) {
       rateRow.appendChild(star);
     }
     menu.appendChild(rateRow);
+    // Report a playback problem (health.js) — single track, edit rights.
+    if (canReport()) {
+      const rep = document.createElement('div');
+      rep.className = 'ctx-report';
+      rep.setAttribute('role', 'group');
+      rep.setAttribute('aria-label', 'Report a playback problem');
+      const lbl = document.createElement('span');
+      lbl.className = 'ctx-report-lbl';
+      lbl.textContent = 'Problem:';
+      rep.appendChild(lbl);
+      const curH = t.health === 'broken' || t.health === 'glitched' ? t.health : '';
+      for (const [state, label] of [['', 'No problem'], ['glitched', 'Glitched'], ['broken', 'Broken']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ctx-report-btn' + (state === curH ? ' on' : '');
+        b.setAttribute('role', 'menuitemradio');
+        b.setAttribute('aria-checked', state === curH ? 'true' : 'false');
+        b.textContent = label;
+        b.title = state === 'broken' ? 'Doesn’t play right — passed by when a list plays through; picking it still plays it'
+          : state === 'glitched' ? 'Plays, with wrong sounds — shown with a badge' : 'No playback problem';
+        b.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          _closeCtxMenu();
+          if (state !== curH) healthMark(t, state || null);
+        });
+        rep.appendChild(b);
+      }
+      menu.appendChild(rep);
+    }
     addSep();
   }
   // Navigation — pivot from this track to its whole artist / album.  Single

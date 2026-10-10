@@ -206,7 +206,7 @@ def _decrypt_ss(rec: dict, fernet) -> None:
 
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._\-]{2,64}$")
-_PASSWORD_MIN_LEN = 8
+
 # Hard ceiling on password length — scrypt over a multi-MB blob will block
 # the event loop and is never legitimate.
 _PASSWORD_MAX_LEN = 1024
@@ -298,15 +298,35 @@ def validate_username(username: str) -> None:
         )
 
 
+STRONG_PASSWORD_MIN_LEN = 10
+STRONG_PASSWORD_RULE = (
+    f"Password must be at least {STRONG_PASSWORD_MIN_LEN} characters and include "
+    "an uppercase letter, a lowercase letter, a number and a symbol."
+)
+
+
+def is_strong_password(password: str) -> bool:
+    """The "Require strong passwords" rule (Settings → Users)."""
+    return (len(password) >= STRONG_PASSWORD_MIN_LEN
+            and any(c.islower() for c in password)
+            and any(c.isupper() for c in password)
+            and any(c.isdigit() for c in password)
+            and any(not c.isalnum() and not c.isspace() for c in password))
+
+
 def validate_password(password: str) -> None:
-    if not password or len(password) < _PASSWORD_MIN_LEN:
-        raise ValueError(
-            f"Password must be at least {_PASSWORD_MIN_LEN} characters.",
-        )
+    """Reject an empty or over-long password, or — while "Require strong
+    passwords" is on (Settings → Users) — one that doesn't meet that rule.
+    With the rule off, any length up to the maximum is accepted."""
+    if not password:
+        raise ValueError("Password can't be empty.")
     if len(password) > _PASSWORD_MAX_LEN:
         raise ValueError(
             f"Password must be at most {_PASSWORD_MAX_LEN} characters.",
         )
+    from soniqboom.config import is_strong_passwords_required
+    if is_strong_passwords_required() and not is_strong_password(password):
+        raise ValueError(STRONG_PASSWORD_RULE)
 
 
 # ── Store ────────────────────────────────────────────────────────────────────

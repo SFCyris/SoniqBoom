@@ -8,6 +8,7 @@ import { Player } from '../player.js';
 import { Auth }   from '../auth.js';
 import { artPlaceholderEmoji, Toast } from '../utils.js';
 import { Offline } from '../offline.js';
+import { Health, nothingToPlayText } from '../health.js';
 // UX-3 P0: mobile shell exposes the same globals desktop does so the
 // classic-script cast_picker.js can read currentTrackId + emit toasts.
 window.SoniqBoom = window.SoniqBoom || {};
@@ -285,9 +286,12 @@ Player.on('queuestall', () => {
   Toast.error('Couldn\u2019t load the next tracks \u2014 check the connection, then press Next.');
 });
 // Settings → "Tracks on unavailable drives": nothing left to play can play now.
-Player.on('offlinequeue', () => {
-  Toast.info('None of these tracks can play right now \u2014 their drive or share isn\u2019t connected.');
+Player.on('offlinequeue', (d) => {
+  Toast.info(nothingToPlayText(d && d.reasons));
 });
+// Playback problems: the one-time skip notice, "clear the broken mark?", the
+// "Mark broken" action on a failed play (health.js).
+Health.init();
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 window.addEventListener('hashchange', () => {

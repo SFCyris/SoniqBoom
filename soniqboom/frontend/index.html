@@ -30,12 +30,12 @@
           <input id="password-dialog-current" type="password" autocomplete="current-password">
         </label>
         <label class="password-dialog-field">
-          <span>New password <em>(≥ 8 chars)</em></span>
-          <input id="password-dialog-new" type="password" autocomplete="new-password" minlength="8" required>
+          <span>New password <em id="password-dialog-rule"></em></span>
+          <input id="password-dialog-new" type="password" autocomplete="new-password" required>
         </label>
         <label class="password-dialog-field">
           <span>Confirm new password</span>
-          <input id="password-dialog-confirm" type="password" autocomplete="new-password" minlength="8" required>
+          <input id="password-dialog-confirm" type="password" autocomplete="new-password" required>
         </label>
         <div id="password-dialog-error" class="password-dialog-error" hidden></div>
         <div class="password-dialog-actions">
@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=112">
+  <link rel="stylesheet" href="/assets/css/app.css?v=115">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -810,50 +810,62 @@
               <div class="renderer-item" id="renderer-ffmpeg">
                 <span class="renderer-icon" id="renderer-icon-ffmpeg">&#8943;</span>
                 <span class="renderer-name">FFmpeg</span>
+                <span class="renderer-version" id="renderer-version-ffmpeg"></span>
               </div>
               <div class="renderer-item" id="renderer-sidplayfp">
                 <span class="renderer-icon" id="renderer-icon-sidplayfp">&#8943;</span>
                 <span class="renderer-name">SID Player (sidplayfp)</span>
+                <span class="renderer-version" id="renderer-version-sidplayfp"></span>
               </div>
               <div class="renderer-item" id="renderer-fluidsynth">
                 <span class="renderer-icon" id="renderer-icon-fluidsynth">&#8943;</span>
                 <span class="renderer-name">MIDI Synth (FluidSynth)</span>
+                <span class="renderer-version" id="renderer-version-fluidsynth"></span>
               </div>
               <div class="renderer-item" id="renderer-openmpt123">
                 <span class="renderer-icon" id="renderer-icon-openmpt123">&#8943;</span>
                 <span class="renderer-name">Tracker (openmpt123)</span>
+                <span class="renderer-version" id="renderer-version-openmpt123"></span>
               </div>
               <div class="renderer-item" id="renderer-uade123">
                 <span class="renderer-icon" id="renderer-icon-uade123">&#8943;</span>
                 <span class="renderer-name">Amiga Exotica (uade123)</span>
+                <span class="renderer-version" id="renderer-version-uade123"></span>
               </div>
               <div class="renderer-item" id="renderer-hvl2wav">
                 <span class="renderer-icon" id="renderer-icon-hvl2wav">&#8943;</span>
                 <span class="renderer-name">AHX / Hively (bundled hvl2wav)</span>
+                <span class="renderer-version" id="renderer-version-hvl2wav"></span>
               </div>
               <div class="renderer-item" id="renderer-gme">
                 <span class="renderer-icon" id="renderer-icon-gme">&#8943;</span>
                 <span class="renderer-name">Chiptune (gme)</span>
+                <span class="renderer-version" id="renderer-version-gme"></span>
               </div>
               <div class="renderer-item" id="renderer-adplay">
                 <span class="renderer-icon" id="renderer-icon-adplay">&#8943;</span>
                 <span class="renderer-name">AdLib (adplay)</span>
+                <span class="renderer-version" id="renderer-version-adplay"></span>
               </div>
               <div class="renderer-item" id="renderer-psgplay">
                 <span class="renderer-icon" id="renderer-icon-psgplay">&#8943;</span>
                 <span class="renderer-name">Atari SNDH (psgplay)</span>
+                <span class="renderer-version" id="renderer-version-psgplay"></span>
               </div>
               <div class="renderer-item" id="renderer-ym2wav">
                 <span class="renderer-icon" id="renderer-icon-ym2wav">&#8943;</span>
                 <span class="renderer-name">Atari YM (bundled ym2wav)</span>
+                <span class="renderer-version" id="renderer-version-ym2wav"></span>
               </div>
               <div class="renderer-item" id="renderer-sc68">
                 <span class="renderer-icon" id="renderer-icon-sc68">&#8943;</span>
                 <span class="renderer-name">Atari/Amiga SC68 (sc68)</span>
+                <span class="renderer-version" id="renderer-version-sc68"></span>
               </div>
               <div class="renderer-item" id="renderer-zxtune123">
                 <span class="renderer-icon" id="renderer-icon-zxtune123">&#8943;</span>
                 <span class="renderer-name">PSF Consoles (zxtune123)</span>
+                <span class="renderer-version" id="renderer-version-zxtune123"></span>
               </div>
             </div>
             <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
@@ -957,7 +969,7 @@
           </div>
 
           <!-- HVSC (High Voltage SID Collection) -->
-          <div class="admin-section">
+          <div class="admin-section" id="hvsc-section">
             <h3>
               &#127908;&#65039; HVSC SID database
               <span id="hvsc-status" class="hvsc-status off">disabled</span>
@@ -1240,6 +1252,17 @@
                   <option value="show">Show them as usual</option>
                 </select>
               </div>
+              <div class="admin-setting admin-setting--sub">
+                <label for="setting-skip-short-tunes">Skip short tunes <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When a list or a tune list plays through, retro tunes (SID, tracker, chip, Atari, Amiga, PSF, AdLib, MIDI) shorter than this are passed by — mostly sound effects and jingles. Ordinary audio files are never skipped. A tune you pick still plays. Only tunes with a known length count: a SID’s from the HVSC song lengths, a multi-tune SNDH’s or NSFe’s from the file, any other tune’s once its length is known (an Amiga, AHX or AdLib tune’s after its first play). A tune is judged by its length before its fade-out. Subsonic apps such as Feishin list a multi-tune file without its short tunes in albums and folders (refresh the album in the app after a change).">&#9432;</span></label>
+                <select id="setting-skip-short-tunes">
+                  <option value="0">Off</option>
+                  <option value="5">Under 5 s</option>
+                  <option value="10">Under 10 s</option>
+                  <option value="20">Under 20 s</option>
+                  <option value="30">Under 30 s</option>
+                </select>
+                <span class="admin-setting-sub" id="setting-skip-short-coverage" aria-live="polite"></span>
+              </div>
               <div class="admin-setting">
                 <label for="setting-use-folder-art">Use folder art <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fall back to folder.jpg / cover.jpg as album art">&#9432;</span></label>
                 <input id="setting-use-folder-art" type="checkbox" checked>
@@ -1502,54 +1525,60 @@
         <!-- Tab: Users (admin only) -->
         <div class="admin-tab-pane" id="tab-users">
           <div class="admin-section">
+            <h3 id="users-list-title">&#128101; Accounts</h3>
+            <div class="users-list" id="users-list" role="list" aria-labelledby="users-list-title"></div>
+            <div id="users-list-status" class="users-empty" role="status" hidden></div>
+            <div id="users-list-msg" class="admin-msg" style="display:none"></div>
+          </div>
+          <div class="admin-section">
             <h3>&#128100; Add user</h3>
             <form id="users-new-form" class="users-new-form" autocomplete="off">
-              <label>Username
+              <label class="users-field">
+                <span class="users-field-label">Username</span>
                 <input id="users-new-username" type="text"
                        autocapitalize="off" autocorrect="off" spellcheck="false"
-                       inputmode="text"
+                       inputmode="text" placeholder="letters, digits, . _ -"
                        minlength="2" maxlength="64"
                        pattern="[A-Za-z0-9._\-]+" required>
               </label>
-              <label>Password
+              <label class="users-field">
+                <span class="users-field-label">Password</span>
                 <input id="users-new-password" type="password"
-                       minlength="8" autocomplete="new-password" required>
+                       autocomplete="new-password" required>
               </label>
-              <label>Role
+              <label class="users-field">
+                <span class="users-field-label">Display name</span>
+                <input id="users-new-display" type="text" maxlength="64" placeholder="Optional">
+              </label>
+              <label class="users-field users-field-role">
+                <span class="users-field-label">Role</span>
                 <select id="users-new-role">
                   <option value="readonly" selected>Read-only</option>
                   <option value="edit">Edit</option>
                   <option value="admin">Admin</option>
                 </select>
               </label>
-              <label>Display name
-                <input id="users-new-display" type="text" maxlength="64">
-              </label>
-              <button type="submit" id="users-new-submit">Add</button>
+              <button type="submit" id="users-new-submit" class="users-add-btn">+ Add user</button>
             </form>
             <div id="users-new-msg" class="admin-msg" style="display:none"></div>
           </div>
           <div class="admin-section">
-            <h3>&#128101; Accounts</h3>
-            <table class="users-table" id="users-table">
-              <thead>
-                <tr>
-                  <th>Username</th>
-                  <th>Display name</th>
-                  <th>Role</th>
-                  <th>Status</th>
-                  <th>Last sign-in</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="users-tbody"></tbody>
-            </table>
-            <div id="users-list-msg" class="admin-msg" style="display:none"></div>
-            <div class="admin-hint">
-              The first administrator must be created on the server with
-              <code>soniqboom-setadm -user &lt;name&gt; -passwd &lt;pass&gt;</code>.
-              Self-registration on the login page creates read-only accounts.
+            <h3>&#128275; Sign-up &amp; passwords</h3>
+            <div class="admin-settings-grid users-settings">
+              <div class="admin-setting">
+                <label for="setting-self-registration">Allow self-registration <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Shows &quot;Create account&quot; on the sign-in page. New accounts are Read-only until an admin changes their role.">&#9432;</span></label>
+                <input id="setting-self-registration" type="checkbox" disabled>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-strong-passwords">Require strong passwords <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="New passwords need at least 10 characters with an uppercase letter, a lowercase letter, a number and a symbol. Applies when a password is set; existing passwords keep working.">&#9432;</span></label>
+                <input id="setting-strong-passwords" type="checkbox" disabled>
+              </div>
             </div>
+            <div class="admin-hint">
+              The first administrator is created on the server with
+              <code>soniqboom-setadm -user &lt;name&gt; -passwd &lt;pass&gt;</code>.
+            </div>
+            <div id="users-reg-msg" class="admin-msg" style="display:none"></div>
           </div>
         </div>
 
@@ -2100,7 +2129,15 @@
 
             <div class="ti-section ti-autohide" id="ti-section-main">
               <div class="ti-section-hdr">Track Info</div>
-              <div class="ti-field" id="ti-field-defect" style="display:none"><span class="ti-label">Status</span><span class="ti-value ti-value-wrap"><span class="track-defect-badge" id="ti-defect-badge"></span> <span id="ti-defect-detail"></span></span></div>
+              <div class="ti-field" id="ti-field-defect" style="display:none"><span class="ti-label">Status</span><span class="ti-value ti-value-wrap"><span id="ti-defect-badge"></span> <span id="ti-defect-detail"></span></span></div>
+              <!-- Report a playback problem (health.js) — users with edit rights. -->
+              <div class="ti-field" id="ti-field-report" hidden><span class="ti-label" id="ti-report-label">Playback</span><span class="ti-value ti-report-value">
+                <span class="ti-report" id="ti-report" role="group" aria-labelledby="ti-report-label" aria-describedby="ti-report-help">
+                  <button type="button" aria-pressed="true" data-state="">No problem</button><button type="button" aria-pressed="false" data-state="glitched">Glitched</button><button type="button" aria-pressed="false" data-state="broken">Broken</button>
+                </span>
+                <input type="text" id="ti-report-note" class="ti-report-note" maxlength="200" placeholder="Note (optional) — e.g. clicks at 1:23" aria-label="Note about the problem" hidden>
+                <span class="ti-report-help" id="ti-report-help">Glitched: plays, with wrong sounds. Broken: passed by when a list plays through.</span>
+              </span></div>
               <div class="ti-field"><span class="ti-label">Title</span><span class="ti-value" id="ti-title">—</span></div>
               <div class="ti-field"><span class="ti-label">Artist</span><span class="ti-value" id="ti-artist">—</span></div>
               <div class="ti-field"><span class="ti-label">Album Artist</span><span class="ti-value" id="ti-album-artist">—</span></div>
@@ -2155,6 +2192,7 @@
                   <button type="button" id="ti-sub-shuffle" class="ti-sub-abtn ti-sub-abtn-icon" title="Shuffle all tunes" aria-label="Shuffle all tunes">&#128256;</button>
                 </span>
               </div>
+              <div id="ti-sub-note" class="ti-sub-note" hidden></div>
               <div id="ti-sub-list" class="ti-sub-list" role="list" aria-label="Subsong list"></div>
               <div class="ti-sub-foot">
                 <span id="ti-sub-more" class="ti-sub-more"></span>

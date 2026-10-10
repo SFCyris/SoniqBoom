@@ -5129,6 +5129,37 @@ def schedule_startup_enrichment() -> None:
     except Exception:                               # noqa: BLE001
         log.debug("derived-genre startup pass failed", exc_info=True)
     try:
+        # Stored SNDH / chiptune / AHX lengths from before those renderers
+        # honoured the length a file states (GitHub #38), corrected once.
+        from soniqboom.core import repair as _repair
+
+        try:
+            # The default render length in use now (and the last run's) means
+            # "unknown length" for "Skip short tunes".
+            from soniqboom.core import skip_rules as _skip_rules
+            _skip_rules.note_default_length()
+        except Exception:                           # noqa: BLE001
+            log.debug("default-length note failed", exc_info=True)
+
+        async def _render_lengths() -> None:
+            try:
+                await _repair.fix_render_lengths_once()
+            except Exception:                       # noqa: BLE001
+                log.exception("render-length correction failed")
+            try:
+                # Per-tune lengths of multi-tune SNDH / chiptune files and PSF
+                # fades still missing ("Skip short tunes"): every start, for
+                # the files still missing them.
+                await _repair.fill_tune_lengths()
+            except Exception:                       # noqa: BLE001
+                log.exception("tune-length backfill failed")
+        t = asyncio.get_running_loop().create_task(_render_lengths(),
+                                                   name="render-lengths-startup")
+        _scene_autoapply_tasks.add(t)
+        t.add_done_callback(_scene_autoapply_tasks.discard)
+    except Exception:                               # noqa: BLE001
+        log.debug("render-length startup pass failed", exc_info=True)
+    try:
         from soniqboom.core import scene_metadata, repair
         from soniqboom.core.store import get_store
         need_modland = scene_metadata.has_index() and not scene_metadata.apply_version_current()

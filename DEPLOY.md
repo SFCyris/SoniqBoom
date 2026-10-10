@@ -324,9 +324,10 @@ docker compose exec soniqboom soniqboom-setadm -user bob -passwd 'pw-1234' -role
 
 - **Renderers degrade gracefully.** If a format won't play, the player names the package
   it needs; everything else keeps working. The image includes every player: ffmpeg,
-  sidplayfp, FluidSynth, openmpt123, adplay and libgme from Debian; psgplay, sc68 and
-  `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled from source; the
-  prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and HivelyTracker (`.hvl`) engines.
+  FluidSynth, openmpt123 and adplay from Debian; sidplayfp (with the reSIDfp engine),
+  libgme, psgplay, sc68 and `uade123` (Amiga AHX and the ~175 Amiga "exotica" players)
+  compiled from source; the prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and
+  HivelyTracker (`.hvl`) engines.
   The image build stops if any of them is missing (unless built with
   `--build-arg ALLOW_MISSING_RENDERERS=1`).
 - **Slim image.** `docker build --build-arg SLIM=1 -t soniqboom .` leaves out `uade123`

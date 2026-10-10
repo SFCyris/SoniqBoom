@@ -538,8 +538,8 @@ async def admin_add_dir(body: dict, _tok: str = Depends(_require_token)):
         aliases = conf.get("folder_aliases", {})
         aliases[path] = alias
         conf["folder_aliases"] = aliases
-        save_local_conf(conf)
-        settings.folder_aliases = aliases
+        # What was written — a concurrent save's aliases included.
+        settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     # Automatically scan the newly added folder in the background
     from soniqboom.api.library import _broadcast
@@ -592,8 +592,8 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
     if path in aliases:
         del aliases[path]
         conf["folder_aliases"] = aliases
-        save_local_conf(conf)
-        settings.folder_aliases = aliases
+        # What was written — a concurrent save's aliases included.
+        settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     if purge:
         asyncio.create_task(_bg_purge_tracks(path))
@@ -638,8 +638,7 @@ async def admin_update_alias(body: dict, _tok: str = Depends(_require_token)):
     else:
         aliases.pop(path, None)
     conf["folder_aliases"] = aliases
-    save_local_conf(conf)
-    settings.folder_aliases = aliases
+    settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     return {"ok": True, "folder_aliases": aliases}
 
@@ -1606,8 +1605,9 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
         aliases = conf.get("folder_aliases", {})
         aliases[scan_root] = alias
         conf["folder_aliases"] = aliases
-        settings.folder_aliases = aliases
-    save_local_conf(conf)
+    written = save_local_conf(conf)
+    if alias:
+        settings.folder_aliases = dict(written.get("folder_aliases") or {})
 
     # Re-bind any orphaned scan_dir for this scan_root to the new share id.
     # Prior versions of `_auto_share_id` collided on host alone, so an existing
@@ -1694,8 +1694,7 @@ async def remove_share(body: dict, _tok: str = Depends(_require_token)):
 
     conf["folder_aliases"] = aliases
     conf["network_shares"] = shares
-    save_local_conf(conf)
-    settings.folder_aliases = aliases
+    settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     return {"removed": share_id, "purging": purge, "dirs": await list_scan_dirs()}
 
@@ -2223,7 +2222,15 @@ _PROBE_RENDERER_SPECS = (
 
 
 async def probe_renderer_runs(path: str) -> bool | None:
-    """Does the binary actually LOAD and start?  ``installed`` only means the
+    """Does the binary actually LOAD and start?  ``probe_renderer``'s
+    verdict alone."""
+    return (await probe_renderer(path))[0]
+
+
+async def probe_renderer(path: str) -> "tuple[bool | None, str]":
+    """``(runs, output)``: does the binary actually LOAD and start, and what
+    its ``--version`` printed (stdout + stderr; "" when it printed nothing
+    or didn't run).  ``runs``:  ``installed`` only means the
     file is present — a prebuilt/from-source binary whose shared libs were
     upgraded out from under it (e.g. Homebrew bumped boost under a from-source
     zxtune123 → dyld symbol-not-found abort) still passes ``is_file()``.  Exec the
@@ -2234,7 +2241,7 @@ async def probe_renderer_runs(path: str) -> bool | None:
     ``forksafe.spawn`` (no fork) — ``subprocess.run`` fork()s unsafely from a
     Core-Foundation process on macOS (see the ffmpeg probe below)."""
     if not path:
-        return None
+        return None, ""
     try:
         proc = await forksafe.spawn(
             path, "--version",
@@ -2243,7 +2250,7 @@ async def probe_renderer_runs(path: str) -> bool | None:
             stderr=asyncio.subprocess.PIPE,
         )
     except (FileNotFoundError, PermissionError, OSError):
-        return False
+        return False, ""
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=4)
     except asyncio.TimeoutError:
@@ -2252,14 +2259,76 @@ async def probe_renderer_runs(path: str) -> bool | None:
             await proc.wait()
         except ProcessLookupError:
             pass
-        return True                        # started and kept running → it loaded fine
+        return True, ""                    # started and kept running → it loaded fine
     if proc.returncode is not None and proc.returncode < 0:
-        return False                       # killed by a signal → loader abort
-    blob = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace")).lower()
+        return False, ""                   # killed by a signal → loader abort
+    text = out.decode("utf-8", "replace") + err.decode("utf-8", "replace")
+    blob = text.lower()
     return not any(m in blob for m in (
         "dyld", "symbol not found", "error while loading shared librar",
         "image not found", "cannot open shared object",
-    ))
+    )), text
+
+
+# The version each renderer's ``--version`` (ffmpeg: ``-version``) states —
+# the first match of its pattern; any other binary: the first version-like
+# token.  ``renderer_version``.
+_VERSION_PATTERNS = {
+    "ffmpeg": r"ffmpeg version\s+(\S+)",
+    "sidplayfp": r"sidplayfp\s+v?(\d[\w.\-]*)",
+    "fluidsynth": r"version\s+(\d[\w.\-]*)",
+    "openmpt123": r"openmpt123\s+v?(\d[\w.\-]*)",
+    "uade123": r"uade123\s+v?(\d[\w.\-]*)",
+    "adplay": r"adplay\S*\s+v?(\d[\w.\-]*)",
+    "psgplay": r"version\s+v?(\d[\w.\-]*)",
+    "sc68": r"version\s+v?(\d[\w.\-]*)",
+    "zxtune123": r"zxtune123\s+(r\d\w*)",
+}
+_VERSION_ANY = r"(?<![\w.])v?(\d+(?:\.\d+)+[\w.\-+]*|r\d+\w*)"
+
+
+def renderer_version(name: str, text: str) -> "tuple[str, str]":
+    """``(version, detail)`` from renderer ``name``'s version output: the
+    version it states ("" when none is found) and the lines that state it
+    (the line with the version and any other naming a library), for a
+    tooltip.  Pure."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not ln.lower().startswith("warning")][:8]
+    # Any version-like token only on the first two lines, and never in usage
+    # or option text (a default value is no version).
+    head = [ln for ln in lines[:2]
+            if "usage" not in ln.lower() and not ln.startswith("-")]
+    for pat, scan in ((_VERSION_PATTERNS.get(name), lines), (_VERSION_ANY, head)):
+        if not pat:
+            continue
+        for ln in scan:
+            m = re.search(pat, ln, re.IGNORECASE)
+            if m:
+                detail = [ln[:200]] + [o[:200] for o in lines
+                                       if o is not ln and re.search(r"\blib\w+\s+v?\d", o)]
+                return m.group(1)[:40], "\n".join(detail[:3])
+    return "", ""
+
+
+async def _run_for_output(path: str, *args: str) -> "tuple[bool, str]":
+    """``(exit 0, stdout + stderr)`` of ``path args`` (10 s at most)."""
+    try:
+        proc = await forksafe.spawn(
+            path, *args, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except (FileNotFoundError, PermissionError, OSError):
+        return False, ""
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        return False, ""
+    return proc.returncode == 0, (out.decode("utf-8", "replace")
+                                  + err.decode("utf-8", "replace"))
 
 
 async def validate_renderers() -> "dict[str, dict]":
@@ -2291,9 +2360,45 @@ async def validate_renderers() -> "dict[str, dict]":
     return out
 
 
+async def renderer_label(key: "str | None") -> "str | None":
+    """``"<renderer> <version>"`` for the renderer ``key`` (a Settings →
+    Renderers key, ``stream.renderer_key_for``) as it is installed now — the
+    name alone when it states no version; None for no key.  Runs it once
+    (``--version``) for a plain binary."""
+    if not key:
+        return None
+    if key == "gme":
+        from soniqboom.core import gme_render
+        v = gme_render.lib_version()
+        return f"libgme {v}" if v else "libgme"
+    if key in ("ym2wav", "hvl2wav"):
+        return key
+    attr = dict(_PROBE_RENDERER_SPECS).get(key)
+    if not attr:
+        return key
+    configured = getattr(settings, attr, "") or ""
+    path = configured if (configured and Path(configured).is_file()) else shutil.which(key)
+    if not path:
+        return key
+    runs, text = await probe_renderer(path)
+    v = renderer_version(key, text)[0] if runs else ""
+    return f"{key} {v}" if v else key
+
+
 async def _none():
     """Awaitable that yields ``None`` (for a renderer with no resolved path)."""
     return None
+
+
+@router.get("/skip-short-coverage")
+async def skip_short_coverage(_tok: str = Depends(_require_token)):
+    """How many retro tunes have a known length — what "Skip short tunes"
+    can act on — and how many known tunes each choice would pass by
+    (core/skip_rules.coverage)."""
+    from soniqboom.core import skip_rules
+    from soniqboom.core.store import get_store
+    tracks = list(get_store()._tracks.values())       # (a stable list for the thread)
+    return await asyncio.to_thread(skip_rules.coverage, tracks)
 
 
 @router.get("/renderers")
@@ -2365,6 +2470,10 @@ async def check_renderers(_tok: str = Depends(_require_token)):
                         )
                 return None
 
+            _ok, _text = await _run_for_output(ff_check.get("path") or bin_, "-version")
+            _v, _d = renderer_version("ffmpeg", _text)
+            if _v:
+                ff_check["version"], ff_check["version_detail"] = _v, _d
             r  = await _probe("-formats")
             r2 = await _probe("-encoders")
             fmts    = (r.stdout or "").lower() if r else ""
@@ -2431,8 +2540,13 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         matters, one of the first two is virtually always present."""
         from soniqboom.core import gme_render
         if gme_render.is_available():
-            return {"installed": True,
-                    "path": f"in-process libgme ({gme_render.lib_name()})"}
+            lib = gme_render.lib_path()
+            out = {"installed": True,
+                   "path": f"in-process libgme ({lib or gme_render.lib_name()})"}
+            ver = gme_render.lib_version()
+            if ver:
+                out["version"], out["version_detail"] = ver, f"libgme {ver}"
+            return out
         return _check(settings.gme_path, "gme")
 
     # Bundled compile-on-first-use engines (HivelyTracker, StSound).  Available
@@ -2447,12 +2561,12 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         import shutil as _sh
         pre = _sh.which(binary_name)
         if pre:
-            return {"installed": True, "path": pre}
+            return {"installed": True, "path": pre, "version": "bundled"}
         built = get_data_dir() / "native" / binary_name
         if built.exists():
-            return {"installed": True, "path": str(built)}
+            return {"installed": True, "path": str(built), "version": "bundled"}
         cxx = _sh.which("c++") or _sh.which("clang++") or _sh.which("g++")
-        return {"installed": bool(cxx),
+        return {"installed": bool(cxx), **({"version": "bundled"} if cxx else {}),
                 "path": f"(builds on first use{'' if cxx else ' — NO C++ compiler found'})"}
 
     _status = {
@@ -2495,11 +2609,14 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         # must not 500 the whole panel.  Leave ``runs`` unset on failure.
         try:
             _runs = await asyncio.gather(
-                *(probe_renderer_runs(_status[k]["path"]) for k in _probe_keys)
+                *(probe_renderer(_status[k]["path"]) for k in _probe_keys)
             )
-            for _k, _r in zip(_probe_keys, _runs):
+            for _k, (_r, _text) in zip(_probe_keys, _runs):
                 if _r is not None:
                     _status[_k]["runs"] = _r
+                _v, _d = renderer_version(_k, _text) if _r else ("", "")
+                if _v:
+                    _status[_k]["version"], _status[_k]["version_detail"] = _v, _d
         except Exception:
             log.debug("renderer run-probe failed", exc_info=True)
     return _status
@@ -3162,8 +3279,7 @@ async def hvsc_cleanup_orphans(_tok: str = Depends(_require_token)):
         aliases.pop(path, None)
         removed.append(path)
     conf["folder_aliases"] = aliases
-    save_local_conf(conf)
-    settings.folder_aliases = aliases
+    settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
     return {
         "removed": len(removed),
         "paths":   removed,
@@ -3193,6 +3309,11 @@ async def hvsc_rescan_sids(_tok: str = Depends(_require_token)):
 
 
 # ── Settings panel ───────────────────────────────────────────────────────────
+
+def _skip_short_secs() -> int:
+    from soniqboom.core import skip_rules
+    return skip_rules.short_secs()
+
 
 def _offline_mode() -> str:
     from soniqboom.core import availability
@@ -3247,6 +3368,9 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # "hide" (left out of searches and track lists) or "show" (as before).
         # Read by core/availability.py.
         "offline_tracks": _offline_mode(),
+        # Tunes shorter than this many seconds are passed by when a list plays
+        # through (0 = off) — core/skip_rules.py.
+        "skip_short_tunes": _skip_short_secs(),
         "use_folder_art": await get_config("use_folder_art", True),
         # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
         # drops subdirectories whose subtree contains zero indexed audio
@@ -3342,6 +3466,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                     except (TypeError, ValueError):
                         val = 180
                     val = max(5, min(1800, val))
+                    _prev_default = settings.sid_default_duration
                 else:
                     val = str(val)             # every remaining key is a path
                 conf["renderers"][k] = val
@@ -3349,6 +3474,16 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 # restart; HVSC re-indexes on the next SID extract.
                 if hasattr(settings, k):
                     setattr(settings, k, val)
+                if k == "sid_default_duration":
+                    # Tracks stored at the old default keep meaning "unknown
+                    # length" ("Skip short tunes" — core/skip_rules).
+                    from soniqboom.core import availability, skip_rules
+                    try:
+                        prev = float(_prev_default)
+                    except (TypeError, ValueError):
+                        prev = None
+                    skip_rules.note_default_length(previous=prev)
+                    availability.notify_changed()
         # If hvsc_docs_path changed, reconfigure the HVSC singleton so the
         # next SID extract (or "Re-extract SID metadata" click) picks it up.
         if "hvsc_docs_path" in body["renderers"]:
@@ -3439,6 +3574,21 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         if mode in availability.MODES and mode != availability.mode():
             await _set_cfg(availability.MODE_KEY, mode)
             # Lists, counts and shuffles key on the mode — tell open pages.
+            availability.notify_changed()
+
+    if "skip_short_tunes" in body:
+        from soniqboom.core import availability, skip_rules
+        from soniqboom.core.data import set_config as _set_cfg
+        try:
+            secs = int(body.get("skip_short_tunes"))
+        except (TypeError, ValueError):
+            secs = None
+        # (A value that isn't one of the choices is ignored, like the other
+        # coerced settings — never read as "off".)
+        if secs in skip_rules.SHORT_CHOICES and secs != skip_rules.short_secs():
+            await _set_cfg(skip_rules.SHORT_KEY, secs)
+            skip_rules.bump()
+            # Open pages re-read their rows; Subsonic listings follow at once.
             availability.notify_changed()
 
     if (

@@ -12,6 +12,7 @@ import { Library }             from './library.js';
 import { Player }              from './player.js';
 import { artPlaceholderEmoji, Toast } from './utils.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
+import { healthBadgeHTML } from './health.js';
 import { listTuneCount, tunesBadgeHTML } from './tunes.js';
 
 const input  = document.getElementById('search-input');
@@ -234,6 +235,7 @@ function _showPreview(tracks, stations = []) {
     const offKind = offlineKind(t);
     const tunes = listTuneCount(t);
     row.className = 'sp-row' + (offKind ? ' track-offline' : '');
+    const health = healthBadgeHTML(t);
     row.dataset.idx = i;
     _optionize(row);
 
@@ -241,8 +243,8 @@ function _showPreview(tracks, stations = []) {
     row.innerHTML = `
       <div class="sp-art"><span class="sp-art-ph">${artPlaceholderEmoji(t)}</span></div>
       <div class="sp-info">
-        <div class="sp-title${offKind || tunes ? ' sp-title--badged' : ''}">${offKind || tunes
-          ? `<span class="sp-title-text">${_esc(t.title || '—')}</span>${tunes ? tunesBadgeHTML(tunes) : ''}${offKind ? offlineBadgeHTML(offKind) : ''}`
+        <div class="sp-title${offKind || tunes || health ? ' sp-title--badged' : ''}">${offKind || tunes || health
+          ? `<span class="sp-title-text">${_esc(t.title || '—')}</span>${tunes ? tunesBadgeHTML(tunes) : ''}${health}${offKind ? offlineBadgeHTML(offKind) : ''}`
           : _esc(t.title || '—')}</div>
         <div class="sp-sub">${_esc(t.artist || t.album_artist || '')}${t.album ? ' — ' + _esc(t.album) : ''}</div>
       </div>

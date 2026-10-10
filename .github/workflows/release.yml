@@ -183,7 +183,7 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="soniqboom-${VERSION}-debian-sources"
-          docker run --rm -v "$PWD:/w" -v /tmp/manifest:/m:ro -w /w debian:bookworm \
+          docker run --rm -v "$PWD:/w" -v /tmp/manifest:/m:ro -w /w debian:trixie \
               bash -c "bash scripts/collect_debian_sources.sh '$NAME' /m/*.txt && chown -R $(id -u):$(id -g) '$NAME'"
           tar -cf "${NAME}.tar" "$NAME"
           cp "$NAME/DEBIAN-SOURCES.txt" "${NAME}.txt"

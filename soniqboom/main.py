@@ -759,6 +759,22 @@ def _catalogue_list_reads() -> bool:
         return False
 
 
+def _tune_placeholders() -> list:
+    try:
+        from soniqboom.core import skip_rules
+        return skip_rules.placeholder_seconds()
+    except Exception:                                   # noqa: BLE001
+        return [180.0]
+
+
+def _skip_short_tunes() -> int:
+    try:
+        from soniqboom.core import skip_rules
+        return skip_rules.short_secs()
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
 @app.get("/api/ui-config")
 async def ui_config():
     """Public UI configuration — no auth required.  Safe subset only.
@@ -784,6 +800,9 @@ async def ui_config():
         "filter_duplicates": await get_config("filter_duplicates", False),
         # Settings → "Tracks on unavailable drives": mark / hide / show.
         "offline_tracks": _availability_mode(),
+        # Settings → "Skip short tunes": seconds (0 = off) — core/skip_rules.py.
+        "skip_short_tunes": _skip_short_tunes(),
+        "tune_placeholders": _tune_placeholders(),
         # External catalogues: their roots, and whether their tunes shown in a
         # list are read for their details (Modland "Read details of tunes not
         # played yet: For tunes shown in lists").

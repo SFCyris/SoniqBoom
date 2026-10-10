@@ -507,6 +507,9 @@ export async function probeAdlibDurations(tracks) {
           const sec = map[id];
           if (sec > 0) { _durKnown.set(id, sec); result[id] = sec; }
         }
+        // An open Track Info of one of these tracks takes its length too.
+        document.dispatchEvent(new CustomEvent('soniqboom:durations-probed',
+          { detail: { durations: map } }));
       } else {
         ids.forEach(id => _durProbed.delete(id));              // allow retry
       }

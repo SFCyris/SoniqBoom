@@ -1546,8 +1546,9 @@ async def _catalogue_tracks_with_meta(path: str, recursive: bool, offset: int,
         def _fetch_order(off: int, lim: int) -> list[dict]:
             return [r for r in (_shape_row(tracks[t]) for t in sel[off:off + lim]
                                 if t in tracks) if r]
-        page = availability.playable_page(_fetch_order, offset, limit,
-                                          availability.snapshot(store))
+        # (``skip`` holds both kinds: the tracks that can't play right now
+        # and the files the skip rules pass by.)
+        page = availability.playable_page(_fetch_order, offset, limit, None, skip=skip)
         return {"total": total, **page}
     if limit > 0:
         page_ids = sel[offset:offset + limit] if offset < total else []
@@ -1639,7 +1640,6 @@ async def tracks_with_meta(
                 # The queue's page (``playable=1``): read on through the order
                 # (bounded, like an ordered list's) until ``limit`` tracks that
                 # can play are found — one request, not one per 50 rows.
-                snap = availability.snapshot()
                 box = {"total": 0}
 
                 def _fetch(off: int, lim: int) -> list[dict]:
@@ -1648,7 +1648,7 @@ async def tracks_with_meta(
                         off, lim, stable)
                     return rows
                 page = await asyncio.to_thread(
-                    lambda: availability.playable_page(_fetch, offset, limit, snap))
+                    lambda: availability.playable_page(_fetch, offset, limit, None, skip=skip))
                 return {"total": box["total"] or len(res), **page}
             if limit > 0:
                 # One page: only ITS rows are materialised (O(limit) once the

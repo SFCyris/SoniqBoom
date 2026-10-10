@@ -709,10 +709,21 @@ def _miss_rebuild_interval() -> float:
                max(_CACHE_DEBOUNCE_SEC, _MISS_REBUILD_MIN_SEC))
 
 
-def _install_catalogue(store, seq, folder_on: bool, cat: _sx.Catalogue) -> _sx.Catalogue:
+def _short_secs(store) -> tuple:
+    """"Skip short tunes" (core/skip_rules): the per-tune listings and album
+    counts leave those tunes out, so a snapshot belongs to one setting (and
+    one set of lengths that mean "unknown")."""
+    from soniqboom.core import skip_rules
+    secs = skip_rules.short_secs(store)
+    return (secs, tuple(skip_rules.placeholder_seconds(store)) if secs else ())
+
+
+def _install_catalogue(store, seq, folder_on: bool, cat: _sx.Catalogue,
+                       short: "int | None" = None) -> _sx.Catalogue:
     c = _ALBUM_LIST_CACHE
     c.update(store=store, seq=seq, folder_on=folder_on, built_at=time.monotonic(),
-             cat=cat, gen=int(c.get("gen") or 0) + 1, build_sec=cat.build_sec)
+             cat=cat, gen=int(c.get("gen") or 0) + 1, build_sec=cat.build_sec,
+             short=_short_secs(store) if short is None else short)
     return cat
 
 
@@ -744,11 +755,12 @@ def _schedule_rebuild(store, folder_on: bool) -> asyncio.Task | None:
 
     async def _run() -> None:
         seq = _catalog_seq(store)             # read BEFORE the snapshot
+        short = _short_secs(store)
         cat = await _sx.build_catalogue_async(store, folder_on=folder_on)
         # Install only if nothing landed meanwhile (any install — an inline
         # build on a flag flip / store swap — bumps ``gen``).
         if c.get("gen") == gen:
-            _install_catalogue(store, seq, folder_on, cat)
+            _install_catalogue(store, seq, folder_on, cat, short)
 
     def _done(t: asyncio.Task) -> None:
         if not t.cancelled() and t.exception() is not None:
@@ -802,7 +814,8 @@ def _catalogue(store, *, refresh_stale: bool = False) -> _sx.Catalogue:
     seq = _catalog_seq(store)
     folder_on = _folder_albums_on(store)
     cat = c.get("cat")
-    if cat is None or c.get("store") is not store or c.get("folder_on") != folder_on:
+    if (cat is None or c.get("store") is not store or c.get("folder_on") != folder_on
+            or c.get("short") != _short_secs(store)):
         if _STALE_RETRY_OK.get():
             raise _StaleMiss()                    # built off-loop by _wrap, then retried
         return _install_catalogue(store, seq, folder_on,
@@ -859,7 +872,8 @@ async def _refresh_for_miss(store) -> None:
     c = _ALBUM_LIST_CACHE
     folder_on = _folder_albums_on(store)
     if (c.get("cat") is not None and c.get("store") is store
-            and c.get("folder_on") == folder_on and c.get("seq") == _catalog_seq(store)):
+            and c.get("folder_on") == folder_on and c.get("seq") == _catalog_seq(store)
+            and c.get("short") == _short_secs(store)):
         return                                       # already fresh
     task = _schedule_rebuild(store, folder_on)
     if task is None:
@@ -1527,7 +1541,9 @@ def _with_tunes(t: dict, song: dict, ctx: _SongCtx | None) -> list[dict]:
     ns = _sx.listed_tunes(t)
     if not ns:
         return [song]
-    return [song] + [_tune_child(song, t, n, ctx) for n in ns]
+    tunes = [_tune_child(song, t, n, ctx) for n in ns]
+    # (A short default tune — "Skip short tunes" — leaves the file's own entry out.)
+    return ([song] + tunes) if _sx.bare_listed(t, ns) else tunes
 
 
 # A big listing is mapped in time slices, the catalogue build's pattern: the
@@ -3438,6 +3454,21 @@ def _random_track_keys(store, root_hash: str | None = None,
     return hit
 
 
+_SKIP_DRAW_MAX = 5000      # left-out files a random draw over-samples for
+
+
+def _auto_skip_ids(store) -> frozenset:
+    """The files a generated list (random / similar / top songs) leaves out:
+    the ones the web player's auto-play passes by — reported broken,
+    undecodable, a known-short default tune (``core/skip_rules``).  Searches
+    and playlists still list them, albums and folders too (a multi-tune
+    file's own entry only while its default tune isn't short —
+    ``subsonic_index.bare_listed``), so they can be picked (and re-tested) on
+    purpose."""
+    from soniqboom.core import skip_rules
+    return skip_rules.skip_ids(store)
+
+
 def _sample_playable(store, preds: dict, size: int, dead: frozenset) -> list:
     """Up to ``size`` random ids of the tracks matching ``preds`` (the store's
     ``filter_track_ids`` predicates), skipping tracks in a ``dead`` scan root.
@@ -3518,7 +3549,20 @@ async def get_random_songs(
         preds = {"genre": genre, "year_min": fromYear, "year_max": toYear}
         if root:
             preds["scan_root_hash"] = root
-        pick_ids = _sample_playable(store, preds, size, dead)
+        skip = _auto_skip_ids(store)
+        # Drawing ``size`` more than there are files left out keeps the list
+        # full whatever the draw holds (bounded; past it, a few more draws).
+        extra = min(len(skip), _SKIP_DRAW_MAX) if skip else 0
+        pick_ids = _sample_playable(store, preds, size + extra, dead)
+        if skip:
+            pick_ids = [i for i in pick_ids if i not in skip]
+            for _ in range(4 if len(skip) > _SKIP_DRAW_MAX else 0):
+                if len(pick_ids) >= size:
+                    break
+                have = set(pick_ids)
+                more = _sample_playable(store, preds, size + extra, dead)
+                pick_ids += [i for i in more if i not in skip and i not in have]
+            pick_ids = pick_ids[:size]
         picks = [m for m in (store.get_track(i) for i in pick_ids) if m]
         songs = [_track_to_song(t_, ctx) for t_ in picks]
         return await _ok_async({"randomSongs": {"song": songs}}, fmt=f, n_hint=len(songs))
@@ -3529,8 +3573,17 @@ async def get_random_songs(
     keys = _random_track_keys(store, root, dead)
     if not keys:
         return _ok({"randomSongs": {"song": []}}, fmt=f)
-    take = min(size, len(keys))
-    picked_ids = random.sample(keys, take)
+    skip = _auto_skip_ids(store)
+    if skip and len(skip) > _SKIP_DRAW_MAX:
+        # Many files left out: sample from what may play.
+        pool = [k for k in keys if k not in skip]
+        picked_ids = random.sample(pool, min(size, len(pool)))
+    else:
+        # ``size`` more than there are files left out: the list stays full.
+        picked_ids = random.sample(keys, min(size + len(skip), len(keys)))
+        if skip:
+            picked_ids = [i for i in picked_ids if i not in skip]
+        picked_ids = picked_ids[:size]
     metas = store.get_tracks_batch(picked_ids)
     songs = [_track_to_song(t_, ctx) for t_ in metas if t_]
     return await _ok_async({"randomSongs": {"song": songs}}, fmt=f, n_hint=len(songs))
@@ -3692,8 +3745,10 @@ def _album_order(store, cat: _sx.Catalogue, album_id: str) -> tuple[list, dict]:
     _alb, tracks = _album_and_tracks(store, album_id)
     order = []
     for t in tracks:
-        order.append((t["id"], 0))
-        order.extend((t["id"], n) for n in _sx.listed_tunes(t))
+        ws = _sx.listed_tunes(t)
+        if _sx.bare_listed(t, ws):                    # (the album's own entries, in order)
+            order.append((t["id"], 0))
+        order.extend((t["id"], n) for n in ws)
     pos = {k: i for i, k in enumerate(order)}
     if len(memo) >= _ALBUM_ORDER_MAX:
         memo.pop(next(iter(memo)))
@@ -5854,9 +5909,12 @@ async def get_similar_songs(
     f: str = Query(default="xml"),
 ):
     user = _require_user(request, sb_session, u, p, s, t)
-    tracks = await _similar_song_tracks(_split_id(get_store(), id)[0], count)
+    skip = _auto_skip_ids(get_store())
+    # (Asked for more when some will be left out, so ``count`` still come back.)
+    want = count + min(len(skip), count) if skip else count
+    tracks = await _similar_song_tracks(_split_id(get_store(), id)[0], want)
     ctx = _song_ctx(get_store(), user)
-    songs = [_track_to_song(tr, ctx) for tr in tracks]
+    songs = [_track_to_song(tr, ctx) for tr in tracks if not (skip and tr.get("id") in skip)][:count]
     is_v2 = "similarsongs2" in request.url.path.lower()
     key = "similarSongs2" if is_v2 else "similarSongs"
     return _ok({key: {"song": songs}}, fmt=f)
@@ -6958,6 +7016,9 @@ async def get_top_songs(
         raise _SubsonicError(10, "Required parameter 'artist' or 'id' is missing.")
     # The reserved [Unknown Artist] ("") has no tag-index bucket: no top songs.
     tids = _artist_track_ids(store, low) if low else set()
+    skip = _auto_skip_ids(store)
+    if skip and tids:
+        tids = tids - skip
     import heapq
     top = heapq.nsmallest(count, tids, key=_rank_key(store)) if count else []
     ctx = _song_ctx(store, user)

@@ -235,8 +235,16 @@ def has_edit_role(user: User | None) -> bool:
 
 # ── Public endpoints ─────────────────────────────────────────────────────────
 
+def _registration_open(store) -> bool:
+    """Self-registration needs an admin to exist (bootstrap is CLI-only) and
+    the "Allow self-registration" setting (Settings → Users) to be on."""
+    from soniqboom.config import is_self_registration_enabled
+    return store.has_any_admin() and is_self_registration_enabled()
+
+
 @router.get("/auth/status")
 async def auth_status():
+    from soniqboom.config import is_strong_passwords_required
     """Public summary of the auth setup — used by the login UI to decide
     whether to show the "Create account" link (only when at least one
     admin already exists; bootstrap creation is via CLI).
@@ -249,7 +257,8 @@ async def auth_status():
     return {
         "has_any_user":  store.has_any(),
         "has_any_admin": store.has_any_admin(),
-        "registration_open": store.has_any_admin(),
+        "registration_open": _registration_open(store),
+        "strong_passwords": is_strong_passwords_required(),
         "session_cookie": _SESSION_COOKIE,
         "data_dir":      str(get_data_dir().absolute()),
     }
@@ -364,6 +373,8 @@ async def register(body: RegisterBody, request: Request, response: Response):
             "Registration is closed — an administrator must exist first. "
             "Run `soniqboom-setadm -user <name> -passwd <pass>` on the server.",
         )
+    if not _registration_open(store):
+        raise HTTPException(403, "Registration is turned off. Ask an administrator for an account.")
     try:
         user = store.create(
             username=body.username,
@@ -560,6 +571,37 @@ async def save_my_play_queue(body: PlayQueueBody, user: User = Depends(require_u
 
 
 # ── Admin: user management ──────────────────────────────────────────────────
+
+class AccountSettingsBody(BaseModel):
+    self_registration: bool | None = None
+    strong_passwords: bool | None = None
+
+
+def _account_settings() -> dict:
+    from soniqboom.config import is_self_registration_enabled, is_strong_passwords_required
+    return {"self_registration": is_self_registration_enabled(),
+            "strong_passwords": is_strong_passwords_required()}
+
+
+@router.get("/users/settings")
+async def get_account_settings(_admin: User = Depends(require_admin)):
+    """Settings → Users: self-registration and the strong-password rule."""
+    return _account_settings()
+
+
+@router.put("/users/settings")
+async def set_account_settings(body: AccountSettingsBody, admin: User = Depends(require_admin)):
+    from soniqboom import config
+    if body.self_registration is not None:
+        config.set_self_registration_enabled(body.self_registration)
+        log.info("self-registration %s by '%s'",
+                 "enabled" if body.self_registration else "disabled", admin.username)
+    if body.strong_passwords is not None:
+        config.set_strong_passwords_required(body.strong_passwords)
+        log.info("strong passwords %s by '%s'",
+                 "required" if body.strong_passwords else "not required", admin.username)
+    return _account_settings()
+
 
 @router.get("/users")
 async def list_users(_admin: User = Depends(require_admin)):

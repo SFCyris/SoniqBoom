@@ -18,6 +18,7 @@ import { fmtDur, esc, trackActions, playlistEntry } from './_common.js';
 import { artPlaceholderEmoji, probeAdlibDurations } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
 import { offlineKind, offlineBadge, Offline } from '../../offline.js';
+import { healthBadge } from '../../health.js';
 
 const PAGE_SIZE = 100;
 
@@ -117,25 +118,19 @@ export function mountLibrary(root, ctx) {
     if (src) img.src = src; else img.removeAttribute('src');
   }
 
-  function setTitle(row, text, defect = '', detail = '', offline = '') {
+  function setTitle(row, text, health = null, offline = '') {
     const title = row.querySelector('.m-row-title');
     row.classList.toggle('track-offline', !!offline);
     // Health badge for a known playback defect, "offline" for a track that
     // can't play right now — only badged rows (rare) take the flex layout so the
     // common path keeps its plain ellipsised text.
-    if (defect || offline) {
+    if (health || offline) {
       title.classList.add('m-row-title--badged');
       const ttlText = document.createElement('span');
       ttlText.className = 'm-row-title-text';
       ttlText.textContent = text;
       const parts = [ttlText];
-      if (defect) {
-        const badge = document.createElement('span');
-        badge.className = `track-defect-badge track-defect-${defect}`;
-        badge.textContent = defect;
-        badge.title = detail || '';
-        parts.push(badge);
-      }
+      if (health) parts.push(health);
       if (offline) parts.push(offlineBadge(offline));
       title.replaceChildren(...parts);
     } else {
@@ -175,8 +170,7 @@ export function mountLibrary(root, ctx) {
     if (t.id) row.dataset.trackId = t.id; else delete row.dataset.trackId;
     // Art: the emoji placeholder always paints; the cover fades in over it.
     setArt(row, artPlaceholderEmoji(t), t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : ''));
-    const defect = (t.defect === 'partial' || t.defect === 'corrupt') ? t.defect : '';
-    setTitle(row, t.title || '—', defect, t.defect_detail, offlineKind(t));
+    setTitle(row, t.title || '—', healthBadge(t), offlineKind(t));
     row.querySelector('.m-row-meta .m-row-artist').textContent = t.artist || t.album_artist || '';
     const trail = row.querySelector('.m-row-trail');
     trail.textContent = fmtDur(t.duration);
@@ -261,6 +255,19 @@ export function mountLibrary(root, ctx) {
   backBtn.addEventListener('click', () => {
     crumb = null;
     render();
+  });
+
+  // A playback problem reported / cleared here (health.js): the list's copies
+  // of those tracks take the new fields and their rows repaint in place.
+  document.addEventListener('soniqboom:health-changed', (e) => {
+    const d = (e && e.detail) || {};
+    const want = new Set(Array.isArray(d.ids) ? d.ids : []);
+    if (!want.size || !Array.isArray(tracks)) return;
+    let hit = false;
+    for (const t of tracks) if (t && want.has(t.id)) { Object.assign(t, d.fields || {}); hit = true; }
+    if (!hit) return;
+    for (const row of vl.rows()) row.__item = null;
+    vl.render(true);
   });
 
   // Which tracks can play changed (a drive came back / went away, or the

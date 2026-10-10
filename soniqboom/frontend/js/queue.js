@@ -8,10 +8,13 @@
 import { Player } from './player.js';
 import { artPlaceholderEmoji } from './utils.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
+import { healthBadgeHTML, skipWord, skipReasonOf } from './health.js';
 
 // A row's identity for the "nothing changed" check: the track, and whether it
 // is marked offline (offline.js re-flags rows in place).
-const _rowKey = (t) => (t ? `${t.id}${t.offline ? '\u0000o' : ''}` : t);
+// … and its playback problem / skip reason (health.js), which a mark or the
+// "Skip short tunes" setting changes in place.
+const _rowKey = (t) => (t ? `${t.id}${t.offline ? '\u0000o' : ''}\u0000${t.health || ''}\u0000${t.defect || ''}\u0000${skipReasonOf(t)}` : t);
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel    = document.getElementById('queue-panel');
@@ -195,6 +198,10 @@ function _renumber() {
   listEl.querySelectorAll('.queue-row').forEach((row, i) => {
     row.dataset.idx = i;
     row.classList.toggle('playing', i === idx);
+    // (The playing row is never shown as "skipped".)
+    row.classList.toggle('queue-skipped', i !== idx && !!row.dataset.skip);
+    const word = row.querySelector('.queue-skip-word');
+    if (word) word.hidden = i === idx;
     const icon = row.querySelector('.queue-playing-icon');
     if (icon) icon.innerHTML = i === idx ? '&#9654;' : '';
     // Durations of rendered formats arrive after the row was built (the track
@@ -246,7 +253,16 @@ function refresh() {
   q.forEach((track, i) => {
     const row = document.createElement('div');
     const offKind = offlineKind(track);
-    row.className = 'queue-row' + (i === idx ? ' playing' : '') + (offKind ? ' track-offline' : '');
+    // A row the queue will pass by when it moves on by itself (not the one
+    // playing): dimmed, with the reason (health.js skipWord).
+    // (An offline row has its own look; a broken / corrupt one is dimmed and
+    // its badge says why; a short tune says "short · skipped".)
+    const reason = skipReasonOf(track);
+    const dim = !!reason && reason !== 'offline';
+    const skip = skipWord(track);
+    if (dim) row.dataset.skip = reason;
+    row.className = 'queue-row' + (i === idx ? ' playing' : '') + (offKind ? ' track-offline' : '')
+      + (dim && i !== idx ? ' queue-skipped' : '');
     row.dataset.idx = i;
     // Drag is gated to the handle only — see _enableHandleDrag below.  This
     // keeps scroll/select gestures on the row body from accidentally
@@ -274,7 +290,7 @@ function refresh() {
       <span class="queue-playing-icon">${i === idx ? '&#9654;' : ''}</span>
       ${artHtml}
       <div class="queue-track-info">
-        <span class="queue-track-titlerow"><span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${offKind ? offlineBadgeHTML(offKind) : ''}</span>
+        <span class="queue-track-titlerow"><span class="queue-track-title" title="${esc(track.title)}">${esc(track.title || '—')}</span>${healthBadgeHTML(track)}${offKind ? offlineBadgeHTML(offKind) : ''}${skip ? `<span class="queue-skip-word"${i === idx ? ' hidden' : ''}>${esc(skip)}</span>` : ''}</span>
         <span class="queue-track-artist">${esc(track.artist || track.album_artist || '')}</span>
       </div>
       <span class="queue-track-dur">${fmtDur(track.duration)}</span>

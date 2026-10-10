@@ -50,6 +50,7 @@ import { Queue }      from './queue.js';
 import { Playlist }   from './playlist.js';
 import { RadioMode }  from './radio.js';
 import { Offline }    from './offline.js';
+import { Health, nothingToPlayText } from './health.js';
 
 // ── Lazily-loaded modules ─────────────────────────────────────────────────────
 // admin.js (~150 KB), visualizer.js (~108 KB) and trackinfo.js (+ its viz
@@ -1800,9 +1801,12 @@ Player.on('queuestall', () => {
 });
 // Settings → "Tracks on unavailable drives" (Mark / Hide): everything left to
 // play is on a drive or share that isn't connected — say so instead of silence.
-Player.on('offlinequeue', () => {
-  window.Toast?.info?.('None of these tracks can play right now — their drive or share isn’t connected.');
+Player.on('offlinequeue', (d) => {
+  window.Toast?.info?.(nothingToPlayText(d && d.reasons));
 });
+// Playback problems: the one-time skip notice, "clear the broken mark?", the
+// "Mark broken" action on a failed play (health.js).
+Health.init();
 // Which tracks can play changed (a drive / share went or came back, or the
 // setting changed): the folder tree repaints its badges, the open view and the
 // track count re-read (offline.js has re-flagged the queue already).
@@ -3792,7 +3796,9 @@ document.addEventListener('keydown', (e) => {
     Library.setExposeLocalFiles(cfg.expose_local_files !== false);
   } catch (_) { /* Store not ready — ignore */ }
   // "Tracks on unavailable drives": the player skips from the first track.
-  Offline.init({ mode: (window.__sbConfig || {}).offline_tracks });
+  Offline.init({ mode: (window.__sbConfig || {}).offline_tracks,
+                 skipShort: (window.__sbConfig || {}).skip_short_tunes,
+                 placeholders: (window.__sbConfig || {}).tune_placeholders });
 })();
 
 // ── Startup intro animation ───────────────────────────────────────────────────

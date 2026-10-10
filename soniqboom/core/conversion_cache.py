@@ -117,6 +117,11 @@ _state_lock = threading.RLock()
 
 # ── Key / path helpers ──────────────────────────────────────────────────────
 
+# Render revision per format type: bumped when that renderer's output for
+# the same tune changes, so older cached renders are left to eviction.
+_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1}
+
+
 def _cache_key(
     track_id: str,
     format_type: str,
@@ -179,12 +184,21 @@ def _cache_key(
         # them here fixes that at the cost of a one-time lazy re-render of
         # existing AdLib cache entries.
         parts.append(f"sub{subsong}")
+        if format_type in _RENDER_REVS:
+            # Renders made before a renderer change are not reused: SNDH and
+            # libgme tunes played every tune at the 180 s default before they
+            # honoured the length the file states (GitHub #38).
+            parts.append(f"r{_RENDER_REVS[format_type]}")
         if variant:
             # A distinct render of the same tune index — uade modules whose
             # subsongs are numbered from 1 (``b1``): an older key for that
             # index holds the wrong tune.  Unset for everything else, so
             # existing keys are unchanged.
             parts.append(f"v{variant}")
+    elif format_type in _RENDER_REVS:
+        # A render without subsongs (PSF: one tune per rip) under a revision:
+        # PSF rips stopped at their length tag before their fade was played.
+        parts.append(f"r{_RENDER_REVS[format_type]}")
     elif format_type == "transcoded":
         parts.append(f"c{codec or 'flac'}")
         # ar=0 means "preserve source sample rate" — distinct from a literal
@@ -1162,6 +1176,62 @@ def _sweep_stale_subsong_renders(base: Path) -> int:
     return removed
 
 
+# Render revisions (``_RENDER_REVS``) are swept once per revision: an older
+# render is never adopted (its key would still match its tune — see
+# ``key_matches`` — and report the tune as rendered), nor its transcodes.
+def _render_rev_marker() -> str:
+    return ".render-revs-" + "-".join(f"{k}{v}" for k, v in sorted(_RENDER_REVS.items()))
+
+
+def _sweep_unrevised_renders(base: Path) -> int:
+    """Remove ``_RENDER_REVS`` renders made before their current revision
+    (and the transcodes made from them).  Idempotent; the marker is written
+    after a complete sweep."""
+    marker = base / _render_rev_marker()
+    if marker.exists():
+        return 0
+    removed = 0
+    stale_variants: set[str] = set()
+    for fmt, rev in _RENDER_REVS.items():
+        sub = base / fmt
+        if not sub.is_dir():
+            continue
+        tag = f"__r{rev}"
+        for f in sub.rglob("*"):
+            if f.suffix not in (".wav", ".vu"):
+                continue
+            stem = f.stem
+            if stem.endswith(".partial"):
+                stem = stem[: -len(".partial")]
+            if tag in stem:
+                continue
+            if f.suffix == ".wav":
+                stale_variants.add(rendered_transcode_variant(stem))
+            try:
+                f.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    tdir = base / "transcoded"
+    if stale_variants and tdir.is_dir():
+        for f in tdir.rglob("*.wav"):
+            _, sep, tail = f.stem.rpartition("__v")
+            if sep and tail in stale_variants:
+                try:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+    try:
+        marker.write_text("renders older than these revisions removed\n")
+    except OSError:
+        log.warning("Conversion cache: could not write %s", marker)
+    if removed:
+        log.info("Conversion cache: removed %d render file(s) older than their "
+                 "renderer's current revision", removed)
+    return removed
+
+
 def warmup_from_disk() -> int:
     """Rebuild ``_meta`` / ``_lru`` / ``_total_bytes`` from on-disk WAVs.
 
@@ -1177,6 +1247,7 @@ def warmup_from_disk() -> int:
     if not base.exists():
         return 0
     _sweep_stale_subsong_renders(base)
+    _sweep_unrevised_renders(base)
     adopted = 0
     with _state_lock:
         for fmt in FORMAT_TYPES:
@@ -1263,6 +1334,36 @@ async def purge_sid_entries_for(
                 except (ValueError, IndexError):
                     pass
             victims.append(key)
+    for key in victims:
+        await asyncio.to_thread(_purge_entry, key)
+    return len(victims)
+
+
+async def purge_entries_for(track_ids, format_type: str) -> int:
+    """Remove every cached ``format_type`` render of the given tracks (all
+    their tunes and variants) — renders a renderer change made wrong.
+    Returns how many entries went (their transcodes included)."""
+    ids = set(track_ids or ())
+    if not ids:
+        return 0
+    victims: list[str] = []
+    with _state_lock:
+        for key, entry in list(_meta.items()):
+            if entry.get("format_type") != format_type:
+                continue
+            tid, sep, _rest = key.partition("__sub")
+            if sep and tid in ids:
+                victims.append(key)
+        # …and the transcodes made from those renders (a Subsonic client's
+        # ``format=mp3``), keyed on the render's key.
+        variants = {rendered_transcode_variant(k) for k in victims}
+        if variants:
+            for key, entry in list(_meta.items()):
+                if entry.get("format_type") != "transcoded":
+                    continue
+                _, sep, tail = key.rpartition("__v")
+                if sep and tail in variants:
+                    victims.append(key)
     for key in victims:
         await asyncio.to_thread(_purge_entry, key)
     return len(victims)

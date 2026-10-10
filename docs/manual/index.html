@@ -448,6 +448,38 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
        and its number follows the title. A tune that renders to silence shows “This tune plays only silence”
        instead of playing — in the web player, a very long C64 tune from its second play on.</p>
 
+    <h3>Skip short tunes and broken tracks</h3>
+    <p>Many SID, SNDH and console-rip files hold short sound-effect tunes next to the music, and collections hold
+       short jingle modules. <strong>System → Settings → Skip short tunes</strong> (off by default; under 5, 10, 20
+       or 30 seconds) passes retro tunes that short by whenever a list or a tune list plays through — Play all,
+       shuffle, the next track; ordinary audio files (MP3, FLAC, …) are never skipped. A tune you click still
+       plays. Only tunes with a known length count: a SID tune's from the HVSC <strong>Songlengths</strong>
+       database, a multi-tune SNDH, NSFe or AY tune's from the file itself, and the tune a file plays by
+       default from its length (before any fade-out) — for a module, YM, PSF or MIDI file once it is scanned, for
+       an Amiga, AHX, SC68 or AdLib tune once it has played. The setting shows how many
+       tunes have a known length and, without any, links to the HVSC folder setting. In the tune picker a short tune
+       is dimmed and tagged <b>short</b>, the header counts how many are skipped, <b>Add all</b> and the playlist
+       button leave them out, and a file whose tune lengths are unknown says so. With the setting on, Subsonic apps
+       such as Feishin list a multi-tune file without its short tunes in an album or folder — its own entry too
+       when its default tune is short, as long as another tune is listed; a file all of whose tunes are short, and
+       a single short file, stay listed (refresh the album in the app after a change).</p>
+    <p>A track that doesn't play right can be reported. In <strong>Track Info</strong>, <em>Playback</em> offers
+       <b>No problem</b>, <b>Glitched</b> (plays, with wrong sounds) and <b>Broken</b> (doesn't play right), with an
+       optional note; the same choice is on a row's right-click menu, on the phone's long-press menu
+       (<em>Report a problem…</em>) and, when a track can't be played, on the message that says so
+       (<b>Mark broken</b>, when the file itself failed to play). Reporting needs edit rights; every user sees the
+       report — who made it, when, and which renderer and version played the track. Identical copies of a module,
+       chiptune or SID file are marked too, and a file that is removed and comes back unchanged keeps its report;
+       a changed file starts without one. A track marked
+       broken, and one no engine can decode (<b>corrupt</b>), is passed by when a list plays through, while a click
+       still plays it: if it then plays, SoniqBoom offers to clear the mark. One badge per row shows the most
+       serious problem — red <b>broken</b> / <b>corrupt</b> (passed by), amber <b>glitched</b> /
+       <b>partial</b> (plays) — in track lists, search results, playlists, the queue, Track Info and on the phone.
+       In the queue, rows that will be passed by are dimmed. Subsonic apps don't get tracks marked broken, tracks
+       that can't be decoded or files whose default tune is short in random songs, similar songs or top songs;
+       albums, folders, playlists and searches still list them.
+       The first time a track is passed by, a one-time message explains why.</p>
+
     <h3>Equalizer &amp; visualizer</h3>
     <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
        toggle it with <span class="kbd">E</span>, and choose from genre presets or drag the bands by hand. A
@@ -953,7 +985,14 @@ docker compose exec soniqboom <span class="k">soniqboom-setadm</span> -user alic
     </table>
     <p class="muted">New accounts come from two places: an admin adds them in the <strong>Users</strong> tab with a
        role, or a visitor signs themselves up from the login screen — self-registered accounts are always
-       <strong>Read-only</strong> until an admin promotes them.</p>
+       <strong>Read-only</strong> until an admin promotes them. Under gear → <strong>Users → Sign-up &amp; passwords</strong>:</p>
+    <ul>
+      <li><strong>Allow self-registration</strong> (on by default) — turn it off and the login screen no longer
+          offers <strong>Create account</strong>.</li>
+      <li><strong>Require strong passwords</strong> (off by default) — new passwords need at least 10 characters with
+          an uppercase letter, a lowercase letter, a number and a symbol. It applies whenever a password is set;
+          existing passwords keep working. While it is off, a password can be any length.</li>
+    </ul>
 
     <h3>Reset a password or recover access</h3>
     <p>Run this on the server host (from inside the SoniqBoom folder) to set any user's password — it's also how
@@ -991,7 +1030,7 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and those tracks show their length once they have played. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. Adjust the size from 256 MB to 100 GB in <strong>gear → Renderers → Transcode &amp; render cache</strong>.</p></div>
-      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing.</p></div>
+      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing.</p></div>
       <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — settings, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later by uploading the file. Back up the data folder too, for user accounts and Subsonic app state.</p></div>
     </div>
   </section>

@@ -1582,6 +1582,10 @@ def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: st
     # builds), and the progressive path synthesizes its WAV header from
     # ``_SID_WAV_RATE`` before the file exists — a mismatch plays at the wrong pitch.
     cmd.append(f"-f{_SID_WAV_RATE}")
+    # …and mono: sidplayfp 3.x writes a tune for two or three SID chips in
+    # stereo, while every SID render is ``_SID_WAV_CHANNELS`` (the progressive
+    # stream's header is written before the render starts).
+    cmd.append("-m")
     cmd.extend([f"-t{int(dur)}", f"-w{out_wav}", str(path)])
     return cmd
 
@@ -2643,6 +2647,14 @@ async def _render_gme(path: Path, subsong: int = 0, *,
         if secs:
             duration = min(3600, int(secs) + 1 + 8)
         unpacked = data is not raw
+    fade_at = None
+    if path.suffix.lower() != ".gym" and gme_render.is_available():
+        # The length the file states (SPC ID666, NSFe, VGM loop) + its fade,
+        # instead of the default for every tune (GitHub #38).
+        if data is None:
+            data = await loop.run_in_executor(None, path.read_bytes)
+        duration, fade_at = await loop.run_in_executor(
+            None, gme_render.render_plan, data, subsong, duration)
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_wav.close()
     out = Path(tmp_wav.name)
@@ -2656,8 +2668,8 @@ async def _render_gme(path: Path, subsong: int = 0, *,
             data = await loop.run_in_executor(None, path.read_bytes)
         if live_key:
             try:
-                got = await _render_gme_live(data, subsong, int(duration), live_key,
-                                             expected_seconds)
+                got = await _render_gme_live(data, subsong, duration, live_key,
+                                             expected_seconds, fade_at=fade_at)
             except BaseException:
                 out.unlink(missing_ok=True)
                 raise
@@ -2666,7 +2678,8 @@ async def _render_gme(path: Path, subsong: int = 0, *,
                 return got
         else:
             wav = await loop.run_in_executor(
-                None, gme_render.render_wav, data, subsong, int(duration),
+                None, functools.partial(gme_render.render_wav, data, subsong, duration,
+                                        fade_at_s=fade_at),
             )
             if wav:
                 out.write_bytes(wav)
@@ -2686,8 +2699,9 @@ async def _render_gme(path: Path, subsong: int = 0, *,
             unpacked_tmp.unlink(missing_ok=True)
 
 
-async def _render_gme_live(data: bytes, subsong: int, duration: int, live_key: str,
-                           expected_seconds: float) -> "Path | None":
+async def _render_gme_live(data: bytes, subsong: int, duration: float, live_key: str,
+                           expected_seconds: float, *,
+                           fade_at: float | None = None) -> "Path | None":
     """The libgme render of ``_render_gme`` as a live render: ``render_pcm``
     runs in a worker thread and appends each block to a ``_LiveWav`` (its
     listeners told on the loop every 128 KB).  The finished file, or None
@@ -2708,7 +2722,8 @@ async def _render_gme_live(data: bytes, subsong: int, duration: int, live_key: s
             loop.call_soon_threadsafe(lw.account, n)
         return True
 
-    fut = loop.run_in_executor(None, gme_render.render_pcm, data, subsong, duration, _sink)
+    fut = loop.run_in_executor(None, functools.partial(
+        gme_render.render_pcm, data, subsong, duration, _sink, fade_at_s=fade_at))
     try:
         total = await asyncio.shield(fut)
         # The thread is done and its queued notices have run: the remainder.
@@ -3960,34 +3975,82 @@ _ZXTUNE_FADE_S = 8
 _ZXTUNE_WALL_S = 120.0
 
 
-def _cap_and_fade_wav(wav: Path, data_bytes: int, fade_s: int) -> None:
+def _fade_pcm16(buf: bytes, first: int, total: int, channels: int = 2) -> bytes:
+    """Fade little-endian s16 PCM ``buf`` (whole frames of ``channels``) as
+    frames ``first``… of a ``total``-frame linear fade-out: frame ``k`` of
+    the fade is scaled by ``(total - k) / total``.  Pure."""
+    import array as _array
+    import sys
+    a = _array.array("h")
+    a.frombytes(buf)
+    if sys.byteorder == "big":
+        a.byteswap()
+    ch = max(1, int(channels))
+    for i in range(len(a) // ch):
+        g = max(0.0, (total - (first + i)) / total)
+        for c in range(ch):
+            a[ch * i + c] = int(a[ch * i + c] * g)
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a.tobytes()
+
+
+def _cap_and_fade_wav(wav: Path, data_bytes: int, fade_s: float) -> None:
     """Cut the 44.1 kHz stereo s16 WAV ``wav`` (a canonical 44-byte header)
     to ``data_bytes`` of audio, fade its last ``fade_s`` seconds out and
     rewrite the header sizes.  Blocking."""
-    import array as _array
-    import sys
     frame = 4
     data_bytes -= data_bytes % frame
     with open(wav, "r+b") as fh:
         fh.truncate(_WAV_HEADER_LEN + data_bytes)
-        n = min(data_bytes, fade_s * 44100 * frame)
+        n = min(data_bytes, int(round(fade_s * 44100)) * frame)
         if n:
             fh.seek(_WAV_HEADER_LEN + data_bytes - n)
-            a = _array.array("h")
-            a.frombytes(fh.read(n))
-            if sys.byteorder == "big":
-                a.byteswap()
-            frames = len(a) // 2
-            for i in range(frames):
-                g = (frames - i) / frames
-                a[2 * i] = int(a[2 * i] * g)
-                a[2 * i + 1] = int(a[2 * i + 1] * g)
-            if sys.byteorder == "big":
-                a.byteswap()
+            faded = _fade_pcm16(fh.read(n), 0, n // frame)
             fh.seek(_WAV_HEADER_LEN + data_bytes - n)
-            fh.write(a.tobytes())
+            fh.write(faded)
         fh.seek(0)
         fh.write(_build_wav_header(44100, 2, data_bytes // frame, bits_per_sample=16))
+
+
+async def _run_zxtune_to_cap(cmd: list[str], out: Path, cap_bytes: int, *,
+                             kind: str, wall_s: float) -> bool:
+    """Run zxtune123 ``cmd``, which writes the WAV ``out``, until it exits or
+    ``out`` holds ``cap_bytes`` of audio (then it is killed).  True when the
+    cap was reached; a run past ``wall_s`` is a 504, a failed one a 502."""
+    capped = False
+    async with _render_sem:
+        proc = await forksafe.spawn(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + wall_s
+            while proc.returncode is None:
+                try:
+                    size = out.stat().st_size
+                except OSError:
+                    size = 0
+                if size >= _WAV_HEADER_LEN + cap_bytes:
+                    capped = True
+                    break
+                if time.monotonic() > deadline:
+                    raise HTTPException(504, f"{kind} render timed out")
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_ZXTUNE_POLL_S)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except Exception:
+                    pass
+    if not capped and proc.returncode != 0:
+        raise HTTPException(502, f"{kind} renderer exited with status {proc.returncode}")
+    return capped
 
 
 async def _render_zxtune_capped(path: Path, *, kind: str) -> Path:
@@ -4005,42 +4068,13 @@ async def _render_zxtune_capped(path: Path, *, kind: str) -> Path:
     tmp_wav.close()
     out = Path(tmp_wav.name)
     out.unlink(missing_ok=True)
-    capped = ok = False
+    ok = False
     try:
-        async with _render_sem:
-            proc = await forksafe.spawn(
-                binary, "--silent", "--wav", f"filename={out}", str(path),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            try:
-                deadline = time.monotonic() + _ZXTUNE_WALL_S
-                while proc.returncode is None:
-                    try:
-                        size = out.stat().st_size
-                    except OSError:
-                        size = 0
-                    if size >= _WAV_HEADER_LEN + cap_bytes:
-                        capped = True
-                        break
-                    if time.monotonic() > deadline:
-                        raise HTTPException(504, f"{kind} render timed out")
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=_ZXTUNE_POLL_S)
-                    except asyncio.TimeoutError:
-                        pass
-            finally:
-                if proc.returncode is None:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
+        capped = await _run_zxtune_to_cap(
+            [binary, "--silent", "--wav", f"filename={out}", str(path)], out, cap_bytes,
+            kind=kind, wall_s=_ZXTUNE_WALL_S)
         if capped:
             await asyncio.to_thread(_cap_and_fade_wav, out, cap_bytes, _ZXTUNE_FADE_S)
-        elif proc.returncode != 0:
-            raise HTTPException(502, f"{kind} renderer exited with status {proc.returncode}")
         if not _render_has_audio(out):
             raise HTTPException(422, "The renderer finished but produced no audio for this file.")
         ok = True
@@ -4387,7 +4421,8 @@ def _tail_fmt(head: bytes) -> "tuple[dict, int] | None":
 async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
                        timeout: float, require_audio: bool = True,
                        env: "dict | None" = None, expected_seconds: float = 0.0,
-                       exact: bool = False, min_audible_seconds: float = 0.0) -> Path:
+                       exact: bool = False, min_audible_seconds: float = 0.0,
+                       stop_after_s: float = 0.0, fade_s: float = 0.0) -> Path:
     """Run renderer ``cmd``, which writes a 16-bit PCM WAV to ``src`` as it
     renders, and copy its audio into a live WAV (``_LiveWav`` registered
     under ``live_key``, made with ``expected_seconds`` / ``exact`` /
@@ -4406,8 +4441,14 @@ async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
     While the renderer runs, the last ``_TAIL_HOLDBACK`` bytes of its file
     are not copied: a trailing chunk of up to that size it appends at close
     (zxtune's tag block), before patching its header's data size, is never
-    taken for audio; at the end the patched data size bounds the copy."""
-    state = {"fd": -1, "pos": None, "fmt": None, "ok": True, "closed": False}
+    taken for audio; at the end the patched data size bounds the copy.
+
+    ``stop_after_s``: a renderer told to play on (zxtune ``--loop``) is
+    stopped once that much audio is copied, and the last ``fade_s`` seconds
+    of it fade out; its output must then be followable live (a 502 if not —
+    it would otherwise play on until ``timeout``)."""
+    state = {"fd": -1, "pos": None, "fmt": None, "ok": True, "closed": False,
+             "cap_end": None, "capped": False}
     live: "_LiveWav | None" = None
     # Held by a worker-thread step and by the close below: a step still
     # running when the render is cancelled must never read a descriptor
@@ -4433,14 +4474,22 @@ async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
             if parsed is None:
                 if size > 65536 or final:
                     state["ok"] = False      # no header we can follow
+                    if stop_after_s > 0:
+                        state["capped"] = True   # never followed: stop it now
                 return 0
             fmt, off = parsed
             state["fmt"], state["pos"] = fmt, off
             if not (fmt["tag"] == 1 and fmt["bits"] == 16
                     and fmt["channels"] == live.channels and fmt["rate"] == live.rate):
                 state["ok"] = False
+                if stop_after_s > 0:
+                    state["capped"] = True   # never followed: stop it now
                 return 0
+            if stop_after_s > 0:
+                state["cap_end"] = off + int(round(stop_after_s * live.rate)) * live.frame_bytes
         if not state["ok"]:
+            if stop_after_s > 0:
+                state["capped"] = True
             return 0
         if final:
             # The renderer patched its header: its data size bounds the audio
@@ -4455,9 +4504,26 @@ async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
         else:
             end = size - _TAIL_HOLDBACK
         pos = state["pos"]
+        cap_end = state["cap_end"]
+        if cap_end is not None:
+            # Whole frames only, so the fade scales every sample in place.
+            end = min(end, cap_end)
+            end -= (end - (cap_end % live.frame_bytes)) % live.frame_bytes
         if end <= pos:
             return 0
-        buf = os.pread(fd, min(end - pos, 4 * 1024 * 1024), pos)
+        # A step holds ``step_lock``: with a stop, fading work keeps each one
+        # short (1 MB ≈ 0.1 s of fading).
+        buf = os.pread(fd, min(end - pos, (1 if cap_end is not None else 4) * 1024 * 1024), pos)
+        if cap_end is not None:
+            buf = buf[:len(buf) - len(buf) % live.frame_bytes]
+            fade_frames = int(round(max(0.0, fade_s) * live.rate))
+            fade_start = cap_end - fade_frames * live.frame_bytes
+            if fade_frames and pos + len(buf) > fade_start:
+                cut = max(0, fade_start - pos)
+                first = (pos + cut - fade_start) // live.frame_bytes
+                buf = buf[:cut] + _fade_pcm16(buf[cut:], first, fade_frames, live.channels)
+            if pos + len(buf) >= cap_end:
+                state["capped"] = True
         if buf:
             live.write(buf)
             state["pos"] = pos + len(buf)
@@ -4500,7 +4566,7 @@ async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
                         live.account(n)
                         if not final:
                             break
-                    if final:
+                    if final or state["capped"]:
                         break
                     if time.monotonic() > deadline:
                         raise HTTPException(504, f"{kind} render timed out after {int(timeout)}s")
@@ -4523,7 +4589,9 @@ async def _tail_render(cmd: list[str], src: Path, live_key: str, *, kind: str,
                     if state["fd"] >= 0:
                         os.close(state["fd"])
                         state["fd"] = -1
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not (state["capped"] and state["ok"]):
+            if state["capped"]:
+                raise HTTPException(502, f"{kind} renderer wrote audio that can't be cut")
             raise _renderer_failure(kind, cmd[0], proc.returncode,
                                     bytes(err_ring).decode("utf-8", "replace"))
         if not state["ok"]:
@@ -4723,15 +4791,108 @@ async def _xpk_unpacked(path: Path):
 
 async def _render_uade(path: Path, *args, **kwargs) -> Path:
     """``_render_uade_file`` on ``path`` — unpacked first when XPK-packed
-    (``_xpk_unpacked``)."""
+    (``_xpk_unpacked``).  An AHX module stops where its song ends
+    (``_ahx_play_seconds``), not at uade's subsong timeout (GitHub #38)."""
     async with _xpk_unpacked(path) as src:
+        if kwargs.get("stop_after_s") is None:
+            subsong = args[0] if args else kwargs.get("subsong", 0)
+            secs = await _ahx_play_seconds(
+                src, int(kwargs.get("subsong_base", 0) or 0) + int(subsong or 0))
+            if secs:
+                kwargs["stop_after_s"] = secs
+                # uade stops on a whole second: the exact length lets the
+                # finished render be trimmed to the song end (``_LiveWav``).
+                if not kwargs.get("expected_seconds"):
+                    kwargs["expected_seconds"] = secs
         return await _render_uade_file(src, *args, **kwargs)
+
+
+def _is_ahx(path: Path) -> bool:
+    """An AHX module (``THX`` magic) — whatever its name or prefix form."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(3) == b"THX"
+    except OSError:
+        return False
+
+
+# uade replays AHX at the Amiga's PAL frame rate (≈49.92 Hz, measured against
+# hvl2wav's 50 Hz: 0.2 s behind after 104 s), so the song end in a uade render
+# is hvl2wav's frame count at that rate.
+_AHX_UADE_HZ = 49.92
+
+
+def _hvl_length(binary: str, path: Path, tune: int, hz: float = _AHX_UADE_HZ) -> float | None:
+    """``hvl2wav -l``: the song length in seconds (its frame count at ``hz``)
+    when the replayer reached the song end; None otherwise.  The output name is in
+    a scratch directory, so an ``hvl2wav`` without ``-l`` (which would
+    convert instead) never writes beside the module.  Blocking."""
+    import subprocess as _sp
+    tmpd = tempfile.mkdtemp(prefix="sq_hvl_len_")
+    try:
+        r = forksafe.run([binary, "-l", f"-s{max(0, int(tune))}",
+                          f"-o{os.path.join(tmpd, 'x.wav')}", str(Path(path).absolute())],
+                         capture_output=True, timeout=20)
+        for line in (r.stdout or b"").decode("ascii", "replace").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "length":
+                frames, ended = int(parts[1]), parts[2] == "1"
+                return round(frames / hz, 2) if ended and frames > 0 else None
+        return None
+    except (_sp.TimeoutExpired, OSError, ValueError):
+        return None
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+async def _ahx_play_seconds(path: Path, tune: int = 0) -> float | None:
+    """How long AHX tune ``tune`` (uade's numbering: 0 = the main song) plays
+    before it loops, from the bundled HivelyTracker replayer — which replays
+    AHX too and detects the song end; uade's AHX player loops for ever and
+    stops only at its ~512 s subsong timeout.  uade stays the renderer; this
+    only says where to stop it.  None for anything else (or no replayer)."""
+    loop = asyncio.get_running_loop()
+    if not await loop.run_in_executor(None, _is_ahx, path):
+        return None
+    binary = await _hvl2wav_with_length()
+    if not binary:
+        return None
+    return await loop.run_in_executor(None, _hvl_length, binary, path, tune)
+
+
+_HVL_LENGTH_OK: dict[str, bool] = {}
+
+
+def _hvl_has_length_option(binary: str) -> bool:
+    """Does this ``hvl2wav`` know ``-l`` (its usage lists it)?  Blocking."""
+    if binary not in _HVL_LENGTH_OK:
+        try:
+            r = forksafe.run([binary], capture_output=True, timeout=10)
+            _HVL_LENGTH_OK[binary] = b"-l " in (r.stdout or b"")
+        except Exception:                               # noqa: BLE001
+            _HVL_LENGTH_OK[binary] = False
+    return _HVL_LENGTH_OK[binary]
+
+
+async def _hvl2wav_with_length() -> str | None:
+    """An ``hvl2wav`` that has ``-l``: the usual one, else the bundled source
+    built into the data dir (an older prebuilt one on PATH lacks it)."""
+    loop = asyncio.get_running_loop()
+    b = await _ensure_hvl2wav()
+    if b and await loop.run_in_executor(None, _hvl_has_length_option, str(b)):
+        return str(b)
+    async with _native_build_lock("hvl2wav"):
+        built = await _build_hvl2wav()
+    if built and await loop.run_in_executor(None, _hvl_has_length_option, str(built)):
+        return str(built)
+    return None
 
 
 async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, *,
                        live_key: str | None = None,
                        expected_seconds: float = 0.0,
-                       subsong_base: int = 0) -> Path:
+                       subsong_base: int = 0,
+                       stop_after_s: float | None = None) -> Path:
     """Render an AHX / Hively / Amiga-tracker module to WAV via uade123.
 
     Returns the temp-file path; caller (``conversion_cache.get_or_render``)
@@ -4760,6 +4921,10 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
     is no longer produced here (it doubled the wait before the first byte) —
     ``_spawn_uade_vu`` builds it in the background, from the cached WAV,
     when the now-playing meter asks for it (``request_uade_vu``).
+
+    ``stop_after_s`` (an AHX song's length, ``_ahx_play_seconds``) ends the
+    render there — uade's ``-w`` subsong timeout takes whole seconds, so it
+    is rounded up — instead of at uade's default ~512 s.
     """
     binary = _find_renderer(settings.uade123_path, "uade123")
     if not binary:
@@ -4778,6 +4943,8 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
     # every FOLLOWING one concatenated into a single render (QA M1).
     cmd = [binary, "-1", "--filter=A1200", "--headphones", "-c"]
     cmd += _uade_subsong_arg(subsong, subsong_base)
+    if stop_after_s and stop_after_s > 0:
+        cmd += ["-w", str(min(3600, math.ceil(stop_after_s)))]
     # uade runs IN the module's folder and gets its bare name: some players
     # (Musicline Editor) crash on a module path longer than 127 characters,
     # which a deep library folder or the extract dir easily reaches.
@@ -5504,13 +5671,18 @@ _UADE_VU_MAX_TUNE_S = 420
 _UADE_VU_MIN_FREE_BYTES = 4 * 1024**3
 
 
-def _uade_vu_cmd(binary: str, path: Path, subsong: int, base: int, dump: str) -> list[str]:
+def _uade_vu_cmd(binary: str, path: Path, subsong: int, base: int, dump: str,
+                 duration: float = 0.0) -> list[str]:
     """uade123 argv for a VU pass — run it with ``cwd=_uade_cwd(path)`` (the
     module goes by its bare name, like ``_render_uade``; ``dump`` stays an
-    absolute path)."""
+    absolute path).  ``duration`` (the cached render's length) ends the pass
+    just after it — the meters need no more, and a looping tune would
+    otherwise run to uade's ~512 s subsong timeout."""
     cmd = [binary, "-1", "--filter=A1200", "--headphones",
            f"--write-audio={dump}", "-e", "wav", "-f", os.devnull]
     cmd += _uade_subsong_arg(subsong, base)
+    if duration > 0:
+        cmd += ["-w", str(min(3600, math.ceil(duration) + 1))]
     return cmd + ["--", path.name]
 
 
@@ -5567,7 +5739,7 @@ async def _uade_vu_dump_file(
         _d = tempfile.NamedTemporaryFile(suffix=".uadedump", delete=False)
         _d.close()
         dump_tmp = Path(_d.name)
-        cmd = _uade_vu_cmd(binary, path, subsong, base, str(dump_tmp))
+        cmd = _uade_vu_cmd(binary, path, subsong, base, str(dump_tmp), duration)
         async with _render_sem:
             if not path.exists():
                 return None
@@ -5649,7 +5821,7 @@ async def _uade_vu_dump_fifo(
                     return None
         reader = loop.run_in_executor(None, _read)
         rfd = -1                                 # the reader owns (and closes) it
-        cmd = _uade_vu_cmd(binary, path, subsong, base, fifo)
+        cmd = _uade_vu_cmd(binary, path, subsong, base, fifo, duration)
         async with _render_sem:
             if not path.exists():
                 return None
@@ -5953,19 +6125,25 @@ def _psf_missing_libs(path: Path) -> list[str]:
     return [n for n in libs if not _psf_lib_present(path.parent, n)]
 
 
-def _psf_render_seconds(path: Path) -> float:
-    """How long zxtune renders a PSF-family rip: its ``length`` tag — the
-    installed zxtune stops there and plays no ``fade`` (measured on PSF,
-    PSF2, USF, GSF, 2SF, NCSF and SSF rips), while the scan stores length +
-    fade as the duration; 0 when untagged, or tagged with something that is
-    no length (not finite, over an hour).  Blocking (header + tag block)."""
-    from soniqboom.core.metadata import _psf_parse_length
+def _psf_render_plan(path: Path) -> "tuple[float, float]":
+    """``(seconds, fade)``: how long a PSF-family rip renders and how much of
+    its end fades out — ``metadata.psf_play_plan`` of its ``[TAG]`` block,
+    the same length + fade the scan stores as its duration; ``(length, 0)``
+    with no fade, ``(0, 0)`` with no length.  Blocking (header + tag
+    block)."""
+    from soniqboom.core.metadata import psf_play_plan
+    tags: dict[str, str] = {}
     for line in _psf_tag_lines(path):
         key, sep, val = line.partition("=")
-        if sep and key.strip().lower() == "length":
-            secs = _psf_parse_length(val)
-            return secs if math.isfinite(secs) and 0 < secs <= _UADE_MAX_EXPECTED_S else 0.0
-    return 0.0
+        if sep:
+            tags.setdefault(key.strip().lower(), val.strip())
+    return psf_play_plan(tags)
+
+
+def _psf_render_seconds(path: Path) -> float:
+    """The length a PSF-family rip renders (``_psf_render_plan``); 0 when
+    untagged.  Blocking."""
+    return _psf_render_plan(path)[0]
 
 
 async def _render_psf(path: Path, subsong: int = 0, *,
@@ -5975,7 +6153,11 @@ async def _render_psf(path: Path, subsong: int = 0, *,
 
     PSF rips are one-track-per-file (minipsf per song, shared *lib beside
     it) — ``subsong`` is accepted for signature parity but unused.  zxtune
-    honours the embedded length/fade tags for the stop point.  A library the
+    stops at the ``length`` tag, fading out inside it; a rip with a ``fade``
+    tag is instead rendered with ``--loop`` (it plays on, unfaded), stopped
+    at length + fade, and its last ``fade`` seconds faded out here
+    (``_psf_render_plan``) — the full length, then the fade, as the
+    duration the scan stores says.  A library the
     rip names (``_lib=…``) that isn't beside it is a 422 naming it
     (``_psf_missing_libs``) — zxtune would render nothing, exit 0.
 
@@ -6006,15 +6188,31 @@ async def _render_psf(path: Path, subsong: int = 0, *,
     # ("File already exists", rc=0 — verified), which cached the pre-created
     # empty temp as a "successful" render.  Unlink the placeholder first.
     Path(tmp_wav.name).unlink(missing_ok=True)
+    total, fade = await asyncio.to_thread(_psf_render_plan, Path(path))
+    out = Path(tmp_wav.name)
     # File-based WAV backend: ``--wav filename=<out>``.  No display needed.
-    cmd = [binary, "--silent", "--wav", f"filename={tmp_wav.name}", str(path)]
+    loop = ["--loop"] if fade > 0 else []
+    cmd = [binary, "--silent", *loop, "--wav", f"filename={out}", str(path)]
     if live_key:
         return await _tail_render(
-            cmd, Path(tmp_wav.name), live_key, kind="PSF", timeout=600,
-            expected_seconds=expected_seconds)
-    await _await_renderer(
-        cmd, Path(tmp_wav.name), timeout=600, kind="PSF")
-    return Path(tmp_wav.name)
+            cmd, out, live_key, kind="PSF", timeout=600,
+            expected_seconds=total if fade > 0 else expected_seconds,
+            stop_after_s=total if fade > 0 else 0.0, fade_s=fade)
+    if not fade:
+        await _await_renderer(cmd, out, timeout=600, kind="PSF")
+        return out
+    cap_bytes = int(round(total * 44100)) * 4
+    ok = False
+    try:
+        if await _run_zxtune_to_cap(cmd, out, cap_bytes, kind="PSF", wall_s=600):
+            await asyncio.to_thread(_cap_and_fade_wav, out, cap_bytes, fade)
+        if not _render_has_audio(out):
+            raise HTTPException(422, "The renderer finished but produced no audio for this file.")
+        ok = True
+        return out
+    finally:
+        if not ok:
+            out.unlink(missing_ok=True)
 
 
 # ── Atari ST renderers (SNDH / YM / SC68) ─────────────────────────────────
@@ -6033,7 +6231,34 @@ async def _render_psf(path: Path, subsong: int = 0, *,
 _SNDH_EXTS = {".sndh"}
 _YM_EXTS = {".ym"}
 _SC68_EXTS = {".sc68"}
-_ATARI_DEFAULT_S = 180        # SNDH TIME tag missing/0 → render this long
+
+
+def renderer_key_for(track: "dict | None") -> "str | None":
+    """The renderer (its Settings → Renderers key) that plays ``track``, by
+    its file's suffix in the order ``stream`` tries them; None for a file the
+    browser plays itself (or through ffmpeg).  Best effort, from the routing
+    ``_render_ident`` gives: a magic-less ``.sid`` / ``.psf`` that uade plays
+    instead is named by its suffix."""
+    if not isinstance(track, dict):
+        return None
+    try:
+        ext, uade_named = _render_ident(str(track.get("path") or ""), track)
+    except Exception:                                   # noqa: BLE001
+        return None
+    if uade_named:
+        return "uade123"
+    for exts, key in ((_SID_EXTS, "sidplayfp"), (_MIDI_EXTS, "fluidsynth"),
+                      (_HVL_EXTS, "hvl2wav"), (_PSF_STREAM_EXTS, "zxtune123"),
+                      (_SNDH_EXTS, "psgplay"), (_YM_EXTS, "ym2wav"),
+                      (_SC68_EXTS, "sc68"), (_UADE_EXTS, "uade123"),
+                      (_ADLIB_EXTS | {".imf"}, "adplay"), (_TRACKER_EXTS, "openmpt123"),
+                      (_GME_EXTS_STREAM, "gme")):
+        if ext in exts:
+            return key
+    if ext == ".dsf" and str(track.get("format") or "").upper().startswith("DSF (DREAMCAST"):
+        return "zxtune123"
+    return None
+_ATARI_DEFAULT_S = 180        # SNDH stating no length (FRMS / TIME) → render this long
 _ym2wav_bin: "Path | None" = None
 
 
@@ -6145,40 +6370,21 @@ async def _render_ym(path: Path, subsong: int = 0) -> Path:
     return Path(tmp_wav.name)
 
 
-def _sndh_info(path: Path) -> tuple[int, dict[int, int], int]:
+def _sndh_info(path: Path) -> tuple[int, dict[int, float], int]:
     """(default_track, {track: seconds}, track count) from ``psgplay -i``
-    tags (``!#`` / ``TIME`` / ``##``).  default_track falls back to 1, the
-    count to 0 (unknown)."""
+    (``metadata.parse_sndh_info``: FRMS / TIME lengths, ``!#``, ``##``).
+    default_track falls back to 1, the count to 0 (unknown)."""
+    from soniqboom.core.metadata import sndh_info
     binary = _find_renderer(settings.psgplay_path, "psgplay")
-    default_track, times, count = 1, {}, 0
-    if not binary:
-        return default_track, times, count
-    import subprocess as _sp
-    try:
-        r = forksafe.run([binary, "-i", str(path)], capture_output=True,   # a worker thread: never a fork
-                         text=True, timeout=20)
-    except (_sp.TimeoutExpired, OSError):
-        return default_track, times, count
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if parts[:2] != ["tag", "field"] or len(parts) < 4:
-            continue
-        if parts[2] == "!#":
-            try:
-                default_track = max(1, int(parts[3]))
-            except ValueError:
-                pass
-        elif parts[2] == "##":
-            try:
-                count = max(0, int(parts[3]))
-            except ValueError:
-                pass
-        elif parts[2] == "TIME" and len(parts) >= 5:
-            try:
-                times[int(parts[3])] = max(0, int(parts[4]))
-            except ValueError:
-                continue
-    return default_track, times, count
+    info = sndh_info(path, binary) if binary else None      # a worker thread: never a fork
+    if not info:
+        return 1, {}, 0
+    return info["default_track"], info["lengths"], info["count"]
+
+
+def _secs_arg(seconds: float) -> str:
+    """``50`` / ``268.63`` — a length for a CLI that takes ``ss.ss``."""
+    return f"{float(seconds):.2f}".rstrip("0").rstrip(".")
 
 
 async def _render_sndh(path: Path, subsong: int = 0, *,
@@ -6190,9 +6396,9 @@ async def _render_sndh(path: Path, subsong: int = 0, *,
     file's default track (SNDH ``!#`` tag) its start song, so wire 0 plays
     that track and the rest follow ``sid_wire_tune``; psgplay's ``-t`` is
     the 1-based track.  psgplay
-    hard-errors on ``--stop=auto`` when a tune declares no TIME tag, so a
-    ``--length`` is ALWAYS passed: the tag's duration when present, else
-    the Atari default cap.  ``track_id`` (optional) gets the start song
+    hard-errors on ``--stop=auto`` when a tune states no length, so a
+    ``--length`` is ALWAYS passed: the FRMS / TIME length when present
+    (``_sndh_info``), else the Atari default cap.  ``track_id`` (optional) gets the start song
     written back to its record (``_persist_start_song``).
 
     ``live_key``: a live render (``_LiveWav``) played while psgplay writes
@@ -6221,7 +6427,7 @@ async def _render_sndh(path: Path, subsong: int = 0, *,
     tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_wav.close()
     cmd = [binary, "-t", str(track), "-f", "44100",
-           f"--length={length}", "-o", tmp_wav.name, str(path)]
+           f"--length={_secs_arg(length)}", "-o", tmp_wav.name, str(path)]
     if live_key:
         return await _tail_render(
             cmd, Path(tmp_wav.name), live_key, kind="SNDH",
@@ -12040,10 +12246,11 @@ async def stream_track(
             _key = _ck(track_id, "sndh", subsong=subsong)
 
             async def _after(cached_path):
-                # SNDH TIME tags are frequently absent; the scan stored the
-                # Atari default cap in that case — backfill only refines a 0
-                # duration.
-                await _backfill_rendered_duration(track_id, track, cached_path, 0.0,
+                # A tune stating no length was stored at the Atari default and
+                # renders exactly that; one stored before its FRMS / TIME
+                # length was read (GitHub #38) gets the rendered length.
+                await _backfill_rendered_duration(track_id, track, cached_path,
+                                                  float(_ATARI_DEFAULT_S),
                                                   subsong=subsong)
             # psgplay renders exactly the length it is given: an exact live
             # render every client may stream.

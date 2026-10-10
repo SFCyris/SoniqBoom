@@ -1312,7 +1312,7 @@ def test_user_management(env, users):
            streamRole="true", **A)
     assert users.get_by_username("dave").role == "readonly"
     assert env.fail("createUser.view", username="dave", password="davepass12", **A)["code"] == 0
-    assert env.fail("createUser.view", username="x", password="short", **A)["code"] == 10
+    assert env.fail("createUser.view", username="x", password="x" * 1025, **A)["code"] == 10
     env.ok("updateUser.view", username="dave", adminRole="true", **A)
     assert users.get_by_username("dave").role == "admin"
     # Sending ONE flag never flips the others: an admin stays admin.
@@ -1324,7 +1324,7 @@ def test_user_management(env, users):
            **{fl: "false" for fl in subsonic._EDIT_FLAGS}, **A)
     assert users.get_by_username("dave").role == "readonly"
     # Atomic: a rejected password leaves the role untouched.
-    assert env.fail("updateUser.view", username="dave", adminRole="true", password="short",
+    assert env.fail("updateUser.view", username="dave", adminRole="true", password="x" * 1025,
                     **A)["code"] == 10
     assert users.get_by_username("dave").role == "readonly"
     env.ok("updateUser.view", username="dave", password="newdavepass", **A)

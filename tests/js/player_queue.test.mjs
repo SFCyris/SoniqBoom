@@ -1554,3 +1554,120 @@ test('offline skip: a sparse folder shuffle is read on by the server, not 50 row
   const reqs = srv.requests.filter((u) => u.includes('/shuffled')).length;
   assert.ok(reqs <= 12, `${reqs} shuffled page requests for a 20,000-track order`);
 });
+
+// ── Skip rules (GitHub #36 / #37): reported broken, undecodable, short tunes ──
+const sid = (i, lens, extra = {}) => ({ id: tid(i), title: 'T' + i, hvsc_lengths: lens, subsongs: lens.length, ...extra });
+
+test('playing through passes broken, corrupt and short entries by; a clicked one plays', async () => {
+  const p = makePlayer();
+  p.setSkipShort(10);
+  const list = [
+    { id: tid(0), title: 'A' },
+    { id: tid(1), title: 'B', health: 'broken' },
+    { id: tid(2), title: 'C', defect: 'corrupt' },
+    sid(3, [3]),                                   // a 3 s sound effect
+    { id: tid(4), title: 'E', health: 'glitched' },  // shown only, never skipped
+    sid(5, [0]),                                   // unknown length: never skipped
+  ];
+  p.setQueue(list, 0, { explicit: false });
+  await p.settle();
+  p._advance(); await p.settle();
+  assert.equal(p.current.id, tid(4));
+  const skip = p.env.events.find(([n]) => n === 'dealtskip');
+  assert.deepEqual(skip[1].tracks.map(x => x.reason), ['broken', 'corrupt', 'short']);
+  p._advance(); await p.settle();
+  assert.equal(p.current.id, tid(5));
+  // A click (a row of the current queue) plays a broken track.
+  p.setQueue(p.queue, 1); await p.settle();
+  assert.equal(p.current.id, tid(1));
+  assert.equal(p.explicitPick, true);
+  // Setting off: the short tune plays through again.
+  p.setSkipShort(0);
+  assert.equal(p.skipReason(list[3]), '');
+  assert.equal(p.skipReason(list[1]), 'broken');
+});
+
+test('a tune entry is judged by its own length, through the wire mapping', () => {
+  const p = makePlayer();
+  p.setSkipShort(10);
+  const base = { id: tid(7), title: 'G', hvsc_lengths: [200, 4, 60], subsongs: 3 };
+  assert.equal(p.skipReason({ ...base }), '');                       // bare: tune 1 (200 s)
+  assert.equal(p.skipReason({ ...base, subsong: 1 }), 'short');      // wire 1 = tune 2 (4 s)
+  // Start song 2: the bare play IS tune 2, wire 1 swaps to tune 1.
+  const st = { ...base, start_subsong: 1 };
+  assert.equal(p.skipReason(st), 'short');
+  assert.equal(p.skipReason({ ...st, subsong: 1 }), '');
+});
+
+test('Prev returns to a short tune that played, passes one that never did', async () => {
+  const p = makePlayer();
+  const list = [{ id: tid(0), title: 'A' }, sid(1, [3]), { id: tid(2), title: 'C' }, { id: tid(3), title: 'D' }];
+  p.setQueue(list, 1); await p.settle();          // clicked: the short tune plays
+  assert.equal(p.current.id, tid(1));
+  p.setSkipShort(10);
+  p._advance(); await p.settle();
+  assert.equal(p.current.id, tid(2));
+  p.prev(); await p.settle();
+  assert.equal(p.current.id, tid(1), 'Prev skipped a tune the listener heard');
+  // Never played: Prev passes it by.
+  const q = [{ id: tid(10), title: 'X' }, sid(11, [2]), { id: tid(12), title: 'Z' }];
+  p.setQueue(q, 2); await p.settle();
+  p.prev(); await p.settle();
+  assert.equal(p.current.id, tid(10));
+});
+
+test('Play all of entries none of which plays through says why and keeps the queue', async () => {
+  const p = makePlayer();
+  p.setSkipShort(10);
+  p.setQueue([{ id: tid(0), title: 'A' }], 0); await p.settle();
+  const ok = p.setQueue([sid(1, [3]), sid(2, [4]), { id: tid(3), title: 'B', health: 'broken' }], 0, { explicit: false });
+  await p.settle();
+  assert.equal(ok, false);
+  assert.equal(p.current.id, tid(0));
+  const ev = p.env.events.filter(([n]) => n === 'offlinequeue').pop();
+  assert.deepEqual(ev[1].reasons.sort(), ['broken', 'short']);
+});
+
+test('paged lists ask the server for playable pages whatever the offline setting', async () => {
+  const server = makeServer(300);
+  const p = makePlayer({ server });
+  p.setQueue(rows(0, 50), 0, { source: { ...SOURCE(300), offset: 0 }, explicit: false });
+  await p.settle();
+  await pressNext(p, 45); await p.settle();
+  const pages = server.requests.filter((u) => u.startsWith('/api/tracks?'));
+  assert.ok(pages.length > 0 && pages.every((u) => u.includes('playable=1')), pages.join('\n'));
+});
+
+test('short tunes of every retro format count, ordinary audio and placeholders never', () => {
+  const p = makePlayer();
+  p.setSkipShort(10, [180, 150]);
+  assert.equal(p.skipReason({ id: 'm', format: 'ProTracker', duration: 4 }), 'short');      // a jingle module
+  assert.equal(p.skipReason({ id: 'y', format: 'YM', duration: 6.5 }), 'short');
+  assert.equal(p.skipReason({ id: 'a', format: 'MP3', duration: 8 }), '');                   // an album interlude
+  assert.equal(p.skipReason({ id: 'p', format: 'SID', duration: 150 }), '');                 // the default length
+  assert.equal(p.skipReason({ id: 'u', format: 'SID' }), '');                                // unknown
+  // An SNDH stating its tunes' lengths: tune 2 is a 3 s jingle.
+  const sn = { id: 's', format: 'SNDH', duration: 40, subsongs: 3, tune_lengths: [40, 3, 0] };
+  assert.equal(p.skipReason(sn), '');
+  assert.equal(p.skipReason({ ...sn, subsong: 1 }), 'short');
+  assert.equal(p.skipReason({ ...sn, subsong: 2 }), '');                                   // tune 3: unknown
+  assert.equal(p.tuneLength({ ...sn, subsong: 1 }), 3);
+});
+
+test('a tune is judged before its fade; a plain play by the tune it plays', () => {
+  const p = makePlayer();
+  p.setSkipShort(10, [180]);
+  // NSFe: lengths stored with the fixed 8 s fade — a 2 s effect lists as 10 s.
+  const nsfe = { id: 'n', format: 'NSFe', path: '/m/a.nsfe', subsongs: 3, duration: 128, tune_lengths: [128, 10, 9] };
+  assert.equal(p.skipReason({ ...nsfe, subsong: 1 }), 'short');
+  assert.equal(p.tuneLength({ ...nsfe, subsong: 2 }), 1);
+  // PSF: its own fade tag.
+  assert.equal(p.skipReason({ id: 'p', format: 'PSF', path: '/m/a.minipsf', duration: 12, fade_s: 10 }), 'short');
+  // A probed default tune (no start song): the plain play is tune 2 (128 s)…
+  const gme = { id: 'g', format: 'AY', path: '/m/a.ay', subsongs: 3, default_subsong: 1, duration: 136, tune_lengths: [13, 136, 9] };
+  assert.equal(p.skipReason(gme), '');
+  // …while picking wire 0 plays tune 1 (5 s before its fade).
+  assert.equal(p.skipReason({ ...gme, subsong: 0 }), 'short');
+  // An MP3 tagged like an Amiga module is still ordinary audio.
+  assert.equal(p.skipReason({ id: 'x', format: 'MP3', path: '/m/remix.mp3', genre: ['Amiga', 'Module'], duration: 5 }), '');
+});
