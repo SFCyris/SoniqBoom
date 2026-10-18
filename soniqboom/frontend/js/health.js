@@ -10,11 +10,14 @@
  *    play right — passed by when a list plays through; a click still plays
  *    it) or **glitched** (plays, with wrong sounds — only shown);
  *  - detected by the server (``defect``): **corrupt** (no engine can decode
- *    it — passed by like broken) or **partial** (plays with substituted
- *    content — only shown).
+ *    it, or an archive that can't be opened — passed by like broken),
+ *    **empty** (a package of an online collection that holds no tune
+ *    SoniqBoom plays: it has left the library — a copy still in a queue or
+ *    Track Info shows why) or **partial** (plays with substituted content —
+ *    only shown).
  *
- * One badge per row, the most serious first (broken > corrupt > glitched >
- * partial); its colour says what happens (red: passed by, amber: plays with
+ * One badge per row, the most serious first (broken > corrupt > empty >
+ * glitched > partial); its colour says what happens (red: passed by, amber: plays with
  * problems), its word and screen-reader text say what and why — never colour
  * alone.  Built the same way as the "offline" badge (offline.js) and shown
  * wherever that one is: library rows, search results, playlists, the queue,
@@ -33,10 +36,14 @@ import { Auth } from './auth.js';
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
 
+// A defect found when an archive was opened (core/online_catalog.py), not at scan.
+const OPENED_RE = /^The archive is damaged/;
+
 // key → [glyph, word, skipped when playing through?]
 const KINDS = {
   broken:   ['⊘', 'broken',   true],
   corrupt:  ['⚠︎', 'corrupt', true],   // (text presentation, not the emoji)
+  empty:    ['∅', 'no tunes', true],
   glitched: ['≈', 'glitched', false],
   partial:  ['◐', 'partial',  false],
 };
@@ -67,21 +74,36 @@ export function healthOf(t) {
   let key = '';
   if (t.health === 'broken') key = 'broken';
   else if (t.defect === 'corrupt') key = 'corrupt';
+  else if (t.defect === 'empty') key = 'empty';
   else if (t.health === 'glitched') key = 'glitched';
   else if (t.defect === 'partial') key = 'partial';
   if (!key) return null;
   const [glyph, word, skipped] = KINDS[key];
   // ``what``: what it means for playback (after the word, which the badge shows).
+  // (a detail loses its full stop: the badge's text goes on after it)
+  const detail = String(t.defect_detail || '').trim().replace(/[.\s]+$/, '');
   let what;
   if (key === 'broken') what = 'passed by when a list plays through; pick it to play anyway';
   else if (key === 'glitched') what = 'plays, with wrong sounds';
-  else if (key === 'corrupt') what = (t.defect_detail || 'no engine can decode it')
+  else if (key === 'corrupt') what = (detail || 'no engine can decode it')
     + ' — passed by when a list plays through';
-  else what = t.defect_detail || 'plays with substituted content';
-  const by = (key === 'broken' || key === 'glitched') ? reportedLine(t) : 'Detected when scanned';
+  else if (key === 'empty') what = (detail || 'it holds no tune SoniqBoom plays')
+    + ' — passed by when a list plays through';
+  else what = detail || 'plays with substituted content';
+  const by = (key === 'broken' || key === 'glitched') ? reportedLine(t)
+    : (key === 'empty' || OPENED_RE.test(String(t.defect_detail || ''))) ? 'Found when it was opened'
+    : 'Detected when scanned';
   const note = (key === 'broken' || key === 'glitched') && t.health_note ? ` — “${t.health_note}”` : '';
   const title = `${word[0].toUpperCase()}${word.slice(1)}: ${what}. ${by}${note}`;
   return { key, glyph, word, skipped, title, sr: `: ${what}. ${by}${note}` };
+}
+
+/** Does ``t`` play at all?  False for a track no engine can decode or an
+ *  archive that can't be opened (``defect`` corrupt) and for a package with
+ *  no tune in it (``empty``): no "how it plays" report, signal path or
+ *  audio facts apply to it. */
+export function isUnplayable(t) {
+  return !!t && typeof t === 'object' && (t.defect === 'corrupt' || t.defect === 'empty');
 }
 
 /** The badge element for ``t`` (a fresh one per call), or null. */
@@ -120,7 +142,7 @@ const SKIP_WORDS = { short: 'short · skipped' };
  *  else '' (a broken / corrupt row's badge says it; it is dimmed all the same —
  *  ``skipReason``). */
 export function skipWord(t) { return SKIP_WORDS[skipReasonOf(t)] || ''; }
-/** Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' | 'short'), else ''. */
+/** Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' | 'empty' | 'short'), else ''. */
 export function skipReasonOf(t) {
   try { return Player.skipReason?.(t) || ''; } catch (_) { return ''; }
 }
@@ -211,6 +233,7 @@ const TAUGHT_KEY = 'sb_skip_taught';
 const TEACH = {
   broken: 'it was reported broken. Tracks reported broken are passed by when a list plays through',
   corrupt: 'it can’t be decoded. Tracks that can’t be decoded are passed by when a list plays through',
+  empty: 'it has no tunes SoniqBoom plays and is no longer listed',
   short: (secs) => `it’s shorter than ${secs} s. Tunes that short are passed by when a list plays through (Settings → Skip short tunes)`,
 };
 function _onDealtSkip(e) {
@@ -220,7 +243,9 @@ function _onDealtSkip(e) {
   try { localStorage.setItem(TAUGHT_KEY, '1'); } catch (_) {}
   let why = TEACH[first.reason];
   if (typeof why === 'function') why = why(Number(Player.skipShortSecs) || 0);
-  window.Toast?.info?.(`Skipped “${_title(first.track)}” — ${why}; a track you pick still plays.`);
+  // (a package with no tune in it doesn't play when picked either)
+  const tail = first.reason === 'empty' ? '.' : '; a track you pick still plays.';
+  window.Toast?.info?.(`Skipped “${_title(first.track)}” — ${why}${tail}`);
 }
 
 // A track marked broken that the listener picked: once it has played 15 s —
@@ -267,6 +292,7 @@ function _onTime(d) {
 const NOTHING_WHY = {
   offline: 'tracks on a drive or share that isn’t connected',
   broken: 'tracks reported broken', corrupt: 'tracks that can’t be decoded', short: 'short tunes',
+  empty: 'packages with no tunes',
 };
 const _andList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
 /** The notice for a queue none of whose tracks plays through. */
@@ -295,8 +321,10 @@ export function init() {
     // plays by the time the toast is clicked) — for users with edit rights,
     // and only when the file itself failed: a file that is missing, a source
     // that can't be reached or a network error is no broken track.
+    // (Nor for a track already found unplayable — no engine decodes it, or a
+    // package with no tune in it: it is passed by already, or gone.)
     Player.setFailAction?.((t, msg) => (canReport() && t && t.id && t.health !== 'broken' && !t.isStation
-      && !NOT_THE_FILE.test(String(msg || ''))
+      && !isUnplayable(t) && !NOT_THE_FILE.test(String(msg || ''))
       ? { label: 'Mark broken', run: (track) => mark(track, 'broken') } : null));
     Player.on('dealtskip', _onDealtSkip);
     Player.on('trackchange', _onTrackChange);
@@ -306,4 +334,4 @@ export function init() {
 }
 
 export const Health = { healthOf, healthBadge, healthBadgeHTML, skipWord, mark, canReport, reportedLine,
-                         nothingToPlayText, init };
+                         nothingToPlayText, isUnplayable, init };

@@ -88,6 +88,17 @@ def _block_put(key: tuple, data: bytes) -> None:
             _blocks_bytes -= len(v)
 
 
+def forget_blocks(scan_root: str, path: str) -> int:
+    """Drop the in-memory blocks of one remote file (it changed at its
+    source — a catalogue file's identity carries no mtime to tell)."""
+    global _blocks_bytes
+    with _blocks_lock:
+        keys = [k for k in _blocks if len(k) > 1 and k[0] == scan_root and k[1] == path]
+        for k in keys:
+            _blocks_bytes -= len(_blocks.pop(k))
+    return len(keys)
+
+
 def clear_blocks() -> None:
     """Drop the in-memory block cache (tests / cache clears)."""
     global _blocks_bytes
@@ -114,6 +125,10 @@ class RangeFile(io.RawIOBase):
         self._lane = lane
         self._pos = 0
         self._window: tuple[int, int] | None = None
+        # An archive's own source reads only ranges it answers as such
+        # (``read_range``: one sending the whole file is refused — a tail would
+        # otherwise cost the file up to it); a share keeps ``read_at``.
+        self._ranged = getattr(source, "read_range", None) or source.read_at
         self.requests = 0                     # read_at calls made (diagnostics)
         self.fetched = 0                      # bytes they returned
 
@@ -158,7 +173,7 @@ class RangeFile(io.RawIOBase):
     def _fetch_run(self, first: int, last: int) -> None:
         off = first * _BLOCK
         want = min(self._size, (last + 1) * _BLOCK) - off
-        data = self._source.read_at(self._path, off, want, lane=self._lane)
+        data = self._ranged(self._path, off, want, lane=self._lane)
         self.requests += 1
         self.fetched += len(data)
         if len(data) < want:
@@ -188,8 +203,7 @@ class RangeFile(io.RawIOBase):
                 self._fetch_run(i, j)
                 blk = _block_get((*self._ident, i))
                 if blk is None:               # evicted between put and get
-                    blk = self._source.read_at(self._path, i * _BLOCK, _BLOCK,
-                                               lane=self._lane)
+                    blk = self._ranged(self._path, i * _BLOCK, _BLOCK, lane=self._lane)
             parts.append(blk)
             i += 1
         buf = b"".join(parts)
@@ -216,7 +230,8 @@ def build_subset(source, zip_rel: str, size: int, mtime: float, member_chain: st
     first = member_chain.split("::", 1)[0]
     with zipfile.ZipFile(rf) as zf:
         infos = zf.infolist()
-        real = archive._build_map([i.filename for i in infos]).get(first, first)
+        head_of = _zip_head_reader(zf)           # (the names the archive layer gives)
+        real = archive.resolve_display([i.filename for i in infos], first, head_of) or first
         info = zf.NameToInfo.get(real)
         if info is None or info.is_dir():
             return False
@@ -247,7 +262,8 @@ def build_subset(source, zip_rel: str, size: int, mtime: float, member_chain: st
                     needed.append(i)
         # The subset must give the member the SAME display name the track path
         # uses (display names are de-duplicated per archive).
-        if archive._build_map([i.filename for i in needed]).get(first, first) != real:
+        if (archive.resolve_display([i.filename for i in needed], first, head_of)
+                or first) != real:
             return False
         if sum(i.compress_size for i in needed) > size * _SUBSET_MAX_SHARE:
             return False
@@ -277,6 +293,18 @@ def build_subset(source, zip_rel: str, size: int, mtime: float, member_chain: st
     return True
 
 
+def _zip_head_reader(zf: zipfile.ZipFile):
+    """``head_of`` for ``archive._build_map`` over an open (ranged) ZIP: the
+    first bytes of a member — read only for the rare member whose name reads
+    two ways."""
+    from soniqboom.core import archive
+
+    def head_of(real: str) -> bytes:
+        with zf.open(real) as fh:
+            return fh.read(archive.HEAD_BYTES)
+    return head_of
+
+
 def _default_companion(member_chain: str) -> Callable[[str], bool] | None:
     """The companion filter playback uses for *member_chain*."""
     try:
@@ -297,9 +325,14 @@ def cached_subset(scan_root: str, zip_rel: str, member_chain: str) -> Path | Non
                                    peek=True)
 
 
+class TooLargeToFetch(OSError):
+    """The whole archive is bigger than the caller allows to download."""
+
+
 def archive_for_member(scan_root: str, zip_rel: str, member_chain: str, source, *,
                        lane: str = "stream",
-                       companion: Callable[[str], bool] | None = None) -> Path:
+                       companion: Callable[[str], bool] | None = None,
+                       max_whole: int | None = None) -> Path:
     """A LOCAL archive that holds remote member *member_chain* of
     ``scan_root:zip_rel`` — the whole archive when it is cached already (or
     small, or not a ZIP, or its size unknown), else a subset built by ranged
@@ -340,6 +373,20 @@ def archive_for_member(scan_root: str, zip_rel: str, member_chain: str, source, 
         except Exception as exc:
             log.info("Ranged read of remote archive %s failed (%s: %s) — "
                      "fetching it whole", zip_rel, type(exc).__name__, exc)
+    if max_whole is None:
+        try:
+            from soniqboom.core import catalogue
+            if catalogue.is_catalogue_root(scan_root):
+                max_whole = cache.whole_download_limit
+        except Exception:                               # noqa: BLE001
+            pass
+    if max_whole is not None and source is not None:
+        # ``max_whole`` (an online collection's: half the remote cache): no
+        # whole download past it — kept, it would push everything else out.
+        size = int(getattr(_stat(source, zip_rel, lane), "size", 0) or 0)
+        if size > max_whole:
+            raise TooLargeToFetch(f"{zip_rel} is too large to download whole "
+                                  f"({size // (1024 * 1024)} MB)")
     return cache.fetch(scan_root, zip_rel, source, lane=lane)
 
 

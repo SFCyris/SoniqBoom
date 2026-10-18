@@ -366,6 +366,21 @@ export function createVirtualList(opts) {
       const g = geometry();
       return Math.max(0, vlToS(g, Math.max(0, idx) * rowH) - insetOf() + offsetOf());
     },
+    // The row at the top of the viewport and how far (px) it is scrolled past.
+    firstVisible() {
+      const g = geo || geometry();
+      const v = vlToV(g, Math.max(0, sOf()));
+      const idx = Math.max(0, Math.floor(v / rowH));
+      return { idx, px: Math.max(0, v - idx * rowH) };
+    },
+    // Put row ``idx`` at the top of the viewport, scrolled ``px`` past it (the
+    // inverse of firstVisible — the same rows on screen after rows were added
+    // or removed above them).
+    scrollToRow(idx, px = 0) {
+      const g = geometry();
+      const v = Math.max(0, idx) * rowH + Math.max(0, px);
+      scroller.scrollTop = Math.max(0, vlToS(g, v) - insetOf() + offsetOf());
+    },
     // Scroll so row ``idx`` is visible: 'start' (top), 'center', or 'nearest'.
     scrollToIndex(idx, align = 'start') {
       if (!n) return;

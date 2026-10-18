@@ -36,7 +36,9 @@ async def export_db(output_path: str) -> None:
 
 
 async def import_db(input_path: str) -> None:
-    from soniqboom.core.persistence import populate_store, write_snapshot_sync
+    from soniqboom.core import persistence
+    from soniqboom.core.persistence import (claim_library, populate_store, release_library,
+                                            write_imported_library)
     from soniqboom.core.store import get_store
 
     inp = Path(input_path)
@@ -56,11 +58,29 @@ async def import_db(input_path: str) -> None:
     data = payload.get("data", {})
     print(f"Found {len(data.get('tracks', {}))} tracks in archive.")
 
-    populate_store(data)
-    store = get_store()
-    store.rebuild_indexes()
-
+    # A running server holds the data directory and would write its own
+    # library over the import when it stops.  (A file system with no locks
+    # can't tell — the import goes ahead there, as it always did.)
     data_dir = get_data_dir()
-    write_snapshot_sync(data_dir)
+    claimed = claim_library(data_dir, wait=0, quiet=True)
+    if not claimed and persistence.claim_failure == "held":
+        print(f"ERROR: a SoniqBoom server is using {data_dir} — stop it, then run the "
+              "import again.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        populate_store(data)
+        store = get_store()
+        store.rebuild_indexes()
+        why = write_imported_library(data_dir)
+        if why == "empty":
+            print(f"ERROR: {inp} holds no tracks — the library in {data_dir} was left "
+                  "as it is.", file=sys.stderr)
+            sys.exit(1)
+        if why:
+            print(f"ERROR: could not write the library to {data_dir}.", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        if claimed:
+            release_library()
 
-    print(f"Imported {store.track_count()} tracks. Snapshot written to {data_dir}.")
+    print(f"Imported {store.track_count()} tracks into {data_dir}.")

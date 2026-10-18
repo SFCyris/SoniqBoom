@@ -230,6 +230,11 @@ table th, table td { text-align: left; padding: 10px 12px; border-bottom: 1px so
 table th { font-family: var(--mono); font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--text2); }
 table tr:hover td { background: rgba(255,255,255,0.018); }
 table td code { color: var(--accent); }
+/* A table wider than a phone screen scrolls sideways on its own instead of
+   widening the page. */
+@media (max-width: 760px) {
+  table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+}
 
 /* ── Reference (addendum) sections ──────────────────────────────────── */
 .ref { border: 1px solid var(--border); border-radius: 14px; background: linear-gradient(180deg, var(--bg1), rgba(19,22,26,0.4)); padding: 24px 26px; margin: 22px 0; }

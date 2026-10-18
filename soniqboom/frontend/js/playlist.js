@@ -378,7 +378,7 @@ function _makePlRow() {
   // The cover fades in on a successful decode; on error the <img> STAYS (it's
   // opacity:0, so the placeholder shows through and no broken glyph renders)
   // and just drops ``loaded``.  Keeping it in the DOM is what lets remote
-  // (FTP/SMB) covers recover: the first request 404s and fires a background
+  // (FTP/SMB) covers recover: the first request gets a 204 and fires a background
   // art-backfill, which broadcasts ``art_ready`` → app.js's _bustArtImg re-busts
   // every in-DOM /api/art/ <img> for that track.  Mirrors the library rows.
   const img = row.querySelector('.qr-art-img');
@@ -388,6 +388,7 @@ function _makePlRow() {
 }
 
 function _isCurrentEntry(track) {
+  if (Player.startFailed) return false;          // (a start that failed: nothing plays)
   return Player.currentTrack?.id === track.id
     && _plSubKey(Player.currentTrack || {}) === _plSubKey(track);   // 0/undefined == default
 }
@@ -436,8 +437,8 @@ function _fillPlRow(row, i) {
   row.querySelector('.queue-track-dur').textContent = fmtDur(track.duration);
 
   // ── Cover: always ask /api/art (``track.cover_art`` is only set when art was
-  // extracted at scan time; the endpoint extracts on demand).  ``fallback=404``
-  // so an art-less track 404s and the format-emoji placeholder shows instead of
+  // extracted at scan time; the endpoint extracts on demand).  ``fallback=none``
+  // so an art-less track gets a 204 and the format-emoji placeholder shows instead of
   // the endpoint's generic ♪ JPEG.
   if (row.__artId !== track.id) {
     row.__artId = track.id;
@@ -446,7 +447,7 @@ function _fillPlRow(row, i) {
     img.classList.remove('loaded');
     if (track.id) {
       const ep = window.__sbArtEpoch ? `&_t=${window.__sbArtEpoch}` : '';
-      img.src = `/api/art/${track.id}?size=sm&fallback=404${ep}`;
+      img.src = `/api/art/${track.id}/sm.jpg?fallback=none${ep}`;
     } else {
       img.removeAttribute('src');
     }
@@ -940,10 +941,12 @@ function showAddDropdown(anchorEl) {
 }
 
 // Add specific entries (bare ids OR {id, subsong} objects) to a chosen
-// playlist — used by the Track Info subsong picker to pin one tune or all N.
-function showAddDropdownForEntries(anchorEl, entries) {
+// playlist — used by the Track Info subsong picker to pin one tune or all N,
+// and by the track context menu (the tracks it was opened on).  ``onDone``
+// runs once they were added.
+function showAddDropdownForEntries(anchorEl, entries, onDone = null) {
   if (!entries || !entries.length) return;
-  _showAddDropdownWith(anchorEl, () => entries, null);
+  _showAddDropdownWith(anchorEl, () => entries, onDone);
 }
 
 function _showAddDropdownWith(anchorEl, getEntries, onDone) {
@@ -1011,5 +1014,6 @@ refresh();
 
 // A track change only moves the now-playing marker on the rows shown.
 Player.on('trackchange', () => _paintPlaying());
+Player.on('statechange', () => _paintPlaying());
 
 export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist };

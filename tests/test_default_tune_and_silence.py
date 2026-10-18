@@ -669,12 +669,12 @@ async def test_extended_probes_an_archive_members_extracted_copy(monkeypatch, st
     from soniqboom.api import tracks as tracks_api
     member = tmp_path / "x.gray"
     member.write_bytes(b"\x01" * 64)
-    t = _rec(store, "ax1", subsongs=4)
+    t = _rec(store, "axm1", subsongs=4)
     t.path = str(tmp_path / "pack.zip") + "::x.gray"
     unpinned = []
 
     async def resolve(tid, track, *, lane="stream"):
-        return member, ".gray", True, "pin-ax1"
+        return member, ".gray", True, "pin-axm1"
     monkeypatch.setattr(stream, "_resolve_play_source", resolve)
     monkeypatch.setattr(stream, "_zip_unpin", lambda pid: unpinned.append(pid))
 
@@ -683,10 +683,10 @@ async def test_extended_probes_an_archive_members_extracted_copy(monkeypatch, st
         return index == 1
     monkeypatch.setattr(stream, "_tune_audible", audible)
     try:
-        assert await tracks_api._default_tune("ax1", t, None) == (2, False)
-        assert unpinned == ["pin-ax1"]
+        assert await tracks_api._default_tune("axm1", t, None) == (2, False)
+        assert unpinned == ["pin-axm1"]
     finally:
-        stream._DEFAULT_TUNE.pop("ax1", None)
+        stream._DEFAULT_TUNE.pop("axm1", None)
 
 
 @pytest.mark.asyncio

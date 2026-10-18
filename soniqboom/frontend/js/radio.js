@@ -42,7 +42,7 @@ function _renderNow() {
   if (!t) return;
   const img = $('radio-art');
   if (img) {
-    img.src = `/api/art/${encodeURIComponent(t.id)}?size=lg&fallback=404`;
+    img.src = `/api/art/${encodeURIComponent(t.id)}/lg.jpg?fallback=none`;
     img.onerror = () => { img.removeAttribute('src'); };
   }
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v || ''; };
@@ -67,7 +67,7 @@ function _renderUpNext() {
     const li = document.createElement('li');
     li.innerHTML =
       `<img class="radio-upnext-art" alt="" loading="lazy" decoding="async"
-            src="/api/art/${encodeURIComponent(t.id)}?size=sm&fallback=404">` +
+            src="/api/art/${encodeURIComponent(t.id)}/sm.jpg?fallback=none">` +
       `<span class="radio-upnext-title">${esc(t.title || '—')}</span>` +
       `<span class="radio-upnext-artist">${esc(t.artist || '')}</span>`;
     const im = li.querySelector('img');

@@ -38,6 +38,7 @@ import { sidWasmPlaybackEnabled } from './sid-wasm-player.js';
 window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 import { Library }    from './library.js';
+import { LibSync, snapshotPlan, watchBootLoads } from './lib_sync.js';
 import { Search }     from './search.js';
 import { FolderTree } from './foldertree.js';
 // Equalizer stays a static import on purpose: its module body restores the
@@ -67,7 +68,7 @@ let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
 import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES,
          ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, isUadeAmigaTrack,
-         Toast, trapFocus, subsongWireToTune, subsongStartOf } from './utils.js';
+         Toast, trapFocus, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -75,6 +76,11 @@ import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES,
 // "stopped casting" confirmation.  Same global-escape-hatch pattern as
 // ``window.SoniqBoom.player`` above; documented at that comment.
 window.Toast = Toast;
+
+// The page's first loads report the library generation they were served at
+// (lib_sync.js): one that answers after the first sync point at another
+// generation re-reads the view once.
+watchBootLoads(LibSync, () => _rereadLibrary());
 
 // Abort all playback-ancillary fetches (waveform, VUMR, transcode-status
 // poll) when the user navigates folders, so a slow remote response can't
@@ -151,7 +157,9 @@ if ('serviceWorker' in navigator) {
       .then((reg) => {
         // Force an immediate update check — don't wait for the browser's lazy
         // (~24 h) one — so a fresh deploy is detected on THIS load.
-        try { reg.update(); } catch (_) {}
+        // (Its promise rejects when the check can't run — offline, the worker
+        // being replaced (Firefox: InvalidStateError): nothing to do then.)
+        try { const u = reg.update(); if (u && typeof u.catch === 'function') u.catch(() => {}); } catch (_) {}
 
         // Apply a newly-installed UPDATE.  Auto-apply (skip-waiting + one
         // reload) ONLY when the tab is pristine: the update landed within
@@ -424,6 +432,7 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
   clearTimeout(_waveformRetryTimer);
   _waveformRetryTimer = null;
   _waveformStoppedFor = null;
+  if (!trackId) return;   // a station: no track, no waveform (the empty-id request could only 404)
 
   // Stash this fetch's trackId so that, if the user advances tracks
   // while we're awaiting the response, the LATE arrival of the prior
@@ -458,7 +467,9 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
                              ctrl ? { cache: 'no-cache', signal: ctrl.signal }
                                   : { cache: 'no-cache' });
     if (!isStillCurrent()) return;  // user advanced; discard late response
-    if (!res.ok) { _waveformData = null; progressEl?.classList.remove('has-waveform'); return; }
+    if (!res.ok || res.status === 204) {          // 204: no waveform for this track
+      _waveformData = null; progressEl?.classList.remove('has-waveform'); return;
+    }
     const data = await res.json();
     if (!isStillCurrent()) return;
     // A rendered track (SID, Amiga, tracker…) whose audio isn't rendered yet:
@@ -600,7 +611,7 @@ let _vuChannelCount = 0;
 // Formats that get a player-bar VU/spectrum visualization.  Trackers get
 // per-voice VUMR; SID + libgme console chiptunes + AdPlug AdLib/OPL render
 // fine but have no VUMR sidecar, so they fall back to the FFT spectrum (their
-// /vu 404s).  Without listing them here the gate hid the visual entirely.
+// /vu has no meters (204)).  Without listing them here the gate hid the visual entirely.
 const _TRACKER_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID', ...CHIP_FORMAT_NAMES]);
 
 // Read the opt-in VU render style ('bars' | 'circuit') from the shared viz
@@ -1009,7 +1020,7 @@ function _parseVUMR(arrayBuf) {
 // folder navigation (_cancelAncillaryFetches) to free the connection slot.
 let _vuFetchAbort = null;
 // _fetchVUMR's answer when the server says no sidecar is coming for this track
-// — ``{unavailable: true, reason}``, from a 404 carrying ``X-VU-Unavailable``:
+// — ``{unavailable: true, reason}``, from a 204 carrying ``X-VU-Unavailable``:
 // 'off' (per-voice Amiga meters are switched off), 'unsupported' (this uade
 // build can't make them) or 'skipped' (this tune's pass ran without a result)
 // — as opposed to null, "not yet / try later".
@@ -1039,7 +1050,9 @@ async function _fetchVUMR(trackId, subsong, { start = true } = {}) {
     const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${q ? `?${q}` : ''}`,
                             ctrl ? { credentials: 'include', signal: ctrl.signal }
                                  : { credentials: 'include' });
-    if (!res.ok) {
+    // 204 = no meters for this tune (yet): the reason header, if any, says
+    // they won't come; without one the retry ladder asks again.
+    if (!res.ok || res.status === 204) {
       const reason = res.headers.get('X-VU-Unavailable');
       return reason ? { unavailable: true, reason: reason.trim().toLowerCase() } : null;
     }
@@ -1271,7 +1284,7 @@ if (_tiOverlayEl) {
 // re-fires and stop only on a genuine track/subsong change.
 let _vuKey = '';
 // SID's per-voice sidecar is generated by 3 background sidplayfp renders on the
-// first play, so /vu 404s at track-load.  Re-poll on this schedule to swap the
+// first play, so /vu answers 204 at track-load.  Re-poll on this schedule to swap the
 // FFT fallback for the real 3-voice meter mid-play (instant on every later play
 // once the sidecar is cached).  Subsongs render short → catch quickly.
 //
@@ -1283,7 +1296,7 @@ let _vuKey = '';
 // FFT for the rest of the tune.  The server side now spawns the VU pass at play
 // start with a shorter grace (≈8 s + ~23 s render ≈ 31 s typical), but the pass
 // is serialised behind a Semaphore(1), so a few queued tunes can push it minutes
-// out.  Poll long and back off — a 404 is cheap, a dead meter is not.
+// out.  Poll long and back off — a 204 is cheap, a dead meter is not.
 const _SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 60000, 60000];
 // Amiga modules: the server builds the sidecar once the render is cached — 4 s
 // later (a head start for the next track's prewarm), one more uade pass
@@ -1609,7 +1622,7 @@ async function _handleVU(track) {
   // file on cache miss (see _try_backfill_vu_sidecar in api/tracks.py),
   // so a 200 here means real per-channel data on the very first play.
   // Chip formats (SID, NSF, SPC, …): no Python binding exists yet for
-  // libsidplay/libgme, so the server returns 404 and we render the
+  // libsidplay/libgme, so the server returns 204 and we render the
   // honest fallback below.
   // Amiga: ask the cache only (``start: false``) — a cached sidecar still
   // paints at once, but a miss leaves starting the per-voice pass to the
@@ -1655,7 +1668,7 @@ async function _handleVU(track) {
       _scheduleSidVURetry(track, key);
     }
     if (primary === 'SID' && _sidPollActive !== key) {
-      // Reaching this branch means /vu just 404'd, which PROVES any earlier
+      // Reaching this branch means /vu just answered 204, which PROVES any earlier
       // "the client already produced this key's sidecar" claim is stale (the
       // upload never landed, or the file is gone).  Clear it, or the poll below
       // would return at attempt 0 and leave this play stranded on FFT forever —
@@ -1770,9 +1783,9 @@ function _commitSeek() {
 seekBar.addEventListener('change', _commitSeek);
 seekBar.addEventListener('pointerup', _commitSeek);
 
-// Also paint right after the toggle: the service worker serves un-versioned
-// modules stale-while-revalidate, so on the first load after an upgrade this
-// file can run against an older player.js that never emits 'shufflechange'.
+// Also paint right after the toggle: a page still running modules from before
+// an upgrade (an older player.js that never emits 'shufflechange') keeps a
+// correct button too.
 function _toggleShuffleFromUi() {
   if (Player.radioActive) {                 // the player refuses the toggle; say why
     window.Toast?.info?.('Radio Mode picks the order — shuffle is available again when radio stops.');
@@ -1932,7 +1945,18 @@ async function downloadTrack(track) {
   const ix = _offlineIndex();
   ix[id] = { id, title: track.title || '', artist: track.artist || '', format: track.format || '', ts: Date.now() };
   _saveOfflineIndex(ix);
+  _offlineChanged();
   return true;
+}
+// The service worker serves only the tracks it knows are downloaded (sw.js
+// ``_offlineIds``): tell it the set changed.
+function _offlineChanged() {
+  // (The active worker — also when this page isn't controlled by it yet.)
+  try {
+    navigator.serviceWorker?.ready
+      ?.then(r => r.active?.postMessage({ type: 'OFFLINE_AUDIO_CHANGED' }))
+      .catch(() => {});
+  } catch {}
 }
 async function removeDownload(id) {
   try {
@@ -1942,6 +1966,7 @@ async function removeDownload(id) {
   const ix = _offlineIndex();
   delete ix[id];
   _saveOfflineIndex(ix);
+  _offlineChanged();
 }
 function _renderDownloadBtn() {
   if (!btnDownload) return;
@@ -2111,7 +2136,7 @@ function _buildPathCrumb(track) {
   const children = [];
   const label = document.createElement('span');
   label.className = 'crumb-label';
-  label.textContent = 'Playing Now:';
+  label.textContent = _crumbLabelText();
   children.push(label);
   children.push(document.createTextNode(' '));
 
@@ -2128,6 +2153,19 @@ function _buildPathCrumb(track) {
 
   playerPathCrumb.replaceChildren(...children);
 }
+
+// The crumb's label: "Playing Now:", or "Couldn’t play:" once the start of the
+// track failed (nothing plays — the toast says why); the bar dims with it.
+function _crumbLabelText() {
+  return Player.startFailed ? 'Couldn\u2019t play:' : 'Playing Now:';
+}
+Player.on('statechange', () => {
+  const failed = !!Player.startFailed;
+  const bar = document.getElementById('player-bar');
+  if (bar && bar.classList.contains('is-failed') !== failed) bar.classList.toggle('is-failed', failed);
+  const label = playerPathCrumb && playerPathCrumb.querySelector('.crumb-label');
+  if (label && label.textContent !== _crumbLabelText()) label.textContent = _crumbLabelText();
+});
 
 // Defer meta-tags + path-crumb rendering to idle time — neither is on the
 // critical audible path; the user hears audio before they read these.
@@ -2231,7 +2269,7 @@ Player.on('queuechange', _paintCued);
 // The player-bar cover (+ the glows behind the bar, sidebar and header).
 function _paintBarArt(track) {
   // Always try the art API — it extracts embedded + folder art lazily.
-  // ``fallback=404`` tells the server to return a cacheable 404 (no
+  // ``fallback=none`` tells the server to return a cacheable 204 (no
   // body) instead of the generic grey placeholder JPEG when the track
   // has no real art.  The browser's IMG.onerror then fires, and we
   // render the format-specific emoji (🕹️ SID, 💾 tracker, 🎼 MIDI…).
@@ -2241,12 +2279,12 @@ function _paintBarArt(track) {
   // (regression D14: folder-open latency went from ~50 ms to several
   // seconds for big SID/MOD directories).
   {
-    const artSrc = track.cover_art || `/api/art/${track.id}?size=sm&fallback=404`;
-    // Glows use the placeholder branch (no &fallback=404) so the
+    const artSrc = staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg?fallback=none`;
+    // Glows use the placeholder branch (no fallback=none) so the
     // background-image URL the browser stores at cache key
     // ``/api/art/X?size=sm`` is the visible-grey JPEG.  If the IMG
-    // path 404s we strip the glow classes; if it 200s we paint them.
-    const glowSrc = track.cover_art || `/api/art/${track.id}?size=sm`;
+    // path errors (204 — no art) we strip the glow classes; if it 200s we paint them.
+    const glowSrc = staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg`;
     const reqGen = ++_artRenderGen;
     const _renderEmojiFallback = () => {
       playerArt.innerHTML = `<span class="art-placeholder">${artPlaceholderEmoji(track)}</span>`;
@@ -2279,6 +2317,9 @@ function _paintBarArt(track) {
       if (reqGen !== _artRenderGen) return;
       _renderEmojiFallback();
     };
+    // A station without a logo has neither art nor a track id — the
+    // request (``/api/art//sm.jpg``) could only fail; same fallback, no 404.
+    if (!track.cover_art && !track.id) { _renderEmojiFallback(); return; }
     img.src = artSrc;
   }
 }
@@ -2388,7 +2429,7 @@ if (npArt) npArt.addEventListener('click', () => { npArt.hidden = true; });
 
 function _showNowPlayingArt(track) {
   if (!track) return;
-  const src = track.cover_art || `/api/art/${track.id}?size=lg`;
+  const src = staticArtUrl(track.cover_art) || `/api/art/${track.id}/lg.jpg`;
   // Reset to placeholder state, fade in real art when it decodes, drop
   // the src on error so the browser's broken-image glyph never paints.
   // (Previously a 404 left the broken-image icon on the dialog
@@ -2580,18 +2621,12 @@ try {
 // with no demoscene music, and appears once an apply/scan has populated groups.
 // Re-run after a scan completes too: the post-scan auto-apply may have landed
 // the FIRST scene data, which the boot-time check (already run) couldn't see.
+// (The sidebar counts carry the number of scene groups; Library reveals the
+// facet from them — the group list itself is read only when the view opens.)
 function _refreshSceneGroupsFacet() {
-  return fetch('/api/library/scene-groups', { credentials: 'same-origin' })
-    .then((r) => (r.ok ? r.json() : []))
-    .then((groups) => {
-      const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
-      if (!li || !Array.isArray(groups) || !groups.length) return false;
-      li.hidden = false;
-      let badge = li.querySelector('.nav-count');
-      if (!badge) { badge = document.createElement('span'); badge.className = 'nav-count'; li.appendChild(badge); }
-      badge.textContent = groups.length.toLocaleString();
-      return true;                              // facet revealed — stop any poll
-    })
+  if (typeof Library.refreshCounts !== 'function') return Promise.resolve(false);   // (older cached library.js)
+  return Library.refreshCounts({ reuse: true })
+    .then((c) => !!(c && c.scene_groups > 0))   // facet revealed — stop any poll
     .catch(() => false);
 }
 // Poll the facet after a scan until the (backgrounded) post-scan Demozoo
@@ -2609,7 +2644,7 @@ function _pollSceneGroupsFacet(delays) {
     setTimeout(() => _pollSceneGroupsFacet(delays.slice(1)), delays[0]);
   });
 }
-_refreshSceneGroupsFacet();
+// (The boot-time check is Library's first counts request.)
 
 // ── Remote-freshness helpers ──────────────────────────────────────────────────
 //
@@ -2628,7 +2663,10 @@ function _shareAliasForRoot(scanRoot) {
   return aliases[scanRoot] || scanRoot;
 }
 
-function _emitRemoteNewTracksToast(scanRoot, count) {
+// The ``lib_gen`` of the last scan end frame (``running: false``) handled.
+let _scanEndGen = null;
+
+function _emitRemoteNewTracksToast(scanRoot, count, reread = true) {
   const now = Date.now();
   // Prune older-than-1-hour entries
   while (_TOAST_HISTORY.length && _TOAST_HISTORY[0] < now - 3600_000) {
@@ -2642,9 +2680,11 @@ function _emitRemoteNewTracksToast(scanRoot, count) {
   const alias = _shareAliasForRoot(scanRoot);
   const noun = count === 1 ? 'new track' : 'new tracks';
   Toast.info(`🎵 ${count} ${noun} in ${alias}`);
-  // Refresh the library + tree so the new entries are visible without
-  // a page reload.
-  try { Library.refreshBadges?.(); } catch {}
+  // Refresh the counts + tree so the new entries are visible without a page
+  // reload.  The counts (and the open view) only when the share check's end
+  // frame didn't already re-read them (``reread``); that frame never touches
+  // the tree, so new folders on the share show up through this refresh.
+  if (reread) { try { Library.refreshBadges?.(); } catch {} }
   try { FolderTree.refresh?.(); } catch {}
 }
 
@@ -2880,7 +2920,10 @@ document.querySelectorAll('#nav-stations li').forEach(li => {
 document.addEventListener('soniqboom:library-changed', () => {
   try {
     if (Library.isInFolderView && Library.isInFolderView()) Library.refreshCurrentFolderInPlace();
-    else if (Library.isInAllTracksView && Library.isInAllTracksView()) Library.showAll();
+    else if (Library.isInAllTracksView && Library.isInAllTracksView()) {
+      if (typeof Library.refreshAllTracksInPlace === 'function') Library.refreshAllTracksInPlace();
+      else Library.showAll();
+    }
     else if (Library.reloadCurrentView) Library.reloadCurrentView();
   } catch (_) {}
 });
@@ -2918,6 +2961,30 @@ async function _refreshTrack(id) {
   }
   document.dispatchEvent(new CustomEvent('soniqboom:track-refreshed',
     { detail: { id, fields: changed || fields } }));
+  if (changed && typeof changed.path === 'string' && changed.path.includes('::')) {
+    _queuePackageMembers(id);
+  }
+}
+
+// A queued package of an online collection (Aminet, scene.org) opened — it
+// played, was prepared as the next track or its Track Info was opened — and
+// became its first tune: the package's other tunes follow it in the queue.
+async function _queuePackageMembers(id) {
+  try {
+    if (!(Player.queue || []).some(t => t && t.id === id)) return;
+    const r = await fetch(`/api/tracks/${encodeURIComponent(id)}/package-members`,
+                          { credentials: 'same-origin' });
+    if (!r.ok) return;
+    const ids = ((await r.json()) || {}).ids || [];
+    if (!ids.length) return;
+    const m = await fetch('/api/tracks/meta/batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }), credentials: 'same-origin',
+    });
+    if (!m.ok) return;
+    const byId = new Map(((await m.json()) || []).filter(Boolean).map(t => [t.id, t]));
+    Player.insertAfterTrack?.(id, ids.map(i => byId.get(i)).filter(Boolean));
+  } catch (_) {}
 }
 
 // A Track Info save (tags / info / year) changed one track: its row in the open
@@ -3125,14 +3192,69 @@ requestAnimationFrame(() => {
 // the fallback for a dropped final WS frame — the very case that most needs this
 // guard).  `allowAllTracksRefresh` is false for silent background freshness
 // scans, which must not reset the All-Tracks scroll position.
+// ``allowAllTracksRefresh``: true, false, or 'in-place' (a silent scan's end:
+// All Tracks only with its in-place refresh, never a reload to the top).
 function _refreshMainAfterScan(finished, allowAllTracksRefresh = true) {
   if (Library.isInFolderView && Library.isInFolderView()) {
     if (Library.currentFolderAffectedBy && Library.currentFolderAffectedBy(finished)) {
       Library.refreshCurrentFolderInPlace();
     }
   } else if (allowAllTracksRefresh && Library.isInAllTracksView && Library.isInAllTracksView()) {
-    Library.showAll();
+    // Same scroll offset, no loading rows.  (A first load after an update can
+    // pair this app.js with a cached older library.js for one page view.)
+    if (typeof Library.refreshAllTracksInPlace === 'function') Library.refreshAllTracksInPlace();
+    else if (allowAllTracksRefresh !== 'in-place') Library.showAll();
   }
+}
+
+// The scan badge's closing text: the track count when the scan reported one
+// (a page that outlived a server restart mid-scan has none — plain "Done").
+function _doneLabel(n) {
+  const k = Number(n);
+  return k > 0 ? `Done \u2014 ${k} tracks` : 'Done';
+}
+
+// A first load answered at another library generation than the one this page
+// synced to (lib_sync.js watchBootLoads): re-read counts, the open view (in
+// place) and the folder tree, as a library change does.
+function _rereadLibrary() {
+  try {
+    Library.refreshBadges();
+    document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    FolderTree.refresh();
+  } catch (_) { /* modules not ready */ }
+}
+
+// The WebSocket's connect snapshot with no scan running (embedding, or idle).
+// Badge + tree spinner follow the server's state; the lists, counts and main
+// view are re-read only for a ``lib_gen`` this page has not synced to — never
+// on the first connect (the page is loading its data now) and never when
+// nothing changed (a reconnect after sleep / a network blip keeps the All
+// Tracks scroll position and costs no requests).
+function _onScanSnapshot(msg) {
+  // A scan this page showed as running ended (or reached embedding) while it
+  // was disconnected: re-read even when no token was synced before (a page
+  // whose first snapshot was a running scan) — see snapshotPlan.
+  const wasScanning = !scanBadge.hidden && /^(Scanning|Computing)/.test(scanBadge.textContent || '');
+  const plan = snapshotPlan(LibSync.snapshot(msg.lib_gen), { wasScanning, embedding: !!msg.embedding });
+  _disarmStuckBadgeWatchdog();
+  if (msg.embedding) {
+    scanBadge.hidden = false;
+    scanBadge.textContent = 'Computing embeddings…';
+    FolderTree.setScanActive(true);
+    if (plan.reread) _rereadLibrary();
+    return;
+  }
+  if (plan.showDone) {
+    scanBadge.textContent = _doneLabel(msg.processed);
+    setTimeout(() => { scanBadge.hidden = true; }, 4000);
+    FolderTree.setScanActive(false);
+  }
+  if (!plan.reread) return;
+  if (plan.pollFacet) _pollSceneGroupsFacet([8000, 12000, 20000, 40000, 60000, 90000]);
+  // The generation just recorded is the server's: everything on screen is
+  // re-read (in place) — the counts, the open view whatever it is, the tree.
+  _rereadLibrary();
 }
 
 let _stuckBadgeTimer = null;
@@ -3144,8 +3266,7 @@ function _armStuckBadgeWatchdog() {
       if (!res.ok) return;  // auth not ready or transient — try again next tick
       const st = await res.json();
       if (!st.running && !st.embedding) {
-        scanBadge.textContent =
-          `Done — ${st.processed != null ? st.processed : st.total ?? 0} tracks`;
+        scanBadge.textContent = _doneLabel(st.processed != null ? st.processed : st.total);
         setTimeout(() => { scanBadge.hidden = true; }, 4000);
         _disarmStuckBadgeWatchdog();
         try {
@@ -3175,14 +3296,14 @@ function _disarmStuckBadgeWatchdog() {
 
 // ── WebSocket — scan progress ─────────────────────────────────────────────────
 // Cache-bust every in-DOM <img> for one track so it refetches the now-cached
-// cover (defeats a cached placeholder/404 by giving the URL a fresh _t).
+// cover (defeats a cached placeholder/no-art 204 by giving the URL a fresh _t).
 function _bustArtImg(trackId) {
   try {
     const want = `/api/art/${trackId}`;
     document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
       let u;
       try { u = new URL(img.src, location.href); } catch (_) { return; }
-      if (u.pathname !== want) return;
+      if (u.pathname !== want && !u.pathname.startsWith(`${want}/`)) return;   // /api/art/{id}[/sm.jpg]
       u.searchParams.set('_t', Date.now());
       img.src = u.pathname + u.search;
     });
@@ -3256,6 +3377,27 @@ function connectWS() {
       return;
     }
     if (msg.event === 'scan_progress') {
+      // The state on (re)connect is not an event: a ``running:false`` snapshot
+      // is not "a scan just finished".  Data is re-read only when the library
+      // changed since this page last synced (lib_sync.js); a scan still running
+      // falls through to the progress branch below.
+      if (msg.snapshot && !msg.running) { _onScanSnapshot(msg); return; }
+      // A scan that ended without changing the library (its ``lib_gen`` is the
+      // one this page already synced to): nothing on the page is read again.
+      let unchanged = false;
+      if (!msg.running && !msg.snapshot) {
+        // (the share check's ``remote_new_tracks`` that follows this frame at
+        // the same generation doesn't re-read the counts again — see there)
+        _scanEndGen = msg.lib_gen;
+        // A silent scan's end (folder watcher, freshness poll, drill-down
+        // refresh) re-reads only the counts and the open folder / All Tracks
+        // in place — not a sync point: the next connect snapshot compares
+        // with the last full sync.  Changed nothing (a page was shown it
+        // running): only the folder tree's spinner goes.
+        const moved = msg.silent ? msg.lib_gen !== LibSync.gen : LibSync.note(msg.lib_gen);
+        if (msg.silent && !msg.embedding && !moved) { FolderTree.setScanActive(false); return; }
+        unchanged = !moved && !msg.embedding;
+      }
       if (msg.running) {
         // Phase 1: metadata scan in progress.  Server can emit a
         // ``pct:0, total:0`` payload while it walks the FS to *count*
@@ -3299,18 +3441,23 @@ function connectWS() {
         // Both phases complete.  Silent freshness scans skip the "Done" badge
         // but still update the open folder in place.
         if (!msg.silent) {
-          scanBadge.textContent = `Done \u2014 ${msg.processed} tracks`;
+          scanBadge.textContent = _doneLabel(msg.processed);
           setTimeout(() => { scanBadge.hidden = true; }, 4000);
         }
         _disarmStuckBadgeWatchdog();
-        Library.refreshBadges();
         FolderTree.setScanActive(false);
+        // Nothing changed (a re-index that found the library as it was): no
+        // counts, list, folder tree or Scene-groups poll to read again — the
+        // user's place, selection and keyboard focus stay as they are.
+        if (unchanged) return;
+        Library.refreshBadges();
+        // (not for a silent end: the post-scan passes follow a full scan)
         // The post-scan Demozoo auto-apply runs a few seconds AFTER scan
         // completion (backgrounded), so poll the Scene-groups facet on a backoff
         // ladder until it lands — a library gaining its first scene data reveals
         // the facet without a page reload, even when the apply outlasts a single
         // fixed timer on a big library / slow box.
-        _pollSceneGroupsFacet([8000, 12000, 20000, 40000, 60000, 90000]);
+        if (!msg.silent) _pollSceneGroupsFacet([8000, 12000, 20000, 40000, 60000, 90000]);
         // Refresh the MAIN panel by what the user is actually looking at.
         // The old unconditional Library.showAll() reset the view to root on
         // EVERY scan completion \u2014 the "re-index finishes and I lose my place"
@@ -3327,7 +3474,9 @@ function connectWS() {
         // Scene-groups view with a track list (the WS event fires seconds after a
         // server restart).
         const finished = Array.isArray(msg.last_dirs) ? msg.last_dirs : [];
-        _refreshMainAfterScan(finished, !msg.silent);
+        // (a silent scan's end — the folder watcher, a share's freshness poll,
+        // a folder's drill-down refresh — refreshes All Tracks in place only)
+        _refreshMainAfterScan(finished, msg.silent ? 'in-place' : true);
         // Only rebuild the sidebar tree on an EXPLICIT re-index (which may add
         // or remove roots).  A silent drill-down / freshness completion must
         // NOT \u2014 FolderTree.refresh() rebuilds from root and would collapse the
@@ -3339,10 +3488,40 @@ function connectWS() {
       // A drive / share went offline or came back (or the setting changed):
       // offline.js re-reads the state and fires soniqboom:availability-changed.
       Offline.refresh();
+    } else if (msg.event === 'server_restarting') {
+      // The server restarts now: a play that fails while it is away is
+      // waited out (the player plays it again once the server is back).
+      try { Player.noteServerRestart(); } catch (_) { /* older player */ }
     } else if (msg.event === 'track_updated' && msg.id) {
       _refreshTrack(msg.id);
+    } else if (msg.event === 'catalogue_folder_changed') {
+      // A package of an online collection opened into its tunes: the open
+      // folder showing it re-reads in place; the folder tree stays as it is.
+      try {
+        if (msg.folder && Library.currentFolderAffectedBy
+            && Library.currentFolderAffectedBy([msg.folder])) Library.refreshCurrentFolderInPlace();
+      } catch (_) {}
+    } else if (msg.event === 'catalogue_tracks_left') {
+      // Rows of an online collection left the library (a package with no
+      // tune in it): the open list and the counts re-read in place (the
+      // folder tree stays as it is), and a copy this page still holds — the
+      // queue, the player, Track Info — shows why (health.js "no tunes").
+      const ids = Array.isArray(msg.ids) ? msg.ids.filter((x) => typeof x === 'string') : [];
+      const reasons = (msg.reasons && typeof msg.reasons === 'object') ? msg.reasons : {};
+      if (ids.length) {
+        try { Player.markGone?.(ids, reasons); } catch (_) {}
+        for (const id of ids) {
+          const fields = { defect: 'empty', defect_detail: String(reasons[id] || '') };
+          document.dispatchEvent(new CustomEvent('soniqboom:health-changed', { detail: { ids: [id], fields } }));
+        }
+        document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+        Library.refreshBadges();
+      }
     } else if (msg.event === 'catalogue_changed') {
-      // A catalogue (Admin → External sources) was built, refreshed or
+      // (also a backup import: the whole library replaced) — a sync point,
+      // everything below is re-read.
+      LibSync.note(msg.lib_gen);
+      // A catalogue (Settings → Online collections) was built, refreshed or
       // removed: the folder tree gains / loses its root, the open view
       // re-reads in place.
       document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
@@ -3391,7 +3570,11 @@ function connectWS() {
       try {
         const count = Number(msg.count || 0);
         if (count > 0) {
-          _emitRemoteNewTracksToast(msg.scan_root, count);
+          // The share check's end frame came first and already re-read the
+          // counts and the open view at this generation: not again.
+          const reread = !(typeof msg.lib_gen === 'string' && msg.lib_gen
+                           && msg.lib_gen === _scanEndGen);
+          _emitRemoteNewTracksToast(msg.scan_root, count, reread);
         }
       } catch (err) {
         console.warn('remote_new_tracks toast failed', err);
@@ -3445,6 +3628,13 @@ function connectWS() {
     // the NEXT close parks above and prompts re-login; a live session is a
     // harmless 200 and we keep backing off until the network recovers.  This
     // stops a restart-orphaned tab from silently retrying a dead cookie forever.
+    // 1012: the server is restarting — the new process answers within
+    // seconds; reconnect at the base delay rather than backing off.
+    if (ev && ev.code === 1012) {
+      window.__sbWsBackoff = 1000;
+      setTimeout(connectWS, 1000);
+      return;
+    }
     const fails = (window.__sbWsFailures = (window.__sbWsFailures || 0) + 1);
     if (fails >= 2) {
       try { await fetch('/api/library/scan/status', { credentials: 'same-origin' }); } catch { /* offline */ }
@@ -3486,9 +3676,36 @@ const _linksOverlay = document.getElementById('links-overlay');
 const _btnLinks     = document.getElementById('btn-links');
 if (_btnLinks && _linksOverlay) {
   const _linksClose = document.getElementById('links-close');
-  _btnLinks.addEventListener('click', () => _linksOverlay.classList.remove('hidden'));
-  if (_linksClose) _linksClose.addEventListener('click', () => _linksOverlay.classList.add('hidden'));
-  _linksOverlay.addEventListener('click', (e) => { if (e.target === _linksOverlay) _linksOverlay.classList.add('hidden'); });
+  // Opening puts focus in the dialog; closing it (×, Escape, a click beside
+  // it) puts focus back on the button that opened it.
+  const closeLinks = () => {
+    if (_linksOverlay.classList.contains('hidden')) return;
+    _linksOverlay.classList.add('hidden');
+    if (_linksOverlay.contains(document.activeElement) || document.activeElement === document.body) {
+      try { _btnLinks.focus({ preventScroll: true }); } catch (_) {}
+    }
+  };
+  _btnLinks.addEventListener('click', () => {
+    _linksOverlay.classList.remove('hidden');
+    if (_linksClose) { try { _linksClose.focus({ preventScroll: true }); } catch (_) {} }
+  });
+  if (_linksClose) _linksClose.addEventListener('click', closeLinks);
+  _linksOverlay.addEventListener('click', (e) => { if (e.target === _linksOverlay) closeLinks(); });
+  // Escape closes it with focus inside too (the page's shortcut handler leaves
+  // a focused dialog's keys alone).
+  _linksOverlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeLinks(); return; }
+    // A modal dialog: Tab / Shift+Tab stay among its controls (wrapping).
+    if (e.key !== 'Tab') return;
+    const list = [..._linksOverlay.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.getClientRects().length > 0);
+    if (!list.length) return;
+    const i = list.indexOf(document.activeElement);
+    const next = i < 0 ? list[e.shiftKey ? list.length - 1 : 0]
+      : list[(i + (e.shiftKey ? list.length - 1 : 1)) % list.length];
+    e.preventDefault();
+    next.focus();
+  });
 }
 
 // ── Welcome / onboarding overlay ─────────────────────────────────────────────
@@ -3638,16 +3855,6 @@ document.addEventListener('keydown', (e) => {
 
   // Space — play/pause
   if (e.code === 'Space') { e.preventDefault(); Player.playPause(); return; }
-
-  // Meta+Right / Meta+Left — next / prev (surf stations in radio mode)
-  if (e.code === 'ArrowRight' && e.metaKey) {
-    if (Player.stationMode && window.Stations) window.Stations.surf(1); else Player.next();
-    return;
-  }
-  if (e.code === 'ArrowLeft'  && e.metaKey) {
-    if (Player.stationMode && window.Stations) window.Stations.surf(-1); else Player.prev();
-    return;
-  }
 
   // ArrowUp / ArrowDown — volume
   if (e.code === 'ArrowUp' && !e.metaKey) {
@@ -3953,7 +4160,9 @@ connectWS();
 // One-shot check: if a scan was already running when the page opened,
 // the WebSocket will deliver progress events to keep the UI in sync.
 fetch('/api/library/scan/status').then(r => r.json()).then(s => {
-  if (s.running || s.embedding) FolderTree.setScanActive(true);
+  // (not for a scan that sends no progress — the folder watcher's, a share's
+  // freshness poll: no frame of it would turn the spinner off)
+  if ((s.running && !s.silent) || s.embedding) FolderTree.setScanActive(true);
 }).catch(() => {});
 
 // Warm the visualizer module off the critical path.  Its module body owns
@@ -3976,12 +4185,3 @@ Player.on('statechange', ({ playing }) => {
   if (playing) loadVisualizer().then(V => V.start()).catch(() => {});
 });
 
-// Warm the browser HTTP cache for the aggregation lists the sidebar views
-// fetch on first click.  The endpoints reply with ETags, so the later
-// view-open revalidates (304) instead of re-pulling the body — first click
-// on Artists/Albums/Genres lands without the payload wait.
-_ric(() => {
-  for (const p of ['artists', 'album-artists', 'albums', 'genres', 'years', 'formats']) {
-    fetch(`/api/library/${p}`, { priority: 'low' }).catch(() => {});
-  }
-});

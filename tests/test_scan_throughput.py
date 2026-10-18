@@ -439,13 +439,22 @@ def test_a_missing_libopenmpt_is_looked_for_once(monkeypatch):
     assert looked == ["openmpt"]                               # (on Linux each look ran ldconfig)
 
 
+def _foreign_ftm(p) -> bool:
+    """A FamiTracker ``.ftm`` (not Face The Music): not indexed at all."""
+    if p.suffix.lower() != ".ftm":
+        return False
+    with open(p, "rb") as fh:
+        return fh.read(4) != b"FTMN"
+
+
 @pytest.mark.skipif(not (_HAVE_LIB and _HAVE_CLI), reason="needs libopenmpt and openmpt123")
 def test_in_process_and_cli_durations_are_the_same_number(tmp_path, monkeypatch):
     """A file re-extracted by the server (CLI) after a scan worker
     (libopenmpt) must not read as changed: the very same float."""
     mods = [_mod(tmp_path / "a.mod"), _mod(tmp_path / "b.mod", rows=21)]
     if SAMPLES.is_dir():
-        mods += sorted(p for p in SAMPLES.rglob("*") if p.suffix.lower() in metadata._TRACKER_EXTS)
+        mods += sorted(p for p in SAMPLES.rglob("*") if p.suffix.lower() in metadata._TRACKER_EXTS
+                       and not _foreign_ftm(p))
     for m in mods:
         monkeypatch.setattr(metadata, "_LIBOPENMPT_IN_PROCESS", True)
         a = metadata.extract(m, "x").duration

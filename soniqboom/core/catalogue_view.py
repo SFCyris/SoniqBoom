@@ -131,10 +131,18 @@ class SubsonicStoreView:
             return frozenset()
         if len(sets) == 1:
             return sets[0]
+        # Several hidden roots (every online collection starts hidden): their
+        # union, built again only after an insert / delete in the store
+        # (``_catalog_seq`` bumps on both) or when a root's set was replaced.
+        key = (getattr(self._s, "_catalog_seq", None), tuple((id(x), len(x)) for x in sets))
+        cached = self.__dict__.get("_union")
+        if cached is not None and cached[0] == key:
+            return cached[1]
         out: set = set()
         for x in sets:
             out |= x
-        return out
+        object.__setattr__(self, "_union", (key, frozenset(out)))
+        return self.__dict__["_union"][1]
 
     # ── the hidden-aware surface ──────────────────────────────────────────
     @property
@@ -201,8 +209,8 @@ class SubsonicStoreView:
 
     def aggregate_genres(self, primary_only: bool = False) -> list[dict]:
         """``store.aggregate_genres`` counting only the visible tracks (set
-        arithmetic on the genre index; memoised on the store's mutation
-        sequence)."""
+        arithmetic on the genre index; memoised on the store's browse
+        sequence, ``_browse_seq``)."""
         s = self._s
         key = f"subsonic_visible_genres:{primary_only}:{len(self._h)}"
         cached = s._agg_cache_get(key)

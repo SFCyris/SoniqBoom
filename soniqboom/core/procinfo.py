@@ -154,3 +154,50 @@ def is_our_forkserver_child(pid: int) -> bool:
         return False
     cmd = cmdline(pid)
     return "multiprocessing" in cmd and ("SoniqBoom" in cmd or "'soniqboom'" in cmd)
+
+
+def _proc_table_linux() -> "dict[int, tuple[int, str, str]]":
+    out: dict[int, tuple[int, str, str]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as fh:
+                stat = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        # "pid (comm) state ppid …" — comm may hold spaces and parentheses
+        tail = stat[stat.rfind(")") + 2:].split()
+        if len(tail) < 2 or not tail[1].lstrip("-").isdigit():
+            continue
+        state, ppid = tail[0], int(tail[1])
+        cmd = cmdline(int(name)) if state != "Z" else ""
+        out[int(name)] = (ppid, state, cmd or ("<defunct>" if state == "Z" else ""))
+    return out
+
+
+def process_table() -> "dict[int, tuple[int, str, str]]":
+    """Every process: ``{pid: (ppid, state, command line)}`` (state: ``ps``'s
+    letters — ``Z`` for one that ended and wasn't waited for).  ``/proc`` on
+    Linux (container images have no ``ps``), else one ``ps`` started without
+    a fork (``forksafe.run``).  Empty when neither can be read."""
+    if sys.platform.startswith("linux") and os.path.isdir("/proc/self"):
+        table = _proc_table_linux()
+        if table:
+            return table
+    try:
+        from soniqboom.core import forksafe
+        out = forksafe.run(["ps", "-A", "-o", "pid=,ppid=,stat=,command="],
+                           capture_output=True, text=True, timeout=3).stdout
+    except Exception:                                       # noqa: BLE001
+        return {}
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2], parts[3] if len(parts) > 3 else "")
+    return table

@@ -8,7 +8,7 @@
 import { Player } from '../../player.js';
 import { MobileRadio } from '../radio-player.js';
 import { artPlaceholderEmoji, subsongStart, subsongStartOf, subsongWireToTune,
-         subsongTuneToWire } from '../../utils.js';
+         subsongTuneToWire, staticArtUrl } from '../../utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur } from './_common.js';
 import { healthBadge } from '../../health.js';
@@ -120,7 +120,7 @@ export function mountNowPlaying(root, ctx) {
     const span = document.createElement('span');
     span.textContent = artPlaceholderEmoji(t);
     art.appendChild(span);
-    const artSrc = t.id ? `/api/art/${t.id}?size=lg&fallback=404` : t.cover_art;
+    const artSrc = t.id ? `/api/art/${t.id}/lg.jpg?fallback=none` : staticArtUrl(t.cover_art);
     if (artSrc) {
       const img = new Image();
       img.alt = '';
@@ -250,6 +250,12 @@ export function mountNowPlaying(root, ctx) {
 
   Player.on('trackchange', renderTrack);
   Player.on('trackchange', (t) => { renderTunes(t); });
+  // The playing track's row was re-read (an online collection's package
+  // opened into its first tune, a catalogue tune's first-play read).
+  document.addEventListener('soniqboom:track-refreshed', (e) => {
+    const cur = Player.currentTrack;
+    if (cur && e && e.detail && e.detail.id === cur.id) { renderTrack(cur); renderTunes(cur); }
+  });
   // A playback problem reported / cleared for the playing track: its badge follows.
   document.addEventListener('soniqboom:health-changed', (e) => {
     const d = (e && e.detail) || {};

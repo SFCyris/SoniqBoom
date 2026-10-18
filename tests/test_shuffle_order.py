@@ -296,6 +296,7 @@ async def test_folder_endpoint_shuffle_seed_pages_the_same_listing(monkeypatch, 
     monkeypatch.setattr("soniqboom.core.store.get_store", lambda: store)
     monkeypatch.setattr("soniqboom.core.data.get_store", lambda: store)
     shuffle_order.clear()
+    store.upsert_scan_dir(str(tmp_path))               # browsing needs a scan root
     for i in range(37):
         (tmp_path / f"tune{i:02d}.mod").write_bytes(b"\0" * 16)
     (tmp_path / "notes.txt").write_text("not audio")
@@ -544,6 +545,7 @@ async def test_folder_endpoint_treats_seed_zero_as_a_seed(monkeypatch, tmp_path)
     monkeypatch.setattr("soniqboom.core.store.get_store", lambda: store)
     monkeypatch.setattr("soniqboom.core.data.get_store", lambda: store)
     shuffle_order.clear()
+    store.upsert_scan_dir(str(tmp_path))               # browsing needs a scan root
     for i in range(25):
         (tmp_path / f"s{i:02d}.mod").write_bytes(b"\0" * 8)
     call = lambda seed: fstree.tracks_with_meta(path=str(tmp_path), recursive=True, offset=0,

@@ -166,9 +166,39 @@ _STORES = {
 # Every path the old middlewares judged the way the gate does.  (The two
 # deliberate differences — paths whose URL re-parse changed them, and the "/ws"
 # suffix exemption — have their own tests below.)
+# (``/api/docs…`` is no longer public — ``test_the_api_reference_needs_a_sign_in``.)
 _PATHS = ["/api/health", "/api/private", "/api/cc", "/api/pragma", "/api/stream/t1", "/api/stream",
-          "/api/streamx", "/api/docs/x", "/apix", "/static/app.js", "/rest/ping",
-          "/api/err", "/api/auth/me", "/", "/api/"]
+          "/api/streamx", "/apix", "/static/app.js", "/rest/ping",
+          "/api/err", "/api/auth/me", "/", "/api/", "/assets/js/app.js", "/m", "/m/x",
+          "/multiroom", "/manual/", "/mx", "/assetsx", "/cast/t/a.mp3", "/dlna/x"]
+# The one deliberate change since the reference: the frontend's own files and
+# HTML shells are revalidated (``no-cache``) instead of never stored.  Written
+# out by hand — not derived from main's rule.
+_REVALIDATED = {"/", "/assets/js/app.js", "/m", "/m/x", "/multiroom", "/manual/"}
+# Also deliberate since: audio under /api/stream is ``private`` when its handler
+# says nothing, and every response but the media byte servers' (/rest, /cast,
+# /dlna) carries the security headers, appended last.
+_SECURITY = ((b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"),
+             (b"x-frame-options", b"SAMEORIGIN"),
+             (b"content-security-policy",
+              b"frame-ancestors 'self'; base-uri 'self'; object-src 'none'"))
+
+
+def _expected(row):
+    method, path, cookies, status, body, headers = row
+    if path in _REVALIDATED:
+        headers = tuple((k, b"no-cache") if k == b"cache-control" and v == b"no-store" else (k, v)
+                        for k, v in headers)
+    if path.startswith("/api/stream") and not any(k == b"cache-control" for k, _v in headers):
+        headers = headers + ((b"cache-control", b"private"),)
+    if not path.startswith(("/rest/", "/cast/", "/dlna/")) and status != 500:
+        # (500, /api/err: the answer to an exception comes from Starlette's
+        # outermost error layer, past every middleware — as before, no
+        # headers added)
+        headers = headers + _SECURITY
+    return (method, path, cookies, status, body, headers)
+
+
 _COOKIES = [
     [],
     [("cookie", "sb_session=good")],
@@ -221,7 +251,7 @@ def test_the_gate_answers_exactly_as_the_three_middlewares_did(store_state, monk
     ref_out, ref_seen = results["ref"]
     new_out, new_seen = results["new"]
     for a, b in zip(ref_out, new_out):
-        assert a == b
+        assert _expected(a) == b
     assert len(ref_out) == len(new_out)
     assert new_seen == ref_seen
     if store_state == "users":                       # the gate does refuse
@@ -353,8 +383,8 @@ def test_the_real_app_stack_keeps_its_order():
     left on the request path."""
     from starlette.middleware.base import BaseHTTPMiddleware
     names = [m.cls.__name__ for m in main.app.user_middleware]
-    assert names == ["_SubsonicCORSMiddleware", "_RequestGateMiddleware",
-                     "CORSMiddleware", "_SelectiveGZipMiddleware"]
+    assert names == ["_SubsonicCORSMiddleware", "_ApiCORSMiddleware",
+                     "_RequestGateMiddleware", "_SelectiveGZipMiddleware"]
     assert not any(m.cls is BaseHTTPMiddleware for m in main.app.user_middleware)
 
 

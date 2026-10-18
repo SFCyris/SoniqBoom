@@ -70,7 +70,7 @@ function _ensureOverlay() {
                  autocomplete="nickname">
         </label>
         <button id="auth-submit" type="submit" class="auth-submit">Sign in</button>
-        <div id="auth-error" class="auth-error" hidden></div>
+        <div id="auth-error" class="auth-error" role="alert" aria-live="assertive" hidden></div>
       </form>
       <div class="auth-switch">
         <button type="button" id="auth-mode-register" class="auth-link" hidden>
@@ -81,7 +81,7 @@ function _ensureOverlay() {
         </button>
       </div>
       <div class="auth-bootstrap-hint" id="auth-bootstrap-hint" hidden>
-        <div>No admin exists yet.  On the server, run:</div>
+        <div id="auth-bootstrap-lead">No admin exists yet.  On the server, run:</div>
         <div style="margin:6px 0">
           <code id="auth-bootstrap-cmd">soniqboom-setadm -user alice -passwd 'changeme123'</code>
         </div>
@@ -181,6 +181,9 @@ async function _handleSubmit(e) {
     }
     const data = await res.json();
     STATE.user = data.user;
+    // The password leaves the page with the sign-in: nothing keeps it in the
+    // DOM (an extension, a later script, devtools) once it was sent.
+    _clearPassword(overlay);
     _hide();
     STATE._readyResolve?.(data.user);
     STATE._readyResolve = null;
@@ -193,6 +196,21 @@ async function _handleSubmit(e) {
   } finally {
     submit.classList.remove('busy');
     submit.disabled = false;
+  }
+}
+
+function _clearPassword(overlay) {
+  const pw = overlay?.querySelector('#auth-password');
+  if (!pw) return;
+  pw.value = '';
+  if (pw.type !== 'password') {
+    pw.type = 'password';
+    const t = overlay.querySelector('#auth-pw-toggle');
+    if (t) {
+      t.textContent = '👁';
+      t.title = 'Show password';
+      t.setAttribute('aria-label', t.title);
+    }
   }
 }
 
@@ -219,8 +237,10 @@ function _wireOverlayControls(el) {
       let r = await fetch('/api/auth/reload', {
         method: 'POST', credentials: 'same-origin',
       });
-      // 403 = an admin exists now, so the server only re-reads users.json for
-      // the CLI — which already told it about the new account.  Just read it.
+      // 403 = an admin exists now, or no account is loaded yet (fresh install,
+      // recovery): then the server re-reads users.json only for the CLI —
+      // which already told it about the new account — and picks a restored
+      // users.json up by itself.  Just read the status.
       if (r.status === 403) {
         r = await fetch('/api/auth/status', { credentials: 'same-origin' });
       }
@@ -245,6 +265,16 @@ function _wireOverlayControls(el) {
 function _refreshBootstrapHint() {
   const el = document.getElementById('auth-overlay');
   if (!el) return;
+  // Recovery: users.json is unreadable on an install that had accounts —
+  // sign-in is locked until an admin restores it or creates an account.
+  const lead = el.querySelector('#auth-bootstrap-lead');
+  if (lead) {
+    lead.textContent = STATE.authStatus?.recovery_required
+      ? 'The user accounts file (users.json) could not be read, so sign-in is '
+        + 'locked.  Restore users.json from a backup into the data dir, or '
+        + 'create an admin on the server:'
+      : 'No admin exists yet.  On the server, run:';
+  }
   const dd = el.querySelector('#auth-bootstrap-datadir');
   if (dd && STATE.authStatus?.data_dir) {
     dd.textContent = `(Server data dir: ${STATE.authStatus.data_dir})`;
@@ -262,11 +292,7 @@ function _show() {
   // overlay is up.  ``inert`` was widely supported by 2023 (Chrome 102+,
   // Safari 15.5+, Firefox 112+) and is the modern replacement for
   // manually setting tabindex=-1 on every focusable descendant.
-  const app = document.getElementById('app');
-  if (app) {
-    app.setAttribute('inert', '');
-    app.setAttribute('aria-hidden', 'true');
-  }
+  _inertBackground(el, true);
   if (firstTime) {
     el.querySelector('#auth-form').addEventListener('submit', _handleSubmit);
     el.querySelector('#auth-mode-register')
@@ -284,29 +310,49 @@ function _show() {
   _refreshBootstrapHint();
 
   _applyMode();
-  setTimeout(() => el.querySelector('#auth-username').focus(), 50);
+  // No account to sign in to (a fresh install, or recovery — users.json
+  // can't be read): "Sign in" stays off however the overlay came up (at
+  // boot, or a session ending mid-use), until re-check finds an account.
+  el.querySelector('#auth-submit').disabled = STATE.authStatus?.has_any_user === false;
+  // Focus where the user can act: Username — or, while the server can't be
+  // reached (Sign in off), the Retry button.
+  setTimeout(() => {
+    const retry = el.querySelector('#auth-retry-network');
+    const target = retry && !retry.hidden ? retry : el.querySelector('#auth-username');
+    try { target.focus(); } catch (_) { /* gone */ }
+  }, 50);
 }
 
+// [auth-trap:begin] — tests/js/auth_overlay.test.mjs runs this region as is
+// The controls Tab can reach in ``modal``: enabled, and shown — an element
+// inside a ``hidden`` ancestor (the register link, the setup hint's re-check)
+// or with no box is skipped.
+const _TRAP_SEL = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), '
+  + 'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+function _trapFocusables(modal) {
+  return [...modal.querySelectorAll(_TRAP_SEL)].filter((el) =>
+    !el.closest('[hidden], [inert]') && !el.disabled
+    && (typeof el.getClientRects !== 'function' || el.getClientRects().length > 0));
+}
+// Tab / Shift+Tab: the next / previous control, wrapping at both ends; focus
+// that is outside the list (on the card, or lost) goes to the first / last.
+function _trapStep(list, active, back) {
+  if (!list.length) return null;
+  const i = list.indexOf(active);
+  if (i < 0) return back ? list[list.length - 1] : list[0];
+  return list[(i + (back ? list.length - 1 : 1)) % list.length];
+}
+// [auth-trap:end]
+
 function _installFocusTrap(modal) {
-  // Tab/Shift+Tab cycle focus inside ``modal``.  Reaching the last
-  // focusable wraps to the first (and vice-versa).  Without this trap
-  // a keyboard user can Tab into the dimmed app behind the overlay.
+  // Tab/Shift+Tab cycle focus inside ``modal`` — every press is handled here,
+  // so focus never leaves for the page behind (also when the overlay's
+  // controls change: Sign in disabled, Retry added, the register link shown).
   modal.addEventListener('keydown', (e) => {
     if (e.key !== 'Tab') return;
-    const focusables = modal.querySelectorAll(
-      'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), '
-      + 'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    );
-    if (!focusables.length) return;
-    const first = focusables[0];
-    const last  = focusables[focusables.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
+    const next = _trapStep(_trapFocusables(modal), document.activeElement, e.shiftKey);
+    e.preventDefault();
+    if (next) next.focus();
   });
 }
 
@@ -314,11 +360,130 @@ function _hide() {
   const el = document.getElementById('auth-overlay');
   if (el) el.classList.add('hidden');
   document.body.classList.remove('auth-blocked');
-  const app = document.getElementById('app');
-  if (app) {
-    app.removeAttribute('inert');
-    app.removeAttribute('aria-hidden');
+  _stopAutoRetry();
+  _signedInOnce = true;
+  // (the next time the card shows for a sign-in, it shows no stale Retry)
+  const retry = el && el.querySelector('#auth-retry-network');
+  if (retry) retry.hidden = true;
+  _inertBackground(el, false);
+}
+
+// The page behind the overlay is out of reach (``inert``: no Tab, no click,
+// not read out) — on the desktop page and the phone's page alike: every element
+// of <body> except the overlay itself and the toasts (a live region).
+function _inertBackground(overlay, on) {
+  for (const n of document.body.children) {
+    if (n === overlay || n.matches('script, audio, .sb-toast-host')) continue;
+    if (on) {
+      if (n.hasAttribute('inert')) continue;           // (inert for another reason: left alone)
+      n.setAttribute('inert', '');
+      n.setAttribute('aria-hidden', 'true');
+      n.dataset.authInert = '1';
+    } else if (n.dataset.authInert) {
+      n.removeAttribute('inert');
+      n.removeAttribute('aria-hidden');
+      delete n.dataset.authInert;
+    }
   }
+}
+
+// The server can't be reached, or answers 503 (``restarting``: the source
+// install's restart refuses requests until the new process is up): the overlay
+// says so and offers Retry — never the setup hint (nothing is known about the
+// accounts) and never an enabled Sign in.
+// [auth-unavailable:begin] — tests/js/auth_overlay.test.mjs runs this region as is
+// What the card says while the server can't be reached.  (No "click": the page
+// tries again by itself, and on a phone nothing is clicked.)
+function _unavailableText(restarting) {
+  return restarting
+    ? 'SoniqBoom is restarting. This page reconnects by itself as soon as it is back.'
+    : 'Can’t reach the SoniqBoom server. Check your connection — this page keeps trying to reconnect.';
+}
+// The pause before try ``n`` (0, 1, …) to reach the server again: every 2 s
+// for the first five tries (a restart takes a few seconds), then longer, at
+// most 15 s.
+function _retryDelayMs(n) { return Math.min(15000, Math.round(2000 * Math.pow(1.5, Math.max(0, n - 4)))); }
+// [auth-unavailable:end]
+
+// While the card shows, the server is asked again on its own (_retryDelayMs);
+// Retry asks at once.  Back up: a page that never got past start-up (no
+// sign-in on it yet) loads again; a session that ended mid-use
+// (_promptReauth) gets the sign-in form back — or, when its sign-in is still
+// valid, simply carries on.
+let _retryTimer = null, _retryTry = 0, _retrying = false, _signedInOnce = false;
+function _stopAutoRetry() { clearTimeout(_retryTimer); _retryTimer = null; _retryTry = 0; }
+function _scheduleAutoRetry() {
+  clearTimeout(_retryTimer);
+  _retryTimer = setTimeout(_retryNow, _retryDelayMs(_retryTry++));
+}
+async function _retryNow() {
+  if (_retrying) return;
+  _retrying = true;
+  clearTimeout(_retryTimer); _retryTimer = null;
+  let me = null, st = null;
+  try {
+    [me, st] = await Promise.all([
+      fetch('/api/auth/me',     { credentials: 'same-origin' }),     // (/api answers are no-store)
+      fetch('/api/auth/status', { credentials: 'same-origin' }),
+    ]);
+  } catch { me = st = null; }
+  _retrying = false;
+  const el = document.getElementById('auth-overlay');
+  if (!el || el.classList.contains('hidden')) return;          // signed in meanwhile
+  const down = !me || !st || [502, 503, 504].includes(me.status) || [502, 503, 504].includes(st.status);
+  if (down) {
+    const restarting = !!((me && me.status === 503) || (st && st.status === 503));
+    const err = el.querySelector('#auth-error');
+    const text = _unavailableText(restarting);
+    if (err.textContent !== text) err.textContent = text;      // (announced only when it changes)
+    _scheduleAutoRetry();
+    return;
+  }
+  _stopAutoRetry();
+  if (!_signedInOnce) { location.reload(); return; }
+  STATE.authStatus = await st.json().catch(() => ({}));
+  if (me.ok) {
+    const user = (await me.json().catch(() => ({}))).user;
+    if (user) {
+      STATE.user = user;
+      _hide();
+      STATE._readyResolve?.(user);
+      STATE._readyResolve = null;
+      return;
+    }
+  }
+  // The server is back and wants a sign-in: the ordinary form.
+  const retryBtn = el.querySelector('#auth-retry-network');
+  if (retryBtn) retryBtn.hidden = true;
+  _show();
+}
+
+function _showUnavailable(restarting) {
+  _show();
+  const el = document.getElementById('auth-overlay');
+  const submit = el.querySelector('#auth-submit');
+  const err = el.querySelector('#auth-error');
+  submit.disabled = true;
+  el.querySelector('#auth-bootstrap-hint').hidden = true;
+  err.textContent = _unavailableText(restarting);
+  err.hidden = false;
+  // Replace the submit affordance with an inline "Retry connection"
+  // button.  We re-append rather than recreate the element so the
+  // existing styles + focus state survive.
+  let retryBtn = el.querySelector('#auth-retry-network');
+  if (!retryBtn) {
+    retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.id = 'auth-retry-network';
+    retryBtn.className = 'auth-submit';
+    retryBtn.textContent = 'Retry connection';
+    retryBtn.style.marginTop = '8px';
+    retryBtn.addEventListener('click', () => _retryNow());
+    submit.insertAdjacentElement('afterend', retryBtn);
+  }
+  retryBtn.hidden = false;
+  _retryTry = 0;
+  _scheduleAutoRetry();
 }
 
 // ── Boot ────────────────────────────────────────────────────────────────────
@@ -343,14 +508,21 @@ function _hide() {
  */
 async function boot() {
   let networkOk = true;
+  let restarting = false;
   try {
     const [me, st] = await Promise.all([
       fetch('/api/auth/me',     { credentials: 'same-origin' }),
       fetch('/api/auth/status', { credentials: 'same-origin' }),
     ]);
+    // 503: the server is restarting (it answers nothing else meanwhile) —
+    // the same affordance as an unreachable server, not the setup hint.
+    if (me.status === 503 || st.status === 503) { restarting = true; throw new Error('restarting'); }
+    // (a reverse proxy's 502 / 504 while the server is down or starting)
+    if ([502, 504].includes(me.status) || [502, 504].includes(st.status)) throw new Error('unreachable');
     STATE.authStatus = await st.json().catch(() => ({}));
     if (me.ok) {
       STATE.user = (await me.json()).user;
+      _signedInOnce = true;
       STATE._readyResolve?.(STATE.user);
       STATE._readyResolve = null;
       return STATE.user;
@@ -363,27 +535,7 @@ async function boot() {
     networkOk = false;
   }
   if (!networkOk) {
-    _show();
-    const el = document.getElementById('auth-overlay');
-    const submit = el.querySelector('#auth-submit');
-    const err = el.querySelector('#auth-error');
-    submit.disabled = true;
-    err.textContent = "Can't reach the SoniqBoom server. Check your connection and click below to retry.";
-    err.hidden = false;
-    // Replace the submit affordance with an inline "Retry connection"
-    // button.  We re-append rather than recreate the element so the
-    // existing styles + focus state survive.
-    let retryBtn = el.querySelector('#auth-retry-network');
-    if (!retryBtn) {
-      retryBtn = document.createElement('button');
-      retryBtn.type = 'button';
-      retryBtn.id = 'auth-retry-network';
-      retryBtn.className = 'auth-submit';
-      retryBtn.textContent = 'Retry connection';
-      retryBtn.style.marginTop = '8px';
-      retryBtn.addEventListener('click', () => location.reload());
-      submit.insertAdjacentElement('afterend', retryBtn);
-    }
+    _showUnavailable(restarting);
     return null;
   }
 
@@ -440,12 +592,15 @@ function _promptReauth() {
     const focusedBefore = document.activeElement;
     // Refresh server-reported status (registration_open may have changed
     // since the user signed in, e.g. an admin closed signups).
+    let restarting = false;
     try {
       const st = await fetch('/api/auth/status', { credentials: 'same-origin' });
-      STATE.authStatus = await st.json().catch(() => ({}));
+      if (st.status === 503) restarting = true;
+      else STATE.authStatus = await st.json().catch(() => ({}));
     } catch { /* network */ }
     return await new Promise(resolve => {
-      _show();
+      if (restarting) _showUnavailable(true);
+      else _show();
       // Hijack _readyResolve so the *original* resolver (from boot) doesn't
       // double-fire — only the reauth caller awaits this promise.
       const original = STATE._readyResolve;
@@ -488,12 +643,28 @@ window.fetch = async function _interceptedFetch(input, init) {
 };
 
 async function logout() {
-  try {
-    await fetch('/api/auth/logout', {
-      method:      'POST',
-      credentials: 'same-origin',
-    });
-  } catch { /* network — fall through */ }
+  // While the server restarts it answers 503 (Retry-After): the sign-out is
+  // sent again until it lands, so the session never outlives the restart.
+  // Given up (still restarting / unreachable after ~30 s): the page stays
+  // signed in and says so, rather than reloading into a session that is
+  // still valid.
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    let res = null;
+    try {
+      res = await fetch('/api/auth/logout', {
+        method:      'POST',
+        credentials: 'same-origin',
+      });
+    } catch { /* network — retried below */ }
+    if (res && res.status !== 503) break;
+    if (Date.now() >= deadline) {
+      Toast.error("Couldn't sign out — the server isn't answering. Try again in a moment.");
+      return;
+    }
+    const after = Number(res?.headers.get('Retry-After')) || 2;
+    await new Promise(r => setTimeout(r, Math.min(Math.max(after, 1), 5) * 1000));
+  }
   STATE.user = null;
   location.reload();
 }

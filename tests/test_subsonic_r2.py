@@ -527,7 +527,11 @@ def test_spa_fallback_refuses_api_paths():
     with pytest.raises(HTTPException):
         asyncio.run(fallback("api"))
     resp = asyncio.run(fallback("some/spa/route"))
-    assert str(resp.path).endswith("index.html")
+    # the desktop shell (rendered with its content-hashed module URLs)
+    from soniqboom.core import shell_html
+    body, _etag = shell_html.render_shell(main.FRONTEND_DIR / "index.html", main.FRONTEND_DIR / "js")
+    assert resp.status_code == 200 and resp.media_type.startswith("text/html")
+    assert resp.body == (body.encode() if isinstance(body, str) else body)
 
 
 def test_main_schedules_startup_enrichment(repo_root):

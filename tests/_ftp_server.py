@@ -8,7 +8,8 @@
 offset) the tests assert against.  Opt-in misbehaviour: no ``SIZE``
 (``size=False``), the first ``abort_retrs`` RETRs cut after ``abort_after``
 bytes with a 426 reply, a per-IP connection cap (``max_conns``, 421 at the
-greeting; ``peak_conns`` records the most at once).
+greeting; ``peak_conns`` records the most at once), no ``MLSD``
+(``mlsd=False``: LIST only).  ``commands`` counts every command by name.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import socket
 import socketserver
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 
@@ -25,7 +27,7 @@ class FtpServer:
                  host: str = "127.0.0.1", abor_replies: int = 2, size: bool = True,
                  abort_after: int | None = None, abort_retrs: int = 1,
                  password: str | None = None, max_conns: int | None = None,
-                 welcome: str | None = None) -> None:
+                 welcome: str | None = None, mlsd: bool = True) -> None:
         self.root = Path(root).resolve()
         self.rate = rate                 # bytes / s per transfer, None = unthrottled
         # 2: an interrupted RETR answers 426, then ABOR answers 226 (RFC 959);
@@ -37,6 +39,8 @@ class FtpServer:
         self.password = password
         self.max_conns = max_conns
         self.welcome = welcome           # extra greeting lines (a multi-line 220)
+        self.mlsd = mlsd
+        self.commands: Counter = Counter()
         self.conns = 0
         self.peak_conns = 0
         self.refused_logins = 0
@@ -106,7 +110,11 @@ class FtpServer:
                     line = line.replace("�", "").strip()
                     cmd, _, arg = line.partition(" ")
                     cmd = cmd.upper()
-                    if cmd == "USER":
+                    with server._lock:
+                        server.commands[cmd] += 1
+                    if cmd == "MLSD" and not server.mlsd:
+                        self.reply("500 MLSD not understood")
+                    elif cmd == "USER":
                         self.reply("331 password please")
                     elif cmd == "PASS":
                         if server.password is not None and arg != server.password:

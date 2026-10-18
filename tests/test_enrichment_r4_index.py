@@ -55,44 +55,55 @@ async def test_a_write_during_the_build_skips_the_swap(monkeypatch):
     assert not report.get("skipped") and report["index_ok"]
 
 
-@pytest.mark.skipif(not _GUARDED, reason="data.rebuild_indexes has no index_generation guard yet")
-async def test_a_skipped_sweep_retries_on_the_next_tick(monkeypatch):
+async def test_an_unfinished_check_retries_on_the_next_tick(monkeypatch):
     s = _store(10)
     monkeypatch.setattr("soniqboom.core.store.get_store", lambda: s)
     calls = []
+    results = [None, None, {"index_ok": True, "mismatches": [], "track_count": 10,
+                            "mutation_seq": s._mutation_seq, "healed": False}]
 
-    async def rebuild():
-        calls.append(1)
-        return {"index_ok": True, "skipped": "concurrent-mutation", "mismatches": [],
-                "track_count": 10, "mutation_seq": s._mutation_seq}
-    monkeypatch.setattr("soniqboom.core.data.rebuild_indexes", rebuild)
+    async def audit(store, *, full=True):
+        calls.append(full)
+        return results.pop(0)
+    monkeypatch.setattr(index_health, "audit", audit)
     monkeypatch.setattr(index_health, "_last_swept_seq", None)
     recorded = []
     monkeypatch.setattr(index_health, "record", lambda *a, **kw: recorded.append(kw))
     assert await index_health._sweep_once() is None
     assert await index_health._sweep_once() is None
     assert len(calls) == 2 and recorded == []            # retried, never "healed"
+    assert (await index_health._sweep_once())["index_ok"]
+    assert len(recorded) == 1
+    assert await index_health._sweep_once() is None and len(calls) == 3   # (stamped)
 
 
 @pytest.mark.skipif(not _GATE_HELPER, reason="index_health has no _gate_seq helper yet")
-async def test_a_freshly_booted_library_is_not_rebuilt(monkeypatch):
+async def test_a_freshly_booted_library_is_not_checked(monkeypatch):
     s = _store(10)
     monkeypatch.setattr("soniqboom.core.store.get_store", lambda: s)
     calls = []
 
-    async def rebuild():
-        calls.append(1)
+    async def audit(store, *, full=True):
+        calls.append(full)
         return {"index_ok": True, "mismatches": [], "track_count": 10,
-                "mutation_seq": s._mutation_seq}
-    monkeypatch.setattr("soniqboom.core.data.rebuild_indexes", rebuild)
+                "mutation_seq": s._mutation_seq, "healed": False}
+    monkeypatch.setattr(index_health, "audit", audit)
     monkeypatch.setattr(index_health, "_task", None)
     monkeypatch.setattr(index_health, "_last_swept_seq", None)
     index_health.start(interval=3600)
     try:
         assert await index_health._sweep_once() is None and calls == []
-        s._duration_seq += 1
+        # A duration-only write: only the duration order is checked.
+        s.update_track_fields("t1", {"duration": 12.5})
         await index_health._sweep_once()
-        assert len(calls) == 1
-        assert await index_health._sweep_once() is None and len(calls) == 1
+        assert calls == [False]
+        assert await index_health._sweep_once() is None and calls == [False]
+        # A write a browse surface reads: the full check.
+        s.update_track_fields("t1", {"title": "renamed"})
+        await index_health._sweep_once()
+        assert calls == [False, True]
+        # A write no index reads: nothing to check.
+        s.update_track_fields("t2", {"health": "broken"})
+        assert await index_health._sweep_once() is None and calls == [False, True]
     finally:
         index_health.stop()

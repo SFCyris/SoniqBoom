@@ -161,7 +161,7 @@ export function mountSettings(root, ctx) {
         dirsCard.innerHTML = `<div class="m-settings-row"><span class="label">No folders configured</span></div>`;
       } else {
         dirsCard.innerHTML = dirs.map(dir => {
-          // A catalogue root (Admin → External sources) shows its name.
+          // A catalogue root (Settings → Online collections) shows its name.
           const path  = dir.catalogue ? `${dir.label || dir.catalogue} catalogue` : (dir.path || '');
           const stat  = dir.status || 'ok';
           const color = stat === 'ok' ? 'var(--accent)' : 'var(--danger)';

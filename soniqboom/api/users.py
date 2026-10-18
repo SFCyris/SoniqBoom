@@ -14,24 +14,41 @@ Endpoints fall into three groups:
 
 Session model: HTTP-only cookie ``sb_session`` issued on login.  Same-site
 ``Lax``, ``Secure`` only when the request was HTTPS (so localhost dev still
-works).  TTL is 7 days, refreshed on every authed request.
+works).  TTL is 7 days from the last use: the server-side expiry slides on
+every authed request, and the cookie is sent again (``main``'s request gate,
+``UserStore.session_cookie_due``) about once an hour so the browser's copy
+follows it.
 """
 from __future__ import annotations
 
+import asyncio
+import collections
 import logging
+import time
 from typing import Literal
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from soniqboom.core.users import (
+    DISPLAY_NAME_MAX_LEN,
+    PasswordChangedMeanwhile,
+    SessionRefused,
+    SignInsClosed,
+    _SESSION_TTL_SEC,
     get_user_store,
+    role_rank,
     validate_password,
     validate_username,
 )
 from soniqboom.models.user import ROLES, Role, User
 
 log = logging.getLogger(__name__)
+
+# The answer to a change of one's own password that an administrator's reset
+# (or another change of it) overtook — web and Subsonic.
+PASSWORD_CHANGED_MEANWHILE = ("Your password was changed by an administrator — "
+                              "sign in again.")
 
 router = APIRouter(tags=["auth"])
 
@@ -114,45 +131,72 @@ def _pub(user: User) -> dict:
 
 # ── Request / response schemas ───────────────────────────────────────────────
 
+# Field length ceilings (the request body itself is capped by the request
+# gate in ``main``): a username is validated to 64 characters and a password
+# to 1024 — these only stop absurd input before any work is done on it.
+_NAME_FIELD = Field(max_length=256)
+_PW_FIELD = Field(max_length=4096)
+_DISPLAY_FIELD = Field(default=None, max_length=DISPLAY_NAME_MAX_LEN)
+_TOKEN_MAX_LEN = 512
+
+
 class LoginBody(BaseModel):
-    username: str
-    password: str
+    username: str = _NAME_FIELD
+    password: str = _PW_FIELD
 
 
 class RegisterBody(BaseModel):
-    username: str
-    password: str
-    display_name: str | None = None
+    username: str = _NAME_FIELD
+    password: str = _PW_FIELD
+    display_name: str | None = _DISPLAY_FIELD
 
 
 class ChangePasswordBody(BaseModel):
-    current_password: str
-    new_password: str
+    current_password: str = _PW_FIELD
+    new_password: str = _PW_FIELD
 
 
 class CreateUserBody(BaseModel):
-    username: str
-    password: str
+    username: str = _NAME_FIELD
+    password: str = _PW_FIELD
     role: Literal["admin", "edit", "readonly"] = "readonly"
-    display_name: str | None = None
+    display_name: str | None = _DISPLAY_FIELD
 
 
 class UpdateUserBody(BaseModel):
     role: Literal["admin", "edit", "readonly"] | None = None
     enabled: bool | None = None
-    display_name: str | None = None
+    display_name: str | None = _DISPLAY_FIELD
 
 
 class AdminSetPasswordBody(BaseModel):
-    new_password: str
+    new_password: str = _PW_FIELD
 
 
 class UpdateTokensBody(BaseModel):
-    listenbrainz_token: str | None = Field(default=None, description="Empty string clears it")
-    lastfm_session_key: str | None = Field(default=None, description="Empty string clears it")
+    listenbrainz_token: str | None = Field(default=None, max_length=_TOKEN_MAX_LEN,
+                                           description="Empty string clears it")
+    lastfm_session_key: str | None = Field(default=None, max_length=_TOKEN_MAX_LEN,
+                                           description="Empty string clears it")
 
 
 # ── Auth helpers (FastAPI dependencies) ─────────────────────────────────────
+
+def request_is_tls(scheme: str, forwarded_proto: str | None) -> bool:
+    """The wire is TLS: the request's own scheme, or a TLS-terminating
+    reverse proxy's ``X-Forwarded-Proto`` (nginx, Caddy, Cloudflare)."""
+    fwd = (forwarded_proto or "").lower().split(",")[0].strip()
+    return scheme in ("https", "wss") or fwd == "https"
+
+
+def session_cookie_header(token: str, secure: bool) -> bytes:
+    """The ``Set-Cookie`` value of the session cookie: HttpOnly, SameSite=Lax,
+    path /, Max-Age = the session TTL, ``Secure`` on TLS."""
+    r = Response()
+    r.set_cookie(key=_SESSION_COOKIE, value=token, max_age=int(_SESSION_TTL_SEC),
+                 httponly=True, samesite="lax", secure=secure, path="/")
+    return next(v for k, v in r.raw_headers if k == b"set-cookie")
+
 
 def _set_session_cookie(response: Response, request: Request, token: str) -> None:
     """Issue the session cookie.  ``Secure`` is set whenever the wire is
@@ -160,17 +204,9 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
     terminating reverse proxy (nginx, Caddy, Cloudflare) get the right
     flag.  Without this the cookie would lack ``Secure`` even on real
     HTTPS, leaking to any downgrade attack."""
-    fwd = (request.headers.get("x-forwarded-proto") or "").lower().split(",")[0].strip()
-    secure = request.url.scheme == "https" or fwd == "https"
-    response.set_cookie(
-        key=_SESSION_COOKIE,
-        value=token,
-        max_age=7 * 24 * 3600,
-        httponly=True,
-        samesite="lax",
-        secure=secure,
-        path="/",
-    )
+    secure = request_is_tls(request.url.scheme, request.headers.get("x-forwarded-proto"))
+    response.raw_headers.append(
+        (b"set-cookie", session_cookie_header(token, secure)))
 
 
 def _clear_session_cookie(response: Response) -> None:
@@ -243,24 +279,46 @@ def _registration_open(store) -> bool:
 
 
 @router.get("/auth/status")
-async def auth_status():
-    from soniqboom.config import is_strong_passwords_required
+async def auth_status(request: Request):
+    """Public summary of the auth setup (``_auth_status_doc``)."""
+    return _auth_status_doc(request)
+
+
+def _auth_status_doc(request: Request, cli: bool = False) -> dict:
     """Public summary of the auth setup — used by the login UI to decide
     whether to show the "Create account" link (only when at least one
     admin already exists; bootstrap creation is via CLI).
 
-    ``data_dir`` is included so the bootstrap hint can show the exact path
-    the server reads users.json from — if the operator's shell uses a
-    different ``SONIQBOOM_DATA_DIR``, this surfaces the mismatch."""
-    from soniqboom.config import get_data_dir
+    ``data_dir`` (the folder the server reads users.json from) is included
+    for an admin, and — while no admin account is loaded (first run, or
+    recovery) — for a request from the server's own host: the sign-in
+    screen's setup hint shows it, so a shell using another
+    ``SONIQBOOM_DATA_DIR`` shows up.  ``soniqboom-setadm``'s reload (it
+    proved it is the server's own CLI with the run's reload token) always
+    gets it: that is how it checks the server it notified serves its data
+    dir.  Anyone else gets ``null``."""
+    from soniqboom.config import get_data_dir, is_strong_passwords_required
+    from soniqboom.core.users import RECOVERY_MESSAGE
     store = get_user_store()
+    recovery = getattr(store, "recovery_required", False) is True
+    if cli:
+        show_dir = True
+    elif not store.has_any_admin():
+        show_dir = _is_loopback_request(request)
+    else:
+        u = store.lookup_session(request.cookies.get(_SESSION_COOKIE) or "")
+        show_dir = u is not None and u.enabled and u.role == "admin"
     return {
-        "has_any_user":  store.has_any(),
+        # (False in recovery: no account is loaded, nobody can sign in —
+        # ``has_any()`` stays True there to keep the gates closed)
+        "has_any_user":  False if recovery else store.has_any(),
         "has_any_admin": store.has_any_admin(),
+        "recovery_required": recovery,
+        "recovery_message": RECOVERY_MESSAGE if recovery else None,
         "registration_open": _registration_open(store),
         "strong_passwords": is_strong_passwords_required(),
         "session_cookie": _SESSION_COOKIE,
-        "data_dir":      str(get_data_dir().absolute()),
+        "data_dir":      str(get_data_dir().absolute()) if show_dir else None,
     }
 
 
@@ -303,13 +361,27 @@ async def auth_reload(request: Request):
       409 and nothing is reloaded — the caller changed another data dir, so a
       stale status file or a copied data dir never reloads the wrong server;
     * **the login overlay's "re-check" button** — any browser, no token, but
-      only while no enabled admin exists (the bootstrap window).  Afterwards it
-      gets 403 and falls back to ``GET /auth/status`` (auth.js).
+      only while accounts are loaded and none of them is an enabled admin.
+      Otherwise it gets 403 and falls back to ``GET /auth/status`` (auth.js).
+
+    While NO account is loaded — recovery (users.json unreadable on a set-up
+    install) or a fresh install — only the CLI's token reloads: a reload reads
+    and may move aside (quarantine) whatever users.json holds at that instant,
+    so an anonymous caller could otherwise move away a users.json an admin is
+    still copying back in.  Without the CLI the server picks a restored file
+    up by itself (``UserStore.check_restored``, polled from the lifespan),
+    and that path never moves a file aside.  A loopback address alone is no
+    proof of the CLI: a reverse proxy on the same host connects from it too.
+
+    The re-check button's reload never moves a file aside either (a
+    users.json still being copied in, read half-written, is left alone and
+    nothing in memory changes): it adopts users.json only when that holds a
+    valid account list (``UserStore.adopt_from_disk``).
 
     Everyone else gets 403: a reload takes the users.json flock and rolls the
     in-memory ``last_login_at`` values back to their last-persisted ones.  500
     when users.json could not be read, so the CLI never reports a change live
-    that the server failed to load."""
+    that the server failed to load.  The CLI's answer carries ``data_dir``."""
     import secrets
     from soniqboom.core import startup_status
     store = get_user_store()
@@ -323,12 +395,59 @@ async def auth_reload(request: Request):
                 token.encode("utf-8"), expected.encode("utf-8"))):
             raise HTTPException(409, "This server does not serve the data dir "
                                      "that reload token came from.")
+    elif store.count() == 0:
+        # Recovery or a fresh install: only soniqboom-setadm (with the token).
+        raise HTTPException(403, "While no user account is loaded, user accounts "
+                                 "are reloaded only by soniqboom-setadm on the "
+                                 "server; a restored users.json is picked up by "
+                                 "itself.")
     elif store.has_any_admin():
         raise HTTPException(403, "Reloading user accounts is only allowed "
                                  "from the server's own host or container.")
-    if not store.reload():
+    else:
+        # The re-check button: accounts loaded, none an enabled admin.
+        await asyncio.to_thread(store.adopt_from_disk, False)
+        return _auth_status_doc(request)
+    if not await asyncio.to_thread(store.reload):
         raise HTTPException(500, "users.json could not be read — see the server log.")
-    return await auth_status()
+    return _auth_status_doc(request, cli=True)
+
+
+def _issue_session(store, user_id: str, pw_hash: str | None = None) -> tuple[str, float]:
+    """``store.issue_session`` — 503 while the server is restarting (sign-ins
+    closed, ``UserStore.close_sign_ins``); 401 when the password changed
+    while the sign-in ran (``SessionRefused``)."""
+    try:
+        return store.issue_session(user_id, pw_hash)
+    except SignInsClosed:
+        raise HTTPException(503, "The server is restarting — sign in again in a moment.",
+                            headers={"Retry-After": "2"})
+    except SessionRefused:
+        raise HTTPException(401, "Wrong username or password.")
+
+
+# Self-registration attempts accepted per client address, and in all, per
+# hour (a default install has self-registration on: an anonymous client must
+# not be able to grow users.json without bound).
+_REGISTER_PER_CLIENT = 10
+_REGISTER_TOTAL = 60
+_REGISTER_WINDOW_SEC = 3600.0
+_register_log: "collections.deque[tuple[float, str]]" = collections.deque()
+
+
+def _register_allowed(client: str) -> float:
+    """0 when a registration from ``client`` may proceed now (and it is
+    counted), else the seconds until one may."""
+    now = time.monotonic()
+    while _register_log and now - _register_log[0][0] >= _REGISTER_WINDOW_SEC:
+        _register_log.popleft()
+    mine = [t for t, c in _register_log if c == client]
+    if len(mine) >= _REGISTER_PER_CLIENT:
+        return _REGISTER_WINDOW_SEC - (now - mine[0])
+    if len(_register_log) >= _REGISTER_TOTAL:
+        return _REGISTER_WINDOW_SEC - (now - _register_log[0][0])
+    _register_log.append((now, client))
+    return 0.0
 
 
 @router.post("/auth/login")
@@ -349,10 +468,12 @@ async def login(body: LoginBody, request: Request, response: Response):
             f"Too many failed attempts. Try again in about {mins} minute"
             + ("s" if mins != 1 else "") + ".",
         )
-    user = await asyncio.to_thread(store.authenticate, body.username, body.password)
-    if not user:
+    hit = await asyncio.to_thread(store.authenticate_with_hash, body.username, body.password)
+    if not hit:
         raise HTTPException(401, "Wrong username or password.")
-    token, expiry = store.issue_session(user.id)
+    user, verified = hit
+    # (bound to the hash just verified: a reset that ran meanwhile ends it)
+    token, expiry = _issue_session(store, user.id, verified)
     _set_session_cookie(response, request, token)
     log.info("user '%s' (role=%s) signed in", user.username, user.role)
     return {"user": _pub(user), "expires_at": expiry}
@@ -375,8 +496,16 @@ async def register(body: RegisterBody, request: Request, response: Response):
         )
     if not _registration_open(store):
         raise HTTPException(403, "Registration is turned off. Ask an administrator for an account.")
+    wait = _register_allowed(request.client.host if request.client else "")
+    if wait:
+        mins = max(1, int(wait // 60) + 1)
+        raise HTTPException(429, f"Too many new accounts — try again in about {mins} minute"
+                                 + ("s" if mins != 1 else "") + ".",
+                            headers={"Retry-After": str(int(wait) + 1)})
     try:
-        user = store.create(
+        # (scrypt + a durable users.json write: off the event loop)
+        user = await asyncio.to_thread(
+            store.create,
             username=body.username,
             password=body.password,
             role="readonly",
@@ -391,7 +520,7 @@ async def register(body: RegisterBody, request: Request, response: Response):
         if "already taken" in msg.lower():
             raise HTTPException(400, "Username unavailable.")
         raise HTTPException(400, msg)
-    token, expiry = store.issue_session(user.id)
+    token, expiry = _issue_session(store, user.id, user.password_hash)
     _set_session_cookie(response, request, token)
     log.info("user '%s' self-registered (role=readonly)", user.username)
     return {"user": _pub(user), "expires_at": expiry}
@@ -425,7 +554,9 @@ async def logout(
     sb_session: str | None = Cookie(default=None),
 ):
     if sb_session:
-        get_user_store().revoke_session(sb_session)
+        import asyncio
+        # (writes sessions.json before answering — off the event loop)
+        await asyncio.to_thread(get_user_store().revoke_session, sb_session)
     _clear_session_cookie(response)
     return {"ok": True}
 
@@ -434,18 +565,34 @@ async def logout(
 async def change_password(
     body: ChangePasswordBody,
     user: User = Depends(require_user),
+    sb_session: str | None = Cookie(default=None),
 ):
+    """Change the signed-in user's own password.  Every other session of the
+    account ends; this one stays signed in (bound to the new password).
+
+    The change applies only over the password that was verified: when the
+    account's password changes between the check of ``current_password`` and
+    the write (an administrator's reset), the request is refused with 409 and
+    the other change stands."""
     import asyncio
     store = get_user_store()
     # scrypt off the event loop — same reason as /auth/login.
-    ok = await asyncio.to_thread(store.authenticate, user.username, body.current_password)
-    if not ok:
+    hit = await asyncio.to_thread(store.authenticate_with_hash, user.username,
+                                  body.current_password)
+    if not hit or hit[0].id != user.id:
         raise HTTPException(401, "Current password is incorrect.")
+    verified_hash = hit[1]
     try:
         validate_password(body.new_password)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    await asyncio.to_thread(store.set_password, user.id, body.new_password)
+    try:
+        await asyncio.to_thread(store.set_password, user.id, body.new_password, sb_session,
+                                expected_hash=verified_hash)
+    except PasswordChangedMeanwhile:
+        raise HTTPException(409, PASSWORD_CHANGED_MEANWHILE)
+    except KeyError:                    # deleted meanwhile
+        raise HTTPException(404, "User not found.")
     return {"ok": True}
 
 
@@ -453,12 +600,18 @@ async def change_password(
 async def update_my_tokens(body: UpdateTokensBody, user: User = Depends(require_user)):
     """Update the signed-in user's scrobble tokens (used by E-11)."""
     store = get_user_store()
-    store.update(
-        user.id,
-        listenbrainz_token=body.listenbrainz_token,
-        lastfm_session_key=body.lastfm_session_key,
-    )
-    return {"user": _pub(store.get(user.id))}
+    try:
+        await asyncio.to_thread(
+            store.update, user.id,
+            listenbrainz_token=body.listenbrainz_token,
+            lastfm_session_key=body.lastfm_session_key,
+        )
+    except KeyError:
+        raise HTTPException(404, "User not found.")
+    u = store.get(user.id)
+    if u is None:                       # deleted meanwhile
+        raise HTTPException(404, "User not found.")
+    return {"user": _pub(u)}
 
 
 class SubsonicPasswordBody(BaseModel):
@@ -483,8 +636,15 @@ async def update_my_subsonic_password(
     itself (``p=``) keep working with the login password either way."""
     store = get_user_store()
     pw = (body.password or "").strip()  # empty string → remove; non-empty → set
-    store.update(user.id, subsonic_password=pw, subsonic_password_custom=bool(pw))
-    return {"user": _pub(store.get(user.id))}
+    try:
+        await asyncio.to_thread(store.update, user.id, subsonic_password=pw,
+                                subsonic_password_custom=bool(pw))
+    except KeyError:
+        raise HTTPException(404, "User not found.")
+    u = store.get(user.id)
+    if u is None:                       # deleted meanwhile
+        raise HTTPException(404, "User not found.")
+    return {"user": _pub(u)}
 
 
 class CreateApiKeyBody(BaseModel):
@@ -507,7 +667,9 @@ async def create_my_api_key(body: CreateApiKeyBody, user: User = Depends(require
     """Mint a Subsonic API key.  ``key`` in the response is the only time the
     plaintext is ever shown."""
     try:
-        key, ent = get_user_store().create_api_key(user.id, body.name)
+        key, ent = await asyncio.to_thread(get_user_store().create_api_key, user.id, body.name)
+    except KeyError:                    # deleted meanwhile
+        raise HTTPException(404, "User not found.")
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"key": key, **ent}
@@ -516,7 +678,7 @@ async def create_my_api_key(body: CreateApiKeyBody, user: User = Depends(require
 @router.delete("/me/api-keys/{key_id}")
 async def revoke_my_api_key(key_id: str, user: User = Depends(require_user)):
     """Revoke one of the signed-in user's API keys (immediately invalid)."""
-    if not get_user_store().revoke_api_key(user.id, key_id):
+    if not await asyncio.to_thread(get_user_store().revoke_api_key, user.id, key_id):
         raise HTTPException(404, "API key not found.")
     return {"ok": True}
 
@@ -618,7 +780,10 @@ async def create_user(
     try:
         validate_username(body.username)
         validate_password(body.password)
-        user = store.create(
+        # (scrypt + a durable users.json write: off the event loop —
+        # ``UserStore`` serialises its writers with its own locks)
+        user = await asyncio.to_thread(
+            store.create,
             username=body.username,
             password=body.password,
             role=body.role,
@@ -656,22 +821,25 @@ async def update_user(
                 "to admin first.",
             )
     # Snapshot pre-update state so we can detect demote / disable below.
-    was_admin = target.role == "admin"
+    was_rank = role_rank(target.role)
     was_enabled = target.enabled
     try:
-        target = store.update(
-            user_id,
+        target = await asyncio.to_thread(
+            store.update, user_id,
             role=body.role,
             enabled=body.enabled,
             display_name=body.display_name,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
-    # If the user was demoted from admin or disabled, slam any open
+    except KeyError:
+        raise HTTPException(404, "User not found.")
+    # If the user was demoted (to any lower role) or disabled, slam any open
     # WebSocket connections so they can't keep receiving server-pushed
-    # events under the previous privilege level.  Cheap no-op when the
-    # user has no live sockets.
-    demoted = was_admin and target.role != "admin"
+    # events under the previous privilege level (their sessions ended with
+    # it — ``UserStore.update``).  Cheap no-op when the user has no live
+    # sockets.
+    demoted = role_rank(target.role) < was_rank
     disabled = was_enabled and not target.enabled
     if demoted or disabled:
         try:
@@ -692,14 +860,20 @@ async def admin_set_password(
     user_id: str,
     body: AdminSetPasswordBody,
     _admin: User = Depends(require_admin),
+    sb_session: str | None = Cookie(default=None),
 ):
+    """Set a user's password: every session of that account ends — the
+    calling admin's own stays when it is their own account."""
     store = get_user_store()
     if not store.get(user_id):
         raise HTTPException(404, "User not found.")
+    keep = sb_session if user_id == _admin.id else None
     try:
-        store.set_password(user_id, body.new_password)
+        await asyncio.to_thread(store.set_password, user_id, body.new_password, keep)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except KeyError:
+        raise HTTPException(404, "User not found.")
     return {"ok": True}
 
 
@@ -714,7 +888,7 @@ async def delete_user(
         )
     store = get_user_store()
     try:
-        store.delete(user_id)
+        await asyncio.to_thread(store.delete, user_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     # Tear down any live WebSocket sessions the now-deleted user held.

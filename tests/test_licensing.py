@@ -20,7 +20,7 @@ def test_collector_reads_every_pin_from_the_dockerfile():
     used = set(re.findall(r"\$\(arg (\w+)\)", COLLECTOR))
     assert used == {"PSGPLAY_COMMIT", "ZXTUNE_REV", "SC68_URL", "SC68_SHA256",
                     "UADE_URL", "UADE_SHA256", "BENCODETOOLS_REF", "LIBZAKALWE_REF",
-                    "LIBGME_URL", "LIBGME_SHA256"}
+                    "LIBGME_URL", "LIBGME_SHA256", "LIBOPENMPT_VERSION", "LIBOPENMPT_SHA256"}
     # (the SID chain's pins are read in a loop: ``arg "${key}_VERSION"``)
     assert 'for c in libresidfp:RESIDFP libsidplayfp:LIBSIDPLAYFP sidplayfp:SIDPLAYFP' in COLLECTOR
     used |= {f"{k}_{f}" for k in ("RESIDFP", "LIBSIDPLAYFP", "SIDPLAYFP") for f in ("VERSION", "SHA256")}
@@ -49,6 +49,11 @@ def test_dockerfile_uses_the_pins_it_declares():
             in COLLECTOR)
     # …and links the reSIDfp engine (without it every SID would fail to render).
     assert "readelf -d /out/lib/libsidplayfp.so" in DOCKERFILE
+    # libopenmpt builds the release tarball the collector fetches.
+    url = "https://lib.openmpt.org/files/libopenmpt/src/libopenmpt-${%s}+release.autotools.tar.gz"
+    assert '"' + url % "LIBOPENMPT_VERSION" + '"' in DOCKERFILE
+    assert '"' + url % "OMPTVER" + '"' in COLLECTOR
+    assert "COPY --from=openmpt /out/ /out/" in DOCKERFILE
     assert not re.search(r"git checkout[^\n]*\|\| true", DOCKERFILE)
 
 
@@ -66,9 +71,11 @@ def test_release_attaches_sources_and_debian_manifest():
 
 def test_downloads_are_hash_checked():
     for name in ("ZXTUNE_SHA256_X86_64", "ZXTUNE_SHA256_ARM64", "SC68_SHA256", "UADE_SHA256",
-                 "LIBGME_SHA256", "RESIDFP_SHA256", "LIBSIDPLAYFP_SHA256", "SIDPLAYFP_SHA256"):
+                 "LIBGME_SHA256", "RESIDFP_SHA256", "LIBSIDPLAYFP_SHA256", "SIDPLAYFP_SHA256",
+                 "LIBOPENMPT_SHA256"):
         assert re.search(rf"^ARG {name}=[0-9a-f]{{64}}$", DOCKERFILE, re.M), name
-    for f in ("/tmp/zx.tar.gz", "/tmp/sc68.tar.gz", "/tmp/uade.tar.bz2", "/tmp/libgme.tar.gz"):
+    for f in ("/tmp/zx.tar.gz", "/tmp/sc68.tar.gz", "/tmp/uade.tar.bz2", "/tmp/libgme.tar.gz",
+              "/tmp/libopenmpt.tar.gz"):
         assert f'  {f}" | sha256sum -c -' in DOCKERFILE, f
     assert 'echo "$3  /tmp/$1.tar.gz" | sha256sum -c -' in DOCKERFILE      # the SID chain
 
@@ -81,7 +88,9 @@ def test_image_carries_third_party_licence_texts():
                  "sc68/COPYING", "uade/COPYING", "uade/COPYING.GPL",
                  "bencodetools/LICENSE", "libzakalwe/COPYING", "libgme/license.txt",
                  "libresidfp/COPYING", "libsidplayfp/COPYING", "sidplayfp/COPYING",
-                 "libsidplayfp/hashlib-LICENSE", "sidplayfp/ghc-filesystem-LICENSE"):
+                 "libsidplayfp/hashlib-LICENSE", "sidplayfp/ghc-filesystem-LICENSE",
+                 "libopenmpt/LICENSE", "libopenmpt/LICENSE.BSD-3-Clause.txt",
+                 "libopenmpt/LICENSE.BSL-1.0.txt", "libopenmpt/TinyFFT-NOTICE"):
         assert f"{doc}/{path}" in gate, path
     assert "COPY --from=builder /out/share/                /usr/local/share/" in DOCKERFILE
     ignored = {l.strip() for l in (ROOT / ".dockerignore").read_text().splitlines()

@@ -15,7 +15,7 @@ import { Player }              from './player.js';
 import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
          subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from './tunes.js';
-import { healthOf, healthBadge, reportedLine, canReport, mark as healthMark } from './health.js';
+import { healthOf, healthBadge, reportedLine, canReport, mark as healthMark, isUnplayable } from './health.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -97,7 +97,9 @@ function _mountSignalChainFor(track) {
   const section = document.getElementById('ti-section-signal');
   const host = document.getElementById('ti-signal-chain');
   if (!section || !host) return;
-  if (!vizGroupEnabled('nowPlaying')) {
+  // (A track that doesn't play — no engine decodes it, a package with no
+  // tune in it — has no decode path to show.)
+  if (!vizGroupEnabled('nowPlaying') || isUnplayable(track)) {
     // Group off (or reduced-motion handled inside the engine) — hide section.
     section.hidden = true;
     if (_signalChain) { _signalChain.unregister(); _signalChain = null; host.textContent = ''; }
@@ -156,8 +158,9 @@ let _focusReturn = null;      // Element that had focus when the panel opened
 // ── Format helpers ────────────────────────────────────────────────────────────
 function _fmt(sec) {
   if (!sec || !isFinite(sec)) return '—';
-  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
+  const ss = s.toString().padStart(2, '0');
+  return h ? `${h}:${m.toString().padStart(2, '0')}:${ss}` : `${m}:${ss}`;   // (a mix: hours)
 }
 function _fmtSize(bytes) {
   if (!bytes) return '—';
@@ -554,6 +557,7 @@ function _renderTagEdit(track) {
   if (!wrap) return;
   wrap.innerHTML = '';
   if (!track || !track.id) return;
+  if (track.defect === 'empty') return;      // (it left the library: nothing to edit)
   // Tags can only be written to LOCAL files (tagwriter can't write to a network
   // share), so hide the edit affordance entirely for any non-local track rather
   // than showing a disabled button.
@@ -804,8 +808,17 @@ function _showTagForm(track, wrap) {
 }
 
 // ── Render one track ──────────────────────────────────────────────────────────
+// The track as the panel last rendered it (a copy): what an update is
+// compared with.  The panel's track object is shared with the list, and the
+// list takes a re-read row first (app.js ``_refreshTrack`` →
+// ``Library.patchTrack``) — compared with the object itself, an opened
+// package's new format and length looked unchanged and the panel kept
+// showing "LHA package" with no duration.
+let _shown = null;
+
 function _render(track) {
   if (!track) return;
+  _shown = { ...track };
 
   // ── Artwork ──
   artImg.src = '';
@@ -822,7 +835,7 @@ function _render(track) {
   // with the now-playing overlay so the bytes are typically already on
   // disk by the time the dialog opens.
   //
-  // ``fallback=404`` tells the server to return a cacheable 404 (no
+  // ``fallback=none`` tells the server to return a cacheable 204 (no
   // body) when there's no real art, so the IMG.onerror fires and we
   // keep the format-specific emoji visible.  We previously tried to
   // read the ``X-SoniqBoom-Art`` header via fetch+blob, which forced
@@ -844,11 +857,10 @@ function _render(track) {
     // Placeholder emoji (above) shows automatically when
     // ``ti-has-art`` is absent.
   };
-  img.src = `/api/art/${track.id}?size=lg&fallback=404`;
+  img.src = `/api/art/${track.id}/lg.jpg?fallback=none`;
 
   // ── Navigation label ──
-  const title = track.title || track.path?.split('/').pop() || '—';
-  navLabel.textContent = `Track ${_idx + 1} of ${_queue.length}  ·  ${title}`;
+  navLabel.textContent = _navText(track);
   btnPrev.disabled = _idx === 0;
   btnNext.disabled = _idx >= _queue.length - 1;
   btnPrev.classList.toggle('ti-btn-disabled', _idx === 0);
@@ -1455,6 +1467,7 @@ const _REPORT_HELP  = _reportHelp ? _reportHelp.textContent : '';
 let   _healthTrack  = null;             // the track the Status / Playback rows show
 function _renderHealth(track) {
   _healthTrack = track || null;
+  _renderPlayability(track);
   if (_defectField && _defectBadge) {
     const h = healthOf(track);
     _defectBadge.textContent = '';
@@ -1474,7 +1487,10 @@ function _renderHealth(track) {
     }
   }
   if (!_reportField || !_reportGroup) return;
-  const can = !!track && canReport() && !track.isStation;
+  // "Playback: No problem · Glitched · Broken" reports how a track plays — not
+  // for one that doesn't play at all (health.js isUnplayable), unless a report
+  // is on it to clear.
+  const can = !!track && canReport() && !track.isStation && (!isUnplayable(track) || !!track.health);
   _reportField.hidden = !can;
   if (!can) return;
   const cur = track.health === 'broken' || track.health === 'glitched' ? track.health : '';
@@ -1489,6 +1505,47 @@ function _renderHealth(track) {
     const n = Number(track.subsongs) || 0;
     _reportHelp.textContent = _REPORT_HELP + (n > 1 ? ` Applies to the whole file (all ${n} tunes).` : '');
   }
+}
+// A track that doesn't play (health.js isUnplayable: no engine decodes it,
+// an archive that can't be opened, a package with no tune in it): the box
+// under the art says so in place of the audio facts ("— / —", "— · —"), and
+// no decode path is drawn.
+function _unplayableWord(t) {
+  if (t.defect === 'empty') return 'No playable tunes';
+  return /^The archive is damaged/.test(String(t.defect_detail || '')) ? 'Can’t be opened' : 'Can’t be decoded';
+}
+// "Track 5 of 19 · title" — just the title for a track that left the library
+// (a package with no tune in it: it is no longer one of the list's tracks).
+function _navText(track) {
+  const title = (track && (track.title || track.path?.split('/').pop())) || '—';
+  return track && track.defect === 'empty' ? title : `Track ${_idx + 1} of ${_queue.length}  ·  ${title}`;
+}
+function _renderPlayability(track) {
+  const bad = isUnplayable(track);
+  if (track && track.defect === 'empty') {
+    // Gone from the library while the panel shows it: no list position, no editor.
+    if (_queue[_idx] && _queue[_idx].id === track.id) navLabel.textContent = _navText(track);
+    const wrap = document.getElementById('ti-tagedit-wrap');
+    if (wrap) wrap.innerHTML = '';
+  }
+  const fmtRow = document.getElementById('ti-format')?.closest('.ti-stat-row');
+  const box = fmtRow ? fmtRow.parentElement : null;
+  const rows = ['ti-bit-depth', 'ti-channels']
+    .map((id) => document.getElementById(id)?.closest('.ti-stat-row')).filter(Boolean);
+  rows.forEach((r) => { r.hidden = bad; });
+  let note = document.getElementById('ti-unplayable');
+  if (bad && !note && box && rows[0]) {
+    note = document.createElement('div');
+    note.id = 'ti-unplayable';
+    note.className = 'ti-stat-row ti-unplayable';
+    box.insertBefore(note, rows[0]);
+  }
+  if (note) {
+    note.hidden = !bad;
+    note.textContent = bad ? _unplayableWord(track) : '';
+  }
+  if (box) box.classList.toggle('ti-stats-unplayable', bad);
+  if (bad && _sigTrack && track && _sigTrack.id === track.id) _mountSignalChainFor(track);
 }
 async function _report(state) {
   const t = _healthTrack;
@@ -1584,6 +1641,16 @@ async function _loadExtendedInfo(track) {
         || PSF_FORMAT_NAMES.has(track.format);
     if (!_MODULE_FORMATS.has(track.format) && !_isScene) {
         section.style.display = 'none';
+        // An online collection's tune (HVSC, Aminet, scene.org — over
+        // http(s)) not read yet: opening its Track Info reads it — an unopened
+        // package is opened, a file fetched (a big one: its tags only, by
+        // ranges) — and the page takes the result when it lands
+        // (track_updated).  The server does nothing for any other track.
+        if (track.id && (/ package$/.test(track.format || '')
+                         || /^https?:\/\//i.test(track.path || ''))) {
+          fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`,
+                { credentials: 'same-origin' }).catch(() => {});
+        }
         // Multi-tune console rips (NSF, GBS, …) have no module details, but
         // their tunes are listed (count + default tune from /extended).
         if (TUNE_CHIP_FORMAT_NAMES.has(track.format)) _loadChipTunes(track);
@@ -1712,7 +1779,7 @@ const _PATTERN_FORMATS = new Set([
   'Impulse Tracker', 'MultiTracker', 'OctaMED', 'Composer 669',
   'DigiBooster Pro', 'UltraTracker', 'Farandole', 'ASYLUM/DMP',
   'General DigiMusic', 'Imago Orpheus', 'Oktalyzer', 'SoundFX',
-  'Grave Composer', 'DSIK',
+  'Grave Composer', 'DSIK', 'Face The Music',
 ]);
 
 const _patSection   = document.getElementById('ti-section-patterns');
@@ -2351,17 +2418,26 @@ function isOpen() { return !overlay.classList.contains('hidden'); }
 function _keptFields(t) {
   return Number.isInteger(t.subsong) ? { subsong: t.subsong, duration: t.duration } : {};
 }
+function _panelBase(t) {
+  return (_shown && t && _shown.id === t.id) ? _shown : t;
+}
 function _applyFields(id, fields) {
   if (!isOpen() || !_queue || !id || !fields) return false;
   const t = _queue[_idx];
   if (!t || t.id !== id) return false;
   const keep = _keptFields(t);
+  const base = _panelBase(t);
   const changed = Object.keys(fields).filter((k) => !(k in keep)
-    && JSON.stringify(fields[k] ?? null) !== JSON.stringify(t[k] ?? null));
+    && JSON.stringify(fields[k] ?? null) !== JSON.stringify(base[k] ?? null));
   Object.assign(t, fields, keep);
   if (!changed.length) return true;
   const wrap = document.getElementById('ti-tagedit-wrap');
-  if (wrap && wrap.querySelector('input, textarea, select')) return true;
+  if (wrap && wrap.querySelector('input, textarea, select')) {
+    // (An edit in progress is not redrawn; the fields count as taken, so a
+    // follow-up read doesn't hand them on again.)
+    if (_shown && _shown.id === id) Object.assign(_shown, fields, keep);
+    return true;
+  }
   _render(t);
   return true;
 }
@@ -2393,10 +2469,11 @@ function _followUp(id) {
       if (!cur) return;
       if (row) {
         const keep = _keptFields(cur);
+        const base = _panelBase(cur);
         const changed = {};
         for (const k of Object.keys(row)) {
           if (k === 'id' || k in keep) continue;
-          if (JSON.stringify(row[k] ?? null) !== JSON.stringify(cur[k] ?? null)) changed[k] = row[k];
+          if (JSON.stringify(row[k] ?? null) !== JSON.stringify(base[k] ?? null)) changed[k] = row[k];
         }
         if (Object.keys(changed).length) {
           try { Player.patchTrackFields?.(id, changed); } catch (_) {}

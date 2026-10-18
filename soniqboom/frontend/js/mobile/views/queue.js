@@ -81,7 +81,7 @@ export function mountQueue(root, ctx) {
       dur.textContent = fmtDur(t.duration);
 
       const row = buildTrackRow(t, { trailing: dur, showHandle: true });
-      if (i === idx) row.classList.add('playing');
+      if (i === idx && !Player.startFailed) row.classList.add('playing');
 
       const c = attachRowGestures(row, {
         onTap: () => Player.setQueue(Player.queue, i),
@@ -126,6 +126,15 @@ export function mountQueue(root, ctx) {
   const renderIfShown = () => { if (root.classList.contains('active')) render(); };
   Player.on('queuechange',  renderIfShown);
   Player.on('trackchange',  renderIfShown);    // highlights the now-playing row
+  // A start that failed (nothing plays): its row is not lit as playing — and
+  // lit again once it plays after all.  Only the marker moves.
+  Player.on('statechange', () => {
+    if (!root.classList.contains('active')) return;
+    const idx = Player.queueIdx;
+    [...listEl.querySelectorAll('.m-row')].forEach((row, i) => {
+      row.classList.toggle('playing', i === idx && !Player.startFailed);
+    });
+  });
   root.addEventListener('viewactive', render);
 
   render();

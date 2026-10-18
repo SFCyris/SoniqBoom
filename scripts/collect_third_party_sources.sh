@@ -89,6 +89,11 @@ for c in libresidfp:RESIDFP libsidplayfp:LIBSIDPLAYFP sidplayfp:SIDPLAYFP; do
           "${name}-${ver}.tar.gz" "$name" "$ver" "$(arg "${key}_SHA256")"
 done
 
+# libopenmpt / openmpt123 — the autotools release tarball the image builds
+OMPTVER="$(arg LIBOPENMPT_VERSION)"
+fetch "https://lib.openmpt.org/files/libopenmpt/src/libopenmpt-${OMPTVER}+release.autotools.tar.gz" \
+      "libopenmpt-${OMPTVER}+release.autotools.tar.gz" libopenmpt "$OMPTVER" "$(arg LIBOPENMPT_SHA256)"
+
 # libsidplayfp — the browser SID engine; its wrapper, patches and build
 # script are in soniqboom/native/sidwasm/ (URL and SHA-256 pinned there)
 pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" "$SIDWASM_BUILD" | head -1; }

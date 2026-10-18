@@ -19,7 +19,7 @@
   <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
   <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
   <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
-  <link rel="stylesheet" href="/assets/css/mobile.css?v=20">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=23">
 </head>
 <body>
   <div id="m-app">
@@ -133,8 +133,8 @@
     </div>
 
     <!-- ── Bottom tab bar ───────────────────────────────────────────────── -->
-    <nav id="m-tabs" role="tablist">
-      <button class="m-tab active" data-view="library"    aria-label="Library">
+    <nav id="m-tabs" aria-label="Sections">
+      <button class="m-tab active" data-view="library"    aria-label="Library" aria-current="page">
         <span class="m-tab-icon">🎵</span><span class="m-tab-label">Library</span>
       </button>
       <button class="m-tab" data-view="search"     aria-label="Search">
@@ -170,7 +170,7 @@
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
 
-  <script type="module" src="/assets/js/mobile/app.js?v=23"></script>
+  <script type="module" src="/assets/js/mobile/app.js?v=28"></script>
   <!-- Same cast picker the desktop shell loads.  Picker is a classic
        script that wires itself to #btn-cast on either route. -->
   <script src="/assets/js/cast_picker.js?v=2" defer></script>

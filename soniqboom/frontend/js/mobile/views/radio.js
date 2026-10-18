@@ -16,6 +16,7 @@
  */
 import { MobileRadio } from '../radio-player.js';
 import { esc } from './_common.js';
+import { createStationLookup, stationQueryKey } from '../../station_lookup.js';
 
 const _probe = document.createElement('audio');
 
@@ -62,7 +63,14 @@ function _canPlayDirect(url, stream) {
 
 export function mountRadio(root, ctx) {
   let tab = 'favorites';                 // 'favorites' | 'scene' | 'browse'
-  let searchTimer = null;
+  let loadGen = 0;                       // the latest load / search; older answers are dropped
+  // Browse searches the Radio Browser directory: once typing paused, the stale
+  // request aborted, recent answers kept (station_lookup.js).
+  const lookup = createStationLookup({
+    fetchRows: (text, signal) =>
+      fetch(`/api/stations/search?q=${encodeURIComponent(text)}&limit=40`, { signal })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))),
+  });
 
   root.innerHTML = `
     <div class="m-group-bar" id="radio-tabs">
@@ -77,6 +85,7 @@ export function mountRadio(root, ctx) {
     <ul class="m-list" id="radio-list"></ul>
     <div class="m-empty hidden" id="radio-empty"></div>
     <div class="m-loading hidden" id="radio-loading">Loading…</div>
+    <div class="sr-only" id="radio-status" role="status" aria-live="polite"></div>
   `;
 
   const tabsBar  = root.querySelector('#radio-tabs');
@@ -85,6 +94,14 @@ export function mountRadio(root, ctx) {
   const listEl   = root.querySelector('#radio-list');
   const emptyEl  = root.querySelector('#radio-empty');
   const loadEl   = root.querySelector('#radio-loading');
+  const statusEl = root.querySelector('#radio-status');
+  // Said to a screen reader (a live region that is always there: one that is
+  // shown only with its message is not read out reliably).  Emptied first, so
+  // the same message said again is read again.
+  function announce(text) {
+    statusEl.textContent = '';
+    setTimeout(() => { statusEl.textContent = text; }, 60);
+  }
 
   tabsBar.addEventListener('click', (e) => {
     const chip = e.target.closest('.m-group-chip');
@@ -92,35 +109,64 @@ export function mountRadio(root, ctx) {
     tab = chip.dataset.t;
     [...tabsBar.children].forEach(c => c.classList.toggle('active', c === chip));
     searchWrap.classList.toggle('hidden', tab !== 'browse');
-    if (tab === 'browse') { listEl.innerHTML = ''; emptyEl.classList.add('hidden'); searchIn.focus(); }
+    if (tab === 'browse') {
+      loadGen++; lookup.cancel();
+      listEl.innerHTML = ''; emptyEl.classList.add('hidden'); loadEl.classList.add('hidden');
+      searchIn.focus();
+      if (searchIn.value.trim()) search();
+    }
     else load();
   });
 
-  searchIn.addEventListener('input', () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => load(), 250);
-  });
+  searchIn.addEventListener('input', () => search());
+
+  // A failed load says so, with a Retry (not "No stations found").
+  function showError(retry) {
+    listEl.innerHTML = '';
+    emptyEl.innerHTML = `Couldn’t load stations. <button type="button" class="m-retry">Retry</button>`;
+    emptyEl.querySelector('.m-retry').addEventListener('click', () => { announce(''); retry(); });
+    emptyEl.classList.remove('hidden');
+    announce('Couldn’t load stations. Retry is below.');
+  }
+
+  function search() {
+    const gen = ++loadGen;
+    const text = searchIn.value;
+    const n = stationQueryKey(text).length;
+    if (n < 2) {
+      lookup.cancel();
+      listEl.innerHTML = '';
+      loadEl.classList.add('hidden');
+      emptyEl.textContent = 'Type two or more characters.';
+      emptyEl.classList.toggle('hidden', n === 0);
+      return;
+    }
+    emptyEl.classList.add('hidden');
+    loadEl.classList.remove('hidden');
+    lookup.request(text,
+      (rows) => { if (gen !== loadGen) return; loadEl.classList.add('hidden'); render(rows); },
+      () => { if (gen !== loadGen) return; loadEl.classList.add('hidden'); showError(search); });
+  }
 
   async function load() {
+    if (tab === 'browse') { search(); return; }
+    lookup.cancel();
+    const gen = ++loadGen;
     loadEl.classList.remove('hidden');
     emptyEl.classList.add('hidden');
-    let url;
-    if (tab === 'favorites') url = '/api/stations/favorites';
-    else if (tab === 'scene') url = '/api/stations/scene';
-    else {
-      const q = searchIn.value.trim();
-      if (!q) { listEl.innerHTML = ''; loadEl.classList.add('hidden'); return; }
-      url = `/api/stations/search?q=${encodeURIComponent(q)}&limit=40`;
-    }
+    const url = tab === 'favorites' ? '/api/stations/favorites' : '/api/stations/scene';
     try {
       const res = await fetch(url);
-      const stations = res.ok ? await res.json() : [];
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const stations = await res.json();
+      if (gen !== loadGen) return;
       render(Array.isArray(stations) ? stations : []);
     } catch (err) {
+      if (gen !== loadGen) return;
       console.error('Stations load failed', err);
-      render([]);
+      showError(load);
     } finally {
-      loadEl.classList.add('hidden');
+      if (gen === loadGen) loadEl.classList.add('hidden');
     }
   }
 

@@ -194,7 +194,10 @@ function _emitActionToast(msg, label, onAction, ms = 15000) {
   );
   const text = document.createElement('span');
   text.textContent = msg;
-  const btnCss = 'font:600 12px system-ui,sans-serif;border-radius:4px;cursor:pointer;padding:4px 10px;';
+  text.style.cssText = 'flex:1 1 auto;min-width:0;';
+  // The buttons keep their word whole (the message wraps, not "Res-ume").
+  const btnCss = 'font:600 12px system-ui,sans-serif;border-radius:4px;cursor:pointer;padding:4px 10px;'
+    + 'flex:0 0 auto;white-space:nowrap;overflow-wrap:normal;min-height:28px;min-width:28px;';   // (≥ 24 px targets)
   const act = document.createElement('button');
   act.type = 'button';
   act.textContent = label;
@@ -279,7 +282,7 @@ export const TRACKER_FORMAT_NAMES = new Set([
   'MultiTracker', 'OctaMED', 'Composer 669', 'DigiBooster Pro',
   'AHX', 'HivelyTracker', 'UltraTracker', 'ScreamTracker 2',
   'Farandole', 'ASYLUM/DMP', 'General DigiMusic', 'Imago Orpheus',
-  'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
+  'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK', 'Face The Music',
 ]);
 
 /**
@@ -405,7 +408,7 @@ export const MODULE_FORMAT_NAMES = new Set([
   'Impulse Tracker', 'MultiTracker', 'OctaMED', 'Composer 669',
   'DigiBooster Pro', 'AHX', 'HivelyTracker', 'UltraTracker',
   'ScreamTracker 2', 'Farandole', 'ASYLUM/DMP', 'General DigiMusic',
-  'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK',
+  'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK', 'Face The Music',
 ]);
 
 /** Module-family test: static tracker/SID/MIDI names plus the dynamic-name
@@ -524,7 +527,7 @@ export async function probeAdlibDurations(tracks) {
 const TRACKER_EXTS = new Set([
   'mod', 's3m', 'xm', 'it', 'mtm', 'med', 'oct', '669',
   'dbm', 'ahx', 'hvl', 'ult', 'stm', 'far', 'amf',
-  'gdm', 'imf', 'okt', 'sfx', 'wow', 'dsm',
+  'gdm', 'imf', 'okt', 'sfx', 'wow', 'dsm', 'ftm',
 ]);
 
 /**
@@ -659,4 +662,20 @@ export function trapFocus(rootEl) {
   };
   rootEl.addEventListener('keydown', _onKey);
   return () => rootEl.removeEventListener('keydown', _onKey);
+}
+
+
+// ``/api/art/{id}`` (as the scanner stores in ``cover_art``, optionally with
+// ``?size=…&…``) → ``/api/art/{id}/{size}.jpg?…`` — the same response, at a
+// path a reverse proxy's security tool (CrowdSec) counts as a static file
+// rather than as crawling (GitHub #40).  Anything else is returned as is.
+export function staticArtUrl(u) {
+  if (typeof u !== 'string') return u;
+  const m = /^((?:https?:\/\/[^/]+)?\/api\/art\/)([^/?#]+)(?:\?([^#]*))?$/.exec(u);
+  if (!m) return u;
+  const qs = new URLSearchParams(m[3] || '');
+  const size = qs.get('size') || 'sm';
+  qs.delete('size');
+  const rest = qs.toString();
+  return `${m[1]}${m[2]}/${size}.jpg${rest ? `?${rest}` : ''}`;
 }

@@ -565,6 +565,33 @@ class SubsonicState:
             await self.save()
         return moved
 
+    def referenced_track_ids(self) -> set:
+        """The track ids any user's song stars, play queue or bookmarks name
+        (a tune id ``<track>~<n>`` as its track)."""
+        out: set = set()
+
+        def _add(key) -> None:
+            if isinstance(key, str) and key:
+                out.add(key.partition("~")[0])
+        for u in list(self._ensure_loaded()["users"].values()):
+            if not isinstance(u, dict):
+                continue
+            st = u.get("starred")
+            songs = st.get("song") if isinstance(st, dict) else None
+            if isinstance(songs, dict):
+                for k in songs:
+                    _add(k)
+            q = u.get("queue")
+            if isinstance(q, dict):
+                for i in q.get("ids") or ():
+                    _add(i)
+                _add(q.get("current"))
+            b = u.get("bookmarks")
+            if isinstance(b, dict):
+                for k in b:
+                    _add(k)
+        return out
+
     async def delete_bookmark(self, uid: str, track_id: str) -> bool:
         u = self._user(uid, create=False)
         b = (u or {}).get("bookmarks")

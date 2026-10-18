@@ -435,6 +435,15 @@ async def test_no_reader_but_a_play_fetches_a_catalogue_file(env, monkeypatch):
                         params={"path": ROOT, "recursive": "true", "offset": 0, "limit": 5,
                                 "shuffle_seed": 7})
         assert r.json()["total"] == 8 and len(r.json()["tracks"]) == 5
+        # Outside the catalogue root (a ``..`` above it, another folder of the
+        # same server): one 403, before the server is asked.
+        n_before = len(env["srv"].retrs)
+        for bad in (f"{ROOT}/../incoming", f"{ROOT}/Protracker/../../..",
+                    ROOT.rsplit("/", 1)[0] + "/other", ROOT + "x"):
+            for url in ("/api/fstree/children", "/api/fstree/tracks-with-meta"):
+                r = await c.get(url, params={"path": bad, "root": bad})
+                assert r.status_code == 403, (url, bad, r.status_code)
+        assert len(env["srv"].retrs) == n_before
     for p in paths:
         assert source_bytes.read_source_bytes(p, lane="stream") is None
         assert source_bytes.read_source_bytes(p, lane="scan") is None

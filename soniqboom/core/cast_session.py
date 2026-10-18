@@ -219,9 +219,13 @@ async def _start_gated_render(priority: int, cache_key: str, format_type: str,
             return                      # started while the cache lookup ran
 
         async def _gated():
+            # The render is background work at ``priority`` (it may stop a
+            # render nobody listens to only as the web prewarm may).
+            prio_tok = _stream._BG_PRIO.set(priority)
             try:
                 return await render_fn()
             finally:
+                _stream._BG_PRIO.reset(prio_tok)
                 gate.release()
         # No await between the check above and the registration inside.
         await _cc.start_background_render(cache_key, format_type, _gated)
@@ -756,10 +760,19 @@ class CastSession:
             ctrl = await self._ensure_controller()
             base = base_url or await _server_base_url()
             urls_meta: list[dict] = []
+            kept: list[QueueItem] = []
+            from soniqboom.core import skip_rules
             for it in items:
                 track = await get_track(it.track_id)
                 if not track:
                     continue
+                # The first entry is the one asked for — it plays; the rest
+                # are dealt, and pass a reported-broken / undecodable track or
+                # (with "Skip short tunes" on) a short tune by, as the web
+                # player's queue does (GitHub #36/#37).
+                if kept and skip_rules.entry_skipped(it.track_id, int(it.subsong or 0)):
+                    continue
+                kept.append(it)
                 src_ext = (track.path or "").rsplit(".", 1)[-1].lower()
                 src_codec = _NORMALISE_SRC.get(src_ext, src_ext)
                 target_codec, needs_transcode = cast_codecs.negotiate_codec(
@@ -788,6 +801,7 @@ class CastSession:
                     "duration_s":     it.duration_s or float(getattr(track, "duration", 0) or 0),
                 })
 
+            items = kept
             self.state.queue = list(items)
             self.state.queue_index = 0
 
@@ -857,14 +871,26 @@ class CastSession:
                 return None
             if not self.state.queue:
                 return None
-            self.state.queue_index += 1
-            if self.state.queue_index >= len(self.state.queue):
+            # Pass what became skippable since the queue was loaded (a new
+            # report, the setting turned on) by, as at load.  Nothing playable
+            # left: the index stays where it is (so a "prev" still works).
+            i = self.state.queue_index + 1
+            while i < len(self.state.queue) and self._entry_skipped(i):
+                i += 1
+            if i >= len(self.state.queue):
                 return None
-            item = self.state.queue[self.state.queue_index]
+            self.state.queue_index = i
+            item = self.state.queue[i]
             return await self._play_track_locked(
                 track_id=item.track_id, user_id=user_id, base_url=base_url,
                 subsong=int(item.subsong or 0),
             )
+
+    def _entry_skipped(self, i: int) -> bool:
+        """Does the skip-rules contract pass queue entry ``i`` by?"""
+        from soniqboom.core import skip_rules
+        it = self.state.queue[i]
+        return skip_rules.entry_skipped(it.track_id, int(it.subsong or 0))
 
     async def queue_prev(
         self,
@@ -890,9 +916,13 @@ class CastSession:
                 return None
             if not self.state.queue:
                 return None
-            self.state.queue_index -= 1
-            if self.state.queue_index < 0:
-                self.state.queue_index = 0
+            cur = max(0, min(self.state.queue_index, len(self.state.queue) - 1))
+            # Back past entries the queue passes by (as the web player's
+            # previous does); none playable before: restart the current one.
+            i = cur - 1
+            while i >= 0 and self._entry_skipped(i):
+                i -= 1
+            self.state.queue_index = i if i >= 0 else cur
             item = self.state.queue[self.state.queue_index]
             return await self._play_track_locked(
                 track_id=item.track_id, user_id=user_id, base_url=base_url,

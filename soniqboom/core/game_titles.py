@@ -1212,6 +1212,8 @@ def _fetch(url: str, dest: Path | None = None, progress=None, timeout: float = 1
     ``site``, a redirect off that site is refused; with ``ctl``,
     ``cancel_download`` stops it (``_Stopped``) — a read in progress too."""
     cap = _MAX_DOWNLOAD if max_bytes is None else max_bytes
+    from soniqboom.core import netpolicy
+    netpolicy.check(url)
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     if deadline is not None:
         timeout = max(1.0, min(timeout, deadline - time.monotonic()))

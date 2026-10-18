@@ -99,6 +99,7 @@ async def rebuild_indexes() -> dict:
         shadow._play_stats = dict(store._play_stats)
         gen0 = store.index_generation()             # no await since the snapshot
         shadow.enter_batch_mode()
+        shadow._mark_all_sorted_dirty()             # (built in full below: nothing to record)
         items = shadow.track_items_list()
         BATCH = 500
         # The cyclic GC is paused per slice: the build allocates millions of
@@ -172,6 +173,7 @@ async def rebuild_indexes() -> dict:
         store._batch_mode = False
         store._mutation_seq += 1   # invalidate seq-keyed memos (store agg cache,
                                    # subsonic _ALBUM_*_CACHE, smart.py dup memos)
+        store.browse_changed()     # and the browse memos (``_browse_seq``)
     # Free the replaced indexes one at a time (outside the lock, after the
     # swap): dropping them all at once was a ~0.3 s deallocation stall.
     for i in range(len(_old)):
@@ -320,16 +322,21 @@ async def upsert_track(track: Track) -> None:
     get_store().upsert_track(track.model_dump())
 
 
-async def upsert_tracks_batch(tracks: list[Track]) -> int:
-    if not tracks:
-        return 0
-    store = get_store()
-    dicts = [t.model_dump() for t in tracks]
+def track_dicts(tracks: "list[Track | dict]") -> list[dict]:
+    """``tracks`` as the dicts the store keeps (an empty / all-zero embedding
+    left out); a dict is taken as it is."""
+    dicts = [t if isinstance(t, dict) else t.model_dump() for t in tracks]
     for d in dicts:
         emb = d.get("embedding")
         if not emb or all(v == 0.0 for v in emb):
             d.pop("embedding", None)
-    return store.upsert_tracks_batch(dicts)
+    return dicts
+
+
+async def upsert_tracks_batch(tracks: "list[Track | dict]") -> int:
+    if not tracks:
+        return 0
+    return get_store().upsert_tracks_batch(track_dicts(tracks))
 
 
 async def get_track(track_id: str) -> Track | None:
@@ -566,7 +573,11 @@ def _parse_tag_query(query: str) -> dict:
                     pass
             if hi not in ("+inf", ")"):
                 try:
-                    if hi.endswith(")"):
+                    # an exclusive upper bound is ``(N`` (RediSearch, as
+                    # ``api.search`` emits ``year:<N``) or a legacy ``N)``
+                    if hi.startswith("("):
+                        kwargs["year_max"] = int(hi[1:]) - 1
+                    elif hi.endswith(")"):
                         kwargs["year_max"] = int(hi[:-1]) - 1
                     else:
                         kwargs["year_max"] = int(hi)

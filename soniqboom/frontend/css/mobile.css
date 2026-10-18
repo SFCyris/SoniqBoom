@@ -339,7 +339,8 @@ input, select, textarea { touch-action: manipulation; }
   border-color: color-mix(in srgb, var(--warm, #ff895c) 38%, transparent);
 }
 .track-health-broken,
-.track-health-corrupt {
+.track-health-corrupt,
+.track-health-empty {
   color: var(--danger, #ff5e5e);
   background: color-mix(in srgb, var(--danger, #ff5e5e) 16%, transparent);
   border-color: color-mix(in srgb, var(--danger, #ff5e5e) 40%, transparent);
@@ -432,6 +433,17 @@ input, select, textarea { touch-action: manipulation; }
   text-align: center;
   color: var(--text-dim);
   font-size: 14px;
+}
+.m-empty .m-retry {
+  display: block;
+  margin: 14px auto 0;
+  min-height: 44px;
+  padding: 0 20px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
 }
 
 /* ── Search view ───────────────────────────────────────────────────────── */
@@ -943,7 +955,7 @@ body.auth-blocked { overflow: hidden; }
 .auth-submit {
   margin-top: 6px;
   background: var(--accent);
-  color: var(--bg);               /* same accent-on-bg contrast as .m-group-chip.active */
+  color: #0a0a0a;                 /* dark on the accent in both schemes: 12.9:1 dark, 5.1:1 light */
   border: none;
   border-radius: 10px;
   padding: 14px 16px;
@@ -959,7 +971,7 @@ body.auth-blocked { overflow: hidden; }
   content: ''; position: absolute; inset: 0; margin: auto;
   width: 18px; height: 18px;
   border: 2px solid rgba(128,128,128,0.4);
-  border-top-color: var(--bg);
+  border-top-color: #0a0a0a;
   border-radius: 50%;
   animation: auth-spin 0.6s linear infinite;
 }

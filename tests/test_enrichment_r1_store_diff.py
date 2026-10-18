@@ -113,9 +113,13 @@ async def test_async_batch_exit_rebuilds_only_the_dirty_lists(monkeypatch):
     s = _seeded_store(r)
     ids = list(s._tracks)
     built: list[str] = []
-    real = s.build_sorted_list
+    merged: list[str] = []
+    real, real_merge = s.build_sorted_list, s.iter_merged_sorted_list
     monkeypatch.setattr(s, "build_sorted_list",
                         lambda name, changed=None: built.append((name, changed)) or real(name, changed))
+    monkeypatch.setattr(s, "iter_merged_sorted_list",
+                        lambda name, changed, step=0: merged.append((name, changed))
+                        or real_merge(name, changed, step))
     s.enter_batch_mode()
     s.update_track_fields_batch([(tid, {"album": f"New Album {i % 5}"})
                                  for i, tid in enumerate(ids[:60])])
@@ -123,18 +127,22 @@ async def test_async_batch_exit_rebuilds_only_the_dirty_lists(monkeypatch):
     assert set(s._dirty_sorted_tids) == {"_sorted_album"}
     assert set(s._dirty_sorted_tids["_sorted_album"]) == set(ids[:60])
     await scanner._async_exit_batch_mode(s)
-    assert sorted((n, set(c)) for n, c in built) == [       # merges
+    assert sorted((n, set(c)) for n, c in merged) == [      # merges
         ("_sorted_album", set(ids[:60]))]
+    assert built == []
     assert not s._dirty_sorted and not s._batch_mode and s._batch_depth == 0
     _assert_parity(s)
-    # An insert still marks (and rebuilds) every list.
-    built.clear()
+    # An insert is recorded in every list (not in any of them before the
+    # batch) and merged in too — no full rebuild.
+    merged.clear()
     s.enter_batch_mode()
     s.upsert_tracks_batch([_rand_track(r, 9999)])
     s.update_track_fields("t1", {"album": "Another"})
     assert s._dirty_sorted == set(store_mod.SORTED_LISTS)
+    new_id = next(tid for tid in s._tracks if tid not in ids)
+    assert all(s._dirty_sorted_tids[n].get(new_id, "x") is None for n in store_mod.SORTED_LISTS)
     await scanner._async_exit_batch_mode(s)
-    assert built == []                           # the single-pass full rebuild
+    assert built == [] and {n for n, _c in merged} == set(store_mod.SORTED_LISTS)
     _assert_parity(s)
 
 

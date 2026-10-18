@@ -22,6 +22,18 @@ def _esc_tag(value: str) -> str:
     return _TAG_ESC_RE.sub(r'\\\1', value)
 
 
+# Spaces inside a year filter — ``year: 2000``, ``year:< 2000``, ``year: >= 2000``,
+# ``year:1990 - 2000`` — joined up, or the value after the space became free text
+# and the year filtered nothing.
+_YEAR_OP_SPACE_RE = re.compile(r'\byear:\s*([<>]=?)?\s*(?=\d)')
+_YEAR_RANGE_SPACE_RE = re.compile(r'\b(year:\d+)(?:\s+-\s*|\s*-\s+)(?=\d)')
+
+
+def _tighten_year(q: str) -> str:
+    q = _YEAR_OP_SPACE_RE.sub(lambda m: 'year:' + (m.group(1) or ''), q)
+    return _YEAR_RANGE_SPACE_RE.sub(r'\1-', q)
+
+
 def _parse_advanced_query(q: str) -> str | None:
     """Parse advanced search syntax like artist:Ghost album:Impera year:>2020.
 
@@ -38,13 +50,16 @@ def _parse_advanced_query(q: str) -> str | None:
       ignored, so ``game:"last ninja"`` also finds "The Last Ninja" and
       ``game:pokemon`` finds "Pokémon"),
       genre:VALUE,
-      year:VALUE, year:>VALUE, year:<VALUE, year:VALUE-VALUE,
+      year:VALUE, year:>VALUE, year:<VALUE, year:>=VALUE, year:<=VALUE,
+      year:VALUE-VALUE, year:VALUE-, year:-VALUE (spaces around the
+      operator or the dash are allowed),
       format:VALUE
     Values can be quoted: artist:"The Ghost Inside"
     """
     # Check if input contains any field: prefix
     if not re.search(r'\b(artist|album_artist|album|game|genre|year|format):', q):
         return None
+    q = _tighten_year(q)
 
     parts: list[str] = []
     # Match field:value or field:"quoted value"
@@ -70,15 +85,20 @@ def _parse_advanced_query(q: str) -> str | None:
         elif field == 'format':
             parts.append(f"@format:{{{_esc_tag(value.upper())}}}")
         elif field == 'year':
-            if '-' in value and not value.startswith('>') and not value.startswith('<'):
-                lo, hi = value.split('-', 1)
-                parts.append(f"@year:[{lo.strip()} {hi.strip()}]")
-            elif value.startswith('>'):
-                parts.append(f"@year:[({value[1:].strip()} +inf]")
-            elif value.startswith('<'):
-                parts.append(f"@year:[-inf ({value[1:].strip()}]")
+            v = value.replace(' ', '')
+            if v.startswith('>='):
+                parts.append(f"@year:[{v[2:]} +inf]")
+            elif v.startswith('<='):
+                parts.append(f"@year:[-inf {v[2:]}]")
+            elif v.startswith('>'):
+                parts.append(f"@year:[({v[1:]} +inf]")
+            elif v.startswith('<'):
+                parts.append(f"@year:[-inf ({v[1:]}]")
+            elif '-' in v:                              # A-B, A- (from A), -B (up to B)
+                lo, hi = v.split('-', 1)
+                parts.append(f"@year:[{lo or '-inf'} {hi or '+inf'}]")
             else:
-                parts.append(f"@year:[{value} {value}]")
+                parts.append(f"@year:[{v} {v}]")
 
     # Also capture any free text not part of field:value
     remainder = re.sub(pattern, '', q).strip()

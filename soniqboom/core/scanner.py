@@ -1021,6 +1021,7 @@ from soniqboom.core.data import (
     path_hash,
     scan_all_tracks_meta,
     store_hash_lookups_batch,
+    track_dicts as _track_dicts,
     upsert_scan_dir,
     upsert_tracks_batch,
 )
@@ -1066,6 +1067,8 @@ _SKIP_WAVEFORM_EXTS = {
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
 }
+from soniqboom.core.metadata import OPENMPT_EXTRA_EXTS as _OPENMPT_EXTRA_EXTS  # noqa: E402
+_SKIP_WAVEFORM_EXTS |= _OPENMPT_EXTRA_EXTS        # (.ftm where libopenmpt reads it)
 
 
 # ── Progress state ────────────────────────────────────────────────────────────
@@ -1107,6 +1110,9 @@ class ScanProgress:
             "paused":       is_scan_paused(),
             "last_plan":    dict(self.last_plan),
             "last_dirs":    list(self.last_dirs),
+            # Every running scan is one that sends no progress (the folder
+            # watcher's, a freshness poll): pages show no badge for it.
+            "silent":       bool(self.running and _scan_count > 0 and _loud_running == 0),
         }
         # Append queue info (combine local + remote active dirs)
         all_active = set(_current_scan_dirs) | _current_remote_dirs
@@ -1118,6 +1124,98 @@ class ScanProgress:
 
 _progress  = ScanProgress()
 _scan_count: int = 0            # number of active scans (local + remote)
+
+# Scans that send no progress (``on_progress`` None — the folder watcher's
+# rescans and fallback polls, remote freshness polls) and the pages: a "busy
+# period" runs from the first scan to the moment none runs (``_scan_count``
+# back to 0).  ``ScanProgress.silent`` is true while every running scan is
+# such a one; when a busy period ends with one, ``_scan_ended`` asks for the
+# ``running: false`` frame no callback sends — plain when a scan with progress
+# ran in it (its own last frame said running: a silent one was still going),
+# else ``silent`` when a silent scan changed the library or a page was told
+# a scan was running (``note_scan_shown``, the connect snapshot).
+_loud_running: int = 0          # running scans with a progress callback
+_busy_loud = False              # … one ran in this busy period
+_busy_changed = False           # a silent scan of this busy period changed the library
+_busy_shown = False             # a page's connect snapshot said running in it
+_busy_dirs: list = []           # the folders the silent scans of this busy period covered
+
+
+def note_scan_shown() -> None:
+    """A page was told a scan is running (the WebSocket's connect snapshot):
+    the end of this busy period sends a ``running: false`` frame."""
+    global _busy_shown
+    if _scan_count > 0:
+        _busy_shown = True
+
+
+def _scan_began(cb, dirs) -> None:
+    """Bookkeeping of a scan starting (with ``_scan_count += 1``)."""
+    global _loud_running, _busy_loud
+    if cb is not None:
+        _loud_running += 1
+        _busy_loud = True
+    else:
+        for d in dirs:
+            if d not in _busy_dirs:
+                _busy_dirs.append(d)
+
+
+def _scan_ended(cb, changed: bool) -> "tuple[bool, list] | None":
+    """Bookkeeping of a scan ending — called right after ``_scan_count`` was
+    counted down, with no await in between.  The frame a scan with no
+    callback must send (``(silent, folders)``: ``silent`` False = a plain
+    completion), or None (more scans run, the scan's own callback sends it,
+    or no page needs one).  The busy period's folders are taken here."""
+    global _loud_running, _busy_loud, _busy_changed, _busy_shown
+    if cb is not None:
+        _loud_running = max(0, _loud_running - 1)
+    elif changed:
+        _busy_changed = True
+    if _scan_count > 0:
+        return None
+    loud, chg, shown = _busy_loud, _busy_changed, _busy_shown
+    _busy_loud = _busy_changed = _busy_shown = False
+    dirs = list(_busy_dirs)
+    _busy_dirs.clear()
+    if cb is not None:
+        # (its own frame ends the period: it names the silent scans' folders too)
+        for d in dirs:
+            if d not in _progress.last_dirs:
+                _progress.last_dirs.append(d)
+        return None
+    if loud:
+        return (False, dirs)
+    return (True, dirs) if (chg or shown) else None
+
+
+async def _send_scan_end(end: "tuple[bool, list] | None") -> None:
+    """Send the frame ``_scan_ended`` asked for (never raises).  A scan that
+    started meanwhile (the caller awaited in between) opened a new busy
+    period: the end is folded into it — its own end sends the frame."""
+    global _busy_loud, _busy_changed
+    if end is None:
+        return
+    silent, dirs = end
+    if _scan_count > 0:
+        if silent:
+            _busy_changed = True
+        else:
+            _busy_loud = True
+        for d in dirs:
+            if d not in _busy_dirs:
+                _busy_dirs.append(d)
+        return
+    try:
+        from soniqboom.api.library import _broadcast, broadcast_silent_scan_end
+        if silent:
+            await broadcast_silent_scan_end(dirs)
+        else:
+            await _broadcast({"event": "scan_progress", **_progress.to_dict()})
+    except Exception:                                       # noqa: BLE001
+        log.debug("scan end frame not sent", exc_info=True)
+
+
 _scan_task: asyncio.Task | None = None
 
 # Folder-art prefetch tasks detach from their parent scan (see comment
@@ -1320,6 +1418,17 @@ def reset_hvsc_probe_cache() -> None:
     """Forget which scan roots were probed for HVSC, so the next scan re-detects
     (e.g. after the user dropped a DOCUMENTS folder onto an already-scanned root)."""
     _hvsc_probed_roots.clear()
+
+
+def _hvsc_online_only() -> bool:
+    """The SID lookups use the online HVSC collection's documents (no HVSC
+    folder of the user's own): a folder of their own found by a scan still
+    takes over."""
+    try:
+        from soniqboom.core import online_hvsc
+        return online_hvsc.fallback_active()
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 def _detect_hvsc_docs_local(sid_dirs: set[str]) -> str | None:
@@ -1595,6 +1704,11 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                     _before = len(files)
                     try:
                         with zipfile.ZipFile(full, 'r') as zf:
+                            def _head_of(real, _zf=zf):
+                                with _zf.open(real) as _fh:
+                                    return _fh.read(archive.HEAD_BYTES)
+                            _shown: set = set()
+                            _plain: list = []
                             for member in zf.namelist():
                                 member_basename = _basename_of(member)
                                 if _is_junk_filename(member_basename):
@@ -1612,12 +1726,18 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                                         continue
                                     try:
                                         with zipfile.ZipFile(io.BytesIO(inner_data), 'r') as inner_zf:
+                                            def _inner_head(real, _zf=inner_zf):
+                                                with _zf.open(real) as _fh:
+                                                    return _fh.read(archive.HEAD_BYTES)
                                             for inner_name in inner_zf.namelist():
                                                 if _is_junk_filename(_basename_of(inner_name)):
                                                     skipped_junk += 1
                                                     continue
                                                 if _is_audio(inner_name):
-                                                    files.append(Path(f"{full}::{member}::{inner_name}"))
+                                                    shown = archive.content_name(inner_name, _inner_head)
+                                                    if archive.rejected_by_bytes(inner_name, shown, _inner_head):
+                                                        continue
+                                                    files.append(Path(f"{full}::{member}::{shown}"))
                                         continue
                                     except zipfile.BadZipFile:
                                         pass            # not a zip: maybe a module named *.zip
@@ -1628,8 +1748,21 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                                             failed_archives.add(str(Path(f"{full}::{member}")))
                                         continue
                                 if _is_audio(member):
-                                    # Direct audio file in ZIP
-                                    files.append(Path(f"{full}::{member}"))
+                                    # Direct audio file in ZIP (a name that
+                                    # reads two ways — ``mod.Opus`` — as its
+                                    # bytes say: ``archive.content_name``)
+                                    shown = archive.content_name(member, _head_of)
+                                    if archive.rejected_by_bytes(member, shown, _head_of):
+                                        continue        # (bytes no reading plays)
+                                    files.append(Path(f"{full}::{shown}"))
+                                    _shown.add(shown)
+                                elif archive.sniffable(member):
+                                    _plain.append(member)
+                            # Members only their bytes name (``Antom`` → ``Antom.ftm``),
+                            # as the archive layer reads them back.
+                            for _disp in archive.sniffed_members(
+                                    _plain, _head_of, taken=_shown | set(zf.namelist())):
+                                files.append(Path(f"{full}::{_disp}"))
                         continue
                     except zipfile.BadZipFile as exc:
                         del files[_before:]
@@ -1968,13 +2101,25 @@ def _pc_memo_key(remote_path: str) -> tuple[str, str]:
     (``_fetch_zip_member``) and reader (``_process_one``) derive the key from
     the same ``remote_path`` so they can never disagree.
     """
-    arc, _, member = remote_path.partition("::")
+    from soniqboom.core.filesource import split_member
+    arc, member = split_member(remote_path) or (remote_path, "")
     mnorm = member.replace("\\", "/")           # Amiga dirs use backslashes
     mdir = mnorm.rsplit("/", 1)[0] if "/" in mnorm else ""
     return (arc, mdir)
 
 
 # ── Phase 1 helpers ───────────────────────────────────────────────────────────
+
+def _zip_stored(zf, member: str) -> str:
+    """The stored name in open ZIP ``zf`` of member ``member`` (itself, or
+    the stored name of a content-decided display name)."""
+    if member in zf.NameToInfo:
+        return member
+    def head_of(real: str) -> bytes:
+        with zf.open(real) as fh:
+            return fh.read(archive.HEAD_BYTES)
+    return archive.stored_name(zf.NameToInfo, member, head_of) or member
+
 
 class _NestedZips:
     """A scan worker's inner archives, read out of their outer archive
@@ -2001,7 +2146,8 @@ class _NestedZips:
         outer, chain, member = parts[0], tuple(parts[1:-1]), parts[-1]
         mtime = os.stat(outer).st_mtime
         with self._lock:
-            return self._inner(outer, mtime, chain).read(member)
+            zf = self._inner(outer, mtime, chain)
+            return zf.read(_zip_stored(zf, member))
 
     def _inner(self, outer: str, mtime: float, chain: tuple):
         import tempfile
@@ -2082,6 +2228,7 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
       /path/archive.zip::track.sid
       /path/outer.zip::inner.zip::track.mod
       /path/disk.d64::THE RUNNER.sid          (C64/Amiga disk images)
+      /path/pkg.zip::disk.adf::mod.title      (a disk image inside a ZIP)
 
     Returns (file_bytes, final_member_name).
     """
@@ -2096,12 +2243,46 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
     # no nesting, so the member is everything after the first ``::``.
     if archive.is_lha_name(outer) and "::" in virtual_path:
         member = virtual_path.split("::", 1)[1]
-        return archive.read_member(outer, member), member
+        first, sep, rest = member.partition("::")
+        if not sep:
+            return archive.read_member(outer, member), member
+        # An archive inside the LHA (an online collection's package lists
+        # its members as ``pkg.lha::inner.zip::tune``): read it out, then the
+        # rest of the chain from it.
+        import tempfile
+        inner = archive.read_member(outer, first)
+        fd, tmp = tempfile.mkstemp(prefix="sb_lhainner_", suffix=Path(first).suffix or ".zip")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(inner)
+            data, _last = _read_from_zip_path(f"{tmp}::{rest}")
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return data, rest.rsplit("::", 1)[-1]
 
     import io
     import zipfile
 
     parts = virtual_path.split("::")
+    if len(parts) >= 3 and diskimage.is_disk_image(parts[1]):
+        # A disk image inside a ZIP (an online collection's package lists its
+        # tunes as ``pkg.zip::disk.adf::mod.title``): read it out, then the
+        # tune from it.
+        import tempfile
+        inner = archive.read_member(parts[0], parts[1])
+        fd, tmp = tempfile.mkstemp(prefix="sb_diskimg_", suffix=Path(parts[1]).suffix.lower())
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(inner)
+            return diskimage.read_member(tmp, "::".join(parts[2:])), parts[-1]
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     # First part is always the outer ZIP on disk.  For nested archives
     # we spill each intermediate level to a tempfile rather than keeping
     # the enclosing member in RAM — Audio-2 P1 found that nesting depth
@@ -2150,9 +2331,10 @@ def _read_from_zip_path(virtual_path: str) -> tuple[bytes, str]:
                         intermediates.append(tmp.name)
                 current_zip_path = tmp.name
             else:
-                # Final level — read into bytes for the caller.
+                # Final level — read into bytes for the caller (a display
+                # name — ``mod.Opus.mod`` — read under its stored name).
                 with zipfile.ZipFile(current_zip_path, 'r') as zf:
-                    return zf.read(member), parts[-1]
+                    return zf.read(_zip_stored(zf, member)), parts[-1]
     finally:
         for p in intermediates:
             try:
@@ -2810,16 +2992,96 @@ async def _sort_yielding(lst: list, run: int = 20_000, slice_: int = 8_000) -> l
     return out
 
 
+# ``_async_exit_batch_mode``: changes / positions / runs per slice of a merge,
+# and the pause after each slice (a timer, not ``sleep(0)``: work that became
+# ready meanwhile runs before the next slice).
+_MERGE_STEP = 2_048
+_MERGE_PAUSE_S = 0.0005
+
+
+async def _merge_yielding(store, name: str, changed: dict):
+    """``store.merged_sorted_list(name, changed)`` with a loop turn between
+    its slices (``iter_merged_sorted_list``)."""
+    return await _run_list_yielding(
+        store, name, store.iter_merged_sorted_list(name, changed, _MERGE_STEP))
+
+
+async def _filter_yielding(store, name: str, changed):
+    """``iter_filtered_sorted_list`` with a loop turn between its slices."""
+    return await _run_list_yielding(
+        store, name, store.iter_filtered_sorted_list(name, changed, _MERGE_STEP))
+
+
+async def _run_list_yielding(store, name: str, gen):
+    """Run a sorted-list generator of the store to its end (its result) with
+    a loop turn between its slices.  The cyclic GC is paused while the new
+    list is assembled, and the young generations are collected once it is
+    complete: every collection that holds the new n-entry list walks all of
+    it (~14 ms at 680K entries) — left to the automatic ones, the half-built
+    list was walked again and again and several finished ones in one
+    generation-1 pass (a ~70 ms stall).  (Paused from the generator's
+    ``ASSEMBLE`` on: the new entries are made with the GC running, its young
+    passes untracking their tuples a few thousand at a time.)"""
+    import gc
+    from soniqboom.core.store import ASSEMBLE
+    was = gc.isenabled()
+    paused = False
+    try:
+        while True:
+            if next(gen) is ASSEMBLE and was:
+                gc.disable()
+                paused = True
+            await asyncio.sleep(_MERGE_PAUSE_S)
+    except StopIteration as stop:
+        result = stop.value
+    finally:
+        if paused:
+            gc.enable()
+    if paused and result is not None and result is not getattr(store, name):
+        await asyncio.sleep(_MERGE_PAUSE_S)    # (not in the last slice's block)
+        gc.collect(1)
+    return result
+
+
+async def _build_lists_yielding(store, names) -> dict:
+    """The sorted lists ``names`` built anew from every track (unsorted —
+    the caller sorts them), 5,000 tracks per loop turn, the cyclic GC paused
+    in each chunk (the tuples are acyclic)."""
+    import gc
+    from soniqboom.core.store import _SORTED_SPECS
+    specs = [(name, _SORTED_SPECS[name][1], []) for name in names]
+    tracks = store._tracks
+    ids = list(tracks)
+    for i in range(0, len(ids), 5_000):
+        was = gc.isenabled()
+        gc.disable()
+        try:
+            for tid in ids[i:i + 5_000]:
+                t = tracks.get(tid)
+                if t is None:
+                    continue
+                for _name, value, out in specs:
+                    v = value(t)
+                    if v is not None:
+                        out.append((v, tid))
+        finally:
+            if was:
+                gc.enable()
+        await asyncio.sleep(_MERGE_PAUSE_S)
+    return {name: out for name, _value, out in specs}
+
+
 async def _async_exit_batch_mode(store) -> None:
     """Exit batch mode with yield points between sorted-index rebuilds.
 
     ``_rebuild_sorted_indexes`` is O(n log n) and freezes the event loop for
     hundreds of milliseconds on large libraries.  By splitting the work into
-    per-field sorts with ``asyncio.sleep(0)`` between them, HTTP requests can
-    be served in the gaps.  Only the lists marked dirty (``store._dirty_sorted``)
-    are rebuilt: all ten after a scan's inserts/deletes, but just the re-keyed
-    ones after a field-update batch (a Modland/folder album pass re-sorts
-    ``_sorted_album`` alone).
+    slices with loop turns between them, HTTP requests can be served in the
+    gaps.  Only the lists marked dirty (``store._dirty_sorted``) are touched:
+    the tracks the batch added, removed or re-keyed are merged into each of
+    them (``_merge_yielding``); a list past the merge cap, or one the merge
+    found out of step, is built anew from every track (``_build_lists_yielding``)
+    — every list in one pass when all of them are (a first scan).
 
     Keep ``_batch_mode = True`` until the freshly-built lists are assigned —
     if we flipped to False first, any ``_index_track`` running concurrently
@@ -2871,8 +3133,10 @@ async def _async_exit_batch_mode(store) -> None:
                 # Duration-only writes (a render / probe backfill) bump only
                 # ``_duration_seq`` but still re-key ``_sorted_duration``.
                 gen0 = (store._mutation_seq, getattr(store, "_duration_seq", 0))
-                built: dict[str, list] = {}
-                if len(names) == len(SORTED_LISTS) and all(v is None for v in plan.values()):
+                built: dict[str, list] = {}         # (not yet sorted)
+                merged: dict[str, list] = {}        # (sorted already)
+                full = len(names) == len(SORTED_LISTS) and all(v is None for v in plan.values())
+                if full:
                     # Build ALL sorted lists (numeric, lexical, the ``game:``
                     # fold side lists) in one pass, mirroring
                     # TrackStore._index_track / _rebuild_sorted_indexes exactly
@@ -2883,7 +3147,8 @@ async def _async_exit_batch_mode(store) -> None:
                     # Snapshot + chunks with yields (the build loop alone was ~2 s
                     # at 263K); a write landing meanwhile fails the generation
                     # guard below and the pass is retried.
-                    _snap = list(store._tracks.items())
+                    _tracks = store._tracks
+                    _snap = list(_tracks)
                     import gc as _gc
                     for _ci in range(0, len(_snap), 5_000):
                         if _ci:
@@ -2893,7 +3158,10 @@ async def _async_exit_batch_mode(store) -> None:
                         _was_gc = _gc.isenabled()
                         _gc.disable()
                         try:
-                            for tid, t in _snap[_ci:_ci + 5_000]:
+                            for tid in _snap[_ci:_ci + 5_000]:
+                                t = _tracks.get(tid)
+                                if t is None:
+                                    continue
                                 year.append((_year_value(t), tid))
                                 a = _added_value(t)
                                 added.append((a, tid))
@@ -2918,12 +3186,33 @@ async def _async_exit_batch_mode(store) -> None:
                                                     title, artist_s, album_artist_s,
                                                     album_s, fmt, title_fold)))
                 else:
-                    # Field-update batches: merge only the re-keyed ids back
-                    # into each list (a full build for lists an insert dirtied).
+                    # The tracks the batch added, removed or re-keyed, merged
+                    # into each list around its untouched entries
+                    # (``iter_merged_sorted_list``, in slices with a loop
+                    # turn after each), a list none of them moved kept as it
+                    # is.  A list past the merge cap — or one the merge found
+                    # out of step with its recorded keys — is built anew from
+                    # every track, in chunks, and sorted with yields.
+                    anew: list[str] = []
+                    cap = store.sorted_merge_cap()
                     for name in SORTED_LISTS:
-                        if name in names:
-                            built[name] = store.build_sorted_list(name, plan[name])
-                            await asyncio.sleep(0)
+                        if name not in names:
+                            continue
+                        lst = None
+                        if plan[name] is not None:
+                            if len(plan[name]) <= cap:
+                                lst = await _merge_yielding(store, name, plan[name])
+                            if lst is None:
+                                # (many re-keyed, or the merge found the list
+                                # out of step: every entry of those tracks
+                                # replaced, the others' kept)
+                                lst = await _filter_yielding(store, name, plan[name])
+                        if lst is None:
+                            anew.append(name)
+                        elif lst is not getattr(store, name):
+                            merged[name] = lst
+                    if anew:
+                        built.update(await _build_lists_yielding(store, anew))
                 await asyncio.sleep(0)
 
                 # Sort each list separately, yielding between them.  ALL sorts
@@ -2953,17 +3242,27 @@ async def _async_exit_batch_mode(store) -> None:
                 # needless retries.)
                 if (store._mutation_seq, getattr(store, "_duration_seq", 0)) != gen0:
                     continue
+                built.update(merged)
                 _replaced = [getattr(store, name) for name in built]
                 for name, lst in built.items():
                     setattr(store, name, lst)
                 store._sorted_rebuilt(names)
-                log.info("Sorted indexes rebuilt: %s",
-                         ", ".join(f"{n[len('_sorted_'):]} {len(lst)}"
-                                   for n, lst in built.items()))
+                log.log(logging.INFO if full else logging.DEBUG,
+                        "Sorted indexes rebuilt: %s",
+                        ", ".join(f"{n[len('_sorted_'):]} {len(lst)}"
+                                  for n, lst in built.items()) or "(none moved)")
                 # Free the replaced lists one per yield (all at once was a
-                # ~0.2 s deallocation stall).
+                # ~0.2 s deallocation stall) — one held nowhere else a slice
+                # at a time: the entries only it still holds (a rebuilt
+                # list's every tuple) go with it, ~0.3 s for 680K at once.
                 for _i in range(len(_replaced)):
+                    _old = _replaced[_i]
                     _replaced[_i] = None
+                    if _old is not None and sys.getrefcount(_old) <= 2:
+                        while _old:
+                            del _old[-8_192:]
+                            await asyncio.sleep(0)
+                    _old = None
                     await asyncio.sleep(0)
             if store._dirty_sorted:
                 # Every yielding pass raced a concurrent write (pathological
@@ -3323,6 +3622,25 @@ def _same_track_content(old: dict, new: dict) -> bool:
     return True
 
 
+def _classify_reextract(store, td: dict) -> "tuple[dict | None, dict | None]":
+    """A freshly extracted track ``td`` against the stored one — what every
+    commit of re-read files (a scan's, a share's freshness scan, a folder
+    click's refresh) writes for it.  Returns ``(stored track or None, patch)``:
+    ``patch`` is the mtime / size refresh of a file whose metadata is
+    unchanged (``_same_track_content`` — no re-index, not a library change);
+    None means ``td`` is to be upserted, and a re-extract of a stored track
+    then keeps its ``_KEEP_ON_REEXTRACT`` fields (``added_at``: it is not a
+    new track; the duplicate annotation, re-grouped after the commit)."""
+    old = store._tracks.get(td["id"])
+    if old is not None and _same_track_content(old, td):
+        return old, {"mtime": td.get("mtime"), "file_size": td.get("file_size")}
+    if old is not None:
+        for k in _KEEP_ON_REEXTRACT:
+            if k in old:
+                td[k] = old[k]
+    return old, None
+
+
 def _in_bucket0(t: dict) -> bool:
     """Does ``t`` fall in duplicate-duration bucket 0 (under 5 s, unknown, or
     non-finite — what ``duplicates._duration_bucket`` maps to 0)?  A numeric
@@ -3400,10 +3718,126 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
 
 
 _FP_KEY = "archive_listing_fp:"
-_ARCHIVE_LISTING_VERSION = 2      # bump when archive discovery rules change
+_ARCHIVE_LISTING_VERSION = 3      # bump when archive discovery rules change
 # 2: re-list every archive once — Linux scans lost members to forked workers
 #    sharing the server's open archive (archive._forget_inherited_archives),
 #    and an automatic scan lists only the members already indexed.
+# 3: members only their bytes name (``archive.sniffed_members``), Face The
+#    Music, and LHA archives lhafile turns down (the embedded reader).
+
+
+def _content_named(members) -> bool:
+    """Does an archive's member list (virtual paths) hold a member whose name
+    only its bytes decide (``archive.needs_content_naming``)?"""
+    for m in members or ():
+        last = str(m).rsplit("::", 1)[-1]
+        if archive.needs_content_naming(re.split(r"[\\/]", last)[-1]):
+            return True
+    return False
+
+
+def _renamed_member_ids(old_ids, store) -> dict[str, str]:
+    """Old id → new id of the archive members in ``old_ids`` that are listed
+    under another name now — a name only the member's bytes decide
+    (``x.zip::mod.Opus``, now ``x.zip::mod.Opus.mod``), or an LHA member
+    lhasa listed under ``/`` directories (``a.lha::DIR/x.mod``, now
+    ``a.lha::DIR\\x.mod``) — and whose new row is in the library.  (A track
+    id is ``uuid5`` of its path.)"""
+    out: dict[str, str] = {}
+    for tid in old_ids:
+        path = str((store._tracks.get(tid) or {}).get("path") or "")
+        _arc, sep, member = path.rpartition("::")
+        if not sep:
+            continue
+        if (archive.is_lha_name(_arc) and "/" in member
+                and "\\" not in member and not member.startswith("/")):
+            # An LHA archive the ``lha`` program (lhasa) listed — its members
+            # under ``/`` directories — now read by the built-in reader, which
+            # keeps the archive's own ``\\`` separators.
+            new = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{_arc}::{member.replace('/', chr(92))}"))
+            if new != tid and new in store._tracks:
+                out[tid] = new
+                continue
+        if not archive.needs_content_naming(member):
+            continue
+        new = str(uuid.uuid5(uuid.NAMESPACE_URL, path + archive._prefix_alternative(member)))
+        if new != tid and new in store._tracks:
+            out[tid] = new
+    return out
+
+
+async def _carry_renamed_members(old_ids) -> int:
+    """Before the rows ``old_ids`` are deleted: those that are archive
+    members listed under another name now (``_renamed_member_ids``) hand
+    their rating, plays, history, playlist entries and waveform
+    (``store.remap_track_ids``) and Subsonic stars, queue and bookmarks to
+    their new rows.  Returns the members moved."""
+    store = get_store()
+    mapping = _renamed_member_ids(old_ids, store)
+    if not mapping:
+        return 0
+    counts = store.remap_track_ids(mapping)
+    try:
+        from soniqboom.core.subsonic_state import get_state
+        await get_state().remap_track_ids(mapping)
+    except Exception:                                   # noqa: BLE001
+        log.debug("Subsonic stars / queues of renamed archive members not moved",
+                  exc_info=True)
+    log.info("Scan: %d archive member(s) listed under a new name keep their user data (%s)",
+             len(mapping), counts)
+    return len(mapping)
+
+
+def _healed_smb_rel(scan_root: str, rel: str) -> "str | None":
+    """The path an SMB share's track stored with a broken path has — or None.
+    Builds whose listing kept the share name in a path gave the share root's
+    entries exactly ``/<share>//<name>`` (the doubled separator of the root's
+    UNC path); only that spelling is taken: ``/Music//x.mod`` on
+    ``smb://nas/Music`` → ``/x.mod``.  (``/Music/x.mod`` is a real folder
+    named like the share, never rewritten.)"""
+    if not scan_root.lower().startswith("smb://"):
+        return None
+    share = scan_root.rstrip("/").rsplit("/", 1)[-1]
+    head = f"/{share}//"
+    if not share or not rel.startswith(head):
+        return None
+    fixed = "/" + "/".join(p for p in rel[len(head):].split("/") if p)
+    return fixed if fixed != "/" else None
+
+
+async def _carry_healed_smb_paths(scan_root: str, ghost_pairs, purge: set,
+                                  seen: set) -> int:
+    """Before the rows of an SMB share's broken paths (``_healed_smb_rel``)
+    are deleted as ghosts: their rating, plays, history, playlist entries and
+    Subsonic stars move to the row of the same file under its right path,
+    when this walk found and stored that one."""
+    mapping: dict[str, str] = {}
+    store = get_store()
+    for rel, tid in ghost_pairs:
+        if tid not in purge:
+            continue
+        fixed = _healed_smb_rel(scan_root, rel)
+        if fixed is None or fixed not in seen:
+            continue
+        new = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{scan_root}:{fixed}"))
+        old_t, new_t = store._tracks.get(tid) or {}, store._tracks.get(new)
+        if new == tid or new_t is None:
+            continue
+        a, b = int(old_t.get("file_size") or 0), int(new_t.get("file_size") or 0)
+        if a and b and a != b:
+            continue                           # not the same file
+        mapping[tid] = new
+    if not mapping:
+        return 0
+    counts = store.remap_track_ids(mapping)
+    try:
+        from soniqboom.core.subsonic_state import get_state
+        await get_state().remap_track_ids(mapping)
+    except Exception:                                   # noqa: BLE001
+        log.debug("Subsonic stars / queues of healed SMB paths not moved", exc_info=True)
+    log.info("Scan of %s: %d track(s) stored under a broken path keep their user data "
+             "under the right one (%s)", scan_root, len(mapping), counts)
+    return len(mapping)
 
 
 def _listing_fingerprint() -> str:
@@ -3730,6 +4164,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     # ── Discover files ────────────────────────────────────────────────────────
     from soniqboom.config import settings as _settings
     _known_archives = None
+    _content_relisted: list[str] = []
     _fp = _listing_fingerprint()
     _full_roots = [] if scope else [str(Path(x).resolve()) for x in directories]
     _light: list[str] = []
@@ -3749,6 +4184,21 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         for _gu in _giveups.values():
             for _p in _gu.due:
                 _known_archives.pop(_GiveUps.outer(_p), None)
+        # An archive holding a member whose name only its bytes decide
+        # (``mod.Opus``) is enumerated again — listed before that rule, its
+        # member may now have another name (``archive.needs_content_naming``)
+        # — once per naming rules and archive version (``named`` in the
+        # enumeration sidecar), not on every scan.
+        _named = (await loop.run_in_executor(None, _load_enum_sidecar)).get("named", {})
+        for _arc, (_m, mem) in list(_known_archives.items()):
+            if not _content_named(mem):
+                continue
+            _rec = _named.get(f"local|{_arc}")
+            if not (isinstance(_rec, list) and len(_rec) == 2
+                    and abs(float(_rec[0]) - float(_m or 0)) < 2.0
+                    and _rec[1] == archive.MEMBER_NAMING_VERSION):
+                _known_archives.pop(_arc, None)
+                _content_relisted.append(_arc)
     _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, directories, _settings.scan_zips, scope, _known_archives,
@@ -3793,6 +4243,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _progress = ScanProgress(total=total, running=True,
                                  last_plan=dict(_progress.last_plan) if scope else {})
     _scan_count += 1
+    _scan_began(on_progress, [str(d) for d in directories])   # (resolved by start_scan)
     # Remember the resolved dirs this scan covers — survives completion (unlike
     # ``current_dirs``, cleared the instant the scan ends) so the scan-complete
     # WS event lets the frontend refresh the OPEN folder in place rather than
@@ -3849,7 +4300,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         if (getattr(_settings, "hvsc_autodetect", True)
                 and scan_root not in _hvsc_probed_roots):
             from soniqboom.core.hvsc import get_hvsc as _get_hvsc
-            if not _get_hvsc().is_configured():
+            if not _get_hvsc().is_configured() or _hvsc_online_only():
                 try:
                     sid_dirs = {
                         str(Path(str(p).split("::")[0]).parent)
@@ -4440,6 +4891,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 if _deferred:
                     _pending_deleted |= orphan_ids
                 else:
+                    await _carry_renamed_members(orphan_ids)
                     await delete_track_ids(list(orphan_ids))
                     _changed = True
                 log.info("Stale cleanup (scoped): %d track(s) removed under %d "
@@ -4485,6 +4937,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 log.info("Stale cleanup: %d orphan tracks queued for removal for %s",
                          len(orphan_ids), scan_root)
             else:
+                await _carry_renamed_members(orphan_ids)
                 orphan_count = await delete_track_ids(list(orphan_ids))
                 _changed = _changed or orphan_count > 0
                 log.info("Stale cleanup: removed %d orphan tracks for %s", orphan_count, scan_root)
@@ -4529,15 +4982,10 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _material: list[dict] = []
         _old_versions: dict[str, "dict | None"] = {}
         for _i, _td in enumerate(_pending_tracks):
-            _old = store._tracks.get(_td["id"])
-            if _old is not None and _same_track_content(_old, _td):
-                _touch.append((_td["id"], {"mtime": _td.get("mtime"),
-                                           "file_size": _td.get("file_size")}))
+            _old, _patch = _classify_reextract(store, _td)
+            if _patch is not None:
+                _touch.append((_td["id"], _patch))
             else:
-                if _old is not None:
-                    for _k in _KEEP_ON_REEXTRACT:
-                        if _k in _old:
-                            _td[_k] = _old[_k]
                 _old_versions[_td["id"]] = _old
                 _material.append(_td)
             if _i % 2000 == 1999:
@@ -4561,6 +5009,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                     for i in range(0, len(_material), 25):
                         store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + 25]))
                         await asyncio.sleep(0)
+                    await _carry_renamed_members(_pending_deleted)
                     _del = list(_pending_deleted)
                     for i in range(0, len(_del), 50):
                         await delete_track_ids(_del[i : i + 50])
@@ -4582,6 +5031,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                             store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + WRITE_CHUNK]))
                             await asyncio.sleep(0)
                         if _pending_deleted:
+                            await _carry_renamed_members(_pending_deleted)
                             _del = list(_pending_deleted)
                             for i in range(0, len(_del), 500):
                                 await delete_track_ids(_del[i : i + 500])
@@ -4617,6 +5067,10 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 await upsert_scan_dir(_root, track_count_val=len(
                     store._tag_scan_root_hash.get(_ph(_root), ())))
 
+    if _content_relisted:
+        # (After the commit: a scan cut short lists them again next time.)
+        await loop.run_in_executor(None, _note_local_named,
+                                   [a for a in _content_relisted if a not in _failed_archives])
     log.info(
         "Phase 1 complete: %d tracks written in %.1fs",
         len(all_track_ids), time.time() - _progress.started_at,
@@ -4692,9 +5146,12 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _progress.running      = False
         _progress.embedding    = False
         _progress.current_file = ""
+    _end = _scan_ended(on_progress, _changed)
 
     if on_progress:
         await on_progress(_progress)
+    else:
+        await _send_scan_end(_end)
 
     return _changed
 
@@ -4727,6 +5184,10 @@ def _reset_scan_state() -> None:
     path left open is unwound (as ``_drain_scan_queue`` does after a crash)."""
     global _pause_event, _scan_count, _scan_task, _progress, _prog_batch_entered
     global _current_scan_dirs, _current_scan_scoped, _current_scan_light
+    global _loud_running, _busy_loud, _busy_changed, _busy_shown
+    _loud_running = 0
+    _busy_loud = _busy_changed = _busy_shown = False
+    _busy_dirs.clear()
     _pause_event = None
     _scan_task = None
     _scan_queue.clear()
@@ -5351,6 +5812,10 @@ async def _drain_scan_queue() -> None:
                 _progress.running      = False
                 _progress.embedding    = False
                 _progress.current_file = ""
+            # (what it wrote before failing is unknown: pages re-read)
+            _end = _scan_ended(cb, True)
+            if cb is None:
+                await _send_scan_end(_end)
             # The progressive first-scan path enters batch mode with no
             # try/finally over its Phase-1 span, so a mid-Phase-1 raise leaks
             # exactly ONE batch level (``_prog_batch_entered``), which would
@@ -5587,6 +6052,14 @@ def _load_enum_sidecar() -> dict:
         return {}
 
 
+def _stamp_enum_sidecar_utc(d: dict) -> None:
+    """Every ftp:// time this build writes into the sidecar is UTC: mark the
+    file so the one-time conversion (``core.ftp_mtime_migration``) never
+    shifts it — the conversion runs at startup, before any scan writes."""
+    from soniqboom.core.ftp_mtime_migration import SIDECAR_MARKER
+    d[SIDECAR_MARKER] = 1
+
+
 def _update_enum_sidecar(
     scan_root: str,
     *,
@@ -5594,6 +6067,7 @@ def _update_enum_sidecar(
     indexed_arcs: set,
     failed_fetch_arcs: set,
     stamp_schema: bool,
+    schema_pending: "list | None" = None,
 ) -> None:
     """Fold one finished scan's enumeration results into the sidecar.
 
@@ -5602,18 +6076,56 @@ def _update_enum_sidecar(
     none of its members ended up indexed — but never mark one barren when
     its fetches failed (transient FTP outage must not blacklist a real
     archive until its mtime happens to change).
+
+    ``stamp_schema``: a full walk enumerated the share by the current
+    format map — except below ``schema_pending`` (folders whose listing
+    failed): their archives are enumerated again by the next walk, the rest
+    are synthesized from the store.
     """
     with _enum_sidecar_lock:
         d = _load_enum_sidecar()
         barren = d.setdefault("barren", {})
+        named = d.setdefault("named", {})
         for arc, (m, s, _n) in enum_report.items():
             key = f"{scan_root}|{arc}"
             if arc in indexed_arcs:
                 barren.pop(key, None)
             elif arc not in failed_fetch_arcs:
                 barren[key] = [m, s]
+            if arc not in failed_fetch_arcs:
+                # Listed by the current member naming rules (an archive whose
+                # names only its bytes decide is not listed again for that).
+                named[key] = [m, s, archive.MEMBER_NAMING_VERSION]
         if stamp_schema:
             d.setdefault("schemas", {})[scan_root] = _member_schema_fingerprint()
+            pend = d.setdefault("schema_pending", {})
+            if schema_pending:
+                pend[scan_root] = sorted(set(schema_pending))
+            else:
+                pend.pop(scan_root, None)
+        _stamp_enum_sidecar_utc(d)
+        path = _enum_sidecar_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d))
+        tmp.replace(path)
+
+
+def _note_local_named(arcs) -> None:
+    """Local archives ``arcs`` were enumerated by the current member naming
+    rules (``named`` in the sidecar, keyed ``local|<path>``, with their
+    mtime)."""
+    if not arcs:
+        return
+    with _enum_sidecar_lock:
+        d = _load_enum_sidecar()
+        named = d.setdefault("named", {})
+        for arc in arcs:
+            try:
+                m = os.stat(arc).st_mtime
+            except OSError:
+                continue
+            named[f"local|{arc}"] = [m, archive.MEMBER_NAMING_VERSION]
+        _stamp_enum_sidecar_utc(d)
         path = _enum_sidecar_path()
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d))
@@ -5621,7 +6133,8 @@ def _update_enum_sidecar(
 
 
 def _list_remote_zip_members(root_path: str, zip_fe, source,
-                             enum_report: dict | None = None) -> list:
+                             enum_report: dict | None = None,
+                             fetch_failed: "dict | None" = None) -> list:
     """Download a remote ``.zip`` (once, via the local remote-cache) and return
     a ``DirEntry`` per audio member.
 
@@ -5629,7 +6142,11 @@ def _list_remote_zip_members(root_path: str, zip_fe, source,
     incremental-skip logic re-extracts a zip's members iff the archive itself
     changed.  Member ``path`` is ``<zip_rel>::<member>``; the caller prepends
     the ``ftp://host/share:`` prefix exactly as it does for a loose file.
-    Best-effort: a broken/oversized archive logs + yields ``[]``.
+    Best-effort: a broken/oversized archive logs + yields ``[]`` — and is
+    put in ``fetch_failed`` (archive rel → (why, size, mtime): why "fetch"
+    when the server refuses that file, "unreadable" when its copy can't be
+    opened, "" for a passing failure): its stored members are kept, not
+    purged.
     """
     from soniqboom.core.filesource import DirEntry
     from soniqboom.core.remote_cache import get_cache
@@ -5643,6 +6160,7 @@ def _list_remote_zip_members(root_path: str, zip_fe, source,
     _progress.current_file = (
         f"Reading archive {PurePosixPath(zip_fe.path).name}…"
     )
+    from soniqboom.core.filesource import is_permanent_fetch_error
     try:
         # Changed-on-remote guard: drop a stale cached copy before
         # enumerating, or the members of the OLD archive get indexed.
@@ -5650,11 +6168,23 @@ def _list_remote_zip_members(root_path: str, zip_fe, source,
         local_archive = get_cache().fetch(root_path, zip_fe.path, source,
                                           lane="scan")
     except Exception as exc:
+        # Not read this walk: its members are unknown, not gone — the caller
+        # keeps their tracks (``fetch_failed``) instead of deleting them.
         log.warning("Cannot fetch remote archive %s: %s", zip_fe.path, exc)
+        if fetch_failed is not None:
+            fetch_failed[zip_fe.path] = ("fetch" if is_permanent_fetch_error(exc) else "",
+                                         zip_fe.size, zip_fe.mtime)
         return out
-    # ``archive.list_members`` dispatches ZIP vs LHA, handles the Amiga
-    # ``MOD.title`` prefix naming, and already filters to playable members.
-    for member in archive.list_members(local_archive):
+    try:
+        # ``archive.list_members`` dispatches ZIP vs LHA, handles the Amiga
+        # ``MOD.title`` prefix naming, and already filters to playable members.
+        members = archive.list_members(local_archive)
+    except Exception as exc:
+        log.warning("Cannot read remote archive %s: %s", zip_fe.path, exc)
+        if fetch_failed is not None:
+            fetch_failed[zip_fe.path] = ("unreadable", zip_fe.size, zip_fe.mtime)
+        return out
+    for member in members:
         out.append(DirEntry(
             name=_basename_of(member),
             path=f"{zip_fe.path}::{member}",
@@ -5668,6 +6198,110 @@ def _list_remote_zip_members(root_path: str, zip_fe, source,
         # archives get remembered; see _update_enum_sidecar).
         enum_report[zip_fe.path] = (zip_fe.mtime, zip_fe.size, len(out))
     return out
+
+
+_REMOTE_GIVEUP_KEY = "remote_giveups:"   # + scan_root hash → {rel: [mtime, size, kind, count, time]}
+_REMOTE_GIVEUP_MAX = 50_000            # records kept per share (the most recent)
+_TRANSIENT_GIVEUPS = 3      # passing failures in a row of one listed file before it waits…
+_TRANSIENT_WAIT_MAX_S = 24 * 3600.0     # …at most this long
+_HVSC_PENDING_KEY = "remote_hvsc_pending:"   # + scan_root hash → SID track ids not joined yet
+
+
+class _RemoteGiveUps:
+    """Files of one remote share that could not be stored — a download the
+    server refuses for that file (FTP 550, access denied …), an extraction
+    error, a file that kills or hangs its worker, a file nothing can be made
+    of — remembered with the (mtime, size) the listing showed.  An automatic
+    scan (a freshness poll) leaves such a file alone until it changes (then
+    it is tried at once) or its wait is over (``_giveup_wait``: an hour,
+    × 4 per failure in a row, at most a week); a manual one tries it again.
+    A held file is no new track and no work.  A download that failed for a
+    passing reason (a timeout, a dropped connection: kind "transient") is
+    tried again by the next scans; only after ``_TRANSIENT_GIVEUPS`` such
+    failures in a row of the same, listed file while the share otherwise
+    works (other downloads did, or the walk listed every folder and only a
+    few files failed) does it wait too (at most ``_TRANSIENT_WAIT_MAX_S``).
+    Persisted in the store's config (``_REMOTE_GIVEUP_KEY``)."""
+
+    def __init__(self, store, root_hash: str, *, auto: bool) -> None:
+        self.key = _REMOTE_GIVEUP_KEY + root_hash
+        self.auto = auto
+        self.now = time.time()
+        self.changed = False
+        recs = None
+        try:
+            recs = store.get_config(self.key)
+        except Exception:                                   # noqa: BLE001
+            recs = None
+        self.records: dict[str, list] = {}
+        for p, r in (recs.items() if isinstance(recs, dict) else ()):
+            if (isinstance(p, str) and isinstance(r, list) and len(r) == 5
+                    and isinstance(r[3], int) and isinstance(r[4], (int, float))):
+                self.records[p] = r
+
+    @staticmethod
+    def _same(rec: list, size: int, mtime: float) -> bool:
+        try:
+            if int(rec[1]) != int(size):
+                return False
+            m = float(rec[0] or 0)
+        except (TypeError, ValueError):
+            return False
+        return (m <= 0 and float(mtime or 0) <= 0) or _mtime_matches_tolerant(m, float(mtime or 0))
+
+    def held(self, rel: str, size: int, mtime: float) -> bool:
+        """Leave ``rel`` (listed at ``size`` / ``mtime``) alone this scan?"""
+        rec = self.records.get(rel)
+        if rec is None:
+            return False
+        if not self._same(rec, size, mtime):
+            self.records.pop(rel, None)                     # changed: tried at once
+            self.changed = True
+            return False
+        n = int(rec[3])
+        if rec[2] == "transient":
+            if n < _TRANSIENT_GIVEUPS:
+                return False                    # (a passing failure: tried again)
+            n -= _TRANSIENT_GIVEUPS - 1
+            return self.auto and self.now < float(rec[4]) + min(_TRANSIENT_WAIT_MAX_S,
+                                                                 _giveup_wait(n))
+        return self.auto and self.now < float(rec[4]) + _giveup_wait(n)
+
+    def fail(self, rel: str, size: int, mtime: float, kind: str) -> None:
+        old = self.records.get(rel)
+        n = (min(int(old[3]) + 1, 99) if old is not None and self._same(old, size, mtime)
+             else 1)
+        self.records[rel] = [float(mtime or 0), int(size or 0), kind, n, time.time()]
+        self.changed = True
+
+    def settle(self, rel: str) -> None:
+        if self.records.pop(rel, None) is not None:
+            self.changed = True
+
+    def prune(self, listed) -> None:
+        """A complete full walk listed ``listed``: records of files it did not
+        list (gone) go."""
+        gone = [p for p in self.records if p not in listed]
+        for p in gone:
+            self.records.pop(p, None)
+        self.changed = self.changed or bool(gone)
+
+    def save(self, store) -> None:
+        if not self.changed:
+            return
+        recs = self.records
+        if len(recs) > _REMOTE_GIVEUP_MAX:
+            recs = dict(sorted(recs.items(), key=lambda kv: kv[1][4],
+                               reverse=True)[:_REMOTE_GIVEUP_MAX])
+            self.records = recs
+        try:
+            if recs:
+                store.set_config(self.key, dict(recs))
+            else:
+                store.delete_config(self.key)
+        except Exception:                                   # noqa: BLE001
+            log.debug("remote give-up records not saved", exc_info=True)
+        self.changed = False
 
 
 def _mtime_matches_tolerant(stored_mtime: float, listed_mtime: float) -> bool:
@@ -5709,12 +6343,19 @@ def _rel_under_any_dir(rel: str, dirs: set[str]) -> bool:
     return False
 
 
+def _dirstate_norm(path: str) -> str:
+    from soniqboom.core.remote_dirstate import norm
+    return norm(path)
+
+
 def _find_remote_audio_entries(
     root_path: str, source: "FileSource",
     *,
     dir_mtime_cap: float | None = None,
     scan_zips: bool = True,
     archive_skip: dict | None = None,
+    walk_plan=None,
+    commit_plan: bool = True,
 ) -> tuple[list, int, bool, set]:
     """Discover audio files via ``walk_with_stat`` — yields DirEntry
     objects preserving ``size`` and ``mtime`` from the underlying
@@ -5725,12 +6366,15 @@ def _find_remote_audio_entries(
     the walk entirely.  On a stable 30 K-file share this turns a
     30 K-entry walk into ~50 dir-mtime checks.
 
-    Caveat: not every FTP/SMB server updates parent-dir mtime when
-    children change.  Servers that don't (mtime stays 0 or constant)
-    are detected here: the cap-check is purely "is mtime > cap"; if
-    mtime is 0 the check always returns False and the subtree is
-    walked normally — i.e. correctness is preserved even when the
-    optimization is unsupported.
+    ``walk_plan`` (a ``remote_dirstate.WalkPlan``) replaces that cap check:
+    a folder's mtime only reflects entries DIRECTLY inside it, so the plan
+    lists every folder with subfolders, every folder whose mtime differs
+    from the one recorded by the last walk, and a rotating set of leaf
+    folders, and prunes the rest.  Every listing is recorded into it (full
+    walks too) for the next fast walk — committed here unless
+    ``commit_plan`` is False (the remote scan commits it once its changes
+    are stored).  Without a plan the bare cap check is used (it misses
+    changes below an unchanged folder).
 
     Returns ``(entries, pruned_subtree_count, walk_completed, failed_dirs)``.
     ``walk_completed`` is False only when the walk itself DIED midway (an
@@ -5766,12 +6410,36 @@ def _find_remote_audio_entries(
         pruned[0] += 1
         return True
 
+    from soniqboom.core.filesource import is_system_folder, split_member
     listing_errors: list = []
+    system_skips = [0]
+
+    def _skip_system(dir_entry) -> bool:
+        if is_system_folder(dir_entry.name):
+            system_skips[0] += 1
+            return True                 # @eaDir, #recycle …: never listed
+        return False
+    _inner = (walk_plan.skip if walk_plan is not None
+              else _skip if dir_mtime_cap is not None and dir_mtime_cap > 0 else None)
+
+    def _skip_any(dir_entry) -> bool:
+        return _skip_system(dir_entry) or (_inner is not None and _inner(dir_entry))
     try:
-        walk_kwargs: dict = {"error_sink": listing_errors}
-        if dir_mtime_cap is not None and dir_mtime_cap > 0:
-            walk_kwargs["skip_subtree_fn"] = _skip
+        walk_kwargs: dict = {"error_sink": listing_errors, "skip_subtree_fn": _skip_any}
+        n_errors = 0
         for _dirpath, _dir_entries, file_entries in source.walk_with_stat("/", **walk_kwargs):
+            # A system folder is not one of the library's: not recorded as a
+            # subfolder either (an album with an ``@eaDir`` stays a leaf).
+            _dir_entries = [d for d in _dir_entries if not is_system_folder(d.name)]
+            if walk_plan is not None:
+                # A listing that failed is reported to ``error_sink`` (FTP
+                # then yields the folder as empty): never record it as empty.
+                new_errs = listing_errors[n_errors:]
+                n_errors = len(listing_errors)
+                walk_plan.record(
+                    _dirpath, _dir_entries, file_entries,
+                    failed=any(_dirstate_norm(p) == _dirstate_norm(_dirpath)
+                               for p, _ in new_errs))
             for fe in file_entries:
                 if _is_junk_filename(fe.name):
                     skipped_junk += 1
@@ -5791,7 +6459,7 @@ def _find_remote_audio_entries(
                             # full download per archive per walk).
                             for rel in ka[2]:
                                 entries.append(DirEntry(
-                                    name=_basename_of(rel.split("::", 1)[1]),
+                                    name=_basename_of((split_member(rel) or ("", rel))[1]),
                                     path=rel,
                                     is_dir=False,
                                     size=fe.size,
@@ -5806,17 +6474,37 @@ def _find_remote_audio_entries(
                             # (mtime, size) — nothing to download.
                             barren_skips += 1
                             continue
+                    _gu = (archive_skip or {}).get("giveups")
+                    if _gu is not None and _gu.held(fe.path, fe.size, fe.mtime):
+                        # Couldn't be read before, unchanged since: left
+                        # alone (its stored members kept) until it changes or
+                        # its wait is over.
+                        _ff = (archive_skip or {}).get("fetch_failed")
+                        if _ff is not None:
+                            _ff.setdefault(fe.path, ("held", fe.size, fe.mtime))
+                        continue
                     # Crack open the remote archive (ZIP or Amiga LHA/LZH) and
                     # surface its audio members as ``<archive_rel>::<member>``.
                     entries.extend(_list_remote_zip_members(
                         root_path, fe, source,
                         enum_report=(archive_skip or {}).get("report"),
+                        fetch_failed=(archive_skip or {}).get("fetch_failed"),
                     ))
     except Exception as exc:
         log.error("Remote walk_with_stat failed for %s: %s", root_path, exc)
         walk_completed = False
     else:
         walk_completed = True
+    if walk_plan is not None:
+        for p, _ in listing_errors:
+            walk_plan.record(p, [], [], failed=True)
+        if commit_plan:
+            try:
+                walk_plan.finish()
+            except Exception:                               # noqa: BLE001
+                log.warning("Recording the folder state of %s failed", root_path,
+                            exc_info=True)
+        pruned[0] = walk_plan.stats["pruned"]
     # A per-directory listing that HARD-FAILED (borrow timeout / socket /
     # transient 5xx) is swallowed to [] inside the source so an interactive
     # browse renders empty instead of crashing — but for a WALK that means the
@@ -5832,6 +6520,9 @@ def _find_remote_audio_entries(
             "ghost cleanup will SKIP those subtree(s) only; first: %s",
             root_path, len(failed_dirs), sorted(failed_dirs)[:3],
         )
+    if system_skips[0]:
+        log.info("Remote walk of %s left out %d system folder(s) (@eaDir, #recycle …)",
+                 root_path, system_skips[0])
     if synth_arcs or barren_skips:
         log.info(
             "Archive skip for %s: %d archive(s) synthesized from the store, "
@@ -6014,6 +6705,7 @@ async def start_remote_scan(
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
     *,
     dir_mtime_cap: float | None = None,
+    auto: bool = False,
 ) -> dict:
     """Scan a remote FileSource — download files, extract metadata, upsert.
 
@@ -6036,6 +6728,10 @@ async def start_remote_scan(
     the cap timestamp are skipped entirely.  Freshness loop passes
     ``last_check_ts - safety_buffer`` here.  Pass ``None`` for a full
     walk (manual re-index, first-time arming, periodic drift sweep).
+
+    ``auto``: an automatic scan (the freshness poller) — files earlier
+    scans could not store are left alone until they change or their wait
+    is over (``_RemoteGiveUps``); a manual scan (the default) tries them.
 
     Per-scan_root dedupe
     --------------------
@@ -6113,6 +6809,7 @@ async def start_remote_scan(
     # dedupe gate above couldn't see a walk-phase scan, so a double
     # trigger started a parallel walk against the same share.
     _scan_count += 1
+    _scan_began(on_progress, [scan_root])
     _current_remote_dirs.add(scan_root)
     if not _progress.running:
         _progress = ScanProgress(total=0, running=True)
@@ -6127,7 +6824,7 @@ async def start_remote_scan(
         plan = await _remote_scan_body(
             share_id, scan_root, source, on_progress,
             dir_mtime_cap=dir_mtime_cap, executor=executor,
-            batch_state=batch_state,
+            batch_state=batch_state, auto=auto,
         ) or {}
     except Exception:
         # A dead scan must NEVER leave zombie state.  Before this guard,
@@ -6155,6 +6852,16 @@ async def start_remote_scan(
             # (see the parallel-scan display bug note in _run_scan).
             if _progress.processed < _progress.total:
                 _progress.processed = _progress.total
+        # (a freshness poll that added, changed or removed tracks changed the
+        # library — open pages re-read: ``_send_scan_end`` below; re-read
+        # files found unchanged are no change.  The body counts what the
+        # store took in ``batch_state`` — also when it died half-way — and
+        # puts it in its plan; a plan without that count says what it
+        # planned.)
+        _lib_changed = (bool(plan.get("extract") or plan.get("ghosts"))
+                        if plan and "changed" not in plan
+                        else bool(batch_state.get("changed")))
+        _end = _scan_ended(on_progress, _lib_changed)
         if batch_state["entered"]:
             try:
                 # shield: on cancellation the await raises immediately but
@@ -6168,22 +6875,46 @@ async def start_remote_scan(
                 await on_progress(_progress)
             except BaseException:
                 pass
+        else:
+            try:
+                await _send_scan_end(_end)
+            except BaseException:
+                pass
     # Reached on the normal and handled-exception paths (a cancellation
     # re-raises out of the finally above and never gets here).  ``plan`` is
     # this scan's own plan, or {} if the body died before building one.
-    # A scan that extracted (new / changed files) or found removed ones feeds
-    # the same post-scan enrichment runner as a local scan (Modland → Demozoo →
-    # header-game backfill → folder pass); a no-change freshness poll (only
-    # skips / mtime refreshes) just gets the cheap, seq-gated folder pass —
-    # unless this share's one-time header-game backfill is still due (a
-    # completed scan that listed files proves the share reachable).
+    # A scan that added, changed or removed tracks feeds the same post-scan
+    # enrichment runner as a local scan (Modland → Demozoo → header-game
+    # backfill → folder pass); a no-change freshness poll (only skips / mtime
+    # refreshes, re-read files found unchanged) just gets the cheap, seq-gated
+    # folder pass — unless this share's one-time header-game backfill is still
+    # due (a completed scan that listed files proves the share reachable).
     backfill_due = (bool(plan.get("walked"))
                     and _queue_remote_album_backfill(scan_root, plan))
-    if plan.get("extract") or plan.get("ghosts") or backfill_due:
+    if _lib_changed or backfill_due:
         _spawn_scene_autoapply()
     else:
         _schedule_folder_album_pass()
     return plan
+
+
+async def _purge_made_from(track_ids: "list[str]") -> None:
+    """Drop what was made from these tracks' files — renders, transcodes, VU
+    data, stored waveforms, a ranged Track Info read: their files changed at
+    the source (as ``online_catalog``'s re-uploaded files)."""
+    if not track_ids:
+        return
+    try:
+        from soniqboom.core import conversion_cache
+        await conversion_cache.purge_tracks(track_ids)
+        get_store().forget_waveforms(track_ids)
+        import sys as _sys
+        st = _sys.modules.get("soniqboom.api.stream")
+        if st is not None:
+            for tid in track_ids:
+                st._RANGED_INFO_DONE.discard(tid)
+    except Exception:
+        log.debug("purging what was made from changed files failed", exc_info=True)
 
 
 async def _remote_scan_body(
@@ -6195,6 +6926,7 @@ async def _remote_scan_body(
     dir_mtime_cap: float | None,
     executor: ProcessPoolExecutor,
     batch_state: dict,
+    auto: bool = False,
 ) -> dict:
     """The working half of :func:`start_remote_scan`.
 
@@ -6272,12 +7004,15 @@ async def _remote_scan_body(
     # ``seen_rel_paths`` — the ghost cleanup below would then delete a
     # perfectly healthy track (QA 2026-07-02).  Mixed/invalid stats →
     # the arc simply enumerates like before.
+    from soniqboom.core.filesource import (is_member_path, is_permanent_fetch_error,
+                                           member_container, split_member)
     _arc_members: dict[str, list[str]] = {}
     _arc_stat: dict[str, tuple[float, int] | None] = {}
     for rel, (m, s, _tid) in existing_map.items():
-        if "::" not in rel:
-            continue
-        arc = rel.split("::", 1)[0]
+        _sp = split_member(rel) if "::" in rel else None
+        if _sp is None:
+            continue                 # no archive member ("Artist :: Album/x.mod")
+        arc = _sp[0]
         _arc_members.setdefault(arc, []).append(rel)
         if m <= 0 or s <= 0:
             _arc_stat[arc] = None                    # invalid → never skip
@@ -6287,15 +7022,31 @@ async def _remote_scan_body(
             prev = _arc_stat[arc]
             if prev is not None and (abs(prev[0] - m) >= 2.0 or prev[1] != s):
                 _arc_stat[arc] = None                # inconsistent → never skip
+    _sidecar = await loop.run_in_executor(None, _load_enum_sidecar)
+    _named = _sidecar.get("named", {})
     known_archives: dict[str, tuple[float, int, list[str]]] = {}
     for arc, members in _arc_members.items():
         st = _arc_stat.get(arc)
-        if st is not None:
-            known_archives[arc] = (st[0], st[1], members)
+        if st is None:
+            continue
+        if _content_named(members):
+            rec = _named.get(f"{scan_root}|{arc}")
+            if not (isinstance(rec, list) and len(rec) == 3
+                    and abs(float(rec[0]) - st[0]) < 2.0 and int(rec[1]) == st[1]
+                    and rec[2] == archive.MEMBER_NAMING_VERSION):
+                continue    # listed before the content rule: enumerated once more
+        known_archives[arc] = (st[0], st[1], members)
 
-    _sidecar = await loop.run_in_executor(None, _load_enum_sidecar)
     _schema_now = _member_schema_fingerprint()
     _schema_ok = _sidecar.get("schemas", {}).get(scan_root) == _schema_now
+    # Folders the last stamp could not vouch for (their listing failed in the
+    # walk that stamped it): the archives below them are enumerated by the
+    # current rules once more — not every archive of the share.
+    _schema_pending = {str(d) for d in (_sidecar.get("schema_pending", {})
+                                        .get(scan_root) or ()) if isinstance(d, str)}
+    if _schema_ok and _schema_pending:
+        known_archives = {a: v for a, v in known_archives.items()
+                          if not _rel_under_any_dir(a, _schema_pending)}
     enum_report: dict[str, tuple[float, int, int]] = {}
     if not _schema_ok and known_archives:
         log.info(
@@ -6311,8 +7062,13 @@ async def _remote_scan_body(
             k.split("|", 1)[1]: (float(v[0]), int(v[1]))
             for k, v in _sidecar.get("barren", {}).items()
             if k.startswith(scan_root + "|") and isinstance(v, list)
+            and not _rel_under_any_dir(k.split("|", 1)[1], _schema_pending)
         } if _schema_ok else {},
         "report": enum_report,
+        # Archives this walk could not read: their stored members are kept.
+        "fetch_failed": {},
+        # Files (and archives) earlier scans could not store (``_RemoteGiveUps``).
+        "giveups": _RemoteGiveUps(store_local, scan_root_hash, auto=auto),
     }
 
     # Walk with stat — preserves mtime+size per file from MLSD.
@@ -6324,20 +7080,61 @@ async def _remote_scan_body(
     # ``run_in_executor`` doesn't forward kwargs.
     import functools as _ft
     from soniqboom.config import settings as _settings   # local bind — not a module global
+    from soniqboom.core import remote_dirstate as _dirstate
+    # The folder state recorded by earlier walks decides what a fast walk
+    # lists (core/remote_dirstate.py); without it the walk is full.
+    _walk_plan = _dirstate.WalkPlan(scan_root, cap=dir_mtime_cap)
+    if dir_mtime_cap is not None and not _walk_plan.fast:
+        log.info("Fast walk of %s: no folder state from an earlier walk yet — "
+                 "walking it fully", scan_root)
+        dir_mtime_cap = None
     _walk_fn = _ft.partial(
         _find_remote_audio_entries,
         dir_mtime_cap=dir_mtime_cap,
         scan_zips=_settings.scan_remote_zips,
         archive_skip=archive_skip,
+        walk_plan=_walk_plan,
+        commit_plan=False,          # committed below, once the changes are stored
     )
+    _lists0 = getattr(source, "list_listings", 0)
     entries, _pruned, walk_completed, walk_failed_dirs = await loop.run_in_executor(
         None, _walk_fn, scan_root, source,
     )
-    # ``walk_ok`` (strict) gates the enum-sidecar schema stamp: a full, clean
-    # walk with zero listing failures is the only walk that proves the barren/
-    # schema verdicts.  Ghost cleanup uses the finer ``walk_completed`` +
-    # ``walk_failed_dirs`` signal instead (per-subtree — see the gate below).
+    walk_failed_dirs = set(walk_failed_dirs)
+    # An FTP walk that fell back to LIST for some folders: most servers' LIST
+    # hides dot-files and dot-folders that MLSD shows — their absence is no
+    # deletion in this walk.
+    _hidden_dots = getattr(source, "list_listings", 0) != _lists0
+    if walk_completed:
+        # A folder that listed EMPTY (no error) although it held tracks is not
+        # believed once: it counts as a failed listing (its tracks are kept,
+        # it is listed again) until a second walk lists it empty too.
+        _stored_dirs: "set[str] | None" = None
+
+        def _holds(key: str) -> bool:
+            nonlocal _stored_dirs
+            if _stored_dirs is None:
+                _stored_dirs = set()
+                for _r in existing_map:
+                    d = str(PurePosixPath("/" + member_container(_r).lstrip("/")).parent)
+                    while d not in _stored_dirs:
+                        _stored_dirs.add(d)
+                        if d == "/":
+                            break
+                        d = str(PurePosixPath(d).parent)
+            return key in _stored_dirs
+        _empty = _walk_plan.unconfirmed_empty(_holds)
+        if _empty:
+            log.warning("Remote walk of %s: %d folder(s) that held tracks listed empty "
+                        "(%s) — kept until a later walk lists them empty again",
+                        scan_root, len(_empty), sorted(_empty)[:3])
+            walk_failed_dirs |= _empty
+    # ``walk_ok`` (strict): a complete walk with zero listing failures.  Ghost
+    # cleanup and the enum-sidecar stamp use the finer ``walk_completed`` +
+    # ``walk_failed_dirs`` signal (per subtree — see the gates below).
     walk_ok = walk_completed and not walk_failed_dirs
+    _giveups: _RemoteGiveUps = archive_skip["giveups"]
+    _fetch_failed: dict = archive_skip["fetch_failed"]
     if not walk_completed:
         log.warning(
             "Walk of %s died midway — the %d entries collected are "
@@ -6352,7 +7149,7 @@ async def _remote_scan_body(
     if (getattr(_settings, "hvsc_autodetect", True)
             and scan_root not in _hvsc_probed_roots):
         from soniqboom.core.hvsc import get_hvsc as _get_hvsc
-        if not _get_hvsc().is_configured():
+        if not _get_hvsc().is_configured() or _hvsc_online_only():
             try:
                 sid_rel_dirs = {
                     str(PurePosixPath("/" + str(fe.path).lstrip("/")).parent)
@@ -6367,8 +7164,8 @@ async def _remote_scan_body(
                     # a transient failure is caught below and leaves the root
                     # un-probed so the next scan retries.
                     _hvsc_probed_roots.add(scan_root)
-                    if docs:
-                        await _apply_hvsc_autoconfig(docs)
+                    if docs and await _apply_hvsc_autoconfig(docs):
+                        batch_state["hvsc_new"] = True
             except Exception:
                 log.debug("HVSC remote auto-detect failed", exc_info=True)
 
@@ -6378,11 +7175,15 @@ async def _remote_scan_body(
     to_refresh: list[tuple[str, float]] = []       # (track_id, new_mtime)
     seen_rel_paths: set[str] = set()
     new_count = 0                                  # genuinely-new files (not yet in the store)
+    held = 0                                       # left alone: earlier scans couldn't store them
     for fe in entries:
         rel = fe.path  # already root-relative from walk_with_stat
         seen_rel_paths.add(rel)
         existing = existing_map.get(rel)
         if existing is None:
+            if _giveups.held(rel, fe.size, fe.mtime):
+                held += 1
+                continue
             to_extract.append(fe)
             new_count += 1
             continue
@@ -6399,6 +7200,9 @@ async def _remote_scan_body(
             # it without re-downloading so the NEXT scan can skip.
             to_refresh.append((tid, fe.mtime))
             continue
+        if _giveups.held(rel, fe.size, fe.mtime):
+            held += 1                      # its new version couldn't be stored
+            continue
         # Drift — re-extract.
         to_extract.append(fe)
 
@@ -6408,7 +7212,18 @@ async def _remote_scan_body(
     ghost_pairs: list[tuple[str, str]] = [
         (rel, tid) for rel, (_m, _s, tid) in existing_map.items()
         if rel not in seen_rel_paths and tid
+        # (the members of an archive this walk could not read are unknown,
+        # not gone)
+        and not (_fetch_failed and "::" in rel and member_container(rel) in _fetch_failed)
+        and not (_hidden_dots and any(p.startswith(".") for p in
+                                      member_container(rel).split("/")))
     ]
+    if dir_mtime_cap is not None:
+        # A fast walk listed only part of the share: a stored path it didn't
+        # see is gone only where the folder above it was listed without it.
+        ghost_pairs = ([(rel, tid) for rel, tid in ghost_pairs
+                        if _walk_plan.confirmed_absent(rel)]
+                       if walk_completed else [])
     ghost_ids: list[str] = [tid for _rel, tid in ghost_pairs]
 
     total = len(to_extract)
@@ -6420,6 +7235,7 @@ async def _remote_scan_body(
         "mtime_refresh": len(to_refresh),
         "skip":          len(entries) - total - len(to_refresh),
         "ghosts":        len(ghost_ids),
+        "held":          held,
         # True iff this was a FULL walk that completed and saw real ground
         # truth — i.e. the exact condition under which ghost cleanup is
         # authorized to run below.  The freshness poller stamps its full-walk
@@ -6428,6 +7244,10 @@ async def _remote_scan_body(
         # cleanup) or ghost cleanup could be deferred indefinitely.
         "full_walk_ok":  (dir_mtime_cap is None and walk_completed
                           and len(entries) > 0),
+        # How the walk went: "fast" (folder state) or "full"; listings made,
+        # folders pruned / re-listed by rotation.
+        "walk": {"mode": "fast" if dir_mtime_cap is not None else "full",
+                 **{k: _walk_plan.stats[k] for k in ("listed", "pruned", "rotated")}},
     }
     log.info(
         "Remote scan plan for %s: walked=%d, extract=%d (new=%d), "
@@ -6453,6 +7273,22 @@ async def _remote_scan_body(
                 scan_root, total, len(entries),
                 dict(_deltas.most_common(8)),
             )
+
+    # What was made from stored files that changed at the source goes before
+    # anything reads them again (the extraction below, a play): the remote
+    # cache's copies (an archive member's: its archive's), and the renders,
+    # transcodes, VU data and waveforms of their tracks — a file replaced in
+    # place never plays its old audio.
+    changed_rels = [fe.path for fe in to_extract if fe.path in existing_map]
+    if changed_rels:
+        drop = sorted({member_container(rel) for rel in changed_rels})
+        try:
+            await loop.run_in_executor(None, cache.forget, scan_root, drop,
+                                       "changed at the source")
+        except Exception:
+            log.debug("dropping changed files' cached copies failed", exc_info=True)
+        await _purge_made_from(sorted({existing_map[rel][2] for rel in changed_rels
+                                       if existing_map[rel][2]}))
 
     # Apply mtime-refresh in a single batched store call (no network).
     if to_refresh:
@@ -6486,13 +7322,58 @@ async def _remote_scan_body(
     track_buffer: list[Track] = []
     art_buffer: dict[str, str] = {}
     track_count = 0
+    changed_ids: set[str] = set()       # tracks this scan added or changed
+    # "A scan of this share wrote SIDs whose HVSC join (below) has not run to
+    # its end" — set (once) as the first SIDs are written, cleared once the
+    # join ran against loaded documents; while set, the next scan joins every
+    # SID of the share, so a join that failed or never ran (a stop, a
+    # shutdown, documents that couldn't be read) is made up.
+    _hvsc_key = _HVSC_PENDING_KEY + scan_root_hash
+    try:
+        _hvsc_due = bool(store.get_config(_hvsc_key))
+    except Exception:                                   # noqa: BLE001
+        _hvsc_due = False
+    _hvsc_marked = [_hvsc_due]
+    try:
+        from soniqboom.core.hvsc import get_hvsc as _get_hvsc_cfg
+        _hvsc_on = bool(_get_hvsc_cfg().is_configured())
+    except Exception:                                   # noqa: BLE001
+        _hvsc_on = False
+    _gave_up: dict[str, str] = {}       # rel → why this scan could not store it
+    _fetched_ok = [0]                   # downloads that worked
 
     async def _flush():
         nonlocal track_buffer, art_buffer
         if not track_buffer:
             return
+        # A re-read file whose metadata is unchanged (touched, rewritten
+        # identically) only has its mtime / size refreshed — no re-index, not
+        # a library change; a changed one keeps its ``added_at`` and duplicate
+        # annotation (``_classify_reextract``, as a local scan's commit).
         for i in range(0, len(track_buffer), WRITE_CHUNK):
-            await upsert_tracks_batch(track_buffer[i : i + WRITE_CHUNK])
+            touch: list[tuple[str, dict]] = []
+            material: list[dict] = []
+            for td in _track_dicts(track_buffer[i : i + WRITE_CHUNK]):
+                _old, patch = _classify_reextract(store, td)
+                if patch is not None:
+                    touch.append((td["id"], patch))
+                else:
+                    material.append(td)
+            if touch:
+                store.update_track_fields_batch(touch)
+            if material:
+                await upsert_tracks_batch(material)
+            batch_state["changed"] = batch_state.get("changed", 0) + len(material)
+            batch_state["unchanged"] = batch_state.get("unchanged", 0) + len(touch)
+            changed_ids.update(td["id"] for td in material)
+            if (_hvsc_on and not _hvsc_marked[0]
+                    and any(str(td.get("path") or "").lower().endswith(_SID_DETECT_EXTS)
+                            for td in material)):
+                _hvsc_marked[0] = True
+                try:
+                    store.set_config(_hvsc_key, True)
+                except Exception:                       # noqa: BLE001
+                    log.debug("HVSC join bookkeeping not saved", exc_info=True)
             await asyncio.sleep(0)
         await store_full_art_batch(art_buffer)
         track_buffer = []
@@ -6625,7 +7506,7 @@ async def _remote_scan_body(
         """Fetch one member of a remote archive (.zip/.lha/.lzh): download the
         outer archive via the local remote-cache (once per archive), then
         extract the member.  ``remote_path`` is ``<archive_rel>::<member>``."""
-        arc_rel, member = remote_path.split("::", 1)
+        arc_rel, member = split_member(remote_path) or remote_path.split("::", 1)
 
         def _read() -> bytes:
             from soniqboom.core.remote_cache import get_cache
@@ -6660,7 +7541,7 @@ async def _remote_scan_body(
         so the operator can see whether the file was smaller than the
         budget (early-EOF) or the server delivered the full request.
         """
-        if "::" in remote_path:        # ZIP member — fetch the whole member
+        if is_member_path(remote_path):        # ZIP member — fetch the whole member
             return await _fetch_zip_member(remote_path)
         return await loop.run_in_executor(
             None, lambda: source.read_partial(
@@ -6669,7 +7550,7 @@ async def _remote_scan_body(
         )
 
     async def _fetch_full(remote_path: str) -> bytes:
-        if "::" in remote_path:
+        if is_member_path(remote_path):
             return await _fetch_zip_member(remote_path)
         return await loop.run_in_executor(
             None, lambda: source.read_file(remote_path, lane="scan"),
@@ -6730,7 +7611,8 @@ async def _remote_scan_body(
             # Build the budget ladder: a list of (label, budget_bytes
             # or None) to try in order.  ``None`` budget = full fetch.
             stages: list[tuple[str, int | None]] = []
-            if "::" in remote_path:
+            _member = is_member_path(remote_path)
+            if _member:
                 # Archive members have NO partial path: _fetch_partial
                 # short-circuits to _fetch_zip_member, so every ladder
                 # stage performed the identical full member read — and a
@@ -6773,16 +7655,20 @@ async def _remote_scan_body(
                         _phase_counts["download"] -= 1
                     # If a PARTIAL fetch fails (e.g. ABOR glitch), step
                     # to the next stage — don't drop the file.  If the
-                    # FULL fetch fails, we're out of options.
-                    if stage_budget is None:
+                    # FULL fetch fails, or the server refuses the file
+                    # (it would at every stage), we're out of options.
+                    _refused = is_permanent_fetch_error(exc)
+                    if stage_budget is None or _refused:
                         log.error("Download failed %s: %s", remote_path, exc)
-                        if ("::" in remote_path
-                                and not isinstance(exc, _PermanentMemberError)):
+                        if _member and not isinstance(exc, _PermanentMemberError):
                             # Network failure — shield this archive from
                             # barren marking.  Permanent member defects
                             # deliberately stay eligible: an archive whose
                             # every member is unreadable IS barren.
-                            _failed_fetch_arcs.add(remote_path.split("::", 1)[0])
+                            _failed_fetch_arcs.add(member_container(remote_path))
+                        _gave_up[remote_path] = (
+                            "fetch" if _refused or isinstance(exc, _PermanentMemberError)
+                            else "transient")
                         _progress.errors += 1
                         _progress.processed += 1
                         if on_progress and (
@@ -6799,10 +7685,11 @@ async def _remote_scan_body(
                 with _phase_lock:
                     _phase_counts["download"] -= 1
                     _phase_counts["extract"] += 1
+                _fetched_ok[0] += 1
                 try:
                     _pc_arc = (
                         _arc_pc_exe.get(_pc_memo_key(remote_path), False)
-                        if "::" in remote_path else False
+                        if _member else False
                     )
                     _, result, _, _ = await extractor.call(
                         file_data, remote_path, track_id, _pc_arc,
@@ -6851,6 +7738,7 @@ async def _remote_scan_body(
             if isinstance(result, str):
                 log.error("Metadata error %s: %s", remote_path, result)
                 _progress.errors += 1
+                _gave_up[remote_path] = "crash" if isinstance(result, _Culprit) else "error"
             else:
                 meta: TrackMeta = result
                 meta.path = f"{scan_root}:{remote_path}"
@@ -6878,9 +7766,11 @@ async def _remote_scan_body(
                     new_hashes = await store_hash_lookups_batch([parent_dir])
                     hash_map.update(new_hashes)
                 track, raw_art = _build_track(meta, scan_root, parent_dir, hash_map)
+                if not track:
+                    _gave_up[remote_path] = "unstorable"
                 if track:
-                    if "::" in remote_path:
-                        _indexed_arcs.add(remote_path.split("::", 1)[0])
+                    if _member:
+                        _indexed_arcs.add(member_container(remote_path))
                     # Serialise buffer growth + flush so two concurrent
                     # workers can't both observe ``len(track_buffer) ==
                     # WRITE_BATCH`` and double-flush the same chunk.
@@ -6970,16 +7860,32 @@ async def _remote_scan_body(
 
     # HVSC: apply per-tune durations + STIL to SID tracks now they're indexed —
     # a main-process join keyed on the cached ``sid_md5`` (worker processes run
-    # an unconfigured HVSC singleton).  Covers pre-configured + auto-detected.
+    # an unconfigured HVSC singleton).  Only the SIDs this scan added or
+    # changed (an unchanged one already has its data) — every SID of the
+    # share while an earlier scan's join didn't finish (``_hvsc_key``), every
+    # SID of the library when this scan configured HVSC.  The mark goes only
+    # once a join ran to its end with documents to join against.
     try:
         from soniqboom.core.hvsc import get_hvsc
-        if get_hvsc().is_configured() and any(
-            str(fe.path).lower().endswith(_SID_DETECT_EXTS) for fe in entries
-        ):
+        hvsc_new = bool(batch_state.get("hvsc_new"))
+        _sid_changed = {t for t in changed_ids
+                        if str((store._tracks.get(t) or {}).get("path") or "")
+                        .lower().endswith(_SID_DETECT_EXTS)}
+        _hv = get_hvsc()
+        if _hv.is_configured() and (hvsc_new or _sid_changed or _hvsc_due):
             from soniqboom.core.hvsc_apply import apply_hvsc_to_library
-            await apply_hvsc_to_library(reload=False)
+            ids = (None if hvsc_new else
+                   set(store.get_track_ids_for_scan_root(scan_root_hash)) if _hvsc_due
+                   else _sid_changed)
+            await apply_hvsc_to_library(reload=False, ids=ids)
+            # (no documents loaded — unreadable for now: the mark stays)
+            if getattr(_hv, "_songlengths", None) != {} and _hvsc_marked[0]:
+                store.delete_config(_hvsc_key)
+        elif _hvsc_due and not _hv.is_configured():
+            store.delete_config(_hvsc_key)          # (HVSC was switched off)
     except Exception:
-        log.debug("HVSC post-scan apply failed (remote)", exc_info=True)
+        log.debug("HVSC post-scan apply failed (remote) — its SIDs are joined by "
+                  "the next scan", exc_info=True)
 
     # Ghost-track cleanup: any track in the store under this scan_root
     # whose path didn't appear in the live walk is a file that was
@@ -6994,14 +7900,15 @@ async def _remote_scan_body(
     # signal that we're looking at real ground truth, not a network
     # failure.
     #
-    # SAFETY 2 (QA 2026-07-02): NEVER purge on a capped walk.  A
-    # ``dir_mtime_cap`` walk PRUNES unchanged subtrees — their files are
-    # absent from ``entries`` because they weren't visited, not because
-    # they were deleted.  The production log showed capped freshness
+    # SAFETY 2 (QA 2026-07-02): NEVER purge an UNVISITED path on a capped
+    # walk.  A ``dir_mtime_cap`` walk PRUNES unchanged subtrees — their
+    # files are absent from ``entries`` because they weren't visited, not
+    # because they were deleted.  The production log showed capped freshness
     # polls planning ghosts_to_delete=44,792 on a healthy share; only
-    # the scan crashing first prevented a mass index wipe.  Ghost truth
-    # requires a FULL walk (manual re-index, cold start, drift sweep —
-    # the latter runs every 5th poll, so real ghosts still clear fast).
+    # the scan crashing first prevented a mass index wipe.  A capped walk's
+    # ``ghost_pairs`` are therefore narrowed to SAFETY 5's confirmed ones
+    # above (before the plan was built); everything else waits for a full
+    # walk (manual re-index, cold start, drift sweep every 5th poll).
     # SAFETY 3: a walk that DIED midway (``walk_completed`` False) returned
     # PARTIAL entries of unknown shape — skip entirely, same as the cap.
     # SAFETY 4 (per-subtree): a walk that completed but had per-directory
@@ -7010,16 +7917,16 @@ async def _remote_scan_body(
     # protect the rest — so one reliably-failing directory (a permission-
     # denied subdir, a symlink that 550s on LIST, a load-shed borrow timeout)
     # can no longer disable ghost cleanup for the WHOLE share indefinitely.
-    if ghost_ids and len(entries) > 0 and (dir_mtime_cap is not None
-                                           or not walk_completed):
+    # SAFETY 5 (fast walks): ``ghost_pairs`` holds only paths whose folder
+    # (or an ancestor) this walk LISTED without them (``confirmed_absent``)
+    # — a pruned folder's files are never candidates, and an empty listing
+    # never confirms anything.  SAFETY 1 (entries > 0) applies to them too.
+    if ghost_ids and len(entries) > 0 and not walk_completed:
         log.info(
-            "Ghost cleanup for %s skipped (%s): %d absent path(s) are "
-            "unverified (next clean full walk decides)",
-            scan_root,
-            "capped walk" if dir_mtime_cap is not None else "partial walk",
-            len(ghost_ids),
+            "Ghost cleanup for %s skipped (partial walk): %d absent path(s) are "
+            "unverified (next clean full walk decides)", scan_root, len(ghost_ids),
         )
-    if ghost_ids and len(entries) > 0 and dir_mtime_cap is None and walk_completed:
+    if ghost_ids and len(entries) > 0 and walk_completed:
         if walk_failed_dirs:
             purge_ids = [tid for rel, tid in ghost_pairs
                          if not _rel_under_any_dir(rel, walk_failed_dirs)]
@@ -7028,7 +7935,25 @@ async def _remote_scan_body(
             purge_ids = ghost_ids
             protected = 0
         try:
+            if purge_ids:
+                await _carry_renamed_members(purge_ids)
+                await _carry_healed_smb_paths(scan_root, ghost_pairs, set(purge_ids),
+                                              seen_rel_paths)
             removed = await delete_track_ids(purge_ids) if purge_ids else 0
+            batch_state["changed"] = batch_state.get("changed", 0) + removed
+            if purge_ids:
+                # … and their copies in the remote cache (an archive member's:
+                # only once no stored member of that archive is left).
+                gone = set(purge_ids)
+                gone_rels = [rel for rel, tid in ghost_pairs if tid in gone]
+                kept_arcs = {member_container(rel) for rel, (_m, _s, tid) in existing_map.items()
+                             if "::" in rel and tid not in gone}
+                drop = sorted({member_container(r) for r in gone_rels} - kept_arcs)
+                try:
+                    await loop.run_in_executor(None, cache.forget, scan_root, drop,
+                                               "removed at the source")
+                except Exception:
+                    log.debug("dropping removed files' cached copies failed", exc_info=True)
             log.info(
                 "Ghost cleanup for %s: removed %d track(s) whose remote "
                 "files no longer exist%s",
@@ -7038,6 +7963,57 @@ async def _remote_scan_body(
             )
         except Exception as exc:
             log.warning("Ghost cleanup for %s failed: %s", scan_root, exc)
+
+    # The walk's folder listings become the state the next fast walk prunes
+    # by — only now that its changes are stored.  A folder whose new or
+    # changed files are not in the store (download / extraction failed) stays
+    # unknown, so the next fast walk lists it again.
+    _new_unstored = 0
+    # A passing download failure counts against its file only while the
+    # share otherwise works: other downloads of this scan did, or the walk
+    # listed every folder and only a few files failed (not an outage).
+    _n_transient = (sum(1 for k in _gave_up.values() if k == "transient")
+                    + sum(1 for w, _s, _m in _fetch_failed.values() if w == ""))
+    _transient_counts = _fetched_ok[0] > 0 or (walk_ok and _n_transient <= 3)
+    try:
+        _unstored = set()
+        if to_extract:
+            _want = {str(uuid.uuid5(uuid.NAMESPACE_URL, f"{scan_root}:{fe.path}")): fe
+                     for fe in to_extract}
+            _have = {r.get("id"): r for r in store.get_tracks_batch(list(_want)) if r}
+            for _tid, fe in _want.items():
+                r = _have.get(_tid)
+                if r is None or not _mtime_matches_tolerant(
+                        float(r.get("mtime", 0) or 0), fe.mtime):
+                    _unstored.add(str(PurePosixPath(
+                        _dirstate.container(str(fe.path))).parent))
+                    if fe.path not in existing_map:
+                        _new_unstored += 1
+                    kind = _gave_up.get(fe.path)
+                    if kind and (kind != "transient" or _transient_counts):
+                        _giveups.fail(fe.path, fe.size, fe.mtime, kind)
+                else:
+                    _giveups.settle(fe.path)
+        # Archives: one the server refuses / that can't be opened waits like
+        # a file; one read this walk is settled.
+        for _arc, (_why, _sz, _mt) in _fetch_failed.items():
+            if _why in ("fetch", "unreadable"):
+                _giveups.fail(_arc, _sz, _mt, _why)
+            elif _why == "" and _transient_counts:
+                _giveups.fail(_arc, _sz, _mt, "transient")
+            if _why != "held":
+                _unstored.add(str(PurePosixPath(_arc).parent))
+        for _arc in enum_report:
+            _giveups.settle(_arc)
+        if dir_mtime_cap is None and walk_ok and entries:
+            _giveups.prune(seen_rel_paths | set(_fetch_failed) | set(enum_report))
+        _giveups.save(store)
+        _walk_plan.finish(forget=_unstored)
+        if _unstored:
+            log.info("Folder state of %s: %d folder(s) with files not stored are "
+                     "listed again by the next poll", scan_root, len(_unstored))
+    except Exception:                                       # noqa: BLE001
+        log.warning("Recording the folder state of %s failed", scan_root, exc_info=True)
 
     await upsert_scan_dir(scan_root, track_count_val=track_count,
                           network_share_id=share_id, status="ok")
@@ -7051,19 +8027,24 @@ async def _remote_scan_body(
     # deep pass must rerun.  ``known_archives`` counts as indexed: an
     # unchanged archive re-enumerated by the deep pass has its members
     # SKIPPED by classification, not re-indexed — it is not barren.
-    # walk_ok gate: a partial walk enumerated who-knows-what — neither
-    # barren verdicts nor the "deep pass done" schema stamp are valid.
+    # walk_completed gate: a walk that died enumerated who-knows-what —
+    # neither barren verdicts nor the "deep pass done" schema stamp are valid.
+    # A walk whose listing failed for some folders vouches for the rest: the
+    # stamp names those folders (``schema_pending``), and only the archives
+    # below them are enumerated again — one unreadable folder (``#recycle``,
+    # ``lost+found``) no longer costs the whole share its archive skip.
     # ``entries`` must also be non-empty for the stamp: a full walk that
     # found nothing (share unreachable at connect) proved nothing.
     if ((enum_report or dir_mtime_cap is None)
-            and walk_ok and not _pool_dead[0]):
+            and walk_completed and not _pool_dead[0]):
         try:
             _upd = _ft.partial(
                 _update_enum_sidecar, scan_root,
                 enum_report=dict(enum_report),
                 indexed_arcs=_indexed_arcs | set(known_archives),
-                failed_fetch_arcs=set(_failed_fetch_arcs),
+                failed_fetch_arcs=set(_failed_fetch_arcs) | set(_fetch_failed),
                 stamp_schema=(dir_mtime_cap is None and len(entries) > 0),
+                schema_pending=sorted(walk_failed_dirs),
             )
             await loop.run_in_executor(None, _upd)
         except Exception:
@@ -7073,6 +8054,13 @@ async def _remote_scan_body(
     # shutdown all live in start_remote_scan's ``finally`` — they must
     # run on the abort path too, not just here on success.
     log.info("Remote scan complete: %d tracks from %s", track_count, scan_root)
+    # What the store took: tracks added, changed or removed, and re-read files
+    # found unchanged (their mtime refreshed only).
+    scan_plan["changed"] = batch_state.get("changed", 0)
+    scan_plan["unchanged_rereads"] = batch_state.get("unchanged", 0)
+    # New = new files now in the library: one that could not be stored is no
+    # new track (no "new tracks" notice, no faster polling for it).
+    scan_plan["new"] = max(0, scan_plan["new"] - _new_unstored)
     # Hand this scan's own plan back to the wrapper (and thence to the
     # freshness poller) so cadence/toast never read the racy global.
     return scan_plan
@@ -7203,23 +8191,36 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
         return {"added": 0, "updated": 0, "removed": 0,
                 "checked": n_checked, "errors": errors, "skipped": True}
     stopped = False
+    unchanged = 0
     with _root_commit({path_hash(root)}):
         # Small chunks with a loop turn after each: a store upsert doesn't
         # yield, so 200-row chunks blocked the loop ~1.9 s for 5,000 new files
-        # (perf round 7).  The removal check runs before every chunk.
+        # (perf round 7).  The removal check runs before every chunk.  A
+        # re-read file whose metadata is unchanged only has its mtime / size
+        # refreshed (no re-index, not counted as updated); a changed one keeps
+        # its ``added_at`` and duplicate annotation (``_classify_reextract``).
         for i in range(0, len(ready), _DRILL_WRITE_CHUNK):
             if _root_removed():
                 stopped = True
                 break
-            chunk = ready[i : i + _DRILL_WRITE_CHUNK]
-            for track in chunk:
-                _prev = store.get_track(track.id)
+            touch: list[tuple[str, dict]] = []
+            material: list[dict] = []
+            for td in _track_dicts(ready[i : i + _DRILL_WRITE_CHUNK]):
+                _prev, patch = _classify_reextract(store, td)
+                if patch is not None:
+                    touch.append((td["id"], patch))
+                    continue
                 if _prev is None:
                     added += 1
                 else:
                     updated += 1
-                _old_versions.setdefault(track.id, _prev)
-            await upsert_tracks_batch(chunk)
+                _old_versions.setdefault(td["id"], _prev)
+                material.append(td)
+            if touch:
+                store.update_track_fields_batch(touch)
+                unchanged += len(touch)
+            if material:
+                await upsert_tracks_batch(material)
             await asyncio.sleep(0)
         if not stopped and _root_removed():
             stopped = True
@@ -7231,4 +8232,5 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
         if _old_versions and not stopped:
             await _refresh_browse_after_commit(store, _old_versions)
     return {"added": added, "updated": updated, "removed": removed,
+            "unchanged": unchanged,
             "checked": n_checked, "errors": errors, "skipped": stopped}

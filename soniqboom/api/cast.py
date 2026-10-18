@@ -349,7 +349,7 @@ async def cast_queue(body: QueueBody, user = Depends(require_user)):
     except Exception:
         log.exception("cast/queue failed for target=%s", body.target_id)
         raise HTTPException(502, "Queue load failed.")
-    return {"ok": True, "queue_size": len(items)}
+    return {"ok": True, "queue_size": len(session.state.queue)}
 
 
 @router.post("/control")

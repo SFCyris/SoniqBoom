@@ -48,8 +48,10 @@ def read_source_bytes(path_str: str, *, lane: str = "stream") -> bytes | None:
     reached or extracted; never raises.
     """
     try:
-        from soniqboom.core.filesource import is_remote_path
-        outer, sep, rest = path_str.partition("::")
+        from soniqboom.core.filesource import is_remote_path, split_member
+        # (at the archive: a folder named "Artist :: Album" is no archive)
+        sp = split_member(path_str)
+        outer, sep, rest = (sp[0], "::", sp[1]) if sp else (path_str, "", "")
         if is_remote_path(outer):
             # Mirror only the OUTER remote file (the module itself, or the
             # archive that contains it) into the local remote-cache first.
@@ -61,7 +63,8 @@ def read_source_bytes(path_str: str, *, lane: str = "stream") -> bytes | None:
             # A catalogue tune (core/catalogue.py) is read only from the cache
             # — or, on the stream lane, by joining its play's running download.
             from soniqboom.core import catalogue
-            if not catalogue.fetch_ok(outer, "stream" if lane == "stream" else "scan"):
+            # (The whole path: a package member may be cached as its ZIP's subset.)
+            if not catalogue.fetch_ok(path_str, "stream" if lane == "stream" else "scan"):
                 return None
             # No source (not connected, or its sign-in refused): what the
             # remote cache holds still answers.

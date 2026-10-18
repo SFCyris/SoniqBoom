@@ -8,7 +8,7 @@ date and per-platform counts.
 
 | File | Source | Licence | Credit |
 |------|--------|---------|--------|
-| `wikidata.tsv.gz` | [Wikidata](https://www.wikidata.org) — video games per platform (English labels and aliases, Japanese labels, titles) | [CC0 1.0](https://www.wikidata.org/wiki/Wikidata:Licensing) | Data from Wikidata |
+| `wikidata.tsv.gz` | [Wikidata](https://www.wikidata.org) — video games per platform (English labels and aliases, Japanese labels and aliases, titles and their romanisations) | [CC0 1.0](https://www.wikidata.org/wiki/Wikidata:Licensing) | Data from Wikidata |
 | `nointro.tsv.gz` | [No-Intro](https://no-intro.org) DAT files (games only; the Software Preservation Society-credited DATs are not included) | [DAT-o-MATIC Data Usage License](https://datomatic.no-intro.org/terms.html) | No-Intro |
 | `mame.tsv.gz` | [MAME software lists](https://github.com/mamedev/mame/tree/master/hash) | CC0 1.0 | MAME |
 | `zxdb.tsv.gz` | [ZXDB](https://github.com/zxdb/ZXDB) — ZX Spectrum games and their aliases | [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) | Contains information from ZXDB, made available under the ODbL |
@@ -21,4 +21,11 @@ directory (`game_titles/`) when the user clicks Download in the Metadata
 settings.
 
 Rebuild with `python3 scripts/build_game_titles.py` (Wikidata, MAME and ZXDB
-are fetched; pass the No-Intro "Love Pack (DAT)" zip with `--nointro`).
+are fetched; pass the No-Intro "Love Pack (DAT)" zip, or its extracted folder,
+with `--nointro`). `--only wikidata,mame,…` rebuilds just the named lists (the
+others keep their current files); `--mame-dir` and `--zxdb-sql` read a local
+copy of MAME's `hash/` folder or of `ZXDB_mysql.sql` instead of downloading it,
+and `--wikidata-cache` sets the folder Wikidata query results are cached in
+(default `sb-wikidata` in the system temp directory). Cached query results are
+reused when present; delete that folder or pass a new `--wikidata-cache` to
+fetch fresh data.

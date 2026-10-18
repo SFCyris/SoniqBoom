@@ -2,7 +2,13 @@
 #
 #   1. Point your domain's DNS at this host; open ports 80 and 443.
 #   2. Edit deploy/Caddyfile — replace music.example.com with your domain.
-#   3. From the repo root:  docker compose -f deploy/docker-compose.https.yml up -d
+#   3. From the repo root:
+#        docker compose -p soniqboom -f deploy/docker-compose.https.yml up -d
+#      -p must be the project name of the plain docker-compose.yml setup so both
+#      use the same data volume: the part before _soniqboom-data in
+#      `docker volume ls` (soniqboom for a git clone, soniqboom-main for the
+#      ZIP).  Use the same -p and -f on every docker compose command, and stop
+#      the plain setup first (both name their container soniqboom).
 #   4. Open https://your-domain — Caddy fetches the certificate on first request.
 #
 # SoniqBoom itself is NOT published on the host here; only Caddy is exposed, so

@@ -73,9 +73,9 @@ def conf_path() -> Path | None:
 # Sourced from metadata.py ext sets; kept as bare tokens (no dots).  ahx/hvl
 # keep their dedicated routes; thx (AHX clone tag) is new and may claim.
 _SUFFIX_OWNED_ELSEWHERE = frozenset({
-    # openmpt trackers
+    # openmpt trackers (``ftm``: Face The Music, where libopenmpt reads it)
     "mod", "s3m", "xm", "it", "mtm", "med", "oct", "669", "dbm",
-    "ult", "stm", "far", "amf", "gdm", "imf", "okt", "sfx", "wow", "dsm",
+    "ult", "stm", "far", "amf", "gdm", "imf", "okt", "sfx", "wow", "dsm", "ftm",
     # dedicated render routes
     "ahx", "hvl", "sid", "psid", "rsid",
     # Atari ST engines (uade's YM-2149 eagleplayer can't even play YM5 —

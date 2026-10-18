@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """``soniqboom-setadm``'s reload notification reaches only the server that
 serves the SAME data dir, and ``POST /api/auth/reload`` only reloads for the
-CLI (loopback + this run's reload token) or during first-run bootstrap.
+CLI (loopback + this run's reload token) or, without a token, while accounts
+are loaded but none is an enabled admin.
 
 Two layers:
 
@@ -186,11 +187,16 @@ def test_loopback_peer_relaying_for_someone_is_refused(gate, header):
     assert not gate.server_knows("alice")
 
 
-def test_bootstrap_recheck_works_from_any_browser(gate):
-    """No admin yet: the login overlay's "re-check" button (a remote browser,
-    no token) must still pick up the admin the operator just created."""
+def test_no_account_loaded_only_the_cli_reloads(gate):
+    """Fresh install (no account loaded): a tokenless reload — the overlay's
+    "re-check", or anyone else — is refused, loopback included; the CLI's
+    token reloads.  (The server picks a users.json written behind its back up
+    by itself: ``UserStore.check_restored``.)"""
     gate.add_on_disk("firstadmin")
-    r = gate.post("192.168.1.50")
+    for peer in ("192.168.1.50", "127.0.0.1"):
+        assert gate.post(peer).status_code == 403
+    assert not gate.server_knows("firstadmin")
+    r = gate.post("127.0.0.1", token=_TOK)
     assert r.status_code == 200, r.text
     assert r.json()["has_any_admin"] is True
     assert gate.server_knows("firstadmin")
@@ -368,7 +374,12 @@ def test_setadm_notifies_the_server_of_its_own_data_dir(
     dir — through the CLI gate, since an admin already exists there."""
     mine = servers("mine")
     users_mod.UserStore(mine.data_dir).create(username="root1", password=_PW, role="admin")
-    assert _http("POST", mine.port, "/api/auth/reload")[0] == 200   # bootstrap re-check
+    # No account loaded yet: a tokenless reload is refused; the CLI's knock
+    # (with this run's token) loads root1.
+    assert _http("POST", mine.port, "/api/auth/reload")[0] == 403
+    cli_setadm._notify_server_reload(mine.data_dir)
+    assert mine.status()["has_any_admin"] is True
+    capsys.readouterr()
     decoy = servers("decoy")
     _plant_canary(decoy)
     monkeypatch.setattr(settings, "port", decoy.port)   # "the default port"
@@ -757,7 +768,7 @@ def test_reload_answer_reports_an_absolute_data_dir(gate, monkeypatch):
     """A relative data dir must not make setadm compare against its own cwd."""
     monkeypatch.chdir(gate.data_dir.parent)
     monkeypatch.setattr(settings, "data_dir", gate.data_dir.name)
-    r = gate.post("192.168.1.50")                      # bootstrap: allowed
+    r = gate.post("127.0.0.1", token=_TOK)            # the CLI's reload
     assert r.status_code == 200
     assert r.json()["data_dir"] == str(gate.data_dir)
 

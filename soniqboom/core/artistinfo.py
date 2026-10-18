@@ -123,6 +123,9 @@ async def _get_json(url: str, *, mb: bool = False) -> dict | None:
     Returns None on HTTP error status; raises _Unreachable on network failure."""
     import httpx
     global _mb_last
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(url):
+        raise _Unreachable(f"offline mode: not contacting {url}")
     try:
         if mb:
             async with _mb_gate:

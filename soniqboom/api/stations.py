@@ -77,6 +77,9 @@ async def _assert_public_url(url: str) -> None:
     host = parts.hostname
     if not host:
         raise HTTPException(400, "Station stream URL has no host")
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(url):
+        raise HTTPException(503, "Offline mode is on: internet radio stations can't be reached")
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
             host, parts.port or (443 if parts.scheme == "https" else 80),
@@ -243,7 +246,9 @@ async def nowplaying_art(slug: str):
     from soniqboom.core.nowplaying_art import read_cover
     data = read_cover(slug)
     if not data:
-        raise HTTPException(404, "No cached cover")
+        # 204, not 404: an IMG's onerror fires the same, and reverse-proxy
+        # security tools ban a client after a burst of 404s (GitHub #40).
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
     return Response(content=data, media_type=mime,
                     headers={"Cache-Control": "public, max-age=86400"})

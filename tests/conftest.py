@@ -49,6 +49,14 @@ if "SONIQBOOM_CONF" not in os.environ:
         "subsonic": True, "multiroom": True, "cast": True, "dlna_server": True}}))
     os.environ["SONIQBOOM_CONF"] = str(_conf)
 
+# ── No internet ────────────────────────────────────────────────────────────
+# Offline mode for the whole suite (``core.netpolicy``): no client contacts an
+# internet host — local fakes (127.0.0.1) still answer.  A test of a client's
+# own logic may switch it off (``monkeypatch.setenv("SONIQBOOM_OFFLINE", "0")``)
+# with its transport mocked; the strict name-lookup guard installed below
+# still refuses any internet host.
+os.environ.setdefault("SONIQBOOM_OFFLINE", "1")
+
 
 # ── Path bootstrap ─────────────────────────────────────────────────────────
 
@@ -79,6 +87,33 @@ def add_repo_root_to_path(repo_root: Path) -> None:
     p = str(repo_root)
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+# Test modules that replace a client's transport with a fake answering for an
+# internet host name (no request leaves the process): offline mode is off
+# for them, so the client's own logic runs — the strict guard below still
+# refuses a real lookup of any internet host.
+_FAKED_INTERNET_CLIENTS = frozenset({
+    "test_game_titles", "test_online_aminet", "test_online_aminet_rules",
+    "test_songdb", "test_songdb_pinned", "test_subsonic_parity", "test_subsonic_r2",
+    "test_subsonic_r3", "test_subsonic_r4", "test_render_r1_misc",
+})
+
+
+@pytest.fixture(autouse=True)
+def _faked_internet_clients_online(request, monkeypatch):
+    mod = getattr(request, "module", None)
+    if mod is not None and mod.__name__.rsplit(".", 1)[-1] in _FAKED_INTERNET_CLIENTS:
+        monkeypatch.setenv("SONIQBOOM_OFFLINE", "0")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_internet(add_repo_root_to_path) -> None:
+    """Strict name-lookup guard for the whole run: a lookup that would lead
+    to an internet host fails, whatever offline mode says (see "No internet"
+    above)."""
+    from soniqboom.core import netpolicy
+    netpolicy.install_guard(strict=True)
 
 
 # ── Optional-binary skip markers ───────────────────────────────────────────
@@ -150,6 +185,17 @@ def tmp_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from soniqboom.config import settings
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _spawns_open():
+    """Processes can be started in every test: a test that ran the server's
+    stop (or the restart's quiesce) left ``forksafe.spawn`` closed, as the
+    process exits right after them in production."""
+    from soniqboom.core import forksafe
+    forksafe.open_spawns()
+    yield
+    forksafe.open_spawns()
 
 
 @pytest.fixture(autouse=True)

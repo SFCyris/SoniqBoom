@@ -174,7 +174,7 @@ def test_old_sndh_and_libgme_renders_are_not_reused():
     assert _cache_key("t", "psf", subsong=0) == "t__r1"      # PSF: the fade (no subsongs)
     # other render keys are unchanged
     assert _cache_key("t", "uade", subsong=2) == "t__sub2"
-    assert _cache_key("t", "tracker", subsong=0) == "t__sub0"
+    assert _cache_key("t", "tracker", subsong=0) == "t__sub0__r2"    # (own float WAV, song-end loops)
 
 
 # ── AHX: stop uade at the song end ──────────────────────────────────────────

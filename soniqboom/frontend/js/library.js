@@ -10,7 +10,7 @@ import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnl
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadge, Offline } from './offline.js';
 import { listTuneCount, tunesBadge } from './tunes.js';
-import { healthBadge, canReport, mark as healthMark } from './health.js';
+import { healthBadge, canReport, mark as healthMark, isUnplayable } from './health.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -30,8 +30,8 @@ const API = (path, q = {}) => {
 async function _viewData(gen, request, retry) {
   try {
     return await request;
-  } catch (_) {
-    if (gen === _browseNavGen && !_reloadingView) _showViewError(retry);
+  } catch (err) {
+    if (gen === _browseNavGen && !_reloadingView) _showViewError(retry, err);
     return null;
   }
 }
@@ -157,6 +157,31 @@ async function refreshCurrentFolderInPlace() {
   // recursive view manages its own scroll and may land at top — acceptable).
   if (wrap) requestAnimationFrame(() => { try { wrap.scrollTop = scrollY; } catch (_) {} });
 }
+
+// ── Refresh All Tracks in place ───────────────────────────────────────────────
+// The library changed under an open All-Tracks list (a scan finished, the page
+// reconnected after missing a change, tags or availability changed): read it
+// again and keep the user's place — the rows on screen are re-filled at the
+// same scroll offset, with no loading rows and no jump to the top
+// (showAll({quiet})).  One refresh at a time: a request arriving meanwhile
+// runs once more after it, and so does a refresh another All-Tracks render (a
+// column sort) superseded — so the newest data always lands.
+// [quiet-refresh:begin] — tests/js/row_repaint.test.mjs runs this region as is
+let _quietRun = null, _quietAgain = false;
+function refreshAllTracksInPlace() {
+  if (!_viewIsAllTracks) return Promise.resolve();
+  if (_quietRun) { _quietAgain = true; return _quietRun; }
+  _quietRun = (async () => {
+    for (let i = 0; i < 3; i++) {                      // (bounded: a refresh can't chase itself)
+      _quietAgain = false;
+      const res = await showAll({ quiet: true });
+      if (!_viewIsAllTracks) break;                    // the user went elsewhere
+      if (!_quietAgain && res !== 'superseded') break;
+    }
+  })().finally(() => { _quietRun = null; });
+  return _quietRun;
+}
+// [quiet-refresh:end]
 
 // ── Reload the open group / drill / search view in place ──────────────────────
 // An admin action changed tags (a retro-album toggle, "Read game names", a
@@ -350,6 +375,13 @@ function createWindowedStore(total, fetcher, opts = {}) {
         if (localIdx >= 0) return c * CHUNK_SIZE + localIdx;
       }
       return -1;
+    },
+    // Row ``i`` if its chunk is loaded — no fetch, no LRU touch (reading what a
+    // list shows without changing what it keeps).
+    peek(i) {
+      if (i < 0 || i >= total) return undefined;
+      const arr = chunks.get(Math.floor(i / CHUNK_SIZE));
+      return arr ? arr[i - Math.floor(i / CHUNK_SIZE) * CHUNK_SIZE] : undefined;
     },
     // Discard every chunk + any in-flight fetches.  Used when the user
     // changes sort (the existing data is in a different order now) or
@@ -553,7 +585,7 @@ export function setExposeLocalFiles(v) { _exposeLocalFiles = v; _repaintTrackRow
 // path form): paint them again.
 function _repaintTrackRows() {
   if (!_trackVL.active) return;
-  for (const row of _trackVL.rows()) row.__tid = undefined;
+  _forgetPaintedRows(_trackVL);
   _vsRender(true);
 }
 
@@ -707,31 +739,47 @@ async function _refreshTrackCount() {
   } catch {}
 }
 
-// The browse badges (Artists … Years) at page load and after a scan — not only
-// once each view was opened.  A list's "[No Artist]" bucket row (``label``) is
-// not an artist, so it isn't counted (here or in the views).
-const _NAV_COUNT_LISTS = [
-  ['artists', '/library/artists'], ['album_artists', '/library/album-artists'],
-  ['albums', '/library/albums'], ['genres', '/library/genres'], ['years', '/library/years'],
-];
+// The sidebar badges (All Tracks, Artists … Years, Scene groups) at page load
+// and after a scan — not only once each view was opened.  One small request
+// (``GET /api/library/counts``, ETag'd) instead of the lists themselves: a list
+// is read only when its view opens.  A list's "[No Artist]" bucket row
+// (``label``) is not an artist, so it isn't counted (here or in the views).
+const _NAV_COUNT_KEYS = ['artists', 'album_artists', 'albums', 'genres', 'years'];
 const _navCount = (rows) => rows.filter(r => !r.label).length;
 
+// (A counts reply is not a sync point for the WebSocket snapshot check —
+// lib_sync.js: it re-reads only the badges, not the open view.)
+function _applyCounts(c) {
+  if (!c || typeof c !== 'object') return;
+  const all = c.visible ?? c.tracks;
+  if (Number.isFinite(all)) _updateNavBadge('all', all);
+  for (const k of _NAV_COUNT_KEYS) if (Number.isFinite(c[k])) _updateNavBadge(k, c[k]);
+  // The Scene-groups facet shows only once the library carries scene data.
+  const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
+  if (li && c.scene_groups > 0) {
+    li.hidden = false;
+    _updateNavBadge('scene_groups', c.scene_groups);
+  }
+}
+
+// Resolves to the counts (or null on failure); one request at a time, and one
+// more after it when asked again meanwhile — unless ``reuse``: then a request
+// in flight answers (a caller that only reads the numbers).
 let _navCountsRun = null, _navCountsAgain = false;
-function _refreshNavCounts() {
-  if (_navCountsRun) { _navCountsAgain = true; return _navCountsRun; }   // one run at a time, one more after
-  _navCountsRun = Promise.allSettled(_NAV_COUNT_LISTS.map(async ([view, url]) => {
-    const rows = await API(url);
-    if (Array.isArray(rows)) _updateNavBadge(view, _navCount(rows));
-  })).finally(() => {
-    _navCountsRun = null;
-    if (_navCountsAgain) { _navCountsAgain = false; _refreshNavCounts(); }
-  });
+function _refreshNavCounts({ reuse = false } = {}) {
+  if (_navCountsRun) { if (!reuse) _navCountsAgain = true; return _navCountsRun; }
+  _navCountsRun = API('/library/counts')
+    .then((c) => { _applyCounts(c); return c; })
+    .catch(() => null)
+    .finally(() => {
+      _navCountsRun = null;
+      if (_navCountsAgain) { _navCountsAgain = false; _refreshNavCounts(); }
+    });
   return _navCountsRun;
 }
 
 function _refreshBadges() {
-  _refreshTrackCount();
-  _refreshNavCounts();
+  return _refreshNavCounts();
 }
 
 // External catalogue tunes on screen whose tune count no index has (SC68,
@@ -792,6 +840,7 @@ function _makeRowSkeleton() {
   return tr;
 }
 
+// [row-repaint:begin] — tests/js/row_repaint.test.mjs runs this region as is
 // Pool callback (vlist.js): paint row ``i``.  ``fresh`` = the row showed another
 // index before; a forced render (``fresh`` false: a chunk landed, the row height
 // changed) repaints only a row whose content is out of date — a row that already
@@ -808,6 +857,14 @@ function _fillTrackRowAt(tr, i, fresh) {
   if (!fresh && tr.__tid === t.id) return;
   _fillTrackRow(tr, t, i);
 }
+
+// The rows on screen hold data that changed under the same track ids (an
+// in-place refresh, other display settings): forget what they show, so the
+// next forced render paints every one of them again.
+function _forgetPaintedRows(vl) {
+  for (const row of vl.rows()) row.__tid = undefined;
+}
+// [row-repaint:end]
 
 // The .skel-bar shimmer's period — keep equal to app.css ``skel-shimmer 1.4s``.
 const SKEL_SHIMMER_MS = 1400;
@@ -909,7 +966,7 @@ function _fillTrackRow(tr, t, i) {
   // Can't play right now (its drive / share is offline): dimmed + badge below.
   const offKind = offlineKind(t);
   if (offKind) tr.classList.add('track-offline');
-  _setRowPlaying(tr, !!Player.currentTrackId && t.id === Player.currentTrackId);
+  _setRowPlaying(tr, _nowPlayingIs(t.id));
 
   const disc = t.disc_number != null ? `D${t.disc_number}` : '';
   const trk  = t.track_number != null ? String(t.track_number).padStart(2, '0') : '';
@@ -931,15 +988,15 @@ function _fillTrackRow(tr, t, i) {
   // the mobile row) so a missing cover never shows a broken-image glyph.
   // On successful load the <img> picks up ``.loaded`` and its opacity goes
   // to 1, hiding the placeholder behind it.  ``onerror`` keeps the
-  // placeholder visible so 404 art still reads as the format icon.
+  // placeholder visible so missing art (204) still reads as the format icon.
   const coverCell  = cells[1];
   const coverFrame = coverCell.firstElementChild;
   const coverPh    = coverFrame?.firstElementChild;
   const coverImg   = coverFrame?.lastElementChild;
   if (coverPh) coverPh.textContent = artPlaceholderEmoji(t);
   if (coverImg) {
-    // ``fallback=404`` is the cheap way to ask "is there real art?"
-    // — when there isn't, the server returns a cacheable 404 (no
+    // ``fallback=none`` is the cheap way to ask "is there real art?"
+    // — when there isn't, the server returns a cacheable 204 (no
     // body) and IMG.onerror fires, leaving the format emoji visible.
     // Earlier revisions tried to read the X-SoniqBoom-Art header via
     // fetch+blob+ObjectURL, which lost the browser image pipeline's
@@ -952,7 +1009,7 @@ function _fillTrackRow(tr, t, i) {
     // subtree, the browser deferred the load past the visible window and
     // never re-fired it, so covers silently never requested.  The grid
     // (_loadAlbumCardArt) sidesteps the same trap with a detached Image().
-    const wantedSrc = t.id ? `/api/art/${t.id}?size=sm&fallback=404` : '';
+    const wantedSrc = t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '';
     // If a background art-fill (play / on-demand extract / backfill) landed for
     // this track while its row was scrolled out of view, the bare URL would
     // reuse the browser-cached placeholder.  ``__sbArtPending`` (set by the
@@ -1235,7 +1292,98 @@ function showSearchResults(tracks, query = '', reload = null) {
   if (query && typeof reload === 'function') _setViewReload(`search\0${query}`, reload);
 }
 
-async function renderTracks(tracks) {
+// ── The user's place across an in-place refresh ───────────────────────────────
+// A background re-read (a scan, a reconnect after a missed change) lands new
+// rows under the same list: the selection, the keyboard row and the rows on
+// screen are carried over BY TRACK ID, not by row index — in the default
+// newest-first order every added track moves every row down by one.
+// [list-place:begin] — tests/js/list_place.test.mjs runs this region as is
+const _PLACE_ROWS = 40;          // rows from the top of the viewport used as the anchor
+
+// The track at ``i`` if the list has it in memory (a windowed store: no fetch).
+function _peekTrack(list, i) {
+  if (!list || !(i >= 0) || i >= list.length) return undefined;
+  return list._isWindowedStore ? list.peek(i) : list[i];
+}
+
+// id → index for every row ``list`` has in memory.
+function _idIndex(list) {
+  const m = new Map();
+  if (!list) return m;
+  if (list._isWindowedStore) {
+    for (const [c, arr] of list._chunks) {
+      const base = c * CHUNK_SIZE;
+      for (let j = 0; j < arr.length; j++) { const t = arr[j]; if (t && t.id != null) m.set(t.id, base + j); }
+    }
+  } else {
+    for (let i = 0; i < list.length; i++) { const t = list[i]; if (t && t.id != null) m.set(t.id, i); }
+  }
+  return m;
+}
+
+// What the user has in ``list``: selected rows, the keyboard row, the
+// shift-click anchor and the rows at the top of the viewport — as [index, id].
+function _captureListPlace(list, { selected, focusIdx, lastIdx, first }) {
+  const at = (i) => { const t = _peekTrack(list, i); return t && t.id != null ? [i, t.id] : null; };
+  const sel = [];
+  for (const i of selected) { const p = at(i); if (p) sel.push(p); }
+  const vis = [];
+  if (first) {
+    for (let i = first.idx; i < Math.min(list ? list.length : 0, first.idx + _PLACE_ROWS); i++) {
+      const p = at(i); if (p) vis.push(p);
+    }
+  }
+  return { sel, focus: focusIdx >= 0 ? (at(focusIdx) || [focusIdx, null]) : null,
+           last: lastIdx >= 0 ? at(lastIdx) : null, first: first || null, vis };
+}
+
+// Where that place is in the new rows (``index``: id → new index, see
+// _idIndex; ``n``: the new row count).  ``shift``: how many rows the first
+// visible track moved — the topmost of the anchor rows still in the list whose
+// move is in line with the others' (within half the anchor rows of their
+// median), so a re-tagged track that jumped far away doesn't drag the view;
+// null when none of them is known.
+function _planListPlace(place, index, n) {
+  const moved = [];
+  for (const [i, id] of place.vis) { const j = index.get(id); if (j !== undefined) moved.push(j - i); }
+  let shift = null;
+  if (moved.length) {
+    const sorted = [...moved].sort((a, b) => a - b);
+    const median = sorted[Math.floor((sorted.length - 1) / 2)];
+    shift = moved.find((d) => Math.abs(d - median) <= _PLACE_ROWS / 2);
+  }
+  const selected = [];
+  for (const [, id] of place.sel) { const j = index.get(id); if (j !== undefined && j < n) selected.push(j); }
+  let focus = -1;
+  if (place.focus) {
+    const j = place.focus[1] != null ? index.get(place.focus[1]) : undefined;
+    // (a keyboard row whose track went away stays at its place on screen)
+    focus = j !== undefined ? j : Math.max(-1, Math.min(n - 1, place.focus[0] + (shift || 0)));
+  }
+  let last = -1;
+  if (place.last) { const j = index.get(place.last[1]); if (j !== undefined) last = j; }
+  const top = place.first && shift !== null
+    ? { idx: Math.max(0, Math.min(n - 1, place.first.idx + shift)), px: place.first.px } : null;
+  return { selected, focus, last, shift, top };
+}
+// [list-place:end]
+
+// The place of the list on screen now (read before its rows are replaced).
+function _currentListPlace() {
+  return _captureListPlace(currentTracks, {
+    selected: _selected, focusIdx: _focusedIdx, lastIdx: _lastClickIdx,
+    first: _trackVL.active ? _trackVL.firstVisible() : null,
+  });
+}
+
+// ``keepScroll`` (an in-place refresh — showAll({quiet}), a folder's quiet
+// refresh): render the new data in the row pool on screen — every row is
+// painted again, also one that shows the same track (its fields or offline
+// mark may have changed) — and keep the user's place: the same rows at the top
+// of the viewport, the selection, the keyboard row (see _planListPlace).
+async function renderTracks(tracks, { keepScroll = false } = {}) {
+  keepScroll = keepScroll && _trackVL.active && tracks.length > 0;
+  const place = keepScroll ? _currentListPlace() : null;
   _leaveGalaxy();          // switching to a table view exits the galaxy
   currentTracks = tracks;
   _browseNavGen++;         // a track view is now rendering → cancel any still-loading group list
@@ -1257,7 +1405,7 @@ async function renderTracks(tracks) {
   // captured at module load keeps the empty state consistent across
   // view switches.
   if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML
-      && (tracks.length > 0 || emptyEl.querySelector('[data-view-error]'))) {
+      && (tracks.length > 0 || emptyEl.querySelector('[data-view-error], [data-view-empty]'))) {
     // Only restore when we have real tracks to render — keeps the
     // customised state visible while the empty case persists.  (A load error's
     // message never outlives the view it was about.)
@@ -1287,18 +1435,35 @@ async function renderTracks(tracks) {
   _hideAlbumGrid();
   document.getElementById('track-table').style.display = '';
 
-  // Tear down the pool — switching datasets (and group/track views toggle
-  // tbody anyway) so the old DOM nodes don't belong here.
-  _resetLists();
-  tbody.innerHTML = '';
+  if (keepScroll) {
+    _forgetPaintedRows(_trackVL);
+    if (place) {
+      const plan = _planListPlace(place, _idIndex(tracks), tracks.length);
+      plan.selected.forEach((j) => _selected.add(j));
+      _focusedIdx = plan.focus;
+      _lastClickIdx = plan.last;
+      if (plan.top && plan.shift) {
+        // (the spacers take the new row count first: at the very bottom the
+        // list must be able to scroll that far)
+        _trackVL.setCount(tracks.length);
+        _trackVL.render(false);
+        _trackVL.scrollToRow(plan.top.idx, plan.top.px);
+      }
+    }
+  } else {
+    // Tear down the pool — switching datasets (and group/track views toggle
+    // tbody anyway) so the old DOM nodes don't belong here.
+    _resetLists();
+    tbody.innerHTML = '';
 
-  // Scroll to top BEFORE the first render (rendering at the previous view's
-  // scroll position would fill — and request covers for — rows nobody sees);
-  // reset the scroll-throttle cache so the first post-render scroll event isn't
-  // dropped by the same-position guard.
-  const wrap = document.getElementById('track-list-wrap');
-  if (wrap) wrap.scrollTop = 0;
-  _scrollLastY = -1;
+    // Scroll to top BEFORE the first render (rendering at the previous view's
+    // scroll position would fill — and request covers for — rows nobody sees);
+    // reset the scroll-throttle cache so the first post-render scroll event isn't
+    // dropped by the same-position guard.
+    const wrap = document.getElementById('track-list-wrap');
+    if (wrap) wrap.scrollTop = 0;
+    _scrollLastY = -1;
+  }
 
   if (tracks.length > 0) {
     _measureThead();
@@ -1315,14 +1480,27 @@ function _clearViewError() {
   if (emptyEl.querySelector('[data-view-error]')) emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
 }
 
+// [view-error:begin] — tests/js/list_place.test.mjs runs this region as is
+// Why a view's data didn't load: no answer at all (a network error), or the
+// server's error answer (the ``HTTP <status>`` the fetch helpers throw).
+function _viewErrorText(err) {
+  const m = /\bHTTP (\d{3})\b/.exec(String((err && err.message) || ''));
+  const status = m ? Number(m[1]) : 0;
+  if (!status) return 'The server didn’t answer.';
+  if (status === 503) return 'The server is busy or restarting (error 503). Try again in a moment.';
+  if (status >= 500) return `The server ran into a problem (error ${status}).`;
+  return `The server refused the request (error ${status}).`;
+}
+// [view-error:end]
+
 // A view's data could not be loaded (_viewData): an empty list that says so,
 // with a Retry that opens the view again.
-function _showViewError(retry) {
+function _showViewError(retry, err = null) {
   renderTracks([]);
   emptyEl.innerHTML = `
     <span class="empty-icon" aria-hidden="true">♫</span>
     <h4 data-view-error>Couldn’t load this view</h4>
-    <p>The server didn’t answer.</p>
+    <p>${esc(_viewErrorText(err))}</p>
     <p style="margin-top:14px"><button type="button" class="btn-secondary" id="view-error-retry">Retry</button></p>`;
   emptyEl.hidden = false;
   const btn = emptyEl.querySelector('#view-error-retry');
@@ -1625,6 +1803,16 @@ function _onCtxOutside(e) {
 }
 function _onCtxKey(e) { if (e.key === 'Escape') { _closeCtxMenu(); } }
 
+// The row that shows track ``t`` now: ``hint`` (where it was) if it still
+// does, else wherever the list has it in memory; -1 when it isn't there.
+function _rowIndexOf(t, hint) {
+  if (!t || !currentTracks) return -1;
+  const at = _peekTrack(currentTracks, hint);
+  if (at && at.id === t.id) return hint;
+  return typeof currentTracks.findIndex === 'function'
+    ? currentTracks.findIndex((x) => x && x.id === t.id) : -1;
+}
+
 // Run a callback for every track the menu targets — the whole selection when
 // the right-clicked row is part of a multi-selection, else just that row.
 function _ctxTargets(i) {
@@ -1640,6 +1828,10 @@ function _showTrackContextMenu(x, y, i) {
   if (!t) return;
   const targets = _ctxTargets(i);
   const multi = targets.length > 1;
+  // The menu acts on the tracks it was opened on, even when the list was read
+  // again meanwhile (an in-place refresh moves rows): ``t`` / ``targets`` are
+  // the tracks, and the row index is looked up again when an item runs.
+  const rowNow = () => _rowIndexOf(t, i);
 
   const menu = document.createElement('div');
   menu.className = 'ctx-menu';
@@ -1662,7 +1854,10 @@ function _showTrackContextMenu(x, y, i) {
   };
 
   addItem(multi ? `Play ${targets.length} tracks` : 'Play', () => {
-    if (multi) { Player.setQueue(targets, 0); } else { playFrom(i); }
+    if (multi) { Player.setQueue(targets, 0); } else {
+      const j = rowNow();
+      if (j >= 0) playFrom(j); else Player.setQueue([t], 0);
+    }
     _closeCtxMenu();
   });
   addItem('Play next', () => {
@@ -1676,8 +1871,10 @@ function _showTrackContextMenu(x, y, i) {
   });
   addItem('Add to playlist…', async (el) => {
     const mod = await import('./playlist.js');
-    mod.Playlist.showAddDropdown(el);     // operates on the current selection
-    // showAddDropdown captured the anchor rect synchronously, so we can drop
+    // The tracks the menu was opened on (not whatever is selected now); the
+    // selection is cleared once they are added, as from the selection bar.
+    mod.Playlist.showAddDropdownForEntries(el, targets.map((x) => x.id), () => clearSelection());
+    // showAddDropdownForEntries captured the anchor rect synchronously, so we can drop
     // the parent menu now — the playlist picker takes its place (no lingering).
     _closeCtxMenu();
   });
@@ -1702,8 +1899,10 @@ function _showTrackContextMenu(x, y, i) {
       rateRow.appendChild(star);
     }
     menu.appendChild(rateRow);
-    // Report a playback problem (health.js) — single track, edit rights.
-    if (canReport()) {
+    // Report a playback problem (health.js) — single track, edit rights; not
+    // for one that doesn't play at all (no engine decodes it, a package with
+    // no tune in it) unless a report is on it to clear.
+    if (canReport() && (!isUnplayable(t) || t.health)) {
       const rep = document.createElement('div');
       rep.className = 'ctx-report';
       rep.setAttribute('role', 'group');
@@ -1741,7 +1940,8 @@ function _showTrackContextMenu(x, y, i) {
     addSep();
   }
   addItem('Get info', () => {
-    if (_infoCallback) _infoCallback(currentTracks, i);
+    const j = rowNow();
+    if (_infoCallback) { if (j >= 0) _infoCallback(currentTracks, j); else _infoCallback([t], 0); }
     _closeCtxMenu();
   });
 
@@ -1792,36 +1992,60 @@ function _repaintRatingCell(trackId) {
 // kicks the render ahead of the click via the existing prewarm endpoint (the
 // server caps concurrent background renders, so this can't swamp the box).
 let _hoverPrefetchTimer = null;
-const _hoverPrefetched = new Set();
+// id → when it was warmed: a hover prewarm lapses on the server after ~10 s,
+// so the same row may warm again once that has passed.
+const _hoverPrefetched = new Map();
+const _HOVER_REWARM_MS = 10000;
+function _hoverWarmed(id) {
+  const at = _hoverPrefetched.get(id);
+  return at !== undefined && Date.now() - at < _HOVER_REWARM_MS;
+}
 tbody.addEventListener('mouseover', (e) => {
   const tr = _rowFromEvent(e);
   if (!tr) return;
   const i = parseInt(tr.dataset.idx, 10);
   const t = currentTracks[i];
-  if (!t || !t.id || _hoverPrefetched.has(t.id)) return;
+  if (!t || !t.id || _hoverWarmed(t.id)) return;
   clearTimeout(_hoverPrefetchTimer);
   _hoverPrefetchTimer = setTimeout(() => {
-    if (_hoverPrefetched.has(t.id)) return;
-    _hoverPrefetched.add(t.id);
+    if (_hoverWarmed(t.id)) return;
+    _hoverPrefetched.delete(t.id);
+    _hoverPrefetched.set(t.id, Date.now());
     // Bound the memo so a long browse session can't grow it without limit.
     if (_hoverPrefetched.size > 1000) {
-      _hoverPrefetched.delete(_hoverPrefetched.values().next().value);
+      _hoverPrefetched.delete(_hoverPrefetched.keys().next().value);
     }
     // Art is immutable-cached, so a bare Image() request is cheap and makes
     // the cover paint instantly if the row's info panel is opened.
     const im = new Image(); im.decoding = 'async';
-    im.src = `/api/art/${encodeURIComponent(t.id)}?size=sm&fallback=404`;
+    im.src = `/api/art/${encodeURIComponent(t.id)}/sm.jpg?fallback=none`;
     // Only prewarm the renders that are actually slow-cold — native audio
     // needs none, and gating here keeps the server's render slots for the
     // formats that benefit (chiptune/AdLib/UADE exotica).
     // ``pw``: this page's prewarm tag, so the player's retain (which drops
-    // prewarms for tracks no longer coming up) can drop this one too.
+    // prewarms for tracks no longer coming up) — and a play of another track
+    // in this page — can drop this one too.  ``hover=1``: the server lets it
+    // lapse after a few seconds unless the track is played or queued next.
     if (isRenderOnlyDuration(t)) {
-      fetch(`/api/stream/${encodeURIComponent(t.id)}/prewarm?pw=${encodeURIComponent(Player.prewarmId || '')}`,
+      fetch(`/api/stream/${encodeURIComponent(t.id)}/prewarm?hover=1&pw=${encodeURIComponent(Player.prewarmId || '')}`,
             { method: 'POST' }).catch(() => {});
     }
   }, 120);
 });
+
+// [rating-keys:begin] — tests/js/list_place.test.mjs runs this region as is
+// The rating an arrow / Home / End key moves ``cur`` (0–5) to: one star at a
+// time, clamped to 1–5 — a step past either end stays put (it never clears).
+const _RATING_STEP_KEYS = new Set(['ArrowLeft', 'ArrowDown', 'ArrowRight', 'ArrowUp', 'Home', 'End']);
+function _ratingForKey(cur, key) {
+  cur = Math.max(0, Math.min(5, cur | 0));
+  if (key === 'Home') return 1;
+  if (key === 'End') return 5;
+  if (key === 'ArrowLeft' || key === 'ArrowDown') return Math.max(1, cur - 1);
+  if (key === 'ArrowRight' || key === 'ArrowUp') return Math.min(5, cur + 1);
+  return cur;
+}
+// [rating-keys:end]
 
 tbody.addEventListener('keydown', (e) => {
   // Star ratings — the col-rating td contains focusable stars.
@@ -1839,16 +2063,11 @@ tbody.addEventListener('keydown', (e) => {
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault(); e.stopPropagation();
       _setRowRating(t.id, current, ratingTd);
-    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+    } else if (_RATING_STEP_KEYS.has(e.key)) {
       e.preventDefault(); e.stopPropagation();
-      _setRowRating(t.id, Math.max(1, cur - 1), ratingTd);
-    } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-      e.preventDefault(); e.stopPropagation();
-      _setRowRating(t.id, Math.min(5, cur + 1 || 1), ratingTd);
-    } else if (e.key === 'Home') {
-      e.preventDefault(); _setRowRating(t.id, 1, ratingTd);
-    } else if (e.key === 'End') {
-      e.preventDefault(); _setRowRating(t.id, 5, ratingTd);
+      // (_setRowRating toggles a repeated value off: at an end, a step stays put)
+      const to = _ratingForKey(cur, e.key);
+      if (to !== cur) _setRowRating(t.id, to, ratingTd);
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
       e.preventDefault();
       _ratingsCache[t.id] = 0;
@@ -1935,11 +2154,17 @@ function selectRow(tr, idx) {
 // take the state in _fillTrackRow.
 function markPlayingRow() {
   if (!_trackVL.active) return;
-  const id = Player.currentTrackId;
   for (const row of _trackVL.rows()) {
     if (row.classList.contains('skeleton') || row.classList.contains('vs-load-failed')) continue;
-    _setRowPlaying(row, !!id && row.dataset.id === id);
+    _setRowPlaying(row, _nowPlayingIs(row.dataset.id));
   }
+}
+// Is ``id`` the track the now-playing marker shows?  The current track —
+// unless its start failed: then nothing plays and no row is marked
+// (``Player.nowPlayingId``; an older cached player.js: the current one).
+function _nowPlayingIs(id) {
+  const cur = ('nowPlayingId' in Player) ? Player.nowPlayingId : Player.currentTrackId;
+  return !!cur && id === cur;
 }
 
 // Move the keyboard-focus indicator (J/K, locate) to row ``_focusedIdx``.
@@ -2220,7 +2445,10 @@ function _rebuildTrackHeader() {
   _initColResize();
 }
 
-function restoreFullHeader() {
+// ``keepHeader``: an in-place refresh of a view that already shows the full
+// header (showAll({quiet})) — the header, its sort arrow and column widths stay
+// as they are (no rebuild: the arrow would blink out until the rows land).
+function restoreFullHeader({ keepHeader = false } = {}) {
   _dupViewActive = false;  // leaving duplicates view — restore user column prefs
   // Leaving folder context: every non-folder flat-track view (All Tracks, drills,
   // smart views, duplicates, "Go to artist/album" pivots, search results) calls
@@ -2236,6 +2464,7 @@ function restoreFullHeader() {
   // clearing it here (before that) is safe.
   _viewIsAllTracks = false;
   _viewReload = null;          // (see reloadCurrentView)
+  if (keepHeader && trackTableHead && trackTableHead.querySelector('th[data-sort]')) return;
   _rebuildTrackHeader();
   _restoreSortState();  // restore sortKey/sortAsc STATE + aria baseline (no paint)
 }
@@ -2374,14 +2603,20 @@ const WINDOWED_SORT_KEYS = new Set([
   'year', 'duration', 'format',
 ]);
 
-async function showAll() {
+// ``quiet``: an in-place refresh of All Tracks (refreshAllTracksInPlace — not a
+// view entry: the page stays on All Tracks, so the flag stays set) — the rows
+// on screen stay up while the data is read again, the new rows render at the
+// same scroll offset, and a failed read keeps what is on screen.  Resolves to
+// 'superseded' when a newer render took over meanwhile.
+async function showAll({ quiet = false } = {}) {
   const _gen = ++_browseNavGen;
   hideBrowseHeader();
   setBrowseHeader('All Tracks', null);      // Play all / Shuffle, no Back (root view)
   _hideGroupFilter();
   _hideGridToggle();
-  restoreFullHeader();
-  _showSkeletonRows();
+  restoreFullHeader({ keepHeader: quiet });
+  if (quiet) _viewIsAllTracks = true;       // (restoreFullHeader cleared it; we never left)
+  else _showSkeletonRows();
   _windowedFilter = null;          // plain All-Tracks view (no format filter)
   const limit = 5000;
   // Probe the real total first.  Cheap (one count() in the store) and
@@ -2395,8 +2630,11 @@ async function showAll() {
     // raw total ends in thousands of rows that can never load.
     const { count, visible } = await API('/tracks/count');
     total = Number(visible ?? count) || 0;
-  } catch { /* fall through to legacy path */ }
-  if (_gen !== _browseNavGen) return;   // a newer view was requested while probing the count
+  } catch {
+    if (quiet) return _gen === _browseNavGen ? 'failed' : 'superseded';   // keep the rows on screen
+    /* fall through to legacy path */
+  }
+  if (_gen !== _browseNavGen) return 'superseded';   // a newer view was requested while probing the count
 
   if (total > limit) {
     // Pick up persisted sort state so the windowed view comes back the
@@ -2408,7 +2646,39 @@ async function showAll() {
     // on the default explicitly.
     const sortBy    = (sortKey && WINDOWED_SORT_KEYS.has(sortKey)) ? sortKey : null;
     const sortOrder = sortBy ? (sortAsc ? 'asc' : 'desc') : null;
-    _rebuildWindowedStore(total, sortBy, sortOrder);
+    if (quiet && currentTracks && currentTracks._isWindowedStore) {
+      // Load the rows on screen into the new store BEFORE it replaces the old
+      // one, so the swap paints real rows (no loading shimmer); a failed read
+      // keeps the old store.
+      const store = _newAllTracksStore(total, sortBy, sortOrder);
+      store.ensureRange(_vsStart, Math.min(total, Math.max(_vsEnd, _vsStart + 1)));
+      await Promise.all([...store._pending.values()]);
+      if (_gen !== _browseNavGen) return 'superseded';
+      const first = Math.floor(_vsStart / CHUNK_SIZE), last = Math.floor(Math.max(_vsStart, _vsEnd - 1) / CHUNK_SIZE);
+      for (let c = first; c <= Math.min(last, Math.ceil(total / CHUNK_SIZE) - 1); c++) {
+        if (!store._chunks.has(c)) return 'failed';
+      }
+      // The user's place moves with the rows (renderTracks): load the rows it
+      // moves to as well — the window after the shift and the selected rows —
+      // so the swap still paints real rows.  (Best effort: a row that didn't
+      // load is simply not selected any more.)
+      const plan = _planListPlace(_currentListPlace(), _idIndex(store), total);
+      const shift = plan.shift || 0;
+      const want = new Set();
+      const span = (a, b) => { for (let c = Math.floor(Math.max(0, a) / CHUNK_SIZE); c <= Math.floor(Math.max(0, Math.min(total, b) - 1) / CHUNK_SIZE); c++) want.add(c); };
+      span(_vsStart + shift, _vsEnd + shift);
+      for (const i of _selected) span(i + shift, i + shift + 1);
+      if (_focusedIdx >= 0) span(_focusedIdx + shift, _focusedIdx + shift + 1);
+      const missing = [...want].filter((c) => !store._chunks.has(c)).slice(0, MAX_CHUNKS - 2);
+      if (missing.length) {
+        missing.forEach((c) => store.ensureRange(c * CHUNK_SIZE, c * CHUNK_SIZE + 1));
+        await Promise.all([...store._pending.values()]);
+        if (_gen !== _browseNavGen) return 'superseded';
+      }
+      _installWindowedStore(store, total, sortBy, sortOrder, { keepScroll: true });
+    } else {
+      _rebuildWindowedStore(total, sortBy, sortOrder, { keepScroll: quiet });
+    }
     _viewIsAllTracks = true;        // re-assert after renderTracks(store) cleared it
     // Paint the sort arrow ONLY for a key the windowed store actually honors
     // (a WINDOWED_SORT_KEY).  A persisted track_number/path key leaves the store
@@ -2421,8 +2691,12 @@ async function showAll() {
 
   // Small-library path (≤ 5000): legacy single-fetch array — simpler,
   // no chunking overhead, no skeleton rows for unloaded slots.
-  const tracks = await _viewData(_gen, API('/tracks', { limit }), () => showAll());
-  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or a newer view was requested while fetching the page
+  // (A quiet refresh that fails keeps the rows on screen.)
+  const tracks = quiet
+    ? await API('/tracks', { limit }).catch(() => null)
+    : await _viewData(_gen, API('/tracks', { limit }), () => showAll());
+  if (_gen !== _browseNavGen) return 'superseded';   // a newer view was requested while fetching the page
+  if (!tracks) return 'failed';         // failed: said so — or, quietly, the old rows stay
   _showAddFolderCta = (total === 0);   // genuinely-empty library → offer the add-folder CTA
   // Apply the persisted sort in memory so the header arrow (painted by
   // _restoreSortState inside restoreFullHeader) matches the data.  The small-
@@ -2430,7 +2704,7 @@ async function showAll() {
   // sorts server-side, and this is its ≤5000-track equivalent.  Any key works
   // here (in-memory _compareTrack), unlike the windowed WINDOWED_SORT_KEYS set.
   const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
-  renderTracks(rows);
+  renderTracks(rows, { keepScroll: quiet });
   _viewIsAllTracks = true;             // re-assert after renderTracks cleared it
   if (sortKey) _paintSortIndicator();  // small path applies ANY key in memory → arrow is honest
   const truncated = tracks.length >= limit;
@@ -2445,7 +2719,11 @@ async function showAll() {
 // not all 267K).  Track-list container is scrolled to top so the user sees
 // the fresh ordering from the start, and selection is cleared because the
 // previous selection indexes refer to the old ordering.
-function _rebuildWindowedStore(total, sortBy, sortOrder) {
+function _rebuildWindowedStore(total, sortBy, sortOrder, { keepScroll = false } = {}) {
+  _installWindowedStore(_newAllTracksStore(total, sortBy, sortOrder), total, sortBy, sortOrder, { keepScroll });
+}
+
+function _newAllTracksStore(total, sortBy, sortOrder) {
   const store = createWindowedStore(
     total,
     (offset, lim) => {
@@ -2465,14 +2743,22 @@ function _rebuildWindowedStore(total, sortBy, sortOrder) {
   // away from must NOT overwrite the new view — this is what let a slow initial
   // All-Tracks chunk repaint tracks over a just-restored Scene-groups list.
   store.setOnChunkLoad(() => { if (currentTracks === store) _vsRender(true); });
+  return store;
+}
+
+// ``keepScroll``: a quiet refresh — same scroll offset (see renderTracks).
+function _installWindowedStore(store, total, sortBy, sortOrder, { keepScroll = false } = {}) {
   // Reset scroll + selection — the indexes the user was looking at no
-  // longer point at the same tracks.
-  _selected.clear();
-  _lastClickIdx = -1;
-  _focusedIdx = -1;
+  // longer point at the same tracks.  (An in-place refresh carries them over
+  // by track id instead: renderTracks reads them before it resets them.)
+  if (!keepScroll) {
+    _selected.clear();
+    _lastClickIdx = -1;
+    _focusedIdx = -1;
+  }
   const wrap = document.getElementById('track-list-wrap');
-  if (wrap) wrap.scrollTop = 0;
-  renderTracks(store);
+  if (wrap && !keepScroll) wrap.scrollTop = 0;
+  renderTracks(store, { keepScroll });
   // The player pages this same list (same sort + filter) for sequential play, and
   // its seeded permutation for shuffle — across ALL ``total`` tracks.
   const viewParams = {};
@@ -2965,13 +3251,13 @@ function _loadAlbumCardArt(card, trackId, tok) {
     if (initialsEl) initialsEl.style.display = 'none';
     card.classList.add('album-card-art-loaded');
   };
-  // fallback=404 so art-less albums keep their letter initials instead
+  // fallback=none so art-less albums keep their letter initials instead
   // of the generic ♪ placeholder JPEG overwriting them as a background.
   // Append the library-wide art epoch (bumped on art_refresh, e.g. Use Folder
   // Art changed) so cards loaded after a setting change re-resolve, matching
   // the track list's _fillTrackRow behavior.
   const _e = window.__sbArtEpoch ? `&_t=${window.__sbArtEpoch}` : '';
-  img.src = `/api/art/${encodeURIComponent(trackId)}?size=sm&fallback=404${_e}`;
+  img.src = `/api/art/${encodeURIComponent(trackId)}/sm.jpg?fallback=none${_e}`;
 }
 
 let _albumGridItems = [];
@@ -3683,8 +3969,10 @@ simBtn.addEventListener('click', () => {
   if (simPanel.hidden) showSimilar(id); else simPanel.hidden = true;
 });
 
-// Update playing highlight when track changes
+// Update playing highlight when track changes — and when a start fails or
+// plays after all (statechange: the marker stands down while nothing plays).
 Player.on('trackchange', () => markPlayingRow());
+Player.on('statechange', () => markPlayingRow());
 
 // ── Lyrics panel ──────────────────────────────────────────────────────────────
 
@@ -4020,9 +4308,9 @@ async function showFolder(path, recursive = false, opts = {}) {
         `/api/fstree/tracks-with-meta?path=${enc}&recursive=false` +
         `&offset=0&limit=${CHUNK_SIZE}`,       // no filter_duplicates → the server applies the setting
       ).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-    } catch {
+    } catch (err) {
       // (A quiet refresh keeps what is on screen.)
-      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive));
+      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive), err);
       return;
     }
     const windowed   = first && !Array.isArray(first) && typeof first.total === 'number';
@@ -4116,9 +4404,9 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
     try {
       firstRes = await fetch(urlFor(0, CHUNK_SIZE))
         .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-    } catch {
+    } catch (err) {
       // (A quiet refresh keeps what is on screen.)
-      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive));
+      if (!opts.quiet && _gen === _browseNavGen) _showViewError(() => showFolder(path, recursive), err);
       return;
     }
   }
@@ -4240,6 +4528,31 @@ function clearSelection() {
 
 // ── Smart playlist views ──────────────────────────────────────────────────────
 
+// What an empty smart view says (instead of the filter/search wording).
+const _SMART_EMPTY = {
+  'history':        ['No listening history yet', 'Tracks you play appear here.'],
+  'history-gone':   ['No tracks to show', 'The tracks in your listening history are no longer in the library.'],
+  'most-played':    ['Nothing played yet', 'Your most played tracks appear here.'],
+  'recently-added': ['No recently added tracks', 'Tracks added to your library appear here.'],
+  'top-rated':      ['No rated tracks yet', 'Tracks you rate appear here.'],
+  'unplayed':       ['No unplayed tracks', 'Tracks you have not played yet appear here.'],
+};
+
+// An empty smart / duplicates view: its own heading and line.  Marked so the
+// next render with tracks (or another empty view) puts the default text back.
+function _setViewEmpty(heading, line, { hidesOffline = false } = {}) {
+  // ("Tracks on unavailable drives: Hide" may be why the view is empty.)
+  if (hidesOffline && Offline.mode === 'hide') line = `${line} Tracks on unavailable drives are not shown.`.trim();
+  emptyEl.innerHTML = '';
+  const icon = document.createElement('span');
+  icon.className = 'empty-icon'; icon.setAttribute('aria-hidden', 'true'); icon.textContent = '♫';
+  const h = document.createElement('h4');
+  h.dataset.viewEmpty = ''; h.textContent = heading;
+  emptyEl.append(icon, h);
+  if (line) { const p = document.createElement('p'); p.textContent = line; emptyEl.append(p); }
+  emptyEl.hidden = false;
+}
+
 /**
  * Fetch and display a Smart playlist from /api/smart/{view}.
  * @param {string} view  One of: history, most-played, recently-added, top-rated, unplayed
@@ -4266,22 +4579,26 @@ async function showSmart(view, label) {
       // History returns [{track_id, title, artist, ts}, ...]
       // We need to fetch the full track metadata for display
       const trackIds = data.map(h => h.track_id).filter(Boolean);
-      if (!trackIds.length) { renderTracks([]); return; }
+      if (!trackIds.length) {
+        renderTracks([]);
+        _smartViewToken = _browseNavGen; _smartViewKey = view; _smartViewLabel = label;
+        _setViewEmpty(..._SMART_EMPTY.history);
+        return;
+      }
       const unique = [...new Set(trackIds)];
 
       // Hydrate every history track in ONE request (was N+1: a separate
       // GET /api/tracks/{id} per unique id, batched 50 at a time, rendering
       // nothing until all batches landed — hundreds of round-trips on a big
       // history).  /api/tracks/meta/batch returns full objects for all ids.
-      let allTracks = [];
-      try {
-        const r = await fetch('/api/tracks/meta/batch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids: unique }),
-        });
-        allTracks = r.ok ? await r.json() : [];
-      } catch { allTracks = []; }
+      // (A failed hydrate is a failed view — the catch below says so.)
+      const r = await fetch('/api/tracks/meta/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: unique }),
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const allTracks = await r.json();
       if (_gen !== _browseNavGen) return;   // superseded during the history hydrate
       const trackMap = Object.fromEntries(allTracks.map(t => [t.id, t]));
       // Maintain history order (newest first)
@@ -4291,16 +4608,19 @@ async function showSmart(view, label) {
       renderTracks(ordered);
       _smartViewToken = _browseNavGen; _smartViewKey = view;   // this render is the live smart view
       _smartViewLabel = label;
+      if (!ordered.length) _setViewEmpty(..._SMART_EMPTY['history-gone'], { hidesOffline: true });
     } else {
       // All other smart views return track arrays directly
-      renderTracks(Array.isArray(data) ? data : []);
+      const rows = Array.isArray(data) ? data : [];
+      renderTracks(rows);
       _smartViewToken = _browseNavGen; _smartViewKey = view;
       _smartViewLabel = label;
+      if (!rows.length && _SMART_EMPTY[view]) _setViewEmpty(..._SMART_EMPTY[view], { hidesOffline: true });
     }
   } catch (err) {
     console.error('Smart view fetch failed:', err);
     if (_gen !== _browseNavGen) return;   // superseded — don't clobber the newer view
-    renderTracks([]);
+    _showViewError(() => showSmart(view, label), err);   // "Couldn't load this view" + Retry, not "No tracks found"
   }
 }
 
@@ -4380,12 +4700,7 @@ async function showDuplicates() {
 
     if (!groups.length) {
       renderTracks([]);
-      // Mutate just the heading so the leading icon + body paragraph
-      // survive — ``textContent = …`` would have stripped them, leaving a
-      // bare line of text on every subsequent empty state until reload.
-      const heading = emptyEl.querySelector('h4');
-      if (heading) heading.textContent = 'No duplicate tracks found.';
-      emptyEl.hidden = false;
+      _setViewEmpty('No duplicate tracks found.', '');
       return;
     }
 
@@ -4417,7 +4732,7 @@ async function showDuplicates() {
   } catch (err) {
     console.error('Duplicates fetch failed:', err);
     if (_gen !== _browseNavGen) return;   // superseded — don't clobber the newer view
-    renderTracks([]);
+    _showViewError(() => showDuplicates(), err);
   }
 }
 
@@ -4461,10 +4776,9 @@ function playFocused() {
 // ── Sort persistence: restore on startup ──────────────────────────────────────
 _restoreSortState();
 
-// Fetch initial sidebar badge counts (the browse lists once the page settled:
-// the view being opened fetches its own first).
-_refreshTrackCount();
-setTimeout(_refreshNavCounts, 1500);
+// Initial sidebar badge counts, once the page settled (the view being opened
+// fetches its own data first).
+setTimeout(() => _refreshNavCounts(), 1500);
 
 // Background duration probe — for AdLib/IMF rows shown in ANY view that still
 // carry the 180s placeholder, ask the server (via the shared probeAdlibDurations
@@ -4606,11 +4920,7 @@ function refreshAvailability({ mode, prevMode } = {}) {
     }
     if (_viewIsAllTracks) {
       // (Hide: the list's length changes — rebuilt, near where it was scrolled.)
-      const wrap = document.getElementById('track-list-wrap');
-      const y = wrap ? wrap.scrollTop : 0;
-      Promise.resolve(showAll()).then(() => {
-        if (_viewIsAllTracks && wrap && y > 0) requestAnimationFrame(() => { try { wrap.scrollTop = y; } catch (_) {} });
-      });
+      refreshAllTracksInPlace();
       return;
     }
     if (_smartViewToken === _browseNavGen && _smartViewKey && !browseHdr.hidden) {
@@ -4658,6 +4968,9 @@ export const Library = {
   viewStillCurrent: (t) => t === _browseNavGen,
   isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace, reloadCurrentView,
   isInAllTracksView: () => _viewIsAllTracks,
+  refreshAllTracksInPlace,
+  // The sidebar counts (GET /api/library/counts), applied to the badges.
+  refreshCounts: (opts) => _refreshNavCounts(opts),
   setBrowseHeader, hideBrowseHeader, onInfo,
   getSelectedTracks, clearSelection, refreshBadges: _refreshBadges,
   // Smart & duplicates views

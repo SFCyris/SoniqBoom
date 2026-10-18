@@ -262,9 +262,9 @@ async def test_a_tune_too_long_for_the_pass_reports_skipped(monkeypatch, tmp_pat
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                      base_url="http://t") as c:
-            # not served yet: a plain 404, the player keeps asking
+            # not served yet: a plain 204, the player keeps asking
             r = await c.get(f"/api/tracks/{tid}/vu", params={"start": "false"})
-            assert r.status_code == 404 and "x-vu-unavailable" not in r.headers
+            assert r.status_code == 204 and "x-vu-unavailable" not in r.headers
             stream._note_uade_vu_wanted(key, src, 0, None)
             r = await c.get(f"/api/tracks/{tid}/vu")               # starts the pass
             assert "x-vu-unavailable" not in r.headers
@@ -273,7 +273,7 @@ async def test_a_tune_too_long_for_the_pass_reports_skipped(monkeypatch, tmp_pat
                     break
                 await asyncio.sleep(0.01)
             r = await c.get(f"/api/tracks/{tid}/vu")
-            assert r.status_code == 404 and r.headers["x-vu-unavailable"] == "skipped"
+            assert r.status_code == 204 and r.headers["x-vu-unavailable"] == "skipped"
             # no second pass is started for it, not even by a new play …
             stream._note_uade_vu_wanted(key, src, 0, None)
             assert stream.request_uade_vu(tid, 0) is False

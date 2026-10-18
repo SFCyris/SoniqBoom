@@ -36,6 +36,10 @@ licence (GPL-2.0-or-later). The patches were written for SoniqBoom on
 2026-10-07; each patch file starts with a note of the change, and each file
 they modify carries a dated modification notice.
 
+`sidwasm.js` and `sidwasm.wasm` also contain the Emscripten runtime (MIT /
+University of Illinois-NCSA) with musl libc (MIT) and LLVM libc++, libc++abi
+and compiler-rt (Apache-2.0 WITH LLVM-exception), compiled in by Emscripten.
+
 ## Contents
 
 | File | Description |
@@ -95,8 +99,12 @@ bash soniqboom/native/sidwasm/build.sh
 This downloads the libsidplayfp tarball inside the container, checks its
 SHA-256, applies `patches/*.patch`, builds the library and the wrapper, and
 writes `sidwasm.js` and `sidwasm.wasm` to `soniqboom/frontend/js/vendor/`.
-An output directory can be given as the first argument. The script prints the
-Emscripten version and the SHA-256 of both outputs.
+An output directory can be given as the first argument. Two environment
+variables are read: `SIDWASM_ENVIRONMENT` (the `-sENVIRONMENT` value, default
+`web,worker,node`) and `SIDWASM_JOBS` (parallel make jobs in the container,
+default 4). The script prints the Emscripten version, the build platform, the
+libsidplayfp version and SHA-256, the environment value and the SHA-256 of both
+outputs.
 
 After replacing the vendor files, bump `WASM_V` in
 `soniqboom/frontend/js/vu-sid-worker.js` and `SHELL_VERSION` in

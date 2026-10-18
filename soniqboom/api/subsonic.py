@@ -63,7 +63,7 @@ from soniqboom.core import store as _store_mod
 from soniqboom.core.store import _SPLIT_RE, track_genres
 from soniqboom.core.store import get_store as _library_store
 from soniqboom.core.subsonic_state import get_state as _get_state
-from soniqboom.core.users import get_user_store
+from soniqboom.core.users import PasswordChangedMeanwhile, get_user_store
 from soniqboom.models.user import User
 
 log = logging.getLogger(__name__)
@@ -1056,6 +1056,8 @@ def _delivery(t: dict) -> tuple[str, str, str | None, str | None]:
             ext = pre                          # Amiga prefix form: mdat.<song>
     if not ext:
         ext = _SUFFIX_JUNK.sub("", (t.get("format") or "").split("/", 1)[0].lower())[:8] or "bin"
+    if ext == "mpg" and (t.get("format") or "") == "MP3":
+        ext = "mp3"                            # Aminet MPEG audio read as MP3 (stream._render_ident)
     hit = _DELIVERY_MEMO.get(ext)
     if hit is None:
         mime = _EXT_MIME.get(ext, "application/octet-stream")
@@ -3619,10 +3621,20 @@ def _stream_preauthed():
         _st._reset_cast_internal_bypass(tok)
 
 
+def _listener_of(user) -> "str | None":
+    """The authenticated account a Subsonic stream plays for, as the stream
+    module's listener tag takes it (``stream._client_tag``'s ``u``): two
+    accounts on one address with the same app are two listeners."""
+    name = getattr(user, "username", None)
+    if name is None and isinstance(user, dict):
+        name = user.get("username")
+    return str(name) if name else None        # (= the ``u`` a direct /rest stream carries)
+
+
 async def _serve_stream(request: Request, track_id: str, *, target_format: str | None,
                         max_bitrate_kbps: int, target_sample_rate: int,
                         seek: float, subsong: int = 0,
-                        estimate_s: float | None = None) -> Response:
+                        estimate_s: float | None = None, user=None) -> Response:
     """The internal stream handler for an authenticated Subsonic request
     (``subsong``: the wire tune of a multi-tune file — ``_split_id``'s).
     ``estimate_s`` (``estimateContentLength=true``; the song's length in
@@ -3648,7 +3660,9 @@ async def _serve_stream(request: Request, track_id: str, *, target_format: str |
                 max_bitrate_kbps=int(max_bitrate_kbps or 0),
                 target_sample_rate=int(target_sample_rate or 0),
                 force_transcode=False,
-                sb_session=None, u=None, p=None, s=None, t=None,
+                # (``u``: who listens — the renders it reads record it; the
+                # credential check is bypassed, ``_stream_preauthed``)
+                sb_session=None, u=_listener_of(user), p=None, s=None, t=None,
             )
         except HTTPException as exc:
             if exc.status_code == 416:
@@ -3796,11 +3810,17 @@ def _next_tune(store, user, raw_id: str, tid: str, sub: int) -> tuple[str, int] 
 
 
 def _prewarm_next_for_subsonic(request: Request, user, raw_id: str, tid: str, sub: int,
-                               time_offset: float) -> None:
+                               time_offset: float, *, target_format: str | None = None,
+                               max_bitrate_kbps: int = 0,
+                               target_sample_rate: int = 0) -> None:
     """Schedule the next track's background render (see above).  Plain work
     on the event loop, no awaits — the stream response is never delayed; the
     render itself runs as a task.  Only a real play start schedules: a HEAD,
-    a Range continuation / seek or a ``timeOffset`` start does not."""
+    a Range continuation / seek or a ``timeOffset`` start does not.  The
+    next play comes from the same client with the same ``format`` /
+    ``maxBitRate`` / ``sampleRate``: a file it will be served as is is not
+    prepared, a transcoded one is prepared as that transcode
+    (``stream._prewarm_conversion``)."""
     try:
         if request.method != "GET" or time_offset:
             return
@@ -3818,23 +3838,35 @@ def _prewarm_next_for_subsonic(request: Request, user, raw_id: str, tid: str, su
         if not path:
             return
         # The web endpoint's gates: routed with the record (a verified Amiga
-        # module keeps its uade key), native formats need nothing, the
-        # "Prepare upcoming tracks" setting gates rendered formats only, and
-        # a remote file must already be in the local cache.
+        # module keeps its uade key), the "Prepare upcoming tracks" setting
+        # gates rendered formats only, and a remote file must already be in
+        # the local cache.  The client's hints decide the rest: a native file
+        # needs nothing unless it is transcoded for this client (``format`` /
+        # ``maxBitRate``), a rendered one is prepared — plus its transcode
+        # when one is asked for — and a conversion as the play will read it.
         ext, uade_named = _st._render_ident(path, t)
-        if ((ext in _st.NATIVE and not uade_named) or not _st._prewarm_allowed(ext, uade_named)
+        serve = _st._prewarm_serve(request, target_format=target_format,
+                                   max_bitrate_kbps=max_bitrate_kbps,
+                                   target_sample_rate=target_sample_rate)
+        hinted = bool(_st._prewarm_serve_tag(serve))
+        if ((ext in _st.NATIVE and not uade_named and not hinted)
+                or not _st._prewarm_allowed(ext, uade_named)
                 or not _st._remote_bytes_local(path)):
             return
         who = _st._prewarm_requester(request, None, getattr(user, "username", None)
                                      or getattr(user, "id", None) or "", None)
-        task = asyncio.get_running_loop().create_task(_start_prewarm(ntid, nsub, ext, who))
+        if _st._is_rendered_ext(ext, uade_named) and not hinted:
+            serve = None                # (prepared the same for every client)
+        task = asyncio.get_running_loop().create_task(
+            _start_prewarm(ntid, nsub, ext, who, serve))
         _PREWARM_BG.add(task)
         task.add_done_callback(_PREWARM_BG.discard)
     except Exception:              # noqa: BLE001 — a prewarm must never fail a stream
         log.debug("Subsonic next-track prewarm not scheduled", exc_info=True)
 
 
-async def _start_prewarm(track_id: str, subsong: int, ext: str, who: str) -> None:
+async def _start_prewarm(track_id: str, subsong: int, ext: str, who: str,
+                         serve: dict | None = None) -> None:
     """Register the prewarm in the stream module's registry
     (``stream._schedule_prewarm`` — the one the web player's
     ``POST /api/stream/{id}/prewarm`` uses), so both share its FIFO cap,
@@ -3844,7 +3876,7 @@ async def _start_prewarm(track_id: str, subsong: int, ext: str, who: str) -> Non
     track = await _gt(track_id)
     if track is None:
         return
-    _st._schedule_prewarm(track_id, track, subsong, _st.PRIO_AHEAD, who, ext)
+    _st._schedule_prewarm(track_id, track, subsong, _st.PRIO_AHEAD, who, ext, serve=serve)
 
 
 @_media_route("/stream")
@@ -3908,13 +3940,16 @@ async def stream(
                                   max_bitrate_kbps=int(maxBitRate or 0),
                                   target_sample_rate=int(sampleRate or 0), subsong=sub)
     _note_now_playing(user, tid, c, subsong=sub)        # getNowPlaying (O(1), in memory)
-    _prewarm_next_for_subsonic(request, user, id, tid, sub, float(timeOffset or 0.0))
+    _prewarm_next_for_subsonic(request, user, id, tid, sub, float(timeOffset or 0.0),
+                               target_format=format, max_bitrate_kbps=int(maxBitRate or 0),
+                               target_sample_rate=int(sampleRate or 0))
     return await _serve_stream(request, tid, target_format=format,
                                max_bitrate_kbps=int(maxBitRate or 0),
                                target_sample_rate=int(sampleRate or 0),
                                seek=float(timeOffset or 0.0), subsong=sub,
                                estimate_s=(float(_tune_duration(track, sub))
-                                           if estimateContentLength else None))
+                                           if estimateContentLength else None),
+                               user=user)
 
 
 @_media_route("/download")
@@ -3957,7 +3992,7 @@ async def download(
                                       max_bitrate_kbps=int(maxBitRate or 0), subsong=sub)
         return await _serve_stream(request, id, target_format=format,
                                    max_bitrate_kbps=int(maxBitRate or 0),
-                                   target_sample_rate=0, seek=0.0, subsong=sub)
+                                   target_sample_rate=0, seek=0.0, subsong=sub, user=user)
     _suffix, mime, _ts, _tm = _delivery(track)
     raw_path = track.get("path") or ""
     member = raw_path.split("::")[-1].replace("\\", "/").rsplit("/", 1)[-1] or f"{id}.{_suffix}"
@@ -4575,7 +4610,7 @@ async def get_transcode_stream(
             target_format=(str(claims["tc"]) if claims.get("tc") else None),
             max_bitrate_kbps=int(claims.get("tbr") or 0),
             target_sample_rate=int(claims.get("tsr") or 0),
-            seek=float(offset or 0.0), subsong=sub,
+            seek=float(offset or 0.0), subsong=sub, user=user,
         )
     except _SubsonicError as exc:
         if not spec:
@@ -5004,6 +5039,9 @@ async def _ensure_station_logo(url: str) -> str | None:
         return key
     if st == "neg":
         return None
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(url):
+        return None                      # offline mode: not fetched, no marker
     data = await _fetch_logo_bytes(url)
     rend = None
     if data:
@@ -5571,7 +5609,7 @@ async def get_genres(
 ):
     _require_user(request, sb_session, u, p, s, t)
     store = get_store()
-    rows = store.aggregate_genres()          # memoised on the store's mutation seq
+    rows = store.aggregate_genres()          # memoised on the store's browse seq
     # albumCount = albums with ≥1 track carrying the genre (catalogue
     # membership, incl. folder albums when on) — the same set byGenre lists.
     cat = _catalogue(store)
@@ -6665,6 +6703,9 @@ async def _ensure_artist_photo(name: str, url: str) -> bool:
             return False
     if await asyncio.to_thread(_neg_fresh):
         return False
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(url):
+        return False                     # offline mode: not fetched, no marker
     data = None
     for u in _photo_candidates(url):
         data = await _fetch_photo_bytes(u)
@@ -7922,6 +7963,14 @@ async def _require_account_auth(request, sb_session, u, p, s, t) -> User:
     """Explicit ``u`` + ``p`` (or HTTP Basic) checked against the main login
     password hash — no cookie, no token mode, no API key, no plaintext-copy
     fast path."""
+    return (await _account_auth_with_hash(request, sb_session, u, p, s, t))[0]
+
+
+async def _account_auth_with_hash(request, sb_session, u, p, s, t) -> tuple[User, str]:
+    """``_require_account_auth``, also answering the password hash the caller's
+    password was verified against — what a change of the caller's OWN
+    password passes as ``set_password(expected_hash=...)``, so an
+    administrator's reset landing after this check is never undone."""
     if request.query_params.get("apiKey") is not None:
         if u or p or s or t or _has_basic_auth(request):
             raise _SubsonicError(43, "Multiple conflicting authentication mechanisms provided.")
@@ -7941,11 +7990,11 @@ async def _require_account_auth(request, sb_session, u, p, s, t) -> User:
                                  "the SoniqBoom web UI.")
     store = get_user_store()
     # scrypt off the event loop, as the web UI's change-password does.
-    user = await asyncio.to_thread(store.authenticate, u, _decode_password(p))
-    if user is None or not user.enabled:
+    hit = await asyncio.to_thread(store.authenticate_with_hash, u, _decode_password(p))
+    if hit is None or not hit[0].enabled:
         raise _SubsonicError(40, "Wrong username or password (account changes need the "
                                  "main login password).")
-    return user
+    return hit
 
 
 def _can_download(user) -> bool:
@@ -7999,10 +8048,19 @@ def _role_from_flags(params, current: dict | None) -> str | None:
 
 
 async def _require_admin_user(request, sb_session, u, p, s, t):
-    user = await _require_account_auth(request, sb_session, u, p, s, t)
-    if user.role != "admin":
+    return (await _require_admin_with_hash(request, sb_session, u, p, s, t))[0]
+
+
+async def _require_admin_with_hash(request, sb_session, u, p, s, t) -> tuple[User, str]:
+    hit = await _account_auth_with_hash(request, sb_session, u, p, s, t)
+    if hit[0].role != "admin":
         raise _SubsonicError(50, "Only an admin can manage users.")
-    return user
+    return hit
+
+
+def _own_password_changed_error() -> "_SubsonicError":
+    from soniqboom.api.users import PASSWORD_CHANGED_MEANWHILE
+    return _SubsonicError(40, PASSWORD_CHANGED_MEANWHILE)
 
 
 async def _close_user_sockets(user_id: str) -> None:
@@ -8052,8 +8110,9 @@ async def create_user(
     await _require_admin_user(request, sb_session, u, p, s, t)
     role = _role_from_flags(request.query_params, None) or "readonly"
     try:
-        get_user_store().create(username=username, password=_decode_password(password),
-                                role=role)
+        # (scrypt + a durable users.json write: off the event loop)
+        await asyncio.to_thread(get_user_store().create, username=username,
+                                password=_decode_password(password), role=role)
     except ValueError as exc:
         raise _SubsonicError(10 if "taken" not in str(exc) else 0, str(exc))
     return _ok(fmt=f)
@@ -8073,11 +8132,14 @@ async def update_user(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
-    await _require_admin_user(request, sb_session, u, p, s, t)
+    me, verified_hash = await _require_admin_with_hash(request, sb_session, u, p, s, t)
     ustore = get_user_store()
     target = ustore.get_by_username(username)
     if target is None:
         raise _SubsonicError(70, "User not found.")
+    # An admin's change of their OWN password applies only over the password
+    # this request verified (another admin's reset landing meanwhile stands).
+    own = target.id == me.id
     role = _role_from_flags(request.query_params, _user_payload(target))
     new_pw = _decode_password(password) if password else None
     if new_pw is not None:
@@ -8089,14 +8151,36 @@ async def update_user(
         except ValueError as exc:
             raise _SubsonicError(10, str(exc))
     demoted = role is not None and role != target.role and target.role == "admin"
+    expected = verified_hash if own and new_pw is not None else None
+    if expected is not None:
+        cur = ustore.get(target.id)
+        if cur is not None and cur.password_hash != expected:
+            # (changed already: refused before anything is applied)
+            raise _own_password_changed_error()
+    role_set, old_role = False, target.role      # (the record changes in place)
     try:
         if role is not None and role != target.role:
-            ustore.update(target.id, role=role)
+            await asyncio.to_thread(ustore.update, target.id, role=role)
+            role_set = True
         if new_pw is not None:
-            ustore.set_password(target.id, new_pw)
+            await asyncio.to_thread(ustore.set_password, target.id, new_pw,
+                                    expected_hash=expected)
+    except PasswordChangedMeanwhile:
+        if role_set:
+            # The refused request leaves nothing behind: its role change is
+            # taken back (unless something changed the role again meanwhile).
+            try:
+                cur = ustore.get(target.id)
+                if cur is not None and cur.role == role:
+                    await asyncio.to_thread(ustore.update, target.id, role=old_role)
+            except (KeyError, ValueError):
+                log.warning("updateUser: role change of %s not taken back", target.username)
+        raise _own_password_changed_error()
+    except KeyError:                     # deleted meanwhile
+        raise _SubsonicError(70, "User not found.")
     except ValueError as exc:            # e.g. demoting the last admin
         raise _SubsonicError(0, str(exc))
-    if demoted or (role == "readonly" and target.role != "readonly"):
+    if demoted or (role == "readonly" and old_role != "readonly"):
         await _close_user_sockets(target.id)
     return _ok(fmt=f)
 
@@ -8122,7 +8206,7 @@ async def delete_user(
     if target.id == me.id:
         raise _SubsonicError(50, "You can't delete your own account.")
     try:
-        ustore.delete(target.id)          # refuses the last enabled admin
+        await asyncio.to_thread(ustore.delete, target.id)   # refuses the last enabled admin
     except ValueError as exc:
         raise _SubsonicError(0, str(exc))
     await _close_user_sockets(target.id)
@@ -8145,17 +8229,25 @@ async def change_password(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
-    me = await _require_account_auth(request, sb_session, u, p, s, t)
+    me, verified_hash = await _account_auth_with_hash(request, sb_session, u, p, s, t)
     ustore = get_user_store()
     target = ustore.get_by_username(username)
     if target is None:
         raise _SubsonicError(70, "User not found.")
-    if target.id != me.id and me.role != "admin":
+    own = target.id == me.id
+    if not own and me.role != "admin":
         raise _SubsonicError(50, "You can only change your own password.")
     try:
         # Rotates the login password AND the Subsonic API password (the store
-        # keeps them in sync), and ends that user's web sessions.
-        ustore.set_password(target.id, _decode_password(password))
+        # keeps them in sync), and ends that user's web sessions.  A change of
+        # the caller's OWN password applies only over the password this
+        # request verified: an administrator's reset landing meanwhile stands.
+        await asyncio.to_thread(ustore.set_password, target.id, _decode_password(password),
+                                expected_hash=verified_hash if own else None)
+    except PasswordChangedMeanwhile:
+        raise _own_password_changed_error()
+    except KeyError:                     # deleted meanwhile
+        raise _SubsonicError(70, "User not found.")
     except ValueError as exc:
         raise _SubsonicError(10, str(exc))
     return _ok(fmt=f)

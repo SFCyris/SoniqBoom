@@ -57,6 +57,9 @@ const FACTORY = new Function('env', `
   function _recordAdvance(skip) { env.advances.push(!!skip); }
   function _invalidatePContinue() {}
   function _streamUrlFor() { return ''; }
+  function _cancelCrossfade() { env.crossfadeCancels = (env.crossfadeCancels || 0) + 1; }   // (crossfade.test.mjs)
+  function _crossfadeOnPlaying() {}
+  function _crossfadeOnPause() {}
   let _seekOffset = 0, _isTranscoded = false, trackId = null, _extAudio = false, _stationMode = false;
   ${extractCore()}
   return {

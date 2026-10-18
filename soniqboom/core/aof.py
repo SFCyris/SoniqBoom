@@ -8,6 +8,15 @@ appended to ``library.aof``.  A background merger process periodically
 consolidates the AOF into the full snapshot (``library.json``).
 
 The main process never serialises the full state — only one-line appends.
+
+Durability (``fsync_policy``): ``"everysec"`` (the default, like Redis's
+``appendfsync everysec``) — a background thread fsyncs the AOF about once a
+second while records are being written, so a power loss loses at most about
+the last second of writes (plus the in-memory buffer, flushed every
+``flush_interval``).  The event loop never fsyncs: ``append`` only buffers,
+writes happen in the executor, the fsync in its own thread.  ``stop`` /
+``seal`` (snapshot, shutdown, restart) fsync before closing the file.
+``"no"`` leaves it to the OS.
 """
 from __future__ import annotations
 
@@ -22,7 +31,34 @@ import time
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 log = logging.getLogger(__name__)
+
+
+# A record is encoded by orjson (one C call, ~6x faster than ``json.dumps`` —
+# ``append`` runs on the event loop) whenever that reads back as what
+# ``json.dumps(record, default=str)`` wrote: a value orjson would encode
+# differently or refuses (a float subclass such as numpy's, a datetime, a
+# dataclass, a set, bytes or anything else ``default=str`` stringifies, a
+# non-str key, a lone surrogate, an int beyond 64 bits) makes it take
+# ``json.dumps`` instead.  UTF-8 rather than ``\u`` escapes, no blanks; a
+# non-finite float (``nan``, ``inf``) is ``null``, as in the snapshot
+# (``persistence.encode_state``) and the API's responses; an ``Enum`` member
+# (the store holds none) would be its value.
+_ORJSON_OPTS = orjson.OPT_PASSTHROUGH_DATETIME | orjson.OPT_PASSTHROUGH_DATACLASS
+
+
+def _not_native(_obj: Any) -> Any:
+    raise TypeError("not a JSON-native value")
+
+
+def encode_record(record: dict) -> str:
+    """One AOF record as its JSON line text (no newline) — see above."""
+    try:
+        return orjson.dumps(record, default=_not_native, option=_ORJSON_OPTS).decode("utf-8")
+    except (orjson.JSONEncodeError, UnicodeDecodeError):
+        return json.dumps(record, default=str)
 
 
 class _JournalEnded(OSError):
@@ -38,9 +74,27 @@ class AOFWriter:
     # next process restart.
     _RETENTION_WARN_THRESHOLD = 3
 
-    def __init__(self, path: Path, flush_interval: float = 0.1) -> None:
+    # Thread-side fsync cadence of the "everysec" policy, and how many idle
+    # periods its thread waits before ending (started again by the next write).
+    _FSYNC_INTERVAL = 1.0
+    _FSYNC_IDLE_EXIT = 30
+
+    def __init__(self, path: Path, flush_interval: float = 0.1,
+                 fsync_policy: str = "everysec") -> None:
+        if fsync_policy not in ("everysec", "no"):
+            raise ValueError(f"unknown AOF fsync policy {fsync_policy!r}")
         self._path = path
         self._flush_interval = flush_interval
+        self._fsync_policy = fsync_policy
+        # Bumped (under ``_write_lock``) after every write that reached the
+        # file; ``_synced_gen`` is the last one an fsync covered.
+        self._write_gen = 0
+        self._synced_gen = 0
+        self._fsync_thread: threading.Thread | None = None
+        self._fsync_tlock = threading.Lock()     # starts / ends of that thread
+        self._fsync_stop = threading.Event()
+        self.fsync_count = 0                     # fsyncs done (stats / tests)
+        self.fsync_last_ms = 0.0
         self._buffer: list[str] = []
         self._flush_task: asyncio.Task | None = None
         self._fd: int | None = None
@@ -64,6 +118,14 @@ class AOFWriter:
         self._late_path: Path | None = None
         self._late_count = 0
         self._late_lock = threading.Lock()  # (never held across a flock wait)
+        # Name of the set-aside file: ``library.aof.<late_tag>-<time>``.  The
+        # source install's restart sets ``late-exec`` before it seals: what a
+        # straggler writes between the seal and the ``os.execv`` precedes the
+        # next image's load and follows every record of the sealed journal, so
+        # the next start appends it to the AOF (``persistence``); any other
+        # stop's set-aside records are never replayed (a later run may have
+        # loaded the AOF already).
+        self.late_tag = "late"
         # Event-driven auto-flush: ``append`` sets this so the background
         # loop wakes immediately instead of polling every ``_flush_interval``
         # seconds.  Idle servers no longer burn 10 wake-ups/second checking
@@ -97,7 +159,7 @@ class AOFWriter:
         """Buffer a single AOF record.  Non-blocking.  After ``seal`` the
         record is set aside instead (``_set_aside``)."""
         record = {"op": op, "ts": time.time(), **kwargs}
-        line = json.dumps(record, default=str) + "\n"
+        line = encode_record(record) + "\n"
         if self._sealed or self._intake_closed:
             self._set_aside([line])
             return
@@ -246,9 +308,86 @@ class AOFWriter:
                     if n <= 0:
                         raise OSError("short write to AOF")
                     view = view[n:]
+                self._write_gen += 1
             finally:
                 if held[0] is not None:
                     fcntl.flock(held[0], fcntl.LOCK_UN)
+        self._ensure_fsync_thread()
+
+    # ── fsync ("everysec") ─────────────────────────────────────────────
+
+    def _ensure_fsync_thread(self) -> None:
+        """Start the background fsync thread if it isn't running (called
+        after a write, never on the event loop: writes run in the executor
+        or a stopping thread)."""
+        if self._fsync_policy != "everysec" or self._sealed:
+            return
+        with self._fsync_tlock:
+            if self._fsync_thread is not None and self._fsync_thread.is_alive():
+                return
+            t = threading.Thread(target=self._fsync_loop, name="aof-fsync", daemon=True)
+            self._fsync_thread = t
+        t.start()
+
+    def _fsync_loop(self) -> None:
+        idle = 0
+        while True:
+            if self._fsync_stop.wait(self._FSYNC_INTERVAL) or self._sealed:
+                with self._fsync_tlock:
+                    self._fsync_thread = None
+                return
+            if self._write_gen != self._synced_gen:
+                try:
+                    self._fsync_written()
+                except Exception:           # (e.g. EMFILE on the dup) — try again next period
+                    log.warning("AOF fsync failed (%s)", self._path, exc_info=True)
+                idle = 0
+                continue
+            idle += 1
+            if idle >= self._FSYNC_IDLE_EXIT:
+                with self._fsync_tlock:
+                    # A write that bumped the generation before this check
+                    # saw the thread still running and started none: keep going.
+                    if self._write_gen == self._synced_gen:
+                        self._fsync_thread = None
+                        return
+                idle = 0
+
+    def _fsync_written(self) -> None:
+        """fsync what has been written so far.  The descriptor is duplicated
+        under ``_write_lock`` (so a concurrent close / replace can't hand us a
+        recycled number) and synced outside it, so writes never wait on the
+        disk.  A closed descriptor was synced by whoever closed it."""
+        with self._write_lock:
+            gen = self._write_gen
+            if self._fd is None:
+                self._synced_gen = gen
+                return
+            dfd = os.dup(self._fd)          # (raises to ``_fsync_loop``, which retries)
+        try:
+            t0 = time.monotonic()
+            os.fsync(dfd)
+            self.fsync_last_ms = (time.monotonic() - t0) * 1000.0
+            self.fsync_count += 1
+            self._synced_gen = gen
+        except OSError:
+            log.warning("AOF fsync failed (%s) — retried in %.0f s", self._path,
+                        self._FSYNC_INTERVAL, exc_info=True)
+        finally:
+            os.close(dfd)
+
+    def _fsync_before_close(self) -> None:
+        """fsync the open descriptor if anything written is not yet synced —
+        ``stop`` / ``seal`` / the exit flush, under ``_write_lock``, right
+        before they close it."""
+        if self._fd is None or self._write_gen == self._synced_gen:
+            return
+        try:
+            os.fsync(self._fd)
+            self.fsync_count += 1
+            self._synced_gen = self._write_gen
+        except OSError:
+            log.warning("AOF fsync before close failed (%s)", self._path, exc_info=True)
 
     def discard_buffered(self, n: int) -> None:
         """Drop the first ``n`` buffered records unwritten: a snapshot that
@@ -271,6 +410,40 @@ class AOFWriter:
             self._flush_locked()
         except Exception:
             log.exception("AOF flush_sync failed — buffer retained")
+
+    def drain(self, budget: float) -> bool:
+        """Write what is buffered now, trying again for up to ``budget``
+        seconds while a merge holds the AOF's lock; with nothing buffered,
+        wait (as long) for such a merge to release it.  The journal stays
+        open.  For the source install's restart, before it starts refusing
+        requests: its final write (``seal``) then finds little to write and
+        the lock free, and the time it refuses requests stays short.  One
+        write attempt waits up to ``_FLOCK_BUDGET_SECONDS`` itself, so the
+        wait can exceed a smaller ``budget`` by that.  True when the AOF
+        could be written."""
+        deadline = time.monotonic() + max(0.0, budget)
+        while True:
+            try:
+                if self._buffer:
+                    self._flush_locked()
+                    return True
+                with self._write_lock:
+                    if self._sealed:
+                        return False
+                    fd = self._ensure_fd()
+                    if not self._acquire_flock(fd, max(0.05, deadline - time.monotonic())):
+                        return False
+                    held = [fd]
+                    try:
+                        self._follow_replaced(held)      # (a merge swapped the file in)
+                    finally:
+                        if held[0] is not None:
+                            fcntl.flock(held[0], fcntl.LOCK_UN)
+                    return True
+            except Exception:                           # noqa: BLE001 (lock contention)
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.1)
 
     def close_intake(self) -> None:
         """No new record into the buffer from now on — set aside instead
@@ -315,12 +488,13 @@ class AOFWriter:
                     time.sleep(0.1)
             with self._late_lock:
                 if self._late_path is None:
-                    self._late_path = (self._path.parent
-                                       / f"{self._path.name}.late-{int(time.time())}")
+                    self._late_path = self._new_late_path()
             self._intake_closed = True
             self._sealed = True
             left = self._buffer[:]
             del self._buffer[:len(left)]
+            self._fsync_before_close()
+            self._fsync_stop.set()
             if self._fd is not None:
                 try:
                     os.close(self._fd)
@@ -335,6 +509,24 @@ class AOFWriter:
     def sealed(self) -> bool:
         return self._sealed
 
+    def _new_late_path(self) -> Path:
+        return self._path.parent / f"{self._path.name}.{self.late_tag}-{int(time.time())}"
+
+    def retire_late_exec(self) -> "Path | None":
+        """The exec of a restart failed: the process now stops the usual way
+        (its snapshot, when it writes one, holds every store write).  What
+        was set aside for the exec'd image (``late-exec``) is handed back to
+        the caller — appended to the AOF now (``persistence.
+        adopt_exec_late_records``), before that stop — and anything set aside
+        from now on goes to a plain ``late`` file, never replayed.  Returns
+        the retired file (None when nothing was set aside)."""
+        with self._late_lock:
+            old = self._late_path if self.late_tag == "late-exec" else None
+            self.late_tag = "late"
+            self._late_path = None
+            self._late_count = 0
+        return old if old is not None and old.exists() else None
+
     def exclusive(self):
         """The writer's lock, as a context manager: while it is held no flush
         writes and nothing is removed from the buffer (other threads; it is
@@ -347,7 +539,7 @@ class AOFWriter:
         ``library.aof.late-<time>`` (one file per sealed writer)."""
         with self._late_lock:
             if self._late_path is None:
-                self._late_path = self._path.parent / f"{self._path.name}.late-{int(time.time())}"
+                self._late_path = self._new_late_path()
             first = self._late_count == 0
             self._late_count += len(lines)
             try:
@@ -359,7 +551,9 @@ class AOFWriter:
                 return
         if first:
             log.warning("AOF: store write(s) after this run's journal ended (the server is "
-                        "stopping) — set aside in %s, not replayed", self._late_path.name)
+                        "stopping) — set aside in %s, %s", self._late_path.name,
+                        "replayed at the next start" if self.late_tag == "late-exec"
+                        else "not replayed")
         else:
             log.debug("AOF: %d more late record(s) set aside in %s",
                       len(lines), self._late_path.name)
@@ -424,6 +618,7 @@ class AOFWriter:
         # merger's flock) waits for it and finds only what came after.
         with self._write_lock:
             self.flush_sync()
+            self._fsync_before_close()
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
@@ -457,7 +652,7 @@ class AOFWriter:
         if left:
             try:
                 tail = self._path.parent / f"{self._path.name}.dropped-{int(time.time())}"
-                with open(tail, "a") as f:
+                with open(tail, "a", encoding="utf-8") as f:
                     for line in left:
                         f.write(line)
                 log.error(
@@ -467,6 +662,7 @@ class AOFWriter:
             except Exception:
                 log.exception("AOF shutdown could not write dropped records")
         with self._write_lock:
+            self._fsync_before_close()
             if self._fd is not None:
                 try:
                     os.close(self._fd)

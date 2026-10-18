@@ -173,6 +173,66 @@ _TRACKER_EXTS = {
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
 }
+# Tracker formats libopenmpt reads only from some version on — listed only
+# when the installed libopenmpt reads them (Face The Music: libopenmpt 0.8;
+# an older one leaves them out, so nothing is listed that can't play).
+_OPENMPT_OPTIONAL = {".ftm": "Face The Music"}
+
+
+def _openmpt_extensions() -> frozenset:
+    """The file extensions the installed libopenmpt reads (lower case, no
+    dot); empty when it can't be loaded.  A plain library load and one call
+    — no ``find_library`` process, no renderer run."""
+    import ctypes
+    import sys as _sys
+    if _sys.platform == "darwin":
+        cands = ["/opt/homebrew/lib/libopenmpt.dylib", "/usr/local/lib/libopenmpt.dylib",
+                 "/opt/homebrew/lib/libopenmpt.0.dylib", "/usr/local/lib/libopenmpt.0.dylib"]
+    elif _sys.platform.startswith("linux"):
+        cands = ["libopenmpt.so.0", "/usr/lib/x86_64-linux-gnu/libopenmpt.so.0",
+                 "/usr/lib/aarch64-linux-gnu/libopenmpt.so.0", "/usr/lib64/libopenmpt.so.0",
+                 "/usr/lib/libopenmpt.so.0"]
+    elif _sys.platform.startswith("win"):
+        cands = ["libopenmpt.dll", "openmpt.dll"]
+    else:
+        cands = []
+    for cand in cands:
+        try:
+            lib = ctypes.CDLL(cand)
+            fn = lib.openmpt_get_supported_extensions
+        except (OSError, AttributeError):
+            continue
+        fn.restype = ctypes.c_void_p
+        ptr = fn()
+        if not ptr:
+            return frozenset()
+        try:
+            raw = ctypes.string_at(ptr).decode("ascii", "replace")
+        finally:
+            try:
+                free = lib.openmpt_free_string
+                free.argtypes = [ctypes.c_void_p]
+                free(ptr)
+            except AttributeError:
+                pass
+        return frozenset(e.strip().lower() for e in raw.split(";") if e.strip())
+    return frozenset()
+
+
+try:
+    _OPENMPT_EXTS = _openmpt_extensions()
+except Exception:                                           # noqa: BLE001
+    _OPENMPT_EXTS = frozenset()
+# The optional tracker formats this host plays (``_OPENMPT_OPTIONAL``): part
+# of SUPPORTED_EXTENSIONS and of every module's tracker set (the stream
+# router, cast, the scanner, Track Info's VU backfill).
+OPENMPT_EXTRA_EXTS = frozenset(e for e in _OPENMPT_OPTIONAL if e[1:] in _OPENMPT_EXTS)
+_TRACKER_EXTS |= OPENMPT_EXTRA_EXTS
+SUPPORTED_EXTENSIONS |= OPENMPT_EXTRA_EXTS
+for _e, _name in _OPENMPT_OPTIONAL.items():
+    FORMAT_NAMES.setdefault(_e, _name)
+del _e, _name
+
 # libgme — Game Music Emu — covers chiptune formats from NES/SNES/
 # Game Boy/Genesis/Master System/MSX/ZX Spectrum.  Rendered to WAV
 # via the ``gme`` CLI when the user installs it.
@@ -1486,7 +1546,7 @@ def _extract_sid(path: Path, track_id: str) -> dict:
                 # Update subsong count if HVSC disagrees with the PSID header.
                 if len(durations) > 1:
                     d["subsongs"] = len(durations)
-            stil = hvsc.lookup_stil(path)
+            stil = hvsc.lookup_stil(path, md5=sid_md5)
             if stil and stil.get("text"):
                 d["stil"] = stil["text"]
     except Exception:
@@ -2175,6 +2235,7 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     instruments: list[str] = []
     channels: int | None = None
     patterns: int | None = None
+    ftm_artist = ""
     file_bytes: bytes | None = None     # the file as read: duration + scene MD5 use it too
 
     try:
@@ -2346,6 +2407,20 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                     end = min(name_off + 128, len(raw))
                 title = _decode_tracker_str(raw[name_off:end])
 
+        elif ext == ".ftm" and raw[:4] == b"FTMN" and len(raw) >= 82:
+            # Face The Music: title and artist at 16 / 48 (32 bytes each),
+            # the sample names (30 of every 32 bytes) after the 82-byte header.
+            title = _decode_tracker_str(raw[16:48])
+            ftm_artist = _decode_tracker_str(raw[48:80])
+            channels = 8
+            for i in range(raw[5]):
+                off = 82 + i * 32
+                if off + 30 > len(raw):
+                    break
+                name = _decode_tracker_str(raw[off:off + 30])
+                if name and name.isprintable():
+                    instruments.append(name)
+
         elif raw[:3] == b"MMD" and raw[3:4] in (b"0", b"1", b"2", b"3"):
             # OctaMED: offset 0 is the magic "MMD0" — the song name is in the
             # MMD0exp block (GitHub #24).
@@ -2428,6 +2503,8 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         d["channels"] = channels
     if patterns is not None:
         d["patterns"] = patterns
+    if ftm_artist and ftm_artist.isprintable():
+        d["artist"] = ftm_artist
     if file_bytes is not None and len(file_bytes) <= _SCENE_MD5_MAX:
         # The scene MD5 ``extract`` would otherwise read the file again for.
         d["file_md5"] = hashlib.md5(file_bytes).hexdigest()
@@ -2731,11 +2808,36 @@ def sndh_tune_lengths(info: dict, count: int) -> "list[float] | None":
 # Raw YM magics StSound's ymDecode accepts (mirrors Ymload.cpp's enum); every
 # other real YM is LHA-wrapped with an ``-lh5-`` payload.  Kept in sync with the
 # play-time gate in api/stream.py, which imports ``ym_is_decodable`` from here.
-_YM_RAW_MAGICS = (b"YM2!", b"YM3!", b"YM3b", b"YM4!", b"YM5!", b"YM6!",
+# (StSound refuses YM4! — "No more YM4! support" — so it isn't one)
+_YM_RAW_MAGICS = (b"YM2!", b"YM3!", b"YM3b", b"YM5!", b"YM6!",
                   b"MIX1", b"YMT1", b"YMT2")
 
 
-def ym_is_decodable(path: Path) -> bool:
+def _close_quietly(arc) -> None:
+    close = getattr(arc, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+def _ym_payload_magic(path: Path) -> bytes | None:
+    """The first 4 bytes of an LHA-wrapped YM's payload, or None when it
+    can't be unpacked here."""
+    lf = None
+    try:
+        from soniqboom.core import archive as _archive
+        lf = _archive.open_lha(path)
+        names = lf.namelist()
+        return lf.read(names[0])[:4] if names else None
+    except Exception:
+        return None
+    finally:
+        _close_quietly(lf)
+
+
+def ym_is_decodable(path: Path, payload_magic: bytes | None = None) -> bool:
     """Cheap pre-flight: can StSound actually load this ``.ym``?
 
     StSound accepts only a raw YM magic or an ``-lh5-`` LZH-wrapped payload.
@@ -2753,6 +2855,11 @@ def ym_is_decodable(path: Path) -> bool:
     the heuristic has zero real false-rejects — but it is deliberately stricter
     than the engine.  Used to reject at play (honest 415) and to stamp
     ``defect="corrupt"`` at scan.  Returns True on I/O error (real error at play).
+
+    A wrapped payload must start with a magic StSound plays too (a YM4! inside
+    the wrapper is refused like a raw one): ``payload_magic`` when the caller
+    already unpacked it, else unpacked here (when it can't be, the wrapper's
+    checksum decides as before).
     """
     try:
         with open(path, "rb") as fh:
@@ -2765,7 +2872,10 @@ def ym_is_decodable(path: Path) -> bool:
         hsize = head[0]
         if hsize == 0 or 2 + hsize > len(head):
             return False
-        return (sum(head[2:2 + hsize]) & 0xFF) == head[1]
+        if (sum(head[2:2 + hsize]) & 0xFF) != head[1]:
+            return False
+        magic = payload_magic if payload_magic is not None else _ym_payload_magic(path)
+        return magic is None or magic in _YM_RAW_MAGICS
     return False        # unknown magic (e.g. "YMST") — not a YM StSound reads
 
 
@@ -2780,17 +2890,22 @@ def _extract_ym(path: Path, track_id: str) -> dict:
     import struct as _struct
     name = Path(str(path).split("::")[-1]).stem
     raw = b""
+    unpacked: bytes | None = None       # the wrapped payload's magic
+    lf = None
     try:
-        import lhafile as _lha
-        lf = _lha.Lhafile(str(path))
+        from soniqboom.core import archive as _archive
+        lf = _archive.open_lha(path)
         names = lf.namelist()
         if names:
             raw = lf.read(names[0])
+            unpacked = raw[:4]
     except Exception:
         try:
             raw = path.read_bytes()       # uncompressed YM
         except OSError:
             raw = b""
+    finally:
+        _close_quietly(lf)
     title, artist, comment, dur = "", "", "", 0.0
     magic = raw[:4]
     try:
@@ -2831,9 +2946,11 @@ def _extract_ym(path: Path, track_id: str) -> dict:
     # Flag files no engine can render (foreign "YMST", corrupt -lh5-) so the UI
     # can badge them instead of the user hitting a bare 415 at play.  Same
     # predicate as the play-time gate, so the badge appears iff play 415s.
-    if not ym_is_decodable(path):
+    if not ym_is_decodable(path, unpacked):
         d["defect"] = "corrupt"
         d["defect_detail"] = (
+            "YM4 file — the YM player plays YM2, YM3, YM5, YM6, MIX and YMT files"
+            if magic == b"YM4!" else
             "Not a YM register dump any available engine can decode "
             "(foreign Atari format or corrupt LHA wrapper)")
     return d
@@ -3244,6 +3361,23 @@ def _extract(
                 f"{FORMAT_NAMES.get(ext, 'AdLib')} by extension; not a playable "
                 f"tune: {path.name}"
             )
+
+    # FamiTracker (NES) saves ``.ftm`` too: only a Face The Music module
+    # ("FTMN") saved with its samples (flag bit 0 at offset 13 — libopenmpt
+    # loads no other kind) is one SoniqBoom plays; anything else under that
+    # name is not indexed.
+    if ext == ".ftm":
+        try:
+            with open(path, "rb") as _fh:
+                _ftm_head = _fh.read(14)
+        except OSError:
+            _ftm_head = b""
+        if _ftm_head[:4] != b"FTMN":
+            raise ValueError(f"not a Face The Music module (FamiTracker's .ftm is "
+                             f"another format): {path.name}")
+        if len(_ftm_head) < 14 or not _ftm_head[13] & 1:
+            raise ValueError(f"a Face The Music module saved without its samples "
+                             f"(libopenmpt doesn't load one): {path.name}")
 
     # ── UADE candidates: authoritative content probe BEFORE the permissive
     # try below (mirrors the HUNK guard — the catch-all would otherwise index

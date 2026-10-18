@@ -128,6 +128,9 @@ def refresh_index() -> dict:
         # Re-entrancy guard (QA): two concurrent refreshes clobber the same
         # .building/.zip/sqlite paths — reject the second.
         return {**status(), "error": "refresh already running"}
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(MODLAND_MD5_URL):
+        return {**status(), "error": "Offline mode is on — the Modland index can't be downloaded"}
     _status.update(refreshing=True, error=None)
     tmp = _db_path().with_suffix(".building")
     try:
@@ -765,9 +768,10 @@ def collect_updates(*, use_filename: bool | None = None,
         md5 = t.get("file_md5")
         if not isinstance(md5, str) or not md5:
             continue
-        if is_catalogue_path(t.get("path")):
+        if is_catalogue_path(t.get("path")) and _is_modland_catalogue(t.get("path")):
             # A Modland CATALOGUE track carries its Modland data from its own
             # path (core/modland_catalog.py) — never joined, never withdrawn.
+            # (Another online collection's tune is joined like a local file.)
             continue
         path = rows.get(md5.lower())
         if path is None:
@@ -1083,3 +1087,14 @@ def siblings_from_paths(paths) -> dict[str, bool]:
             if g[1] != fw:
                 g[1] = None
     return {k: g[1] is not None for k, g in groups.items() if g[0] >= 2}
+
+
+def _is_modland_catalogue(path) -> bool:
+    """Is ``path`` a tune of the Modland catalogue itself (not of another
+    online collection)?"""
+    try:
+        from soniqboom.core import catalogue
+        from soniqboom.core.modland_catalog import ROOT
+        return catalogue.root_of(path) == catalogue._norm_root(ROOT)
+    except Exception:                                   # noqa: BLE001
+        return True

@@ -32,12 +32,24 @@ ReadDirectoryChangesW (Windows) backends.
 
 Armed for every local scan root at startup and when a root is added (never
 for remote SMB/FTP shares, which have no push notifications).
+
+Each root is armed on its own, off the event loop, on an observer that is
+already running: one root that can't be watched (Linux: the inotify watch or
+instance limit, ``ENOSPC`` / ``EMFILE``; an unreadable folder) never stops the
+others.  A root that can't be watched is retried with a doubling back-off
+(``_RETRY_BASE_SEC`` → ``_RETRY_MAX_SEC``) and, until it is watched again, gets
+an incremental rescan every ``_FALLBACK_POLL_SEC``; once it is watched again
+one rescan covers what changed meanwhile.  A watch whose thread stops, or a
+folder moved in that hits the watch limit, is handled the same way.  The state
+of every root is in :func:`root_status` / :func:`summary` (Settings → Library
+folders, ``/api/health``).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -83,6 +95,33 @@ _MAX_WAIT_SEC = 60.0    # …but at most this long after the first event
 _SCOPE_MAX = 1024       # more changed (collapsed, widened) paths in one root → full rescan
 _SCOPE_HARD_MAX = 8192  # raw paths buffered per root before giving up → full rescan
 
+_RETRY_BASE_SEC = 60.0          # first re-arm of a root that couldn't be watched…
+_RETRY_MAX_SEC = 30 * 60.0      # …doubling up to this
+_RETRY_MISSING_MAX_SEC = 5 * 60.0   # a missing root (unmounted drive) is a cheap stat
+_FALLBACK_POLL_SEC = 15 * 60.0  # incremental rescan of a root that isn't watched
+_SUPERVISE_SEC = 5.0            # how often retries / polls / watch threads are checked
+_LIMIT_WARN_SEC = 10 * 60.0     # one "watch limit reached" warning per root per this long
+
+# root → (monotonic time of its last "watch limit" warning, folders not
+# warned about since) — folders moved in one after another past the limit
+# would otherwise log one warning each.
+_limit_warned: dict = {}
+_limit_warned_lock = threading.Lock()
+
+
+def _limit_warning_due(root: str) -> "int | None":
+    """None while ``root``'s last watch-limit warning is recent (the folder is
+    counted); else the number of folders not warned about since (the caller
+    warns now)."""
+    now = time.monotonic()
+    with _limit_warned_lock:
+        last, held = _limit_warned.get(root, (None, 0))
+        if last is not None and now - last < _LIMIT_WARN_SEC:
+            _limit_warned[root] = (last, held + 1)
+            return None
+        _limit_warned[root] = (now, 0)
+        return held
+
 
 # ── Singleton observer state ─────────────────────────────────────────────────
 
@@ -98,6 +137,17 @@ class _State:
     first_event_at: float = 0.0
     last_event_at: float = 0.0
     warned_no_cover: bool = False
+    roots: "set[str]" = set()           # roots asked for (resolved), armed or not
+    # root → {"state": "watching" | "partial" | "retrying" | "missing", ...}
+    status: "dict[str, dict]" = {}
+    supervisor: "asyncio.Task | None" = None
+    arm_lock: "asyncio.Lock | None" = None
+    handlers: "dict[str, _Handler]" = {}  # root → its event handler (partial-root retries)
+
+    def __init__(self) -> None:
+        self.roots = set()
+        self.status = {}
+        self.handlers = {}
 
 
 _state = _State()
@@ -169,12 +219,14 @@ class _Handler(FileSystemEventHandler):
 
     _interesting = staticmethod(_interesting)
 
-    def _cover_subtree(self, d: str) -> None:
+    def _cover_subtree(self, d: str, *, notify: bool = True) -> bool:
         """inotify watches every folder separately, and watchdog adds them
         only for folders CREATED inside the tree: a folder MOVED IN from
         outside would stay unwatched (watchdog's own TODO).  Add a watch for
         it and each folder below — idempotent for folders already watched.
-        Runs on the observer's dispatch thread, never on the event loop."""
+        Runs on the observer's dispatch thread (or, to retry a partly watched
+        root, a worker thread), never on the event loop.  False when the
+        watch limit stopped it (``notify``: the root is marked partial)."""
         ino = self._inotify
         if ino is None:
             if type(_state.observer).__name__ == "InotifyObserver" and not _state.warned_no_cover:
@@ -182,19 +234,27 @@ class _Handler(FileSystemEventHandler):
                 log.warning("watcher: this watchdog version doesn't expose its inotify "
                             "handle — folders moved into a library from outside are not "
                             "watched until the next restart")
-            return
+            return True
         for dirpath, _dirs, _files in os.walk(d):
             try:
                 ino.add_watch(os.fsencode(dirpath))
             except OSError as exc:
                 if exc.errno == 28:           # ENOSPC: fs.inotify.max_user_watches reached
-                    log.warning("watcher: inotify watch limit reached — %s and below are "
-                                "not watched (raise fs.inotify.max_user_watches)", dirpath)
-                    return
+                    if notify:
+                        held = _limit_warning_due(self._root)
+                        if held is not None:
+                            log.warning("watcher: inotify watch limit reached — %s and below "
+                                        "are not watched (raise fs.inotify.max_user_watches)%s",
+                                        dirpath,
+                                        f"; {held} more folder(s) in {self._root} since the "
+                                        f"last warning" if held else "")
+                        _call_on_loop(_note_partial, self._root, _limit_reason(exc))
+                    return False
                 log.debug("watcher: could not watch %s", dirpath, exc_info=True)
             except Exception:                     # noqa: BLE001 — best effort
                 log.debug("watcher: could not watch %s", dirpath, exc_info=True)
-                return
+                return True
+        return True
 
     @property
     def _inotify(self):
@@ -444,7 +504,8 @@ def is_supported() -> bool:
 
 
 async def start(roots: Iterable[str]) -> None:
-    """Spin up the observer and arm a watch on every (local) root."""
+    """Start the observer, then arm a watch on every (local) root — each on
+    its own, so a root that can't be watched never stops the others."""
     if not _HAS_WATCHDOG:
         log.warning("watcher: ``watchdog`` not installed; auto-rescan disabled.")
         return
@@ -452,31 +513,69 @@ async def start(roots: Iterable[str]) -> None:
         return
     _state.enabled = True
     _state.loop = asyncio.get_running_loop()
+    _state.roots = set()
+    _state.status = {}
+    _state.handlers = {}
+    # (a previous run in this process — the bundled app — may have left
+    # these behind: a root still listed as watched would never be armed on
+    # this run's observer)
+    _state.watches = {}
+    _state.pending = {}
+    _state.debounce_task = None
+    _state.arm_lock = asyncio.Lock()
     _state.observer = Observer()
+    # Started before any watch is scheduled: ``schedule`` on a running
+    # observer starts that root's emitter at once, so its failure is that
+    # root's alone (watchdog's ``start`` re-raised the first emitter's error
+    # and left every other root — and the dispatcher — unstarted).
+    _state.observer.start()
     for root in roots:
         await _arm(root)
-    _state.observer.start()
-    log.info("watcher: started with %d watch(es)", len(_state.watches))
+    _state.supervisor = asyncio.create_task(_supervise(), name="watcher.supervise")
+    n_bad = sum(1 for st in _state.status.values() if st.get("state") != "watching")
+    log.info("watcher: started with %d watch(es)%s", len(_state.watches),
+             f", {n_bad} root(s) not watched" if n_bad else "")
 
 
 async def stop() -> None:
-    """Tear down the observer.  Safe to call multiple times."""
+    """Tear down the observer.  Safe to call multiple times.
+
+    The watcher's state is cleared first, before any await: a stop cancelled
+    while it waits (the shutdown step's timeout) still leaves nothing behind
+    for a later ``start``, and an arm still running finds the watcher off
+    (``_arm`` checks after each await).  The observer's ``stop`` + ``join``
+    run in a worker thread — ``stop`` waits for the observer's lock, which a
+    ``schedule`` in progress (inotify adding a watch per folder of a big
+    tree) holds for as long as it takes."""
     if not _state.enabled:
         return
     _state.enabled = False
-    if _state.observer:
+    obs, _state.observer = _state.observer, None
+    sup, _state.supervisor = _state.supervisor, None
+    _state.watches = {}
+    _state.pending = {}
+    _state.roots = set()
+    _state.status = {}
+    _state.handlers = {}
+    with _limit_warned_lock:
+        _limit_warned.clear()
+    deb, _state.debounce_task = _state.debounce_task, None
+    if deb is not None and not deb.done():
+        deb.cancel()
+    if sup is not None and not sup.done():
+        sup.cancel()
         try:
-            _state.observer.stop()
-            # ``join`` blocks the event loop; run it off-thread.
-            await asyncio.get_running_loop().run_in_executor(None, _state.observer.join)
+            await sup
+        except (asyncio.CancelledError, Exception):
+            pass
+    if obs is not None:
+        def _stop_join() -> None:
+            obs.stop()
+            obs.join()
+        try:
+            await asyncio.to_thread(_stop_join)
         except Exception:
             log.exception("watcher: stop failed")
-    _state.observer = None
-    _state.watches.clear()
-    _state.pending.clear()
-    if _state.debounce_task and not _state.debounce_task.done():
-        _state.debounce_task.cancel()
-    _state.debounce_task = None
 
 
 async def add_root(root: str) -> None:
@@ -491,39 +590,385 @@ async def remove_root(root: str) -> None:
     if not _state.enabled or not _state.observer:
         return
     p = str(Path(root).resolve())
+    _state.roots.discard(p)
+    _state.status.pop(p, None)
+    _state.handlers.pop(p, None)
     _state.pending.pop(p, None)                # never rescan (and re-add) a removed root
     watch = _state.watches.pop(p, None)
     if watch:
         try:
-            _state.observer.unschedule(watch)
+            # (waits for the observer's lock: off the loop)
+            await asyncio.to_thread(_state.observer.unschedule, watch)
         except Exception:
             log.exception("watcher: unschedule failed for %s", p)
 
 
+def root_status(root: str) -> "dict | None":
+    """How ``root`` is kept up to date — None for a root the watcher doesn't
+    handle (remote, or the watcher is off).  ``state``: ``watching``;
+    ``partial`` (watched, but folders below ``reason``'s limit are not);
+    ``retrying`` (not watched: re-armed every ``retry_in_s`` with back-off,
+    rescanned every ``poll_interval_s`` meanwhile); ``missing`` (the folder
+    isn't there — re-armed when it is)."""
+    if not _state.enabled:
+        return None
+    # No ``resolve()`` here (a stalled mount would block the caller): the
+    # folder list stores roots in their resolved spelling already.
+    st = _state.status.get(root) or _state.status.get(os.path.normpath(os.path.abspath(root)))
+    return _public(st) if st is not None else None
+
+
+def summary() -> dict:
+    """Counts only (no paths) — for the public health endpoint."""
+    if not _HAS_WATCHDOG:
+        return {"state": "unsupported", "roots": 0, "watching": 0, "not_watching": 0,
+                "missing": 0}
+    if not _state.enabled:
+        return {"state": "off", "roots": 0, "watching": 0, "not_watching": 0, "missing": 0}
+    states = [st.get("state") for st in _state.status.values()]
+    watching = sum(1 for x in states if x == "watching")
+    missing = sum(1 for x in states if x == "missing")
+    bad = len(states) - watching - missing
+    return {"state": "degraded" if bad else "ok", "roots": len(states),
+            "watching": watching, "not_watching": bad, "missing": missing}
+
+
 # ── Internals ────────────────────────────────────────────────────────────────
 
-async def _arm(root: str) -> None:
-    """Schedule a recursive watch on ``root``.  Skips remote / nonexistent
-    paths and roots already armed."""
-    p = Path(root)
-    # Remote shares (smb://, ftp://, http://) and Cloud-only roots don't
-    # produce inotify/FSEvents — skip them silently.
-    if not p.exists() or not p.is_dir():
-        return
-    abs_p = str(p.resolve())
-    if abs_p in _state.watches:
+def _public(st: dict) -> dict:
+    now = time.time()
+    out = {
+        "state": st.get("state"),
+        "reason": st.get("reason"),
+        "since": st.get("since"),
+        "attempts": st.get("attempts", 0),
+        "retry_in_s": None,
+        "polling": bool(st.get("polling")),
+        "poll_interval_s": int(_FALLBACK_POLL_SEC) if st.get("polling") else None,
+        "last_poll_ts": st.get("last_poll"),
+    }
+    if st.get("state") != "watching" and st.get("next_retry"):
+        out["retry_in_s"] = max(0, int(st["next_retry"] - now))
+    return out
+
+
+def _call_on_loop(fn, *args) -> None:
+    """Run ``fn(*args)`` on the event loop (from an observer thread)."""
+    loop = _state.loop
+    if loop is None or not loop.is_running():
         return
     try:
-        handler = _Handler(abs_p, await asyncio.to_thread(_canonical_path, abs_p))
-        kw = {}
-        if type(_state.observer).__name__ == "InotifyObserver":
-            kw["event_filter"] = _INOTIFY_EVENT_FILTER
+        loop.call_soon_threadsafe(fn, *args)
+    except RuntimeError:                       # loop closed meanwhile
+        pass
+
+
+def _limit_reason(exc: BaseException) -> str:
+    """The reason shown for a root that couldn't be watched."""
+    err = getattr(exc, "errno", None)
+    if err == 28:                              # ENOSPC
+        return "inotify watch limit reached, raise fs.inotify.max_user_watches"
+    if err == 24:                              # EMFILE
+        return "inotify instance limit reached, raise fs.inotify.max_user_instances"
+    msg = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+    return msg
+
+
+def _retry_delay(attempts: int, *, missing: bool = False) -> float:
+    cap = _RETRY_MISSING_MAX_SEC if missing else _RETRY_MAX_SEC
+    return min(cap, _RETRY_BASE_SEC * (2 ** max(0, attempts - 1)))
+
+
+def _set_watching(abs_p: str) -> None:
+    _state.status[abs_p] = {"state": "watching", "reason": None, "since": time.time(),
+                            "attempts": 0, "polling": False}
+
+
+def _set_failed(abs_p: str, reason: str, *, state: str = "retrying",
+                poll_now: bool = False) -> dict:
+    """Record that ``abs_p`` isn't (fully) watched and when to try again."""
+    now = time.time()
+    prev = _state.status.get(abs_p) or {}
+    attempts = int(prev.get("attempts", 0)) + 1
+    was_bad = prev.get("state") not in (None, "watching")
+    polling = state in ("retrying", "partial")
+    st = {
+        "state": state,
+        "reason": reason,
+        "since": prev.get("since") if was_bad and prev.get("since") else now,
+        "attempts": attempts,
+        "next_retry": now + _retry_delay(attempts, missing=(state == "missing")),
+        "polling": polling,
+        "next_poll": (now if poll_now else
+                      prev.get("next_poll") or now + _FALLBACK_POLL_SEC) if polling else None,
+        "last_poll": prev.get("last_poll"),
+    }
+    _state.status[abs_p] = st
+    return st
+
+
+def _note_partial(root: str, reason: str = "") -> None:
+    """On the loop: a folder moved into ``root`` hit the watch limit — the
+    root is only partly watched.  Rescan it now and on the poll cadence, and
+    re-arm it with back-off."""
+    if root not in _state.roots:
+        return
+    st = _state.status.get(root) or {}
+    if st.get("state") == "partial":
+        return                                 # already handled
+    _set_failed(root, reason or "watch limit reached", state="partial", poll_now=True)
+    log.warning("watcher: %s is only partly watched (%s) — rescanning it every %d min "
+                "until it is fully watched again", root, reason, _FALLBACK_POLL_SEC // 60)
+
+
+def _release_failed_arm(exc: BaseException, observer, abs_p: str) -> None:
+    """Free what a failed ``schedule`` left behind.  watchdog's inotify opens
+    its instance and adds watches folder by folder; when one fails (the
+    watch limit) the half-built instance is dropped WITHOUT closing it — its
+    descriptor, kill pipe and every watch it added stay allocated (and count
+    against the limit) until the process ends.  It is still reachable from the
+    exception's traceback: close it there.  The handler ``schedule``
+    registered for the watch is dropped too."""
+    tb = exc.__traceback__
+    seen: set[int] = set()
+    while tb is not None:
+        obj = tb.tb_frame.f_locals.get("self")
+        tb = tb.tb_next
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if type(obj).__name__ == "Inotify" and hasattr(obj, "_close_resources"):
+            if getattr(obj, "_closed", True):
+                continue
+            try:
+                obj._closed = True
+                obj._close_resources()
+            except Exception:                  # noqa: BLE001 — best effort
+                log.debug("watcher: closing a half-built inotify failed", exc_info=True)
+    try:
+        lock = getattr(observer, "_lock", None)
+        handlers = getattr(observer, "_handlers", None)
+        watches = getattr(observer, "_watches", set())
+        if lock is not None and handlers is not None:
+            with lock:
+                for w in [w for w in list(handlers) if getattr(w, "path", None) == abs_p
+                          and w not in watches]:
+                    handlers.pop(w, None)
+    except Exception:                          # noqa: BLE001
+        log.debug("watcher: dropping a failed watch's handler failed", exc_info=True)
+
+
+def _schedule_blocking(observer, handler, abs_p: str):
+    """``observer.schedule`` — on a running observer this starts the root's
+    emitter (inotify: a watch per folder of the tree), so it runs in a
+    worker thread.  Raises what the backend raised, after cleaning up."""
+    kw = {}
+    if type(observer).__name__ == "InotifyObserver":
+        kw["event_filter"] = _INOTIFY_EVENT_FILTER
+    try:
         try:
-            watch = _state.observer.schedule(handler, abs_p, recursive=True, **kw)
+            return observer.schedule(handler, abs_p, recursive=True, **kw)
         except TypeError:                     # watchdog without ``event_filter``
-            watch = _state.observer.schedule(handler, abs_p, recursive=True)
+            return observer.schedule(handler, abs_p, recursive=True)
+    except BaseException as exc:
+        _release_failed_arm(exc, observer, abs_p)
+        raise
+
+
+async def _arm(root: str, *, retry: bool = False) -> bool:
+    """Schedule a recursive watch on ``root`` (skips remote paths and roots
+    already armed).  A root that can't be watched — missing, or the backend
+    refused it — is recorded in ``_state.status`` and retried by
+    :func:`_supervise` (``retry``: such a retry never adds the root again —
+    one removed while it waited stays removed).  True when the root is
+    watched."""
+    try:
+        from soniqboom.core.filesource import is_remote_path
+        if is_remote_path(root):
+            return False                      # no push notifications on a share
+    except Exception:                         # noqa: BLE001
+        pass
+    p = Path(root)
+    abs_p = await asyncio.to_thread(lambda: str(p.resolve()))
+    lock = _state.arm_lock
+    if lock is None:
+        lock = _state.arm_lock = asyncio.Lock()
+    async with lock:
+        if not _state.enabled or _state.observer is None:
+            return False
+        observer = _state.observer
+        if retry and abs_p not in _state.roots:
+            return False                      # removed while this retry waited
+
+        def _gone() -> bool:
+            """After an await: the watcher stopped (or was started again —
+            another observer), or the root was removed meanwhile.  Nothing of
+            this arm may land in the state then."""
+            return (not _state.enabled or _state.observer is not observer
+                    or abs_p not in _state.roots)
+
+        _state.roots.add(abs_p)
+        if abs_p in _state.watches:
+            return True
+        is_dir = await asyncio.to_thread(lambda: p.exists() and p.is_dir())
+        if _gone():
+            return False                      # removed / stopped meanwhile
+        if not is_dir:
+            prev = _state.status.get(abs_p) or {}
+            st = _set_failed(abs_p, "folder not found", state="missing")
+            if prev.get("state") != "missing":
+                log.info("watcher: %s is not there — watching it once it is (next "
+                         "check in %.0f s)", abs_p, st["next_retry"] - time.time())
+            return False
+        prev = _state.status.get(abs_p) or {}
+        try:
+            handler = _Handler(abs_p, await asyncio.to_thread(_canonical_path, abs_p))
+            if _gone():
+                return False                  # removed / stopped meanwhile
+            watch = await asyncio.to_thread(_schedule_blocking, observer, handler, abs_p)
+        except Exception as exc:
+            if _gone():
+                return False                  # removed / stopped while arming
+            reason = _limit_reason(exc)
+            st = _set_failed(abs_p, reason)
+            delay = st["next_retry"] - time.time()
+            if prev.get("state") in (None, "watching", "missing"):
+                log.error("watcher: cannot watch %s — %s; rescanning it every %d min "
+                          "and retrying in %.0f s (the other folders are not affected)",
+                          abs_p, reason, _FALLBACK_POLL_SEC // 60, delay)
+                if not isinstance(exc, OSError):
+                    log.debug("watcher: arm failure detail", exc_info=True)
+            else:
+                log.info("watcher: %s still can't be watched (%s, attempt %d) — next "
+                         "retry in %.0f s", abs_p, reason, st["attempts"], delay)
+            return False
+        if _gone():
+            # Removed, stopped or the observer replaced while arming: the
+            # watch goes (off the loop — ``unschedule`` waits for the
+            # observer's lock; a stopped observer drops it anyway).
+            try:
+                await asyncio.to_thread(observer.unschedule, watch)
+            except Exception:                 # noqa: BLE001
+                pass
+            return False
         handler.watch = watch
         _state.watches[abs_p] = watch
-        log.info("watcher: armed %s", abs_p)
+        _state.handlers[abs_p] = handler
+        _set_watching(abs_p)
+        if prev.get("state") in ("retrying", "partial", "missing"):
+            log.info("watcher: %s is watched again (after %d attempt(s)) — one rescan "
+                     "picks up what changed meanwhile", abs_p, prev.get("attempts", 0))
+            await _rescan_root(abs_p)
+        else:
+            log.info("watcher: armed %s", abs_p)
+        return True
+
+
+async def _rescan_root(abs_p: str) -> None:
+    """One incremental (light) rescan of ``abs_p`` — the fallback poll, and
+    the catch-up once a root is watched again."""
+    try:
+        from soniqboom.core.scanner import start_scan
+        await start_scan([abs_p], rescan_if_running=True, light=True)
     except Exception:
-        log.exception("watcher: failed to arm %s", abs_p)
+        log.exception("watcher: rescan of %s failed", abs_p)
+
+
+def _emitter_alive(watch) -> bool:
+    obs = _state.observer
+    try:
+        em = obs._emitter_for_watch.get(watch)        # type: ignore[union-attr]
+    except Exception:                                  # noqa: BLE001
+        return True                                    # can't tell: assume fine
+    if em is None:
+        return True
+    if not em.is_alive():
+        return False
+    # inotify: the reader thread ends on its own (the watched folder was
+    # unmounted: IN_UNMOUNT / IN_IGNORED) while the emitter keeps waiting.
+    buf = getattr(em, "_inotify", None)
+    return buf is None or not hasattr(buf, "is_alive") or buf.is_alive()
+
+
+async def _restart_observer() -> None:
+    """The dispatcher thread stopped: start a new observer and re-arm every
+    root on it (each rescanned once it is watched again)."""
+    old = _state.observer
+    log.error("watcher: the observer stopped — restarting it and re-arming %d root(s)",
+              len(_state.roots))
+    try:
+        if old is not None:
+            await asyncio.to_thread(old.stop)          # joins its emitters
+    except Exception:                                  # noqa: BLE001
+        pass
+    _state.observer = Observer()
+    _state.observer.start()
+    _state.watches.clear()
+    _state.handlers.clear()
+    for r in list(_state.roots):
+        st = _set_failed(r, "the watcher restarted", poll_now=False)
+        st["next_retry"] = 0.0
+
+
+async def _supervise_once() -> None:
+    """Retry roots that can't be watched, rescan them meanwhile, and notice a
+    watch (or the whole observer) that stopped."""
+    obs = _state.observer
+    if obs is None or not _state.enabled:
+        return
+    if not obs.is_alive():
+        await _restart_observer()
+    now = time.time()
+    for root in list(_state.roots):
+        st = _state.status.get(root)
+        if st is None:
+            continue
+        if st.get("state") == "watching":
+            w = _state.watches.get(root)
+            if w is not None and not _emitter_alive(w):
+                _state.watches.pop(root, None)
+                _state.handlers.pop(root, None)
+                try:
+                    await asyncio.to_thread(_state.observer.unschedule, w)
+                except Exception:                      # noqa: BLE001
+                    pass
+                _set_failed(root, "the watch stopped", poll_now=True)
+                log.error("watcher: the watch on %s stopped — rescanning it and re-arming",
+                          root)
+            continue
+        if st.get("next_retry", 0.0) <= now:
+            if st.get("state") == "partial":
+                # Keep the watch (most of the tree is watched) and add the
+                # folders that are missing — idempotent for the others.
+                h = _state.handlers.get(root)
+                ok = h is not None and await asyncio.to_thread(h._cover_subtree, root,
+                                                               notify=False)
+                if root not in _state.roots:
+                    continue                           # removed meanwhile
+                if ok:
+                    _set_watching(root)
+                    log.info("watcher: %s is fully watched again — one rescan picks up "
+                             "what changed meanwhile", root)
+                    await _rescan_root(root)
+                    continue
+                _set_failed(root, st.get("reason") or "watch limit reached", state="partial")
+            else:
+                await _arm(root, retry=True)
+            st = _state.status.get(root)
+            if st is None or st.get("state") == "watching":
+                continue
+        if st.get("polling") and (st.get("next_poll") or 0.0) <= now:
+            st["next_poll"] = now + _FALLBACK_POLL_SEC
+            st["last_poll"] = now
+            await _rescan_root(root)
+
+
+async def _supervise() -> None:
+    while _state.enabled:
+        await asyncio.sleep(_SUPERVISE_SEC)
+        try:
+            await _supervise_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watcher: supervision pass failed (continuing)")

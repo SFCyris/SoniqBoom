@@ -6,7 +6,7 @@
  */
 import { Player } from '../player.js';
 import { Auth }   from '../auth.js';
-import { artPlaceholderEmoji, Toast } from '../utils.js';
+import { artPlaceholderEmoji, Toast, staticArtUrl } from '../utils.js';
 import { Offline } from '../offline.js';
 import { Health, nothingToPlayText } from '../health.js';
 // UX-3 P0: mobile shell exposes the same globals desktop does so the
@@ -86,7 +86,12 @@ function activate(viewName) {
   if (!v) return;
 
   views.forEach(el => el.classList.toggle('active', el === v.el));
-  tabs.forEach(t => t.classList.toggle('active', t.dataset.view === viewName));
+  tabs.forEach(t => {
+    const on = t.dataset.view === viewName;
+    t.classList.toggle('active', on);
+    // (a navigation bar, not a tab list: the section shown is "current")
+    if (on) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+  });
   topbarTitle.textContent = v.title;
 
   if (!_mounted[viewName]) {
@@ -149,7 +154,7 @@ function renderMini(track) {
   span.className = 'm-mp-art-ph';
   span.textContent = artPlaceholderEmoji(track);
   miniArt.appendChild(span);
-  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm&fallback=404` : null);
+  const artSrc = staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null);
   if (artSrc) {
     const img = new Image();
     img.alt = '';
@@ -182,6 +187,103 @@ function renderMiniStation(st) {
 }
 
 Player.on('trackchange', renderMini);
+
+// A tune of an online collection not read yet — a package (Aminet, scene.org)
+// that opens into its first tune on this play, a catalogue file read on its
+// first play: the server rewrites its row a moment after the play starts.
+// The desktop page hears that over the library WebSocket; this shell reads
+// the row again a few times, and a package's other tunes follow it in the
+// queue once it opened.
+let _rowRefreshGen = 0;
+const _REMOTE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+Player.on('trackchange', (t) => {
+  const gen = ++_rowRefreshGen;
+  if (!t || !t.id || (t.mtime || 0) > 0 || !_REMOTE_RE.test(String(t.path || ''))) return;
+  const id = t.id;
+  let queued = false;
+  [2000, 5000, 10000, 20000].forEach((ms) => setTimeout(async () => {
+    if (gen !== _rowRefreshGen) return;
+    try {
+      const r = await fetch('/api/tracks/meta/batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [id] }), credentials: 'same-origin',
+      });
+      if (!r.ok || gen !== _rowRefreshGen) return;
+      const row = ((await r.json()) || []).find((x) => x && x.id === id);
+      if (!row) return;
+      const fields = { ...row }; delete fields.id;
+      const changed = Player.patchTrackFields?.(id, fields);
+      if (!changed || !Object.keys(changed).length) return;
+      renderMini(Player.currentTrack);
+      document.dispatchEvent(new CustomEvent('soniqboom:track-refreshed',
+        { detail: { id, fields: changed } }));
+      if (!queued && typeof changed.path === 'string' && changed.path.includes('::')) {
+        queued = true;
+        const m = await fetch(`/api/tracks/${encodeURIComponent(id)}/package-members`,
+                              { credentials: 'same-origin' });
+        const ids = m.ok ? (((await m.json()) || {}).ids || []) : [];
+        if (!ids.length) return;
+        const b = await fetch('/api/tracks/meta/batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids }), credentials: 'same-origin',
+        });
+        if (!b.ok) return;
+        const byId = new Map(((await b.json()) || []).filter(Boolean).map((x) => [x.id, x]));
+        Player.insertAfterTrack?.(id, ids.map((i) => byId.get(i)).filter(Boolean));
+      }
+    } catch (_) {}
+  }, ms));
+});
+// [m-restart:begin] — tests/js/mobile_restart.test.mjs runs this region as is
+// The server says it restarts (the library socket's "server_restarting", as
+// the desktop page hears it): a play that fails while it is away — also while
+// the new process doesn't answer at all yet — is waited out and played again
+// (Player.noteServerRestart), instead of being reported as a failure.  Also
+// read: rows of an online collection that left the library
+// (``catalogue_tracks_left`` → ``left``, see _tracksLeft).  The socket comes
+// back after a pause that grows to 30 s (1 s after the server's own restart
+// close, 1012) and rests while the page is hidden.
+function _listenForRestart({ WS = globalThis.WebSocket, doc = globalThis.document,
+                             loc = globalThis.location, wait = (fn, ms) => setTimeout(fn, ms),
+                             note = () => Player.noteServerRestart(),
+                             left = (m) => _tracksLeft(m) } = {}) {
+  let backoff = 2000;
+  const connect = () => {
+    if (doc.visibilityState === 'hidden') { doc.addEventListener('visibilitychange', connect, { once: true }); return; }
+    let ws;
+    try { ws = new WS(`${loc.protocol === 'https:' ? 'wss' : 'ws'}://${loc.host}/api/library/ws`); } catch (_) { return; }
+    ws.onmessage = (e) => {
+      let m = null;
+      try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m && m.event === 'server_restarting') { try { note(); } catch (_) { /* older player */ } }
+      else if (m && m.event === 'catalogue_tracks_left') { try { left(m); } catch (_) { /* isolation */ } }
+    };
+    ws.onopen = () => { backoff = 2000; };
+    ws.onclose = (ev) => {
+      const ms = ev && ev.code === 1012 ? 1000 : backoff;
+      backoff = Math.min(30000, backoff * 2);
+      wait(connect, ms);
+    };
+  };
+  connect();
+}
+// [m-restart:end]
+
+// Rows of an online collection left the library (a package with no tune in
+// it): the player's copies show why (health.js "no tunes"), the rows built
+// here repaint their badge, and the open list drops them.
+function _tracksLeft(m) {
+  const ids = Array.isArray(m && m.ids) ? m.ids.filter((x) => typeof x === 'string') : [];
+  if (!ids.length) return;
+  const reasons = (m.reasons && typeof m.reasons === 'object') ? m.reasons : {};
+  try { Player.markGone?.(ids, reasons); } catch (_) { /* older player */ }
+  for (const id of ids) {
+    document.dispatchEvent(new CustomEvent('soniqboom:health-changed',
+      { detail: { ids: [id], fields: { defect: 'empty', defect_detail: String(reasons[id] || '') } } }));
+  }
+  document.dispatchEvent(new CustomEvent('soniqboom:tracks-left', { detail: { ids } }));
+}
+
 // A queue cued for ▶ (see renderMini): repaint when the cued entry changes —
 // the resume / restore itself, a queue edit or a clear.  While a track is
 // loaded this is one test and nothing else.
@@ -203,6 +305,11 @@ Player.on('statechange', ({ playing }) => {
   // play of a session found nothing resumable and left the mini hidden: show
   // it once playback has actually started.
   if (playing && mini.classList.contains('hidden') && Player.currentTrack) renderMini(Player.currentTrack);
+  // A start that failed (the toast says why, and "Press Next to move on"):
+  // the mini-player shows the track, not playing, so Next is there to press.
+  else if (!playing && Player.startFailed && mini.classList.contains('hidden') && Player.currentTrack) {
+    renderMini(Player.currentTrack);
+  }
 });
 Player.on('timeupdate', ({ pct }) => {
   if (MobileRadio.active) return;
@@ -318,6 +425,7 @@ while (!Auth.user) {
 
 activate(initialView());
 renderMini(Player.currentTrack);
+_listenForRestart();
 // Follow "Tracks on unavailable drives" (marks, auto-play skipping); the views
 // re-read their lists on 'soniqboom:availability-changed'.
 Offline.init();

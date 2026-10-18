@@ -66,8 +66,11 @@ router = APIRouter(tags=["cast"])
 _NATIVE_EXTS = {".mp3", ".flac", ".wav", ".ogg", ".opus"}
 
 
-def _ext_for(track_path: str) -> str:
-    return Path(track_path.split("::")[-1] if "::" in track_path else track_path).suffix.lower()
+def _ext_for(track_path: str, track=None) -> str:
+    ext = Path(track_path.split("::")[-1] if "::" in track_path else track_path).suffix.lower()
+    if ext == ".mpg" and track is not None and getattr(track, "format", None) == "MP3":
+        return ".mp3"                    # Aminet MPEG audio read as MP3 (stream._render_ident)
+    return ext
 
 
 def _safe_header_filename(raw: str) -> str:
@@ -123,6 +126,15 @@ async def _authorize_cast(token: str, request: Request, *, bind: bool = True):
     # refuse to keep streaming.  This closes a 30-min window where a
     # token outlived the user record.
     uid = claims.get("uid")
+    if not uid:
+        # A user-less link (the DLNA Media Server's browse results): nobody
+        # vouches for it but the server, and a server in recovery (its
+        # accounts can't be loaded) serves nothing.  The link works again
+        # once it is unlocked (while it is still valid).
+        from soniqboom.core.users import accounts_locked
+        if accounts_locked():
+            raise HTTPException(503, "The server is locked: its user accounts "
+                                     "could not be loaded.")
     if uid:
         try:
             from soniqboom.core.users import get_user_store
@@ -159,13 +171,35 @@ async def _authorize_cast(token: str, request: Request, *, bind: bool = True):
     return claims, track, track_id
 
 
+async def _open_if_package(track_id: str, track):
+    """A package row of an online collection (an archive listed as one row)
+    is opened when the renderer asks for it — the cast IS its play — and
+    the member it became is cast."""
+    from soniqboom.core import catalogue, online_catalog
+    cat = online_catalog.owner_of(track.path)
+    if cat is None or not cat.is_package(cat.rel_of(track.path)):
+        return track
+    from soniqboom.core.filesource import get_source
+    from soniqboom.api.stream import _refuse_cache_flood
+    _refuse_cache_flood(track.path, track)           # (an LHA opens whole)
+    if not catalogue.is_cached(track.path) and get_source(cat.root) is None:
+        raise HTTPException(503, f"{cat.label} can't be reached right now — tunes played "
+                                 "before still play.")
+    if not catalogue.permit_play(track.path):
+        raise HTTPException(429, "Too many new downloads from the online collections — "
+                                 "try again shortly.")
+    from soniqboom.api.stream import _catalogue_expand
+    await _catalogue_expand(track_id, track.path, "stream")
+    return await get_track(track_id) or track
+
+
 def _cast_delivery(claims: dict, track) -> tuple:
     """(target_codec, bitrate, sample_rate, src_ext, src_codec, native_fastpath)
     — the delivery decision GET and HEAD must agree on."""
     target_codec = (claims.get("c") or "").lower() or None
     target_bitrate = int(claims.get("br") or 0) or None
     target_sample_rate = int(claims.get("sr") or 0) or None
-    src_ext = _ext_for(track.path)
+    src_ext = _ext_for(track.path, track)
     src_codec = src_ext.lstrip(".") if src_ext else "?"
     use_native_fastpath = (
         target_codec is None
@@ -239,6 +273,7 @@ async def cast_stream(
     use to pick the Content-Type and contentFeatures.dlna.org header.
     """
     claims, track, track_id = await _authorize_cast(token, request)
+    track = await _open_if_package(track_id, track)
 
     # Sanitise the filename before reflecting into Content-Disposition.
     filename = _safe_header_filename(filename)
@@ -251,7 +286,7 @@ async def cast_stream(
     # path so dither runs — see cast_pipe._build_cmd.
     target_bit_depth = int(claims.get("bd") or 0) or None
 
-    src_ext = _ext_for(track.path)
+    src_ext = _ext_for(track.path, track)
     src_codec = src_ext.lstrip(".") if src_ext else "?"
     proto = claims.get("proto") or "http"  # used only for telemetry tagging
     target_for_tel = target_codec or src_codec
@@ -311,7 +346,11 @@ async def cast_stream(
                     target_sample_rate=target_sample_rate or 0,
                     force_transcode=False,
                     sb_session=None,
-                    u=None, p=None, s=None, t=None,
+                    # (who listens — the renders it reads record it: the
+                    # token's user and cast target, not only the device's
+                    # address; the credential check is bypassed above)
+                    u=f"cast:{claims.get('uid') or ''}:{claims.get('tg') or ''}",
+                    p=None, s=None, t=None,
                 )
             finally:
                 _reset_cast_internal_bypass(bypass_token)
@@ -347,7 +386,8 @@ async def cast_stream(
         # downstream.  Without this, ``path_obj.exists()`` returns
         # False for any ZIP-contained track and the cast call 410s.
         _zip_track_id_for_unpin: str | None = None
-        if is_remote_path(track.path) and "::" in track.path:
+        from soniqboom.core.filesource import is_member_path, split_member
+        if is_remote_path(track.path) and is_member_path(track.path):
             # COMPOSITE remote archive member — ``ftp://host/share:/a.zip::x.mod``.
             # Partition the ``::`` tail FIRST, fetch only the OUTER archive into
             # the local remote-cache, THEN extract the member with the same
@@ -363,22 +403,37 @@ async def cast_stream(
             if not remote_path or "::" not in remote_path:
                 raise HTTPException(400, "Remote archive path is malformed.")
             source = get_source(scan_root)
-            zip_rel, _member = remote_path.split("::", 1)
+            zip_rel, _member = split_member(remote_path) or remote_path.split("::", 1)
             from soniqboom.core.remote_cache import get_cache as _get_cache
             from soniqboom.core.remote_zip import archive_for_member, cached_subset
             if source is None and not (_get_cache().peek_cached(scan_root, zip_rel)
                                        or cached_subset(scan_root, zip_rel, _member)):
                 raise HTTPException(503, "Network share unavailable.")
+            from soniqboom.core import catalogue as _cat
+            _is_cat_member = _cat.is_catalogue_path(track.path)
+            if _is_cat_member:
+                from soniqboom.api.stream import _refuse_cache_flood
+                _refuse_cache_flood(track.path, track)
+            if _is_cat_member and not _cat.permit_play(track.path):
+                raise HTTPException(429, "Too many new downloads from the online "
+                                         "collections — try again shortly.")
             import asyncio
             loop = asyncio.get_running_loop()
             try:
                 from soniqboom.api.stream import _archive_companion_filter
+                from soniqboom.api.stream import _remote_cache_half
+                _max = _remote_cache_half() if _is_cat_member else None
                 _local_zip = await loop.run_in_executor(
                     None, lambda: archive_for_member(
                         scan_root, zip_rel, _member, source,
-                        companion=_archive_companion_filter(_member)),
+                        companion=_archive_companion_filter(_member), max_whole=_max),
                 )
+            except HTTPException:
+                raise
             except Exception as exc:
+                from soniqboom.core.remote_zip import TooLargeToFetch
+                if isinstance(exc, TooLargeToFetch):
+                    raise HTTPException(413, f"Too large to download: {exc}.")
                 if source is None:              # its cached copy went meanwhile
                     raise HTTPException(503, "Network share unavailable.")
                 log.warning("cast: remote archive fetch failed for %s: %s", track.path, exc)
@@ -389,6 +444,9 @@ async def cast_stream(
             if extracted is None:
                 raise HTTPException(410, "Track missing inside the remote archive.")
             path_obj = extracted
+            if _is_cat_member:
+                from soniqboom.core import online_catalog
+                online_catalog.merge_after_play(track_id, path_obj)
             # Pin the extracted member so the LRU sweeper can't unlink it
             # mid-render; unpinned in _counting_gen / the early-raise handler.
             _zip_pin(track_id)
@@ -437,9 +495,12 @@ async def cast_stream(
             else:
                 # The cast device playing a catalogue tune IS its play: open
                 # the tune's fetch window (core/catalogue.py).
+                if _is_cat:
+                    from soniqboom.api.stream import _refuse_cache_flood
+                    _refuse_cache_flood(track.path, track)
                 if _is_cat and not catalogue.permit_play(track.path):
-                    raise HTTPException(429, "Too many new Modland downloads — "
-                                             "try again shortly.")
+                    raise HTTPException(429, "Too many new downloads from the online "
+                                             "collections — try again shortly.")
                 import asyncio
                 loop = asyncio.get_running_loop()
                 try:
@@ -450,8 +511,8 @@ async def cast_stream(
                     log.warning("cast: remote fetch failed for %s: %s", track.path, exc)
                     raise HTTPException(502, "Could not fetch remote source.")
             if catalogue.is_catalogue_path(track.path):
-                from soniqboom.core import modland_catalog
-                modland_catalog.merge_after_play(track_id, path_obj)
+                from soniqboom.core import online_catalog
+                online_catalog.merge_after_play(track_id, path_obj)   # (Modland's too)
         elif not path_obj.exists():
             raise HTTPException(410, "Source file no longer on disk.")
 
@@ -486,7 +547,7 @@ async def cast_stream(
                 prepare_source_for_stream, prepare_live_source, is_rendered_format,
             )
             target_subsong = int(claims.get("sn") or 0)
-            was_rendered = is_rendered_format(_ext_for(track.path))
+            was_rendered = is_rendered_format(_ext_for(track.path, track))
             if was_rendered:
                 try:
                     # ALWAYS the RESOLVED LOCAL path — path_obj has already

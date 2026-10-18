@@ -79,17 +79,27 @@ async def test_async_rebuild_retries_when_a_duration_write_lands_mid_build(monke
     s.update_track_fields_batch([(f"t{i:04d}", {"duration": 500.0 + i}) for i in range(20)])
     assert "_sorted_duration" in s._dirty_sorted
     real = s.build_sorted_list
+    real_merge = s.iter_merged_sorted_list
     fired = []
 
-    def build_then_write(name, changed=None):
-        out = real(name, changed)
+    def fire(name):
         if name == "_sorted_duration" and not fired:
             fired.append(1)
             # The first-play backfill of another track lands during the
             # rebuild's yields — after this list was built.
             s.update_track_fields("t0100", {"duration": 777.0})
+
+    def build_then_write(name, changed=None):
+        out = real(name, changed)
+        fire(name)
+        return out
+
+    def merge_then_write(name, changed, step=0):
+        out = yield from real_merge(name, changed, step)   # (the batch's tracks merged in)
+        fire(name)
         return out
     monkeypatch.setattr(s, "build_sorted_list", build_then_write)
+    monkeypatch.setattr(s, "iter_merged_sorted_list", merge_then_write)
     await scanner._async_exit_batch_mode(s)
     assert fired and not s._dirty_sorted and not s._batch_mode
     assert (777.0, "t0100") in s._sorted_duration

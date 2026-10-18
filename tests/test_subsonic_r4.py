@@ -957,7 +957,7 @@ def test_subsonic_prewarm_shares_the_stream_registry(env, monkeypatch):
     monkeypatch.setattr(data_mod, "get_store", lambda: env.store)
     started = []
 
-    async def _do(track_id, track, subsong, priority=None):
+    async def _do(track_id, track, subsong, priority=None, **_kw):
         started.append((track_id, subsong, priority))
         await asyncio.sleep(3600)                        # still running
     monkeypatch.setattr(stream_mod, "_do_prewarm", _do)
@@ -1000,7 +1000,7 @@ def test_subsonic_prewarm_setting_holds_back_rendered_formats_only(env, monkeypa
     monkeypatch.setattr(stream_mod, "stream_track", _fake)
     started = []
 
-    async def _do(track_id, track, subsong, priority=None):
+    async def _do(track_id, track, subsong, priority=None, **_kw):
         started.append(track_id)
     monkeypatch.setattr(stream_mod, "_do_prewarm", _do)
     stream_mod._prewarm_tasks.clear()

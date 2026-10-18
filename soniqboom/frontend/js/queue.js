@@ -46,6 +46,8 @@ function _paintOffer() {
 }
 if (offerBtn) offerBtn.addEventListener('click', () => { Player.resumeQueueOffer?.(); });
 Player.on('queueoffer', _paintOffer);
+// A start that failed / one that plays after all: the playing marker follows.
+Player.on('statechange', () => refresh());
 _paintOffer();
 
 // ── Clear queue with confirmation + undo ──────────────────────────────────────
@@ -191,9 +193,15 @@ let _restoring = false;           // Undo is putting the old queue back right no
 // Re-sync row indices + playing highlight after a spot-update.  Handlers
 // read ``row.dataset.idx`` at event time, so this sweep is all that's
 // needed to keep them correct.
+// The row the queue marks as playing: the current one — none while its start
+// has failed (nothing plays; its badge says why).
+function _playingIdx() {
+  return Player.startFailed ? -1 : Player.queueIdx;
+}
+
 function _renumber() {
   const q   = Player.queue;
-  const idx = Player.queueIdx;
+  const idx = _playingIdx();
   countEl.textContent = q.length ? `(${q.length})` : '';
   listEl.querySelectorAll('.queue-row').forEach((row, i) => {
     row.dataset.idx = i;
@@ -214,7 +222,7 @@ function _renumber() {
 function refresh() {
   if (_suppressRefresh) return;   // self-initiated spot-update already applied
   const q   = Player.queue;
-  const idx = Player.queueIdx;
+  const idx = _playingIdx();
 
   // Update count badge
   countEl.textContent = q.length ? `(${q.length})` : '';
@@ -273,13 +281,13 @@ function refresh() {
     // positioned <img>; ``track.cover_art`` is only populated when art
     // was extracted at scan time, but ``/api/art/{id}`` extracts on
     // demand for tracks where it wasn't.  Asking for the endpoint
-    // unconditionally — and dropping the <img> when it 404s — keeps the
+    // unconditionally — and dropping the <img> when it errors (204 — no art) — keeps the
     // queue/playlist row visually consistent with the bottom-left
     // player, which uses the same endpoint.
-    // ``fallback=404`` so an art-less track 404s (→ <img> onerror removes it)
+    // ``fallback=none`` so an art-less track gets a 204 (→ <img> onerror removes it)
     // and the format-emoji placeholder shows — without it the endpoint returns
     // the generic ♪ placeholder JPEG, which paints over the emoji.
-    const artSrc = track.id ? `/api/art/${track.id}?size=sm&fallback=404` : '';
+    const artSrc = track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : '';
     const artHtml = `<div class="queue-row-art">
       <span class="qr-art-ph">${artPlaceholderEmoji(track)}</span>
       ${artSrc ? `<img class="qr-art-img" src="${esc(artSrc)}" decoding="async" alt="">` : ''}
@@ -298,7 +306,7 @@ function refresh() {
     `;
 
     // Cover thumbnail load/error handlers — fade-in on decode, remove
-    // the <img> on 404 so the format emoji stays the visible default.
+    // the <img> on error (204 — no art) so the format emoji stays the visible default.
     const _qArtImg = row.querySelector('.qr-art-img');
     if (_qArtImg) {
       _qArtImg.onload  = () => _qArtImg.classList.add('loaded');

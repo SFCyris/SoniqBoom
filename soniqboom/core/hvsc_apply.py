@@ -18,18 +18,32 @@ This is called:
     HVSC actually updates the tracks without the user clicking anything.
 
 It is idempotent: only tracks whose data actually changes are written, so the
-auto-fire path is cheap to run after every SID-bearing scan.
+auto-fire path is cheap to run after every SID-bearing scan.  A scan passes the
+SIDs it added or changed (``ids``); the whole SID library is joined in chunks
+of at most ``_SLICE_S`` of loop time each, after the HVSC documents are loaded
+in a worker thread.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+import time
 from pathlib import Path
 
 from soniqboom.core.filesource import is_remote_path
 
 log = logging.getLogger(__name__)
+
+# Loop time one synchronous slice of the join may take, and the pause after
+# it (a timer: work that became ready meanwhile runs before the next slice);
+# how many tracks one file-reading batch (no cached MD5) / one conversion-cache
+# reconcile call takes.
+_SLICE_S = 0.004
+_PAUSE_S = 0.0005
+_IO_BATCH = 256
+_PURGE_BATCH = 2048
+_PURGE_PASSES = 4
 
 
 def _ints(seq) -> set[int]:
@@ -64,17 +78,21 @@ async def apply_hvsc_to_library(*, reload: bool = False,
     if reload:
         hvsc.reload()                       # pick up an updated/auto-detected DB
     store = get_store()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+    # The documents are read and parsed (megabytes; over the share when the
+    # DOCUMENTS path is remote) by the first lookup — in a worker thread
+    # here, not by the first lookup of the join on the loop.
+    preload = getattr(hvsc, "_ensure_loaded", None)
+    if callable(preload):
+        await loop.run_in_executor(None, preload)
 
     # Reuse the maintained _tag_format index (keyed lowercase) instead of
     # materializing + scanning all 270k metas — O(|SID bucket|).
-    if ids is not None:
-        bucket = store._tag_format.get("sid", ())
-        sids = [store._meta_dict(tid) for tid in ids if tid in bucket and tid in store._tracks]
-    else:
-        sids = store.tracks_for_format("SID")
-    scanned = len(sids)
-    sid_track_ids = [t["id"] for t in sids]
+    t0 = time.perf_counter()
+    bucket = store._tag_format.get("sid", ())
+    # (a track no longer stored is skipped by the join below)
+    tids = [tid for tid in ids if tid in bucket] if ids is not None else list(bucket)
+    sid_track_ids: list[str] = []
 
     # ── Resolve each track's whole-file MD5 (cached → compute → fetch) ──
     skipped_missing = 0
@@ -84,9 +102,6 @@ async def apply_hvsc_to_library(*, reload: bool = False,
 
     async def _resolve(t: dict):
         nonlocal skipped_missing, skipped_unreadable, skipped_catalogue
-        md5 = (t.get("sid_md5") or "").strip().lower() or None
-        if md5:
-            return t, md5, False            # cached — no I/O, nothing to persist
         path_str = t.get("path") or ""
         from soniqboom.core import catalogue
         if catalogue.is_catalogue_path(path_str):
@@ -139,13 +154,15 @@ async def apply_hvsc_to_library(*, reload: bool = False,
                 return t, None, False
         return t, md5, True
 
-    resolved = await asyncio.gather(*[_resolve(t) for t in sids])
-
     # ── Build patches — idempotent: only include fields that actually change ──
     updates: list[tuple[str, dict]] = []
-    correct_durations: dict[str, set[int]] = {}
+    # The MD5 of each track HVSC has lengths for: its valid render durations
+    # are looked up again batch by batch at the conversion-cache reconcile
+    # below (one set per track held for the whole pass kept the cyclic GC
+    # busy on a full-library join).
+    hvsc_md5: dict[str, str] = {}
 
-    for t, md5, newly in resolved:
+    def _patch(t: dict, md5, newly: bool) -> None:
         patch: dict = {}
         if newly and md5 and md5 != (t.get("sid_md5") or ""):
             patch["sid_md5"] = md5           # cache for next time (one-time backfill)
@@ -162,21 +179,51 @@ async def apply_hvsc_to_library(*, reload: bool = False,
                 patch["hvsc_lengths"] = durations
             if len(durations) > 1 and t.get("subsongs") != len(durations):
                 patch["subsongs"] = len(durations)
-            correct_durations[t["id"]] = _ints(durations)
-        else:
-            # No HVSC entry — keep whatever durations the track already had so
-            # its conversion-cache entries survive.
-            valid = _ints(t.get("hvsc_lengths") or [])
-            if t.get("duration"):
-                valid |= _ints([t["duration"]])
-            if valid:
-                correct_durations[t["id"]] = valid
+            hvsc_md5[t["id"]] = md5
         key = hvsc.stil_key_for(t.get("path") or "")
         stil = hvsc.lookup_stil_by_relpath(key) if key else None
+        by_md5 = getattr(hvsc, "path_for_md5", None)
+        if stil is None and md5 and by_md5 is not None:
+            # A SID outside the HVSC tree: its entry by its checksum's HVSC path.
+            rel = by_md5(md5)
+            stil = hvsc.lookup_stil_by_relpath(rel) if rel else None
         if stil and stil.get("text") and stil["text"] != (t.get("stil") or ""):
             patch["stil"] = stil["text"]
         if patch:
             updates.append((t["id"], patch))
+
+    # A track with a cached MD5 (the common case — the scan workers cache it)
+    # is joined right away, from its stored fields, in slices of at most
+    # ``_SLICE_S`` of loop time; the rest are read (file / remote / archive
+    # member) in bounded batches, then joined.
+    needs_io: list[dict] = []
+    for tid in tids:
+        t = store._tracks.get(tid)
+        if t is None:
+            continue                        # (removed meanwhile)
+        sid_track_ids.append(tid)
+        md5 = (t.get("sid_md5") or "").strip().lower() or None
+        if md5:
+            _patch(t, md5, False)           # cached — no I/O, nothing to persist
+        else:
+            needs_io.append(store._meta_dict(tid))
+        if time.perf_counter() - t0 >= _SLICE_S:
+            await asyncio.sleep(_PAUSE_S)
+            t0 = time.perf_counter()
+    scanned = len(sid_track_ids)
+    # Valid durations of a track without HVSC lengths — kept so its
+    # conversion-cache entries survive — from its stored fields (which the
+    # join doesn't write for it): read at the reconcile below.
+    no_lengths: dict[str, tuple] = {}
+    for i in range(0, len(needs_io), _IO_BATCH):
+        part = needs_io[i:i + _IO_BATCH]
+        resolved = await asyncio.gather(*[_resolve(t) for t in part])
+        for t, md5, newly in resolved:
+            _patch(t, md5, newly)
+            if t["id"] not in hvsc_md5:
+                # (the copy read before the files: the track as joined)
+                no_lengths[t["id"]] = (t.get("hvsc_lengths"), t.get("duration"))
+        await asyncio.sleep(_PAUSE_S)
 
     if updates:
         # On the loop thread (the store has no lock — a write from a worker
@@ -196,11 +243,50 @@ async def apply_hvsc_to_library(*, reload: bool = False,
         except Exception:
             log.debug("HVSC apply: cache refresh failed", exc_info=True)
 
-    # Reconcile the SID conversion cache against the post-apply durations.
+    # Reconcile the SID conversion cache against the post-apply durations: a
+    # track's HVSC lengths, else the durations it already had.  Only the SIDs
+    # with an entry in the cache (one sliced pass over its keys), in batches —
+    # each purge call walks the cache once.
+    from soniqboom.core import conversion_cache as _cc
     from soniqboom.core.conversion_cache import purge_sid_entries_for
-    purged = await purge_sid_entries_for(
-        sid_track_ids, keep_duration=correct_durations,
-    )
+    purge_ids = sid_track_ids
+    meta = getattr(_cc, "_meta", None)
+    if isinstance(meta, dict):
+        cached: set[str] = set()
+        keys = list(meta)
+        for j in range(0, len(keys), 8_192):
+            for k in keys[j:j + 8_192]:
+                tid, sep, _rest = k.partition("__sub")
+                if sep:
+                    cached.add(tid)
+            await asyncio.sleep(_PAUSE_S)
+        del keys
+        purge_ids = []
+        for j in range(0, len(sid_track_ids), 8_192):
+            purge_ids += [tid for tid in sid_track_ids[j:j + 8_192] if tid in cached]
+            await asyncio.sleep(_PAUSE_S)
+    purged = 0
+    # (at most ``_PURGE_PASSES`` walks of the cache, batches of at least
+    # ``_PURGE_BATCH``)
+    batch = max(_PURGE_BATCH, -(-len(purge_ids) // _PURGE_PASSES))
+    for i in range(0, len(purge_ids), batch):
+        keep: dict[str, set[int]] = {}
+        for tid in purge_ids[i:i + batch]:
+            md5 = hvsc_md5.get(tid)
+            if md5 is not None:
+                keep[tid] = _ints(hvsc.lookup_durations_by_md5(md5))
+                continue
+            src = no_lengths.get(tid)
+            if src is None:
+                t = store._tracks.get(tid) or {}
+                src = (t.get("hvsc_lengths"), t.get("duration"))
+            valid = _ints(src[0] or [])
+            if src[1]:
+                valid |= _ints([src[1]])
+            if valid:
+                keep[tid] = valid
+        purged += await purge_sid_entries_for(purge_ids[i:i + batch], keep_duration=keep)
+        await asyncio.sleep(_PAUSE_S)
 
     msg_parts = [f"Updated {len(updates)} of {scanned} SID track(s)."]
     if purged:

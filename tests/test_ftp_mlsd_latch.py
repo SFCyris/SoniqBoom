@@ -287,8 +287,8 @@ def test_double_colon_directory_names_ARE_listed(path):
 # ── L: LIST date columns parse to a real, stable mtime ─────────────────────
 def test_parse_list_mtime_unix_year_form():
     ts = FTPFileSource._parse_list_mtime_unix("Jan", "15", "2024")
-    import datetime
-    assert ts == datetime.datetime(2024, 1, 15).timestamp()
+    import calendar
+    assert ts == calendar.timegm((2024, 1, 15, 0, 0, 0))       # read as UTC
 
 
 def test_parse_list_mtime_unix_time_form_keeps_minute_precision():
@@ -296,9 +296,9 @@ def test_parse_list_mtime_unix_time_form_keeps_minute_precision():
     # same-day same-size re-tag is detected while the file is recent (its
     # minute changes).  Year inferred: this year, or last if that's future.
     import datetime
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     ts = FTPFileSource._parse_list_mtime_unix("Jan", "15", "12:34")
-    got = datetime.datetime.fromtimestamp(ts)
+    got = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).replace(tzinfo=None)
     assert got.month == 1 and got.day == 15
     assert got.hour == 12 and got.minute == 34        # real time preserved
     assert got.year in (now.year, now.year - 1)
@@ -321,9 +321,9 @@ def test_parse_list_mtime_unix_bad_inputs_return_zero():
 
 
 def test_parse_list_mtime_windows():
-    import datetime
+    import calendar
     ts = FTPFileSource._parse_list_mtime_windows("01-15-24", "12:34PM")
-    assert ts == datetime.datetime(2024, 1, 15, 12, 34).timestamp()
+    assert ts == calendar.timegm((2024, 1, 15, 12, 34, 0))     # read as UTC
     assert FTPFileSource._parse_list_mtime_windows("bad", "bad") == 0.0
 
 

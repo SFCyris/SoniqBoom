@@ -330,7 +330,215 @@ def _on_uvloop() -> bool:
         return False
 
 
+# Every process ``spawn`` started that may still run: pid → (asyncio process,
+# its event loop) — what the server's stop ends (``live_processes``).  Pruned
+# at each start and read of the ended ones and of those whose loop is closed
+# (its process can no longer be waited for there; its pid may be reused).
+_LIVE: "dict[int, tuple]" = {}
+_live_lock = threading.Lock()
+# Set while the server stops: ``spawn`` refuses new processes
+# (``SpawnsClosed``) — a render a stopping task still starts would outlive it.
+_spawns_closed = False
+
+
+class SpawnsClosed(RuntimeError):
+    """``spawn`` was called while the server stops."""
+
+
+def close_spawns() -> None:
+    """The server stops: ``spawn`` refuses to start processes until
+    ``open_spawns``."""
+    global _spawns_closed
+    _spawns_closed = True
+
+
+def open_spawns() -> None:
+    """A server run starts: ``spawn`` starts processes again."""
+    global _spawns_closed
+    _spawns_closed = False
+
+
+def _prune_locked() -> None:
+    for pid in [pid for pid, (pr, lp) in _LIVE.items()
+                if getattr(pr, "returncode", None) is not None or lp.is_closed()]:
+        _LIVE.pop(pid, None)
+        _watchdog_note("-", pid)
+
+
+def _register(proc, program=None) -> None:
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    with _live_lock:
+        _prune_locked()
+        _LIVE[pid] = (proc, loop)
+        if program is not None and getattr(proc, "returncode", None) is None:
+            _watchdog_note("+", pid, os.path.basename(os.fsdecode(program)))
+
+
+# ── Children end with the server ────────────────────────────────────────────
+# A process ``spawn`` started must not outlive the server, also when the
+# server dies without its stop (a crash, ``kill -9``): a renderer told to play
+# on (zxtune ``--loop``) would go on writing its temp file for ever.
+#
+#   • Linux: the child asks the kernel for SIGKILL when its parent dies
+#     (``prctl(PR_SET_PDEATHSIG)`` in a ``preexec_fn``; Linux forks anyway).
+#   • elsewhere (macOS): one watchdog per server process — ``/usr/bin/awk``
+#     reading a pipe whose only write end the server holds.  The server
+#     writes ``+ <pid> <name>`` for each child it starts and ``- <pid>`` once
+#     it has seen it end; the pipe reaches its end when the server's
+#     descriptors close — it exited, however — and the watchdog then SIGKILLs
+#     each child still listed whose parent is the server or init (it was
+#     re-parented) and whose process name is the one recorded, never any other
+#     process.  An in-place restart (``os.execv``) closes the pipe too
+#     (close-on-exec): the previous image's leftover children end with it.
+#
+# ``render_tmp.kill_orphan_renderers`` is the safety net at the next start.
+_PR_SET_PDEATHSIG = 1
+_prctl = None
+_WATCHDOG_AWK = r"""
+$1 == "+" { live[$2] = $3; next }
+$1 == "-" { delete live[$2]; next }
+END {
+  for (p in live) {
+    cmd = "ps -o ppid= -o ucomm= -p " p
+    line = ""
+    if ((cmd | getline line) > 0) {
+      n = split(line, f, " ")
+      if (n >= 2 && (f[1] == 1 || f[1] == srv) && f[2] == live[p]) system("kill -9 " p)
+    }
+    close(cmd)
+  }
+}
+"""
+_AWK = "/usr/bin/awk"
+_wd_lock = threading.Lock()
+_wd = {"owner": None, "fd": -1, "pid": None}
+# The process name ``ps -o ucomm`` shows: the program's file name, cut to
+# MAXCOMLEN (16) characters.
+_UCOMM_MAX = 16
+
+
+def _pdeathsig_preexec():
+    """A ``preexec_fn`` (Linux) that has the child SIGKILLed when the server
+    dies — and ends it at once if the server died before it could ask.  None
+    when the C library has no ``prctl``."""
+    global _prctl
+    if _prctl is None:
+        try:
+            import ctypes
+            _prctl = ctypes.CDLL(None, use_errno=True).prctl
+        except (OSError, AttributeError):
+            _prctl = False
+    if not _prctl:
+        return None
+    prctl, parent = _prctl, os.getpid()
+
+    def _pre() -> None:
+        prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+        if os.getppid() != parent:
+            os._exit(1)
+    return _pre
+
+
+def _watchdog_wanted() -> bool:
+    return (sys.platform != "win32" and not sys.platform.startswith("linux")
+            and os.environ.get("SONIQBOOM_CHILD_WATCHDOG", "1") != "0"
+            and os.path.exists(_AWK))
+
+
+def _watchdog_fd() -> int:
+    """The write end of this process's watchdog pipe, the watchdog started
+    on first use (``_wd_lock`` held); -1 when it can't be started."""
+    me = os.getpid()
+    if _wd["owner"] == me and _wd["fd"] >= 0:
+        return _wd["fd"]
+    if _wd["owner"] is not None and _wd["owner"] != me:
+        _wd.update(owner=None, fd=-1, pid=None)     # a forked child: never its parent's
+    r = w = nul = -1
+    try:
+        r, w = os.pipe()                            # both close-on-exec
+        nul = os.open(os.devnull, os.O_RDWR)
+        args = [_AWK, "-v", f"srv={me}", _WATCHDOG_AWK]
+        if sys.platform == "darwin":
+            pid = _spawn_tight(_AWK, args, dict(os.environ), True, ((r, 0), (nul, 1), (nul, 2)))
+        else:
+            pid = subprocess.Popen(args, stdin=r, stdout=nul, stderr=nul, close_fds=True).pid
+        os.set_blocking(w, False)
+    except Exception:                               # noqa: BLE001
+        log.debug("child watchdog could not be started", exc_info=True)
+        for fd in (w,):
+            if fd >= 0:
+                os.close(fd)
+        w = -1
+        pid = None
+    finally:
+        for fd in (r, nul):
+            if fd >= 0:
+                os.close(fd)
+    _wd.update(owner=me, fd=w, pid=pid)
+    return w
+
+
+def _watchdog_note(op: str, pid: int, name: str = "") -> None:
+    """Tell the watchdog that child ``pid`` started (``+``, its program's
+    file name) or ended (``-``).  Never blocks: a record the pipe can't take
+    now is dropped (the start's sweep is the safety net)."""
+    if not _watchdog_wanted():
+        return
+    name = "".join(ch for ch in name if not ch.isspace())[:_UCOMM_MAX]
+    if op == "+" and not name:
+        return
+    with _wd_lock:
+        if op == "-" and _wd["owner"] != os.getpid():
+            return                                  # nothing was recorded here
+        fd = _watchdog_fd()
+        if fd < 0:
+            return
+        line = (f"+ {pid} {name}\n" if op == "+" else f"- {pid}\n").encode()
+        try:
+            os.write(fd, line)
+        except BlockingIOError:
+            pass
+        except OSError:                             # the watchdog ended: start another
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _wd.update(fd=-1)
+
+
+def live_processes() -> list:
+    """The processes ``spawn`` started on the running event loop that haven't
+    ended (as far as it has seen)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return []
+    with _live_lock:
+        _prune_locked()
+        return [pr for pr, lp in _LIVE.values() if lp is loop]
+
+
 async def spawn(program, *args, **kwargs):
+    """``_spawn`` (below), recorded until it ends (``live_processes``) —
+    refused with ``SpawnsClosed`` while the server stops.  The process ends
+    with the server, however the server ends (see "Children end with the
+    server" above)."""
+    if _spawns_closed:
+        raise SpawnsClosed(f"not starting {os.path.basename(os.fspath(program))}: "
+                           "the server is stopping")
+    if sys.platform.startswith("linux") and kwargs.get("preexec_fn") is None:
+        pre = _pdeathsig_preexec()
+        if pre is not None:
+            kwargs["preexec_fn"] = pre
+    proc = await _spawn(program, *args, **kwargs)
+    _register(proc, program)
+    return proc
+
+
+async def _spawn(program, *args, **kwargs):
     """``asyncio.create_subprocess_exec`` that never forks on macOS (see the
     module docstring).  The process runs in the background and is handled —
     pipes, ``wait``, ``kill``, cancellation — exactly as

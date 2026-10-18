@@ -19,7 +19,10 @@ oldest entry and delete its file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import hashlib
+import itertools
 import logging
 import os
 import shutil
@@ -74,6 +77,134 @@ def _lock_for(key: str) -> asyncio.Lock:
             _keyed_locks[key] = lock
     return lock
 
+# ── Who still wants a render ────────────────────────────────────────────────
+# Every caller waiting for a render's result, by cache key: a callable each
+# that says whether that caller still wants it.  ``get_or_render`` registers
+# its caller for as long as it waits — wanted throughout unless the caller's
+# context says otherwise (``render_interest``: a prewarm that is retired stops
+# wanting its render; ``NO_INTEREST``: bookkeeping that only follows a render
+# someone else asked for).  A render no caller wants (``wanted`` False) and
+# no listener reads may be stopped to free its render slot
+# (``stream._preempt_abandoned_render``); its waiters then see it cancelled.
+render_interest: "contextvars.ContextVar" = contextvars.ContextVar(
+    "soniqboom_render_interest", default=None)
+_interest: "dict[str, dict[int, object]]" = {}
+_interest_seq = itertools.count()
+# The cache key the render running in this task fills: set inside
+# ``get_or_render``'s detached render task, so a live render can tell that
+# cancelling the task it runs in stops exactly that render.
+rendering_key: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "soniqboom_rendering_key", default=None)
+# A list a caller sets to learn which entries its ``get_or_render`` calls
+# produced: ``(key, format_type, path)`` appended per call (the next-track
+# prewarm: the render a transcode is then made from).
+render_results: "contextvars.ContextVar[list | None]" = contextvars.ContextVar(
+    "soniqboom_render_results", default=None)
+
+
+def _note_result(key: str, format_type: str, path: Path) -> None:
+    out = render_results.get()
+    if out is not None:
+        out.append((key, format_type, path))
+
+
+def _always_wanted() -> bool:
+    return True
+
+
+def NO_INTEREST() -> bool:       # noqa: N802 — a constant callable
+    return False
+
+
+class RenderStopped(RuntimeError):
+    """The render a caller that no longer wants it was waiting for was
+    stopped (``get_or_render`` doesn't render it again for such a caller)."""
+
+
+def register_interest(key: str, cb=None) -> int:
+    """Count a waiter on ``key``'s render (``cb``: whether it still wants it;
+    default the context's ``render_interest``, else always).  Returns the
+    token for ``drop_interest``."""
+    if cb is None:
+        cb = render_interest.get() or _always_wanted
+    tok = next(_interest_seq)
+    _interest.setdefault(key, {})[tok] = cb
+    return tok
+
+
+# Called (on the loop) when a caller stops waiting for a render — the stream
+# module's ``_poke_slot_waiters``: a play waiting for a slot looks again.
+on_interest_dropped = None
+
+
+def drop_interest(key: str, tok: int) -> None:
+    waiters = _interest.get(key)
+    if waiters is not None:
+        waiters.pop(tok, None)
+        if not waiters:
+            _interest.pop(key, None)
+    hook = on_interest_dropped
+    if hook is not None:
+        try:
+            hook()
+        except Exception:                               # noqa: BLE001
+            pass
+
+
+@contextlib.contextmanager
+def interest(key: str, cb=None):
+    """``register_interest`` for the duration of a ``with`` block."""
+    tok = register_interest(key, cb)
+    try:
+        yield
+    finally:
+        drop_interest(key, tok)
+
+
+class PrewarmWant:
+    """A prewarm's ``render_interest``: it wants its render until retired
+    (cancelled, expired, or its render was stopped for a play — ``retire``).
+    A play that needs a render slot doesn't count it (``wanted(by_play=True)``):
+    speculative work never keeps a slot from a listener."""
+
+    prewarm = True
+    __slots__ = ("alive",)
+
+    def __init__(self) -> None:
+        self.alive = True
+
+    def __call__(self) -> bool:
+        return self.alive
+
+    def retire(self) -> None:
+        self.alive = False
+
+
+def wanted(key: str, *, by_play: bool = False) -> bool:
+    """Does any caller still want ``key``'s render?  ``by_play``: as a play
+    waiting for a slot sees it — prewarms (``PrewarmWant``) don't count."""
+    for cb in list((_interest.get(key) or {}).values()):
+        if by_play and getattr(cb, "prewarm", False):
+            continue
+        try:
+            if cb():
+                return True
+        except Exception:                               # noqa: BLE001
+            return True          # can't tell: keep it
+    return False
+
+
+def retire_prewarm_wants(key: str) -> int:
+    """Retire every prewarm waiting for ``key``'s render (its render was
+    stopped for a play): none of them renders it again.  Returns how many."""
+    n = 0
+    for cb in list((_interest.get(key) or {}).values()):
+        if getattr(cb, "prewarm", False) and callable(getattr(cb, "retire", None)):
+            cb.retire()
+            n += 1
+    return n
+
+
 # ── Eviction-pin set — keys protected from LRU eviction ─────────────────────
 # Populated/cleared by the stream endpoint at playback start/end so a
 # speculative N+2 prewarm can't evict the currently-playing track and force
@@ -119,7 +250,11 @@ _state_lock = threading.RLock()
 
 # Render revision per format type: bumped when that renderer's output for
 # the same tune changes, so older cached renders are left to eviction.
-_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1}
+# tracker 2: our own float WAV with libopenmpt's end fade, and modules ending
+# in a song-end loop stop where it first repeats (a 65:56 render of a 5:02
+# tune was played — and its length written back — while it stayed cached);
+# rev 1 was a 16-bit 44.1 kHz render that never shipped.
+_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1, "tracker": 2}
 
 
 def _cache_key(
@@ -259,6 +394,10 @@ def _find_orphan_sidecar(track_id: str, subsong: int,
     base = get_conversion_cache_dir()
     exact = f"{track_id}__sub{int(subsong)}"
     shard = track_id[:2]
+    # A tracker render's own key carries its render revision (``_RENDER_REVS``).
+    p = base / "tracker" / shard / f"{_cache_key(track_id, 'tracker', int(subsong))}.vu"
+    if not uade_variant and p.exists():
+        return p
     if uade_variant:
         # Only the variant's own sidecar is right for this tune — the plain
         # ``__sub<N>`` one (or the glob below) could be another tune's.
@@ -285,9 +424,9 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
     *subsong* (0-based wire index), or None if that subsong hasn't been
     rendered yet.
 
-    The tracker/uade cache key is exactly ``"<track_id>__sub<N>"`` (those
-    format types append no other key parts — see ``_cache_key``), so we
-    match by EQUALITY on ``sub<subsong>``.  Equality (not ``startswith``)
+    The tracker/uade cache key is exactly ``"<track_id>__sub<N>"`` plus, for
+    a tracker, its render revision (see ``_cache_key``), so we match by
+    EQUALITY on the whole key.  Equality (not ``startswith``)
     is deliberate: a prefix match on ``sub1`` would also catch ``sub10``,
     ``sub12`` … and a subsong-agnostic match would serve tune 0's meters
     while tune 3 plays.  Multi-subsong UADE files (AHX/HVL/TFMX) and the
@@ -304,14 +443,16 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
     want = f"{track_id}__sub{int(subsong)}"
     want_sid_prefix = want + "__"      # SID keys append __dur{D}[+fidelity parts]
     want_uade = f"{want}__v{uade_variant}" if uade_variant else want
+    want_tracker = _cache_key(track_id, "tracker", int(subsong))
     with _state_lock:
         for cache_key, entry in _meta.items():
             fmt = entry.get("format_type")
             if fmt in ("tracker", "uade"):
                 # tracker renders get VU from libopenmpt; uade renders from the
                 # Paula --write-audio dump (uade_vu.py).  Their keys are exactly
-                # "<track_id>__sub<N>" (uade: plus the variant) → equality.
-                if cache_key != (want_uade if fmt == "uade" else want):
+                # "<track_id>__sub<N>" (uade: plus the variant; tracker: plus
+                # its render revision) → equality.
+                if cache_key != (want_uade if fmt == "uade" else want_tracker):
                     continue
             elif fmt == "sid":
                 # SID renders get VU from 3 sidplayfp voice-isolation passes
@@ -358,6 +499,90 @@ def get_sid_wav_path_for_upload(track_id: str, subsong: int = 0) -> Path | None:
     return None
 
 
+# A copy into the cache in progress (``_move_into_place``): never adopted, and
+# removed by ``warmup_from_disk`` (a process that died part-way left it).
+_COPY_TMP_SUFFIX = ".copying"
+
+
+def _move_into_place(src: Path, dest: Path) -> None:
+    """Move ``src`` to ``dest`` so that ``dest`` only ever names a complete
+    file: a rename when they share a filesystem; otherwise (the temp folder on
+    another volume — the Docker layout) a copy into a temp name in ``dest``'s
+    folder, fsync'd, then renamed over ``dest`` (the folder fsync'd too), and
+    ``src`` removed.  A process that ends part-way leaves the temp copy, never
+    a truncated ``dest``."""
+    try:
+        os.replace(str(src), str(dest))
+        return
+    except OSError:
+        pass
+    import secrets
+    from soniqboom.core import durable
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}{_COPY_TMP_SUFFIX}")
+    try:
+        shutil.copyfile(str(src), str(tmp))
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(dest))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    durable.fsync_dir(dest.parent)
+    try:
+        src.unlink()
+    except OSError:
+        pass
+
+
+def _wav_data_chunk(head: bytes, pad: bool) -> "tuple[int, int] | None":
+    """``(offset of the audio, declared size)`` of the ``data`` chunk in the
+    RIFF header bytes ``head``, chunks walked with (``pad``) or without the
+    pad byte after an odd-sized one; None when not found in ``head``."""
+    pos = 12
+    while pos + 8 <= len(head):
+        cid = head[pos:pos + 4]
+        clen = int.from_bytes(head[pos + 4:pos + 8], "little")
+        if cid == b"data":
+            return pos + 8, clen
+        pos += 8 + clen + (clen & 1 if pad else 0)
+    return None
+
+
+def _wav_is_whole(path: Path, size: int) -> bool:
+    """False for an empty file and for a RIFF/WAVE file whose ``data`` chunk
+    declares more audio than the file holds (a copy or write cut off
+    part-way).  A ``data`` size of ``0xFFFFFFFF`` (written while streaming),
+    a file that is not a RIFF/WAVE (a cached transcode in another codec) and
+    one whose ``data`` chunk isn't in its first 4 KB can't be checked: True.
+    The RIFF size itself isn't trusted (some writers get it wrong)."""
+    if size <= 0:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if head[:4] != b"RIFF":
+        return True
+    if len(head) < 12:
+        return False
+    if head[8:12] != b"WAVE":
+        return True
+    found = _wav_data_chunk(head, True) or _wav_data_chunk(head, False)
+    if found is None:
+        # The whole file was read and holds no audio chunk → cut off; else a
+        # big chunk comes first (cover art) — not told without reading on.
+        return size > len(head)
+    off, dlen = found
+    return dlen == 0xFFFFFFFF or off + dlen <= size
+
+
 # ── Core cache operations ───────────────────────────────────────────────────
 
 async def get_cached(cache_key: str) -> Path | None:
@@ -366,20 +591,21 @@ async def get_cached(cache_key: str) -> Path | None:
     On a hit, updates the LRU timestamp.
     Self-heals if the metadata exists but the file is missing on disk.
     """
-    # Single lock acquisition for the read + LRU touch.  The conversion
-    # cache lives on local disk so ``path.exists`` is a microsecond
-    # syscall — running it under the lock is cheaper than the
-    # acquire/release pair Perf #1 flagged.
     with _state_lock:
         entry = _meta.get(cache_key)
         if not entry:
             _lru.pop(cache_key, None)
             return None
         path = Path(entry["path"])
-        exists_now = path.exists()
-        if exists_now:
-            _lru[cache_key] = time.time()
-            _lru.move_to_end(cache_key)
+    # The file check runs on the playback threads, never on the loop: the
+    # cache may sit on a NAS data dir (``core.playback_io``).
+    from soniqboom.core import playback_io
+    exists_now = await playback_io.run(playback_io.mount_key(path), path.exists)
+    if exists_now:
+        with _state_lock:
+            if cache_key in _meta:
+                _lru[cache_key] = time.time()
+                _lru.move_to_end(cache_key)
 
     if not exists_now:
         # Off-loop purge so a slow filesystem doesn't block the request.
@@ -397,8 +623,10 @@ async def store_cached(
 ) -> Path:
     """Move a rendered temp WAV into the cache and register it.
 
-    Uses os.replace() for atomic placement when possible, falling back to
-    shutil.move() across filesystems.  Triggers LRU eviction if over quota.
+    Placed by a rename when the temp file and the cache share a filesystem,
+    else copied in under a temp name beside the entry and renamed once
+    complete (``_move_into_place``) — the entry's name never holds a partial
+    copy.  Triggers LRU eviction if over quota.
 
     ``cold``: a speculative render nobody has played yet (a duration probe)
     — a NEW entry goes in at the eviction end of the LRU, so browsing never
@@ -422,19 +650,13 @@ async def store_cached(
 
     def _place_and_size() -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.replace(str(source_path), str(dest))
-        except OSError:
-            shutil.move(str(source_path), str(dest))
+        _move_into_place(source_path, dest)
         # Move the sidecar too if it exists — non-fatal if it doesn't.
         if src_sidecar.exists():
             try:
-                os.replace(str(src_sidecar), str(dest_sidecar))
-            except OSError:
-                try:
-                    shutil.move(str(src_sidecar), str(dest_sidecar))
-                except Exception:
-                    pass
+                _move_into_place(src_sidecar, dest_sidecar)
+            except Exception:
+                pass
         return dest.stat().st_size
 
     size_bytes = await asyncio.to_thread(_place_and_size)
@@ -467,7 +689,7 @@ async def store_cached(
         _total_bytes += size_bytes
 
     # Eviction may unlink several files; do it off the event loop.
-    await asyncio.to_thread(_maybe_evict)
+    await asyncio.to_thread(_maybe_evict, cache_key)
     return dest
 
 
@@ -521,7 +743,7 @@ async def register_existing(
         _total_bytes += size_bytes
     # Run eviction off the event loop — bounded by the entry count above
     # the LRU budget, so a one-off register won't stall callers.
-    await asyncio.to_thread(_maybe_evict)
+    await asyncio.to_thread(_maybe_evict, cache_key)
     return dest_path
 
 
@@ -575,8 +797,15 @@ def _purge_entry(cache_key: str) -> None:
         _unlink_cached(entry["path"])
 
 
-def _maybe_evict() -> None:
+def _maybe_evict(keep: "str | None" = None) -> None:
     """Evict oldest entries until total size is within the configured limit.
+
+    ``keep``: the entry just stored (``store_cached`` / ``register_existing``)
+    is never a victim of its own store — the caller is about to serve it.  A
+    render larger than the whole budget (a 66-minute module at a 1 GB limit)
+    was otherwise unlinked the moment it was stored, and its play failed
+    with a missing file; now the cache holds it over budget until a later
+    store evicts it (or, while a reader pins it, defers its unlink).
 
     Eviction is O(1) per item now that ``_lru`` is an ``OrderedDict`` —
     ``popitem(last=False)`` removes the least-recently-used key without
@@ -602,14 +831,16 @@ def _maybe_evict() -> None:
             # First pass: pick the oldest unpinned key.  Refcount==0 means
             # no in-flight reader is currently using this entry.
             for k in _lru:
-                if _pin_refs.get(k, 0) == 0:
+                if k != keep and _pin_refs.get(k, 0) == 0:
                     evict_key = k
                     break
             # Fallback: every entry is pinned — evict the oldest anyway so
             # we don't blow past the disk budget indefinitely.  The unlink
             # below will be deferred for any key still actually pinned.
             if evict_key is None:
-                evict_key = next(iter(_lru))
+                evict_key = next((k for k in _lru if k != keep), None)
+                if evict_key is None:
+                    break                   # only ``keep`` is left: it stays
                 log.warning("ConvCache over budget but all entries pinned — evicting %s anyway",
                             evict_key)
             _lru.pop(evict_key, None)
@@ -676,6 +907,45 @@ def unpin(cache_key: str) -> int:
         except Exception:
             pass
     return n
+
+
+class PinHold:
+    """One pin on ``key``, taken at construction and released exactly once by
+    ``release()`` — from any thread, however many of the holder's cleanup
+    paths call it (a response body's ``finally``, its background task, the
+    error path of the code building it).  Usable as a context manager that
+    releases on an exception only (``with PinHold(k) as hold: …`` hands the
+    pin on to a response that releases it)."""
+
+    __slots__ = ("key", "_done", "_lock")
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self._done = False
+        self._lock = threading.Lock()
+        pin(key)
+
+    @property
+    def released(self) -> bool:
+        return self._done
+
+    def release(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+        try:
+            unpin(self.key)
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def __enter__(self) -> "PinHold":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            self.release()
+        return False
 
 
 # ── Recent render failures ──────────────────────────────────────────────────
@@ -806,6 +1076,7 @@ async def get_or_render(
     variant: str | None = None,
     *,
     cold: bool = False,
+    interest=None,
 ) -> tuple[Path, bool]:
     """Look up cache; on miss, render and store.  Returns (path, cache_hit).
 
@@ -819,6 +1090,9 @@ async def get_or_render(
     doesn't collide with an ALAC-as-source-rate-FLAC entry.  ``bitrate`` and
     ``variant`` likewise separate transcodes (see ``_cache_key``).  ``cold``
     registers a new render at the eviction end of the LRU (``store_cached``).
+    ``interest``: whether this caller still wants the render, asked while it
+    waits (``register_interest``; default the context's ``render_interest``,
+    else always) — a render nobody wants may be stopped for another.
     """
     key = _cache_key(
         track_id, format_type, subsong, soundfont_path,
@@ -830,6 +1104,7 @@ async def get_or_render(
     cached = await get_cached(key)
     if cached:
         _cstats.hit("conversion")
+        _note_result(key, format_type, cached)
         return cached, True
     # A render of this key came out silent a moment ago: say so again
     # rather than render the silence again (``_SILENT_TTL_S``).
@@ -841,6 +1116,18 @@ async def get_or_render(
     # cache-check + inflight-register sequence is atomic, so two coroutines
     # arriving cold can't both decide "no one else is rendering" and both
     # kick off ffmpeg.
+    cb = interest if interest is not None else (render_interest.get() or _always_wanted)
+    tok = register_interest(key, cb)
+    try:
+        got = await _get_or_render_slow(key, format_type, render_fn, cold, cb)
+    finally:
+        drop_interest(key, tok)
+    _note_result(key, format_type, got[0])
+    return got
+
+
+async def _get_or_render_slow(key: str, format_type: str, render_fn,
+                              cold: bool, wants=_always_wanted) -> tuple[Path, bool]:
     lock = _lock_for(key)
     reentries = 0
     while True:
@@ -880,6 +1167,17 @@ async def get_or_render(
             raise HTTPException(
                 502, "Cache fill failed in a concurrent render — try again",
             )
+        # Stopped because nobody wanted it (``stream._preempt_abandoned_render``):
+        # it renders again only when someone wants it now — this caller, or
+        # another request waiting on the key (a play that arrived while it
+        # was being stopped holds ``interest`` on it); bookkeeping alone never
+        # starts it again.
+        try:
+            still_wanted = bool(wants()) or wanted(key)
+        except Exception:                               # noqa: BLE001
+            still_wanted = True
+        if not still_wanted:
+            raise RenderStopped(f"the render of {key} was stopped")
         reentries += 1
 
     # Run the render + store in a DETACHED, shield-protected task so a client
@@ -892,6 +1190,7 @@ async def get_or_render(
     # renders are bounded by ``stream._sid_blocking_sem`` so detached ones can't
     # pile up unbounded, and other formats' renders are short.
     async def _render_and_store() -> Path:
+        rendering_key.set(key)          # (this task's own context)
         try:
             tmp_path = await render_fn()
             await refuse_silent(key, format_type, tmp_path)
@@ -1232,6 +1531,29 @@ def _sweep_unrevised_renders(base: Path) -> int:
     return removed
 
 
+def _sweep_unfinished_writes(base: Path) -> int:
+    """Remove what a process that ended part-way left in the cache: copies
+    in progress (``_move_into_place``'s ``.copying`` temps), the cast pipe's
+    ``<key>.wav.partial`` (``cast_pipe.render_stream``) and a SID upload's
+    temp (``tracks``' SID WAV upload).  Run at the
+    start, before anything writes the cache."""
+    removed = 0
+    for fmt in FORMAT_TYPES:
+        sub = base / fmt
+        if not sub.is_dir():
+            continue
+        for pat in (f"*{_COPY_TMP_SUFFIX}", "*.wav.partial", "*.wav.upload"):
+            for f in sub.rglob(pat):
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    if removed:
+        log.info("Conversion cache: removed %d unfinished write(s) a previous run left", removed)
+    return removed
+
+
 def warmup_from_disk() -> int:
     """Rebuild ``_meta`` / ``_lru`` / ``_total_bytes`` from on-disk WAVs.
 
@@ -1239,7 +1561,9 @@ def warmup_from_disk() -> int:
     previously-rendered WAVs orphaned on disk, so the next play re-renders
     even though the file already exists.  Run once at startup.  Renders from
     before the multi-tune index fix are swept first (once per cache dir —
-    ``_sweep_stale_subsong_renders``).
+    ``_sweep_stale_subsong_renders``), and so are unfinished writes
+    (``_sweep_unfinished_writes``); a WAV shorter than its header declares
+    is removed, not adopted (``_wav_is_whole``).
 
     Returns the number of entries adopted."""
     global _total_bytes
@@ -1248,6 +1572,7 @@ def warmup_from_disk() -> int:
         return 0
     _sweep_stale_subsong_renders(base)
     _sweep_unrevised_renders(base)
+    _sweep_unfinished_writes(base)
     adopted = 0
     with _state_lock:
         for fmt in FORMAT_TYPES:
@@ -1272,6 +1597,17 @@ def warmup_from_disk() -> int:
                 try:
                     st = wav.stat()
                 except OSError:
+                    continue
+                # Shorter than its header says: a write or copy that ended
+                # part-way (a process killed mid-store, a power loss) —
+                # removed, the next play renders it again.
+                if not _wav_is_whole(wav, st.st_size):
+                    log.warning("Conversion cache: removed %s — %d bytes, less than "
+                                "its WAV header declares", wav.name, st.st_size)
+                    try:
+                        wav.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     continue
                 _meta[key] = {
                     "path": str(wav),
@@ -1336,6 +1672,40 @@ async def purge_sid_entries_for(
             victims.append(key)
     for key in victims:
         await asyncio.to_thread(_purge_entry, key)
+    return len(victims)
+
+
+async def purge_tracks(track_ids) -> int:
+    """Everything cached FROM these tracks' files — every render and
+    transcode (all formats, tunes, variants), their VU sidecars (eviction
+    keeps those) and recent failure / silence notes: the files changed at
+    their source (an online collection's re-uploaded file).  Returns the
+    entries purged."""
+    ids = {str(t) for t in (track_ids or ()) if t}
+    if not ids:
+        return 0
+    with _state_lock:
+        victims = [k for k in list(_meta) if k.split("__", 1)[0] in ids]
+    for key in victims:
+        await asyncio.to_thread(_purge_entry, key)
+    for k in [k for k in list(_recent_failures) if k.split("__", 1)[0] in ids]:
+        _recent_failures.pop(k, None)
+    for k in [k for k in list(_silent_keys) if k.split("__", 1)[0] in ids]:
+        _silent_keys.pop(k, None)
+
+    def _sidecars() -> None:
+        base = get_conversion_cache_dir()
+        for tid in ids:
+            for fmt in FORMAT_TYPES:
+                d = base / fmt / tid[:2]
+                if not d.is_dir():
+                    continue
+                for p in [d / f"{tid}.vu", *d.glob(f"{tid}__*.vu")]:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    await asyncio.to_thread(_sidecars)
     return len(victims)
 
 

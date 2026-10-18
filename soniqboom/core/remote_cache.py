@@ -116,6 +116,41 @@ def _flac_seektable_in_prefix(path, available: int) -> bool | str | None:
         return None
 
 
+def _norm_ident(ident) -> "tuple[int, float] | None":
+    """``(size, mtime)`` of the remote file as the library knows it (the
+    store record / the latest poll), or None when neither is known."""
+    if not ident:
+        return None
+    try:
+        size, mtime = int(ident[0] or 0), float(ident[1] or 0.0)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if size <= 0 and mtime <= 0:
+        return None
+    return size, mtime
+
+
+def _mtimes_match(a: float, b: float) -> bool:
+    """The same modification, tolerant of the MLSD (seconds) / LIST (minutes)
+    precision gap — the scanner's rule (``scanner._mtime_matches_tolerant``)."""
+    if int(a) % 60 == 0 or int(b) % 60 == 0:
+        a -= int(a) % 60
+        b -= int(b) % 60
+    return abs(a - b) < 2.0
+
+
+def _same_ident(made_from, now) -> bool:
+    """Is a copy made from remote identity ``made_from`` still the file the
+    library knows as ``now``?  A value either side doesn't know (0) isn't
+    compared."""
+    (s0, m0), (s1, m1) = made_from, now
+    if s0 > 0 and s1 > 0 and s0 != s1:
+        return False
+    if m0 > 0 and m1 > 0 and not _mtimes_match(m0, m1):
+        return False
+    return True
+
+
 class _SourceChanged(OSError):
     """The remote file changed size while it was being downloaded."""
 
@@ -367,6 +402,9 @@ class RemoteCache:
         # start; names whose entry left the index are dropped on lookup.
         self._subsets: dict[tuple[str, str], set[str]] = {}
         self._dl_cond = threading.Condition()
+        # Key → when ``forget`` dropped it (bounded): a download that started
+        # before then indexes its copy as ``suspect``.
+        self._forgotten: "dict[str, float]" = {}
         self._dl_pool: concurrent.futures.ThreadPoolExecutor | None = None
         # Change counters of the index: one per share (an entry of it added,
         # dropped, retired or un-retired) and one for the whole cache (load,
@@ -379,6 +417,11 @@ class RemoteCache:
         for e in self._index.values():
             self._note_subset(e.get("share_id", ""), e.get("remote", ""))
         self._sweep_part_files()
+
+    @property
+    def root(self) -> Path:
+        """The folder the copies live in (in the data / cache folder)."""
+        return self._root
 
     def _touch(self, share_id: str | None) -> None:
         """Count a change of *share_id*'s entries (see ``generation``)."""
@@ -446,15 +489,30 @@ class RemoteCache:
         ext = Path(remote_path).suffix
         return self._root / f"{key}{ext}"
 
-    def get_cached(self, share_id: str, remote_path: str) -> Path | None:
+    def get_cached(self, share_id: str, remote_path: str, *,
+                   ident=None) -> Path | None:
+        """The local copy of *remote_path*, or None.  ``ident``: the remote
+        file's ``(size, mtime)`` as the library knows it now (the store
+        record, which every freshness poll updates) — a copy made from
+        another version is dropped and None returned, so the caller fetches
+        the current one.  A copy indexed without the identity it was made
+        from takes ``ident`` (unless its size already disagrees — not
+        compared for a FLAC, whose copy may carry an inserted SEEKTABLE).
+        No remote request either way."""
         from soniqboom.core import cache_stats
         key = self._cache_key(share_id, remote_path)
+        want = _norm_ident(ident)
         with self._mutex:
             entry = self._index.get(key)
             if entry is None:
                 cache_stats.miss("remote")
                 return None
+            changed = want is not None and not self._ident_ok_locked(entry, remote_path, want)
             local = Path(entry["local"])
+        if changed:
+            self._drop_entry(key, entry, remote_path, "it changed at its source")
+            cache_stats.miss("remote")
+            return None
         if not local.exists():
             with self._mutex:
                 stale = self._index.pop(key, None)
@@ -477,6 +535,83 @@ class RemoteCache:
             entry["last_access"] = time.time()
         cache_stats.hit("remote")
         return local
+
+    @staticmethod
+    def _ident_ok_locked(entry: dict, remote_path: str, want: "tuple[int, float]") -> bool:
+        """``get_cached``'s check of one entry (caller holds ``_mutex``).  A
+        copy whose download overlapped a ``forget`` (``suspect``) is never
+        the current version.  One indexed without the identity it was made
+        from is another version when its size disagrees (not compared for a
+        FLAC: its copy may carry an inserted SEEKTABLE) or when the file was
+        modified after the copy was fetched; else it takes ``want``."""
+        if entry.get("suspect"):
+            return False
+        made = _norm_ident(entry.get("ident"))
+        if made is not None:
+            return _same_ident(made, want)
+        size = int(entry.get("size", 0) or 0)
+        if (want[0] > 0 and size > 0 and size != want[0]
+                and not remote_path.lower().endswith(".flac")):
+            return False
+        fetched = float(entry.get("fetched", 0) or 0)
+        if want[1] > 0 and fetched > 0 and want[1] > fetched + 2.0:
+            return False
+        entry["ident"] = [want[0], want[1]]       # persisted with the next index write
+        return True
+
+    def _drop_entry(self, key: str, entry: dict, remote_path: str, why: str) -> bool:
+        """Remove *entry* (still under *key*) from the index and its file."""
+        with self._mutex:
+            if self._index.get(key) is not entry:
+                return False
+            self._index.pop(key)
+            self._touch(entry.get("share_id"))
+            self._total_bytes = max(0, self._total_bytes - int(entry.get("size", 0) or 0))
+            self._save_index()
+        local = entry.get("local") or ""
+        if local:
+            try:
+                Path(local).unlink(missing_ok=True)
+            except OSError:
+                pass
+        log.info("Remote cache: dropped the copy of %s — %s", remote_path, why)
+        return True
+
+    def forget(self, share_id: str, remote_paths, why: str = "changed or removed at its source") -> int:
+        """Drop the cached copies of *remote_paths* of *share_id* (a freshness
+        poll found them changed or gone) and retire the cached subsets of
+        those that are archives.  Returns how many copies went."""
+        doomed: list[tuple[str, str]] = []
+        retired = 0
+        now = time.time()
+        with self._mutex:
+            for rp in remote_paths:
+                key = self._cache_key(share_id, rp)
+                # A download of it running now may index the old bytes after
+                # this: such a copy is marked suspect (``_download_to_cache``).
+                self._forgotten[key] = now
+                entry = self._index.pop(key, None)
+                if entry is not None:
+                    self._total_bytes = max(0, self._total_bytes - int(entry.get("size", 0) or 0))
+                    doomed.append((rp, entry.get("local") or ""))
+                retired += self._mark_subsets_stale_locked(share_id, rp, lambda _p: True)
+            if len(self._forgotten) > 4096:
+                cut = now - 3600.0
+                self._forgotten = {k: t for k, t in self._forgotten.items() if t >= cut}
+            if doomed:
+                self._touch(share_id)
+            if doomed or retired:
+                self._save_index()
+        for _rp, local in doomed:
+            if local:
+                try:
+                    Path(local).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if doomed:
+            log.info("Remote cache: dropped %d cached cop%s of %s (%s)", len(doomed),
+                     "y" if len(doomed) == 1 else "ies", share_id, why)
+        return len(doomed)
 
     def peek_cached(self, share_id: str, remote_path: str) -> bool:
         """Is *remote_path* indexed?  No hit/miss statistics, no LRU bump —
@@ -596,6 +731,38 @@ class RemoteCache:
                 self._touch(share_id)
                 self._save_index()
 
+    def drop_if_older(self, share_id: str, remote_path: str, ts: float) -> int:
+        """Drop the cached copy of *remote_path* — and retire its cached ZIP
+        subsets — that were fetched BEFORE ``ts`` (the file changed at its
+        source then; a copy fetched since is the new version and stays).
+        Returns how many went."""
+        doomed: list[str] = []
+        n = 0
+        with self._mutex:
+            key = self._cache_key(share_id, remote_path)
+            entry = self._index.get(key)
+            if entry is not None and float(entry.get("fetched", 0) or 0) < ts:
+                self._index.pop(key)
+                self._touch(share_id)
+                self._total_bytes = max(0, self._total_bytes - int(entry.get("size", 0) or 0))
+                doomed.append(entry.get("local") or "")
+                n += 1
+            for name in list(self._subsets.get((share_id, remote_path), ())):
+                sub = self._index.get(self._cache_key(share_id, name))
+                if (sub is not None and not sub.get("stale")
+                        and float(sub.get("fetched", 0) or 0) < ts):
+                    sub["stale"] = True
+                    n += 1
+            if n:
+                self._save_index()
+        for local in doomed:
+            if local:
+                try:
+                    Path(local).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return n
+
     def drop_stale_subsets(self, share_id: str, zip_rel: str, size: int,
                            mtime: float) -> int:
         """Retire the cached subsets of ``share_id:zip_rel`` built from another
@@ -643,7 +810,7 @@ class RemoteCache:
         return lock
 
     def fetch(self, share_id: str, remote_path: str, source: FileSource,
-              *, lane: str = "stream") -> Path:
+              *, lane: str = "stream", ident=None) -> Path:
         """Download *remote_path* into the cache (or return the cached copy).
 
         ``lane`` is forwarded to ``FileSource.open_stream`` so pooled-FTP
@@ -653,7 +820,7 @@ class RemoteCache:
         concurrent play request (observed: 22 GB of scan traffic riding
         the stream lane of a 2-connection pool).
         """
-        cached = self.get_cached(share_id, remote_path)
+        cached = self.get_cached(share_id, remote_path, ident=ident)
         if cached is not None:
             return cached
 
@@ -666,10 +833,10 @@ class RemoteCache:
         if lane != "stream":
             with lock:
                 # Double-checked: the cache may have filled while we waited.
-                cached = self.get_cached(share_id, remote_path)
+                cached = self.get_cached(share_id, remote_path, ident=ident)
                 if cached is not None:
                     return cached
-                local = self._download_to_cache(key, share_id, remote_path, source, lane)
+                local = self._download_to_cache(key, share_id, remote_path, source, lane, ident)
         else:
             # A PLAYBACK fetch never queues behind a BACKGROUND (scan /
             # prewarm) fetch of the same file for longer than
@@ -683,19 +850,19 @@ class RemoteCache:
             # cache: whichever download (the background one or the bypass)
             # lands first serves every waiting playback request.
             while not slock.acquire(timeout=0.1):
-                cached = self.get_cached(share_id, remote_path)
+                cached = self.get_cached(share_id, remote_path, ident=ident)
                 if cached is not None:
                     return cached
             try:
-                cached = self.get_cached(share_id, remote_path)
+                cached = self.get_cached(share_id, remote_path, ident=ident)
                 if cached is not None:
                     return cached
                 got = lock.acquire(timeout=_STREAM_LOCK_WAIT_S)
                 try:
-                    cached = self.get_cached(share_id, remote_path)
+                    cached = self.get_cached(share_id, remote_path, ident=ident)
                     if cached is not None:
                         return cached
-                    local = self._download_to_cache(key, share_id, remote_path, source, lane)
+                    local = self._download_to_cache(key, share_id, remote_path, source, lane, ident)
                 finally:
                     if got:
                         lock.release()
@@ -712,7 +879,7 @@ class RemoteCache:
         return local
 
     def _download_to_cache(self, key: str, share_id: str, remote_path: str,
-                           source: "FileSource", lane: str) -> Path:
+                           source: "FileSource", lane: str, ident=None) -> Path:
         """Stream into a private temp file, finish it (FLAC seektable), move it
         into place atomically and index it — counting its bytes only if no
         concurrent fetch of the same key indexed it first.
@@ -723,6 +890,7 @@ class RemoteCache:
         local = self._cache_path(key, remote_path)
         local.parent.mkdir(parents=True, exist_ok=True)
         tmp = local.with_name(local.name + f".{uuid.uuid4().hex}.part")
+        started = time.time()
         dl = _Download(key, lane, tmp, share_id)
         with self._dl_cond:
             self._active_dls.add(dl)
@@ -776,6 +944,14 @@ class RemoteCache:
                 "fetched": now,
                 "last_access": now,
             }
+            made = _norm_ident(ident)
+            if made is not None:
+                self._index[key]["ident"] = [made[0], made[1]]
+            if self._forgotten.get(key, 0.0) >= started:
+                # A poll found the file changed while this ran: these bytes may
+                # be the old version — served to this caller, never as current.
+                self._index[key]["suspect"] = True
+                self._index[key].pop("ident", None)
             self._touch(share_id)
             self._total_bytes += size - (int(prev.get("size", 0) or 0) if prev else 0)
         self._end_download(dl, final=local)
@@ -894,7 +1070,8 @@ class RemoteCache:
                 log.debug("download listener failed", exc_info=True)
 
     def _background_fetch(self, key: str, share_id: str, remote_path: str,
-                          source: "FileSource", lane: str) -> concurrent.futures.Future:
+                          source: "FileSource", lane: str,
+                          ident=None) -> concurrent.futures.Future:
         """The running background ``fetch`` of *key* started for progressive
         playback, or a new one.  It outlives the request that started it, so
         a listener who skips away still leaves the file in the cache."""
@@ -905,7 +1082,8 @@ class RemoteCache:
             if self._dl_pool is None:
                 self._dl_pool = concurrent.futures.ThreadPoolExecutor(
                     max_workers=_DL_WORKERS, thread_name_prefix="remote-dl")
-            fut = self._dl_pool.submit(self.fetch, share_id, remote_path, source, lane=lane)
+            fut = self._dl_pool.submit(self.fetch, share_id, remote_path, source, lane=lane,
+                                       ident=ident)
             self._bg_fetches[key] = fut
 
         def _done(f, k=key):
@@ -917,8 +1095,8 @@ class RemoteCache:
         return fut
 
     def open_progressive(self, share_id: str, remote_path: str, source: "FileSource",
-                         *, lane: str = "stream",
-                         wait_s: float = _PROGRESSIVE_WAIT_S) -> "Path | ProgressiveRead":
+                         *, lane: str = "stream", wait_s: float = _PROGRESSIVE_WAIT_S,
+                         ident=None) -> "Path | ProgressiveRead":
         """The cached copy of *remote_path*, or a :class:`ProgressiveRead` on
         its download in progress, so playback can start on the head of the
         file.  Starts the download (a normal ``fetch`` — same per-key /
@@ -928,12 +1106,13 @@ class RemoteCache:
         when the download's final size is unknown (the server didn't say),
         and for a FLAC without a SEEKTABLE: the cache inserts one into the
         finished copy, which shifts every audio byte a reader already got.
-        Blocking — call from an executor.  Raises what the fetch raised."""
-        cached = self.get_cached(share_id, remote_path)
+        Blocking — call from an executor.  Raises what the fetch raised.
+        ``ident``: as ``fetch``'s."""
+        cached = self.get_cached(share_id, remote_path, ident=ident)
         if cached is not None:
             return cached
         key = self._cache_key(share_id, remote_path)
-        fut = self._background_fetch(key, share_id, remote_path, source, lane)
+        fut = self._background_fetch(key, share_id, remote_path, source, lane, ident)
         # Only a FLAC the cache will rewrite (a SEEKTABLE inserted — metaflac
         # present) has to wait for the finished copy.
         is_flac = (remote_path.lower().endswith(".flac")
@@ -1128,6 +1307,13 @@ class RemoteCache:
     def entry_count(self) -> int:
         with self._mutex:
             return len(self._index)
+
+    @property
+    def whole_download_limit(self) -> int:
+        """The biggest file an online collection may download whole into the
+        cache: half its size (at least 48 MB) — a bigger one, kept, would push
+        everything else out (eviction ignores its grace past twice the budget)."""
+        return max(48 * 1024 * 1024, self._max_bytes // 2)
 
     @property
     def max_mb(self) -> int:

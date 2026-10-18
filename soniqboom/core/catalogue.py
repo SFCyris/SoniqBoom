@@ -109,6 +109,17 @@ _read_log: collections.deque = collections.deque(maxlen=200)
 _refused_log: collections.deque = collections.deque(maxlen=50)
 
 
+# The format an online collection's unopened package is listed with (an
+# archive whose tunes — and their formats — are known once it opens).  Not a
+# music format: left out of the format lists (``store.aggregate_formats``).
+PACKAGE_FORMATS = frozenset({"LHA package", "ZIP package"})
+_PACKAGE_FORMAT_KEYS = frozenset(f.lower() for f in PACKAGE_FORMATS)
+
+
+def is_package_format(fmt) -> bool:
+    return isinstance(fmt, str) and fmt.strip().lower() in _PACKAGE_FORMAT_KEYS
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 def _norm_root(root: str) -> str:
@@ -224,11 +235,13 @@ def key_of(root: str) -> str | None:
 
 def _split(path: str) -> tuple[str, str] | None:
     """``(root, rel)`` of a catalogue track path; ``rel`` without a leading
-    slash ("Protracker/4-Mat/x.mod")."""
+    slash ("Protracker/4-Mat/x.mod").  A member of a package
+    (``<root>:/mods/techn/x.lha::x.mod``) is its archive's file: ``rel`` is
+    the archive's (what is fetched, cached and granted)."""
     s = str(path)
     for r in _root_list:
         if s.startswith(r.prefix):
-            return r.root, s[len(r.prefix):].lstrip("/")
+            return r.root, s[len(r.prefix):].lstrip("/").split("::", 1)[0]
     return None
 
 
@@ -252,7 +265,14 @@ def is_cached(path) -> bool:
         return True
     try:
         from soniqboom.core.remote_cache import get_cache
-        return get_cache().peek_cached(sp[0], "/" + sp[1])
+        if get_cache().peek_cached(sp[0], "/" + sp[1]):
+            return True
+        member = str(path).split("::", 1)[1] if "::" in str(path) else ""
+        if member:
+            # A package member read from a big ZIP by ranges: its subset.
+            from soniqboom.core.remote_zip import cached_subset
+            return cached_subset(sp[0], "/" + sp[1], member) is not None
+        return False
     except Exception:                                   # noqa: BLE001
         return False
 
@@ -429,7 +449,7 @@ def allowed(root: str, rel: str) -> bool:
     archive now?  Inside a play's / prewarm's window: the tune itself, and any
     NON-music file (a companion) in its folder or the few above it."""
     root = _norm_root(root)
-    rel = (rel or "").lstrip("/")
+    rel = (rel or "").lstrip("/").split("::", 1)[0]      # a package member: its archive
     now = time.monotonic()
     with _lock:
         r = _roots.get(root)

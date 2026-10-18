@@ -34,12 +34,17 @@ log = logging.getLogger(__name__)
 # used whenever it gives exactly what ``json.loads`` gives: it refuses NaN /
 # Infinity tokens and lone surrogates (such a file takes the stdlib parser),
 # and it reads an integer beyond 64 bits as a float — so a document with an
-# integer token of 19+ digits takes the stdlib parser too.  The file is
-# written with the stdlib's ``json.dumps``: the very bytes ``json.dump`` wrote
-# (NaN stays ``NaN``, everything non-ASCII escaped — old and new servers read
-# each other's files), in one C call instead of ``json.dump``'s pure-Python
-# chunk encoder (4x faster).  (One C call holds the GIL for its whole length,
-# so it is also a consistent picture of the live store dicts it encodes.)
+# integer token of 19+ digits takes the stdlib parser too.  Every snapshot —
+# the merger's, the shutdown's and a web import's — is encoded by
+# ``encode_state`` (orjson, ~7x faster than ``json.dumps``): UTF-8, NaN /
+# ±Infinity as ``null``, and datetime / UUID / dataclass values encoded rather
+# than refused; it falls back to ``json.dumps`` for what orjson refuses.  (The
+# AOF's records likewise: ``aof.encode_record``.)  Every
+# reader here opens the file as bytes and decodes UTF-8; a version before
+# 1.11 read it in the locale's encoding, so downgrading on a host whose locale
+# isn't UTF-8 can misread non-ASCII names.  (Either encoder is one C call that
+# holds the GIL for its whole length — a consistent picture of the live store
+# dicts it encodes.)
 
 _DIGIT_MASK = bytes(0x30 if 0x30 <= b <= 0x39 else 0x20 for b in range(256))
 _LONG_DIGITS = b"0" * 19
@@ -168,6 +173,29 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def encode_state(state: dict) -> str:
+    """``state`` as JSON text — orjson (~7x faster than ``json.dumps``: the
+    snapshot is encoded ON the event loop, so for a 270k-track library this
+    is ~0.1 s instead of ~0.8 s of a stalled server), falling back to
+    ``json.dumps`` for what orjson refuses (a lone surrogate, an int beyond
+    64 bits, a non-str key).  Differences: a non-finite float (``nan``,
+    ``inf``) is ``null``, as in the API's responses; datetime / UUID /
+    dataclass values are encoded instead of refused."""
+    try:
+        return orjson.dumps(state).decode("utf-8")
+    except (orjson.JSONEncodeError, UnicodeDecodeError):
+        return json.dumps(state)
+
+
+def encode_state_bytes(state: dict) -> bytes:
+    """``encode_state`` as the UTF-8 bytes written to the file — orjson's
+    output as it is (no text copy of a snapshot of several hundred MB)."""
+    try:
+        return orjson.dumps(state)
+    except orjson.JSONEncodeError:
+        return json.dumps(state).encode("utf-8")
+
+
 def write_library_file(data_dir: Path, state: dict, who: str) -> bool:
     """Write ``state`` as the new ``library.json`` — the merger's and the
     shutdown snapshot's shared rotation, robust against network-volume quirks:
@@ -180,17 +208,20 @@ def write_library_file(data_dir: Path, state: dict, who: str) -> bool:
         — the original stays in place until the swap
       • ``os.replace`` for the swap (atomic on POSIX, overwrites the target)
 
-    True when ``library.json`` now holds ``state``; ``who`` prefixes the log."""
-    return _write_library_text(data_dir, json.dumps(state), who)
+    True when ``library.json`` now holds ``state`` (``encode_state_bytes``);
+    ``who`` prefixes the log."""
+    return _write_library_text(data_dir, encode_state_bytes(state), who)
 
 
-def _write_library_text(data_dir: Path, text: str, who: str) -> bool:
-    """``write_library_file`` of an already encoded state ``text``."""
+def _write_library_text(data_dir: Path, text: "str | bytes", who: str) -> bool:
+    """``write_library_file`` of an already encoded state ``text`` (str, or
+    its UTF-8 bytes)."""
     primary = data_dir / "library.json"
     tmp = data_dir / "library.json.new"
     data_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with (open(tmp, "wb") if isinstance(text, bytes)
+              else open(tmp, "w", encoding="utf-8")) as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -636,8 +667,54 @@ def replay_aof(state: dict, data_dir: Path) -> int:
     return applied
 
 
+def forget_derived_caches(store, *, drop_browse_disk: bool = False) -> None:
+    """A whole library replaced the one in memory (a start's load — in the
+    bundled app also a later run in the same process — or a backup import):
+    every cache built from the previous one starts over.
+
+      * the store's write counters move (``_mutation_seq``, ``_catalog_seq``,
+        ``_duration_seq``; ``bulk_load`` keeps them): what is keyed on them —
+        the store's aggregate memos, the Subsonic catalogue, the duplicate
+        memos — is rebuilt (as ``data.rebuild_indexes``' heal does);
+      * the web lists' aggregate cache (``invalidate_agg_cache``: the library
+        generation moves, so a connected page re-reads);
+      * the folder-browse caches in memory (validated by per-root track
+        counts, which a replaced library can match), the catalogue roots' path
+        order, every root's listing generation and the Subsonic catalogue;
+        with ``drop_browse_disk`` also the browse caches' copy on disk
+        (``browse_cache.pickle`` — an import: a start restores it, and its
+        check is the same per-root count)."""
+    store._mutation_seq += 1
+    store._catalog_seq += 1
+    store._duration_seq += 1
+    try:
+        from soniqboom.api.library import invalidate_agg_cache
+        invalidate_agg_cache()
+    except Exception:                                   # noqa: BLE001
+        log.warning("The library lists' cache could not be reset", exc_info=True)
+    try:
+        from soniqboom.api import fstree
+        fstree.invalidate_browse_cache(drop_disk=drop_browse_disk)
+        fstree._CAT_SORTED.clear()
+        for h in list(fstree._ROOT_GEN):
+            fstree._bump_root_gen(h)
+    except Exception:                                   # noqa: BLE001
+        log.warning("The folder-browse cache could not be reset", exc_info=True)
+    try:
+        # (rebuilt at the next request, not after the catalogue's debounce)
+        from soniqboom.api import subsonic
+        c = subsonic._ALBUM_LIST_CACHE
+        c["cat"] = None                                 # (a rebuild under way won't
+        c["gen"] = int(c.get("gen") or 0) + 1           # install: ``gen`` moved)
+    except Exception:                                   # noqa: BLE001
+        log.debug("The Subsonic catalogue cache could not be reset", exc_info=True)
+
+
 def populate_store(state: dict) -> None:
-    """Populate the TrackStore singleton from a loaded snapshot state."""
+    """Populate the TrackStore singleton from a loaded snapshot state, and
+    start every cache built from the previous library over
+    (``forget_derived_caches``).  Every caller: the start's load, the web and
+    CLI imports (which also drop the browse cache's copy on disk)."""
     from soniqboom.core.store import get_store
     from soniqboom.core.startup_status import set_phase as _ss_phase
 
@@ -664,6 +741,7 @@ def populate_store(state: dict) -> None:
     _ss_phase("building_indexes", "Building search indexes",
               f"{track_count:,} tracks")
     store.rebuild_indexes()
+    forget_derived_caches(store)
     elapsed = (time.monotonic() - t0) * 1000
     log.info(
         "Store loaded: %d tracks, %d waveforms, %d ratings — indexes built in %.0fms",
@@ -748,14 +826,19 @@ def library_files_locked(data_dir: Path):
 _INSTANCE_WAIT_S = 60.0
 _instance_fd: int | None = None
 _instance_dir: str | None = None
+# Why the last ``claim_library`` returned False: "held" (another process holds
+# the data directory) or "no-lock" (no lock file / no flock on this file system).
+claim_failure: str | None = None
 
 
-def claim_library(data_dir: Path, wait: float = _INSTANCE_WAIT_S) -> bool:
+def claim_library(data_dir: Path, wait: float = _INSTANCE_WAIT_S, quiet: bool = False) -> bool:
     """Hold the data directory for this process (see above).  True when held
     (already, or now); False when another process still holds it after
     ``wait`` seconds or the file system has no flock — then this run's
-    shutdown snapshot leaves the AOF alone (``owns_library``)."""
-    global _instance_fd, _instance_dir
+    shutdown snapshot leaves the AOF alone (``owns_library``).  ``quiet``: no
+    server-start log lines (the command-line import reports it itself)."""
+    global _instance_fd, _instance_dir, claim_failure
+    claim_failure = None
     if _instance_fd is not None:
         if _instance_dir == os.path.abspath(data_dir):
             return True
@@ -764,8 +847,10 @@ def claim_library(data_dir: Path, wait: float = _INSTANCE_WAIT_S) -> bool:
         data_dir.mkdir(parents=True, exist_ok=True)
         fd = os.open(data_dir / "library.instance.lock", os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
-        log.warning("library.instance.lock unavailable (%s) — the shutdown snapshot "
-                    "will leave the AOF as it is", exc)
+        if not quiet:
+            log.warning("library.instance.lock unavailable (%s) — the shutdown snapshot "
+                        "will leave the AOF as it is", exc)
+        claim_failure = "no-lock"
         return False
     deadline = time.monotonic() + wait
     waiting = False
@@ -776,19 +861,24 @@ def claim_library(data_dir: Path, wait: float = _INSTANCE_WAIT_S) -> bool:
         except BlockingIOError:
             if not waiting:
                 waiting = True
-                log.info("Waiting for the previous SoniqBoom instance to finish writing "
-                         "the library before loading it")
+                if not quiet:
+                    log.info("Waiting for the previous SoniqBoom instance to finish writing "
+                             "the library before loading it")
             if time.monotonic() >= deadline:
-                log.warning("Another SoniqBoom process still holds this data directory "
-                            "after %.0f s — starting anyway; this run's shutdown snapshot "
-                            "will leave the AOF as it is", wait)
+                if not quiet:
+                    log.warning("Another SoniqBoom process still holds this data directory "
+                                "after %.0f s — starting anyway; this run's shutdown snapshot "
+                                "will leave the AOF as it is", wait)
                 os.close(fd)
+                claim_failure = "held"
                 return False
             time.sleep(0.1)
         except OSError as exc:
-            log.warning("No file locks on the data directory (%s) — the shutdown snapshot "
-                        "will leave the AOF as it is", exc)
+            if not quiet:
+                log.warning("No file locks on the data directory (%s) — the shutdown snapshot "
+                            "will leave the AOF as it is", exc)
             os.close(fd)
+            claim_failure = "no-lock"
             return False
     _instance_fd, _instance_dir = fd, os.path.abspath(data_dir)
     return True
@@ -812,10 +902,11 @@ def release_library() -> None:
 
 
 def write_snapshot_sync(data_dir: Path, consume_aof: bool = False, aof_writer=None,
-                        loop=None) -> None:
-    """``_write_snapshot_sync`` under ``library_files_locked``."""
+                        loop=None, who: str = "Shutdown") -> bool:
+    """``_write_snapshot_sync`` under ``library_files_locked``; True when
+    ``library.json`` was written."""
     with library_files_locked(data_dir):
-        _write_snapshot_sync(data_dir, consume_aof, aof_writer, loop)
+        return _write_snapshot_sync(data_dir, consume_aof, aof_writer, loop, who)
 
 
 # How long a snapshot written from a worker thread waits for the event loop to
@@ -869,7 +960,7 @@ def _call_on_loop(loop, fn):
 
 
 def _write_snapshot_sync(data_dir: Path, consume_aof: bool = False, aof_writer=None,
-                         loop=None) -> None:
+                         loop=None, who: str = "Shutdown") -> bool:
     """Write a full snapshot synchronously.  Used during shutdown.
 
     Safety: refuses to overwrite a populated snapshot with an empty state.
@@ -903,10 +994,11 @@ def _write_snapshot_sync(data_dir: Path, consume_aof: bool = False, aof_writer=N
     held = (aof_writer.exclusive() if consume_aof and aof_writer is not None
             else contextlib.nullcontext())
     with held:
-        _write_snapshot_locked(data_dir, store, consume_aof, aof_writer, loop)
+        return _write_snapshot_locked(data_dir, store, consume_aof, aof_writer, loop, who)
 
 
-def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer, loop) -> None:
+def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer, loop,
+                           who: str = "Shutdown") -> bool:
     primary = data_dir / "library.json"
     aof_path = data_dir / "library.aof"
 
@@ -916,13 +1008,13 @@ def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer,
             try:
                 aof_writer.stop()                       # flush + close (reopened only to write)
             except Exception:                           # noqa: BLE001 — records stay buffered
-                log.warning("Shutdown: final AOF flush failed", exc_info=True)
+                log.warning("%s: final AOF flush failed", who, exc_info=True)
         try:
             consumed = read_aof(aof_path)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            log.warning("Shutdown: AOF unreadable (%s) — the snapshot leaves it as it is", exc)
+            log.warning("%s: AOF unreadable (%s) — the snapshot leaves it as it is", who, exc)
             consume_aof = False
     mark = aof_mark(consumed) if consumed else None     # (hashing: off the loop)
     count_held = consume_aof and aof_writer is not None
@@ -932,7 +1024,7 @@ def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer,
         state = store.to_snapshot()
         if mark is not None:
             state[AOF_MARK] = mark
-        return held_back, len(state.get("tracks", {})), json.dumps(state)
+        return held_back, len(state.get("tracks", {})), encode_state(state)
 
     t0 = time.monotonic()
     held_back, new_count, text = _call_on_loop(loop, _encode)
@@ -943,13 +1035,13 @@ def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer,
         old_count = len(old.get("tracks", {})) if isinstance(old, dict) else 0
         if old_count > 0:
             log.warning(
-                "Shutdown: store is empty but snapshot has %d tracks — skipping write to preserve data",
-                old_count,
+                "%s: store is empty but snapshot has %d tracks — skipping write to preserve data",
+                who, old_count,
             )
-            return
+            return False
 
-    if not _write_library_text(data_dir, text, "Shutdown"):
-        return
+    if not _write_library_text(data_dir, text, who):
+        return False
     del text
     try:
         if consumed:
@@ -960,24 +1052,127 @@ def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer,
         # written after them at exit would be applied on top of it)
         if held_back:
             aof_writer.discard_buffered(held_back)
-            log.info("Shutdown: %d unflushed AOF record(s) are in the snapshot — not written",
-                     held_back)
+            log.info("%s: %d unflushed AOF record(s) are in the snapshot — not written",
+                     who, held_back)
 
     elapsed = (time.monotonic() - t0) * 1000
-    log.info("Shutdown snapshot written in %.0fms (%d tracks)", elapsed, new_count)
+    log.info("%s snapshot written in %.0fms (%d tracks)", who, elapsed, new_count)
+    return True
+
+
+def write_imported_library(data_dir: Path) -> str | None:
+    """Save the store (just filled from a backup by the command-line import)
+    as the data directory's library: ``library.json`` written, then the AOF
+    removed — its records are the replaced library's, and replayed on top of
+    the import they'd bring back what the backup doesn't hold.  The snapshot
+    carries the AOF's mark (``AOF_MARK``), so a stop between the write and the
+    removal still skips those records at the next start.  The caller holds the
+    data directory (``claim_library``), so no server writes meanwhile.
+
+    None when saved; else why not ("empty": the backup has no tracks and the
+    library has — refused, as the shutdown snapshot refuses it; "write": the
+    file could not be written).  Nothing is changed then."""
+    from soniqboom.core.store import get_store
+
+    primary = data_dir / "library.json"
+    aof_path = data_dir / "library.aof"
+    with library_files_locked(data_dir):
+        state = get_store().to_snapshot()
+        if not state.get("tracks") and primary.exists():
+            old = _try_load_json(primary)
+            if isinstance(old, dict) and old.get("tracks"):
+                return "empty"
+        try:
+            old_aof = read_aof(aof_path)
+        except FileNotFoundError:
+            old_aof = b""
+        if old_aof:
+            state[AOF_MARK] = aof_mark(old_aof)
+        if not _write_library_text(data_dir, encode_state(state), "Import"):
+            return "write"
+        # (records a restart set aside for the replaced library, and its
+        # folder-browse cache, go with its AOF)
+        for stale in (aof_path, *data_dir.glob("library.aof.late-exec-*"),
+                      data_dir / "browse_cache.pickle"):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+        _fsync_dir(data_dir)
+    return None
+
+
+def adopt_exec_late_records(data_dir: Path) -> int:
+    """Append the records the source install's restart set aside between
+    sealing its journal and its ``os.execv`` (``library.aof.late-exec-*``,
+    ``AOFWriter.late_tag``) to ``library.aof``, oldest file first, and remove
+    those files.  They follow every record of that journal and precede this
+    start's load, so they are replayed with the AOF.  Only complete lines are
+    taken (an exec in the middle of a write leaves a torn last one), the
+    append is fsynced before the file is removed (and the removal before
+    returning), and an AOF that already ends with them (a start that stopped
+    between the two) gets nothing twice.  A file that can't be added is
+    renamed to a plain set-aside file (``library.aof.late-…``, kept for an
+    operator, never replayed — later it would land after newer records).
+    Caller holds the library's locks (``init_persistence``).  Returns the
+    records adopted."""
+    aof = data_dir / "library.aof"
+    adopted = 0
+    for late in sorted(data_dir.glob("library.aof.late-exec-*")):
+        def _set_aside(why: str) -> None:
+            kept = late.with_name(late.name.replace(".late-exec-", ".late-", 1))
+            log.exception("AOF: %s %s — kept as %s, not replayed", late.name, why, kept.name)
+            try:
+                os.replace(late, kept)
+            except OSError:
+                log.warning("AOF: %s could not be renamed", late.name, exc_info=True)
+        try:
+            raw = late.read_bytes()
+        except OSError:
+            _set_aside("could not be read")
+            continue
+        body = raw[:raw.rfind(b"\n") + 1]
+        if len(body) < len(raw):
+            log.warning("AOF: %s ends in a partial record (%d bytes) — not replayed",
+                        late.name, len(raw) - len(body))
+        if body:
+            try:
+                existing = aof.read_bytes() if aof.exists() else b""
+                if not existing.endswith(body):
+                    sep = b"" if not existing or existing.endswith(b"\n") else b"\n"
+                    with open(aof, "ab") as f:
+                        f.write(sep + body)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    _fsync_dir(data_dir)
+            except OSError:
+                _set_aside("could not be added to the AOF")
+                continue
+            adopted += body.count(b"\n")
+        try:
+            late.unlink()
+            _fsync_dir(data_dir)
+        except OSError:
+            log.warning("AOF: %s could not be removed", late.name, exc_info=True)
+    if adopted:
+        log.info("AOF: %d record(s) written while the last restart was ending added to "
+                 "the journal", adopted)
+    return adopted
 
 
 def init_persistence(data_dir: Path) -> None:
     """Full startup sequence: load snapshot → replay AOF → populate store —
     the files read under ``library_files_lock`` (waiting for a merge of a
     stopped run still ending) and ``_library_flock`` (a merge of the merger
-    process)."""
+    process).  First, the records a restart set aside right before its exec
+    join the AOF (``adopt_exec_late_records``)."""
     data_dir.mkdir(parents=True, exist_ok=True)
     if not library_files_lock.acquire(timeout=1.0):
         log.info("Waiting for a merge of the previous server run to finish before loading the library")
         library_files_lock.acquire()
     try:
         with _library_flock(data_dir):
+            adopt_exec_late_records(data_dir)
             state = load_snapshot(data_dir)
             replay_aof(state, data_dir)
     finally:

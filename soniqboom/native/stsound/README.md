@@ -1,4 +1,29 @@
 # StSound
+
+> **In SoniqBoom.** This folder vendors part of
+> [arnaud-carre/StSound](https://github.com/arnaud-carre/StSound): the
+> `StSoundLibrary/` sources (with `LZH/`), `Ym2Wav/Ym2Wav.cpp` and the
+> repository's `LICENSE`. The other upstream directories and project files
+> described below (SmallYmPlayer, YmSampleFiles, the Visual Studio solution and
+> the CMake build) are not included.
+>
+> SoniqBoom renders Atari ST `.ym` files with a `ym2wav` helper built from
+> these sources:
+>
+>     c++ -O2 -w -o ym2wav Ym2Wav/Ym2Wav.cpp StSoundLibrary/*.cpp \
+>         StSoundLibrary/LZH/*.cpp -I StSoundLibrary -I StSoundLibrary/LZH
+>
+> A `ym2wav` already on `PATH` is used as is (the Docker image ships one,
+> pre-built in `/usr/local/bin`). Otherwise
+> `soniqboom/api/stream.py:_ensure_ym2wav()` compiles it on first use into
+> `<data_dir>/native/ym2wav` (with `c++`, `clang++` or `g++`).
+>
+> Licence: [`LICENSE`](LICENSE) (MIT, Copyright (c) 2021 Arnaud Carré); the
+> source files carry BSD-2-Clause headers (Copyright (c) 1995-1999 Arnaud
+> Carré). The LZH depacking code is by Haruhiko Okumura and Kerwin F. Medina.
+> `LICENSE` and these per-file headers are the licence terms that apply to the
+> files in this folder. The upstream README follows.
+
 Library to replay YM files ( Atari ST music file format )
 
 written by Arnaud Carré (aka Leonard/Oxygene)

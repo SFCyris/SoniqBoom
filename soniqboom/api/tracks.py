@@ -288,9 +288,11 @@ async def _resolve_zip_member_to_local(path_str: str):
             scan_root, remote_path = parse_remote_path(path_str)
             # (no source: the cached subset / archive still answers)
             source = get_source(scan_root)
-            if "::" not in remote_path:
+            from soniqboom.core.filesource import split_member
+            _sp = split_member(remote_path)
+            if _sp is None:
                 return None
-            arc_rel, member_name = remote_path.split("::", 1)
+            arc_rel, member_name = _sp
             from soniqboom.core.remote_zip import archive_for_member
             local_archive = await loop.run_in_executor(
                 None, archive_for_member, scan_root, arc_rel, member_name, source)
@@ -624,6 +626,15 @@ from soniqboom.api.users import (
 )
 
 
+def _no_content(headers: dict | None = None) -> Response:
+    """``204 No Content`` — what a per-track resource that doesn't exist for
+    this track (no VU meters, no waveform) answers, with the reason in a
+    header.  Not a 404: the track exists, and reverse-proxy security tools
+    (CrowdSec ``http-probing``, fail2ban) ban a client after a burst of 404s
+    (GitHub #40).  Not cached — a later render may produce it."""
+    return Response(status_code=204, headers={"Cache-Control": "no-store", **(headers or {})})
+
+
 @router.put("/{track_id}/tags")
 async def update_tags(track_id: str, body: _TagUpdate, user=_Depends(_require_edit)):
     """Write tags into the local audio file AND mirror them into the library.
@@ -834,11 +845,16 @@ async def update_meta(track_id: str, body: _MetaUpdate, user=_Depends(_require_e
 # ── Shared httpx client for LRCLib requests ──────────────────────────────────
 
 _lrclib_client: httpx.AsyncClient | None = None
+_lrclib_loop = None          # the event loop ``_lrclib_client`` belongs to
 
 
 def _get_lrclib_client() -> httpx.AsyncClient:
-    global _lrclib_client
-    if _lrclib_client is None:
+    """The shared LRCLib client of the running event loop: the bundled app
+    runs each server run on a new loop in the same process, and a client
+    made on a closed loop fails ("Event loop is closed")."""
+    global _lrclib_client, _lrclib_loop
+    loop = asyncio.get_running_loop()
+    if _lrclib_client is None or _lrclib_loop is not loop or _lrclib_client.is_closed:
         # Cap connection use so a track-change storm (5 users + 3 rooms
         # all switching together) doesn't open 100 concurrent connections
         # to LRClib — Perf #1 flagged the missing limits.
@@ -849,7 +865,19 @@ def _get_lrclib_client() -> httpx.AsyncClient:
                 max_keepalive_connections=5,
             ),
         )
+        _lrclib_loop = loop
     return _lrclib_client
+
+
+async def shutdown_lyrics_client() -> None:
+    """Close the shared LRCLib client (the server's stop)."""
+    global _lrclib_client, _lrclib_loop
+    client, _lrclib_client, _lrclib_loop = _lrclib_client, None, None
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:                                   # noqa: BLE001
+            pass
 
 
 # ── LRCLib fuzzy-fallback helpers ─────────────────────────────────────────────
@@ -1161,9 +1189,10 @@ async def list_tracks(
     The All Tracks windowed view passes ``sort=<col>&order=<asc|desc>`` to
     drive the per-column lexical / numeric sort indexes maintained by the
     in-memory store: pages are slices of those sorted indexes (O(limit)).
-    With duplicates hidden, a page at offset >= 5,000 slices a primary-only
-    order memoised until the next track write (one O(N) build, ~125 ms at
-    263K tracks, then ~1 ms per 500-row page); shallower pages walk and filter.
+    With duplicates hidden, a page at offset >= 5,000 reads a primary-only
+    order kept until the next browse write (``store._browse_seq``), walked only
+    as deep as the deepest page so far (``store._FilterWalk``); shallower
+    pages walk and filter.
     """
     # Defensive whitelist — silently ignore unknown sort keys so a stale
     # frontend can't 400 the page; we fall back to the default sort instead.
@@ -1518,6 +1547,18 @@ async def catalogue_reads(body: dict, request: Request, _user=_Depends(_require_
     return {"queued": _stream.catalogue_read_for_list([str(i) for i in ids], owner)}
 
 
+@router.get("/{track_id}/package-members")
+async def get_package_members(track_id: str):
+    """The other tunes of the package this tune of an online collection came
+    from (Aminet, scene.org), in the archive's order — a queue that held the
+    package takes them after it once it opened.  ``{"ids": []}`` for any
+    other track."""
+    from soniqboom.core import online_catalog
+    ids = await asyncio.get_running_loop().run_in_executor(
+        None, online_catalog.package_member_ids, track_id)
+    return {"ids": ids}
+
+
 @router.get("/{track_id}/extended")
 async def get_track_extended(track_id: str, request: Request):
     """Return extended metadata for tracker/SID/MIDI files.  For a catalogue
@@ -1526,7 +1567,9 @@ async def get_track_extended(track_id: str, request: Request):
     page takes the result when it lands."""
     track = await get_track(track_id)
     if not track:
-        raise HTTPException(404, "Track not found")
+        # (410 with the reason for a package that left the library)
+        from soniqboom.api import stream as _stream
+        raise _stream._track_missing(track_id)
     from soniqboom.api import stream as _stream
     _stream.catalogue_read_for_info(
         track_id, track, (request.client.host if request.client else "") or "?")
@@ -1725,7 +1768,7 @@ _PATTERN_FORMAT_NAMES = frozenset({
     "Impulse Tracker", "MultiTracker", "OctaMED", "Composer 669",
     "DigiBooster Pro", "UltraTracker", "Farandole", "ASYLUM/DMP",
     "General DigiMusic", "Imago Orpheus", "Oktalyzer", "SoundFX",
-    "Grave Composer", "DSIK",
+    "Grave Composer", "DSIK", "Face The Music",
 })
 
 
@@ -1856,15 +1899,16 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
       * 200 ``application/octet-stream`` with the VUMR binary +
         immutable cache headers, when a sidecar exists or was
         just generated.
-      * 404 when the track isn't a tracker format, the source file
-        can't be reached, or libopenmpt isn't available on this
-        host.  The frontend falls back to its FFT-spectrum
+      * 204 (no body) when there are no meters for this track: it isn't
+        a tracker format, the source file can't be reached, or
+        libopenmpt isn't available on this host.  The frontend falls back to its FFT-spectrum
         visualiser with the honest label.  For an Amiga track whose
         meters can't come at all it carries ``X-VU-Unavailable``
         (``off``: the setting is off; ``unsupported``: this uade build
         can't dump voices; ``skipped``: this tune's pass ran without a
         result — longer than the pass allows, or uade failed on it), so
         the player stops asking.
+      * 404 for an unknown track.
     """
     from fastapi.responses import Response
     from soniqboom.core.conversion_cache import (
@@ -1900,23 +1944,23 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
         # An Amiga track whose meters can't come (the setting is off, this
         # uade build can't dump voices, or this tune's pass already ran
         # without a result): say so, so the player stops polling.  Every
-        # other miss — a pass pending or running, other formats — stays a
-        # plain 404 and the player's retry ladder keeps asking.
+        # other miss — a pass pending or running, other formats — is a plain
+        # 204 and the player's retry ladder keeps asking.  (204, not 404:
+        # "no meters" is a state of the track, and reverse-proxy security
+        # tools ban a client after a burst of 404s — GitHub #40.)
         reason = _stream.uade_vu_unavailable_reason()
         if reason is not None and (
                 _stream.is_uade_routed(getattr(track, "path", "") or "", track)
                 or _stream._ck(track_id, "uade", subsong=subsong) in _stream._UADE_VU_WANTED):
-            raise HTTPException(404, "Per-voice Amiga meters unavailable",
-                                headers={"X-VU-Unavailable": reason})
+            return _no_content({"X-VU-Unavailable": reason})
         skipped = _stream.uade_vu_skipped_reason(track_id, subsong)
         if skipped is not None:
-            raise HTTPException(404, "No per-voice meters for this tune",
-                                headers={"X-VU-Unavailable": skipped})
-        raise HTTPException(404, "No VU sidecar (not a tracker render or libopenmpt unavailable)")
+            return _no_content({"X-VU-Unavailable": skipped})
+        return _no_content()
     try:
         data = sidecar.read_bytes()
     except OSError:
-        raise HTTPException(404, "VU sidecar unreadable")
+        return _no_content()
     import hashlib
     etag = f'"{hashlib.sha256(data).hexdigest()[:16]}"'
     return Response(
@@ -2213,7 +2257,9 @@ async def upload_sid_audio(
         import tempfile
         cdir = get_conversion_cache_dir() / "sid"
         cdir.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(suffix=".wav", dir=str(cdir))
+        # (never ``*.wav`` there: the start would adopt it as a cache entry;
+        # a ``.wav.upload`` a stop cut off is removed by the start)
+        fd, tmp = tempfile.mkstemp(suffix=".wav.upload", dir=str(cdir))
         digest = hashlib.sha256()
         header = bytearray()
         total = 0
@@ -2259,7 +2305,7 @@ _VU_BACKFILL_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mptm", ".med", ".oct",
     ".669", ".dbm", ".dsm", ".far", ".gdm", ".imf", ".mtm",
     ".okt", ".sfx", ".stm", ".ult", ".wow",
-}
+} | {".ftm"}
 
 
 async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
@@ -2333,14 +2379,15 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     # WAV (so eviction is uniform); fall back to a freshly-keyed
     # cache slot if no audio cache exists for this track yet.
     try:
-        from soniqboom.core.conversion_cache import _meta, _state_lock
+        from soniqboom.core.conversion_cache import _cache_key, _meta, _state_lock
         candidate: Path | None = None
+        want = _cache_key(track_id, "tracker", subsong)
         with _state_lock:
             for cache_key, entry in _meta.items():
                 # This subsong's cached WAV specifically — write the .vu next to
                 # it so eviction stays uniform.  Exact match (not startswith) so
                 # subsong 3's backfill doesn't land on subsong 0's WAV.
-                if cache_key == f"{track_id}__sub{subsong}" and entry.get("format_type") == "tracker":
+                if cache_key == want and entry.get("format_type") == "tracker":
                     candidate = Path(entry["path"]).with_suffix(".vu")
                     break
         if candidate is None:
@@ -2488,10 +2535,13 @@ _probe_in_flight = False
 async def probe_lyrics_providers() -> None:
     """Measure each provider's response latency and rank them fastest-first, so
     the faster source is tried first.  A provider that errors/times out sorts
-    LAST (used only as a fallback).  Called at startup and lazily re-run every
-    ``_PROBE_INTERVAL_S`` — provider health drifts (LRCLib was fast, then 5–13 s
-    within a day)."""
+    LAST (used only as a fallback).  Run on the first lookup and lazily re-run
+    every ``_PROBE_INTERVAL_S`` — provider health drifts (LRCLib was fast, then
+    5–13 s within a day).  Offline mode (``netpolicy``): nothing is probed."""
     global _lyrics_order, _last_probe_ts, _probe_in_flight
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked():
+        return
     _probe_in_flight = True
     _last_probe_ts = time.monotonic()
     client = _get_lrclib_client()
@@ -2526,8 +2576,14 @@ async def _resolve_online_lyrics(artist, title, album, duration):
     """Try the online providers fastest-first; return ``(hit, clean)`` — the
     first confident hit (or None), and whether EVERY provider answered with a
     clean "not found" (only then is a miss worth remembering).
-    Kicks a non-blocking background re-probe when the ranking is stale."""
-    if not _probe_in_flight and (time.monotonic() - _last_probe_ts) > _PROBE_INTERVAL_S:
+    Kicks a non-blocking background (re-)probe when there is no ranking yet
+    or it is stale.  Offline mode (``netpolicy``): no provider is asked, and
+    the miss is not clean (not remembered)."""
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked():
+        return None, False
+    if not _probe_in_flight and (_last_probe_ts == 0.0
+                                 or (time.monotonic() - _last_probe_ts) > _PROBE_INTERVAL_S):
         asyncio.create_task(probe_lyrics_providers())
     client = _get_lrclib_client()
     log = logging.getLogger(__name__)
@@ -3114,8 +3170,21 @@ async def get_track_waveform(track_id: str, response: Response,
                         # worker forever.
                         _log.debug("waveform %s awaiting inflight pump...",
                                   track_id[:8])
-                        await asyncio.wait_for(pump_task, timeout=120.0)
+                        # Shielded: the pump is shared with the listener —
+                        # this request going away (the player aborts it on
+                        # every track change) or timing out must never
+                        # cancel it.
+                        await asyncio.wait_for(asyncio.shield(pump_task), timeout=120.0)
                         _log.debug("waveform %s pump finished", track_id[:8])
+                    except asyncio.CancelledError:
+                        me = asyncio.current_task()
+                        if (pump_task.cancelled()
+                                and not (me is not None and me.cancelling())):
+                            # The pump was stopped (nobody listened to it):
+                            # the waveform comes from the source below.
+                            _log.debug("waveform %s pump was stopped", track_id[:8])
+                        else:
+                            raise
                     except asyncio.TimeoutError:
                         _log.debug("waveform %s pump timed out after 120s",
                                      track_id[:8])
@@ -3163,7 +3232,7 @@ async def get_track_waveform(track_id: str, response: Response,
             # down.
             local = await _resolve_zip_member_to_local(path_str)
             if local is None:
-                raise HTTPException(404, "Waveform not available for this format")
+                return _no_content({"X-Waveform-Unavailable": "format"})
             try:
                 result = await _compute_waveform_safe(str(local))
                 stored, response = _normalise_waveform(result)
@@ -3233,7 +3302,7 @@ async def get_track_waveform(track_id: str, response: Response,
     if '::' in path_str:
         local = await _resolve_zip_member_to_local(path_str)
         if local is None:
-            raise HTTPException(404, "Waveform not available for this format")
+            return _no_content({"X-Waveform-Unavailable": "format"})
         try:
             result = await _compute_waveform_safe(str(local))
             stored, response = _normalise_waveform(result)

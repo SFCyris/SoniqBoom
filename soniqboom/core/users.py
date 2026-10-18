@@ -3,9 +3,33 @@
 
 """UserStore — load, save, authenticate, and manage user accounts.
 
-Storage layout: a single ``users.json`` file in the data dir, with atomic
-replace on every mutation.  Sessions are in-memory (cleared on restart),
-matching the existing admin-token pattern in ``api/admin.py``.
+Storage layout: ``users.json`` in the data dir, replaced crash-safely on
+every mutation (``durable.atomic_write_bytes``: temp file, fsync, rename,
+directory fsync), with ``users.json.bak`` holding a second copy of the last
+write.  A main file that can't be read falls back to the backup; when neither
+holds an account but the install was set up before (``_install_evidence``),
+the store is in **recovery** (``recovery_required``): ``has_any()`` stays True
+so every gate keeps asking for a sign-in, and no request can succeed until an
+admin restores ``users.json`` or creates an account with ``soniqboom-setadm``.
+A fresh install (no users file ever) is not affected.
+
+Sessions: the server's store (``init_user_store``) keeps them in
+``sessions.json`` (0600) — the SHA-256 of each token, never the token — so a
+restart keeps everyone signed in.  New sessions and sliding-expiry advances
+are written in the background (coalesced); a revocation (sign-out, password
+change, user delete, demotion / disable) is written before the call returns.
+A session is bound to the password hash its sign-in verified, so a password
+changed by another process (``soniqboom-setadm``), or while the sign-in ran,
+ends it too.  An account keeps at most ``_MAX_SESSIONS_PER_USER`` sessions
+(the least recently used goes first).
+
+Saves never undo a change another process made: ``_save`` compares
+users.json with what this store last read or wrote (``disk_signature`` of the
+file) and, when it changed, merges this store's own changes into it — field
+by field, the file winning where both changed the same field, a deletion on
+either side winning.  A users.json that changed and can't be read is never
+overwritten (``UsersFileUnreadable``); one this store could never read is moved
+aside (``users.json.corrupt-*``) before the first account list replaces it.
 
 Password hashing: stdlib ``hashlib.scrypt`` with per-user random salt.
 The stored hash is ``scrypt$N$r$p$<salt_hex>$<key_hex>`` so the
@@ -18,6 +42,7 @@ threads, matching the rest of the store.
 from __future__ import annotations
 
 import fcntl
+import functools
 import hashlib
 import json
 import logging
@@ -30,9 +55,60 @@ import time
 import uuid
 from pathlib import Path
 
+from soniqboom.core.durable import atomic_write_bytes
 from soniqboom.models.user import User, ROLES, Role
 
 log = logging.getLogger(__name__)
+
+# Shown (log, /api/auth/status, the sign-in overlay, soniqboom-setadm) while
+# the store is in recovery — see the module docstring.
+RECOVERY_MESSAGE = (
+    "The user accounts file (users.json) could not be read and no usable backup "
+    "was found, so sign-in is locked. Restore users.json from a backup into the "
+    "server's data directory, or create an admin account on the server with: "
+    "soniqboom-setadm -user <name> -passwd '<password>' -role admin"
+)
+
+
+class SignInsClosed(RuntimeError):
+    """No new sign-in session: the server is restarting
+    (``UserStore.close_sign_ins``)."""
+
+
+class SessionRefused(RuntimeError):
+    """No session for this sign-in: the account is gone or disabled, or its
+    password changed after the sign-in verified it (``issue_session``)."""
+
+
+class PasswordChangedMeanwhile(RuntimeError):
+    """``set_password(expected_hash=...)`` refused: the account's password
+    changed after the caller verified the old one (an administrator's reset,
+    or another change of it), so the change would undo that one."""
+
+
+class UsersFileUnreadable(OSError):
+    """users.json changed on disk since this store read it and can't be read
+    now: nothing is saved (saving would replace whatever it holds)."""
+
+
+class _UnreadableUsers(ValueError):
+    """users.json (or its backup) holds something that isn't a users document."""
+
+
+def _parse_users_doc(raw: bytes) -> dict:
+    """``raw`` as a users document, or ``_UnreadableUsers``: a JSON object
+    whose ``users`` is a list of objects.  ``{}``, ``[]``, ``null`` and other
+    valid-JSON garbage are refused here — read as "no users" they would turn a
+    damaged file into an install with no accounts."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _UnreadableUsers(f"not JSON ({exc})") from None
+    if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+        raise _UnreadableUsers("no 'users' list")
+    if not all(isinstance(u, dict) for u in data["users"]):
+        raise _UnreadableUsers("a user record is not an object")
+    return data
 
 # scrypt parameters — NIST SP 800-63B "memory-hard" defaults.  N=2**15
 # (~32 MB), r=8, p=1 hashes in ~80 ms on an M-series Mac, plenty fast
@@ -207,6 +283,24 @@ def _decrypt_ss(rec: dict, fernet) -> None:
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._\-]{2,64}$")
 
+# Longest display name accepted (the API, the CLI).
+DISPLAY_NAME_MAX_LEN = 100
+
+# Sign-in sessions one account keeps; a new one beyond this ends the least
+# recently used.
+_MAX_SESSIONS_PER_USER = 50
+
+# How often a session's cookie is sent again (``session_cookie_due``): the
+# browser's copy follows the sliding expiry, about once an hour.
+_COOKIE_REFRESH_SEC = 3600.0
+
+# Temp files ``durable.atomic_write_bytes`` leaves behind when a write is cut
+# off: ``<name>.<pid>.<8 hex>.tmp``.
+_USERS_TMP_RE = re.compile(r"^users\.json(?:\.bak)?\.\d+\.[0-9a-f]{8}\.tmp$")
+_SESSIONS_TMP_RE = re.compile(r"^sessions\.json\.(\d+)\.[0-9a-f]{8}\.tmp$")
+
+_ROLE_RANK = {"readonly": 0, "edit": 1, "admin": 2}
+
 # Hard ceiling on password length — scrypt over a multi-MB blob will block
 # the event loop and is never legitimate.
 _PASSWORD_MAX_LEN = 1024
@@ -215,6 +309,27 @@ _PASSWORD_MAX_LEN = 1024
 # longer than the old admin token (1 h) because users expect "stay signed
 # in" behaviour from a media player.
 _SESSION_TTL_SEC = 7 * 24 * 3600
+
+# sessions.json: new sessions and expiry advances are written this long after
+# the first change (one write for a burst of sign-ins); a sliding-expiry
+# advance is only written once it is this far past the stored expiry (so an
+# active session is rewritten about once an hour, not on every request).
+_SESSION_WRITE_DELAY_SEC = 1.0
+_SESSION_EXPIRY_PERSIST_SEC = 3600.0
+_SESSION_WRITE_RETRY_SEC = 30.0
+
+
+def _token_hash(token: str) -> str:
+    """What identifies a session in memory and on disk: SHA-256 of the token
+    (256-bit random, so an unsalted hash is not invertible)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@functools.lru_cache(maxsize=4096)
+def _pw_binding(password_hash: str) -> str:
+    """A session's binding to the password hash it was issued under — a
+    password changed anywhere (another process included) ends it."""
+    return hashlib.sha256(b"sb-session\0" + (password_hash or "").encode("utf-8")).hexdigest()[:32]
 
 # A successful login rewrites users.json only when the persisted
 # ``last_login_at`` is older than this (or a password-derived field changed):
@@ -298,6 +413,19 @@ def validate_username(username: str) -> None:
         )
 
 
+def validate_display_name(display_name: str | None) -> None:
+    """Raise ValueError for a display name longer than DISPLAY_NAME_MAX_LEN."""
+    if display_name is not None and len(display_name) > DISPLAY_NAME_MAX_LEN:
+        raise ValueError(
+            f"Display name must be at most {DISPLAY_NAME_MAX_LEN} characters.",
+        )
+
+
+def role_rank(role: str | None) -> int:
+    """readonly < edit < admin (an unknown role ranks lowest)."""
+    return _ROLE_RANK.get(role or "", -1)
+
+
 STRONG_PASSWORD_MIN_LEN = 10
 STRONG_PASSWORD_RULE = (
     f"Password must be at least {STRONG_PASSWORD_MIN_LEN} characters and include "
@@ -334,10 +462,24 @@ def validate_password(password: str) -> None:
 class UserStore:
     """In-memory user/session manager, persisted to ``users.json``."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, persist_sessions: bool = False) -> None:
         self._data_dir = data_dir
         self._path = data_dir / "users.json"
+        self._bak_path = data_dir / "users.json.bak"
         self._lock_path = data_dir / "users.json.lock"
+        # No account could be loaded although the install was set up before
+        # (see the module docstring and ``_load``).
+        self._recovery_required = False
+        # Sessions survive a restart only for the server's store
+        # (``init_user_store``): the CLI (``soniqboom-setadm``) builds its own
+        # store and must never write the server's sessions.
+        self._persist_sessions = persist_sessions
+        self._sessions_path = data_dir / "sessions.json"
+        self._sess_lock = threading.Lock()      # session-map inserts / removals + snapshots
+        self._sess_io_lock = threading.Lock()   # one sessions.json write at a time
+        self._sess_dirty = False
+        self._sess_timer: threading.Timer | None = None
+        self._sign_ins_closed = False           # ``close_sign_ins``
         self._secret_key_path = data_dir / "secret.key"   # at-rest key for the Subsonic secret
         self._ss_key = None                               # Fernet, loaded once (``_ss_fernet``)
         # Ciphertext of secrets that could not be decrypted because the key was
@@ -348,12 +490,17 @@ class UserStore:
         # Users keyed by id (UUID), with a username→id index for fast lookup.
         self._users: dict[str, User] = {}
         self._by_username: dict[str, str] = {}
-        # Sessions: token → {user_id, expiry}.  In-memory only.
+        # Sessions: sha256(token) → {user_id, expiry, pw (``_pw_binding``),
+        # persisted (the expiry last written to sessions.json)}.
         self._sessions: dict[str, dict] = {}
         # Lockout state: username_lower → {fails: [(ts, ...)], locked_until}.
         # In-memory only; a restart clears all counters which is acceptable
         # (an attacker who can restart the server has bigger leverage).
         self._lockout: dict[str, dict] = {}
+        # Guards ``_lockout``: a guess is counted (``_reserve_attempt``)
+        # before its scrypt check, so parallel guesses can't all pass a check
+        # made before any of them failed.
+        self._lockout_lock = threading.Lock()
         # OpenSubsonic API keys: user id → [{id, name, sha256, created}], and
         # sha256(key) → (user id, key id) for the O(1) per-request lookup.
         # Persisted in users.json under ``api_keys`` (hashes only — the
@@ -385,7 +532,31 @@ class UserStore:
         # The fcntl flock on _lock_path serialises *across* processes — the
         # CLI and the server can both touch users.json safely.
         self._lock = threading.Lock()
+        # What this store last read from / wrote to users.json (``_save``
+        # merges a file that changed since): the file's signature, and the
+        # account records (plaintext ``User.to_storage()``), API key ids and
+        # custom flags as they were then.  ``_main_unknown``: users.json
+        # exists but could not be read at the last load — its content is
+        # unknown.  ``_bak_sig``: users.json.bak as last written / read.
+        self._synced_sig = None
+        self._bak_sig = None
+        self._base_users: dict[str, dict] = {}
+        self._base_keys: dict[str, set[str]] = {}
+        self._base_custom: dict[str, bool] = {}
+        self._main_unknown = False
+        # The last read of users.json / .bak failed with a read error (EIO,
+        # EMFILE, permissions): ``check_restored`` tries again on every poll,
+        # not only when the file changes.  ``_adopt_logged``: that error, as
+        # last logged (one line per distinct error).
+        self._read_error = False
+        self._adopt_logged = None
         self._load()
+        # What users.json / .bak looked like when last read while no account
+        # was loaded (``check_restored``): a changed file is read again.
+        self._adopt_sig = self.disk_signature()
+        if self._persist_sessions:
+            self._load_sessions()
+        self._remove_stale_temp_files()
 
     # ── Cross-process file lock ─────────────────────────────────────────
 
@@ -447,82 +618,217 @@ class UserStore:
             self._ss_raw.pop(u.id, None)               # a new secret supersedes it
         return _encrypt_ss(rec, fer)
 
-    def _load(self) -> bool:
-        """Read users.json into memory.  On a parse error we move the
-        corrupt file aside (``users.json.corrupt-<ts>``) and continue with
-        an empty store.  Without this, the next save() would atomically
-        replace the unreadable but on-disk file, silently wiping
-        whatever legitimate users.json may have been (e.g. partial write,
-        version mismatch).
+    def _build_maps(self, data: dict) -> dict:
+        """The in-memory maps for a parsed users document (``_parse_users_doc``),
+        built aside — ``_swap_maps`` installs them.  Raises on a bad record.
 
         Scrobble tokens are stored encrypted at rest (Fernet, same key as
-        share passwords).  We decrypt on load so the in-memory User
-        objects hold plaintext for the scrobble path — but the on-disk
-        file never reveals them.
+        share passwords).  We decrypt here so the in-memory User objects hold
+        plaintext for the scrobble path — but the on-disk file never reveals
+        them."""
+        new_users: dict[str, User] = {}
+        new_by_username: dict[str, str] = {}
+        new_raw: dict[str, str] = {}
+        fer = self._ss_fernet()
+        for u in data["users"]:
+            _decrypt_token_fields(u)
+            raw_ss = u.get(_SS_FIELD)
+            _decrypt_ss(u, fer)
+            user = User.from_storage(u)
+            if fer is None and isinstance(raw_ss, str) and raw_ss.startswith(_SS_PREFIX):
+                new_raw[user.id] = raw_ss
+            new_users[user.id] = user
+            new_by_username[user.username.lower()] = user.id
+        new_keys, new_by_hash = _parse_api_keys(data.get("api_keys"), new_users)
+        raw_custom = data.get("subsonic_password_custom")
+        new_custom = ({uid: v for uid, v in raw_custom.items()
+                       if uid in new_users and isinstance(v, bool)}
+                      if isinstance(raw_custom, dict) else {})
+        return {"users": new_users, "by_username": new_by_username, "ss_raw": new_raw,
+                "api_keys": new_keys, "by_api_key_hash": new_by_hash, "custom": new_custom}
 
-        Returns False when the file could not be read (and was moved
-        aside); a missing file is nothing to load, not a failure."""
-        if not self._path.exists():
-            return True
+    def _swap_maps(self, m: dict) -> None:
+        # Swap fresh maps in ATOMICALLY rather than clear()+repopulate.
+        # ``lookup_session`` reads ``_users`` / ``_by_username`` WITHOUT the
+        # lock (it's the hot auth path on every request); the old
+        # clear-then-fill exposed an empty-map window during which a
+        # concurrent lookup saw "user not found", POPPED the still-valid
+        # session, and then returned a *sticky* 401 on every authenticated
+        # route until the user signed in again.  A dict rebind is atomic under
+        # the GIL, so a lock-free reader always sees either the complete old
+        # map or the complete new one — never a partial state.  ``reload()``
+        # still holds ``self._lock`` so writers remain serialised.
+        if not self._users and m["users"]:
+            # Accounts arrive in a store that had none (recovery ended, a
+            # restore was adopted): the failed guesses counted meanwhile —
+            # every sign-in failed then — start over (Subsonic apps that kept
+            # polling would otherwise stay locked out for the cooldown).
+            with self._lockout_lock:
+                self._lockout.clear()
+        self._ss_raw = m["ss_raw"]
+        self._users = m["users"]
+        self._by_username = m["by_username"]
+        self._api_keys = m["api_keys"]
+        self._by_api_key_hash = m["by_api_key_hash"]
+        self._ss_custom = m["custom"]
+        self._login_persisted = {uid: float(u.last_login_at or 0)
+                                 for uid, u in m["users"].items()}
+
+    @staticmethod
+    def _read_users_file(path: Path) -> tuple[str, dict | None, Exception | None]:
+        """``("missing" | "ok" | "bad" | "error", document, error)`` for one
+        users file: "bad" = read, but not a users document; "error" = could
+        not be read (permissions, EMFILE, EIO) — the file may be fine."""
         try:
-            raw = self._path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            users = data.get("users", [])
-            # Build fresh maps and swap them in ATOMICALLY rather than
-            # clear()+repopulate.  ``lookup_session`` reads ``_users`` /
-            # ``_by_username`` WITHOUT the lock (it's the hot auth path on every
-            # request); the old clear-then-fill exposed an empty-map window
-            # during which a concurrent lookup saw "user not found", POPPED the
-            # still-valid session (see ``lookup_session`` line ~559), and then
-            # returned a *sticky* 401 on every authenticated route until the
-            # user signed in again.  A dict rebind is atomic under the GIL, so a
-            # lock-free reader always sees either the complete old map or the
-            # complete new one — never a partial state.  ``reload()`` still holds
-            # ``self._lock`` so writers remain serialised.
-            new_users: dict[str, User] = {}
-            new_by_username: dict[str, str] = {}
-            new_raw: dict[str, str] = {}
-            fer = self._ss_fernet()
-            for u in users:
-                _decrypt_token_fields(u)
-                raw_ss = u.get(_SS_FIELD)
-                _decrypt_ss(u, fer)
-                user = User.from_storage(u)
-                if fer is None and isinstance(raw_ss, str) and raw_ss.startswith(_SS_PREFIX):
-                    new_raw[user.id] = raw_ss
-                new_users[user.id] = user
-                new_by_username[user.username.lower()] = user.id
-            new_keys, new_by_hash = _parse_api_keys(data.get("api_keys"), new_users)
-            raw_custom = data.get("subsonic_password_custom")
-            new_custom = ({uid: v for uid, v in raw_custom.items()
-                           if uid in new_users and isinstance(v, bool)}
-                          if isinstance(raw_custom, dict) else {})
-            self._ss_raw = new_raw
-            self._users = new_users
-            self._by_username = new_by_username
-            self._api_keys = new_keys
-            self._by_api_key_hash = new_by_hash
-            self._ss_custom = new_custom
-            self._login_persisted = {uid: float(u.last_login_at or 0)
-                                     for uid, u in new_users.items()}
-            log.info("Loaded %d user(s) from %s", len(self._users), self._path)
-            return True
-        except (json.JSONDecodeError, OSError, ValueError, KeyError) as exc:
-            # Move corrupt file aside so an admin can investigate; refuse
-            # to overwrite their data on next save.
-            try:
-                ts = int(time.time())
-                quarantine = self._path.with_suffix(f".json.corrupt-{ts}")
-                shutil.move(str(self._path), str(quarantine))
-                log.error("users.json could not be parsed (%s); moved aside to %s",
-                          exc, quarantine)
-            except OSError:
-                log.exception("users.json corrupt and could not be quarantined; aborting")
-                raise RuntimeError(
-                    f"users.json at {self._path} is corrupt and cannot be moved aside. "
-                    f"Fix or remove the file before restarting."
-                )
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return "missing", None, None
+        except OSError as exc:
+            return "error", None, exc
+        try:
+            return "ok", _parse_users_doc(raw), None
+        except _UnreadableUsers as exc:
+            return "bad", None, exc
+
+    def _quarantine(self, path: Path, exc, fatal: bool) -> None:
+        """Move an unreadable users file aside (``<name>.corrupt-<ts>``) so an
+        admin can investigate and the next save can't silently overwrite it.
+        ``fatal``: a main file that can't be moved aside stops the start."""
+        ts = int(time.time())
+        quarantine = path.with_name(f"{path.name}.corrupt-{ts}")
+        if quarantine.exists():
+            quarantine = path.with_name(f"{path.name}.corrupt-{ts}-{time.time_ns()}")
+        try:
+            shutil.move(str(path), str(quarantine))
+            log.error("%s could not be read (%s); moved aside to %s",
+                      path.name, exc, quarantine.name)
+        except OSError:
+            if not fatal:
+                log.exception("%s could not be read (%s) nor moved aside", path.name, exc)
+                return
+            log.exception("users.json corrupt and could not be quarantined; aborting")
+            raise RuntimeError(
+                f"users.json at {path} is corrupt and cannot be moved aside. "
+                f"Fix or remove the file before restarting."
+            )
+
+    def _install_evidence(self) -> bool:
+        """Whether this install was set up before: a users file in any form
+        (a quarantined copy ``users.json*.corrupt-*``, a temp file a crash
+        left behind) or ``sessions.json`` (only written once accounts exist).
+        ``users.json.lock`` doesn't count — the sign-in overlay's "re-check"
+        creates it on a fresh install.  A data dir that can't be listed counts
+        (fail closed)."""
+        try:
+            return any((p.name.startswith("users.json") and p.name != "users.json.lock")
+                       or p.name == "sessions.json"
+                       for p in self._data_dir.iterdir())
+        except FileNotFoundError:
             return False
+        except OSError:
+            return True
+
+    _BAD_RECORD = (KeyError, TypeError, ValueError, AttributeError)
+
+    def _load(self) -> bool:
+        """Read the accounts into memory: ``users.json``, else its backup
+        ``users.json.bak``.  An unreadable file (bad JSON, valid JSON that
+        isn't a users document, a bad record, a read error) is moved aside
+        (``<name>.corrupt-<ts>``) — without this the next save would replace
+        it and silently wipe whatever it held.
+
+        Neither file holding an account: on a fresh install (no users file
+        ever — ``_install_evidence``) nothing changes, the open first-run
+        setup as before; otherwise the store is in recovery
+        (``recovery_required``, see the module docstring) — never an install
+        without accounts.  Accounts already in memory (a ``reload``) are kept
+        when nothing could be read.
+
+        Returns False when a file could not be read (and was moved aside);
+        a missing file is nothing to load, not a failure."""
+        unreadable = False
+        empty_main = None
+        sig0 = self._file_sig(self._path)       # (before the read: a later change is seen)
+        status, data, exc = self._read_users_file(self._path)
+        if status == "error":
+            # Not readable right now — not proof of damage: nothing is moved
+            # aside and the backup (possibly as stale as a file another user
+            # just wrote) is not used.  Accounts in memory stay; none → recovery.
+            log.error("users.json could not be read (%s)", exc)
+            self._read_error = True
+            self._main_unknown = True
+            self._synced_sig = sig0
+            return self._no_accounts_loaded(evidence=True, unreadable=True)
+        self._read_error = False
+        if status == "ok":
+            try:
+                maps = self._build_maps(data)
+            except self._BAD_RECORD as e:
+                status, exc = "bad", e
+            else:
+                if maps["users"]:
+                    self._swap_maps(maps)
+                    self._mark_synced(sig0, bak_sig=None)
+                    self._recovery_required = False
+                    log.info("Loaded %d user(s) from %s", len(self._users), self._path)
+                    return True
+                empty_main = maps               # a valid document without an account
+        if status == "bad":
+            unreadable = True
+            self._quarantine(self._path, exc, fatal=True)
+        bsig0 = self._file_sig(self._bak_path)
+        bstatus, bdata, bexc = self._read_users_file(self._bak_path)
+        if bstatus == "ok":
+            try:
+                maps = self._build_maps(bdata)
+            except self._BAD_RECORD as e:
+                bstatus, bexc = "bad", e
+            else:
+                if maps["users"]:
+                    self._swap_maps(maps)
+                    self._mark_synced(self._file_sig(self._path), bak_sig=bsig0)
+                    self._recovery_required = False
+                    log.error("users.json %s — loaded the %d account(s) of the backup %s",
+                              "is missing" if status == "missing" else "could not be read",
+                              len(self._users), self._bak_path.name)
+                    return True
+        if bstatus == "bad":
+            unreadable = True
+            self._quarantine(self._bak_path, bexc, fatal=False)
+        elif bstatus == "error":
+            unreadable = True
+            self._read_error = True
+            log.error("%s could not be read (%s)", self._bak_path.name, bexc)
+        if empty_main is not None:
+            self._swap_maps(empty_main)
+            self._mark_synced(sig0, bak_sig=None)
+        elif not self._users:
+            self._synced_sig = self._file_sig(self._path)
+            self._main_unknown = False
+        return self._no_accounts_loaded(
+            evidence=status != "missing" or bstatus != "missing" or self._install_evidence(),
+            unreadable=unreadable)
+
+    def _no_accounts_loaded(self, evidence: bool, unreadable: bool) -> bool:
+        """The end of a ``_load`` that found no account to load: keep the
+        accounts in memory if any, else recovery when the install was set up
+        before.  The recovery message is logged once per entry into it."""
+        if self._users:
+            self._recovery_required = False
+        else:
+            was = self._recovery_required
+            self._recovery_required = evidence
+            if evidence and not was:
+                log.error("No user account could be loaded from %s. %s",
+                          self._data_dir, RECOVERY_MESSAGE)
+        return not unreadable
+
+    @property
+    def recovery_required(self) -> bool:
+        """No account is loaded although this install was set up before (its
+        users file is unreadable or gone): sign-in stays required and cannot
+        succeed until an admin restores users.json or creates an account."""
+        return self._recovery_required and not self._users
 
     def reload(self) -> bool:
         """Re-read users.json from disk.  Used by ``POST /auth/reload``
@@ -532,11 +838,299 @@ class UserStore:
         with self._flock(), self._lock:
             return self._load()
 
+    def disk_signature(self) -> tuple:
+        """``(inode, size, mtime_ns, ctime_ns)`` of users.json and of
+        users.json.bak (None for a file that can't be stat'ed): changes when
+        either file is written, replaced, chmod'ed or chown'ed."""
+        out = []
+        for path in (self._path, self._bak_path):
+            try:
+                st = path.stat()
+            except OSError:
+                out.append(None)
+                continue
+            out.append((st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+        return tuple(out)
+
+    def adopt_from_disk(self, sessions: bool = True) -> bool:
+        """Load accounts from disk only when that cannot hurt: users.json
+        holding a valid account list (or, with no users.json at all, the
+        backup holding one).  Unlike ``reload`` nothing is ever moved aside
+        and nothing in memory changes otherwise — a file that is still being
+        copied in is left alone and read again later.  True when accounts
+        were loaded.  ``sessions``: the sign-ins in sessions.json are read
+        again too (as a restart would) — only while no account was loaded."""
+        with self._flock(), self._lock:
+            sig0 = self._file_sig(self._path)
+            status, data, exc = self._read_users_file(self._path)
+            bstatus = bdata = bexc = None
+            if status == "missing":
+                bsig0 = self._file_sig(self._bak_path)
+                bstatus, bdata, bexc = self._read_users_file(self._bak_path)
+            # A read error (EIO, EMFILE, permissions) may pass: read again at
+            # the next poll even if the file doesn't change (``check_restored``).
+            self._read_error = status == "error" or bstatus == "error"
+            if status in ("error", "bad"):
+                # One line per distinct error, not one per poll.
+                key = (status, str(exc))
+                if key != self._adopt_logged:
+                    self._adopt_logged = key
+                    log.warning("users.json could not be loaded (%s) — it is read "
+                                "again %s", exc,
+                                "until it can be" if status == "error" else "when it changes")
+            candidates = []
+            if status == "ok":
+                candidates.append((self._path, data))
+            elif status == "missing" and bstatus == "ok":
+                candidates.append((self._bak_path, bdata))
+            for path, doc in candidates:
+                try:
+                    maps = self._build_maps(doc)
+                except self._BAD_RECORD:
+                    continue
+                if maps["users"]:
+                    had_accounts = bool(self._users)
+                    self._swap_maps(maps)
+                    if path == self._path:
+                        self._mark_synced(sig0, bak_sig=None)
+                    else:
+                        self._mark_synced(None, bak_sig=bsig0)
+                    self._recovery_required = False
+                    self._adopt_logged = None
+                    log.warning("Loaded %d user account(s) from %s%s", len(self._users), path,
+                                "" if had_accounts else
+                                " (restored while no account was loaded)")
+                    if sessions and self._persist_sessions and not had_accounts:
+                        # As a restart would: the sign-ins in sessions.json of
+                        # these accounts are valid again (none existed meanwhile).
+                        self._load_sessions()
+                    return True
+            return False
+
+    def check_restored(self) -> bool:
+        """While no account is loaded (recovery, or a fresh install): when
+        users.json / .bak changed on disk since the last look — or the last
+        read of it failed with a read error, which may have passed — try
+        ``adopt_from_disk``.  The server calls this every few seconds, so a
+        users.json put back from a backup (or one that was unreadable for a
+        moment) is picked up without a restart and without any request
+        asking for it.  True when accounts were loaded."""
+        if self._users:
+            return False
+        sig = self.disk_signature()
+        if sig == self._adopt_sig and not self._read_error:
+            return False
+        self._adopt_sig = sig
+        return self.adopt_from_disk()
+
+    # ── Sync with users.json (``_save`` never undoes another writer) ─────
+
+    @staticmethod
+    def _file_sig(path: Path):
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    _UNSET = object()
+
+    def _mark_synced(self, main_sig, bak_sig=_UNSET) -> None:
+        """users.json (signature ``main_sig``) now holds exactly the accounts
+        in memory: they become the base the next ``_save`` merges against."""
+        self._synced_sig = main_sig
+        if bak_sig is not UserStore._UNSET:
+            self._bak_sig = bak_sig
+        self._base_users = {uid: u.to_storage() for uid, u in self._users.items()}
+        self._base_keys = {uid: {k["id"] for k in lst} for uid, lst in self._api_keys.items()}
+        self._base_custom = dict(self._ss_custom)
+        self._main_unknown = False
+
+    def _move_aside(self, path: Path, exc) -> bool:
+        """``<name>.corrupt-<ts>`` for a users file that can't be read; False
+        when it couldn't be moved (logged)."""
+        ts = int(time.time())
+        aside = path.with_name(f"{path.name}.corrupt-{ts}")
+        if aside.exists():
+            aside = path.with_name(f"{path.name}.corrupt-{ts}-{time.time_ns()}")
+        try:
+            os.replace(path, aside)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            log.exception("%s could not be read (%s) nor moved aside", path.name, exc)
+            return False
+        log.error("%s could not be read (%s); moved aside to %s — a new account "
+                  "list is written in its place", path.name, exc, aside.name)
+        return True
+
+    def _reconcile_with_disk(self) -> None:
+        """Before a save (under the flock and the lock): when users.json is
+        not what this store last read or wrote, take in what changed there
+        (``_merge_disk``).  A changed users.json that can't be read raises
+        ``UsersFileUnreadable`` (it is never overwritten); one this store
+        never read an account from is moved aside first — the account list
+        written now starts afresh, and the old file is kept."""
+        sig = self._file_sig(self._path)
+        if not self._main_unknown and sig == self._synced_sig:
+            return
+        status, doc, exc = self._read_users_file(self._path)
+        if status == "ok":
+            try:
+                disk = self._build_maps(doc)
+            except self._BAD_RECORD as e:
+                status, exc = "bad", e
+            else:
+                self._merge_disk(disk)
+                return
+        if status == "missing":
+            return
+        if not self._base_users:
+            if self._move_aside(self._path, exc):
+                self._main_unknown = False
+                return
+        raise UsersFileUnreadable(
+            getattr(exc, "errno", None) or 0,
+            f"users.json in {self._data_dir} changed on disk and can't be read ({exc}) "
+            "— nothing was saved; fix the file (or its owner / permissions) first")
+
+    def _merge_disk(self, disk: dict) -> None:
+        """Merge users.json as it is on disk (``disk``: ``_build_maps``) with
+        this store's own changes since the base (``_mark_synced``), in place.
+        Per account: one created on either side is kept, one deleted on either
+        side is gone; for an account both have, a field changed on disk takes
+        the disk's value (a password reset, a disable by ``soniqboom-setadm``
+        is never undone), else this store's stays.  API keys and the custom
+        flags merge the same way.  A username created on both sides keeps
+        the disk's account."""
+        base = self._base_users
+        dusers: dict[str, User] = disk["users"]
+        d_raw: dict[str, str] = disk["ss_raw"]
+        out: dict[str, User] = {}
+        took_disk: set[str] = set()
+        for uid in set(base) | set(self._users) | set(dusers):
+            b, m, d = base.get(uid), self._users.get(uid), dusers.get(uid)
+            if b is None:
+                if d is not None:
+                    out[uid] = d                       # created on disk
+                    took_disk.add(uid)
+                elif m is not None:
+                    out[uid] = m                       # created here
+                continue
+            if d is None or m is None:
+                continue                               # deleted on either side
+            for f, dv in d.to_storage().items():
+                if f == "id":
+                    continue
+                if f == _SS_FIELD and uid in d_raw:
+                    continue                           # (not readable here: keep ours)
+                if dv != b.get(f):
+                    if f == "last_login_at":
+                        mv = getattr(m, f)
+                        dv = max(v for v in (dv, mv) if v is not None) if (dv or mv) else dv
+                    setattr(m, f, dv)
+                    if f == _SS_FIELD:
+                        self._ss_raw.pop(uid, None)
+            out[uid] = m
+        # Usernames stay unique: a name created here that the disk also
+        # created meanwhile (another account) gives way.
+        by_username: dict[str, str] = {}
+        for uid in sorted(out, key=lambda i: (i not in took_disk and i not in base, i)):
+            low = out[uid].username.lower()
+            if low in by_username:
+                log.error("User '%s' was created by another process meanwhile — "
+                          "this store's account of that name is dropped", out[uid].username)
+                out.pop(uid)
+                continue
+            by_username[low] = uid
+        # API keys: per key id, the same rule.
+        keys: dict[str, list[dict]] = {}
+        for uid in out:
+            bids = self._base_keys.get(uid, set())
+            mine = self._api_keys.get(uid) or []
+            dlst = disk["api_keys"].get(uid) or []
+            dids = {k["id"] for k in dlst}
+            mids = {k["id"] for k in mine}
+            lst = [k for k in mine if not (k["id"] in bids and k["id"] not in dids)]
+            lst += [k for k in dlst if k["id"] not in bids and k["id"] not in mids]
+            if lst:
+                keys[uid] = lst
+        by_hash = {k["sha256"]: (uid, k["id"]) for uid, lst in keys.items() for k in lst}
+        custom: dict[str, bool] = {}
+        for uid in out:
+            bv = self._base_custom.get(uid, UserStore._UNSET)
+            dv = disk["custom"].get(uid, UserStore._UNSET)
+            v = dv if dv != bv else self._ss_custom.get(uid, UserStore._UNSET)
+            if v is not UserStore._UNSET:
+                custom[uid] = v
+        for uid in took_disk:
+            if uid in d_raw:
+                self._ss_raw[uid] = d_raw[uid]
+        for uid in list(self._ss_raw):
+            if uid not in out:
+                self._ss_raw.pop(uid, None)
+        for uid in took_disk:
+            self._login_persisted[uid] = float(out[uid].last_login_at or 0) if uid in out else 0.0
+        self._users = out
+        self._by_username = by_username
+        self._api_keys = keys
+        self._by_api_key_hash = by_hash
+        self._ss_custom = custom
+        log.info("users.json changed on disk since it was read — merged (%d account(s))",
+                 len(out))
+
+    def _remove_stale_temp_files(self) -> None:
+        """Temp copies a cut-off write left (``durable.atomic_write_bytes``:
+        ``users.json[.bak].<pid>.<hex>.tmp``, ``sessions.json.<pid>.<hex>.tmp``)
+        hold password hashes / session hashes: remove them — only once accounts
+        are loaded (in recovery such a file may be the only copy left) and,
+        for users files, under the flock every writer holds while its temp file
+        exists."""
+        if not self._users:
+            return
+        try:
+            names = list(self._data_dir.iterdir())
+        except OSError:
+            return
+        users_tmp = [q for q in names if _USERS_TMP_RE.match(q.name)]
+        sess_tmp = []
+        if self._persist_sessions:
+            for q in names:
+                m = _SESSIONS_TMP_RE.match(q.name)
+                if m and int(m.group(1)) != os.getpid():
+                    sess_tmp.append(q)
+        removed = 0
+        if users_tmp:
+            try:
+                with self._flock():
+                    for q in users_tmp:
+                        try:
+                            q.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        for q in sess_tmp:
+            try:
+                q.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            log.info("Removed %d leftover temp file(s) of users.json / sessions.json", removed)
+
     def _save(self) -> None:
-        """Atomic write of users.json under the cross-process flock.
+        """Crash-safe write of users.json (``durable.atomic_write_bytes``)
+        and then of the same bytes to ``users.json.bak``, under the
+        cross-process flock.  A users.json another process changed since this
+        store read it is merged first (``_reconcile_with_disk``; raises
+        ``UsersFileUnreadable`` for one that changed and can't be read), and a
+        backup that can't be read is moved aside before it is replaced.
         Sensitive token fields (last.fm session, ListenBrainz token) are
         encrypted with the machine-bound credentials key before write."""
         with self._flock(), self._lock:
+            self._reconcile_with_disk()
             data = {
                 "version": 1,
                 "users": [self._storage_record(u) for u in self._users.values()],
@@ -550,25 +1144,38 @@ class UserStore:
                 data["subsonic_password_custom"] = custom
             for u in self._users.values():
                 self._login_persisted[u.id] = float(u.last_login_at or 0)
-            tmp = self._path.with_suffix(".json.tmp")
-            tmp.parent.mkdir(parents=True, exist_ok=True)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
             # Lock down the data dir + lock file too — the QA pass flagged
             # them as relying on umask, which on multi-user UNIX hosts
             # could leak users.json's existence (or contents under a bad
             # umask) to other local users.
             for p, mode in [
-                (tmp.parent,   0o700),
+                (self._path.parent, 0o700),
                 (self._lock_path, 0o600),
             ]:
                 try: os.chmod(p, mode)
                 except OSError: pass
-            tmp.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            try: os.chmod(tmp, 0o600)
-            except OSError: pass
-            os.replace(tmp, self._path)
+            payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            atomic_write_bytes(self._path, payload, 0o600)
+            self._mark_synced(self._file_sig(self._path))
+            # The backup is written only once the main file is durable, so at
+            # every instant at least one of the two holds a complete copy.
+            # One that is not the copy this store last wrote and can't be read
+            # (another OS user's file, a damaged one) is moved aside first.
+            bsig = self._file_sig(self._bak_path)
+            write_bak = True
+            if bsig is not None and bsig != self._bak_sig:
+                bstatus, _bdoc, bexc = self._read_users_file(self._bak_path)
+                if bstatus in ("error", "bad"):
+                    write_bak = self._move_aside(self._bak_path, bexc)
+            if write_bak:
+                try:
+                    atomic_write_bytes(self._bak_path, payload, 0o600)
+                    self._bak_sig = self._file_sig(self._bak_path)
+                except OSError:
+                    log.warning("%s could not be written", self._bak_path.name, exc_info=True)
+            if self._users:
+                self._recovery_required = False
 
     # ── Queries ──────────────────────────────────────────────────────────
 
@@ -576,7 +1183,11 @@ class UserStore:
         return len(self._users)
 
     def has_any(self) -> bool:
-        return len(self._users) > 0
+        """Whether sign-in is required: an account exists, or the store is in
+        recovery (``recovery_required``).  Every "no users yet → open
+        first-run setup" gate keys on this, so recovery keeps them closed.
+        ``count()`` is the number of accounts actually loaded."""
+        return len(self._users) > 0 or self._recovery_required
 
     def has_any_admin(self) -> bool:
         return any(u.role == "admin" and u.enabled for u in self._users.values())
@@ -624,6 +1235,7 @@ class UserStore:
     ) -> User:
         validate_username(username)
         validate_password(password)
+        validate_display_name(display_name)
         if role not in ROLES:
             raise ValueError(f"Invalid role: {role}")
         if self.get_by_username(username):
@@ -640,6 +1252,11 @@ class UserStore:
             subsonic_password=password,
         )
         with self._lock:
+            # (checked again under the lock: two creates of one name in two
+            # threads — the API runs them off the event loop — both passed
+            # the check above)
+            if user.username.lower() in self._by_username:
+                raise ValueError(f"Username already taken: {username}")
             self._users[user.id] = user
             self._by_username[user.username.lower()] = user.id
             self._ss_custom[user.id] = False            # the seeded login password
@@ -681,10 +1298,12 @@ class UserStore:
         # admins exist" check and leave zero admins (pen-test #1 P1-7).
         # Coupled with the cross-process flock in _save() this closes the
         # window completely.
+        validate_display_name(display_name)
         with self._lock:
             user = self._users.get(user_id)
             if not user:
                 raise KeyError(user_id)
+            prev_role = user.role
             next_role    = role    if role    is not None else user.role
             next_enabled = enabled if enabled is not None else user.enabled
             # Invariant: there must always be at least one enabled admin.
@@ -728,11 +1347,12 @@ class UserStore:
                 self._ss_custom[user_id] = bool(subsonic_password_custom)
             elif subsonic_password is not None:
                 self._ss_custom.pop(user_id, None)
-            # Demoting or disabling a user kicks out their open sessions —
-            # without this, a user demoted from admin to readonly keeps
-            # admin-level cookies until their session naturally expires.
+            # Demoting (any lower role) or disabling a user kicks out their
+            # open sessions — without this, a user demoted from admin to
+            # readonly keeps admin-level cookies until their session naturally
+            # expires.  A promotion, or the same role again, keeps them.
             should_purge = (
-                (role is not None and role != "admin" and user.role != "admin") or
+                (role is not None and role_rank(role) < role_rank(prev_role)) or
                 (enabled is False)
             )
             if should_purge:
@@ -740,52 +1360,125 @@ class UserStore:
         # _save() acquires its own flock; call outside the in-process lock
         # to avoid holding it across IO.
         self._save()
+        if should_purge:
+            self._write_sessions()          # the revocation is on disk before we return
         return user
 
-    def set_password(self, user_id: str, new_password: str) -> None:
+    def set_password(self, user_id: str, new_password: str,
+                     keep_token: str | None = None, *,
+                     expected_hash: str | None = None) -> None:
+        """Set ``user_id``'s login password: every session of the account
+        ends — except ``keep_token``'s (the caller's own sign-in, when the
+        account changes its own password), which stays, bound to the new
+        password.
+
+        ``expected_hash`` (an account changing its own password): the password
+        hash the caller's old password was verified against
+        (``authenticate_with_hash``).  When the account's hash is no longer
+        that one — an administrator's reset (or another change) landed after
+        the verification — nothing changes and ``PasswordChangedMeanwhile``
+        is raised; the check is made under the in-process lock, in the same
+        hold as the write, after users.json was taken in (a reset made by
+        another process — ``soniqboom-setadm`` — counts too; one that lands on
+        disk while this change is saved wins the merge, and is reported the
+        same way)."""
         validate_password(new_password)
-        user = self._users.get(user_id)
-        if not user:
-            raise KeyError(user_id)
+        if expected_hash is not None:
+            # Another process's change of the file first (a setadm reset).
+            with self._flock(), self._lock:
+                self._reconcile_with_disk()
+        new_hash = hash_password(new_password)
+        keep_h = _token_hash(keep_token) if keep_token else None
         # The token-mode secret follows the login password only when it IS a
         # copy of it (seeded, never customised): a generated Subsonic app
         # password — or an explicit removal ("") — survives a login-password
         # change.  The custom flag answers that in O(1); only a record whose
-        # flag is still unknown pays one scrypt check, on this rare path.
-        sp = user.subsonic_password
-        known = self._ss_custom.get(user_id)
-        held = user_id in self._ss_raw     # set, but unreadable right now (key outage)
-        follows = ((sp is None and not held)
-                   or (held and known is False)
-                   or (bool(sp) and (known is False or (
-                       known is None and verify_password(sp, user.password_hash)))))
-        user.password_hash = hash_password(new_password)
-        if follows:
-            user.subsonic_password = new_password
-            self._ss_custom[user_id] = False
-        elif sp and known is None:
-            self._ss_custom[user_id] = True
-        self._pw_verified.pop(user_id, None)
-        # Force re-login everywhere when password rotates.
-        self._purge_sessions_for(user_id)
+        # flag is still unknown pays one scrypt check, on this rare path —
+        # outside the in-process lock (other writers, some on the event loop,
+        # take it), then the record is re-checked under it and the change
+        # applied there (callers run this in worker threads: two changes of
+        # one account, or one racing an ``update``, must not interleave).
+        for attempt in range(3):
+            last = attempt == 2                 # (then checked under the lock)
+            user = self._users.get(user_id)
+            if not user:
+                raise KeyError(user_id)
+            seen = (user.subsonic_password, user.password_hash, self._ss_custom.get(user_id),
+                    user_id in self._ss_raw)
+            sp, cur_hash, known, held = seen
+            copy_of_login = (not last and known is None and bool(sp)
+                             and verify_password(sp, cur_hash))
+            with self._lock:
+                user = self._users.get(user_id)
+                if not user:
+                    raise KeyError(user_id)
+                if expected_hash is not None and not secrets.compare_digest(
+                        user.password_hash.encode("utf-8"), expected_hash.encode("utf-8")):
+                    raise PasswordChangedMeanwhile(user_id)
+                now = (user.subsonic_password, user.password_hash, self._ss_custom.get(user_id),
+                       user_id in self._ss_raw)
+                if now != seen:
+                    if not last:
+                        continue                # changed meanwhile: look again
+                    seen = now
+                sp, cur_hash, known, held = seen
+                if last:
+                    copy_of_login = (known is None and bool(sp)
+                                     and verify_password(sp, cur_hash))
+                follows = ((sp is None and not held)
+                           or (held and known is False)
+                           or (bool(sp) and (known is False or copy_of_login)))
+                keep_rec = self._sessions.get(keep_h) if keep_h else None
+                if keep_rec is not None and keep_rec.get("user_id") != user_id:
+                    keep_rec = None
+                new_bind = _pw_binding(new_hash)
+                if keep_rec is not None:
+                    # (a lookup between the next two lines accepts either
+                    # binding — the kept session never sees a mismatch)
+                    keep_rec["pw_next"] = new_bind
+                user.password_hash = new_hash
+                if follows:
+                    user.subsonic_password = new_password
+                    self._ss_custom[user_id] = False
+                elif sp and known is None:
+                    self._ss_custom[user_id] = True
+                self._pw_verified.pop(user_id, None)
+                # Force re-login everywhere when password rotates (but on the
+                # device that changed it).
+                self._purge_sessions_for(user_id, keep=keep_h if keep_rec is not None else None)
+                if keep_rec is not None:
+                    keep_rec["pw"] = new_bind
+                    keep_rec.pop("pw_next", None)
+                    self._sess_dirty = True
+                break
         self._save()
+        self._write_sessions()
+        if expected_hash is not None:
+            # The save merged users.json: a reset another process wrote
+            # meanwhile took the field (``_merge_disk``) — this change lost.
+            user = self._users.get(user_id)
+            if user is not None and user.password_hash != new_hash:
+                raise PasswordChangedMeanwhile(user_id)
 
     def delete(self, user_id: str) -> None:
-        user = self._users.get(user_id)
-        if not user:
-            return
-        # Refuse to delete the last enabled admin — would lock everyone out.
-        if user.role == "admin":
-            remaining = [
-                u for u in self._users.values()
-                if u.id != user_id and u.role == "admin" and u.enabled
-            ]
-            if not remaining:
-                raise ValueError(
-                    "Refusing to delete the last enabled admin — promote "
-                    "another user to admin first.",
-                )
+        # The check and the removal under one hold of the in-process lock:
+        # two deletes in two threads (the API runs them off the event loop)
+        # must not both see the other admin and remove the last two.
         with self._lock:
+            user = self._users.get(user_id)
+            if not user:
+                return
+            # Refuse to delete the last enabled admin — would lock everyone out.
+            if user.role == "admin":
+                remaining = [
+                    u for u in self._users.values()
+                    if u.id != user_id and u.role == "admin" and u.enabled
+                ]
+                if not remaining:
+                    raise ValueError(
+                        "Refusing to delete the last enabled admin — promote "
+                        "another user to admin first.",
+                    )
             self._users.pop(user_id, None)
             self._by_username.pop(user.username.lower(), None)
             for k in self._api_keys.pop(user_id, None) or ():
@@ -795,6 +1488,7 @@ class UserStore:
             self._ss_custom.pop(user_id, None)
         self._purge_sessions_for(user_id)
         self._save()
+        self._write_sessions()
         log.info("Deleted user '%s'", user.username)
 
     # ── OpenSubsonic API keys ────────────────────────────────────────────
@@ -804,13 +1498,15 @@ class UserStore:
         plaintext exists only in this return value — users.json keeps its
         sha256.  Raises ``KeyError`` for an unknown user, ``ValueError`` at
         the per-user cap."""
-        if user_id not in self._users:
-            raise KeyError(user_id)
         key = secrets.token_urlsafe(32)          # 256 bits of entropy
         ent = {"id": secrets.token_hex(8),
                "name": " ".join((name or "").split())[:_API_KEY_NAME_MAX],
                "sha256": _api_key_hash(key), "created": time.time()}
         with self._lock:
+            # (under the lock: a delete — another thread — can't leave a key
+            # behind for an account that is gone)
+            if user_id not in self._users:
+                raise KeyError(user_id)
             lst = self._api_keys.setdefault(user_id, [])
             if len(lst) >= _MAX_API_KEYS_PER_USER:
                 raise ValueError(f"At most {_MAX_API_KEYS_PER_USER} API keys per account — "
@@ -882,20 +1578,41 @@ class UserStore:
         return (False, 0.0)
 
     def _note_failed_login(self, username_lower: str) -> None:
-        now = time.time()
+        with self._lockout_lock:
+            self._count_attempt(username_lower, time.time())
+
+    def _count_attempt(self, username_lower: str, now: float) -> None:
+        """One guess against ``username_lower`` (``_lockout_lock`` held)."""
         rec = self._lockout.setdefault(username_lower, {"fails": [], "locked_until": 0.0})
         # Drop fails outside the rolling window.
         rec["fails"] = [t for t in rec["fails"] if now - t < _LOCKOUT_WINDOW_SEC]
         rec["fails"].append(now)
-        if len(rec["fails"]) >= _LOCKOUT_MAX_ATTEMPTS:
+        if len(rec["fails"]) >= _LOCKOUT_MAX_ATTEMPTS and rec["locked_until"] <= now:
             rec["locked_until"] = now + _LOCKOUT_COOLDOWN_SEC
             log.warning(
                 "Account '%s' locked for %ds after %d failed login attempts",
-                username_lower, _LOCKOUT_COOLDOWN_SEC, len(rec["fails"]),
+                username_lower.split("\0", 1)[0], _LOCKOUT_COOLDOWN_SEC, len(rec["fails"]),
             )
 
+    def _reserve_attempt(self, username_lower: str, also_locked: str | None = None) -> bool:
+        """Count a guess BEFORE it is checked — under one lock with the
+        lockout check, so a parallel burst gets exactly the guesses a serial
+        one would: False (refused, not counted) while ``username_lower`` (or
+        ``also_locked``) is locked.  A guess that then succeeds clears the
+        count (``_clear_failed_logins``); one that fails stays counted."""
+        with self._lockout_lock:
+            now = time.time()
+            for key in (username_lower, also_locked):
+                if key is not None:
+                    rec = self._lockout.get(key)
+                    if rec and rec.get("locked_until", 0.0) > now:
+                        return False
+            self._count_attempt(username_lower, now)
+            return True
+
     def _clear_failed_logins(self, username_lower: str) -> None:
-        self._lockout.pop(username_lower, None)
+        with self._lockout_lock:
+            self._lockout.pop(username_lower, None)
 
     def is_locked(self, username: str, scope: str = "") -> bool:
         """Whether ``username`` is locked out (``scope`` "" = the main login
@@ -926,9 +1643,15 @@ class UserStore:
         """Verify ``(username, password)``.  Bounded by per-username
         lockout so brute-force is impractical even with the scrypt cost.
         Returns None on bad creds OR lockout."""
+        hit = self.authenticate_with_hash(username, password)
+        return hit[0] if hit else None
+
+    def authenticate_with_hash(self, username: str, password: str) -> tuple[User, str] | None:
+        """``authenticate``, also answering the password hash the password was
+        verified against — what a sign-in session is bound to
+        (``issue_session``), so a password reset racing the sign-in ends it."""
         u_lower = (username or "").lower()
-        locked, _remaining = self._is_locked(u_lower)
-        if locked:
+        if not self._reserve_attempt(u_lower):
             # Burn the same scrypt time as a real check so locked accounts
             # don't have an obvious timing fingerprint.
             verify_password(password, UserStore._dummy_hash())
@@ -936,14 +1659,13 @@ class UserStore:
         user = self.get_by_username(username)
         if not user or not user.enabled:
             verify_password(password, UserStore._dummy_hash())
-            self._note_failed_login(u_lower)
             return None
-        if not verify_password(password, user.password_hash):
-            self._note_failed_login(u_lower)
+        verified = user.password_hash
+        if not verify_password(password, verified):
             return None
         # Successful auth — clear the counter and bump last_login.
         self._clear_failed_logins(u_lower)
-        return self._login_ok(user, password)
+        return self._login_ok(user, password, verified), verified
 
     def authenticate_subsonic_password(self, username: str, password: str) -> User | None:
         """``authenticate`` for a Subsonic ``p=`` password (plain / enc:)
@@ -954,21 +1676,20 @@ class UserStore:
         while either scope is locked (a locked web login stays locked here
         too).  Success does the same bookkeeping as ``authenticate``."""
         p_key = self._lock_key(username, "p")
-        if self._is_locked((username or "").lower())[0] or self._is_locked(p_key)[0]:
+        if not self._reserve_attempt(p_key, also_locked=(username or "").lower()):
             verify_password(password, UserStore._dummy_hash())
             return None
         user = self.get_by_username(username)
         if not user or not user.enabled:
             verify_password(password, UserStore._dummy_hash())
-            self._note_failed_login(p_key)
             return None
-        if not verify_password(password, user.password_hash):
-            self._note_failed_login(p_key)
+        verified = user.password_hash
+        if not verify_password(password, verified):
             return None
         self._clear_failed_logins(p_key)
-        return self._login_ok(user, password)
+        return self._login_ok(user, password, verified)
 
-    def _login_ok(self, user: User, password: str) -> User:
+    def _login_ok(self, user: User, password: str, verified: str | None = None) -> User:
         """The success tail shared by ``authenticate`` and
         ``authenticate_subsonic_password`` (``password`` = the verified LOGIN
         password): last-login stamp, the O(1) re-check cache, the Subsonic
@@ -976,7 +1697,7 @@ class UserStore:
         matters changed."""
         now = time.time()
         user.last_login_at = now
-        self._pw_verified[user.id] = (user.password_hash, self._pw_digest(password))
+        self._pw_verified[user.id] = (verified or user.password_hash, self._pw_digest(password))
         # ── Subsonic token-mode seed ───────────────────────────────────
         # An account whose token-mode secret was NEVER set (None — created
         # before Subsonic support) gets the password we just verified, so
@@ -1002,7 +1723,12 @@ class UserStore:
         # I/O on every Subsonic call and moved the file's mtime on read-only
         # requests).
         if changed or now - self._login_persisted.get(user.id, 0.0) >= _LAST_LOGIN_PERSIST_SEC:
-            self._save()
+            try:
+                self._save()
+            except OSError:
+                # (users.json unreadable / unwritable right now: the sign-in
+                # itself stands — the stamp is written by a later save)
+                log.error("users.json not written after a sign-in", exc_info=True)
         return user
 
     def _pw_digest(self, password: str) -> bytes:
@@ -1025,37 +1751,249 @@ class UserStore:
         return user if secrets.compare_digest(hit[1], self._pw_digest(password)) else None
 
     # ── Sessions ─────────────────────────────────────────────────────────
+    #
+    # Keyed by ``_token_hash(token)`` — the raw token exists only in the
+    # client's cookie.  Inserts and removals of ``_sessions`` take
+    # ``_sess_lock`` (the background writer snapshots the map under it); the
+    # hot read path (``lookup_session``) reads without it.
 
-    def issue_session(self, user_id: str) -> tuple[str, float]:
+    def issue_session(self, user_id: str, pw_hash: str | None = None) -> tuple[str, float]:
+        """A new sign-in session, bound to ``pw_hash`` — the password hash the
+        sign-in verified (``authenticate_with_hash``; default: the account's
+        current one).  Checked under the session lock: ``SessionRefused`` when
+        the account is gone or disabled or its password is no longer
+        ``pw_hash`` (a reset that raced the sign-in — the reset's purge then
+        has nothing to miss); ``SignInsClosed`` once ``close_sign_ins`` ran (a
+        session is either issued before the close — and in the final sessions
+        write — or refused).  The account's least recently used sessions go
+        beyond ``_MAX_SESSIONS_PER_USER``."""
         token = secrets.token_urlsafe(32)
-        expiry = time.time() + _SESSION_TTL_SEC
-        self._sessions[token] = {"user_id": user_id, "expiry": expiry}
+        now = time.time()
+        expiry = now + _SESSION_TTL_SEC
+        with self._sess_lock:
+            if self._sign_ins_closed:
+                raise SignInsClosed("the server is restarting")
+            user = self._users.get(user_id)
+            if user is None or not user.enabled:
+                raise SessionRefused("the account is gone or disabled")
+            cur = user.password_hash
+            if pw_hash is not None and pw_hash != cur:
+                raise SessionRefused("the password changed during the sign-in")
+            mine = [(s["expiry"], h) for h, s in self._sessions.items()
+                    if s["user_id"] == user_id]
+            if len(mine) >= _MAX_SESSIONS_PER_USER:
+                mine.sort()
+                for _exp, h in mine[:len(mine) - _MAX_SESSIONS_PER_USER + 1]:
+                    self._sessions.pop(h, None)
+            self._sessions[_token_hash(token)] = {
+                "user_id": user_id, "expiry": expiry, "pw": _pw_binding(cur),
+                "persisted": 0.0, "cookie_at": now}
+        self._schedule_session_write()
         return token, expiry
+
+    def session_cookie_due(self, token: str) -> bool:
+        """Whether the browser's cookie for this live session should be sent
+        again now (its Max-Age follows the sliding expiry): True at most once
+        per ``_COOKIE_REFRESH_SEC`` per session — the first call after a
+        restart included."""
+        if not token or not isinstance(token, str):
+            return False
+        s = self._sessions.get(_token_hash(token))
+        if not s:
+            return False
+        now = time.time()
+        if now > s["expiry"] or now - s.get("cookie_at", 0.0) < _COOKIE_REFRESH_SEC:
+            return False
+        s["cookie_at"] = now
+        return True
+
+    def close_sign_ins(self) -> None:
+        """No new session from now on (``issue_session`` refuses): the source
+        install's restart, before its final ``flush_sessions``."""
+        with self._sess_lock:
+            self._sign_ins_closed = True
 
     def lookup_session(self, token: str) -> User | None:
         """Return the active user for a session token, or None.  Refreshes the
         expiry on every successful lookup so active users stay signed in."""
-        s = self._sessions.get(token)
+        if not token or not isinstance(token, str):
+            return None
+        h = _token_hash(token)
+        s = self._sessions.get(h)
         if not s:
             return None
-        if time.time() > s["expiry"]:
-            self._sessions.pop(token, None)
+        now = time.time()
+        if now > s["expiry"]:
+            self._drop_session(h)
             return None
         user = self._users.get(s["user_id"])
         if not user or not user.enabled:
-            self._sessions.pop(token, None)
+            self._drop_session(h)
             return None
-        # Sliding expiry
-        s["expiry"] = time.time() + _SESSION_TTL_SEC
+        pw = s.get("pw")
+        if pw is not None:
+            cur = _pw_binding(user.password_hash)
+            if pw != cur and s.get("pw_next") != cur:
+                # The password changed since this session began (here, the
+                # in-process paths already purged it — this catches a change
+                # made by another process, e.g. soniqboom-setadm + reload, and
+                # a sign-in that raced a reset).
+                self._drop_session(h)
+                return None
+        # Sliding expiry — written back only once it has moved far enough.
+        s["expiry"] = now + _SESSION_TTL_SEC
+        if (self._persist_sessions and not self._sess_dirty
+                and s["expiry"] - s.get("persisted", 0.0) >= _SESSION_EXPIRY_PERSIST_SEC):
+            self._schedule_session_write()
         return user
 
     def revoke_session(self, token: str) -> None:
-        self._sessions.pop(token, None)
+        """Sign-out: the session is gone from memory and from sessions.json
+        when this returns (it does file I/O — call it off the event loop)."""
+        if not token or not isinstance(token, str):
+            return
+        with self._sess_lock:
+            gone = self._sessions.pop(_token_hash(token), None) is not None
+        if gone:
+            self._write_sessions()
 
-    def _purge_sessions_for(self, user_id: str) -> None:
-        dead = [t for t, s in self._sessions.items() if s["user_id"] == user_id]
-        for t in dead:
-            self._sessions.pop(t, None)
+    def _drop_session(self, h: str) -> None:
+        """Forget a session found dead at lookup (expired, user gone or
+        disabled, password changed).  Written lazily: the same checks run on
+        every session restored from disk."""
+        with self._sess_lock:
+            gone = self._sessions.pop(h, None) is not None
+        if gone:
+            self._schedule_session_write()
+
+    def _purge_sessions_for(self, user_id: str, keep: str | None = None) -> None:
+        """Drop every session of ``user_id`` (but ``keep``, a token hash) from
+        memory.  The caller writes sessions.json (``_write_sessions``) once
+        its own save is done."""
+        with self._sess_lock:
+            dead = [h for h, s in self._sessions.items()
+                    if s["user_id"] == user_id and h != keep]
+            for h in dead:
+                self._sessions.pop(h, None)
+            if dead:
+                self._sess_dirty = True
+
+    def _schedule_session_write(self, delay: float | None = None) -> None:
+        """Write sessions.json ``delay`` seconds (default
+        ``_SESSION_WRITE_DELAY_SEC``) from now in a background thread,
+        coalescing every change made meanwhile into that one write."""
+        if not self._persist_sessions:
+            return
+        if delay is None:
+            delay = _SESSION_WRITE_DELAY_SEC
+        with self._sess_lock:
+            self._sess_dirty = True
+            if self._sess_timer is not None:
+                return
+            t = threading.Timer(delay, self._timer_write)
+            t.daemon = True
+            self._sess_timer = t
+        t.start()
+
+    def _timer_write(self) -> None:
+        with self._sess_lock:
+            self._sess_timer = None
+        if self._sess_dirty:
+            self._write_sessions()           # (re-schedules itself on failure)
+
+    def flush_sessions(self) -> bool:
+        """Write sessions.json now if anything changed since the last write
+        (the server's stop / restart).  Blocking file I/O.  A coalesced write
+        already under way is waited for first: it cleared the change flag
+        before writing, and the source install's restart replaces the process
+        right after this returns."""
+        with self._sess_io_lock:
+            if not self._sess_dirty:
+                return True
+        return self._write_sessions()
+
+    def _write_sessions(self) -> bool:
+        """Durably write the current sessions to sessions.json (0600): one
+        row per live session — the token's SHA-256, user id, expiry and
+        password binding.  Expired sessions are left out.  Nothing is written
+        while no account is loaded (recovery), so a restart after the accounts
+        are restored still finds the sessions (a ``reload`` doesn't re-read
+        them).  False when the write failed (logged, retried in the
+        background)."""
+        if not self._persist_sessions:
+            return True
+        with self._sess_io_lock:
+            if not self._users:
+                return True
+            now = time.time()
+            with self._sess_lock:
+                self._sess_dirty = False
+                for h in [h for h, s in self._sessions.items() if s["expiry"] <= now]:
+                    self._sessions.pop(h, None)
+                rows = []
+                for h, s in self._sessions.items():
+                    exp = s["expiry"]
+                    rows.append({"h": h, "uid": s["user_id"], "exp": exp, "pw": s.get("pw")})
+                    s["persisted"] = exp
+            payload = json.dumps({"version": 1, "sessions": rows},
+                                 separators=(",", ":")).encode("utf-8")
+            try:
+                atomic_write_bytes(self._sessions_path, payload, 0o600)
+            except OSError:
+                log.error("Could not write %s — retried in %.0f s", self._sessions_path.name,
+                          _SESSION_WRITE_RETRY_SEC, exc_info=True)
+            else:
+                return True
+        # Retried in the background (a revocation included: until it is
+        # written, a crash would bring that session back).
+        self._schedule_session_write(_SESSION_WRITE_RETRY_SEC)
+        return False
+
+    def _load_sessions(self) -> None:
+        """Restore sessions.json: only sessions still valid now — not
+        expired, user present and enabled, password unchanged.  An unreadable
+        file means nobody stays signed in (logged), never a failed start."""
+        try:
+            raw = self._sessions_path.read_bytes()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log.warning("Could not read %s (%s) — everyone signs in again",
+                        self._sessions_path.name, exc)
+            return
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            rows = data["sessions"]
+            if not isinstance(rows, list):
+                raise TypeError("sessions is not a list")
+        except (ValueError, KeyError, TypeError) as exc:
+            log.warning("%s is unreadable (%s) — everyone signs in again",
+                        self._sessions_path.name, exc)
+            return
+        now = time.time()
+        restored: dict[str, dict] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            h, uid, exp, pw = r.get("h"), r.get("uid"), r.get("exp"), r.get("pw")
+            if not (isinstance(h, str) and len(h) == 64 and isinstance(uid, str)
+                    and isinstance(exp, (int, float)) and not isinstance(exp, bool)
+                    and (pw is None or isinstance(pw, str))):
+                continue
+            if exp <= now:
+                continue
+            user = self._users.get(uid)
+            if user is None or not user.enabled:
+                continue
+            if pw is not None and pw != _pw_binding(user.password_hash):
+                continue
+            # Never longer than a fresh session (a hand-edited or future-dated file).
+            exp = min(float(exp), now + _SESSION_TTL_SEC)
+            restored[h] = {"user_id": uid, "expiry": exp, "pw": pw, "persisted": exp}
+        with self._sess_lock:
+            self._sessions = restored
+        if restored:
+            log.info("Restored %d session(s) from %s", len(restored), self._sessions_path.name)
 
 
 # ── Singleton accessor ───────────────────────────────────────────────────────
@@ -1064,9 +2002,29 @@ _instance: UserStore | None = None
 
 
 def init_user_store(data_dir: Path) -> UserStore:
+    """The server's store: its sessions persist in ``sessions.json``.  A
+    previous store of this process (the bundled app restarts the server in
+    the same process) writes its pending sessions first and then never
+    writes again — a late coalesced write must not overwrite the new store's."""
     global _instance
-    _instance = UserStore(data_dir)
+    old = _instance
+    if old is not None:
+        try:
+            old.flush_sessions()
+        except Exception:
+            log.exception("Could not write the previous run's sessions")
+        old._persist_sessions = False
+    _instance = UserStore(data_dir, persist_sessions=True)
     return _instance
+
+
+def accounts_locked() -> bool:
+    """The server's store is in recovery (``UserStore.recovery_required``):
+    no account can be loaded on an install that had them, so nothing is
+    served — not even the anonymous services an admin turned on (the DLNA
+    Media Server).  False before the store exists (early boot)."""
+    st = _instance
+    return st is not None and st.recovery_required
 
 
 def get_user_store() -> UserStore:

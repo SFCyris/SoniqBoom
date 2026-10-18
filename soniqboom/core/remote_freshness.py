@@ -133,6 +133,11 @@ class ShareState:
     # Total counters since first arm (for telemetry).
     total_polls: int = 0
     total_new_tracks: int = 0
+    # Background ticks only (``reason="tick"``): what the cold start and the
+    # every-5th-poll drift sweep count.  One-shot checks (Check now, a folder
+    # opened in the browser, app focus, a stream 404) never advance it — they
+    # are fast polls, so browsing a share never brings its full walks closer.
+    tick_polls: int = 0
     # Computed once per tick — what the NEXT tick will sleep for.
     # Surfaced via /admin/freshness/status so the UI shows "Next in N min".
     next_check_ts: float = 0.0
@@ -151,6 +156,7 @@ class ShareState:
             change_intervals=[float(x) for x in d.get("change_intervals", [])],
             total_polls=int(d.get("total_polls", 0)),
             total_new_tracks=int(d.get("total_new_tracks", 0)),
+            tick_polls=int(d.get("tick_polls", d.get("total_polls", 0))),
             next_check_ts=float(d.get("next_check_ts", 0.0)),
         )
 
@@ -383,37 +389,47 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
 
     # Compute dir-mtime cap for the fast-path walk.
     #
-    # ``cap = last_check_ts - safety_buffer`` so we re-walk any
-    # subtree whose dir.mtime is >= our last walk start.  Safety
-    # buffer (15 min) absorbs clock skew between client and FTP
-    # server and any 1-tick-late writes.
+    # A fast walk lists what the folder state of earlier walks says may
+    # have changed (core/remote_dirstate.py: every folder with subfolders,
+    # every folder whose mtime moved, a rotating set of leaf folders); the
+    # cap additionally re-lists any folder whose mtime is >= our last walk
+    # start.  Safety buffer (15 min) absorbs clock skew between client and
+    # server and any 1-tick-late writes.  Without folder state (first poll
+    # after a restart) the scanner walks fully.
     #
-    # On the FIRST poll OR the FIRST TWO POLLS overall we pass
-    # ``None`` to force full walks (cold-start can't trust the
-    # cap yet).  After that, every 5th poll is also a full walk
-    # (drift sweep) — guards against the case where the server
-    # doesn't update parent-dir mtime on child changes (some FTP
-    # servers don't).  At 30-min adaptive cadence, drift sweep
-    # fires every 2.5 hours; at the 5-min lower bound it fires
-    # every 25 min.
+    # On the FIRST TWO background ticks we pass ``None`` to force full walks.
+    # After that, every 5th tick is also a full walk (drift sweep): a file
+    # rewritten in place (same name, so its folder's mtime doesn't move) in
+    # a leaf folder the rotation hasn't reached, and members of a changed
+    # archive that vanished, are only seen by a full walk.  At 30-min
+    # adaptive cadence, drift sweep fires every 2.5 hours; at the 5-min
+    # lower bound it fires every 25 min.
     #
     # Reason= telemetry surfaces 'fast' vs 'full' so the operator
     # can see what the cap is actually saving.
     DRIFT_SWEEP_EVERY = 5
     SAFETY_BUFFER_S = 15 * 60
     cap_reason = "fast"
+    tick = reason == "tick"
     full_walk_overdue = (
         st.last_full_walk_ts > 0
         and (now - st.last_full_walk_ts) > _FULL_WALK_CEILING_S
     )
-    if st.last_check_ts <= 0 or st.total_polls < 2:
+    if not tick:
+        # A one-shot check (a folder opened, Check now, app focus, a stream
+        # 404) is a fast poll: it never takes a full walk's turn, and never
+        # advances the drift sweep (``tick_polls``).  Without the folder state
+        # of an earlier walk the scanner walks fully anyway.
+        dir_mtime_cap = max(0.0, (st.last_check_ts or now) - SAFETY_BUFFER_S)
+        cap_reason = "one_shot"
+    elif st.last_check_ts <= 0 or st.tick_polls < 2:
         dir_mtime_cap = None
         cap_reason = "cold_start"
-    elif st.total_polls > 0 and (st.total_polls % DRIFT_SWEEP_EVERY) == 0:
+    elif st.tick_polls > 0 and (st.tick_polls % DRIFT_SWEEP_EVERY) == 0:
         dir_mtime_cap = None
         cap_reason = "drift_sweep"
         log.info("freshness: %s drift sweep (full walk) — poll #%d",
-                 scan_root, st.total_polls)
+                 scan_root, st.tick_polls)
     elif full_walk_overdue:
         # Wall-clock ceiling: even a heavily-relaxed share (cadence pushed
         # toward the 4h max) must run a full walk — and thus ghost cleanup —
@@ -447,6 +463,8 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
             source=source,
             on_progress=None,  # quiet — freshness doesn't drive scan badge
             dir_mtime_cap=dir_mtime_cap,
+            # files earlier scans couldn't store wait until they change
+            auto=True,
         ) or {})
     except Exception as exc:
         log.warning("freshness: scan of %s failed: %s", scan_root, exc)
@@ -455,6 +473,8 @@ async def _poll_share(scan_root: str, *, reason: str) -> dict:
         _reg.inflight.pop(scan_root, None)
         st.last_check_ts = time.time()
         st.total_polls += 1
+        if tick:
+            st.tick_polls += 1
         # Reset the full-walk ceiling clock ONLY on the scanner's authoritative
         # "a full walk completed and ghost cleanup was authorized" signal —
         # NOT merely because we requested dir_mtime_cap=None.  A deduped scan
@@ -597,6 +617,11 @@ async def remove_share(scan_root: str) -> None:
             pass
     _reg.states.pop(scan_root, None)
     _save_state()
+    try:
+        from soniqboom.core import remote_dirstate
+        remote_dirstate.forget(scan_root)
+    except Exception:                                   # noqa: BLE001
+        pass
 
 
 # The one-shot checks running now (``check_now``) — the shutdown's "scans"

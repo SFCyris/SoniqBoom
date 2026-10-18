@@ -195,10 +195,20 @@ test('the queue re-anchors after an availability change in Mark mode too', () =>
 test('the sidebar browse counts are fetched at page load and after a scan (GitHub #26)', () => {
   const lib = read('soniqboom/frontend/js/library.js');
   assert.match(lib, /refreshBadges: _refreshBadges,/);
-  assert.match(lib, /function _refreshBadges\(\) \{\s*_refreshTrackCount\(\);\s*_refreshNavCounts\(\);/);
-  assert.match(lib, /setTimeout\(_refreshNavCounts, \d+\);/);
+  assert.match(lib, /function _refreshBadges\(\) \{\s*return _refreshNavCounts\(\);/);
+  assert.match(lib, /setTimeout\(\(\) => _refreshNavCounts\(\), \d+\);/);
+  // one small counts request, not the lists (those load when their view opens)
+  assert.match(lib, /API\('\/library\/counts'\)/);
+  const keys = lib.match(/const _NAV_COUNT_KEYS = \[([^\]]*)\]/);
+  assert.ok(keys, '_NAV_COUNT_KEYS not found');
   for (const v of ['artists', 'album_artists', 'albums', 'genres', 'years']) {
-    assert.ok(lib.includes(`['${v}', '/library/`), `${v} is not refreshed at load`);
+    assert.ok(keys[1].includes(`'${v}'`), `${v} is not refreshed at load`);
+  }
+  // every key the page reads is one the server sends
+  const py = read('soniqboom/api/library.py');
+  const body = py.slice(py.indexOf('async def library_counts'), py.indexOf('@router.get("/artists")'));
+  for (const k of ['tracks', 'visible', 'scene_groups', ...keys[1].match(/'(\w+)'/g).map((x) => x.slice(1, -1))]) {
+    assert.ok(body.includes(`"${k}":`), `GET /library/counts has no "${k}"`);
   }
   // the "[No Artist]" bucket rows are not artists, in the views or at load
   assert.match(lib, /_updateNavBadge\('artists', _navCount\(artists\)\)/);
@@ -212,4 +222,54 @@ test("the Track Info tune list's play button pauses the loaded tune (GitHub #28)
   assert.match(ti, /Player\.on\?\.\('statechange', \(\) => _highlightPlayingSubsong\(\)\);/);
   // Space on a row is handled there only — not also by the page's play/pause
   assert.match(ti, /e\.preventDefault\(\);\s*e\.stopPropagation\(\);[^\n]*\n\s*_subAction\('play'/);
+});
+
+test('every web-player stream request names its page (pg), never from sessionStorage', () => {
+  const src = read('soniqboom/frontend/js/player.js');
+  const body = src.match(/function _streamUrl\(id, params = \{\}\) \{([\s\S]*?)\n  \}/);
+  assert.ok(body, '_streamUrl not found');
+  assert.match(body[1], /qs\.set\('pg', PREWARM_PAGE_ID\)/);
+  // the gapless preload of the next track is NOT a play start of this page:
+  // it carries no pg (the server would retire the page's prewarms / render)
+  const pre = src.match(/function _maybeGaplessPreload\([\s\S]*?\n  \}/);
+  assert.ok(pre, '_maybeGaplessPreload not found');
+  assert.match(pre[0], /fetch\(`\/api\/stream\/\$\{next\.id\}/);
+  assert.doesNotMatch(pre[0], /pg=/);
+  const def = src.match(/const PREWARM_PAGE_ID = \(\(\) => \{([\s\S]*?)\}\)\(\);/);
+  assert.ok(def, 'PREWARM_PAGE_ID not found');
+  assert.doesNotMatch(def[1], /sessionStorage|localStorage/);
+  // the server accepts what the page sends
+  const py = read('soniqboom/api/stream.py');
+  const re = py.match(/_PAGE_ID_RE = re\.compile\(r"([^"]+)"\)/);
+  assert.ok(re, '_PAGE_ID_RE not found');
+  const ok = new RegExp(`^(?:${re[1]})$`);
+  assert.ok(ok.test('0123456789abcdef0123456789abcdef'));                 // randomUUID form
+  assert.ok(ok.test((Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 32)));
+});
+
+test('the offline match ignores the query, so a page id never splits the download cache', () => {
+  const sw = read('soniqboom/frontend/sw.js');
+  assert.match(sw, /c\.match\(req, \{ ignoreSearch: true \}\)/);
+});
+
+test('a share check re-reads the counts once: remote_new_tracks skips them at the end frame\'s generation', () => {
+  const app = read('soniqboom/frontend/js/app.js');
+  assert.match(app, /if \(!msg\.running && !msg\.snapshot\) \{[\s\S]{0,300}_scanEndGen = msg\.lib_gen;/);
+  assert.match(app, /msg\.lib_gen === _scanEndGen/);
+  assert.match(app, /if \(reread\) \{ try \{ Library\.refreshBadges\?\.\(\); \} catch \{\} \}/);
+});
+
+test('a page going away tells the server (page-gone beacon with its page id)', () => {
+  const src = read('soniqboom/frontend/js/player.js');
+  assert.match(src, /addEventListener\?\.\('pagehide'[\s\S]{0,200}sendBeacon\?\.\(`\/api\/stream\/page-gone\?pg=\$\{PREWARM_PAGE_ID\}`\)/);
+  assert.match(read('soniqboom/api/stream.py'), /@router\.post\("\/page-gone"\)/);
+});
+
+test('a hovered row may warm again once the server-side hover prewarm has lapsed', () => {
+  const lib = read('soniqboom/frontend/js/library.js');
+  assert.match(lib, /const _hoverPrefetched = new Map\(\);/);
+  const ms = Number((lib.match(/const _HOVER_REWARM_MS = (\d+);/) || [])[1]);
+  assert.ok(ms > 0 && ms <= 10000, 'memo must not outlive the 10 s server lapse');
+  assert.match(lib, /function _hoverWarmed\(id\)[\s\S]*?Date\.now\(\) - at < _HOVER_REWARM_MS/);
+  assert.doesNotMatch(lib, /_hoverPrefetched\.has\(/);
 });

@@ -6,7 +6,6 @@ dies half-way leaves), the shutdown snapshot, the fast reader / writer, the
 .bak rotation and the cross-process lock."""
 from __future__ import annotations
 
-import io
 import json
 import math
 import os
@@ -16,6 +15,7 @@ import textwrap
 import time
 from pathlib import Path
 
+import orjson
 import pytest
 
 from soniqboom.core import merger, persistence
@@ -315,14 +315,33 @@ def test_trailing_garbage_is_still_trimmed(tmp_path):
     assert persistence._try_load_json(p) is None             # not UTF-8: no crash
 
 
-def test_the_snapshot_bytes_are_what_json_dump_wrote(tmp_path):
-    """Written with ``json.dumps`` (one C call) — byte for byte the old
-    ``json.dump(state, f)`` output, NaN and all."""
-    state = {"tracks": {"t": {"id": "t", "x": _TRICKY}}, "nan": math.nan}
-    buf = io.StringIO()
-    json.dump(state, buf)
+def _finite(x):
+    """``x`` with every non-finite float as None (what orjson writes)."""
+    if isinstance(x, float) and not math.isfinite(x):
+        return None
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_finite(v) for v in x]
+    return x
+
+
+@pytest.mark.parametrize("doc", _TRICKY)
+def test_the_snapshot_reads_back_as_what_json_dump_wrote(doc, tmp_path):
+    """Written with ``encode_state`` (orjson; the stdlib's ``json.dumps`` for
+    what orjson refuses — a lone surrogate, an int beyond 64 bits, a non-str
+    key: then byte for byte the old output): it reads back — through the
+    reader, a pre-1.11 build's plain ``json.loads`` too — as what the old
+    ``json.dump`` wrote, a non-finite float as None."""
+    state = {"tracks": {"t": {"id": "t", "x": doc}}}
     assert persistence.write_library_file(tmp_path, state, "test")
-    assert (tmp_path / "library.json").read_text(encoding="utf-8") == buf.getvalue()
+    raw = (tmp_path / "library.json").read_bytes()
+    old = json.dumps(state)
+    want = _finite(json.loads(old))
+    assert persistence.loads_json(raw) == want
+    assert json.loads(raw.decode("utf-8")) == want
+    if raw.decode("utf-8") != old:                    # (the orjson path was taken)
+        assert raw == orjson.dumps(state)
 
 
 def test_the_backup_is_a_hard_link_rotation(tmp_path):
@@ -866,7 +885,8 @@ def test_the_stop_ends_scans_before_the_flush_and_seals_before_the_release():
     assert src.index('_step("aof-flush"') < src.index('_step("merger"') \
         < src.index("_aof_writer.close_intake()") < src.index('_step("aof-seal"') \
         < src.index("_aof_writer.end_journal()") < src.index("release_library()")
-    assert "stop_background_writers" in src and "_bg_scan_tasks" in src
+    assert "stop_background_writers(_background_writer_tasks()" in src
+    assert "_bg_scan_tasks" in inspect.getsource(main._background_writer_tasks)
     assert "aof-seal" in main._WRITING_STEPS
     start = inspect.getsource(main.startup)
     assert start.index("_aof_append = None") < start.index("init_persistence(data_dir)")

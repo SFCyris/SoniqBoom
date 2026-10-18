@@ -116,6 +116,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _note_recovery(store: UserStore, data_dir: Path) -> None:
+    """Explain the recovery state (``UserStore.recovery_required``): the
+    server's sign-in is locked until users.json is restored or an account is
+    created here — which starts a new account list."""
+    if not getattr(store, "recovery_required", False):
+        return
+    print(
+        f"\nNo user account could be read from {data_dir / 'users.json'} (or its "
+        "backup); an unreadable copy is kept beside it (users.json*.corrupt-*).\n"
+        "The server keeps sign-in locked until users.json is restored or an admin "
+        "account is created with this command (which starts a new account list).\n",
+        file=sys.stderr,
+    )
+
+
 def _ensure_admin_interactive(verbose: bool = False) -> int:
     """First-run bootstrap: if no admin account exists yet, prompt for a
     username + password (hidden via getpass) and create one.
@@ -143,6 +158,7 @@ def _ensure_admin_interactive(verbose: bool = False) -> int:
         print(f"setadm: couldn't open user store at {data_dir}: {e}", file=sys.stderr)
         return 0
 
+    _note_recovery(store, data_dir)
     if store.has_any_admin():
         if verbose:
             admins = [u.username for u in store.list_users()
@@ -157,21 +173,28 @@ def _ensure_admin_interactive(verbose: bool = False) -> int:
             print("")
         return 0   # already bootstrapped — nothing to do
 
+    recovery = getattr(store, "recovery_required", False)
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print(
-            "SoniqBoom has no admin account yet and this start is "
-            "non-interactive.\n"
-            "Create one with:  soniqboom-setadm -user <name> -passwd <password>",
+            ("Sign-in stays locked and this start is non-interactive.\n" if recovery else
+             "SoniqBoom has no admin account yet and this start is "
+             "non-interactive.\n")
+            + "Create one with:  soniqboom-setadm -user <name> -passwd <password>",
             file=sys.stderr,
         )
         return 0
 
     print("")
     print("  ──────────────────────────────────────────────────────")
-    print("  First-run setup — create the SoniqBoom admin account")
+    if recovery:
+        print("  Create a SoniqBoom admin account (or press Ctrl+C and")
+        print("  restore users.json from a backup instead)")
+    else:
+        print("  First-run setup — create the SoniqBoom admin account")
     print("  ──────────────────────────────────────────────────────")
-    print("  Web-UI registration stays locked until one admin exists,")
-    print("  so let's create it now.")
+    if not recovery:
+        print("  Web-UI registration stays locked until one admin exists,")
+        print("  so let's create it now.")
     print("")
     try:
         while True:
@@ -343,6 +366,26 @@ def _notify_server_reload(data_dir: Path) -> None:
               "change, restart it.")
 
 
+def _reload_outcome(raw: bytes, data_dir: Path, port) -> str:
+    """What to print for a 200 answer ``raw`` of ``POST /api/auth/reload``:
+    "live now" only when it is a SoniqBoom status naming this ``data_dir``
+    (the server shows ``data_dir`` to the reload token's caller)."""
+    import json
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        body = None
+    served = body.get("data_dir") if isinstance(body, dict) else None
+    if not isinstance(served, str):
+        return (f"Whatever answered on port {port} isn't a SoniqBoom server — "
+                "restart the server to apply the change.")
+    if not _same_dir(served, data_dir):
+        return (f"The server on port {port} serves {served}, not {data_dir} — "
+                "restart the server to apply the change.")
+    return (f"Notified the running server (port {port}) — the change is live now "
+            "(no restart needed).")
+
+
 def _notify(data_dir: Path) -> None:
     import http.client
     import json
@@ -480,19 +523,7 @@ def _notify(data_dir: Path) -> None:
             return
         if raw is None:
             continue                         # 409 from a restarted server
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except ValueError:
-            body = None
-        served = body.get("data_dir") if isinstance(body, dict) else None
-        if not isinstance(served, str):
-            _not_live(f"Whatever answered on port {port} isn't a SoniqBoom server")
-            return
-        if not _same_dir(served, data_dir):
-            _not_live(f"The server on port {port} serves {served}, not {data_dir}")
-            return
-        print(f"Notified the running server (port {port}) — the change is live now "
-              "(no restart needed).")
+        print(_reload_outcome(raw, data_dir, port))
         return
     _not_live(f"The server for {data_dir} kept restarting while it was notified")
 
@@ -549,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError) as e:
         print(f"error: couldn't open user store at {data_dir}: {e}", file=sys.stderr)
         return 3
+    _note_recovery(store, data_dir)
     existing = store.get_by_username(args.user)
 
     # ── Create flow ──────────────────────────────────────────────────────

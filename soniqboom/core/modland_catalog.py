@@ -757,6 +757,8 @@ def _download_index(dest: Path) -> dict:
     Blocking.  ``tests/conftest.py`` replaces it (no network in tests)."""
     import httpx
     from soniqboom import __version__
+    from soniqboom.core import netpolicy
+    netpolicy.check(INDEX_URL)
     last: Exception | None = None
     for attempt in range(3):
         try:
@@ -769,15 +771,54 @@ def _download_index(dest: Path) -> dict:
                         for chunk in resp.iter_bytes(1 << 16):
                             got += len(chunk)
                             if got > _MAX_INDEX_BYTES:
-                                raise RuntimeError("the index is larger than expected")
+                                raise _IndexTooLarge(
+                                    "the index is larger than expected — implausible")
                             fh.write(chunk)
                     return {"bytes": got, "last_modified": resp.headers.get("last-modified")}
+        except _IndexTooLarge:
+            # The same file every time: no second download now, and the next
+            # try a day later (``_next_due``: "implausible").
+            dest.unlink(missing_ok=True)
+            raise
+        except httpx.HTTPStatusError as exc:
+            dest.unlink(missing_ok=True)
+            code = exc.response.status_code
+            from soniqboom.core.online_catalog import retry_after_of
+            ra = retry_after_of(exc)
+            if 400 <= code < 500 and code not in (408, 429):
+                # Refused, and it would be again: no retry now, the next a
+                # day later.
+                raise _IndexRefused(f"Modland refused the index download (HTTP {code})") \
+                    from exc
+            if ra is not None:
+                # 429 / 503 with a Retry-After: no retry before it.
+                raise _IndexBusy(f"Modland asked for a pause of {ra:.0f} s",
+                                 retry_after=ra) from exc
+            last = exc
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
         except Exception as exc:                        # noqa: BLE001
             last = exc
             dest.unlink(missing_ok=True)
             if attempt < 2:
                 time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"index download failed: {last}")
+
+
+class _IndexTooLarge(RuntimeError):
+    """The index download passed ``_MAX_INDEX_BYTES``."""
+
+
+class _IndexRefused(RuntimeError):
+    """Modland refused the index download (HTTP 4xx): retried a day later."""
+
+
+class _IndexBusy(RuntimeError):
+    """Modland asked for a pause (``retry_after`` seconds)."""
+
+    def __init__(self, msg: str, retry_after: float) -> None:
+        super().__init__(msg)
+        self.retry_after = retry_after
 
 
 def _refresh_index_files(*, download: bool, local_zip: Path | None = None,
@@ -868,6 +909,8 @@ def _delta_connect():
     short connection, not the play pool.  Blocking.  ``tests/conftest.py``
     replaces it (no network in tests)."""
     import ftplib
+    from soniqboom.core import netpolicy
+    netpolicy.check(CONNECT_HOST)
     ftp = ftplib.FTP(timeout=30)
     welcome = ftp.connect(CONNECT_HOST, CONNECT_PORT)
     ftp.login(FTP_USER, FTP_PASSWORD)
@@ -1891,13 +1934,38 @@ def build_track(rel: str, size: int, *, added_at: int, siblings: dict | None,
     return share_values(t)
 
 
+def _hvsc_left_out() -> bool:
+    """The online HVSC collection is on with "Leave Modland's HVSC folder out"
+    (``core/online_hvsc``): Modland's ``HVSC/`` mirror is left out of the
+    catalogue (parked like a narrower scope's tunes)."""
+    try:
+        st = _store()
+        if not (bool(st.get_config("online_hvsc_enabled", False))
+                and bool(st.get_config("online_hvsc_replace_modland", True))):
+            return False
+        # Only while the online collection HAS the tunes (a switch-on that
+        # failed — 6581.nl unreachable — leaves Modland's folder in).
+        from soniqboom.core import online_hvsc
+        return online_hvsc.HVSC_ONLINE.tune_count() > 0
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def _left_out_tops(scope_: str) -> frozenset:
+    """The top folders the scope (and the HVSC option) leave out."""
+    tops = set(PC_TRACKER_DIRS) if scope_ == SCOPE_STANDARD else set()
+    if _hvsc_left_out():
+        tops.add("HVSC")
+    return frozenset(tops)
+
+
 def _wanted_rows(scope_: str) -> list[tuple[str, int, int]]:
     """``(rel, size, seen)`` of every catalogue track the scope lists.
     Blocking."""
     con = _ro()
     if con is None:
         return []
-    skip = frozenset(PC_TRACKER_DIRS) if scope_ == SCOPE_STANDARD else frozenset()
+    skip = _left_out_tops(scope_)
     try:
         rows = list(_all_rels(con, KIND_MUSIC, seen=True))
     except sqlite3.OperationalError:                    # an index from before "seen"
@@ -1993,7 +2061,7 @@ async def apply_index() -> dict:
         dirs = sorted({"/" + want[tid][0].rpartition("/")[0] for tid in (*to_add, *changed)})
         # The removed tunes a narrower scope leaves out (they come back with
         # the wider one) — the others left Modland's index.
-        pc = frozenset(PC_TRACKER_DIRS) if scope_ == SCOPE_STANDARD else frozenset()
+        pc = _left_out_tops(scope_)
         cut = len(ROOT) + 2
         to_park = [tid for tid in to_remove
                    if pc and ((tracks.get(tid) or {}).get("path") or "")[cut:].split("/", 1)[0]
@@ -2006,6 +2074,7 @@ async def apply_index() -> dict:
     if not total:
         if store.get_config(CONFIG_RULES) != RULES_VERSION:
             store.set_config(CONFIG_RULES, RULES_VERSION)
+        _hvsc_reconcile_soon()
         await _refill_quietly()
         return result
     memo: dict = {}
@@ -2108,8 +2177,19 @@ async def apply_index() -> dict:
     await _after_library_change()
     log.info("Modland catalogue: %d added, %d updated, %d removed (%d tunes, scope %s)",
              result["added"], result["changed"], result["removed"], result["tracks"], scope_)
+    _hvsc_reconcile_soon()
     await _refill_quietly()
     return result
+
+
+def _hvsc_reconcile_soon() -> None:
+    """The online HVSC collection moves ratings, plays and playlist entries
+    to whichever HVSC copy is in the library (``online_hvsc.reconcile_user_data``)."""
+    try:
+        from soniqboom.core import online_hvsc
+        online_hvsc.schedule_reconcile()
+    except Exception:                                   # noqa: BLE001
+        log.debug("HVSC user-data reconcile not scheduled", exc_info=True)
 
 
 async def _refill_quietly() -> None:
@@ -2185,7 +2265,11 @@ async def refill_tune_counts() -> int:
     rh = root_hash()
     cut = len(ROOT) + 2
     want: dict = {}
-    for tid in store.get_track_ids_for_scan_root(rh):
+    t0 = time.perf_counter()
+    for tid in list(store.get_track_ids_for_scan_root(rh)):
+        if time.perf_counter() - t0 >= _SLICE_S:
+            await asyncio.sleep(0)          # (400k rows: in slices of the loop)
+            t0 = time.perf_counter()
         t = store._tracks.get(tid)
         if not t or is_merged(t):
             continue                        # a played tune has what the file says
@@ -2447,7 +2531,8 @@ class CatalogueFTPSource(FTPFileSource):
 
     # Offline hold (circuit breaker) ------------------------------------------
     def is_offline(self) -> bool:
-        return time.monotonic() < self._offline_until
+        from soniqboom.core import netpolicy
+        return netpolicy.blocked(self._host) or time.monotonic() < self._offline_until
 
     def _note_network_failure(self, exc: BaseException) -> None:
         if not isinstance(exc, Exception):               # cancelled, exiting
@@ -2802,6 +2887,7 @@ async def _run_job(name: str, body) -> dict:
                 raise
             except Exception as exc:                    # noqa: BLE001
                 log.warning("Modland catalogue %s failed: %s", name, exc)
+                _note_retry_after(exc)
                 _status.update(error=f"{exc}", phase="",
                                shrink_refused=isinstance(exc, IndexShrank),
                                state=("ready" if enabled() and _has_tracks() else
@@ -2831,10 +2917,27 @@ def _expected_count() -> int:
     build holds; -1 when unknown)."""
     info = index_info()
     try:
-        return int(info.get("standard_rows" if scope() == SCOPE_STANDARD
-                            else "music_rows"))
+        n = int(info.get("standard_rows" if scope() == SCOPE_STANDARD
+                         else "music_rows"))
     except (TypeError, ValueError):
         return -1
+    if _hvsc_left_out():
+        n -= _hvsc_music_rows()
+    return n
+
+
+def _hvsc_music_rows() -> int:
+    """Music files the index lists under ``HVSC/``."""
+    con = _ro()
+    if con is None:
+        return 0
+    try:
+        return int(con.execute(
+            "SELECT COUNT(*) FROM files f JOIN dirs d ON f.dir = d.id "
+            "WHERE f.kind = ? AND (d.dir = 'HVSC' OR d.dir LIKE 'HVSC/%')",
+            (KIND_MUSIC,)).fetchone()[0])
+    except sqlite3.Error:
+        return 0
 
 
 def _has_tracks() -> bool:
@@ -2923,6 +3026,7 @@ async def _update_then_apply(*, local_zip: Path | None = None) -> dict:
                     "one is used", err)
         res = await apply_index()
         _status["error"] = f"{err}"
+        _note_retry_after(err)
         return res
     info = await _ensure_index(force_download=False, local_zip=local_zip)
     _count_index_bytes(int((info or {}).get("downloaded") or 0))
@@ -2978,6 +3082,12 @@ async def set_scope(new_scope: str) -> dict:
     return await _run_job("scope", body)
 
 
+async def reapply() -> dict:
+    """Apply the kept index again — what it lists changed (the online HVSC
+    collection's "Leave Modland's HVSC folder out")."""
+    return await _run_job("reapply", apply_index)
+
+
 def set_interval(name: str) -> dict:
     """Choose how often the index is refreshed (a key of ``INTERVALS``).  The
     schedule follows at once: next refresh = last successful refresh + the
@@ -2999,6 +3109,7 @@ def set_subsonic(visible: bool) -> dict:
     # The Subsonic catalogue (artists / albums / genres) is cached on this.
     store._catalog_seq += 1
     store._mutation_seq += 1
+    store.browse_changed()          # (and the hidden-catalogue counts on this)
     return status()
 
 
@@ -3151,6 +3262,11 @@ def _next_due(now: float | None = None) -> float:
     if now is None:
         now = time.time()
     info = index_info()
+    if not info and has_index() and _ro() is None:
+        # The index is there but can't be read right now (no descriptor
+        # left, the volume gone for a moment): no download on that — a look
+        # again in a few minutes.
+        return now + 300
     try:
         built = float(info.get("built_at") or 0)
     except (TypeError, ValueError):
@@ -3158,14 +3274,33 @@ def _next_due(now: float | None = None) -> float:
     due = built + interval_seconds() if built else now
     last_try = _status.get("last_attempt") or 0
     if _status.get("error") and last_try:
-        again = (_RETRY_AFTER_IMPLAUSIBLE_S if "implausible" in str(_status.get("error"))
-                 or _status.get("shrink_refused") else _RETRY_AFTER_FAILURE_S)
+        err_s = str(_status.get("error"))
+        again = (_RETRY_AFTER_IMPLAUSIBLE_S if "implausible" in err_s
+                 or _status.get("shrink_refused") or _status.get("index_refused")
+                 else _RETRY_AFTER_FAILURE_S)
+        again = max(again, float(_status.get("retry_after") or 0))
         # (The failed attempt built the index itself — a later step failed, e.g.
         # applying it: retried from the failure, not an interval later.)
         failed_after_build = bool(built) and built >= last_try
         due = (last_try + again if failed_after_build
                else max(due if built else 0, last_try + again))
     return max(due, _rearm_not_before)
+
+
+def _note_retry_after(exc: BaseException | None) -> None:
+    """Keep the pause an answer's ``Retry-After`` asked for (at most a week)
+    for ``_next_due``."""
+    try:
+        from soniqboom.core.online_catalog import retry_after_of
+        ra = retry_after_of(exc)
+    except Exception:                                   # noqa: BLE001
+        ra = None
+    _status["retry_after"] = min(float(ra), 7 * 24 * 3600.0) if ra else 0.0
+    e, refused, seen = exc, False, 0
+    while e is not None and seen < 4:
+        refused = refused or isinstance(e, _IndexRefused)
+        e, seen = e.__cause__ or e.__context__, seen + 1
+    _status["index_refused"] = refused
 
 
 def _wake_refresh_loop() -> None:
@@ -3188,18 +3323,31 @@ async def _sleep_or_wake(seconds: float) -> None:
 
 
 async def _refresh_loop() -> None:
-    """Refresh the index on its schedule (``_next_due``)."""
+    """Refresh the index on its schedule (``_next_due``) — supervised: an
+    error computing it (an index that can't be opened for a moment) waits
+    and carries on, never ends the schedule."""
+    failures = 0
     while enabled():
-        wait = _next_due() - time.time()
-        if wait > 0:
-            await _sleep_or_wake(min(wait, 3600))
-            continue
-        if busy():
+        try:
+            wait = _next_due() - time.time()
+            if wait > 0:
+                await _sleep_or_wake(min(wait, 3600))
+                failures = 0
+                continue
+            if busy():
+                await asyncio.sleep(60)
+                continue
+            log.info("Modland catalogue: scheduled index refresh (%s)", interval())
+            await refresh()
+            failures = 0
             await asyncio.sleep(60)
-            continue
-        log.info("Modland catalogue: scheduled index refresh (%s)", interval())
-        await refresh()
-        await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                               # noqa: BLE001
+            failures += 1
+            log.warning("Modland catalogue: refresh schedule hit an error (%d in a row) — "
+                        "carrying on", failures, exc_info=True)
+            await asyncio.sleep(min(3600, 60 * failures))
 
 
 def register_at_startup() -> None:
@@ -3412,7 +3560,7 @@ def _extract_copy(local: Path, track_id: str, real_name: str) -> dict | None:
         return None
     if local.name == real_name:
         meta = metadata.extract(local, track_id)
-        return meta.model_dump()
+        return _song_end_loop_length(local, real_name, meta.model_dump())
     tdir = Path(tempfile.mkdtemp(prefix="sq_catalog_"))
     try:
         dst = tdir / real_name
@@ -3421,9 +3569,30 @@ def _extract_copy(local: Path, track_id: str, real_name: str) -> dict | None:
         except OSError:
             shutil.copyfile(local, dst)
         meta = metadata.extract(dst, track_id)
-        return meta.model_dump()
+        return _song_end_loop_length(local, real_name, meta.model_dump())
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
+
+
+def _song_end_loop_length(local: Path, real_name: str, d: dict) -> dict:
+    """``d`` with the length SoniqBoom renders for a tracker module that ends
+    in a song-end loop (``openmpt_vu.song_end_loop``: the time the loop
+    first repeats).  The server's own metadata reads take a module's length
+    from ``openmpt123 --info`` (libopenmpt in-process only in scan workers),
+    which plays such a loop out — but a catalogue tune is read here only on
+    intent (its play, a prewarm, Track Info), whose render reads it with
+    libopenmpt in-process anyway.  Blocking; never raises."""
+    try:
+        from soniqboom.core import metadata, openmpt_vu
+        if (os.path.splitext(real_name)[1].lower() not in metadata._TRACKER_EXTS
+                or not float(d.get("duration") or 0) > 0):
+            return d
+        cut = openmpt_vu.song_end_loop(local.read_bytes())
+        if cut is not None and cut < float(d["duration"]):
+            d["duration"] = openmpt_vu.duration_ms(cut) / 1000
+    except Exception:                                   # noqa: BLE001
+        log.debug("song-end loop check of %s failed", real_name, exc_info=True)
+    return d
 
 
 async def _merge(track_id: str, local: Path) -> None:

@@ -307,6 +307,14 @@ async def test_play_learns_the_start_song_and_status_agrees(monkeypatch, tmp_pat
             r = await c.get("/api/stream/st3")                  # blocking (no session)
             assert r.status_code == 200
             assert r.headers["x-sid-target-seconds"] == "7"     # tune 3's own length
+            # A cold play is served progressively: its last byte can reach the
+            # client before sidplayfp has exited and ``_finalise`` has moved
+            # the render into the cache (a task of its own).  Wait for that
+            # render to settle (``_SID_PROG_DONE``, what render-status itself
+            # waits on) — under load the status otherwise reads "not ready yet".
+            for key, ev in list(stream._SID_PROG_DONE.items()):
+                if key.startswith("st3__"):                     # this play's render
+                    await asyncio.wait_for(ev.wait(), 60)
             st = (await c.get("/api/stream/st3/render-status")).json()
             assert st["target_seconds"] == 7 and st["ready"] is True
             st2 = (await c.get("/api/stream/st3/render-status?subsong=2")).json()

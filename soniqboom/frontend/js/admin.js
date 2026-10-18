@@ -296,6 +296,7 @@ function close() {
   overlay.classList.add('hidden');
   stopScanPoller();
   clearTimeout(_mlPoll);
+  clearTimeout(_ocPoll);
   // Close the conversion-cache SSE stream on EVERY dismissal path —
   // it used to be wired only to the ✕ button, so Escape / Cancel left
   // an EventSource reconnecting forever in the background (QA).
@@ -357,8 +358,9 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
     const pane = document.getElementById(tab.dataset.tab);
     if (pane) pane.classList.add('active');
     // Load tab-specific data on switch
-    if (tab.dataset.tab === 'tab-library') {
+    if (tab.dataset.tab === 'tab-collections') {
       loadModlandStatus();
+      loadOnlineCollections();
     } else if (tab.dataset.tab === 'tab-system') {
       loadDiskUsage();
       loadSettings();
@@ -829,8 +831,8 @@ function _renderFtpPoolCard(srv) {
 
 function renderDirRow(list, d, scanActive = false) {
   if (d.catalogue) {
-    // A catalogue root (the Modland catalogue): listed from its index, never
-    // scanned — switched on / off under External sources below.
+    // A catalogue root (Modland, an online collection): listed from its index,
+    // never scanned — switched on / off in the Online collections tab.
     const row = document.createElement('div');
     const off = d.status === 'unavailable';
     row.className = 'admin-dir-row admin-dir-catalogue' + (off ? ' dir-unavailable' : '');
@@ -838,7 +840,7 @@ function renderDirRow(list, d, scanActive = false) {
     row.innerHTML = `
       <span class="dir-status-dot ${off ? 'dot-red' : 'dot-green'}" title="${off ? 'Unreachable — only tunes played before can play' : 'Available'}"></span>
       <span class="admin-dir-path" title="${esc(d.path)}">${esc(d.label || 'Catalogue')} catalogue</span>
-      <span class="admin-dir-note">Managed under External sources</span>
+      <span class="admin-dir-note">Managed under Collections</span>
       <span class="admin-dir-count">${(d.track_count ?? 0).toLocaleString()} tunes</span>`;
     list.appendChild(row);
     return;
@@ -862,6 +864,9 @@ function renderDirRow(list, d, scanActive = false) {
   const statusDot = (isNetwork || isUnavailable)
     ? `<span class="dir-status-dot ${isUnavailable ? 'dot-red' : 'dot-green'}" title="${isUnavailable ? (isNetwork ? 'Unavailable' : 'Drive not connected') : 'Connected'}"></span>`
     : '';
+  // Why a folder isn't (fully) watched, as a line of its own under the row — a
+  // tooltip alone can't be read on a touch screen or from the keyboard.
+  let whyLine = '';
   // Reconnect needs a network share; a local drive just has to be plugged in.
   const localNote = (isUnavailable && !isNetwork)
     ? '<span class="admin-dir-note" title="Drive not connected \u2014 library data kept">Drive not connected \u2014 library data kept</span>'
@@ -871,7 +876,21 @@ function renderDirRow(list, d, scanActive = false) {
           const txt = `Sign-in refused \u2014 next try in ${mins} min (Reconnect tries now)`;
           return `<span class="admin-dir-note" title="${esc(txt)}">${esc(txt)}</span>`;
         })()
-      : '';
+      : (!isNetwork && d.watch && (d.watch.state === 'retrying' || d.watch.state === 'partial'))
+        ? (() => {
+            // The folder watcher can't watch this folder (or all of it): say
+            // why and how it is kept up to date meanwhile.
+            const every = Math.max(1, Math.round((d.watch.poll_interval_s || 0) / 60));
+            const head = d.watch.state === 'partial' ? 'Partly watched' : 'Not watched';
+            const txt = `${head} — rescanned every ${every} min`;
+            const why = d.watch.reason ? `: ${d.watch.reason}` : '';
+            const tip = `${head} for changes${why}. Rescanned every ${every} min; watching is retried automatically.`;
+            whyLine = `<span class="admin-dir-why">${esc(d.watch.reason
+              ? `${String(d.watch.reason).replace(/[.\s]+$/, '')}. Watching is retried automatically.`
+              : 'Watching is retried automatically.')}</span>`;
+            return `<span class="admin-dir-note" title="${esc(tip)}">${esc(txt)}</span>`;
+          })()
+        : '';
 
   row.innerHTML = `
     ${statusDot}
@@ -884,7 +903,9 @@ function renderDirRow(list, d, scanActive = false) {
             data-path="${esc(d.path)}"${isUnavailable ? ` disabled title="${isNetwork ? 'Reconnect the share to re-index' : 'Connect the drive to re-index'}"` : ''}>
       ${btnLabel}
     </button>
-    <button class="btn-danger" data-path="${esc(d.path)}">${isNetwork ? 'Disconnect' : 'Remove'}</button>`;
+    <button class="btn-danger" data-path="${esc(d.path)}">${isNetwork ? 'Disconnect' : 'Remove'}</button>
+    ${whyLine}`;
+  if (whyLine) row.classList.add('has-why');
 
   row.querySelector('.btn-alias-edit').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1442,6 +1463,179 @@ function _bindModland() {
   });
 }
 
+// ── Online collections (HVSC on 6581.nl …) ───────────────────────────────────
+// One card per collection (backend: core/online_catalog.py, /api/admin/catalog/
+// online).  Same flow as Modland's: a switch, options, Subsonic visibility,
+// Refresh now + how often; the status line follows a running job every 1.5 s.
+let _ocPoll = null;
+const _ocWasBusy = {};
+const _ocSaving = {};
+
+function _ocCard(s) {
+  const k = s.key;
+  const id = `online-${k}`;
+  let el = document.getElementById(`ext-source-${id}`);
+  if (el) return el;
+  el = document.createElement('div');
+  el.className = 'admin-section ext-source';
+  el.id = `ext-source-${id}`;
+  const opts = Object.entries(s.option_labels || {}).map(([name, label]) => `
+      <div class="admin-setting">
+        <label for="setting-${id}-opt-${name}">${_esc(label)}</label>
+        <input id="setting-${id}-opt-${name}" type="checkbox" data-opt="${_esc(name)}">
+      </div>`).join('');
+  const ivs = Object.entries(s.intervals || {}).map(([v, l]) =>
+    `<option value="${_esc(v)}">${_esc(l)}</option>`).join('');
+  const site = s.site ? ` &mdash; from <a href="${_esc(s.site)}" target="_blank" rel="noopener noreferrer">${_esc(new URL(s.site).host)}</a>` : '';
+  el.innerHTML = `
+    <h3>&#127760; ${_esc(s.label)}</h3>
+    <div class="admin-setting ext-source-head">
+      <label for="setting-${id}">Show ${_esc(s.label)} in the library</label>
+      <input id="setting-${id}" type="checkbox" aria-describedby="${id}-about ${id}-status">
+    </div>
+    <p class="admin-hint" id="${id}-about">${_esc(s.description)}${site}, in the folder &ldquo;${_esc(s.label)}&rdquo;. ${_esc(s.how || '')} Thanks to the collection and its maintainers.</p>
+    <div class="ext-source-options" id="${id}-options">${opts}
+      <div class="admin-setting">
+        <label for="setting-${id}-subsonic">Show its tunes to Subsonic apps<span class="sr-only"> (${_esc(s.label)})</span> <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: Subsonic and DLNA apps don't see this collection. Apps that sync or cache a whole library for offline use would download all of it.">&#9432;</span></label>
+        <input id="setting-${id}-subsonic" type="checkbox">
+      </div>
+    </div>
+    <div id="${id}-status" class="admin-hint ext-status" role="status" aria-live="polite">Off.</div>
+    <progress id="${id}-progress" class="ext-progress" max="1" value="0" hidden aria-label="Listing ${_esc(s.label)}"></progress>
+    <div class="admin-io-row ext-refresh-row">
+      <button id="btn-${id}-refresh" class="btn-secondary" aria-label="Refresh now (${_esc(s.label)})">Refresh now</button>
+      <select id="setting-${id}-interval" class="ext-interval" aria-label="How often to update the index (${_esc(s.label)})" title="How often the index is updated">${ivs}</select>
+    </div>
+    <div id="${id}-msg" class="admin-msg" style="display:none"></div>`;
+  document.getElementById('online-collections-list')?.appendChild(el);
+  const post = async (body) => {
+    _ocSaving[k] = true;
+    try {
+      const res = await api(`/admin/catalog/online/${encodeURIComponent(k)}`,
+                            { method: 'POST', body: JSON.stringify(body) });
+      const st = await res.json();
+      if (!res.ok) showMsg(`${id}-msg`, st.detail || 'Not saved.', 'err');
+      else { if (_mlBusy(st)) _ocWasBusy[k] = true; _ocRender(st); }
+    } catch (e) {
+      showMsg(`${id}-msg`, (e && e.message) || 'Network error.', 'err');
+    } finally {
+      _ocSaving[k] = false;
+      loadOnlineCollections();
+    }
+  };
+  el.querySelector(`#setting-${id}`).addEventListener('change', async (e) => {
+    const cb = e.target;
+    const want = cb.checked;          // (a status poll may reset the box while asking)
+    if (!want) {
+      _ocSaving[k] = true;            // no poll touches the toggle while the dialog is open
+      let ok = false;
+      try {
+        ok = await styledConfirm(
+          `Remove ${s.label} from the library?\n\nIts tunes and the “${s.label}” folder go; `
+          + 'ratings, play counts and playlist entries are kept for when you switch it on again.',
+          { title: s.label, okLabel: 'Remove' });
+      } finally {
+        _ocSaving[k] = false;
+      }
+      if (!ok) { cb.checked = true; return; }
+      cb.checked = false;
+    }
+    post({ enabled: want });
+  });
+  el.querySelector(`#setting-${id}-subsonic`).addEventListener('change', e => post({ subsonic: e.target.checked }));
+  el.querySelector(`#setting-${id}-interval`).addEventListener('change', e => post({ interval: e.target.value }));
+  el.querySelectorAll('input[data-opt]').forEach(cb => cb.addEventListener('change', () =>
+    post({ options: { [cb.dataset.opt]: cb.checked } })));
+  el.querySelector(`#btn-${id}-refresh`).addEventListener('click', async () => {
+    try {
+      const res = await api(`/admin/catalog/online/${encodeURIComponent(k)}/refresh`, { method: 'POST' });
+      const st = await res.json();
+      if (!res.ok) { showMsg(`${id}-msg`, st.detail || 'Not started.', 'err'); return; }
+      _ocWasBusy[k] = true;
+      _ocRender(st);
+    } catch (e) { showMsg(`${id}-msg`, (e && e.message) || 'Network error.', 'err'); }
+    loadOnlineCollections();
+  });
+  return el;
+}
+
+function _ocRender(s) {
+  if (!s || !s.key) return false;
+  const k = s.key;
+  const id = `online-${k}`;
+  _ocCard(s);
+  const busy = _mlBusy(s);
+  const tog = document.getElementById(`setting-${id}`);
+  if (tog && !_ocSaving[k]) tog.checked = !!s.enabled;
+  if (tog) tog.disabled = !!_ocSaving[k];
+  const sub = document.getElementById(`setting-${id}-subsonic`);
+  if (sub) sub.checked = !!s.subsonic;
+  for (const [name, val] of Object.entries(s.options || {})) {
+    const cb = document.getElementById(`setting-${id}-opt-${name}`);
+    if (cb) cb.checked = !!val;
+  }
+  const iv = document.getElementById(`setting-${id}-interval`);
+  if (iv && document.activeElement !== iv) iv.value = s.interval || 'weekly';
+  const refresh = document.getElementById(`btn-${id}-refresh`);
+  if (refresh) refresh.disabled = busy || !s.enabled;
+  document.getElementById(`${id}-options`)?.classList.toggle('ext-off', !s.enabled);
+  const parts = [];
+  if (busy) {
+    const what = s.state === 'removing' ? `Removing ${s.label}` : `Listing ${s.label}`;
+    const prog = Number(s.total) > 0 ? ` ${_fmtCount(s.done)} of ${_fmtCount(s.total)}` : '';
+    parts.push(`${what}${s.phase ? ` — ${s.phase}` : ''}${prog}…`);
+  } else if (!s.enabled) {
+    parts.push('Off.');
+  } else if (s.state === 'error' && !Number(s.tunes)) {
+    const err = s.error || 'unknown error';
+    parts.push(/Refresh now/.test(err) ? `Not available: ${err}.`
+                                       : `Not available: ${err} — press Refresh now to try again.`);
+  } else {
+    let t = `${_fmtCount(s.tunes)} ${s.packaged ? 'entries' : 'tunes'} in the “${s.label}” folder`;
+    if (s.index_date) t += ` · index of ${s.index_date}`;
+    if (s.last_refresh) t += ` · refreshed ${_mlAgo(s.last_refresh)}`;
+    if (s.next_refresh) t += ` · next refresh ${_mlIn(s.next_refresh)}`;
+    parts.push(t);
+    if (s.error) parts.push(`the last refresh failed (${s.error}) — the tunes are kept`);
+  }
+  if (s.enabled && s.offline) parts.push(`${s.label} is unreachable right now: only tunes played before can play`);
+  const line = document.getElementById(`${id}-status`);
+  if (line) {
+    line.textContent = parts.join(' · ');
+    line.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+  const bar = document.getElementById(`${id}-progress`);
+  if (bar) {
+    const show = busy && Number(s.total) > 0;
+    bar.hidden = !show;
+    if (show) { bar.max = Number(s.total); bar.value = Number(s.done || 0); }
+  }
+  if (_ocWasBusy[k] && !busy) {
+    if (s.error) showMsg(`${id}-msg`, `${s.label}: ${s.error}`, 'err');
+    else if (s.enabled) showMsg(`${id}-msg`, `${s.label} is ready — ${_fmtCount(s.tunes)} tunes in the “${s.label}” folder.`, 'ok');
+    else showMsg(`${id}-msg`, `${s.label} was removed. Ratings, play counts and playlist entries of its tunes are kept for when you switch it on again.`, 'ok');
+    document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
+    document.dispatchEvent(new CustomEvent('soniqboom:library-changed'));
+    loadDirs();
+  }
+  _ocWasBusy[k] = busy;
+  return busy;
+}
+
+async function loadOnlineCollections() {
+  clearTimeout(_ocPoll);
+  try {
+    const res = await api('/admin/catalog/online');
+    const data = await res.json();
+    let anyBusy = false;
+    for (const s of (data.collections || [])) anyBusy = _ocRender(s) || anyBusy;
+    if (anyBusy && _isOpen) _ocPoll = setTimeout(loadOnlineCollections, 1500);
+  } catch (_) {
+    if (_isOpen) _ocPoll = setTimeout(loadOnlineCollections, 5000);
+  }
+}
+
+
 async function removeShare(shareId, path) {
   if (_removingShare) return;  // guard against double-click
   const confirmed = await styledConfirm(
@@ -1897,7 +2091,12 @@ document.getElementById('admin-import-file').addEventListener('change', async (e
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
-      showMsg('admin-io-msg', `Import complete: ${data.imported ?? '?'} keys restored.`, 'ok');
+      if (data.saved === false) {
+        showMsg('admin-io-msg', `Imported ${data.imported ?? '?'} tracks for now, but the library couldn't be `
+          + 'saved — SoniqBoom loads the previous one when it restarts. See the server log.', 'err');
+      } else {
+        showMsg('admin-io-msg', `Import complete: ${data.imported ?? '?'} tracks restored.`, 'ok');
+      }
       await loadStats();
       await loadDirs();
     } else {
@@ -3148,7 +3347,7 @@ let _syncGameTagStatus = null;
 // copy ("required for X") was less informative than consequence-framed copy.
 const _SERVICE_HINTS = {
   subsonic:    'Lets Subsonic-compatible clients (Amperfy, DSub, Symfonium, play:Sub) connect over /rest/*. Turning off blocks every such client.',
-  multiroom:   'Synchronises playback across multiple SoniqBoom instances on the LAN. Turning off leaves only single-machine playback.',
+  multiroom:   'Plays the same music in step on several browsers and devices connected to this server. Turning off leaves only single-device playback.',
   cast:        'Beta — outgoing Cast / DLNA / AirPlay sender; picks a TV, speaker, or receiver from the player toolbar. Turning off hides the toolbar cast button.',
   // UX-2 P0: dlna_server was missing from the hint dict.  Also flag the
   // privacy implication of turning it ON so the user can make an informed
@@ -4173,7 +4372,7 @@ async function loadHvscStatus() {
     if (s.enabled && (s.songlengths || s.stil)) {
       statusEl.classList.remove('off');
       statusEl.classList.add('on');
-      statusEl.textContent = `loaded · ${s.songlengths.toLocaleString()} song lengths · ${s.stil.toLocaleString()} STIL entries`;
+      statusEl.textContent = `${s.source === 'online' ? 'from the online HVSC collection' : 'loaded'} · ${s.songlengths.toLocaleString()} song lengths · ${s.stil.toLocaleString()} STIL entries`;
       // Surface the "fallback only" semantics on the SID-duration field
       // in the System tab so users understand HVSC is in charge.
       if (sidHint) {

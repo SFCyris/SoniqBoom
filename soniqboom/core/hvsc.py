@@ -81,7 +81,9 @@ def _parse_duration(text: str) -> float:
         return 0.0
     minutes = int(m.group(1))
     seconds = int(m.group(2))
-    millis  = int(m.group(3) or "0")
+    # The fraction is decimal seconds: HVSC's Songlengths drops trailing
+    # zeros ("0:03.5" is 3.500 s — 0.2 % of its 3-digit fractions end in 0).
+    millis  = int((m.group(3) or "0")[:3].ljust(3, "0"))
     return minutes * 60 + seconds + millis / 1000.0
 
 
@@ -113,6 +115,9 @@ class HVSC:
     def __init__(self) -> None:
         self._songlengths: dict[str, list[float]] = {}
         self._stil:        dict[str, dict]        = {}
+        # md5 → HVSC path, from Songlengths' "; /PATH" comment lines: a SID
+        # outside an HVSC tree finds its STIL entry by its checksum.
+        self._md5_paths:   dict[str, str]         = {}
         self._docs_path:   str | None             = None
         self._remote:      bool                   = False
         self._loaded:      bool                   = False
@@ -127,6 +132,7 @@ class HVSC:
         with self._lock:
             self._songlengths.clear()
             self._stil.clear()
+            self._md5_paths = {}
             self._loaded = False
             if docs_path:
                 self._docs_path = str(docs_path)
@@ -221,9 +227,11 @@ class HVSC:
 
         songlengths: dict[str, list[float]] = {}
         stil: dict[str, dict] = {}
+        md5_paths: dict[str, str] = {}
         try:
             if songlengths_text:
                 songlengths = self._parse_songlengths(songlengths_text)
+                md5_paths = self._parse_md5_paths(songlengths_text)
             if stil_text:
                 stil = self._parse_stil(stil_text)
         except Exception:
@@ -238,6 +246,7 @@ class HVSC:
                 return
             self._songlengths = songlengths
             self._stil = stil
+            self._md5_paths = md5_paths
             self._loaded = True
             log.info(
                 "HVSC: indexed %d song-length entries + %d STIL entries from %s",
@@ -259,6 +268,23 @@ class HVSC:
             ]
             if durations:
                 out[md5] = durations
+        return out
+
+    @staticmethod
+    def _parse_md5_paths(text: str) -> dict[str, str]:
+        """md5 → HVSC path from Songlengths.md5, whose entries follow a
+        ``; /MUSICIANS/H/Hubbard_Rob/Commando.sid`` comment line."""
+        out: dict[str, str] = {}
+        path: str | None = None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("; /"):
+                path = line[2:].strip()
+                continue
+            m = _SONGLENGTH_RE.match(line)
+            if m and path:
+                out.setdefault(m.group(1).lower(), path)
+            path = None
         return out
 
     @staticmethod
@@ -332,6 +358,10 @@ class HVSC:
         # MUSICIANS/…``) is the same tree — its tunes have STIL entries too.
         from soniqboom.core import catalogue
         if catalogue.is_catalogue_path(track_path):
+            croot = catalogue.root_of(track_path)
+            if croot and catalogue.key_of(croot) == "hvsc":
+                # The online HVSC collection: its tree IS the HVSC tree.
+                return "/" + track_path[len(croot) + 2:].lstrip("/")
             i = track_path.find(":/HVSC/")
             return track_path[i + len(":/HVSC"):] if i >= 0 else None
         track_remote = _is_remote(track_path)
@@ -380,15 +410,27 @@ class HVSC:
         with self._lock:                         # guard against a concurrent reload()
             return self._stil.get(rel.lower())
 
-    def lookup_stil(self, sid_path: Path | str, hvsc_root=None) -> dict | None:
+    def path_for_md5(self, md5: str) -> str | None:
+        """The HVSC path (``/MUSICIANS/…``) Songlengths lists for a SID's md5."""
+        if not md5:
+            return None
+        self._ensure_loaded()
+        return self._md5_paths.get(md5.lower())
+
+    def lookup_stil(self, sid_path: Path | str, hvsc_root=None, md5: str | None = None) -> dict | None:
         """STIL entry for a SID file at ``sid_path`` (local path or remote
-        ``scan_root:/rel`` string).  ``hvsc_root`` is accepted for
+        ``scan_root:/rel`` string) — by its HVSC path, else (``md5``) by the
+        path Songlengths lists for its checksum, so a SID kept outside an
+        HVSC tree finds its entry too.  ``hvsc_root`` is accepted for
         backward-compatibility but ignored — the configured docs path
         determines the root."""
         key = self.stil_key_for(str(sid_path))
-        if key is None:
-            return None
-        return self.lookup_stil_by_relpath(key)
+        hit = self.lookup_stil_by_relpath(key) if key is not None else None
+        if hit is None and md5:
+            rel = self.path_for_md5(md5)
+            if rel:
+                hit = self.lookup_stil_by_relpath(rel)
+        return hit
 
 
 # Module-level singleton.

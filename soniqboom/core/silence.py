@@ -68,17 +68,20 @@ def pcm16_audible(buf: bytes, channels: int = 2) -> bool:
 
 
 class AudibilityMeter:
-    """Feed a growing 16-bit LE PCM stream (``channels`` interleaved) and
-    learn how long it is and whether it is audible.  Cheap once audible:
-    later chunks are only counted."""
+    """Feed a growing 16-bit LE PCM stream (``channels`` interleaved) — or
+    32-bit LE float with ``kind="f"`` — and learn how long it is and whether
+    it is audible.  Cheap once audible: later chunks are only counted."""
 
-    def __init__(self, channels: int = 2, rate: int = 44100) -> None:
+    def __init__(self, channels: int = 2, rate: int = 44100, kind: str = _PCM16) -> None:
+        if kind not in _THRESHOLD:
+            raise ValueError(f"unknown sample kind {kind!r}")
         self.channels = max(1, int(channels))
         self.rate = max(1, int(rate))
+        self.kind = kind
         self.frames = 0
         self.audible = False
         self._carry = b""
-        self._frame_bytes = 2 * self.channels
+        self._frame_bytes = array.array(kind).itemsize * self.channels
 
     @property
     def seconds(self) -> float:
@@ -93,7 +96,7 @@ class AudibilityMeter:
         self._carry = data[whole:]
         self.frames += whole // self._frame_bytes
         if not self.audible and whole:
-            self.audible = pcm16_audible(data[:whole], self.channels)
+            self.audible = _audible(_samples(data[:whole], self.kind), self.channels, self.kind)
         return self.audible
 
 

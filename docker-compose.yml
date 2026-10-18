@@ -18,8 +18,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./music:/music:ro       # your library — read-only; the server never writes here
-      - soniqboom-data:/data    # index, conversion cache, config, logs (back this up)
+      - ./music:/music:ro       # your library — read-only (drop :ro to let SoniqBoom edit tags / save lyrics)
+      - soniqboom-data:/data    # index, users, settings, caches, SoundFonts, logs (back this up)
     environment:
       - SONIQBOOM_DATA_DIR=/data
       # - TZ=Europe/Berlin

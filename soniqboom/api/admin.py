@@ -290,6 +290,80 @@ async def admin_modland_catalog_refresh(_tok: str = Depends(_require_token)):
     return mc.status()
 
 
+# ── Online collections (core/online_catalog.py: HVSC on 6581.nl …) ─────────────
+
+def _online(key: str):
+    from soniqboom.core import online_catalog
+    cat = online_catalog.get(key)
+    if cat is None:
+        raise HTTPException(404, f"No online collection {key!r}")
+    return cat
+
+
+@router.get("/catalog/online")
+async def admin_online_catalogs(_tok: str = Depends(_require_token)):
+    """Every online collection's state (on/off, index, tune count, the running
+    job and its progress, options), in display order."""
+    from soniqboom.core import online_catalog
+    return {"collections": [c.status() for c in online_catalog.all_catalogues()]}
+
+
+@router.post("/catalog/online/{key}")
+async def admin_online_catalog_set(key: str, body: dict, _tok: str = Depends(_require_token)):
+    """Change an online collection's settings.  ``enabled`` switches it on
+    (download the index, list its tunes in the background) or off (remove
+    them — ratings, plays, stars and playlist entries stay for when it comes
+    back); ``subsonic`` shows / hides its tunes to Subsonic and DLNA clients;
+    ``interval`` (``daily`` / ``weekly`` / ``biweekly`` / ``monthly``) sets how
+    often its index is refreshed; ``options`` (``{name: bool}``) sets its own
+    switches.  Returns the status at once; a background job's progress is in
+    ``GET /admin/catalog/online``."""
+    from soniqboom.core import online_catalog
+    cat = _online(key)
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object expected")
+    if "interval" in body:
+        if body["interval"] not in online_catalog.INTERVALS:
+            raise HTTPException(400, f"interval must be one of {list(online_catalog.INTERVALS)}")
+        cat.set_interval(body["interval"])
+    if "subsonic" in body:
+        cat.set_subsonic(_flag(body["subsonic"]))
+    opts = body.get("options")
+    if opts is not None:
+        if not isinstance(opts, dict):
+            raise HTTPException(400, "options must be an object")
+        for name, value in opts.items():
+            try:
+                cat.set_option(name, _flag(value))
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+    if "enabled" in body:
+        want = _flag(body["enabled"])
+        if not want and (cat.enabled() or cat.busy() or cat.tune_count()):
+            cat.start_disable()
+        elif want and (not cat.enabled() or cat.status().get("state") == "error"):
+            if cat.busy():
+                raise HTTPException(409, f"{cat.label} is busy — try again when the current "
+                                         f"step has finished.")
+            cat.start_job(cat.enable)
+    await asyncio.sleep(0)
+    return cat.status()
+
+
+@router.post("/catalog/online/{key}/refresh")
+async def admin_online_catalog_refresh(key: str, _tok: str = Depends(_require_token)):
+    """Download the collection's index now and apply the changes in the
+    background.  A failed or implausible download keeps the current tunes."""
+    cat = _online(key)
+    if not cat.enabled():
+        raise HTTPException(409, f"{cat.label} is off.")
+    if not cat.start_job(cat.refresh, manual=True):
+        raise HTTPException(409, f"{cat.label} is busy — try again when the current step "
+                                 f"has finished.")
+    await asyncio.sleep(0)
+    return cat.status()
+
+
 @router.get("/demozoo/status")
 async def admin_demozoo_status(_tok: str = Depends(_require_token)):
     """Demozoo scene-group enrichment state (index name→group rows, last apply)."""
@@ -505,6 +579,19 @@ async def admin_list_dirs(_tok: str = Depends(_require_token)):
                 d["auth_retry_in_s"] = int(retry_in)
     except Exception:                                   # noqa: BLE001
         log.debug("share sign-in status for /admin/dirs failed", exc_info=True)
+    # How a local folder is kept up to date (watched, or rescanned on a timer
+    # while the folder watcher can't watch it).
+    try:
+        from soniqboom.core import watcher
+        from soniqboom.core.filesource import is_remote_path
+        for d in dirs:
+            if d.get("catalogue") or is_remote_path(d.get("path") or ""):
+                continue
+            st = watcher.root_status(d.get("path") or "")
+            if st is not None:
+                d["watch"] = st
+    except Exception:                                   # noqa: BLE001
+        log.debug("watch status for /admin/dirs failed", exc_info=True)
     return {"dirs": dirs}
 
 
@@ -674,7 +761,7 @@ async def _scan_dirs_split(dirs: list[str], progress_cb=None) -> dict:
     """
     from soniqboom.core import catalogue as _catalogue
     # A catalogue root (core/catalogue.py) is never scanned — its index is
-    # refreshed instead (Admin → External sources).
+    # refreshed instead (Settings → Collections).
     dirs = [d for d in dirs if not _catalogue.is_catalogue_root(d)]
     local = [d for d in dirs if not _is_remote(d)]
     remote = [d for d in dirs if _is_remote(d)]
@@ -1177,6 +1264,48 @@ async def admin_export(_tok: str = Depends(_require_token)):
     )
 
 
+async def _save_imported_library() -> str | None:
+    """Write the imported store as ``library.json`` and drop the AOF records of
+    the library it replaced — the shutdown snapshot's path (``consume_aof``).
+    Without it the import lived in memory only: the next start loaded the old
+    ``library.json`` + AOF.  None when saved; else why not: "not-owner" (this
+    server doesn't hold the data directory — ``owns_library``), "empty" (no
+    tracks in the backup and some in the library: refused, as at shutdown),
+    "failed" (the write failed — logged)."""
+    from soniqboom import main as _main_mod
+    from soniqboom.core.persistence import owns_library, write_snapshot_sync
+
+    data_dir = get_data_dir()
+    if not owns_library():
+        log.warning("Import: this server doesn't hold %s — the import is not saved", data_dir)
+        return "not-owner"
+    if get_store().track_count() == 0:
+        from soniqboom.core.persistence import _try_load_json
+        old = _try_load_json(data_dir / "library.json")
+        if isinstance(old, dict) and old.get("tracks"):
+            log.warning("Import: the backup has no tracks — the saved library is left as it is")
+            return "empty"
+    writer = getattr(_main_mod, "_aof_writer", None)
+    if writer is not None and (writer.sealed or getattr(writer, "_intake_closed", False)):
+        writer = None                                   # stopping: the shutdown saves it
+    try:
+        if writer is not None:
+            writer.cancel_flush_task()                  # (on the loop; stop() runs off it)
+        try:
+            saved = await asyncio.to_thread(write_snapshot_sync, data_dir, True, writer,
+                                            asyncio.get_running_loop(), "Import")
+        finally:
+            # not when the server began stopping meanwhile (its shutdown
+            # cancelled the flush task and stops the writer itself)
+            if (writer is not None and not writer.sealed
+                    and not getattr(writer, "_intake_closed", False)):
+                await writer.start_auto_flush()
+        return None if saved else "failed"
+    except Exception:
+        log.exception("Import: saving the imported library failed")
+        return "failed"
+
+
 @router.post("/import")
 async def admin_import(
     file: UploadFile = File(...),
@@ -1200,9 +1329,35 @@ async def admin_import(
     store = get_store()
     if version == 2:
         from soniqboom.core.persistence import populate_store
-        populate_store(payload.get("data", {}))
+        data = payload.get("data", {})
+        if not (data.get("tracks") if isinstance(data, dict) else None) and store.track_count():
+            raise HTTPException(400, "This backup holds no tracks — the library was left as it is.")
+        populate_store(data)
+        # A backup exported by a build that stored FTP listing times as host
+        # time carries no conversion marker: convert it now, as a start would
+        # (one from this build says "done" and is left as it is).
+        try:
+            from soniqboom.core import ftp_mtime_migration
+            ftp_mtime_migration.run(store)
+        except Exception:                               # noqa: BLE001
+            log.warning("import: converting stored FTP listing times failed", exc_info=True)
         store.rebuild_indexes()
-        return {"imported": store.track_count(), "errors": 0}
+        # (the folder-browse cache's copy on disk is the replaced library's: a
+        # start would restore it — its check is the per-root track count)
+        try:
+            from soniqboom.api.fstree import invalidate_browse_cache
+            invalidate_browse_cache(drop_disk=True)
+        except Exception:                               # noqa: BLE001
+            log.warning("import: the folder-browse cache could not be dropped", exc_info=True)
+        # Open pages re-read their counts, view and folder tree now.
+        from soniqboom.api.library import broadcast_library_replaced
+        try:
+            await broadcast_library_replaced()
+        except Exception:                               # noqa: BLE001
+            log.debug("import: library-changed broadcast failed", exc_info=True)
+        why = await _save_imported_library()
+        return {"imported": store.track_count(), "errors": 0,
+                "saved": why is None, "not_saved_reason": why}
 
     raise HTTPException(400, "Version 1 exports are no longer supported — re-export from a v2 instance")
 
@@ -1236,11 +1391,18 @@ def _graceful_pre_exec_flush(loop=None) -> None:
     """Run the work FastAPI's shutdown hook would do before ``os.execv``.
 
     ``execv`` replaces the process image, so neither FastAPI's shutdown event
-    nor any ``atexit`` handler fires.  These things have to happen here:
+    nor any ``atexit`` handler fires.  These things have to happen here (the
+    caller, ``_do_restart``, has already made the server refuse requests and
+    sign-ins — ``main.begin_exec_restart``):
 
-      0. Stop the scans and post-scan passes (``loop``: the server's event
-         loop, this running in a worker thread) — as the normal stop's step
-         1b, so their last writes reach the journal before it ends.
+      0. Quiesce the background work that writes the store (``loop``: the
+         server's event loop, this running in a worker thread —
+         ``main.quiesce_for_exec``): the share health monitor, the folder
+         watcher and its supervisor, the remote freshness loops, the
+         availability watch, the index-integrity sweep, a pending startup
+         reconcile, the duplicate re-group runner, then the scans and
+         post-scan passes (as the normal stop's step 1b) — so their last
+         writes reach the journal before it ends.
 
       1. Stop the scan worker pools and the TOSEC / Redump downloads — first,
          so no scan or download writes after the flush.  ``execv`` keeps the
@@ -1250,23 +1412,26 @@ def _graceful_pre_exec_flush(loop=None) -> None:
          write after the stop.  Both are bounded: a pool whose worker can't
          exit is left to that reap.
       2. Flush the AOF buffer and end the journal (``AOFWriter.seal``): a
-         write arriving after it is set aside (``library.aof.late-*``)
-         instead of being lost unseen at the exec.
+         write still arriving after it (a request or job that was already
+         running) is set aside in ``library.aof.late-exec-*``, which the next
+         start appends to the journal before it loads
+         (``persistence.adopt_exec_late_records``).
       3. Terminate the background merger process.  ``execv`` keeps the
          parent PID alive but loses the daemon-cleanup guarantee — without
          an explicit terminate, the old merger keeps running and the new
          exec'd instance spawns *another* merger, both racing on
          ``library.json.new``.
+      4. Last, write the sign-in sessions (``sessions.json``) a coalesced
+         write may still hold back, so nobody is signed out by the restart
+         (no session is issued after it: sign-ins are closed).
     """
     if loop is not None:
         try:
-            from soniqboom.core import scanner as _scanner
-
-            async def _stop_writers() -> None:
-                await _scanner.stop_background_writers([*_bg_scan_tasks, *_BG_TASKS])
-            asyncio.run_coroutine_threadsafe(_stop_writers(), loop).result(timeout=5.0)
+            from soniqboom import main as _main_quiesce
+            asyncio.run_coroutine_threadsafe(_main_quiesce.quiesce_for_exec(), loop).result(
+                timeout=20.0)              # (its own steps' bounds add up to 17.5 s)
         except Exception:
-            log.exception("Pre-restart scan / enrichment stop failed — continuing")
+            log.exception("Pre-restart stop of the background work failed — continuing")
     try:
         from soniqboom.core import game_titles, scanner
         game_titles.cancel_downloads()
@@ -1277,7 +1442,13 @@ def _graceful_pre_exec_flush(loop=None) -> None:
         from soniqboom import main as _main_mod
         from soniqboom.core.aof import AOFWriter
         writer = getattr(_main_mod, "_aof_writer", None)
+        # A duplicate-relevant write after the re-group delta was saved
+        # (``quiesce_for_exec``) → one full pass at the next start, as the
+        # stop does before its flush.
+        from soniqboom.core.scanner import finalize_dup_pending
+        finalize_dup_pending()
         if writer is not None:
+            writer.late_tag = "late-exec"     # replayed by the exec'd image's start
             writer.stop()  # flush_sync + close fd
             writer.close_intake()
             writer.seal(AOFWriter._FLOCK_BUDGET_SECONDS * 2)
@@ -1294,11 +1465,35 @@ def _graceful_pre_exec_flush(loop=None) -> None:
                 proc.join(timeout=2)
     except Exception:
         log.exception("Pre-restart merger terminate failed — continuing")
+    try:
+        from soniqboom.core.users import get_user_store
+        get_user_store().flush_sessions()      # sign-ins survive the restart
+    except Exception:
+        log.exception("Pre-restart session flush failed — continuing with restart")
+
+
+def _tell_pages_restarting(loop) -> None:
+    """Open pages learn of the restart first (``library.broadcast_server_
+    restarting``): a play that fails while the server is away is then waited
+    out, not reported and skipped.  Best-effort, 2.5 s at most."""
+    if loop is None:
+        return
+    try:
+        from soniqboom.api.library import broadcast_server_restarting
+        asyncio.run_coroutine_threadsafe(broadcast_server_restarting(), loop).result(timeout=2.5)
+    except Exception:
+        log.debug("restart: telling the open pages failed", exc_info=True)
+
+
+# How long the source install's restart waits, before it refuses requests, for
+# a merge holding the AOF to end (``AOFWriter.drain``).
+_PRE_GATE_DRAIN_S = 15.0
 
 
 def _do_restart(loop=None) -> None:
     """Perform the actual process restart — blocking, runs in a worker thread
     (``loop``: the server's event loop, for ``_graceful_pre_exec_flush``)."""
+    _tell_pages_restarting(loop)
     bundle = _detect_app_bundle()
     if bundle is not None:
         # Relaunch the bundle via LaunchServices so the Dock / window wrapper
@@ -1325,12 +1520,52 @@ def _do_restart(loop=None) -> None:
         # shell keeps its terminal.  execv won't run shutdown hooks, so flush
         # the AOF synchronously first.
         log.info("Restart: exec'ing %s with argv=%r", sys.executable, sys.argv)
+        from soniqboom import main as _main_mod
+        # While requests are still answered: what is buffered goes to the
+        # journal now, waiting out a merge that holds it — the window in which
+        # requests are refused (below) then doesn't include that wait.
+        writer = getattr(_main_mod, "_aof_writer", None)
+        if writer is not None and hasattr(writer, "drain"):
+            t0 = time.monotonic()
+            ok = writer.drain(_PRE_GATE_DRAIN_S)
+            log.info("Restart: journal written before requests are refused (%d ms%s)",
+                     (time.monotonic() - t0) * 1000, "" if ok else ", the AOF stayed busy")
+        _main_mod.begin_exec_restart()          # requests and sign-ins refused (503)
         _graceful_pre_exec_flush(loop)
+        try:
+            _main_mod.note_exec_leftovers()     # the exec'd image waits for them
+        except Exception:
+            log.debug("recording the children for the exec'd image failed", exc_info=True)
         try:
             os.execv(sys.executable, [sys.executable, *sys.argv])
         except Exception as exc:  # pragma: no cover
             log.exception("Restart: execv failed: %s", exc)
+            os.environ.pop(_main_mod._EXEC_LEFTOVERS_ENV, None)
+            _exec_failed_keep_records()
             os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _exec_failed_keep_records() -> None:
+    """The exec failed and the usual stop follows: the records set aside for
+    the exec'd image since the seal (``library.aof.late-exec-*``) are written
+    to the AOF now — the stop either replays them next start with it, or its
+    snapshot holds them and drops the AOF — and later stragglers go to a plain
+    set-aside file (``AOFWriter.retire_late_exec``)."""
+    try:
+        from soniqboom import main as _main_mod
+        from soniqboom.core import persistence
+        writer = getattr(_main_mod, "_aof_writer", None)
+        if writer is None or not hasattr(writer, "retire_late_exec"):
+            return
+        writer.retire_late_exec()
+        data_dir = writer.path.parent
+        with persistence.library_files_locked(data_dir):
+            n = persistence.adopt_exec_late_records(data_dir)
+        if n:
+            log.info("Restart: the exec failed — %d record(s) written after the seal kept "
+                     "in the AOF", n)
+    except Exception:
+        log.exception("Restart: the records set aside for the exec could not be kept")
 
 
 @router.post("/restart")
@@ -1578,7 +1813,7 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
         _new_root = ""
     if _new_root and any(_new_root.lower() == r["root"].lower() for r in _catalogue.roots()):
         raise HTTPException(409, "This folder is already in the library as a catalogue "
-                                 "(Admin → Library → External sources).")
+                                 "(Settings → Collections).")
     scan_root = _scan_root_for_share(share_conf)
 
     try:
@@ -2636,6 +2871,9 @@ async def admin_fetch_ffmpeg(_tok: str = Depends(_require_token)):
     the event loop for the ~10 s the fetch takes on a fast LAN.
     """
     import asyncio as _asyncio
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked():
+        raise HTTPException(503, "Offline mode is on — ffmpeg can't be downloaded")
     try:
         from scripts.fetch_ffmpeg import install as _ff_install, _default_dest
     except ImportError:
@@ -2727,7 +2965,7 @@ async def list_soundfonts(_tok: str = Depends(_require_token)):
 
     fonts = []
     for f in sorted(sf_dir.iterdir()):
-        if f.suffix.lower() in (".sf2", ".sf3"):
+        if f.suffix.lower() in (".sf2", ".sf3") and f.is_file():   # (not a dangling link)
             display_name = unicodedata.normalize("NFC", f.name)
             fonts.append({
                 "name": display_name,
@@ -2815,6 +3053,9 @@ async def download_known_soundfont(body: dict, _tok: str = Depends(_require_toke
     name = body.get("name", "")
     if not url:
         raise HTTPException(400, "url and name required")
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(url):
+        raise HTTPException(503, "Offline mode is on — the SoundFont can't be downloaded")
 
     safe_name = _safe_soundfont_filename(name)
     sf_dir = get_soundfonts_dir()
@@ -3185,9 +3426,17 @@ async def hvsc_status(_tok: str = Depends(_require_token)):
     from soniqboom.core.hvsc import get_hvsc
     h = get_hvsc()
     h._ensure_loaded()
+    try:
+        from soniqboom.core import online_hvsc
+        online = online_hvsc.fallback_active()
+    except Exception:                                   # noqa: BLE001
+        online = False
     return {
         "enabled":     h.is_configured(),
-        "docs_path":   str(h._docs_path) if h._docs_path else "",
+        # The online HVSC collection's documents are no folder of the user's
+        # own: the path field stays empty and the status says where they are.
+        "docs_path":   "" if online else (str(h._docs_path) if h._docs_path else ""),
+        "source":      "online" if online else ("folder" if h.is_configured() else ""),
         "songlengths": len(h._songlengths),
         "stil":        len(h._stil),
     }
@@ -3490,6 +3739,10 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             try:
                 from soniqboom.core.hvsc import get_hvsc
                 get_hvsc().configure(body["renderers"]["hvsc_docs_path"] or None)
+                # No local HVSC folder any more: the online collection's
+                # documents step in again (its "Use for my own SID files").
+                from soniqboom.core import online_hvsc
+                online_hvsc.apply_docs_fallback()
                 if get_hvsc().is_configured():
                     # Scans only join HVSC onto the tracks they changed: apply
                     # the new database to the SIDs already indexed, once.

@@ -67,6 +67,144 @@ def _is_remote(path: str) -> bool:
     return is_remote_path(path)
 
 
+# ── Scan-root confinement ────────────────────────────────────────────────────
+# Every browse endpoint that takes a folder path answers only for paths under a
+# registered scan root (the server's own list — never a root the caller names).
+# A path outside every root gets this one 403, judged before the path itself is
+# looked at on disk: missing and existing paths outside the roots answer alike.
+
+_OUTSIDE_DETAIL = "Path is not under any registered scan root"
+
+
+def _outside() -> HTTPException:
+    return HTTPException(403, _OUTSIDE_DETAIL)
+
+
+def _under(path: str, root: str) -> bool:
+    """Is normalised absolute ``path`` the normalised ``root`` or inside it
+    (component-wise: ``/M/Foo`` is not under ``/M/Fo``)?"""
+    if root == "/":
+        return path.startswith("/")
+    return path == root or path.startswith(root + "/")
+
+
+def _norm_abs(path: str) -> str:
+    """``os.path.normpath`` with POSIX's kept leading ``//`` collapsed."""
+    n = os.path.normpath(path)
+    return "/" + n.lstrip("/") if n.startswith("//") else n
+
+
+def _local_roots() -> list[str]:
+    """The registered LOCAL scan roots, normalised (read on the event loop:
+    the store's scan-dir map is not for worker threads to iterate)."""
+    from soniqboom.core.store import get_store
+    return [_norm_abs(str(sd["path"])) for sd in get_store().list_scan_dirs()
+            if sd.get("path") and not _is_remote(sd["path"])
+            and str(sd["path"]).startswith("/")]
+
+
+def _lexical_local(path: str) -> str:
+    """``path`` normalised without touching the disk — or the shared 403 for
+    anything that isn't an absolute POSIX path."""
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        raise _outside()
+    return _norm_abs(path)
+
+
+# Real path of each registered root (``os.path.realpath``), so a request
+# doesn't resolve every root again: refreshed after _ROOT_REAL_TTL_S; a root
+# no longer registered is dropped.  Bounded by the roots' number.
+_ROOT_REAL: dict[str, tuple[str, float]] = {}
+_ROOT_REAL_TTL_S = 60.0
+
+
+def _root_real(n: str) -> str:
+    hit = _ROOT_REAL.get(n)
+    now = time.monotonic()
+    if hit is not None and now - hit[1] < _ROOT_REAL_TTL_S:
+        return hit[0]
+    real = os.path.realpath(n)
+    _ROOT_REAL[n] = (real, now)
+    return real
+
+
+def _confine_local(path: str, hint_root: str | None = None,
+                   roots: list[str] | None = None) -> tuple[Path, Path]:
+    """The real (symlink-free) path of local folder ``path`` and the real path
+    of the registered scan root it is under — or the shared 403.  Does file
+    system calls (``realpath``): run it in a worker thread with ``roots``
+    from ``_local_roots()`` (``_confine_local_async``).
+
+    Two checks.  First lexically: the normalised path must sit under a
+    registered root (by its stored spelling, or by its real path for a root
+    registered through a symlinked spelling, e.g. /tmp/… on macOS), so
+    nothing outside the roots is ever looked up — only the roots' own paths
+    are resolved (cached).  Then the path's ``realpath`` must still sit
+    under that root's ``realpath``: a ``..`` or a symlink inside a root can't
+    lead out of it.  The caller uses the returned real path — what was
+    checked is what is read.  ``hint_root`` (the tree root the client
+    browses under) only picks among the registered roots that hold the
+    path; it never authorises one."""
+    lexical = _lexical_local(path)
+    if roots is None:
+        roots = _local_roots()
+    stale = [k for k in _ROOT_REAL if k not in roots]
+    for k in stale:
+        _ROOT_REAL.pop(k, None)
+    try:
+        cands = [(n, _root_real(n)) for n in roots if _under(lexical, n)]
+        if not cands:
+            cands = [(n, real_r) for n, real_r in ((n, _root_real(n)) for n in roots)
+                     if _under(lexical, real_r)]
+        if not cands:
+            raise _outside()
+        real = os.path.realpath(lexical)
+    except (OSError, ValueError):
+        raise _outside()
+    hint = _norm_abs(hint_root) if isinstance(hint_root, str) and hint_root.startswith("/") else None
+    # The client's tree root first (when it is one of the matches), then the
+    # most specific root (nested roots).
+    cands.sort(key=lambda c: (c[0] != hint and c[1] != hint, -len(c[1])))
+    for _n, real_r in cands:
+        if _under(real, real_r):
+            return Path(real), Path(real_r)
+    raise _outside()
+
+
+async def _confine_local_async(path: str, hint_root: str | None = None) -> tuple[Path, Path]:
+    """``_confine_local`` off the event loop (its ``realpath`` calls can stall
+    on a network mount)."""
+    lexical = _lexical_local(path)          # (malformed: refused without a thread hop)
+    roots = _local_roots()
+    if not any(_under(lexical, n) for n in roots) and not any(
+            _under(lexical, h[0]) for n, h in list(_ROOT_REAL.items()) if n in roots):
+        # Under no root by any spelling known so far: the only thing left to
+        # look at is the real path of a root not resolved yet.
+        if all(n in _ROOT_REAL for n in roots):
+            raise _outside()
+    return await asyncio.to_thread(_confine_local, path, hint_root, roots)
+
+
+def _confine_remote(path: str) -> None:
+    """403 unless remote ``path`` (a share or an online collection) sits under
+    a registered remote scan root and has no ``.`` / ``..`` segment (which a
+    share server would resolve above the root)."""
+    if not isinstance(path, str) or any(c in path for c in ("\x00", "\r", "\n")):
+        raise _outside()
+    from soniqboom.core.store import get_store
+    for sd in get_store().list_scan_dirs():
+        r = str(sd.get("path") or "")
+        if not r or not _is_remote(r):
+            continue
+        root = r.rstrip("/")
+        if path == r or path.rstrip("/") == root or path.startswith(root + "/"):
+            rest = path[len(root):]
+            if any(seg in (".", "..") for seg in rest.replace("\\", "/").split("/")):
+                raise _outside()
+            return
+    raise _outside()
+
+
 def _has_audio(path: Path) -> bool:
     """Return True if the directory contains at least one supported audio file (shallow).
 
@@ -208,13 +346,26 @@ def _children(path: Path, root: Path) -> list[dict]:
     Not-yet-indexed folders read as no-audio until the next scan touches
     them — display-only, and self-heals.
     """
+    root_s = str(root)
+    found: list[Path] = []
     try:
-        dirs = sorted(
-            (p for p in path.iterdir() if p.is_dir() and not p.name.startswith(".")),
-            key=lambda p: p.name.lower(),
-        )
-    except PermissionError:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    if not e.is_dir():
+                        continue
+                    # A symlinked folder that leads out of the scan root is not
+                    # listed (browsing it is refused: ``_confine_local``).
+                    if e.is_symlink() and not _under(os.path.realpath(e.path), root_s):
+                        continue
+                except OSError:
+                    continue
+                found.append(Path(e.path))
+    except (PermissionError, FileNotFoundError, NotADirectoryError):
         return []
+    dirs = sorted(found, key=lambda p: p.name.lower())
     from soniqboom.core.store import get_store
     store = get_store()
     return [
@@ -381,7 +532,7 @@ def _remote_list_children(scan_root: str, remote_path: str, source) -> list[dict
 @router.get("/children")
 async def get_children(
     path: str = Query(..., description="Absolute directory path"),
-    root: str = Query(..., description="Scan root this path belongs to"),
+    root: str | None = Query(None, description="Scan root the folder tree browses under"),
 ):
     """Return immediate subdirectories of *path* (lazy expansion).
 
@@ -390,8 +541,12 @@ async def get_children(
     from the response — useful when a scan root is shared with non-audio
     content (photo dumps, build directories, video files) and the user
     just wants to navigate music.
+
+    ``path`` must sit under a registered scan root (403 otherwise — the same
+    answer whether or not it exists).
     """
     if _is_remote(path):
+        _confine_remote(path)
         from soniqboom.core.filesource import find_source_for_path
         result = find_source_for_path(path)
         if not result:
@@ -434,24 +589,25 @@ async def get_children(
     loop = asyncio.get_running_loop()
     from soniqboom.core.store import get_store
     store = get_store()
-    children = _local_children_from_store(store, path, root)
+    # Store-first answers from the index alone (no disk access) — so a lexical
+    # check against the registered roots is all it needs: it can only name
+    # folders that indexed tracks sit in.
+    lexical = _lexical_local(path)
+    for n in _local_roots():
+        if _under(lexical, n):
+            children = _local_children_from_store(store, lexical, n)
+            if children is not None:
+                return {"path": path, "children": children}
+    p, r = await _confine_local_async(path, root)
+    children = _local_children_from_store(store, str(p), str(r))
     if children is not None:
         return {"path": path, "children": children}
 
     # Nothing indexed under this path — fall back to a live listing.  Only now
     # do we touch the filesystem (exists/is_dir + iterdir), which is the slow
     # part on a cold network mount; it covers brand-new and non-audio folders.
-    p = Path(path).resolve()
-    r = Path(root).resolve()
-
     if not p.exists() or not p.is_dir():
         raise HTTPException(404, f"Directory not found: {path}")
-
-    # Safety: path must be inside root
-    try:
-        p.relative_to(r)
-    except ValueError:
-        raise HTTPException(403, "Path is outside scan root")
 
     children = await loop.run_in_executor(None, _children, p, r)
 
@@ -501,31 +657,14 @@ async def refresh_subtree(body: dict):
     if _is_remote(raw):
         return {"queued": False, "reason": "remote — handled by freshness loop"}
 
-    try:
-        p = Path(raw).resolve()
-    except OSError:
-        raise HTTPException(404, f"Path not found: {raw}")
-    if not p.exists() or not p.is_dir():
-        raise HTTPException(404, f"Directory not found: {raw}")
-
     # Confine to registered scan roots — refusing arbitrary paths
     # closes a potential FS-walk DoS vector AND scopes the scan to
-    # what's actually part of the library.
-    from soniqboom.core.store import get_store
-    store = get_store()
-    scan_dirs = [Path(sd["path"]).resolve()
-                 for sd in store.list_scan_dirs()
-                 if not _is_remote(sd["path"])]
-    matched_root: Path | None = None
-    for root in scan_dirs:
-        try:
-            p.relative_to(root)
-            matched_root = root
-            break
-        except ValueError:
-            continue
-    if matched_root is None:
-        raise HTTPException(403, "Path is not under any registered scan root")
+    # what's actually part of the library.  Judged BEFORE the path is looked
+    # at on disk: a path outside every root gets the same 403 whether or not
+    # it exists (no probing the server's file system).
+    p, matched_root = await _confine_local_async(raw)
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(404, f"Directory not found: {raw}")
 
     # One refresh per path per 30 s — back-and-forth clicking between
     # siblings must not stack walks on a network mount.
@@ -568,8 +707,12 @@ async def tracks_in_dir(
     path: str = Query(..., description="Absolute directory path"),
     recursive: bool = Query(False),
 ):
-    """Return track paths found directly in *path* (or recursively)."""
-    p = Path(path).resolve()
+    """Return track paths found directly in *path* (or recursively).  Local
+    folders under a registered scan root only (403 otherwise)."""
+    if _is_remote(path):
+        _confine_remote(path)
+        raise HTTPException(404, f"Directory not found: {path}")
+    p, _root = await _confine_local_async(path)
     if not p.exists() or not p.is_dir():
         raise HTTPException(404, f"Directory not found: {path}")
 
@@ -626,26 +769,49 @@ def _zip_basename(member: str) -> str:
 
 def _scan_zip(zip_path: str) -> list[Path]:
     """Enumerate audio files inside a ZIP (including nested ZIPs)."""
+    from soniqboom.core import archive
     results: list[Path] = []
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            def _head_of(real, _zf=zf):
+                with _zf.open(real) as fh:
+                    return fh.read(archive.HEAD_BYTES)
+            shown: set = set()
+            plain: list = []
             for member in zf.namelist():
                 if _is_junk_filename(_zip_basename(member)):
                     continue
                 if _is_audio(member):
-                    results.append(Path(f"{zip_path}::{member}"))
+                    # (the scanner's name: ``mod.Opus`` as its bytes say)
+                    name = archive.content_name(member, _head_of)
+                    if archive.rejected_by_bytes(member, name, _head_of):
+                        continue
+                    shown.add(name)
+                    results.append(Path(f"{zip_path}::{name}"))
+                elif archive.sniffable(member):
+                    plain.append(member)
                 elif member.lower().endswith(".zip"):
                     # Nested ZIP (e.g. modarchive: outer.zip -> track.it.zip -> track.it)
                     try:
                         inner_data = zf.read(member)
                         with zipfile.ZipFile(io.BytesIO(inner_data), "r") as inner_zf:
+                            def _inner_head(real, _zf=inner_zf):
+                                with _zf.open(real) as fh:
+                                    return fh.read(archive.HEAD_BYTES)
                             for inner_name in inner_zf.namelist():
                                 if _is_junk_filename(_zip_basename(inner_name)):
                                     continue
                                 if _is_audio(inner_name):
-                                    results.append(Path(f"{zip_path}::{member}::{inner_name}"))
+                                    shown = archive.content_name(inner_name, _inner_head)
+                                    if archive.rejected_by_bytes(inner_name, shown, _inner_head):
+                                        continue
+                                    results.append(Path(f"{zip_path}::{member}::{shown}"))
                     except (zipfile.BadZipFile, OSError):
                         pass
+            # (members only their bytes name, as the scanner lists them)
+            for disp in archive.sniffed_members(plain, _head_of,
+                                                taken=shown | set(zf.namelist())):
+                results.append(Path(f"{zip_path}::{disp}"))
     except (zipfile.BadZipFile, OSError):
         pass
     return results
@@ -1667,6 +1833,7 @@ async def tracks_with_meta(
         return _marked(_maybe_paginate(res, offset, limit, recursive))
 
     if _is_remote(path):
+        _confine_remote(path)
         from soniqboom.core import catalogue
         if catalogue.is_catalogue_path(path):
             return await _catalogue_tracks_with_meta(path, recursive, offset, limit,
@@ -1676,7 +1843,7 @@ async def tracks_with_meta(
             result = _drop_duplicate_alternates(result)   # a fresh list per request: nothing to memoise on
         return await _page(result, stable=False)
 
-    p = Path(path).resolve()
+    p, _root = await _confine_local_async(path)
     if not p.exists() or not p.is_dir():
         raise HTTPException(404, f"Directory not found: {path}")
 

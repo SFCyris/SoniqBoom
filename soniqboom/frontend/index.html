@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=115">
+  <link rel="stylesheet" href="/assets/css/app.css?v=118">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -544,6 +544,8 @@
                 role="tab" aria-controls="tab-system" aria-selected="false">&#9881;&#65039; System</button>
         <button class="admin-tab" data-tab="tab-metadata"
                 role="tab" aria-controls="tab-metadata" aria-selected="false">&#127760; Metadata</button>
+        <button class="admin-tab" data-tab="tab-collections"
+                role="tab" aria-controls="tab-collections" aria-selected="false">&#128225; Collections</button>
         <button class="admin-tab admin-tab-admin-only" data-tab="tab-users"
                 role="tab" aria-controls="tab-users" aria-selected="false" hidden>&#128100; Users</button>
         <button class="admin-tab" data-tab="tab-log"
@@ -629,61 +631,6 @@
               </div>
             </div>
             <div id="admin-dir-msg" class="admin-msg" style="display:none"></div>
-          </div>
-
-          <!-- ── External sources ───────────────────────────────────────
-               Public archives listed in the library from their index,
-               fetched only when a tune is played — one switch per source
-               (admin.js loadExternalSources). -->
-          <div class="admin-section" id="admin-external-section">
-            <h3>&#127760; External sources</h3>
-            <p class="admin-hint ext-intro">Add a public music archive to the library without copying it: its tunes are listed from the archive&rsquo;s index and fetched only when you play them.</p>
-            <div class="ext-source" id="ext-source-modland">
-              <div class="admin-setting ext-source-head">
-                <label for="setting-modland-catalog">Modland catalogue</label>
-                <input id="setting-modland-catalog" type="checkbox" disabled
-                       aria-describedby="modland-about modland-status">
-              </div>
-              <p class="admin-hint" id="modland-about">Lists <a href="https://ftp.modland.com/" target="_blank" rel="noopener noreferrer">Modland</a>&rsquo;s module archive &mdash; <span id="modland-about-count">over 300,000</span> tunes of Amiga, C64, Atari&nbsp;ST, console and tracker music &mdash; in a &ldquo;Modland&rdquo; folder, browsable and searchable at once. Nothing is copied: a tune is fetched from Modland when you play it or open its Track Info (for most formats) and, with the setting below, when it is shown in a list — and then plays from the cache. The index is updated daily, weekly, every 2&nbsp;weeks or monthly &mdash; pick how often next to <em>Refresh now</em>. An update downloads only the changes since the last one, usually a few kilobytes; the full index (about 6&nbsp;MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check. The catalogue needs about 1&nbsp;GB of server memory. Thanks to Modland and its maintainers.</p>
-              <div class="ext-source-options" id="modland-options">
-                <div class="admin-setting">
-                  <label for="setting-modland-scope">Tunes</label>
-                  <select id="setting-modland-scope" disabled>
-                    <option value="standard">Everything except the large PC tracker folders</option>
-                    <option value="all">Everything</option>
-                  </select>
-                </div>
-                <div class="admin-setting">
-                  <label for="setting-modland-subsonic">Show catalogue tunes to Subsonic apps <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: Subsonic and DLNA apps don't see the catalogue. Apps that sync or cache a whole library for offline use would download all of it from Modland.">&#9432;</span></label>
-                  <input id="setting-modland-subsonic" type="checkbox" disabled>
-                </div>
-                <div class="admin-setting">
-                  <label for="setting-modland-tune-details">Read details of tunes not played yet <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="A tune's number of tunes, length and tags come from its file. When I open Track Info: that one file is downloaded when you open a tune's Track Info. For tunes shown in lists: SC68, SNDH and console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list are downloaded and read one at a time as well — more downloads from Modland's server, within their own limit that always leaves room for plays. Amiga modules (with the song database) and HVSC SIDs (with HVSC set up) show their number of tunes either way when Modland's checksum list is installed.">&#9432;</span></label>
-                  <select id="setting-modland-tune-details" disabled>
-                    <option value="intent">When I open Track Info</option>
-                    <option value="lists">For tunes shown in lists</option>
-                  </select>
-                </div>
-              </div>
-              <div id="modland-status" class="admin-hint ext-status" role="status" aria-live="polite">Off.</div>
-              <progress id="modland-progress" class="ext-progress" max="1" value="0" hidden
-                        aria-label="Building the Modland catalogue"></progress>
-              <div class="admin-io-row ext-refresh-row">
-                <button id="btn-modland-refresh" class="btn-secondary" disabled>Refresh now</button>
-                <select id="setting-modland-interval" class="ext-interval" aria-label="How often to update the index"
-                        aria-describedby="modland-interval-tip" title="How often the index is updated" disabled>
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                  <option value="biweekly">Every 2 weeks</option>
-                  <option value="monthly">Monthly</option>
-                </select>
-                <span class="setting-info ext-interval-info" tabindex="0" role="img"
-                      aria-label="About index updates" aria-describedby="modland-interval-tip"
-                      data-tip="An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.">&#9432;</span>
-                <span id="modland-interval-tip" hidden>An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.</span>
-              </div>
-              <div id="modland-msg" class="admin-msg" style="display:none"></div>
-            </div>
           </div>
 
           <!-- ── FTP Connection Pools ──────────────────────────────────
@@ -834,7 +781,7 @@
               </div>
               <div class="renderer-item" id="renderer-hvl2wav">
                 <span class="renderer-icon" id="renderer-icon-hvl2wav">&#8943;</span>
-                <span class="renderer-name">AHX / Hively (bundled hvl2wav)</span>
+                <span class="renderer-name">Hively, AHX song lengths (bundled hvl2wav)</span>
                 <span class="renderer-version" id="renderer-version-hvl2wav"></span>
               </div>
               <div class="renderer-item" id="renderer-gme">
@@ -923,7 +870,7 @@
               <li><span class="cache-type">MIDI</span>     <span class="cache-bytes" id="cache-bytes-midi">—</span></li>
               <li><span class="cache-type">Tracker</span>  <span class="cache-bytes" id="cache-bytes-tracker">—</span></li>
               <li><span class="cache-type">Amiga (UADE)</span> <span class="cache-bytes" id="cache-bytes-uade">—</span></li>
-              <li><span class="cache-type">AHX / Hively</span> <span class="cache-bytes" id="cache-bytes-hvl">—</span></li>
+              <li><span class="cache-type">Hively</span> <span class="cache-bytes" id="cache-bytes-hvl">—</span></li>
               <li><span class="cache-type">Chiptune (GME)</span> <span class="cache-bytes" id="cache-bytes-gme">—</span></li>
               <li><span class="cache-type">AdLib</span>    <span class="cache-bytes" id="cache-bytes-adlib">—</span></li>
               <li><span class="cache-type">IMF</span>      <span class="cache-bytes" id="cache-bytes-imf">—</span></li>
@@ -1006,9 +953,9 @@
           <div class="admin-section admin-sid-fidelity">
             <h3>&#127911; SID fidelity</h3>
             <p class="admin-hint" style="margin-bottom:12px">
-              Chip and filter options passed to sidplayfp.  Changes apply to
-              future renders immediately (no restart); tunes already in the
-              render cache keep their old sound until re-rendered.
+              Chip and filter options passed to sidplayfp.  Changes apply from
+              the next play of each tune, with no restart — tunes rendered with
+              the old settings are rendered again.
             </p>
             <div class="admin-setting">
               <label for="setting-sid-model">SID chip model
@@ -1520,6 +1467,64 @@
             </div>
           </div>
 
+        </div>
+
+        <!-- Tab: Online collections — public archives listed in the library
+             from their index, fetched only when a tune is played (Modland:
+             admin.js loadModlandStatus; the others: loadOnlineCollections). -->
+        <div class="admin-tab-pane" id="tab-collections">
+          <p class="admin-hint ext-intro">Add a public music archive to the library without copying it: its tunes are listed from the archive&rsquo;s index and fetched only when you play them or open their Track Info. Each one is a folder in the library, browsable and searchable at once, and off until you switch it on.</p>
+          <div class="admin-section" id="admin-external-section">
+            <h3>&#127760; Modland</h3>
+            <div class="ext-source" id="ext-source-modland">
+              <div class="admin-setting ext-source-head">
+                <label for="setting-modland-catalog">Modland catalogue</label>
+                <input id="setting-modland-catalog" type="checkbox" disabled
+                       aria-describedby="modland-about modland-status">
+              </div>
+              <p class="admin-hint" id="modland-about">Lists <a href="https://ftp.modland.com/" target="_blank" rel="noopener noreferrer">Modland</a>&rsquo;s module archive &mdash; <span id="modland-about-count">over 300,000</span> tunes of Amiga, C64, Atari&nbsp;ST, console and tracker music &mdash; in a &ldquo;Modland&rdquo; folder, browsable and searchable at once. Nothing is copied: a tune is fetched from Modland when you play it or open its Track Info (for most formats) and, with the setting below, when it is shown in a list — and then plays from the cache. The index is updated daily, weekly, every 2&nbsp;weeks or monthly &mdash; pick how often next to <em>Refresh now</em>. An update downloads only the changes since the last one, usually a few kilobytes; the full index (about 6&nbsp;MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check. The catalogue needs about 1&nbsp;GB of server memory. Thanks to Modland and its maintainers.</p>
+              <div class="ext-source-options" id="modland-options">
+                <div class="admin-setting">
+                  <label for="setting-modland-scope">Tunes</label>
+                  <select id="setting-modland-scope" disabled>
+                    <option value="standard">Everything except the large PC tracker folders</option>
+                    <option value="all">Everything</option>
+                  </select>
+                </div>
+                <div class="admin-setting">
+                  <label for="setting-modland-subsonic">Show catalogue tunes to Subsonic apps <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Off: Subsonic and DLNA apps don't see the catalogue. Apps that sync or cache a whole library for offline use would download all of it from Modland.">&#9432;</span></label>
+                  <input id="setting-modland-subsonic" type="checkbox" disabled>
+                </div>
+                <div class="admin-setting">
+                  <label for="setting-modland-tune-details">Read details of tunes not played yet <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="A tune's number of tunes, length and tags come from its file. When I open Track Info: that one file is downloaded when you open a tune's Track Info. For tunes shown in lists: SC68, SNDH and console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list are downloaded and read one at a time as well — more downloads from Modland's server, within their own limit that always leaves room for plays. Amiga modules (with the song database) and HVSC SIDs (with HVSC set up) show their number of tunes either way when Modland's checksum list is installed.">&#9432;</span></label>
+                  <select id="setting-modland-tune-details" disabled>
+                    <option value="intent">When I open Track Info</option>
+                    <option value="lists">For tunes shown in lists</option>
+                  </select>
+                </div>
+              </div>
+              <div id="modland-status" class="admin-hint ext-status" role="status" aria-live="polite">Off.</div>
+              <progress id="modland-progress" class="ext-progress" max="1" value="0" hidden
+                        aria-label="Building the Modland catalogue"></progress>
+              <div class="admin-io-row ext-refresh-row">
+                <button id="btn-modland-refresh" class="btn-secondary" aria-label="Refresh now (Modland)" disabled>Refresh now</button>
+                <select id="setting-modland-interval" class="ext-interval" aria-label="How often to update the index (Modland)"
+                        aria-describedby="modland-interval-tip" title="How often the index is updated" disabled>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="biweekly">Every 2 weeks</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+                <span class="setting-info ext-interval-info" tabindex="0" role="img"
+                      aria-label="About index updates" aria-describedby="modland-interval-tip"
+                      data-tip="An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.">&#9432;</span>
+                <span id="modland-interval-tip" hidden>An update downloads only Modland’s changes since the last one — usually a few kilobytes. The full index (about 6 MB) is downloaded only when needed: the first time you switch the catalogue on, after a large reorganisation, and about once a month as a check.</span>
+              </div>
+              <div id="modland-msg" class="admin-msg" style="display:none"></div>
+            </div>
+          </div>
+
+          <div id="online-collections-list"></div>
         </div>
 
         <!-- Tab: Users (admin only) -->
@@ -2532,8 +2537,6 @@
         <div class="shortcuts-col">
           <h4>Playback</h4>
           <div class="sc-row"><kbd>Space</kbd><span>Play / Pause</span></div>
-          <div class="sc-row"><kbd>⌘ →</kbd><span>Next track</span></div>
-          <div class="sc-row"><kbd>⌘ ←</kbd><span>Previous track</span></div>
           <div class="sc-row"><kbd>↑</kbd><span>Volume up</span></div>
           <div class="sc-row"><kbd>↓</kbd><span>Volume down</span></div>
           <div class="sc-row"><kbd>M</kbd><span>Mute / Unmute</span></div>
@@ -2545,22 +2548,23 @@
         <div class="shortcuts-col">
           <h4>Navigation</h4>
           <div class="sc-row"><kbd>/</kbd><span>Focus search</span></div>
-          <div class="sc-row"><kbd>Escape</kbd><span>Close overlay / Clear search</span></div>
+          <div class="sc-row"><kbd>Escape</kbd><span>Close Track Info, an overlay or the search preview; leave radio</span></div>
           <div class="sc-row"><kbd>E</kbd><span>Toggle equalizer</span></div>
           <div class="sc-row"><kbd>Q</kbd><span>Toggle queue</span></div>
           <div class="sc-row"><kbd>I</kbd><span>Track info</span></div>
+          <div class="sc-row"><kbd>← / →</kbd><span>Previous / next track in Track Info</span></div>
           <div class="sc-row"><kbd>V</kbd><span>Toggle visualizer mode</span></div>
           <div class="sc-row"><kbd>1–6</kbd><span>Library views (All, Artists, …)</span></div>
           <div class="sc-row"><kbd>⌥ 1–6</kbd><span>Smart views (History, Most Played, …)</span></div>
         </div>
         <div class="shortcuts-col">
           <h4>Library</h4>
-          <div class="sc-row"><kbd>/</kbd><span>Focus search</span></div>
           <div class="sc-row"><kbd>Enter</kbd><span>Play selected</span></div>
           <div class="sc-row"><kbd>A</kbd><span>Add focused to queue</span></div>
           <div class="sc-row"><kbd>J / K</kbd><span>Navigate tracks down / up</span></div>
-          <div class="sc-row"><kbd>H</kbd><span>Toggle history view</span></div>
-          <div class="sc-row"><kbd>D</kbd><span>Toggle duplicates view</span></div>
+          <div class="sc-row"><kbd>G</kbd><span>Locate the playing track</span></div>
+          <div class="sc-row"><kbd>H</kbd><span>Open the history view</span></div>
+          <div class="sc-row"><kbd>D</kbd><span>Open the duplicates view</span></div>
           <div class="sc-row"><kbd>?</kbd><span>Show this help</span></div>
         </div>
       </div>
@@ -2572,7 +2576,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=184"></script>
+  <script type="module" src="/assets/js/app.js?v=195"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

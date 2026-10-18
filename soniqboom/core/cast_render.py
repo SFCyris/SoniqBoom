@@ -60,6 +60,8 @@ _TRACKER_EXTS = {
     ".669", ".dbm", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
 }
+from soniqboom.core.metadata import OPENMPT_EXTRA_EXTS as _OPENMPT_EXTRA_EXTS  # noqa: E402
+_TRACKER_EXTS |= _OPENMPT_EXTRA_EXTS          # (.ftm where libopenmpt reads it)
 # Stream-supported libgme containers (matches _GME_EXTS_STREAM in stream.py).
 _GME_EXTS = {
     ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
@@ -160,7 +162,9 @@ async def materialize_source(
     any miss so callers degrade gracefully.
     """
     try:
-        outer, sep, member = track_path.partition("::")
+        from soniqboom.core.filesource import split_member
+        _sp = split_member(track_path)
+        outer, sep, member = (_sp[0], "::", _sp[1]) if _sp else (track_path, "", "")
         if is_remote_path(outer):
             # Mirror ONLY the OUTER remote file (the module itself, or the
             # archive that contains it) into the local remote-cache first.
@@ -173,7 +177,7 @@ async def materialize_source(
             # cast lookahead, ``lane="scan"``) read only what is cached; the
             # cast play itself opened its fetch window (cast_stream).
             from soniqboom.core import catalogue
-            if lane != "stream" and not catalogue.fetch_ok(outer, "scan"):
+            if lane != "stream" and not catalogue.fetch_ok(track_path, "scan"):
                 return None
             # No source (not connected, or its sign-in refused): what the
             # remote cache holds still plays.

@@ -689,6 +689,9 @@ def refresh_index(dump_path: Path | None = None) -> dict:
     """
     if _status["refreshing"]:
         return status()
+    from soniqboom.core import netpolicy
+    if dump_path is None and netpolicy.blocked(DUMP_URL):
+        return {**status(), "error": "Offline mode is on — the Demozoo index can't be downloaded"}
     _status.update(refreshing=True, error=None)
     tmp: Path | None = None
     try:
@@ -1228,6 +1231,8 @@ async def fetch_scener_details(releaser_id: int) -> dict | None:
     url = f"https://demozoo.org/api/v1/releasers/{rid}/"
 
     def _get() -> dict:
+        from soniqboom.core import netpolicy
+        netpolicy.check(url)
         req = urllib.request.Request(
             url, headers={"User-Agent": "SoniqBoom (+demozoo artist enrichment)"})
         with urllib.request.urlopen(req, timeout=8) as r:  # noqa: S310 — fixed HTTPS host
@@ -1318,6 +1323,8 @@ async def fetch_scener_productions(releaser_id: int) -> list[dict] | None:
         url: str | None = f"{_API_BASE}releasers/{rid}/productions/"
         pages = 0
         while url and pages < _PROD_PAGE_CAP:
+            from soniqboom.core import netpolicy
+            netpolicy.check(url)
             req = urllib.request.Request(
                 url, headers={"User-Agent": "SoniqBoom (+demozoo discography)"})
             with urllib.request.urlopen(req, timeout=8) as r:  # noqa: S310 — fixed HTTPS host
@@ -1384,6 +1391,8 @@ async def fetch_production_detail(production_id: int) -> dict | None:
         pass
 
     def _get() -> dict:
+        from soniqboom.core import netpolicy
+        netpolicy.check(_API_BASE)
         req = urllib.request.Request(
             f"{_API_BASE}productions/{pid}/",
             headers={"User-Agent": "SoniqBoom (+demozoo production)"})

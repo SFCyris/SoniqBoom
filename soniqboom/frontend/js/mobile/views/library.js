@@ -15,12 +15,19 @@
 import { Player } from '../../player.js';
 import { attachRowGestures, attachListGestures, attachDragReorder } from '../gestures.js';
 import { fmtDur, esc, trackActions, playlistEntry } from './_common.js';
-import { artPlaceholderEmoji, probeAdlibDurations } from '../../utils.js';
+import { artPlaceholderEmoji, probeAdlibDurations, staticArtUrl } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
 import { offlineKind, offlineBadge, Offline } from '../../offline.js';
 import { healthBadge } from '../../health.js';
 
 const PAGE_SIZE = 100;
+
+// The track the now-playing highlight shows: the current one, unless its start
+// failed (nothing plays) — ``Player.nowPlayingId``; an older cached player.js:
+// the current one.
+function _nowPlayingId() {
+  return ('nowPlayingId' in Player) ? Player.nowPlayingId : Player.currentTrackId;
+}
 
 export function mountLibrary(root, ctx) {
   // ── State ────────────────────────────────────────────────────────────
@@ -90,7 +97,7 @@ export function mountLibrary(root, ctx) {
         <span class="m-row-chev" style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
         <div class="m-row-handle">☰</div>
       </div>`;
-    // No cover (404) / not decoded: the img stays transparent over the glyph.
+    // No cover (204) / not decoded: the img stays transparent over the glyph.
     const img = row.querySelector('img');
     img.onload  = () => img.classList.add('loaded');
     img.onerror = () => img.classList.remove('loaded');
@@ -164,12 +171,12 @@ export function mountLibrary(root, ctx) {
     }
     const t = tracks[idx];
     if (!t) return;
-    row.classList.toggle('playing', !!t.id && t.id === Player.currentTrackId);
+    row.classList.toggle('playing', !!t.id && t.id === _nowPlayingId());
     if (!fresh && row.__item === t) return;
     row.__item = t;
     if (t.id) row.dataset.trackId = t.id; else delete row.dataset.trackId;
     // Art: the emoji placeholder always paints; the cover fades in over it.
-    setArt(row, artPlaceholderEmoji(t), t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : ''));
+    setArt(row, artPlaceholderEmoji(t), staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : ''));
     setTitle(row, t.title || '—', healthBadge(t), offlineKind(t));
     row.querySelector('.m-row-meta .m-row-artist').textContent = t.artist || t.album_artist || '';
     const trail = row.querySelector('.m-row-trail');
@@ -267,6 +274,22 @@ export function mountLibrary(root, ctx) {
     for (const t of tracks) if (t && want.has(t.id)) { Object.assign(t, d.fields || {}); hit = true; }
     if (!hit) return;
     for (const row of vl.rows()) row.__item = null;
+    vl.render(true);
+  });
+
+  // Rows of an online collection that left the library (a package with no
+  // tune in it — app.js _tracksLeft): the open list drops them in place.  The
+  // server's list shrank with it: the next page starts that many rows earlier.
+  document.addEventListener('soniqboom:tracks-left', (e) => {
+    const ids = new Set(((e && e.detail) || {}).ids || []);
+    if (!ids.size || (mode !== 'tracks' && mode !== 'pltracks')) return;
+    const before = tracks.length;
+    tracks = tracks.filter((t) => !(t && ids.has(t.id)));
+    const gone = before - tracks.length;
+    if (!gone) return;
+    if (mode === 'tracks') offset = Math.max(0, offset - gone);
+    for (const row of vl.rows()) row.__item = null;
+    vl.setCount(tracks.length);
     vl.render(true);
   });
 
@@ -678,12 +701,13 @@ export function mountLibrary(root, ctx) {
   // rows filled later take the state in fillRow.
   function markPlaying() {
     if (mode !== 'tracks' && mode !== 'pltracks') return;
-    const cur = Player.currentTrackId;
+    const cur = _nowPlayingId();
     for (const row of vl.rows()) {
       row.classList.toggle('playing', !!cur && row.dataset.trackId === cur);
     }
   }
   Player.on('trackchange', markPlaying);
+  Player.on('statechange', markPlaying);       // (a start that failed: no row is lit)
 
   // First render
   render();

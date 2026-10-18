@@ -61,6 +61,68 @@ def is_remote_path(path) -> bool:
     return s.startswith(REMOTE_SCHEMES) or s[:10].lower().startswith(REMOTE_SCHEMES)
 
 
+def _is_container_name(name: str) -> bool:
+    """A file name SoniqBoom opens as a container of tracks (a ZIP / LHA /
+    LZH archive or a disk image)."""
+    from soniqboom.core import archive, diskimage
+    return archive.is_archive_name(name) or diskimage.is_disk_image(name)
+
+
+def split_member(path) -> "tuple[str, str] | None":
+    """``(container, member)`` of an archive-member path — or None when
+    ``path`` is no member.
+
+    The split is at the first ``::`` whose left side ends in an archive or
+    disk-image file name (``…/a.zip::b.mod`` → ``(…/a.zip, b.mod)``;
+    ``…/a.zip::n.zip::b.mod`` → ``(…/a.zip, n.zip::b.mod)``).  A folder or
+    file whose name merely contains ``::`` (``Artist :: Album/x.mod``) is a
+    real path: ``/Artist :: Album/a.zip::b.mod`` splits at the archive, and
+    ``/Artist :: Album/x.mod`` is no member at all."""
+    s = str(path or "")
+    i = s.find("::")
+    while i >= 0:
+        head = s[:i]
+        name = head.replace("\\", "/").rsplit("/", 1)[-1]
+        if name:
+            try:
+                if _is_container_name(name):
+                    return head, s[i + 2:]
+            except Exception:                               # noqa: BLE001
+                return head, s[i + 2:]
+        i = s.find("::", i + 1)
+    return None
+
+
+def member_container(path) -> str:
+    """The real file a path lives in: an archive member's archive (see
+    ``split_member``), else the path itself."""
+    sp = split_member(path)
+    return sp[0] if sp is not None else str(path or "")
+
+
+def is_member_path(path) -> bool:
+    """Is ``path`` a member of an archive or disk image (``split_member``)?"""
+    return "::" in str(path or "") and split_member(path) is not None
+
+
+# Folders NAS systems and operating systems keep for themselves — thumbnails
+# and index data (Synology ``@eaDir``, QNAP ``.@__thumb``), recycle bins and
+# snapshots, file-system recovery, macOS / netatalk metadata.  Remote walks
+# neither list nor index them.
+_SYSTEM_FOLDER_NAMES = frozenset({
+    "@eadir", "#recycle", "#snapshot", "@recycle", "@recently-snapshot",
+    ".@__thumb", ".appledouble", "lost+found", "system volume information",
+    "$recycle.bin", ".spotlight-v100", ".fseventsd", ".temporaryitems",
+})
+
+
+def is_system_folder(name) -> bool:
+    """A folder kept by the NAS / operating system (``_SYSTEM_FOLDER_NAMES``,
+    ``.Trash*``), never one of the library's."""
+    n = str(name or "").strip().lower()
+    return n in _SYSTEM_FOLDER_NAMES or n.startswith(".trash")
+
+
 def scan_root_for_share(share: dict) -> str:
     """The scan-root URL a configured network share is registered under —
     the key of ``scan_dirs``, the source registry and every track path
@@ -282,6 +344,35 @@ _TOO_MANY_CLIENTS_PATTERNS = (
 )
 
 
+# FTP replies that refuse the FILE, not the connection: 550 (not found / no
+# access), 551, 552 (exceeded storage), 553 (name not allowed), 554.
+_FTP_FILE_REFUSED = frozenset({"550", "551", "552", "553", "554"})
+# NTSTATUS of the same kind: ACCESS_DENIED, OBJECT_NAME_NOT_FOUND,
+# OBJECT_PATH_NOT_FOUND, NO_SUCH_FILE, FILE_IS_A_DIRECTORY, DELETE_PENDING (a
+# sharing violation — another reader — is not: it passes).
+_SMB_FILE_REFUSED = frozenset({0xC0000022, 0xC0000034, 0xC000003A, 0xC000000F,
+                               0xC00000BA, 0xC0000056})
+
+
+def is_permanent_fetch_error(exc: BaseException | None) -> bool:
+    """Does reading a file fail the same way every time it is tried — the
+    server refuses that file (FTP 550-554, SMB access denied / not found,
+    HTTP 403/404/410/451), it is gone, or it is not readable here — as
+    opposed to a connection that dropped or timed out?"""
+    if exc is None:
+        return False
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError,
+                        NotADirectoryError)):
+        return True
+    if isinstance(exc, ftplib.error_perm):
+        return str(exc)[:3] in _FTP_FILE_REFUSED
+    if _smb_status(exc) in _SMB_FILE_REFUSED:
+        return True
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    return isinstance(code, int) and code in (403, 404, 410, 451)
+
+
 class FTPLoginRefused(ftplib.error_perm):
     """The server refused the LOGIN (530 that isn't a too-many-clients reply)
     — raised by the pool's connection factory only, so a mid-session
@@ -422,6 +513,46 @@ class _FileObjStream(SourceStream):
                 pass
 
 
+_WALK_MAX_DEPTH = 64          # folders below this depth are not walked (a loop's backstop)
+
+
+class _LoopGuard:
+    """Stops a walk from following a folder back up the tree — a symbolic
+    link the server reports as a folder (``All -> .``, ``Up -> ..``), which
+    would otherwise be walked without end.  Such a folder lists exactly what
+    a folder above it lists (the same names, sizes and times, its own entry
+    among them), which no real folder below another can; it is left out.
+    Past ``_WALK_MAX_DEPTH`` levels a walk goes no deeper (reported as a
+    failed listing: what is stored there is kept)."""
+
+    def __init__(self) -> None:
+        self.sigs: dict[str, int] = {}
+        self.warned = False
+
+    @staticmethod
+    def depth(path: str) -> int:
+        p = (path or "").strip("/")
+        return p.count("/") + 1 if p else 0
+
+    def is_loop(self, path: str, entries) -> bool:
+        sig = hash(tuple(sorted((e.name, bool(e.is_dir), int(e.size or 0),
+                                 round(float(e.mtime or 0.0), 3)) for e in entries)))
+        key = "/" + (path or "").strip("/")
+        self.sigs[key] = sig
+        if not entries:
+            return False
+        p = key
+        while p != "/":
+            p = p.rsplit("/", 1)[0] or "/"
+            if self.sigs.get(p) == sig:
+                if not self.warned:
+                    self.warned = True
+                    log.warning("Remote walk: %s lists exactly what %s does — a link back "
+                                "up the tree; not walked", key, p)
+                return True
+        return False
+
+
 class FileSource(ABC):
     """Abstract filesystem source."""
 
@@ -478,14 +609,21 @@ class FileSource(ABC):
         every byte" into "list everything, fetch what changed."
         """
         stack = [top]
+        guard = _LoopGuard()
         while stack:
             current = stack.pop()
+            if guard.depth(current) > _WALK_MAX_DEPTH:
+                if error_sink is not None:
+                    error_sink.append((current, "too deep"))
+                continue
             try:
                 entries = self.list_dir(current)
             except Exception as exc:
                 log.warning("walk_with_stat: list_dir(%s) failed: %s", current, exc)
                 if error_sink is not None:
                     error_sink.append((current, str(exc)))
+                continue
+            if guard.is_loop(current, entries):
                 continue
             dir_entries = [e for e in entries if e.is_dir]
             file_entries = [e for e in entries if not e.is_dir]
@@ -570,6 +708,11 @@ class FileSource(ABC):
     @abstractmethod
     def is_dir(self, path: str) -> bool:
         """Check if path is an accessible directory."""
+
+    def serving_transfers(self, within: float = 15.0) -> bool:
+        """Is the source moving file data right now (a probe queued behind
+        it timing out means "busy", not "gone")?  Pooled backends override."""
+        return False
 
     def close(self) -> None:
         """Release any held connections gracefully.
@@ -715,6 +858,44 @@ def _smb_status(exc: BaseException | None) -> int | None:
         exc = exc.__cause__ or exc.__context__
         seen += 1
     return None
+
+
+_SMB_ATTR_DIRECTORY = 0x10                       # FILE_ATTRIBUTE_DIRECTORY
+# STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_NO_SUCH_FILE
+_SMB_NOT_FOUND = frozenset({0xC0000034, 0xC000003A, 0xC000000F})
+
+
+def _smb_link_failure(exc: BaseException) -> bool:
+    """Is ``exc`` (following a symbolic link) about that LINK — its target
+    gone, refused or out of reach (``SMBLinkRedirectionError``: another
+    server or drive, ``STATUS_STOPPED_ON_SYMLINK``) — rather than about the
+    connection (a dropped session / tree, a socket error, a timeout)?"""
+    if type(exc).__name__ == "SMBLinkRedirectionError":
+        return True
+    status = _smb_status(exc)
+    if status is not None:
+        return status not in (_SMB_TREE_GONE | _SMB_SESSION_GONE)
+    return isinstance(exc, (FileNotFoundError, PermissionError, NotADirectoryError,
+                            IsADirectoryError))
+
+
+def _smb_epoch(value) -> float:
+    """A listing's ``last_write_time`` (a UTC ``datetime`` from smbprotocol,
+    or a FILETIME / epoch number) as Unix epoch seconds; 0.0 when unknown."""
+    import datetime as _dt
+    try:
+        if isinstance(value, _dt.datetime):
+            if value.year >= 9999 or value.year < 1971:
+                return 0.0
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=_dt.timezone.utc)
+            return float(value.timestamp())
+        v = float(value or 0)
+        if v > 1e14:                                  # 100-ns ticks since 1601
+            v = (v - 116444736000000000) / 1e7
+        return v if v > 0 else 0.0
+    except (TypeError, ValueError, OverflowError, OSError):
+        return 0.0
 
 
 def _smb_force_close(conn) -> None:
@@ -1105,7 +1286,21 @@ class SMBFileSource(FileSource):
         return f"\\\\{self._host}\\{self._share}\\{rel}".replace("/", "\\")
 
     def _to_posix(self, smb_path: str) -> str:
-        return "/" + smb_path.split("\\", 3)[-1].replace("\\", "/") if "\\" in smb_path else smb_path
+        """``\\\\host\\share\\A\\B`` → the share-relative ``/A/B`` (``/`` for
+        the share itself).  smbclient builds an entry's path as the listed
+        folder's path + ``\\`` + name, so the share root's entries carry a
+        doubled separator (``\\\\host\\share\\\\A``) — empty parts are dropped."""
+        if "\\" not in smb_path:
+            return smb_path
+        parts = [p for p in smb_path.split("\\") if p]
+        # parts[0] = host, parts[1] = share, the rest = the path in the share
+        return "/" + "/".join(parts[2:])
+
+    @staticmethod
+    def _child(parent: str, name: str) -> str:
+        """The share-relative path of entry ``name`` of folder ``parent``."""
+        base = "/".join(p for p in str(parent or "").replace("\\", "/").split("/") if p)
+        return f"/{base}/{name}" if base else f"/{name}"
 
     def walk(self, top: str) -> Iterator[tuple[str, list[str], list[str]]]:
         import smbclient
@@ -1115,6 +1310,12 @@ class SMBFileSource(FileSource):
             yield self._to_posix(dirpath), dirnames, filenames
 
     def list_dir(self, path: str) -> list[DirEntry]:
+        """One folder's entries, with the size and modification time the
+        listing reply (``FileIdFullDirectoryInformation``) already carries —
+        one request per folder, none per entry.  Only a symbolic link needs
+        one more (its target's facts); a link whose target is gone is left
+        out, and any other failure of that request fails the listing, never
+        drops the entry from an otherwise complete one."""
         import smbclient
         smb_path = self._smb_path(path)
 
@@ -1122,19 +1323,45 @@ class SMBFileSource(FileSource):
             entries: list[DirEntry] = []
             with smbclient.scandir(smb_path, **kw) as it:
                 for e in it:
-                    try:
-                        st = e.stat()
-                        entries.append(DirEntry(
-                            name=e.name,
-                            path=self._to_posix(e.path),
-                            is_dir=e.is_dir(),
-                            size=st.st_size,
-                            mtime=st.st_mtime,
-                        ))
-                    except OSError:
-                        continue
+                    entry = self._entry_of(path, e)
+                    if entry is not None:
+                        entries.append(entry)
             return entries
         return self._call(_list)
+
+    def _entry_of(self, parent: str, e) -> "DirEntry | None":
+        import stat as _stat
+        name = e.name
+        info = getattr(e, "smb_info", None)
+        link = False
+        if info is not None:
+            try:
+                link = bool(e.is_symlink())
+            except OSError:
+                link = True
+        if info is None or link:
+            # A symbolic link (or an entry without listing facts): its
+            # target's facts, one request.  A failure of the connection fails
+            # the listing; a link that can't be followed (its target gone or
+            # refused, on another server or drive) is listed by its own facts
+            # as a file — kept, never walked into — the same at every walk.
+            try:
+                st = e.stat()
+            except Exception as exc:                        # noqa: BLE001
+                if info is None or not _smb_link_failure(exc):
+                    raise
+                if isinstance(exc, FileNotFoundError) or _smb_status(exc) in _SMB_NOT_FOUND:
+                    return None                 # a link to nothing: nothing to list
+                return DirEntry(name=name, path=self._child(parent, name), is_dir=False,
+                                size=int(info.end_of_file or 0),
+                                mtime=_smb_epoch(info.last_write_time))
+            return DirEntry(name=name, path=self._child(parent, name),
+                            is_dir=_stat.S_ISDIR(st.st_mode),
+                            size=int(st.st_size or 0), mtime=float(st.st_mtime or 0.0))
+        is_dir = bool(int(info.file_attributes) & _SMB_ATTR_DIRECTORY)
+        return DirEntry(name=name, path=self._child(parent, name), is_dir=is_dir,
+                        size=0 if is_dir else int(info.end_of_file or 0),
+                        mtime=_smb_epoch(info.last_write_time))
 
     def read_file(self, path: str, *, lane: str = "stream") -> bytes:
         # SMB has no pooled-connection lane semantics today; ``lane`` is
@@ -2524,13 +2751,26 @@ def _mlsd_unsupported(exc: Exception) -> bool:
     return str(exc).strip()[:3] in _MLSD_UNSUPPORTED_CODES
 
 
+# (host, port) → monotonic time the last data bytes of a transfer arrived
+# (any pool / lane / encoding of that server).  The share health probe takes
+# a probe that timed out behind transfers that are moving as a busy share,
+# not a missing one (``FTPFileSource.serving_transfers``).
+_FTP_PROGRESS: dict[tuple[str, int], float] = {}
+
+
+def _note_ftp_progress(key: tuple[str, int]) -> None:
+    _FTP_PROGRESS[key] = time.monotonic()
+
+
 class _FTPStream(SourceStream):
     """A ``RETR`` (from a ``REST`` offset) read off the data socket.  Holds
     its pooled connection until closed — an early close ``ABOR``s the
     transfer, a desynced control channel retires the connection."""
 
-    def __init__(self, borrow_cm, handle: "_PooledFTP", sock, size: int | None) -> None:
+    def __init__(self, borrow_cm, handle: "_PooledFTP", sock, size: int | None,
+                 progress_key: "tuple[str, int] | None" = None) -> None:
         self.size = size
+        self._progress_key = progress_key
         self._cm = borrow_cm
         self._handle = handle
         self._sock = sock
@@ -2546,6 +2786,8 @@ class _FTPStream(SourceStream):
         except BaseException:
             self._failed = True
             raise
+        if chunk and self._progress_key is not None:
+            _note_ftp_progress(self._progress_key)
         if not chunk:
             # The data socket closing is not proof the file is complete: a
             # server that aborts the transfer (426, 451 …) closes it too.  The
@@ -2622,6 +2864,10 @@ class FTPFileSource(FileSource):
         # mutations, never the socket round-trip, so listings still parallelise.
         self._mlsd_lock = threading.Lock()
         self._encoding: str = "utf-8"  # downgraded to latin-1 on decode errors
+        # Folders listed by LIST (the MLSD fallback) — most servers' LIST
+        # hides dot-files and dot-folders an MLSD listing shows: a walk with
+        # LIST listings does not take their absence for a deletion (scanner).
+        self.list_listings = 0
 
     @property
     def _pool(self) -> _FTPConnectionPool:
@@ -2674,9 +2920,14 @@ class FTPFileSource(FileSource):
             raise ValueError(
                 "FTP path contains illegal control characters (CR/LF/NUL)",
             )
-        if path.startswith(self._remote_path):
-            return path
+        # ``path`` is ROOT-RELATIVE (every caller's frame: stored track paths,
+        # walk entries, browse paths).  It is never taken for a server path
+        # because it happens to start with the remote path's spelling: with
+        # remote path ``/Music`` a sub-folder ``/Music`` is ``/Music/Music``
+        # and ``/Musicals`` is ``/Music/Musicals``.
         rel = path.lstrip("/")
+        if self._remote_path == "/":
+            return f"/{rel}"
         return f"{self._remote_path}/{rel}" if rel else self._remote_path
 
     # ── Directory listing with MLSD → LIST fallback ────────────────────────
@@ -2765,18 +3016,15 @@ class FTPFileSource(FileSource):
         # listing to LIST (which reports mtime=0) and breaking incremental
         # scan-skip.  Archive contents are enumerated by the archive layer,
         # never by FTP LIST.
-        if "::" in path:
+        if is_member_path(path):
             # Refuse to FTP-list only GENUINE archive / disk-image interiors.
             # A benign user directory that merely CONTAINS "::" in its name
             # (e.g. "Artist :: Album", "Live :: 1998") IS a real, listable
             # server directory and must NOT be short-circuited — doing so
             # makes its whole subtree invisible in the browser and unscanned
             # by the indexer (every track inside silently missing).
-            from soniqboom.core import archive as _archive
-            from soniqboom.core import diskimage as _diskimage
-            outer = path.split("::", 1)[0]
-            if _archive.is_archive_name(outer) or _diskimage.is_disk_image(outer):
-                return []
+            return []
+        # ``path`` is root-relative; so are the paths of the entries returned.
         abs_path = self._abs(path)
 
         # Periodic re-probe (under the latch lock): a source latched to LIST is
@@ -2800,13 +3048,13 @@ class FTPFileSource(FileSource):
             try:
                 entries = self._list_via_mlsd(abs_path, lane)
                 self._mark_mlsd_ok()          # success → consistent "MLSD on" state
-                return entries
+                return self._rooted(entries)
             except UnicodeDecodeError:
                 self._switch_encoding_latin1()
                 try:
                     entries = self._list_via_mlsd(abs_path, lane)
                     self._mark_mlsd_ok()
-                    return entries
+                    return self._rooted(entries)
                 except Exception as exc:
                     self._note_mlsd_failure(exc)
                     log.info("MLSD failed on %s (%s), using LIST fallback",
@@ -2828,11 +3076,11 @@ class FTPFileSource(FileSource):
         # is recorded in ``error_sink`` as a ROOT-RELATIVE dir path so the
         # scanner can protect exactly that subtree's tracks from ghost cleanup.
         try:
-            return self._list_via_list(abs_path, lane)
+            return self._rooted(self._list_via_list(abs_path, lane))
         except UnicodeDecodeError:
             self._switch_encoding_latin1()
             try:
-                return self._list_via_list(abs_path, lane)
+                return self._rooted(self._list_via_list(abs_path, lane))
             except Exception as exc:
                 log.warning("FTP LIST failed for %s: %s", abs_path, exc)
                 if error_sink is not None:
@@ -2844,6 +3092,12 @@ class FTPFileSource(FileSource):
                 error_sink.append((self._rel(abs_path), str(exc)))
             return []
 
+    def _rooted(self, entries: list[DirEntry]) -> list[DirEntry]:
+        """A listing's entries (server-absolute paths) as ROOT-RELATIVE ones."""
+        return [DirEntry(name=e.name, path=self._rel(e.path), is_dir=e.is_dir,
+                         size=e.size, mtime=e.mtime)
+                for e in entries if e.name]
+
     def _list_via_mlsd(self, abs_path: str, lane: str = "scan") -> list[DirEntry]:
         """List a directory via MLSD (RFC 3659 — structured output)."""
         entries: list[DirEntry] = []
@@ -2852,7 +3106,18 @@ class FTPFileSource(FileSource):
             for name, facts in ftp.mlsd(abs_path):
                 if name in (".", ".."):
                     continue
-                is_d = facts.get("type", "").lower() in ("dir", "cdir", "pdir")
+                typ = facts.get("type", "").lower()
+                if typ in ("cdir", "pdir"):
+                    continue                  # the folder itself / its parent
+                # A symbolic link (``OS.unix=symlink`` / ``slink:…``) is a file
+                # entry, never walked into — as LIST's ``l`` lines are.  (A
+                # server that reports a link to a folder as ``dir`` is walked;
+                # the walk's loop check stops a link back up the tree.)
+                is_d = typ == "dir"
+                if "/" in name:
+                    name = name.rstrip("/").rsplit("/", 1)[-1]
+                    if not name:
+                        continue
                 sz = int(facts.get("size", "0")) if facts.get("size") else 0
                 mtime = self._parse_mtime(facts.get("modify", ""))
                 entry_path = f"{abs_path}/{name}" if abs_path != "/" else f"/{name}"
@@ -2862,6 +3127,7 @@ class FTPFileSource(FileSource):
 
     def _list_via_list(self, abs_path: str, lane: str = "scan") -> list[DirEntry]:
         """List a directory via LIST (universal fallback)."""
+        self.list_listings += 1
         with self._pool.borrow(lane=lane) as handle:
             ftp = handle.conn
             ftp.cwd(abs_path)
@@ -2900,8 +3166,14 @@ class FTPFileSource(FileSource):
         parts = line.split(None, 8)
         if len(parts) >= 9 and len(parts[0]) >= 10 and parts[0][0] in "dlbcps-":
             perms = parts[0]
-            is_dir = perms[0] in ("d", "l")
             name = parts[8]
+            if perms[0] == "l":
+                # ``name -> target``: the link's own name, a file entry (never
+                # walked into) — as MLSD's ``OS.unix=symlink`` facts are.
+                name = name.split(" -> ", 1)[0]
+                is_dir = False
+            else:
+                is_dir = perms[0] == "d"
             if name in (".", ".."):
                 return None
             try:
@@ -2966,7 +3238,18 @@ class FTPFileSource(FileSource):
         same-size re-tags are undetectable from LIST regardless — the aged
         form has no time; that needs MDTM/MLSD.)  All of this is moot on an
         MLSD-capable server, which never reaches LIST.
+
+        Time zone: LIST carries none.  The date is read as UTC — what MLSD
+        reports (RFC 3659) and what vsftpd (``use_localtime=NO``) and ProFTPD
+        (``TimesGMT on``) print by default — so a share's stored times are
+        the same whichever zone SoniqBoom's host is in, and a switch between
+        MLSD and LIST stays within ``scanner._mtime_matches_tolerant``'s
+        minute tolerance on such servers.  A server that prints its own
+        local time is off by its UTC offset, consistently from poll to poll
+        (the incremental skip compares like with like).  The ``HH:MM`` form's
+        year is inferred against the current UTC date.
         """
+        import calendar
         import datetime
         mon_i = FTPFileSource._LIST_MONTHS.get(str(mon)[:3].lower())
         if mon_i is None:
@@ -2975,65 +3258,75 @@ class FTPFileSource(FileSource):
             day_i = int(day)
         except (ValueError, TypeError):
             return 0.0
-        now = datetime.datetime.now()
+        now = time.time()
         try:
             if ":" in year_or_time:
                 hh, mm = year_or_time.split(":", 1)
-                year = now.year
+                year = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).year
                 cand = datetime.datetime(year, mon_i, day_i, int(hh), int(mm))
-                if cand.timestamp() > now.timestamp() + 86400:
+                if calendar.timegm(cand.timetuple()) > now + 86400:
                     cand = cand.replace(year=year - 1)
                 dt = cand
             else:
                 dt = datetime.datetime(int(year_or_time), mon_i, day_i)
-            return dt.timestamp()
+            return float(calendar.timegm(dt.timetuple()))
         except (ValueError, OSError, OverflowError):
             return 0.0
 
     @staticmethod
     def _parse_list_mtime_windows(date_s: str, time_s: str) -> float:
         """Parse a Windows/IIS LIST ``MM-DD-YY HH:MM(AM|PM)`` date into a
-        Unix timestamp; 0.0 if unparseable."""
+        Unix timestamp, read as UTC (see ``_parse_list_mtime_unix``); 0.0 if
+        unparseable."""
+        import calendar
         import datetime
         stamp = f"{date_s} {time_s}"
         for fmt in ("%m-%d-%y %I:%M%p", "%m-%d-%Y %I:%M%p",
                     "%m-%d-%y %H:%M", "%m-%d-%Y %H:%M"):
             try:
-                return datetime.datetime.strptime(stamp, fmt).timestamp()
+                dt = datetime.datetime.strptime(stamp, fmt)
+                return float(calendar.timegm(dt.timetuple()))
             except (ValueError, OSError, OverflowError):
                 continue
         return 0.0
 
     @staticmethod
     def _parse_mtime(val: str) -> float:
+        """An MLSD ``modify=`` fact (``YYYYMMDDHHMMSS[.sss]``, always UTC —
+        RFC 3659 §2.3) as a Unix timestamp; 0.0 if unparseable.  Fractional
+        seconds are dropped (stored values are whole seconds)."""
         if not val or len(val) < 14:
             return 0.0
         try:
+            import calendar
             import datetime
             dt = datetime.datetime.strptime(val[:14], "%Y%m%d%H%M%S")
-            return dt.timestamp()
-        except (ValueError, OSError):
+            return float(calendar.timegm(dt.timetuple()))
+        except (ValueError, OSError, OverflowError):
             return 0.0
 
     def _rel(self, abs_path: str) -> str:
-        """Strip ``_remote_path`` prefix so yielded paths are root-relative."""
-        if self._remote_path != "/" and abs_path.startswith(self._remote_path):
-            sub = abs_path[len(self._remote_path):]
-            return sub or "/"
+        """Strip the ``_remote_path`` prefix — at a path-component boundary
+        — so yielded paths are root-relative."""
+        rp = self._remote_path
+        if rp == "/":
+            return abs_path or "/"
+        if abs_path == rp:
+            return "/"
+        if abs_path.startswith(rp + "/"):
+            return abs_path[len(rp):]
         return abs_path
 
     def walk(self, top: str) -> Iterator[tuple[str, list[str], list[str]]]:
-        abs_top = self._abs(top)
-        stack = [abs_top]
+        stack = ["/" + (top or "").strip("/")]
         while stack:
             current = stack.pop()
             entries = self._list_entries(current)
             dirs = [e.name for e in entries if e.is_dir]
             files = [e.name for e in entries if not e.is_dir]
-            yield self._rel(current), dirs, files
+            yield current, dirs, files
             for d in dirs:
-                child = f"{current}/{d}" if current != "/" else f"/{d}"
-                stack.append(child)
+                stack.append(f"{current}/{d}" if current != "/" else f"/{d}")
 
     def walk_with_stat(
         self, top: str, *,
@@ -3077,49 +3370,35 @@ class FTPFileSource(FileSource):
         damage; the cure is to ensure every entry yielded here passes
         through ``self._rel()`` first.
         """
-        abs_top = self._abs(top)
-        stack = [abs_top]
+        # The stack holds ROOT-RELATIVE paths — the frame ``_list_entries``
+        # takes and returns, and the one the scanner's keys are in.  A path is
+        # never translated back from the server's absolute spelling (a
+        # sub-folder named like the remote path would map onto the root).
+        stack = ["/" + (top or "").strip("/")]
+        guard = _LoopGuard()
         while stack:
             current = stack.pop()
+            if guard.depth(current) > _WALK_MAX_DEPTH:
+                if error_sink is not None:
+                    error_sink.append((current, "too deep"))
+                continue
             try:
                 entries = self._list_entries(current, error_sink=error_sink)
             except Exception as exc:
                 log.warning("walk_with_stat: _list_entries(%s) failed: %s",
                             current, exc)
                 if error_sink is not None:
-                    # Record ROOT-RELATIVE (same frame _list_entries uses and
-                    # the scanner's ghost keys are in) so per-subtree ghost
-                    # protection actually matches this failed directory.
-                    error_sink.append((self._rel(current), str(exc)))
+                    error_sink.append((current, str(exc)))
                 continue
-            dir_entries: list[DirEntry] = []
-            file_entries: list[DirEntry] = []
-            for e in entries:
-                # Normalise entry.path from FTP-absolute to scan-root-
-                # relative.  ``_list_via_mlsd`` produced paths like
-                # ``/Music/Music FLAC/REOL/foo.flac``; we want
-                # ``/REOL/foo.flac`` so the scanner can build the
-                # canonical ``ftp://host/share:/REOL/foo.flac`` URL.
-                rel_entry = DirEntry(
-                    name=e.name,
-                    path=self._rel(e.path),
-                    is_dir=e.is_dir,
-                    size=e.size,
-                    mtime=e.mtime,
-                )
-                if e.is_dir:
-                    dir_entries.append(rel_entry)
-                else:
-                    file_entries.append(rel_entry)
-            yield self._rel(current), dir_entries, file_entries
-            # Recurse: stack holds ABSOLUTE paths (what _list_entries
-            # expects).  Translate each dir's now-relative path back
-            # via ``_abs`` so the next iteration's _list_entries call
-            # has what it needs.
+            if guard.is_loop(current, entries):
+                continue
+            dir_entries = [e for e in entries if e.is_dir]
+            file_entries = [e for e in entries if not e.is_dir]
+            yield current, dir_entries, file_entries
             for d in dir_entries:
                 if skip_subtree_fn is not None and skip_subtree_fn(d):
                     continue
-                stack.append(self._abs(d.path))
+                stack.append(d.path)
 
     def list_dir(self, path: str) -> list[DirEntry]:
         # Interactive file-browser listing → "browse" lane, NOT "scan" or "stream".
@@ -3150,9 +3429,14 @@ class FTPFileSource(FileSource):
         for attempt in range(3):
             try:
                 buf = io.BytesIO()
+                key = (self._host, self._port)
+
+                def _sink(block: bytes, _w=buf.write, _k=key) -> None:
+                    _w(block)
+                    _note_ftp_progress(_k)
                 with self._pool.borrow(lane=lane) as handle:
                     handle.conn.retrbinary(
-                        f"RETR {self._abs(path)}", buf.write,
+                        f"RETR {self._abs(path)}", _sink,
                     )
                     # Mark the transfer so the pool can recycle this socket
                     # on return when it crosses the per-conn ceiling.  Note:
@@ -3165,6 +3449,8 @@ class FTPFileSource(FileSource):
                 # The ``with`` already marked the handle broken via the
                 # exception path, so the next borrow gets a fresh socket.
                 last_exc = exc
+                if is_permanent_fetch_error(exc):
+                    raise                       # that file, every time: no retry
                 if attempt < 2:
                     time.sleep(0.3)     # brief pause before retry
         raise last_exc  # type: ignore[misc]
@@ -3224,6 +3510,7 @@ class FTPFileSource(FileSource):
                                 eof = True
                                 break
                             buf.extend(chunk)
+                            _note_ftp_progress((self._host, self._port))
                     finally:
                         # Always close the data socket BEFORE handling
                         # the control side; the server signals end-of-
@@ -3254,6 +3541,8 @@ class FTPFileSource(FileSource):
                 return bytes(buf)
             except Exception as exc:
                 last_exc = exc
+                if is_permanent_fetch_error(exc):
+                    raise                       # that file, every time: no retry
                 if attempt < 2:
                     time.sleep(0.3)
         raise last_exc  # type: ignore[misc]
@@ -3293,6 +3582,7 @@ class FTPFileSource(FileSource):
                                 eof = True
                                 break
                             buf.extend(chunk)
+                            _note_ftp_progress((self._host, self._port))
                     finally:
                         try:
                             data_sock.close()
@@ -3309,6 +3599,8 @@ class FTPFileSource(FileSource):
                 return bytes(buf)
             except Exception as exc:
                 last_exc = exc
+                if is_permanent_fetch_error(exc):
+                    raise                       # that file, every time: no retry
                 if attempt < 2:
                     time.sleep(0.3)
         raise last_exc  # type: ignore[misc]
@@ -3333,7 +3625,7 @@ class FTPFileSource(FileSource):
                 except (ftplib.error_perm, ftplib.error_reply, ftplib.error_temp):
                     size = None        # SIZE unsupported — length unknown
                 sock = ftp.transfercmd(f"RETR {abs_path}", rest=offset or None)
-                return _FTPStream(cm, handle, sock, size)
+                return _FTPStream(cm, handle, sock, size, (self._host, self._port))
             except Exception as exc:
                 cm.__exit__(*_sys.exc_info())   # marks the handle broken, releases it
                 last_exc = exc
@@ -3380,7 +3672,15 @@ class FTPFileSource(FileSource):
     def is_dir(self, path: str) -> bool:
         self.last_error_auth = False
         try:
-            with self._pool.borrow(lane="scan") as handle:
+            if self._pool_saturated():
+                # Every pooled connection is busy (a scan's downloads): the
+                # check gets a connection of its own — the slot the pool
+                # leaves free under the server's limit (``detected_cap - 1``)
+                # — instead of queueing behind transfers.
+                return self._probe_on_own_connection(path)
+            # ``browse`` lane: a reachability check (the health monitor, the
+            # share's Test button) goes ahead of queued scan downloads.
+            with self._pool.borrow(lane="browse") as handle:
                 handle.conn.cwd(self._abs(path))
             return True
         except Exception as exc:
@@ -3395,6 +3695,50 @@ class FTPFileSource(FileSource):
             )
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.last_error_auth = is_auth_failure(exc)
+            return False
+
+    def _pool_saturated(self) -> bool:
+        try:
+            st = self._pool.status()
+            return (int(st.get("idle", 0)) == 0
+                    and int(st.get("in_use", 0)) >= int(st.get("max_size", 1) or 1))
+        except Exception:                                   # noqa: BLE001
+            return False
+
+    def _probe_on_own_connection(self, path: str) -> bool:
+        """``CWD path`` on a connection opened for it (and closed after) —
+        a reachability check while the pool is busy.  A server that refuses
+        it as one client too many is reachable all the same."""
+        conn = None
+        try:
+            conn = self._pool._factory()
+        except Exception as exc:
+            if _is_too_many_clients_error(exc):
+                return True                     # it answered: busy, not gone
+            raise
+        try:
+            conn.cwd(self._abs(path))
+            return True
+        finally:
+            try:
+                conn.quit()
+            except Exception:                               # noqa: BLE001
+                try:
+                    conn.close()
+                except Exception:                           # noqa: BLE001
+                    pass
+
+    def serving_transfers(self, within: float = 15.0) -> bool:
+        """Is this server moving file data right now — a transfer had bytes
+        arrive within ``within`` seconds while connections are in use?  A
+        reachability probe that waited out its timeout behind such
+        transfers says the share is busy, not gone."""
+        last = _FTP_PROGRESS.get((self._host, self._port), 0.0)
+        if time.monotonic() - last > within:
+            return False
+        try:
+            return int(self._pool.status().get("in_use", 0)) > 0
+        except Exception:                                   # noqa: BLE001
             return False
 
     def close(self) -> None:

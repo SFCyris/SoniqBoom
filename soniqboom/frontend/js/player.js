@@ -6,7 +6,7 @@
  * Exports: Player singleton
  */
 // version bump needed in index.html for player.js (queue/race/EQ chain fixes)
-import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf } from './utils.js';
+import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
 // Experimental, flag-gated in-browser SID playback (see sid-wasm-player.js).
 // Remove the feature by deleting this import + the one branch it guards below.
 import { sidWasmPlaybackEnabled, isC64SidTrack, renderSidForPlayback,
@@ -627,12 +627,14 @@ export const Player = (() => {
     return 0;
   }
   // Why the queue passes ``t`` by when it moves on by itself: 'offline' |
-  // 'broken' | 'corrupt' | 'short', or '' (it plays).
+  // 'broken' | 'corrupt' | 'empty' (a package with no tune in it) | 'short',
+  // or '' (it plays).
   function _skipReason(t) {
     if (!t || typeof t !== 'object') return '';
     if (_offlineSkip && t.offline) return 'offline';
     if (t.health === 'broken') return 'broken';
     if (t.defect === 'corrupt') return 'corrupt';
+    if (t.defect === 'empty') return 'empty';
     if (_shortSecs > 0) {
       const n = _tuneLen(t);
       if (n > 0 && n < _shortSecs) return 'short';
@@ -670,8 +672,230 @@ export const Player = (() => {
     const v = localStorage.getItem(CROSSFADE_KEY);
     return v !== null ? parseFloat(v) : 0;  // 0 = disabled (gapless only)
   }
-  let _crossfadeTimer = null;
   let _crossfading = false;
+
+  // [xfade-core:begin] — tests/js/crossfade.test.mjs runs this region as is
+  // A real crossfade: near the end of a track the rest of it goes on playing on
+  // a second <audio> element (the "tail", same URL, same position) and fades
+  // out, while the next track starts on the player's own element and fades in —
+  // each over the crossfade time (or what is left of the track).  The volumes
+  // are ``audio.volume`` ramps (straight lines), 20 steps a second.
+  //   * The tail takes over only once it actually plays; until then the track
+  //     goes on as it was.  A tail that can't start in time (a source that
+  //     can't be reopened, an autoplay block) falls back to fading the track
+  //     out on the player's element, then the track ends and the next starts.
+  //   * The start of the next track (playTrack) keeps the fade going; any other
+  //     start (Next, a click, a station), a pause (by any means — the button,
+  //     a cast or radio takeover), a seek or the queue running out stops it:
+  //     the tail goes quiet and the volume is the user's again.
+  //   * Once the Web Audio graph exists, the tail goes through a copy of the
+  //     EQ with the OUTGOING track's ReplayGain, into the same meters.
+  //   * Repeat-one plays the track again instead (no crossfade).
+  const XF_STEP_MS = 50;
+  const XF_LEAD_S = 0.02;          // the tail is put this far ahead (its start latency)
+  let _xf = null;                  // the fade under way (see _startCrossfade)
+  let _xfTailEl = null;
+  function _xfNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
+  function _xfUserVolume() {
+    const v = parseFloat(localStorage.getItem('sb_volume'));
+    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.8;
+  }
+  function _xfTail() {
+    if (_xfTailEl) return _xfTailEl;
+    const el = document.createElement('audio');
+    el.id = 'audio-xfade';
+    el.preload = 'auto';
+    try { el.crossOrigin = audio.crossOrigin || 'anonymous'; } catch (_) {}
+    el.setAttribute('playsinline', '');
+    el.hidden = true;
+    (document.body || document.documentElement).appendChild(el);
+    _xfTailEl = el;
+    return el;
+  }
+  // The tail through the Web Audio graph (once it exists): its own copy of
+  // the EQ and the outgoing track's ReplayGain, into the same analyser.
+  // (createMediaElementSource is once per element: the chain is built once
+  // and its values copied from the player's chain at each fade.)
+  let _xfChain = null;
+  function _xfRouteTail(tail) {
+    if (!ctx || !replayGain) return;
+    try {
+      if (!_xfChain) {
+        const src = ctx.createMediaElementSource(tail);
+        const pre = ctx.createGain();
+        const eq = (eqFilters || []).map((f) => {
+          const n = ctx.createBiquadFilter();
+          n.type = f.type; n.frequency.value = f.frequency.value; n.Q.value = f.Q.value;
+          return n;
+        });
+        const rg = ctx.createGain();
+        let node = src;
+        node.connect(pre); node = pre;
+        for (const f of eq) { node.connect(f); node = f; }
+        node.connect(rg);
+        rg.connect(analyser || ctx.destination);
+        _xfChain = { pre, eq, rg };
+      }
+      _xfChain.pre.gain.value = eqPreGain ? eqPreGain.gain.value : 1;
+      _xfChain.eq.forEach((n, i) => { if (eqFilters[i]) n.gain.value = eqFilters[i].gain.value; });
+      _xfChain.rg.gain.value = replayGain.gain.value;
+    } catch (_) { /* the tail plays straight to the output */ }
+  }
+  function _xfQuietTail(x) {
+    const t = x && x.tail;
+    if (!t) return;
+    for (const [ev, fn] of x.listeners || []) t.removeEventListener(ev, fn);
+    x.listeners = [];
+    try { t.pause(); } catch (_) {}
+    try { t.removeAttribute('src'); t.load(); } catch (_) {}
+  }
+  // Stop any fade: the tail goes quiet, the player's element gets the user's
+  // volume back.
+  function _cancelCrossfade() {
+    const x = _xf;
+    if (!x) return;
+    _xf = null;
+    _crossfading = false;                          // ('ended' advances as without a fade)
+    clearInterval(x.timer);
+    clearTimeout(x.armTimer);
+    _xfQuietTail(x);
+    audio.volume = x.to;
+  }
+  // One step of the ramps.
+  function _xfStep() {
+    const x = _xf;
+    if (!x || x.mode === 'arming') return;         // (no ramp before the tail takes over)
+    const now = _xfNow();
+    const p = Math.min(1, (now - x.t0) / x.durMs);
+    if (x.mode === 'fadeout') {                    // (no tail: the track itself fades)
+      audio.volume = x.from * (1 - p);
+      return;                                      // 'ended' → the next track → playTrack ends it
+    }
+    if (x.tail) {
+      x.tail.volume = x.from * (1 - p);
+      if (p >= 1) { _xfQuietTail(x); x.tail = null; }
+    }
+    if (x.upAt !== null) {
+      const q = Math.min(1, (now - x.upAt) / x.durMs);
+      audio.volume = x.to * q;
+      if (q >= 1 && !x.tail) { clearInterval(x.timer); _xf = null; audio.volume = x.to; }
+    } else if (!x.tail && now - x.t0 > 3 * x.durMs + 30000) {
+      _cancelCrossfade();                          // the next track never started
+    }
+  }
+  function _xfRun(x) {
+    x.t0 = _xfNow();
+    clearInterval(x.timer);
+    x.timer = setInterval(_xfStep, XF_STEP_MS);
+  }
+  // The tail couldn't take over: fade the track out where it plays.
+  function _xfFallBack(x) {
+    if (_xf !== x || x.mode !== 'arming') return;
+    clearTimeout(x.armTimer);
+    _xfQuietTail(x);
+    x.tail = null;
+    x.mode = 'fadeout';
+    _crossfading = false;                          // ('ended' moves on to the next track)
+    const left = (_duration() || 0) - (audio.currentTime || 0);
+    x.durMs = Math.max(200, left * 1000);
+    _xfRun(x);
+  }
+  // Near the end (``remaining`` s left, ``xfade`` s set): begin the crossfade.
+  function _startCrossfade(remaining) {
+    _cancelCrossfade();
+    const src = audio.currentSrc || audio.src;
+    const vol = audio.volume;
+    const x = { mode: 'arming', from: vol, to: _xfUserVolume(), durMs: remaining * 1000, t0: 0,
+                upAt: null, timer: null, armTimer: null, tail: null, listeners: [], handover: false };
+    _xf = x;
+    if (!src) { _xfFallBack(x); return; }
+    const tail = _xfTail();
+    x.tail = tail;
+    _xfRouteTail(tail);
+    const on = (ev, fn) => { tail.addEventListener(ev, fn); x.listeners.push([ev, fn]); };
+    // Leave a little time for the switch, else fade where it plays.
+    x.armTimer = setTimeout(() => _xfFallBack(x), Math.max(150, Math.min(2000, (remaining - 0.4) * 1000)));
+    on('loadedmetadata', () => {
+      if (_xf !== x) return;
+      try { tail.currentTime = Math.min((audio.currentTime || 0) + XF_LEAD_S, (tail.duration || Infinity) - 0.05); } catch (_) { _xfFallBack(x); }
+    });
+    on('seeked', () => {
+      if (_xf !== x || x.mode !== 'arming') return;
+      // Next to silent until it takes over — but not 0: WebKit pauses an
+      // element that started inaudible and then turns audible on its own.
+      tail.volume = 0.001;
+      const p = tail.play();
+      if (p && typeof p.catch === 'function') p.catch(() => _xfFallBack(x));
+    });
+    on('playing', () => {
+      if (_xf !== x || x.mode !== 'arming') return;
+      // The tail plays: it takes the track over, the player's element moves on.
+      clearTimeout(x.armTimer);
+      x.mode = 'crossfade';
+      x.from = audio.volume;
+      tail.volume = x.from;
+      audio.volume = 0;
+      x.durMs = Math.max(200, ((tail.duration || 0) - (tail.currentTime || 0)) * 1000 || remaining * 1000);
+      x.handover = true;
+      _xfRun(x);
+      _autoAdvance();
+    });
+    on('error', () => _xfFallBack(x));
+    try { tail.pause(); } catch (_) {}
+    tail.volume = 0.001;
+    tail.src = src;
+    tail.load();
+  }
+  // WebKit lets an element play audibly on its own only after it was played
+  // once from a user action: the first start the user asks for primes the tail
+  // (a play() with no source — refused, harmless — inside the click).
+  let _xfPrimed = false;
+  function _xfPrime() {
+    if (_xfPrimed) return;
+    _xfPrimed = true;
+    try {
+      const t = _xfTail();
+      const p = t.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      t.pause();                                   // (it must not start by itself on a source)
+    } catch (_) { /* no media support */ }
+  }
+  // playTrack: the start of the next track that the crossfade itself asked for
+  // keeps the fade (true; the new track starts silent and fades in), any other
+  // start stops it (false).
+  function _crossfadeOnTrackStart() {
+    const x = _xf;
+    if (x && x.handover) {
+      x.handover = false;                          // (once: a second start stops it)
+      audio.volume = 0;
+      return true;
+    }
+    _cancelCrossfade();
+    return false;
+  }
+  // The incoming track started playing: its fade-in runs from now.
+  function _crossfadeOnPlaying() {
+    if (_xf && _xf.mode === 'crossfade' && _xf.upAt === null && !_xf.handover) _xf.upAt = _xfNow();
+  }
+  // The user set the volume during a fade: both ramps go to / from it.
+  function _crossfadeVolume(v) {
+    if (!_xf) return false;
+    _xf.to = v;
+    if (_xf.mode !== 'fadeout') _xf.from = v;
+    if (_xf.mode === 'arming') audio.volume = v;    // (the track still plays here)
+    else _xfStep();
+    return true;
+  }
+  // The player's element paused: by the user, a cast / radio takeover, the
+  // track's end — the fade stops.  (Not the pause of the switch to the
+  // incoming track: that comes after the hand-over, before it plays.)
+  function _crossfadeOnPause() {
+    const x = _xf;
+    if (!x) return;
+    if (x.mode === 'crossfade' && x.upAt === null) return;
+    _cancelCrossfade();
+  }
+  // [xfade-core:end]
 
   // ── Gapless next-track preload ─────────────────────────────────────────
   // Near the end of a track (and only when crossfade is off) the next queue
@@ -708,7 +932,10 @@ export const Player = (() => {
     _dropNextPreload();
     const abort = new AbortController();
     _nextPreload = { id: next.id, subsong: nextSub, url: null, abort };
-    fetch(`/api/stream/${next.id}${nextSub !== null ? `?subsong=${nextSub}` : ''}`, { signal: abort.signal })
+    // No ``pg``: a preload is not a play start of this page (the server would
+    // count it as one and retire the page's prewarms / the current render).
+    fetch(`/api/stream/${next.id}${nextSub !== null ? `?subsong=${nextSub}` : ''}`,
+          { signal: abort.signal })
       .then(res => {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const len = parseInt(res.headers.get('content-length') || '0', 10);
@@ -1214,13 +1441,25 @@ export const Player = (() => {
   /** Build a stream URL, appending the file path for on-demand ingestion.
    *  If the track isn't in the store yet (e.g. browsed via fstree before scan),
    *  the server uses the path to extract metadata and upsert on the fly.
+   *  ``pg``: this page (``PREWARM_PAGE_ID``, defined further down — read at
+   *  call time); the service worker's offline match ignores the query, so it
+   *  never splits the download cache.
    */
   function _streamUrl(id, params = {}) {
     let url = `/api/stream/${id}`;
     const qs = new URLSearchParams(params);
     if (_track?.path) qs.set('path', _track.path);
-    const s = qs.toString();
-    return s ? `${url}?${s}` : url;
+    if (_isDownloaded(id)) qs.set('dl', '1');
+    qs.set('pg', PREWARM_PAGE_ID);
+    return `${url}?${qs}`;
+  }
+
+  // A track downloaded for offline (app.js ``downloadTrack``): its stream URL
+  // says so (``dl=1``) — the service worker serves only those from the device
+  // (sw.js), and leaves every other stream request to the network.
+  function _isDownloaded(id) {
+    try { return !!(id && JSON.parse(localStorage.getItem('sb_offline_index') || '{}')[id]); }
+    catch (_) { return false; }
   }
 
   // ── SID progressive helpers ─────────────────────────────────────────────────
@@ -1452,7 +1691,7 @@ export const Player = (() => {
     _resetSidPartial();
     _stopTranscodePolling();
     _hideConvertBadge();
-    if (_crossfadeTimer) { clearInterval(_crossfadeTimer); _crossfadeTimer = null; }
+    _cancelCrossfade();
     _crossfading = false;
     const savedVol = localStorage.getItem('sb_volume');
     audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
@@ -1526,6 +1765,7 @@ export const Player = (() => {
   async function playTrack(track, opts = {}) {
     const attempt = ++_playSeq;  // ANY start (row double-click, info panel, multiroom) disarms a pending auto-skip
     _noteStart();                // an open "Resume the queue from …?" offer no longer applies
+    _clearStartFailed();         // (a new start: nothing failed yet)
     _cancelledStart = false;
     // Started from outside the queue logic (similar-tracks row, info panel, a
     // multiroom follower): the listener / master chose THIS track — if it cannot
@@ -1570,12 +1810,13 @@ export const Player = (() => {
     _playRecorded  = false;
     _resetSidPartial();
 
-    // Reset crossfade state
-    if (_crossfadeTimer) { clearInterval(_crossfadeTimer); _crossfadeTimer = null; }
+    // Crossfade: the start it asked for keeps the fade (this track fades in);
+    // any other start ends it and the volume is the user's again.
     _crossfading = false;
-    // Restore volume (may have been faded down by crossfade)
-    const savedVol = localStorage.getItem('sb_volume');
-    audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
+    if (!_crossfadeOnTrackStart()) {
+      const savedVol = localStorage.getItem('sb_volume');
+      audio.volume = savedVol !== null ? parseFloat(savedVol) : 0.8;
+    }
 
     emit('trackchange', track);
     // Abort any in-flight transcode-status fetch + watchdog from the prior
@@ -1617,11 +1858,11 @@ export const Player = (() => {
       if (track.id) {
         const base = `${location.origin}/api/art/${encodeURIComponent(track.id)}`;
         artwork.push(
-          { src: `${base}?size=sm`, sizes: '256x256', type: 'image/jpeg' },
-          { src: `${base}?size=lg`, sizes: '512x512', type: 'image/jpeg' },
+          { src: `${base}/sm.jpg`, sizes: '256x256', type: 'image/jpeg' },
+          { src: `${base}/lg.jpg`, sizes: '512x512', type: 'image/jpeg' },
         );
       } else if (track.cover_art) {
-        artwork.push({ src: track.cover_art, sizes: '512x512', type: 'image/jpeg' });
+        artwork.push({ src: staticArtUrl(track.cover_art), sizes: '512x512', type: 'image/jpeg' });
       }
       navigator.mediaSession.metadata = new MediaMetadata({
         title:  track.title  || '',
@@ -1638,6 +1879,7 @@ export const Player = (() => {
     emit('statechange', { playing: false });
 
     _initAudioContext();
+    _xfPrime();          // (in the click: lets the crossfade tail play later — WebKit)
     if (ctx && ctx.state === 'suspended') {
       try { await ctx.resume(); } catch (_) {}
     }
@@ -1802,16 +2044,172 @@ export const Player = (() => {
   // (``setFailAction`` — "Mark broken" for a listener with edit rights) when
   // it offers one for that track.
   let _failAction = null;
-  function _failToast(msg, track) {
+  function _failToast(msg, track, gone = false) {
     let a = null;
-    try { a = _failAction && track ? _failAction(track, msg) : null; } catch (_) { a = null; }
+    try { a = (_failAction && track && !gone) ? _failAction(track, msg) : null; } catch (_) { a = null; }
     if (a && a.label && typeof a.run === 'function') Toast.action(msg, a.label, () => a.run(track), 15000);
     else Toast.error(msg);
   }
+  // ── A start that failed ────────────────────────────────────────────────
+  // Once a start is reported as failed nothing plays: the list's now-playing
+  // marker and the bar's "Playing Now" stand down for it (``nowPlayingId``,
+  // ``startFailed``, read on the 'statechange' every failure report sends) —
+  // until it is started again or plays after all (a transcode, a retry).
+  let _failedStart = null;              // { id, seq }
+  function _noteStartFailed(track, seq) {
+    if (!track || track.id !== trackId || seq !== _playSeq) return;
+    _failedStart = { id: track.id, seq };
+    _hideBufferingBadge();
+    // The OS media controls (lock screen, Control Center) say "not playing"
+    // too — WebKit keeps 'playing' from the play() that failed.
+    _setSessionState('paused');
+  }
+  function _clearStartFailed() {
+    if (!_failedStart) return;
+    _failedStart = null;
+    _setSessionState('none');          // (the browser follows the element again)
+  }
+  function _setSessionState(state) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.mediaSession) navigator.mediaSession.playbackState = state;
+    } catch (_) { /* not supported */ }
+  }
+  function _startFailedNow() { return !!_failedStart && _failedStart.id === trackId; }
+  // A track the server says left the library (HTTP 410: a package of an
+  // online collection with no tune in it): ``_onGone(id, reason)`` marks
+  // every copy this page holds (set outside this region).
+  let _onGone = null;
+
+  // ── The server restarting ──────────────────────────────────────────────
+  // While the server restarts it answers every request with 503 and a
+  // Retry-After header, then is gone for a moment.  A start (or a reload of
+  // the playing track) that fails then is no codec or file trouble: no
+  // force_transcode retry, no failure toast, no skip — the player says the
+  // server is restarting, waits until it answers again, and plays the same
+  // track again from where it was.
+  // The new process isn't listening yet for a moment after the refusals end:
+  // a failure to reach the server within ``_RESTART_RECENT_MS`` of a restart
+  // signal (a 503 + Retry-After, or the library socket's "server_restarting"
+  // event — ``noteServerRestart``) is waited out the same way.  One wait per
+  // start: a failure after it is reported as usual.
+  let _restartWait = null;            // { seq, id } while waiting out a restart
+  let _restartRetried = -1;           // the start (_playSeq) a wait already played again
+  let _restartSeenAt = 0;             // when the server last said it restarts
+  const _RESTART_MAX_WAIT_MS = 120000;
+  const _RESTART_POLL_MS = 1000;
+  const _RESTART_RECENT_MS = 60000;
+  function _restartWaitFor(seq) { return !!_restartWait && _restartWait.seq === seq; }
+  function noteServerRestart() { _restartSeenAt = Date.now(); }
+  function _restartRecent() { return _restartSeenAt > 0 && Date.now() - _restartSeenAt < _RESTART_RECENT_MS; }
+  // The seconds the server asked to wait when ``res`` is its restarting
+  // answer (503 + Retry-After), else 0.
+  function _restartRetryAfter(res) {
+    if (!res || res.status !== 503 || !res.headers || typeof res.headers.get !== 'function') return 0;
+    const v = parseInt(res.headers.get('Retry-After') || '', 10);
+    if (!(Number.isFinite(v) && v > 0)) return 0;
+    noteServerRestart();
+    return Math.min(v, 30);
+  }
+  // A 1-byte probe of ``url``: the server's Retry-After when it is
+  // restarting (or unreachable right after it said it restarts), else 0.
+  async function _probeRestarting(url, out = null) {
+    // ``out.status``: the HTTP status the probe got (0: none answered) — per
+    // probe, so two starts' probes never read each other's.
+    let ctrl = null;
+    if (out) out.status = 0;
+    try { ctrl = new AbortController(); } catch (_) { ctrl = null; }
+    try {
+      const res = await fetch(url, {
+        method: 'GET', headers: { 'Range': 'bytes=0-0' }, credentials: 'same-origin',
+        cache: 'no-store', signal: ctrl ? ctrl.signal : undefined,
+      });
+      if (out) out.status = (res && res.status) || 0;
+      const secs = _restartRetryAfter(res);
+      try { if (ctrl) ctrl.abort(); } catch (_) {}
+      return secs;
+    } catch (_) {
+      return _restartRecent() ? 1 : 0;
+    }
+  }
+  // Wait out the restart for start ``seq`` of ``track`` (``src``: the URL
+  // that failed, ``at``: the position to go back to), then load ``src`` again.
+  // True when the wait is (already) under way; false when the start is stale
+  // or was already played again once.
+  function _waitServerRestart(track, seq, src, at, secs) {
+    if (_restartWaitFor(seq)) return true;
+    if (!track || seq !== _playSeq || track.id !== trackId || !src || _restartRetried === seq) return false;
+    _restartWait = { seq, id: track.id };
+    _stopTranscodePolling();
+    _hideConvertBadge();
+    if (typeof Toast.warn === 'function') {
+      Toast.warn('The server is restarting — playback resumes in a moment.');
+    }
+    emit('statechange', { playing: false });
+    const until = Date.now() + _RESTART_MAX_WAIT_MS;
+    const ours = () => _restartWaitFor(seq) && seq === _playSeq && trackId === track.id;
+    const again = async () => {
+      if (!ours()) { if (_restartWaitFor(seq)) _restartWait = null; return; }
+      let up = false;
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store', credentials: 'same-origin' });
+        up = !!(r && r.ok);
+      } catch (_) { up = false; }
+      if (!ours()) { if (_restartWaitFor(seq)) _restartWait = null; return; }
+      if (!up) {
+        if (Date.now() > until) {
+          _restartWait = null;
+          const title = track.title || track.name || 'track';
+          Toast.error(`The server didn’t come back — couldn’t play “${title}”.`);
+          return;
+        }
+        setTimeout(again, _RESTART_POLL_MS);
+        return;
+      }
+      _restartWait = null;
+      _restartRetried = seq;
+      audio.src = _freshUrl(src);
+      if (at > 0.5) {
+        const seekBack = () => {
+          if (seq === _playSeq) { try { audio.currentTime = at; } catch (_) {} }
+        };
+        audio.addEventListener('loadedmetadata', seekBack, { once: true });
+      }
+      audio.load();
+      // Playing again: say so (transport button, now-playing bars, the phone's
+      // mini player), as the render recovery does once its play() resolves.
+      audio.play().then(() => {
+        if (seq === _playSeq && trackId === track.id) emit('statechange', { playing: true });
+      }, (e) => {
+        if (seq === _playSeq && e && e.name === 'NotAllowedError') {
+          Toast.error('Browser blocked autoplay — click play again.');
+        }
+      });
+    };
+    setTimeout(again, Math.max(1, secs) * 1000);
+    return true;
+  }
+
   // The play() rejection report: one diagnostic toast per attempt.
   // ``serverReason``: why the server's render failed (render-status
   // ``state: 'failed'``) — said as is, with no probe.
+  // The browser can't play a track's own file (a codec it lacks — an IMA-ADPCM
+  // WAV): the <audio> 'error' handler asks for the server's transcode of it
+  // instead (force_transcode).  While that runs, a failure report of the same
+  // start waits for it and speaks only if the transcode fails too.
+  let _codecRetry = null;          // { seq, state: 'running' | 'played' | 'failed', waiters }
+  function _codecRetryBegin(seq) { _codecRetry = { seq, state: 'running', waiters: [] }; }
+  function _codecRetryEnd(seq, played) {
+    const c = _codecRetry;
+    if (!c || c.seq !== seq || c.state !== 'running') return;
+    c.state = played ? 'played' : 'failed';
+    const w = c.waiters;
+    c.waiters = [];
+    w.forEach((fn) => { try { fn(played); } catch (_) { /* listener isolation */ } });
+  }
+  function _codecRetryState(seq) { return _codecRetry && _codecRetry.seq === seq ? _codecRetry.state : null; }
+
   function _reportPlayFailure(track, title, err, attempt, serverReason = '') {
+    _noteStartFailed(track, attempt);
     // Diagnostic toast: one toast only.  Race a 1-byte probe of the stream
     // against a 400 ms timeout.  Whoever resolves first writes the toast —
     // the other arm is suppressed.  This way the user sees a meaningful
@@ -1828,8 +2226,18 @@ export const Player = (() => {
       || 'playback error';
     const genericReason = `Couldn\u2019t play \u201c${title}\u201d${fmtHint} (${errName}).`;
     let toastShown = false;
-    const showOnce = (msg) => {
-      if (toastShown) return;
+    const showOnce = (msg, waited = false, gone = false) => {
+      if (toastShown || _restartWaitFor(attempt)) return;
+      // The transcode of a file the browser can't decode is being tried: say
+      // nothing unless it fails too (and nothing once it plays).  The element's
+      // 'error' — which starts it — can come a moment after play() rejected.
+      const codec = _codecRetryState(attempt);
+      if (codec === 'played') return;
+      if (codec === 'running') {
+        _codecRetry.waiters.push((played) => { if (!played) showOnce(msg, true); });
+        return;
+      }
+      if (codec === null && !waited) { setTimeout(() => showOnce(msg, true, gone), 250); return; }
       toastShown = true;
       // Guard once more: between the play() failure and the probe
       // resolving the user may have moved on.  Don't backseat-toast.
@@ -1838,7 +2246,7 @@ export const Player = (() => {
       // again must say so again.
       if (_failToastFor === track.id && _failToastSeq === attempt) return;   // the <audio> 'error' handler already reported it
       _failToastFor = track.id; _failToastSeq = attempt;                     // …and it stays quiet if we got here first
-      _failToast(msg + _nextHint(), track);
+      _failToast(msg + _nextHint(), track, gone);
     };
     const why = typeof serverReason === 'string' ? serverReason.trim().slice(0, 200) : '';
     if (why) {
@@ -1866,6 +2274,12 @@ export const Player = (() => {
         signal: ctrl.signal,
         credentials: 'same-origin',
       }).then(async res => {
+        const restartSecs = _restartRetryAfter(res);
+        if (restartSecs > 0) {
+          // The server is restarting: wait it out, then play this track again.
+          try { ctrl.abort(); } catch (_) {}
+          if (_waitServerRestart(track, attempt, url, 0, restartSecs)) return;
+        }
         if (res.ok || res.status === 206) {
           // 200 or 206 Partial Content → the source is fine; play failed for
           // browser-side reasons (codec, corrupt frame).  Abort the (large)
@@ -1885,6 +2299,13 @@ export const Player = (() => {
           if (body && typeof body.detail === 'string') detail = body.detail.trim().slice(0, 200);
         } catch (_) {}
         try { ctrl.abort(); } catch (_) {}
+        if (code === 410 && detail) {
+          // Gone from the library (a package with no tune in it): the
+          // server's sentence says what it holds — no "Mark broken" offer.
+          try { if (_onGone) _onGone(track.id, detail); } catch (_) { /* listener isolation */ }
+          showOnce(detail, false, true);
+          return;
+        }
         const httpReason = detail ||
           (code === 502 ? `Source unavailable (share unreachable or ffmpeg failed)` :
            code === 503 ? `Server busy — try again in a moment` :
@@ -1896,14 +2317,18 @@ export const Player = (() => {
         showOnce(`Couldn\u2019t play \u201c${title}\u201d${fmtHint}: ${String(httpReason).replace(/[.\s]+$/, '')}.`);
       }).catch((err) => {
         if (err && err.name === 'AbortError') return;
+        // Unreachable right after the server said it restarts: its new
+        // process isn't listening yet — wait for it.
+        if (_restartRecent() && _waitServerRestart(track, attempt, url, 0, 1)) return;
         showOnce(`Couldn\u2019t reach the server for \u201c${title}\u201d${fmtHint} \u2014 check your connection.`);
       });
     } catch (_) {
       showOnce(genericReason);
     }
     // Fallback: if the probe doesn't resolve quickly, show the generic
-    // toast so the user isn't left wondering.
-    setTimeout(() => showOnce(genericReason), 400);
+    // toast so the user isn't left wondering (later while a restart is under
+    // way: the probe may wait on a server that is just coming back).
+    setTimeout(() => showOnce(genericReason), _restartRecent() ? 5000 : 400);
 
     emit('statechange', { playing: false });
     emit('error', { track, error: err });
@@ -1928,11 +2353,15 @@ export const Player = (() => {
   function _freshUrl(url) {
     return `${url}${url.includes('?') ? '&' : '?'}r=${Date.now().toString(36)}`;
   }
-  // One id per page load, sent as ``pw=`` with every prewarm and retain
-  // request: a retain from this page drops only this page's queued prewarms,
-  // never those of another tab signed in as the same listener.
-  // (crypto.randomUUID exists only in secure contexts — plain-http LAN
-  // installs get the Math.random id.)
+  // One id per page load (a module constant — never sessionStorage, which a
+  // duplicated tab copies), sent as ``pw=`` with every prewarm and retain
+  // request — a retain from this page drops only this page's queued
+  // prewarms — and as ``pg=`` with every stream request: the server counts
+  // each page as its own listener, so a play in one tab doesn't count as
+  // another tab moving on (its paused render keeps its slot through the
+  // server's grace period, like another device's); ``pagehide`` tells the
+  // server when this page goes.  (crypto.randomUUID exists only in secure
+  // contexts — plain-http LAN installs get the Math.random id.)
   const PREWARM_PAGE_ID = (() => {
     try {
       if (globalThis.crypto && typeof crypto.randomUUID === 'function') {
@@ -2184,6 +2613,7 @@ export const Player = (() => {
     if (_stationMode) return;    // live stream — nothing to seek into
     const dur = _duration();
     if (!dur) return;
+    _cancelCrossfade();          // (a seek during a fade: the listener chose the place)
     const targetSec = (pct / 100) * dur;
 
     // ── SID partial: seeking past the cached boundary ───────────────────
@@ -2292,14 +2722,16 @@ export const Player = (() => {
         .then(() => emit('statechange', { playing: true }))
         .catch(console.warn);
     } else {
+      _cancelCrossfade();          // (a pause also silences a fading-out tail)
       audio.pause();
       emit('statechange', { playing: false });
     }
   }
 
   function setVolume(v) {
-    audio.volume = Math.max(0, Math.min(1, v));
     localStorage.setItem('sb_volume', String(v));
+    if (_crossfadeVolume(Math.max(0, Math.min(1, v)))) return;   // (a fade under way: it ramps to it)
+    audio.volume = Math.max(0, Math.min(1, v));
   }
 
   // [queue-core:begin]
@@ -3315,6 +3747,7 @@ export const Player = (() => {
       _clearSource();
       queue    = [];
       queueIdx = -1;
+      _cancelCrossfade();
       try { audio.pause(); } catch (_) {}
       audio.removeAttribute('src');
       emit('queuechange', { queue, queueIdx });
@@ -3583,6 +4016,27 @@ export const Player = (() => {
     _saveQueueSoon();
   }
 
+  // A queued package of an online collection opened into its tunes (the
+  // entry became the first one): the others follow it, in the archive's
+  // order — those not queued already.  Like "Play next", outside the shuffle
+  // order.  Returns how many went in.
+  function insertAfterTrack(id, tracks) {
+    let at = -1;
+    for (let i = Math.max(0, queueIdx); i < queue.length; i++) {
+      if (queue[i] && queue[i].id === id) { at = i; break; }
+    }
+    if (at < 0) at = queue.findIndex(t => t && t.id === id);
+    if (at < 0 || !Array.isArray(tracks)) return 0;
+    const have = new Set(queue.map(t => t && t.id));
+    const add = tracks.filter(t => t && t.id && !have.has(t.id));
+    if (!add.length) return 0;
+    for (const t of add) { _manual.add(t); _shufExtras.add(t.id); }
+    queue = [...queue.slice(0, at + 1), ...add, ...queue.slice(at + 1)];
+    emit('queuechange', { queue, queueIdx });
+    _saveQueueSoon();
+    return add.length;
+  }
+
   function removeFromQueue(idx) {
     if (idx < 0 || idx >= queue.length) return;
     const wasCurrent = (idx === queueIdx);
@@ -3602,6 +4056,7 @@ export const Player = (() => {
       // next entry as "current".  Then either swap to the new track at
       // the same slot (so removing track N starts track N+1) or clear
       // playback entirely if the queue is now empty.
+      _cancelCrossfade();
       try { audio.pause(); } catch (_) {}
       if (queue.length === 0) {
         queueIdx = -1;
@@ -3678,6 +4133,7 @@ export const Player = (() => {
   // owns audio output.  See ``_extAudio`` for the full rationale.
   function suspendForExternalAudio(v) {
     _extAudio = !!v;
+    if (_extAudio) _cancelCrossfade();   // (the output went elsewhere: no tail fading on here)
     if (_extAudio) _noteStart();     // the phone's radio took the output
   }
 
@@ -3716,10 +4172,11 @@ export const Player = (() => {
   }
 
   function _maybeCrossfade(dur, current) {
-    if (_stationMode) return;   // a live station has no track end to cross-fade into
+    if (_stationMode || _extAudio) return;   // a live station has no track end to cross-fade into
+    if (repeatMode === 'one') return;         // the track plays again: 'ended' restarts it
     // Crossfade: when approaching end of track, trigger crossfade to next
     const xfade = _getCrossfade();
-    if (xfade > 0 && !_crossfading && dur > 0 && queue.length > 0) {
+    if (xfade > 0 && !_crossfading && !_xf && dur > 0 && queue.length > 0 && !audio.paused) {
       const remaining = dur - current;
       // Only fade out when the next track is actually IN HAND.  At the edge of a
       // pageable window "there is more" still means a fetch, and a fade that
@@ -3727,48 +4184,19 @@ export const Player = (() => {
       // there the track simply plays out and 'ended' advances.
       const nextReady = !!_peekNext() || (repeatMode === 'all' && !_srcPageable());
       if (remaining <= xfade && remaining > 0.2 && nextReady) {
+        if (remaining < 0.5) {
+          // Too little time left for a fade: straight to the next track.
+          _crossfading = true;
+          _autoAdvance();
+          return;
+        }
+        // The next track starts once the tail took the rest of this one over
+        // (_startCrossfade); 'ended' must not advance a second time meanwhile.
         _crossfading = true;
-        const origVol = audio.volume;
         try {
-          if (remaining < 0.5) {
-            // Too little time left to render a smooth fade — even one
-            // setInterval tick would land after the track ends.  Just cut
-            // straight to the next track; ear difference vs a 200 ms
-            // half-fade is inaudible.
-            _autoAdvance();
-          } else {
-            // Cap the interval to at least 25 ms (≈40 Hz update) — JS
-            // timers below ~16 ms get coalesced and visibly stutter on
-            // slow systems, so a hypothetical "100 steps in 200 ms"
-            // schedule wastes ticks.  Drop step count instead.
-            const MIN_INTERVAL_MS = 25;
-            let fadeSteps = 20;
-            let fadeInterval = (remaining * 1000) / fadeSteps;
-            if (fadeInterval < MIN_INTERVAL_MS) {
-              fadeInterval = MIN_INTERVAL_MS;
-              fadeSteps = Math.max(2, Math.floor((remaining * 1000) / MIN_INTERVAL_MS));
-            }
-            let step = 0;
-            _crossfadeTimer = setInterval(() => {
-              step++;
-              audio.volume = origVol * Math.max(0, 1 - step / fadeSteps);
-              if (step >= fadeSteps) {
-                clearInterval(_crossfadeTimer);
-                _crossfadeTimer = null;
-              }
-            }, fadeInterval);
-            // Start next track
-            _autoAdvance();
-          }
+          _startCrossfade(remaining);
         } catch (err) {
-          // Ensure we never strand the interval if the next() call throws
-          // — leaving _crossfadeTimer hot would keep ramping the new
-          // track's volume down forever.
-          if (_crossfadeTimer) {
-            clearInterval(_crossfadeTimer);
-            _crossfadeTimer = null;
-          }
-          audio.volume = origVol;
+          _cancelCrossfade();
           _crossfading = false;
           throw err;
         }
@@ -4097,6 +4525,7 @@ export const Player = (() => {
     _showBufferingBadge();
   });
   audio.addEventListener('playing', () => {
+    _clearStartFailed();                 // (it plays after all — a retry, a transcode)
     _hideBufferingBadge();
     // ``playing`` fires the instant audio frames start hitting the
     // output device — earlier than the audio.play() promise resolves
@@ -4266,6 +4695,17 @@ export const Player = (() => {
     return _streamUrl(id, params);
   }
 
+  // This page is going away (closed, reloaded, navigated): the server counts
+  // the renders it was reading as moved on at once, as a skip here would —
+  // a reloaded page has a new page id and its old render must not hold a
+  // render slot for the grace period.
+  try {
+    globalThis.addEventListener?.('pagehide', () => {
+      try { navigator.sendBeacon?.(`/api/stream/page-gone?pg=${PREWARM_PAGE_ID}`); }
+      catch (_) { /* best effort */ }
+    });
+  } catch (_) { /* not a browser */ }
+
   /** Extract the track id from a stream URL, regardless of query params.
    *  We can't rely on the closure's ``trackId`` because anything that
    *  set ``audio.src`` outside ``playTrack`` (a direct probe, a queue
@@ -4303,6 +4743,50 @@ export const Player = (() => {
       return;
     }
 
+    const id = trackId || _idFromSrc(audio.src);
+    // A file the browser can't decode or play: its transcode is tried next
+    // (_onMediaError) — failure reports of this start wait for it from now on.
+    if (_codecFallbackEligible(err, id)) _codecRetryBegin(_playSeq);
+    // The server restarting (503 + Retry-After): neither a codec nor a file
+    // problem — wait it out and play the same track again (_waitServerRestart).
+    // An element can't see the HTTP status, so a load failure asks once.
+    if (_restartWaitFor(_playSeq)) return;
+    // (A rendered track is never probed — the probe would start its failing
+    // render again; its render recovery's report probes when it has to.)
+    const renderedNow = !!(_track && _track.id === id && _isRenderedTrack(_track));
+    if (id && renderedNow && _restartRecent() && (err.code === 2 || err.code === 4)
+        && _waitServerRestart(_track, _playSeq, audio.src, audio.currentTime || 0, 1)) return;
+    if (id && !renderedNow && (err.code === 2 || err.code === 4) && navigator.onLine !== false) {
+      const seq = _playSeq, t = _track, src = audio.src, at = audio.currentTime || 0;
+      const probe = { status: 0 };
+      _probeRestarting(src, probe).then((secs) => {
+        if (seq !== _playSeq || audio.src !== src) return;          // another start meanwhile
+        if (secs > 0 && t && t.id === id && _waitServerRestart(t, seq, src, at, secs)) return;
+        // The server refused the file itself (404 / 410 / 415 / 422 …): no
+        // codec trouble — no transcode to try, the failure is said at once.
+        const st = probe.status;
+        _onMediaError(err, id, st >= 400 && st < 500 && st !== 408 && st !== 429);
+      });
+      return;
+    }
+    _onMediaError(err, id);
+  });
+
+  // The element's own source failed in a way the server's transcode can fix:
+  // a decode error (MEDIA_ERR_DECODE — Firefox's answer to a codec it lacks)
+  // or an unsupported source (MEDIA_ERR_SRC_NOT_SUPPORTED — Chromium / WebKit),
+  // not a rendered track, not already the transcode, not a track known to need
+  // it, and online.
+  function _codecFallbackEligible(err, id) {
+    if (!err || (err.code !== 3 && err.code !== 4) || !id) return false;
+    if (_track && _track.id === id && _isRenderedTrack(_track)) return false;
+    if (/[?&]force_transcode=1/.test(audio.src) || _forcedIds.has(id)) return false;
+    return navigator.onLine !== false;
+  }
+
+  // The <audio> error after the restart check: codec fallback, render
+  // recovery, or the failure report.
+  function _onMediaError(err, id, refused = false) {
     const codes = { 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
     const tag = codes[err.code] || err.code;
     const title = (_track && (_track.title || _track.name)) || 'track';
@@ -4321,7 +4805,6 @@ export const Player = (() => {
     // through ``playTrack`` (which is the only writer of ``trackId``).
     // Also skip if the src already carries ``force_transcode`` to
     // prevent a transcoded-WAV failure from triggering another retry.
-    const id = trackId || _idFromSrc(audio.src);
     // A rendered track (SID, Amiga, tracker, …) that failed while the server
     // may still be rendering it: wait for the render instead of reporting —
     // and never mark it for force_transcode, which means nothing for a render.
@@ -4339,28 +4822,43 @@ export const Player = (() => {
         _reportMediaError(tag, title, err);
       })) return;
     }
-    const alreadyForced = /[?&]force_transcode=1/.test(audio.src);
-    if (err.code === 4 && id && !rendered && !alreadyForced && !_forcedIds.has(id)) {
+    // (Offline, the failure is no codec trouble: nothing to retry or remember.)
+    if (!rendered && !refused && _codecFallbackEligible(err, id)) {
       console.warn(`Media error [${tag}] on "${title}" — retrying with force_transcode=1`);
-      _markForceTranscoded(id);
+      const seq = _playSeq;
+      if (_codecRetryState(seq) !== 'running') _codecRetryBegin(seq);
+      // (a transcode that neither plays nor fails within 30 s: the waiting
+      // failure report is said after all)
+      setTimeout(() => _codecRetryEnd(seq, false), 30000);
       const wasAt = audio.currentTime || 0;
       audio.src = _streamUrl(id, { force_transcode: '1' });
       audio.load();
       const _onReady = () => {
         audio.removeEventListener('canplay', _onReady);
+        // (Another track since — the retry failed and this one loaded.)
+        if (_idFromSrc(audio.src) !== id || !/[?&]force_transcode=1/.test(audio.src)) return;
+        // Remembered only once the transcode plays: a file that can't be
+        // reached (a share, an online collection) is no codec trouble.
+        _markForceTranscoded(id);
         if (wasAt > 0.5) {
           try { audio.currentTime = wasAt; } catch (_) {}
         }
-        audio.play().catch(() => {});
+        audio.play().then(() => {
+          if (seq !== _playSeq) return;
+          _codecRetryEnd(seq, true);
+          emit('statechange', { playing: true });
+        }, () => _codecRetryEnd(seq, false));
       };
       audio.addEventListener('canplay', _onReady);
       return;
     }
     _reportMediaError(tag, title, err);
-  });
+  }
 
   // The <audio> error report: one toast per attempt, then auto-skip a dealt track.
   function _reportMediaError(tag, title, err) {
+    _codecRetryEnd(_playSeq, false);                 // (the transcode, if tried, failed too)
+    if (_restartWaitFor(_playSeq)) return;           // waiting out a restart: nothing failed
     console.error(`Media error [${tag}]: ${err && err.message}`);
     // ONE message per failed track: play()'s rejection path explains the failure
     // better (HTTP status, missing file, unreachable share) and lands within
@@ -4368,6 +4866,7 @@ export const Player = (() => {
     const failedId = trackId, failedSeq = _playSeq;
     const failedFmt = _fmtLabel(_track && _track.format);
     const failedTrack = _track;
+    _noteStartFailed(failedTrack, failedSeq);
     setTimeout(() => {
       const told = _failToastFor === failedId && _failToastSeq === failedSeq;
       if (!told && trackId === failedId && _playSeq === failedSeq) {
@@ -4396,6 +4895,8 @@ export const Player = (() => {
   let _failToastSeq = -1;        // …for THIS start (_playSeq): a retry that fails again is reported again
   let _skipTimer = null;
   audio.addEventListener('playing', () => { _failStreak = 0; _failToastFor = null; });
+  audio.addEventListener('playing', () => _crossfadeOnPlaying());   // the incoming track's fade-in
+  audio.addEventListener('pause', () => _crossfadeOnPause());       // a pause stops a fade
   function _skipUnplayable() {
     const failedId = trackId;
     if (_skipTimer) { clearTimeout(_skipTimer); _skipTimer = null; }
@@ -4427,6 +4928,24 @@ export const Player = (() => {
   const _TUNE_KEYS = ['subsong', 'subsongTotal', 'subsongStart', 'subsongLabel'];
   // Returns the fields that differed on the first entry found (null: the
   // track isn't in the player).
+  // Tracks that left the library (``ids``: a package of an online collection
+  // with no tune in it — the play's 410, or the library socket's
+  // ``catalogue_tracks_left``): every copy this page holds is marked
+  // (``defect`` 'empty', ``defect_detail`` the server's reason), so the queue
+  // shows why and passes them by when it moves on.
+  function markGone(ids, reasons = {}) {
+    const list = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
+    let hit = false;
+    for (const id of list) {
+      const why = (reasons && typeof reasons[id] === 'string') ? reasons[id] : '';
+      const ch = patchTrackFields(id, { defect: 'empty', defect_detail: why });
+      if (ch && Object.keys(ch).length) hit = true;
+    }
+    if (hit) { emit('queuechange', { queue, queueIdx }); _saveQueueSoon(); }
+    if (list.length) emit('trackgone', { ids: list, reasons: reasons || {} });
+  }
+  _onGone = (id, reason) => markGone([id], { [id]: reason });
+
   function patchTrackFields(id, fields) {
     if (!id || !fields || typeof fields !== 'object') return null;
     let changed = null;
@@ -4459,7 +4978,7 @@ export const Player = (() => {
   }
 
   return {
-    patchTrackFields,
+    patchTrackFields, markGone,
     get analyser()       { return analyser; },
     get vuAnalyser()     { return vuAnalyser; },
     get ctx()            { return ctx; },
@@ -4467,6 +4986,10 @@ export const Player = (() => {
     get eqPreGain()      { return eqPreGain; },
     get replayGain()     { return replayGain; },
     get currentTrackId() { return trackId; },
+    // The track the now-playing markers show: the current one, unless its
+    // start failed (nothing plays) — then ''.
+    get nowPlayingId()   { return _startFailedNow() ? '' : (trackId || ''); },
+    get startFailed()    { return _startFailedNow(); },
     get playing()        { return !audio.paused; },
     get queue()          { return queue; },
     get queueIdx()       { return queueIdx; },
@@ -4481,6 +5004,7 @@ export const Player = (() => {
     getSourceNode()      { return source; },
     fmt,
     playTrack, playPause, seek, setVolume, next, prev, setQueue, playSource,
+    noteServerRestart,
     // Diagnostics / tests: the live queue-source state (null for a plain array).
     // Radio Mode: how many of ITS tracks are still queued right after the current one.
     get radioActive() { return _radioActive; },
@@ -4492,7 +5016,7 @@ export const Player = (() => {
                       ordNext: _ordNext, shufNext: _shufNext, ended: _srcEnded,
                       hasMore: _srcHasMore() } : null;
     },
-    addToQueue, playNext, removeFromQueue, moveInQueue,
+    addToQueue, playNext, insertAfterTrack, removeFromQueue, moveInQueue,
     playStation, stopStation, updateStationArt, setStationNowPlaying,
     get stationMode() { return _stationMode; },
     get station()     { return _station; },

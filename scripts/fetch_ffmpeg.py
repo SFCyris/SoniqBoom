@@ -165,7 +165,10 @@ _UA = "soniqboom-ffmpeg-fetcher/1.0"
 
 def _http_get(url: str, dest: Path | None = None) -> bytes | None:
     """Fetch a URL.  If ``dest`` is given, stream to disk and return None;
-    otherwise return the body as bytes."""
+    otherwise return the body as bytes.  Offline mode (``SONIQBOOM_OFFLINE``)
+    refuses."""
+    if os.environ.get("SONIQBOOM_OFFLINE", "").strip().lower() in ("1", "true", "yes", "on"):
+        raise RuntimeError(f"offline mode (SONIQBOOM_OFFLINE): not downloading {url}")
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:

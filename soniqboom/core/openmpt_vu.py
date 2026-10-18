@@ -272,6 +272,12 @@ def extract_vu(
         duration = float(lib.openmpt_module_get_duration_seconds(mod))
         if max_seconds > 0:
             duration = min(duration, max_seconds)
+        elif subsong < 1 and duration > 0:
+            # The length SoniqBoom renders: a song-end loop is cut where it
+            # first repeats (``song_end_loop``) — the sidecar matches the WAV.
+            cut = _loop_cut(lib, mod, file_bytes)
+            if cut is not None:
+                duration = min(duration, cut)
         if duration <= 0:
             duration = 600.0  # 10-min defensive ceiling for broken metadata
 
@@ -343,19 +349,9 @@ def extract_vu(
             pass
 
 
-def module_duration(file_bytes: bytes) -> float | None:
-    """The play length of the module in *file_bytes*, in seconds — what
-    ``openmpt123 --info`` reports as its Duration (every subsong played in
-    turn, subsong -1), to the same millisecond (``duration_ms``), without
-    starting a process.
-
-    ``None`` when libopenmpt can't be loaded on this host (the caller falls
-    back to the CLI); ``0.0`` for bytes libopenmpt can't open.  Nothing is
-    logged to stderr (``openmpt_log_func_silent``)."""
-    if not _bind():
-        return None
-    lib = _load()
-    assert lib is not None
+def _open_silent(lib, file_bytes: bytes):
+    """A module handle for *file_bytes* that logs nothing to stderr
+    (``openmpt_log_func_silent``), or None when libopenmpt can't open them."""
     if not hasattr(lib, "_sb_silent"):
         try:
             lib._sb_silent = ctypes.cast(lib.openmpt_log_func_silent, ctypes.c_void_p)
@@ -375,13 +371,286 @@ def module_duration(file_bytes: bytes) -> float | None:
         msg = ctypes.cast(err_msg, ctypes.c_void_p).value
         if msg:
             lib.openmpt_free_string(msg)
+        return None
+    return mod
+
+
+def module_duration(file_bytes: bytes) -> float | None:
+    """The play length of the module in *file_bytes*, in seconds, without
+    starting a process: what ``openmpt123 --info`` reports as its Duration
+    (every subsong played in turn, subsong -1), to the same millisecond
+    (``duration_ms``) — or, for a module that ends in a repeat-count loop
+    (``song_end_loop``), the time the loop first repeats, which is what
+    SoniqBoom renders.
+
+    ``None`` when libopenmpt can't be loaded on this host (the caller falls
+    back to the CLI); ``0.0`` for bytes libopenmpt can't open.  Nothing is
+    logged to stderr (``openmpt_log_func_silent``)."""
+    if not _bind():
+        return None
+    lib = _load()
+    assert lib is not None
+    mod = _open_silent(lib, file_bytes)
+    if not mod:
         return 0.0
     try:
         lib.openmpt_module_select_subsong(mod, -1)
         duration = float(lib.openmpt_module_get_duration_seconds(mod))
-        return duration_ms(duration) / 1000 if duration > 0 else 0.0
+        if duration <= 0:
+            return 0.0
+        cut = _loop_cut(lib, mod, file_bytes)
+        return duration_ms(cut if cut is not None else duration) / 1000
     finally:
         lib.openmpt_module_destroy(mod)
+
+
+# ── Song-end loops written as a repeat count ────────────────────────────────
+#
+# libopenmpt plays a module until it would repeat itself — a jump back to an
+# earlier position ends the song there — but a loop with a repeat COUNT is
+# played that many times.  Face The Music's loader writes a counted loop out
+# into the order list, pass by pass: Aminet's "Jonahara" sets its closing 32
+# measures to repeat 63 times (the most its 6-bit count holds) and libopenmpt
+# plays 5:02 of music followed by 62 sample-identical repeats of the last
+# 58.9 s — 65:56, a 1.5 GB render.
+#
+# The rule: when the order list ENDS in one block of orders played back to
+# back at least ``LOOP_MIN_PASSES`` times, and two of those passes render
+# sample for sample the same (float output, bit-exact), the song ends where
+# the block first repeats — exactly where libopenmpt ends a module that
+# jumps back to that block instead of counting.  Everything else plays as
+# libopenmpt plays it: repeats with more music after them, fewer passes than
+# ``LOOP_MIN_PASSES`` (an arrangement that plays its last section twice or
+# three times), passes that change (a fade or a slide across the repeats),
+# modules with several subsongs, and libraries without the position API.
+LOOP_MIN_PASSES = 8
+# Longest order list examined, and longest single pass compared (seconds):
+# beyond these the rule does not apply.
+_LOOP_MAX_ORDERS = 8192
+_LOOP_MAX_PASS_S = 600.0
+_LOOP_RATE = 44100
+_LOOP_CHUNK = 4096
+
+
+def terminal_block(orders: "list[int]", num_patterns: int,
+                   min_passes: int = LOOP_MIN_PASSES) -> "tuple[int, int, int] | None":
+    """``(first, length, passes)`` of the shortest block of orders that the
+    order list ``orders`` ends with, repeated back to back at least
+    ``min_passes`` times — ``orders[first:]`` is ``passes`` copies of
+    ``orders[first:first + length]`` — or None.  An entry that names no
+    pattern (a skip / end marker, or ``>= num_patterns``) in the repeats
+    disqualifies them.  Pure."""
+    n = len(orders)
+    if n < min_passes or n > _LOOP_MAX_ORDERS:
+        return None
+    for k in range(1, n // min_passes + 1):
+        block = orders[n - k:]
+        if any(not (0 <= p < num_patterns) for p in block):
+            return None
+        passes = 1
+        while n - (passes + 1) * k >= 0 and orders[n - (passes + 1) * k:n - passes * k] == block:
+            passes += 1
+        if passes >= min_passes:
+            return n - passes * k, k, passes
+    return None
+
+
+def _bind_positions(lib) -> bool:
+    """Prototypes of the order / position calls the loop rule uses; False on
+    a library without them (``openmpt_module_get_time_at_position`` is
+    libopenmpt 0.7+)."""
+    if getattr(lib, "_sb_pos_bound", None) is not None:
+        return lib._sb_pos_bound
+    try:
+        V = _Module
+        lib.openmpt_module_get_num_orders.argtypes = [V]
+        lib.openmpt_module_get_num_orders.restype = ctypes.c_int32
+        lib.openmpt_module_get_num_patterns.argtypes = [V]
+        lib.openmpt_module_get_num_patterns.restype = ctypes.c_int32
+        lib.openmpt_module_get_order_pattern.argtypes = [V, ctypes.c_int32]
+        lib.openmpt_module_get_order_pattern.restype = ctypes.c_int32
+        lib.openmpt_module_get_time_at_position.argtypes = [V, ctypes.c_int32, ctypes.c_int32]
+        lib.openmpt_module_get_time_at_position.restype = ctypes.c_double
+        lib.openmpt_module_set_position_order_row.argtypes = [V, ctypes.c_int32, ctypes.c_int32]
+        lib.openmpt_module_set_position_order_row.restype = ctypes.c_double
+        lib.openmpt_module_get_current_order.argtypes = [V]
+        lib.openmpt_module_get_current_order.restype = ctypes.c_int32
+        lib.openmpt_module_read_interleaved_float_stereo.argtypes = [
+            V, ctypes.c_int32, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float)]
+        lib.openmpt_module_read_interleaved_float_stereo.restype = ctypes.c_size_t
+        lib._sb_pos_bound = True
+    except AttributeError:
+        lib._sb_pos_bound = False
+    return lib._sb_pos_bound
+
+
+def _ctl_on(lib, mod, name: bytes) -> bool:
+    """Set the boolean ctl ``name`` of ``mod`` on; False when it can't be."""
+    try:
+        f = lib.openmpt_module_ctl_set_boolean
+        f.argtypes = [_Module, ctypes.c_char_p, ctypes.c_int]
+        f.restype = ctypes.c_int
+        return bool(f(mod, name, 1))
+    except AttributeError:
+        pass
+    try:
+        f = lib.openmpt_module_ctl_set                 # (before libopenmpt 0.5)
+        f.argtypes = [_Module, ctypes.c_char_p, ctypes.c_char_p]
+        f.restype = ctypes.c_int
+        return bool(f(mod, name, b"1"))
+    except AttributeError:
+        return False
+
+
+def _passes_identical(lib, file_bytes: bytes, start_a: int, start_b: int,
+                      stop_a: int, max_frames: int) -> bool:
+    """Do the passes starting at orders ``start_a`` and ``start_b`` render
+    the same, sample for sample?  Two copies of the module, one placed at
+    each, are rendered in step (float, ``_LOOP_RATE``) and compared chunk by
+    chunk — memory stays one chunk whatever the length — until copy A
+    reaches order ``stop_a`` (the start of its next pass).  False on any
+    difference, on an end before that, or past ``max_frames``."""
+    a = _open_silent(lib, file_bytes)
+    b = _open_silent(lib, file_bytes) if a else None
+    if not (a and b):
+        for m in (a, b):
+            if m:
+                lib.openmpt_module_destroy(m)
+        return False
+    try:
+        # A seek must rebuild what still sounds from before (a long sample
+        # played on through the repeats): without it a pass would look like
+        # the next one while the real playback differs.  libopenmpt's default,
+        # set explicitly — the rule doesn't apply where it can't be.
+        if not (_ctl_on(lib, a, b"seek.sync_samples") and _ctl_on(lib, b, b"seek.sync_samples")):
+            return False
+        lib.openmpt_module_set_position_order_row(a, start_a, 0)
+        lib.openmpt_module_set_position_order_row(b, start_b, 0)
+        buf_a = (ctypes.c_float * (2 * _LOOP_CHUNK))()
+        buf_b = (ctypes.c_float * (2 * _LOOP_CHUNK))()
+        done = 0
+        compared = 0
+        while done < max_frames:
+            na = lib.openmpt_module_read_interleaved_float_stereo(a, _LOOP_RATE, _LOOP_CHUNK, buf_a)
+            nb = lib.openmpt_module_read_interleaved_float_stereo(b, _LOOP_RATE, _LOOP_CHUNK, buf_b)
+            if lib.openmpt_module_get_current_order(a) >= stop_a:
+                # This chunk crossed into A's next pass: its part after the
+                # boundary is compared with B's next pass — still the same
+                # if the passes are, but not needed.
+                return compared > 0
+            if na != _LOOP_CHUNK or nb != _LOOP_CHUNK:
+                return False
+            if ctypes.string_at(buf_a, 8 * na) != ctypes.string_at(buf_b, 8 * nb):
+                return False
+            done += na
+            compared += 1
+        return False
+    finally:
+        lib.openmpt_module_destroy(a)
+        lib.openmpt_module_destroy(b)
+
+
+def song_end_loop(file_bytes: bytes, subsong: int = -1) -> "float | None":
+    """Seconds at which the module in *file_bytes* ends under the song-end
+    loop rule (see above), or None when the rule doesn't apply — the module
+    then plays its full libopenmpt length.  Only the default play (subsong
+    -1 / 0) of a module with one subsong is ever cut.  Never raises."""
+    if subsong > 0 or not file_bytes:
+        return None
+    try:
+        if not _bind():
+            return None
+        lib = _load()
+        if lib is None:
+            return None
+        mod = _open_silent(lib, file_bytes)
+        if not mod:
+            return None
+        try:
+            return _loop_cut(lib, mod, file_bytes)
+        finally:
+            lib.openmpt_module_destroy(mod)
+    except Exception:                                   # noqa: BLE001
+        log.debug("openmpt_vu: song-end loop check failed", exc_info=True)
+        return None
+
+
+def _loop_cut(lib, mod, file_bytes: bytes) -> "float | None":
+    """``song_end_loop`` on the open module ``mod`` (made from *file_bytes*;
+    its play position is not moved).  Only a module whose order list ends in
+    a repeated block (``terminal_block``) costs more than reading its order
+    list: two more copies render two passes to compare.  Never raises."""
+    try:
+        if not _bind_positions(lib):
+            return None
+        if int(lib.openmpt_module_get_num_subsongs(mod)) != 1:
+            return None
+        n = int(lib.openmpt_module_get_num_orders(mod))
+        if not (LOOP_MIN_PASSES <= n <= _LOOP_MAX_ORDERS):
+            return None
+        npat = int(lib.openmpt_module_get_num_patterns(mod))
+        orders = [int(lib.openmpt_module_get_order_pattern(mod, i)) for i in range(n)]
+        found = terminal_block(orders, npat)
+        if found is None:
+            return None
+        first, k, passes = found
+        # Start times of the first four passes: each pass must be played, in
+        # order, and as long as the others; and the song's length must be
+        # the passes played through to its end.
+        t = [float(lib.openmpt_module_get_time_at_position(mod, first + i * k, 0))
+             for i in range(4)]
+        duration = float(lib.openmpt_module_get_duration_seconds(mod))
+        if min(t) < 0 or not (t[0] < t[1] < t[2] < t[3] < duration):
+            return None
+        pass_s = t[2] - t[1]
+        if pass_s <= 0 or pass_s > _LOOP_MAX_PASS_S:
+            return None
+        if any(abs((t[i + 1] - t[i]) - pass_s) > 0.05 for i in range(3)):
+            return None
+        if abs(duration - (t[0] + passes * pass_s)) > max(1.0, 0.002 * duration):
+            return None
+        # The second and third passes (the first follows other music, whose
+        # notes may still ring into it) must sound the same.
+        max_frames = int((pass_s + 2.0) * _LOOP_RATE)
+        if not _passes_identical(lib, file_bytes, first + k, first + 2 * k,
+                                 first + 2 * k, max_frames):
+            return None
+        return t[1]
+    except Exception:                                   # noqa: BLE001
+        log.debug("openmpt_vu: song-end loop check failed", exc_info=True)
+        return None
+
+
+def render_plan(file_bytes: bytes, subsong: int = 0) -> "tuple[float, float | None] | None":
+    """``(seconds, end_at)`` of the render of tune index ``subsong`` (0: the
+    default play — every subsong in turn, as ``openmpt123`` without
+    ``--subsong``; N > 0: libopenmpt subsong N): how long it plays, and the
+    time to stop it at (``openmpt123 --end-time``) when a song-end loop is
+    cut there (``song_end_loop``), else None.  ``(0.0, None)`` for bytes
+    libopenmpt can't open; None when libopenmpt can't be loaded.  Never
+    raises."""
+    try:
+        if not _bind():
+            return None
+        lib = _load()
+        assert lib is not None
+        mod = _open_silent(lib, file_bytes)
+        if not mod:
+            return 0.0, None
+        try:
+            lib.openmpt_module_select_subsong(mod, subsong if subsong > 0 else -1)
+            duration = float(lib.openmpt_module_get_duration_seconds(mod))
+            if duration <= 0:
+                return 0.0, None
+            cut = _loop_cut(lib, mod, file_bytes) if subsong <= 0 else None
+        finally:
+            lib.openmpt_module_destroy(mod)
+        if cut is not None and 0 < cut < duration:
+            return cut, cut
+        return duration, None
+    except Exception:                                   # noqa: BLE001
+        log.debug("openmpt_vu: render plan failed", exc_info=True)
+        return None
 
 
 def duration_ms(seconds: float) -> int:

@@ -494,13 +494,13 @@ async def test_vu_pass_starts_only_when_the_meter_asks(monkeypatch, tmp_path):
     async with _client(tapp) as c:
         r = await c.get("/api/tracks/vu1/vu")
         # within the first seconds of a play the pass is left for a later ask
-        assert r.status_code == 404 and spawned == []
+        assert r.status_code == 204 and spawned == []
         ent = stream._UADE_VU_WANTED[key]
         stream._UADE_VU_WANTED[key] = ent[:3] + (ent[3] - 60,) + ent[4:]
         r = await c.get("/api/tracks/vu1/vu?start=0")       # cache-only ask
-        assert r.status_code == 404 and spawned == []
+        assert r.status_code == 204 and spawned == []
         r = await c.get("/api/tracks/vu1/vu")
-    assert r.status_code == 404
+    assert r.status_code == 204
     assert spawned == [(key, 0)]
     assert stream.request_uade_vu("never-played", 0) is False
 

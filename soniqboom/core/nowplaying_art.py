@@ -320,6 +320,9 @@ async def lookup(artist: str, title: str) -> dict | None:
         if cached is not None:
             return cached.get("result")
         result = await _resolve(artist, title)
+        from soniqboom.core import netpolicy
+        if result is None and netpolicy.blocked():
+            return None                  # offline: not looked up, nothing remembered
         _write_cache(key, {"found": result is not None, "result": result})
         return result
 
@@ -328,10 +331,14 @@ async def _resolve(artist: str, title: str) -> dict | None:
     # 0. Local library — exact, instant, private.
     tid = _local_match(artist, title)
     if tid:
-        return {"cover_url": f"/api/art/{tid}?size=lg", "album": "", "year": None,
+        return {"cover_url": f"/api/art/{tid}/lg.jpg", "album": "", "year": None,
                 "label": "", "source": "library"}
 
-    # 1. Discogs (only if a token is configured), then 2. MusicBrainz/CAA.
+    # 1. Discogs (only if a token is configured), then 2. MusicBrainz/CAA —
+    # never in offline mode (``netpolicy``).
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked():
+        return None
     from soniqboom.config import settings
     token = (getattr(settings, "discogs_token", "") or "").strip()
     found = None

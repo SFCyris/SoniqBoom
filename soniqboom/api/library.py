@@ -8,6 +8,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
@@ -72,6 +73,7 @@ async def _broadcast(data: dict) -> None:
     """
     if not _ws_clients:
         return
+    data = _with_lib_gen(data)
 
     async def _send(ws):
         try:
@@ -97,6 +99,20 @@ async def _broadcast(data: dict) -> None:
             _ws_user_id.pop(ws, None)
 
 
+def _with_lib_gen(data: dict) -> dict:
+    """A ``scan_progress`` frame with ``running`` false (a scan's completion,
+    its embedding phase, a silent scan's end) and a ``catalogue_changed``
+    event (after which a page re-reads its counts, open view and folder tree)
+    carry the :func:`library_generation` they left the library at.  So does
+    ``remote_new_tracks`` (sent right after its share check's end frame): a
+    page that already re-read at that generation only shows the toast."""
+    ev = data.get("event")
+    if "lib_gen" not in data and (ev in ("catalogue_changed", "remote_new_tracks")
+                                  or (ev == "scan_progress" and not data.get("running"))):
+        return {**data, "lib_gen": library_generation()}
+    return data
+
+
 async def broadcast_track_updated(track_id: str) -> None:
     """Tell every open page one track's stored fields changed (a catalogue
     tune read on its first play): pages holding it re-read it."""
@@ -109,14 +125,61 @@ async def broadcast_catalogue_changed(root: str) -> None:
     await _broadcast({"event": "catalogue_changed", "root": root})
 
 
+async def broadcast_server_restarting() -> None:
+    """Tell every open page the server restarts in place now (the source
+    install's restart, right before it starts refusing requests): a play
+    that fails while it is away is waited out (``player.noteServerRestart``)."""
+    await _broadcast({"event": "server_restarting"})
+
+
+async def broadcast_library_replaced() -> None:
+    """Tell every open page the whole library was replaced (a backup import):
+    the same event as a catalogue change — the folder tree, the open view and
+    the counts are re-read (``root`` is empty: no one root)."""
+    await _broadcast({"event": "catalogue_changed", "root": ""})
+
+
+async def broadcast_silent_scan_end(dirs: "list[str] | None" = None) -> None:
+    """The ``running: false`` frame of a scan that sends no progress (the
+    folder watcher's rescans, a share's freshness poll): marked ``silent`` —
+    no "Done" badge — with the folders it covered (``last_dirs``), so an open
+    folder among them is re-read in place, the counts follow and the page
+    records the generation it reached (``lib_gen``)."""
+    from soniqboom.core.scanner import get_progress as _gp
+    frame = {"event": "scan_progress", **_gp().to_dict(),
+             "running": False, "embedding": False, "silent": True}
+    if dirs is not None:
+        frame["last_dirs"] = list(dirs)
+    await _broadcast(frame)
+
+
+async def broadcast_catalogue_tracks_left(root: str, folder: str, ids: list,
+                                          reasons: "dict | None" = None) -> None:
+    """Tell every open page that rows of a catalogue root left the library
+    (a package that holds nothing playable): its lists and counts re-read in
+    place, the folder tree stays as it is, and a queue / Track Info holding
+    one of ``ids`` shows why (``reasons``: id → sentence)."""
+    await _broadcast({"event": "catalogue_tracks_left", "root": root, "folder": folder,
+                      "ids": list(ids), "reasons": dict(reasons or {})})
+
+
+async def broadcast_catalogue_folder_changed(root: str, folder: str) -> None:
+    """Tell every open page that ONE folder of a catalogue root changed (a
+    package opened into its tunes): a view showing it re-reads it; the folder
+    tree stays as it is."""
+    await _broadcast({"event": "catalogue_folder_changed", "root": root, "folder": folder})
+
+
 # ── Aggregation cache (event-driven: cached until scan invalidates) ───────────
 
-# Entry is ``(mutation_seq, data)`` — the HTTP cache is gated on the store's
-# ``_mutation_seq`` (same freshness signal the store's own aggregate cache uses)
-# so ANY track mutation — not just a scan-complete/reindex/filter-toggle — makes
-# a stale legend recompute.  Without the seq gate the Galaxy legend could serve
-# counts from before a retag / set-primary / metadata backfill and disagree with
-# the (always-fresh) ``/api/tracks?format=X`` drill-down.
+# Entry is ``(browse_seq, data)`` — the HTTP cache is gated on the store's
+# ``_browse_seq`` (same freshness signal the store's own aggregate cache uses)
+# so ANY track mutation a legend can show — not just a scan-complete/reindex/
+# filter-toggle — makes a stale legend recompute, while writes no legend reads
+# (a play-time duration backfill, a health mark, cover art) keep it.  Without
+# the seq gate the Galaxy legend could serve counts from before a retag /
+# set-primary / metadata backfill and disagree with the (always-fresh)
+# ``/api/tracks?format=X`` drill-down.
 _AGG_CACHE: dict[str, tuple[int, list]] = {}
 # Parallel dict: cache_key → (etag, raw_json_bytes, gzipped_json_bytes | None).
 # Computed lazily on first HTTP hit so we don't pay the hash+serialise cost when
@@ -134,13 +197,13 @@ _GZIP_LEVEL = 6
 
 
 def _current_agg_seq():
-    """What an aggregate cache entry is valid for: the store's mutation
-    sequence, plus — while "Tracks on unavailable drives: Hide" leaves tracks
-    out, or a duplicate's copy stands in for a primary that can't play — the
-    availability generation (the counts follow both)."""
+    """What an aggregate cache entry is valid for: the store's browse
+    sequence (``_browse_seq``), plus — while "Tracks on unavailable drives:
+    Hide" leaves tracks out, or a duplicate's copy stands in for a primary that
+    can't play — the availability generation (the counts follow both)."""
     try:
         store = get_store()
-        seq = int(getattr(store, "_mutation_seq", 0))
+        seq = int(getattr(store, "_browse_seq", getattr(store, "_mutation_seq", 0)))
     except Exception:
         return 0
     try:
@@ -150,6 +213,67 @@ def _current_agg_seq():
     except Exception:
         tok = swap_tok = None
     return seq if tok is None and swap_tok is None else (seq, tok, swap_tok)
+
+
+# Library generation (``library_generation``): this server run, the number of
+# ``invalidate_agg_cache`` calls, the aggregate cache key above and the store's
+# write and duration sequences.
+_BOOT_ID = secrets.token_hex(4)
+_AGG_EPOCH = 0
+
+
+def new_server_run() -> None:
+    """A server run starts (``main.startup``; the bundled app runs one after
+    another in the same process): a new run id for :func:`library_generation`
+    — a page connected to the previous run re-reads — and an empty aggregate
+    cache (the library is loaded again)."""
+    global _BOOT_ID
+    _BOOT_ID = secrets.token_hex(4)
+    _AGG_CACHE.clear()
+    _AGG_ETAGS.clear()
+
+
+def _duration_seq() -> int:
+    """The store's count of duration-only writes (a render-only format's real
+    length found at its first play): the lists show durations, so the
+    generation follows them — the aggregates (no duration in them) don't."""
+    try:
+        return int(getattr(get_store(), "_duration_seq", 0))
+    except Exception:
+        return 0
+
+
+def _mutation_seq() -> int:
+    """The store's write sequence: it also moves for fields the rows show but
+    the browse sequence leaves out (health / defect badges, tune counts, track
+    and disc numbers, surround channels)."""
+    try:
+        return int(getattr(get_store(), "_mutation_seq", 0))
+    except Exception:
+        return 0
+
+
+def library_generation() -> str:
+    """An opaque token that moves whenever the browse lists, counts or the
+    All-Tracks list may have changed: a track write a list can show (the
+    store's browse sequence, ``_browse_seq``), a duration write
+    (``_duration_seq``), an availability change that the lists
+    follow, an ``invalidate_agg_cache`` call (scan, reindex, "Hide duplicates"
+    toggle, album-cache reset, a library loaded or imported) or a server run
+    (``new_server_run``).  A page compares the WebSocket connect snapshot's
+    ``lib_gen`` with the one it last synced to (the previous snapshot, the
+    last ``scan_progress`` frame with ``running`` false or ``catalogue_changed``
+    event) — and, on its first snapshot, with the ``X-SB-Lib-Gen`` its first
+    data requests were served at (``LIB_GEN_HEADER``)."""
+    return (f"{_BOOT_ID}.{_AGG_EPOCH}.{_current_agg_seq()!r}.{_mutation_seq()}"
+            f".{_duration_seq()}".replace(" ", ""))
+
+
+# Response header with the :func:`library_generation` a browse request was
+# served at (taken before its handler read anything) — ``main``'s request
+# gate adds it to GET requests under ``LIB_GEN_PATHS``.
+LIB_GEN_HEADER = "X-SB-Lib-Gen"
+LIB_GEN_PATHS = ("/api/library/", "/api/tracks", "/api/fstree/", "/api/search/", "/api/smart/")
 
 
 def _cache_get(key: str) -> list | None:
@@ -172,6 +296,8 @@ def _cache_set(key: str, data: list) -> None:
 
 def invalidate_agg_cache() -> None:
     """Call after a scan completes to force fresh aggregations."""
+    global _AGG_EPOCH
+    _AGG_EPOCH += 1
     _AGG_CACHE.clear()
     _AGG_ETAGS.clear()
     # Tell DLNA controllers the tree changed (bumps SystemUpdateID + NOTIFYs
@@ -346,10 +472,11 @@ async def reindex(_admin=Depends(require_admin)):
     from soniqboom.core import index_health
     if not report.get("skipped"):
         index_health.record(report, kind="reindex", healed=True)
-    # The HTTP aggregation cache (/library/formats etc.) is NOT keyed on the
-    # store mutation seq, so a rebuild alone would leave it serving pre-reindex
-    # counts — e.g. the Galaxy legend showing "Ken's AdLib · 41" while the
-    # freshly-rebuilt live index is queried by the filter.  Invalidate it here.
+    # The HTTP aggregation cache (/library/formats etc.) is keyed on the
+    # store's browse sequence (``_browse_seq``), which a swap moves; a skipped
+    # rebuild moves nothing.  Invalidated here either way, so no pre-reindex
+    # count (the Galaxy legend's "Ken's AdLib · 41" while the rebuilt index
+    # answered the filter) is served after a reindex.
     invalidate_agg_cache()
     return {
         "reindexed": not report.get("skipped"),
@@ -509,7 +636,18 @@ async def library_ws(ws: WebSocket):
         except Exception:
             pass
     try:
-        await ws.send_json({"event": "scan_progress", **get_progress().to_dict()})
+        # The state on connect, not an event: ``snapshot`` marks it so a page
+        # does not take ``running: false`` for a scan that just finished, and
+        # ``lib_gen`` tells a reconnecting page whether the library changed
+        # since it last synced.
+        # A scan running now ends with a ``running: false`` frame, also one
+        # that sends no progress (``silent`` — scanner.note_scan_shown).
+        snap = get_progress().to_dict()
+        if snap.get("running"):
+            from soniqboom.core.scanner import note_scan_shown
+            note_scan_shown()
+        await ws.send_json({"event": "scan_progress", **snap,
+                            "snapshot": True, "lib_gen": library_generation()})
         # Initial snapshot of any in-flight transcodes so a client that
         # connects mid-render learns the current determinate progress
         # immediately (otherwise its badge would spin until the next ~1 Hz
@@ -547,6 +685,39 @@ async def library_ws(ws: WebSocket):
 
 
 # ── Aggregations ──────────────────────────────────────────────────────────────
+
+
+@router.get("/counts")
+async def library_counts(request: Request):
+    """The sidebar badge numbers in one small reply (ETag / 304).
+
+    ``tracks`` / ``visible`` as ``GET /api/tracks/count``; ``artists``,
+    ``album_artists``, ``albums``, ``genres``, ``years`` = the rows of the
+    matching list endpoint, without its "[No Artist]"-style bucket row
+    (``label``); ``scene_groups`` = the rows of ``/library/scene-groups``.
+    Same mode as the lists ("Hide duplicates", "Tracks on unavailable
+    drives: Hide")."""
+    cached = _cache_get("counts")
+    if cached is None:
+        from soniqboom.core.data import track_count
+        store = get_store()
+        kw = {"primary_only": _dedup_on(store), "exclude": _hidden(store), "swap": _swap(store)}
+
+        def rows(agg) -> int:
+            return sum(1 for r in agg if not r.get("label"))
+
+        cached = {
+            "tracks": await track_count(),
+            "visible": store.visible_track_count(**kw),
+            "artists": rows(store.aggregate_artists(**kw)),
+            "album_artists": rows(store.aggregate_album_artists(**kw)),
+            "albums": rows(store.aggregate_albums(artist=None, album_artist=None, **kw)),
+            "genres": rows(store.aggregate_genres(**kw)),
+            "years": rows(store.aggregate_years(**kw)),
+            "scene_groups": len(store.aggregate_scene_group(**kw)),
+        }
+        _cache_set("counts", cached)
+    return _etag_response(request, "counts", cached)
 
 
 @router.get("/artists")

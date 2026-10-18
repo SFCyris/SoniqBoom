@@ -678,7 +678,8 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
         source = get_source(scan_root)
         cache = get_cache()
         try:
-            if "::" in remote_path:
+            from soniqboom.core.filesource import is_member_path, split_member
+            if is_member_path(remote_path):
                 # Composite remote-archive member — split the "::" tail FIRST so
                 # we look up (and extract from) the OUTER archive, not the whole
                 # "archive.zip::member" string (which is never a cache key, so the
@@ -687,7 +688,7 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
                 # locally-cached archive.  Mirror the non-blocking get_cached
                 # semantics of the plain-remote branch below (no forced fetch —
                 # the is_remote backfill covers the not-yet-cached case).
-                arc_rel, member = remote_path.split("::", 1)
+                arc_rel, member = split_member(remote_path)
                 local_path = cache.get_cached(scan_root, arc_rel)
                 if local_path and local_path.exists():
                     data, mime = await loop.run_in_executor(
@@ -948,12 +949,31 @@ def _persist_and_notify(track_id: str, data: bytes) -> None:
         pass
 
 
+@router.get("/{track_id}/{size}.jpg")
+async def cover_art_jpg(
+    track_id: str,
+    size: str,
+    request: Request,
+    fallback: str = Query("placeholder", pattern="^(placeholder|none|404)$"),
+):
+    """Cover art at ``/api/art/{id}/{size}.jpg`` (``size``: ``sm``, ``lg`` or
+    ``full``) — the same answer as ``/api/art/{id}?size=…``.  The body is
+    whatever the cover is (JPEG, PNG …) with its own ``Content-Type``."""
+    # The web app's form.  Security tools that watch a reverse proxy's access
+    # log (CrowdSec ``http-crawl-non_statics``, ``http-probing``) skip requests
+    # for static files by their extension; a fast scroll through a big list
+    # asks for dozens of covers a second (GitHub #40).
+    if size not in ("sm", "lg", "full"):
+        raise HTTPException(404, "Unknown size")
+    return await cover_art(track_id, request, size=size, fallback=fallback)
+
+
 @router.get("/{track_id}")
 async def cover_art(
     track_id: str,
     request: Request,
     size: str = Query("sm", pattern="^(sm|lg|full)$"),
-    fallback: str = Query("placeholder", pattern="^(placeholder|404)$"),
+    fallback: str = Query("placeholder", pattern="^(placeholder|none|404)$"),
 ):
     """Serve cover art with optional thumbnail sizing and ETag caching.
 
@@ -964,10 +984,11 @@ async def cover_art(
               ``X-SoniqBoom-Art: placeholder`` header.  Cheaply cacheable
               by ETag so every tagless track in a library shares one
               download.  This is what e.g. Subsonic clients expect.
-            * ``404`` — a plain 404 with cache headers.  The frontend
-              track-list and player-bar IMG loaders pass this so the
-              browser's image pipeline reports ``onerror`` and the
-              format-specific emoji stays visible behind the IMG.
+            * ``none`` (``404``, its old name, is the same) — a body-less
+              ``204`` with cache headers (``_no_art_response``).  The
+              frontend IMG loaders pass this so the browser's image
+              pipeline reports ``onerror`` and the format-specific emoji
+              stays visible behind the IMG.
               Crucially, the IMG path keeps lazy-loading, image-priority
               queueing, and bitmap-level cache coalescing — all of which
               the alternative (fetch + blob + ObjectURL to read the
@@ -1035,8 +1056,8 @@ async def cover_art(
         # browser's IMG.onerror fires and the UI's format emoji stays
         # visible — without paying the bitmap-decode + blob-alloc cost
         # of fetching the placeholder body just to inspect a header.
-        if fallback == "404":
-            return _no_art_404(etag)
+        if fallback != "placeholder":
+            return _no_art_response(etag)
         return _placeholder_response()
 
     # --- Full size ----------------------------------------------------------
@@ -1047,8 +1068,8 @@ async def cover_art(
     if full_data:
         return _etag_response(full_data, mime or "image/jpeg", etag)
 
-    if fallback == "404":
-        return _no_art_404(etag)
+    if fallback != "placeholder":
+        return _no_art_response(etag)
     return _placeholder_response()
 
 
@@ -1074,12 +1095,16 @@ def _placeholder_response() -> Response:
     )
 
 
-def _no_art_404(etag: str = "") -> Response:
-    """Return a 404 with cache headers for the ``fallback=404`` path.
+def _no_art_response(etag: str = "") -> Response:
+    """``204 No Content`` with cache headers for the ``fallback=none`` path.
 
-    The frontend track-list IMG loader uses this so the browser's
-    ``onerror`` handler fires for tagless tracks while the format-
-    appropriate emoji stays visible behind the IMG.  The 404 is cacheable
+    The frontend IMG loaders use this so the browser's ``onerror`` handler
+    fires for tagless tracks while the format-appropriate emoji stays
+    visible behind the IMG — a 204 fires ``error`` exactly like the 404 this
+    used to be (Chromium, WebKit, Firefox), without counting as an error:
+    reverse-proxy security tools (CrowdSec ``http-probing``, fail2ban) ban a
+    client after a burst of 404s, which scrolling past art-less tracks was
+    (GitHub #40).  It is cacheable
     so scrolling past the same track-id re-uses it without a round trip —
     BUT it must be REVALIDATABLE, not ``immutable``: for remote tracks the
     cover is filled in later (on play, or by the background backfill), and
@@ -1095,4 +1120,4 @@ def _no_art_404(etag: str = "") -> Response:
     }
     if etag:
         headers["ETag"] = etag
-    return Response(status_code=404, headers=headers)
+    return Response(status_code=204, headers=headers)

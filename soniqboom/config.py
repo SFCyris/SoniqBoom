@@ -132,6 +132,9 @@ _CONF_DEFAULTS: dict[str, Any] = {
     # Internet-radio now-playing cover lookup (library → Discogs → MusicBrainz).
     "radio_art_lookup": True,
     "discogs_token": "",        # optional Discogs personal access token
+    # No requests to internet hosts at all (radio directory, lyrics, artist
+    # info, online collections, scrobbling, downloads …); env SONIQBOOM_OFFLINE.
+    "offline": False,
     "folder_aliases": {},          # { "/abs/path": "alias", ... }
     "network_shares": {},          # { "share_id": { protocol, host, ... }, ... }
     "remote_cache_max_mb": 2048,   # LRU cache limit for remote audio files
@@ -304,6 +307,9 @@ _CONF_TEMPLATE = """\
   "display_startup_logo": true,
   "radio_art_lookup": true,
   "discogs_token": "",
+
+  "_comment_offline": "offline: true makes no request to any host on the internet (radio directory, lyrics, artist info, online collections, scrobbling, downloads). Same as SONIQBOOM_OFFLINE=1.",
+  "offline": false,
 
   "_comment_aliases": "Map absolute directory paths to short display names in the UI.",
   "folder_aliases": {},
@@ -735,6 +741,10 @@ class Settings(BaseSettings):
     radio_art_lookup: bool = bool(_local_conf.get("radio_art_lookup", True))
     discogs_token: str = _local_conf.get("discogs_token", "")
 
+    # Offline mode (``SONIQBOOM_OFFLINE=1`` / conf ``offline: true``): the
+    # server makes no request to a host on the internet — ``core.netpolicy``.
+    offline: bool = bool(_local_conf.get("offline", False))
+
     # Location / alias display
     expose_local_files: bool = _local_conf.get("expose_local_files", True)
     folder_aliases: dict = _local_conf.get("folder_aliases", {})
@@ -787,6 +797,32 @@ def get_soundfonts_dir() -> Path:
     return p
 
 
+def seed_default_soundfont() -> Path | None:
+    """Link ``SONIQBOOM_DEFAULT_SOUNDFONT`` (the Docker image's General MIDI
+    SoundFont) into the SoundFonts folder when that folder holds none — the
+    image keeps the folder on the /data volume, which starts empty.  The link
+    made, or None."""
+    src = os.environ.get("SONIQBOOM_DEFAULT_SOUNDFONT", "")
+    if not src or not Path(src).is_file():
+        return None
+    sf_dir = get_soundfonts_dir()
+    fonts = [*sf_dir.glob("*.sf2"), *sf_dir.glob("*.sf3")]
+    for f in fonts:
+        if f.is_symlink() and not f.exists():           # a link to a font that's gone
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    if any(f.is_file() for f in fonts):
+        return None
+    link = sf_dir / Path(src).name
+    try:
+        link.symlink_to(src)
+    except OSError:
+        return None
+    return link
+
+
 def get_active_soundfont() -> Path | None:
     """Return the active soundfont path, or None."""
     if settings.soundfont_path:
@@ -796,9 +832,11 @@ def get_active_soundfont() -> Path | None:
     # Try to find any .sf2/.sf3 in soundfonts dir
     sf_dir = get_soundfonts_dir()
     for sf in sorted(sf_dir.glob("*.sf2")):
-        return sf
+        if sf.is_file():
+            return sf
     for sf in sorted(sf_dir.glob("*.sf3")):
-        return sf
+        if sf.is_file():
+            return sf
     return None
 
 

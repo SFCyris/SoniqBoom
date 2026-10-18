@@ -419,6 +419,9 @@ def _latest_upstream() -> dict | None:
     or None (offline, rate-limited, anything unexpected).  Best effort, one
     short request."""
     import httpx
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(_UPSTREAM_COMMITS_API):
+        return None
     try:
         with httpx.Client(timeout=5.0, follow_redirects=True) as client:
             resp = client.get(_UPSTREAM_COMMITS_API,
@@ -504,6 +507,9 @@ def refresh_index() -> dict:
     index.  Returns the updated status."""
     if _status["refreshing"]:
         return {**status(), "error": "refresh already running"}
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(BASE_URL):
+        return {**status(), "error": "Offline mode is on — the song database can't be downloaded"}
     _status.update(refreshing=True, error=None)
     db = _db_path()
     tmp = {n: db.with_name(f"songdb-{n}.part") for n in FILES}

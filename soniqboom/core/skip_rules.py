@@ -281,6 +281,22 @@ def file_skipped(t: dict, secs: int) -> bool:
     return tune_is_short(t, 0, secs)
 
 
+def entry_skipped(tid: str, wire: int = 0, store=None) -> bool:
+    """Does auto-play pass the queue entry (``tid``, tune ``wire``; 0 = the
+    file's bare play) by?  For queues SoniqBoom deals itself outside the web
+    player — the cast queue (``cast_session``): reported broken, undecodable,
+    or (with "Skip short tunes" on) that tune known to be short."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    t = store.get_track(tid)
+    if not isinstance(t, dict):
+        return False
+    if t.get("health") == "broken" or t.get("defect") == "corrupt":
+        return True
+    return tune_is_short(t, int(wire or 0), short_secs(store))
+
+
 # After library writes (a scan writes all the time) the set is rebuilt in a
 # worker thread, at most this often, while the previous one is served; a mark
 # or a change of the setting rebuilds it at once.

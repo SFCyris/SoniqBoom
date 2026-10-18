@@ -470,6 +470,14 @@ async def cds_control(request: Request):
         # event), so a controller can tell its cached tree is stale.
         return _soap_response(_UPNP_CDS_NS, action, {"Id": str(_system_update_id)})
 
+    if action in ("Browse", "Search"):
+        # Recovery (users.json unreadable): the server is locked for
+        # everyone — the library isn't listed to anonymous controllers either.
+        from soniqboom.core.users import accounts_locked
+        if accounts_locked():
+            return _soap_fault(501, "The server is locked: its user accounts "
+                                    "could not be loaded.")
+
     if action == "Browse":
         return await _do_browse(args, request)
 

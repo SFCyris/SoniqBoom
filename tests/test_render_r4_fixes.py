@@ -647,7 +647,7 @@ def _prewarm_env(monkeypatch, tr, *, enabled: bool):
     monkeypatch.setattr(stream, "get_track", get_track)
     ran: list[str] = []
 
-    async def fake_do_prewarm(tid, track, subsong, prio=0):
+    async def fake_do_prewarm(tid, track, subsong, prio=0, **_kw):
         ran.append(tid)
     monkeypatch.setattr(stream, "_do_prewarm", fake_do_prewarm)
     return ran
@@ -746,7 +746,7 @@ async def test_schedule_prewarm_joins_owners_and_evicts_unpinned_first(monkeypat
     monkeypatch.setattr(conversion_cache, "_pin_refs", {"sp1__sub0": 1})
     hold = asyncio.Event()
 
-    async def fake_do_prewarm(tid, track, subsong, prio=0):
+    async def fake_do_prewarm(tid, track, subsong, prio=0, **_kw):
         await hold.wait()
     monkeypatch.setattr(stream, "_do_prewarm", fake_do_prewarm)
     sched = stream._schedule_prewarm

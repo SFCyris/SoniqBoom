@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import httpx
@@ -53,6 +54,11 @@ _RB_HOSTS = (
 _COUNTRIES_TTL = 7 * 86400
 _COUNTRY_STATIONS_TTL = 86400
 _COUNTRY_STATIONS_CAP = 5000   # safety cap per country (US ≈ 8k raw entries)
+# Name searches (``search_stations``): the directory's answer per (name, size)
+# is kept in memory for this long, newest ``_SEARCH_CACHE_MAX`` names only.
+_SEARCH_CACHE_TTL = 300.0
+_SEARCH_CACHE_MAX = 64
+_search_cache: "OrderedDict[tuple[str, int], tuple[float, list[dict]]]" = OrderedDict()
 
 # ── Disk layout ───────────────────────────────────────────────────────────────
 
@@ -237,8 +243,12 @@ def continent_of(code: str) -> str:
 
 async def _rb_get(path: str, params: dict | None = None):
     """GET from the first Radio Browser mirror that answers."""
+    from soniqboom.core import netpolicy
     last_exc: Exception | None = None
     for host in _RB_HOSTS:
+        if netpolicy.blocked(f"https://{host}"):
+            last_exc = netpolicy.Offline(f"offline mode: not contacting {host}")
+            continue
         try:
             async with httpx.AsyncClient(
                 timeout=20.0, headers={"User-Agent": USER_AGENT},
@@ -259,7 +269,13 @@ async def get_countries(force: bool = False) -> list[dict]:
         cached = _read_json("countries.json")
         if cached:
             return cached
-    raw = await _rb_get("/json/countries")
+    try:
+        raw = await _rb_get("/json/countries")
+    except Exception:
+        stale = _read_json("countries.json")
+        if stale and not force:
+            return stale                    # unreachable: the last list we had
+        raise
     out = [
         {
             "code": c.get("iso_3166_1", ""),
@@ -390,6 +406,27 @@ async def get_country_stations(code: str, force: bool = False) -> list[dict]:
     return groups
 
 
+async def _directory_search(name: str, fetch: int) -> list[dict]:
+    """Radio Browser's grouped matches for ``name``, best voted first — from
+    ``_search_cache`` while fresh.  A failed lookup is not kept."""
+    key = (name, fetch)
+    hit = _search_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < _SEARCH_CACHE_TTL:
+        _search_cache.move_to_end(key)
+        return [dict(g) for g in hit[1]]
+    raw = await _rb_get("/json/stations/search", params={
+        "name": name, "hidebroken": "true", "order": "votes",
+        "reverse": "true", "limit": str(fetch),
+    })
+    rb = _group_stations([_trim_station(s) for s in raw])
+    rb.sort(key=lambda g: (g["votes"], g["clicks"]), reverse=True)
+    _search_cache[key] = (time.monotonic(), rb)
+    _search_cache.move_to_end(key)
+    while len(_search_cache) > _SEARCH_CACHE_MAX:
+        _search_cache.popitem(last=False)
+    return [dict(g) for g in rb]
+
+
 async def search_stations(q: str, limit: int = 30) -> list[dict]:
     """Search stations by name across the scene pack, favorites, and the
     Radio Browser directory.  Local (curated + favorite) matches rank first,
@@ -409,12 +446,7 @@ async def search_stations(q: str, limit: int = 30) -> list[dict]:
             out.append(st)
             seen.add(sid)
     try:
-        raw = await _rb_get("/json/stations/search", params={
-            "name": q, "hidebroken": "true", "order": "votes",
-            "reverse": "true", "limit": str(min(limit * 4, 400)),
-        })
-        rb = _group_stations([_trim_station(s) for s in raw])
-        rb.sort(key=lambda g: (g["votes"], g["clicks"]), reverse=True)
+        rb = await _directory_search(q, min(limit * 4, 400))
         for g in rb:
             if g["sid"] in seen:
                 continue
@@ -523,13 +555,16 @@ async def resolve_station(sid: str) -> dict | None:
     return None
 
 
-async def ensure_ready() -> None:
-    """Startup hook: seed favorites with Nectarine on first run and make
-    sure the Radio Browser country metadata is on disk (or refreshed)."""
+async def ensure_ready(*, fetch: bool = False) -> None:
+    """Startup hook: seed favorites with Nectarine on first run.  The Radio
+    Browser country metadata is fetched when the world browser first asks
+    for it (``get_countries``); ``fetch`` fetches (or refreshes) it now."""
     if _read_json(_FAVS_FILE) is None:
         nectarine = _scene_by_sid("scene:nectarine")
         _write_json(_FAVS_FILE, [nectarine] if nectarine else [])
         log.info("Stations: favorites seeded with Nectarine")
+    if not fetch:
+        return
     try:
         countries = await get_countries()
         log.info("Stations: Radio Browser metadata ready (%d countries)", len(countries))

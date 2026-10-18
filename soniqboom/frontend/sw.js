@@ -822,7 +822,7 @@
 // auth.js, password-rule.js, index.html app.css?v=113).
 // v242: an open Track Info takes a measured length and the scene genres that
 // follow a catalogue tune's first read (trackinfo.js, utils.js).
-const SHELL_VERSION = 'v244';   // v244: skip short tunes + reported playback problems (health.js); v243: renderer versions in Settings → Renderers; older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
+const SHELL_VERSION = 'v255';   // v255: a package of an online collection with no tune in it leaves the lists at once (library socket catalogue_tracks_left: lists and counts re-read in place, the phone's list drops it), a play of one says why in one toast (410, no Mark broken) and no row or bar shows it as playing (player.js nowPlayingId / startFailed, library.js, playlist.js, mobile library), Track Info of a track that doesn't play shows no Playback marks, signal path or audio facts (trackinfo.js), the "no tunes" badge (health.js), app.css?v=118, mobile.css?v=23; earlier v255: the served shells name every JS module by a content-hashed URL (import map + rewritten src/href, core/shell_html.py) and install precaches those URLs (an updated module reaches an open WebKit tab on reload); in-place list refreshes keep the selection, keyboard row and rows on screen by track id (library.js), a real two-element crossfade (player.js), restart resume says "playing", a decode error (Firefox) gets the transcode and no early "Couldn't play" toast, the sign-in card's focus trap / live region / auto-reconnect (auth.js), folder-tree focus kept (foldertree.js), app.css?v=117, mobile.css?v=22; earlier v255: the sign-in form drops the password once signed in and a sign-out made while the server restarts is sent again until it lands (auth.js), a row-hover prewarm says so (hover=1, library.js: it lapses after a few seconds), every web-player stream request names its page (pg=, player.js: two tabs are two listeners; the offline match ignores it), a share check's new-tracks toast doesn't re-read the counts its end frame already did (app.js?v=194), re-check reads the status while no account is loaded (auth.js); the sign-in overlay explains a locked server whose users.json can't be read (auth.js); sidebar counts from /api/library/counts (lists read when their view opens), WS connect snapshot re-reads only a changed library (All Tracks refreshed in place), smart views say a failed load (Retry), station matches only in the Stations view (debounced, cached), Settings → Library folders says a local folder that is not (fully) watched — Not watched / Partly watched, rescanned on a cadence (admin.js), a background rescan (folder watcher, share freshness poll) shows no Scanning badge and its end re-reads open pages in place, the first loads' X-SB-Lib-Gen checked against the first snapshot (lib_sync.js), "Done" without a count after a restart mid-scan, Sign in stays off while no account can be loaded and a page loaded while the server restarts says so with a Retry (auth.js), app.js?v=193, lib_sync.js precached, mobile radio search debounced/cached with a Retry on failure (mobile.css?v=21, mobile/app.js?v=27); v254: a collection's Remove keeps the choice while a status poll runs (admin.js); v253: downloaded tracks' streams marked (dl=1) and only those (or offline) served by the worker, never a subsong from the download; Track Info reads online-collection tunes; hours in Track Info lengths; app.js?v=191; v252: stream requests intercepted only for offline-downloaded tracks (or while offline), cancelled requests answered quietly; Aminet MPEG audio; v251: Aminet + scene.org online collections (packages: Track Info opens one, its tunes follow it in the queue, mobile row refresh, no tree rebuild on opening), per-collection card text, app.js?v=189, mobile/app.js?v=26; v250: Settings → Online collections tab (Modland moved there, HVSC online); v249: H / D labels; v248: shortcut sheet (Track Info ←/→, one /, Escape text); v247: stored cover URLs via staticArtUrl, station without logo asks for no art/waveform; v246: art at /api/art/{id}/{size}.jpg, no-art/VU/waveform answer 204 (GitHub #40); v245: shortcut sheet (G, no dead ⌘→/⌘←), SID fidelity + multi-room hints, import saved; v244: skip short tunes + reported playback problems (health.js); v243: renderer versions in Settings → Renderers; older history — v194: Demozoo "Reset enrichment" admin button + name-first ambig/paren resolution
                                 // (run-probe) so a present-but-broken renderer
                                 // (dyld/loader failure) shows red instead of a
                                 // false ✓; needs the backend admin.py restart too.
@@ -949,12 +949,11 @@ const SHELL_CACHE = `soniqboom-shell-${SHELL_VERSION}`;
 // survives shell upgrades — the activate cleanup only reaps `soniqboom-shell-*`.
 const OFFLINE_AUDIO_CACHE = 'soniqboom-offline-audio';
 
-// Precache: entry-point HTML + the four critical-path JS modules and the
-// main CSS.  This way a cold first visit warms the cache for the next
-// reload (offline-instant on visit #2).  We intentionally omit the
-// `?v=N` cache-buster query strings — the runtime handler below will
-// re-fetch the busted URLs on demand once index.html lands; the bare
-// paths here just seed Module-Cache priming.
+// Precache: entry-point HTML + the critical-path JS modules and the main CSS.
+// This way a cold first visit warms the cache for the next reload
+// (offline-instant on visit #2).  The modules are listed by their bare paths;
+// install precaches the content-hashed URL the served shell's import map names
+// for each (_shellModuleUrls) — the URL a page actually loads.
 const SHELL_PRECACHE = [
   '/',
   // NOTE: ``/m`` is deliberately NOT precached.  Fetching it during SW
@@ -966,6 +965,7 @@ const SHELL_PRECACHE = [
   '/assets/js/player.js',
   '/assets/js/equalizer.js',
   '/assets/js/library.js',
+  '/assets/js/lib_sync.js',
   '/assets/js/vlist.js',
   '/assets/js/tunes.js',
   '/assets/js/offline.js',
@@ -974,13 +974,33 @@ const SHELL_PRECACHE = [
   '/assets/js/queue.js',
 ];
 
+// The served shell names every JS module by a content-hashed URL (its import
+// map: ``"/assets/js/player.js": "/assets/js/player.js?v=<hash>"``) — the URLs
+// a page loads.  The precache takes those for the precached modules (the bare
+// path when the shell has no map).
+async function _shellModuleUrls(cache) {
+  let imports = {};
+  try {
+    const res = await fetch(new Request('/', { cache: 'reload', credentials: 'same-origin' }));
+    if (res && res.status === 200) {
+      await cache.put('/', res.clone());
+      const m = /<script type="importmap">([\s\S]*?)<\/script>/.exec(await res.text());
+      if (m) imports = (JSON.parse(m[1]) || {}).imports || {};
+    }
+  } catch (_) { imports = {}; }
+  return SHELL_PRECACHE.filter((u) => u !== '/').map((u) => imports[u] || u);
+}
+
 self.addEventListener('install', (e) => {
   e.waitUntil((async () => {
     const cache = await caches.open(SHELL_CACHE);
     // Best-effort precache — a missing entry shouldn't abort install.
+    const urls = await _shellModuleUrls(cache);
     await Promise.allSettled(
-      SHELL_PRECACHE.map(url => cache.add(new Request(url, { cache: 'reload' }))),
+      urls.map(url => cache.add(new Request(url, { cache: 'reload' }))),
     );
+    await Promise.allSettled(urls.filter((u) => u.includes('?v='))
+      .map((u) => _dropOtherVersions(cache, new URL(u, self.location.origin))));
     // NOTE: we deliberately do NOT self.skipWaiting() here.  An UPDATE (a new
     // SW found while an old one still controls open tabs) now goes to the
     // "waiting" state, and app.js surfaces a "new version — refresh" prompt;
@@ -995,7 +1015,32 @@ self.addEventListener('install', (e) => {
 // app.js posts this when the user clicks "Refresh" on the update prompt.
 self.addEventListener('message', (e) => {
   if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
+  // A track was downloaded for offline or removed (app.js downloadTrack /
+  // removeDownload): the set of offline track ids is read again.
+  if (e.data && e.data.type === 'OFFLINE_AUDIO_CHANGED') e.waitUntil(_loadOfflineIds());
 });
+
+// The track ids downloaded for offline (``/api/stream/<id>`` in the offline
+// audio cache), known synchronously in the fetch handler: a stream request
+// for any OTHER track is not intercepted at all — the browser plays it from
+// the network as if there were no service worker.  (Intercepting every
+// stream request made the browser report each request a page cancels — the
+// player re-requesting a growing render — as a service-worker failure.)
+// ``null`` until read: then only a request the page marks (``dl=1``) is.
+let _offlineIds = null;
+async function _loadOfflineIds() {
+  try {
+    const cache = await caches.open(OFFLINE_AUDIO_CACHE);
+    const keys = await cache.keys();
+    _offlineIds = new Set(keys.map(r => {
+      const m = /\/api\/stream\/([^/?#]+)/.exec(new URL(r.url).pathname);
+      return m ? decodeURIComponent(m[1]) : null;
+    }).filter(Boolean));
+  } catch (_) {
+    _offlineIds = null;
+  }
+}
+_loadOfflineIds();
 
 self.addEventListener('activate', (e) => {
   e.waitUntil((async () => {
@@ -1007,8 +1052,19 @@ self.addEventListener('activate', (e) => {
         .map(n => caches.delete(n)),
     );
     await self.clients.claim();
+    await _loadOfflineIds();
   })());
 });
+
+// A module cached under a new content hash replaces its older versions (the
+// shell cache would otherwise keep every hash until SHELL_VERSION changes).
+async function _dropOtherVersions(cache, url) {
+  const keys = await cache.keys();
+  await Promise.all(keys.map((k) => {
+    const u = new URL(k.url);
+    return (u.pathname === url.pathname && u.search !== url.search) ? cache.delete(k) : null;
+  }));
+}
 
 self.addEventListener('fetch', (e) => {
   const req = e.request;
@@ -1025,12 +1081,29 @@ self.addEventListener('fetch', (e) => {
   // online and off). Only the exact /api/stream/<id> audio URL is considered —
   // status/cancel sub-endpoints fall through. A cache MISS goes straight to the
   // network, so tracks that aren't downloaded stream exactly as before.
-  if (/^\/api\/stream\/[^/]+$/.test(path)) {
+  const streamId = /^\/api\/stream\/([^/]+)$/.exec(path);
+  if (streamId) {
+    const id = decodeURIComponent(streamId[1]);
+    const online = self.navigator ? self.navigator.onLine !== false : true;
+    // Online, only a downloaded track's default tune is served from here: one
+    // the page marks (``dl=1``) or this worker knows.  Everything else — also
+    // before the set is read — goes to the network untouched.  A tune of a
+    // multi-tune file (``subsong``) is never the download (its default tune).
+    const sub = url.searchParams.has('subsong');
+    const downloaded = url.searchParams.get('dl') === '1'
+      || (_offlineIds !== null && _offlineIds.has(id));
+    if (online && (sub || !downloaded)) return;                          // network, untouched
+    // (The match ignores the query: ``dl``, ``path`` and the page id ``pg`` —
+    // one per page load, player.js — never split the download's cache key.)
+    // A request the page cancelled (it re-requests a growing render) needs no
+    // answer: a quiet one, never a failed respondWith.
+    const quiet = () => new Response(null, { status: 499, statusText: 'Cancelled' });
     e.respondWith(
       caches.open(OFFLINE_AUDIO_CACHE)
-        .then(c => c.match(req, { ignoreSearch: true }))
+        .then(c => (sub ? null : c.match(req, { ignoreSearch: true })))
         .then(hit => hit || fetch(req))
-        .catch(() => fetch(req)),
+        .catch(() => (req.signal && req.signal.aborted ? quiet() : fetch(req)))
+        .catch(() => (req.signal && req.signal.aborted ? quiet() : Response.error())),
     );
     return;
   }
@@ -1048,8 +1121,9 @@ self.addEventListener('fetch', (e) => {
     // cast_picker.js…) are IMMUTABLE per URL: a content change ships a NEW url,
     // so a cache hit is served straight from cache with NO background
     // revalidation — dropping a redundant network round-trip on every load.
-    // Unversioned module imports (player.js, trackinfo.js…) keep
-    // stale-while-revalidate as their between-SHELL_VERSION freshness net.
+    // (Every JS module is versioned: the served shells name each by its
+    // content hash.)  Anything unversioned (icons, a bare URL) keeps
+    // stale-while-revalidate as its between-SHELL_VERSION freshness net.
     const versioned = url.searchParams.has('v');
     e.respondWith((async () => {
       const cache = await caches.open(SHELL_CACHE);
@@ -1057,7 +1131,11 @@ self.addEventListener('fetch', (e) => {
       if (versioned && hit) return hit;   // immutable — cache-first, no revalidate
       // Background refresh — don't block the response on it.
       const fetchAndUpdate = fetch(req).then(res => {
-        if (res && res.status === 200) cache.put(req, res.clone());
+        if (res && res.status === 200) {
+          cache.put(req, res.clone())
+            .then(() => (versioned && path.startsWith('/assets/js/') ? _dropOtherVersions(cache, url) : null))
+            .catch(() => {});
+        }
         return res;
       }).catch(() => null);
       return hit || fetchAndUpdate || fetch(req);

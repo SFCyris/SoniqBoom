@@ -338,8 +338,21 @@ async def test_elsewhere_than_macos_the_start_is_unchanged(monkeypatch, platform
         return None
     monkeypatch.setattr(forksafe.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(forksafe.sys, "platform", platform)
+    calls = []
+    monkeypatch.setattr(forksafe, "_prctl", lambda *a: calls.append(a) or 0)
     await forksafe.spawn("ffmpeg", "-i", "x", stdout=-1, cwd="/tmp")
-    assert seen == [("ffmpeg", ("-i", "x"), {"stdout": -1, "cwd": "/tmp"})]
+    (program, args, kw), = seen
+    pre = kw.pop("preexec_fn", None)
+    assert (program, args, kw) == ("ffmpeg", ("-i", "x"), {"stdout": -1, "cwd": "/tmp"})
+    if platform == "linux":
+        # The child asks to be SIGKILLed when the server dies (PR_SET_PDEATHSIG).
+        assert callable(pre)
+        me = os.getpid()
+        monkeypatch.setattr(forksafe.os, "getppid", lambda: me)   # (as in the child)
+        pre()
+        assert calls == [(forksafe._PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)]
+    else:
+        assert pre is None
 
 
 # ── run: subprocess.run without a fork ──────────────────────────────────────

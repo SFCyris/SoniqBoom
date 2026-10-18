@@ -114,7 +114,7 @@ _FORMAT_PLATFORM = {
     # Amiga-born sample trackers (PC trackers — S3M, XM, IT … — name no
     # platform).
     "ProTracker": "Amiga", "OctaMED": "Amiga", "SoundFX": "Amiga",
-    "Oktalyzer": "Amiga", "DigiBooster Pro": "Amiga",
+    "Oktalyzer": "Amiga", "DigiBooster Pro": "Amiga", "Face The Music": "Amiga",
     "MIDI": "MIDI", "General MIDI": "MIDI",
 }
 _FAMILY_PLATFORM = {"adlib": "AdLib", "atari": "Atari ST", "sid": "SID", "midi": "MIDI",
@@ -504,8 +504,8 @@ async def _scan_idle() -> None:
     """Wait until no scan and no catalogue build (``modland_catalog``) runs —
     their writes would only re-trigger the pass."""
     try:
-        from soniqboom.core import modland_catalog, scanner
-        while scanner.is_scanning() or modland_catalog.busy():
+        from soniqboom.core import modland_catalog, online_catalog, scanner
+        while scanner.is_scanning() or modland_catalog.busy() or online_catalog.any_busy():
             await asyncio.sleep(_SCAN_POLL_S)
     except Exception:                            # noqa: BLE001
         log.debug("scan state unavailable", exc_info=True)

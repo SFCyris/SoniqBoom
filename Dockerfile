@@ -7,11 +7,66 @@
 #
 # Multi-stage: a `builder` stage carries the full toolchain and compiles/fetches
 # the renderers that aren't in Debian's apt archive, or not in the version
-# SoniqBoom needs (psgplay, sc68, uade123, libgme, the sidplayfp chain;
-# zxtune123 is a prebuilt fetch) AND pre-builds the vendored StSound (.ym) /
-# HivelyTracker (.hvl) engines.  The final runtime stage copies only the results,
+# SoniqBoom needs (psgplay, sc68, uade123, libgme, the sidplayfp chain, and
+# libopenmpt / openmpt123 in a stage of its own; zxtune123 is a prebuilt fetch)
+# AND pre-builds the vendored StSound (.ym) / HivelyTracker (.hvl) engines.
+# The final runtime stage copies only the results,
 # so it ships NO compiler — smaller, immutable, and quick to start.  Multi-arch:
 #   docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .
+
+# ════════════════════════ Stage 1a: libopenmpt / openmpt123 ════════════════════════
+# Tracker modules (MOD, XM, S3M, IT, … and Face The Music, which libopenmpt
+# reads from 0.8 on; Debian 13 ships 0.7.13).  Built from the upstream release
+# tarball in its own stage, so it compiles alongside the builder stage below,
+# which copies the results into /out.  Same libraries as Debian's package:
+# libopenmpt with zlib, mpg123, ogg, vorbis and vorbisfile; openmpt123 with
+# libsndfile (its WAV writer on Linux), FLAC, PortAudio and PulseAudio.
+# libopenmpt goes to /usr/local/lib/<multiarch>, which the dynamic linker
+# searches before /usr/lib/<multiarch>, where Debian's libopenmpt.so.0 stays
+# installed for ffmpeg (libavformat depends on it), so openmpt123, ffmpeg and
+# the server's ctypes load all use this build (the runtime gate checks it).
+# Compiled with Debian's hardening flags (dpkg-buildflags, hardening=+all: stack
+# protector, FORTIFY_SOURCE, full RELRO / BIND_NOW, as Debian's package has), and
+# stripped (the autotools default -g leaves libopenmpt at ~90 MB).  Licence texts:
+# libopenmpt's own, its mpt library's, and the attribution of the TinyFFT code
+# compiled in (soundlib/TinyFFT.cpp, Ryuhei Mori, BSD-2-Clause).
+FROM python:3.12-slim-trixie AS openmpt
+ENV DEBIAN_FRONTEND=noninteractive
+ARG LIBOPENMPT_VERSION=0.8.9
+ARG LIBOPENMPT_SHA256=d7ce84fd05d686c4bcf66af40eae857afa371442db60eeda3f874bd6cf6fc318
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl pkg-config \
+        zlib1g-dev libmpg123-dev libogg-dev libvorbis-dev \
+        libsndfile1-dev libflac-dev portaudio19-dev libpulse-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    MA="$(gcc -dumpmachine)"; \
+    mkdir -p /out/bin "/out/lib/$MA" /out/share/doc/third-party; \
+    ( curl -sfL --max-time 300 \
+        "https://lib.openmpt.org/files/libopenmpt/src/libopenmpt-${LIBOPENMPT_VERSION}+release.autotools.tar.gz" \
+        -o /tmp/libopenmpt.tar.gz \
+      && echo "$LIBOPENMPT_SHA256  /tmp/libopenmpt.tar.gz" | sha256sum -c - \
+      && mkdir -p /tmp/libopenmpt && tar xzf /tmp/libopenmpt.tar.gz -C /tmp/libopenmpt --strip-components=1 \
+      && cd /tmp/libopenmpt \
+      && eval "$(DEB_BUILD_MAINT_OPTIONS=hardening=+all dpkg-buildflags --export=sh)" \
+      && ./configure --prefix=/usr/local --libdir="/usr/local/lib/$MA" --disable-static \
+           --disable-examples --disable-tests --disable-doxygen-doc \
+           --with-zlib --with-mpg123 --with-ogg --with-vorbis --with-vorbisfile \
+           --with-sndfile --with-flac --with-portaudio --with-pulseaudio \
+           --without-portaudiocpp --without-sdl2 \
+      && { make -j"$(nproc)" || make -j"$(nproc)" || make -j1; } \
+      && make install \
+      && install -m0755 /usr/local/bin/openmpt123 /out/bin/openmpt123 \
+      && cp -a "/usr/local/lib/$MA"/libopenmpt.so* "/out/lib/$MA/" \
+      && strip --strip-unneeded /out/bin/openmpt123 "/out/lib/$MA"/libopenmpt.so.0.* \
+      && mkdir -p /out/share/doc/third-party/libopenmpt \
+      && cp LICENSE README.md /out/share/doc/third-party/libopenmpt/ \
+      && cp src/mpt/LICENSE.BSD-3-Clause.txt src/mpt/LICENSE.BSL-1.0.txt \
+            /out/share/doc/third-party/libopenmpt/ \
+      && sed -n '1,/\*\//p' soundlib/TinyFFT.cpp > /out/share/doc/third-party/libopenmpt/TinyFFT-NOTICE \
+      && grep -q "BSD 2-clause" /out/share/doc/third-party/libopenmpt/TinyFFT-NOTICE ) \
+      || echo "NOTE: libopenmpt build failed — tracker modules disabled." ; \
+    rm -rf /tmp/libopenmpt /tmp/libopenmpt.tar.gz
 
 # ═══════════════════════════════ Stage 1: builder ═══════════════════════════════
 FROM python:3.12-slim-trixie AS builder
@@ -219,7 +274,7 @@ RUN set -eux; \
 # requested length; libsidplayfp 3.x's KERNAL stub plays them.  No SIMD flags
 # (the default): one image runs on every x86-64 / arm64 CPU.  Compiled into the
 # binaries under MIT, their notices shipped too: libsidplayfp's hashlib (MD5),
-# sidplayfp's ghc::filesystem.  (Last of the builds: a pin bump here rebuilds
+# sidplayfp's ghc::filesystem.  (Last of the builds here: a pin bump rebuilds
 # nothing else.)
 ARG RESIDFP_VERSION=1.2.2
 ARG RESIDFP_SHA256=2eb0204b76d52fe825c0e1f98826f62a179033a60543032d0e8b90060ecaa50e
@@ -259,6 +314,10 @@ RUN set -eux; \
       || echo "NOTE: sidplayfp chain build failed — C64 SID (.sid) disabled." ; \
     rm -rf /tmp/libresidfp* /tmp/libsidplayfp* /tmp/sidplayfp*
 
+# libopenmpt / openmpt123 from its own stage (Stage 1a above): openmpt123 → bin,
+# libopenmpt.so* → lib/<multiarch>, licence texts → share/doc/third-party.
+COPY --from=openmpt /out/ /out/
+
 # ── Gate: every renderer must be present before we build the runtime image ──────
 # Each step above is best-effort (|| echo NOTE) so a transient failure prints a
 # clear reason instead of a cryptic mid-build COPY error.  This gate turns "no
@@ -280,7 +339,12 @@ RUN set -eu; \
          /out/share/doc/third-party/sidplayfp/ghc-filesystem-LICENSE \
          /out/lib/libgme.so.0 /out/share/doc/third-party/libgme/license.txt \
          /out/share/doc/third-party/zxtune/LICENSE.md /out/share/doc/third-party/zxtune/3rdparty/unrar/license.txt \
-         /out/share/doc/third-party/psgplay/licence/GPL-2.0 /out/share/doc/third-party/psgplay/lib/toslibc/licence/GPL-2.0"; \
+         /out/share/doc/third-party/psgplay/licence/GPL-2.0 /out/share/doc/third-party/psgplay/lib/toslibc/licence/GPL-2.0 \
+         /out/bin/openmpt123 /out/lib/$(gcc -dumpmachine)/libopenmpt.so.0 \
+         /out/share/doc/third-party/libopenmpt/LICENSE \
+         /out/share/doc/third-party/libopenmpt/LICENSE.BSD-3-Clause.txt \
+         /out/share/doc/third-party/libopenmpt/LICENSE.BSL-1.0.txt \
+         /out/share/doc/third-party/libopenmpt/TinyFFT-NOTICE"; \
     if [ "$SLIM" != "1" ]; then \
       req="$req /out/bin/uade123 /out/lib/uade/uadecore /out/lib/libzakalwe.so \
            /out/lib/libbencodetools.so /out/share/uade/eagleplayer.conf \
@@ -292,6 +356,8 @@ RUN set -eu; \
     for f in $req; do [ -e "$f" ] || missing="$missing $f"; done; \
     readelf -d /out/lib/libsidplayfp.so 2>/dev/null | grep -q 'libresidfp' \
       || missing="$missing (libsidplayfp-without-reSIDfp)"; \
+    readelf -d /out/bin/openmpt123 2>/dev/null | grep -q 'libsndfile' \
+      || missing="$missing (openmpt123-without-libsndfile:no-WAV-output)"; \
     if [ -n "$missing" ]; then \
       echo "═══ RENDERER GAP — missing artifacts:$missing" >&2; \
       [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
@@ -314,22 +380,31 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ── Runtime renderers via apt (NO compiler / build tools in the final image) ──
 #   ffmpeg            transcoding + DSD/ALAC/etc.
 #   fluidsynth (+gm)  MIDI, with a General-MIDI SoundFont
-#   openmpt123        tracker modules  (C64 SID: the sidplayfp chain built above)
 #   adplay            AdLib / OPL2 FM  libgme0     ffmpeg's (SoniqBoom loads the libgme built above)
 #   libasound2t64/zlib1g runtime libs for the copied-in renderers (zxtune/sc68)
 #   libao4            runtime lib for the source-built uade123
+#   libmpg123-0t64 libogg0 libvorbis0a libvorbisfile3 libsndfile1 libflac14
+#   libportaudio2 libpulse0
+#                     runtime libs for the source-built libopenmpt / openmpt123
+#                     (tracker modules; Debian's openmpt123 package is NOT
+#                     installed — ffmpeg still pulls in Debian's libopenmpt,
+#                     which the build above takes precedence over)
+# (C64 SID and tracker modules: the builds above)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         fluidsynth fluid-soundfont-gm \
-        openmpt123 \
         adplay \
         libgme0 \
         libasound2t64 zlib1g libao4 \
+        libmpg123-0t64 libogg0 libvorbis0a libvorbisfile3 \
+        libsndfile1 libflac14 libportaudio2 libpulse0 \
         curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123/
-# sidplayfp onto PATH (libsidplayfp / libresidfp / libstilview into /usr/local/lib) (the app finds ym2wav/hvl2wav via shutil.which — no runtime compiler);
+# sidplayfp/openmpt123 onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
+# no runtime compiler); libsidplayfp / libresidfp / libstilview into /usr/local/lib,
+# libopenmpt into /usr/local/lib/<multiarch>;
 # uade's libzakalwe/bencodetools .so + its eagleplayer/score data into /usr/local;
 # sc68 + its shared libs into /usr/local.  sc68's share/sc68/Replay/*.bin are the
 # m68k replay drivers it loads at render time (compiled-in path is
@@ -342,6 +417,21 @@ COPY --from=builder /out/sc68/usr/local/bin/   /usr/local/bin/
 COPY --from=builder /out/sc68/usr/local/lib/   /usr/local/lib/
 COPY --from=builder /out/sc68/usr/local/share/ /usr/local/share/
 RUN ldconfig
+
+# ── Gate: tracker modules must render ────────────────────────────────────────
+# The self-test synthesizes a ProTracker MOD and a Face The Music module,
+# renders both with openmpt123 as the server does, and fails the build unless
+# each WAV is audible; it also checks that libopenmpt.so.0 (loaded by SONAME,
+# as the server's ctypes code loads it) is 0.8 or newer, reads Face The Music
+# and is the build above — for openmpt123 and for ffmpeg's libavformat alike —
+# and not Debian's 0.7 copy in /usr/lib.  --build-arg ALLOW_MISSING_RENDERERS=1
+# turns a failure into a warning, as in the builder's gate.
+ARG ALLOW_MISSING_RENDERERS=0
+RUN --mount=type=bind,source=scripts/openmpt_selftest.py,target=/tmp/openmpt_selftest.py \
+    python -B -I /tmp/openmpt_selftest.py --prefix /usr/local/lib \
+        --linked /usr/lib/*-linux-gnu/libavformat.so.[0-9]* \
+    || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
+         && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2; }
 
 # ── App ──────────────────────────────────────────────────────────────────────
 WORKDIR /app
@@ -368,16 +458,24 @@ RUN apt-get update \
 # it too (--deadline, 600 s).  -B: no .pyc in the layer.
 RUN python -B /app/scripts/archive_selftest.py
 
-# The bundled soundfonts/ (~260 MB) is excluded from the image; point the app's
-# SoundFont lookup at the apt-provided GM SoundFont so MIDI plays out of the box.
-# Add richer SoundFonts at runtime via Settings → SoundFonts.
-RUN mkdir -p /app/soundfonts \
-    && ln -sf /usr/share/sounds/sf2/FluidR3_GM.sf2 /app/soundfonts/FluidR3_GM.sf2
-
 # ── Runtime contract ─────────────────────────────────────────────────────────
-# Mount your library read-only at /music; ALL state (index, conversion cache,
-# config, logs) lives under /data so one named volume persists everything.
+# Mount your library read-only at /music; ALL state lives under /data so one
+# named volume persists everything across updates:
+#   /data                    library index, users, logs, scene/radio data
+#   /data/soniqboom          SoniqBoom.conf, prefs.json, cover-art and render caches
+#                            (XDG_DATA_HOME — the settings folder on Linux)
+#   /data/soniqboom/soundfonts  SoundFonts added in Settings; the apt-provided
+#                            GM SoundFont is linked in while it holds none, so
+#                            MIDI plays out of the box (the bundled soundfonts/
+#                            folder, ~260 MB, is excluded from the image)
+#   /data/credential.key     the key saved share passwords and scrobbling tokens
+#                            are encrypted with (a container's host name changes
+#                            on every recreate)
 ENV SONIQBOOM_DATA_DIR=/data \
+    XDG_DATA_HOME=/data \
+    SONIQBOOM_SOUNDFONTS_DIR=/data/soniqboom/soundfonts \
+    SONIQBOOM_DEFAULT_SOUNDFONT=/usr/share/sounds/sf2/FluidR3_GM.sf2 \
+    SONIQBOOM_CREDENTIAL_KEY_FILE=/data/credential.key \
     PYTHONUNBUFFERED=1
 VOLUME ["/data"]
 EXPOSE 8080

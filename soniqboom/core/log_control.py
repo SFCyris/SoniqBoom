@@ -64,6 +64,9 @@ DEFAULT_ACCESS_MODE = "problems"   # quiet, but real HTTP problems still surface
 # Paths whose 404 is BY DESIGN — the client asks for ``fallback=404`` so it can
 # render a placeholder.  These must never count as a "problem".  (The mobile SPA
 # uses the same ``/api/art/`` endpoint — there is no separate mobile art route.)
+# Since GitHub #40 "no art" is a 204 for ``fallback=404`` and ``fallback=none``
+# alike — below 400, so "problems" never shows it and this filter no longer
+# matches anything; kept as a guard should an art 404 return.
 _EXPECTED_404_PREFIXES = ("/api/art/",)
 
 # Auth-gated WebSocket endpoints.  A rejected handshake on one of these is an

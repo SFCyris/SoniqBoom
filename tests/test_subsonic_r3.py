@@ -839,7 +839,7 @@ def _prewarm_env(env, monkeypatch):
     _capture_streams(monkeypatch)
     started = []
 
-    async def _do(track_id, track, subsong, priority=None):
+    async def _do(track_id, track, subsong, priority=None, **_kw):
         started.append((track_id, subsong, priority))
 
     monkeypatch.setattr(stream_mod, "_do_prewarm", _do)

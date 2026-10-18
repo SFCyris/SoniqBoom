@@ -84,7 +84,7 @@ function makeNode(path, root, { isRoot = false, hasAudio = false, hasChildren = 
   label.title = path;
   row.appendChild(label);
   if (isRoot && catalogue) {
-    // A catalogue root (Admin → Library → External sources): listed from the
+    // A catalogue root (Settings → Online collections): listed from the
     // archive's index; a tune is fetched from the archive when it is played.
     li.classList.add('tree-catalogue');
     label.title = `${alias || path} catalogue \u2014 tunes are fetched from ${alias || 'the archive'} when you play them`;
@@ -267,6 +267,12 @@ async function _doRefresh() {
   });
   const activePath = treeEl.querySelector('.tree-node.active')
     ?.closest('li[data-path]')?.dataset.path || null;
+  // The folder the keyboard is on (and where the list is scrolled to): back on
+  // the same folder once the rebuilt tree has it again.
+  const ae = document.activeElement;
+  const focusPath = ae && treeEl.contains(ae) ? (ae.closest('li[data-path]')?.dataset.path || null) : null;
+  const scroller = _scrollerOf(treeEl);
+  const scrollY = scroller ? scroller.scrollTop : 0;
   const wasScanning = treeEl.querySelector('.tree-root-scanning') !== null;
 
   treeEl.innerHTML = '';
@@ -293,7 +299,32 @@ async function _doRefresh() {
   }
   checkEmpty();
   if (wasScanning) _setScanningClass(true);
-  if (expanded.length || activePath) _restoreExpansion(expanded, activePath, gen);
+  if (expanded.length || activePath || focusPath) {
+    await _restoreExpansion(expanded, activePath, gen);
+  }
+  if (gen !== _refreshGen) return;
+  if (scroller && scrollY) scroller.scrollTop = scrollY;
+  if (focusPath) _refocus(focusPath);
+}
+
+// The element the tree scrolls in (its nearest scrolling ancestor).
+function _scrollerOf(node) {
+  for (let n = node; n && n !== document.body; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) return n;
+  }
+  return null;
+}
+
+// Focus the row of ``path`` again — unless the user put the focus somewhere
+// else meanwhile (it is only taken back from nowhere: the page body).
+function _refocus(path) {
+  const a = document.activeElement;
+  if (a && a !== document.body && a !== document.documentElement && a.isConnected) return;
+  let li;
+  try { li = treeEl.querySelector(`li[data-path="${CSS.escape(path)}"]`); } catch { li = null; }
+  const row = li && li.querySelector(':scope > .tree-node');
+  if (row) { try { row.focus({ preventScroll: true }); } catch (_) { /* gone */ } }
 }
 
 // Re-open the previously-expanded paths after a rebuild.  Sorted shallow→deep

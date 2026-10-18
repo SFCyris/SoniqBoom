@@ -155,7 +155,9 @@ async def test_a_catalogue_sids_first_play_renders_its_hvsc_length(env, monkeypa
     # … wired into the stream route, right after the play source resolves
     import inspect
     src = inspect.getsource(stream.stream_track)
-    assert "await _resolve_play_source(track_id, track)\n    track = await _catalogue_sid_read(" in src
+    assert ("await _resolve_play_source(track_id, track)\n"
+            "    track = await refreshed_after_expand(track_id, track)\n"
+            "    track = await _catalogue_sid_read(") in src
     # a local / merged track passes straight through
     assert await stream._catalogue_sid_read(tid, track, ext) is track
 
@@ -315,7 +317,9 @@ def test_the_refresh_rebuilds_the_meter_only_when_what_picks_it_changed():
     assert "Library.patchTrack(id, changed || fields)" in body
     ti = (Path(__file__).resolve().parent.parent / "soniqboom/frontend/js/trackinfo.js").read_text()
     # An open edit form is never redrawn under the listener's typing.
-    assert "if (wrap && wrap.querySelector('input, textarea, select')) return true;" in ti
+    guard = ti.index("if (wrap && wrap.querySelector('input, textarea, select')) {")
+    block = ti[guard:ti.index("_render(t);", guard)]
+    assert "return true;" in block
 
 
 # ── Tune counts before the first play (the list's "N tunes" badge) ──────────

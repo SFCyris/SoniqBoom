@@ -12,8 +12,12 @@ The submitters are deliberately lightweight:
 * ``submit_play(user, track)`` — called after the track has been
   listened to enough to count as a play (the existing
   ``record_play`` threshold in ``api/tracks.py``).  Failures are
-  queued to disk (``scrobble_queue.json``) and retried by a small
-  background task.
+  queued to disk (``scrobble_queue.json``, 0600) and retried by a small
+  background task.  A queued play names its account (``uid``), never a
+  token: the retry sends it with the account's token of that moment, and
+  drops it once the account is gone or disabled or disconnected that
+  service.  A queue written before (tokens inside) is converted at the
+  first retry pass.
 
 Network calls use ``httpx`` (already a top-level dep) with a 5 s timeout
 and never block the audio path — every submit is awaited via
@@ -27,6 +31,8 @@ import json
 import logging
 import os
 import time
+import uuid
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -53,26 +59,32 @@ _HTTP_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=5.0)
 # across calls.  Previously every scrobble spawned a fresh AsyncClient
 # (SSL handshake + DNS each time) — under 5 users that's 5 handshakes/min
 # steady state and 1000 in a queue-drain (load-test #1 P2-9).
+# One per event loop: the bundled app runs each server run on a new loop in
+# the same process, and a client made on a closed loop fails ("Event loop is
+# closed").
 _HTTP_CLIENT: httpx.AsyncClient | None = None
+_HTTP_CLIENT_LOOP = None
 
 
 def _client() -> httpx.AsyncClient:
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
+    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if _HTTP_CLIENT is None or _HTTP_CLIENT_LOOP is not loop or _HTTP_CLIENT.is_closed:
         _HTTP_CLIENT = httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
+        _HTTP_CLIENT_LOOP = loop
     return _HTTP_CLIENT
 
 
 async def shutdown() -> None:
     """Close the shared client on app shutdown."""
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is not None:
-        try: await _HTTP_CLIENT.aclose()
+    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP
+    client, _HTTP_CLIENT, _HTTP_CLIENT_LOOP = _HTTP_CLIENT, None, None
+    if client is not None:
+        try: await client.aclose()
         except Exception: pass
-        _HTTP_CLIENT = None
 
 # ── Failure queue (persisted) ───────────────────────────────────────────────
 
@@ -82,18 +94,112 @@ def _queue_path() -> Path:
 
 def _load_queue() -> list[dict]:
     try:
-        return json.loads(_queue_path().read_text(encoding="utf-8"))
+        items = json.loads(_queue_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return []
+    return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
 
 
 def _save_queue(items: list[dict]) -> None:
-    tmp = _queue_path().with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, _queue_path())
+    """Replace the queue file (owner-only, 0600)."""
+    path = _queue_path()
+    tmp = path.with_suffix(".json.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            try:
+                os.fchmod(f.fileno(), 0o600)      # (O_CREAT's mode is masked; an old tmp kept its own)
+            except OSError:
+                pass
+            f.write(json.dumps(items, ensure_ascii=False).encode("utf-8"))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
-_queue_lock = asyncio.Lock()
+_SECRET_KEYS = {"lastfm": "session_key", "listenbrainz": "token"}
+
+
+def _service_token(uid: str | None, service: str) -> str | None:
+    """The account ``uid``'s token for ``service`` now — None when the
+    account is gone or disabled, or that service is disconnected."""
+    if not uid:
+        return None
+    try:
+        from soniqboom.core.users import get_user_store
+        user = get_user_store().get(uid)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if user is None or not user.enabled:
+        return None
+    return (user.lastfm_session_key if service == "lastfm"
+            else user.listenbrainz_token if service == "listenbrainz" else None) or None
+
+
+def _migrate_items(items: list[dict]) -> bool:
+    """Queue items written with the token inside (before ``uid``): the
+    account whose current token it is takes it (the token leaves the item);
+    one no account holds any more (disconnected, replaced) is dropped.  In
+    place; True when anything changed.  Left as is while the user store
+    isn't up yet."""
+    legacy = [it for it in items if it.get(_SECRET_KEYS.get(it.get("service"), ""))]
+    if not legacy:
+        return False
+    try:
+        from soniqboom.core.users import get_user_store
+        users = get_user_store().list_users()
+    except Exception:                                       # noqa: BLE001
+        return False
+    owners: dict[tuple[str, str], str] = {}
+    for u in users:
+        if u.lastfm_session_key:
+            owners[("lastfm", u.lastfm_session_key)] = u.id
+        if u.listenbrainz_token:
+            owners[("listenbrainz", u.listenbrainz_token)] = u.id
+    keep = []
+    for it in items:
+        key = _SECRET_KEYS.get(it.get("service"), "")
+        secret = it.get(key) if key else None
+        if secret:
+            uid = owners.get((it["service"], secret))
+            it.pop(key, None)
+            if uid is None:
+                continue                                    # nobody's token now: dropped
+            it["uid"] = uid
+        keep.append(it)
+    items[:] = keep
+    return True
+
+
+def _restrict_queue_file() -> None:
+    """An older queue file may be world-readable: owner-only."""
+    try:
+        path = _queue_path()
+        if path.stat().st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+# The queue file's lock, and one retry pass at a time (two overlapping passes
+# would send the same queued play twice) — one pair per event loop, made on
+# first use: an ``asyncio.Lock`` belongs to the loop that first waited on it,
+# and the bundled app runs each server run on a new loop in the same process.
+_loop_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[asyncio.Lock, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _locks() -> "tuple[asyncio.Lock, asyncio.Lock]":
+    """``(queue lock, retry lock)`` of the running loop."""
+    loop = asyncio.get_running_loop()
+    pair = _loop_locks.get(loop)
+    if pair is None:
+        pair = _loop_locks[loop] = (asyncio.Lock(), asyncio.Lock())
+    return pair
 
 # Counter of plays dropped because the queue overflowed.  Reset at
 # process restart; persistent counts would need its own AOF, which is
@@ -114,7 +220,10 @@ def queue_depth() -> int:
 
 async def _enqueue(item: dict) -> None:
     global _dropped_count
-    async with _queue_lock:
+    # ``qid``: the item's identity, so a retry pass removes exactly the items
+    # it sent (``retry_pending``) and never one queued while it ran.
+    item = {**item, "qid": item.get("qid") or uuid.uuid4().hex}
+    async with _locks()[0]:
         items = _load_queue()
         items.append(item)
         # Cap the queue so a long network outage doesn't grow unbounded.
@@ -175,6 +284,9 @@ async def _post_lastfm(session_key: str, method: str, extra: dict[str, str]) -> 
         raise _PermanentScrobbleError("last.fm API keys not configured on server")
     if not session_key:
         raise _PermanentScrobbleError("no last.fm session key")
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked():
+        return False                     # offline mode: stays queued
     params = {
         "method":  method,
         "api_key": LASTFM_API_KEY,
@@ -213,6 +325,9 @@ async def _post_lastfm(session_key: str, method: str, extra: dict[str, str]) -> 
 async def _post_listenbrainz(token: str, payload: dict) -> bool:
     if not token:
         raise _PermanentScrobbleError("no ListenBrainz token")
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(LISTENBRAINZ_API):
+        return False                     # offline mode: stays queued
     try:
         r = await _client().post(
             LISTENBRAINZ_API,
@@ -315,7 +430,7 @@ async def submit_play(user: User, track: dict, ts: int | None = None) -> None:
             if not ok:
                 await _enqueue({
                     "service": "lastfm",
-                    "session_key": user.lastfm_session_key,
+                    "uid": user.id,
                     "ts": ts,
                     **info,
                 })
@@ -342,7 +457,7 @@ async def submit_play(user: User, track: dict, ts: int | None = None) -> None:
             if not ok:
                 await _enqueue({
                     "service": "listenbrainz",
-                    "token":   user.listenbrainz_token,
+                    "uid":     user.id,
                     "ts":      ts,
                     **info,
                 })
@@ -360,47 +475,90 @@ async def retry_pending() -> int:
     doing the per-item network IO.  The previous behaviour held the lock
     across the entire drain — at 1000 items × ~150 ms RTT that's >2 min
     of holding the lock, blocking every concurrent ``submit_play``
-    (load-test #1 P2-10)."""
-    async with _queue_lock:
+    (load-test #1 P2-10).
+
+    Items queued while the pass runs are kept: at the end the queue is
+    re-read under the lock and only the items this pass settled (sent, or
+    dropped for a permanent error) are removed from it, by their ``qid`` —
+    never a wholesale overwrite with this pass's snapshot.  Items still
+    failing stay where they are; nothing is added back, so nothing is
+    duplicated."""
+    async with _locks()[1]:
+        return await _retry_pass()
+
+
+async def _retry_pass() -> int:
+    async with _locks()[0]:
         items = _load_queue()
+        _restrict_queue_file()
+        # Items with a token inside (an older queue) name their account now;
+        # items queued before ``qid`` existed get one (saved, so the removal
+        # below can find them).
+        changed = _migrate_items(items)
+        if any(not it.get("qid") for it in items):
+            for it in items:
+                if not it.get("qid"):
+                    it["qid"] = uuid.uuid4().hex
+            changed = True
+        if changed:
+            _save_queue(items)
     if not items:
         return 0
-    remaining: list[dict] = []
-    for item in items:
-        ok = False
-        try:
-            if item.get("service") == "lastfm" and item.get("session_key"):
-                ok = await _post_lastfm(
-                    item["session_key"],
-                    "track.scrobble",
-                    {"artist[0]":      item["artist"],
-                     "track[0]":       item["track"],
-                     "album[0]":       item["album"],
-                     "albumArtist[0]": item["albumArtist"],
-                     "duration[0]":    item["duration"],
-                     "timestamp[0]":   str(item["ts"])},
-                )
-            elif item.get("service") == "listenbrainz" and item.get("token"):
-                ok = await _post_listenbrainz(item["token"], {
-                    "listen_type": "single",
-                    "payload": [{
-                        "listened_at": item["ts"],
-                        "track_metadata": {
-                            "artist_name":  item["artist"],
-                            "track_name":   item["track"],
-                            "release_name": item["album"] or None,
-                        },
-                    }],
-                })
-        except _PermanentScrobbleError as e:
-            # Drop permanent failures — never retry these.
-            log.warning("Dropping scrobble (%s) permanent error: %s",
-                        item.get("service"), e)
-            continue
-        if not ok:
-            remaining.append(item)
-    async with _queue_lock:
-        _save_queue(remaining)
+    settled: set[str] = set()
+    try:
+        for item in items:
+            ok = False
+            service = item.get("service")
+            # (an item still holding a token: the user store wasn't up to
+            # convert it — kept for a later pass, not sent)
+            legacy = bool(item.get(_SECRET_KEYS.get(service, "")))
+            token = None if legacy else _service_token(item.get("uid"), service)
+            if token is None and not legacy:
+                # The account is gone / disabled, or disconnected the service.
+                log.info("Dropping a queued %s scrobble: its account no longer "
+                         "scrobbles there", service)
+                settled.add(item["qid"])
+                continue
+            try:
+                if service == "lastfm" and token:
+                    ok = await _post_lastfm(
+                        token,
+                        "track.scrobble",
+                        {"artist[0]":      item["artist"],
+                         "track[0]":       item["track"],
+                         "album[0]":       item["album"],
+                         "albumArtist[0]": item["albumArtist"],
+                         "duration[0]":    item["duration"],
+                         "timestamp[0]":   str(item["ts"])},
+                    )
+                elif service == "listenbrainz" and token:
+                    ok = await _post_listenbrainz(token, {
+                        "listen_type": "single",
+                        "payload": [{
+                            "listened_at": item["ts"],
+                            "track_metadata": {
+                                "artist_name":  item["artist"],
+                                "track_name":   item["track"],
+                                "release_name": item["album"] or None,
+                            },
+                        }],
+                    })
+            except _PermanentScrobbleError as e:
+                # Drop permanent failures — never retry these.
+                log.warning("Dropping scrobble (%s) permanent error: %s",
+                            item.get("service"), e)
+                settled.add(item["qid"])
+                continue
+            if ok:
+                settled.add(item["qid"])
+    finally:
+        # (also when the pass ends early — an exception, a cancelled task:
+        # what was already sent must not be sent again by the next pass)
+        async with _locks()[0]:
+            current = _load_queue()
+            remaining = [it for it in current if it.get("qid") not in settled]
+            if len(remaining) != len(current):
+                _save_queue(remaining)
     return len(remaining)
 
 

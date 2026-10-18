@@ -81,7 +81,7 @@ async def test_poll_share_uses_returned_plan_not_global(monkeypatch):
     }
 
     async def _fake_start(share_id, scan_root, source, on_progress=None, *,
-                          dir_mtime_cap=None):
+                          dir_mtime_cap=None, **_kw):
         return {"scan_root": scan_root, "new": 3, "extract": 3,
                 "walked": 10, "skip": 7}
 
@@ -127,7 +127,7 @@ def _arm_capture(monkeypatch, *, full_walk_ok=None):
     captured: dict = {}
 
     async def _fake_start(share_id, scan_root, source, on_progress=None, *,
-                          dir_mtime_cap=None):
+                          dir_mtime_cap=None, **_kw):
         captured["cap"] = dir_mtime_cap
         plan = {"scan_root": scan_root, "new": 0, "extract": 0, "walked": 5}
         # By default mirror the scanner: a full walk (cap None) that saw
@@ -143,7 +143,7 @@ def _arm_capture(monkeypatch, *, full_walk_ok=None):
 async def test_full_walk_ceiling_forces_full_walk_when_relaxed(monkeypatch):
     captured = _arm_capture(monkeypatch)
     st = RF._reg.states.setdefault("ftp://h/s", ShareState(scan_root="ftp://h/s"))
-    st.total_polls = 3                              # not a drift-sweep multiple, not cold-start
+    st.total_polls = st.tick_polls = 3                              # not a drift-sweep multiple, not cold-start
     st.last_check_ts = time.time() - 300
     st.last_full_walk_ts = time.time() - (RF._FULL_WALK_CEILING_S + 600)  # overdue
     await RF._poll_share("ftp://h/s", reason="tick")
@@ -155,7 +155,7 @@ async def test_full_walk_ceiling_forces_full_walk_when_relaxed(monkeypatch):
 async def test_fast_walk_when_ceiling_not_reached(monkeypatch):
     captured = _arm_capture(monkeypatch)
     st = RF._reg.states.setdefault("ftp://h/s", ShareState(scan_root="ftp://h/s"))
-    st.total_polls = 3
+    st.total_polls = st.tick_polls = 3
     st.last_check_ts = time.time()
     st.last_full_walk_ts = time.time() - 60         # just did a full walk → not overdue
     await RF._poll_share("ftp://h/s", reason="tick")
@@ -170,7 +170,7 @@ async def test_ceiling_clock_not_stamped_when_full_walk_did_not_complete(monkeyp
     # chronically-degraded share while telemetry claims a clean full walk.
     captured = _arm_capture(monkeypatch, full_walk_ok=False)
     st = RF._reg.states.setdefault("ftp://h/s", ShareState(scan_root="ftp://h/s"))
-    st.total_polls = 3
+    st.total_polls = st.tick_polls = 3
     st.last_check_ts = time.time() - 300
     overdue_ts = time.time() - (RF._FULL_WALK_CEILING_S + 600)
     st.last_full_walk_ts = overdue_ts

@@ -4,9 +4,9 @@
 /**
  * _common.js — Shared row builder + helpers for mobile views.
  */
-import { artPlaceholderEmoji } from '../../utils.js';
+import { artPlaceholderEmoji, staticArtUrl } from '../../utils.js';
 import { offlineKind, offlineBadge } from '../../offline.js';
-import { healthBadge, canReport, mark as healthMark } from '../../health.js';
+import { healthBadge, canReport, mark as healthMark, isUnplayable } from '../../health.js';
 
 export function esc(s) {
   return String(s ?? '')
@@ -25,7 +25,7 @@ export function lazyArt(img, src) {
   img.decoding = 'async';
   // Set src directly.  The rows carry ``content-visibility:auto`` which already
   // skips off-screen layout/paint/DECODE, so the only remaining cost is the
-  // network request — cheap for same-origin /api/art (mostly cacheable 404s in a
+  // network request — cheap for same-origin /api/art (mostly cacheable 204s in a
   // chiptune library).  This is deliberately NOT loading="lazy" + no manual
   // IntersectionObserver: an observer does not fire for imgs inside a
   // content-visibility-skipped subtree, which left covers permanently blank.
@@ -83,13 +83,13 @@ export function buildTrackRow(track, opts = {}) {
   const ph = document.createElement('span');
   ph.textContent = artPlaceholderEmoji(track);
   art.appendChild(ph);
-  const artSrc = track.cover_art || (track.id ? `/api/art/${track.id}?size=sm&fallback=404` : null);
+  const artSrc = staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null);
   if (artSrc) {
     const img = new Image();
     img.alt = '';
     img.decoding = 'async';   // decode off the main thread — keeps scroll smooth
     // Append the img alongside the placeholder span (no innerHTML wipe)
-    // so a 404 / decode failure leaves the format glyph visible.  The
+    // so a 204 (no art) / decode failure leaves the format glyph visible.  The
     // .loaded class triggers the CSS opacity fade-in defined in mobile.css.
     // src is set on viewport entry via lazyArt() (see the trap note above).
     img.onload  = () => img.classList.add('loaded');
@@ -152,7 +152,9 @@ export function fmtDur(sec) {
  *  Deliberately NO tag-editing on mobile — playback + playlist actions only,
  *  and (edit rights) reporting a playback problem, which is no tag edit. */
 export function trackActions(track, ctx) {
-  const report = canReport() ? [
+  // (Not for a track that doesn't play at all — health.js isUnplayable —
+  // unless a report is on it to clear.)
+  const report = canReport() && (!isUnplayable(track) || track.health) ? [
     { label: '⚠︎ Report a problem…', onSelect: () => reportSheet(track, ctx) },
   ] : [];
   return [

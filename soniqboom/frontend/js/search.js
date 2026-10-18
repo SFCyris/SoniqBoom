@@ -10,10 +10,11 @@
  */
 import { Library }             from './library.js';
 import { Player }              from './player.js';
-import { artPlaceholderEmoji, Toast } from './utils.js';
+import { artPlaceholderEmoji, Toast, staticArtUrl } from './utils.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
 import { healthBadgeHTML } from './health.js';
 import { listTuneCount, tunesBadgeHTML } from './tunes.js';
+import { createStationLookup } from './station_lookup.js';
 
 const input  = document.getElementById('search-input');
 const clear  = document.getElementById('search-clear');
@@ -199,13 +200,12 @@ function _showPreview(tracks, stations = []) {
   listbox.setAttribute('aria-label', 'Search suggestions');
   dd.appendChild(listbox);
 
-  // While the Stations view is open the header IS a station search, so put
-  // stations first; otherwise tracks lead and stations follow as a group.
+  // Station matches exist only while the Stations view is open (the header is
+  // a station search there — _lookupStations): they lead, tracks follow.
   const stationsFirst = !document.getElementById('stations-view')?.hidden;
   if (stationsFirst) _renderStationGroup(listbox, stations);
 
   if (!tracks.length) {
-    if (!stationsFirst && stations.length) _renderStationGroup(listbox, stations);
     if (!tracks.length && !stations.length) {
       const empty = document.createElement('div');
       empty.className = 'sp-empty';
@@ -259,7 +259,7 @@ function _showPreview(tracks, stations = []) {
     // ``fetchpriority=low`` keeps these preview thumbnails from competing
     // with the actual /api/search request that produced the dropdown, and
     // we stash a ref so the next keystroke can cancel by clearing ``src``.
-    const _previewSrc = t.cover_art || (t.id ? `/api/art/${t.id}?size=sm&fallback=404` : '');
+    const _previewSrc = staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '');
     if (_previewSrc) {
       const artBox = row.querySelector('.sp-art');
       const img = new Image();
@@ -272,7 +272,7 @@ function _showPreview(tracks, stations = []) {
         artBox.appendChild(img);
       };
       // No onerror handler needed — the placeholder remains in the DOM
-      // until ``onload`` swaps it; a 404 just leaves the emoji visible.
+      // until ``onload`` swaps it; a 204 (no art) just leaves the emoji visible.
       _previewArtImgs.push(img);
       img.src = _previewSrc;  // fires request; onload swaps content when ready
     }
@@ -285,9 +285,6 @@ function _showPreview(tracks, stations = []) {
     });
     trackBox.appendChild(row);
   });
-
-  // In library mode, stations follow the tracks as a labelled group.
-  if (!stationsFirst) _renderStationGroup(listbox, stations);
 
   // Always show "press Enter" hint so behaviour is discoverable.  In the
   // Stations view Enter opens the full station list, not the song search, so
@@ -519,7 +516,34 @@ async function query(text) {
 let _quickAbort = null;
 let _searchGen = 0;        // monotonic — guards two independent async sources
 let _lastTracks = [];
+let _lastTracksText = null;   // the text _lastTracks answer
 let _curStations = [];
+
+// Station matches come from the Radio Browser directory (a third party), so
+// they are asked for only while the Stations view is open — the box is a
+// station search there; in the library it searches the library alone — and
+// only once typing paused, with the stale request aborted and recent answers
+// kept (station_lookup.js).
+const _stationLookup = createStationLookup({
+  fetchRows: (text, signal) =>
+    fetch(`/api/stations/search?q=${encodeURIComponent(text)}&limit=4`, { signal })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))),
+});
+function _inStationsView() {
+  const v = document.getElementById('stations-view');
+  return !!v && !v.hidden;
+}
+function _lookupStations(text) {
+  _curStations = [];                 // an older text's stations never pair with this one
+  if (!_inStationsView()) { _stationLookup.cancel(); return; }
+  _stationLookup.request(text, (rows) => {
+    if (!_inStationsView() || input.value !== text) return;
+    _curStations = rows;
+    // (No stations and the tracks not in yet: the track preview paints both.)
+    if (!rows.length && _lastTracksText !== text) return;
+    _showPreview(_lastTracksText === text ? _lastTracks : [], _curStations);
+  });
+}
 
 // The quick preview is no longer wanted (Enter ran the full search, a row was
 // picked, Escape, focus left): drop the pending keystroke timer, retire the
@@ -530,6 +554,7 @@ let _curStations = [];
 function _cancelPreviewSearch() {
   clearTimeout(previewTimer);
   previewTimer = null;
+  _stationLookup.cancel();
   _searchGen++;
   if (_quickAbort) {
     try { _quickAbort.abort(); } catch {}
@@ -544,21 +569,9 @@ async function _quickSearch(text) {
   }
   const ctl = new AbortController();
   _quickAbort = ctl;
-  _curStations = [];
   _lastTracks = [];   // avoid an early station injection pairing with stale tracks
-  // Stations search hits Radio Browser (can be slow), so it runs INDEPENDENTLY
-  // of the fast local track preview and injects when it lands — never blocking
-  // the track results.  Gated at ≥2 chars to avoid hammering the directory.
-  if (text.trim().length >= 2) {
-    fetch(`/api/stations/search?q=${encodeURIComponent(text)}&limit=4`, { signal: ctl.signal })
-      .then(r => (r.ok ? r.json() : []))
-      .then(st => {
-        if (gen !== _searchGen) return;            // a newer keystroke won
-        _curStations = Array.isArray(st) ? st : [];
-        _showPreview(_lastTracks, _curStations);
-      })
-      .catch(() => {});
-  }
+  _lastTracksText = null;
+  // (Station matches run on their own — _lookupStations, from the keystroke.)
   try {
     const res = await fetch(
       `/api/search/quick?q=${encodeURIComponent(text)}&limit=8`,
@@ -569,6 +582,7 @@ async function _quickSearch(text) {
     // could have replaced the generation while we were awaiting json).
     if (gen === _searchGen) {
       _lastTracks = Array.isArray(tracks) ? tracks : [];
+      _lastTracksText = text;
       _showPreview(_lastTracks, _curStations);
     }
   } catch (err) {
@@ -594,7 +608,10 @@ input.addEventListener('input', () => {
   clearTimeout(previewTimer);
   if (val.trim()) {
     previewTimer = setTimeout(() => _quickSearch(val), 100);
+    _lookupStations(val);
   } else {
+    _stationLookup.cancel();
+    _curStations = [];
     _hidePreview();
     Library.showAll();
   }

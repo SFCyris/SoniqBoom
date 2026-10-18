@@ -227,8 +227,12 @@ def test_listing_behind_a_proxy_that_moves_the_share(monkeypatch):
 
 async def test_folder_browse_of_a_webdav_root(dav, registered, monkeypatch):
     from soniqboom.api import fstree
+    from soniqboom.core import store as store_mod
     root = dav.url
     registered(root, WebDAVFileSource(root, USER, PW))
+    st = store_mod.TrackStore()
+    st.upsert_scan_dir(root)                    # a share is browsed as a scan root
+    monkeypatch.setattr(store_mod, "_store", st)
     monkeypatch.setattr(fstree, "_get_or_build_scan_root_sorted", lambda s, h: ([], {}))
     res = await fstree.get_children(path=root, root=root)
     assert [c["name"] for c in res["children"]] == ["Archives", "Artist A"]

@@ -31,7 +31,8 @@ function extractCore() {
 const FACTORY = new Function('env', `
   'use strict';
   const { fetch, setTimeout, clearTimeout, audio } = env;
-  const Toast = { error: (m) => env.toasts.push(['error', m]) };
+  const Toast = { error: (m) => env.toasts.push(['error', m]), warn: (m) => env.toasts.push(['warn', m]),
+                  action: (m, label) => env.toasts.push(['action', m, label]) };
   const console = { warn() {}, error() {}, log() {} };
   function emit(name, data) { env.events.push([name, data]); }
   let trackId = null, _track = null, _playSeq = 0, _pendingSeekSec = null;
@@ -61,7 +62,14 @@ const FACTORY = new Function('env', `
     get recoverySeq() { return _renderRecoverySeq; },
     _subQs, _renderStatusUrl, _prewarmUrl, _startRenderRecovery, _cancelPendingStart,
     _watchRenderLength, _switchToCachedRender, _duration, _knownLength, _reportPlayFailure, _fmtLabel,
+    _restartRetryAfter, _probeRestarting, _waitServerRestart, _restartWaitFor, noteServerRestart,
+    _codecRetryBegin, _codecRetryEnd, _codecRetryState,
     get prewarmId() { return PREWARM_PAGE_ID; },
+    // A start reported as failed (nothing plays) / a track gone from the library.
+    get startFailed() { return typeof _startFailedNow === 'function' ? _startFailedNow() : null; },
+    set onGone(fn) { _onGone = fn; },
+    set failAction(fn) { _failAction = fn; },
+
   };
 `);
 

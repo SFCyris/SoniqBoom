@@ -555,7 +555,7 @@ async def test_route_contract_is_unchanged(lib, monkeypatch):
         old, new = await _both(monkeypatch, method, url)
         assert new.status_code == old.status_code, (method, url, old.status_code,
                                                     new.status_code)
-        assert new.status_code in (404, 405, 422)
+        assert new.status_code in (403, 404, 405, 422)   # 403: outside every scan root
 
 
 async def test_direct_callers_still_get_python_data(lib):

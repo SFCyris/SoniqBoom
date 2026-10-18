@@ -3026,6 +3026,17 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
   pointer-events: none;
 }
 .dir-unavailable .admin-dir-path { opacity: 0.5; }
+/* Why a folder isn't (fully) watched: a line of its own under the row. */
+.admin-dir-row.has-why { flex-wrap: wrap; }
+.admin-dir-why {
+  flex: 1 0 100%;
+  order: 99;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text2);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .admin-dir-note {
   flex: 0 1 auto;
   min-width: 0;          /* shrinks (with an ellipsis) before the row overflows */
@@ -3789,6 +3800,12 @@ body.ti-open {
   letter-spacing: 0.03em;
 }
 .ti-stat-size { color: var(--text2); }
+/* A track that doesn't play (no engine decodes it, a package with no tune in
+   it): the format name loses its accent and the audio facts give way to what
+   it is ("No playable tunes"). */
+.ti-stats-unplayable .ti-stat-row:first-child { color: var(--text2); }
+.ti-stat-row.ti-unplayable { color: var(--danger, #ee5555); font-weight: 600; }
+:root[data-theme="light"] .ti-stat-row.ti-unplayable { color: #b42318; }
 
 /* ── Right column: scrollable metadata ───────────────────────────────────── */
 .ti-right {
@@ -4136,6 +4153,9 @@ body.ti-open {
 
 /* Nothing loaded yet: the bar shows the queued track Play starts, dimmed. */
 #player-bar.is-cued .player-art-info { opacity: 0.72; }
+/* The start of the track failed (nothing plays — the toast says why): dimmed,
+   and the crumb reads "Couldn't play:". */
+#player-bar.is-failed .player-art-info { opacity: 0.72; }
 
 .queue-list[hidden] { display: none; }
 .queue-list {
@@ -4211,7 +4231,7 @@ body.ti-open {
   display: block;
   /* Match the library-row pattern: image stays transparent until the
      bitmap actually decodes, so the format placeholder underneath shows
-     through whenever ``/api/art/{id}`` is unavailable, 404s, or hasn't
+     through whenever ``/api/art/{id}`` is unavailable, answers 204 (no art), or hasn't
      been extracted yet.  No track in the playlist/queue ever shows a
      broken-image glyph. */
   opacity: 0;
@@ -5748,6 +5768,11 @@ tr.dragging { opacity: 0.4; }
 .admin-tab:hover {
   color: var(--text1);
 }
+/* Desktop: every tab fits the panel (eight of them since Collections);
+   phones keep the horizontal scroll above. */
+@media (min-width: 769px) {
+  .admin-tab { padding-left: 8px; padding-right: 8px; }
+}
 .admin-tab.active {
   color: var(--accent);
   border-bottom-color: var(--accent);
@@ -6461,7 +6486,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
    or detected at scan (corrupt / partial) — one badge per row, built like the
    offline badge: a glyph (aria-hidden) + a word + screen-reader text, so it is
    never colour alone (WCAG 1.4.1).  Red = passed by when a list plays through
-   (broken, corrupt); amber = plays, with problems (glitched, partial). */
+   (broken, corrupt, no tunes); amber = plays, with problems (glitched, partial). */
 .track-health-badge {
   display: inline-flex;
   align-items: center;
@@ -6482,7 +6507,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 }
 .track-health-icon { font-size: 10px; line-height: 1; }
 .track-health-broken,
-.track-health-corrupt {
+.track-health-corrupt,
+.track-health-empty {
   color: var(--danger, #ee5555);
   background: rgba(238,85,85,0.14);
   border-color: rgba(238,85,85,0.38);
@@ -6496,7 +6522,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 :root[data-theme="light"] .track-health-glitched,
 :root[data-theme="light"] .track-health-partial { color: #8a5a00; }
 :root[data-theme="light"] .track-health-broken,
-:root[data-theme="light"] .track-health-corrupt { color: #b42318; }
+:root[data-theme="light"] .track-health-corrupt,
+:root[data-theme="light"] .track-health-empty { color: #b42318; }
 .queue-row .track-health-badge,
 #playlist-tracks .track-health-badge { margin-left: 5px; line-height: 13px; }
 /* A queue row the queue will pass by (offline, broken, corrupt, a short tune):
@@ -7029,7 +7056,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .auth-submit {
   margin-top: 6px;
   background: var(--accent);
-  color: #fff;
+  color: #111;                    /* dark on the accent: 6.4:1 (white was 2.9:1) */
   border: none;
   border-radius: var(--radius-md, 8px);
   padding: 11px 16px;
@@ -7038,7 +7065,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   cursor: pointer;
   transition: background 0.15s, transform 0.05s;
 }
-.auth-submit:hover  { background: var(--accent-dim); }
+.auth-submit:hover  { background: var(--accent-dim); color: #fff; }   /* 5.6:1 */
 .auth-submit:active { transform: translateY(1px); }
 .auth-submit:disabled {
   opacity: 0.5;
@@ -7403,10 +7430,9 @@ body.auth-blocked > #app {
   width: 16px;
   height: 16px;
   margin: -8px 0 0 -8px;
-  /* Bumped from rgba(255,255,255,0.4) — 2:1 against the accent orange.
-     0.7 alpha clears the ~3:1 non-text-component bar (WCAG 1.4.11). */
-  border: 2px solid rgba(255,255,255,0.7);
-  border-top-color: #fff;
+  /* Dark like the label: ≥ 3:1 against the accent orange (WCAG 1.4.11). */
+  border: 2px solid rgba(17,17,17,0.45);
+  border-top-color: #111;
   border-radius: 50%;
   animation: auth-spin 0.8s linear infinite;
 }

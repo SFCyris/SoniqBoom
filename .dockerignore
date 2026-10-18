@@ -8,9 +8,8 @@ venv
 **/*.pyc
 **/*.pyo
 node_modules
-# Local runtime state / config — must NEVER be baked into the image. A shipped
-# SoniqBoom.conf overrides the container's SONIQBOOM_DATA_DIR (so state stops
-# persisting to the /data volume) and would leak the dev's paths/settings.
+# Local runtime state / config — must NEVER be baked into the image: it would
+# leak the dev's paths, shares and settings into every container.
 SoniqBoom.conf
 .soniqboom.env
 prefs.json

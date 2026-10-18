@@ -405,10 +405,17 @@ class _FakeRemoteCache:
         self.fetches: list = []
         self.cached: set = set()
 
-    def get_cached(self, share, rel):
+    @property
+    def root(self):
+        return self.local.parent
+
+    def peek_cached(self, share, rel):
+        return (share, rel) in self.cached
+
+    def get_cached(self, share, rel, *, ident=None):
         return self.local if (share, rel) in self.cached else None
 
-    def fetch(self, share, rel, source, *, lane="stream"):
+    def fetch(self, share, rel, source, *, lane="stream", ident=None):
         self.fetches.append((rel, lane))
         if self.block is not None:
             self.block.wait(5)
@@ -823,12 +830,12 @@ async def test_vu_endpoint_says_when_amiga_meters_cannot_come(monkeypatch, tmp_p
     app.include_router(tracks_api.router, prefix="/api")
     async with _client(app) as c:
         r = await c.get("/api/tracks/am/vu")
-        assert r.status_code == 404 and r.headers["x-vu-unavailable"] == "off"
+        assert r.status_code == 204 and r.headers["x-vu-unavailable"] == "off"
         r = await c.get("/api/tracks/tk/vu")
-        assert r.status_code == 404 and "x-vu-unavailable" not in r.headers
+        assert r.status_code == 204 and "x-vu-unavailable" not in r.headers
         cfg["uade_vu_meters"] = True
         r = await c.get("/api/tracks/am/vu")
-        assert r.status_code == 404 and "x-vu-unavailable" not in r.headers
+        assert r.status_code == 204 and "x-vu-unavailable" not in r.headers
         monkeypatch.setattr(stream, "_UADE_VU_UNSUPPORTED", True)
         monkeypatch.setattr(stream, "_UADE_VU_UNSUPPORTED_AT", time.monotonic())
         r = await c.get("/api/tracks/am/vu")

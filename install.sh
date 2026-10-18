@@ -106,9 +106,16 @@ _clean_renderers(){
       warn "  $name is Homebrew-managed (symlink) — skipping (use 'brew reinstall $name')"
     elif [ -f "$bin" ]; then
       _clean_bundled_siblings "$bin" "$bindir"
-      rm -f "$bin" && { info "  removed $name + bundled libs"; removed=$((removed + 1)); }
+      { rm -f "$bin" 2>/dev/null || { command -v sudo >/dev/null 2>&1 && sudo rm -f "$bin"; }; } \
+        && { info "  removed $name + bundled libs"; removed=$((removed + 1)); }
     fi
   done
+  # Linux: the SID chain install.sh builds into /usr/local also leaves its libraries.
+  if [ "$(uname -s)" = "Linux" ] && ls /usr/local/lib/libsidplayfp.so* /usr/local/lib/libresidfp.so* >/dev/null 2>&1; then
+    if [ -w /usr/local/lib ]; then rm -f /usr/local/lib/libsidplayfp.so* /usr/local/lib/libresidfp.so*
+    elif command -v sudo >/dev/null 2>&1; then sudo rm -f /usr/local/lib/libsidplayfp.so* /usr/local/lib/libresidfp.so*; fi
+    info "  removed the SID libraries in /usr/local/lib"
+  fi
   for name in ym2wav hvl2wav; do
     if [ -f "$DATA_DIR/native/$name" ]; then
       rm -f "$DATA_DIR/native/$name" && { info "  removed $name (rebuilds on first play)"; removed=$((removed + 1)); }
@@ -332,14 +339,14 @@ if [ "$PLATFORM" = "macos" ]; then
   fi
   info "adplay: $(command -v adplay || echo 'not found — AdLib/OPL disabled')"
 
-  # lhasa provides the reference ``lha`` CLI — it decodes every LHA method,
-  # including ``-lh1-`` (common in older Amiga archives) that the in-process
-  # ``lhafile`` reader rejects.  Optional: LHA scanning degrades without it.
+  # lhasa provides the reference ``lha`` CLI — a last resort for an LHA
+  # archive the in-process readers (lhafile, then soniqboom/core/lha.py, which
+  # reads every method) can't read.  Optional.
   if ! command -v lha &>/dev/null; then
     info "Installing lhasa (LHA/LZH archive decoder)…"
-    brew install lhasa || warn "lhasa install failed — LHA -lh1- archives won't be scanned"
+    brew install lhasa || warn "lhasa install failed — SoniqBoom's built-in LHA reader is used"
   fi
-  info "lha (lhasa): $(command -v lha || echo 'not found — LHA -lh1- archives skipped')"
+  info "lha (lhasa): $(command -v lha || echo 'not found — the built-in LHA reader is used')"
 
   # sc68 — native Atari ST .sc68 disks.  (SNDH uses psgplay, built from
   # source below for both platforms; .ym uses the bundled StSound engine.)
@@ -501,7 +508,7 @@ elif [ "$PLATFORM" = "linux" ]; then
     # ``pip install`` fails with ``fatal error: Python.h: No such file`` — the
     # Fedora (python3-devel) and macOS (framework Python) paths ship them already.
     run_pkg apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-pip python3-dev build-essential ffmpeg \
+      python3 python3-venv python3-pip python3-dev build-essential pkg-config ffmpeg \
       fluidsynth libfluidsynth3 \
       openmpt123 \
       curl ca-certificates xz-utils
@@ -515,21 +522,21 @@ elif [ "$PLATFORM" = "linux" ]; then
   elif [ "$PKG" = "dnf" ]; then
     section "Installing system dependencies (dnf)"
     run_pkg dnf install -y \
-      python3 python3-virtualenv python3-pip python3-devel gcc ffmpeg \
+      python3 python3-virtualenv python3-pip python3-devel gcc gcc-c++ make pkgconf-pkg-config ffmpeg \
       fluidsynth libopenmpt \
       sidplayfp \
       curl ca-certificates xz || true
   elif [ "$PKG" = "pacman" ]; then
     section "Installing system dependencies (pacman)"
     run_pkg pacman -S --noconfirm --needed \
-      python python-virtualenv python-pip gcc ffmpeg \
+      python python-virtualenv python-pip gcc make pkgconf ffmpeg \
       fluidsynth libopenmpt \
       sidplayfp \
       curl ca-certificates xz || true
   elif [ "$PKG" = "zypper" ]; then
     section "Installing system dependencies (zypper)"
     run_pkg zypper --non-interactive install \
-      python3 python3-virtualenv python3-pip python3-devel gcc ffmpeg \
+      python3 python3-virtualenv python3-pip python3-devel gcc gcc-c++ make pkg-config ffmpeg \
       fluidsynth libopenmpt0 \
       sidplayfp \
       curl ca-certificates xz || true
@@ -552,16 +559,16 @@ elif [ "$PLATFORM" = "linux" ]; then
     esac
   fi
 
-  # LHA archive support: the reference ``lha`` CLI (from lhasa) decodes Amiga
-  # ``-lh1-`` archives the in-process ``lhafile`` reader can't.  Best-effort and
-  # isolated (its own command per manager) so a distro that doesn't package it
-  # never blocks the core deps.
+  # LHA archives: the reference ``lha`` CLI (from lhasa), a last resort for an
+  # archive the in-process readers can't read.  Best-effort and isolated (its
+  # own command per manager) so a distro that doesn't package it never blocks
+  # the core deps.
   if [ "$PKG" != "none" ] && ! command -v lha &>/dev/null; then
     case "$PKG" in
       apt)    run_pkg apt-get install -y --no-install-recommends lhasa || true ;;
       dnf)    run_pkg dnf install -y lhasa || true ;;
       zypper) run_pkg zypper --non-interactive install lhasa || true ;;
-      pacman) warn "lhasa is in the AUR — install it with an AUR helper for LHA -lh1- support" ;;
+      pacman) warn "lhasa is in the AUR — optional: SoniqBoom's built-in LHA reader reads every method" ;;
     esac
   fi
 
@@ -603,10 +610,9 @@ elif [ "$PLATFORM" = "linux" ]; then
   [ -z "$PYTHON" ] && die "python3 not found after install.  Aborting."
   info "Python: $($PYTHON --version)"
   info "ffmpeg (system): $(ffmpeg -version 2>&1 | head -1 || echo 'not installed')"
-  info "sidplayfp:        $(command -v sidplayfp  || echo 'not found — SID rendering disabled')"
   info "fluidsynth:       $(command -v fluidsynth || echo 'not found — MIDI rendering disabled')"
   info "openmpt123:       $(command -v openmpt123 || echo 'not found — tracker rendering disabled')"
-  info "lha (lhasa):      $(command -v lha        || echo 'not found — LHA -lh1- archives skipped')"
+  info "lha (lhasa):      $(command -v lha        || echo 'not found — the built-in LHA reader is used')"
 
   # sc68 — native Atari ST .sc68 disks.  Try a distro package first (a few ship
   # it), then fall back to a source build so .sc68 works on bare-metal Linux the
@@ -619,6 +625,80 @@ elif [ "$PLATFORM" = "linux" ]; then
     command -v sc68 &>/dev/null || build_sc68_from_source
   fi
   info "sc68:             $(command -v sc68       || echo 'not found — .sc68 disabled')"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sidplayfp (C64 SID) on Linux — the accurate chain, built from pinned source
+# ─────────────────────────────────────────────────────────────────────────────
+# Distribution packages carry an older libsidplayfp (Debian 13: 2.12) that plays
+# RSID tunes nearly silent.  Build libresidfp → libsidplayfp → sidplayfp at the
+# versions the Docker image uses (same SHA-256 pins) into /usr/local, with the
+# library path recorded in the binaries (rpath), unless a sidplayfp with
+# libsidplayfp 3.1 or newer is already installed.  A distribution sidplayfp
+# installed above stays as the fallback if the build fails.
+if [ "$PLATFORM" = "linux" ]; then
+  section "sidplayfp (C64 SID)"
+  RESIDFP_VER="1.2.2"; RESIDFP_SHA="2eb0204b76d52fe825c0e1f98826f62a179033a60543032d0e8b90060ecaa50e"
+  LIBSID_VER="3.1.0";  LIBSID_SHA="12a7ba238a6f61a811134a31d494e251eba0dd8f1c03b627d2422d8133a3584b"
+  SIDCLI_VER="3.1.0";  SIDCLI_SHA="287cc5fe859e242f885f8f2c6da37add62b89b232c8a55d23b74e2c59281f4e7"
+  _sid_ok() {   # <binary>: runs, linked against libsidplayfp ≥ 3.1
+    [ -n "$1" ] && [ -x "$1" ] \
+      && "$1" --version 2>/dev/null | grep -Eq 'libsidplayfp ([4-9]|[1-9][0-9]+)\.|libsidplayfp 3\.([1-9][0-9]*)\.'
+  }
+  if _sid_ok "$(command -v sidplayfp 2>/dev/null)"; then
+    info "sidplayfp already installed: $(command -v sidplayfp) ($(sidplayfp --version 2>/dev/null | grep -o 'libsidplayfp [0-9.]*'))"
+  elif _sid_ok /usr/local/bin/sidplayfp; then
+    info "sidplayfp already installed: /usr/local/bin/sidplayfp"
+    warn "sidplayfp at $(command -v sidplayfp) comes before /usr/local/bin/sidplayfp on PATH — put /usr/local/bin first"
+  else
+    SID_DEST="/usr/local"
+    SID_SUDO=""
+    if [ ! -w "$SID_DEST/lib" ] || [ ! -w "$SID_DEST/bin" ]; then
+      command -v sudo >/dev/null 2>&1 && SID_SUDO="sudo"
+    fi
+    SID_TMP="$(mktemp -d)"
+    SID_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    SID_PC="$SID_DEST/lib/pkgconfig"
+    SID_LDFLAGS="-Wl,-rpath,$SID_DEST/lib"
+    _sid_fetch() {   # <project> <version> <sha256>: download, verify, unpack
+      curl -sfL --max-time 300 "https://github.com/libsidplayfp/$1/releases/download/v$2/$1-$2.tar.gz" \
+          -o "$SID_TMP/$1.tar.gz" \
+        && echo "$3  $SID_TMP/$1.tar.gz" | sha256sum -c - >/dev/null 2>&1 \
+        && tar xzf "$SID_TMP/$1.tar.gz" -C "$SID_TMP"
+    }
+    _sid_build() {   # <dir> <log> <configure args…>: configure, make, install
+      local dir="$1" log="$2"; shift 2
+      ( cd "$SID_TMP/$dir" \
+          && PKG_CONFIG_PATH="$SID_PC" LDFLAGS="$SID_LDFLAGS" ./configure --prefix="$SID_DEST" --quiet "$@" \
+          && make -j"$SID_JOBS" && $SID_SUDO make install ) >"$SID_TMP/$log" 2>&1
+    }
+    info "Building the accurate SID chain (libresidfp → libsidplayfp → sidplayfp, a few minutes)…"
+    if _sid_fetch libresidfp "$RESIDFP_VER" "$RESIDFP_SHA" \
+        && _sid_build "libresidfp-$RESIDFP_VER" 1_residfp.log --disable-static \
+        && _sid_fetch libsidplayfp "$LIBSID_VER" "$LIBSID_SHA" \
+        && _sid_build "libsidplayfp-$LIBSID_VER" 2_libsidplayfp.log --disable-static --without-usbsid --without-exsid \
+        && _sid_fetch sidplayfp "$SIDCLI_VER" "$SIDCLI_SHA" \
+        && _sid_build "sidplayfp-$SIDCLI_VER" 3_sidplayfp.log; then
+      { $SID_SUDO /sbin/ldconfig || $SID_SUDO ldconfig; } >/dev/null 2>&1 || true
+      hash -r
+      if [ "$(command -v sidplayfp)" != "$SID_DEST/bin/sidplayfp" ]; then
+        warn "sidplayfp at $(command -v sidplayfp) comes before $SID_DEST/bin/sidplayfp on PATH — put $SID_DEST/bin first"
+      fi
+      if "$SID_DEST/bin/sidplayfp" --version >/dev/null 2>&1; then
+        info "sidplayfp: $SID_DEST/bin/sidplayfp ($("$SID_DEST/bin/sidplayfp" --version 2>/dev/null | grep -o 'libsidplayfp [0-9.]*'))"
+        rm -rf "$SID_TMP" 2>/dev/null || $SID_SUDO rm -rf "$SID_TMP" 2>/dev/null || true
+      else
+        warn "the built sidplayfp doesn't start — see $SID_TMP/*.log"
+      fi
+    else
+      warn "sidplayfp download or build failed — see $SID_TMP (re-run install.sh to retry)"
+      if command -v sidplayfp >/dev/null 2>&1; then
+        warn "using $(command -v sidplayfp) meanwhile — RSID tunes may play nearly silent with it"
+      else
+        warn "no sidplayfp — C64 SID files won't play"
+      fi
+    fi
+  fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

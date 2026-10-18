@@ -15,13 +15,15 @@ from __future__ import annotations
 import bisect
 import hashlib
 import heapq
+import itertools
 import logging
 import math
 import re
 import sys
+import threading
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -448,14 +450,48 @@ _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
                                 "scene_group", "game"))
                    | frozenset().union(*(f for f, _ in _SORTED_SPECS.values())))
 
-# Fields NO ``_mutation_seq``-keyed consumer reads (store ``_agg_cache``, the
-# library legend cache, the Subsonic caches, smart.py's duplicate memo, the
-# folder-album pass, the index-health sweep).  An ALLOWLIST, deliberately: a
+# Fields NO ``_mutation_seq``-keyed consumer reads (core/skip_rules, the
+# Subsonic caches, smart.py's duplicate memo, the folder-album pass, the
+# index-health sweep; the browse memos key on ``_browse_seq``, whose exempt
+# fields are ``_BROWSE_EXEMPT_FIELDS``).  An ALLOWLIST, deliberately: a
 # change to any other field bumps the seq.  ``cover_art`` is written on the
 # first art extraction of every track, so bumping for it re-cooled every
 # library-wide cache on normal browsing; ``default_subsong`` (a multi-tune
 # file's probed default tune) on its first play.
 _SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subsong"))
+
+# Fields a browse surface reads besides the indexed ones: the duplicate
+# stand-in pick (``duplicates.primary_sort_key`` — ``bitrate``) and the
+# ``game:`` operator's title test (``_game_title_hit`` — ``game_source``,
+# ``user_edited``).
+_BROWSE_EXTRA_FIELDS = frozenset(("bitrate", "game_source", "user_edited"))
+
+# Fields NO browse surface reads — the lists, counts, legends and orders
+# (``filter_tracks``, ``filter_track_ids``, the ``aggregate_*`` legends and
+# their HTTP cache, ``visible_track_count`` / ``untagged_count``,
+# ``primary_swap``).  A change confined to these — or to these and
+# ``duration``, which the duration order keys on via ``_duration_seq``
+# (``_browse_duration_only``) — leaves ``_browse_seq`` alone.  An ALLOWLIST, like ``_SEQ_EXEMPT_FIELDS``: a
+# change to any other field — one added later included — bumps it.  Disjoint
+# from ``_INDEXED_FIELDS | _BROWSE_EXTRA_FIELDS`` (test-guarded).
+_BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
+    # a listener's playback-problem mark (core/skip_rules) and the health badge
+    "health", "health_note", "health_by", "health_at", "health_renderer",
+    "defect", "defect_detail",
+    # tune data of SID / libgme / PSF files (the start pass, HVSC, repair)
+    "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s",
+    "hvsc_lengths", "stil", "sid_md5", "sid_model",
+    # enrichment join keys and provenance (the values they set are indexed)
+    "file_md5", "scene_path", "scene_use", "scene_party", "year_source", "year_file",
+    "album_source", "songdb_fields",
+    "game_by_tag", "game_by_modland", "game_by_demozoo", "game_by_songdb",
+    "game_by_modland_filename", "game_by_archive", "game_by_folder",
+    # technical and tag fields no list sorts, filters or counts by
+    "replaygain_track_gain", "replaygain_track_peak", "replaygain_album_gain",
+    "replaygain_album_peak", "is_lossless", "sample_rate", "channels", "bit_depth",
+    "format_score", "instruments", "patterns", "label", "comment", "isrc",
+    "track_number", "total_tracks", "disc_number", "total_discs",
+))
 
 # Inputs of the duplicate grouping (``duplicates.group_key_for`` + the primary
 # pick) and its output.  A write that changes an input — or loses the output —
@@ -465,6 +501,10 @@ _SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subs
 _DUP_FIELDS = frozenset(("title", "artist", "album_artist", "duration",
                          "format", "bitrate", "added_at"))
 _DUP_OUTPUT_FIELDS = frozenset(("duplicate_group_id", "is_duplicate_primary", "format_score"))
+# What ``TrackStore.primary_swap`` reads of a group member: its group, whether
+# it is the primary and ``duplicates.primary_sort_key``'s fields.
+_SWAP_FIELDS = frozenset(("duplicate_group_id", "is_duplicate_primary", "format", "bitrate",
+                          "added_at", "id"))
 _DUP_DIRTY_MAX = 20_000     # more pending changes than this → one full pass instead
 
 # The post-scan enrichment passes (Modland, song database, Demozoo, game from
@@ -516,17 +556,90 @@ def _duration_only(changed: dict) -> bool:
     return "duration" in changed and changed.keys() <= _DURATION_SEQ_FIELDS
 
 
-# ``_paginate_all``: a sorted page with duplicates hidden at an offset of at
-# least this many rows slices the memoised primary-only order
-# (``TrackStore._primary_order``) instead of walking and filtering ``offset``
-# rows; shallower pages keep the walk (~1.5 ms at this depth), so writes that
-# keep invalidating the memo never make a first page pay for building it.
+def _browse_duration_only(changed: dict) -> bool:
+    """Is the (diffed) field update ``changed`` a duration write as far as
+    the browse surfaces go — ``duration`` and otherwise only fields none of
+    them reads (``_BROWSE_EXEMPT_FIELDS``: the tune-length backfill's
+    ``tune_lengths``, a default-tune probe's ``start_subsong``)?  It moves
+    ``_duration_seq`` (the duration order keys on it), not ``_browse_seq``;
+    ``_mutation_seq`` / ``_catalog_seq`` follow its other fields as usual
+    (``_duration_only`` is the narrower case that moves neither)."""
+    return "duration" in changed and changed.keys() - {"duration"} <= _BROWSE_EXEMPT_FIELDS
+
+
+def _browse_change(changed: dict) -> bool:
+    """Whether the (diffed) field update ``changed`` can change a browse
+    result — what bumps ``_browse_seq``: not a duration write as far as the
+    browse surfaces go (``_browse_duration_only`` — the duration order keys on
+    ``_duration_seq``), not one confined to ``_BROWSE_EXEMPT_FIELDS``."""
+    return not _browse_duration_only(changed) and not changed.keys() <= _BROWSE_EXEMPT_FIELDS
+
+
+# The "[No Artist]"-style buckets (``untagged``): field → (the maintained id
+# set's attribute, the fields its blank test reads).
+_UNTAGGED_SPECS = (
+    ("artist", "_untagged_artist", frozenset(("artist",))),
+    ("album_artist", "_untagged_album_artist", frozenset(("album_artist",))),
+    ("album", "_untagged_album", frozenset(("album",))),
+    ("genre", "_untagged_genre", frozenset(("genre", "genre_derived"))),
+)
+_UNTAGGED_ATTR = {f: a for f, a, _i in _UNTAGGED_SPECS}
+
+
+def _blank_tag(v) -> bool:
+    """THE missing/blank tag test of the ``untagged`` buckets: a list counts
+    as blank when no element has text, any other value when its text is empty
+    (None included)."""
+    if isinstance(v, (list, tuple)):
+        return not any(str(x).strip() for x in v)
+    return not (str(v).strip() if v is not None else "")
+
+
+def _untagged(t: dict, field: str) -> bool:
+    """Is track ``t``'s ``field`` tag blank (``_UNTAGGED_SPECS``)?  Genre reads
+    the genres the track is listed under (``track_genres``)."""
+    if field == "genre":
+        return _blank_tag(track_genres(t))
+    return _blank_tag(t.get(field))
+
+
+# ``_paginate_all`` / ``_paginate_excluding``: a sorted page with duplicates
+# hidden (or ids excluded) at an offset of at least this many rows reads the
+# memoised order of what is listed (``TrackStore._primary_order`` /
+# ``_excluded_order`` — a walk resumed where the deepest page so far stopped)
+# instead of walking and filtering ``offset`` rows per request; shallower pages
+# keep the plain walk (~1.5 ms at this depth).
 _PRIMARY_ORDER_MIN_OFFSET = 5000
 
 # ``filter_tracks`` sorts a candidate set of up to this many ids (or 1/64 of
 # the library, if larger) directly instead of walking the full sorted index:
 # measured on a 263K-track library, ``game:uridium`` (8 ids) 28 ms → 0.03 ms.
 _SMALL_CANDIDATE_SET = 2000
+
+# ``filter_tracks``: the order a larger candidate set's pages walk is kept
+# (``_FilterWalk``) — per predicates, sort and direction, valid until the next
+# browse write (``_browse_seq``) — and each page resumes the walk where the
+# last one stopped, so paging a 300 K-track genre costs one walk of the index
+# in all, not one per page.  Bounded: this many orders, and this many ids held
+# (their candidate sets and walked prefixes) in all; the least recently used
+# goes first.
+_FILTER_WALK_MAX = 64
+_FILTER_WALK_MAX_IDS = 8_000_000
+# A walk reads the index in slices of at least this many rows (doubling).
+_FILTER_WALK_STEP = 2048
+
+
+# Batch mode: a sorted list whose deferred update lists at most this many
+# tracks, or 1/``_SORTED_MERGE_DIV`` of the library if more, is merged at the
+# exit (``merged_sorted_list``: the list copied around the changes, ~3 ms at
+# 680K tracks); past that it is rebuilt and sorted in full — every list, when
+# inserts / deletes crossed it (they are in every list), the one list, when
+# field updates re-keyed that many of its tracks.
+_SORTED_MERGE_MIN = 20_000
+_SORTED_MERGE_DIV = 8
+# Up to this many entries cut / inserted, a merge copies the list once and
+# edits the copy in place (each edit a memmove of its tail).
+_SORTED_MERGE_INPLACE = 16
 
 
 # A scan commit that upserted at least this many tracks since the last freeze
@@ -654,7 +767,38 @@ INDEX_ATTRS = (
     "_agg_artists", "_agg_album_artists", "_agg_albums", "_agg_genres",
     "_agg_years", "_agg_albums_by_artist", "_agg_albums_by_album_artist",
     "_agg_cache", "_unplayed_ids",
+    # Browse id sets (set arithmetic instead of per-row tests): the non-primary
+    # duplicate copies, the "[No Artist]"-style buckets, year → ids.
+    "_nonprimary_ids", "_untagged_artist", "_untagged_album_artist",
+    "_untagged_album", "_untagged_genre", "_tag_year",
 )
+
+
+# What a sorted-list generator (``iter_merged_sorted_list`` /
+# ``iter_filtered_sorted_list``) yields right before it starts assembling the
+# new list (a pause yields None): an async driver pauses the cyclic GC from
+# there on (every collection holding the half-built n-entry list walks all of
+# it), after the new entries were made with the GC running (young passes
+# untrack their tuples as they go).
+ASSEMBLE = object()
+
+
+def _run_generator(gen):
+    """Run ``gen`` to its end; its return value."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
+def shadowed_index_attrs() -> tuple:
+    """The ``INDEX_ATTRS`` the index audit (``core/index_health``) compares
+    against a shadow rebuild: all but the sorted lists (checked in place),
+    ``_unplayed_ids`` (checked against ``_play_stats``) and the lazy
+    ``_word_list`` / the ``_agg_cache`` memo (``TrackStore._DIFF_SKIP``)."""
+    return tuple(a for a in INDEX_ATTRS
+                 if a not in _ALL_SORTED and a not in ("_word_list", "_agg_cache", "_unplayed_ids"))
 
 
 def _index_sample_diff(live, exp, limit: int = 5) -> list:
@@ -1058,6 +1202,86 @@ class PrimarySwap:
         return t.get("is_duplicate_primary", True) and tid not in self.demoted
 
 
+class _FilterWalk:
+    """One list order: the ids of sorted index ``idx``, walked in one
+    direction (``desc``: from its end), that pass a membership test —
+    collected as far as the deepest page so far needed them (``out``) and
+    resumed from ``pos`` for a deeper one.  The test (``mode``):
+
+    * ``_IN`` — in ``member``: a ``filter_tracks`` candidate set (``exclude``
+      already left out); exactly the ids, in the order, that its per-request
+      walk of the index collects;
+    * ``_OUT_LISTED`` — not in ``member`` (the ids a list hides,
+      ``TrackStore._invisible``) and in ``tracks``: the deep-page orders of a
+      deduped list (``_primary_order`` / ``_excluded_order``);
+    * ``_OUT`` — not in ``member`` (the ``exclude`` ids).
+
+    ``filter_tracks`` keeps its walks in ``_filter_walk_memo``: valid while
+    ``gen`` (``TrackStore._primary_order_key``), the index list object and
+    the ``exclude`` / ``swap`` objects are the ones it was built with —
+    ``TrackStore._filter_walk_get`` checks."""
+
+    __slots__ = ("idx", "gen", "exclude", "swap", "member", "desc", "pos", "out", "done",
+                 "mode", "tracks")
+
+    _IN, _OUT_LISTED, _OUT = 0, 1, 2
+
+    def __init__(self, idx: list, gen, exclude, swap, member, desc: bool,
+                 mode: int = 0, tracks=None) -> None:
+        self.idx = idx
+        self.gen = gen
+        self.exclude = exclude
+        self.swap = swap
+        self.member = member
+        self.desc = desc
+        self.mode = mode
+        self.tracks = tracks
+        self.pos = len(idx) if desc else 0
+        self.out: list[str] = []
+        self.done = not idx
+
+    def upto(self, need: int) -> list[str]:
+        """``out`` holding at least ``need`` ids, or every one the walk finds.
+        The index is read in slices that double in size, filtered by a list
+        comprehension each (a short page reads a few thousand rows)."""
+        out = self.out
+        if len(out) >= need or self.done:
+            return out
+        idx, member, mode, tracks = self.idx, self.member, self.mode, self.tracks
+        n = len(idx)
+        step = max(_FILTER_WALK_STEP, 2 * (need - len(out)))
+        while len(out) < need and not self.done:
+            if self.desc:
+                hi = self.pos
+                lo = hi - step if hi > step else 0
+                seg = idx[lo:hi]
+                seg.reverse()
+                self.pos = lo
+                self.done = lo == 0
+            else:
+                lo = self.pos
+                hi = lo + step if lo + step < n else n
+                seg = idx[lo:hi]
+                self.pos = hi
+                self.done = hi == n
+            if mode == 0:
+                out += [tid for _v, tid in seg if tid in member]
+            elif mode == 1:
+                out += [tid for _v, tid in seg if tid not in member and tid in tracks]
+            else:
+                out += [tid for _v, tid in seg if tid not in member]
+            step *= 2
+        return out
+
+    def page(self, offset: int, limit: int) -> list[str]:
+        """``limit`` ids from position ``offset`` of the order (both ≥ 0)."""
+        return self.upto(offset + limit)[offset:offset + limit]
+
+    def full(self) -> list[str]:
+        """The whole order (walked to the end)."""
+        return self.upto(len(self.idx) + 1)
+
+
 class TrackStore:
     """Central in-memory data store with indexed search."""
 
@@ -1089,9 +1313,23 @@ class TrackStore:
         # Narrower sequence for the Subsonic catalogue: inserts / deletes and
         # changes to ``_CATALOG_FIELDS`` only.
         self._catalog_seq: int = 0
-        # Duration-only field writes (``_duration_only``), which bump neither
-        # sequence above.
+        # Duration writes no browse surface sees otherwise
+        # (``_browse_duration_only``): the duration-only ones
+        # (``_duration_only``), which bump neither sequence above, and those
+        # with fields only non-browse consumers read (``tune_lengths``,
+        # ``start_subsong``), which still bump them.
         self._duration_seq: int = 0
+        # Narrower sequence for what the browse lists, counts, legends and
+        # orders show (``_browse_change``): inserts / deletes, a change to a
+        # field outside ``_BROWSE_EXEMPT_FIELDS`` (a duration write with only
+        # such fields beside it — ``_browse_duration_only`` — moves
+        # ``_duration_seq`` instead), a sorted list replaced (a batch exit, a
+        # rebuild) and an index swap.  The browse memos key on it — the store's
+        # aggregate / order / swap memos and the library legend cache — so
+        # a play-time backfill, a health mark or an art write keeps them warm;
+        # ``_mutation_seq`` keeps its meaning for every other consumer
+        # (core/skip_rules, the Subsonic caches, smart.py, the sweep).
+        self._browse_seq: int = 0
         # Per-track write counter: bumped by every upsert and every in-place
         # field write, whatever the field (seq-exempt ones included), so a
         # per-track memo (the Subsonic song memo) validates an entry with one
@@ -1104,6 +1342,16 @@ class TrackStore:
         self._word_index: dict[str, set[str]] = {}
         self._word_list: list[str] = []
         self._word_list_dirty = False
+        # The words that appeared in / vanished from ``_word_index`` since
+        # ``_word_list`` was last sorted (``_word_appeared`` /
+        # ``_word_vanished``): the next ``_rebuild_word_list`` merges them in
+        # instead of sorting the whole vocabulary again, and a word that goes
+        # and comes back (a re-upsert) is no change at all.
+        # ``_word_list_full``: no such account (after a clear or an index
+        # swap) — the next one sorts everything.
+        self._word_fresh: set[str] = set()
+        self._word_gone: set[str] = set()
+        self._word_list_full = True             # (an empty list: the first sort is a full one)
 
         # ── Tag indexes (lowered value → set of track IDs) ──────────────
         self._tag_artist: dict[str, set[str]] = {}
@@ -1196,6 +1444,20 @@ class TrackStore:
         # oddly spaced), keyed on that folded key (``_game_fold_value``).
         self._sorted_title_fold: list[tuple[str, str]] = []
 
+        # ── Browse id sets (maintained on every write, like the tag indexes) ──
+        # So the lists, counts and legends leave out what a list hides with set
+        # arithmetic (in C) instead of a per-row test: the non-primary
+        # duplicate copies (``not t.get("is_duplicate_primary", True)``), the
+        # tracks with a blank artist / album artist / album / genre (the
+        # "[No Artist]" buckets — ``_untagged``), and year → ids keyed like
+        # ``_agg_years`` (``_agg_year``; no year: in none).
+        self._nonprimary_ids: set[str] = set()
+        self._untagged_artist: set[str] = set()
+        self._untagged_album_artist: set[str] = set()
+        self._untagged_album: set[str] = set()
+        self._untagged_genre: set[str] = set()
+        self._tag_year: dict[Any, set[str]] = {}
+
         # ── Pre-computed aggregations ────────────────────────────────────
         self._agg_artists: Counter[str] = Counter()
         self._agg_album_artists: Counter[str] = Counter()
@@ -1205,10 +1467,9 @@ class TrackStore:
         self._agg_albums_by_artist: dict[str, Counter[str]] = {}
         self._agg_albums_by_album_artist: dict[str, Counter[str]] = {}
 
-        # ── Memoised aggregations keyed on _mutation_seq ─────────────────
-        # Each entry is ``(seq, key, value)`` so a single ``_mutation_seq``
-        # bump invalidates every cached aggregation in lock-step.  Mirrors
-        # the (already-existing) duplicate-snapshot cache in api/smart.py.
+        # ── Memoised aggregations keyed on _browse_seq ───────────────────
+        # Each entry is ``(seq, value)`` so a single ``_browse_seq`` bump
+        # invalidates every cached aggregation in lock-step.
         self._agg_cache: dict[str, tuple[int, Any]] = {}
         # ``_primary_order`` memo: sorted-index name → (the list it was built
         # from, ``_primary_order_key``, primary-only ids in list order).
@@ -1221,13 +1482,33 @@ class TrackStore:
         # drive is offline, the copies standing in for primaries that can't
         # play): a stale entry is dropped on the next build.
         self._excluded_order_memo: dict[tuple, tuple] = {}
-        # Exclude-aware aggregate memo: key → (``_mutation_seq``, the exclude
+        # Exclude-aware aggregate memo: key → (``_browse_seq``, the exclude
         # set it was computed without, value, the primary swap it used) — see
         # ``_agg_x_get``.
         self._agg_x_cache: dict[str, tuple[int, Any, Any, Any]] = {}
-        # ``primary_swap`` memo: (the unplayable set, ``_mutation_seq``, the
-        # swap or None).
+        # ``primary_swap`` memo: (the unplayable set, the swap or None, {group
+        # key: (its primaries, their stand-in)}), and the groups written since
+        # it was built (``_swap_touch``; None: build it all again).
         self._primary_swap_memo: tuple | None = None
+        self._swap_dirty: set[str] | None = None
+        # ``_dup_invisible`` memo: (``_browse_seq``, the swap, the ids a
+        # deduped list leaves out with it).
+        self._dup_inv_memo: tuple | None = None
+        # ``_invisible`` memo: (``_browse_seq``, the exclude set, the swap, the
+        # ids a deduped list leaves out with both).
+        self._inv_memo: tuple | None = None
+        # ``filter_tracks`` orders (``_FilterWalk``), least recently used first:
+        # (predicates, duplicates hidden, id(exclude), id(swap), sorted-index
+        # name, descending) → walk (which holds the exclude set and the swap:
+        # an id is not reused while its entry lives).
+        self._filter_walk_memo: dict[tuple, _FilterWalk] = {}
+        # The thread that writes the store (the event loop's — the one that
+        # created or loaded it, ``bulk_load``).  Only it keeps, extends or
+        # stores the browse memos — the walks, the incremental swap state, the
+        # hidden-id sets, the aggregate memos — and the sorted word list
+        # (``_memo_ok``): a read off the loop (DLNA queries in a worker
+        # thread) computes its answer privately (it may read a valid memo).
+        self._owner_thread = threading.get_ident()
         # Called (no arguments) after a scan dir was added or removed or its
         # reachability ``status`` changed — ``core.availability`` listens.
         self._on_scan_dirs_changed: Callable[[], None] | None = None
@@ -1241,6 +1522,10 @@ class TrackStore:
 
         # ── AOF hook (set by aof module after init) ──────────────────────
         self._aof_append: Callable[..., None] | None = None
+        # Called as ``(track id, the track before the write or None)`` before
+        # every track upsert, delete and field write while an index audit
+        # runs (``core/index_health``) — None otherwise.
+        self._write_watch: Callable[[str, "dict | None"], None] | None = None
 
         # ── Batch mode: defer O(n) sorted-list rebuilds ─────────────────
         # Reference-counted so concurrent scan commits on the ONE shared store
@@ -1282,12 +1567,240 @@ class TrackStore:
         self._dirty_sorted.update(_ALL_SORTED)
         self._dirty_sorted_tids.clear()
 
+    def _note_sorted_batch(self, tid: str, old: "dict | None") -> None:
+        """Batch mode: record track ``tid`` for every sorted list's deferred
+        merge (``_dirty_sorted_tids``) with the key it has in that list's
+        pre-batch contents — ``old``'s (the track as the lists hold it), None
+        when it is in none of them (a track added in this batch).  The first
+        record per track and list is kept: a later write in the same batch
+        leaves the pre-batch contents as they are.  Once a list has more
+        tracks recorded than ``_SORTED_MERGE_MIN`` or 1/``_SORTED_MERGE_DIV``
+        of the library, every list is rebuilt in full instead."""
+        dirty = self._dirty_sorted
+        tids = self._dirty_sorted_tids
+        if not tids and len(dirty) == _N_SORTED:
+            return                              # every list is rebuilt in full anyway
+        over = False
+        cap = None
+        for name, (_fields, value) in _SORTED_SPECS.items():
+            pending = tids.get(name)
+            if pending is None:
+                if name in dirty:
+                    continue                    # (this list is rebuilt in full)
+                dirty.add(name)
+                pending = tids[name] = {}
+            if tid not in pending:
+                pending[tid] = None if old is None else value(old)
+                if len(pending) > _SORTED_MERGE_MIN:
+                    if cap is None:
+                        cap = max(_SORTED_MERGE_MIN, len(self._tracks) // _SORTED_MERGE_DIV)
+                    over = over or len(pending) > cap
+        if over:
+            self._mark_all_sorted_dirty()
+
+    def merged_sorted_list(self, name: str, changed: dict) -> "list[tuple] | None":
+        """Sorted list ``name`` with the tracks of ``changed`` (``{track id:
+        its key in the list now, None = not in it}``, a ``sorted_rebuild_plan``
+        entry) moved to their current keys — the list itself when none of
+        them moves.  A new list, sorted: the entries between two changes are
+        copied as slices (in C), each change is located by bisection —
+        O(n + k log n) for k changes, no sort of the n entries.  None when an
+        entry is not where its recorded key says, a changed track is listed
+        twice, or keys don't compare: the caller rebuilds that list in full.
+        (``iter_merged_sorted_list`` run to its end.)"""
+        return _run_generator(self.iter_merged_sorted_list(name, changed))
+
+    def iter_merged_sorted_list(self, name: str, changed: dict, step: int = 0):
+        """``merged_sorted_list`` as a generator — its result is the
+        ``StopIteration`` value; with ``step``, it pauses (yields None) after
+        every ``step`` changes, positions and assembly runs, so an async
+        caller can give the loop a turn between slices of a large merge, and
+        yields ``ASSEMBLE`` once, before it assembles the new list.  The list
+        must not be written meanwhile (batch mode keeps it as it is); replaced
+        meanwhile, the result is None."""
+        cur = getattr(self, name)
+        value = _SORTED_SPECS[name][1]
+        tracks = self._tracks
+        bl = bisect.bisect_left
+        n = len(cur)
+        items = list(changed.items())
+        width = step or max(1, len(items))
+        cuts: list[int] = []
+        fresh: list[tuple] = []
+        try:
+            for j in range(0, len(items), width):
+                for tid, ov in items[j:j + width]:
+                    t = tracks.get(tid)
+                    nv = value(t) if t is not None else None
+                    if ov is not None:
+                        if nv is not None and nv == ov:
+                            continue            # (unchanged entry: stays where it is)
+                        e = (ov, tid)
+                        i = bl(cur, e)
+                        if i >= n or cur[i] != e:
+                            return None
+                        cuts.append(i)
+                    if nv is not None:
+                        fresh.append((nv, tid))
+                if step:
+                    yield
+            if not cuts and not fresh:
+                return cur
+            if step and len(fresh) > 4 * step:
+                # (sorted in runs, merged a slice at a time)
+                runs = []
+                for j in range(0, len(fresh), 4 * step):
+                    r = fresh[j:j + 4 * step]
+                    r.sort()
+                    runs.append(r)
+                    yield
+                merged = heapq.merge(*runs)
+                fresh = []
+                while True:
+                    part = list(itertools.islice(merged, 4 * step))
+                    if not part:
+                        break
+                    fresh.extend(part)
+                    yield
+            else:
+                fresh.sort()
+            cut_set = set(cuts)
+            ins: list[int] = []
+            width = step or max(1, len(fresh))
+            for j in range(0, len(fresh), width):
+                for e in fresh[j:j + width]:
+                    p = bl(cur, e)
+                    if p < n and p not in cut_set and cur[p] == e:
+                        return None             # (already listed: a duplicate entry)
+                    ins.append(p)
+                if step:
+                    yield
+        except TypeError:
+            return None
+        cuts.sort()
+        if step:
+            yield ASSEMBLE
+        if len(cuts) + len(ins) <= _SORTED_MERGE_INPLACE:
+            # A few changes: one copy, then each change in place from the
+            # back (a memmove of the tail each) — one allocation instead of
+            # a slice per run between changes.
+            if step and getattr(self, name) is not cur:
+                return None
+            out = cur.copy()
+            events = sorted([(c, 1, None) for c in cuts]
+                            + [(p, 0, i) for i, p in enumerate(ins)], reverse=True)
+            for pos, kind, i in events:
+                if kind:
+                    del out[pos]
+                else:
+                    out.insert(pos, fresh[i])
+            return out
+        out: list[tuple] = []
+        prev = ci = ii = 0
+        nc, ni = len(cuts), len(ins)
+        done = 0
+        while ci < nc or ii < ni:
+            if ii < ni and (ci >= nc or ins[ii] <= cuts[ci]):
+                p = ins[ii]
+                if p > prev:
+                    out += cur[prev:p]
+                    prev = p
+                out.append(fresh[ii])
+                ii += 1
+            else:
+                c = cuts[ci]
+                if c > prev:
+                    out += cur[prev:c]
+                prev = c + 1
+                ci += 1
+            done += 1
+            if step and done % step == 0:
+                yield
+        out += cur[prev:]
+        if step and getattr(self, name) is not cur:
+            return None                         # (replaced meanwhile)
+        return out
+
+    def sorted_merge_cap(self) -> int:
+        """How many recorded tracks a sorted list's deferred update is merged
+        for (``iter_merged_sorted_list``); past it, the list is filtered
+        instead (``iter_filtered_sorted_list``)."""
+        return max(_SORTED_MERGE_MIN, len(self._tracks) // _SORTED_MERGE_DIV)
+
+    def iter_filtered_sorted_list(self, name: str, changed, step: int = 0):
+        """Sorted list ``name`` with EVERY entry of the tracks in ``changed``
+        (track ids) taken out and their current entries merged back in — the
+        update of a list a batch re-keyed many of its tracks in (past
+        ``sorted_merge_cap``), and the fallback of a merge that found the list
+        out of step (a stale duplicate is dropped too).  O(n + k log k), the
+        untouched entries' tuples reused.  A generator like
+        ``iter_merged_sorted_list``: the result is the ``StopIteration``
+        value; with ``step`` it pauses after every slice of about ``4 * step``
+        entries and yields ``ASSEMBLE`` once its new entries are made.  None
+        when keys don't compare (the caller builds the list from every track)
+        or the list was replaced meanwhile."""
+        cur = getattr(self, name)
+        value = _SORTED_SPECS[name][1]
+        tracks = self._tracks
+        chg = changed if isinstance(changed, (set, frozenset, dict)) else set(changed)
+        width = 4 * step if step else max(1, len(cur), len(chg))
+        fresh: list[tuple] = []
+        ids = list(chg)
+        for j in range(0, len(ids), width):
+            for tid in ids[j:j + width]:
+                t = tracks.get(tid)
+                if t is not None:
+                    v = value(t)
+                    if v is not None:
+                        fresh.append((v, tid))
+            if step:
+                yield
+        if step:
+            yield ASSEMBLE
+        kept: list[tuple] = []
+        for j in range(0, len(cur), width):
+            kept += [e for e in cur[j:j + width] if e[1] not in chg]
+            if step:
+                yield
+        try:
+            if not step:
+                kept += fresh
+                kept.sort()                     # (two sorted runs: one merge)
+                return kept
+            runs = []
+            for j in range(0, len(fresh), width):
+                r = fresh[j:j + width]
+                r.sort()
+                runs.append(r)
+                yield
+            if not runs:
+                out = kept
+            else:
+                merged = heapq.merge(kept, *runs)
+                out = []
+                while True:
+                    part = list(itertools.islice(merged, width))
+                    if not part:
+                        break
+                    out += part
+                    yield
+        except TypeError:
+            return None
+        if getattr(self, name) is not cur:
+            return None                         # (replaced meanwhile)
+        return out
+
     def sorted_rebuild_plan(self) -> dict[str, dict[str, Any] | None]:
         """Snapshot of the pending sorted-list rebuilds: name → ``{track id:
         its pre-batch key (None = was not in the list)}`` to merge, or None
         for a full rebuild."""
         tids = self._dirty_sorted_tids
         return {n: (dict(tids[n]) if n in tids else None) for n in self._dirty_sorted}
+
+    def _memo_ok(self) -> bool:
+        """Whether this thread may use the kept walks / swap state
+        (``_owner_thread``)."""
+        return threading.get_ident() == self._owner_thread
 
     def _sorted_rebuilt(self, names) -> None:
         """Mark ``names`` rebuilt (their pending state is cleared) and drop
@@ -1297,6 +1810,26 @@ class TrackStore:
             self._dirty_sorted_tids.pop(n, None)
             self._primary_order_memo.pop(n, None)
         self._excluded_order_memo.clear()
+        # A replaced list can change a ``game:`` / year predicate's ids (they
+        # read the sorted lists) with no write of its own.
+        self._browse_seq += 1
+        self._filter_walk_memo.clear()
+
+    def browse_changed(self) -> None:
+        """Invalidate every browse memo (``_browse_seq``) and drop the ones
+        holding index lists — after the indexes were swapped
+        (``data.rebuild_indexes``) or what a list may show changed outside a
+        track write (the Subsonic visibility of a catalogue)."""
+        self._browse_seq += 1
+        self._filter_walk_memo.clear()
+        self._primary_order_memo.clear()
+        self._excluded_order_memo.clear()
+        self._swap_dirty = None
+        # (the word index may have been swapped with its list: no account of
+        # what changed since that list was sorted)
+        self._word_fresh.clear()
+        self._word_gone.clear()
+        self._word_list_full = self._word_list_dirty
 
     # ── AOF helper ───────────────────────────────────────────────────────
 
@@ -1308,9 +1841,14 @@ class TrackStore:
 
     def _index_track(self, tid: str, t: dict) -> None:
         """Add a track to all indexes."""
+        wi = self._word_index
         for token in _tokenize_track(t):
-            self._word_index.setdefault(token, set()).add(tid)
-        self._word_list_dirty = True
+            s = wi.get(token)
+            if s is None:
+                wi[token] = {tid}
+                self._word_appeared(token)
+            else:
+                s.add(tid)
 
         for k in _name_keys(t.get("artist")):
             self._tag_set(self._tag_artist, k, tid)
@@ -1324,7 +1862,9 @@ class TrackStore:
         gid = t.get("duplicate_group_id")
         if gid:
             self._tag_set(self._tag_dup_group, gid, tid)
-        for g in track_genres(t):
+            self._swap_touch(gid)
+        genres = track_genres(t)
+        for g in genres:
             self._tag_set(self._tag_genre, g, tid)
         for grp in _scene_group_keys(t.get("scene_group")):
             self._tag_set(self._tag_scene_group, grp, tid)
@@ -1337,22 +1877,39 @@ class TrackStore:
         # is reused by scanner._async_exit_batch_mode via the module helper.
         year = _agg_year(t)
 
-        # Lexical sort keys for the column-header sort (windowed view).
-        # Lower-cased so ABBA and abba sort adjacent; empty values fall
-        # to the end of asc / start of desc — we use the ``￿``
-        # sentinel for empties to keep that behaviour without a separate
-        # filter pass at query time.  Using a high-BMP unicode codepoint
-        # not present in real metadata.  (The numeric keys come from their
-        # value functions: a missing year / duration / bpm likewise keys
-        # ``_NO_VALUE_KEY``, a missing ``added_at`` 0.)
-        EMPTY_SORT_KEY = "￿"
-        title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
-        artist_key       = _lex_key_shared(t.get("artist"))
-        album_artist_key = _lex_key_shared(t.get("album_artist"))
-        album_key        = _lex_key_shared(t.get("album"))
-        fmt_key          = _lex_key_shared(t.get("format"))
+        # Browse id sets (eager, also in batch mode — they are not sorted).
+        if not t.get("is_duplicate_primary", True):
+            self._nonprimary_ids.add(tid)
+        if _blank_tag(t.get("artist")):
+            self._untagged_artist.add(tid)
+        if _blank_tag(t.get("album_artist")):
+            self._untagged_album_artist.add(tid)
+        if _blank_tag(t.get("album")):
+            self._untagged_album.add(tid)
+        if _blank_tag(genres):
+            self._untagged_genre.add(tid)
+        if year is not None:
+            ys = self._tag_year.get(year)
+            if ys is None:
+                self._tag_year[year] = {tid}
+            else:
+                ys.add(tid)
 
         if not self._batch_mode:
+            # Lexical sort keys for the column-header sort (windowed view).
+            # Lower-cased so ABBA and abba sort adjacent; empty values fall
+            # to the end of asc / start of desc — we use the ``￿``
+            # sentinel for empties to keep that behaviour without a separate
+            # filter pass at query time.  Using a high-BMP unicode codepoint
+            # not present in real metadata.  (The numeric keys come from their
+            # value functions: a missing year / duration / bpm likewise keys
+            # ``_NO_VALUE_KEY``, a missing ``added_at`` 0.)
+            EMPTY_SORT_KEY = "￿"
+            title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
+            artist_key       = _lex_key_shared(t.get("artist"))
+            album_artist_key = _lex_key_shared(t.get("album_artist"))
+            album_key        = _lex_key_shared(t.get("album"))
+            fmt_key          = _lex_key_shared(t.get("format"))
             _sorted_insert(self._sorted_year, (_year_value(t), tid))
             added = _added_value(t)
             _sorted_insert(self._sorted_added_at, (added, tid))
@@ -1368,8 +1925,10 @@ class TrackStore:
             title_fold = _game_fold_value(t.get("title"))
             if title_fold is not None:
                 _sorted_insert(self._sorted_title_fold, (title_fold, tid))
-        elif len(self._dirty_sorted) != _N_SORTED or self._dirty_sorted_tids:
-            self._mark_all_sorted_dirty()
+        else:
+            # (in no list before this batch, unless an ``_unindex_track`` of
+            # this batch already recorded where it was)
+            self._note_sorted_batch(tid, None)
 
         # Unplayed bookkeeping — a freshly-indexed track has no play stats yet
         # so it counts as unplayed unless ``record_play`` has already fired
@@ -1409,7 +1968,7 @@ class TrackStore:
                 s.discard(tid)
                 if not s:
                     del self._word_index[token]
-        self._word_list_dirty = True
+                    self._word_vanished(token)
 
         for k in _name_keys(t.get("artist")):
             self._tag_del(self._tag_artist, k, tid)
@@ -1423,6 +1982,7 @@ class TrackStore:
         gid = t.get("duplicate_group_id")
         if gid:
             self._tag_del(self._tag_dup_group, gid, tid)
+            self._swap_touch(gid)
         for g in track_genres(t):
             self._tag_del(self._tag_genre, g, tid)
         for grp in _scene_group_keys(t.get("scene_group")):
@@ -1434,16 +1994,27 @@ class TrackStore:
         # ``normalise_year`` keeps insert/remove in agreement.
         year = _agg_year(t)
 
-        # Same lexical key derivation as ``_index_track`` — must match
-        # exactly or the remove turns into a no-op and the index drifts.
-        EMPTY_SORT_KEY = "￿"
-        title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
-        artist_key       = _lex_key_shared(t.get("artist"))
-        album_artist_key = _lex_key_shared(t.get("album_artist"))
-        album_key        = _lex_key_shared(t.get("album"))
-        fmt_key          = _lex_key_shared(t.get("format"))
+        self._nonprimary_ids.discard(tid)
+        self._untagged_artist.discard(tid)
+        self._untagged_album_artist.discard(tid)
+        self._untagged_album.discard(tid)
+        self._untagged_genre.discard(tid)
+        if year is not None:
+            ys = self._tag_year.get(year)
+            if ys:
+                ys.discard(tid)
+                if not ys:
+                    del self._tag_year[year]
 
         if not self._batch_mode:
+            # Same lexical key derivation as ``_index_track`` — must match
+            # exactly or the remove turns into a no-op and the index drifts.
+            EMPTY_SORT_KEY = "￿"
+            title_key        = (t.get("title")        or "").strip().lower() or EMPTY_SORT_KEY
+            artist_key       = _lex_key_shared(t.get("artist"))
+            album_artist_key = _lex_key_shared(t.get("album_artist"))
+            album_key        = _lex_key_shared(t.get("album"))
+            fmt_key          = _lex_key_shared(t.get("format"))
             _sorted_remove(self._sorted_year, (_year_value(t), tid))
             added = _added_value(t)
             _sorted_remove(self._sorted_added_at, (added, tid))
@@ -1459,8 +2030,8 @@ class TrackStore:
             title_fold = _game_fold_value(t.get("title"))
             if title_fold is not None:
                 _sorted_remove(self._sorted_title_fold, (title_fold, tid))
-        elif len(self._dirty_sorted) != _N_SORTED or self._dirty_sorted_tids:
-            self._mark_all_sorted_dirty()
+        else:
+            self._note_sorted_batch(tid, t)     # (where it is in every list)
 
         # Unplayed bookkeeping — when a track is removed it can't be unplayed
         # anymore; this stops the set leaking entries for deleted tracks.
@@ -1532,10 +2103,63 @@ class TrackStore:
                 if not s:
                     del idx[key]
 
+    def _word_appeared(self, tok: str) -> None:
+        """``tok`` became a ``_word_index`` key."""
+        self._word_list_dirty = True
+        if self._word_list_full:
+            return
+        if tok in self._word_gone:
+            self._word_gone.discard(tok)        # back again: still in the sorted list
+        else:
+            self._word_fresh.add(tok)
+        self._word_list_dirty = bool(self._word_fresh or self._word_gone)
+
+    def _word_vanished(self, tok: str) -> None:
+        """``tok`` is no longer a ``_word_index`` key."""
+        self._word_list_dirty = True
+        if self._word_list_full:
+            return
+        if tok in self._word_fresh:
+            self._word_fresh.discard(tok)       # never sorted in
+        else:
+            self._word_gone.add(tok)
+        self._word_list_dirty = bool(self._word_fresh or self._word_gone)
+
     def _rebuild_word_list(self) -> None:
-        if self._word_list_dirty:
-            self._word_list = sorted(self._word_index.keys())
-            self._word_list_dirty = False
+        """``_word_list`` = the sorted ``_word_index`` keys again (lazily, before
+        a prefix lookup): the words that came and went since the last sort
+        merged in — a few against a long list in about O(vocabulary) memmove
+        — else (many, or no account of them) one full sort."""
+        if not self._word_list_dirty:
+            return
+        fresh, gone = self._word_fresh, self._word_gone
+        lst = self._word_list
+        new = None
+        if not self._word_list_full and len(fresh) + len(gone) <= len(lst) // 8 + 64:
+            if len(gone) > 32:
+                new = [w for w in lst if w not in gone]
+            else:
+                new = lst.copy()
+                for w in sorted(gone, reverse=True):
+                    i = bisect.bisect_left(new, w)
+                    if i < len(new) and new[i] == w:
+                        del new[i]
+                    else:                       # (not where it should be: sort all)
+                        new = None
+                        break
+            if new is not None:
+                if len(new) != len(lst) - len(gone):
+                    new = None
+                elif fresh:
+                    new.extend(sorted(fresh))
+                    new.sort()                  # two sorted runs: one merge
+        if new is None or len(new) != len(self._word_index):
+            new = sorted(self._word_index.keys())
+        self._word_list = new
+        fresh.clear()
+        gone.clear()
+        self._word_list_full = False
+        self._word_list_dirty = False
 
     def _bump_root_rev(self, root_hash) -> None:
         if root_hash:
@@ -1570,12 +2194,12 @@ class TrackStore:
                         s.discard(tid)
                         if not s:
                             del wi[tok]
-                            self._word_list_dirty = True
+                            self._word_vanished(tok)
                 for tok in new_tok - old_tok:
                     s = wi.get(tok)
                     if s is None:
                         wi[tok] = {tid}
-                        self._word_list_dirty = True
+                        self._word_appeared(tok)
                     else:
                         s.add(tid)
 
@@ -1639,13 +2263,45 @@ class TrackStore:
             self._agg_remove(old, _agg_year(old))
             self._agg_add(t, _agg_year(t))
 
+        if "is_duplicate_primary" in changed:
+            if t.get("is_duplicate_primary", True):
+                self._nonprimary_ids.discard(tid)
+            else:
+                self._nonprimary_ids.add(tid)
+        for field, attr, inputs in _UNTAGGED_SPECS:
+            if not inputs.isdisjoint(changed):
+                ids = getattr(self, attr)
+                if _untagged(t, field):
+                    ids.add(tid)
+                else:
+                    ids.discard(tid)
+        if "year" in changed:
+            oy, ny = _agg_year(old), _agg_year(t)
+            if oy is not None:
+                ys = self._tag_year.get(oy)
+                if ys:
+                    ys.discard(tid)
+                    if not ys:
+                        del self._tag_year[oy]
+            if ny is not None:
+                ys = self._tag_year.get(ny)
+                if ys is None:
+                    self._tag_year[ny] = {tid}
+                else:
+                    ys.add(tid)
+
     def _apply_field_changes(self, tid: str, t: dict, changed: dict) -> None:
         """Write the (already diffed, non-empty) ``changed`` fields onto
         stored track ``t`` and maintain the derived indexes."""
+        if self._write_watch is not None:
+            self._write_watch(tid, t)
         if not _DUP_FIELDS.isdisjoint(changed):
             self._note_dup_dirty(tid, t)
         if not changed.keys() <= _ENRICH_EXEMPT_FIELDS:
             self._note_enrich(tid)
+        if not _SWAP_FIELDS.isdisjoint(changed):
+            self._swap_touch(t.get("duplicate_group_id"))
+            self._swap_touch(changed.get("duplicate_group_id"))
         if _INDEXED_FIELDS.isdisjoint(changed):
             t.update(changed)                   # e.g. cover_art, file_md5, defect
         else:
@@ -1680,6 +2336,7 @@ class TrackStore:
             if extra:
                 t.update(extra)
             share_values(t)
+        self._owner_thread = threading.get_ident()      # (the loop of this run)
         self._tracks = tracks
         self._waveforms = waveforms
         self._ratings = ratings
@@ -1690,6 +2347,10 @@ class TrackStore:
         self._hash_lookups = hash_lookups
         self._config = config
         self._reset_enrich_log()
+        # Another library (a start, a backup import, the app's Stop / Start):
+        # nothing keyed on the old one may be served — not even before the
+        # caller's ``rebuild_indexes``.
+        self._library_replaced()
         self._scan_dirs_changed()
 
     def rebuild_indexes(self) -> None:
@@ -1699,10 +2360,13 @@ class TrackStore:
         ``sort()`` at the end rather than N × ``bisect.insort`` (which is
         O(N) per call thanks to the memmove, so the per-track loop ends up
         O(N²) wall-clock and goes from ~17 s baseline to >70 s once we
-        started maintaining the 5 lexical indexes too).
+        started maintaining the 5 lexical indexes too).  Then every sequence
+        and memo moves (``_library_replaced``): nothing built from the indexes
+        before is served after.
         """
         self.clear_indexes()
         self.enter_batch_mode()
+        self._mark_all_sorted_dirty()           # (every list is built anew: nothing to record)
         try:
             for tid, t in self._tracks.items():
                 self._index_track(tid, t)
@@ -1710,10 +2374,34 @@ class TrackStore:
             self.exit_batch_mode()
         self._rebuild_word_list()
         self._build_sim_token_index()
+        # Every index is new (and usually ``_tracks`` too — ``bulk_load``):
+        # every cache keyed on the store's sequences is stale.
+        self._library_replaced()
         # ``_index_track`` adds every track to ``_unplayed_ids`` whose key
         # isn't already in ``_play_stats`` — the order above guarantees that
         # snapshot-loaded play stats correctly suppress those tids.
         log.info("Indexes rebuilt for %d tracks", len(self._tracks))
+
+    def _library_replaced(self) -> None:
+        """The library was loaded or its indexes rebuilt: move every sequence
+        a cache keys on (``_mutation_seq`` — core/skip_rules, the Subsonic
+        caches, smart.py —, ``_catalog_seq``, ``_duration_seq``, ``_play_seq``,
+        ``_rating_seq``, ``_browse_seq``) and drop the store's own memos
+        (aggregates, the exclude-aware ones, the duplicate stand-ins, the
+        orders and walks).  ``index_generation`` moves with them, so an index
+        rebuild built from the library before (``data.rebuild_indexes``) is
+        not swapped in over this one."""
+        self._mutation_seq += 1
+        self._catalog_seq += 1
+        self._duration_seq += 1
+        self._play_seq += 1
+        self._rating_seq += 1
+        self._agg_cache.clear()
+        self._agg_x_cache.clear()
+        self._primary_swap_memo = None
+        self._dup_inv_memo = None
+        self._inv_memo = None
+        self.browse_changed()
 
     def index_generation(self) -> tuple[int, int, int]:
         """``(_mutation_seq, _duration_seq, _play_seq)``: moves on every write
@@ -1755,7 +2443,7 @@ class TrackStore:
     # yields FALSE positives.  Both are still SWAPPED by a rebuild (so it resets
     # them); they're just not drift signals:
     #   _word_list  — lazy derivative of _word_index (which IS compared).
-    #   _agg_cache  — per-query aggregation MEMO (key -> (mutation_seq, value)):
+    #   _agg_cache  — per-query aggregation MEMO (key -> (_browse_seq, value)):
     #     empty after a rebuild but populated by serving aggregate_* requests,
     #     so its contents track query traffic, not _tracks.  The structural
     #     _agg_* COUNTERS it memoizes from ARE compared, so coverage is intact.
@@ -1793,9 +2481,20 @@ class TrackStore:
         batched ``index_tracks_batch`` calls)."""
         self._word_index.clear()
         self._word_list_dirty = True
+        self._word_list_full = True
         self._primary_order_memo.clear()        # built from the lists emptied below
         self._excluded_order_memo.clear()
         self._primary_swap_memo = None          # built from the duplicate groups emptied below
+        self._swap_dirty = None
+        self._dup_inv_memo = None
+        self._inv_memo = None
+        self.browse_changed()
+        self._nonprimary_ids.clear()
+        self._untagged_artist.clear()
+        self._untagged_album_artist.clear()
+        self._untagged_album.clear()
+        self._untagged_genre.clear()
+        self._tag_year.clear()
         for tag_idx in (
             self._tag_artist, self._tag_album_artist, self._tag_album,
             self._tag_genre, self._tag_format, self._tag_dir_hash,
@@ -1833,6 +2532,9 @@ class TrackStore:
         self._agg_albums_by_album_artist.clear()
         self._agg_cache.clear()
         self._unplayed_ids.clear()
+        if self._batch_mode:
+            # (a batch's deferred merge would start from the emptied lists)
+            self._mark_all_sorted_dirty()
 
     def index_tracks_batch(self, items: list[tuple[str, dict]]) -> None:
         """Index a batch of (track_id, track_dict) tuples."""
@@ -1864,15 +2566,19 @@ class TrackStore:
 
     def _iter_build_sim_token_index(self, chunk: int = 20_000):
         """``_build_sim_token_index`` as a generator that pauses (yields)
-        every ``chunk`` tracks so an async caller can give the loop a turn.
-        Iterates a snapshot; binds the result only at the end."""
+        every ``chunk`` tracks (and every ``chunk`` tokens of the singleton
+        prune) so an async caller can give the loop a turn.  Iterates a
+        snapshot of the track ids (a track removed meanwhile is left out);
+        binds the result only at the end."""
         from soniqboom.core.retro import is_retro_format, instrument_tokens
         postings: dict[str, list[str]] = {}
         counts: dict[str, int] = {}
-        items = list(self._tracks.items())
-        for i in range(0, len(items), chunk):
-            for tid, t in items[i : i + chunk]:
-                if not is_retro_format(t.get("format")):
+        tracks = self._tracks
+        ids = list(tracks)
+        for i in range(0, len(ids), chunk):
+            for tid in ids[i : i + chunk]:
+                t = tracks.get(tid)
+                if t is None or not is_retro_format(t.get("format")):
                     continue
                 inst = t.get("instruments")
                 if not inst:
@@ -1883,7 +2589,14 @@ class TrackStore:
                     postings.setdefault(tok, []).append(tid)
             yield
         # Drop singleton tokens — lossless (a token in one track is never shared).
-        postings = {tok: ids for tok, ids in postings.items() if len(ids) > 1}
+        kept: dict[str, list[str]] = {}
+        toks = list(postings.items())
+        for i in range(0, len(toks), chunk):
+            for tok, tids in toks[i : i + chunk]:
+                if len(tids) > 1:
+                    kept[tok] = tids
+            yield
+        postings = kept
         self._sim_tok_postings = postings    # atomic rebind (build-and-swap)
         self._sim_tok_count = counts
         log.info(
@@ -1971,6 +2684,8 @@ class TrackStore:
     def upsert_track(self, track: dict) -> None:
         tid = track["id"]
         old = self._tracks.get(tid)
+        if self._write_watch is not None:
+            self._write_watch(tid, old)
         if not old:
             self._restore_mark(track)
         track.update(game_follow(track))
@@ -1983,13 +2698,17 @@ class TrackStore:
         self._index_track(tid, track)
         self._mutation_seq += 1
         self._catalog_seq += 1
+        self._browse_seq += 1
         self._upserts_since_freeze += 1
         self._aof("upsert_track", id=tid, data=track)
 
     def upsert_tracks_batch(self, tracks: list[dict]) -> int:
+        watch = self._write_watch
         for t in tracks:
             tid = t["id"]
             old = self._tracks.get(tid)
+            if watch is not None:
+                watch(tid, old)
             if old:
                 _carry_enrichment(old, t)     # keep post-scan enrichment (+ the game)
                 self._unindex_track(tid, old)
@@ -2003,6 +2722,7 @@ class TrackStore:
             self._index_track(tid, t)
         self._mutation_seq += 1
         self._catalog_seq += 1
+        self._browse_seq += 1
         self._upserts_since_freeze += len(tracks)
         # ``t`` now carries the merged enrichment, so the AOF record replays
         # the same result — the carry is idempotent (a stamped record re-upserted
@@ -2022,9 +2742,10 @@ class TrackStore:
         self._batch_mode = True
 
     def exit_batch_mode(self) -> None:
-        """Exit batch mode; on the OUTERMOST exit only, rebuild the sorted
-        indexes marked dirty (``_dirty_sorted``) — all of them after an
-        insert/delete, only the re-keyed ones after field updates."""
+        """Exit batch mode; on the OUTERMOST exit only, bring the sorted
+        indexes marked dirty (``_dirty_sorted``) up to date — the tracks
+        written in the batch merged in (``merged_sorted_list``), or every list
+        rebuilt after a large batch."""
         self._batch_depth -= 1
         if self._batch_depth > 0:
             return                       # a concurrent batch section is still open
@@ -2032,12 +2753,22 @@ class TrackStore:
         self._batch_mode = False
         if self._dirty_sorted:
             plan = self.sorted_rebuild_plan()
-            if all(v is None for v in plan.values()):
+            if len(plan) == _N_SORTED and all(v is None for v in plan.values()):
                 self._rebuild_sorted_indexes(set(plan))
             else:
+                cap = self.sorted_merge_cap()
                 for name, tids in plan.items():
-                    lst = self.build_sorted_list(name, tids)
-                    lst.sort()
+                    lst = None
+                    if tids is not None:
+                        if len(tids) <= cap:
+                            lst = self.merged_sorted_list(name, tids)
+                        if lst is None:
+                            # (many re-keyed, or the merge found the list out
+                            # of step: every entry of those tracks replaced)
+                            lst = _run_generator(self.iter_filtered_sorted_list(name, tids))
+                    if lst is None:
+                        lst = self.build_sorted_list(name)
+                        lst.sort()
                     setattr(self, name, lst)
             self._sorted_rebuilt(list(plan))
 
@@ -2101,6 +2832,8 @@ class TrackStore:
         """
         self._primary_order_memo.clear()        # it would pin the replaced lists
         self._excluded_order_memo.clear()
+        self._browse_seq += 1                   # (as ``_sorted_rebuilt``)
+        self._filter_walk_memo.clear()
         if names is not None and not _ALL_SORTED <= set(names):
             for name in list(names):
                 lst = self.build_sorted_list(name)
@@ -2156,22 +2889,29 @@ class TrackStore:
         )
 
     def delete_track(self, track_id: str) -> bool:
-        t = self._tracks.pop(track_id, None)
+        t = self._tracks.get(track_id)
         if t is None:
             return False
+        if self._write_watch is not None:
+            self._write_watch(track_id, t)
+        del self._tracks[track_id]
         self._note_dup_dirty(track_id, t)
         self._note_enrich(track_id)
         self._unindex_track(track_id, t)
         self._waveforms.pop(track_id, None)
         self._mutation_seq += 1
         self._catalog_seq += 1
+        self._browse_seq += 1
         self._aof("delete_tracks", ids=[track_id])
         return True
 
     def delete_track_ids(self, track_ids: list[str]) -> int:
         deleted = 0
         ids = []
+        watch = self._write_watch
         for tid in track_ids:
+            if watch is not None and tid in self._tracks:
+                watch(tid, self._tracks[tid])
             t = self._tracks.pop(tid, None)
             if t:
                 self._note_dup_dirty(tid, t)
@@ -2183,6 +2923,7 @@ class TrackStore:
         if ids:
             self._mutation_seq += 1
             self._catalog_seq += 1
+            self._browse_seq += 1
             self._aof("delete_tracks", ids=ids)
         return deleted
 
@@ -2421,18 +3162,30 @@ class TrackStore:
         when there is no such group.  A group whose members all can't play
         keeps its primary.
 
-        Memoised until the next track write or another ``unplayable`` set
-        (compared by identity — callers hand the same frozenset back until it
-        changes); a result equal to the previous one keeps the previous object,
-        so memos keyed on it stay valid.  A build reads the unplayable ids or
-        the duplicate groups, whichever are fewer, then the found groups'
-        members."""
+        Memoised per ``unplayable`` set (compared by identity — callers hand
+        the same frozenset back until it changes); a result equal to the
+        previous one keeps the previous object, so memos keyed on it stay
+        valid.  A build reads the unplayable ids or the duplicate groups,
+        whichever are fewer, then the found groups' members.  After writes,
+        only the groups they touched (``_swap_dirty``: a member added, removed
+        or re-grouped, or a change to what the pick reads — ``_SWAP_FIELDS``)
+        are worked out again; the result is the full build's."""
         if not unplayable or not self._tag_dup_group:
             return None
-        memo = self._primary_swap_memo
-        if memo is not None and memo[0] is unplayable and memo[1] == self._mutation_seq:
-            return memo[2]
-        from soniqboom.core.duplicates import primary_sort_key
+        owner = self._memo_ok()
+        memo = self._primary_swap_memo if owner else None
+        dirty = self._swap_dirty
+        if memo is not None and memo[0] is unplayable and dirty is not None:
+            if not dirty:
+                return memo[1]
+            if len(dirty) <= max(256, len(self._tag_dup_group) // 8):
+                by_group = dict(memo[2])
+                for gid in dirty:
+                    by_group.pop(gid, None)
+                    entry = self._swap_group(gid, unplayable)
+                    if entry is not None:
+                        by_group[gid] = entry
+                return self._swap_done(unplayable, by_group, memo[1])
         tracks = self._tracks
         groups = self._tag_dup_group
         if len(unplayable) <= len(groups):
@@ -2446,27 +3199,61 @@ class TrackStore:
         else:
             gids = {gid for gid, members in groups.items()
                     if members and not members.isdisjoint(unplayable)}
-        stand_in: dict[str, str] = {}
+        by_group: dict[str, tuple[list[str], str]] = {}
         for gid in gids:
-            members = groups.get(gid)
-            if not members or len(members) < 2:
-                continue
-            prims = [m for m in members
-                     if (t := tracks.get(m)) is not None and t.get("is_duplicate_primary", True)]
-            if not prims or not unplayable.issuperset(prims):
-                continue                # no primary (a group being re-picked), or one plays
-            alts = [m for m in members if m not in unplayable and m in tracks]
-            if not alts:
-                continue                # no member plays: the primary stays
-            best = min(alts, key=lambda m: primary_sort_key(tracks[m]))
+            entry = self._swap_group(gid, unplayable)
+            if entry is not None:
+                by_group[gid] = entry
+        if not owner:                   # (off the loop: nothing kept — ``_memo_ok``)
+            prev = self._primary_swap_memo
+            stand_in = {p: best for prims, best in by_group.values() for p in prims}
+            if not stand_in:
+                return None
+            prev = prev[1] if prev is not None else None
+            return prev if prev is not None and prev.stand_in == stand_in else PrimarySwap(stand_in)
+        return self._swap_done(unplayable, by_group, memo[1] if memo is not None else None)
+
+    def _swap_group(self, gid: str, unplayable) -> "tuple[list[str], str] | None":
+        """Duplicate group ``gid`` (a ``_tag_dup_group`` key)'s stand-in for
+        ``unplayable``: ``(its primaries, the best member that can play)``
+        when every primary can't play and another member can, else None."""
+        groups = self._tag_dup_group
+        members = groups.get(gid)
+        if not members or len(members) < 2:
+            return None
+        tracks = self._tracks
+        prims = [m for m in members
+                 if (t := tracks.get(m)) is not None and t.get("is_duplicate_primary", True)]
+        if not prims or not unplayable.issuperset(prims):
+            return None                 # no primary (a group being re-picked), or one plays
+        alts = [m for m in members if m not in unplayable and m in tracks]
+        if not alts:
+            return None                 # no member plays: the primary stays
+        from soniqboom.core.duplicates import primary_sort_key
+        return prims, min(alts, key=lambda m: primary_sort_key(tracks[m]))
+
+    def _swap_done(self, unplayable, by_group: dict, prev: "PrimarySwap | None"):
+        """Memoise and return the swap of ``by_group`` (``_swap_group``
+        results) — ``prev`` itself when it is equal."""
+        stand_in: dict[str, str] = {}
+        for prims, best in by_group.values():
             for p in prims:
                 stand_in[p] = best
         swap = None
         if stand_in:
-            prev = memo[2] if memo is not None else None
             swap = prev if prev is not None and prev.stand_in == stand_in else PrimarySwap(stand_in)
-        self._primary_swap_memo = (unplayable, self._mutation_seq, swap)
+        self._primary_swap_memo = (unplayable, swap, by_group)
+        self._swap_dirty = set()
         return swap
+
+    def _swap_touch(self, gid) -> None:
+        """Duplicate group ``gid`` (a field value) changed in a way the swap
+        reads: work it out again at the next ``primary_swap``."""
+        dirty = self._swap_dirty
+        if dirty is not None and gid:
+            key = gid.strip().lower() if isinstance(gid, str) else str(gid)
+            if key:
+                dirty.add(key)
 
     def shown_member(self, tid: str, swap: PrimarySwap | None = None) -> str:
         """The member of ``tid``'s duplicate group a deduped list shows now:
@@ -2507,7 +3294,10 @@ class TrackStore:
         field are maintained (``_reindex_changed``), the AOF record carries the
         changed fields, and ``_mutation_seq`` bumps unless every changed field
         is in ``_SEQ_EXEMPT_FIELDS`` — or the change is duration-only
-        (``_duration_only``), which bumps ``_duration_seq`` instead."""
+        (``_duration_only``), which bumps ``_duration_seq`` instead.
+        ``_browse_seq`` bumps when the change can alter a browse result
+        (``_browse_change``); a duration write that can't otherwise
+        (``_browse_duration_only``) bumps ``_duration_seq`` instead."""
         t = self._tracks.get(track_id)
         if not t:
             return False
@@ -2515,8 +3305,11 @@ class TrackStore:
         if not changed:
             return True
         self._apply_field_changes(track_id, t, changed)
+        if _browse_change(changed):
+            self._browse_seq += 1
+        elif "duration" in changed:
+            self._duration_seq += 1             # (``_browse_duration_only``)
         if _duration_only(changed):
-            self._duration_seq += 1
             if _multi_tune(t):
                 # (a multi-tune file's default-tune length decides whether
                 # Subsonic lists its own entry — core/skip_rules)
@@ -2542,7 +3335,7 @@ class TrackStore:
         of tracks that actually changed.
         """
         applied = 0
-        bump = catalog = duration = False
+        bump = catalog = duration = browse = False
         records: list[dict] = []
         for tid, updates in items:
             t = self._tracks.get(tid)
@@ -2553,8 +3346,11 @@ class TrackStore:
                 continue
             self._apply_field_changes(tid, t, changed)
             applied += 1
+            if _browse_change(changed):
+                browse = True
+            elif "duration" in changed:
+                duration = True                 # (``_browse_duration_only``)
             if _duration_only(changed):
-                duration = True
                 catalog = catalog or _multi_tune(t)
             else:
                 bump = bump or not changed.keys() <= _SEQ_EXEMPT_FIELDS
@@ -2567,6 +3363,8 @@ class TrackStore:
                 self._catalog_seq += 1
             if duration:
                 self._duration_seq += 1
+            if browse:
+                self._browse_seq += 1
             self._aof("update_track_fields_batch", data=records)
         return applied
 
@@ -2684,39 +3482,49 @@ class TrackStore:
         """
         if not filter_duplicates:
             swap = None
-        result = self._candidate_ids(
-            artist=artist, album_artist=album_artist, album=album, genre=genre,
-            scene_group=scene_group, format_=format_,
-            year_min=year_min, year_max=year_max,
-            dir_hash=dir_hash, scan_root_hash=scan_root_hash, query=query,
-            game=game, artist_match=artist_match, album_artist_match=album_artist_match,
-            untagged=untagged, filter_duplicates=filter_duplicates,
-            swap=swap,
-        )
-        if result is None and (exclude or swap is not None):
-            return self._paginate_excluding(limit, offset, exclude,
-                                            filter_duplicates=filter_duplicates,
-                                            sort_by=sort_by, sort_order=sort_order,
-                                            swap=swap)
-        if result is None:
-            return self._paginate_all(
-                limit, offset,
-                filter_duplicates=filter_duplicates,
-                sort_by=sort_by, sort_order=sort_order,
-            )
-        if exclude and result:
-            result = result - exclude if len(result) <= len(exclude) * 4 else (
-                {t for t in result if t not in exclude})
-        if not result:
-            return []
-
         # (With a swap the candidates are already the effective primaries:
         # ordered by the full list, which holds the stand-ins too — the
         # primary-only side list doesn't.)
         attr = self._sort_index_attr(sort_by,
                                      filter_duplicates=filter_duplicates and swap is None)
-        idx = getattr(self, attr)
         descending = self._is_descending(sort_by, sort_order)
+        # A deeper page of a list walked before resumes that walk
+        # (``_FilterWalk``) instead of resolving the predicates and walking the
+        # index from its start again.
+        wkey = (artist, album_artist, album, genre, scene_group, format_, year_min, year_max,
+                dir_hash, scan_root_hash, query, game, artist_match, album_artist_match,
+                untagged, bool(filter_duplicates), id(exclude), id(swap), attr, descending)
+        owner = self._memo_ok()
+        walk = self._filter_walk_get(wkey, attr, exclude, swap) if owner else None
+        if walk is not None:
+            result = walk.member
+            idx = walk.idx
+        else:
+            result = self._candidate_ids(
+                artist=artist, album_artist=album_artist, album=album, genre=genre,
+                scene_group=scene_group, format_=format_,
+                year_min=year_min, year_max=year_max,
+                dir_hash=dir_hash, scan_root_hash=scan_root_hash, query=query,
+                game=game, artist_match=artist_match, album_artist_match=album_artist_match,
+                untagged=untagged, filter_duplicates=filter_duplicates,
+                swap=swap,
+            )
+            if result is None and (exclude or swap is not None):
+                return self._paginate_excluding(limit, offset, exclude,
+                                                filter_duplicates=filter_duplicates,
+                                                sort_by=sort_by, sort_order=sort_order,
+                                                swap=swap)
+            if result is None:
+                return self._paginate_all(
+                    limit, offset,
+                    filter_duplicates=filter_duplicates,
+                    sort_by=sort_by, sort_order=sort_order,
+                )
+            if exclude and result:
+                result = result.difference(exclude)           # (in C)
+            if not result:
+                return []
+            idx = getattr(self, attr)
         if len(result) <= max(_SMALL_CANDIDATE_SET, len(idx) // 64):
             # A small candidate set (a ``game:`` / specific search) is sorted
             # directly — O(k log k) — instead of walking the whole library's
@@ -2727,20 +3535,59 @@ class TrackStore:
                 return [self._meta_dict(tid) for tid in page[offset:offset + limit]]
 
         # Walk the chosen sorted index in the requested direction keeping only
-        # tids that are in the candidate set.  ``descending`` walk = reversed
-        # iterator over the ascending index — Python's reversed() over a list
-        # is O(1) setup + O(k) for k items consumed.
-        walk_iter = reversed(idx) if descending else iter(idx)
-
+        # tids that are in the candidate set — collecting the first
+        # ``offset + limit`` of them (at least one) — and page that.  The walk
+        # is kept, so the next page goes on from where this one stopped.
+        if walk is None:
+            walk = _FilterWalk(idx, self._primary_order_key(attr), exclude, swap,
+                               result, descending)
+            if owner:
+                self._filter_walk_put(wkey, walk)
         need = offset + limit
-        collected: list[str] = []
-        for _, tid in walk_iter:
-            if tid in result:
-                collected.append(tid)
-                if len(collected) >= need:
-                    break
-        page = collected[offset : offset + limit]
+        order = walk.upto(need if need > 0 else 1)
+        if offset >= 0 and limit >= 0:
+            page = order[offset:need]
+        else:                       # (the walk's ``collected[offset:offset + limit]``)
+            page = order[:need if need > 0 else 1][offset:offset + limit]
         return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+
+    def _filter_walk_get(self, key: tuple, attr: str, exclude, swap) -> "_FilterWalk | None":
+        """The kept ``filter_tracks`` order for ``key`` if it still holds — the
+        same browse state (``_primary_order_key``), index list, ``exclude`` and
+        ``swap`` objects it was walked with — else None (a stale one is
+        dropped)."""
+        memo = self._filter_walk_memo
+        try:
+            walk = memo.get(key)
+        except TypeError:                       # an unhashable predicate value
+            return None
+        if walk is None:
+            return None
+        if (walk.gen == self._primary_order_key(attr) and walk.idx is getattr(self, attr)
+                and walk.exclude is exclude and walk.swap is swap):
+            memo[key] = memo.pop(key)           # (most recently used last)
+            return walk
+        del memo[key]
+        return None
+
+    def _filter_walk_put(self, key: tuple, walk: _FilterWalk) -> None:
+        """Keep ``walk`` under ``key`` — after dropping the stale orders, and
+        the least recently used ones past ``_FILTER_WALK_MAX`` orders /
+        ``_FILTER_WALK_MAX_IDS`` ids held."""
+        memo = self._filter_walk_memo
+        try:
+            memo.pop(key, None)
+        except TypeError:                       # an unhashable predicate value: not kept
+            return
+        for k in [k for k, w in memo.items()
+                  if w.gen != self._primary_order_key(k[-2]) or w.idx is not getattr(self, k[-2])]:
+            del memo[k]
+        held = sum(len(w.member) + len(w.out) for w in memo.values())
+        size = len(walk.member)
+        while memo and (len(memo) >= _FILTER_WALK_MAX or held + size > _FILTER_WALK_MAX_IDS):
+            old = memo.pop(next(iter(memo)))
+            held -= len(old.member) + len(old.out)
+        memo[key] = walk
 
     def _sort_candidates(self, ids, attr: str, descending: bool) -> list[str] | None:
         """``ids`` in the order of sorted index ``attr`` (``descending`` = the
@@ -2778,14 +3625,55 @@ class TrackStore:
         if field not in cls._UNTAGGED_FIELDS:
             # An unknown field must not quietly mean "no predicate" (= everything).
             raise ValueError(f"untagged must be one of {cls._UNTAGGED_FIELDS}, got {field!r}")
+        return lambda t: _untagged(t, field)
 
-        def _blank(v) -> bool:
-            if isinstance(v, (list, tuple)):
-                return not any(str(x).strip() for x in v)
-            return not (str(v).strip() if v is not None else "")
-        if field == "genre":
-            return lambda t: _blank(track_genres(t))
-        return lambda t: _blank(t.get(field))
+    def _untagged_ids(self, field: str) -> set[str]:
+        """The maintained id set of the "``field`` tag is blank" bucket — the
+        tracks ``_untagged_test(field)`` passes (raises like it for an unknown
+        field).  The live set: callers must not change it."""
+        self._untagged_test(field)
+        return getattr(self, _UNTAGGED_ATTR[field])
+
+    def _dup_invisible(self, swap: PrimarySwap | None) -> set[str]:
+        """The ids a list with duplicates hidden leaves out: the non-primary
+        copies — with a ``swap``, the effective ones: ``(non-primaries ∪
+        demoted) − promoted``, the complement of ``PrimarySwap.is_primary``.
+        Without a swap the live ``_nonprimary_ids`` (callers must not change
+        it or keep it past a write); with one memoised per swap until the next
+        browse write."""
+        if swap is None:
+            return self._nonprimary_ids
+        seq = self._browse_seq                  # (read before the build: a write
+        memo = self._dup_inv_memo               #  meanwhile leaves the entry stale)
+        if memo is not None and memo[0] == seq and memo[1] is swap:
+            return memo[2]
+        inv = self._nonprimary_ids | swap.demoted
+        inv -= swap.promoted
+        if self._memo_ok():
+            self._dup_inv_memo = (seq, swap, inv)
+        return inv
+
+    def _invisible(self, dedup: bool, exclude, swap: PrimarySwap | None = None):
+        """The ids a list leaves out: ``exclude`` and — ``dedup`` — the
+        duplicate copies it hides (``_dup_invisible``).  ``exclude`` itself
+        (maybe None) without ``dedup``.  Memoised for one (exclude, swap) pair
+        until the next browse write (kept only by the owner thread —
+        ``_memo_ok``); never to be changed by callers."""
+        if not dedup:
+            return exclude
+        seq = self._browse_seq                  # (read before the build)
+        dinv = self._dup_invisible(swap)
+        if not exclude:
+            return dinv
+        memo = self._inv_memo
+        if (memo is not None and memo[0] == seq and memo[1] is exclude
+                and memo[2] is swap):
+            return memo[3]
+        inv = set(exclude)
+        inv |= dinv
+        if self._memo_ok():
+            self._inv_memo = (seq, exclude, swap, inv)
+        return inv
 
     def _candidate_ids(
         self,
@@ -2820,6 +3708,8 @@ class TrackStore:
         their all-tracks fast path), otherwise the intersected set — already
         reduced to duplicate-group primaries when ``filter_duplicates`` is set
         (with ``swap``: the stand-ins instead of the primaries that can't play).
+        It may be a LIVE index set (one predicate, nothing left out): callers
+        must not change it.
 
         ``artist`` / ``album_artist`` are exact (case-insensitive) names (an
         artist's page); ``artist_match`` / ``album_artist_match`` (the search
@@ -2905,10 +3795,9 @@ class TrackStore:
                 hits &= tracks.keys()
                 sets.append(hits)
         if untagged:
-            # Tracks whose tag is missing/blank — the tag indexes can't express
-            # "empty", so this is one O(N) pass (~60 ms at 260 K tracks).
-            blank = self._untagged_test(untagged)
-            sets.append({tid for tid, t in self._tracks.items() if blank(t)})
+            # Tracks whose tag is missing/blank: the maintained bucket (the
+            # live set — nothing below changes it in place).
+            sets.append(self._untagged_ids(untagged))
 
         if not sets:
             return None
@@ -2920,12 +3809,12 @@ class TrackStore:
                 return set()
 
         if filter_duplicates:
-            tracks = self._tracks
-            if swap is None:
-                result = {tid for tid in result
-                          if tracks.get(tid, {}).get("is_duplicate_primary", True)}
-            else:
-                result = {tid for tid in result if swap.is_primary(tid, tracks.get(tid, {}))}
+            # The copies the list hides, as one set difference (in C) — the
+            # complement of the per-row ``is_duplicate_primary`` /
+            # ``PrimarySwap.is_primary`` test.
+            inv = self._dup_invisible(swap)
+            if inv:
+                result = result.difference(inv)
         return result
 
     def _paginate_excluding(self, limit: int, offset: int, exclude, *,
@@ -2948,30 +3837,40 @@ class TrackStore:
         idx = getattr(self, attr)
         descending = self._is_descending(sort_by, sort_order)
         if offset >= _PRIMARY_ORDER_MIN_OFFSET:
-            order = self._excluded_order(attr, idx, exclude, filter_duplicates, swap)
-            n = len(order)
-            if descending:
-                page = order[max(0, n - offset - limit):max(0, n - offset)][::-1]
-            else:
-                page = order[offset:offset + limit]
-            return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+            return self._deep_page(
+                lambda desc: self._excluded_order(attr, idx, exclude, filter_duplicates,
+                                                  swap, desc),
+                offset, limit, descending)
         walk_iter = reversed(idx) if descending else iter(idx)
         skipped = 0
         collected: list[str] = []
         tracks = self._tracks
+        if filter_duplicates:
+            # Per row with set lookups only — a shallow page reads a few rows,
+            # so no union is built for it: not excluded, in the library, and
+            # shown of its group (``PrimarySwap.is_primary``: a stand-in, or a
+            # primary not stood in for).
+            ex = exclude or ()
+            nonprim = self._nonprimary_ids
+            get = tracks.get
+            promoted = swap.promoted if swap is not None else ()
+            demoted = swap.demoted if swap is not None else ()
+            for _, tid in walk_iter:
+                if tid in ex or not get(tid):
+                    continue
+                if tid not in promoted and (tid in nonprim or tid in demoted):
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                collected.append(tid)
+                if len(collected) >= limit:
+                    break
+            return [self._meta_dict(tid) for tid in collected if tid in tracks]
         ex = exclude or ()
         for _, tid in walk_iter:
             if tid in ex:
                 continue
-            if filter_duplicates:
-                t = tracks.get(tid)
-                if not t:
-                    continue
-                if swap is None:
-                    if not t.get("is_duplicate_primary", True):
-                        continue
-                elif not swap.is_primary(tid, t):
-                    continue
             if skipped < offset:
                 skipped += 1
                 continue
@@ -2980,18 +3879,41 @@ class TrackStore:
                 break
         return [self._meta_dict(tid) for tid in collected if tid in tracks]
 
-    _EXCLUDED_ORDER_MEMO_MAX = 6
+    # Deep-page orders kept (``_excluded_order``): one per sort index, duplicates
+    # setting, exclude set and swap in use — every column of a deduped list in
+    # Mark mode with a swap, and of Hide mode too, without evicting each other.
+    _EXCLUDED_ORDER_MEMO_MAX = 32
+
+    def _deep_page(self, walk_of, offset: int, limit: int, descending: bool) -> list[dict]:
+        """A deep page of a memoised list order: ``walk_of(desc)`` gives the
+        order walked in that direction (``_FilterWalk``), read only as far as
+        the page needs.  (A negative offset / limit: the full ascending order,
+        sliced as a list of it always was.)"""
+        if offset >= 0 and limit >= 0:
+            page = walk_of(descending).page(offset, limit)
+        else:
+            order = walk_of(False).full()
+            n = len(order)
+            if descending:
+                page = order[max(0, n - offset - limit):max(0, n - offset)][::-1]
+            else:
+                page = order[offset:offset + limit]
+        return [self._meta_dict(tid) for tid in page if tid in self._tracks]
 
     def _excluded_order(self, attr: str, idx: list[tuple], exclude,
                         filter_duplicates: bool,
-                        swap: PrimarySwap | None = None) -> list[str]:
+                        swap: PrimarySwap | None = None,
+                        descending: bool = False) -> _FilterWalk:
         """The ids of sorted index ``attr`` (``idx``) that are not in
         ``exclude`` (and, with ``filter_duplicates``, are duplicate-group
-        primaries — with a ``swap``, the effective ones), in index order.
-        Memoised like ``_primary_order`` — until the next track write or the
-        list is replaced — and only for the exclude set and swap it was built
-        with (compared by identity: callers hand the same objects back until
-        they change).  O(N) to build, then a deep page is a slice."""
+        primaries — with a ``swap``, the effective ones — in the library), in
+        index order (``descending``: from its end) — a walk read as far as the
+        deepest page so far (``_FilterWalk``).  Memoised like
+        ``_primary_order`` — until the next browse write or the list is
+        replaced — and only for the exclude set and swap it was built with
+        (compared by identity: callers hand the same objects back until they
+        change).  A page at offset k reads O(k) index rows once, then a deeper
+        one goes on from there."""
         # (Keyed by the exclude set too: two callers with their own sets — the
         # web's Hide set, the Subsonic API's catalogue exclusion — must not
         # throw each other's orders away on every page.)
@@ -2999,30 +3921,35 @@ class TrackStore:
         key = self._primary_order_key(attr)
         memo = self._excluded_order_memo
         hit = memo.get(mkey)
-        if (hit is not None and hit[0] is idx and hit[1] == key and hit[2] is exclude
+        if not self._memo_ok():
+            walks = {}                  # (off the loop: a private walk — ``_memo_ok``)
+        elif (hit is not None and hit[0] is idx and hit[1] == key and hit[2] is exclude
                 and hit[4] is swap):
-            return hit[3]
-        # Drop what can't be hit again (written since, or for the same id slot
-        # of a replaced set) — each holds a full-length order — and keep a few.
-        for k in [k for k, e in memo.items()
-                  if e[1] != self._primary_order_key(k[0]) or k == mkey]:
-            memo.pop(k, None)
-        while len(memo) >= self._EXCLUDED_ORDER_MEMO_MAX:
-            memo.pop(next(iter(memo)))
-        tracks = self._tracks
-        ex = exclude or ()
-        if filter_duplicates and swap is not None:
-            order = [tid for _v, tid in idx
-                     if tid not in ex and (t := tracks.get(tid)) is not None
-                     and swap.is_primary(tid, t)]
-        elif filter_duplicates:
-            order = [tid for _v, tid in idx
-                     if tid not in ex and (t := tracks.get(tid)) is not None
-                     and t.get("is_duplicate_primary", True)]
+            walks = hit[3]
         else:
-            order = [tid for _v, tid in idx if tid not in ex]
-        memo[mkey] = (idx, key, exclude, order, swap)
-        return order
+            # Drop what can't be hit again (written since, or for the same id
+            # slot of a replaced set) and keep a few.
+            for k in [k for k, e in memo.items()
+                      if e[1] != self._primary_order_key(k[0]) or k == mkey]:
+                memo.pop(k, None)
+            while len(memo) >= self._EXCLUDED_ORDER_MEMO_MAX:
+                memo.pop(next(iter(memo)))
+            walks = {}
+            memo[mkey] = (idx, key, exclude, walks, swap)
+        walk = walks.get(bool(descending))
+        if walk is None:
+            if filter_duplicates:
+                # Not excluded, not a hidden copy (``_invisible`` — with a swap
+                # the effective primaries), and in the library (a row a
+                # deferred batch rebuild still lists after its delete is left
+                # out).
+                walk = _FilterWalk(idx, key, exclude, swap, self._invisible(True, exclude, swap),
+                                   bool(descending), _FilterWalk._OUT_LISTED, self._tracks)
+            else:
+                walk = _FilterWalk(idx, key, exclude, swap, exclude or (), bool(descending),
+                                   _FilterWalk._OUT)
+            walks[bool(descending)] = walk
+        return walk
 
     def filter_track_ids(self, *, filter_duplicates: bool = False,
                          swap: PrimarySwap | None = None,
@@ -3048,12 +3975,12 @@ class TrackStore:
             # ``_sorted_added_at_primary``: that is a sort index, behind the live
             # tracks while a batch section defers its rebuild, so it cannot stand
             # in for the set.
-            # Memoised on ``_mutation_seq`` like the aggregates: this O(N) pass runs
-            # on the event loop for every cold "shuffle all" (25 ms at 263 K).
+            # Memoised on ``_browse_seq`` like the aggregates (one pass over the
+            # ids with a set lookup each, in library order).
             cached = self._agg_cache_get("primary_track_ids")
             if cached is None:
-                cached = [tid for tid, t in self._tracks.items()
-                          if t.get("is_duplicate_primary", True)]
+                nonprim = self._nonprimary_ids
+                cached = [tid for tid in self._tracks if tid not in nonprim]
                 self._agg_cache_set("primary_track_ids", cached)
             if swap is None:
                 return list(cached)
@@ -3092,7 +4019,7 @@ class TrackStore:
         if not tokens:
             return None
 
-        self._rebuild_word_list()
+        words = self._query_word_list()
         sets: list[set[str]] = []
         for token in tokens:
             # Every word of 2+ characters is a prefix ("var" finds "Varga" even
@@ -3102,7 +4029,7 @@ class TrackStore:
             if exact:
                 sets.append(exact)
             else:
-                prefix_match = self._prefix_match(token)
+                prefix_match = self._prefix_match(token, words)
                 if prefix_match:
                     sets.append(prefix_match)
                 else:
@@ -3116,12 +4043,27 @@ class TrackStore:
             result &= s
         return result
 
-    def _prefix_match(self, prefix: str) -> set[str]:
-        """Find all track IDs matching tokens that start with prefix."""
-        lo = bisect.bisect_left(self._word_list, prefix)
-        hi = bisect.bisect_right(self._word_list, prefix + "\uffff")
+    def _query_word_list(self) -> list[str]:
+        """The sorted vocabulary a prefix lookup bisects: ``_word_list``
+        brought up to date (``_rebuild_word_list``) — or, off the owner thread
+        while it is out of date, a private sorted copy (the shared list and its
+        account are only ever changed by the owner — ``_memo_ok``)."""
+        if not self._memo_ok():
+            # Read the flag once: a rebuild here could race the owner's
+            # writes (a word indexed but left out of a list marked clean).
+            return sorted(self._word_index) if self._word_list_dirty else self._word_list
+        self._rebuild_word_list()
+        return self._word_list
+
+    def _prefix_match(self, prefix: str, words: "list[str] | None" = None) -> set[str]:
+        """Find all track IDs matching tokens that start with prefix
+        (``words``: the sorted vocabulary — ``_query_word_list``)."""
+        if words is None:
+            words = self._word_list
+        lo = bisect.bisect_left(words, prefix)
+        hi = bisect.bisect_right(words, prefix + "\uffff")
         result: set[str] = set()
-        for word in self._word_list[lo:hi]:
+        for word in words[lo:hi]:
             result |= self._word_index.get(word, set())
         return result
 
@@ -3186,20 +4128,22 @@ class TrackStore:
         # General path for non-default sort keys.
         attr = self._sort_index_attr(sort_by, filter_duplicates=filter_duplicates)
         idx = getattr(self, attr)
-        if not filter_duplicates or offset >= _PRIMARY_ORDER_MIN_OFFSET:
-            # Every row counts (no duplicate filter), or a deep page of the
-            # primary-only order: a plain slice — O(limit) instead of walking
-            # ``offset`` rows (a deep page cost 68-136 ms at 263K tracks).
-            order = idx if not filter_duplicates else self._primary_order(attr, idx)
-            n = len(order)
+        if not filter_duplicates:
+            # Every row counts (no duplicate filter): a plain slice — O(limit)
+            # instead of walking ``offset`` rows.
+            n = len(idx)
             if descending:
-                page = order[max(0, n - offset - limit):max(0, n - offset)]
+                page = idx[max(0, n - offset - limit):max(0, n - offset)]
                 page = page[::-1]
             else:
-                page = order[offset:offset + limit]
-            if order is idx:
-                page = [tid for _v, tid in page]
-            return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+                page = idx[offset:offset + limit]
+            return [self._meta_dict(tid) for _v, tid in page if tid in self._tracks]
+        if offset >= _PRIMARY_ORDER_MIN_OFFSET:
+            # A deep page of the primary-only order: the memoised walk of it,
+            # read only as deep as the page (a deep page cost 68-136 ms at 263K
+            # tracks walking ``offset`` rows per request).
+            return self._deep_page(lambda desc: self._primary_order(attr, idx, desc),
+                                   offset, limit, descending)
 
         # A shallow page with duplicates hidden: walk the chosen sorted index
         # in the requested direction, filtering duplicates per row (cheaper
@@ -3209,10 +4153,11 @@ class TrackStore:
         # Consume offset items first, then collect limit items.
         skipped = 0
         collected: list[str] = []
+        get = self._tracks.get
+        nonprim = self._nonprimary_ids
         for _, tid in walk_iter:
             if filter_duplicates:
-                t = self._tracks.get(tid)
-                if not t or not t.get("is_duplicate_primary", True):
+                if tid in nonprim or not get(tid):
                     continue
             if skipped < offset:
                 skipped += 1
@@ -3225,31 +4170,41 @@ class TrackStore:
     def _primary_order_key(self, attr: str) -> tuple[int, int]:
         # A duration-only write (the render / probe backfill on a first play)
         # re-keys only ``_sorted_duration``, so only that order keys on it.
-        return (self._mutation_seq,
+        return (self._browse_seq,
                 self._duration_seq if attr == "_sorted_duration" else -1)
 
-    def _primary_order(self, attr: str, idx: list[tuple]) -> list[str]:
+    def _primary_order(self, attr: str, idx: list[tuple],
+                       descending: bool = False) -> _FilterWalk:
         """The ids of sorted index ``attr`` (``idx``) that are duplicate-group
-        primaries, in index order — memoised until the next track write
-        (``_mutation_seq``; for ``_sorted_duration`` also ``_duration_seq``, a
+        primaries in the library, in index order (``descending``: from its
+        end) — a walk read as far as the deepest page so far
+        (``_FilterWalk``), memoised until the next browse write
+        (``_browse_seq``; for ``_sorted_duration`` also ``_duration_seq``, a
         duration-only write re-keys it) or until the list itself is replaced
-        (a batch exit rebuilds it without a new write).  O(N) to build (~125
-        ms at 263K tracks), then a deep page is a slice (~1 ms for 500 rows).
-        A rebuild also drops every other stale entry, so the memo never keeps
-        a replaced sorted list (~17 MB of tuples at 263K tracks) alive."""
+        (a batch exit rebuilds it without a new write).  A page at offset k
+        reads O(k) index rows once (two set lookups a row), then a deeper one
+        goes on from there.  A rebuild also drops every other stale entry, so
+        the memo never keeps a replaced sorted list (~17 MB of tuples at 263K
+        tracks) alive."""
         key = self._primary_order_key(attr)
         memo = self._primary_order_memo
         hit = memo.get(attr)
-        if hit is not None and hit[0] is idx and hit[1] == key:
-            return hit[2]
-        for a in [a for a, (lst, k, _o) in memo.items()
-                  if k != self._primary_order_key(a) or lst is not getattr(self, a, None)]:
-            del memo[a]
-        tracks = self._tracks
-        order = [tid for _v, tid in idx
-                 if (t := tracks.get(tid)) is not None and t.get("is_duplicate_primary", True)]
-        memo[attr] = (idx, key, order)
-        return order
+        if not self._memo_ok():
+            walks = {}                  # (off the loop: a private walk — ``_memo_ok``)
+        elif hit is not None and hit[0] is idx and hit[1] == key:
+            walks = hit[2]
+        else:
+            for a in [a for a, (lst, k, _o) in memo.items()
+                      if k != self._primary_order_key(a) or lst is not getattr(self, a, None)]:
+                del memo[a]
+            walks = {}
+            memo[attr] = (idx, key, walks)
+        walk = walks.get(bool(descending))
+        if walk is None:
+            walk = walks[bool(descending)] = _FilterWalk(
+                idx, key, None, None, self._nonprimary_ids, bool(descending),
+                _FilterWalk._OUT_LISTED, self._tracks)
+        return walk
 
     def _meta_dict(self, tid: str) -> dict:
         t = self._tracks.get(tid)
@@ -3262,36 +4217,42 @@ class TrackStore:
     def _agg_cache_get(self, key: str) -> Any | None:
         """Return the cached aggregation result for ``key`` if still valid.
 
-        The cache is keyed on ``_mutation_seq`` so any track upsert / update /
-        delete since the previous call automatically invalidates every entry
-        without an explicit ``clear()`` — mirrors the duplicate-snapshot
-        cache pattern in api/smart.py.
+        The cache is keyed on ``_browse_seq`` so any track upsert / delete or
+        browse-relevant field update since the previous call invalidates every
+        entry without an explicit ``clear()``.  (Every value cached here reads
+        only fields outside ``_BROWSE_EXEMPT_FIELDS``.)  Values are stored by
+        the owner thread only (``_agg_cache_set``): one computed off the loop
+        could have been built from the tracks before a write the loop made
+        meanwhile, and would be filed under the counter after it.
         """
         entry = self._agg_cache.get(key)
-        if entry is not None and entry[0] == self._mutation_seq:
+        if entry is not None and entry[0] == self._browse_seq:
             return entry[1]
         return None
 
     def _agg_cache_set(self, key: str, value: Any) -> Any:
-        self._agg_cache[key] = (self._mutation_seq, value)
+        if self._memo_ok():
+            self._agg_cache[key] = (self._browse_seq, value)
         return value
 
     def _agg_x_get(self, key: str, exclude, swap: PrimarySwap | None = None) -> Any | None:
         """``_agg_cache_get`` for a result computed WITHOUT the ids of
         ``exclude`` (the tracks the web UI hides while their drive is
         offline) and with the stand-ins of ``swap`` (``primary_swap``): valid
-        until the next track write or another exclude set / swap (compared by
-        identity — callers hand the same objects back until they change).  One
-        entry per key, so a new set replaces the old results instead of piling
-        up."""
+        until the next browse write (``_browse_seq``) or another exclude set /
+        swap (compared by identity — callers hand the same objects back until
+        they change).  One entry per key, so a new set replaces the old results
+        instead of piling up; stored by the owner thread only (as
+        ``_agg_cache_set``)."""
         entry = self._agg_x_cache.get(key)
-        if (entry is not None and entry[0] == self._mutation_seq and entry[1] is exclude
+        if (entry is not None and entry[0] == self._browse_seq and entry[1] is exclude
                 and entry[3] is swap):
             return entry[2]
         return None
 
     def _agg_x_set(self, key: str, exclude, value: Any, swap: PrimarySwap | None = None) -> Any:
-        self._agg_x_cache[key] = (self._mutation_seq, exclude, value, swap)
+        if self._memo_ok():
+            self._agg_x_cache[key] = (self._browse_seq, exclude, value, swap)
         return value
 
     def _count_visible(self, tids, primary_only: bool, exclude,
@@ -3302,12 +4263,10 @@ class TrackStore:
         exclude=…, swap=…)`` drill-down returns."""
         if not primary_only:
             return len(tids) - len(exclude.intersection(tids))   # set ops, in C
-        tracks = self._tracks
-        shown = tids.difference(exclude) if exclude else tids
-        if swap is None:
-            return sum(1 for tid in shown
-                       if tracks.get(tid, {}).get("is_duplicate_primary", True))
-        return sum(1 for tid in shown if swap.is_primary(tid, tracks.get(tid, {})))
+        # ``exclude`` and the hidden copies in one set (``_invisible``): the
+        # shown ones are the rest — set arithmetic in C, no per-row test.
+        inv = self._invisible(True, exclude, swap)
+        return len(tids) - len(tids.intersection(inv)) if inv else len(tids)
 
     def _bucket_count(self, tids, primary_only: bool, exclude,
                       swap: PrimarySwap | None) -> int | None:
@@ -3339,12 +4298,11 @@ class TrackStore:
             key = "visible:1"
             gone = self._agg_x_get(key, exclude)
             if gone is None:
-                tracks = self._tracks
-                gone = 0
-                for tid in exclude:
-                    t = tracks.get(tid)
-                    if t is not None and t.get("is_duplicate_primary", True):
-                        gone += 1
+                # The excluded ids that are primaries in the library: those in
+                # the library less the non-primary ones (all in the library).
+                ex = exclude if isinstance(exclude, (set, frozenset)) else set(exclude)
+                gone = ((len(ex) - len(ex.difference(self._tracks)))
+                        - len(ex.intersection(self._nonprimary_ids)))
                 self._agg_x_set(key, exclude, gone)
             n -= gone
         if swap is not None:
@@ -3365,9 +4323,10 @@ class TrackStore:
         test, never as "all tracks minus the tagged buckets" — a multi-artist
         track ("A • B") sits in two artist buckets, so that subtraction comes
         out short (or negative) and the bucket vanished while its drill-down
-        still listed tracks.  One O(N) pass, memoised until the next track write
-        (or another ``exclude`` set / swap)."""
-        blank = self._untagged_test(field)
+        still listed tracks.  The maintained bucket (``_untagged_ids``) less
+        what the list hides (``_invisible``) — set arithmetic, memoised until
+        the next browse write (or another ``exclude`` set / swap)."""
+        ids = self._untagged_ids(field)
         if not primary_only:
             swap = None
         key = f"untagged:{field}:{int(bool(primary_only))}"
@@ -3375,14 +4334,8 @@ class TrackStore:
                   else self._agg_cache_get(key))
         if cached is not None:
             return cached
-        n = 0
-        for tid, t in self._tracks.items():
-            if not blank(t) or (exclude and tid in exclude):
-                continue
-            if primary_only and not (swap.is_primary(tid, t) if swap is not None
-                                     else t.get("is_duplicate_primary", True)):
-                continue
-            n += 1
+        inv = self._invisible(bool(primary_only), exclude, swap)
+        n = len(ids) - len(ids.intersection(inv)) if inv else len(ids)
         if exclude or swap is not None:
             return self._agg_x_set(key, exclude, n, swap)
         return self._agg_cache_set(key, n)
@@ -3395,30 +4348,26 @@ class TrackStore:
         True)`` — ``is_duplicate_primary`` defaulting to True for any track not
         in a duplicate group — so an aggregate legend count computed with this
         helper agrees with what the corresponding drill-down actually returns.
+        Set arithmetic against ``_dup_invisible`` (the complement of that
+        predicate) for a set of ids; any other iterable is counted per row.
         """
-        if swap is not None:
+        if not isinstance(tids, (set, frozenset)):
             tracks = self._tracks
-            return sum(1 for tid in tids if swap.is_primary(tid, tracks.get(tid, {})))
-        return sum(
-            1 for tid in tids
-            if self._tracks.get(tid, {}).get("is_duplicate_primary", True)
-        )
+            if swap is not None:
+                return sum(1 for tid in tids if swap.is_primary(tid, tracks.get(tid, {})))
+            return sum(1 for tid in tids
+                       if tracks.get(tid, {}).get("is_duplicate_primary", True))
+        inv = self._dup_invisible(swap)
+        return len(tids) - len(tids.intersection(inv)) if inv else len(tids)
 
     def primary_track_count(self) -> int:
         """Total tracks excluding non-primary duplicates.
 
         The deduped analogue of ``track_count`` — the length of the deduped
-        All-Tracks list (``visible_track_count(primary_only=True)``).
-        Memoised on ``_mutation_seq`` like the other aggregate views.
+        All-Tracks list (``visible_track_count(primary_only=True)``): every
+        track less the maintained non-primary copies (all in the library).
         """
-        cached = self._agg_cache_get("primary_track_count")
-        if cached is not None:
-            return cached
-        n = sum(
-            1 for t in self._tracks.values()
-            if t.get("is_duplicate_primary", True)
-        )
-        return self._agg_cache_set("primary_track_count", n)
+        return len(self._tracks) - len(self._nonprimary_ids)
 
     def aggregate_artists(self, primary_only: bool = False, exclude=None,
                           swap: PrimarySwap | None = None) -> list[dict]:
@@ -3564,16 +4513,8 @@ class TrackStore:
                 # for a primary that can't play: count and pick the cover from
                 # the ones the drill-down lists.
                 members = tids if scope is None else (tids & scope)
-                ex = exclude or ()
-                if swap is not None:
-                    shown = [x for x in members
-                             if x not in ex and swap.is_primary(x, self._tracks.get(x, {}))]
-                else:
-                    shown = [
-                        x for x in members
-                        if x not in ex and (not primary_only or self._tracks.get(
-                            x, {}).get("is_duplicate_primary", True))
-                    ]
+                inv = self._invisible(primary_only, exclude, swap)
+                shown = members.difference(inv) if inv else members
                 count = len(shown)
                 if count == 0:
                     continue
@@ -3581,15 +4522,13 @@ class TrackStore:
             elif primary_only:
                 members = tids if scope is None else (tids & scope)
                 # Prefer a PRIMARY representative so the cover-art id points at
-                # a track the drill-down actually returns.
-                primaries = [
-                    x for x in members
-                    if self._tracks.get(x, {}).get("is_duplicate_primary", True)
-                ]
-                count = len(primaries)
+                # a track the drill-down actually returns: the first one in the
+                # members' order.
+                nonprim = self._nonprimary_ids
+                count = len(members) - len(members.intersection(nonprim))
                 if count == 0:
                     continue
-                rep = primaries[0]
+                rep = next(x for x in members if x not in nonprim)
             else:
                 rep = next(iter(tids))
             t = self._tracks.get(rep)
@@ -3722,10 +4661,11 @@ class TrackStore:
                   else self._agg_cache_get(cache_key))
         if cached is not None:
             return cached
+        from soniqboom.core.catalogue import is_package_format
         results: list[dict] = []
         for key, tids in self._tag_format.items():
-            if not key or not tids:
-                continue
+            if not key or not tids or is_package_format(key):
+                continue        # (an unopened package: no music format yet)
             touched = self._bucket_count(tids, hide_dups, exclude, swap)
             if touched is not None:
                 # Some of the format's tracks are hidden (their drive is
@@ -3740,15 +4680,24 @@ class TrackStore:
             elif hide_dups:
                 # Count only primary tracks; a format that survives ONLY as
                 # non-primary duplicates is dropped (matches the drill-down).
-                count = 0
-                name = key
-                for tid in tids:
-                    t = self._tracks.get(tid)
-                    if t is None:
-                        continue
-                    name = t.get("format") or name
-                    if t.get("is_duplicate_primary", True):
-                        count += 1
+                # The display name is the format of the bucket's LAST member
+                # (in the set's order) — the one a walk over the members ends
+                # on; that member is found in C.  (A last member without a
+                # format, not in the library, falls back to the walk.)
+                t = self._tracks.get(deque(tids, maxlen=1)[0])
+                if t is not None and t.get("format"):
+                    name = t.get("format")
+                    count = len(tids) - len(tids.intersection(self._nonprimary_ids))
+                else:
+                    count = 0
+                    name = key
+                    for tid in tids:
+                        t = self._tracks.get(tid)
+                        if t is None:
+                            continue
+                        name = t.get("format") or name
+                        if t.get("is_duplicate_primary", True):
+                            count += 1
                 if count == 0:
                     continue
             else:
@@ -3775,13 +4724,12 @@ class TrackStore:
         non-primary duplicates so the legend agrees with the deduped drill-down
         (``/search/filter?year_min=Y&year_max=Y``).
 
-        There is no ``_tag_year`` bucket to walk (years drive a *range* index,
-        not a tag set), so the primary path scans ``_tracks`` once — the same
-        O(N)-on-cache-miss cost the format/genre buckets already pay — keying
-        each primary by ``normalise_year`` exactly as ``_sorted_year`` (which
-        backs the drill-down) does, so the counts line up.  Any year left with
-        no primaries simply never appears (no "ghost" year).  Caller-controlled
-        like the sibling browse aggregates."""
+        With duplicates hidden, an ``exclude`` set or a ``swap`` each year's
+        bucket of the maintained ``_tag_year`` (keyed by ``_agg_year`` exactly
+        as ``_sorted_year``, which backs the drill-down, is) less what the list
+        hides (``_invisible``) — set arithmetic, so the counts line up with the
+        drill-down.  Any year left with no shown track simply never appears (no
+        "ghost" year).  Caller-controlled like the sibling browse aggregates."""
         hide_dups = primary_only
         if not hide_dups:
             swap = None
@@ -3795,35 +4743,15 @@ class TrackStore:
         # the first was unreachable because the second matched first for any
         # 5-or-more-digit value.
         merged: dict[int, int] = {}
-        if swap is not None:
-            # Copies stand in for primaries that can't play (and some tracks
-            # may be hidden): one pass keyed like ``_sorted_year``, as below.
-            ex = exclude or ()
-            for tid, t in self._tracks.items():
-                if tid in ex or not swap.is_primary(tid, t):
-                    continue
-                y = _agg_year(t)
-                if y is None:
-                    continue
-                merged[y] = merged.get(y, 0) + 1
-        elif exclude:
-            # Some tracks are hidden (their drive is offline): one pass keyed
-            # like ``_sorted_year`` (which backs the drill-down), as below.
-            for tid, t in self._tracks.items():
-                if tid in exclude or (hide_dups and not t.get("is_duplicate_primary", True)):
-                    continue
-                y = _agg_year(t)
-                if y is None:
-                    continue
-                merged[y] = merged.get(y, 0) + 1
-        elif hide_dups:
-            for t in self._tracks.values():
-                if not t.get("is_duplicate_primary", True):
-                    continue
-                y = _agg_year(t)
-                if y is None:
-                    continue
-                merged[y] = merged.get(y, 0) + 1
+        if swap is not None or exclude or hide_dups:
+            # Copies stand in for primaries that can't play, some tracks are
+            # hidden (their drive is offline) or duplicate copies are: each
+            # year's ids less the ones the list leaves out.
+            inv = self._invisible(hide_dups, exclude, swap)
+            for y, ids in self._tag_year.items():
+                n = len(ids) - len(ids.intersection(inv)) if inv else len(ids)
+                if n:
+                    merged[y] = n
         else:
             for y, count in self._agg_years.items():
                 if isinstance(y, int) and y > 9999:
@@ -3889,6 +4817,14 @@ class TrackStore:
 
     def waveform_exists_batch(self, track_ids: list[str]) -> dict[str, bool]:
         return {tid: tid in self._waveforms for tid in track_ids}
+
+    def forget_waveforms(self, track_ids) -> int:
+        """Drop the stored waveforms of these tracks (their files changed)."""
+        n = 0
+        for tid in track_ids or ():
+            if self._waveforms.pop(tid, None) is not None:
+                n += 1
+        return n
 
     def clear_waveforms(self) -> int:
         n = len(self._waveforms)

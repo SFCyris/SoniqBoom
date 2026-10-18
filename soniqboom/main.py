@@ -17,7 +17,6 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers, MutableHeaders
@@ -116,7 +115,10 @@ app = FastAPI(
         "identifier": "AGPL-3.0-or-later",
         "url":        "https://www.gnu.org/licenses/agpl-3.0.html",
     },
+    # The API reference (Swagger UI + its OpenAPI document) sits under /api,
+    # behind the sign-in like every other /api path.
     docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
     redoc_url=None,
 )
 
@@ -223,24 +225,239 @@ class _SelectiveGZipMiddleware:
 
 
 app.add_middleware(_SelectiveGZipMiddleware, minimum_size=1000)
-# CORS: default to same-origin (localhost) only.  ``allow_origins=["*"]``
-# would let any webpage in the user's browser drive the admin endpoints once
-# auth is skipped — set ``SONIQBOOM_CORS_ORIGINS`` to a comma-separated list
-# of explicit origins if you actually need cross-origin access.
-#
-# Note: any literal ``allow_origins=[f".../{settings.port}"]`` would freeze
-# the port at import time, which is wrong because ``cli()`` may rewrite the
-# port after parsing arguments.  Use a regex over the localhost loopback so
-# whatever port the server eventually binds is accepted.
-_extra_cors_raw = os.environ.get("SONIQBOOM_CORS_ORIGINS", "")
-_extra_cors = [o.strip() for o in _extra_cors_raw.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_origins=_extra_cors,
-    allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-)
+
+
+# ── Origins: CSRF / WebSocket origin check, CORS, framing ──────────────────
+# A page of another origin — another port of the same host counts: cookies
+# are per host, not per port, and SameSite=Lax treats it as the same site —
+# must not drive the signed-in API.  A request that changes state (any method
+# but GET / HEAD / OPTIONS) under /api, and every WebSocket handshake, is
+# refused (403) when the browser says another origin started it: an
+# ``Origin`` that is neither this server (its Host, or a reverse proxy's
+# X-Forwarded-Host) nor one of ``SONIQBOOM_CORS_ORIGINS``, unless
+# ``Sec-Fetch-Site: same-origin``; without an Origin, ``Sec-Fetch-Site:
+# cross-site / same-site`` or a foreign ``Referer``.  A request with none of
+# these (curl, soniqboom-setadm, Subsonic apps) is not a browser's and passes.
+# ``SONIQBOOM_CORS_ORIGINS`` (comma-separated origins, e.g.
+# ``https://music.example.com``) may call the API cross-origin, signed in
+# (``_ApiCORSMiddleware``); ``SONIQBOOM_FRAME_ANCESTORS`` (space- or
+# comma-separated origins) may embed the web UI in a frame — by default only
+# the server's own pages may (``frame-ancestors 'self'``).
+
+def _parse_origins(raw: str) -> frozenset:
+    return frozenset(o.strip().rstrip("/").lower() for o in raw.split(",") if o.strip())
+
+
+_CORS_ORIGINS = _parse_origins(os.environ.get("SONIQBOOM_CORS_ORIGINS", ""))
+_FRAME_ANCESTORS = " ".join(
+    o for o in os.environ.get("SONIQBOOM_FRAME_ANCESTORS", "").replace(",", " ").split() if o)
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _header(scope: Scope, name: bytes) -> "str | None":
+    """The first ``name`` header of the request, or None."""
+    for k, v in scope.get("headers") or ():
+        if k == name:
+            return v.decode("latin-1")
+    return None
+
+
+def _netloc_key(netloc: str) -> str:
+    """``host[:port]`` lower-cased, a default port (80 / 443) dropped."""
+    n = netloc.strip().lower()
+    for suffix in (":80", ":443"):
+        if n.endswith(suffix):
+            return n[:-len(suffix)]
+    return n
+
+
+def _origin_allowed(scope: Scope, origin: str) -> bool:
+    """``origin`` (``scheme://host[:port]``) is this server — the request's
+    Host, or the X-Forwarded-Host a reverse proxy sets (a page can't make a
+    browser send either for another server) — or a ``SONIQBOOM_CORS_ORIGINS``
+    entry."""
+    o = origin.strip().rstrip("/").lower()
+    if o in _CORS_ORIGINS:
+        return True
+    scheme, sep, netloc = o.partition("://")
+    if not sep or scheme not in ("http", "https") or not netloc or "/" in netloc:
+        return False
+    own = set()
+    host = _header(scope, b"host")
+    if host:
+        own.add(_netloc_key(host))
+    fwd = _header(scope, b"x-forwarded-host")
+    if fwd:
+        own.add(_netloc_key(fwd.split(",")[0]))
+    return _netloc_key(netloc) in own
+
+
+def _cross_origin_refused(scope: Scope) -> bool:
+    """A browser request another origin started (see the section comment)."""
+    site = (_header(scope, b"sec-fetch-site") or "").strip().lower()
+    origin = _header(scope, b"origin")
+    if origin is not None:
+        return not (_origin_allowed(scope, origin) or site == "same-origin")
+    if site in ("cross-site", "same-site"):
+        return True
+    referer = _header(scope, b"referer")
+    if referer:
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(referer)
+        except ValueError:
+            return True
+        return not _origin_allowed(scope, f"{parts.scheme}://{parts.netloc}")
+    return False
+
+
+class _ApiCORSMiddleware:
+    """CORS for the origins in ``SONIQBOOM_CORS_ORIGINS`` — signed in (with
+    ``Access-Control-Allow-Credentials``), every path but the Subsonic API
+    (``/rest`` has its own open policy, ``_SubsonicCORSMiddleware``).  Their
+    preflights are answered here, before the session gate (a preflight
+    carries no cookie).  Any other origin gets no CORS headers: the browser
+    keeps its responses from the page."""
+
+    _ALLOW_METHODS = b"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+    _EXPOSE = b"Content-Length, Content-Range, Accept-Ranges, Content-Type, X-SB-Lib-Gen"
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _CORS_ORIGINS:
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        origin = _header(scope, b"origin")
+        if (origin is None or path == "/rest" or path.startswith("/rest/")
+                or origin.strip().rstrip("/").lower() not in _CORS_ORIGINS):
+            await self.app(scope, receive, send)
+            return
+        allow = origin.encode("latin-1")
+        req_method = _header(scope, b"access-control-request-method")
+        if scope.get("method") == "OPTIONS" and req_method is not None:
+            req_headers = _header(scope, b"access-control-request-headers") or ""
+            allowed_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_, ")
+            hdrs = [(b"access-control-allow-origin", allow),
+                    (b"access-control-allow-credentials", b"true"),
+                    (b"access-control-allow-methods", self._ALLOW_METHODS),
+                    (b"access-control-max-age", b"600"),
+                    (b"vary", b"Origin"),
+                    (b"content-length", b"0")]
+            if req_headers and len(req_headers) <= 1024 and set(req_headers) <= allowed_chars:
+                hdrs.append((b"access-control-allow-headers", req_headers.encode("latin-1")))
+            await send({"type": "http.response.start", "status": 204, "headers": hdrs})
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        async def _send(message) -> None:
+            if message["type"] == "http.response.start":
+                hdrs = [(k, v) for k, v in message.get("headers") or ()
+                        if k.lower() not in (b"access-control-allow-origin",
+                                             b"access-control-allow-credentials",
+                                             b"access-control-expose-headers")]
+                hdrs += [(b"access-control-allow-origin", allow),
+                         (b"access-control-allow-credentials", b"true"),
+                         (b"access-control-expose-headers", self._EXPOSE),
+                         (b"vary", b"Origin")]
+                message = {**message, "headers": hdrs}
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
+# ── Request-body ceilings ─────────────────────────────────────────────────
+# A body over its path's ceiling is refused with 413 — up front when its
+# Content-Length says so, else the moment the bytes read cross it.  Sign-in
+# requests are small; the library import and soundfont upload carry whole
+# files; a client-rendered SID WAV is capped by its own handler (64 MB).
+_BODY_MAX_DEFAULT = 16 * 1024 * 1024
+_BODY_MAX_AUTH = 64 * 1024
+_BODY_MAX_UPLOAD = 4 * 1024 * 1024 * 1024
+_BODY_MAX_SID_AUDIO = 80 * 1024 * 1024
+_UPLOAD_PATHS = frozenset({"/api/admin/import", "/api/admin/soundfonts/upload"})
+
+
+def _body_limit(path: str) -> int:
+    if path.startswith("/api/auth/"):
+        return _BODY_MAX_AUTH
+    if path in _UPLOAD_PATHS:
+        return _BODY_MAX_UPLOAD
+    if path.startswith("/api/tracks/") and path.endswith("/sid-audio"):
+        return _BODY_MAX_SID_AUDIO
+    return _BODY_MAX_DEFAULT
+
+
+def _limited_receive(receive: Receive, limit: int) -> Receive:
+    total = 0
+
+    async def _receive():
+        nonlocal total
+        message = await receive()
+        if message.get("type") == "http.request":
+            total += len(message.get("body") or b"")
+            if total > limit:
+                raise HTTPException(413, "Request body too large.")
+        return message
+    return _receive
+
+
+def _body_too_large(scope: Scope, limit: int) -> bool:
+    clen = _header(scope, b"content-length")
+    try:
+        return clen is not None and int(clen) > limit
+    except ValueError:
+        return False
+
+
+# ── Security headers (pages, API, frontend files) ─────────────────────────
+# Not on the media byte servers other origins' players read (/rest, /cast,
+# /dlna): nosniff there could make a browser refuse a mislabelled stream.
+_CSP = ("frame-ancestors 'self'" + (f" {_FRAME_ANCESTORS}" if _FRAME_ANCESTORS else "")
+        + "; base-uri 'self'; object-src 'none'").encode("latin-1")
+_SECURITY_HEADERS = tuple(h for h in (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"same-origin"),
+    None if _FRAME_ANCESTORS else (b"x-frame-options", b"SAMEORIGIN"),
+    (b"content-security-policy", _CSP),
+) if h is not None)
+_NO_SECURITY_HEADER_PREFIXES = ("/rest/", "/cast/", "/dlna/")
+
+
+def _add_security_headers(message: dict, path: str) -> dict:
+    if path == "/rest" or path.startswith(_NO_SECURITY_HEADER_PREFIXES):
+        return message
+    raw = list(message.get("headers") or ())
+    have = {k.lower() for k, _v in raw}
+    added = [(k, v) for k, v in _SECURITY_HEADERS if k not in have]
+    if not added:
+        return message
+    return {**message, "headers": raw + added}
+
+
+def _cookie_refresh(message: dict, scope: Scope, cookie: "str | None") -> dict:
+    """Send the session cookie again when its sliding expiry has moved on
+    (``UserStore.session_cookie_due``: about once an hour per session) — the
+    browser's copy then expires 7 days after the last use, not after the
+    sign-in.  Never over a response that sets the cookie itself (sign-in,
+    sign-out)."""
+    if not cookie or message.get("status", 200) == 401:
+        return message
+    raw = list(message.get("headers") or ())
+    if any(k.lower() == b"set-cookie" and v.lstrip().startswith(b"sb_session=") for k, v in raw):
+        return message
+    try:
+        store = _core_users.get_user_store()
+        if not store.session_cookie_due(cookie):
+            return message
+    except Exception:                                       # noqa: BLE001
+        return message
+    secure = users_api.request_is_tls(scope.get("scheme", "http"),
+                                      _header(scope, b"x-forwarded-proto"))
+    raw.append((b"set-cookie", users_api.session_cookie_header(cookie, secure)))
+    return {**message, "headers": raw}
 
 
 # ── The request gate: auth, Cache-Control, deadlock watchdog ───────────────
@@ -249,10 +466,13 @@ app.add_middleware(
 # task of its own behind a memory stream — three hops on every request
 # (/api/health in-process: 688 µs with them, 253 µs with this layer).  Here the scope is read
 # directly and the response's ``send`` wrapped; a streamed body (audio, SSE,
-# chunked) goes through chunk by chunk, websockets pass straight through.
-# Same position in the stack as the three (inside ``_SubsonicCORSMiddleware``,
-# outside CORS and GZip), same order among them: the watchdog registration
-# outermost, then the Cache-Control policy, then the session gate.
+# chunked) goes through chunk by chunk; a websocket passes through once its
+# Origin is judged.  Stack, outermost first: ``_SubsonicCORSMiddleware``,
+# ``_ApiCORSMiddleware`` (a listed origin's preflight is answered before the
+# session gate), this gate, GZip.  In the gate: the watchdog registration
+# outermost, then the response headers (Cache-Control, security headers, the
+# session cookie's refresh), then the cross-origin check, the body ceiling and
+# the session gate.
 
 # Public /api/* allowlist — endpoints the unauthenticated UI needs.
 _PUBLIC_API_PATHS = frozenset({
@@ -265,8 +485,6 @@ _PUBLIC_API_PATHS = frozenset({
     "/api/auth/register",
     "/api/auth/me",
     "/api/auth/logout",          # idempotent on a missing session
-    "/api/docs",
-    "/api/openapi.json",
 })
 _API_NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
 
@@ -313,7 +531,7 @@ def _api_auth_refused(scope: Scope, path: str) -> bool:
     # has its own auth in every handler).
     if not path.startswith("/api/"):
         return False
-    if path in _PUBLIC_API_PATHS or path.startswith("/api/docs/"):
+    if path in _PUBLIC_API_PATHS:
         return False
     # (WebSocket endpoints handle their own auth in-handler: a websocket
     # scope never reaches this gate.  The old "path ends in /ws" exemption
@@ -345,33 +563,128 @@ def _add_cache_headers(message: dict, path: str) -> dict:
     Rules, in precedence order:
       * If a handler set its own ``Cache-Control`` (e.g. art endpoints with
         ``immutable`` thumbnails, or aggregation endpoints returning 304s),
-        respect it — we don't clobber handler intent.
-      * ``/api/stream/*``: leave untouched so byte-range audio buffering
-        stays healthy.
+        respect it — we don't clobber handler intent — except that under
+        ``/api`` (signed-in content) ``public`` becomes ``private``: no shared
+        cache may keep it.
+      * ``/api/stream/*``: ``private`` (the browser may keep the bytes it
+        buffered, no shared cache may) so byte-range audio buffering stays
+        healthy.
       * Other ``/api/*``: ``no-store`` so admin/library state stays fresh.
-      * Static paths / SPA HTML / JS / CSS: ``no-store`` so edits are visible
-        on the next refresh.  The ``?v=`` tag in ``index.html`` is static
-        (not a content hash), so we deliberately don't mark versioned
-        assets as immutable — that caused browsers to keep serving stale
-        JS forever after code changes.  Re-enable later once ``?v=`` is
-        bumped automatically on every build.
+      * The frontend's own files (``/assets/*``, ``/manual/*``) and HTML
+        shells (``/``, ``/m``, ``/multiroom``): ``no-cache`` — the browser
+        may keep a copy but asks again on every use, and an unchanged file
+        comes back as a 304 against its ETag / Last-Modified.  Not
+        ``immutable``: the JS URLs in the shells carry content hashes
+        (``core.shell_html``), but the CSS ``?v=`` tags are set by hand,
+        so an edit without a bump must still reach the next load.
+      * Everything else (``/rest``, ``/dlna``, ``/cast``, …): ``no-store``.
     """
     raw = message.get("headers") or ()
     # Respect handler-set headers.  This matters for ETag 304s from
     # /api/library/* which choose their own revalidation policy.
-    if any(k.lower() == b"cache-control" for k, _v in raw):
+    own = [v for k, v in raw if k.lower() == b"cache-control"]
+    if own:
+        if path.startswith("/api") and any(b"public" in v.lower() for v in own):
+            import re as _re
+            headers = MutableHeaders(raw=list(raw))
+            headers["Cache-Control"] = _re.sub(
+                "public", "private", own[0].decode("latin-1"), flags=_re.IGNORECASE)
+            return {**message, "headers": headers.raw}
         return message
-    if path.startswith("/api/stream"):
-        return message  # media pipeline owns its own buffering
     headers = MutableHeaders(raw=list(raw))
+    if path.startswith("/api/stream"):
+        headers["Cache-Control"] = "private"   # media pipeline owns its buffering
+        return {**message, "headers": headers.raw}
     if path.startswith("/api"):
         headers["Cache-Control"] = _API_NO_STORE
         headers["Pragma"] = "no-cache"
         headers["Expires"] = "0"
+    elif _revalidated_static(path):
+        headers["Cache-Control"] = "no-cache"
     else:
-        # Static JS/CSS/HTML — serve fresh each load.
         headers["Cache-Control"] = "no-store"
     return {**message, "headers": headers.raw}
+
+
+# Frontend files and HTML shells (``_add_cache_headers``): revalidated, not
+# re-downloaded — the static mounts answer a conditional request with a 304.
+_STATIC_SHELLS = frozenset({"/", "/m", "/multiroom", "/manual"})
+_STATIC_PREFIXES = ("/assets/", "/manual/", "/m/", "/multiroom/")
+
+
+def _revalidated_static(path: str) -> bool:
+    return path in _STATIC_SHELLS or path.startswith(_STATIC_PREFIXES)
+
+
+# The source install's restart (``admin._do_restart`` → ``os.execv``): from
+# ``begin_exec_restart`` until the exec this process answers every request but
+# the frontend's own files with 503 — no sign-in, store write or new stream is
+# taken on while the restart quiesces the server, seals the journal and writes
+# the sign-ins (and ``/api/health`` stays unhealthy until the new image answers).
+_exec_restarting = False
+
+
+def begin_exec_restart() -> None:
+    """The exec restart begins: requests are refused (503) and sign-ins
+    closed (``UserStore.close_sign_ins`` — a sign-in already past the gate is
+    refused too, so every session issued is in the final sessions write)."""
+    global _exec_restarting
+    _exec_restarting = True
+    try:
+        _core_users.get_user_store().close_sign_ins()
+    except Exception:                                       # noqa: BLE001
+        log.debug("closing sign-ins for the restart failed", exc_info=True)
+
+
+def _lib_gen_for(scope: Scope, path: str) -> "str | None":
+    """The library generation a browse GET is served at (``X-SB-Lib-Gen``) —
+    read before its handler runs, so a change while it runs makes the header
+    older than the data, never newer."""
+    if scope.get("method") != "GET":
+        return None
+    from soniqboom.api import library as _lib
+    if not path.startswith(_lib.LIB_GEN_PATHS):
+        return None
+    try:
+        return _lib.library_generation()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+_LIB_GEN_HEADER = "X-SB-Lib-Gen"          # = api.library.LIB_GEN_HEADER
+
+
+async def _restarting_response(scope: Scope, receive: Receive, path: str):
+    """The answer to a request while the source install's restart runs:
+    503 + ``Retry-After`` — for the Subsonic API (``/rest``) a Subsonic error
+    envelope (code 0) in the format the request asked for (``f``, in the
+    query or a form-encoded POST body), as Subsonic errors are answered
+    (HTTP 200)."""
+    if path == "/rest" or path.startswith("/rest/"):
+        try:
+            from urllib.parse import parse_qs
+            from starlette.requests import Request as _Req
+            from soniqboom.api import subsonic as _ss
+            req = _Req(scope)
+            fmt = req.query_params.get("f")
+            ctype = req.headers.get("content-type", "")
+            if (fmt is None and scope.get("method") == "POST"
+                    and ctype.startswith("application/x-www-form-urlencoded")):
+                body, more = b"", True
+                while more and len(body) < 65536:
+                    msg = await receive()
+                    body += msg.get("body", b"")
+                    more = msg.get("more_body", False)
+                fmt = (parse_qs(body.decode("latin-1")).get("f") or [None])[0]
+            fmt = (fmt or "xml").lower()
+            resp = _ss._maybe_jsonp(req, _ss._err(
+                0, "The server is restarting — try again in a moment.", fmt=fmt))
+            resp.headers["Retry-After"] = "2"
+            return resp
+        except Exception:                                   # noqa: BLE001
+            log.debug("Subsonic restart envelope failed", exc_info=True)
+    return JSONResponse({"detail": "The server is restarting."}, status_code=503,
+                        headers={"Retry-After": "2"})
 
 
 class _RequestGateMiddleware:
@@ -392,37 +705,72 @@ class _RequestGateMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
+            if scope["type"] == "websocket" and _cross_origin_refused(scope):
+                # A page of another origin (cross-site WebSocket hijacking):
+                # refused before the handshake completes (HTTP 403).
+                await receive()                                   # websocket.connect
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            if scope["type"] == "websocket" and _exec_restarting:
+                # (the exec restart: accepted, then closed "service restart"
+                # — a close before the accept reaches the page as 1006 — and
+                # the page reconnects to the new image right away)
+                await receive()                                   # websocket.connect
+                await send({"type": "websocket.accept"})
+                await send({"type": "websocket.close", "code": 1012})
+                return
             await self.app(scope, receive, send)
             return
         path = _request_path(scope)
+        is_api = path.startswith("/api/")
+        cookie = _session_cookie(scope) if is_api else None
         client = scope.get("client")
         token = _watchdog.begin_request(
             scope.get("method", ""), path,
             client=f"{client[0]}:{client[1]}" if client else "",
         )
         ended = False
+        lib_gen = _lib_gen_for(scope, path)
 
         async def _send(message) -> None:
             nonlocal ended
             if message["type"] == "http.response.start":
                 message = _add_cache_headers(message, path)
+                message = _add_security_headers(message, path)
+                if cookie:
+                    message = _cookie_refresh(message, scope, cookie)
+                if lib_gen is not None:
+                    headers = MutableHeaders(raw=list(message.get("headers") or ()))
+                    headers[_LIB_GEN_HEADER] = lib_gen
+                    message = {**message, "headers": headers.raw}
                 if not ended:
                     ended = True
                     _watchdog.end_request(token)
             await send(message)
 
+        limit = _body_limit(path)
         try:
-            if _api_auth_refused(scope, path):
+            if _exec_restarting and not _revalidated_static(path):
+                await (await _restarting_response(scope, receive, path))(scope, receive, _send)
+            elif (is_api and scope.get("method", "GET") not in _SAFE_METHODS
+                    and _cross_origin_refused(scope)):
+                await JSONResponse({"detail": "Cross-origin request refused."},
+                                   status_code=403)(scope, receive, _send)
+            elif _body_too_large(scope, limit):
+                await JSONResponse({"detail": "Request body too large."},
+                                   status_code=413)(scope, receive, _send)
+            elif _api_auth_refused(scope, path):
                 await JSONResponse({"detail": "Sign in to access this endpoint."},
                                    status_code=401)(scope, receive, _send)
             else:
-                await self.app(scope, receive, _send)
+                await self.app(scope, _limited_receive(receive, limit), _send)
         finally:
             if not ended:
                 _watchdog.end_request(token)
 
 
 app.add_middleware(_RequestGateMiddleware)
+app.add_middleware(_ApiCORSMiddleware)
 
 
 class _SubsonicCORSMiddleware:
@@ -636,17 +984,43 @@ async def _ampache_probe_reject():
     raise HTTPException(404, "This server speaks Subsonic, not Ampache.")
 
 
+def _signed_in_or_fresh(request: Request) -> bool:
+    """The caller is signed in — or no account exists yet (a fresh install:
+    everything is open).  ``request`` None: an in-process call."""
+    if request is None:
+        return True
+    try:
+        store = _core_users.get_user_store()
+    except Exception:                                   # noqa: BLE001
+        return False
+    if not store.has_any():
+        return True
+    cookie = request.cookies.get("sb_session")
+    return bool(cookie) and store.lookup_session(cookie) is not None
+
+
 @app.get("/api/health")
-async def health():
+async def health(request: Request):
     # Include the current service-toggle state in the health payload so
     # the run.sh / restart.sh banner can render "Services:" without
     # needing to parse the Python log.  Public — no PII, just on/off.
+    # ``version``: for a signed-in caller and for the server's own host
+    # (run.sh, the menu-bar app); null for anyone else.
     from soniqboom.config import (
         SERVICE_NAMES, SERVICE_LABELS, is_service_enabled,
     )
+    # Folder watcher: counts only (no paths — this endpoint is public).
+    try:
+        from soniqboom.core import watcher as _watcher
+        watch = _watcher.summary()
+    except Exception:                                   # noqa: BLE001
+        watch = None
+    show_version = (users_api._is_loopback_request(request)
+                    or _signed_in_or_fresh(request))
     return {
         "status":  "ok",
-        "version": __version__,
+        "version": __version__ if show_version else None,
+        "watcher": watch,
         "services": [
             {
                 "name":    n,
@@ -776,8 +1150,10 @@ def _skip_short_tunes() -> int:
 
 
 @app.get("/api/ui-config")
-async def ui_config():
-    """Public UI configuration — no auth required.  Safe subset only.
+async def ui_config(request: Request = None):
+    """Public UI configuration — no auth required.  Safe subset only: the
+    folder aliases and catalogue roots (keyed by library paths) only for a
+    signed-in caller (the web UI reads this after its sign-in).
 
     ``placeholder_art_data_uri`` ships the cover-art placeholder JPEG
     inline (base64-encoded) so the frontend can render tagless tracks
@@ -790,8 +1166,9 @@ async def ui_config():
     from soniqboom.api.art import _PLACEHOLDER_JPEG
     placeholder_b64 = base64.b64encode(_PLACEHOLDER_JPEG).decode("ascii")
     from soniqboom.core import catalogue as _catalogue
-    aliases = dict(settings.folder_aliases or {})
-    for r in _catalogue.roots():                # catalogue roots show their label
+    signed_in = _signed_in_or_fresh(request)
+    aliases = dict(settings.folder_aliases or {}) if signed_in else {}
+    for r in (_catalogue.roots() if signed_in else ()):   # catalogue roots show their label
         aliases.setdefault(r["root"], r["label"])
     return {
         "display_startup_logo": settings.display_startup_logo,
@@ -806,7 +1183,7 @@ async def ui_config():
         # External catalogues: their roots, and whether their tunes shown in a
         # list are read for their details (Modland "Read details of tunes not
         # played yet: For tunes shown in lists").
-        "catalogue_roots": [r["root"] for r in _catalogue.roots()],
+        "catalogue_roots": [r["root"] for r in _catalogue.roots()] if signed_in else [],
         "catalogue_list_reads": _catalogue_list_reads(),
         "placeholder_art_data_uri": f"data:image/jpeg;base64,{placeholder_b64}",
     }
@@ -1014,13 +1391,42 @@ _POOL_GRACE_S = 5.0
 _process_exiting = False
 
 
+def _counting_pool_class():
+    from concurrent.futures import ThreadPoolExecutor
+
+    class _CountingPool(ThreadPoolExecutor):
+        """A ``ThreadPoolExecutor`` that knows how many jobs run right now
+        (``running_jobs``) — its threads stay alive idle, so counting live
+        threads counts idle ones too."""
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._running = 0
+            self._running_lock = threading.Lock()
+
+        def submit(self, fn, /, *args, **kwargs):
+            def _job(*a, **k):
+                with self._running_lock:
+                    self._running += 1
+                try:
+                    return fn(*a, **k)
+                finally:
+                    with self._running_lock:
+                        self._running -= 1
+            return super().submit(_job, *args, **kwargs)
+
+        def running_jobs(self) -> int:
+            with self._running_lock:
+                return self._running
+    return _CountingPool
+
+
 def _install_thread_pool() -> None:
     global _thread_pool
-    from concurrent.futures import ThreadPoolExecutor
     from soniqboom.core import procinfo
     # The library default (CPUs + 4, max 32) counted the host's CPUs (GitHub #21).
-    _thread_pool = ThreadPoolExecutor(max_workers=min(32, procinfo.usable_cpus() + 4),
-                                      thread_name_prefix="sb-pool")
+    _thread_pool = _counting_pool_class()(max_workers=min(32, procinfo.usable_cpus() + 4),
+                                          thread_name_prefix="sb-pool")
     asyncio.get_running_loop().set_default_executor(_thread_pool)
 
 
@@ -1041,6 +1447,15 @@ async def _release_thread_pool(results: dict) -> bool:
     and the close waits for it as before.  (A merge of this run still running
     can't overlap the next run's load either: ``persistence.library_files_lock``.)
     True when released."""
+    # The playback I/O threads (``core.playback_io``: reads of the files
+    # being played, never a library write) go in any case: queued jobs
+    # dropped, a read stuck on a share not waited for; a play after this
+    # starts a fresh pool.
+    try:
+        from soniqboom.core import playback_io
+        playback_io.release()
+    except Exception:                                   # noqa: BLE001
+        log.debug("Shutdown: playback pool release failed", exc_info=True)
     late = sorted(k for k, v in results.items() if v in ("TIMEOUT", "FAIL") and k in _WRITING_STEPS)
     if late:
         log.warning("Shutdown: waiting for %s to finish before the server's thread ends", ", ".join(late))
@@ -1050,16 +1465,117 @@ async def _release_thread_pool(results: dict) -> bool:
     pool = _thread_pool
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
+
+        def _busy() -> int:
+            running = getattr(pool, "running_jobs", None)
+            if running is not None:
+                return running()
+            return sum(t.is_alive() for t in list(getattr(pool, "_threads", ())))
         if _process_exiting:
             deadline = time.monotonic() + _POOL_GRACE_S
-            while (any(t.is_alive() for t in list(getattr(pool, "_threads", ())))
-                   and time.monotonic() < deadline):
+            while _busy() and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
-        busy = sum(t.is_alive() for t in list(getattr(pool, "_threads", ())))
+        busy = _busy()
         if busy:
             log.warning("Shutdown: %d thread-pool job(s) still running (a share that doesn't "
                         "answer?) — not waited for", busy)
     return True
+
+
+# The children a process image had right before the source install's restart
+# replaced it (``os.execv`` keeps the pid, so they stay this process's
+# children): ``[[pid, command line], …]`` as JSON, for the image it starts.
+_EXEC_LEFTOVERS_ENV = "SONIQBOOM_EXEC_LEFTOVERS"
+# Taken (and removed from the environment, so no process this one starts
+# inherits it) once, as this image loads.
+_exec_leftovers_raw: "str | None" = os.environ.pop(_EXEC_LEFTOVERS_ENV, None)
+
+
+def _own_children() -> "dict[int, tuple[str, str]]":
+    """This process's children: ``{pid: (state, command line)}``
+    (``procinfo.process_table``: ``/proc`` on Linux, else a fork-free ``ps``)."""
+    from soniqboom.core import procinfo
+    me = os.getpid()
+    return {pid: (st, cmd) for pid, (ppid, st, cmd) in procinfo.process_table().items()
+            if ppid == me}
+
+
+def note_exec_leftovers() -> int:
+    """Right before ``os.execv``: record this process's children (a stopped
+    renderer not yet waited for, the forkserver, the resource tracker) for
+    the exec'd image, which ends and waits for them
+    (``_reap_exec_leftovers``) — nothing else would: they'd stay zombies.
+    Returns how many."""
+    import json
+    rows = _own_children()
+    os.environ[_EXEC_LEFTOVERS_ENV] = json.dumps([[pid, cmd] for pid, (_st, cmd) in rows.items()])
+    return len(rows)
+
+
+def _waitpid_quiet(pid: int, flags: int = 0) -> bool:
+    """Reap child ``pid``; True when it was reaped (or is no child of ours)."""
+    try:
+        got, _status = os.waitpid(pid, flags)
+    except ChildProcessError:
+        return True
+    except OSError:
+        return True
+    return got == pid
+
+
+def _reap_exec_leftovers(raw: "str | None" = None) -> "tuple[int, int]":
+    """At the first start of an image the source install's restart exec'd:
+    end the children the previous image recorded (``note_exec_leftovers``,
+    read as this image loaded — or ``raw``) that are still this process's
+    children with the same command line, and wait for them and for those
+    that already ended (zombies).  A pid that is no longer our child, or now
+    runs something else, is left alone.  Once per image.  Returns
+    ``(reaped, signalled)``."""
+    import json
+    global _exec_leftovers_raw
+    if raw is None:
+        raw, _exec_leftovers_raw = _exec_leftovers_raw, None
+    if not raw:
+        return 0, 0
+    try:
+        recorded = {int(pid): str(cmd) for pid, cmd in json.loads(raw)}
+    except (ValueError, TypeError):
+        return 0, 0
+    now = _own_children()
+    zombies = [pid for pid in recorded if pid in now and "Z" in now[pid][0]]
+    live = [pid for pid in recorded
+            if pid in now and "Z" not in now[pid][0] and now[pid][1] == recorded[pid]]
+    signalled = 0
+    for pid in live:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            signalled += 1
+        except OSError:
+            pass
+    reaped = sum(1 for pid in zombies if _waitpid_quiet(pid, os.WNOHANG))
+    pending = set(live)
+    deadline = time.monotonic() + 1.0
+    while pending and time.monotonic() < deadline:
+        for pid in list(pending):
+            if _waitpid_quiet(pid, os.WNOHANG):
+                pending.discard(pid)
+                reaped += 1
+        if pending:
+            time.sleep(0.05)
+    for pid in list(pending):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 1.0
+    while pending and time.monotonic() < deadline:
+        for pid in list(pending):
+            if _waitpid_quiet(pid, os.WNOHANG):
+                pending.discard(pid)
+                reaped += 1
+        if pending:
+            time.sleep(0.05)
+    return reaped, signalled
 
 
 def _reap_at_start() -> int:
@@ -1150,6 +1666,30 @@ def _reap_orphaned_forkservers(own_leftovers: bool = False) -> int:
 # asyncio may garbage-collect a bare create_task() mid-flight (CPython docs).
 _BG_TASKS: "set" = set()
 
+# How often a server with no account loaded (recovery, fresh install) looks
+# for a users.json put back on disk (``UserStore.check_restored``).
+_USERS_RESTORED_POLL_SEC = 2.0
+
+
+async def _watch_for_restored_accounts() -> None:
+    """While no user account is loaded, pick up a users.json restored on disk
+    (``UserStore.check_restored``: stat both files; read only when they
+    changed; never moves a file aside).  ``POST /api/auth/reload`` without
+    the CLI's token is refused in that state, so this is how a restored file
+    goes live without a restart."""
+    from soniqboom.core.users import get_user_store
+    while True:
+        await asyncio.sleep(_USERS_RESTORED_POLL_SEC)
+        try:
+            store = get_user_store()
+            if store.count() == 0:
+                await asyncio.to_thread(store.check_restored)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            log.debug("restored-accounts check failed", exc_info=True)
+
+
 # Seconds after startup the Subsonic catalogue prewarm starts — past the
 # startup phases, so it never competes with them.
 _SUBSONIC_PREWARM_DELAY_SEC = 5.0
@@ -1188,6 +1728,41 @@ async def startup():
     log.info("SoniqBoom %s starting on %s:%s", __version__, settings.host, settings.port)
     _install_sighup_handler()
 
+    from soniqboom.core import forksafe as _fs_start
+    _fs_start.open_spawns()
+    # Offline mode (SONIQBOOM_OFFLINE / conf ``offline``): no request to an
+    # internet host — the clients check ``netpolicy``; this is the safety net.
+    from soniqboom.core import netpolicy as _netpolicy
+    if _netpolicy.offline():
+        _netpolicy.install_guard()
+        log.info("Offline mode: on — no requests to internet hosts")
+    # The children the image before an in-place restart left (stopped
+    # renderers not yet waited for, its forkserver, its resource tracker).
+    try:
+        n_reaped, n_sig = await asyncio.to_thread(_reap_exec_leftovers)
+        if n_reaped or n_sig:
+            log.info("Restart: ended %d and reaped %d child process(es) of the previous image",
+                     n_sig, n_reaped)
+    except Exception:                                   # noqa: BLE001
+        log.debug("reaping the previous image's children failed", exc_info=True)
+    # Render temp folders of server images that are gone (killed, or the image
+    # an in-place restart replaced) — only ``core.render_tmp``'s own folders.
+    try:
+        from soniqboom.core import render_tmp as _rt
+        n_killed = await asyncio.to_thread(_rt.kill_orphan_renderers)
+        if n_killed:
+            log.info("Ended %d renderer(s) left running by stopped server runs", n_killed)
+        n_dirs, n_files, n_bytes = await asyncio.to_thread(_rt.sweep_orphans)
+        if n_dirs:
+            log.info("Removed %d render temp folder(s) of stopped server runs: %d file(s), %.1f MB",
+                     n_dirs, n_files, n_bytes / 1e6)
+        n_stray, b_stray = await asyncio.to_thread(_rt.stray_temp_wavs)
+        if n_stray:
+            log.info("%d temp WAV file(s) (%.1f MB) of unknown origin in %s (tmp*.wav) — "
+                     "not removed", n_stray, b_stray / 1e6, __import__("tempfile").gettempdir())
+    except Exception:                                   # noqa: BLE001
+        log.debug("render temp sweep failed", exc_info=True)
+
     # Reap any forkserver-tree leftovers from a previous instance that
     # was SIGKILL'd (or whose SIGTERM handler timed out).  Must run
     # BEFORE the first ProcessPoolExecutor() in scanner.py creates our
@@ -1201,6 +1776,10 @@ async def startup():
     global _run_epoch, _reap_later_task
     from soniqboom.core.scanner import begin_run
     _run_epoch = begin_run()
+    # … and the library generation / aggregate cache of the web lists (a page
+    # still connected to the previous run in this process re-reads).
+    from soniqboom.api.library import new_server_run
+    new_server_run()
 
     # Once more a little later: the instance an in-app Restart replaced may
     # still have been ending at this start (its forkserver's parent alive).
@@ -1246,6 +1825,16 @@ async def startup():
     _get_store()._aof_append = None
     init_persistence(data_dir)
 
+    # The journal (library.aof) is attached right after the load, before
+    # anything that may write the store starts (the folder watcher's
+    # rescans, remote freshness polls, the share health monitor, startup
+    # maintenance): a write with no journal attached lives in memory only.
+    from soniqboom.core.aof import AOFWriter
+    _prune_late_aof_files(data_dir)
+    _aof_writer = AOFWriter(data_dir / "library.aof", flush_interval=settings.aof_flush_interval)
+    _get_store()._aof_append = _aof_writer.append
+    await _aof_writer.start_auto_flush()
+
     # Duplicate groups follow every duplicate-relevant write from here on
     # (tag edits, duration backfills, scans local and remote).
     try:
@@ -1261,6 +1850,23 @@ async def startup():
         modland_catalog.register_at_startup()
     except Exception:
         log.warning("Modland catalogue registration failed", exc_info=True)
+    # … and the online collections' (HVSC on 6581.nl …).
+    try:
+        from soniqboom.core import online_catalog
+        online_catalog.register_at_startup()
+    except Exception:
+        log.warning("Online collection registration failed", exc_info=True)
+
+    # FTP listing times are UTC from this build on: convert the ones an
+    # earlier build stored as host-local time, once — after the load and the
+    # journal (it writes through the store), with the catalogue roots known
+    # (their tracks are skipped), before any FTP share is listed.
+    try:
+        from soniqboom.core import ftp_mtime_migration
+        ftp_mtime_migration.run(_get_store())
+    except Exception:
+        log.warning("Converting stored FTP listing times failed (FTP files may "
+                    "be read again once)", exc_info=True)
 
     # Now that config is loaded, apply the persisted log-verbosity dials
     # (app level + access-log mode).  See core/log_control.py.
@@ -1340,11 +1946,17 @@ async def startup():
     except Exception as exc:
         log.warning("Folder browse cache warmup failed (will lazy-build on first click): %s", exc)
 
-    # Initialise user store (users.json).  Safe even on fresh installs —
-    # ``has_any()`` returns False until the first ``soniqboom-setadm`` run.
+    # Initialise user store (users.json + sessions.json).  Safe even on fresh
+    # installs — ``has_any()`` returns False until the first
+    # ``soniqboom-setadm`` run (and stays True in recovery: an unreadable
+    # users.json never opens the server, see ``UserStore._load``).
     _ss_phase("loading_users", "Loading user accounts")
     from soniqboom.core.users import init_user_store
     init_user_store(data_dir)
+    _t = asyncio.create_task(_watch_for_restored_accounts(),
+                             name="users_restored_watch")
+    _BG_TASKS.add(_t)
+    _t.add_done_callback(_BG_TASKS.discard)
 
     # AirPlay pairing credentials.  Stored at ``data_dir/airplay_credentials.json``
     # and applied on each ``AirPlayController.connect()`` so the user
@@ -1635,14 +2247,9 @@ async def startup():
     except Exception:
         log.exception("freshness start failed (non-fatal — manual re-index still works)")
 
-    _ss_phase("persistence", "Starting AOF writer & merger")
-    # Start AOF writer (appends every mutation to library.aof)
-    from soniqboom.core.aof import AOFWriter
+    _ss_phase("persistence", "Starting the merger")
+    # (the AOF writer was started right after the load, above)
     from soniqboom.core.store import get_store
-    _prune_late_aof_files(data_dir)
-    _aof_writer = AOFWriter(data_dir / "library.aof", flush_interval=settings.aof_flush_interval)
-    get_store()._aof_append = _aof_writer.append
-    await _aof_writer.start_auto_flush()
 
     # Spawn background merger process
     from soniqboom.core.merger import start_merger
@@ -1660,6 +2267,13 @@ async def startup():
         await purge_junk_tracks()
     except Exception as exc:
         log.warning("purge_junk_tracks failed: %s", exc)
+
+    try:
+        from soniqboom.config import seed_default_soundfont
+        if (seeded := seed_default_soundfont()) is not None:
+            log.info("SoundFonts: added the default SoundFont %s", seeded.name)
+    except Exception as exc:
+        log.warning("Default SoundFont not added: %s", exc)
 
     # Reap any ``.partial`` orphans from interrupted soundfont uploads —
     # crashed uploads used to leave ``<name>.<pid>.<token>.partial`` in
@@ -1702,8 +2316,7 @@ async def startup():
 
     _ss_phase("network_shares", "Connecting network shares")
     await _init_network_shares()
-    global _health_task
-    _health_task = asyncio.create_task(_share_health_monitor())
+    _start_share_health_monitor()
 
     # External sources: the Modland catalogue (heals / arms its daily index
     # refresh; never touches the network at startup).
@@ -1712,6 +2325,11 @@ async def startup():
         await modland_catalog.startup()
     except Exception:
         log.warning("Modland catalogue startup failed", exc_info=True)
+    try:
+        from soniqboom.core import online_catalog
+        await online_catalog.startup()
+    except Exception:
+        log.warning("Online collections startup failed", exc_info=True)
 
     # Which tracks can play right now (Settings → "Tracks on unavailable
     # drives"): follow scan-root status changes, re-probe local roots, and
@@ -1764,9 +2382,8 @@ async def startup():
     global _cast_reaper_task
     _cast_reaper_task = asyncio.create_task(_cast_session_reaper())
 
-    # Stations (internet radio): seed favorites and warm the Radio Browser
-    # country metadata in the background — startup never blocks on the
-    # public directory being reachable; a cache on disk serves either way.
+    # Stations (internet radio): seed favorites (no network — the Radio
+    # Browser country list is fetched when the world browser first opens).
     from soniqboom.core import radiodir as _radiodir
     asyncio.create_task(_radiodir.ensure_ready())
 
@@ -1775,12 +2392,8 @@ async def startup():
     from soniqboom.core import ssrf_proxy as _ssrf_proxy
     await _ssrf_proxy.start()
 
-    # Rank the online lyrics providers (LRCLib, lyrics.ovh) by responsiveness so
-    # the faster one is tried first.  Background + best-effort — never blocks
-    # startup, and the lyrics endpoint falls back to the default order until it
-    # completes (it re-probes lazily thereafter).
-    from soniqboom.api.tracks import probe_lyrics_providers as _probe_lyrics
-    asyncio.create_task(_probe_lyrics())
+    # (The online lyrics providers are ranked by responsiveness on the first
+    # lyrics lookup, in the background — ``tracks._resolve_online_lyrics``.)
 
     # Arm the deadlock watchdog last — once everything else has loaded,
     # so a slow startup step (e.g. HVSC reindex) doesn't trip the
@@ -2157,6 +2770,14 @@ async def _cast_session_reaper():
             log.exception("cast reaper iteration failed (continuing)")
 
 
+def _busy_serving(source) -> bool:
+    """Is ``source`` moving file data right now (``serving_transfers``)?"""
+    try:
+        return bool(source.serving_transfers())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 async def _share_health_monitor():
     """Probe network shares periodically; flip status up and down as they come and go.
 
@@ -2178,6 +2799,10 @@ async def _share_health_monitor():
         with them again until it is over or the user presses Reconnect.
       * Only log + upsert the DB when the status actually *changes*, so a
         long outage doesn't spam the log.
+      * A probe that times out while the share's transfers are moving data
+        (``FileSource.serving_transfers`` — a scan holding every pooled FTP
+        connection) is no miss: the share is busy, not gone.  FTP probes go
+        on the ``browse`` lane, ahead of queued scan downloads.
     """
     from soniqboom.core.data import upsert_scan_dir
     from soniqboom.core.filesource import (
@@ -2197,97 +2822,204 @@ async def _share_health_monitor():
     PROBE_TIMEOUT = 10.0
 
     interval = BASE_INTERVAL
+    failed_passes = 0          # consecutive passes that raised
+
+    async def _probe_one(scan_root: str, source, loop) -> bool:
+        """Probe one share and publish a status change.  True = it is down."""
+        akey = source_auth_key(source)
+        if share_retry_wait(akey) > 0:
+            # The server refused this share's credentials: no probe (a
+            # WebDAV probe is a login) until its back-off is over.
+            return True
+        try:
+            ok = await asyncio.wait_for(
+                loop.run_in_executor(None, source.is_dir, "/"),
+                timeout=PROBE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # A probe that waited out its timeout behind transfers the share
+            # is serving (every pooled connection busy, data arriving) says
+            # "busy", not "gone": no miss, no change.
+            if _busy_serving(source):
+                log.debug("Share %s: probe timed out behind its transfers — busy, "
+                          "not counted", scan_root)
+                return last_status.get(scan_root, "ok") != "ok"
+            ok = False
+        except Exception:
+            ok = False
+
+        prev = last_status.get(scan_root, "ok")
+        if ok and prev == "ok" and _stored_unavailable(scan_root):
+            # Marked down by someone else (a refused sign-in, the folder
+            # availability probe while the source was missing) — and it
+            # answers: say so.  Catalogue roots keep their own offline
+            # hold (their source answers from the index, never the net).
+            prev = "unavailable"
+
+        if not ok and akey and getattr(source, "last_error_auth", False):
+            wait = note_share_auth_failure(akey, scan_root)
+            log.warning("Share %s: the server refused the credentials — not "
+                        "probing it for %.0f min; fix them or press Reconnect",
+                        scan_root, wait / 60)
+            fail_streak[scan_root] = fail_streak.get(scan_root, 0) + 1
+            if prev == "ok":
+                await _set_share_status(scan_root, "unavailable")
+                last_status[scan_root] = "unavailable"
+            return True
+
+        if ok:
+            reset_share_backoff(akey)
+            fail_streak[scan_root] = 0
+            if prev != "ok":
+                log.info("Share %s is back online", scan_root)
+                await _set_share_status(scan_root, "ok")
+                last_status[scan_root] = "ok"
+            return False
+
+        fail_streak[scan_root] = fail_streak.get(scan_root, 0) + 1
+        # First miss after being healthy: try an explicit reconnect —
+        # the source object may just have a stale socket.  Success here
+        # keeps the share "ok" without flipping state.
+        if prev == "ok" and fail_streak[scan_root] == 1:
+            try:
+                recovered = await loop.run_in_executor(None, source.reconnect)
+            except Exception:
+                recovered = False
+            if recovered:
+                # Verify: probe once more after reconnect.
+                try:
+                    ok2 = await asyncio.wait_for(
+                        loop.run_in_executor(None, source.is_dir, "/"),
+                        timeout=PROBE_TIMEOUT,
+                    )
+                except Exception:
+                    ok2 = False
+                if ok2:
+                    fail_streak[scan_root] = 0
+                    log.info("Share %s recovered via reconnect", scan_root)
+                    return True
+        # Still down — flip state only after FLIP_THRESHOLD misses,
+        # so one flaky probe doesn't alarm the UI.
+        if prev == "ok" and fail_streak[scan_root] >= FLIP_THRESHOLD:
+            log.warning("Share %s became unavailable", scan_root)
+            await _set_share_status(scan_root, "unavailable")
+            last_status[scan_root] = "unavailable"
+        return True
 
     while True:
         await asyncio.sleep(interval)
         loop = asyncio.get_running_loop()
         any_down = False
-
-        for scan_root, source in list(all_sources().items()):
-            akey = source_auth_key(source)
-            if share_retry_wait(akey) > 0:
-                # The server refused this share's credentials: no probe (a
-                # WebDAV probe is a login) until its back-off is over.
-                any_down = True
-                continue
-            try:
-                ok = await asyncio.wait_for(
-                    loop.run_in_executor(None, source.is_dir, "/"),
-                    timeout=PROBE_TIMEOUT,
-                )
-            except Exception:
-                ok = False
-
-            prev = last_status.get(scan_root, "ok")
-            if ok and prev == "ok" and _stored_unavailable(scan_root):
-                # Marked down by someone else (a refused sign-in, the folder
-                # availability probe while the source was missing) — and it
-                # answers: say so.  Catalogue roots keep their own offline
-                # hold (their source answers from the index, never the net).
-                prev = "unavailable"
-
-            if not ok and akey and getattr(source, "last_error_auth", False):
-                wait = note_share_auth_failure(akey, scan_root)
-                log.warning("Share %s: the server refused the credentials — not "
-                            "probing it for %.0f min; fix them or press Reconnect",
-                            scan_root, wait / 60)
-                any_down = True
-                fail_streak[scan_root] = fail_streak.get(scan_root, 0) + 1
-                if prev == "ok":
-                    await _set_share_status(scan_root, "unavailable")
-                    last_status[scan_root] = "unavailable"
-                continue
-
-            if ok:
-                reset_share_backoff(akey)
-                fail_streak[scan_root] = 0
-                if prev != "ok":
-                    log.info("Share %s is back online", scan_root)
-                    await _set_share_status(scan_root, "ok")
-                    last_status[scan_root] = "ok"
-            else:
-                fail_streak[scan_root] = fail_streak.get(scan_root, 0) + 1
-                any_down = True
-                # First miss after being healthy: try an explicit reconnect —
-                # the source object may just have a stale socket.  Success here
-                # keeps the share "ok" without flipping state.
-                if prev == "ok" and fail_streak[scan_root] == 1:
-                    try:
-                        recovered = await loop.run_in_executor(
-                            None, source.reconnect,
-                        )
-                    except Exception:
-                        recovered = False
-                    if recovered:
-                        # Verify: probe once more after reconnect.
-                        try:
-                            ok2 = await asyncio.wait_for(
-                                loop.run_in_executor(None, source.is_dir, "/"),
-                                timeout=PROBE_TIMEOUT,
-                            )
-                        except Exception:
-                            ok2 = False
-                        if ok2:
-                            fail_streak[scan_root] = 0
-                            log.info("Share %s recovered via reconnect", scan_root)
-                            continue
-                # Still down — flip state only after FLIP_THRESHOLD misses,
-                # so one flaky probe doesn't alarm the UI.
-                if prev == "ok" and fail_streak[scan_root] >= FLIP_THRESHOLD:
-                    log.warning("Share %s became unavailable", scan_root)
-                    await _set_share_status(scan_root, "unavailable")
-                    last_status[scan_root] = "unavailable"
-
-        # Configured shares with no source at all (their server was down at
-        # startup, or a connect failed): try them again.
         try:
-            if await _reconnect_pending_shares():
-                any_down = True
+            for scan_root, source in list(all_sources().items()):
+                try:
+                    if await _probe_one(scan_root, source, loop):
+                        any_down = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One share's failure (a status write, a broken source
+                    # object) never ends the pass for the others.
+                    any_down = True
+                    log.warning("Share health: probing %s failed", scan_root,
+                                exc_info=True)
+
+            # Configured shares with no source at all (their server was down
+            # at startup, or a connect failed): try them again.
+            try:
+                if await _reconnect_pending_shares():
+                    any_down = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("Retrying unconnected shares failed", exc_info=True)
+            failed_passes = 0
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            log.warning("Retrying unconnected shares failed", exc_info=True)
+            # A pass that raised (outside the per-share guard) is logged and
+            # retried with the down-share back-off — recovery never stops.
+            failed_passes += 1
+            any_down = True
+            if failed_passes == 1 or failed_passes & (failed_passes - 1) == 0:
+                log.exception("Share health pass failed (%d in a row) — retrying",
+                              failed_passes)
+            else:
+                log.warning("Share health pass failed (%d in a row)", failed_passes)
 
         # Adaptive cadence: back off while anything is down, snap back when healthy.
         interval = min(interval * 1.5, MAX_INTERVAL) if any_down else BASE_INTERVAL
+
+
+# Restart delays of the health monitor's supervisor (doubling, capped); a
+# monitor that ran this long before dying restarts at the base delay again.
+_HEALTH_RESTART_BASE_S = 5.0
+_HEALTH_RESTART_MAX_S = 300.0
+_HEALTH_RESTART_RESET_S = 600.0
+_health_stopping = False
+
+
+async def _share_health_supervisor():
+    """Run :func:`_share_health_monitor` for the server's lifetime: when it
+    raises, log it and start it again after a doubling delay.  Cancelling
+    this task (shutdown) cancels the monitor with it."""
+    delay = _HEALTH_RESTART_BASE_S
+    while True:
+        started = time.monotonic()
+        try:
+            await _share_health_monitor()
+            log.error("Share health monitor returned — restarting in %.0f s", delay)
+        except asyncio.CancelledError:
+            me = asyncio.current_task()
+            if _health_stopping or me is None or me.cancelling():
+                raise                       # this task is being cancelled (shutdown)
+            # A cancellation raised by something the monitor awaited, not
+            # aimed at this task: the monitor ended — restart it.
+            log.error("Share health monitor was cancelled from inside — restarting "
+                      "in %.0f s", delay)
+        except Exception:
+            log.exception("Share health monitor crashed — restarting in %.0f s", delay)
+        if time.monotonic() - started >= _HEALTH_RESTART_RESET_S:
+            delay = _HEALTH_RESTART_BASE_S
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _HEALTH_RESTART_MAX_S)
+
+
+def _start_share_health_monitor() -> "asyncio.Task":
+    """Start the supervised share health monitor; a task that ends while the
+    server is not stopping is started again (``_on_health_task_done``)."""
+    global _health_task, _health_stopping
+    _health_stopping = False
+    _health_task = asyncio.create_task(_share_health_supervisor(),
+                                       name="share-health-monitor")
+    _health_task.add_done_callback(_on_health_task_done)
+    return _health_task
+
+
+def _on_health_task_done(task: "asyncio.Task") -> None:
+    if _health_stopping or task is not _health_task:
+        return                              # shutdown, or already replaced
+    exc = None if task.cancelled() else task.exception()
+    log.error("Share health monitor task ended unexpectedly (%r) — restarting in %.0f s",
+              exc, _HEALTH_RESTART_BASE_S)
+
+    def _restart() -> None:
+        if not _health_stopping and _health_task is task:
+            _start_share_health_monitor()
+    task.get_loop().call_later(_HEALTH_RESTART_BASE_S, _restart)
+
+
+async def _stop_share_health_monitor(timeout: float = 1.0) -> None:
+    """Cancel the health monitor (shutdown); no restart follows."""
+    global _health_stopping
+    _health_stopping = True
+    t = _health_task
+    if t and not t.done():
+        t.cancel()
+        try:
+            await asyncio.wait_for(t, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
 
 
 def _stored_unavailable(scan_root: str) -> bool:
@@ -2317,6 +3049,87 @@ async def _set_share_status(scan_root: str, status: str) -> None:
                 status=status,
             )
             return
+
+
+def _background_writer_tasks() -> list:
+    """The tasks outside the scanner that write the store and are stopped
+    with the scans (``scanner.stop_background_writers``' ``extra``): the admin
+    API's remote scans and jobs, catalogue builds and merges, the online
+    collections' jobs (told to stop at their next request), Track Info reads."""
+    extra: list = []
+    try:
+        from soniqboom.api import admin as _admin
+        extra = [*_admin._bg_scan_tasks, *_admin._BG_TASKS]
+    except Exception:
+        log.debug("admin background tasks not listed", exc_info=True)
+    try:
+        from soniqboom.core import modland_catalog
+        extra.extend(modland_catalog._tasks)       # catalogue builds / merges
+        from soniqboom.core import online_catalog
+        online_catalog.signal_stop()               # a running listing ends at its next request
+        extra.extend(online_catalog.all_tasks())   # online collections' jobs / merges
+        from soniqboom.api import stream as _stream_mod
+        extra.extend(_stream_mod._INFO_READ_TASKS)  # Track Info reads, merge watchers
+    except Exception:
+        log.debug("catalogue tasks not listed", exc_info=True)
+    return extra
+
+
+async def quiesce_for_exec() -> None:
+    """The source install's restart (``admin._graceful_pre_exec_flush``, on
+    this loop), before the journal is sealed: what the stop's first steps
+    stop — the playback work (renderers, temp files: ``core.playback_stop``),
+    the share health monitor, the folder watcher and its supervisor,
+    the remote freshness loops, the availability watch (it re-probes local
+    roots and records their status), the index-integrity sweep, a pending
+    startup reconcile and the duplicate re-group runner (its pending work
+    saved) — then the scans and the passes that write the store (as the
+    stop's step 1b).  Each step bounded like the stop's."""
+    t0 = time.monotonic()
+    if _reconcile_handle is not None:
+        _reconcile_handle.cancel()
+
+    async def _bounded(name: str, coro, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except Exception:                                   # noqa: BLE001 (incl. timeout)
+            log.warning("Pre-restart stop of the %s failed or timed out — continuing",
+                        name, exc_info=True)
+
+    # Renders, transcodes, pumps and prewarms first: ``os.execv`` keeps the
+    # pid, so a renderer left running would stay this process's child — never
+    # waited for (a zombie once it ends) — and go on writing its temp file.
+    from soniqboom.core.playback_stop import stop_playback_work
+    await _bounded("playback work", stop_playback_work(), 4.5)
+    await _stop_share_health_monitor(timeout=1.0)
+
+    from soniqboom.core import remote_freshness, watcher
+    await _bounded("folder watcher", watcher.stop(), 3.0)
+    await _bounded("remote freshness polls", remote_freshness.stop(), 5.0)
+    for stop_one in ("availability", "index_health", "dup_runner"):
+        try:
+            if stop_one == "availability":
+                from soniqboom.core import availability
+                availability.uninstall()
+            elif stop_one == "index_health":
+                from soniqboom.core import index_health
+                index_health.stop()
+            else:
+                from soniqboom.core.scanner import cancel_background_tasks
+                cancel_background_tasks()
+        except Exception:                                   # noqa: BLE001
+            log.debug("pre-restart stop of %s failed", stop_one, exc_info=True)
+    from soniqboom.core.scanner import stop_background_writers
+    await _bounded("scans and passes", stop_background_writers(_background_writer_tasks(),
+                                                               timeout=3.0), 4.0)
+    log.info("Pre-restart: background work stopped in %dms", (time.monotonic() - t0) * 1000)
+
+
+def _snapshot_skippable(aof_ok: bool, journal_ended: bool, aof_bytes: int, max_mb: float) -> bool:
+    """The stop's full snapshot may be skipped: the AOF flushed cleanly and is
+    lean (``max_mb``) — and the journal hadn't already ended before the stop
+    (a failed exec restart: the writes since are in memory only)."""
+    return aof_ok and not journal_ended and aof_bytes <= max_mb * 1024 * 1024
 
 
 @app.on_event("shutdown")
@@ -2388,6 +3201,14 @@ async def shutdown():
     for _t in list(_BG_TASKS):
         if not _t.done():
             _t.cancel()
+
+    # Renders, transcodes, pumps and prewarms: their renderer processes and
+    # temp files must not outlive the process (uvicorn re-raises the signal
+    # once this stop returns — nothing runs after it; ``core.playback_stop``).
+    async def _stop_playback() -> None:
+        from soniqboom.core.playback_stop import stop_playback_work
+        await stop_playback_work()
+    await _step("playback", _stop_playback(), 4.5)
 
     # Stop the deadlock watchdog so its asyncio.sleep doesn't keep the
     # event loop alive past the shutdown budget.  Idempotent.
@@ -2480,12 +3301,7 @@ async def shutdown():
             log.exception("close_cast_sessions failed")
     await _step("cast-sessions", _close_cast_sessions(), 3.0)
 
-    if _health_task and not _health_task.done():
-        _health_task.cancel()
-        try:
-            await asyncio.wait_for(_health_task, timeout=1.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
+    await _stop_share_health_monitor(timeout=1.0)
     try:
         from soniqboom.core import availability
         availability.uninstall()
@@ -2519,6 +3335,23 @@ async def shutdown():
 
     await _step("websockets", _close_all_ws(), timeout=3.0)
 
+    # ── Step 1a: sign-in sessions → sessions.json (a coalesced write may
+    # still be pending; they are restored at the next start) ──────────────
+    async def _flush_sessions() -> None:
+        from soniqboom.core.users import get_user_store
+        await asyncio.to_thread(get_user_store().flush_sessions)
+
+    await _step("sessions", _flush_sessions(), timeout=2.0)
+
+    # ── Step 1a': the shared outbound HTTP clients (scrobbling, lyrics) are
+    # bound to this run's event loop: closed with it (the bundled app's next
+    # run, on a new loop, makes new ones) ──────────────────────────────────
+    async def _close_http_clients() -> None:
+        from soniqboom.core import scrobble as _scrobble
+        await _scrobble.shutdown()
+        await tracks.shutdown_lyrics_client()
+
+    await _step("http-clients", _close_http_clients(), timeout=2.0)
 
     # ── Step 1b: scans + enrichment passes (3 s budget) ───────────────────
     # Stopped BEFORE the journal's final flush: a scan or post-scan pass still
@@ -2529,18 +3362,7 @@ async def shutdown():
     # admin API's tasks.
     async def _stop_writers() -> None:
         from soniqboom.core.scanner import stop_background_writers
-        extra: list = []
-        try:
-            from soniqboom.api import admin as _admin
-            extra = [*_admin._bg_scan_tasks, *_admin._BG_TASKS]
-        except Exception:
-            log.debug("admin background tasks not listed", exc_info=True)
-        try:
-            from soniqboom.core import modland_catalog
-            extra.extend(modland_catalog._tasks)       # catalogue builds / merges
-        except Exception:
-            log.debug("catalogue tasks not listed", exc_info=True)
-        await stop_background_writers(extra, timeout=3.0)
+        await stop_background_writers(_background_writer_tasks(), timeout=3.0)
     await _step("scans", _stop_writers(), timeout=4.0)
 
     # ── Step 2: AOF flush + close fd (flock budget + 1 s) ─────────────────
@@ -2557,6 +3379,10 @@ async def shutdown():
     except Exception:
         log.debug("finalize_dup_pending failed", exc_info=True)
     aof_ok = False
+    # The journal already ended when this stop began: the source install's
+    # restart sealed it and its exec failed — writes since then are in memory
+    # only (set aside, never replayed): the snapshot below is not optional.
+    journal_ended = bool(_aof_writer) and bool(getattr(_aof_writer, "sealed", False))
     if _aof_writer:
         from soniqboom.core.aof import AOFWriter as _AOFWriter
         _aof_writer.cancel_flush_task()
@@ -2594,13 +3420,15 @@ async def shutdown():
         _aof_bytes = (get_data_dir() / "library.aof").stat().st_size
     except OSError:
         _aof_bytes = 0
-    if aof_ok and _aof_bytes <= _max_aof_mb * 1024 * 1024:
+    if _snapshot_skippable(aof_ok, journal_ended, _aof_bytes, _max_aof_mb):
         log.info("Shutdown step snapshot: SKIPPED — AOF flushed cleanly and lean "
                  "(%.2f MB ≤ %.0f MB); next boot replays it, so the full snapshot "
                  "write is unnecessary.", _aof_bytes / 1e6, _max_aof_mb)
         _results["snapshot"] = "skipped"
     else:
-        reason = "AOF flush incomplete" if not aof_ok else f"AOF is large ({_aof_bytes / 1e6:.1f} MB)"
+        reason = ("the journal had ended (a failed restart)" if journal_ended
+                  else "AOF flush incomplete" if not aof_ok
+                  else f"AOF is large ({_aof_bytes / 1e6:.1f} MB)")
         log.info("Shutdown: writing the full snapshot (%s).", reason)
         await _step("snapshot", _write_snap(), timeout=10.0)
 
@@ -2728,6 +3556,10 @@ async def shutdown():
         (time.monotonic() - t_total) * 1000,
     )
     await _release_thread_pool(_results)
+    # (A later run in this process — the bundled app's Start — starts
+    # renderers again; this run's tasks are gone with its loop.)
+    from soniqboom.core import forksafe as _fs_reopen
+    _fs_reopen.open_spawns()
     _release_server()
 
 
@@ -2744,6 +3576,19 @@ if FRONTEND_DIR.exists():
 if DOCS_DIR.is_dir():
     log.info("Serving user manual from %s", DOCS_DIR)
     app.mount("/manual", StaticFiles(directory=DOCS_DIR, html=True), name="manual")
+
+def _shell_file(request: "Request | None", path: Path):
+    """An HTML shell (``/``, ``/m``, ``/multiroom``) with its JS URLs versioned
+    by content (``core.shell_html``): ETag, and a 304 when the browser's copy
+    is current (the shells are ``no-cache``, so every load asks)."""
+    from fastapi.responses import Response
+    from soniqboom.core import shell_html
+    body, etag = shell_html.render_shell(path, FRONTEND_DIR / "js")
+    headers = {"ETag": etag}
+    if request is not None and shell_html.shell_etag(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="text/html; charset=utf-8", headers=headers)
+
 
 if FRONTEND_DIR.exists():
     # Service Worker for the offline shell (PERC-6).  Must be served from
@@ -2768,7 +3613,7 @@ if FRONTEND_DIR.exists():
 
     @app.get("/m", include_in_schema=False)
     @app.get("/m/{rest:path}", include_in_schema=False)
-    async def mobile_shell(rest: str = ""):
+    async def mobile_shell(request: Request, rest: str = ""):
         # Plain serve — deliberately does NOT pin sb_ui=mobile.  Setting a
         # sticky cookie here had a nasty side effect: the service worker
         # precaches ``/m`` (and any link/prefetch hits it too), so a desktop
@@ -2777,7 +3622,7 @@ if FRONTEND_DIR.exists():
         # mobile pinning still happens via the explicit ``?ui=mobile``
         # override on ``/``; real phones get ``/m`` via UA sniffing each
         # visit (cheap), so losing the optimization costs nothing.
-        return FileResponse(FRONTEND_DIR / "mobile.html")
+        return _shell_file(request, FRONTEND_DIR / "mobile.html")
 
     # ``/multiroom`` HTML shell is gated on the multiroom service toggle —
     # disable in Settings → Services to hide the page entirely (404 from
@@ -2785,8 +3630,8 @@ if FRONTEND_DIR.exists():
     if _svc_on("multiroom"):
         @app.get("/multiroom", include_in_schema=False)
         @app.get("/multiroom/{rest:path}", include_in_schema=False)
-        async def multiroom_shell(rest: str = ""):
-            return FileResponse(FRONTEND_DIR / "multiroom.html")
+        async def multiroom_shell(request: Request, rest: str = ""):
+            return _shell_file(request, FRONTEND_DIR / "multiroom.html")
 
     # Mobile user agents that should get the mobile shell on / by default.
     # The user can override either way: append ``?ui=desktop`` (or ``?ui=mobile``)
@@ -2810,7 +3655,7 @@ if FRONTEND_DIR.exists():
         if override in ("desktop", "mobile"):
             resp = (RedirectResponse("/m", status_code=302)
                     if override == "mobile" else
-                    FileResponse(FRONTEND_DIR / "index.html"))
+                    _shell_file(None, FRONTEND_DIR / "index.html"))
             resp.set_cookie("sb_ui", override, max_age=60 * 60 * 24 * 365,
                             samesite="lax")
             return resp
@@ -2819,13 +3664,13 @@ if FRONTEND_DIR.exists():
         if pinned == "mobile":
             return RedirectResponse("/m", status_code=302)
         if pinned == "desktop":
-            return FileResponse(FRONTEND_DIR / "index.html")
+            return _shell_file(request, FRONTEND_DIR / "index.html")
         # First visit: route phones to the mobile shell.  iPads + desktops
         # still get the rich UI because the regex deliberately excludes them.
         ua = request.headers.get("user-agent", "")
         if _MOBILE_UA_RE.search(ua):
             return RedirectResponse("/m", status_code=302)
-        return FileResponse(FRONTEND_DIR / "index.html")
+        return _shell_file(request, FRONTEND_DIR / "index.html")
 
     # SPA fallback MUST be registered after explicit "/" — Starlette's
     # ``{full_path:path}`` converter matches empty string, so ``/`` would
@@ -2838,7 +3683,7 @@ if FRONTEND_DIR.exists():
         # (Unknown /rest paths get a Subsonic envelope from api/subsonic.)
         if full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(FRONTEND_DIR / "index.html")
+        return _shell_file(None, FRONTEND_DIR / "index.html")
 else:
     log.error(
         "Frontend directory not found — UI will return 404. "

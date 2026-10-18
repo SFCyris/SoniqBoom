@@ -7,7 +7,7 @@
  */
 import { Player } from '../player.js';
 import { Sync } from './sync.js';
-import { artPlaceholderEmoji } from '../utils.js';
+import { artPlaceholderEmoji, staticArtUrl } from '../utils.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -124,7 +124,7 @@ function _renderCard(track) {
   $('mr-slave-title').textContent = track.title || '(Untitled)';
   $('mr-slave-artist').textContent = track.artist || track.album_artist || '';
   // Same format-aware fallback as master.js — see comment there.
-  const src = track.cover_art || (track.id ? `/api/art/${track.id}?size=lg&fallback=404` : '');
+  const src = staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/lg.jpg?fallback=none` : '');
   artEl.innerHTML = `<span class="mr-art-ph">${artPlaceholderEmoji(track)}</span>` +
     (src ? `<img class="mr-art-img" src="${_esc(src)}" alt="">` : '');
   const _mrImg = artEl.querySelector('.mr-art-img');

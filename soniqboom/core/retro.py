@@ -29,7 +29,7 @@ _TRACKER = {
     "Impulse Tracker", "MultiTracker", "OctaMED", "Composer 669",
     "DigiBooster Pro", "UltraTracker", "Farandole", "ASYLUM/DMP",
     "General DigiMusic", "Imago Orpheus", "Oktalyzer", "SoundFX",
-    "Grave Composer", "DSIK",
+    "Grave Composer", "DSIK", "Face The Music",
 }
 _AHX = {"AHX", "HivelyTracker"}                       # Amiga synth (not sample)
 _ADLIB = {
@@ -143,7 +143,8 @@ def chip_family(fmt: str | None) -> str | None:
 # — covers the DSD quality tiers DSD64/128/256/512, WavPack, TTA — imported
 # lazily in coarse_family so this never re-declares/drifts from it).  Every other
 # chip_family==None format the scanner can stamp is recorded LOSSY audio.
-_LOSSY_NAMES = frozenset({"MP3", "AAC", "Ogg Vorbis", "Opus", "Musepack", "M4A", "WMA"})
+_LOSSY_NAMES = frozenset({"MP3", "AAC", "Ogg Vorbis", "Opus", "Musepack", "M4A", "WMA",
+                          "MP2", "MP1", "MPEG audio"})       # (Aminet's .mpg uploads)
 # fine chip_family -> coarse family.  Anything chip-ish not listed defaults to
 # chiptune (a new console chip should read as chiptune, never leak to "other").
 _COARSE_BY_CHIP = {
