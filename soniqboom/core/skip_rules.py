@@ -8,8 +8,10 @@ follows (``core/availability.py``): a track the queue moves on to by itself
 listener clicks still plays.
 
 * **Reported problems** (GitHub #36): a track marked *broken* by a user with
-  edit rights (``health == "broken"``), and a file no engine can decode
-  (``defect == "corrupt"``).  *Glitched* marks and *partial* defects are only
+  edit rights (``health == "broken"``), a file no engine can decode
+  (``defect == "corrupt"``) and one its renderer refused the same way twice
+  when it was played (``defect == "unplayable"``, ``core/unplayable.py`` —
+  a click renders it again).  *Glitched* marks and *partial* defects are only
   shown, never skipped.  The mark lives on the track (``health``,
   ``health_note``, ``health_by``, ``health_at``, ``health_renderer``), is
   carried over rescans (``store._carry_enrichment``) and is set on every copy
@@ -44,6 +46,9 @@ SHORT_KEY = "skip_short_tunes"
 SHORT_CHOICES = (0, 5, 10, 20, 30)
 
 STATES = ("broken", "glitched")
+# Defects auto-play passes by: a file no engine decodes (found at scan) and
+# one its renderer refused twice when played (``core/unplayable.py``).
+_UNPLAYABLE_DEFECTS = ("corrupt", "unplayable")
 HEALTH_FIELDS = ("health", "health_note", "health_by", "health_at", "health_renderer")
 REG_KEY = "health_marks"
 NOTE_MAX = 200
@@ -276,7 +281,7 @@ def file_skipped(t: dict, secs: int) -> bool:
     """Does auto-play pass the file ``t`` (its bare play) by?"""
     if not isinstance(t, dict):
         return False
-    if t.get("health") == "broken" or t.get("defect") == "corrupt":
+    if t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS:
         return True
     return tune_is_short(t, 0, secs)
 
@@ -292,7 +297,7 @@ def entry_skipped(tid: str, wire: int = 0, store=None) -> bool:
     t = store.get_track(tid)
     if not isinstance(t, dict):
         return False
-    if t.get("health") == "broken" or t.get("defect") == "corrupt":
+    if t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS:
         return True
     return tune_is_short(t, int(wire or 0), short_secs(store))
 
@@ -353,7 +358,7 @@ def _scan(store, secs: int) -> frozenset:
     ph = tuple(placeholder_seconds(store))
     out = []
     for tid, t in list((getattr(store, "_tracks", {}) or {}).items()):
-        if (t.get("health") == "broken" or t.get("defect") == "corrupt"
+        if (t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS
                 or (secs and _default_short(t, secs, ph))):
             out.append(tid)
     return frozenset(out)

@@ -15,7 +15,7 @@ import { Player }              from './player.js';
 import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
          subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from './tunes.js';
-import { healthOf, healthBadge, reportedLine, canReport, mark as healthMark, isUnplayable } from './health.js';
+import { healthOf, healthBadge, reportedLine, foundLine, canReport, mark as healthMark, isUnplayable } from './health.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 
@@ -1481,7 +1481,10 @@ function _renderHealth(track) {
         const reported = h.key === 'broken' || h.key === 'glitched';
         _defectDetail.textContent = reported
           ? [reportedLine(track), track.health_note ? `“${track.health_note}”` : ''].filter(Boolean).join(' · ')
-          : (track.defect_detail || '');
+          : h.key === 'unplayable'
+            ? [track.defect_detail ? `${String(track.defect_detail).replace(/[.\s]+$/, '')}.` : '', foundLine(track)]
+                .filter(Boolean).join(' ')
+            : (track.defect_detail || '');
       }
       _defectField.style.display = '';
     }
@@ -1507,11 +1510,13 @@ function _renderHealth(track) {
   }
 }
 // A track that doesn't play (health.js isUnplayable: no engine decodes it,
-// an archive that can't be opened, a package with no tune in it): the box
+// an archive that can't be opened, one its renderer refused twice, a
+// package with no tune in it): the box
 // under the art says so in place of the audio facts ("— / —", "— · —"), and
 // no decode path is drawn.
 function _unplayableWord(t) {
   if (t.defect === 'empty') return 'No playable tunes';
+  if (t.defect === 'unplayable') return 'Can’t be played here';
   return /^The archive is damaged/.test(String(t.defect_detail || '')) ? 'Can’t be opened' : 'Can’t be decoded';
 }
 // "Track 5 of 19 · title" — just the title for a track that left the library

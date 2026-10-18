@@ -112,6 +112,7 @@ log = logging.getLogger(__name__)
 from soniqboom.core import playback_io as _playback_io
 from soniqboom.core import procinfo as _procinfo
 from soniqboom.core import render_tmp as _render_tmp
+from soniqboom.core import unplayable as _unplayable
 
 # Renders' and transcodes' temp files go in this server image's own temp
 # folder (``core.render_tmp``): the stop removes it once its renderers are
@@ -1222,8 +1223,17 @@ async def _hold_until_done(aw, on_cancel=None):
 
 
 def _renderer_failure(kind: str, binary: str, returncode, err_text: str, *,
-                      module_path: "Path | None" = None) -> HTTPException:
+                      module_path: "Path | None" = None, audio: bool = False,
+                      tiny: bool = False) -> HTTPException:
     """Map a renderer's non-zero exit + stderr to the HTTP error the player shows.
+
+    A failure that says the file can't be played by this renderer
+    (``core/unplayable.classify``; ``audio``: it wrote audio before it
+    failed — then it is never that; ``tiny``: less than a second of it) is a
+    ``RenderRefusal``: the same status and text; when a second render refuses
+    it the same way, the track may be marked (``unplayable.render_checked`` —
+    a render of the file's default tune, of a file the library lists as it
+    is, by a renderer that hasn't refused everything).
 
     uade prints "module check failed" to stderr ONLY when the input isn't a
     real Amiga module — e.g. a PC ``.dat`` misindexed as PaulRobotham by
@@ -1242,20 +1252,20 @@ def _renderer_failure(kind: str, binary: str, returncode, err_text: str, *,
     if kind == "uade" and "please depack" in low:
         # uade names the packer ("The file is SQSH packed") — a packed file
         # the server couldn't unpack before handing it over.
-        return HTTPException(
-            422,
+        return _unplayable.refusal(
+            kind, 422,
             "This Amiga module is packed with a cruncher that can't be "
             "unpacked here — unpack it first (e.g. with amigadepacker).",
-        )
+            returncode, err_text, audio=audio, tiny=tiny)
     if kind == "uade" and "module check failed" in low:
-        return HTTPException(
-            422,
+        return _unplayable.refusal(
+            kind, 422,
             "This file isn't a playable Amiga module — it looks "
             "like non-module data (e.g. a PC/DOS file) indexed by "
             "mistake.",
-        )
+            returncode, err_text, audio=audio, tiny=tiny)
     if (kind == "uade" and module_path is not None
-            and ("score died" in low or "can not play" in low)):
+            and ("score died" in low or "can not play" in low or "score crashed" in low)):
         missing = _missing_companion_names(Path(module_path))
         if missing is not None:
             log.info("uade render of %s failed without its companion file "
@@ -1290,7 +1300,22 @@ def _renderer_failure(kind: str, binary: str, returncode, err_text: str, *,
         log.warning(
             "%s renderer failed (exit %s): %s", kind,
             returncode, err_text.strip()[:500])
-    return HTTPException(502, f"{kind} renderer exited with status {returncode}")
+    return _unplayable.refusal(kind, 502, f"{kind} renderer exited with status {returncode}",
+                               returncode, err_text, audio=audio, tiny=tiny)
+
+
+def _uade_companion_failure(module_path: Path) -> "HTTPException | None":
+    """The 422 for a uade module whose companion half isn't beside it
+    (``_missing_companion_names``), else None.  One directory listing."""
+    missing = _missing_companion_names(Path(module_path))
+    if missing is None:
+        return None
+    eg = f" (e.g. {' / '.join(missing)})" if missing else ""
+    return HTTPException(
+        422,
+        "This Amiga module couldn't be played — it probably needs a "
+        f"companion sample file{eg} that isn't next to it.",
+    )
 
 
 def _missing_companion_names(module_path: Path) -> "list[str] | None":
@@ -1377,9 +1402,11 @@ async def _await_renderer(
                 Path(tmp_path).unlink(missing_ok=True)
                 raise HTTPException(504, f"{kind} render timed out after {int(timeout)}s")
             if proc.returncode != 0:
+                had_audio = _render_has_audio(Path(tmp_path))
                 Path(tmp_path).unlink(missing_ok=True)
                 err_text = (stderr_data or b"").decode("utf-8", "replace")
-                raise _renderer_failure(kind, cmd[0], proc.returncode, err_text)
+                raise _renderer_failure(kind, cmd[0], proc.returncode, err_text,
+                                        audio=had_audio)
             # Exit 0 is not proof of audio: zxtune exits 0 without writing
             # anything when a PSF's library is missing.  No output (or a bare
             # WAV header) is a failure the listener is told about, not a
@@ -1389,8 +1416,7 @@ async def _await_renderer(
                 err_text = (stderr_data or b"").decode("utf-8", "replace").strip()
                 log.warning("%s renderer exited 0 without audio for %s: %s",
                             kind, cmd[-1], err_text[:300])
-                raise HTTPException(
-                    422, "The renderer finished but produced no audio for this file.")
+                raise _unplayable.no_audio(kind, err_text)
         finally:
             # If we got here on cancel/timeout/error, make sure the subprocess
             # is dead and the temp file is gone.  Idempotent — successful
@@ -3520,7 +3546,8 @@ async def _render_gme_external(path: Path, out: Path, subsong: int, duration) ->
         if subsong > 0:
             cmd += ["-track_index", str(subsong)]
         cmd += ["-i", str(path), "-y", str(out)]
-    await _await_renderer(cmd, out, timeout=duration + 30, kind="GME")
+    # (ffmpeg's failure is not libgme's: never a can't-play mark — core/unplayable)
+    await _await_renderer(cmd, out, timeout=duration + 30, kind="GME" if gme_bin else "GME-ffmpeg")
     return out
 
 
@@ -4877,37 +4904,48 @@ async def _run_zxtune_to_cap(cmd: list[str], out: Path, cap_bytes: int, *,
     ``out`` holds ``cap_bytes`` of audio (then it is killed).  True when the
     cap was reached; a run past ``wall_s`` is a 504, a failed one a 502."""
     capped = False
-    async with _render_sem:
-        proc = await forksafe.spawn(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    # (its stderr to a file: a refusal is classified by it — core/unplayable)
+    err_f = tempfile.TemporaryFile(dir=_rtmp())
+    try:
+        async with _render_sem:
+            proc = await forksafe.spawn(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=err_f)
+            try:
+                deadline = time.monotonic() + wall_s
+                while proc.returncode is None:
+                    try:
+                        size = out.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size >= _WAV_HEADER_LEN + cap_bytes:
+                        capped = True
+                        break
+                    if time.monotonic() > deadline:
+                        raise HTTPException(504, f"{kind} render timed out")
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=_ZXTUNE_POLL_S)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except Exception:
+                        pass
         try:
-            deadline = time.monotonic() + wall_s
-            while proc.returncode is None:
-                try:
-                    size = out.stat().st_size
-                except OSError:
-                    size = 0
-                if size >= _WAV_HEADER_LEN + cap_bytes:
-                    capped = True
-                    break
-                if time.monotonic() > deadline:
-                    raise HTTPException(504, f"{kind} render timed out")
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=_ZXTUNE_POLL_S)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except Exception:
-                    pass
+            err_f.seek(0)
+            err_text = err_f.read(8192).decode("utf-8", "replace")
+        except OSError:
+            err_text = ""
+    finally:
+        err_f.close()
     if not capped and proc.returncode != 0:
-        raise HTTPException(502, f"{kind} renderer exited with status {proc.returncode}")
+        raise _unplayable.refusal(kind, 502, f"{kind} renderer exited with status {proc.returncode}",
+                                  proc.returncode, err_text, audio=_render_has_audio(out))
     return capped
 
 
@@ -4934,7 +4972,7 @@ async def _render_zxtune_capped(path: Path, *, kind: str) -> Path:
         if capped:
             await asyncio.wrap_future(_pb_submit(_cap_and_fade_wav, out, cap_bytes, _ZXTUNE_FADE_S))
         if not _render_has_audio(out):
-            raise HTTPException(422, "The renderer finished but produced no audio for this file.")
+            raise _unplayable.no_audio(kind)
         ok = True
         return out
     finally:
@@ -5512,13 +5550,13 @@ async def _tail_render(cmd: list[str], src: Path, live_key: "str | None", *, kin
             if state["capped"]:
                 raise HTTPException(502, f"{kind} renderer wrote audio that can't be cut")
             raise _renderer_failure(kind, cmd[0], proc.returncode,
-                                    bytes(err_ring).decode("utf-8", "replace"))
+                                    bytes(err_ring).decode("utf-8", "replace"),
+                                    audio=(live.written > 0 or _render_has_audio(src)))
         if not state["ok"]:
             # Not followable live: the renderer's own file is the render.
             live.abandon()
             if require_audio and not _render_has_audio(src):
-                raise HTTPException(
-                    422, "The renderer finished but produced no audio for this file.")
+                raise _unplayable.no_audio(kind, bytes(err_ring).decode("utf-8", "replace"))
             ok = True
             return src
         out = live.finish()
@@ -5526,8 +5564,7 @@ async def _tail_render(cmd: list[str], src: Path, live_key: "str | None", *, kin
             log.warning("%s renderer exited 0 without audio for %s: %s", kind, cmd[-1],
                         bytes(err_ring).decode("utf-8", "replace").strip()[:300])
             live.clean = False
-            raise HTTPException(
-                422, "The renderer finished but produced no audio for this file.")
+            raise _unplayable.no_audio(kind, bytes(err_ring).decode("utf-8", "replace"))
         ok = True
         src.unlink(missing_ok=True)
         return out
@@ -5940,17 +5977,44 @@ async def _render_uade_file(path: Path, subsong: int = 0, with_vu: bool = True, 
                         err_task.cancel()
                 finally:
                     forksafe.close_stdout(proc)
+            err = bytes(err_ring).decode("utf-8", "replace")
+            # (under a second of output from a player that crashed is no tune)
+            tiny = 0 < lw.written < _UADE_BYTES_PER_SEC
             if proc.returncode != 0:
-                raise _renderer_failure("uade", binary, proc.returncode,
-                                        bytes(err_ring).decode("utf-8", "replace"),
-                                        module_path=path)
+                raise _renderer_failure("uade", binary, proc.returncode, err,
+                                        module_path=path, audio=lw.written > 0, tiny=tiny)
             if lw.written <= 0:
                 # uade exited cleanly but its player crashed before the first
                 # sample ("score crashed"): a listener-facing reason, the raw
-                # text in the log.
+                # text in the log.  (A module whose companion half is missing
+                # says that instead — never a refusal of the file.)
                 log.info("uade123 produced no audio for %s: %s", path.name,
-                         bytes(err_ring).decode("utf-8", "replace").strip()[-300:])
-                raise HTTPException(502, "The Amiga player couldn't render this module.")
+                         err.strip()[-300:])
+                companion = _uade_companion_failure(path)
+                if companion is not None:
+                    raise companion
+                raise _unplayable.refusal("uade", 502,
+                                          "The Amiga player couldn't render this module.", 0, err)
+            crashed = (_unplayable.refusal("uade", 502,
+                                           "The Amiga player couldn't render this module.",
+                                           0, err, audio=True, tiny=True) if tiny else None)
+        if isinstance(crashed, _unplayable.RenderRefusal):
+            # Under a second of output from a player that crashed: when it
+            # holds nothing audible (no listener was ever attached to it —
+            # ``_LiveWav`` attaches one only once it is audible) it is no
+            # tune but the crash.
+            from soniqboom.core.silence import wav_audible
+            out = lw.finish()
+            try:
+                audible = await asyncio.to_thread(wav_audible, out)
+            except Exception:                           # noqa: BLE001
+                audible = None
+            if audible is False and _uade_companion_failure(path) is None:
+                out.unlink(missing_ok=True)
+                log.info("uade123 crashed after %d silent bytes of %s: %s", lw.written,
+                         path.name, err.strip()[-300:])
+                raise crashed
+            return out
         # The file is self-consistent whatever the real length turned out to
         # be: the header is rewritten to the bytes that actually landed.  When
         # a length was promised up front and the render lands within a second
@@ -7162,7 +7226,7 @@ async def _render_psf(path: Path, subsong: int = 0, *,
         if await _run_zxtune_to_cap(cmd, out, cap_bytes, kind="PSF", wall_s=600):
             await asyncio.wrap_future(_pb_submit(_cap_and_fade_wav, out, cap_bytes, fade))
         if not _render_has_audio(out):
-            raise HTTPException(422, "The renderer finished but produced no audio for this file.")
+            raise _unplayable.no_audio("PSF")
         ok = True
         return out
     finally:
@@ -7497,11 +7561,11 @@ async def _render_sc68(path: Path, subsong: int = 0) -> Path:
                 raise HTTPException(504, "sc68 render timed out")
         raw_size = Path(tmp_raw.name).stat().st_size
         if proc.returncode != 0 or raw_size < 8820:   # <0.05 s → failed
-            raise HTTPException(
-                422,
+            raise _unplayable.refusal(
+                "sc68", 422,
                 "This .sc68 file couldn't be decoded — it may be corrupt or "
                 "use an unsupported variant.",
-            )
+                proc.returncode, "", audio=raw_size >= 8820)
         # RIFF sizes are uint32 — a runaway/looping disk that outrendered the
         # timeout budget would overflow struct.pack into an unclean 500
         # (QA C1).  2 GB ≈ 3.4 h of audio: nothing legitimate.
@@ -10856,6 +10920,16 @@ async def render_status(
         if fail is not None:
             out["error"] = fail["detail"]
             out["error_status"] = fail["status"]
+    if state == "failed" and track is not None:
+        from soniqboom.core.conversion_cache import recent_refusal
+        refused = recent_refusal(track_id, idx)
+        if refused is not None and getattr(track, "defect", None) == _unplayable.DEFECT:
+            # This render ended in a verified refusal (its renderer refused the
+            # file twice — core/unplayable.py): the player says why — once,
+            # with no "Mark broken" — and every copy it holds takes the mark.
+            out["error"], out["error_status"] = refused.detail, refused.status_code
+            for f in _unplayable.PUBLIC_FIELDS:
+                out[f] = getattr(track, f, None)
     # Live renders (uade and the others) are keyed per subsong, so tune N
     # never reports tune 0's length.  A scan of a tiny map, O(1) lookups.
     out["provisional"] = any(
@@ -11160,10 +11234,14 @@ async def _do_prewarm_render(
         if (ext == ".psf" and not uade_named
                 and not await asyncio.to_thread(_psf_has_magic, file_path)):
             uade_named = True              # Amiga SoundFactory, as in stream_track
+        bare = subsong is None
         if subsong is None:              # the file's default tune (probed once)
             track = await _bare_play_track(
                 track_id, track, file_path, _probe_family(ext, uade_named, file_path, c64=c64))
         subsong = tune_index(track_id, track, subsong)
+        _unplayable.set_play(               # (as stream_track: core/unplayable.py)
+            track_id, file_path, bare=bare or subsong == tune_index(track_id, track, None),
+            remote=is_remote_path(str(getattr(track, "path", "") or "")))
         if c64:
             # Honour HVSC per-tune duration so the prewarm caches under the
             # same key the streaming path uses.
@@ -11504,6 +11582,10 @@ async def prewarm(
     # Native formats need no server-side prewarm.
     if ext in NATIVE and not uade_named:
         return {"status": "skipped", "reason": "native (no transcode needed)"}
+    if getattr(track, "defect", None) == _unplayable.DEFECT and subsong is None:
+        # Its renderer refused it twice (core/unplayable.py): nothing to
+        # prepare — a click renders it again.
+        return {"status": "skipped", "reason": "renderer refused it"}
     if not _prewarm_allowed(ext, uade_named):
         return {"status": "skipped", "reason": "prewarm disabled in settings"}
     # A remote file not yet in the local cache is fetched only for the track
@@ -14418,6 +14500,11 @@ async def stream_track(
             track = await _bare_play_track(
                 track_id, track, path, _probe_family(ext, _uade_named, path, c64=_c64))
         subsong = tune_index(track_id, track, _wire)
+        # What the renders below are for: a renderer that refuses the file's
+        # own default tune twice marks the track (core/unplayable.py).
+        _unplayable.set_play(
+            track_id, path, bare=_wire is None or subsong == tune_index(track_id, track, None),
+            remote=is_remote_path(str(track.path or "")))
 
         if _c64:
             from soniqboom.core.conversion_cache import (

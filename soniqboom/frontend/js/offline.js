@@ -88,7 +88,7 @@ function _applyShort(secs, placeholders) {
 
 // The fields a reported playback problem / a decode defect puts on a row.
 const HEALTH_FIELDS = ['health', 'health_note', 'health_by', 'health_at', 'health_renderer',
-                       'defect', 'defect_detail'];
+                       'defect', 'defect_detail', 'defect_renderer', 'defect_at'];
 
 /**
  * Re-flag ``rows`` in place from the server (they were flagged when fetched);

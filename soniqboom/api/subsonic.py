@@ -2127,6 +2127,10 @@ def _stream_http_error(exc: HTTPException) -> _SubsonicError:
     which no client may see: it is logged for the operator instead."""
     st = int(exc.status_code)
     log.info("Subsonic stream failed (HTTP %s): %s", st, exc.detail)
+    if getattr(exc, "verified", False) and isinstance(exc.detail, str):
+        # Its renderer refused it twice (core/unplayable.py): the sentence
+        # names the track's title, the renderer and why — no path.
+        return _SubsonicError(0, exc.detail, http_status=st)
     if st in (404, 410):
         return _SubsonicError(70, "This song's file is missing on the server.", http_status=st)
     if st == 503:

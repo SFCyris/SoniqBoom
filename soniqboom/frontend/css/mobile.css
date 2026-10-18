@@ -340,7 +340,8 @@ input, select, textarea { touch-action: manipulation; }
 }
 .track-health-broken,
 .track-health-corrupt,
-.track-health-empty {
+.track-health-empty,
+.track-health-unplayable {
   color: var(--danger, #ff5e5e);
   background: color-mix(in srgb, var(--danger, #ff5e5e) 16%, transparent);
   border-color: color-mix(in srgb, var(--danger, #ff5e5e) 40%, transparent);

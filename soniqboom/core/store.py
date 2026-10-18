@@ -477,7 +477,7 @@ _BROWSE_EXTRA_FIELDS = frozenset(("bitrate", "game_source", "user_edited"))
 _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     # a listener's playback-problem mark (core/skip_rules) and the health badge
     "health", "health_note", "health_by", "health_at", "health_renderer",
-    "defect", "defect_detail",
+    "defect", "defect_detail", "defect_renderer", "defect_at", "defect_evidence",
     # tune data of SID / libgme / PSF files (the start pass, HVSC, repair)
     "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s",
     "hvsc_lengths", "stil", "sid_md5", "sid_model",
@@ -1142,6 +1142,10 @@ def _carry_enrichment(old: dict, new: dict) -> None:
         for f in ("health", "health_note", "health_by", "health_at", "health_renderer"):
             if old.get(f) is not None:
                 new[f] = old[f]
+    # A renderer's refusal found on play (core/unplayable.py): carried while
+    # it is the same file — the checksum (or size) the mark was made on.
+    from soniqboom.core import unplayable as _unplayable
+    _unplayable.carry(old, new)
     _carry_default_tune(old, new)
     new.update(game_follow(new))                # the game follows the carried album
 

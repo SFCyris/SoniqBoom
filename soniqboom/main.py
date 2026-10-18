@@ -1914,6 +1914,13 @@ async def startup():
                          ", ".join(missing))
         except Exception:
             log.debug("renderer health probe failed", exc_info=True)
+        # Tracks a renderer refused (core/unplayable.py) are tried again once
+        # their renderer or SoniqBoom changed: now, and every hour.
+        try:
+            from soniqboom.core import unplayable as _unplayable
+            await _unplayable.sweep_loop()
+        except Exception:
+            log.debug("can't-play mark sweep stopped", exc_info=True)
     try:
         _t = asyncio.create_task(_probe_renderer_health(), name="renderer_health_probe")
         _BG_TASKS.add(_t); _t.add_done_callback(_BG_TASKS.discard)

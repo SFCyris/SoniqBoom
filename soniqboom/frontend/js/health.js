@@ -11,16 +11,21 @@
  *    it) or **glitched** (plays, with wrong sounds — only shown);
  *  - detected by the server (``defect``): **corrupt** (no engine can decode
  *    it, or an archive that can't be opened — passed by like broken),
- *    **empty** (a package of an online collection that holds no tune
- *    SoniqBoom plays: it has left the library — a copy still in a queue or
- *    Track Info shows why) or **partial** (plays with substituted content —
- *    only shown).
+ *    **unplayable** ("can't play": its renderer refused it the same way
+ *    twice when it was played — core/unplayable.py; passed by, a click tries
+ *    it again), **empty** (a package of an online collection that holds no
+ *    tune SoniqBoom plays: it has left the library — a copy still in a queue
+ *    or Track Info shows why) or **partial** (plays with substituted content
+ *    — only shown).
  *
- * One badge per row, the most serious first (broken > corrupt > empty >
- * glitched > partial); its colour says what happens (red: passed by, amber: plays with
- * problems), its word and screen-reader text say what and why — never colour
- * alone.  Built the same way as the "offline" badge (offline.js) and shown
- * wherever that one is: library rows, search results, playlists, the queue,
+ * One badge per row, the most serious first (unplayable > broken > corrupt >
+ * empty > glitched > partial — the server's finding that this renderer
+ * can't play the file comes before a listener's report, which stays on the
+ * track and is the badge again once that finding clears); its colour says
+ * what happens (red: passed by, amber: plays with problems), its word and
+ * screen-reader text say what and why — never colour alone.  Built the
+ * same way as the "offline" badge (offline.js) and shown wherever that one
+ * is: library rows, search results, playlists, the queue,
  * Track Info and the phone's rows.
  *
  * Also here: reporting / clearing a problem (``mark`` — with Undo), the
@@ -43,6 +48,7 @@ const OPENED_RE = /^The archive is damaged/;
 const KINDS = {
   broken:   ['⊘', 'broken',   true],
   corrupt:  ['⚠︎', 'corrupt', true],   // (text presentation, not the emoji)
+  unplayable: ['⊗', 'can’t play', true],
   empty:    ['∅', 'no tunes', true],
   glitched: ['≈', 'glitched', false],
   partial:  ['◐', 'partial',  false],
@@ -65,6 +71,21 @@ export function reportedLine(t) {
   return parts.join(' · ');
 }
 
+/** When and with what an automatic "can't play" mark was found: "Found
+ *  when it was played · 18 Oct 2026 · uade123 3.05". */
+export function foundLine(t) {
+  if (!t || t.defect !== 'unplayable') return '';
+  const parts = ['Found when it was played'];
+  const d = _when(t.defect_at);
+  if (d) parts.push(d);
+  if (t.defect_renderer) parts.push(t.defect_renderer);
+  return parts.join(' · ');
+}
+
+// "The Amiga player (uade) stops …" → "the Amiga player (uade) stops …"
+// (the badge's text goes on after "Can’t play:").
+const _lowerFirst = (s) => (/^The /.test(s) ? `t${s.slice(1)}` : s);
+
 /**
  * The row's playback problem, or null: ``{ key, glyph, word, skipped, title,
  * sr }`` — ``title`` the tooltip, ``sr`` the screen-reader text.
@@ -72,7 +93,8 @@ export function reportedLine(t) {
 export function healthOf(t) {
   if (!t || typeof t !== 'object') return null;
   let key = '';
-  if (t.health === 'broken') key = 'broken';
+  if (t.defect === 'unplayable') key = 'unplayable';
+  else if (t.health === 'broken') key = 'broken';
   else if (t.defect === 'corrupt') key = 'corrupt';
   else if (t.defect === 'empty') key = 'empty';
   else if (t.health === 'glitched') key = 'glitched';
@@ -89,8 +111,11 @@ export function healthOf(t) {
     + ' — passed by when a list plays through';
   else if (key === 'empty') what = (detail || 'it holds no tune SoniqBoom plays')
     + ' — passed by when a list plays through';
+  else if (key === 'unplayable') what = (_lowerFirst(detail) || 'its renderer can’t play it')
+    + ' — passed by when a list plays through';
   else what = detail || 'plays with substituted content';
   const by = (key === 'broken' || key === 'glitched') ? reportedLine(t)
+    : key === 'unplayable' ? foundLine(t)
     : (key === 'empty' || OPENED_RE.test(String(t.defect_detail || ''))) ? 'Found when it was opened'
     : 'Detected when scanned';
   const note = (key === 'broken' || key === 'glitched') && t.health_note ? ` — “${t.health_note}”` : '';
@@ -99,11 +124,13 @@ export function healthOf(t) {
 }
 
 /** Does ``t`` play at all?  False for a track no engine can decode or an
- *  archive that can't be opened (``defect`` corrupt) and for a package with
- *  no tune in it (``empty``): no "how it plays" report, signal path or
- *  audio facts apply to it. */
+ *  archive that can't be opened (``defect`` corrupt), for one its renderer
+ *  refused twice (``unplayable``) and for a package with no tune in it
+ *  (``empty``): no "how it plays" report, signal path or audio facts apply
+ *  to it. */
 export function isUnplayable(t) {
-  return !!t && typeof t === 'object' && (t.defect === 'corrupt' || t.defect === 'empty');
+  return !!t && typeof t === 'object'
+    && (t.defect === 'corrupt' || t.defect === 'empty' || t.defect === 'unplayable');
 }
 
 /** The badge element for ``t`` (a fresh one per call), or null. */
@@ -142,7 +169,8 @@ const SKIP_WORDS = { short: 'short · skipped' };
  *  else '' (a broken / corrupt row's badge says it; it is dimmed all the same —
  *  ``skipReason``). */
 export function skipWord(t) { return SKIP_WORDS[skipReasonOf(t)] || ''; }
-/** Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' | 'empty' | 'short'), else ''. */
+/** Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' | 'unplayable' | 'empty' |
+ *  'short'), else ''. */
 export function skipReasonOf(t) {
   try { return Player.skipReason?.(t) || ''; } catch (_) { return ''; }
 }
@@ -233,6 +261,7 @@ const TAUGHT_KEY = 'sb_skip_taught';
 const TEACH = {
   broken: 'it was reported broken. Tracks reported broken are passed by when a list plays through',
   corrupt: 'it can’t be decoded. Tracks that can’t be decoded are passed by when a list plays through',
+  unplayable: 'its player can’t play it. Tracks a player refused are passed by when a list plays through',
   empty: 'it has no tunes SoniqBoom plays and is no longer listed',
   short: (secs) => `it’s shorter than ${secs} s. Tunes that short are passed by when a list plays through (Settings → Skip short tunes)`,
 };
@@ -244,7 +273,9 @@ function _onDealtSkip(e) {
   let why = TEACH[first.reason];
   if (typeof why === 'function') why = why(Number(Player.skipShortSecs) || 0);
   // (a package with no tune in it doesn't play when picked either)
-  const tail = first.reason === 'empty' ? '.' : '; a track you pick still plays.';
+  const tail = first.reason === 'empty' ? '.'
+    : first.reason === 'unplayable' ? '; a track you pick is tried again.'
+    : '; a track you pick still plays.';
   window.Toast?.info?.(`Skipped “${_title(first.track)}” — ${why}${tail}`);
 }
 
@@ -292,6 +323,7 @@ function _onTime(d) {
 const NOTHING_WHY = {
   offline: 'tracks on a drive or share that isn’t connected',
   broken: 'tracks reported broken', corrupt: 'tracks that can’t be decoded', short: 'short tunes',
+  unplayable: 'tracks their player can’t play',
   empty: 'packages with no tunes',
 };
 const _andList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
@@ -327,6 +359,9 @@ export function init() {
       && !isUnplayable(t) && !NOT_THE_FILE.test(String(msg || ''))
       ? { label: 'Mark broken', run: (track) => mark(track, 'broken') } : null));
     Player.on('dealtskip', _onDealtSkip);
+    // A track the server found its renderer can't play (a play's answer —
+    // player.js ``markUnplayable``): every view holding it shows the badge.
+    Player.on('trackunplayable', (d) => { if (d && d.id) _spread([d.id], d.fields || {}); });
     Player.on('trackchange', _onTrackChange);
     Player.on('timeupdate', _onTime);
     Player.on('ended', () => { if (_watch && _playedEnough(_watch)) _offerClear(); });
@@ -334,4 +369,4 @@ export function init() {
 }
 
 export const Health = { healthOf, healthBadge, healthBadgeHTML, skipWord, mark, canReport, reportedLine,
-                         nothingToPlayText, isUnplayable, init };
+                         foundLine, nothingToPlayText, isUnplayable, init };

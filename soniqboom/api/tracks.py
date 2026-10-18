@@ -1465,7 +1465,8 @@ async def tracks_availability(body: dict):
     for tid in ids:
         t = store.get_track(tid) if isinstance(tid, str) else None
         if t and (t.get("health") or t.get("defect")):
-            health[tid] = {f: t.get(f) for f in (*_HEALTH_ROW_FIELDS, "defect", "defect_detail")}
+            health[tid] = {f: t.get(f) for f in (*_HEALTH_ROW_FIELDS, "defect", "defect_detail",
+                                                 "defect_renderer", "defect_at")}
     return {"mode": m, "token": availability.token(store),
             "offline": availability.offline_kinds(ids, store), "health": health}
 
@@ -1619,10 +1620,14 @@ async def get_track_extended(track_id: str, request: Request):
         # header at scan time; None when the header didn't specify one.  Drives
         # a chip badge in the Track-Info header.
         "sid_model": getattr(track, "sid_model", None),
-        # Known playback defect flagged at scan ("partial" | "corrupt") + human
-        # context — drives the health badge in the info panel + listings.
+        # Known playback defect ("partial" | "corrupt" at scan, "empty" when a
+        # package opened, "unplayable" when its renderer refused it twice —
+        # with that renderer and when) + human context — drives the health
+        # badge in the info panel + listings.
         "defect": getattr(track, "defect", None),
         "defect_detail": getattr(track, "defect_detail", None),
+        "defect_renderer": getattr(track, "defect_renderer", None),
+        "defect_at": getattr(track, "defect_at", None),
     }
     return result
 

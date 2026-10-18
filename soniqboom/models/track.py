@@ -78,8 +78,16 @@ class TrackMeta(BaseModel):
     #   "corrupt" — cannot be decoded by any available engine (e.g. a foreign
     #               "YMST" file mislabelled .ym, or a corrupt LHA-wrapped .ym);
     #               plays return an honest 415.
+    #   "empty"   — a package of an online collection with no tune in it.
+    #   "unplayable" — found when played: its renderer refused it the same
+    #               way twice (core/unplayable.py); ``defect_renderer`` is the
+    #               renderer and version ("uade123 3.05"), ``defect_at`` when
+    #               (epoch seconds).  Cleared when the renderer or SoniqBoom
+    #               changes, the file changes, or a render of it plays.
     defect: str | None = None
     defect_detail: str | None = None
+    defect_renderer: str | None = None
+    defect_at: float | None = None
     # A playback problem a listener reported (GitHub #36 — core/skip_rules.py):
     # ``health`` "broken" (auto-play passes it by; a click still plays it) or
     # "glitched" (plays, with wrong sounds — shown only), the optional note,

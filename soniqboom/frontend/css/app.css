@@ -6508,7 +6508,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .track-health-icon { font-size: 10px; line-height: 1; }
 .track-health-broken,
 .track-health-corrupt,
-.track-health-empty {
+.track-health-empty,
+.track-health-unplayable {
   color: var(--danger, #ee5555);
   background: rgba(238,85,85,0.14);
   border-color: rgba(238,85,85,0.38);
@@ -6523,7 +6524,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 :root[data-theme="light"] .track-health-partial { color: #8a5a00; }
 :root[data-theme="light"] .track-health-broken,
 :root[data-theme="light"] .track-health-corrupt,
-:root[data-theme="light"] .track-health-empty { color: #b42318; }
+:root[data-theme="light"] .track-health-empty,
+:root[data-theme="light"] .track-health-unplayable { color: #b42318; }
 .queue-row .track-health-badge,
 #playlist-tracks .track-health-badge { margin-left: 5px; line-height: 13px; }
 /* A queue row the queue will pass by (offline, broken, corrupt, a short tune):

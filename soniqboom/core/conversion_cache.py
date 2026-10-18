@@ -40,6 +40,7 @@ from soniqboom.config import get_conversion_cache_dir, settings
 # this telemetry module at module scope, so ``cache_stats.miss`` resolves to
 # the function → AttributeError on every cold render (MIDI/SID/MOD/GME).
 from soniqboom.core import cache_stats as _cstats
+from soniqboom.core import unplayable as _unplayable
 
 log = logging.getLogger(__name__)
 
@@ -970,6 +971,27 @@ def note_render_failure(cache_key: str, status: int, detail: str) -> None:
 
 def _clear_render_failure(cache_key: str) -> None:
     _recent_failures.pop(cache_key, None)
+    _recent_refusals.pop(cache_key, None)
+
+
+# key → the verified refusal (core/unplayable.py: its renderer refused the
+# file twice) a render of it just ended with — what a request that waited
+# for that render answers, and what /render-status names.  Kept like
+# ``_recent_failures`` (same lifetime, cleared with it).
+_recent_refusals: "OrderedDict[str, BaseException]" = OrderedDict()
+
+
+def recent_refusal(track_id: str, subsong: int | None = None) -> "BaseException | None":
+    """The verified refusal a render of ``track_id`` (``subsong``) ended with
+    within ``_FAILURE_TTL_S`` (``recent_failure`` still lists it), else None."""
+    now = time.monotonic()
+    for k, exc in list(_recent_refusals.items()):
+        hit = _recent_failures.get(k)
+        if hit is None or now - hit[0] >= _FAILURE_TTL_S:
+            _recent_refusals.pop(k, None)
+        elif key_matches(k, track_id, subsong):
+            return exc
+    return None
 
 
 def recent_failure(track_id: str, subsong: int | None = None) -> dict | None:
@@ -1051,6 +1073,13 @@ def _note_failure_from(cache_key: str, exc: BaseException) -> None:
     client that left, a retired prewarm) is not a failure."""
     if isinstance(exc, asyncio.CancelledError):
         return
+    if getattr(exc, "verified", False):
+        _recent_refusals[cache_key] = exc
+        _recent_refusals.move_to_end(cache_key)
+        while len(_recent_refusals) > _FAILURE_MAX:
+            _recent_refusals.popitem(last=False)
+    else:
+        _recent_refusals.pop(cache_key, None)
     if isinstance(exc, HTTPException):
         note_render_failure(cache_key, exc.status_code, exc.detail)
     else:
@@ -1164,6 +1193,14 @@ async def _get_or_render_slow(key: str, format_type: str, render_fn,
         # progressive play of the same tune) — go round again: attach to the
         # render that replaced it, or render ourselves.  Bounded.
         if key in _recent_failures or reentries >= _WAITER_REENTRIES:
+            refused = _recent_refusals.get(key)
+            if refused is not None:
+                # Its renderer refused the file twice: the same answer the
+                # request that rendered it got.
+                raise _unplayable.RenderRefusal(
+                    refused.status_code, refused.detail, renderer=refused.renderer,
+                    why=refused.why, diagnosed=refused.diagnosed,
+                    headers=dict(refused.headers or {}), verified=True)
             raise HTTPException(
                 502, "Cache fill failed in a concurrent render — try again",
             )
@@ -1192,9 +1229,13 @@ async def _get_or_render_slow(key: str, format_type: str, render_fn,
     async def _render_and_store() -> Path:
         rendering_key.set(key)          # (this task's own context)
         try:
-            tmp_path = await render_fn()
+            # (a refusal is rendered once more and, the same again, marks the
+            # track it was for — core/unplayable.py)
+            tmp_path = await _unplayable.render_checked(render_fn, format_type)
             await refuse_silent(key, format_type, tmp_path)
-            return await store_cached(key, format_type, tmp_path, cold=cold)
+            stored = await store_cached(key, format_type, tmp_path, cold=cold)
+            _unplayable.rendered_ok(format_type)
+            return stored
         except BaseException as exc:
             _note_failure_from(key, exc)
             raise
@@ -1293,9 +1334,10 @@ async def start_background_render(
         _inflight[cache_key] = event
         _clear_render_failure(cache_key)
         try:
-            tmp_path = await render_fn()
+            tmp_path = await _unplayable.render_checked(render_fn, format_type)
             await refuse_silent(cache_key, format_type, tmp_path)
             await store_cached(cache_key, format_type, tmp_path)
+            _unplayable.rendered_ok(format_type)
             log.info("Background render complete: %s", cache_key)
         except Exception as exc:
             _note_failure_from(cache_key, exc)

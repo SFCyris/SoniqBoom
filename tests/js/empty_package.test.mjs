@@ -170,7 +170,7 @@ test('wiring: the queue panels light no row while a start has failed', () => {
 test('wiring: the "no tunes" badge says it is passed by; its teaching toast promises no play', () => {
   const h = read('health.js');
   assert.match(h, /else if \(key === 'empty'\) what = \(detail \|\| 'it holds no tune SoniqBoom plays'\)\s*\+ ' — passed by when a list plays through';/);
-  assert.match(h, /const tail = first\.reason === 'empty' \? '\.' : '; a track you pick still plays\.';/);
+  assert.match(h, /const tail = first\.reason === 'empty' \? '\.'\s*: first\.reason === 'unplayable' \? '; a track you pick is tried again\.'\s*: '; a track you pick still plays\.';/);
 });
 
 test('wiring: Track Info of a package that left shows no list position and no editor', () => {

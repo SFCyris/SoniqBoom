@@ -68,6 +68,8 @@ const FACTORY = new Function('env', `
     // A start reported as failed (nothing plays) / a track gone from the library.
     get startFailed() { return typeof _startFailedNow === 'function' ? _startFailedNow() : null; },
     set onGone(fn) { _onGone = fn; },
+    // A track its renderer refused twice (render-status / 422: defect 'unplayable').
+    set onUnplayable(fn) { if (typeof _onUnplayable !== 'undefined') _onUnplayable = fn; },
     set failAction(fn) { _failAction = fn; },
 
   };

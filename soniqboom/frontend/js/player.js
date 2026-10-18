@@ -627,11 +627,12 @@ export const Player = (() => {
     return 0;
   }
   // Why the queue passes ``t`` by when it moves on by itself: 'offline' |
-  // 'broken' | 'corrupt' | 'empty' (a package with no tune in it) | 'short',
-  // or '' (it plays).
+  // 'broken' | 'corrupt' | 'unplayable' (its renderer refused it twice) |
+  // 'empty' (a package with no tune in it) | 'short', or '' (it plays).
   function _skipReason(t) {
     if (!t || typeof t !== 'object') return '';
     if (_offlineSkip && t.offline) return 'offline';
+    if (t.defect === 'unplayable') return 'unplayable';
     if (t.health === 'broken') return 'broken';
     if (t.defect === 'corrupt') return 'corrupt';
     if (t.defect === 'empty') return 'empty';
@@ -2027,7 +2028,7 @@ export const Player = (() => {
       // A rendered track whose first attempt failed while the server may still
       // be rendering it: wait for the render instead of reporting a failure.
       if (_renderRecoverySeq === attempt) return;
-      if (_startRenderRecovery(track, attempt, (why) => _reportPlayFailure(track, title, err, attempt, why))) return;
+      if (_startRenderRecovery(track, attempt, (why, info) => _reportPlayFailure(track, title, err, attempt, why, info))) return;
       _reportPlayFailure(track, title, err, attempt);
     }
   }
@@ -2079,6 +2080,17 @@ export const Player = (() => {
   // online collection with no tune in it): ``_onGone(id, reason)`` marks
   // every copy this page holds (set outside this region).
   let _onGone = null;
+  // A track its renderer refused twice (render-status ``defect``
+  // 'unplayable', or a 422 with ``X-SB-Defect: unplayable``):
+  // ``_onUnplayable(id, fields)`` marks every copy this page holds.
+  let _onUnplayable = null;
+  const _UNPLAYABLE_FIELDS = ['defect', 'defect_detail', 'defect_renderer', 'defect_at'];
+  function _unplayableFields(info) {
+    const f = {};
+    for (const k of _UNPLAYABLE_FIELDS) if (info && info[k] !== undefined) f[k] = info[k];
+    f.defect = 'unplayable';
+    return f;
+  }
 
   // ── The server restarting ──────────────────────────────────────────────
   // While the server restarts it answers every request with 503 and a
@@ -2208,7 +2220,7 @@ export const Player = (() => {
   }
   function _codecRetryState(seq) { return _codecRetry && _codecRetry.seq === seq ? _codecRetry.state : null; }
 
-  function _reportPlayFailure(track, title, err, attempt, serverReason = '') {
+  function _reportPlayFailure(track, title, err, attempt, serverReason = '', serverInfo = null) {
     _noteStartFailed(track, attempt);
     // Diagnostic toast: one toast only.  Race a 1-byte probe of the stream
     // against a 400 ms timeout.  Whoever resolves first writes the toast —
@@ -2249,6 +2261,16 @@ export const Player = (() => {
       _failToast(msg + _nextHint(), track, gone);
     };
     const why = typeof serverReason === 'string' ? serverReason.trim().slice(0, 200) : '';
+    if (why && serverInfo && serverInfo.defect === 'unplayable') {
+      // Its renderer refused it twice: the server's sentence names the track
+      // and why — said once, with no "Mark broken" offer — and every copy
+      // this page holds takes the mark (the queue passes it by from now on).
+      try { if (_onUnplayable) _onUnplayable(track.id, _unplayableFields(serverInfo)); } catch (_) { /* listener isolation */ }
+      showOnce(why, false, true);
+      emit('statechange', { playing: false });
+      emit('error', { track, error: err });
+      return;
+    }
     if (why) {
       // The render itself failed and the server said why: no probe (it would
       // only run the failing render again).
@@ -2303,6 +2325,21 @@ export const Player = (() => {
           // Gone from the library (a package with no tune in it): the
           // server's sentence says what it holds — no "Mark broken" offer.
           try { if (_onGone) _onGone(track.id, detail); } catch (_) { /* listener isolation */ }
+          showOnce(detail, false, true);
+          return;
+        }
+        let defectHdr = '';
+        try { defectHdr = (res.headers && typeof res.headers.get === 'function' && res.headers.get('X-SB-Defect')) || ''; } catch (_) { defectHdr = ''; }
+        if (code === 422 && detail && defectHdr === 'unplayable') {
+          // Its renderer refused it twice: as the render-status answer above
+          // (its reason, renderer and date arrive with the server's
+          // track_updated — none of an earlier defect's stays meanwhile).
+          try {
+            if (_onUnplayable) {
+              _onUnplayable(track.id, { defect: 'unplayable', defect_detail: null,
+                                        defect_renderer: null, defect_at: null });
+            }
+          } catch (_) { /* listener isolation */ }
           showOnce(detail, false, true);
           return;
         }
@@ -2427,7 +2464,7 @@ export const Player = (() => {
         // A failed render names its reason: report that as is.  Anything else
         // (nothing cached, a server without failure reasons) keeps the probe.
         const why = state === 'failed' && last && typeof last.error === 'string' ? last.error : '';
-        giveUp(why);
+        giveUp(why, state === 'failed' ? last : null);
         return;
       }
       const at = _pendingSeekSec != null ? _pendingSeekSec : wasAt;
@@ -4817,8 +4854,8 @@ export const Player = (() => {
       // _reportMediaError do the rest: its own later toast stays quiet once the
       // probe has reported, and a dealt track still auto-skips.
       const seq = _playSeq, t = _track;
-      if (_startRenderRecovery(t, seq, (why) => {
-        _reportPlayFailure(t, title, err, seq, why);
+      if (_startRenderRecovery(t, seq, (why, info) => {
+        _reportPlayFailure(t, title, err, seq, why, info);
         _reportMediaError(tag, title, err);
       })) return;
     }
@@ -4946,6 +4983,19 @@ export const Player = (() => {
   }
   _onGone = (id, reason) => markGone([id], { [id]: reason });
 
+  // A track its renderer refused twice (the play's answer — core/unplayable.py
+  // on the server): every copy this page holds takes ``fields`` (``defect``
+  // 'unplayable' and its reason), so the queue shows why and passes it by;
+  // health.js spreads it to the open views (``trackunplayable``).  The
+  // server also tells every open page (``track_updated``).
+  function markUnplayable(id, fields) {
+    if (!id || !fields) return;
+    const ch = patchTrackFields(id, fields);
+    if (ch && Object.keys(ch).length) { emit('queuechange', { queue, queueIdx }); _saveQueueSoon(); }
+    emit('trackunplayable', { id, fields });
+  }
+  _onUnplayable = (id, fields) => markUnplayable(id, fields);
+
   function patchTrackFields(id, fields) {
     if (!id || !fields || typeof fields !== 'object') return null;
     let changed = null;
@@ -4978,7 +5028,7 @@ export const Player = (() => {
   }
 
   return {
-    patchTrackFields, markGone,
+    patchTrackFields, markGone, markUnplayable,
     get analyser()       { return analyser; },
     get vuAnalyser()     { return vuAnalyser; },
     get ctx()            { return ctx; },
@@ -5064,7 +5114,7 @@ export const Player = (() => {
     // ``fn(track, message)`` → ``{ label, run(track) }`` | null: an action the
     // "couldn't play" toast offers for that track (health.js: Mark broken).
     setFailAction(fn)        { _failAction = typeof fn === 'function' ? fn : null; },
-    // Why auto-play passes ``t`` by ('offline' | 'broken' | 'corrupt' |
+    // Why auto-play passes ``t`` by ('offline' | 'unplayable' | 'broken' | 'corrupt' |
     // 'short' | '') — the queue panel's reasons, the multi-room master's skip.
     skipReason(t)            { return _skipReason(t); },
     // The own length of the tune entry ``t`` plays (seconds, 0 = unknown).

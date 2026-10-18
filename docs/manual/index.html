@@ -619,16 +619,29 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        a changed file starts without one. A track marked
        broken, and one no engine can decode (<b>corrupt</b> — such as a YM4 file, or a <code>.ym</code> file that isn't a YM register
        dump), is passed by when a list plays through, while a click
-       still plays it: if it then plays, SoniqBoom offers to clear the mark. One badge per row shows the most
-       serious problem — red <b>broken</b> / <b>corrupt</b> / <b>no tunes</b> (passed by; <b>no tunes</b> is an
+       still plays it: if it then plays, SoniqBoom offers to clear the mark.</p>
+    <p>A track whose player refuses it the same way twice in a row — for example an Amiga module on which uade
+       stops with <em>score crashed</em> — is marked <b>can't play</b> by SoniqBoom itself. The message that says
+       so names the player and the reason (“<i>title</i> can't be played here — the Amiga player (uade) stops on
+       this file: score crashed”), with no <b>Mark broken</b> offer; the track is passed by when a list plays through, and a
+       click tries it once more. Track Info shows the reason, the player and its version, and when it was found,
+       with no signal path and no Playback choice (unless a listener reported the track, so the report can be
+       cleared). The mark is taken off when the player or SoniqBoom is updated, when
+       the file changes, and when the track plays after all. A failure that isn't about the file — a timeout, a
+       track you skipped while it was being prepared, a player that was stopped, a download cut short, a full disk
+       — never marks a track, nor does a player that refuses one file after another (its marks are taken off
+       until it plays a track again); a report a listener made stays on the track beside the mark.</p>
+    <p>One badge per row shows the most
+       serious problem — red <b>can't play</b> / <b>broken</b> / <b>corrupt</b> / <b>no tunes</b> (passed by; <b>no tunes</b> is an
        archive of an online collection with no tune in it, shown where a copy of it is still on screen), amber <b>glitched</b> /
        <b>partial</b> (plays; a Sonix module whose instrument files are missing, which play as silence) — in track
        lists, search results, playlists, the queue, Track Info and on the phone.
        In the queue, rows that will be passed by are dimmed. Subsonic apps don't get tracks marked broken, tracks
-       that can't be decoded or files whose default tune is short in random songs, similar songs
+       that can't be decoded or played or files whose default tune is short in random songs, similar songs
        (<code>getSimilarSongs</code>) or top songs; albums, folders, playlists, searches and the OpenSubsonic
        sonic-similarity lists still list them.
-       The first time a track is passed by, a one-time message explains why.</p>
+       The first time a track is passed by, a one-time message explains why. A Subsonic app that plays a track
+       marked <b>can't play</b> gets an error naming the reason.</p>
 
     <h3>Equalizer &amp; visualizer</h3>
     <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
