@@ -37,6 +37,7 @@
  */
 import { Player } from './player.js';
 import { Auth } from './auth.js';
+import { Offline } from './offline.js';
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
@@ -234,11 +235,18 @@ export async function mark(track, state, note = null, { quiet = false } = {}) {
   catch (e) { window.Toast?.error?.(e.message || 'Couldn’t save.'); return null; }
   const ids = Array.isArray(res.ids) && res.ids.length ? res.ids : [track.id];
   _spread(ids, res.fields || {});
+  // "Tracks that can't be played: Hide": a broken mark takes the track out of
+  // the lists (and clearing one brings it back) — re-read now, not only when
+  // the library socket's availability_changed arrives.
+  const hiding = _hidesUnplayable();
+  if (hiding && (state === 'broken') !== (before.health === 'broken')) _refreshLists();
   if (!quiet) {
     const name = `“${_title(track)}”`;
     const copies = ids.length > 1 ? ` (and ${ids.length - 1} identical ${ids.length === 2 ? 'copy' : 'copies'})` : '';
     const msg = state === 'broken'
-      ? `Marked ${name}${copies} broken — from now on it’s passed by when a list plays through.`
+      ? (hiding
+        ? `Marked ${name}${copies} broken — it’s left out of the lists now (Settings → Tracks that can’t be played) and passed by when a list plays through.`
+        : `Marked ${name}${copies} broken — from now on it’s passed by when a list plays through.`)
       : state === 'glitched' ? `Marked ${name}${copies} glitched.`
       : `Cleared the report on ${name}${copies}.`;
     window.Toast?.action?.(msg, 'Undo', async () => {
@@ -247,10 +255,18 @@ export async function mark(track, state, note = null, { quiet = false } = {}) {
       try {
         const r2 = await _put(track.id, before.health, before.health_note);
         _spread(Array.isArray(r2.ids) && r2.ids.length ? r2.ids : ids, r2.fields || {});
+        if (_hidesUnplayable() && (state === 'broken') !== (before.health === 'broken')) _refreshLists();
       } catch (e) { window.Toast?.error?.(e.message || 'Couldn’t undo.'); }
     });
   }
   return res.fields || {};
+}
+
+function _hidesUnplayable() {
+  try { return Offline.unplayable === 'hide'; } catch (_) { return false; }
+}
+function _refreshLists() {
+  try { Offline.refresh?.(); } catch (_) { /* older cached offline.js */ }
 }
 
 // ── Notices ──────────────────────────────────────────────────────────────────

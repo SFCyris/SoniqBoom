@@ -128,8 +128,10 @@ def test_remap_moves_every_kind_of_user_data_and_is_safe_to_redo():
     from soniqboom.core.id_remap import remap_user_data
     # "b" already has data: another file once at that path (since removed)
     ratings = {"a": 4, "b": 2, "c": 5}
-    plays = {"a": {"count": 2, "last_played": 100}, "b": {"count": 1, "last_played": 300}}
-    history = [{"track_id": "a", "ts": 1}, {"track_id": "x", "ts": 2}]
+    plays = {"u1": {"a": {"count": 2, "last_played": 100}, "b": {"count": 1, "last_played": 300}},
+             "u2": {"a": {"count": 5, "last_played": 50}}}
+    history = {"u1": [{"track_id": "a", "ts": 1}, {"track_id": "x", "ts": 2}],
+               "u3": [{"track_id": "a", "ts": 9}]}
     pl_in = {"id": "p", "track_ids": ["a", {"id": "c", "subsong": 3}, "x"]}
     playlists = {"p": pl_in}
     waves = {"a": [0.1], "b": [0.9], "d": [0.7]}
@@ -137,14 +139,17 @@ def test_remap_moves_every_kind_of_user_data_and_is_safe_to_redo():
                              ratings=ratings, play_stats=plays, history=history,
                              playlists=playlists, waveforms=waves)
     assert ratings == {"b": 4, "d": 5}                 # the moved file's data wins
-    assert plays == {"b": {"count": 2, "last_played": 100}}
-    assert history[0] == {"track_id": "b", "ts": 1} and history[1]["track_id"] == "x"
+    assert plays == {"u1": {"b": {"count": 2, "last_played": 100}},      # each user's own
+                     "u2": {"b": {"count": 5, "last_played": 50}}}
+    assert history["u1"][0] == {"track_id": "b", "ts": 1} and history["u1"][1]["track_id"] == "x"
+    assert history["u3"] == [{"track_id": "b", "ts": 9}]
     assert playlists["p"]["track_ids"] == ["b", {"id": "d", "subsong": 3}, "x"]
     assert pl_in["track_ids"] == ["a", {"id": "c", "subsong": 3}, "x"]   # replaced, not edited
     assert waves == {"b": [0.1], "d": [0.7]}           # (c had none: d's stays)
-    assert counts == {"ratings": 2, "play_stats": 1, "history": 1, "playlists": 2, "waveforms": 1}
+    assert counts == {"ratings": 2, "play_stats": 2, "history": 2, "playlists": 2, "waveforms": 1}
     # Redone (a move followed again after a crash): nothing changes.
-    snap = (dict(ratings), dict(plays), list(history), dict(playlists), dict(waves))
+    snap = (dict(ratings), {u: dict(m) for u, m in plays.items()},
+            {u: list(h) for u, h in history.items()}, dict(playlists), dict(waves))
     again = remap_user_data({"a": "b", "c": "d"}, ratings=ratings, play_stats=plays,
                             history=history, playlists=playlists, waveforms=waves)
     assert (ratings, plays, history, playlists, waves) == snap
@@ -160,12 +165,12 @@ def test_remap_chains_and_swaps_land_on_the_right_ids(mapping):
     and a swap swaps."""
     from soniqboom.core.id_remap import remap_user_data
     ratings = {"a": 5, "b": 2}
-    plays = {"a": {"count": 7, "last_played": 1}}
+    plays = {"u1": {"a": {"count": 7, "last_played": 1}}}
     remap_user_data(mapping, ratings=ratings, play_stats=plays, history=None,
                     playlists=None, waveforms=None)
     want = {mapping[k]: v for k, v in {"a": 5, "b": 2}.items()}
     assert ratings == want
-    assert plays == {mapping["a"]: {"count": 7, "last_played": 1}}
+    assert plays == {"u1": {mapping["a"]: {"count": 7, "last_played": 1}}}
 
 
 def test_a_remap_survives_a_restart_and_a_merge(tmp_path, monkeypatch):
@@ -180,13 +185,13 @@ def test_a_remap_survives_a_restart_and_a_merge(tmp_path, monkeypatch):
     w = AOFWriter(tmp_path / "library.aof")
     st._aof_append = w.append
     st.set_rating("old", 4)
-    st.record_play("old")
-    st.record_play("old")
-    st.push_history({"track_id": "old", "title": "t", "artist": "", "ts": 7})
+    st.record_play("old", uid="")
+    st.record_play("old", uid="")
+    st.push_history({"track_id": "old", "title": "t", "artist": "", "ts": 7}, uid="")
     st.create_playlist("pl", "Mine", track_ids=["old", {"id": "old2", "subsong": 2}])
     st.store_waveform("old", [0.5, 0.25])
     st.remap_track_ids({"old": "new", "old2": "new2"})
-    live = (st.get_rating("new"), st.get_play_stats("new")["count"],
+    live = (st.get_rating("new"), st.get_play_stats("new", uid="")["count"],
             st.get_playlist("pl")["track_ids"], st.get_waveform("new"))
     assert live == (4, 2, ["new", {"id": "new2", "subsong": 2}], [0.5, 0.25])
     w.flush_sync()
@@ -199,9 +204,9 @@ def test_a_remap_survives_a_restart_and_a_merge(tmp_path, monkeypatch):
         persistence.populate_store(state)
         s = store_mod.get_store()
         assert s is not st
-        return (s.get_rating("new"), (s.get_play_stats("new") or {}).get("count"),
+        return (s.get_rating("new"), (s.get_play_stats("new", uid="") or {}).get("count"),
                 s.get_playlist("pl")["track_ids"],
-                bool(s.get_rating("old")), [h["track_id"] for h in s.get_history(5)])
+                bool(s.get_rating("old")), [h["track_id"] for h in s.get_history(5, uid="")])
     # (Waveforms reach disk with the snapshot, not the AOF: compared live only.)
     assert _loaded() == (*live[:3], False, ["new"])               # AOF replay
     assert merger._do_merge(tmp_path) > 0

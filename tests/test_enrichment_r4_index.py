@@ -43,7 +43,7 @@ async def test_a_write_during_the_build_skips_the_swap(monkeypatch):
         s.update_track_fields("t1", {"album": "Gold of the Aztecs", "album_source": "modland"})
         s.upsert_track({"id": "new", "path": "/m/new.sid", "title": "uridium",
                         "format": "SID", "genre": [], "added_at": 2})
-        s.record_play("t2")
+        s.record_play("t2", uid="")
 
     report, _ = await asyncio.gather(data.rebuild_indexes(), writer())
     assert report["skipped"] == "concurrent-mutation"

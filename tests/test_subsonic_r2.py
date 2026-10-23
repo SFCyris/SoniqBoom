@@ -309,8 +309,8 @@ def test_p_scope_below_threshold_keeps_the_new_password_working(env, users, monk
 
 def test_report_playback_drives_now_playing_and_counts_one_play(env, monkeypatch):
     subsonic._NOW_PLAYING.clear()
-    base = env.store.get_play_stats("q1").get("count", 0) if hasattr(
-        env.store, "get_play_stats") else (env.store._play_stats.get("q1") or {}).get("count", 0)
+    base = env.store.get_play_stats("q1", uid="u1").get("count", 0) if hasattr(
+        env.store, "get_play_stats") else (env.store._play_stats.get("u1", {}).get("q1") or {}).get("count", 0)
     clock = [time.time()]
     monkeypatch.setattr(subsonic.time, "time", lambda: clock[0])
     env.ok("reportPlayback.view", mediaId="q1", mediaType="song", positionMs=0,
@@ -321,7 +321,7 @@ def test_report_playback_drives_now_playing_and_counts_one_play(env, monkeypatch
     row = env.ok("getNowPlaying.view")["nowPlaying"]["entry"][0]
     assert row["state"] == "playing" and row["playbackRate"] == 1.0
     assert 14_900 <= row["positionMs"] <= 15_100             # projected
-    plays = lambda: (env.store._play_stats.get("q1") or {}).get("count", 0)   # noqa: E731
+    plays = lambda: (env.store._play_stats.get("u1", {}).get("q1") or {}).get("count", 0)   # noqa: E731
     assert plays() == base                                   # 10 s: not yet a play
     env.ok("reportPlayback.view", mediaId="q1", mediaType="song", positionMs=31_000,
            state="paused", c="Feishin")
@@ -338,7 +338,7 @@ def test_report_playback_drives_now_playing_and_counts_one_play(env, monkeypatch
     # ignoreScrobble: now-playing only.
     env.ok("reportPlayback.view", mediaId="q2", mediaType="song", positionMs=40_000,
            state="playing", ignoreScrobble="true", c="Feishin")
-    assert (env.store._play_stats.get("q2") or {}).get("count", 0) == 0
+    assert (env.store._play_stats.get("u1", {}).get("q2") or {}).get("count", 0) == 0
     assert env.fail("reportPlayback.view", mediaId="q2", mediaType="song", positionMs=1,
                     state="bogus")["code"] == 10
     assert env.fail("reportPlayback.view", mediaId="nope", mediaType="song", positionMs=1,
@@ -465,7 +465,7 @@ def test_tune_ids_in_playlists_queue_stars_and_scrobbles(env, monkeypatch):
     env.ok("star.view", id="sid1~1")
     assert "sid1" in subsonic_state.get_state().starred("u1", "song")
     env.ok("scrobble.view", id="sid1~2")
-    assert env.store._play_stats["sid1"]["count"] == 1
+    assert env.store._play_stats["u1"]["sid1"]["count"] == 1
 
 
 # ── r2-sub-10: is the token secret a generated app password? ─────────────────
@@ -841,7 +841,8 @@ def test_similar_songs_yield_between_seeds(env, monkeypatch):
         loop = asyncio.get_running_loop()
         for _ in range(3):
             loop.call_soon(lambda: events.append(("other",)))
-        await subsonic._similar_song_tracks(sx.album_id("Queen", "A Night at the Opera"), 5)
+        await subsonic._similar_song_tracks(sx.album_id("Queen", "A Night at the Opera"), 5,
+                                            uid="u1")
 
     asyncio.run(_run())
     first = events.index(("seed", events[0][1]))
@@ -854,10 +855,10 @@ def test_similar_songs_yield_between_seeds(env, monkeypatch):
 def test_scrobble_appends_listening_history(env, monkeypatch):
     from soniqboom.api import smart
     monkeypatch.setattr(smart, "get_store", lambda: env.store)
-    before = len(env.store.get_history(500))
+    before = len(env.store.get_history(500, uid="u1"))
     t1 = int(time.time()) - 3600
     env.ok("scrobble.view", id=["q1", "q2"], time=[t1 * 1000, (t1 + 200) * 1000])
-    hist = env.store.get_history(500)
+    hist = env.store.get_history(500, uid="u1")
     assert len(hist) == before + 2
     assert {h["track_id"] for h in hist[:2]} == {"q1", "q2"}
 

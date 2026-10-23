@@ -180,14 +180,25 @@ test('the queue re-anchors after an availability change in Mark mode too', () =>
   // With duplicates hidden, a copy stands in for an offline primary at its own
   // list position (core/availability.primary_swap) in Mark mode as well as in
   // Hide, so an ordered queue resumes after its last list row, not at the old
-  // offset; only Show → Show leaves list positions where they were.
+  // offset; only Show → Show leaves list positions where they were — unless
+  // "Tracks that can't be played: Hide" is (or was) on, whose lists change
+  // length whenever a track becomes one that can't be played.
   const src = read('soniqboom/frontend/js/offline.js');
   const m = src.match(/if \(([^\n{}]*)\) \{\s*try \{ Player\.reanchorOrdered/);
   assert.ok(m, 'the reanchorOrdered call (and its condition) not found');
-  const cond = new Function('j', 'prevMode', `return (${m[1]});`);
-  for (const prev of ['mark', 'hide', 'show']) {
-    for (const mode of ['mark', 'hide', 'show']) {
-      assert.equal(cond({ mode }, prev), !(prev === 'show' && mode === 'show'), `${prev} → ${mode}`);
+  const u = src.match(/const unplayHide = ([^\n;]*);/);
+  assert.ok(u, 'the unplayHide test not found');
+  const hide = new Function('state', 'prevUnplayable', `return (${u[1]});`);
+  const cond = new Function('j', 'prevMode', 'unplayHide', `return (${m[1]});`);
+  for (const [now, before] of [['mark', 'mark'], ['mark', null], ['hide', 'mark'], ['mark', 'hide'],
+                               ['hide', 'hide']]) {
+    const uh = hide({ unplayable: now }, before);
+    assert.equal(uh, now === 'hide' || before === 'hide', `${before} → ${now}`);
+    for (const prev of ['mark', 'hide', 'show']) {
+      for (const mode of ['mark', 'hide', 'show']) {
+        assert.equal(cond({ mode }, prev, uh), uh || !(prev === 'show' && mode === 'show'),
+                     `${prev} → ${mode}, can't be played ${before} → ${now}`);
+      }
     }
   }
 });
@@ -272,4 +283,52 @@ test('a hovered row may warm again once the server-side hover prewarm has lapsed
   assert.ok(ms > 0 && ms <= 10000, 'memo must not outlive the 10 s server lapse');
   assert.match(lib, /function _hoverWarmed\(id\)[\s\S]*?Date\.now\(\) - at < _HOVER_REWARM_MS/);
   assert.doesNotMatch(lib, /_hoverPrefetched\.has\(/);
+});
+
+test('"Tracks that can\'t be played: Hide" rebuilds the open list and the phone list, and a broken mark re-reads them', () => {
+  // Desktop: the open view is re-read in place when no list can change length,
+  // rebuilt when either Hide is (or was) on, and left alone only when nothing
+  // is flagged or left out (offline Show → Show with can't-be-played Mark).
+  const lib = read('soniqboom/frontend/js/library.js');
+  const fn = lib.slice(lib.indexOf('function refreshAvailability('));
+  const uh = fn.match(/const unplayHide = ([^;\n]*);/);
+  const lc = fn.match(/const lengthsChange = ([^;\n]*);/);
+  const early = fn.match(/if \(([^\n{}]*)\) return;/);
+  assert.ok(uh && lc && early, 'refreshAvailability conditions not found');
+  const unplayHide = new Function('unplayable', 'prevUnplayable', `return (${uh[1]});`);
+  const lengths = new Function('mode', 'prevMode', 'unplayHide', `return (${lc[1]});`);
+  const skip = new Function('mode', 'prevMode', 'unplayHide', `return (${early[1]});`);
+  const M = ['mark', 'hide', 'show'];
+  for (const prevMode of M) for (const mode of M) for (const u of ['mark', 'hide']) for (const pu of ['mark', 'hide']) {
+    const h = unplayHide(u, pu);
+    assert.equal(h, u === 'hide' || pu === 'hide');
+    assert.equal(lengths(mode, prevMode, h), mode === 'hide' || prevMode === 'hide' || h,
+                 `${prevMode}→${mode}, ${pu}→${u}`);
+    assert.equal(skip(mode, prevMode, h), mode === 'show' && prevMode === 'show' && !h,
+                 `${prevMode}→${mode}, ${pu}→${u}`);
+  }
+  // The phone's library view re-reads its list under the same rule.
+  const mob = read('soniqboom/frontend/js/mobile/views/library.js');
+  const at = mob.indexOf("addEventListener('soniqboom:availability-changed'");
+  const mc = mob.slice(at).match(/if \(([\s\S]*?)\) \{ render\(\); return; \}/);
+  assert.ok(mc, 'the phone list condition not found');
+  const rerender = new Function('d', `return (${mc[1]});`);
+  for (const prevMode of M) for (const mode of M) for (const u of ['mark', 'hide']) for (const pu of ['mark', 'hide']) {
+    assert.equal(rerender({ mode, prevMode, unplayable: u, prevUnplayable: pu }),
+                 mode === 'hide' || prevMode === 'hide' || u === 'hide' || pu === 'hide');
+  }
+  // offline.js sends both values with the event (and seeds the setting from ui-config).
+  const off = read('soniqboom/frontend/js/offline.js');
+  assert.match(off, /unplayable: state\.unplayable, prevUnplayable: prevUnplayable \|\| state\.unplayable/);
+  assert.match(read('soniqboom/frontend/js/app.js'), /unplayable: \(window\.__sbConfig \|\| \{\}\)\.unplayable_tracks/);
+  // health.js: a broken mark (or its clearing) re-reads the lists at once while Hide is on.
+  const hj = read('soniqboom/frontend/js/health.js');
+  const hc = hj.match(/if \(hiding && \(([^\n]*)\)\) _refreshLists\(\);/);
+  assert.ok(hc, 'the health.js re-read condition not found');
+  const changes = new Function('state', 'before', `return (${hc[1]});`);
+  assert.equal(changes('broken', { health: null }), true);
+  assert.equal(changes(null, { health: 'broken' }), true);
+  assert.equal(changes('glitched', { health: null }), false);        // glitched plays: no list change
+  assert.equal(changes('broken', { health: 'broken' }), false);     // a new note only
+  assert.equal(changes('glitched', { health: 'broken' }), true);
 });

@@ -5,8 +5,10 @@
 
 On startup:
   1. Load library.json (full snapshot)
-  2. Replay library.aof (unapplied changes since last merge)
-  3. Populate the TrackStore and rebuild indexes
+  2. An older database version: back the files up, convert (see "Database
+     version" below)
+  3. Replay library.aof (unapplied changes since last merge)
+  4. Populate the TrackStore and rebuild indexes
 """
 from __future__ import annotations
 
@@ -153,9 +155,16 @@ def _rotate_backup(primary: Path, backup: Path, who: str) -> None:
         except OSError:
             pass
     try:
-        shutil.copy2(primary, backup)
+        # (a copy to a new file swapped in, never over the old .bak in place:
+        # that file may be the conversion backup's hard link — ``backup_before_upgrade``)
+        shutil.copy2(primary, link)
+        os.replace(link, backup)
     except OSError as exc:
         log.warning("%s: backup copy failed (%s), continuing", who, exc)
+        try:
+            link.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _fsync_dir(path: Path) -> None:
@@ -250,6 +259,517 @@ def _write_library_text(data_dir: Path, text: "str | bytes", who: str) -> bool:
         return False
     _fsync_dir(data_dir)
     return True
+
+
+# ── Database version ─────────────────────────────────────────────────────────
+# ``library.json`` carries ``"db_version"``: the layout of what it holds.  A
+# snapshot without it is V1 (before 1.14.5: one shared play-stats map and one
+# shared listening history); V2 keeps both per user (``core/user_data``).  A
+# start that finds an older database — the snapshot, or AOF records written
+# by an older version (a per-user record without ``uid``) — first copies the
+# library's files to ``<data>/backups/db-v<old>-<stamp>/`` (``backup_before_upgrade``),
+# and only then converts (``_convert``): the snapshot is brought up step by
+# step (``_UPGRADES``), the AOF and the set-aside late-exec records replayed on
+# top (records without ``uid`` go to the legacy owner), and the result written
+# as a fresh snapshot that also holds those records, which are then dropped —
+# so no V1 record remains.  Nothing but the backup is written before that
+# snapshot: a crash before it leaves the V1 files as they were, and the next
+# start converts again (reusing the backup).  A database newer than this code
+# is refused (``DatabaseVersionError``).
+
+DB_VERSION = 2
+
+BACKUPS_DIRNAME = "backups"
+
+# The files a backup before an upgrade copies (those that exist), relative to
+# the data directory; ``library.aof.late-exec-*`` files are added.
+_UPGRADE_BACKUP_FILES = ("library.json", "library.aof", "radio/favorites.json",
+                         "subsonic_state.json")
+
+_BACKUP_README = """\
+SoniqBoom database backup
+=========================
+
+SoniqBoom {version} found a library database in an older format (V{old}) in
+this data folder and copied its files here on {when}, before converting
+them to the current format (V{new}).  The conversion only started after this
+copy was complete.
+
+Files: {files}
+
+To go back to the state before the conversion:
+  1. Stop the SoniqBoom server.
+  2. Copy these files back into the data folder ({data_dir}),
+     replacing the files there of the same name.  Remove a library.aof that
+     this folder does not hold, and library.json.bak / library.json.prev
+     (they may hold the converted V{new} database).
+  3. Run the previous SoniqBoom version (a version that writes V{old}).
+
+What changed after the conversion is not in this copy: plays and listening
+history, and — when you copy those files back too — Subsonic stars, ratings,
+play queues and bookmarks, and the favourite stations.  SoniqBoom never
+deletes this folder; remove it yourself when you no longer need it.
+"""
+
+
+class DatabaseVersionError(RuntimeError):
+    """The library's database can't be opened by this version: it is newer
+    than ``DB_VERSION``, or an older one could not be backed up (or written)
+    before its conversion.  Raised by ``init_persistence``: the server does
+    not start."""
+
+
+def state_db_version(state: Any) -> int | None:
+    """The database version of a loaded snapshot state: None for an empty
+    state (no snapshot), 1 for one without ``db_version``."""
+    if not isinstance(state, dict) or not state:
+        return None
+    v = state.get("db_version")
+    if v is None:
+        return 1
+    if type(v) is not int or v < 1:
+        raise DatabaseVersionError(
+            f"library.json holds an unknown database version ({v!r}) — not loaded")
+    return v
+
+
+def _is_play_entry(v: Any) -> bool:
+    """A V1 play-stats value (``{count, last_played}``), as opposed to a V2
+    user's map of them."""
+    return (isinstance(v, dict) and ("count" in v or "last_played" in v)
+            and not any(isinstance(x, dict) for x in v.values()))
+
+
+def _has_v1_shapes(state: dict) -> bool:
+    """Does a (V2-stamped) state hold V1-shaped data — flat play-stats
+    entries or a flat history list?  An older version's merger rewrites a V2
+    library.json keeping its ``db_version`` and adds its own flat entries (a
+    downgrade); ``_needs_upgrade`` converts such a file again."""
+    ps, hist = state.get("play_stats"), state.get("history")
+    return (isinstance(hist, list) and bool(hist)) or (
+        isinstance(ps, dict) and any(_is_play_entry(v) for v in ps.values()))
+
+
+def _upgrade_v1_to_v2(state: dict, owner: str) -> None:
+    """V1 → V2: the shared play stats and history — and every playlist with
+    no owner — become ``owner``'s (the legacy owner, or the no-user bucket
+    ``""``: then the playlists stay unowned, claimed with that bucket).
+
+    A "V1" snapshot can also be a V2 one an older version wrote back after a
+    downgrade (it drops ``db_version``): its play stats then hold the per-user
+    maps beside the flat entries that version added, and its history is still
+    the per-user dict.  Per-user maps are kept as they are; only the flat
+    entries (and a flat history list) go to ``owner``, added to what that user
+    has (``user_data.merge_user_data``)."""
+    from soniqboom.core.user_data import HISTORY_MAX, merge_user_data
+    ps = state.get("play_stats")
+    hist = state.get("history")
+    ps = ps if isinstance(ps, dict) else {}
+    users = {k: v for k, v in ps.items()
+             if isinstance(v, dict) and not _is_play_entry(v)
+             and all(isinstance(x, dict) for x in v.values())}
+    flat = {k: v for k, v in ps.items() if k not in users and _is_play_entry(v)}
+    users_h = ({k: v for k, v in hist.items() if isinstance(v, list)}
+               if isinstance(hist, dict) else {})
+    flat_h = hist[-HISTORY_MAX:] if isinstance(hist, list) else []
+    src = "\x00v1"                                     # (no account id)
+    if flat:
+        users[src] = flat
+    if flat_h:
+        users_h[src] = flat_h
+    merge_user_data(users, users_h, src, owner)
+    state["play_stats"] = {k: v for k, v in users.items() if v}
+    state["history"] = {k: v for k, v in users_h.items() if v}
+    # Playlists with no owner (the shared ones of V1) become the owner's.
+    pls = state.get("playlists")
+    if owner and isinstance(pls, dict):
+        for pid, pl in list(pls.items()):
+            if isinstance(pl, dict) and not pl.get("owner_user_id"):
+                pls[pid] = {**pl, "owner_user_id": owner}
+    _set_owner(state, owner)
+
+
+# Upgrade steps, run in order: ``{from version: step(state, owner)}``.
+_UPGRADES = {1: _upgrade_v1_to_v2}
+
+
+def _newer_database_error(version: int, data_dir: Path | None) -> DatabaseVersionError:
+    from soniqboom import __version__
+    where = (f" or restore the backup SoniqBoom made before its last upgrade from "
+             f"{data_dir / BACKUPS_DIRNAME} (stop the server, copy those files back into "
+             f"the data folder)") if data_dir is not None else ""
+    return DatabaseVersionError(
+        f"The library database is V{version}, but SoniqBoom {__version__} reads up to "
+        f"V{DB_VERSION}: it was written by a newer SoniqBoom.  Run that version again{where}.")
+
+
+def upgrade_state(state: dict, owner: str, data_dir: Path | None = None) -> int | None:
+    """Bring a loaded snapshot ``state`` to ``DB_VERSION`` in place (data of
+    an older layout goes to ``owner``) and return the version it had — None
+    for an empty state, which is just stamped.  No files are touched (the
+    backup is the caller's: ``init_persistence``).  A newer state raises
+    ``DatabaseVersionError`` (naming ``data_dir``'s backups folder)."""
+    v = state_db_version(state)
+    if v is None:
+        state["db_version"] = DB_VERSION
+        return None
+    if v > DB_VERSION:
+        raise _newer_database_error(v, data_dir)
+    old = v
+    while v < DB_VERSION:
+        _UPGRADES[v](state, owner)
+        v += 1
+        state["db_version"] = v
+    return old
+
+
+def import_backup_state(payload: dict, *, accounts: dict[str, str], legacy_owner: str,
+                        favorites_out: dict | None = None) -> dict:
+    """The library state of a ``.sbz`` backup ``payload`` (``{"version": 2,
+    "db_version", "users_map": {uid: username}, "data": snapshot}``), made
+    ready to load on this server (``populate_store``).  Nobody is given
+    another user's data:
+
+      * a backup of an older database (no ``db_version``: V1) is upgraded as
+        a start would (``upgrade_state``) — its shared data goes to
+        ``legacy_owner`` (this server's legacy owner, ``users.legacy_owner_id``;
+        ``""`` without accounts: the no-user bucket);
+      * a V2 backup's per-user data is mapped onto this server's accounts by
+        user name (``users_map`` → ``accounts``: lower-cased user name →
+        account id; two that land on one account are merged —
+        ``user_data.merge_user_data``).  A user with no account of that name
+        here keeps its data under ``PENDING_PREFIX`` + its id, the name noted
+        in ``PENDING_CONFIG_KEY``, until such an account exists
+        (``user_data.claim_pending``); the backup's own pending data the same
+        way.  The no-user bucket stays one (``claim_unowned``).
+        ``user_data_owner`` follows its user (dropped when that has no account
+        here: this server's legacy owner then follows the usual rule).
+        Playlist owners and subscribers, and the per-user favourite stations
+        (``payload["favorites"]``), follow the same mapping — the stations
+        into ``favorites_out`` (``{account id / kept-aside key: stations}``)
+        for the caller to save (``radiodir.set_favorites``).
+
+    Raises ``DatabaseVersionError`` for a backup newer than ``DB_VERSION``."""
+    from soniqboom.core.user_data import (NO_USER, OWNER_CONFIG_KEY, PENDING_CONFIG_KEY,
+                                          PENDING_PREFIX, merge_user_data)
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    outer = payload.get("db_version")
+    if type(outer) is int and outer > DB_VERSION:
+        raise _newer_database_error(outer, None)
+    cfg = data.get("config")
+    if not isinstance(cfg, dict):
+        cfg = data["config"] = {}
+    if state_db_version(data) not in (None, DB_VERSION):
+        # (an older database: its owner is this server's, whoever the backup named)
+        cfg.pop(OWNER_CONFIG_KEY, None)
+    favs_in = payload.get("favorites")
+    favs_in = favs_in if isinstance(favs_in, dict) else {}
+    old = upgrade_state(data, legacy_owner or NO_USER)
+    if old is not None and old < DB_VERSION:
+        return data                     # (an older backup holds no per-user stations)
+    users_map = payload.get("users_map")
+    users_map = users_map if isinstance(users_map, dict) else {}
+    src_pending = cfg.get(PENDING_CONFIG_KEY)
+    src_pending = src_pending if isinstance(src_pending, dict) else {}
+    pending: dict = {}
+
+    def _target(uid: str) -> str:
+        if not isinstance(uid, str) or uid == NO_USER:
+            return NO_USER
+        name = src_pending.get(uid) if uid.startswith(PENDING_PREFIX) else users_map.get(uid)
+        hit = accounts.get(name.lower()) if isinstance(name, str) else None
+        if hit:
+            return hit
+        key = uid if uid.startswith(PENDING_PREFIX) else PENDING_PREFIX + uid
+        pending[key] = name if isinstance(name, str) else None
+        return key
+
+    ps = data.get("play_stats")
+    hist = data.get("history")
+    ps = data["play_stats"] = ps if isinstance(ps, dict) else {}
+    hist = data["history"] = hist if isinstance(hist, dict) else {}
+    src_uids = list(dict.fromkeys([*ps, *hist]))
+    # Aside first: a source id that is also a target id must not be merged into
+    # before its own data moved.
+    aside_ps = {u: v for u in src_uids if isinstance(v := ps.pop(u, None), dict)}
+    aside_h = {u: v for u in src_uids if isinstance(v := hist.pop(u, None), list)}
+    src = "\x00import"                                 # (no account id)
+    for uid in src_uids:
+        dst = _target(uid)
+        tmp_ps = {src: aside_ps[uid]} if uid in aside_ps else {}
+        tmp_h = {src: aside_h[uid]} if uid in aside_h else {}
+        if dst in ps:
+            tmp_ps[dst] = ps.pop(dst)
+        if dst in hist:
+            tmp_h[dst] = hist.pop(dst)
+        merge_user_data(tmp_ps, tmp_h, src, dst)
+        ps.update(tmp_ps)
+        hist.update(tmp_h)
+    pls = data.get("playlists")
+    if isinstance(pls, dict):
+        for pid, pl in list(pls.items()):
+            if not isinstance(pl, dict):
+                continue
+            owner_src = pl.get("owner_user_id")
+            owner_dst = _target(owner_src) if isinstance(owner_src, str) else NO_USER
+            subs = []
+            for s_uid in pl.get("subscribers") or ():
+                if isinstance(s_uid, str) and s_uid:
+                    t = _target(s_uid)
+                    if t and t != owner_dst and t not in subs:
+                        subs.append(t)
+            pls[pid] = {**pl, "owner_user_id": owner_dst or None, "subscribers": subs}
+    if favorites_out is not None:
+        for uid, stations in favs_in.items():
+            if isinstance(uid, str) and isinstance(stations, list):
+                key = _target(uid)
+                have = favorites_out.setdefault(key, [])
+                seen = {st.get("sid") for st in have if isinstance(st, dict)}
+                have += [st for st in stations
+                         if isinstance(st, dict) and st.get("sid") not in seen]
+    if pending:
+        cfg[PENDING_CONFIG_KEY] = pending
+    else:
+        cfg.pop(PENDING_CONFIG_KEY, None)
+    owner = cfg.get(OWNER_CONFIG_KEY)
+    if isinstance(owner, str) and owner:
+        name = users_map.get(owner)
+        hit = accounts.get(name.lower()) if isinstance(name, str) else None
+        if hit:
+            cfg[OWNER_CONFIG_KEY] = hit
+        else:
+            cfg.pop(OWNER_CONFIG_KEY, None)
+    return data
+
+
+def _has_uidless_record(data: bytes) -> bool:
+    """Does ``data`` (AOF records) hold a per-user record (``record_play`` /
+    ``push_history``) without ``uid`` — one written by a version before V2?
+    Stops at the first.  A line carrying ``"uid":`` is passed over unparsed
+    (in a title the quotes would be escaped), so a V2 journal costs a byte
+    search per line."""
+    for raw in data.split(b"\n"):
+        if b'"uid":' in raw or (b'"record_play"' not in raw and b'"push_history"' not in raw):
+            continue
+        try:
+            e = loads_json(raw.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (isinstance(e, dict) and e.get("op") in ("record_play", "push_history")
+                and not isinstance(e.get("uid"), str)):
+            return True
+    return False
+
+
+def _needs_upgrade(data_dir: Path, state: dict) -> int | None:
+    """The database version a start must convert from (backup first), or
+    None when the files are this version's (or there are none).  Older: the
+    snapshot's ``db_version``, or 1 when the AOF (past the bytes the snapshot
+    already holds) or a set-aside ``library.aof.late-exec-*`` file it doesn't
+    hold (``_late_records``) holds a per-user record without ``uid``, or a
+    V2-stamped snapshot holds V1-shaped data (``_has_v1_shapes``).  Raises
+    ``DatabaseVersionError`` for a newer snapshot."""
+    v = state_db_version(state)
+    if v is not None and v > DB_VERSION:
+        raise _newer_database_error(v, data_dir)
+    if v is not None and v < DB_VERSION:
+        return v
+    if v == DB_VERSION and _has_v1_shapes(state):
+        log.info("library.json holds data written by a version before database V%d",
+                 DB_VERSION)
+        return 1
+    aof_path = data_dir / "library.aof"
+    try:
+        data = aof_path.read_bytes()
+    except FileNotFoundError:
+        data = b""
+    if (_has_uidless_record(data[aof_merged_prefix(state, data):])
+            or any(_has_uidless_record(body)
+                   for _p, body in _late_records(data_dir, data, state.get(LATE_MARK)))):
+        log.info("AOF: records written by a version before database V%d", DB_VERSION)
+        return 1
+    return None
+
+
+def _fsync_file(path: Path) -> None:
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# The files of a backup a hard link may hold instead of a copy: they are only
+# ever replaced (``os.replace`` of a new file — the snapshot writes, the .bak
+# rotation's link or copy, ``_rotate_backup``), never written in place, so the
+# backup's link keeps the old bytes.  The AOF is appended to: always copied.
+_LINKABLE = ("library.json", "library.json.bak")
+
+# Free space a conversion needs beyond the backup's copies: the new snapshot
+# (about the size of the current one) and this much headroom.
+_UPGRADE_SPACE_MARGIN = 16 * 1024 * 1024
+
+
+def _backup_manifest(folder: Path) -> dict | None:
+    try:
+        m = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) and isinstance(m.get("files"), dict) else None
+
+
+def backup_before_upgrade(data_dir: Path, old_version: int, snapshot_from: Path | None = None,
+                          ) -> Path:
+    """Back up the library's files before a conversion: ``_UPGRADE_BACKUP_FILES``
+    that exist, the ``library.aof.late-exec-*`` files, and ``snapshot_from``
+    (the ``library.json.bak`` the snapshot was loaded from, when it was).
+
+      * A complete backup of exactly these files (``manifest.json``: each
+        file's size and SHA-256) is reused — a start that failed after its
+        backup and is tried again (a restart loop) makes no second copy.
+      * Else a new ``<data>/backups/db-v<old>-<YYYYmmdd-HHMMSS>/``: the
+        snapshot hard-linked where the file system allows (``_LINKABLE``),
+        everything else copied; each file checked against the original's
+        SHA-256 (a link: the same file) and fsync'd; ``manifest.json`` and
+        a ``README.txt`` written.  Built under a temporary name and renamed
+        when complete, so a folder with the final name is a whole copy (a
+        temporary one a crash left is removed first).  Before copying, the
+        free space is checked: the copies plus the new snapshot (plus the
+        .bak copy of the current one where hard links fail); a file system
+        that reports no size at all (some network shares) is not checked.
+
+    Returns the folder; raises ``DatabaseVersionError`` when the backup could
+    not be made (the partial copy removed) — no conversion without a backup."""
+    from soniqboom import __version__
+    root = data_dir / BACKUPS_DIRNAME
+    rels = [r for r in _UPGRADE_BACKUP_FILES if (data_dir / r).is_file()]
+    rels += sorted(p.name for p in data_dir.glob("library.aof.late-exec-*") if p.is_file())
+    if snapshot_from is not None and snapshot_from.is_file():
+        rel = os.path.relpath(snapshot_from, data_dir)
+        if rel not in rels:
+            rels.append(rel)
+    tmp = None
+    try:
+        files = {rel: {"size": (data_dir / rel).stat().st_size,
+                       "sha256": _sha256(data_dir / rel)} for rel in rels}
+        if root.is_dir():
+            for prior in sorted(root.glob(f"db-v{old_version}-*"), reverse=True):
+                m = _backup_manifest(prior)
+                if (m is not None and m["files"] == files
+                        and all((prior / r).is_file()
+                                and (prior / r).stat().st_size == f["size"]
+                                for r, f in files.items())):
+                    log.info("Database V%d: the backup %s already holds these files — "
+                             "reused", old_version, prior)
+                    return prior
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        final = root / f"db-v{old_version}-{stamp}"
+        n = 1
+        while final.exists():
+            final = root / f"db-v{old_version}-{stamp}-{n}"
+            n += 1
+        tmp = root / f".{final.name}.incomplete"
+        root.mkdir(parents=True, exist_ok=True)
+        for stale in root.glob(".db-v*.incomplete"):    # (a copy a crash cut short)
+            shutil.rmtree(stale, ignore_errors=True)
+        tmp.mkdir()
+        linked = set()
+        for rel in rels:
+            if rel in _LINKABLE:
+                try:
+                    os.link(data_dir / rel, tmp / rel)
+                    linked.add(rel)
+                except OSError:
+                    pass                                # (copied below)
+        snap = data_dir / "library.json"
+        # (the new snapshot is about the size of the one loaded — library.json,
+        # or the .bak it fell back to)
+        snap_size = max((p.stat().st_size for p in (snap, snapshot_from)
+                         if p is not None and p.is_file()), default=0)
+        # The copies, the new snapshot, and — without hard links — the copy
+        # of the current snapshot the write keeps as library.json.bak.
+        need = (sum(files[r]["size"] for r in rels if r not in linked) + snap_size
+                + (snap_size if "library.json" not in linked else 0) + _UPGRADE_SPACE_MARGIN)
+        usage = shutil.disk_usage(root)
+        if usage.total == 0:
+            log.info("Database V%d: the file system reports no size — the free space "
+                     "before the backup is not checked", old_version)
+        elif usage.free < need:
+            raise OSError(f"not enough free space: {need / 1e6:.0f} MB needed "
+                          f"(the backup and the converted library), "
+                          f"{usage.free / 1e6:.0f} MB free")
+        for rel in rels:
+            src, dst = data_dir / rel, tmp / rel
+            if rel in linked:
+                if not os.path.samefile(src, dst):
+                    raise OSError(f"{rel}: the link is not the original")
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            try:
+                shutil.copystat(src, dst)
+            except OSError:
+                pass                                    # (times / modes: not needed to restore)
+            _fsync_file(dst)
+            if _sha256(dst) != files[rel]["sha256"]:
+                raise OSError(f"{rel}: the copy differs from the original")
+        (tmp / "manifest.json").write_text(json.dumps(
+            {"db_version": old_version, "files": files}, indent=1), encoding="utf-8")
+        readme = tmp / "README.txt"
+        readme.write_text(_BACKUP_README.format(
+            version=__version__, old=old_version, new=DB_VERSION,
+            when=time.strftime("%Y-%m-%d %H:%M:%S"),
+            files=", ".join(rels) or "(none)", data_dir=data_dir), encoding="utf-8")
+        _fsync_file(readme)
+        _fsync_file(tmp / "manifest.json")
+        for d in {(tmp / r).parent for r in rels} | {tmp}:
+            _fsync_dir(d)
+        os.rename(tmp, final)
+        _fsync_dir(root)
+        _fsync_dir(data_dir)
+    except Exception as exc:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+        raise DatabaseVersionError(
+            f"The library database V{old_version} could not be backed up to {root} "
+            f"({exc}) — it was not converted to V{DB_VERSION}.  Free some space or fix the "
+            f"folder's permissions, then start SoniqBoom again.") from exc
+    log.info("Database V%d backed up to %s (%s%s) before converting it to V%d",
+             old_version, final, ", ".join(rels) or "no files",
+             f"; linked: {', '.join(sorted(linked))}" if linked else "", DB_VERSION)
+    return final
+
+
+def _legacy_owner(state: dict, data_dir: Path) -> str:
+    """The account the data of an older database goes to: the state's
+    ``user_data_owner`` when set (and an account of that id is on disk, or
+    none could be read), else ``users.legacy_owner_id`` of the accounts on
+    disk (``users.accounts_on_disk`` — read-only, the user store isn't loaded
+    yet at a start): the oldest enabled admin, else the oldest admin, else the
+    oldest account; else the no-user bucket ``""`` (no account yet: it moves
+    to the first account once there is one — ``user_data.claim_unowned``)."""
+    from soniqboom.core.user_data import NO_USER, OWNER_CONFIG_KEY
+    cfg = state.get("config")
+    owner = cfg.get(OWNER_CONFIG_KEY) if isinstance(cfg, dict) else None
+    try:
+        from soniqboom.core.users import accounts_on_disk, legacy_owner_id
+        accounts = accounts_on_disk(data_dir)
+        if isinstance(owner, str) and owner and (
+                not accounts or any(u.get("id") == owner for u in accounts)):
+            return owner
+        return legacy_owner_id(accounts) or NO_USER
+    except Exception:                                   # noqa: BLE001
+        log.warning("The accounts could not be read for the database upgrade — "
+                    "the listening data stays unassigned until an account exists",
+                    exc_info=True)
+        return NO_USER
 
 
 # ── The AOF bytes a snapshot holds ───────────────────────────────────────────
@@ -456,8 +976,8 @@ _MISSING = object()
 def _entry_undo(state: dict, entry: dict):
     """Capture the MINIMAL pre-state needed to roll one AOF entry back.
 
-    Returns a list of undo records covering only the sub-dict keys (or list
-    slot) the op can actually touch — O(touched), not O(whole store).  This
+    Returns a list of undo records covering only the sub-dict keys (or the
+    per-user map keys) the op can actually touch — O(touched), not O(whole store).  This
     deliberately mirrors the op set in
     :func:`soniqboom.core.merger._apply_entry`; **keep the two in sync**.
     Returns ``None`` for an unrecognised op so the caller falls back to a
@@ -471,11 +991,13 @@ def _entry_undo(state: dict, entry: dict):
     172K-entry AOF and replay became 172K × 172K ≈ 3e10 dict copies — startup
     spun at 100% CPU for many minutes and never became ready.
     """
+    from soniqboom.core.merger import _entry_uid
+
     op = entry.get("op")
 
     def kv(slot: str, keys):
         # Undo specific KEYS of a dict slot.  copy.copy the pre-value because
-        # some ops (update_track_fields, record_play) mutate it in place — a
+        # some ops (update_track_fields, push_history) mutate it in place — a
         # bare reference would already reflect the mutation by rollback time.
         d = state.get(slot)
         d = d if isinstance(d, dict) else {}
@@ -484,13 +1006,24 @@ def _entry_undo(state: dict, entry: dict):
             for k in keys if k is not None
         })
 
-    def whole(slot: str):
-        # Undo the ENTIRE slot value (for the list-typed ``history`` slot,
-        # which push_history may wholesale-replace on truncation).
-        v = state.get(slot, _MISSING)
-        if isinstance(v, list):
-            v = list(v)
-        return ("whole", slot, v)
+    def nested(slot: str, outer_keys, inner_keys):
+        # Undo specific INNER keys of the per-user maps (``play_stats``:
+        # ``{user: {track: stats}}``) — the stats dicts copied, as ``kv`` does
+        # (``record_play`` edits them in place) — and whether each user's map
+        # existed at all.
+        d = state.get(slot)
+        d = d if isinstance(d, dict) else {}
+        saved = {}
+        for ok in outer_keys:
+            if ok is None:
+                continue
+            inner = d.get(ok, _MISSING)
+            if not isinstance(inner, dict):
+                saved[ok] = (copy.copy(inner) if inner is not _MISSING else _MISSING, None)
+                continue
+            saved[ok] = (True, {k: (copy.copy(inner[k]) if k in inner else _MISSING)
+                                for k in inner_keys if k is not None})
+        return ("nested", slot, saved)
 
     if op in ("upsert_track", "update_track_fields"):
         return [kv("tracks", [entry.get("id")])]
@@ -506,7 +1039,7 @@ def _entry_undo(state: dict, entry: dict):
     if op == "set_rating":
         return [kv("ratings", [entry.get("id")])]
     if op == "record_play":
-        return [kv("play_stats", [entry.get("id")])]
+        return [nested("play_stats", [_entry_uid(state, entry)], [entry.get("id")])]
     if op in ("upsert_playlist", "delete_playlist"):
         return [kv("playlists", [entry.get("id")])]
     if op in ("upsert_scan_dir", "delete_scan_dir"):
@@ -514,14 +1047,23 @@ def _entry_undo(state: dict, entry: dict):
     if op in ("set_config", "delete_config"):
         return [kv("config", [entry.get("key")])]
     if op == "push_history":
-        return [whole("history")]
+        return [kv("history", [_entry_uid(state, entry)])]
     if op == "remap_track_ids":
         m = entry.get("mapping") or {}
         keys = [*m.keys(), *m.values()] if isinstance(m, dict) else []
         pls = state.get("playlists")
-        return [kv("ratings", keys), kv("play_stats", keys), kv("waveforms", keys),
-                whole("history"),
+        ps = state.get("play_stats")
+        hist = state.get("history")
+        return [kv("ratings", keys),
+                nested("play_stats", list(ps) if isinstance(ps, dict) else [], keys),
+                kv("waveforms", keys),
+                kv("history", list(hist) if isinstance(hist, dict) else []),
                 kv("playlists", list(pls.keys()) if isinstance(pls, dict) else [])]
+    if op == "move_user_data":
+        uids = [entry.get("src"), entry.get("dst")]
+        return [kv("play_stats", uids), kv("history", uids)]
+    if op == "delete_user_data":
+        return [kv("play_stats", [entry.get("uid")]), kv("history", [entry.get("uid")])]
     return None
 
 
@@ -537,12 +1079,25 @@ def _entry_restore(state: dict, undo) -> None:
                     d.pop(k, None)
                 else:
                     d[k] = v
-        else:  # "whole"
-            _, slot, v = rec
-            if v is _MISSING:
-                state.pop(slot, None)
-            else:
-                state[slot] = v
+        else:  # "nested"
+            _, slot, saved = rec
+            d = state.setdefault(slot, {})
+            for ok, (existed, inner_saved) in saved.items():
+                if inner_saved is None:
+                    # (no map for that user before the op, or not a dict)
+                    if existed is _MISSING:
+                        d.pop(ok, None)
+                    else:
+                        d[ok] = existed
+                    continue
+                inner = d.get(ok)
+                if not isinstance(inner, dict):
+                    inner = d[ok] = {}
+                for k, v in inner_saved.items():
+                    if v is _MISSING:
+                        inner.pop(k, None)
+                    else:
+                        inner[k] = v
 
 
 def _apply_entry_transactional(state: dict, entry: dict) -> bool:
@@ -582,23 +1137,44 @@ def _apply_entry_transactional(state: dict, entry: dict) -> bool:
         return False
 
 
-def replay_aof(state: dict, data_dir: Path) -> int:
+def replay_aof(state: dict, data_dir: Path, data: bytes | None = None, *,
+               extra: "list[bytes]" = (), quarantine: "bool | list" = True) -> int:
     """Replay AOF entries on top of the loaded snapshot.
 
     Returns the number of entries applied.  Corrupt or unparseable entries
     (and any that fail the transactional apply) are written to
     ``library.aof.quarantine`` with the current timestamp so an operator
-    can inspect them rather than the events being silently dropped.
-    Counters are surfaced via ``aof_quarantine_count``.  An AOF prefix the
-    snapshot already holds (``AOF_MARK`` — a merge or shutdown snapshot that
-    ended before dropping it) is skipped, not applied a second time.
+    can inspect them rather than the events being silently dropped
+    (``quarantine`` False: only counted and logged — a reader that must not
+    write the data folder, ``read_library_state``; a list: those lines are
+    collected in it, for the caller to write later — ``_convert``, after its
+    snapshot).  Counters are surfaced
+    via ``aof_quarantine_count``.  An AOF prefix the snapshot already holds
+    (``AOF_MARK`` — a merge or shutdown snapshot that ended before dropping
+    it) is skipped, not applied a second time.
+
+    ``data``: the AOF's contents when the caller read them already (the
+    conversion marks exactly the bytes replayed), else the file is read.
+    ``extra``: more records replayed after them, in order (the set-aside
+    ``library.aof.late-exec-*`` records a conversion replays without adding
+    them to the AOF first).
     """
     global _aof_quarantine_count
     _aof_quarantine_count = 0
 
     aof_path = data_dir / "library.aof"
-    if not aof_path.exists() or aof_path.stat().st_size == 0:
+    if data is None:
+        try:
+            with open(aof_path, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            data = b""
+    if not data and not any(extra):
         return 0
+    if not state:
+        # (no snapshot: the records build one of this database version — the
+        # caller converts an older snapshot before, ``init_persistence``)
+        state["db_version"] = DB_VERSION
 
     quarantine_path = data_dir / "library.aof.quarantine"
     quarantine_fp = None
@@ -606,50 +1182,49 @@ def replay_aof(state: dict, data_dir: Path) -> int:
     def _quarantine(raw: str, reason: str) -> None:
         nonlocal quarantine_fp
         global _aof_quarantine_count
+        _aof_quarantine_count += 1
+        line = json.dumps({"quarantined_at": time.time(), "reason": reason, "raw": raw}) + "\n"
+        if isinstance(quarantine, list):
+            quarantine.append(line)
+            return
+        if not quarantine:
+            return
         try:
             if quarantine_fp is None:
                 quarantine_fp = open(quarantine_path, "a")
-            quarantine_fp.write(
-                json.dumps({
-                    "quarantined_at": time.time(),
-                    "reason": reason,
-                    "raw": raw,
-                }) + "\n",
-            )
+            quarantine_fp.write(line)
         except OSError:
             log.exception("Could not write to AOF quarantine at %s", quarantine_path)
-        _aof_quarantine_count += 1
 
     applied = 0
-    with open(aof_path, "rb") as f:
-        data = f.read()
     skip = aof_merged_prefix(state, data)
     if skip:
         log.info("AOF: its first %d bytes are already in the snapshot (a merge that "
                  "ended before dropping them) — not replayed", skip)
-    for raw_line in data[skip:].split(b"\n"):
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        try:
-            entry = loads_json(raw_line)
-        except json.JSONDecodeError as exc:
-            log.warning("Skipping corrupt AOF entry: %s", exc)
-            _quarantine(raw_line.decode("utf-8", errors="replace"), f"json: {exc}")
-            continue
-        try:
-            ok = _apply_entry_transactional(state, entry)
-        except Exception as exc:
-            # Defensive — _apply_entry_transactional already catches
-            # most failures; this covers anything that escapes the
-            # snapshot/restore (e.g. an OOM mid-copy).
-            log.warning("AOF entry raised %s — quarantining", exc)
-            _quarantine(raw_line.decode("utf-8", errors="replace"), f"apply: {exc}")
-            continue
-        if ok:
-            applied += 1
-        else:
-            _quarantine(raw_line.decode("utf-8", errors="replace"), "transactional rollback")
+    for blob in (data[skip:], *extra):
+        for raw_line in blob.split(b"\n"):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                entry = loads_json(raw_line)
+            except json.JSONDecodeError as exc:
+                log.warning("Skipping corrupt AOF entry: %s", exc)
+                _quarantine(raw_line.decode("utf-8", errors="replace"), f"json: {exc}")
+                continue
+            try:
+                ok = _apply_entry_transactional(state, entry)
+            except Exception as exc:
+                # Defensive — _apply_entry_transactional already catches
+                # most failures; this covers anything that escapes the
+                # snapshot/restore (e.g. an OOM mid-copy).
+                log.warning("AOF entry raised %s — quarantining", exc)
+                _quarantine(raw_line.decode("utf-8", errors="replace"), f"apply: {exc}")
+                continue
+            if ok:
+                applied += 1
+            else:
+                _quarantine(raw_line.decode("utf-8", errors="replace"), "transactional rollback")
 
     if quarantine_fp is not None:
         try:
@@ -661,8 +1236,9 @@ def replay_aof(state: dict, data_dir: Path) -> int:
         log.info("Replayed %d AOF entries", applied)
     if _aof_quarantine_count:
         log.warning(
-            "Quarantined %d AOF entries to %s",
-            _aof_quarantine_count, quarantine_path,
+            "Quarantined %d AOF entries%s",
+            _aof_quarantine_count,
+            f" to {quarantine_path}" if quarantine is True else "",
         )
     return applied
 
@@ -720,6 +1296,13 @@ def populate_store(state: dict) -> None:
 
     store = get_store()
     t0 = time.monotonic()
+    if state_db_version(state) != DB_VERSION:
+        # (a state no start converted: one built in memory — the start and
+        # the imports convert theirs before; its data goes to its owner)
+        from soniqboom.core.user_data import NO_USER, OWNER_CONFIG_KEY
+        cfg = state.get("config")
+        owner = cfg.get(OWNER_CONFIG_KEY) if isinstance(cfg, dict) else None
+        upgrade_state(state, owner if isinstance(owner, str) else NO_USER)
 
     store.bulk_load(
         tracks=state.get("tracks", {}),
@@ -727,7 +1310,7 @@ def populate_store(state: dict) -> None:
         ratings=state.get("ratings", {}),
         play_stats=state.get("play_stats", {}),
         playlists=state.get("playlists", {}),
-        history=state.get("history", []),
+        history=state.get("history", {}),
         scan_dirs=state.get("scan_dirs", {}),
         hash_lookups=state.get("hash_lookups", {}),
         config=state.get("config", {}),
@@ -770,7 +1353,7 @@ _flocks_held: dict[str, list] = {}
 
 
 @contextlib.contextmanager
-def _library_flock(data_dir: Path):
+def _library_flock(data_dir: Path, create: bool = True):
     key = os.path.abspath(data_dir / "library.lock")
     held = _flocks_held.get(key)
     if held is not None:
@@ -782,8 +1365,11 @@ def _library_flock(data_dir: Path):
         return
     fd: int | None = None
     try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o644)
+        if create:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        # (``create`` False: a reader that writes nothing — an existing lock
+        # file is taken, a missing one means no lock)
+        fd = os.open(key, os.O_RDWR | (os.O_CREAT if create else 0), 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1102,7 +1688,46 @@ def write_imported_library(data_dir: Path) -> str | None:
     return None
 
 
-def adopt_exec_late_records(data_dir: Path) -> int:
+# The set-aside ``library.aof.late-exec-*`` files a snapshot written by a
+# conversion holds (``_convert``): ``{file name: _late_digest(its records)}``.
+# A start finding such a file still there (a stop between the write and the
+# removal) removes it instead of adding its records a second time.
+LATE_MARK = "late_exec_merged"
+
+
+def _late_digest(body: bytes) -> str:
+    return hashlib.blake2b(body, digest_size=16).hexdigest()
+
+
+def _late_records(data_dir: Path, aof: bytes, held: Any,
+                  covered: "list | None" = None) -> "list[tuple[Path, bytes]]":
+    """The set-aside ``library.aof.late-exec-*`` files whose records are still
+    to replay after the AOF ``aof``, oldest first, as ``(path, complete
+    lines)`` — read only (``adopt_exec_late_records`` adds them to the AOF
+    instead).  Left out: one ``held`` names (``LATE_MARK``: in the snapshot),
+    one the AOF already ends with (a start that stopped before removing it —
+    added to ``covered``, when given: its records are replayed with the AOF),
+    one with no complete record or that can't be read."""
+    held = held if isinstance(held, dict) else {}
+    out = []
+    for late in sorted(data_dir.glob("library.aof.late-exec-*")):
+        try:
+            raw = late.read_bytes()
+        except OSError:
+            log.warning("AOF: %s could not be read — not replayed", late.name)
+            continue
+        body = raw[:raw.rfind(b"\n") + 1]
+        if not body or held.get(late.name) == _late_digest(body):
+            continue
+        if aof.endswith(body):
+            if covered is not None:
+                covered.append((late, body))
+            continue
+        out.append((late, body))
+    return out
+
+
+def adopt_exec_late_records(data_dir: Path, held: Any = None) -> int:
     """Append the records the source install's restart set aside between
     sealing its journal and its ``os.execv`` (``library.aof.late-exec-*``,
     ``AOFWriter.late_tag``) to ``library.aof``, oldest file first, and remove
@@ -1114,10 +1739,12 @@ def adopt_exec_late_records(data_dir: Path) -> int:
     between the two) gets nothing twice.  A file that can't be added is
     renamed to a plain set-aside file (``library.aof.late-…``, kept for an
     operator, never replayed — later it would land after newer records).
-    Caller holds the library's locks (``init_persistence``).  Returns the
-    records adopted."""
+    A file ``held`` names (the snapshot's ``LATE_MARK``: a conversion holds
+    its records) is removed without adding anything.  Caller holds the
+    library's locks (``init_persistence``).  Returns the records adopted."""
     aof = data_dir / "library.aof"
     adopted = 0
+    held = held if isinstance(held, dict) else {}
     for late in sorted(data_dir.glob("library.aof.late-exec-*")):
         def _set_aside(why: str) -> None:
             kept = late.with_name(late.name.replace(".late-exec-", ".late-", 1))
@@ -1135,6 +1762,8 @@ def adopt_exec_late_records(data_dir: Path) -> int:
         if len(body) < len(raw):
             log.warning("AOF: %s ends in a partial record (%d bytes) — not replayed",
                         late.name, len(raw) - len(body))
+        if body and held.get(late.name) == _late_digest(body):
+            body = b""                                  # (already in the snapshot)
         if body:
             try:
                 existing = aof.read_bytes() if aof.exists() else b""
@@ -1165,19 +1794,201 @@ def init_persistence(data_dir: Path) -> None:
     the files read under ``library_files_lock`` (waiting for a merge of a
     stopped run still ending) and ``_library_flock`` (a merge of the merger
     process).  First, the records a restart set aside right before its exec
-    join the AOF (``adopt_exec_late_records``)."""
+    join the AOF (``adopt_exec_late_records``).
+
+    An older database (``_needs_upgrade``) is converted instead
+    (``_convert``): backed up first, converted in memory, saved — and the
+    files are only changed by that save.  A database newer than
+    ``DB_VERSION``, a failed backup or a failed save raise
+    ``DatabaseVersionError`` (logged, and shown as the startup status):
+    nothing is loaded."""
     data_dir.mkdir(parents=True, exist_ok=True)
     if not library_files_lock.acquire(timeout=1.0):
         log.info("Waiting for a merge of the previous server run to finish before loading the library")
         library_files_lock.acquire()
     try:
         with _library_flock(data_dir):
-            adopt_exec_late_records(data_dir)
             state = load_snapshot(data_dir)
-            replay_aof(state, data_dir)
+            try:
+                old = _needs_upgrade(data_dir, state)
+                if old is not None:
+                    _convert(data_dir, state, old)
+                else:
+                    adopt_exec_late_records(data_dir, held=state.get(LATE_MARK))
+                    upgrade_state(state, "", data_dir)
+                    replay_aof(state, data_dir)
+            except DatabaseVersionError as exc:
+                log.critical("%s", exc)
+                try:
+                    from soniqboom.core.startup_status import set_phase
+                    set_phase("failed", "The library database could not be opened", str(exc))
+                except Exception:                       # noqa: BLE001
+                    pass
+                raise
     finally:
         library_files_lock.release()
     populate_store(state)
+    log.info("Library database V%d", DB_VERSION)
     # Preserve a "last known good" copy of the snapshot that just loaded, for
     # hand-restore if the primary + .bak ever both go bad (see make_prev_backup).
     make_prev_backup(data_dir)
+
+
+def _set_owner(state: dict, owner: str) -> None:
+    """Record ``owner`` as the state's ``user_data_owner`` (records without
+    uid go to it — ``merger._entry_uid``); nothing for ``""``."""
+    from soniqboom.core.user_data import OWNER_CONFIG_KEY
+    if owner:
+        cfg = state.get("config")
+        if not isinstance(cfg, dict):
+            cfg = state["config"] = {}
+        cfg[OWNER_CONFIG_KEY] = owner
+
+
+def _drop_orphan_playlists(state: dict, data_dir: Path) -> int:
+    """At a conversion: remove the playlists whose owner account no longer
+    exists — accounts deleted before 1.14.5 left them behind, reachable by
+    nobody (Sebastian's decision: deleted, not handed to an admin).  Only when
+    the accounts can be read (``users.accounts_on_disk``: an unreadable or
+    missing ``users.json`` removes nothing); a playlist kept aside for an
+    account a restore didn't find (``import:…``) stays.  The backup holds
+    them.  Returns how many went."""
+    from soniqboom.core.users import accounts_on_disk
+    pls = state.get("playlists")
+    if not isinstance(pls, dict) or not pls:
+        return 0
+    ids = {a.get("id") for a in accounts_on_disk(data_dir) if isinstance(a, dict)}
+    ids.discard(None)
+    if not ids:
+        return 0
+    gone = [pid for pid, pl in pls.items()
+            if isinstance(pl, dict) and isinstance(pl.get("owner_user_id"), str)
+            and pl["owner_user_id"] and pl["owner_user_id"] not in ids
+            and not pl["owner_user_id"].startswith("import:")]
+    for pid in gone:
+        log.info("Upgrade: playlist %r removed — its account no longer exists",
+                 pls[pid].get("name") or pid)
+        del pls[pid]
+    return len(gone)
+
+
+def _convert(data_dir: Path, state: dict, old: int) -> None:
+    """Convert a database of version ``old`` (loaded: ``state``) at a start.
+    Caller holds the library's locks; no journal writes yet.
+
+      1. back the files up (``backup_before_upgrade``);
+      2. convert the snapshot in memory (``upgrade_state``; the data goes to
+         the legacy owner — ``_legacy_owner``) and replay on top the AOF's
+         bytes and the set-aside ``library.aof.late-exec-*`` records — the
+         latter without adding them to the AOF first;
+      3. refuse when no snapshot loaded (no tracks) while ``library.json`` or
+         its ``.bak`` on disk holds tracks (one could not be read just now);
+      4. write the V2 snapshot, which marks the AOF bytes (``AOF_MARK``) and
+         the set-aside files (``LATE_MARK``) it holds, then write the lines
+         the replay refused to the quarantine file, drop those bytes from the
+         AOF and remove those files.
+
+    Until step 4's write nothing in the data folder but the backup changes:
+    a crash before it converts again at the next start (reusing the backup).
+    A crash after it skips what the marks name."""
+    global _last_loaded_from
+    loaded = _last_loaded_from
+    backup = backup_before_upgrade(
+        data_dir, old,
+        snapshot_from=loaded if loaded is not None and loaded.name != "library.json" else None)
+    owner = _legacy_owner(state, data_dir)
+    upgrade_state(state, owner, data_dir)
+    if _has_v1_shapes(state):
+        _upgrade_v1_to_v2(state, owner)                 # (a V2 file an older version wrote to)
+    _set_owner(state, owner)
+    _drop_orphan_playlists(state, data_dir)
+    if not state.get("tracks"):
+        # Nothing loaded: refused while the files on disk hold tracks (one
+        # could not be read just now) — whatever the AOF would add.
+        for name in ("library.json", "library.json.bak"):
+            on_disk = _try_load_json(data_dir / name)
+            if isinstance(on_disk, dict) and on_disk.get("tracks"):
+                raise DatabaseVersionError(
+                    f"The library database could not be read completely ({name} holds "
+                    f"tracks, the loaded library none) — it was not converted to "
+                    f"V{DB_VERSION}.  Start SoniqBoom again; the files are unchanged "
+                    f"(backup: {backup}).")
+    aof_path = data_dir / "library.aof"
+    try:
+        data = read_aof(aof_path)
+    except FileNotFoundError:
+        data = b""
+    covered: list = []
+    late = _late_records(data_dir, data, state.get(LATE_MARK), covered)
+    quarantined: list = []
+    replay_aof(state, data_dir, data, extra=[body for _p, body in late], quarantine=quarantined)
+    done = late + covered
+    if data:
+        state[AOF_MARK] = aof_mark(data)
+    if done:
+        state[LATE_MARK] = {p.name: _late_digest(body) for p, body in done}
+    try:
+        ok = write_library_file(data_dir, state, "Upgrade")
+    except Exception as exc:                            # noqa: BLE001
+        raise DatabaseVersionError(
+            f"The converted library database could not be written ({exc}) — the V{old} "
+            f"files are unchanged (backup: {backup})") from exc
+    if not ok:
+        raise DatabaseVersionError(
+            f"The converted library database could not be written — the V{old} files are "
+            f"unchanged (backup: {backup})")
+    # (the converted file is the one that loaded — ``make_prev_backup`` keeps a
+    # copy of a POPULATED one only, as for any load)
+    _last_loaded_from = data_dir / "library.json" if state.get("tracks") else None
+    if quarantined:
+        try:
+            with open(data_dir / "library.aof.quarantine", "a") as f:
+                f.writelines(quarantined)
+        except OSError:
+            log.exception("Could not write to the AOF quarantine")
+    if data:
+        drop_aof_prefix(aof_path, len(data))
+    for p, _body in done:
+        try:
+            p.unlink()
+        except OSError:
+            # Set aside under a name no start replays (as adopt_exec_late_records
+            # does), so its records — in the snapshot now — can't apply twice.
+            kept = p.with_name(p.name.replace(".late-exec-", ".late-", 1))
+            log.warning("AOF: %s could not be removed (its records are in the snapshot) "
+                        "— renamed %s", p.name, kept.name, exc_info=True)
+            try:
+                os.replace(p, kept)
+            except OSError:
+                log.error("AOF: %s could not be renamed either — the snapshot's mark "
+                          "keeps its records from being applied again", p.name)
+    if done:
+        _fsync_dir(data_dir)
+    log.info("Library database converted from V%d to V%d (the previous files: %s)",
+             old, DB_VERSION, backup)
+
+
+def read_library_state(data_dir: Path) -> dict:
+    """The library as a start would load it — the snapshot, the AOF and the
+    set-aside records replayed, an older database converted — built in
+    memory only: nothing in the data folder is written (no backup, no
+    conversion, no quarantine file, no lock file created).  For the
+    command-line export, which may run beside a server.  Raises
+    ``DatabaseVersionError`` for a newer database."""
+    with library_files_lock, _library_flock(data_dir, create=False):
+        state = load_snapshot(data_dir)
+        old = _needs_upgrade(data_dir, state)
+        owner = _legacy_owner(state, data_dir) if old is not None else ""
+        upgrade_state(state, owner, data_dir)
+        if _has_v1_shapes(state):
+            _upgrade_v1_to_v2(state, owner)
+        _set_owner(state, owner)
+        try:
+            data = (data_dir / "library.aof").read_bytes()
+        except FileNotFoundError:
+            data = b""
+        late = _late_records(data_dir, data, state.get(LATE_MARK))
+        replay_aof(state, data_dir, data, extra=[body for _p, body in late], quarantine=False)
+    state.pop(AOF_MARK, None)
+    state.pop(LATE_MARK, None)
+    return state

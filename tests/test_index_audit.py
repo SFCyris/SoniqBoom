@@ -47,7 +47,7 @@ def _store(n: int = 1500, seed: int = 1) -> TrackStore:
     s = TrackStore()
     s.upsert_tracks_batch([_mk(r, i) for i in range(n)] + [_mk(r, i, "w") for i in range(n // 3)])
     for i in range(0, n, 5):
-        s.record_play(f"t{i:05d}")
+        s.record_play(f"t{i:05d}", uid="")
     return s
 
 
@@ -78,7 +78,7 @@ async def _writer(s, stop, r, counter):
         elif op == "duration" and ws:
             s.update_track_fields(r.choice(ws), {"duration": r.choice([12.0, 333.0])})
         elif op == "play" and ws:
-            s.record_play(r.choice(ws))
+            s.record_play(r.choice(ws), uid="")
         elif op == "batch" and ws:
             s.enter_batch_mode()
             s.upsert_tracks_batch([_mk(r, int(r.choice(ws)[1:]), "w")])
@@ -100,7 +100,7 @@ async def test_a_clean_check_moves_nothing():
     agg = s.aggregate_artists()
     rep = await ih.audit(s)
     assert rep is not None and rep["index_ok"] and rep["mismatches"] == []
-    assert set(rep["indexes"]) >= set(SORTED_LISTS) | {"_word_index", "_unplayed_ids"}
+    assert set(rep["indexes"]) >= set(SORTED_LISTS) | {"_word_index"}
     assert _seqs(s) == seqs and s.aggregate_artists() is agg      # no memo dropped
     assert s._write_watch is None
 
@@ -128,12 +128,6 @@ def _plant(s, kind: str) -> str:
     if kind == "nonprimary":
         s._nonprimary_ids ^= {tid}
         return "_nonprimary_ids"
-    if kind == "unplayed":
-        s._unplayed_ids ^= {tid}
-        return "_unplayed_ids"
-    if kind == "unplayed_gone":
-        s._unplayed_ids.add("a-track-no-longer-there")
-        return "_unplayed_ids"
     if kind == "sorted_missing":
         lst = s._sorted_artist
         del lst[len(lst) // 2]
@@ -163,7 +157,7 @@ def _plant(s, kind: str) -> str:
 
 
 @pytest.mark.parametrize("kind", ["tag", "word", "agg", "by_artist", "set", "nonprimary",
-                                  "unplayed", "unplayed_gone", "sorted_missing", "sorted_stale",
+                                  "sorted_missing", "sorted_stale",
                                   "fold_missing",
                                   "sorted_disorder", "sorted_rekey"])
 async def test_planted_drift_is_found_and_healed_under_concurrent_writes(kind):
@@ -179,8 +173,6 @@ async def test_planted_drift_is_found_and_healed_under_concurrent_writes(kind):
     sample = rep["mismatches"][0]["sample"]
     if kind == "tag":
         assert sample == ["ghost-format"]               # (what drifted, not only that it did)
-    if kind == "unplayed_gone":
-        assert sample == ["a-track-no-longer-there"]
     assert rep["healed"] and s.verify_indexes()["index_ok"]
     rep = await ih.audit(s)
     assert rep["index_ok"]

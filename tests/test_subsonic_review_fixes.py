@@ -253,7 +253,7 @@ def test_suffix_content_type_and_transcoded_fields(path, fmt, suffix, ctype, tsu
 
 
 def test_child_carries_play_count_bpm_comment_isrc_and_bookmark(env):
-    env.store.record_play("q2")
+    env.store.record_play("q2", uid="u1")
     env.store.update_track_fields("q2", {"bpm": 72.4, "comment": "live", "composer": "Mercury",
                                          "isrc": "GBUM71029604"})
     env.ok("createBookmark.view", id="q2", position=61000)
@@ -563,12 +563,12 @@ def test_similar_songs_accepts_album_and_artist_ids(env, monkeypatch):
 def test_scrobble_records_every_id_with_its_time(env):
     t1, t2 = 1_700_000_100_000, 1_700_000_200_000
     env.ok("scrobble.view", id=["q1", "nope", "q2"], time=[t1, 5, t2])
-    assert env.store._play_stats["q1"] == {"count": 1, "last_played": t1 // 1000}
-    assert env.store._play_stats["q2"] == {"count": 1, "last_played": t2 // 1000}
-    assert "nope" not in env.store._play_stats
+    assert env.store._play_stats["u1"]["q1"] == {"count": 1, "last_played": t1 // 1000}
+    assert env.store._play_stats["u1"]["q2"] == {"count": 1, "last_played": t2 // 1000}
+    assert "nope" not in env.store._play_stats["u1"]
     before = int(time.time())
     env.ok("scrobble.view", id="q3")
-    assert env.store._play_stats["q3"]["last_played"] >= before
+    assert env.store._play_stats["u1"]["q3"]["last_played"] >= before
     assert env.fail("scrobble.view")["code"] == 10
 
 
@@ -634,7 +634,7 @@ def test_stream_unknown_id_is_an_error_document(env, method):
 
 
 def test_top_songs_by_artist_id(env):
-    env.store.record_play("q2")
+    env.store.record_play("q2", uid="u1")
     by_name = [s["id"] for s in env.ok("getTopSongs.view", artist="queen")["topSongs"]["song"]]
     by_id = [s["id"] for s in env.ok("getTopSongs.view", id=sx.artist_id("Queen"))["topSongs"]["song"]]
     assert by_id == by_name and by_id[0] == "q2"
@@ -690,9 +690,9 @@ def test_head_radio_opens_no_upstream(env, radio_favs, monkeypatch):
 
 
 def test_radio_homepage_is_sanitised_and_relay_is_unbuffered(env, radio_favs, monkeypatch):
-    favs = radio_favs.get_favorites()
+    favs = radio_favs.get_favorites("u1")
     favs[1]["homepage"] = "javascript:alert(1)"
-    radio_favs._write_json(radio_favs._FAVS_FILE, favs)
+    radio_favs.set_favorites("u1", favs)
     rows = env.ok("getInternetRadioStations.view")["internetRadioStations"]["internetRadioStation"]
     assert rows[0]["homePageUrl"] == "https://a.example/" and "homePageUrl" not in rows[1]
     assert radio_favs._trim_station({"homepage": "javascript:x", "url": "u"})["homepage"] == ""

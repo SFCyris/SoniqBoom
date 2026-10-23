@@ -91,14 +91,15 @@ def test_a_falsified_encoder_is_caught():
 
 
 def test_records_appended_replay_and_merge_like_the_old_ones(tmp_path):
-    base = {"tracks": {"t1": {"id": "t1", "title": "x", "n": 1}}, "config": {},
-            "scan_dirs": {}, "playlists": {}, "history": [], "ratings": {}, "play_stats": {}}
+    base = {"db_version": persistence.DB_VERSION,
+            "tracks": {"t1": {"id": "t1", "title": "x", "n": 1}}, "config": {},
+            "scan_dirs": {}, "playlists": {}, "history": {}, "ratings": {}, "play_stats": {}}
     recs = [("batch_upsert_tracks", {"count": 2, "data": [
                 {"id": "t2", "title": _WEIRD[0], "n": 2 ** 64 - 1, "f": -0.0},
                 {"id": "t3", "title": "half \ud800", "n": 2 ** 70}]}),
             ("update_track_fields_batch", {"data": [{"id": "t1", "data": {"title": _WEIRD[4]}}]}),
             ("update_track_fields", {"id": "t2", "data": {"duration": 12.5}}),
-            ("record_play", {"id": "t1", "ts": 1792118490}),
+            ("record_play", {"id": "t1", "ts": 1792118490, "uid": "u1"}),
             ("set_config", {"key": "k😀", "value": {"v": _WEIRD}}),
             ("delete_tracks", {"ids": ["t3"]})]
     out = {}

@@ -723,7 +723,7 @@ async def test_radio_and_similar_never_suggest_an_offline_track(lib, monkeypatch
 @pytest.mark.asyncio
 async def test_smart_lists_hide_but_still_fill_their_limit(lib):
     for i, t in enumerate(lib.ids_b + lib.ids_a):
-        lib.store.record_play(t)
+        lib.store.record_play(t, uid="")
         lib.store.set_rating(t, 5 if i < 50 else 3)
     lib.offline()
     lib.mode("hide")

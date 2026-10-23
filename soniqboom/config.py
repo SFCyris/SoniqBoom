@@ -159,6 +159,7 @@ _CONF_DEFAULTS: dict[str, Any] = {
         "soundfonts_dir": "",
         "sid_default_duration": 180,
         "hvsc_autodetect": True,
+        "hvsc_source": "local",
     },
     # ── Optional access services ────────────────────────────────────────────
     # Each toggle gates whether the corresponding router + frontend page is
@@ -328,7 +329,8 @@ _CONF_TEMPLATE = """\
     "soundfont_path": "",
     "soundfonts_dir": "",
     "sid_default_duration": 180,
-    "hvsc_autodetect": true
+    "hvsc_autodetect": true,
+    "hvsc_source": "local"
   },
 
   "_comment_services": "Optional access services. Disable a flag to remove the corresponding router from the FastAPI app — clients then get 404. Toggle live from Settings → Services or `soniqboom services enable|disable <name>`.",
@@ -690,6 +692,11 @@ class Settings(BaseSettings):
     # configured will look for a ``DOCUMENTS/`` folder up the tree and auto-set
     # it.  Never overrides a path the user set.  Turn off to disable detection.
     hvsc_autodetect:   bool = bool(_local_conf.get("renderers", {}).get("hvsc_autodetect", True))
+    # Where the HVSC documents come from: "local" (``hvsc_docs_path``, empty =
+    # no HVSC) or "online" (downloaded from the 6581.nl mirror and checked
+    # weekly — ``core/hvsc_download``; the local path is then not used).
+    hvsc_source:       str = ("online" if _local_conf.get("renderers", {}).get("hvsc_source")
+                              == "online" else "local")
     # libgme renderer (E-14) — covers NSF/SPC/GBS/VGM/AY/KSS/SAP/HES/GYM.
     # Path to the ``gme`` CLI (from gme-tools or similar) that writes WAV
     # to stdout from a chiptune file.  Empty disables — falls back to

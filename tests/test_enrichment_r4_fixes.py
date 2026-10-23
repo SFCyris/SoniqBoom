@@ -560,9 +560,7 @@ def test_index_generation_moves_with_every_index_write():
     s.update_track_fields("a", {"duration": 12.0})             # duration-only
     assert s.index_generation() != g
     g = s.index_generation()
-    s.record_play("a")                                        # leaves _unplayed_ids
-    assert s.index_generation() != g
-    g = s.index_generation()
+    s.record_play("a", uid="")                                # plays feed no index
     s.update_track_fields("a", {"cover_art": "/api/art/a"})    # feeds no index
     s.set_rating("a", 5)
     assert s.index_generation() == g

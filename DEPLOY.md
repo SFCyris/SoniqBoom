@@ -40,7 +40,7 @@ docker --version
 
 > **Skip the build?** A prebuilt multi-arch image (Intel/AMD + 64-bit ARM) is published at
 > `ghcr.io/sfcyris/soniqboom:latest`; each release is also tagged with its version
-> (for example `:1.14.0`, and `:1.14` for the newest 1.14.x). In `docker-compose.yml`,
+> (for example `:1.14.5`, and `:1.14` for the newest 1.14.x). In `docker-compose.yml`,
 > comment out `build: .` and uncomment the `image:` line (there's a comment marking the
 > spot), then use `docker compose pull && docker compose up -d` at step 3 — it starts in
 > seconds instead of compiling the players. Building from source (below) is only needed

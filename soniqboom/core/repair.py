@@ -219,6 +219,17 @@ def _has_replacement_char(track: dict) -> bool:
     return False
 
 
+def _has_placeholder_title(track: dict) -> bool:
+    """A module (any format but ordinary audio, whose tags are its own)
+    whose stored title is a stand-in (``metadata.is_placeholder_title``) —
+    a re-extract names it after its file."""
+    from soniqboom.core.metadata import is_placeholder_title
+    from soniqboom.core.skip_rules import _AUDIO_EXTS   # ordinary audio: never a module
+    if not is_placeholder_title(track.get("title")):
+        return False
+    return os.path.splitext((track.get("path") or "").lower())[1] not in _AUDIO_EXTS
+
+
 def _has_bad_tracker_title(track: dict) -> bool:
     """True for an AHX/HVL/OctaMED track whose stored title is a known mis-extraction
     artifact from the pre-fix ``_extract_tracker``:
@@ -231,8 +242,8 @@ def _has_bad_tracker_title(track: dict) -> bool:
     Re-extracting with the corrected parser yields the real embedded name.
     """
     ext = os.path.splitext((track.get("path") or "").lower())[1]
-    if (track.get("title") or "").strip() in ("<no songtitle>", "<unnamed>"):
-        return True                         # a player's stand-in, not a name (any Amiga format, #24)
+    if _has_placeholder_title(track):
+        return True                         # a player's stand-in, not a name (any module, #24)
     if ext not in _MAGIC_TITLE_BUG:
         return False
     title = (track.get("title") or "").strip()
@@ -292,6 +303,22 @@ def _needs_repair(track: dict) -> bool:
     return (_has_replacement_char(track)
             or _has_bad_tracker_title(track)
             or _has_cp437_corruption(track))
+
+
+def repair_kind(track: dict) -> str | None:
+    """Why ``_needs_repair`` flags ``track``: ``"garbled"`` (U+FFFD),
+    ``"placeholder"`` (a stand-in title such as ``<unnamed>``), ``"bad-title"``
+    (another mis-extracted AHX/HVL/OctaMED title), ``"cp437"`` (a SID name
+    CP437-mis-decoded) — or None."""
+    if _has_replacement_char(track):
+        return "garbled"
+    if _has_placeholder_title(track):
+        return "placeholder"
+    if _has_bad_tracker_title(track):
+        return "bad-title"
+    if _has_cp437_corruption(track):
+        return "cp437"
+    return None
 
 
 def find_corrupt_tracks(*, tracker_only: bool = False) -> list[dict]:
@@ -1154,7 +1181,7 @@ def _apply_re_extract(tid: str, new_meta: dict) -> tuple[bool, bool, str | None]
         return False, False, "read-incomplete"
     if _write_delta(tid, delta):
         return True, True, None
-    return True, False, "store-rejected"
+    return False, False, "store-rejected"
 
 
 # Fields a failed read comes back without: an extractor that swallowed an I/O

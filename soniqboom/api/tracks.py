@@ -326,6 +326,7 @@ from soniqboom.core.data import (
 )
 from soniqboom.core.metadata import extract_lyrics
 from soniqboom.models.track import TrackMeta
+from soniqboom.api.users import listener_uid as _listener_uid
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
 
@@ -1217,9 +1218,10 @@ async def list_tracks(
     from soniqboom.core.store import get_store
     store = get_store()
     # "Tracks on unavailable drives": Hide leaves them out of the list (the
-    # count endpoint agrees), Mark flags them (``offline``), Show does neither.
-    # With duplicates hidden, Mark / Hide list a group whose primary can't play
-    # by its best playable member (``swap``).
+    # count endpoint agrees), Mark flags them (``offline``), Show does neither;
+    # "Tracks that can't be played: Hide" leaves those out too (``hidden``).
+    # With duplicates hidden, a group whose primary can't play is listed by its
+    # best playable member (``swap``).
     excl = availability.hidden(store)
     hide_dups = bool(store.get_config("filter_duplicates", False))
     swap = availability.primary_swap(store, dedup=hide_dups)
@@ -1251,8 +1253,9 @@ async def count_tracks():
     ``GET /api/tracks`` returns one track per duplicate group (its primary, or
     the member standing in for a primary that can't play), and with
     "Tracks on unavailable drives: Hide" it leaves out the tracks that can't
-    play right now, so a list sized from ``count`` would end in rows that never
-    load.  Size lists from ``visible``.
+    play right now — with "Tracks that can't be played: Hide" the tracks
+    reported broken, corrupt or refused by their player — so a list sized from
+    ``count`` would end in rows that never load.  Size lists from ``visible``.
     """
     from soniqboom.core import availability
     from soniqboom.core.store import get_store
@@ -1321,7 +1324,6 @@ async def shuffled_tracks(
     Response: ``{"total", "seed", "offset", "tracks": [TrackMeta…]}``.
     """
     from soniqboom.core import shuffle_order
-    from soniqboom.core.data import _parse_tag_query
     from soniqboom.core.store import get_store
 
     store = get_store()
@@ -1332,10 +1334,8 @@ async def shuffled_tracks(
     if q:
         # Identical parse path to /api/search so "shuffle these results" means
         # exactly the tracks the search would list (uncapped).
-        from soniqboom.api.search import _parse_advanced_query
-        advanced = _parse_advanced_query(q)
-        tagq = advanced or q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
-        preds.update(_parse_tag_query(tagq))
+        from soniqboom.api.search import search_predicates
+        preds.update(search_predicates(q))
     for name, val in (("artist", artist), ("album_artist", album_artist),
                       ("album", album), ("genre", genre),
                       ("scene_group", scene_group), ("format_", format),
@@ -1403,16 +1403,17 @@ async def batch_ratings(body: dict):
 
 
 @router.get("/meta/playstats")
-async def all_play_stats_endpoint():
-    """Return all play stats as {track_id: {count, last_played}}."""
-    return await get_all_play_stats()
+async def all_play_stats_endpoint(uid: str = _Depends(_listener_uid)):
+    """Return the signed-in user's play stats as {track_id: {count,
+    last_played}}."""
+    return await get_all_play_stats(uid=uid)
 
 
 @router.post("/meta/playstats/batch")
-async def batch_play_stats(body: dict):
-    """Return play stats for a list of track IDs."""
+async def batch_play_stats(body: dict, uid: str = _Depends(_listener_uid)):
+    """Return the signed-in user's play stats for a list of track IDs."""
     ids = body.get("ids", [])
-    return await get_play_stats_batch(ids)
+    return await get_play_stats_batch(ids, uid=uid)
 
 
 @json_route(router, "/meta/batch", methods=("POST",))
@@ -3380,9 +3381,12 @@ async def read_rating(track_id: str):
 
 @router.post("/{track_id}/played")
 async def mark_played(track_id: str, sb_session: str | None = Cookie(default=None)):
-    """Record a play event for the track (increments count, sets last_played).
+    """Record a play event for the track (increments count, sets last_played)
+    under the signed-in user (the session cookie) — before any account
+    exists under the no-user bucket ``""``; with accounts and no signed-in
+    user, 401.
 
-    Also pushes the event to the listening history log (smart.py), shows the
+    Also pushes the event to that user's listening history (smart.py), shows the
     signed-in listener in Subsonic ``getNowPlaying`` (player "SoniqBoom
     Web"), and forwards the play to last.fm / ListenBrainz if that user has
     scrobble tokens configured.
@@ -3390,15 +3394,25 @@ async def mark_played(track_id: str, sb_session: str | None = Cookie(default=Non
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
-    stats = await record_play(track_id)
 
+    # The signed-in listener's play (readonly accounts too); before any
+    # account exists, the no-user bucket.  With accounts but no session user
+    # (signed out meanwhile, the account deleted): 401 — never filed under
+    # nobody.  Looked up after the last await before the write, so a play of
+    # an account deleted meanwhile is not recorded.
     user = None
-    if sb_session:
-        try:
-            from soniqboom.core.users import get_user_store
-            user = get_user_store().lookup_session(sb_session)
-        except Exception:
-            user = None
+    users = None
+    try:
+        from soniqboom.core.users import get_user_store
+        users = get_user_store()
+    except RuntimeError:
+        pass                                    # (no user store yet: early boot)
+    if sb_session and users is not None:
+        user = users.lookup_session(sb_session)
+    if user is None and users is not None and users.has_any():
+        raise HTTPException(401, "Not signed in.")
+    uid = user.id if user is not None else ""
+    stats = await record_play(track_id, uid=uid)
     if user is not None:
         # The web / mobile player only reports a play once it crossed the
         # record threshold (never on a preload), so this is a real listen.
@@ -3411,7 +3425,8 @@ async def mark_played(track_id: str, sb_session: str | None = Cookie(default=Non
     # Push to listening history (non-blocking, fire-and-forget)
     try:
         from soniqboom.api.smart import push_history
-        await push_history(track_id, title=track.title or "", artist=track.artist or "")
+        await push_history(track_id, title=track.title or "", artist=track.artist or "",
+                           uid=uid)
     except Exception:
         pass  # history is best-effort, don't fail the play recording
 
@@ -3431,6 +3446,6 @@ async def mark_played(track_id: str, sb_session: str | None = Cookie(default=Non
 
 
 @router.get("/{track_id}/stats")
-async def read_play_stats(track_id: str):
-    stats = await get_play_stats(track_id)
+async def read_play_stats(track_id: str, uid: str = _Depends(_listener_uid)):
+    stats = await get_play_stats(track_id, uid=uid)
     return {"id": track_id, **stats}

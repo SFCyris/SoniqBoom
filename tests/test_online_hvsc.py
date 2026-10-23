@@ -146,6 +146,17 @@ async def _enable(env) -> dict:
     return st
 
 
+async def _reconcile_settled() -> None:
+    """Let a reconcile the catalogue scheduled itself (``schedule_reconcile``
+    — spawned via ``call_soon_threadsafe``) finish, so an explicit run in a
+    test doesn't race it."""
+    for _ in range(3):
+        await asyncio.sleep(0.05)
+        t = online_hvsc._reconcile_task
+        if t is not None and not t.done():
+            await t
+
+
 def _sid_gets():
     return [p for m, p in _Handler.log if m == "GET" and p.endswith(".sid")]
 
@@ -419,12 +430,13 @@ def test_who_counts_as_the_folders_composer():
 async def test_user_data_follows_the_hvsc_copy_in_the_library(env):
     from soniqboom.core import modland_catalog as mc
     await _enable(env)
+    await _reconcile_settled()
     cat, store = env["cat"], env["store"]
     rel = "MUSICIANS/H/Hubbard_Rob/Commando.sid"
     mid, oid = mc.track_id("HVSC/" + rel), cat.track_id(rel)
     # Rated and played as Modland's copy (now left out of the library).
     store.set_rating(mid, 5)
-    store.record_play(mid)
+    store.record_play(mid, uid="")
     store.create_playlist("pl", "mine", track_ids=[mid])
     store.store_waveform(oid, [0.5, 0.25])          # (computed for the copy: no user data)
     other = "MUSICIANS/H/Hubbard_Rob/Monty_on_the_Run.sid"
@@ -433,7 +445,7 @@ async def test_user_data_follows_the_hvsc_copy_in_the_library(env):
     store.create_playlist("pl2", "both", track_ids=[mc.track_id("HVSC/" + other)])
     res = await online_hvsc.reconcile_user_data()
     assert res["moved"] == 1 and res["conflicts"] == 1
-    assert store.get_rating(oid) == 5 and store.get_play_stats(oid).get("count") == 1
+    assert store.get_rating(oid) == 5 and store.get_play_stats(oid, uid="").get("count") == 1
     assert not store.get_rating(mid)
     pl = next(p for p in store.list_playlists() if p.get("id") == "pl")
     ids = [e.get("id") if isinstance(e, dict) else e for e in pl["track_ids"]]
@@ -453,7 +465,49 @@ async def test_user_data_follows_the_hvsc_copy_in_the_library(env):
     if online_hvsc._reconcile_task is not None:
         await online_hvsc._reconcile_task
     assert store.get_rating(mid) == 5 and not store.get_rating(oid)
-    assert store.get_play_stats(mid).get("count") == 1
+    assert store.get_play_stats(mid, uid="").get("count") == 1
+
+
+@pytest.mark.asyncio
+async def test_plays_follow_the_hvsc_copy_per_user(env):
+    """Plays alone are user data that moves; where one user played both
+    copies, that user's plays (and history) stay on each copy while another
+    user's move."""
+    from soniqboom.core import modland_catalog as mc
+    await _enable(env)
+    await _reconcile_settled()
+    cat, store = env["cat"], env["store"]
+    both = "MUSICIANS/H/Hubbard_Rob/Commando.sid"
+    only = "MUSICIANS/H/Hubbard_Rob/Monty_on_the_Run.sid"
+    mid, oid = mc.track_id("HVSC/" + both), cat.track_id(both)
+    m_only, o_only = mc.track_id("HVSC/" + only), cat.track_id(only)
+    store.record_play(m_only, uid="u1")                              # plays only, no rating
+    store.record_play(m_only, uid="u1")
+    store.record_play(mid, uid="u1")
+    store.record_play(mid, uid="u2")
+    for _ in range(7):
+        store.record_play(oid, uid="u2")                             # u2 played both copies
+    store.push_history({"track_id": mid, "ts": 1}, uid="u1")
+    store.push_history({"track_id": mid, "ts": 2}, uid="u2")
+    res = await online_hvsc.reconcile_user_data()
+    assert res == {"moved": 1, "conflicts": 1}
+    assert store.get_play_stats(o_only, uid="u1")["count"] == 2
+    assert store.get_play_stats(m_only, uid="u1")["count"] == 0
+    assert store.get_play_stats(oid, uid="u1")["count"] == 1        # u1: moved
+    assert store.get_history(5, uid="u1")[0]["track_id"] == oid
+    assert store.get_play_stats(oid, uid="u2")["count"] == 7        # u2: each copy its own
+    assert store.get_play_stats(mid, uid="u2")["count"] == 1
+    assert store.get_history(5, uid="u2")[0]["track_id"] == mid
+    # Nothing left to move: a second run does nothing (and writes nothing).
+    await _reconcile_settled()
+    writes: list = []
+    real = store._aof_append
+    store._aof_append = lambda op, **kw: writes.append(op)
+    try:
+        assert await online_hvsc.reconcile_user_data() == {"moved": 0, "conflicts": 0}
+    finally:
+        store._aof_append = real
+    assert writes == []
 
 
 @pytest.mark.asyncio

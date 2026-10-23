@@ -159,7 +159,7 @@ async def test_a_member_listed_under_its_new_name_keeps_its_user_data(scan_lib, 
     store.delete_track_ids([new])
     store.upsert_tracks_batch([row])
     store.set_rating(old, 4)
-    store.record_play(old)
+    store.record_play(old, uid="")
     store.create_playlist("pl1", "Mix", [old, gone])
     store.set_rating(gone, 3)
     (root / "other.zip").unlink()                    # (a member that really goes)
@@ -167,7 +167,7 @@ async def test_a_member_listed_under_its_new_name_keeps_its_user_data(scan_lib, 
     assert old not in store._tracks and new in store._tracks
     assert store._tracks[new]["format"] == "ProTracker"
     assert store.get_rating(new) == 4 and store.get_rating(old) == 0
-    assert store.get_play_stats(new)["count"] == 1 and store.get_play_stats(old)["count"] == 0
+    assert store.get_play_stats(new, uid="")["count"] == 1 and store.get_play_stats(old, uid="")["count"] == 0
     assert store._playlists["pl1"]["track_ids"] == [new, gone]
     # Nothing renamed it: its data stays with its id (it may come back).
     assert gone not in store._tracks and store.get_rating(gone) == 3

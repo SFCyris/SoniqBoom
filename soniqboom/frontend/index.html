@@ -56,7 +56,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=119">
+  <link rel="stylesheet" href="/assets/css/app.css?v=123">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -119,7 +119,7 @@
         <button id="search-save-smart" type="button" hidden
                 title="Save this search as a smart playlist (it updates itself)"
                 aria-label="Save current search as a smart playlist"
-                style="font-size:12px;padding:4px 10px">&#9889; Save search</button>
+                style="font-size:12px;padding:0 10px">&#9889; Save search</button>
         <span id="scan-badge" class="scan-badge" hidden></span>
         <span id="user-chip" class="user-chip" hidden>
           <span aria-hidden="true">&#128100;</span>
@@ -133,7 +133,7 @@
            title="User guide &amp; documentation (opens a new tab)"
            aria-label="Open the user guide and documentation in a new tab">&#128214;</a>
         <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
-        <button id="btn-admin" title="Settings" aria-label="Settings">&#9881;</button>
+        <button id="btn-admin" title="Settings" aria-label="Settings"><span class="btn-admin-gear" aria-hidden="true">&#9881;</span></button>
       </div>
     </header>
 
@@ -710,14 +710,16 @@
             <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
               Re-extracts titles / artists / albums for tracks containing the
               U+FFFD replacement character (the diamond <code>&#65533;</code>),
-              left behind by the old tracker / chiptune header decoder. Mostly
-              affects SID / NSF / SPC / MOD / S3M / IT / XM files.
+              left behind by the old tracker / chiptune header decoder, and for
+              modules stored with a placeholder title such as
+              <code>&lt;unnamed&gt;</code>, which get their file name instead.
+              Mostly affects SID / NSF / SPC / MOD / S3M / IT / XM files.
             </p>
             <div class="admin-io-row" style="gap:8px;flex-wrap:wrap">
-              <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px">
+              <div class="admin-setting" style="flex:1 1 100%">
+                <label for="repair-tracker-only">Only tracker / chiptune files (faster — skips remote FLAC/MP3)</label>
                 <input type="checkbox" id="repair-tracker-only" checked>
-                Only tracker / chiptune files (faster — skips remote FLAC/MP3)
-              </label>
+              </div>
             </div>
             <div class="admin-io-row" style="gap:8px;flex-wrap:wrap;margin-top:8px">
               <button class="btn-secondary" id="btn-repair-scan" type="button">
@@ -922,12 +924,24 @@
               <span id="hvsc-status" class="hvsc-status off">disabled</span>
             </h3>
             <p class="admin-hint" style="margin-bottom:12px">
-              Point at the HVSC <code>DOCUMENTS/</code> folder (download from
-              <a href="https://www.hvsc.de/" target="_blank" rel="noopener noreferrer">hvsc.de</a>)
-              to upgrade every SID track with per-subsong durations and STIL commentary.
-              Leave empty to use the default-duration estimate.
+              The <a href="https://www.hvsc.de/" target="_blank" rel="noopener noreferrer">HVSC</a>
+              song lengths and STIL commentary give every SID track its per-subsong durations
+              and background notes. Download them from the internet (the 6581.nl HVSC mirror,
+              checked weekly), or point at the HVSC <code>DOCUMENTS/</code> folder on your
+              computer. With neither, SID tracks use the default duration.
             </p>
-            <div class="admin-setting">
+            <div class="admin-setting" role="radiogroup" aria-label="Where the HVSC database comes from"
+                 style="flex-direction:column;align-items:flex-start;gap:6px">
+              <label style="display:inline-flex;align-items:center;gap:6px">
+                <input type="radio" name="hvsc-source" id="hvsc-source-online" value="online">
+                Download from the internet
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px">
+                <input type="radio" name="hvsc-source" id="hvsc-source-local" value="local">
+                Local DOCUMENTS folder
+              </label>
+            </div>
+            <div class="admin-setting" id="hvsc-path-row">
               <label for="setting-hvsc-path">HVSC DOCUMENTS folder</label>
               <input id="setting-hvsc-path" type="text"
                      autocapitalize="off" autocorrect="off" spellcheck="false"
@@ -937,6 +951,10 @@
             </div>
             <div class="admin-io-row" style="margin-top:12px">
               <button id="btn-save-hvsc">Save &amp; reload</button>
+              <button id="btn-hvsc-download-now" class="btn-secondary" style="display:none"
+                      title="Ask the HVSC mirror for newer song lengths and STIL now">
+                Check now
+              </button>
               <button id="btn-rescan-sids" class="btn-secondary"
                       title="Apply HVSC durations + STIL to every SID track in the library (no rescan, no extra folders added)">
                 Re-extract SID metadata
@@ -946,6 +964,7 @@
                 Clean up auto-imported HVSC folders
               </button>
             </div>
+            <p id="hvsc-download-info" class="admin-hint" style="display:none;margin:8px 0 0"></p>
             <div id="admin-hvsc-msg" class="admin-msg" style="display:none"></div>
           </div>
 
@@ -1197,6 +1216,13 @@
                   <option value="mark">Mark them</option>
                   <option value="hide">Hide them</option>
                   <option value="show">Show them as usual</option>
+                </select>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-unplayable-tracks">Tracks that can’t be played <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Tracks that don’t play: a file its player refused the same way twice (“can’t play”), a file no engine can decode (“corrupt”) and a track someone marked Broken. Glitched and partial tracks still play and this setting never hides them. Mark: list them with their badge. Hide: leave them out of searches, track lists and their counts — playlists, the queue, the duplicates view and any folder you open list them, marked. With Hide duplicates in search on, a copy of the track that plays is listed in its place. Shuffle, radio and the next track skip them either way; a track you click still tries.">&#9432;</span></label>
+                <select id="setting-unplayable-tracks">
+                  <option value="mark">Mark them</option>
+                  <option value="hide">Hide them</option>
                 </select>
               </div>
               <div class="admin-setting admin-setting--sub">
@@ -1456,6 +1482,7 @@
                 <div class="about-title">SoniqBoom</div>
                 <div class="about-byline">by S.F.Cyris</div>
                 <div class="about-version">Version <span id="about-version">—</span></div>
+                <div class="about-version" id="about-db-row" hidden>Database <span id="about-db-version">—</span></div>
                 <div class="about-links">
                   <a href="https://github.com/SFCyris/SoniqBoom" target="_blank" rel="noopener noreferrer">
                     <span aria-hidden="true">&#128279;</span> github.com/SFCyris/SoniqBoom
@@ -1704,11 +1731,11 @@
                  target="_blank" rel="noopener noreferrer"
                  title="The song database files on GitHub at the commit SoniqBoom downloads (95b3eab)">Validated set&nbsp;&#8599;</a>
             </div>
-            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+            <div class="admin-setting" style="margin-top:10px">
+              <label for="md-songdb-autoapply">Re-apply automatically after each library scan
+                <span class="admin-setting-note">(off keeps a reset in place until you re-apply)</span></label>
               <input type="checkbox" id="md-songdb-autoapply">
-              <span>Re-apply automatically after each library scan
-                <span>(off keeps a reset in place until you re-apply)</span></span>
-            </label>
+            </div>
             <div id="md-songdb-msg" class="admin-msg" style="display:none"></div>
           </div>
 
@@ -1813,11 +1840,11 @@
               read from those chip-music files (such as titles); albums and games
               you typed are never changed.
             </p>
-            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer">
+            <div class="admin-setting" style="margin-bottom:10px">
+              <label for="md-game-tags-remote">Include network shares
+                <span class="admin-setting-note">(their files are read over the network, which can take hours on a large share)</span></label>
               <input type="checkbox" id="md-game-tags-remote" checked>
-              <span>Include network shares
-                <span>(their files are read over the network, which can take hours on a large share)</span></span>
-            </label>
+            </div>
             <div class="admin-io-row">
               <button id="btn-md-game-tags" class="btn-secondary">Read game names</button>
               <button id="btn-md-game-tags-cancel" class="btn-secondary" type="button"
@@ -1844,11 +1871,11 @@
               <button id="md-demozoo-reset" class="btn-secondary"
                       title="Remove all Demozoo enrichment (release years, scene groups, auto-filled composers). Your own tag edits are kept.">Reset enrichment</button>
             </div>
-            <label class="admin-hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+            <div class="admin-setting" style="margin-top:10px">
+              <label for="md-demozoo-autoapply">Re-apply automatically after each library scan
+                <span class="admin-setting-note">(off keeps a reset in place until you re-apply)</span></label>
               <input type="checkbox" id="md-demozoo-autoapply">
-              <span>Re-apply automatically after each library scan
-                <span>(off keeps a reset in place until you re-apply)</span></span>
-            </label>
+            </div>
             <div id="md-demozoo-msg" class="admin-msg" style="display:none"></div>
           </div>
         </div>
@@ -2305,6 +2332,7 @@
     <!-- List-view header: shows when browsing playlists -->
     <div class="playlist-header" id="pl-hdr-list">
       <span class="playlist-title">Playlists</span>
+      <button id="btn-playlist-import" title="Import playlists other users share">Import…</button>
       <button id="btn-playlist-new" title="New playlist">+ New</button>
       <button id="btn-playlist-close" aria-label="Close playlist panel">&times;</button>
     </div>
@@ -2313,6 +2341,10 @@
       <button id="btn-playlist-back" class="pl-back-btn" title="All playlists">&#8592;</button>
       <span class="playlist-title" id="pl-active-name">Playlist</span>
       <span class="pl-track-count" id="pl-active-count"></span>
+      <button id="btn-playlist-share" class="pl-share-btn" hidden
+              title="Offer this playlist to every user (they can import it, read-only)">Share</button>
+      <button id="btn-playlist-unsub" class="pl-unsub-btn" hidden
+              title="Remove this imported playlist from your list">Unsubscribe</button>
       <button id="btn-playlist-close2" class="playlist-close-btn" aria-label="Close playlist panel">&times;</button>
     </div>
     <!-- Playlist selector (list view) -->

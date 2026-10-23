@@ -183,6 +183,12 @@ class HVSCOnline(OnlineCatalogue):
     async def enable(self) -> dict:
         res = await super().enable()
         _modland_reapply()               # Modland's HVSC folder leaves (option on)
+        _hvsc_download_follow()          # its refresh keeps the documents now
+        return res
+
+    async def disable(self) -> dict:
+        res = await super().disable()
+        _hvsc_download_follow(take_over=True)   # the HVSC card's download takes over (if chosen)
         return res
 
     def after_disable(self) -> None:
@@ -582,31 +588,88 @@ _reapply_task = None
 _fallback_active = False
 
 
+def _hvsc_download_follow(*, take_over: bool = False) -> None:
+    """Re-arm (or stop) the HVSC card's own download (``core/hvsc_download``);
+    ``take_over``: the collection went off — its last refresh counts as the
+    download's (no download again at once)."""
+    try:
+        from soniqboom.core import hvsc_download
+        if take_over and online_docs_chosen():
+            hvsc_download._take_over_from_collection()
+        hvsc_download.start()
+    except Exception:                                   # noqa: BLE001
+        log.debug("HVSC download not re-armed", exc_info=True)
+
+
+def online_docs_chosen() -> bool:
+    """The HVSC card's source is "Download from the internet" (``hvsc_source``)."""
+    from soniqboom.config import settings
+    return getattr(settings, "hvsc_source", "local") == "online"
+
+
+def local_docs_path() -> str:
+    """The local HVSC ``DOCUMENTS`` folder in use: the configured path while
+    the HVSC card's source is the local folder, else none."""
+    from soniqboom.config import settings
+    if online_docs_chosen():
+        return ""
+    return (getattr(settings, "hvsc_docs_path", "") or "").strip()
+
+
 def apply_docs_fallback() -> None:
     """Point the SID lookups (``core/hvsc``) at the downloaded documents when
-    no local HVSC folder is set, the collection is on and its "Use for my own
-    SID files" option is too; undo it when that no longer holds."""
+    no local HVSC folder is in use and either the HVSC card downloads them
+    (``hvsc_source`` "online", ``core/hvsc_download``) or the collection is on
+    with its "Use for my own SID files" option; undo it when that no longer
+    holds."""
     global _fallback_active
-    from soniqboom.config import settings
     from soniqboom.core.hvsc import get_hvsc
     hv = get_hvsc()
     docs = HVSC_ONLINE.dir() / "DOCUMENTS"
-    local = (getattr(settings, "hvsc_docs_path", "") or "").strip()
-    want = (not local and HVSC_ONLINE.enabled()
-            and HVSC_ONLINE.options().get(OPT_LOCAL_DOCS, True)
+    local = local_docs_path()
+    want = (not local
+            and (online_docs_chosen()
+                 or (HVSC_ONLINE.enabled()
+                     and HVSC_ONLINE.options().get(OPT_LOCAL_DOCS, True)))
             and (docs / "Songlengths.md5").exists())
     ours = str(docs)
     if want:
+        sig = _docs_signature(docs)
+        if hv.docs_path == ours and _fallback_active and sig == _applied_sig:
+            return                   # these very documents are in use already
         if hv.docs_path != ours:
             hv.configure(ours)
-            log.info("HVSC: song lengths and STIL from the online collection's documents")
+            log.info("HVSC: song lengths and STIL from the downloaded HVSC documents")
         else:
             hv.reload()
         _fallback_active = True
+        _set_applied(sig)
         _apply_to_library()          # the SIDs already in the library take them
     elif hv.docs_path == ours:
         hv.configure(local or None)
         _fallback_active = False
+        _set_applied(None)
+
+
+_applied_sig = None
+
+
+def _set_applied(sig) -> None:
+    global _applied_sig
+    _applied_sig = sig
+
+
+def _docs_signature(docs: Path):
+    """The documents as they are on disk (size + modification time of each) —
+    unchanged documents in use are not applied to the library again."""
+    out = []
+    for n in _DOCS:
+        try:
+            st = (docs / n).stat()
+            out.append((n, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append((n, None, None))
+    return tuple(out)
 
 
 def fallback_active() -> bool:
@@ -618,6 +681,9 @@ def fallback_active() -> bool:
         return False
 
 
+_apply_again = False
+
+
 def _apply_to_library() -> None:
     """Join the (new) documents onto every SID of the library — the user's
     own included — in the background.  Callable from any thread."""
@@ -626,15 +692,25 @@ def _apply_to_library() -> None:
         return
 
     def _spawn() -> None:
+        global _apply_again
+        if any(t.get_name() == "online-hvsc.apply-library" and not t.done()
+               for t in HVSC_ONLINE._tasks):
+            _apply_again = True      # one apply at a time: the running one goes again
+            return
+
         async def _run() -> None:
-            try:
-                from soniqboom.core import hvsc_apply
-                res = await hvsc_apply.apply_hvsc_to_library()
-                log.info("HVSC: the online collection's documents applied to the library (%s)",
-                         res)
-            except Exception:                           # noqa: BLE001
-                log.warning("HVSC apply after the online documents changed failed",
-                            exc_info=True)
+            global _apply_again
+            from soniqboom.core import hvsc_apply
+            while True:
+                _apply_again = False
+                try:
+                    res = await hvsc_apply.apply_hvsc_to_library()
+                    log.info("HVSC: the downloaded documents applied to the library (%s)", res)
+                except Exception:                       # noqa: BLE001
+                    log.warning("HVSC apply after the downloaded documents changed failed",
+                                exc_info=True)
+                if not _apply_again:
+                    break
         t = loop.create_task(_run(), name="online-hvsc.apply-library")
         HVSC_ONLINE._tasks.add(t)
         t.add_done_callback(HVSC_ONLINE._tasks.discard)
@@ -652,9 +728,10 @@ def _apply_to_library() -> None:
 # that left (rating, plays, history, playlist entries, Subsonic stars, queue,
 # bookmarks) moves to the copy that is there (``store.remap_track_ids``, the
 # Modland catalogue's move machinery), and back when that turns around.  Both
-# copies there, or neither: nothing moves.  A pair whose target already has a
-# rating or plays of its own keeps each copy's own (nothing is overwritten);
-# its playlist entries still move.
+# copies there, or neither: nothing moves.  Where the target already has a
+# rating, or one user's plays, of its own, both copies keep theirs (nothing is
+# overwritten; that user's history entries stay too); playlist entries still
+# move.
 _reconcile_task = None
 _reconcile_again = False
 
@@ -702,7 +779,11 @@ def _index_rels() -> list:
 
 async def reconcile_user_data() -> dict:
     """Move user data to the HVSC copy that is in the library (see above).
-    Returns ``{"moved": n, "conflicts": n}``."""
+    Returns ``{"moved": n, "conflicts": n}`` — tunes whose data moved: all
+    of it ("moved"), or the part the copy in the library had none of
+    ("conflicts": both copies hold a rating, or one user's plays, of their
+    own).  A tune with nothing left to move is not counted (a later run
+    finds nothing to do)."""
     from soniqboom.core import modland_catalog as mc
     from soniqboom.core.store import PARKED_PLAYLIST_IDS, get_store
     if not HVSC_ONLINE.has_index():
@@ -711,52 +792,57 @@ async def reconcile_user_data() -> dict:
     loop = asyncio.get_running_loop()
     rels = await loop.run_in_executor(None, _index_rels)
     # (Snapshots on the loop: the store's containers change only here.)
-    strong = set(store._ratings) | set(store._play_stats)      # (a waveform is computed)
-    weak = set()
+    # Strong data is kept per container — the library-wide ratings, each
+    # user's plays — and never overwritten: where the target already has its
+    # own, both copies keep theirs (``remap_track_ids(keep_both=True)``).
+    rated = set(store._ratings)                                 # (a waveform is computed)
+    # Per user: (the tunes played, the tunes in the history).
+    users = [(set(store._play_stats.get(u) or ()),
+              {e["track_id"] for e in store._history.get(u) or ()
+               if isinstance(e, dict) and e.get("track_id")})
+             for u in {*store._play_stats, *store._history}]
+    weak = set()                                    # (entries that always follow)
     for pl in store.list_playlists():
         for e in pl.get("track_ids") or ():
             weak.add(e.get("id") if isinstance(e, dict) else e)
-    for e in store._history or ():
-        if isinstance(e, dict) and e.get("track_id"):
-            weak.add(e["track_id"])
     try:
         from soniqboom.core.subsonic_state import get_state
         weak |= get_state().referenced_track_ids()
     except Exception:                                   # noqa: BLE001
         pass
-    has_data = strong | weak
     tracks = store._tracks
 
     def _plan():
-        mapping, refs_only = {}, {}
+        mapping, conflicts = {}, 0
         for rel in rels:
             mid, oid = mc.track_id("HVSC/" + rel), HVSC_ONLINE.track_id(rel)
             m_in, o_in = mid in tracks, oid in tracks
             if m_in == o_in:
                 continue
             src, dst = (mid, oid) if o_in else (oid, mid)
-            if src not in has_data:
+            # What would move: a rating / a user's plays the target lacks, a
+            # user's history entries (unless that user played both copies:
+            # they stay with that user's plays), or an entry that only points
+            # at the tune (a playlist's, Subsonic's: it always follows).
+            movable = (src in weak or (src in rated and dst not in rated)
+                       or any((src in p and dst not in p)
+                              or (src in h and not (src in p and dst in p))
+                              for p, h in users))
+            if not movable:
                 continue
-            if dst in strong and src in strong:
-                refs_only[src] = dst         # both rated / played: each keeps its own
-            else:
-                mapping[src] = dst
-        return mapping, refs_only
-    mapping, refs_only = await loop.run_in_executor(None, _plan)
-    conflicts = len(refs_only)
-    if not mapping and not refs_only:
+            if (src in rated and dst in rated) or any(src in p and dst in p for p, _h in users):
+                conflicts += 1
+            mapping[src] = dst
+        return mapping, conflicts
+    mapping, conflicts = await loop.run_in_executor(None, _plan)
+    if not mapping:
         return {"moved": 0, "conflicts": 0}
-    counts = store.remap_track_ids(mapping) if mapping else {}
-    if refs_only:
-        # Where both copies were rated or played, the entries that only point
-        # at a tune — playlist entries — still follow the copy in the library.
-        _move_playlist_entries(store, refs_only)
+    counts = store.remap_track_ids(mapping, keep_both=True)
     try:
         from soniqboom.core.subsonic_state import get_state
-        await get_state().remap_track_ids({**refs_only, **mapping})
+        await get_state().remap_track_ids(mapping)
     except Exception:                                   # noqa: BLE001
         log.debug("HVSC: Subsonic stars / queues not moved", exc_info=True)
-    mapping = {**refs_only, **mapping}
     parked = store.get_config(PARKED_PLAYLIST_IDS) or []
     if any(p in mapping for p in parked):
         store.set_config(PARKED_PLAYLIST_IDS, sorted({mapping.get(p, p) for p in parked}
@@ -767,23 +853,3 @@ async def reconcile_user_data() -> dict:
              f"; {conflicts} rated / played on both copies kept each copy's own"
              if conflicts else "")
     return {"moved": len(mapping) - conflicts, "conflicts": conflicts}
-
-
-def _move_playlist_entries(store, mapping: dict) -> int:
-    """Point playlist entries at ``mapping``'s new ids (nothing else moves)."""
-    n = 0
-    for pl in store.list_playlists():
-        entries = pl.get("track_ids") or []
-        fresh, hit = [], 0
-        for e in entries:
-            tid = e.get("id") if isinstance(e, dict) else e
-            if tid in mapping:
-                fresh.append({**e, "id": mapping[tid]} if isinstance(e, dict) else mapping[tid])
-                hit += 1
-            else:
-                fresh.append(e)
-        if hit:
-            ids = {e.get("id") if isinstance(e, dict) else e for e in fresh}
-            store.update_playlist(pl["id"], {"track_ids": fresh}, keep_ids=ids)
-            n += hit
-    return n

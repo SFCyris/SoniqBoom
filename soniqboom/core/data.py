@@ -65,7 +65,7 @@ async def rebuild_indexes() -> dict:
     + live held together until the swap + GC).
 
     The shadow is built from a snapshot across ~500 ``await`` yields, so a
-    write landing meanwhile (an edit, an enrichment pass, a play, a duration
+    write landing meanwhile (an edit, an enrichment pass, a duration
     backfill — all move ``store.index_generation()``) would be missing from
     it.  Such a build is NOT swapped in: the live indexes, maintained
     incrementally, stay, and the result says ``skipped:
@@ -94,9 +94,6 @@ async def rebuild_indexes() -> dict:
                     "mutation_seq": store._mutation_seq}
         shadow = TrackStore()
         shadow._tracks = dict(store._tracks)        # consistent snapshot for the build
-        # _index_track derives _unplayed_ids from membership in _play_stats, so the
-        # shadow MUST see the real play stats or it would mark every track unplayed.
-        shadow._play_stats = dict(store._play_stats)
         gen0 = store.index_generation()             # no await since the snapshot
         shadow.enter_batch_mode()
         shadow._mark_all_sorted_dirty()             # (built in full below: nothing to record)
@@ -263,8 +260,9 @@ async def get_playlist(playlist_id: str) -> dict | None:
     return get_store().get_playlist(playlist_id)
 
 
-async def list_playlists(user_id: str | None = None) -> list[dict]:
-    """Return playlists visible to ``user_id`` (or all when None)."""
+async def list_playlists(user_id: str) -> list[dict]:
+    """``user_id``'s playlist list: own, then subscribed shared ones
+    (``TrackStore.list_playlists_for_user``)."""
     return get_store().list_playlists_for_user(user_id)
 
 
@@ -298,22 +296,22 @@ async def get_all_ratings() -> dict[str, int]:
 
 # ── Play stats ───────────────────────────────────────────────────────────────
 
-async def record_play(track_id: str) -> dict:
-    return get_store().record_play(track_id)
+async def record_play(track_id: str, *, uid: str) -> dict:
+    return get_store().record_play(track_id, uid=uid)
 
 
-async def get_play_stats(track_id: str) -> dict:
-    return get_store().get_play_stats(track_id)
+async def get_play_stats(track_id: str, *, uid: str) -> dict:
+    return get_store().get_play_stats(track_id, uid=uid)
 
 
-async def get_play_stats_batch(track_ids: list[str]) -> dict[str, dict]:
+async def get_play_stats_batch(track_ids: list[str], *, uid: str) -> dict[str, dict]:
     if not track_ids:
         return {}
-    return get_store().get_play_stats_batch(track_ids)
+    return get_store().get_play_stats_batch(track_ids, uid=uid)
 
 
-async def get_all_play_stats() -> dict[str, dict]:
-    return get_store().get_all_play_stats()
+async def get_all_play_stats(*, uid: str) -> dict[str, dict]:
+    return get_store().get_all_play_stats(uid=uid)
 
 
 # ── Track CRUD ───────────────────────────────────────────────────────────────

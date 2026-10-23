@@ -848,7 +848,7 @@ def test_importing_an_a_only_backup_over_a_and_b_shows_a_only(monkeypatch, via):
     monkeypatch.setattr(store_mod, "_store", s)
     s.upsert_tracks_batch(copy.deepcopy(a_rows + b_rows))
     for t in b_rows[:20]:
-        s.record_play(t["id"])
+        s.record_play(t["id"], uid="")
         s.set_rating(t["id"], 5)
     un = frozenset(s._tag_scan_root_hash.get("r1", set()))          # (kept: the same object)
     _warm_everything(s, un)

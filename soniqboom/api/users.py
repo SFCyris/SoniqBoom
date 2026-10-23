@@ -121,6 +121,27 @@ async def close_open_ws_for(user_id: str, code: int = 4401) -> int:
     return len(sockets)
 
 
+def claim_unowned_user_data() -> bool:
+    """Accounts are loaded or added (a start, a reload, a restored
+    users.json, an account created): the legacy data goes to the legacy
+    owner (``user_data.claim_unowned``) and a restored backup's data kept
+    for a user name to that user's account (``user_data.claim_pending``).
+    Runs on the event loop; a failure is logged.  True when data moved."""
+    try:
+        from soniqboom.core.store import get_store
+        from soniqboom.core.user_data import claim_pending, claim_unowned
+        store, users = get_store(), get_user_store()
+        moved = claim_unowned(store, users)
+        moved = claim_pending(store, users) or moved
+    except Exception:                                   # noqa: BLE001
+        log.exception("The listening data could not be given to its accounts")
+        return False
+    if moved:
+        log.info("Listening data kept for accounts went to them (legacy owner: %s)",
+                 store.user_data_owner() or "none")
+    return moved
+
+
 def _pub(user: User) -> dict:
     """A user as the API returns it — ``to_public()`` plus whether the
     Subsonic token secret is a generated app password
@@ -237,6 +258,22 @@ async def require_user(user: User | None = Depends(current_user)) -> User:
     if user is None:
         raise HTTPException(401, "Not signed in.")
     return user
+
+
+async def listener_uid(user: User | None = Depends(current_user)) -> str:
+    """Whose plays and listening history a request reads or records: the
+    signed-in user's id; before any account exists, the no-user bucket
+    ``""``; otherwise 401 (every account's data is its own — no one,
+    admins included, reads another's)."""
+    if user is not None:
+        return user.id
+    try:
+        store = get_user_store()
+    except RuntimeError:
+        return ""                       # (no user store yet: early boot, as the gate)
+    if store.has_any():
+        raise HTTPException(401, "Not signed in.")
+    return ""
 
 
 def require_role(*allowed: Role):
@@ -407,9 +444,11 @@ async def auth_reload(request: Request):
     else:
         # The re-check button: accounts loaded, none an enabled admin.
         await asyncio.to_thread(store.adopt_from_disk, False)
+        claim_unowned_user_data()
         return _auth_status_doc(request)
     if not await asyncio.to_thread(store.reload):
         raise HTTPException(500, "users.json could not be read — see the server log.")
+    claim_unowned_user_data()
     return _auth_status_doc(request, cli=True)
 
 
@@ -510,6 +549,7 @@ async def register(body: RegisterBody, request: Request, response: Response):
             password=body.password,
             role="readonly",
             display_name=body.display_name,
+            self_registered=True,
         )
     except ValueError as e:
         msg = str(e)
@@ -791,6 +831,7 @@ async def create_user(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    claim_unowned_user_data()           # (a restored backup's data kept for this name)
     return {"user": _pub(user)}
 
 
@@ -887,10 +928,20 @@ async def delete_user(
             400, "You can't delete your own account while signed in.",
         )
     store = get_user_store()
+    # The account's plays and history go WITH it: marked first (nothing is
+    # recorded for it or handed to another account meanwhile), dropped right
+    # after the delete — no await in between.
+    from soniqboom.core.store import get_store as _lib_store
+    lib = _lib_store()
+    lib.user_deleting(user_id)
     try:
         await asyncio.to_thread(store.delete, user_id)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    except BaseException as e:
+        lib.user_deleting(user_id, False)
+        if isinstance(e, ValueError):
+            raise HTTPException(400, str(e))
+        raise
+    lib.delete_user_data(user_id)
     # Tear down any live WebSocket sessions the now-deleted user held.
     try:
         closed = await close_open_ws_for(user_id)
@@ -898,13 +949,14 @@ async def delete_user(
             log.info("Closed %d WebSocket(s) for deleted user %s", closed, user_id)
     except Exception:
         log.exception("Error closing WSs for deleted user %s", user_id)
-    # Their Subsonic state (stars, ratings, play queue, bookmarks) and
-    # now-playing entries go too — the same cleanup as Subsonic deleteUser.
+    # Their play counts and listening history, Subsonic state (stars,
+    # ratings, play queue, bookmarks) and now-playing entries go too — the
+    # same cleanup as Subsonic deleteUser.
     # Imported here: api/subsonic imports this module.  A failure is logged,
     # never turned into an error for a delete that already happened.
     try:
         from soniqboom.api.subsonic import forget_user
         await forget_user(user_id)
     except Exception:
-        log.exception("Error dropping Subsonic state for deleted user %s", user_id)
+        log.exception("Error dropping the data of deleted user %s", user_id)
     return {"ok": True}

@@ -123,7 +123,7 @@ def test_library_generation_moves_only_on_change(lib, monkeypatch):
     monkeypatch.setattr(library, "_AGG_EPOCH", 0)
     g0 = library.library_generation()
     assert library.library_generation() == g0                 # nothing happened
-    lib.record_play("t1")
+    lib.record_play("t1", uid="")
     lib.set_rating("t2", 5)
     assert library.library_generation() == g0                 # plays / ratings change no list
     lib.upsert_track(_row(600))
@@ -226,7 +226,7 @@ def rb(monkeypatch):
                  "name": f"{params['name']} Radio", "url_resolved": "http://198.51.100.7/s",
                  "votes": 5, "clickcount": 1, "tags": "chiptune", "countrycode": "DE"}]
     monkeypatch.setattr(radiodir, "_rb_get", fake_rb_get)
-    monkeypatch.setattr(radiodir, "get_favorites", lambda: [])
+    monkeypatch.setattr(radiodir, "all_favorites", lambda: [])
     monkeypatch.setattr(radiodir, "_search_cache", OrderedDict())
     return calls
 

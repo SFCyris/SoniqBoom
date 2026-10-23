@@ -756,15 +756,15 @@ def test_update_station_keeps_its_position_with_one_write(env, radio_favs, monke
     monkeypatch.setattr(stations_api, "_assert_public_url", _public)
     for n in ("One", "Two", "Three"):
         env.ok("createInternetRadioStation.view", streamUrl=f"http://{n.lower()}.example/s", name=n)
-    custom = [x["sid"] for x in radio_favs.get_favorites() if x["sid"].startswith("custom:")]
+    custom = [x["sid"] for x in radio_favs.get_favorites("u1") if x["sid"].startswith("custom:")]
     writes = []
-    real = radio_favs._write_json
-    monkeypatch.setattr(radio_favs, "_write_json", lambda *a: (writes.append(a[0]), real(*a)))
+    real = radio_favs._write_favs
+    monkeypatch.setattr(radio_favs, "_write_favs", lambda *a: (writes.append(a[0]), real(*a)))
     env.ok("updateInternetRadioStation.view", id=custom[0], name="Uno")
     rows = env.ok("getInternetRadioStations.view")["internetRadioStations"]["internetRadioStation"]
     mine = [r["name"] for r in rows if r["id"].startswith("custom:")]
-    assert mine == ["Uno", "Two", "Three"] and writes == [radio_favs._FAVS_FILE]
-    assert radio_favs.update_favorite("custom:nope", {"sid": "custom:nope"}) is None
+    assert mine == ["Uno", "Two", "Three"] and writes == ["u1"]       # one write, u1's list
+    assert radio_favs.update_favorite("custom:nope", {"sid": "custom:nope"}, uid="u1") is None
 
 
 # ── r3-sub-8: artist photos are served by this server ────────────────────────

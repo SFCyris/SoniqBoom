@@ -49,6 +49,8 @@ STATES = ("broken", "glitched")
 # Defects auto-play passes by: a file no engine decodes (found at scan) and
 # one its renderer refused twice when played (``core/unplayable.py``).
 _UNPLAYABLE_DEFECTS = ("corrupt", "unplayable")
+# The fields ``cant_play`` reads.
+CANT_PLAY_FIELDS = frozenset(("health", "defect"))
 HEALTH_FIELDS = ("health", "health_note", "health_by", "health_at", "health_renderer")
 REG_KEY = "health_marks"
 NOTE_MAX = 200
@@ -277,11 +279,22 @@ def tune_is_short(t: dict, wire: int, secs: int) -> bool:
     return 0 < known_len(t, wire) < secs
 
 
+def cant_play(t: dict) -> bool:
+    """Is ``t`` a track that can't be played — reported broken
+    (``health == "broken"``), undecodable (``defect == "corrupt"``) or
+    refused twice by its renderer (``defect == "unplayable"``)?  What
+    auto-play always passes by and what Settings → "Tracks that can't be
+    played: Hide" leaves out of the lists (``core/availability``; the store
+    keeps these ids as ``TrackStore._cant_play_ids``).  Glitched and partial
+    tracks play: not these."""
+    return t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS
+
+
 def file_skipped(t: dict, secs: int) -> bool:
     """Does auto-play pass the file ``t`` (its bare play) by?"""
     if not isinstance(t, dict):
         return False
-    if t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS:
+    if cant_play(t):
         return True
     return tune_is_short(t, 0, secs)
 
@@ -297,7 +310,7 @@ def entry_skipped(tid: str, wire: int = 0, store=None) -> bool:
     t = store.get_track(tid)
     if not isinstance(t, dict):
         return False
-    if t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS:
+    if cant_play(t):
         return True
     return tune_is_short(t, int(wire or 0), short_secs(store))
 
@@ -358,8 +371,7 @@ def _scan(store, secs: int) -> frozenset:
     ph = tuple(placeholder_seconds(store))
     out = []
     for tid, t in list((getattr(store, "_tracks", {}) or {}).items()):
-        if (t.get("health") == "broken" or t.get("defect") in _UNPLAYABLE_DEFECTS
-                or (secs and _default_short(t, secs, ph))):
+        if cant_play(t) or (secs and _default_short(t, secs, ph)):
             out.append(tid)
     return frozenset(out)
 

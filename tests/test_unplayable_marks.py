@@ -736,3 +736,102 @@ async def test_a_prewarm_marks_through_its_own_play_context(tmp_path, store, uad
             break
         await asyncio.sleep(0.05)
     assert store.get_track("t1")["defect"] == "unplayable" and uade.runs() == 2
+
+
+# ── the progressive SID play (api/stream.py ``_serve_sid_progressive``) ─────
+
+SID_STUB = r'''import math, os, struct, sys
+d = os.path.dirname(os.path.abspath(__file__))
+if "--version" in sys.argv or "-h" in sys.argv:
+    print("Sidplayfp V2.16.0")
+    sys.exit(0)
+src = sys.argv[-1]
+if "bad" in os.path.basename(src) and not os.path.exists(os.path.join(d, "fixed")):
+    sys.stderr.write("sidplayfp: Compute!'s Sidplayer MUS data is not supported yet\n")
+    sys.exit(1)
+dur = next(int(a[2:]) for a in sys.argv if a.startswith("-t"))
+out = next(a[2:] for a in sys.argv if a.startswith("-w"))
+n = 44100 * dur
+with open(out, "wb") as fh:
+    fh.write(b"RIFF" + struct.pack("<I", 36 + 2 * n) + b"WAVEfmt "
+             + struct.pack("<IHHIIHH", 16, 1, 1, 44100, 88200, 2, 16)
+             + b"data" + struct.pack("<I", 2 * n))
+    fh.write(b"".join(struct.pack("<h", int(9000 * math.sin(2 * math.pi * 440 * i / 44100)))
+                      for i in range(n)))
+'''
+
+
+@pytest.fixture
+def sidplayfp(tmp_path, monkeypatch):
+    """A stand-in sidplayfp: it refuses every file whose name holds "bad"
+    (as sidplayfp 2.x refuses a Compute! Sidplayer tune) until
+    ``fix()``, and renders anything else as an audible tone of ``-t`` s."""
+    from soniqboom.config import settings
+    d = tmp_path / "sidbin"
+    d.mkdir()
+    (d / "sidplayfp.py").write_text(SID_STUB)
+    exe = d / "sidplayfp"
+    exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/sidplayfp.py" "$@"\n')
+    exe.chmod(0o755)
+    monkeypatch.setattr(settings, "sidplayfp_path", str(exe))
+    monkeypatch.setattr(settings, "sid_default_duration", 5)
+    monkeypatch.setattr(settings, "conversion_cache_dir", str(tmp_path / "conv"))
+    return types.SimpleNamespace(fix=lambda: (d / "fixed").write_text("1"))
+
+
+def _sid(store, tmp_path, name):
+    f = tmp_path / "music" / name
+    f.parent.mkdir(exist_ok=True)
+    f.write_bytes(b"PSID" + bytes(0x7c - 4) + bytes(64))
+    tid = Path(name).stem
+    _track(store, f, tid=tid, title=tid, format="C64 SID", duration=5.0)
+    return tid
+
+
+async def test_a_progressive_sid_play_proves_sidplayfp_and_clears_its_mark(
+        tmp_path, store, sidplayfp, monkeypatch):
+    """A SID that plays through the web player's progressive render (stored
+    straight from ``_serve_sid_progressive``, not through ``get_or_render``)
+    is a good render like any other: sidplayfp's breaker resets — the next
+    refused file is marked again — and the track the play was for loses an
+    automatic mark it carried."""
+    import httpx
+    from soniqboom.api import stream
+    from soniqboom.core import conversion_cache as cc
+    monkeypatch.setattr(stream, "_spawn_sid_vu", lambda *a, **k: None)
+    monkeypatch.setattr(stream, "ensure_sid_vu_sidecar", lambda *a, **k: None)
+    app = _stream_app(monkeypatch)
+    bad = [_sid(store, tmp_path, f"bad{i}.sid") for i in range(unplayable._BREAKER + 1)]
+    good = _sid(store, tmp_path, "good.sid")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async def play(tid):
+            r = await c.get(f"/api/stream/{tid}", cookies={"sb_session": "x"})
+            if r.status_code == 200:            # wait for the finaliser's cache decision
+                assert r.headers["x-stream-mode"] == "sid-progressive"
+                key = cc._cache_key(tid, "sid", 0, duration=5)
+                for _ in range(200):            # (its done event is set after the store)
+                    ev = stream._SID_PROG_DONE.get(key)
+                    if ev is None or ev.is_set():
+                        break
+                    await asyncio.sleep(0.05)
+                assert await cc.get_cached(key) is not None
+            return r
+
+        for tid in bad[:unplayable._BREAKER]:          # refused in a row: the breaker trips
+            assert (await play(tid)).status_code in (422, 502)
+        assert "sidplayfp" in unplayable._tripped
+        last = bad[unplayable._BREAKER]
+        assert (await play(last)).status_code == 502
+        assert store.get_track(last).get("defect") is None      # tripped: not marked
+
+        assert (await play(good)).status_code == 200            # a progressive play …
+        assert "sidplayfp" not in unplayable._tripped           # … proves sidplayfp
+        r = await play(last)
+        assert r.status_code == 422 and r.headers["x-sb-defect"] == "unplayable"
+        assert store.get_track(last)["defect"] == "unplayable"
+
+        sidplayfp.fix()                                         # (say, a newer sidplayfp)
+        assert (await play(last)).status_code == 200            # it plays progressively …
+        assert store.get_track(last).get("defect") is None      # … and its mark is gone
+        assert last not in skip_rules.skip_ids(store)

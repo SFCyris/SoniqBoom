@@ -184,7 +184,8 @@ export function mountLibrary(root, ctx) {
     show(trail, true);
     show(row.querySelector('.m-row-chev'), false);
     // Drag handle to reorder — only for regular (hand-editable) playlists.
-    show(row.querySelector('.m-row-handle'), mode === 'pltracks' && !!crumb && !crumb.smart);
+    show(row.querySelector('.m-row-handle'),
+         mode === 'pltracks' && !!crumb && !crumb.smart && !crumb.readOnly);
   }
 
   const vl = createVirtualList({
@@ -231,7 +232,9 @@ export function mountLibrary(root, ctx) {
       };
     }
     if (mode === 'pltracks') {
-      const smart = !!(crumb && crumb.smart);
+      // Smart (query-driven) and imported (someone else's, read-only)
+      // playlists can't be hand-edited.
+      const smart = !!(crumb && (crumb.smart || crumb.readOnly));
       const actions = trackActions(t, gctx);
       if (!smart) {
         actions.push({ label: '✕ Remove from playlist', danger: true,
@@ -293,13 +296,15 @@ export function mountLibrary(root, ctx) {
     vl.render(true);
   });
 
-  // Which tracks can play changed (a drive came back / went away, or the
-  // "Tracks on unavailable drives" setting).  Hide (now or before): the lists
-  // change length — re-read the open one.  Mark / Show: the same rows — their
-  // flags are re-read in place, the scroll position kept.
+  // Which tracks can play changed (a drive came back / went away, a track
+  // became one that can't be played or stopped being one, or the "Tracks on
+  // unavailable drives" / "Tracks that can't be played" setting).  Either Hide
+  // (now or before): the lists change length — re-read the open one.  Mark /
+  // Show: the same rows — their flags are re-read in place, the scroll kept.
   document.addEventListener('soniqboom:availability-changed', (e) => {
     const d = (e && e.detail) || {};
-    if (d.mode === 'hide' || d.prevMode === 'hide') { render(); return; }
+    if (d.mode === 'hide' || d.prevMode === 'hide'
+        || d.unplayable === 'hide' || d.prevUnplayable === 'hide') { render(); return; }
     if (mode !== 'tracks' && mode !== 'pltracks') return;
     const list = tracks;
     Promise.resolve(Offline.recheckRows?.(list)).then(() => {
@@ -374,22 +379,39 @@ export function mountLibrary(root, ctx) {
       </div>`;
     newRow.addEventListener('click', createPlaylist);
     listEl.appendChild(newRow);
+    // The playlists other users share: tick to import (read-only).
+    const impRow = document.createElement('div');
+    impRow.className = 'm-row m-pl-import';
+    impRow.innerHTML = `<div class="m-row-content">
+        <div class="m-row-art"><span>⇩</span></div>
+        <div class="m-row-meta"><div class="m-row-title">Import shared playlists…</div></div>
+      </div>`;
+    impRow.addEventListener('click', importSheet);
+    listEl.appendChild(impRow);
 
     pls.forEach(p => {
       const row = document.createElement('div');
       row.className = 'm-row';
+      const sub = p.subscribed
+        ? ` · by ${esc(p.owner_name || '?')} · read-only`
+        : (p.shared ? ' · shared' : '');
       row.innerHTML = `
         <div class="m-row-content">
           <div class="m-row-art"><span>${p.smart ? '⚡' : '🎵'}</span></div>
           <div class="m-row-meta">
             <div class="m-row-title">${esc(p.name || 'Playlist')}</div>
-            <div class="m-row-artist">${p.track_count || 0} tracks${p.smart ? ' · smart' : ''}</div>
+            <div class="m-row-artist">${p.track_count || 0} tracks${p.smart ? ' · smart' : ''}${sub}</div>
           </div>
           <span style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
         </div>`;
       const cleanup = attachRowGestures(row, {
-        onTap: () => { crumb = { label: p.name, playlistId: p.id, smart: !!p.smart }; render(); },
-        onLongPress: () => ctx.showSheet({ title: p.name || 'Playlist', actions: [
+        onTap: () => {
+          crumb = { label: p.name, playlistId: p.id, smart: !!p.smart, readOnly: !!p.read_only };
+          render();
+        },
+        onLongPress: () => ctx.showSheet({ title: p.name || 'Playlist', actions: p.subscribed ? [
+          { label: '✕ Remove from my list', danger: true, onSelect: () => setSubscribed(p, false) },
+        ] : [
           { label: '✎ Rename', onSelect: () => renamePlaylist(p) },
           { label: '🗑 Delete', danger: true, onSelect: () => deletePlaylist(p) },
         ]}),
@@ -397,6 +419,35 @@ export function mountLibrary(root, ctx) {
       _gestureCleanups.push(cleanup);
       listEl.appendChild(row);
     });
+  }
+
+  async function setSubscribed(p, subscribed) {
+    try {
+      const r = await fetch(`/api/playlists/${encodeURIComponent(p.id)}/subscription`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscribed }),
+      });
+      if (!r.ok) throw new Error();
+      ctx.toast(subscribed ? `Imported "${p.name}"` : `Removed "${p.name}"`);
+      if (!subscribed && crumb && crumb.playlistId === p.id) crumb = null;
+      render();
+    } catch { ctx.toast('Could not change the import', 'error'); }
+  }
+
+  // A checkbox list (☑ imported / ☐ not) of the playlists other users share;
+  // a tap toggles one and opens the list again.
+  async function importSheet() {
+    let rows = [];
+    try {
+      const r = await fetch('/api/playlists/shared');
+      if (!r.ok) throw new Error();
+      rows = await r.json();
+    } catch { ctx.toast("Couldn't load the shared playlists", 'error'); return; }
+    if (!rows.length) { ctx.toast('No other user shares a playlist yet'); return; }
+    ctx.showSheet({ title: 'Import shared playlists', actions: rows.map(p => ({
+      label: `${p.subscribed ? '☑' : '☐'}  ${p.name}  ·  by ${p.owner_name || '?'}`,
+      onSelect: async () => { await setSubscribed(p, !p.subscribed); importSheet(); },
+    }))});
   }
 
   async function createPlaylist() {
@@ -468,7 +519,7 @@ export function mountLibrary(root, ctx) {
     // Drag-handle reorder (regular playlists only) — the drag snaps the row back,
     // so onReorder re-renders in the new order and persists it.  The rows are a
     // window of the list, so the indexes come from the rows themselves.
-    if (!crumb.smart && !_dragCleanup) {
+    if (!crumb.smart && !crumb.readOnly && !_dragCleanup) {
       _dragCleanup = attachDragReorder(listEl, {
         onReorder: reorderPlaylist,
         getRows: () => vl.rows(),

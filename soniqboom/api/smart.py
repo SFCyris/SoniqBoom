@@ -27,7 +27,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from soniqboom.api.tracks import json_route, public_track
-from soniqboom.api.users import require_edit
+from soniqboom.api.users import listener_uid, require_edit
 
 from soniqboom.core.data import (
     get_all_play_stats, get_all_ratings, get_track,
@@ -51,27 +51,27 @@ router = APIRouter(tags=["smart"])
 # mix never deals them (Mark and Hide); the duplicates view always lists them
 # (flagged): it is about files, not about playing.
 
-# ── History settings ──────────────────────────────────────────────────────────
-HISTORY_MAX = 500                       # cap to avoid unbounded growth
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  SMART PLAYLIST VIEWS
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Ranked-list memos for /smart/most-played + /smart/top-rated.  The full sorted
 # id list is reused across requests until a play / rating actually changes — keyed
-# on the store's _play_seq / _rating_seq (which record_play / set_rating bump; they
-# do NOT touch _mutation_seq).  Sized by the played/rated subset, not the library.
-_MOST_PLAYED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
+# on the store's _play_seq (with the user whose plays are ranked) / _rating_seq
+# (which record_play / set_rating bump; they do NOT touch _mutation_seq).  Sized
+# by the played/rated subset, not the library.
+_MOST_PLAYED_MEMO: dict[str, object] = {"seq": None, "ranked": []}
 _TOP_RATED_MEMO: dict[str, object] = {"seq": -1, "ranked": []}
 
 
 @json_route(router, "/smart/most-played")
-async def most_played(limit: int = Query(100, ge=1, le=500)):
-    """Return tracks sorted by play count (most → least)."""
-    seq = get_store()._play_seq
-    all_stats = await get_all_play_stats()
+async def most_played(limit: int = Query(100, ge=1, le=500),
+                      uid: str = Depends(listener_uid)):
+    """Return the signed-in user's tracks sorted by play count (most →
+    least)."""
+    store = get_store()
+    seq = (uid, store._play_seq)
+    all_stats = await get_all_play_stats(uid=uid)
     if not all_stats:
         return []
     if _MOST_PLAYED_MEMO["seq"] != seq:
@@ -95,17 +95,16 @@ async def recently_added(limit: int = Query(100, ge=1, le=500)):
 
 
 @json_route(router, "/smart/unplayed")
-async def unplayed(limit: int = Query(100, ge=1, le=500)):
-    """Return tracks that have never been played.
+async def unplayed(limit: int = Query(100, ge=1, le=500),
+                   uid: str = Depends(listener_uid)):
+    """Return tracks the signed-in user has never played.
 
-    Backed by the store's incrementally-maintained ``_unplayed_ids`` set —
-    we walk ``_sorted_added_at`` in reverse and stop at ``limit`` matches
-    rather than scanning every track in the library (previously O(N) per
-    call, even for tiny pages).
+    ``store.list_unplayed`` walks ``_sorted_added_at`` in reverse and stops
+    at ``limit`` matches rather than scanning every track in the library.
     """
     store = get_store()
     return availability.mark_rows(
-        store.list_unplayed(limit, exclude=availability.hidden(store)), store)
+        store.list_unplayed(limit, exclude=availability.hidden(store), uid=uid), store)
 
 
 @json_route(router, "/smart/top-rated")
@@ -158,6 +157,7 @@ def _as_dict(t) -> dict | None:
 async def instant_mix(
     seed: str = Query(..., description="Seed track id to build the mix around"),
     limit: int = Query(60, ge=5, le=200),
+    uid: str = Depends(listener_uid),
 ):
     """Build an endless, varied queue around a seed track.
 
@@ -177,7 +177,7 @@ async def instant_mix(
     store = get_store()
     ratings = await get_all_ratings()
     try:
-        history = store.get_history(40) or []
+        history = store.get_history(40, uid=uid) or []
     except Exception:
         history = []
     recent_ids = [h.get("track_id") for h in history if isinstance(h, dict) and h.get("track_id")]
@@ -216,8 +216,9 @@ async def instant_mix(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def push_history(track_id: str, title: str = "", artist: str = "",
-                       at: int | None = None) -> None:
-    """Append a play event to the listening history.
+                       at: int | None = None, *, uid: str) -> None:
+    """Append a play event to user ``uid``'s listening history (``""``: no
+    account).
 
     Called from the mark_played() endpoint in tracks.py and from Subsonic
     scrobbles.  ``at`` (epoch seconds) is when the play happened — an offline
@@ -235,13 +236,14 @@ async def push_history(track_id: str, title: str = "", artist: str = "",
         "title": title,
         "artist": artist,
         "ts": ts,
-    })
+    }, uid=uid)
 
 
 @json_route(router, "/smart/history")
-async def listening_history(limit: int = Query(50, ge=1, le=200)):
-    """Return recent listening history (newest first)."""
-    return get_store().get_history(limit)
+async def listening_history(limit: int = Query(50, ge=1, le=200),
+                            uid: str = Depends(listener_uid)):
+    """Return the signed-in user's recent listening history (newest first)."""
+    return get_store().get_history(limit, uid=uid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

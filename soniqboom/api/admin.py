@@ -1024,17 +1024,23 @@ async def metadata_repair_scan(
     network re-downloads of regular FLAC files that the decoder fix
     couldn't have touched).
 
-    Returns ``{count, sample: [paths…]}``.  ``sample`` is capped at 50
-    paths for the UI preview.
+    Returns ``{count, kinds, sample: [paths…]}``.  ``kinds`` counts the
+    candidates per reason (``repair.repair_kind``: garbled / placeholder /
+    bad-title / cp437).  ``sample`` is capped at 50 paths for the UI preview.
     """
     body = body or {}
     tracker_only = _flag(body.get("tracker_only", False))
 
-    from soniqboom.core.repair import find_corrupt_tracks
+    from soniqboom.core.repair import find_corrupt_tracks, repair_kind
     candidates = find_corrupt_tracks(tracker_only=tracker_only)
+    kinds: dict[str, int] = {}
+    for t in candidates:
+        k = repair_kind(t) or "other"
+        kinds[k] = kinds.get(k, 0) + 1
 
     return {
         "count": len(candidates),
+        "kinds": kinds,
         "tracker_only": tracker_only,
         "sample": [t.get("path", "") for t in candidates[:50]],
     }
@@ -1249,14 +1255,28 @@ async def admin_backup_status(_tok: str = Depends(_require_token)):
 
 @router.get("/export")
 async def admin_export(_tok: str = Depends(_require_token)):
-    """Stream a gzip-compressed JSON backup of the library."""
+    """Stream a gzip-compressed JSON backup of the library: ``data`` (the
+    snapshot, database ``db_version``) and ``users_map`` (account id → user
+    name: an import maps the per-user data onto its accounts by name)."""
+    from soniqboom.core.persistence import DB_VERSION, encode_state_bytes
     store = get_store()
-    payload = {"version": 2, "data": store.to_snapshot()}
-    # JSON-serialise + gzip on a thread.  For a 170K-track library this can
-    # take seconds — running it inline stalls every other request.
-    compressed = await asyncio.to_thread(
-        lambda: gzip.compress(json.dumps(payload).encode()),
-    )
+    try:
+        from soniqboom.core.users import get_user_store
+        users_map = {u.id: u.username for u in get_user_store().list_users()}
+    except RuntimeError:                                # (no user store yet)
+        users_map = {}
+    from soniqboom.core import radiodir
+    favorites = await asyncio.to_thread(radiodir.favorites_by_user)
+    payload = {"version": 2, "db_version": DB_VERSION, "users_map": users_map,
+               "favorites": favorites, "data": store.to_snapshot()}
+    # Encoded HERE, on the event loop — the snapshot holds the live store's
+    # dicts, which the loop's writes change: one C call (orjson, as the
+    # shutdown snapshot's) reads them consistently; encoding in a worker
+    # thread raced those writes.  The gzip (seconds for a big library) runs
+    # on a thread.
+    raw = encode_state_bytes(payload)
+    del payload
+    compressed = await asyncio.to_thread(gzip.compress, raw)
     return StreamingResponse(
         iter([compressed]),
         media_type="application/octet-stream",
@@ -1328,11 +1348,41 @@ async def admin_import(
 
     store = get_store()
     if version == 2:
-        from soniqboom.core.persistence import populate_store
+        from soniqboom.core.persistence import (DatabaseVersionError, import_backup_state,
+                                                populate_store)
         data = payload.get("data", {})
         if not (data.get("tracks") if isinstance(data, dict) else None) and store.track_count():
             raise HTTPException(400, "This backup holds no tracks — the library was left as it is.")
+        # Per-user data (plays, history) lands on this server's accounts by
+        # user name; a user with no account here keeps it aside until one
+        # exists (never given to the importing admin), and an older backup's
+        # shared data goes to this server's legacy owner.
+        from soniqboom.core.user_data import claim_accounts
+        from soniqboom.core.users import legacy_owner_id
+        try:
+            from soniqboom.core.users import get_user_store
+            users = get_user_store().list_users()
+        except RuntimeError:                            # (no user store yet)
+            users = []
+        favorites: dict = {}
+        try:
+            data = import_backup_state(payload, accounts=claim_accounts(users),
+                                       legacy_owner=legacy_owner_id(users) or "",
+                                       favorites_out=favorites)
+        except DatabaseVersionError as exc:
+            raise HTTPException(400, str(exc))
         populate_store(data)
+        if favorites:
+            # The backup's favourites replace the stored ones: a list of an
+            # account the backup doesn't hold (or an older kept-aside one) goes.
+            from soniqboom.core import radiodir
+            for key in list(radiodir.favorites_by_user()):
+                if key not in favorites:
+                    radiodir.delete_favorites(key)
+            for key, stations in favorites.items():
+                radiodir.set_favorites(key, stations)
+        from soniqboom.api.users import claim_unowned_user_data
+        claim_unowned_user_data()
         # A backup exported by a build that stored FTP listing times as host
         # time carries no conversion marker: convert it now, as a start would
         # (one from this build says "done" and is left as it is).
@@ -3425,21 +3475,35 @@ async def hvsc_status(_tok: str = Depends(_require_token)):
     the database has loaded.  Used by the Renderers tab status pill."""
     from soniqboom.core.hvsc import get_hvsc
     h = get_hvsc()
-    h._ensure_loaded()
+    await asyncio.to_thread(h._ensure_loaded)     # (parses several MB: off the loop)
     try:
         from soniqboom.core import online_hvsc
         online = online_hvsc.fallback_active()
     except Exception:                                   # noqa: BLE001
         online = False
+    from soniqboom.core import hvsc_download
     return {
         "enabled":     h.is_configured(),
         # The online HVSC collection's documents are no folder of the user's
         # own: the path field stays empty and the status says where they are.
         "docs_path":   "" if online else (str(h._docs_path) if h._docs_path else ""),
         "source":      "online" if online else ("folder" if h.is_configured() else ""),
+        # The card's choice (Download from the internet / Local folder) and
+        # the download's state (last check, HVSC release date, error, next).
+        "source_setting": settings.hvsc_source,
+        "local_path":  settings.hvsc_docs_path or "",
+        "download":    hvsc_download.status(),
         "songlengths": len(h._songlengths),
         "stil":        len(h._stil),
     }
+
+
+@router.post("/hvsc/download-now")
+async def hvsc_download_now(_tok: str = Depends(_require_token)):
+    """"Check now" for the downloaded HVSC documents (``core/hvsc_download``):
+    one conditional download from the HVSC mirror at once."""
+    from soniqboom.core import hvsc_download
+    return await hvsc_download.refresh(manual=True)
 
 
 @router.post("/hvsc/cleanup-orphans")
@@ -3569,6 +3633,11 @@ def _offline_mode() -> str:
     return availability.mode()
 
 
+def _unplayable_mode() -> str:
+    from soniqboom.core import availability
+    return availability.unplay_mode()
+
+
 @router.get("/settings")
 async def get_settings(_tok: str = Depends(_require_token)):
     """Return current application settings (safe subset)."""
@@ -3599,6 +3668,7 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "sid_digiboost": settings.sid_digiboost,
             "hvsc_docs_path": settings.hvsc_docs_path,
             "hvsc_autodetect": settings.hvsc_autodetect,
+            "hvsc_source": settings.hvsc_source,
         },
         "scan_zips": settings.scan_zips,
         "scan_remote_zips": settings.scan_remote_zips,
@@ -3617,6 +3687,11 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # "hide" (left out of searches and track lists) or "show" (as before).
         # Read by core/availability.py.
         "offline_tracks": _offline_mode(),
+        # Tracks that can't be played (reported broken, corrupt, refused twice
+        # by their renderer — skip_rules.cant_play): "mark" (listed with their
+        # badge — the default) or "hide" (left out of searches and track
+        # lists).  Read by core/availability.py.
+        "unplayable_tracks": _unplayable_mode(),
         # Tunes shorter than this many seconds are passed by when a list plays
         # through (0 = off) — core/skip_rules.py.
         "skip_short_tunes": _skip_short_secs(),
@@ -3686,7 +3761,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             conf["renderers"] = {}
         for k in ("sidplayfp_path", "fluidsynth_path", "openmpt123_path",
                    "soundfont_path", "soundfonts_dir", "sid_default_duration",
-                   "hvsc_docs_path", "hvsc_autodetect",
+                   "hvsc_docs_path", "hvsc_autodetect", "hvsc_source",
                    "sid_model", "sid_model_force", "sid_filter",
                    "sid_filter_curve", "sid_digiboost",
                    "psgplay_path", "sc68_path", "zxtune123_path",
@@ -3696,6 +3771,8 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                 if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
                          "sid_digiboost"):
                     val = _flag(val)           # coerce — keep the schema honest
+                elif k == "hvsc_source":
+                    val = "online" if str(val).lower() == "online" else "local"
                 elif k == "sid_model":
                     val = str(val).lower()
                     if val not in ("auto", "6581", "8580"):
@@ -3735,15 +3812,22 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                     availability.notify_changed()
         # If hvsc_docs_path changed, reconfigure the HVSC singleton so the
         # next SID extract (or "Re-extract SID metadata" click) picks it up.
-        if "hvsc_docs_path" in body["renderers"]:
+        if "hvsc_docs_path" in body["renderers"] or "hvsc_source" in body["renderers"]:
             try:
+                from soniqboom.core import hvsc_download, online_hvsc
                 from soniqboom.core.hvsc import get_hvsc
-                get_hvsc().configure(body["renderers"]["hvsc_docs_path"] or None)
-                # No local HVSC folder any more: the online collection's
-                # documents step in again (its "Use for my own SID files").
-                from soniqboom.core import online_hvsc
+                local = online_hvsc.local_docs_path()
+                if local or not online_hvsc.fallback_active():
+                    # (The downloaded documents in use stay as they are: no
+                    # reload, no second library apply.)
+                    get_hvsc().configure(local or None)
+                # No local HVSC folder in use: the downloaded documents step in
+                # (the card's "Download from the internet", or the online
+                # collection's "Use for my own SID files"), and the card's
+                # weekly download is armed — or stopped.
                 online_hvsc.apply_docs_fallback()
-                if get_hvsc().is_configured():
+                hvsc_download.start()
+                if get_hvsc().is_configured() and not online_hvsc.fallback_active():
                     # Scans only join HVSC onto the tracks they changed: apply
                     # the new database to the SIDs already indexed, once.
                     from soniqboom.core.hvsc_apply import apply_hvsc_to_library
@@ -3827,6 +3911,15 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         if mode in availability.MODES and mode != availability.mode():
             await _set_cfg(availability.MODE_KEY, mode)
             # Lists, counts and shuffles key on the mode — tell open pages.
+            availability.notify_changed()
+
+    if "unplayable_tracks" in body:
+        from soniqboom.core import availability
+        from soniqboom.core.data import set_config as _set_cfg
+        mode = str(body.get("unplayable_tracks") or "").strip().lower()
+        # (An unknown value is ignored, like "offline_tracks" above.)
+        if mode in availability.UNPLAY_MODES and mode != availability.unplay_mode():
+            await _set_cfg(availability.UNPLAY_KEY, mode)
             availability.notify_changed()
 
     if "skip_short_tunes" in body:

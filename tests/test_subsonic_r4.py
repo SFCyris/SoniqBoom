@@ -768,21 +768,21 @@ def logo_net(radio_favs, monkeypatch):
     monkeypatch.setattr(stations_mod, "_assert_public_url", _guard)
     monkeypatch.setattr(ssrf_proxy, "proxy_url", lambda: None)
     subsonic._LOGO_TASKS.clear()
-    favs = radio_favs.get_favorites()
+    favs = radio_favs.get_favorites("u1")
     favs[0]["favicon"] = "https://a.example/logo.png"
     favs[1]["favicon"] = "https://b.example/favicon.ico"
     favs.append({"sid": "rb:d", "name": "D", "favicon": "javascript:alert(1)",
                  "streams": [{"url": "http://d.example/s"}]})
-    radio_favs._write_json(radio_favs._FAVS_FILE, favs)
+    radio_favs.set_favorites("u1", favs)
     return types.SimpleNamespace(routes=routes, hits=hits, radiodir=radio_favs)
 
 
 def _set_logo(net, sid, url):
-    favs = net.radiodir.get_favorites()
+    favs = net.radiodir.get_favorites("u1")
     for f in favs:
         if f["sid"] == sid:
             f["favicon"] = url
-    net.radiodir._write_json(net.radiodir._FAVS_FILE, favs)
+    net.radiodir.set_favorites("u1", favs)
     return subsonic._station_cover_id(sid)
 
 

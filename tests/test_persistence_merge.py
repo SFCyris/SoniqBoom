@@ -22,7 +22,8 @@ from soniqboom.core import merger, persistence
 
 
 def _lib(d: Path, tracks=("t1", "t2"), **extra) -> dict:
-    state = {"tracks": {t: {"id": t, "path": f"/m/{t}.mp3", "title": t} for t in tracks}, **extra}
+    state = {"db_version": persistence.DB_VERSION,
+             "tracks": {t: {"id": t, "path": f"/m/{t}.mp3", "title": t} for t in tracks}, **extra}
     (d / "library.json").write_text(json.dumps(state))
     return state
 
@@ -34,11 +35,11 @@ def _aof(d: Path, *records) -> None:
 
 
 def _play(tid: str, ts: int) -> dict:
-    return {"op": "record_play", "ts": ts, "id": tid}
+    return {"op": "record_play", "ts": ts, "id": tid, "uid": ""}
 
 
 def _hist(tid: str, ts: int) -> dict:
-    return {"op": "push_history", "ts": ts, "data": {"track_id": tid, "ts": ts}}
+    return {"op": "push_history", "ts": ts, "data": {"track_id": tid, "ts": ts}, "uid": ""}
 
 
 def _boot(d: Path) -> dict:
@@ -48,7 +49,7 @@ def _boot(d: Path) -> dict:
 
 
 def _count(state: dict, tid: str) -> int:
-    return (state.get("play_stats", {}).get(tid) or {}).get("count", 0)
+    return ((state.get("play_stats", {}).get("") or {}).get(tid) or {}).get("count", 0)
 
 
 # ── Plays counted once, whatever stops where ────────────────────────────────
@@ -74,9 +75,9 @@ def test_a_shutdown_snapshot_does_not_count_the_plays_twice(tmp_path, store, the
     st = get_store()
     w = AOFWriter(tmp_path / "library.aof")
     st._aof_append = w.append
-    st.record_play("t1")
-    st.record_play("t1")
-    st.push_history({"track_id": "t1", "ts": 5})
+    st.record_play("t1", uid="")
+    st.record_play("t1", uid="")
+    st.push_history({"track_id": "t1", "ts": 5}, uid="")
     w.flush_sync()
     persistence.write_snapshot_sync(tmp_path, consume_aof=True)
     assert (tmp_path / "library.aof").stat().st_size == 0
@@ -84,7 +85,7 @@ def test_a_shutdown_snapshot_does_not_count_the_plays_twice(tmp_path, store, the
         assert merger._do_merge(tmp_path) == 0
     state = _boot(tmp_path)
     assert _count(state, "t1") == 2
-    assert len(state["history"]) == 1
+    assert len(state["history"][""]) == 1
 
 
 def test_the_command_line_import_snapshot_leaves_the_aof_alone(tmp_path, store):
@@ -127,7 +128,7 @@ def test_a_merge_that_dies_before_dropping_the_aof_applies_nothing_twice(tmp_pat
     assert (tmp_path / "library.aof").stat().st_size == 0
     state = _boot(tmp_path)
     assert _count(state, "t1") == 3 and _count(state, "t2") == 1
-    assert len(state["history"]) == 1
+    assert len(state["history"][""]) == 1
 
 
 def test_a_merge_with_only_held_entries_left_just_drops_them(tmp_path, monkeypatch):
@@ -150,7 +151,7 @@ def test_a_shutdown_snapshot_that_dies_before_dropping_the_aof(tmp_path, store, 
     _lib(tmp_path)
     _aof(tmp_path, _play("t1", 10))
     persistence.init_persistence(tmp_path)
-    assert get_store().get_play_stats("t1")["count"] == 1
+    assert get_store().get_play_stats("t1", uid="")["count"] == 1
     monkeypatch.setattr(persistence, "drop_aof_prefix", lambda *a: (_ for _ in ()).throw(_Died()))
     with pytest.raises(_Died):
         persistence.write_snapshot_sync(tmp_path, consume_aof=True)
@@ -174,22 +175,22 @@ def test_a_mark_that_does_not_match_the_aof_skips_nothing(tmp_path):
 
 def test_an_old_snapshot_and_aof_replay_as_before(tmp_path):
     """Files from a server before the mark: no mark → the whole AOF replays."""
-    _lib(tmp_path, play_stats={"t1": {"count": 3, "last_played": 5}})
+    _lib(tmp_path, play_stats={"": {"t1": {"count": 3, "last_played": 5}}})
     _aof(tmp_path, _play("t1", 10), {"op": "set_rating", "ts": 1, "id": "t2", "rating": 4})
     state = _boot(tmp_path)
     assert _count(state, "t1") == 4 and state["ratings"] == {"t2": 4}
 
 
 def test_the_new_snapshot_reads_with_the_old_reader(tmp_path):
-    """The mark is one more top-level key: the stdlib reader of an older
-    server reads the file, and ``populate_store`` ignores the key."""
+    """The mark is one more top-level key: the stdlib reader reads the
+    file, and ``populate_store`` ignores the key."""
     _lib(tmp_path)
     _aof(tmp_path, _play("t1", 10))
     assert merger._do_merge(tmp_path) == 1
     with open(tmp_path / "library.json", "r") as f:          # the old reader
         old = json.load(f)
-    assert old["play_stats"]["t1"]["count"] == 1 and persistence.AOF_MARK in old
-    assert set(old) - {"tracks", "play_stats", persistence.AOF_MARK} == set()
+    assert old["play_stats"][""]["t1"]["count"] == 1 and persistence.AOF_MARK in old
+    assert set(old) - {"db_version", "tracks", "play_stats", persistence.AOF_MARK} == set()
 
 
 # ── When a periodic merge runs ──────────────────────────────────────────────
@@ -448,9 +449,9 @@ def test_records_a_failed_flush_kept_are_not_counted_twice(tmp_path, store):
         w = AOFWriter(d / "library.aof")
         w._FLOCK_BUDGET_SECONDS = 0.2
         st._aof_append = w.append
-        st.record_play("t1")
+        st.record_play("t1", uid="")
         w.flush_sync()
-        st.record_play("t2")                                  # buffered
+        st.record_play("t2", uid="")                                  # buffered
         with open(d / "library.aof", "rb+") as holder:        # the stop's flush fails
             fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
             w.stop()
@@ -792,7 +793,7 @@ async def test_writes_during_the_shutdown_snapshot_are_counted_once(tmp_path, st
     st = get_store()
     w = AOFWriter(tmp_path / "library.aof")
     st._aof_append = w.append
-    st.record_play("t1")
+    st.record_play("t1", uid="")
     w.flush_sync()
     real_mark = persistence.aof_mark
 
@@ -806,7 +807,7 @@ async def test_writes_during_the_shutdown_snapshot_are_counted_once(tmp_path, st
     async def plays():
         nonlocal made
         while not done:
-            st.record_play("t2")
+            st.record_play("t2", uid="")
             made += 1
             await asyncio.sleep(0)
     try:
@@ -836,9 +837,9 @@ def test_a_failed_drop_still_keeps_the_held_back_records_out(tmp_path, store, mo
     w = AOFWriter(tmp_path / "library.aof")
     w._FLOCK_BUDGET_SECONDS = 0.2
     st._aof_append = w.append
-    st.record_play("t1")
+    st.record_play("t1", uid="")
     w.flush_sync()
-    st.record_play("t2")                            # stays buffered: the flush fails
+    st.record_play("t2", uid="")                            # stays buffered: the flush fails
     with open(tmp_path / "library.aof", "rb+") as holder:
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
         w.stop()
@@ -907,11 +908,11 @@ async def test_scans_and_passes_are_stopped_before_the_journal_ends(store, monke
     async def writer(name):
         try:
             while True:
-                st.record_play("t1")
+                st.record_play("t1", uid="")
                 writes.append(name)
                 await asyncio.sleep(0.005)
         except asyncio.CancelledError:
-            st.record_play("t1")                    # a finally that still writes
+            st.record_play("t1", uid="")                    # a finally that still writes
             writes.append(name + "-final")
             finished.append(name)
             raise

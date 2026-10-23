@@ -942,9 +942,16 @@ def _safe_int(v: Any, default: int = 0, *, round_: bool = False) -> int:
     return int(round(f)) if round_ else int(f)
 
 
+def _plays_of(store, uid: str) -> dict:
+    """User ``uid``'s play stats map (``TrackStore.play_stats_view``: live,
+    read-only) — empty for a minimal stub store (tests) without it."""
+    view = getattr(store, "play_stats_view", None)
+    return (view(uid) if callable(view) else None) or {}
+
+
 class _SongCtx:
     """Per-request context for song mapping: the folder-albums flag, the
-    (global) rating and play-count maps, the caller's starred songs and
+    (global) rating map, the caller's play counts, starred songs and
     bookmarks, and the scan roots client paths are relative to — all O(1)
     lookups, so decorating a 5,000-song listing adds no per-item store work."""
 
@@ -969,9 +976,9 @@ class _SongCtx:
         self.roots = _sx.scan_roots(store) if store is not None else ()
         # Minimal stub stores (tests) may lack the private rating / play maps.
         # Live references (never copied); read on the event loop only.
-        self.ratings = getattr(store, "_ratings", None) or {}
-        self.plays = getattr(store, "_play_stats", None) or {}
         uid = getattr(user, "id", None)
+        self.ratings = getattr(store, "_ratings", None) or {}
+        self.plays = _plays_of(store, uid or "")
         state = _get_state()
         self.starred = state.starred(uid, "song") if uid else {}
         self.marks = state.bookmarks(uid) if uid else {}
@@ -1402,7 +1409,7 @@ def _composer_is_artist(fmt) -> bool:
 
 def _song_user(out: dict, tid: str, ctx: _SongCtx) -> None:
     """Add the caller's fields for track ``tid`` to ``out`` (in place): the
-    library-wide rating and play stats, the caller's star and bookmark."""
+    library-wide rating, the caller's play stats, star and bookmark."""
     r = ctx.ratings.get(tid)
     if r:
         out["userRating"] = r
@@ -3031,13 +3038,14 @@ async def get_album_list(
                 for e in (_resolve_album_entry(store, i, cat),) if e is not None]
         mine.sort(key=lambda x: (-x[0], x[1].name.lower(), x[1].id))
         seen = {e.id for _r, e in mine}
-        base = [e for _r, e in mine] + [e for e in _ranked_albums(store, cat, "highest")
+        base = [e for _r, e in mine] + [e for e in _ranked_albums(store, cat, "highest",
+                                                                  uid=user.id)
                                         if e.id not in seen]
         if root:
             ids = _folder_view(store, cat, root)[0]
             base = [e for e in base if e.id in ids]
     elif type in ("frequent", "recent", "highest"):
-        base = _ranked_albums(store, cat, type)
+        base = _ranked_albums(store, cat, type, uid=user.id)
         if root:
             ids = _folder_view(store, cat, root)[0]
             base = [e for e in base if e.id in ids]
@@ -3155,19 +3163,21 @@ def _genre_ids(cat: _sx.Catalogue, genre: str) -> set[str]:
     return hit
 
 
-def _ranked_albums(store, cat: _sx.Catalogue, kind: str) -> list[_sx.AlbumEntry]:
-    """``frequent`` (total plays), ``recent`` (last played) and ``highest``
-    (mean track rating — the shared fallback getAlbumList puts after the
-    caller's own album ratings) album lists.  One pass over the PLAYED / RATED tracks
-    only — not the library — memoised on the snapshot + the store's play /
-    rating sequence, which bump on every play / rating without touching
-    ``_mutation_seq``."""
+def _ranked_albums(store, cat: _sx.Catalogue, kind: str, *, uid: str) -> list[_sx.AlbumEntry]:
+    """``frequent`` (total plays), ``recent`` (last played) — user ``uid``'s
+    plays — and ``highest`` (mean track rating, library-wide — the shared
+    fallback getAlbumList puts after the caller's own album ratings) album
+    lists.  One pass over the PLAYED / RATED tracks only — not the library —
+    memoised on the snapshot + the store's play / rating sequence (with the
+    user for the play lists), which bump on every play / rating without
+    touching ``_mutation_seq``."""
+    who = "" if kind == "highest" else uid
     seq = getattr(store, "_rating_seq" if kind == "highest" else "_play_seq", 0)
-    key = ("ranked", kind, seq)
+    key = ("ranked", kind, who, seq)
     hit = cat.memo.get(key)
     if hit is not None:
         return hit
-    for k in [k for k in cat.memo if isinstance(k, tuple) and k[:2] == ("ranked", kind)]:
+    for k in [k for k in cat.memo if isinstance(k, tuple) and k[:3] == ("ranked", kind, who)]:
         del cat.memo[k]                              # drop superseded rankings
     agg: dict[str, list] = {}
     if kind == "highest":
@@ -3182,7 +3192,7 @@ def _ranked_albums(store, cat: _sx.Catalogue, kind: str) -> list[_sx.AlbumEntry]
         ranked = sorted(agg.values(), key=lambda a: (-(a[1] / a[2]), -a[2], a[0].name.lower()))
     else:
         field = "count" if kind == "frequent" else "last_played"
-        for tid, st in store._play_stats.items():
+        for tid, st in _plays_of(store, uid).items():
             t = store.get_track(tid)
             e = cat.track_entry(t) if t else None
             if e is None:
@@ -5097,7 +5107,7 @@ async def _station_logo_response(request: Request, cover_id: str, bucket: str,
     """getCoverArt for an ``rs:`` id: the favourite station's logo, else the
     placeholder (short-lived: a logo may still be on its way)."""
     from soniqboom.core import radiodir
-    favs = await asyncio.to_thread(radiodir.get_favorites)
+    favs = await asyncio.to_thread(radiodir.all_favorites)      # (any user's station)
     url = ""
     for st in favs:
         sid = st.get("sid") if isinstance(st, dict) else None
@@ -5157,19 +5167,30 @@ async def _record_subsonic_play(store, user, track: dict, *, ts: int | None = No
     player's ``/api/tracks/{id}/played``: the play-stat update, a listening-
     history entry and the external scrobblers (last.fm / ListenBrainz — a
     noop until the user links them).  ``ts`` (epoch s) is when it happened;
-    passed on to the store / scrobbler / history versions that take it."""
+    passed on to the store / scrobbler / history versions that take it.  The
+    play stats and history are ``user``'s (none for an account deleted
+    meanwhile — ``TrackStore._deleted_uids``), and only that user's open
+    pages hear of it (``library.push_to_user``, in the background)."""
     tid = track["id"]
+    uid = user.id
     if ts is not None and _accepts_kw(store.record_play, "at"):
-        store.record_play(tid, at=ts)
+        store.record_play(tid, at=ts, uid=uid)
     else:
-        store.record_play(tid)
+        store.record_play(tid, uid=uid)
     try:
         from soniqboom.api.smart import push_history
         kw = {"at": ts} if ts is not None and _accepts_kw(push_history, "at") else {}
         await push_history(tid, title=track.get("title") or "",
-                           artist=track.get("artist") or "", **kw)
+                           artist=track.get("artist") or "", uid=uid, **kw)
     except Exception:                      # noqa: BLE001 — history is best-effort
         log.debug("history append failed for %s", tid, exc_info=True)
+    try:
+        # That user's open pages (only theirs) re-read an open History /
+        # Most Played view — a play from a Subsonic app is news to them.
+        from soniqboom.api.library import push_to_user
+        push_to_user(uid, {"event": "plays_changed"})
+    except Exception:                      # noqa: BLE001
+        log.debug("plays_changed push failed", exc_info=True)
     try:
         from soniqboom.core.scrobble import submit_play
         if ts is not None and _accepts_kw(submit_play, "ts"):
@@ -5291,19 +5312,14 @@ async def get_playlists(
     user = _require_user(request, sb_session, u, p, s, t)
     store = get_store()
     pls = []
-    # Owner-filtered: a user sees only their own playlists plus any
-    # legacy/shared ones (owner_user_id None) so existing single-user
-    # libraries keep working until they're explicitly migrated.
+    # The caller's list: their own playlists, then the shared ones of others
+    # they imported (``TrackStore.list_playlists_for_user``).
     for pl in store.list_playlists_for_user(user.id):
-        owner_id = pl.get("owner_user_id")
-        owner = get_user_store().get(owner_id) if owner_id and owner_id != user.id else None
-        owner_name = user.username if owner_id == user.id else (
-            owner.username if owner is not None else "shared")
         row = {
             "id":         pl["id"],
             "name":       pl["name"],
-            "owner":      owner_name,
-            "public":     owner_id is None,
+            "owner":      _playlist_owner_name(store, pl, user),
+            "public":     bool(pl.get("shared")),
             "created":    _iso_req(pl.get("created_at"), pl.get("updated_at")),
             "changed":    _iso_req(pl.get("updated_at"), pl.get("created_at")),
         }
@@ -5321,6 +5337,35 @@ async def get_playlists(
         pls.append(row)
     pls.sort(key=lambda x: x.get("changed") or "", reverse=True)
     return _ok({"playlists": {"playlist": pls}}, fmt=f)
+
+
+def _playlist_owner_name(store, pl: dict, user) -> str:
+    """The owner's user name for a playlist's ``owner`` field."""
+    owner_id = store.playlist_owner(pl)
+    if owner_id == user.id:
+        return user.username
+    owner = get_user_store().get(owner_id) if owner_id else None
+    return owner.username if owner is not None else ""
+
+
+def _playlist_public(request: Request) -> bool | None:
+    """The ``public`` parameter (true / false), None when absent."""
+    raw = request.query_params.get("public")
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("true", "1", "yes")
+
+
+def _apply_public(store, user, playlist_id: str, public: bool | None) -> None:
+    """``public`` ⇔ the playlist is shared with every account — the owner
+    sets it; a readonly account can't share (unsharing is allowed)."""
+    if public is None:
+        return
+    if public and user.role == "readonly":
+        raise _SubsonicError(50, "Your account is read-only — it can't share playlists.")
+    pl = store._playlists.get(playlist_id)
+    if pl is not None and bool(pl.get("shared")) != public:
+        store.set_playlist_shared(playlist_id, public)
 
 
 @_route("/getPlaylist")
@@ -5341,10 +5386,9 @@ async def get_playlist(
     pl = store._playlists.get(id)
     if not pl:
         raise _SubsonicError(70, "Playlist not found.")
-    # Owner check — return 70 (not 50) so we don't reveal existence to
-    # someone who shouldn't see the playlist at all.
-    owner_id = pl.get("owner_user_id")
-    if owner_id is not None and owner_id != user.id:
+    # The owner's, or a shared one (an app may open one to import) — else 70
+    # (not 50) so we don't reveal existence to someone who shouldn't see it.
+    if not store.playlist_readable(pl, user.id):
         raise _SubsonicError(70, "Playlist not found.")
     ctx = _song_ctx(store, user)
     if pl.get("query"):
@@ -5366,8 +5410,8 @@ async def get_playlist(
         "playlist": {
             "id":        pl["id"],
             "name":      pl["name"],
-            "owner":     user.username if owner_id == user.id else "shared",
-            "public":    owner_id is None,
+            "owner":     _playlist_owner_name(store, pl, user),
+            "public":    bool(pl.get("shared")),
             "songCount": len(entries),
             "duration":  sum(e.get("duration") or 0 for e in entries),
             "created":   _iso_req(pl.get("created_at"), pl.get("updated_at")),
@@ -5392,18 +5436,19 @@ async def create_playlist(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
+    # Any account manages its own playlists (readonly too: not ``public``).
     user = _require_user_no_cookie(request, sb_session, u, p, s, t)
-    if user.role == "readonly":
-        raise _SubsonicError(50, "Your account is read-only. Ask an admin to upgrade you to 'edit' to manage playlists.")
+    public = _playlist_public(request)
+    if public and user.role == "readonly":
+        raise _SubsonicError(50, "Your account is read-only — it can't share playlists.")
     from soniqboom.core.data import create_playlist as _create, update_playlist as _update
     store = get_store()
     if playlistId:
         # Owner check before mutating someone else's playlist
         existing = store._playlists.get(playlistId)
-        if not existing:
+        if not existing or not store.playlist_readable(existing, user.id):
             raise _SubsonicError(70, "Playlist not found.")
-        owner_id = existing.get("owner_user_id")
-        if owner_id is not None and owner_id != user.id and user.role != "admin":
+        if store.playlist_owner(existing) != user.id:
             raise _SubsonicError(50, "You can only edit your own playlists.")
         # Spec: with a playlistId the songs REPLACE the playlist's (entries
         # of tracks hidden from Subsonic apps stay — the app never saw them).
@@ -5426,6 +5471,7 @@ async def create_playlist(
         pl = await _create(name, track_ids=entries, owner_user_id=user.id)
     if not pl:
         raise _SubsonicError(70, "Playlist not found.")
+    _apply_public(store, user, pl["id"], public)
     return await get_playlist(
         request, id=pl["id"], sb_session=sb_session,
         u=u, p=p, s=s, t=t, f=f,
@@ -5449,15 +5495,13 @@ async def update_playlist(
     f: str = Query(default="xml"),
 ):
     user = _require_user_no_cookie(request, sb_session, u, p, s, t)
-    if user.role == "readonly":
-        raise _SubsonicError(50, "Your account is read-only. Ask an admin to upgrade you to 'edit' to manage playlists.")
     store = get_store()
     pl = store._playlists.get(playlistId)
-    if not pl:
+    if not pl or not store.playlist_readable(pl, user.id):
         raise _SubsonicError(70, "Playlist not found.")
-    owner_id = pl.get("owner_user_id")
-    if owner_id is not None and owner_id != user.id and user.role != "admin":
+    if store.playlist_owner(pl) != user.id:
         raise _SubsonicError(50, "You can only edit your own playlists.")
+    _apply_public(store, user, playlistId, _playlist_public(request))
     ids = list(pl.get("track_ids") or [])
     # ``songIndexToRemove`` indexes the list getPlaylist SHOWED — entries
     # whose track still exists — so map it onto the stored list (which may
@@ -5491,14 +5535,17 @@ async def delete_playlist(
     f: str = Query(default="xml"),
 ):
     user = _require_user_no_cookie(request, sb_session, u, p, s, t)
-    if user.role == "readonly":
-        raise _SubsonicError(50, "Your account is read-only. Ask an admin to upgrade you to 'edit' to manage playlists.")
     store = get_store()
     pl = store._playlists.get(id)
     if not pl:
         return _ok(fmt=f)
-    owner_id = pl.get("owner_user_id")
-    if owner_id is not None and owner_id != user.id and user.role != "admin":
+    if store.playlist_owner(pl) != user.id:
+        if user.id in (pl.get("subscribers") or ()):
+            # An imported playlist: deleting it removes it from the caller's list.
+            store.set_playlist_subscription(id, user.id, False)
+            return _ok(fmt=f)
+        if not store.playlist_readable(pl, user.id):
+            return _ok(fmt=f)                   # (someone else's: as if not there)
         raise _SubsonicError(50, "You can only delete your own playlists.")
     from soniqboom.core.data import delete_playlist as _delete
     await _delete(id)
@@ -5838,9 +5885,9 @@ async def get_lyrics_by_song_id(
 _SIMILAR_MAX_SEEDS = 5
 
 
-def _rank_key(store):
-    """Top-songs order: play count desc, rating desc, title, id."""
-    plays = getattr(store, "_play_stats", None) or {}
+def _rank_key(store, *, uid: str):
+    """Top-songs order: user ``uid``'s play count desc, rating desc, title, id."""
+    plays = _plays_of(store, uid)
     ratings = getattr(store, "_ratings", None) or {}
 
     def _rank(tid: str):
@@ -5850,14 +5897,14 @@ def _rank_key(store):
     return _rank
 
 
-def _similar_seeds(store, raw: str) -> list[dict]:
+def _similar_seeds(store, raw: str, *, uid: str) -> list[dict]:
     import heapq
     if raw.startswith("ar:"):
         hit = _decode_artist(raw, store)
         if hit is None:
             raise _SubsonicError(70, "Artist not found.")
         tids = _artist_track_ids(store, hit[0]) if hit[0] else set()
-        top = heapq.nsmallest(_SIMILAR_MAX_SEEDS, tids, key=_rank_key(store))
+        top = heapq.nsmallest(_SIMILAR_MAX_SEEDS, tids, key=_rank_key(store, uid=uid))
         seeds = [tr for tr in store.get_tracks_batch(top) if tr]
     elif raw.startswith(("al:", _sx.FOLDER_PREFIX)):
         _album, tracks = _album_and_tracks(store, raw)
@@ -5869,8 +5916,10 @@ def _similar_seeds(store, raw: str) -> list[dict]:
             # Most-played first, then spread across the tracklist so an album
             # nobody has played yet isn't represented by its intro alone.
             by_id = {tr["id"]: tr for tr in tracks}
-            played = [i for i in heapq.nsmallest(_SIMILAR_MAX_SEEDS, by_id, key=_rank_key(store))
-                      if ((getattr(store, "_play_stats", None) or {}).get(i) or {}).get("count")]
+            plays = _plays_of(store, uid)
+            played = [i for i in heapq.nsmallest(_SIMILAR_MAX_SEEDS, by_id,
+                                                 key=_rank_key(store, uid=uid))
+                      if (plays.get(i) or {}).get("count")]
             step = len(tracks) / _SIMILAR_MAX_SEEDS
             spread = [tracks[int(k * step)]["id"] for k in range(_SIMILAR_MAX_SEEDS)]
             order = list(dict.fromkeys(played + spread))[:_SIMILAR_MAX_SEEDS]
@@ -5883,7 +5932,8 @@ def _similar_seeds(store, raw: str) -> list[dict]:
     return seeds
 
 
-async def _similar_song_scored(raw_id: str, count: int) -> list[tuple[dict, float]]:
+async def _similar_song_scored(raw_id: str, count: int, *,
+                               uid: str) -> list[tuple[dict, float]]:
     """Seed the audio-envelope similarity engine from a song / album / artist
     id and return ``(track, score)`` pairs, best first — ``score`` in 0..1
     (relative: the best match of a seed is 1.0).  Store reads stay on the
@@ -5893,7 +5943,7 @@ async def _similar_song_scored(raw_id: str, count: int) -> list[tuple[dict, floa
     from soniqboom.core.data import get_all_ratings
     from soniqboom.core.similar import find_similar
     store = get_store()
-    seeds = _similar_seeds(store, raw_id)
+    seeds = _similar_seeds(store, raw_id, uid=uid)
     k = max(1, min(count, 100))
     ratings = await get_all_ratings()
     jobs = []
@@ -5929,9 +5979,9 @@ async def _similar_song_scored(raw_id: str, count: int) -> list[tuple[dict, floa
     return [(tr, sc) for sc, tr in ranked[:k]]
 
 
-async def _similar_song_tracks(raw_id: str, count: int) -> list[dict]:
+async def _similar_song_tracks(raw_id: str, count: int, *, uid: str) -> list[dict]:
     """``_similar_song_scored`` without the scores (getSimilarSongs / 2)."""
-    return [tr for tr, _sc in await _similar_song_scored(raw_id, count)]
+    return [tr for tr, _sc in await _similar_song_scored(raw_id, count, uid=uid)]
 
 
 @_route("/getSimilarSongs")
@@ -5954,7 +6004,7 @@ async def get_similar_songs(
     skip = _auto_skip_ids(get_store())
     # (Asked for more when some will be left out, so ``count`` still come back.)
     want = count + min(len(skip), count) if skip else count
-    tracks = await _similar_song_tracks(_split_id(get_store(), id)[0], want)
+    tracks = await _similar_song_tracks(_split_id(get_store(), id)[0], want, uid=user.id)
     ctx = _song_ctx(get_store(), user)
     songs = [_track_to_song(tr, ctx) for tr in tracks if not (skip and tr.get("id") in skip)][:count]
     is_v2 = "similarsongs2" in request.url.path.lower()
@@ -5994,7 +6044,7 @@ async def get_sonic_similar_tracks(
     tid = _split_id(store, id)[0]
     if tid.startswith(("ar:", "al:", _sx.FOLDER_PREFIX)) or not store.get_track(tid):
         raise _SubsonicError(70, "Song not found.")
-    pairs = await _similar_song_scored(tid, max(1, min(int(count or 10), 100)))
+    pairs = await _similar_song_scored(tid, max(1, min(int(count or 10), 100)), uid=user.id)
     ctx = _song_ctx(store, user)
     return _ok({"sonicMatch": [_sonic_match(tr, ctx) for tr, _sc in pairs]}, fmt=f)
 
@@ -7065,7 +7115,7 @@ async def get_top_songs(
     if skip and tids:
         tids = tids - skip
     import heapq
-    top = heapq.nsmallest(count, tids, key=_rank_key(store)) if count else []
+    top = heapq.nsmallest(count, tids, key=_rank_key(store, uid=user.id)) if count else []
     ctx = _song_ctx(store, user)
     songs = [_track_to_song(tr, ctx) for tr in store.get_tracks_batch(top) if tr]
     return _ok({"topSongs": {"song": songs}}, fmt=f)
@@ -7236,7 +7286,7 @@ async def start_scan(
 
 
 # ── Internet radio ───────────────────────────────────────────────────────────
-# The station favorites (core/radiodir.py) are the server's radio list.  The
+# Each account's station favorites (core/radiodir.py) are its radio list.  The
 # web player streams them through ``/api/stations/relay/{sid}``, which sits
 # behind the session-cookie middleware a Subsonic client can't satisfy.  So
 # Subsonic gets its own relay route, ``/rest/radioStream``, which calls the
@@ -7399,7 +7449,7 @@ async def get_internet_radio_stations(
     user = _require_user(request, sb_session, u, p, s, t)
     from soniqboom.core import radiodir
     out = []
-    for st in radiodir.get_favorites():
+    for st in radiodir.get_favorites(user.id):
         sid = st.get("sid") if isinstance(st, dict) else None
         if not sid or not any(isinstance(x, dict) and x.get("url")
                               for x in (st.get("streams") or [])):
@@ -7418,12 +7468,9 @@ async def get_internet_radio_stations(
 
 
 def _require_radio_editor(request, sb_session, u, p, s, t):
-    # Same gate as the web API's favorites endpoints (require_edit).
-    user = _require_user_no_cookie(request, sb_session, u, p, s, t)
-    if user.role not in ("admin", "edit"):
-        raise _SubsonicError(50, "Your account is read-only — only admin / edit users "
-                                 "can manage radio stations.")
-    return user
+    # The caller's own station list: any signed-in account (readonly too), as
+    # the web API's favorites endpoints.
+    return _require_user_no_cookie(request, sb_session, u, p, s, t)
 
 
 async def _checked_stream_url(url: str | None) -> str:
@@ -7486,16 +7533,17 @@ async def create_internet_radio_station(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
-    """Add a station to the favorites.  A URL belonging to a curated station
-    adds THAT station (its trusted stream list); any other public URL becomes
-    a custom favorite with its own ``custom:`` id — it can never take over an
-    existing station's id."""
-    _require_radio_editor(request, sb_session, u, p, s, t)
+    """Add a station to the caller's favorites (at most
+    ``_MAX_FAVORITE_STATIONS`` per user).  A URL belonging to a curated
+    station adds THAT station (its trusted stream list); any other public URL
+    becomes a custom favorite with its own ``custom:`` id — it can never take
+    over an existing station's id."""
+    uid = _require_radio_editor(request, sb_session, u, p, s, t).id
     if not (name or "").strip():
         raise _SubsonicError(10, "Required parameter 'name' is missing.")
     url = await _checked_stream_url(streamUrl)
     from soniqboom.core import radiodir
-    favs = radiodir.get_favorites()
+    favs = radiodir.get_favorites(uid)
     if _station_with_url(favs, url):
         return _ok(fmt=f)                                    # already there
     if len(favs) >= _MAX_FAVORITE_STATIONS:
@@ -7503,10 +7551,10 @@ async def create_internet_radio_station(
                                 "delete some first.")
     known = _station_with_url(radiodir.SCENE_PACK, url)
     if known is not None:
-        radiodir.add_favorite(dict(known))
+        radiodir.add_favorite(dict(known), uid=uid)
         return _ok(fmt=f)
     import secrets as _secrets
-    radiodir.add_favorite({
+    radiodir.add_favorite(uid=uid, station={
         # Random, never derived from the URL: an edited custom station's old
         # URL can be added again without colliding with it.
         "sid": "custom:" + _secrets.token_hex(8),
@@ -7515,6 +7563,7 @@ async def create_internet_radio_station(
         "favicon": "", "country": "", "tags": "", "votes": 0,
         "streams": [{"url": url, "codec": "", "bitrate": 0, "hls": 0}],
         "custom": True,
+        "creator": uid,                    # (its URL is this account's to change)
     })
     return _ok(fmt=f)
 
@@ -7535,15 +7584,20 @@ async def update_internet_radio_station(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
-    _require_radio_editor(request, sb_session, u, p, s, t)
+    uid = _require_radio_editor(request, sb_session, u, p, s, t).id
     from soniqboom.core import radiodir
-    cur = next((x for x in radiodir.get_favorites()
+    cur = next((x for x in radiodir.get_favorites(uid)
                 if isinstance(x, dict) and x.get("sid") == id), None)
     if cur is None:
         raise _SubsonicError(70, "Radio station not found.")
     upd = dict(cur)
     if streamUrl is not None:
         url = await _checked_stream_url(streamUrl)
+        if id.startswith("custom:") and cur.get("creator") not in (None, uid):
+            # Another account's station (a copy in this list): its stream is
+            # theirs — station lookup plays the creator's (radiodir.all_favorites).
+            raise _SubsonicError(50, "This station was added by another user — add the "
+                                     "URL as a new station instead.")
         if id.startswith("custom:"):
             upd["streams"] = [{"url": url, "codec": "", "bitrate": 0, "hls": 0}]
         elif not _station_with_url([cur], url):
@@ -7554,7 +7608,7 @@ async def update_internet_radio_station(
         upd["name"] = name.strip()[:200]
     if homepageUrl is not None:
         upd["homepage"] = _clean_homepage(homepageUrl)
-    if upd != cur and radiodir.update_favorite(id, upd) is None:
+    if upd != cur and radiodir.update_favorite(id, upd, uid=uid) is None:
         raise _SubsonicError(70, "Radio station not found.")    # removed meanwhile
     return _ok(fmt=f)
 
@@ -7572,12 +7626,12 @@ async def delete_internet_radio_station(
     t: str | None = Query(default=None),
     f: str = Query(default="xml"),
 ):
-    # Maps 1:1 onto removing a favorite; same edit-role gate as the web API.
-    _require_radio_editor(request, sb_session, u, p, s, t)
+    # Maps 1:1 onto removing one of the caller's favorites (as the web API).
+    uid = _require_radio_editor(request, sb_session, u, p, s, t).id
     from soniqboom.core import radiodir
-    if not radiodir.is_favorite(id):
+    if not radiodir.is_favorite(id, uid=uid):
         raise _SubsonicError(70, "Radio station not found.")
-    radiodir.remove_favorite(id)
+    radiodir.remove_favorite(id, uid=uid)
     return _ok(fmt=f)
 
 
@@ -7936,10 +7990,28 @@ async def get_now_playing(
 
 
 async def forget_user(uid: str) -> None:
-    """Drop everything the Subsonic surface keeps for a deleted user: their
-    stars, ratings, play queue and bookmarks (persisted state) and their
-    now-playing entries.  Called by Subsonic deleteUser and by the web UI's
-    DELETE /api/users/{id}."""
+    """Drop what is kept for a deleted user: their play counts and listening
+    history (the library store, ``TrackStore.delete_user_data``), their
+    playlists (``TrackStore.delete_user_playlists`` — shared ones vanish for
+    their subscribers; their subscriptions to others' end), their favourite
+    stations (``radiodir.delete_favorites``), and on the Subsonic surface
+    their stars, ratings, play queue and bookmarks (persisted state) and
+    their now-playing entries.  Called by Subsonic deleteUser and by the web
+    UI's DELETE /api/users/{id}."""
+    if uid:
+        lib = _library_store()
+        lib.delete_user_data(uid)
+        lib.delete_user_playlists(uid)
+        try:
+            from soniqboom.core import radiodir
+            radiodir.delete_favorites(uid)
+        except Exception:                  # noqa: BLE001
+            log.warning("The favourite stations of a deleted user could not be removed",
+                        exc_info=True)
+        if lib.user_data_owner() == uid:
+            # (the legacy owner went: the next oldest admin takes that role)
+            from soniqboom.api.users import claim_unowned_user_data
+            claim_unowned_user_data()
     await _get_state().delete_user(uid)
     for key in [k for k in _NOW_PLAYING if k[0] == uid]:
         _NOW_PLAYING.pop(key, None)
@@ -8119,6 +8191,8 @@ async def create_user(
                                 password=_decode_password(password), role=role)
     except ValueError as exc:
         raise _SubsonicError(10 if "taken" not in str(exc) else 0, str(exc))
+    from soniqboom.api.users import claim_unowned_user_data
+    claim_unowned_user_data()           # (a restored backup's data kept for this name)
     return _ok(fmt=f)
 
 
@@ -8209,12 +8283,19 @@ async def delete_user(
         raise _SubsonicError(70, "User not found.")
     if target.id == me.id:
         raise _SubsonicError(50, "You can't delete your own account.")
+    lib = _library_store()
+    lib.user_deleting(target.id)            # (see users.delete_user: data goes with it)
     try:
         await asyncio.to_thread(ustore.delete, target.id)   # refuses the last enabled admin
-    except ValueError as exc:
-        raise _SubsonicError(0, str(exc))
+    except BaseException as exc:
+        lib.user_deleting(target.id, False)
+        if isinstance(exc, ValueError):
+            raise _SubsonicError(0, str(exc))
+        raise
+    lib.delete_user_data(target.id)
     await _close_user_sockets(target.id)
-    # Their Subsonic state (stars, queue, bookmarks) and now-playing entries go too.
+    # Their plays and history, Subsonic state (stars, queue, bookmarks) and
+    # now-playing entries go too.
     await forget_user(target.id)
     return _ok(fmt=f)
 

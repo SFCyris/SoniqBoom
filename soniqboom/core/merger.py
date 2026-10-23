@@ -72,17 +72,11 @@ def _apply_entry(state: dict, entry: dict) -> None:
             ratings[entry["id"]] = rating
 
     elif op == "record_play":
-        stats = state.setdefault("play_stats", {})
-        tid = entry["id"]
-        ts = entry.get("ts", int(time.time()))
-        existing = stats.get(tid)
-        if existing:
-            existing["count"] = existing.get("count", 0) + 1
-            # Same rule as TrackStore.record_play: a back-dated play (an
-            # offline client's scrobble) never moves last_played backwards.
-            existing["last_played"] = max(existing.get("last_played", 0) or 0, ts)
-        else:
-            stats[tid] = {"count": 1, "last_played": ts}
+        from soniqboom.core.user_data import add_play
+        stats = state.setdefault("play_stats", {}).setdefault(_entry_uid(state, entry), {})
+        # Same rule as TrackStore.record_play: a back-dated play (an offline
+        # client's scrobble) never moves last_played backwards.
+        add_play(stats, entry["id"], entry.get("ts", int(time.time())))
 
     elif op == "upsert_playlist":
         state.setdefault("playlists", {})[entry["id"]] = entry["data"]
@@ -91,18 +85,11 @@ def _apply_entry(state: dict, entry: dict) -> None:
         state.get("playlists", {}).pop(entry["id"], None)
 
     elif op == "push_history":
-        history = state.setdefault("history", [])
-        # Play order, not arrival order (same rule as TrackStore.push_history).
-        data = entry["data"]
-        ts = (data or {}).get("ts") or 0
-        if history and ts < (history[-1].get("ts") or 0):
-            import bisect
-            history.insert(bisect.bisect_right([e.get("ts") or 0 for e in history], ts), data)
-        else:
-            history.append(data)
-        max_h = 500
-        if len(history) > max_h:
-            state["history"] = history[-max_h:]
+        from soniqboom.core.user_data import add_history
+        # Play order, not arrival order, capped per user (same rule as
+        # TrackStore.push_history).
+        add_history(state.setdefault("history", {}).setdefault(_entry_uid(state, entry), []),
+                    entry["data"])
 
     elif op == "upsert_scan_dir":
         state.setdefault("scan_dirs", {})[entry["path"]] = entry["data"]
@@ -122,9 +109,35 @@ def _apply_entry(state: dict, entry: dict) -> None:
         remap_user_data(entry.get("mapping") or {},
                         ratings=state.setdefault("ratings", {}),
                         play_stats=state.setdefault("play_stats", {}),
-                        history=state.get("history"),
+                        history=state.setdefault("history", {}),
                         playlists=state.get("playlists"),
-                        waveforms=state.get("waveforms"))
+                        waveforms=state.get("waveforms"),
+                        keep_both=bool(entry.get("keep_both")))
+
+    elif op == "move_user_data":
+        # One user's plays and history go to another (TrackStore.move_user_data).
+        from soniqboom.core.user_data import merge_user_data
+        merge_user_data(state.setdefault("play_stats", {}), state.setdefault("history", {}),
+                        entry["src"], entry["dst"])
+
+    elif op == "delete_user_data":
+        # A deleted account's plays and history (TrackStore.delete_user_data).
+        from soniqboom.core.user_data import drop_user_data
+        drop_user_data(state.setdefault("play_stats", {}), state.setdefault("history", {}),
+                       entry["uid"])
+
+
+def _entry_uid(state: dict, entry: dict) -> str:
+    """The user a per-user record (``record_play``, ``push_history``) belongs
+    to: its ``uid``; a record without one (written before the database was
+    per user) belongs to the legacy owner (``user_data.OWNER_CONFIG_KEY`` in
+    the state's config, else the no-user bucket)."""
+    uid = entry.get("uid")
+    if isinstance(uid, str):
+        return uid
+    from soniqboom.core.user_data import NO_USER, OWNER_CONFIG_KEY
+    owner = (state.get("config") or {}).get(OWNER_CONFIG_KEY)
+    return owner if isinstance(owner, str) else NO_USER
 
 
 def _do_merge(data_dir: Path) -> int:
@@ -206,6 +219,18 @@ def _do_merge_locked(data_dir: Path) -> int:
             state = candidate
             if cand_tracks > 0:
                 break  # found a populated snapshot, use it
+
+    # Only a snapshot of this database version takes the records: an older
+    # one is converted (with a backup first) by the server's next start
+    # (``persistence.init_persistence``), a newer one is not this code's.
+    version = _p.state_db_version(state)
+    if version is None:
+        state["db_version"] = _p.DB_VERSION
+    elif version != _p.DB_VERSION:
+        log.warning("Merger: library.json is database V%s, this version writes V%s — "
+                    "not merged (the server converts it at its next start)",
+                    version, _p.DB_VERSION)
+        return 0
 
     # Entries the snapshot already holds (a merge that died after its
     # rotation, before dropping them from the AOF) are not applied again.

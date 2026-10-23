@@ -166,7 +166,7 @@ function _renderStationGroup(listbox, stations) {
   });
 }
 
-function _showPreview(tracks, stations = []) {
+function _showPreview(tracks, stations = [], total = null) {
   const dd = _ensureDropdown();
   // Drop refs to art images from the prior preview before we rebuild — any
   // loads still in flight no longer have a target row.
@@ -289,12 +289,15 @@ function _showPreview(tracks, stations = []) {
   // Always show "press Enter" hint so behaviour is discoverable.  In the
   // Stations view Enter opens the full station list, not the song search, so
   // the hint reflects that (the footer's "more" count only applies to songs).
+  // ``total``: the exact number of matches (the full results list every one).
+  const shown = Math.min(tracks.length, 8);
+  const more = !stationsFirst && typeof total === 'number' && total > shown;
   const hint = document.createElement('div');
-  hint.className = (!stationsFirst && tracks.length > 8) ? 'sp-more' : 'sp-hint';
+  hint.className = more ? 'sp-more' : 'sp-hint';
   hint.textContent = stationsFirst
     ? '↵ all station results · ↓ to play a row'
-    : (tracks.length > 8
-        ? `${tracks.length - 8} more — ↵ full results · ↓ to play a row`
+    : (more
+        ? `${total.toLocaleString()} matches — ↵ all results · ↓ to play a row`
         : '↵ full results · ↓ to play a row');
   dd.appendChild(hint);
 
@@ -487,23 +490,11 @@ async function query(text) {
   _cancelPreviewSearch();
   _hidePreview();
   if (!text.trim()) { Library.showAll(); return; }
-  // A full search is a view change: claim the cross-view nav token so that if the
-  // user clicks a nav facet before results land, the late results don't paint over
-  // that facet (search → nav render race).
-  const _tok = Library.beginView();
-  // Previously an uncaught fetch/json error here left the library blank with
-  // no explanation.  Surface failures and keep the prior view intact.
+  // The whole result set, paged like All Tracks (Library.showSearch — a view
+  // entry: a newer search or a nav click wins over a late answer).  A failure
+  // is said and the prior view stays.
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(text)}&limit=200`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const tracks = await res.json();
-    if (!Library.viewStillCurrent(_tok)) return;   // superseded by a newer view while searching
-    // showSearchResults (not bare renderTracks) so results always render as a
-    // proper sortable track list with the group header/filter chrome cleared —
-    // otherwise a search launched from a group view (Genres, Scene groups, …)
-    // shows the results under that view's stale header + live filter bar.
-    // The third argument re-runs this search when an admin action changes tags.
-    Library.showSearchResults(tracks, text, () => query(text));
+    await Library.showSearch(text);
   } catch (err) {
     console.error('Search failed:', err);
     Toast.error('Search failed — check the server log.');
@@ -516,6 +507,7 @@ async function query(text) {
 let _quickAbort = null;
 let _searchGen = 0;        // monotonic — guards two independent async sources
 let _lastTracks = [];
+let _lastTotal = null;        // the exact number of matches _lastTracks are the first of
 let _lastTracksText = null;   // the text _lastTracks answer
 let _curStations = [];
 
@@ -541,7 +533,8 @@ function _lookupStations(text) {
     _curStations = rows;
     // (No stations and the tracks not in yet: the track preview paints both.)
     if (!rows.length && _lastTracksText !== text) return;
-    _showPreview(_lastTracksText === text ? _lastTracks : [], _curStations);
+    _showPreview(_lastTracksText === text ? _lastTracks : [], _curStations,
+                 _lastTracksText === text ? _lastTotal : null);
   });
 }
 
@@ -570,20 +563,25 @@ async function _quickSearch(text) {
   const ctl = new AbortController();
   _quickAbort = ctl;
   _lastTracks = [];   // avoid an early station injection pairing with stale tracks
+  _lastTotal = null;
   _lastTracksText = null;
   // (Station matches run on their own — _lookupStations, from the keystroke.)
   try {
+    // The first rows of the very result set the full results list (the same
+    // endpoint, order and rows — /api/search/page), with its exact total.
     const res = await fetch(
-      `/api/search/quick?q=${encodeURIComponent(text)}&limit=8`,
+      `/api/search/page?q=${encodeURIComponent(text)}&limit=8&fields=list`,
       { signal: ctl.signal },
     );
-    const tracks = await res.json();
+    const j = res.ok ? await res.json() : null;
+    const tracks = j && Array.isArray(j.tracks) ? j.tracks : [];
     // Only render if we're still the latest request (another keystroke
     // could have replaced the generation while we were awaiting json).
     if (gen === _searchGen) {
-      _lastTracks = Array.isArray(tracks) ? tracks : [];
+      _lastTracks = tracks;
+      _lastTotal = j && typeof j.total === 'number' ? j.total : null;
       _lastTracksText = text;
-      _showPreview(_lastTracks, _curStations);
+      _showPreview(_lastTracks, _curStations, _lastTotal);
     }
   } catch (err) {
     if (err && err.name === 'AbortError') return;

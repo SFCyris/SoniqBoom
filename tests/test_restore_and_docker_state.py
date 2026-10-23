@@ -126,13 +126,13 @@ def test_web_import_is_saved_and_the_old_aof_is_dropped(tmp_data_dir, fresh_stor
         get_store()._aof_append = w.append
         await w.start_auto_flush()
         monkeypatch.setattr(main_mod, "_aof_writer", w, raising=False)
-        get_store().record_play("old2")                  # buffered, the old library's
+        get_store().record_play("old2", uid="")                  # buffered, the old library's
         persistence.populate_store(
             {"tracks": {t: {"id": t, "path": f"/m/{t}.mp3", "title": t} for t in ("n1", "n2")}})
         get_store().rebuild_indexes()
         saved = await admin._save_imported_library() is None
         # the journal keeps working after the save
-        get_store().record_play("n1")
+        get_store().record_play("n1", uid="")
         await w.flush()
         alive = w._flush_task is not None
         w.stop()
@@ -141,7 +141,7 @@ def test_web_import_is_saved_and_the_old_aof_is_dropped(tmp_data_dir, fresh_stor
     assert asyncio.run(run())
     state = _boot(data)                                  # what the next start loads
     assert sorted(state["tracks"]) == ["n1", "n2"]
-    plays = {k: v.get("count") for k, v in (state.get("play_stats") or {}).items()}
+    plays = {k: v.get("count") for k, v in (state.get("play_stats") or {}).get("", {}).items()}
     assert plays == {"n1": 1}
 
 
@@ -161,7 +161,7 @@ def test_cli_import_of_an_empty_backup_leaves_the_library(tmp_path):
     assert (data / "library.aof").exists()
     state = _boot(data)
     assert sorted(state["tracks"]) == ["a", "b"]
-    assert state["play_stats"]["a"]["count"] == 1
+    assert state["play_stats"][""]["a"]["count"] == 1        # (a record without uid: no owner)
 
 
 def test_cli_import_snapshot_marks_the_old_aof(tmp_path, fresh_store, monkeypatch):

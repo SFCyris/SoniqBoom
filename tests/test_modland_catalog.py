@@ -303,7 +303,7 @@ async def test_switch_off_and_on_brings_ids_and_user_data_back(env):
     store = env["store"]
     tiny = _tid("Protracker/Test Artist/tiny song.mod")
     store.set_rating(tiny, 5)
-    store.record_play(tiny)
+    store.record_play(tiny, uid="")
     pl = store.create_playlist("pl-cat", "cat", [tiny])
     from soniqboom.core.subsonic_state import get_state
     st = get_state()
@@ -318,7 +318,7 @@ async def test_switch_off_and_on_brings_ids_and_user_data_back(env):
     assert on["state"] == "ready"
     assert set(store.get_track_ids_for_scan_root(mc.root_hash())) == before
     assert store.get_rating(tiny) == 5
-    assert store.get_play_stats(tiny).get("count", 0) >= 1
+    assert store.get_play_stats(tiny, uid="").get("count", 0) >= 1
     assert tiny in st.starred("u1", "song")
     assert tiny in [e if isinstance(e, str) else e.get("id")
                     for e in store.get_playlist(pl["id"])["track_ids"]]
@@ -909,8 +909,8 @@ async def test_playlist_entries_survive_edits_while_hidden_or_switched_off(env, 
                             "scan_root_hash": "r", "file_size": 3})
     tiny = _tid("Protracker/Test Artist/tiny song.mod")
     other = _tid("Protracker/Test Artist/other song.mod")
-    store.create_playlist("pl", "mix", ["local-1", tiny, "local-2", other])
-    store.create_playlist("smart", "smart", query="tiny")
+    store.create_playlist("pl", "mix", ["local-1", tiny, "local-2", other], owner_user_id="u1")
+    store.create_playlist("smart", "smart", query="tiny", owner_user_id="u1")
     user = types.SimpleNamespace(id="u1", username="alice", role="admin", enabled=True)
     monkeypatch.setattr(subsonic, "_require_user", lambda *a, **k: user)
     monkeypatch.setattr(subsonic, "_require_user_no_cookie", lambda *a, **k: user)
@@ -1416,9 +1416,9 @@ async def test_a_refresh_applies_the_changelogs_and_keeps_user_data_of_moved_tun
     moved_old = "Protracker/- unknown/nameless.mod"
     moved_new = "Protracker/Someone Known/nameless.mod"
     store.set_rating(_tid(old_rel), 4)
-    store.record_play(_tid(old_rel))
-    store.record_play(_tid(old_rel))
-    store.push_history({"track_id": _tid(old_rel), "title": "x", "artist": "", "ts": 5})
+    store.record_play(_tid(old_rel), uid="")
+    store.record_play(_tid(old_rel), uid="")
+    store.push_history({"track_id": _tid(old_rel), "title": "x", "artist": "", "ts": 5}, uid="")
     store.create_playlist("pl1", "Mine", track_ids=[_tid(old_rel), {"id": _tid(moved_old)}])
     await st.star("u1", "song", [_tid(old_rel)])
     await st.save_play_queue("u1", [_tid(old_rel), _tid(moved_old)], current=_tid(old_rel),
@@ -1463,9 +1463,9 @@ async def test_a_refresh_applies_the_changelogs_and_keeps_user_data_of_moved_tun
     assert store.get_track(_tid("Protracker/Test Artist/tiny song.mod"))["file_size"] == len(bigger)
     # the user data followed the renamed / moved tunes
     assert store.get_rating(_tid(new_rel)) == 4 and not store.get_rating(_tid(old_rel))
-    assert store.get_play_stats(_tid(new_rel))["count"] == 2
-    assert not (store.get_play_stats(_tid(old_rel)) or {}).get("count")
-    assert any(h["track_id"] == _tid(new_rel) for h in store.get_history(10))
+    assert store.get_play_stats(_tid(new_rel), uid="")["count"] == 2
+    assert not (store.get_play_stats(_tid(old_rel), uid="") or {}).get("count")
+    assert any(h["track_id"] == _tid(new_rel) for h in store.get_history(10, uid=""))
     entries = store.get_playlist("pl1")["track_ids"]
     assert entries == [_tid(new_rel), {"id": _tid(moved_new)}]
     assert _tid(new_rel) in st.starred("u1", "song") and _tid(old_rel) not in st.starred("u1", "song")
@@ -1719,7 +1719,7 @@ async def test_rename_chains_and_swaps_keep_every_file_and_its_data(env, monkeyp
     b = "Protracker/Test Artist/tiny song.mod"
     b2 = "Protracker/Test Artist/tiny song_z.mod"
     store.set_rating(_tid(a), 5)
-    store.record_play(_tid(a))
+    store.record_play(_tid(a), uid="")
     store.set_rating(_tid(b), 2)
     rows = int(mc.index_info()["rows"])
     size_a, size_b = mc.entry(a)[0], mc.entry(b)[0]
@@ -1747,7 +1747,7 @@ async def test_rename_chains_and_swaps_keep_every_file_and_its_data(env, monkeyp
         assert store.get_track(_tid(rel)) is not None, rel
         assert store.get_rating(_tid(rel)) == rating, rel
     tune_a_now = next(r for r, (_s, rt) in want.items() if rt == 5)
-    assert store.get_play_stats(_tid(tune_a_now))["count"] == 1
+    assert store.get_play_stats(_tid(tune_a_now), uid="")["count"] == 1
 
 
 @pytest.mark.asyncio

@@ -6,8 +6,8 @@ stations.py — internet-radio Stations API.
 
 Listing endpoints serve the curated scene pack, the Radio Browser world
 tree (continent → country → top-10 / 11-50 / remaining buckets) and the
-favorites list; every listing filters out dead stations and flags
-favorites.
+signed-in user's favorites list (each account has its own — readonly ones
+too); every listing flags that user's favorites.
 
 ``GET /stations/relay/{sid}`` is the playback path: the server connects
 to the station upstream (so plain-http streams play on an https UI, the
@@ -32,7 +32,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
-from soniqboom.api.users import require_edit
+from soniqboom.api.users import listener_uid
 from pydantic import BaseModel
 
 from soniqboom.core import forksafe, radiodir
@@ -96,10 +96,11 @@ async def _assert_public_url(url: str) -> None:
             raise HTTPException(403, "Station stream resolves to a non-public address")
 
 
-def _decorate(stations: list[dict]) -> list[dict]:
-    """Flag favorites on a listing.  Stations are never permanently hidden —
-    an unavailable station is treated as a temporary outage."""
-    fav = {f.get("sid") for f in radiodir.get_favorites()}
+def _decorate(stations: list[dict], uid: str) -> list[dict]:
+    """Flag user ``uid``'s favorites on a listing.  Stations are never
+    permanently hidden — an unavailable station is treated as a temporary
+    outage."""
+    fav = {f.get("sid") for f in radiodir.get_favorites(uid)}
     out = []
     for s in stations:
         s = dict(s)
@@ -111,19 +112,21 @@ def _decorate(stations: list[dict]) -> list[dict]:
 # ── Listings ──────────────────────────────────────────────────────────────────
 
 @router.get("/scene")
-async def scene():
-    return _decorate(radiodir.SCENE_PACK)
+async def scene(uid: str = Depends(listener_uid)):
+    return _decorate(radiodir.SCENE_PACK, uid)
 
 
 @router.get("/favorites")
-async def favorites():
-    return _decorate(radiodir.get_favorites())
+async def favorites(uid: str = Depends(listener_uid)):
+    """The signed-in user's favourite stations."""
+    return _decorate(radiodir.get_favorites(uid), uid)
 
 
 @router.get("/search")
-async def search(q: str = Query(""), limit: int = Query(30, ge=1, le=100)):
+async def search(q: str = Query(""), limit: int = Query(30, ge=1, le=100),
+                 uid: str = Depends(listener_uid)):
     """Search stations by name (scene pack + favorites + Radio Browser)."""
-    return _decorate(await radiodir.search_stations(q, limit))
+    return _decorate(await radiodir.search_stations(q, limit, uid=uid), uid)
 
 
 @router.get("/world")
@@ -145,13 +148,14 @@ async def world():
 
 
 @router.get("/country/{code}")
-async def country(code: str, bucket: str = Query("top10", pattern="^(top10|top50|rest)$")):
+async def country(code: str, bucket: str = Query("top10", pattern="^(top10|top50|rest)$"),
+                  uid: str = Depends(listener_uid)):
     """Stations of a country: top10 = ranks 1–10, top50 = 11–50, rest = 51+."""
     try:
         groups = await radiodir.get_country_stations(code)
     except Exception as exc:                # noqa: BLE001
         raise HTTPException(503, f"Radio directory unavailable: {exc}") from exc
-    groups = _decorate(groups)
+    groups = _decorate(groups, uid)
     if bucket == "top10":
         return groups[:10]
     if bucket == "top50":
@@ -173,7 +177,8 @@ class StationBody(BaseModel):
 
 
 @router.post("/favorites")
-async def add_favorite(body: StationBody, _user=Depends(require_edit)):
+async def add_favorite(body: StationBody, uid: str = Depends(listener_uid)):
+    # Each account's own list — readonly accounts too.
     # Resolve the station from a TRUSTED source (scene pack, country cache,
     # or a live Radio Browser lookup) rather than trusting the client's
     # posted ``streams``.  Without this, a user could store an arbitrary URL
@@ -182,14 +187,14 @@ async def add_favorite(body: StationBody, _user=Depends(require_edit)):
     st = await radiodir.resolve_station(body.sid)
     if not st:
         raise HTTPException(404, "Unknown station — cannot favorite")
-    radiodir.add_favorite(st)
-    return {"ok": True, "favorites": _decorate(radiodir.get_favorites())}
+    radiodir.add_favorite(st, uid=uid)
+    return {"ok": True, "favorites": _decorate(radiodir.get_favorites(uid), uid)}
 
 
 @router.delete("/favorites/{sid:path}")
-async def del_favorite(sid: str, _user=Depends(require_edit)):
-    radiodir.remove_favorite(sid)
-    return {"ok": True, "favorites": _decorate(radiodir.get_favorites())}
+async def del_favorite(sid: str, uid: str = Depends(listener_uid)):
+    radiodir.remove_favorite(sid, uid=uid)
+    return {"ok": True, "favorites": _decorate(radiodir.get_favorites(uid), uid)}
 
 
 # ── Relay ─────────────────────────────────────────────────────────────────────

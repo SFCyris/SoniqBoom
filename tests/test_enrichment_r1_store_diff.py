@@ -250,14 +250,14 @@ def test_record_play_at_a_past_time_never_moves_last_played_backwards():
     s.upsert_track({"id": "a", "title": "t"})
     aof: list = []
     s._aof_append = lambda op, **kw: aof.append((op, kw))
-    st = s.record_play("a", at=1600000100)
+    st = s.record_play("a", at=1600000100, uid="")
     assert st == {"count": 1, "last_played": 1600000100}
-    st = s.record_play("a", at=1500000000)                # an older offline play
+    st = s.record_play("a", at=1500000000, uid="")                # an older offline play
     assert st == {"count": 2, "last_played": 1600000100}
     assert [kw["ts"] for _op, kw in aof] == [1600000100, 1500000000]
-    st = s.record_play("a", at=99999999999)                 # future → clamped to now
+    st = s.record_play("a", at=99999999999, uid="")                 # future → clamped to now
     assert st["count"] == 3 and st["last_played"] <= int(__import__("time").time())
-    assert "a" not in s._unplayed_ids
+    assert s.list_unplayed(10, uid="") == []
 
 
 def test_record_play_default_is_now():
@@ -265,7 +265,7 @@ def test_record_play_default_is_now():
     s = TrackStore()
     s.upsert_track({"id": "a", "title": "t"})
     before = int(time.time())
-    assert s.record_play("a")["last_played"] >= before
+    assert s.record_play("a", uid="")["last_played"] >= before
 
 
 def test_async_exit_does_not_run_with_an_open_outer_section():

@@ -552,7 +552,7 @@ def test_records_written_after_the_seal_are_replayed_by_the_next_start(tmp_path,
     def boot() -> dict:
         state = persistence.load_snapshot(data)
         persistence.replay_aof(state, data)
-        return {k: v.get("count") for k, v in (state.get("play_stats") or {}).items()}
+        return {k: v.get("count") for k, v in (state.get("play_stats") or {}).get("", {}).items()}
     assert persistence.adopt_exec_late_records(data) == 1
     assert not late[0].exists()
     assert boot() == {"t1": 1, "t2": 1}
@@ -587,7 +587,7 @@ def test_a_failed_exec_keeps_its_set_aside_records_in_the_journal(tmp_path, monk
     assert persistence.adopt_exec_late_records(tmp_path) == 0
     state = persistence.load_snapshot(tmp_path)
     persistence.replay_aof(state, tmp_path)
-    assert {k: v.get("count") for k, v in state["play_stats"].items()} == {"x": 1}
+    assert {k: v.get("count") for k, v in state["play_stats"][""].items()} == {"x": 1}
     plain = list(tmp_path.glob("library.aof.late-*"))
     assert len(plain) == 1 and '"y"' in plain[0].read_text()
     # … which is why the stop that follows always writes its snapshot (it holds
@@ -611,20 +611,20 @@ async def test_after_a_failed_exec_the_stop_snapshot_holds_the_late_writes(tmp_p
     store = store_mod.get_store()
     w = AOFWriter(tmp_path / "library.aof")
     store._aof_append = w.append
-    store.record_play("x")                                 # journaled
+    store.record_play("x", uid="")                                 # journaled
     w.flush_sync()
     w.late_tag = "late-exec"
     w.close_intake()
     w.seal()
-    store.record_play("y")                                 # after the seal
+    store.record_play("y", uid="")                                 # after the seal
     w.retire_late_exec()                                   # the exec failed
-    store.record_play("y")                                 # during the stop
+    store.record_play("y", uid="")                                 # during the stop
     assert persistence.adopt_exec_late_records(tmp_path) == 1
     loop = asyncio.get_running_loop()
     assert await asyncio.to_thread(persistence.write_snapshot_sync, tmp_path, True, w, loop)
     state = persistence.load_snapshot(tmp_path)
     persistence.replay_aof(state, tmp_path)
-    assert {k: v.get("count") for k, v in state["play_stats"].items()} == {"x": 1, "y": 2}
+    assert {k: v.get("count") for k, v in state["play_stats"][""].items()} == {"x": 1, "y": 2}
     persistence.release_library()
 
 

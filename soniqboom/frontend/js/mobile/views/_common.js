@@ -211,7 +211,8 @@ export async function fetchPlaylists() {
  *  new one.  Smart playlists are query-driven and can't take manual tracks, so
  *  they're excluded here. */
 export async function addToPlaylistSheet(track, ctx) {
-  const pls = (await fetchPlaylists()).filter(p => !p.smart);
+  // (nor imported ones: someone else's, read-only)
+  const pls = (await fetchPlaylists()).filter(p => !p.smart && !p.read_only);
   const actions = [
     { label: '＋ New playlist…', onSelect: async () => {
       const name = (window.prompt('New playlist name') || '').trim();

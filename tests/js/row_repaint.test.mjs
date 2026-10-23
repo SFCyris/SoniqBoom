@@ -113,7 +113,9 @@ test('a refresh another All-Tracks render superseded runs again; leaving All Tra
 test('keep-scroll is an explicit render option, never a module-wide token', () => {
   assert.doesNotMatch(SRC, /_keepScrollGen/);
   const calls = [...SRC.matchAll(/(?<!function )renderTracks\([^)]*keepScroll[^)]*\)/g)].map((m) => m[0]);
-  assert.deepEqual(calls.sort(), ['renderTracks(rows, { keepScroll: quiet })', 'renderTracks(store, { keepScroll })'].sort());
+  // (All Tracks' quiet refresh, a windowed store's install, the search view's in-place re-read)
+  assert.deepEqual(calls.sort(), ['renderTracks(rows, { keepScroll: quiet })', 'renderTracks(store, { keepScroll })',
+                                  'renderTracks(list, { keepScroll })'].sort());
   // a quiet refresh whose count probe fails keeps the rows on screen (large libraries too)
   const all = SRC.slice(SRC.indexOf('async function showAll('), SRC.indexOf('function _rebuildWindowedStore('));
   assert.match(all, /catch \{\s*if \(quiet\) return _gen === _browseNavGen \? 'failed' : 'superseded';/);

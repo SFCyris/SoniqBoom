@@ -458,6 +458,8 @@ def auto_configure(docs_path: str) -> bool:
             )
             if (getattr(settings, "hvsc_docs_path", "") or "").strip():
                 return False  # already configured — leave it alone
+            if getattr(settings, "hvsc_source", "local") == "online":
+                return False  # the documents are downloaded (core/hvsc_download)
             conf = load_local_conf()
             conf.setdefault("renderers", {})
             conf["renderers"]["hvsc_docs_path"] = docs_path

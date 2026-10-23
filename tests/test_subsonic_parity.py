@@ -490,8 +490,8 @@ def test_set_rating(env):
 
 def test_get_top_songs_ordering(env):
     for _ in range(3):
-        env.store.record_play("q2")
-    env.store.record_play("q1")
+        env.store.record_play("q2", uid="u1")
+    env.store.record_play("q1", uid="u1")
     env.store.set_rating("q4", 5)
     top = env.ok("getTopSongs.view", artist="queen", count=10)["topSongs"]["song"]
     ids = [s["id"] for s in top]
@@ -584,7 +584,7 @@ def radio_favs(monkeypatch, tmp_path):
         {"sid": "rb:b", "name": "B", "streams": [{"url": "https://b.example/x.m3u8"}]},
         {"sid": "rb:c", "name": "C", "streams": []},
     ]
-    radiodir._write_json(radiodir._FAVS_FILE, favs)
+    radiodir.set_favorites("u1", favs)
     return radiodir
 
 
@@ -601,7 +601,7 @@ def test_internet_radio_stations_point_at_the_subsonic_relay(env, radio_favs):
         assert "/api/stations/relay" not in r["streamUrl"]            # cookie-gated for clients
         assert "p=" not in parts.query and "u=" not in parts.query    # no credentials in URLs
     # The Subsonic relay prefers the plain MP3 mount of a multi-stream station.
-    assert subsonic._station_stream_index(radio_favs.get_favorites()[0]) == 2
+    assert subsonic._station_stream_index(radio_favs.get_favorites("u1")[0]) == 2
 
 
 def test_radio_stream_token_checks_and_ssrf_guard(env, radio_favs, monkeypatch):
@@ -615,9 +615,9 @@ def test_radio_stream_token_checks_and_ssrf_guard(env, radio_favs, monkeypatch):
     assert env.fail("radioStream.view", id="scene:a", token="x.y.z")["code"] == 40
     # A station whose stream resolves to a private address: the relay's SSRF
     # guard (not bypassed) refuses it — error envelope, no audio.
-    favs = radio_favs.get_favorites() + [{"sid": "custom:lan", "name": "LAN",
+    favs = radio_favs.get_favorites("u1") + [{"sid": "custom:lan", "name": "LAN",
                                           "streams": [{"url": "http://127.0.0.1:9/x"}]}]
-    radio_favs._write_json(radio_favs._FAVS_FILE, favs)
+    radio_favs.set_favorites("u1", favs)
     rows = env.ok("getInternetRadioStations.view")["internetRadioStations"]["internetRadioStation"]
     lan = next(r for r in rows if r["id"] == "custom:lan")
     r = env.client.get(lan["streamUrl"] + "&f=json")
@@ -634,9 +634,11 @@ def test_radio_station_create_update_delete(env, radio_favs, monkeypatch):
             raise HTTPException(403, "Station stream resolves to a non-public address")
 
     monkeypatch.setattr(stations_api, "_assert_public_url", _public)
+    # Each account manages its own list — a readonly one too.
     env.user = types.SimpleNamespace(id="u3", username="ro", role="readonly", enabled=True)
-    assert env.fail("createInternetRadioStation.view", streamUrl="http://x.example/s",
-                    name="X")["code"] == 50
+    env.ok("createInternetRadioStation.view", streamUrl="http://x.example/s", name="X")
+    assert [x["name"] for x in radio_favs.get_favorites("u3")][-1] == "X"
+    assert "X" not in [x["name"] for x in radio_favs.get_favorites("u1")]
     env.user = types.SimpleNamespace(id="u2", username="ed", role="edit", enabled=True)
     assert env.fail("createInternetRadioStation.view", streamUrl="ftp://x", name="X")["code"] == 10
     assert env.fail("createInternetRadioStation.view", streamUrl="http://127.0.0.1/s",
@@ -646,16 +648,18 @@ def test_radio_station_create_update_delete(env, radio_favs, monkeypatch):
     # A curated scene-pack URL adds THAT station (trusted id + streams).
     scene = radio_favs.SCENE_PACK[0]
     env.ok("createInternetRadioStation.view", streamUrl=scene["streams"][0]["url"], name="whatever")
-    ids = [x["sid"] for x in radio_favs.get_favorites()]
+    ids = [x["sid"] for x in radio_favs.get_favorites("u2")]
     custom = next(i for i in ids if i.startswith("custom:"))
     assert scene["sid"] in ids
     env.ok("updateInternetRadioStation.view", id=custom, streamUrl="http://y.example/s", name="Y")
-    cur = next(x for x in radio_favs.get_favorites() if x["sid"] == custom)
+    cur = next(x for x in radio_favs.get_favorites("u2") if x["sid"] == custom)
     assert cur["name"] == "Y" and cur["streams"][0]["url"] == "http://y.example/s"
-    assert env.fail("updateInternetRadioStation.view", id="scene:a",
+    assert env.fail("updateInternetRadioStation.view", id=scene["sid"],
                     streamUrl="http://z.example/s", name="Z")["code"] == 50
+    assert env.fail("updateInternetRadioStation.view", id="scene:a",      # u1's, not u2's
+                    name="Z")["code"] == 70
     env.ok("deleteInternetRadioStation.view", id=custom)
-    assert custom not in [x["sid"] for x in radio_favs.get_favorites()]
+    assert custom not in [x["sid"] for x in radio_favs.get_favorites("u2")]
     assert env.fail("deleteInternetRadioStation.view", id=custom)["code"] == 70
 
 
@@ -713,7 +717,7 @@ def test_radio_stream_plays_end_to_end_over_http(monkeypatch, tmp_path):
     rdir = tmp_path / "radio"
     rdir.mkdir()
     monkeypatch.setattr(radiodir, "_dir", lambda: rdir)
-    radiodir._write_json(radiodir._FAVS_FILE, [{
+    radiodir.set_favorites("u1", [{
         "sid": "custom:local", "name": "Local", "homepage": "",
         "streams": [{"url": f"http://127.0.0.1:{up_port}/live", "codec": "MP3", "hls": 0}]}])
     real_guard = stations_api._assert_public_url
@@ -1422,7 +1426,7 @@ def test_new_write_endpoints_refuse_cookie_only_over_http(env, radio_favs, monke
     monkeypatch.setattr(subsonic, "_require_user_no_cookie", _REAL_REQUIRE_NO_COOKIE)
     monkeypatch.setattr(subsonic, "_resolve_user", _fake_resolve)
     env.client.cookies.set("sb_session", "good-cookie")
-    before = json.dumps(radio_favs.get_favorites())
+    before = json.dumps(radio_favs.get_favorites("u1"))
     cases = [
         ("createInternetRadioStation.view", {"streamUrl": "http://x.example/s", "name": "X"}, 10),
         ("updateInternetRadioStation.view", {"id": "scene:a", "name": "Z"}, 10),
@@ -1440,7 +1444,7 @@ def test_new_write_endpoints_refuse_cookie_only_over_http(env, radio_favs, monke
         assert env.fail(method, **params)["code"] == code, method              # cookie only
         r = env.client.post(f"/rest/{method}", data={"f": "json", **params})    # cross-site form
         assert r.json()["subsonic-response"]["error"]["code"] == code, method
-    assert json.dumps(radio_favs.get_favorites()) == before                    # nothing changed
+    assert json.dumps(radio_favs.get_favorites("u1")) == before                    # nothing changed
     assert env.ok("getBookmarks.view")["bookmarks"]["bookmark"] == []
 
 
@@ -1535,9 +1539,9 @@ def test_radio_station_input_hardening(env, radio_favs, monkeypatch):
                     name="X")["code"] == 10
     env.ok("createInternetRadioStation.view", streamUrl="http://x.example/s", name="X",
            homepageUrl="javascript:alert(1)")
-    cur = next(x for x in radio_favs.get_favorites() if x["sid"].startswith("custom:"))
+    cur = next(x for x in radio_favs.get_favorites("u1") if x["sid"].startswith("custom:"))
     assert cur["homepage"] == ""
     # Editing the URL, then re-adding the OLD URL, creates a second station.
     env.ok("updateInternetRadioStation.view", id=cur["sid"], streamUrl="http://y.example/s")
     env.ok("createInternetRadioStation.view", streamUrl="http://x.example/s", name="X again")
-    assert sum(1 for x in radio_favs.get_favorites() if x["sid"].startswith("custom:")) == 2
+    assert sum(1 for x in radio_favs.get_favorites("u1") if x["sid"].startswith("custom:")) == 2

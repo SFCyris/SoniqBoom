@@ -1825,7 +1825,10 @@ Health.init();
 // track count re-read (offline.js has re-flagged the queue already).
 document.addEventListener('soniqboom:availability-changed', (e) => {
   const d = (e && e.detail) || {};
-  try { window.__sbConfig = { ...window.__sbConfig, offline_tracks: d.mode }; } catch (_) {}
+  try {
+    window.__sbConfig = { ...window.__sbConfig, offline_tracks: d.mode,
+                          unplayable_tracks: d.unplayable || 'mark' };
+  } catch (_) {}
   try { FolderTree.refresh(); } catch (_) {}
   try { Library.refreshAvailability(d); } catch (_) {}
   try { Library.refreshBadges(); } catch (_) {}
@@ -3204,6 +3207,9 @@ function _refreshMainAfterScan(finished, allowAllTracksRefresh = true) {
     // pair this app.js with a cached older library.js for one page view.)
     if (typeof Library.refreshAllTracksInPlace === 'function') Library.refreshAllTracksInPlace();
     else if (allowAllTracksRefresh !== 'in-place') Library.showAll();
+  } else if (allowAllTracksRefresh && Library.isInSearchView && Library.isInSearchView()) {
+    // Search results: read again in place — the place kept by track.
+    Library.refreshSearchInPlace();
   }
 }
 
@@ -3346,6 +3352,9 @@ function _rebustMissingArt() {
   } catch (_) { /* ignore */ }
 }
 
+// ``plays_changed`` (connectWS's library socket): one re-read per burst of them.
+let _playsChangedTimer = null;
+
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/library/ws`);
@@ -3430,9 +3439,9 @@ function connectWS() {
         scanBadge.hidden = false;
         scanBadge.textContent = 'Computing embeddings…';
         _disarmStuckBadgeWatchdog();
-        // Library is already usable — refresh All Tracks in place if that's where
-        // the user is, but never yank a folder / group / search view just because
-        // phase-2 embeddings started.
+        // Library is already usable — refresh All Tracks (or search results) in
+        // place if that's where the user is, but never yank a folder / group view
+        // just because phase-2 embeddings started.
         _refreshMainAfterScan([], !msg.silent);
         // Don't rebuild the sidebar tree here — embeddings add no folders, and
         // FolderTree.refresh() collapses every expanded node back to root.
@@ -3467,8 +3476,8 @@ function connectWS() {
         // falls back to showAll().  The in-place refresh runs for silent +
         // visible scans alike, so drill-down freshness updates quietly.
         // Refresh the main panel without stealing the user's place: All Tracks in
-        // place, a touched folder in place, every other view (group list, search
-        // result, format filter) left alone.  Silent freshness scans don't
+        // place, a touched folder in place, search results re-read in place, every
+        // other view (group list, format filter) left alone.  Silent freshness scans don't
         // refresh All Tracks (would reset scroll for a background poll).  This is
         // also what made a boot-time scan-complete overwrite a just-restored
         // Scene-groups view with a track list (the WS event fires seconds after a
@@ -3494,6 +3503,14 @@ function connectWS() {
       try { Player.noteServerRestart(); } catch (_) { /* older player */ }
     } else if (msg.event === 'track_updated' && msg.id) {
       _refreshTrack(msg.id);
+    } else if (msg.event === 'plays_changed') {
+      // This account played something elsewhere (a Subsonic app): an open
+      // Listening-History / Most-Played view re-reads (sent to its own pages
+      // only) — once per burst (an offline client's batch of scrobbles).
+      clearTimeout(_playsChangedTimer);
+      _playsChangedTimer = setTimeout(() => {
+        try { Library.refreshSmartOnPlay(); } catch (_) {}
+      }, 1000);
     } else if (msg.event === 'catalogue_folder_changed') {
       // A package of an online collection opened into its tunes: the open
       // folder showing it re-reads in place; the folder tree stays as it is.
@@ -4004,6 +4021,7 @@ document.addEventListener('keydown', (e) => {
   } catch (_) { /* Store not ready — ignore */ }
   // "Tracks on unavailable drives": the player skips from the first track.
   Offline.init({ mode: (window.__sbConfig || {}).offline_tracks,
+                 unplayable: (window.__sbConfig || {}).unplayable_tracks,
                  skipShort: (window.__sbConfig || {}).skip_short_tunes,
                  placeholders: (window.__sbConfig || {}).tune_placeholders });
 })();

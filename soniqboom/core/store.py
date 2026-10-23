@@ -43,6 +43,11 @@ from soniqboom.core.folder_album import spc_name_completes as _spc_name_complete
 from soniqboom.core.folder_album import _ARTIST_PLACEHOLDERS
 from soniqboom.core.retro import chip_family as _chip_family
 from soniqboom.core.retro import is_retro_format as _is_retro_format
+from soniqboom.core.skip_rules import CANT_PLAY_FIELDS as _CANT_PLAY_FIELDS
+from soniqboom.core.skip_rules import cant_play as _cant_play
+from soniqboom.core.user_data import (
+    NO_USER, OWNER_CONFIG_KEY, add_history, add_play, drop_user_data, merge_user_data,
+)
 from soniqboom.models.track import Track, TrackMeta
 
 log = logging.getLogger(__name__)
@@ -766,11 +771,12 @@ INDEX_ATTRS = (
     "_sorted_album", "_sorted_format", "_sorted_title_fold",
     "_agg_artists", "_agg_album_artists", "_agg_albums", "_agg_genres",
     "_agg_years", "_agg_albums_by_artist", "_agg_albums_by_album_artist",
-    "_agg_cache", "_unplayed_ids",
+    "_agg_cache",
     # Browse id sets (set arithmetic instead of per-row tests): the non-primary
-    # duplicate copies, the "[No Artist]"-style buckets, year → ids.
+    # duplicate copies, the "[No Artist]"-style buckets, year → ids, the
+    # tracks that can't be played (``skip_rules.cant_play``).
     "_nonprimary_ids", "_untagged_artist", "_untagged_album_artist",
-    "_untagged_album", "_untagged_genre", "_tag_year",
+    "_untagged_album", "_untagged_genre", "_tag_year", "_cant_play_ids",
 )
 
 
@@ -794,11 +800,11 @@ def _run_generator(gen):
 
 def shadowed_index_attrs() -> tuple:
     """The ``INDEX_ATTRS`` the index audit (``core/index_health``) compares
-    against a shadow rebuild: all but the sorted lists (checked in place),
-    ``_unplayed_ids`` (checked against ``_play_stats``) and the lazy
-    ``_word_list`` / the ``_agg_cache`` memo (``TrackStore._DIFF_SKIP``)."""
+    against a shadow rebuild: all but the sorted lists (checked in place)
+    and the lazy ``_word_list`` / the ``_agg_cache`` memo
+    (``TrackStore._DIFF_SKIP``)."""
     return tuple(a for a in INDEX_ATTRS
-                 if a not in _ALL_SORTED and a not in ("_word_list", "_agg_cache", "_unplayed_ids"))
+                 if a not in _ALL_SORTED and a not in ("_word_list", "_agg_cache"))
 
 
 def _index_sample_diff(live, exp, limit: int = 5) -> list:
@@ -1251,31 +1257,47 @@ class _FilterWalk:
         out = self.out
         if len(out) >= need or self.done:
             return out
-        idx, member, mode, tracks = self.idx, self.member, self.mode, self.tracks
-        n = len(idx)
         step = max(_FILTER_WALK_STEP, 2 * (need - len(out)))
         while len(out) < need and not self.done:
-            if self.desc:
-                hi = self.pos
-                lo = hi - step if hi > step else 0
-                seg = idx[lo:hi]
-                seg.reverse()
-                self.pos = lo
-                self.done = lo == 0
-            else:
-                lo = self.pos
-                hi = lo + step if lo + step < n else n
-                seg = idx[lo:hi]
-                self.pos = hi
-                self.done = hi == n
-            if mode == 0:
-                out += [tid for _v, tid in seg if tid in member]
-            elif mode == 1:
-                out += [tid for _v, tid in seg if tid not in member and tid in tracks]
-            else:
-                out += [tid for _v, tid in seg if tid not in member]
+            self._read(step)
             step *= 2
         return out
+
+    def advance(self, rows: int) -> None:
+        """Read the next slice of at most ``rows`` index rows (nothing once
+        ``done``) — for a caller that reads a long walk a bounded slice at a
+        time, giving the event loop a turn between slices
+        (``core/search_sets``)."""
+        if not self.done:
+            self._read(max(1, rows))
+
+    def _read(self, step: int) -> None:
+        """One slice of ``step`` index rows from ``pos`` (in the walk's
+        direction), its ids that pass the membership test appended to
+        ``out``."""
+        idx = self.idx
+        if self.desc:
+            hi = self.pos
+            lo = hi - step if hi > step else 0
+            seg = idx[lo:hi]
+            seg.reverse()
+            self.pos = lo
+            self.done = lo == 0
+        else:
+            n = len(idx)
+            lo = self.pos
+            hi = lo + step if lo + step < n else n
+            seg = idx[lo:hi]
+            self.pos = hi
+            self.done = hi == n
+        member, mode = self.member, self.mode
+        if mode == 0:
+            self.out += [tid for _v, tid in seg if tid in member]
+        elif mode == 1:
+            tracks = self.tracks
+            self.out += [tid for _v, tid in seg if tid not in member and tid in tracks]
+        else:
+            self.out += [tid for _v, tid in seg if tid not in member]
 
     def page(self, offset: int, limit: int) -> list[str]:
         """``limit`` ids from position ``offset`` of the order (both ≥ 0)."""
@@ -1294,15 +1316,26 @@ class TrackStore:
         self._tracks: dict[str, dict] = {}
         self._waveforms: dict[str, list[float]] = {}
         self._ratings: dict[str, int] = {}
-        self._play_stats: dict[str, dict] = {}
+        # Per user (``core/user_data``): ``{user id: {track id: {count,
+        # last_played}}}`` and ``{user id: [history entries]}``; "" = plays
+        # made while no account existed.  Ratings are library-wide.
+        self._play_stats: dict[str, dict[str, dict]] = {}
         # Bumped on every rating / play change so the /smart/top-rated and
         # /smart/most-played ranked-list memos invalidate WITHOUT touching the
         # library-wide _mutation_seq (which play/rating writes deliberately
-        # don't bump — they're far hotter than structural mutations).
+        # don't bump — they're far hotter than structural mutations).  One
+        # play sequence for all users: a memo of one user's plays keys on the
+        # user id too.
         self._rating_seq: int = 0
         self._play_seq: int = 0
         self._playlists: dict[str, dict] = {}
-        self._history: list[dict] = []
+        self._history: dict[str, list[dict]] = {}
+        # Accounts whose data was dropped (``delete_user_data``) in this run: a
+        # play of theirs still in flight (a Subsonic batch scrobble that
+        # resolved its user before the delete) is not recorded — it would
+        # bring the deleted account's data back.  (Account ids are never
+        # reused; after a restart no session of theirs exists.)
+        self._deleted_uids: set[str] = set()
         self._scan_dirs: dict[str, dict] = {}
         self._hash_lookups: dict[str, str] = {}
         self._config: dict[str, Any] = {}
@@ -1461,6 +1494,18 @@ class TrackStore:
         self._untagged_album: set[str] = set()
         self._untagged_genre: set[str] = set()
         self._tag_year: dict[Any, set[str]] = {}
+        # The tracks that can't be played (``skip_rules.cant_play``: reported
+        # broken, corrupt, refused twice by their renderer) — what Settings →
+        # "Tracks that can't be played: Hide" leaves out (core/availability).
+        # Its fields are browse-exempt (a mark leaves ``_browse_seq`` alone),
+        # so this set has its own counter: ``_cant_play_gen`` moves whenever
+        # the set may have changed (an id added or removed, the set cleared or
+        # swapped by an index rebuild) and ``_on_cant_play_changed`` (no
+        # arguments; ``core.availability`` listens) is called after each
+        # change made by a write.  The counter is never reset.
+        self._cant_play_ids: set[str] = set()
+        self._cant_play_gen: int = 0
+        self._on_cant_play_changed: Callable[[], None] | None = None
 
         # ── Pre-computed aggregations ────────────────────────────────────
         self._agg_artists: Counter[str] = Counter()
@@ -1506,6 +1551,14 @@ class TrackStore:
         # name, descending) → walk (which holds the exclude set and the swap:
         # an id is not reused while its entry lives).
         self._filter_walk_memo: dict[tuple, _FilterWalk] = {}
+        # Search result sets (``core/search_sets.py``), least recently used
+        # first: handle → set, and (predicates, duplicates hidden) → the handle
+        # of the newest set for them.  Kept by the owner thread only
+        # (``_memo_ok``); each set validates itself against the browse state
+        # it was made in, and every one is dropped when the library or its
+        # lists are replaced (``_drop_result_sets``).
+        self._result_sets: dict[str, Any] = {}
+        self._result_set_keys: dict[tuple, str] = {}
         # The thread that writes the store (the event loop's — the one that
         # created or loaded it, ``bulk_load``).  Only it keeps, extends or
         # stores the browse memos — the walks, the incremental swap state, the
@@ -1516,13 +1569,6 @@ class TrackStore:
         # Called (no arguments) after a scan dir was added or removed or its
         # reachability ``status`` changed — ``core.availability`` listens.
         self._on_scan_dirs_changed: Callable[[], None] | None = None
-
-        # ── Track IDs that have never been played ────────────────────────
-        # Mirrors `play_stats` keys; updated on every track upsert / delete
-        # and on `record_play`.  Lets api/smart.py serve the "unplayed"
-        # view by walking ``_sorted_added_at`` filtered through this set
-        # instead of scanning every track in the library.
-        self._unplayed_ids: set[str] = set()
 
         # ── AOF hook (set by aof module after init) ──────────────────────
         self._aof_append: Callable[..., None] | None = None
@@ -1552,8 +1598,6 @@ class TrackStore:
         # ``_sorted_dirty`` is the boolean view (setting True marks all full).
         self._dirty_sorted: set[str] = set()
         self._dirty_sorted_tids: dict[str, dict[str, Any]] = {}
-
-        self.history_max = 500
 
     @property
     def _sorted_dirty(self) -> bool:
@@ -1818,6 +1862,7 @@ class TrackStore:
         # read the sorted lists) with no write of its own.
         self._browse_seq += 1
         self._filter_walk_memo.clear()
+        self._drop_result_sets()
 
     def browse_changed(self) -> None:
         """Invalidate every browse memo (``_browse_seq``) and drop the ones
@@ -1828,12 +1873,34 @@ class TrackStore:
         self._filter_walk_memo.clear()
         self._primary_order_memo.clear()
         self._excluded_order_memo.clear()
+        self._drop_result_sets()
         self._swap_dirty = None
         # (the word index may have been swapped with its list: no account of
         # what changed since that list was sorted)
         self._word_fresh.clear()
         self._word_gone.clear()
         self._word_list_full = self._word_list_dirty
+        # (an index swap installs another ``_cant_play_ids``)
+        self._cant_play_gen += 1
+
+    def _cant_play_moved(self) -> None:
+        """``_cant_play_ids`` changed (a write added or removed an id): move
+        its counter and tell the listener."""
+        self._cant_play_gen += 1
+        hook = self._on_cant_play_changed
+        if hook is not None:
+            try:
+                hook()
+            except Exception:                           # noqa: BLE001 — never fail a write
+                log.debug("cant-play listener failed", exc_info=True)
+
+    def cant_play_ids(self) -> tuple[int, set[str]]:
+        """``(_cant_play_gen, _cant_play_ids)``: the tracks that can't be
+        played (``skip_rules.cant_play``) and the counter that moves whenever
+        that set may have changed.  The live set: callers must not change it
+        or keep it past a write (``core.availability.cant_play_ids`` freezes
+        it once per change)."""
+        return self._cant_play_gen, self._cant_play_ids
 
     # ── AOF helper ───────────────────────────────────────────────────────
 
@@ -1898,6 +1965,9 @@ class TrackStore:
                 self._tag_year[year] = {tid}
             else:
                 ys.add(tid)
+        if _cant_play(t):
+            self._cant_play_ids.add(tid)
+            self._cant_play_moved()
 
         if not self._batch_mode:
             # Lexical sort keys for the column-header sort (windowed view).
@@ -1933,13 +2003,6 @@ class TrackStore:
             # (in no list before this batch, unless an ``_unindex_track`` of
             # this batch already recorded where it was)
             self._note_sorted_batch(tid, None)
-
-        # Unplayed bookkeeping — a freshly-indexed track has no play stats yet
-        # so it counts as unplayed unless ``record_play`` has already fired
-        # (e.g. AOF replay applied "record_play" before the track upsert in
-        # rare reorder cases — we still respect the existing entry).
-        if tid not in self._play_stats:
-            self._unplayed_ids.add(tid)
 
         self._agg_add(t, year)
 
@@ -2009,6 +2072,9 @@ class TrackStore:
                 ys.discard(tid)
                 if not ys:
                     del self._tag_year[year]
+        if tid in self._cant_play_ids:
+            self._cant_play_ids.discard(tid)
+            self._cant_play_moved()
 
         if not self._batch_mode:
             # Same lexical key derivation as ``_index_track`` — must match
@@ -2036,10 +2102,6 @@ class TrackStore:
                 _sorted_remove(self._sorted_title_fold, (title_fold, tid))
         else:
             self._note_sorted_batch(tid, t)     # (where it is in every list)
-
-        # Unplayed bookkeeping — when a track is removed it can't be unplayed
-        # anymore; this stops the set leaking entries for deleted tracks.
-        self._unplayed_ids.discard(tid)
 
         self._agg_remove(t, year)
 
@@ -2182,8 +2244,7 @@ class TrackStore:
         Tokens: only the added/removed tokens are touched, and the sorted word
         list is dirtied only when a word-index KEY appears or disappears.
         Sorted lists: a list is re-keyed only when its key changed (in batch
-        mode the list is marked for the deferred rebuild instead).
-        ``_unplayed_ids`` is not field-derived, so it is left alone."""
+        mode the list is marked for the deferred rebuild instead)."""
         if "scan_root_hash" in changed or "path" in changed:
             self._bump_root_rev(old.get("scan_root_hash", ""))
             self._bump_root_rev(t.get("scan_root_hash", ""))
@@ -2312,6 +2373,16 @@ class TrackStore:
             old = dict(t)
             t.update(changed)
             self._reindex_changed(tid, old, t, changed)
+        if not _CANT_PLAY_FIELDS.isdisjoint(changed):
+            # (browse-exempt fields: no ``_reindex_changed`` for them alone)
+            ids = self._cant_play_ids
+            if _cant_play(t):
+                if tid not in ids:
+                    ids.add(tid)
+                    self._cant_play_moved()
+            elif tid in ids:
+                ids.discard(tid)
+                self._cant_play_moved()
         # Counted once the fields are written: whatever a per-track memo built
         # from ``t`` before is keyed to the old count.
         self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
@@ -2323,14 +2394,15 @@ class TrackStore:
         tracks: dict[str, dict],
         waveforms: dict[str, list[float]],
         ratings: dict[str, int],
-        play_stats: dict[str, dict],
+        play_stats: dict[str, dict[str, dict]],
         playlists: dict[str, dict],
-        history: list[dict],
+        history: dict[str, list[dict]],
         scan_dirs: dict[str, dict],
         hash_lookups: dict[str, str],
         config: dict[str, Any],
     ) -> None:
-        """Load all data from a snapshot.  Call rebuild_indexes() afterwards.
+        """Load all data from a snapshot (database ``DB_VERSION``: ``play_stats``
+        and ``history`` per user).  Call rebuild_indexes() afterwards.
 
         Every track's game is brought in step with its game album on the way
         in (``game_follow``) — a library saved before the ``game`` field
@@ -2381,9 +2453,6 @@ class TrackStore:
         # Every index is new (and usually ``_tracks`` too — ``bulk_load``):
         # every cache keyed on the store's sequences is stale.
         self._library_replaced()
-        # ``_index_track`` adds every track to ``_unplayed_ids`` whose key
-        # isn't already in ``_play_stats`` — the order above guarantees that
-        # snapshot-loaded play stats correctly suppress those tids.
         log.info("Indexes rebuilt for %d tracks", len(self._tracks))
 
     def _library_replaced(self) -> None:
@@ -2407,21 +2476,22 @@ class TrackStore:
         self._inv_memo = None
         self.browse_changed()
 
-    def index_generation(self) -> tuple[int, int, int]:
-        """``(_mutation_seq, _duration_seq, _play_seq)``: moves on every write
-        that changes an ``INDEX_ATTRS`` index — track upserts / deletes /
-        field updates (``_mutation_seq``; ``_SEQ_EXEMPT_FIELDS`` feed no
-        index), duration-only backfills (``_duration_seq``, they re-key
-        ``_sorted_duration``) and plays (``_play_seq``, a first play leaves
-        ``_unplayed_ids``).  An index rebuild that yields while it builds from
-        a snapshot (``data.rebuild_indexes``) compares it before and after, and
-        must not install indexes built from a snapshot a write has outdated."""
-        return (self._mutation_seq, self._duration_seq, self._play_seq)
+    def index_generation(self) -> tuple[int, int]:
+        """``(_mutation_seq, _duration_seq)``: moves on every write that
+        changes an ``INDEX_ATTRS`` index — track upserts / deletes / field
+        updates (``_mutation_seq``; ``_SEQ_EXEMPT_FIELDS`` feed no index) and
+        duration-only backfills (``_duration_seq``, they re-key
+        ``_sorted_duration``).  Plays feed no index (a user's unplayed tracks
+        are read from that user's play stats, ``list_unplayed``).  An index
+        rebuild that yields while it builds from a snapshot
+        (``data.rebuild_indexes``) compares it before and after, and must not
+        install indexes built from a snapshot a write has outdated."""
+        return (self._mutation_seq, self._duration_seq)
 
     def verify_indexes(self) -> dict:
         """Check the live derived indexes against a fresh rebuild from _tracks.
 
-        Builds a throwaway shadow store from the SAME _tracks/_play_stats and
+        Builds a throwaway shadow store from the SAME _tracks and
         diffs every index in ``INDEX_ATTRS`` against the live one.  Returns
         ``{index_ok, track_count, mutation_seq, indexes:{attr:{actual,expected,
         ok}}, mismatches:[...]}``.  Authoritative (uses the same _index_track
@@ -2438,7 +2508,6 @@ class TrackStore:
         # IS compared.
         shadow = TrackStore()
         shadow._tracks = self._tracks          # shared, read-only during build
-        shadow._play_stats = self._play_stats  # _index_track derives _unplayed_ids from this
         shadow.rebuild_indexes()
         return self._diff_indexes(shadow)
 
@@ -2499,6 +2568,8 @@ class TrackStore:
         self._untagged_album.clear()
         self._untagged_genre.clear()
         self._tag_year.clear()
+        self._cant_play_ids.clear()
+        self._cant_play_gen += 1
         for tag_idx in (
             self._tag_artist, self._tag_album_artist, self._tag_album,
             self._tag_genre, self._tag_format, self._tag_dir_hash,
@@ -2535,7 +2606,6 @@ class TrackStore:
         self._agg_albums_by_artist.clear()
         self._agg_albums_by_album_artist.clear()
         self._agg_cache.clear()
-        self._unplayed_ids.clear()
         if self._batch_mode:
             # (a batch's deferred merge would start from the emptied lists)
             self._mark_all_sorted_dirty()
@@ -2838,6 +2908,7 @@ class TrackStore:
         self._excluded_order_memo.clear()
         self._browse_seq += 1                   # (as ``_sorted_rebuilt``)
         self._filter_walk_memo.clear()
+        self._drop_result_sets()
         if names is not None and not _ALL_SORTED <= set(names):
             for name in list(names):
                 lst = self.build_sorted_list(name)
@@ -3159,37 +3230,41 @@ class TrackStore:
         """Cheap O(1)-ish count of maintained duplicate groups (no snapshot)."""
         return sum(1 for tids in self._tag_dup_group.values() if tids)
 
-    def primary_swap(self, unplayable) -> PrimarySwap | None:
+    def primary_swap(self, unplayable, hidden=None) -> PrimarySwap | None:
         """The duplicate groups whose primary is in ``unplayable`` (the tracks
         that can't play right now — ``core.availability``) while another member
         is not, each with its stand-in: the best member that can play.  None
         when there is no such group.  A group whose members all can't play
-        keeps its primary.
+        keeps its primary — unless every primary is in ``hidden`` (the ids
+        the list leaves out, a subset of ``unplayable``) while another member
+        is not: then the best member the list shows stands in (a copy on a
+        drive that is offline, listed dimmed, for a primary that is hidden).
 
-        Memoised per ``unplayable`` set (compared by identity — callers hand
-        the same frozenset back until it changes); a result equal to the
-        previous one keeps the previous object, so memos keyed on it stay
-        valid.  A build reads the unplayable ids or the duplicate groups,
+        Memoised per ``unplayable`` and ``hidden`` set (compared by identity —
+        callers hand the same frozensets back until they change); a result
+        equal to the previous one keeps the previous object, so memos keyed on
+        it stay valid.  A build reads the unplayable ids or the duplicate groups,
         whichever are fewer, then the found groups' members.  After writes,
         only the groups they touched (``_swap_dirty``: a member added, removed
         or re-grouped, or a change to what the pick reads — ``_SWAP_FIELDS``)
         are worked out again; the result is the full build's."""
         if not unplayable or not self._tag_dup_group:
             return None
+        hidden = hidden or None
         owner = self._memo_ok()
         memo = self._primary_swap_memo if owner else None
         dirty = self._swap_dirty
-        if memo is not None and memo[0] is unplayable and dirty is not None:
+        if memo is not None and memo[0] is unplayable and memo[3] is hidden and dirty is not None:
             if not dirty:
                 return memo[1]
             if len(dirty) <= max(256, len(self._tag_dup_group) // 8):
                 by_group = dict(memo[2])
                 for gid in dirty:
                     by_group.pop(gid, None)
-                    entry = self._swap_group(gid, unplayable)
+                    entry = self._swap_group(gid, unplayable, hidden)
                     if entry is not None:
                         by_group[gid] = entry
-                return self._swap_done(unplayable, by_group, memo[1])
+                return self._swap_done(unplayable, by_group, memo[1], hidden)
         tracks = self._tracks
         groups = self._tag_dup_group
         if len(unplayable) <= len(groups):
@@ -3205,7 +3280,7 @@ class TrackStore:
                     if members and not members.isdisjoint(unplayable)}
         by_group: dict[str, tuple[list[str], str]] = {}
         for gid in gids:
-            entry = self._swap_group(gid, unplayable)
+            entry = self._swap_group(gid, unplayable, hidden)
             if entry is not None:
                 by_group[gid] = entry
         if not owner:                   # (off the loop: nothing kept — ``_memo_ok``)
@@ -3215,12 +3290,14 @@ class TrackStore:
                 return None
             prev = prev[1] if prev is not None else None
             return prev if prev is not None and prev.stand_in == stand_in else PrimarySwap(stand_in)
-        return self._swap_done(unplayable, by_group, memo[1] if memo is not None else None)
+        return self._swap_done(unplayable, by_group, memo[1] if memo is not None else None, hidden)
 
-    def _swap_group(self, gid: str, unplayable) -> "tuple[list[str], str] | None":
+    def _swap_group(self, gid: str, unplayable, hidden=None) -> "tuple[list[str], str] | None":
         """Duplicate group ``gid`` (a ``_tag_dup_group`` key)'s stand-in for
         ``unplayable``: ``(its primaries, the best member that can play)``
-        when every primary can't play and another member can, else None."""
+        when every primary can't play and another member can; when none can,
+        ``(its primaries, the best member the list shows)`` if every primary
+        is in ``hidden`` and another member is not; else None."""
         groups = self._tag_dup_group
         members = groups.get(gid)
         if not members or len(members) < 2:
@@ -3232,11 +3309,17 @@ class TrackStore:
             return None                 # no primary (a group being re-picked), or one plays
         alts = [m for m in members if m not in unplayable and m in tracks]
         if not alts:
-            return None                 # no member plays: the primary stays
+            # No member plays: the primary stays — unless the list hides it
+            # and shows another member (one listed, marked).
+            if not hidden or not hidden.issuperset(prims):
+                return None
+            alts = [m for m in members if m not in hidden and m in tracks]
+            if not alts:
+                return None             # every member hidden: so is the group
         from soniqboom.core.duplicates import primary_sort_key
         return prims, min(alts, key=lambda m: primary_sort_key(tracks[m]))
 
-    def _swap_done(self, unplayable, by_group: dict, prev: "PrimarySwap | None"):
+    def _swap_done(self, unplayable, by_group: dict, prev: "PrimarySwap | None", hidden=None):
         """Memoise and return the swap of ``by_group`` (``_swap_group``
         results) — ``prev`` itself when it is equal."""
         stand_in: dict[str, str] = {}
@@ -3246,7 +3329,7 @@ class TrackStore:
         swap = None
         if stand_in:
             swap = prev if prev is not None and prev.stand_in == stand_in else PrimarySwap(stand_in)
-        self._primary_swap_memo = (unplayable, swap, by_group)
+        self._primary_swap_memo = (unplayable, swap, by_group, hidden)
         self._swap_dirty = set()
         return swap
 
@@ -3699,6 +3782,7 @@ class TrackStore:
         album_artist_match: str | None = None,
         filter_duplicates: bool = False,
         swap: PrimarySwap | None = None,
+        own: bool = False,
     ) -> set[str] | None:
         """THE predicate → candidate-id-set resolver (single source of truth).
 
@@ -3713,7 +3797,9 @@ class TrackStore:
         reduced to duplicate-group primaries when ``filter_duplicates`` is set
         (with ``swap``: the stand-ins instead of the primaries that can't play).
         It may be a LIVE index set (one predicate, nothing left out): callers
-        must not change it.
+        must not change it — or keep it past a write; ``own``: never a live
+        set (that one is copied), for a caller that keeps the set
+        (``result_ids``).
 
         ``artist`` / ``album_artist`` are exact (case-insensitive) names (an
         artist's page); ``artist_match`` / ``album_artist_match`` (the search
@@ -3735,26 +3821,35 @@ class TrackStore:
         (``_tag_game``) plus bisect ranges over the title lists.
         """
         sets: list[set[str]] = []
+        live: list[set[str]] = []           # the index sets among them (``own``)
         if artist:
             sets.append(self._tag_artist.get(artist.lower(), set()))
+            live.append(sets[-1])
         if album_artist:
             sets.append(self._tag_album_artist.get(album_artist.lower(), set()))
+            live.append(sets[-1])
         if artist_match is not None:
             sets.append(_name_word_hits(self._tag_artist, artist_match))
         if album_artist_match is not None:
             sets.append(_name_word_hits(self._tag_album_artist, album_artist_match))
         if album:
             sets.append(self._tag_album.get(album.lower(), set()))
+            live.append(sets[-1])
         if genre:
             sets.append(self._tag_genre.get(genre.lower(), set()))
+            live.append(sets[-1])
         if scene_group:
             sets.append(self._tag_scene_group.get(scene_group.lower(), set()))
+            live.append(sets[-1])
         if format_:
             sets.append(self._tag_format.get(str(format_).strip().lower(), set()))
+            live.append(sets[-1])
         if dir_hash:
             sets.append(self._tag_dir_hash.get(dir_hash, set()))
+            live.append(sets[-1])
         if scan_root_hash:
             sets.append(self._tag_scan_root_hash.get(scan_root_hash, set()))
+            live.append(sets[-1])
         if year_min is not None or year_max is not None:
             lo = year_min if year_min is not None else -999999
             hi = year_max if year_max is not None else 999999
@@ -3802,6 +3897,7 @@ class TrackStore:
             # Tracks whose tag is missing/blank: the maintained bucket (the
             # live set — nothing below changes it in place).
             sets.append(self._untagged_ids(untagged))
+            live.append(sets[-1])
 
         if not sets:
             return None
@@ -3819,6 +3915,8 @@ class TrackStore:
             inv = self._dup_invisible(swap)
             if inv:
                 result = result.difference(inv)
+        if own and any(result is s for s in live):
+            result = set(result)
         return result
 
     def _paginate_excluding(self, limit: int, offset: int, exclude, *,
@@ -3992,6 +4090,58 @@ class TrackStore:
             return ([tid for tid in cached if tid not in demoted]
                     + [tid for tid in swap.promoted if tid in self._tracks])
         return list(self._tracks.keys())
+
+    # ── Search result sets (core/search_sets.py) ─────────────────────────
+
+    def result_ids(self, *, filter_duplicates: bool = False, exclude=None,
+                   swap: PrimarySwap | None = None, **predicates) -> set[str]:
+        """Every id :meth:`filter_tracks` lists for these predicates, as one
+        set the caller may keep (never a live index set — ``_candidate_ids``
+        ``own``): the candidates without ``exclude`` and — with
+        ``filter_duplicates`` — the copies the list hides (with ``swap``: the
+        stand-ins instead of the primaries that can't play).  No predicate:
+        every track the list shows.  The pages of a search result set
+        (``core/search_sets``) are orders of this set."""
+        if not filter_duplicates:
+            swap = None
+        result = self._candidate_ids(filter_duplicates=filter_duplicates, swap=swap,
+                                     own=True, **predicates)
+        if result is None:
+            inv = self._invisible(filter_duplicates, exclude, swap)
+            return self._tracks.keys() - inv if inv else set(self._tracks)
+        if exclude and result:
+            result = result.difference(exclude)        # (in C)
+        return result
+
+    def result_order(self, ids, attr: str, descending: bool) -> "list[str] | _FilterWalk":
+        """``ids`` (a :meth:`result_ids` set) in the order of sorted index
+        ``attr`` (``descending``: from its end) — the order the same index
+        gives every list: All Tracks' column sort and ``filter_tracks``, tie
+        broken on the id like the index.  A small set (as ``filter_tracks``
+        decides: ``_SMALL_CANDIDATE_SET``, or 1/64 of the index) comes back
+        sorted in full (``_sort_candidates`` — the same keys); a larger one as
+        a walk of the index keeping its members (``_FilterWalk``, valid while
+        ``_primary_order_key(attr)`` and the list object stay the ones it was
+        made with), read as far as the caller needs."""
+        idx = getattr(self, attr)
+        if len(ids) <= max(_SMALL_CANDIDATE_SET, len(idx) // 64):
+            lst = self._sort_candidates(ids, attr, descending)
+            if lst is not None:
+                return lst
+        return _FilterWalk(idx, self._primary_order_key(attr), None, None, ids,
+                           bool(descending))
+
+    def sort_value(self, attr: str):
+        """The key function of sorted index ``attr`` (track dict → key, None
+        when the index leaves the track out) — ``_SORTED_SPECS``."""
+        return _SORTED_SPECS[attr][1]
+
+    def _drop_result_sets(self) -> None:
+        """Forget every kept search result set (``core/search_sets``): the
+        library / its lists were replaced — they are stale, and their walks
+        would keep the replaced lists alive."""
+        self._result_sets.clear()
+        self._result_set_keys.clear()
 
     @staticmethod
     def _is_descending(sort_by: str | None, sort_order: str | None) -> bool:
@@ -4785,19 +4935,17 @@ class TrackStore:
                     break
         return results
 
-    def list_unplayed(self, limit: int = 100, exclude=None) -> list[dict]:
-        """Return tracks never played, newest-first.
+    def list_unplayed(self, limit: int = 100, exclude=None, *, uid: str) -> list[dict]:
+        """Return the tracks user ``uid`` never played, newest-first.
 
-        Backed by the incrementally-maintained ``_unplayed_ids`` set — walks
-        ``_sorted_added_at`` in reverse, filtering membership.  This is
-        O(limit + misses) instead of the previous O(N) scan over every
-        track + ``get_all_play_stats`` snapshot in api/smart.py.
-        """
+        Walks ``_sorted_added_at`` in reverse, testing each id against that
+        user's play stats — O(limit + played tracks skipped), no per-user set
+        to keep in step."""
         results: list[dict] = []
-        unplayed = self._unplayed_ids
+        played = self._play_stats.get(uid) or {}
         exclude = exclude or ()
         for _, tid in reversed(self._sorted_added_at):
-            if tid in unplayed and tid in self._tracks and tid not in exclude:
+            if tid not in played and tid in self._tracks and tid not in exclude:
                 results.append(self._meta_dict(tid))
                 if len(results) >= limit:
                     break
@@ -4848,10 +4996,11 @@ class TrackStore:
         self._rating_seq += 1
         self._aof("set_rating", id=track_id, rating=rating)
 
-    def remap_track_ids(self, mapping: dict[str, str]) -> dict:
+    def remap_track_ids(self, mapping: dict[str, str], *, keep_both: bool = False) -> dict:
         """Move user data from old track ids to new ones (a moved / renamed
-        file: ``core/id_remap.remap_user_data`` — ratings, play stats,
-        history, playlist entries, waveforms).  One AOF record (op
+        file: ``core/id_remap.remap_user_data`` — ratings, every user's play
+        stats and history, playlist entries, waveforms; ``keep_both``: where
+        the new id has its own, both keep theirs).  One AOF record (op
         ``remap_track_ids``).  Returns the per-container counts."""
         mapping = {o: n for o, n in (mapping or {}).items()
                    if isinstance(o, str) and isinstance(n, str) and o and n and o != n}
@@ -4860,17 +5009,15 @@ class TrackStore:
         from soniqboom.core.id_remap import remap_user_data
         counts = remap_user_data(mapping, ratings=self._ratings, play_stats=self._play_stats,
                                  history=self._history, playlists=self._playlists,
-                                 waveforms=self._waveforms)
-        for tid in {*mapping, *mapping.values()}:
-            if tid in self._tracks and tid not in self._play_stats:
-                self._unplayed_ids.add(tid)
-            else:
-                self._unplayed_ids.discard(tid)
+                                 waveforms=self._waveforms, keep_both=keep_both)
         if counts.get("ratings"):
             self._rating_seq += 1
         if counts.get("play_stats"):
             self._play_seq += 1
-        self._aof("remap_track_ids", mapping=mapping)
+        if keep_both:
+            self._aof("remap_track_ids", mapping=mapping, keep_both=True)
+        else:
+            self._aof("remap_track_ids", mapping=mapping)
         return counts
 
     def get_ratings_batch(self, track_ids: list[str]) -> dict[str, int]:
@@ -4881,10 +5028,17 @@ class TrackStore:
 
     # ── Play stats ───────────────────────────────────────────────────────
 
-    def record_play(self, track_id: str, at: int | None = None) -> dict:
-        """Count one play.  ``at`` (epoch seconds, default now) is when it
-        happened — an offline client's submitted play, say; it is clamped to
-        ``[0, now]`` and never moves ``last_played`` backwards."""
+    def record_play(self, track_id: str, at: int | None = None, *, uid: str) -> dict:
+        """Count one play by user ``uid`` (``""``: no account).  ``at`` (epoch
+        seconds, default now) is when it happened — an offline client's
+        submitted play, say; it is clamped to ``[0, now]`` and never moves
+        ``last_played`` backwards.  A play of an account deleted in this run
+        (``_deleted_uids``) is not recorded (``{"count": 0}``)."""
+        if not isinstance(uid, str):
+            raise TypeError("record_play: uid must be a str")
+        if uid in self._deleted_uids:
+            log.info("A play of a deleted account was not recorded")
+            return {"count": 0}
         now = int(time.time())
         ts = now
         if at is not None:
@@ -4892,29 +5046,78 @@ class TrackStore:
                 ts = max(0, min(int(at), now))
             except (TypeError, ValueError):
                 ts = now
-        stats = self._play_stats.get(track_id)
-        if stats:
-            stats["count"] = stats.get("count", 0) + 1
-            stats["last_played"] = max(stats.get("last_played", 0) or 0, ts)
-        else:
-            stats = {"count": 1, "last_played": ts}
-            self._play_stats[track_id] = stats
-            # First play — track is no longer unplayed.  Discard rather than
-            # remove() so the set stays consistent if a play event arrives
-            # before the corresponding track upsert (rare AOF replay reorder).
-            self._unplayed_ids.discard(track_id)
+        stats = add_play(self._play_stats.setdefault(uid, {}), track_id, ts)
         self._play_seq += 1
-        self._aof("record_play", id=track_id, ts=ts)
+        self._aof("record_play", id=track_id, ts=ts, uid=uid)
         return dict(stats)
 
-    def get_play_stats(self, track_id: str) -> dict:
-        return dict(self._play_stats.get(track_id, {"count": 0}))
+    def get_play_stats(self, track_id: str, *, uid: str) -> dict:
+        return dict((self._play_stats.get(uid) or {}).get(track_id, {"count": 0}))
 
-    def get_play_stats_batch(self, track_ids: list[str]) -> dict[str, dict]:
-        return {tid: dict(self._play_stats[tid]) for tid in track_ids if tid in self._play_stats}
+    def get_play_stats_batch(self, track_ids: list[str], *, uid: str) -> dict[str, dict]:
+        stats = self._play_stats.get(uid) or {}
+        return {tid: dict(stats[tid]) for tid in track_ids if tid in stats}
 
-    def get_all_play_stats(self) -> dict[str, dict]:
-        return {tid: dict(s) for tid, s in self._play_stats.items()}
+    def get_all_play_stats(self, *, uid: str) -> dict[str, dict]:
+        return {tid: dict(s) for tid, s in (self._play_stats.get(uid) or {}).items()}
+
+    def play_stats_view(self, uid: str) -> dict[str, dict]:
+        """User ``uid``'s play stats map itself (live, not copied — read it
+        on the event loop and never change it); empty for a user without
+        plays."""
+        return self._play_stats.get(uid) or {}
+
+    # ── Per-user data (plays + history) ──────────────────────────────────
+
+    def user_data_owner(self) -> str:
+        """The account the data of the database before per-user data (V1)
+        went to, and where plays made with no account (``""``) go once an
+        account exists (config ``user_data_owner``); ``""`` while none."""
+        owner = self._config.get(OWNER_CONFIG_KEY)
+        return owner if isinstance(owner, str) else NO_USER
+
+    def move_user_data(self, src: str, dst: str) -> bool:
+        """Move user ``src``'s play stats and history to ``dst`` (merged with
+        what ``dst`` has — ``user_data.merge_user_data``).  One AOF record (op
+        ``move_user_data``) when anything moved; True then."""
+        if not isinstance(src, str) or not isinstance(dst, str) or src == dst:
+            return False
+        if not self._play_stats.get(src) and not self._history.get(src):
+            return False
+        merge_user_data(self._play_stats, self._history, src, dst)
+        self._play_seq += 1
+        self._aof("move_user_data", src=src, dst=dst)
+        return True
+
+    def user_deleting(self, uid: str, deleting: bool = True) -> None:
+        """An account's deletion starts (``deleting``) or was refused: while
+        it runs, nothing is recorded for it and its data is not handed to
+        anyone (``user_data.claim_unowned``); ``delete_user_data`` follows
+        once the account is gone."""
+        if not uid:
+            return
+        if deleting:
+            self._deleted_uids.add(uid)
+        else:
+            self._deleted_uids.discard(uid)
+
+    def user_deleted(self, uid: str) -> bool:
+        """Is ``uid`` an account deleted (or being deleted) in this run?"""
+        return uid in self._deleted_uids
+
+    def delete_user_data(self, uid: str) -> dict:
+        """Drop user ``uid``'s play stats and history (a deleted account) —
+        and record nothing more for it in this run (``_deleted_uids``).  One
+        AOF record (op ``delete_user_data``) when there was any.  Returns how
+        many tracks / history entries went."""
+        if uid:
+            self._deleted_uids.add(uid)
+        if uid not in self._play_stats and uid not in self._history:
+            return {"play_stats": 0, "history": 0}
+        counts = drop_user_data(self._play_stats, self._history, uid)
+        self._play_seq += 1
+        self._aof("delete_user_data", uid=uid)
+        return counts
 
     # ── Playlists ────────────────────────────────────────────────────────
 
@@ -4934,8 +5137,10 @@ class TrackStore:
             "id": playlist_id,
             "name": name,
             "track_ids": list(track_ids or []),
-            "owner_user_id": owner_user_id,  # None ⇒ legacy/shared
+            "owner_user_id": owner_user_id,  # None / "" ⇒ made with no account
             "query": query,                  # non-None ⇒ smart (auto-updating) playlist
+            "shared": False,                 # the owner offers it to every account
+            "subscribers": [],               # accounts that imported it (read-only link)
             "created_at": now,
             "updated_at": now,
         }
@@ -4943,20 +5148,118 @@ class TrackStore:
         self._aof("upsert_playlist", id=playlist_id, data=pl)
         return dict(pl)
 
-    def list_playlists_for_user(self, user_id: str | None) -> list[dict]:
-        """Return playlists visible to ``user_id``.  Visibility rule:
-          * owner_user_id == user_id  → always visible (their own)
-          * owner_user_id is None     → legacy/shared, visible to all
-          * otherwise                 → hidden
-        Pass ``user_id=None`` to get every playlist (admin view).
-        """
-        out = []
+    # ── Playlist ownership, sharing and subscriptions ───────────────────
+    # Every playlist belongs to its owner (``owner_user_id``; None / "" =
+    # made with no account — it goes to the first account with the rest of
+    # that data, ``user_data.claim_unowned``).  The owner may share it
+    # (``shared``); another account that imports it is a subscriber
+    # (``subscribers``): a read-only link that follows the owner's edits.
+    # Unsharing ends every subscription; deleting it (or the owner's
+    # account) removes it for everyone.  Nobody — admins included — reads
+    # another account's unshared playlist.  All of it rides in the playlist
+    # dict (op ``upsert_playlist``).
+
+    @staticmethod
+    def playlist_owner(pl: dict) -> str:
+        """The playlist's owner id (``""``: made with no account)."""
+        return pl.get("owner_user_id") or ""
+
+    @staticmethod
+    def playlist_offered(pl: dict) -> bool:
+        """Shared by an account (not by the no-user bucket or data kept
+        aside for an account to come — ``user_data.PENDING_PREFIX``)."""
+        from soniqboom.core.user_data import PENDING_PREFIX
+        owner = pl.get("owner_user_id") or ""
+        return bool(pl.get("shared")) and bool(owner) and not owner.startswith(PENDING_PREFIX)
+
+    def playlist_readable(self, pl: dict, uid: str) -> bool:
+        """``uid`` may open ``pl``: its owner, or anyone while it is shared
+        (the Import list shows it, a subscriber plays it)."""
+        return self.playlist_owner(pl) == uid or self.playlist_offered(pl)
+
+    def list_playlists_for_user(self, user_id: str) -> list[dict]:
+        """The playlists in ``user_id``'s list: their own, then the shared
+        ones they subscribed to (``""``: the playlists made with no
+        account)."""
+        own, subscribed = [], []
         for pl in self._playlists.values():
             pl = self._migrate_playlist(pl)
-            owner = pl.get("owner_user_id")
-            if user_id is None or owner is None or owner == user_id:
-                out.append(dict(pl))
-        return out
+            if self.playlist_owner(pl) == user_id:
+                own.append(dict(pl))
+            elif user_id and self.playlist_offered(pl) and user_id in (pl.get("subscribers") or ()):
+                subscribed.append(dict(pl))
+        return own + subscribed
+
+    def shared_playlists_for(self, user_id: str) -> list[dict]:
+        """Every playlist other accounts share (what ``user_id`` may import)."""
+        return [dict(self._migrate_playlist(pl)) for pl in self._playlists.values()
+                if self.playlist_offered(pl) and self.playlist_owner(pl) != user_id]
+
+    def set_playlist_shared(self, playlist_id: str, shared: bool) -> dict | None:
+        """Share or unshare a playlist; unsharing ends every subscription."""
+        pl = self._playlists.get(playlist_id)
+        if pl is None:
+            return None
+        upd = {"shared": bool(shared)}
+        if not shared:
+            upd["subscribers"] = []
+        return self.update_playlist(playlist_id, upd)
+
+    def set_playlist_subscription(self, playlist_id: str, user_id: str,
+                                  subscribed: bool) -> dict | None:
+        """Subscribe ``user_id`` to a shared playlist of another account, or
+        end the subscription.  None when there is no such playlist (or it is
+        not shared, or it is ``user_id``'s own, for a subscription)."""
+        pl = self._playlists.get(playlist_id)
+        if pl is None or not user_id:
+            return None
+        subs = [s for s in (pl.get("subscribers") or []) if s != user_id]
+        if subscribed:
+            if not self.playlist_offered(pl) or self.playlist_owner(pl) == user_id:
+                return None
+            subs.append(user_id)
+        if subs == list(pl.get("subscribers") or []):
+            return dict(pl)
+        return self.update_playlist(playlist_id, {"subscribers": subs})
+
+    def reassign_playlists(self, src: str, dst: str) -> int:
+        """User ``src``'s playlists become ``dst``'s (``src`` ``""`` also
+        takes the ones with no owner at all), and ``src``'s subscriptions
+        ``dst``'s — the moves of ``user_data.move_everything``.  Returns the
+        playlists changed."""
+        if src == dst or not dst:
+            return 0
+        n = 0
+        for pid, pl in list(self._playlists.items()):
+            upd = {}
+            if self.playlist_owner(pl) == src:
+                upd["owner_user_id"] = dst
+                upd["subscribers"] = [s for s in (pl.get("subscribers") or []) if s != dst]
+            elif src and src in (pl.get("subscribers") or ()):
+                subs = [s for s in pl["subscribers"] if s != src]
+                if dst != self.playlist_owner(pl) and dst not in subs:
+                    subs.append(dst)
+                upd["subscribers"] = subs
+            if upd:
+                self.update_playlist(pid, upd)
+                n += 1
+        return n
+
+    def delete_user_playlists(self, user_id: str) -> int:
+        """A deleted account: its playlists are deleted (shared ones vanish
+        for their subscribers) and its subscriptions end.  Returns the
+        playlists deleted."""
+        if not user_id:
+            return 0
+        n = 0
+        for pid, pl in list(self._playlists.items()):
+            if self.playlist_owner(pl) == user_id:
+                self.delete_playlist(pid)
+                n += 1
+            elif user_id in (pl.get("subscribers") or ()):
+                self.update_playlist(pid, {"subscribers": [
+                    s for s in pl["subscribers"] if s != user_id]})
+        return n
 
     def _migrate_playlist(self, pl: dict) -> dict:
         # Legacy playlists persisted with ``tracks`` instead of ``track_ids``.
@@ -5045,26 +5348,20 @@ class TrackStore:
 
     # ── History ──────────────────────────────────────────────────────────
 
-    def push_history(self, entry: dict) -> None:
-        # Kept in PLAY order, not arrival order: an offline Subsonic client's
-        # back-dated scrobbles land where they were played (same rule on AOF
-        # replay — merger._apply_entry).
-        h = self._history
-        ts = entry.get("ts") or 0
-        if h and ts < (h[-1].get("ts") or 0):
-            import bisect
-            i = bisect.bisect_right([e.get("ts") or 0 for e in h], ts)
-            h.insert(i, entry)
-        else:
-            h.append(entry)
-        if len(self._history) > self.history_max:
-            # In-place slice delete — avoids the previous full-list
-            # reallocation that fired on every recorded play.
-            del self._history[: -self.history_max]
-        self._aof("push_history", data=entry)
+    def push_history(self, entry: dict, *, uid: str) -> None:
+        """Add ``entry`` to user ``uid``'s listening history — in PLAY order,
+        not arrival order: an offline Subsonic client's back-dated scrobbles
+        land where they were played (same rule on AOF replay —
+        merger._apply_entry); capped at ``user_data.HISTORY_MAX`` per user."""
+        if not isinstance(uid, str):
+            raise TypeError("push_history: uid must be a str")
+        if uid in self._deleted_uids:
+            return                              # (a deleted account: see record_play)
+        add_history(self._history.setdefault(uid, []), entry)
+        self._aof("push_history", data=entry, uid=uid)
 
-    def get_history(self, limit: int = 50) -> list[dict]:
-        return list(reversed(self._history[-limit:]))
+    def get_history(self, limit: int = 50, *, uid: str) -> list[dict]:
+        return list(reversed((self._history.get(uid) or [])[-limit:]))
 
     # ── Scan dirs ────────────────────────────────────────────────────────
 
@@ -5221,8 +5518,11 @@ class TrackStore:
     # ── Serialisation (for persistence snapshot) ─────────────────────────
 
     def to_snapshot(self) -> dict:
-        """Serialise entire store state to a dict for JSON persistence."""
+        """Serialise entire store state to a dict for JSON persistence
+        (database ``persistence.DB_VERSION``)."""
+        from soniqboom.core.persistence import DB_VERSION
         return {
+            "db_version": DB_VERSION,
             "tracks": self._tracks,
             "waveforms": self._waveforms,
             "ratings": self._ratings,

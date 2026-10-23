@@ -47,6 +47,15 @@ export function mountSettings(root, ctx) {
               <option value="show">Show</option>
             </select>
           </label>
+          <label class="m-settings-row" for="set-unplayable-tracks">
+            <span class="label"><span id="set-unplayable-name">Tracks that can’t be played</span>
+              <small id="set-unplayable-hint">Tracks marked “can’t play”, “corrupt” or Broken (glitched ones still play). Mark: listed with their badge. Hide: left out of searches and lists (playlists and folders still show them). Shuffle and the next track skip them either way.</small></span>
+            <select id="set-unplayable-tracks" class="m-settings-select"
+                    aria-labelledby="set-unplayable-name" aria-describedby="set-unplayable-hint">
+              <option value="mark">Mark</option>
+              <option value="hide">Hide</option>
+            </select>
+          </label>
         </div>
       </div>
 
@@ -129,9 +138,36 @@ export function mountSettings(root, ctx) {
     }
     paintOffline();
   });
-  _paintOffline = paintOffline;
+  // "Tracks that can't be played" — a server setting too, beside it.
+  const unSel  = root.querySelector('#set-unplayable-tracks');
+  const unHint = root.querySelector('#set-unplayable-hint');
+  const unHintText = unHint.textContent;
+  function paintUnplayable() {
+    const admin = !!Auth.isAdmin;
+    if (Offline.unplayable) unSel.value = Offline.unplayable;
+    unSel.disabled = !admin;
+    unHint.textContent = admin ? unHintText : `${unHintText} Set by an admin for every user.`;
+  }
+  unSel.addEventListener('change', async () => {
+    const want = unSel.value;
+    try {
+      const r = await fetch('/api/admin/settings', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unplayable_tracks: want }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await Offline.refresh();
+      ctx.toast(want === 'hide' ? 'Tracks that can’t be played are hidden.'
+        : 'Tracks that can’t be played are marked.');
+    } catch (_) {
+      ctx.toast('Couldn’t save the setting.', 'error');
+    }
+    paintUnplayable();
+  });
+  _paintOffline = () => { paintOffline(); paintUnplayable(); };
   paintOffline();
-  Offline.refresh().finally(paintOffline);
+  paintUnplayable();
+  Offline.refresh().finally(_paintOffline);
 
   // The player learns whether the server keeps a queue a few seconds after load:
   // this view may already be up by then.

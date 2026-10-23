@@ -190,10 +190,12 @@ function refreshAllTracksInPlace() {
 // position and the group filter text.  Each such view records how to open
 // itself again once it has rendered (``_setViewReload``); every view entry
 // clears the record first (setGroupHeader, restoreFullHeader, renderTracks,
-// showFolder, beginView), so it names the view on screen or nothing.
-let _viewReload = null;          // { key, fn }
+// showFolder, showSearch), so it names the view on screen or nothing.
+let _viewReload = null;          // { key, fn, keepsPlace }
 let _reloadingView = false;      // a reload is running: no skeleton flash, no focus grab
-function _setViewReload(key, fn) { _viewReload = { key, fn }; }
+// ``keepsPlace``: the reload keeps the user's place itself (by track id — the
+// search view's in-place re-read), so the scroll offset is not put back after it.
+function _setViewReload(key, fn, { keepsPlace = false } = {}) { _viewReload = { key, fn, keepsPlace }; }
 async function reloadCurrentView() {
   const r = _viewReload;
   if (!r || _reloadingView) return false;
@@ -209,6 +211,7 @@ async function reloadCurrentView() {
     groupFilterInput.value = filter;
     groupFilterInput.dispatchEvent(new Event('input'));
   }
+  if (r.keepsPlace) return true;
   // The list can reach its full height a frame or two late (rows are
   // measured on their first paint): keep asking until it is tall enough
   // again (or ~0.5 s passed).
@@ -265,6 +268,7 @@ let _smartViewKey = null;
 let _smartViewLabel = '';
 let sortKey = null;
 let sortAsc = true;
+let _bestMatchBtn = null;     // the search view's "Best match" header button (_paintBestMatchBtn)
 // Extra query params for the windowed track view (the chunked /tracks fetcher
 // merges these in).  null = the plain All-Tracks view; {format:'MIDI'} = the
 // Galaxy per-format browse.  Preserved across sort-clicks so re-sorting a
@@ -329,6 +333,10 @@ function _setCappedSource(shown, cap, total, shuffleParams, orderedSpec, label) 
 // [windowed-store:begin] — tests/js/windowed_store.test.mjs runs this region as is
 const CHUNK_SIZE = 2000;
 const MAX_CHUNKS = 10;
+// Rows a search list reads ahead of (and behind) its window, so the next chunk
+// is there by the time it scrolls in.  The range it covers is what a re-read
+// of the list loads in one answer (``_searchReread``): at most two chunks.
+const SEARCH_READ_AHEAD = CHUNK_SIZE / 4;
 // A chunk whose fetch fails is asked again after these pauses (its rows keep the
 // loading shimmer meanwhile); once they are used up its rows say so and offer
 // Retry, and scrolling back to them after the last pause asks once more.
@@ -375,6 +383,23 @@ function createWindowedStore(total, fetcher, opts = {}) {
         if (localIdx >= 0) return c * CHUNK_SIZE + localIdx;
       }
       return -1;
+    },
+    // Rows already in hand for chunk ``chunkIdx`` (the first page of a search
+    // came with its answer): stored as if fetched — only a whole chunk (a short
+    // one is the last chunk only), so no row of it is left unloaded.
+    prime(chunkIdx, arr) {
+      const offset = chunkIdx * CHUNK_SIZE;
+      if (!Array.isArray(arr) || offset < 0 || offset >= total) return false;
+      if (arr.length !== Math.min(CHUNK_SIZE, total - offset)) return false;
+      chunks.set(chunkIdx, arr);
+      const ix = lru.indexOf(chunkIdx);
+      if (ix >= 0) lru.splice(ix, 1);
+      lru.push(chunkIdx);
+      while (lru.length > MAX_CHUNKS) {
+        const evict = lru.shift();
+        if (evict !== chunkIdx) chunks.delete(evict);
+      }
+      return true;
     },
     // Row ``i`` if its chunk is loaded — no fetch, no LRU touch (reading what a
     // list shows without changing what it keeps).
@@ -668,6 +693,7 @@ function _showSkeletonRows(count = 18) {
   // rows are still being fetched — without this the buttons play the previous list.
   currentTracks = [];
   _viewQueueSource = null;
+  _searchCtx = null;
   // …and no selection: the selection bar's actions index ``currentTracks``, and a
   // bar left over from the previous view queued ``undefined`` rows (→ playback crash).
   _selected.clear(); _lastClickIdx = -1; _focusedIdx = -1; _updateSelectionBar();
@@ -1217,7 +1243,10 @@ const _trackVL = createVirtualList({
     // Fetch the chunks the window (and its buffer) reaches into; no-op for a
     // plain array.
     if (currentTracks && typeof currentTracks.ensureRange === 'function') {
-      currentTracks.ensureRange(start, end);
+      // (a search list reads the next chunk — or the one before — ahead of
+      // the window: it is there by the time the rows scroll in)
+      const pre = currentTracks._search ? SEARCH_READ_AHEAD : 0;
+      currentTracks.ensureRange(Math.max(0, start - pre), Math.min(currentTracks.length, end + pre));
     }
     // Background-fill real lengths for any AdLib/IMF rows now on screen that
     // still show the 180s placeholder (debounced; one-time per track; any view).
@@ -1252,44 +1281,386 @@ document.addEventListener('themechange', () => {
   _groupVL.remeasure();
 });
 
-// Render full-search results as a flat, sortable track list.  Search used to
-// call renderTracks() directly, which leaves whatever header/filter chrome the
-// previous view set up — so searching from e.g. Genres showed the results under
-// a "Genre" colspan header with no sortable columns and a live "Filter genres…"
-// bar (typing in which wiped the results).  Restoring the full header + hiding
-// the group filter/grid toggle first makes search results always look and
-// behave like a proper track list, regardless of where the search was launched.
-const SEARCH_LIMIT = 200;      // keep in sync with search.js (/api/search?limit=)
-// ``reload``: re-runs this search (search.js), so an admin action that changed
-// tags refreshes the results in place (reloadCurrentView).
-function showSearchResults(tracks, query = '', reload = null) {
-  // Keep the Back handler of a previous search in place while the header is
-  // rebuilt, so a second, third… search does not push another history entry.
-  const again = !browseHdr.hidden && browseCrumb.textContent.startsWith('Search: ');
-  hideBrowseHeader();
-  if (query) {
-    const n = tracks.length;
-    const coversAll = n >= SEARCH_LIMIT && /[\p{L}\p{N}]/u.test(query);   // same test as the shuffle source below
+// ── Search results: the whole result set, paged like All Tracks ──────────────
+// A search lists EVERY match.  The server keeps the result set
+// (core/search_sets.py): ``GET /api/search/page`` answers its first page with the
+// exact total and a handle (``rs``), and later pages — 2,000-row chunks of the
+// windowed store, fetched as the list scrolls, like the windowed All Tracks — name
+// it.  A column sort orders the WHOLE set on the server (the sorted index All
+// Tracks' column sort uses: same keys, ties by id); the default order is Best
+// match (core/search_rank.py — newest first for a search without free text,
+// ``ranked`` false), which the header's "Best match" button returns to.  Results
+// always render as a proper sortable track
+// list with the group header / filter chrome cleared, wherever the search was
+// launched.  ``_searchCtx`` = the set on screen ``{q, rs, total, sort, order,
+// client, ranked}`` (``sort`` / ``order``: the server's column order, null = the
+// default; ``ranked``: the default is Best match;
+// ``client``: ``{key, asc}`` while the list is re-sorted in the browser — a column
+// the server can't sort, the whole set in hand; ``gen``: the nav token the list
+// was rendered under — any view entry since, a new search included, makes a
+// background re-read of it moot); null in every other view (renderTracks clears
+// it, the search view sets it again after rendering — ``_putSearchCtx``).
+let _searchCtx = null;
+const _SEARCH_COL_LABEL = { track_number: 'Track', path: 'Location' };
+
+// [search-set:begin] — tests/js/search_set.test.mjs runs this region as is
+// One page of a search's result set (the store's chunk size by default).
+function _searchPage(q, rs, offset, limit, sort, order) {
+  const p = { q, offset, limit, fields: 'list' };
+  if (rs) p.rs = rs;
+  if (sort) { p.sort = sort; p.order = order || 'asc'; }
+  return API('/search/page', p);
+}
+
+// A chunk of the set ``ctx`` names.  An answer from ANOTHER set (the library or
+// what the lists leave out changed, the server restarted: ``renewed``) is never
+// stored next to rows of this one — the list re-reads itself in place instead
+// (``_searchRenewed``), and this chunk counts as not loaded.
+async function _searchChunk(ctx, offset, limit) {
+  const j = await _searchPage(ctx.q, ctx.rs, offset, limit, ctx.sort, ctx.order);
+  if (!j || !Array.isArray(j.tracks)) throw new Error('not a track list');
+  if (j.rs !== ctx.rs) {
+    _searchRenewed(ctx, j);
+    throw new Error('search renewed');
+  }
+  return j.tracks;
+}
+
+// The set under the list was replaced (``j``: the answer that said so).  One
+// re-read at a time; a renewal to a NEWER set noticed while one runs makes it
+// run once more (at most three runs), so the newest set always lands — another
+// chunk naming the set already being read is no news.
+let _searchRefreshRun = null, _searchRefreshAgain = false, _searchRenewRs = null;
+function _searchRenewed(ctx, j) {
+  // (a list no longer on screen, one a re-read is loading, or one a newer view —
+  // another search still fetching its first page — is replacing)
+  if (ctx !== _searchCtx || ctx.gen !== _browseNavGen) return;
+  const rs = j && j.rs;
+  if (_searchRefreshRun) {
+    if (rs !== _searchRenewRs) { _searchRefreshAgain = true; _searchRenewRs = rs; }
+    return;
+  }
+  _searchRenewRs = rs;
+  _refreshSearchInPlace(j);
+}
+function _refreshSearchInPlace(seed = null) {
+  if (!_searchCtx) return Promise.resolve();
+  if (_searchRefreshRun) { _searchRefreshAgain = true; return _searchRefreshRun; }
+  _searchRefreshRun = (async () => {
+    for (let i = 0; i < 3; i++) {
+      _searchRefreshAgain = false;
+      const res = await _searchReread(seed);
+      seed = null;
+      if (!_searchCtx || res === 'gone') break;
+      if (!_searchRefreshAgain && res !== 'renewed') break;
+    }
+  })().catch((err) => { console.debug('search re-read failed', err); })
+    .finally(() => { _searchRefreshRun = null; });
+  return _searchRefreshRun;
+}
+
+// The search list now on screen is ``ctx`` (after its render).
+function _putSearchCtx(ctx) {
+  ctx.gen = _browseNavGen;
+  _searchCtx = ctx;
+}
+// [search-set:end]
+
+// The header line: the search and its exact number of matches.
+function _searchHeadText(q, total) {
+  return `Search: ${q} — ${total ? `${total.toLocaleString()} match${total === 1 ? '' : 'es'}` : 'no matches'}`;
+}
+
+// The player's view of the set: its own pages for sequential play, and the
+// seeded shuffle of the same search (``/api/tracks/shuffled?q=`` — the same
+// predicates) — both cover every match.  A list sorted in the browser has no
+// server order (``ordered: null``: a plain array that keeps its shuffle).
+function _searchSource(ctx) {
+  const params = { q: ctx.q, rs: ctx.rs };
+  if (ctx.sort) { params.sort = ctx.sort; params.order = ctx.order || 'asc'; }
+  return {
+    ordered: ctx.client ? null : { url: '/api/search/page', params },
+    shuffle: { url: SHUFFLE_URL, params: { q: ctx.q } },
+    total: ctx.total,
+    label: `Search: ${ctx.q}`,
+  };
+}
+
+function _newSearchStore(ctx, head = null) {
+  const store = createWindowedStore(ctx.total, (offset, lim) => _searchChunk(ctx, offset, lim),
+                                    { sortBy: ctx.sort, sortOrder: ctx.order });
+  store._search = ctx;
+  if (head && Array.isArray(head.tracks)) {
+    // (an answer of one or more whole chunks: each stored as fetched)
+    const c0 = Math.floor((head.offset || 0) / CHUNK_SIZE);
+    for (let k = 0; k * CHUNK_SIZE < head.tracks.length; k++) {
+      store.prime(c0 + k, head.tracks.slice(k * CHUNK_SIZE, (k + 1) * CHUNK_SIZE));
+    }
+  }
+  store.setOnChunkLoad(() => { if (currentTracks === store) _vsRender(true); });
+  return store;
+}
+
+// Put the set ``ctx`` on screen as ``list`` (its windowed store, or an array).
+// ``keepScroll``: an in-place re-read — the user's place carried over by track
+// id (renderTracks), the header and its sort arrow as they are.
+function _installSearch(ctx, list, { keepScroll = false } = {}) {
+  if (!keepScroll) {
+    // Keep the Back handler of a previous search in place while the header is
+    // rebuilt, so a second, third… search does not push another history entry.
+    const again = !browseHdr.hidden && browseCrumb.textContent.startsWith('Search: ');
+    hideBrowseHeader();
     if (again) browseHdr.hidden = false;
-    // At the cap the real number of matches is unknown — don't call 200 "the results".
-    const head = n >= SEARCH_LIMIT
-      ? `Search: ${query} — listing first ${SEARCH_LIMIT} matches`
-      : `Search: ${query} — ${n.toLocaleString()} result${n === 1 ? '' : 's'}`;
-    setBrowseHeader(head + (coversAll ? ' · Shuffle covers all matches' : ''), () => showAll(), n > 0);
+    _hideGroupFilter();
+    _hideGridToggle();
+    restoreFullHeader();
+    // The search's own order: the default (no column) or the column it is sorted by.
+    sortKey = ctx.sort || null;
+    sortAsc = ctx.order !== 'desc';
+    document.querySelectorAll('th[data-sort]').forEach((t) => t.classList.remove('sorted', 'sorted-asc', 'sorted-desc'));
+    if (sortKey) _paintSortIndicator();
+  } else {
+    restoreFullHeader({ keepHeader: true });
   }
-  _hideGroupFilter();
-  _hideGridToggle();
-  restoreFullHeader();
-  renderTracks(tracks);
-  // A search that hit the result cap matched more than it lists — let shuffle /
-  // play-through reach ALL matches (the list endpoint has no offset, so only the
-  // shuffled order is pageable).
-  // (Text with no letter or digit — "*", "…" — matches nothing in particular; the
-  // server would deal the whole library for it, so such a list shuffles only itself.)
-  if (query && /[\p{L}\p{N}]/u.test(query)) {
-    _setCappedSource(tracks.length, SEARCH_LIMIT, 0, { q: query }, null, `Search: ${query}`);
+  setBrowseHeader(_searchHeadText(ctx.q, ctx.total), () => showAll(), ctx.total > 0);
+  renderTracks(list, { keepScroll });
+  _putSearchCtx(ctx);
+  _paintBestMatchBtn(ctx);
+  _viewQueueSource = ctx.total > 0 ? _searchSource(ctx) : null;
+  _paintShuffleAllTitle();
+  _setViewReload(`search\0${ctx.q}`, () => _refreshSearchInPlace(), { keepsPlace: true });
+  _updateAzRail();
+}
+
+// Open the full results of a search (search.js, on Enter).  A view entry: the
+// nav token is taken and the All-Tracks / folder flags are cleared before the
+// first await; a newer view (another search, a nav click) wins over a late
+// answer.  Resolves 'ok' / 'superseded'; rejects when the first page failed and
+// this search is still the one asked for (the list on screen stays).
+async function showSearch(q) {
+  // (what the list on screen is — put back if this search's first page fails)
+  const prev = { all: _viewIsAllTracks, path: _currentBrowsePath, reload: _viewReload, ctx: _searchCtx };
+  const gen = ++_browseNavGen;
+  _viewIsAllTracks = false;
+  _currentBrowsePath = null;
+  _viewReload = null;
+  let head;
+  try {
+    head = await _searchPage(q, null, 0, CHUNK_SIZE, null, null);
+  } catch (err) {
+    if (gen !== _browseNavGen) return 'superseded';
+    // The list on screen stays the view: its flags, its reload and — a search —
+    // its token come back, so it still refreshes and re-reads itself.
+    _viewIsAllTracks = prev.all;
+    _currentBrowsePath = prev.path;
+    _viewReload = prev.reload;
+    if (prev.ctx && prev.ctx === _searchCtx) prev.ctx.gen = _browseNavGen;
+    throw err;
   }
-  if (query && typeof reload === 'function') _setViewReload(`search\0${query}`, reload);
+  if (gen !== _browseNavGen) return 'superseded';
+  const ctx = { q, rs: head.rs, total: head.total || 0, sort: null, order: null, client: null,
+                ranked: head.ranked !== false };
+  _installSearch(ctx, ctx.total ? _newSearchStore(ctx, head) : []);
+  return 'ok';
+}
+
+// Re-read the search on screen in place (its set was replaced, an admin action
+// changed tags, which tracks can play changed): the new set's rows near the
+// viewport are loaded BEFORE they replace the old ones (no loading shimmer), the
+// user's place moves with the rows by track id, and a failed read keeps what is
+// on screen.  ``seed``: a renewed answer already in hand (its chunk is reused).
+async function _searchReread(seed = null) {
+  const ctx = _searchCtx;
+  // (the list on screen, still under the token it was rendered with: a view
+  // entry since — another search loading its first page — wins)
+  if (!ctx || ctx.gen !== _browseNavGen) return 'gone';
+  const gen = ctx.gen;                        // a background re-read: captured, not bumped
+  const old = currentTracks;
+  const gone = () => gen !== _browseNavGen || _searchCtx !== ctx;
+  if (ctx.client) {
+    // A list sorted in the browser: the whole (small) set read again, sorted
+    // again; one that grew past what the browser sorts gets the default order.
+    const head = await _searchPage(ctx.q, ctx.rs, 0, CHUNK_SIZE, null, null).catch(() => null);
+    if (gone()) return 'gone';
+    if (!head || !Array.isArray(head.tracks)) return 'failed';
+    const nctx = { ...ctx, rs: head.rs, total: head.total || 0, sort: null, order: null,
+                   ranked: head.ranked !== false };
+    if (nctx.total <= CHUNK_SIZE && head.tracks.length === nctx.total) {
+      const { key, asc } = ctx.client;
+      _installSearch(nctx, _sortRows(head.tracks, key, asc), { keepScroll: true });
+      return 'ok';
+    }
+    nctx.client = null;
+    _installSearch(nctx, _newSearchStore(nctx, head));
+    return 'ok';
+  }
+  // The rows on screen and the ones the list reads ahead of them come in ONE
+  // answer — whichever set answers it is the newest, and rows of one answer
+  // never mix two sets — so once it is installed the list asks for nothing
+  // more until it is scrolled (a renewal per scroll, not per read-ahead).  A
+  // renewed answer already in hand serves when it holds those chunks.
+  const cover = (a, b, total) => {
+    const lo = Math.max(0, a - SEARCH_READ_AHEAD);
+    const hi = Math.max(lo + 1, Math.min(total, b + SEARCH_READ_AHEAD));
+    const c0 = Math.floor(lo / CHUNK_SIZE);
+    const c1 = Math.min(c0 + 1, Math.floor((hi - 1) / CHUNK_SIZE));
+    return [c0, c1];
+  };
+  const [c0, c1] = cover(_vsStart, _vsEnd, ctx.total);
+  const span = (c1 - c0 + 1) * CHUNK_SIZE;
+  let head = seed && seed.offset === c0 * CHUNK_SIZE && Array.isArray(seed.tracks)
+    && seed.tracks.length >= Math.min(span, Math.max(0, seed.total - seed.offset)) ? seed : null;
+  if (!head) {
+    head = await _searchPage(ctx.q, ctx.rs, c0 * CHUNK_SIZE, span, ctx.sort, ctx.order).catch(() => null);
+  }
+  if (gone()) return 'gone';
+  if (!head || typeof head.total !== 'number' || !Array.isArray(head.tracks)) return 'failed';
+  const nctx = { ...ctx, rs: head.rs, total: head.total };
+  if (typeof head.ranked === 'boolean') nctx.ranked = head.ranked;
+  if (!nctx.total) {
+    _installSearch(nctx, [], { keepScroll: true });
+    return 'ok';
+  }
+  const store = _newSearchStore(nctx, (head.sort || null) === (nctx.sort || null) ? head : null);
+  // The user's place moves with the rows: the window it moves to (and its
+  // read-ahead) is read too — in one answer, kept only when it comes from the
+  // same set (else those rows are read, renewing the list once more, when the
+  // list asks for them).  Selected rows elsewhere stay selected when loaded.
+  const plan = old && old.length ? _planListPlace(_currentListPlace(), _idIndex(store), nctx.total) : null;
+  if (plan && plan.shift) {
+    const [d0, d1] = cover(_vsStart + plan.shift, _vsEnd + plan.shift, nctx.total);
+    if (!store._chunks.has(d0) || !store._chunks.has(d1)) {
+      const j = await _searchPage(ctx.q, nctx.rs, d0 * CHUNK_SIZE, (d1 - d0 + 1) * CHUNK_SIZE,
+                                  nctx.sort, nctx.order).catch(() => null);
+      if (gone()) return 'gone';
+      if (j && j.rs === nctx.rs && Array.isArray(j.tracks)) {
+        for (let k = 0; k * CHUNK_SIZE < j.tracks.length; k++) {
+          store.prime(d0 + k, j.tracks.slice(k * CHUNK_SIZE, (k + 1) * CHUNK_SIZE));
+        }
+      }
+    }
+  }
+  _installSearch(nctx, store, { keepScroll: true });
+  if (old && old !== store && old._isWindowedStore) old.invalidate();     // (its retry timers)
+  return 'ok';
+}
+
+// Re-sort the search on screen by a column the server can't sort (track
+// number, location) — in the browser, which needs the whole set in hand: a
+// list of at most one chunk.  The source then has no server order (shuffle
+// still covers the set).
+function _sortSearchInBrowser(key, asc) {
+  const ctx = _searchCtx;
+  const list = currentTracks;
+  const rows = Array.isArray(list) ? list : list.loadedSliceFrom(0, list.length);
+  const nctx = { ...ctx, client: { key, asc } };
+  renderTracks(_sortRows(rows, key, asc));
+  _putSearchCtx(nctx);
+  _paintBestMatchBtn(nctx);
+  _viewQueueSource = _searchSource(nctx);
+  _paintShuffleAllTitle();
+  _setViewReload(`search\0${nctx.q}`, () => _refreshSearchInPlace(), { keepsPlace: true });
+  _updateAzRail();
+}
+
+// Every row of the search on screen is in hand (a browser sort can order it).
+function _searchAllInHand() {
+  const list = currentTracks;
+  if (Array.isArray(list)) return true;
+  if (!list || !list._isWindowedStore || list.length > CHUNK_SIZE) return false;
+  return list.loadedSliceFrom(0, list.length).length === list.length;
+}
+
+// A column header clicked while a search is on screen.
+function _onSearchSortClick(th, key) {
+  const server = WINDOWED_SORT_KEYS.has(key);
+  if (!server && !_searchAllInHand()) {
+    window.Toast?.info?.(`Sort by ${(_SEARCH_COL_LABEL[key] || key).toLowerCase()} isn’t available for a search with more than ${CHUNK_SIZE.toLocaleString()} matches.`);
+    return;
+  }
+  if (_viewLoading() || !_searchCtx.total) return;
+  if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
+  document.querySelectorAll('th[data-sort]').forEach((t) => t.classList.remove('sorted', 'sorted-asc', 'sorted-desc'));
+  th.classList.add('sorted', sortAsc ? 'sorted-asc' : 'sorted-desc');
+  _updateAriaSort(th, sortAsc);
+  _saveSortState();
+  if (server) _resortSearch(key, sortAsc);
+  else _sortSearchInBrowser(key, sortAsc);
+}
+
+// "Best match" in the search view's header: lit while the list is in the
+// search's default order (Best match — or newest first for a search without
+// free text, and then it says so); a click on it while a column orders the list
+// puts the default order back (the column's arrow goes).  (``_bestMatchBtn``:
+// declared with the sort state.)
+function _paintBestMatchBtn(ctx) {
+  if (!_bestMatchBtn) {
+    _bestMatchBtn = document.createElement('button');
+    _bestMatchBtn.type = 'button';
+    _bestMatchBtn.id = 'btn-best-match';
+    _bestMatchBtn.className = 'btn-best-match';
+    _bestMatchBtn.addEventListener('click', _onBestMatchClick);
+  }
+  const b = _bestMatchBtn;
+  if (b.parentNode !== browseHdr) browseHdr.insertBefore(b, browseBack);
+  const on = !!ctx && !ctx.sort && !ctx.client;
+  const label = ctx && ctx.ranked === false ? 'Newest first' : 'Best match';
+  b.textContent = label;
+  b.hidden = !ctx || !ctx.total;
+  b.classList.toggle('active', on);
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.title = on ? `Sorted by ${label.toLowerCase()}` : `Sort by ${label.toLowerCase()} (the search’s own order)`;
+}
+function _hideBestMatchBtn() {
+  if (_bestMatchBtn) _bestMatchBtn.remove();
+}
+async function _onBestMatchClick() {
+  const ctx = _searchCtx;
+  if (!ctx || !ctx.total || _viewLoading()) return;
+  if (!ctx.sort && !ctx.client) return;                     // (already)
+  // A list sorted in the browser holds the whole (small) set: its Best match
+  // rows are read first and replace it in one go (no loading rows meanwhile).
+  let head = null;
+  if (ctx.client) {
+    head = await _searchPage(ctx.q, ctx.rs, 0, CHUNK_SIZE, null, null).catch(() => null);
+    if (_searchCtx !== ctx || ctx.gen !== _browseNavGen) return;      // (another view, a re-read, a sort)
+  }
+  sortKey = null;
+  document.querySelectorAll('th[data-sort]').forEach((t) => t.classList.remove('sorted', 'sorted-asc', 'sorted-desc'));
+  _updateAriaSort(null, true);
+  _resortSearch(null, true, head);
+}
+
+// A column click in the search view: the WHOLE set re-ordered by the server
+// (scroll to the top, selection cleared — as All Tracks' windowed sort).  ``key``
+// null: back to the default order (Best match); ``head``: its first rows, read
+// already (a list sorted in the browser goes back without loading rows).
+function _resortSearch(key, asc, head = null) {
+  const ctx = _searchCtx;
+  if (!ctx || !ctx.total) return;
+  const nctx = { ...ctx, sort: key || null, order: key ? (asc ? 'asc' : 'desc') : null, client: null };
+  if (head && Array.isArray(head.tracks) && typeof head.total === 'number' && head.total > 0) {
+    nctx.rs = head.rs;
+    nctx.total = head.total;
+    if (typeof head.ranked === 'boolean') nctx.ranked = head.ranked;
+    if (nctx.total !== ctx.total) {                // (answered from a renewed set)
+      browseCrumb.textContent = browseCrumb.title = _searchHeadText(nctx.q, nctx.total);
+    }
+  } else {
+    head = null;
+  }
+  _selected.clear(); _lastClickIdx = -1; _focusedIdx = -1;
+  const wrap = document.getElementById('track-list-wrap');
+  if (wrap) wrap.scrollTop = 0;
+  const old = currentTracks;
+  renderTracks(_newSearchStore(nctx, head));
+  _putSearchCtx(nctx);
+  _paintBestMatchBtn(nctx);
+  _viewQueueSource = _searchSource(nctx);
+  _paintShuffleAllTitle();
+  _setViewReload(`search\0${nctx.q}`, () => _refreshSearchInPlace(), { keepsPlace: true });
+  _updateAzRail();
+  if (old && old._isWindowedStore) old.invalidate();
 }
 
 // ── The user's place across an in-place refresh ───────────────────────────────
@@ -1394,6 +1765,7 @@ async function renderTracks(tracks, { keepScroll = false } = {}) {
   _viewIsAllTracks = false;
   _viewQueueSource = null;   // views re-assert their queue source after rendering
   _viewReload = null;        // …and their reload (see reloadCurrentView)
+  _searchCtx = null;         // …and the search result set (the search view, after rendering)
   _selected.clear();
   _lastClickIdx = -1;
   _focusedIdx   = -1;
@@ -1511,7 +1883,10 @@ function _showViewError(retry, err = null) {
 // ── A–Z jump rail ─────────────────────────────────────────────────────────────
 const _AZ = ['#','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
 let _azRail = null;
-function _azSortKey() { return (sortKey && ['title','artist','album','album_artist'].includes(sortKey)) ? sortKey : (sortKey ? null : 'title'); }
+function _azSortKey() {
+  if (_searchCtx && !sortKey) return null;     // (a search's own order is not alphabetical)
+  return (sortKey && ['title','artist','album','album_artist'].includes(sortKey)) ? sortKey : (sortKey ? null : 'title');
+}
 function _azInitial(t) {
   const k = _azSortKey() || 'title';
   const s = String((t && (t[k] ?? t.title)) || '').trim().toUpperCase();
@@ -2301,24 +2676,114 @@ function _paintSortIndicator() {
 }
 
 // ── Sorting ────────────────────────────────────────────────────────────────────
-function _compareTrack(a, b, key, asc) {
-  if (key === 'track_number') {
-    // Sort by disc first, then track number
-    const da = a.disc_number ?? 0, db = b.disc_number ?? 0;
-    if (da !== db) return asc ? da - db : db - da;
-    const ta = a.track_number ?? 0, tb = b.track_number ?? 0;
-    return asc ? ta - tb : tb - ta;
-  }
-  const av = a[key] ?? '', bv = b[key] ?? '';
-  return asc ? (av > bv ? 1 : av < bv ? -1 : 0) : (av < bv ? 1 : av > bv ? -1 : 0);
+// [list-sort:begin] — tests/js/list_sort.test.mjs and tests/test_list_sort_parity.py run this region as is
+// A list sorted in the browser (a small All Tracks, a small folder or format
+// list, a search's Track / Location sort) is in EXACTLY the order the server's
+// sorted indexes give a large All Tracks and a search (store.py _SORTED_SPECS):
+// the same key per column, ties broken by the track id, descending = ascending
+// reversed.  Text columns: trimmed (Python's whitespace), lower-cased, compared
+// by code point, a blank value after every other one (U+FFFF).  Year / Duration:
+// the number (a numeric string as its number; a YYYYMMDD year as its year),
+// no value after every number.  Track (disc, then track number) and Location
+// (the path) have no server index: the same rule — Track by disc then number
+// with no track number last, Location as text.
+const _SORT_BLANK = '\uffff';
+const _SORT_NONE = Infinity;
+const _PY_SPACE_RE = /^[\t\n\v\f\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+const _PY_FLOAT_RE = /^[+-]?(?:(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?$/;
+const _PY_NONFINITE_RE = /^[+-]?(?:inf|infinity|nan)$/i;
+
+// A text key (store.py _lex_key).
+function _lexKey(v) {
+  if (!v) return _SORT_BLANK;                                            // ((v or "") — None, "", 0)
+  const s = String(v).replace(_PY_SPACE_RE, '').toLowerCase();
+  return s || _SORT_BLANK;
 }
+// A raw value as a number key (store.py _num_key): a number as it is, a numeric
+// string as its number, anything else — no value.
+function _numKey(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : _SORT_NONE;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  if (typeof v === 'string') {
+    const s = v.replace(_PY_SPACE_RE, '');
+    if (_PY_NONFINITE_RE.test(s) || !_PY_FLOAT_RE.test(s)) return _SORT_NONE;
+    const f = Number(s.replace(/_/g, ''));
+    return Number.isFinite(f) ? f : _SORT_NONE;
+  }
+  return _SORT_NONE;
+}
+function _yearKey(v) {
+  const y = _numKey(v);
+  return (Number.isInteger(y) && y > 9999) ? Math.floor(y / 10000) : y;   // (normalise_year)
+}
+function _durationKey(v) {
+  const d = _numKey(v);
+  return d ? d : _SORT_NONE;                                            // (0: no length)
+}
+function _trackNoKey(t) {
+  const n = _numKey(t.track_number);
+  if (n === _SORT_NONE) return [_SORT_NONE, _SORT_NONE];
+  const d = _numKey(t.disc_number);
+  return [d === _SORT_NONE ? 0 : d, n];
+}
+const _SORT_KEY_OF = {
+  title:        (t) => _lexKey(t.title),
+  artist:       (t) => _lexKey(t.artist),
+  album_artist: (t) => _lexKey(t.album_artist),
+  album:        (t) => _lexKey(t.album),
+  format:       (t) => _lexKey(t.format),
+  path:         (t) => _lexKey(t.path),
+  year:         (t) => _yearKey(t.year),
+  duration:     (t) => _durationKey(t.duration),
+  bpm:          (t) => _numKey(t.bpm),
+  added:        (t) => { const a = _numKey(t.added_at); return a && a !== _SORT_NONE ? a : 0; },
+  track_number: _trackNoKey,
+};
+// Python's str order (by code point): UTF-16 units compare the same except a
+// surrogate (a character past U+FFFF) against U+E000–U+FFFF.
+function _cmpStr(a, b) {
+  if (a === b) return 0;
+  const n = a.length < b.length ? a.length : b.length;
+  for (let i = 0; i < n; i++) {
+    let x = a.charCodeAt(i), y = b.charCodeAt(i);
+    if (x !== y) {
+      if (x >= 0xD800 && y >= 0xD800) {
+        x = x >= 0xE000 ? x - 0x800 : x + 0x2000;
+        y = y >= 0xE000 ? y - 0x800 : y + 0x2000;
+      }
+      return x < y ? -1 : 1;
+    }
+  }
+  return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+}
+function _cmpKey(a, b) {
+  if (typeof a === 'string') return _cmpStr(a, b);
+  if (Array.isArray(a)) {
+    for (let i = 0; i < a.length; i++) { const c = _cmpKey(a[i], b[i]); if (c) return c; }
+    return 0;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+// ``rows`` sorted by column ``key`` (a copy; ``asc`` false: the exact reverse).
+// An unknown key leaves the order as it is.
+function _sortRows(rows, key, asc = true) {
+  const keyOf = _SORT_KEY_OF[key];
+  if (!keyOf) return [...rows];
+  const dec = rows.map((t) => [keyOf(t), String(t.id ?? ''), t]);
+  const dir = asc ? 1 : -1;
+  dec.sort((a, b) => dir * (_cmpKey(a[0], b[0]) || _cmpStr(a[1], b[1])));
+  return dec.map((d) => d[2]);
+}
+// [list-sort:end]
 
 // Shared sort-click handler — wired here for the initial header render,
 // and re-wired by ``restoreFullHeader()`` after a header-rebuild (group
 // view / duplicates view exit).  Hoisted into a function so the two
 // attach sites can't drift.
 function _onSortHeaderClick(th) {
+  if (_colResizeSuppressClick) return;   // the click ending a column-resize drag
   const key = th.dataset.sort;
+  if (_searchCtx) { _onSearchSortClick(th, key); return; }   // (the whole result set, on the server)
 
   // Windowed mode: the loaded chunks cover ~20K of N rows, so an in-memory sort
   // would lie about positions outside the loaded window.  We round-trip to the
@@ -2371,7 +2836,7 @@ function _onSortHeaderClick(th) {
 
   // Small-library path: client-side sort over the full in-memory array.
   const keepSrc = _viewQueueSource;
-  const sorted = [...currentTracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc));
+  const sorted = _sortRows(currentTracks, sortKey, sortAsc);
   renderTracks(sorted);
   _viewIsAllTracks = wasAllTracks;
   // A capped list sorted in the browser no longer matches the server's page
@@ -2422,7 +2887,11 @@ function setGroupHeader(label) {
   // with this view's own label + count once the data lands.
   if (groupFilterBar) { groupFilterBar.hidden = true; if (groupFilterInput) groupFilterInput.value = ''; }
   if (!trackTableHead) return;
-  trackTableHead.innerHTML = `<th colspan="12" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`;
+  // Same two cells as the group rows below (_makeGroupRow): the label sits right
+  // above the names and the count column has a fixed width, instead of one
+  // 12-column cell over rows that began with empty number + cover columns.
+  trackTableHead.innerHTML = `<th class="group-name" colspan="11" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`
+    + '<th class="group-count" aria-label="Count"></th>';
 }
 
 // Rebuild the full sortable track-table header (FULL_HEADERS + fresh sort
@@ -2532,10 +3001,15 @@ if (trackTableHead) {
 }
 
 // ── Column resize ──────────────────────────────────────────────────────────────
-function _initColResize() {
-  // Switch to auto layout so widths work correctly with resize
-  document.getElementById('track-table').style.tableLayout = 'auto';
+// True from a resize-handle mousedown until just after its mouseup, so the
+// click that ends a drag (it lands on the <th> when the pointer stays inside it)
+// doesn't also toggle that column's sort.
+let _colResizeSuppressClick = false;
 
+function _initColResize() {
+  // (The table stays ``table-layout: fixed`` — the header cells' widths, incl. a
+  // dragged px width, set the columns, and long cell text ellipsises instead of
+  // widening the table past the pane.  ``auto`` let one long artist stretch it.)
   const ths = trackTableHead.querySelectorAll('th');
   ths.forEach((th, idx) => {
     if (idx === ths.length - 1) return; // skip last col
@@ -2548,17 +3022,23 @@ function _initColResize() {
 
     let startX = 0, startW = 0;
     handle.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;          // primary button only
+      _colResizeSuppressClick = true;
       startX = e.clientX;
       startW = th.offsetWidth;
       e.preventDefault();
       e.stopPropagation();
       const onMove = (me) => {
+        // The mouseup was lost (window switch / dialog mid-drag): end the drag
+        // here instead of letting the column follow an unpressed pointer.
+        if (me.buttons === 0) { onUp(); return; }
         const newW = Math.max(40, startW + me.clientX - startX);
         th.style.width = newW + 'px';
       };
       const onUp = () => {
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
+        setTimeout(() => { _colResizeSuppressClick = false; }, 0);
         _saveColWidths();
       };
       document.addEventListener('mousemove', onMove);
@@ -2702,8 +3182,8 @@ async function showAll({ quiet = false } = {}) {
   // _restoreSortState inside restoreFullHeader) matches the data.  The small-
   // library path renders a plain unsorted array from /tracks; the windowed path
   // sorts server-side, and this is its ≤5000-track equivalent.  Any key works
-  // here (in-memory _compareTrack), unlike the windowed WINDOWED_SORT_KEYS set.
-  const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
+  // here (in-memory _sortRows), unlike the windowed WINDOWED_SORT_KEYS set.
+  const rows = sortKey ? _sortRows(tracks, sortKey, sortAsc) : tracks;
   renderTracks(rows, { keepScroll: quiet });
   _viewIsAllTracks = true;             // re-assert after renderTracks cleared it
   if (sortKey) _paintSortIndicator();  // small path applies ANY key in memory → arrow is honest
@@ -3182,7 +3662,7 @@ async function showFormatTracks(format, count = 0) {
   // consistently regardless of size.
   const tracks = await _viewData(_gen, API('/tracks', { format, limit: WINDOW_THRESHOLD }), () => showFormatTracks(format, count));
   if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  const rows = sortKey ? [...tracks].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc)) : tracks;
+  const rows = sortKey ? _sortRows(tracks, sortKey, sortAsc) : tracks;
   renderTracks(rows);
   if (sortKey) _paintSortIndicator();
   _setViewReload(`format\0${format}`, () => showFormatTracks(format, count));
@@ -3540,8 +4020,10 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
 
   // Show/hide the browse filter boxes (sidebar + content area)
   if (showFilter && items.length > 0) {
-    // Sidebar filter (legacy, keep for compatibility)
-    browseFilterWrap.hidden = false;
+    // Sidebar filter (legacy): stays HIDDEN — the content-area bar below is the
+    // one visible filter (it duplicated it, half-clipped in the sidebar).  The
+    // input is kept because the bar drives the filter through it (input event).
+    browseFilterWrap.hidden = true;
     browseFilter.value = '';
     // Content-area filter bar (more prominent)
     if (groupFilterBar) {
@@ -3596,12 +4078,12 @@ function _groupRowName(item, nameKey) { return item.label || item[nameKey] || '�
 function _makeGroupRow() {
   const tr = document.createElement('tr');
   tr.className = 'group-row';
+  // Own column classes (not col-title / col-dur): the track-column widths and the
+  // user's hide-col-* choices don't apply to a group list — hiding Duration used
+  // to blank the counts.  The header (setGroupHeader) has the same two cells.
   tr.innerHTML = `
-      <td class="col-num"></td>
-      <td class="col-cover"></td>
-      <td class="col-title" colspan="7"></td>
-      <td class="col-dur"></td>
-      <td class="col-rating"></td>`;
+      <td class="group-name" colspan="11"></td>
+      <td class="group-count"></td>`;
   return tr;
 }
 
@@ -3610,10 +4092,10 @@ function _fillGroupRow(tr, i) {
   const item = g && g.items[i];
   if (!item) return;
   tr.dataset.gidx = i;
-  const title = tr.cells[2];
+  const title = tr.cells[0];
   title.textContent = _groupRowName(item, g.nameKey);
   title.classList.toggle('group-untagged', !!item.label);   // "[No Artist]" etc.
-  tr.cells[3].textContent = _countText(item[g.countKey] || 0, g.countLabel);
+  tr.cells[1].textContent = _countText(item[g.countKey] || 0, g.countLabel);
 }
 
 const _groupVL = createVirtualList({
@@ -3829,6 +4311,7 @@ function setBrowseHeader(label, backFn, playable = true) {
   browseBack.onclick = hasBack ? backFn : null;
   browseBack.hidden = !hasBack;
   _hideExportBtn();
+  _hideBestMatchBtn();          // (the search view puts it back: _paintBestMatchBtn)
   _ensurePlayAllBtns();
   // Only track-list views are "playable"; group/grid drill-in crumbs are not.
   _playAllBtn.hidden = !playable;
@@ -4342,7 +4825,7 @@ async function showFolder(path, recursive = false, opts = {}) {
       const folderSorted = sortKey && trackTableHead &&
         trackTableHead.querySelector(`th[data-sort="${sortKey}"].sorted`);
       const rows = folderSorted
-        ? [...firstChunk].sort((a, b) => _compareTrack(a, b, sortKey, sortAsc))
+        ? _sortRows(firstChunk, sortKey, sortAsc)
         : firstChunk;
       if (opts.quiet && _sameTrackList(rows, currentTracks)) return;
       renderTracks(rows);
@@ -4890,16 +5373,20 @@ function patchTrack(id, fields) {
   });
 }
 
-// Which tracks can play changed (a drive / share went offline or came back, or
-// Settings → "Tracks on unavailable drives" changed): re-read the open view so
-// its rows carry the new marks.  A list whose length cannot change — every mode
-// but Hide lists the same rows — is re-read IN PLACE: a windowed list refetches
-// the chunks on screen (scroll kept), a folder / group / search / drill
-// reloads keeping its scroll; a smart list re-runs.  When Hide is (or was) on,
-// the lists and totals change, so a windowed list is rebuilt.
-function refreshAvailability({ mode, prevMode } = {}) {
-  const lengthsChange = mode === 'hide' || prevMode === 'hide';
-  if (mode === 'show' && prevMode === 'show') return;   // (nothing is flagged or left out)
+// Which tracks can play changed (a drive / share went offline or came back, a
+// track became one that can't be played or stopped being one, or Settings →
+// "Tracks on unavailable drives" / "Tracks that can't be played" changed):
+// re-read the open view so its rows carry the new marks.  A list whose length
+// cannot change — every mode but Hide lists the same rows — is re-read IN
+// PLACE: a windowed list refetches the chunks on screen (scroll kept), a
+// folder / group / search / drill reloads keeping its scroll; a smart list
+// re-runs.  When either Hide is (or was) on, the lists and totals change, so a
+// windowed list is rebuilt.
+function refreshAvailability({ mode, prevMode, unplayable, prevUnplayable } = {}) {
+  const unplayHide = unplayable === 'hide' || prevUnplayable === 'hide';
+  const lengthsChange = mode === 'hide' || prevMode === 'hide' || unplayHide;
+  // (nothing is flagged or left out)
+  if (mode === 'show' && prevMode === 'show' && !unplayHide) return;
   try {
     if (_currentBrowsePath != null) {
       // A folder lists every file whatever the mode (its length never changes),
@@ -4951,21 +5438,10 @@ export const Library = {
   patchTrackDuration, patchTrack, refreshAvailability,
   showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
   showGenres, showYears, showSceneGroups, showGalaxy, showFolder, renderTracks,
-  showSearchResults,
-  // Cross-view render-race token: an async caller in another module (search.js)
-  // captures it before its fetch and bails if a newer view superseded it, the
-  // same guard the in-file views use — so a search that resolves after the user
-  // clicked a nav facet no longer paints results over that facet.
-  beginView: () => {
-    // Search is leaving All Tracks / any folder: clear both flags synchronously
-    // (before the /api/search fetch) so a scan completing mid-search can't fire
-    // showAll()/refreshCurrentFolderInPlace() and clobber the pending results.
-    _viewIsAllTracks = false;
-    _currentBrowsePath = null;
-    _viewReload = null;
-    return ++_browseNavGen;
-  },
-  viewStillCurrent: (t) => t === _browseNavGen,
+  showSearch,
+  // The search results on screen: re-read in place (a scan finished, …).
+  isInSearchView: () => !!_searchCtx,
+  refreshSearchInPlace: () => _refreshSearchInPlace(),
   isInFolderView, currentFolderAffectedBy, refreshCurrentFolderInPlace, reloadCurrentView,
   isInAllTracksView: () => _viewIsAllTracks,
   refreshAllTracksInPlace,

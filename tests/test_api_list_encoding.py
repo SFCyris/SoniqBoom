@@ -145,6 +145,11 @@ def lib(tmp_path, monkeypatch):
     monkeypatch.setattr(smart, "_TOP_RATED_MEMO", {"seq": -1, "ranked": []})
     monkeypatch.setattr(library, "_AGG_CACHE", {})
     monkeypatch.setattr(library, "_AGG_ETAGS", {})
+    # No accounts (whatever user store an earlier test left): the play and
+    # history views read the no-user bucket the rows' plays went to.
+    from soniqboom.api import users as users_api
+    monkeypatch.setattr(users_api, "get_user_store", lambda: type(
+        "_NoAccounts", (), {"has_any": staticmethod(lambda: False)})())
 
     class Lib:
         store = s
@@ -153,10 +158,10 @@ def lib(tmp_path, monkeypatch):
             for i, r in enumerate(rows):
                 s.upsert_track(copy.deepcopy(r))
                 if i % 2 == 0:                    # half played: "unplayed" lists the rest
-                    s.record_play(r["id"])
+                    s.record_play(r["id"], uid="")
                 s.set_rating(r["id"], 1 + i % 5)
                 s.push_history({"track_id": r["id"], "title": r.get("title") or "",
-                                "artist": "", "ts": 1000})
+                                "artist": "", "ts": 1000}, uid="")
     lib = Lib()
     lib.root, lib.dir = root, d
     return lib
@@ -252,7 +257,7 @@ def _ref_app(monkeypatch) -> FastAPI:
     async def most_played(limit: int = Query(100, ge=1, le=500)):
         with monkeypatch.context() as m:
             m.setattr(smart, "_enrich_tracks", _old_enrich_tracks)
-            return await smart.most_played(limit=limit)
+            return await smart.most_played(limit=limit, uid="")   # (no accounts: no user)
 
     @ref.get("/api/smart/top-rated")
     async def top_rated(limit: int = Query(100, ge=1, le=500)):

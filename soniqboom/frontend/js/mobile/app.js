@@ -240,13 +240,16 @@ Player.on('trackchange', (t) => {
 // the new process doesn't answer at all yet — is waited out and played again
 // (Player.noteServerRestart), instead of being reported as a failure.  Also
 // read: rows of an online collection that left the library
-// (``catalogue_tracks_left`` → ``left``, see _tracksLeft).  The socket comes
+// (``catalogue_tracks_left`` → ``left``, see _tracksLeft), and which tracks
+// can play changed (``availability_changed`` → ``avail``: offline.js re-reads
+// the state, and the open view and the settings follow).  The socket comes
 // back after a pause that grows to 30 s (1 s after the server's own restart
 // close, 1012) and rests while the page is hidden.
 function _listenForRestart({ WS = globalThis.WebSocket, doc = globalThis.document,
                              loc = globalThis.location, wait = (fn, ms) => setTimeout(fn, ms),
                              note = () => Player.noteServerRestart(),
-                             left = (m) => _tracksLeft(m) } = {}) {
+                             left = (m) => _tracksLeft(m),
+                             avail = () => Offline.refresh() } = {}) {
   let backoff = 2000;
   const connect = () => {
     if (doc.visibilityState === 'hidden') { doc.addEventListener('visibilitychange', connect, { once: true }); return; }
@@ -257,6 +260,7 @@ function _listenForRestart({ WS = globalThis.WebSocket, doc = globalThis.documen
       try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m && m.event === 'server_restarting') { try { note(); } catch (_) { /* older player */ } }
       else if (m && m.event === 'catalogue_tracks_left') { try { left(m); } catch (_) { /* isolation */ } }
+      else if (m && m.event === 'availability_changed') { try { avail(m); } catch (_) { /* isolation */ } }
     };
     ws.onopen = () => { backoff = 2000; };
     ws.onclose = (ev) => {
@@ -426,6 +430,7 @@ while (!Auth.user) {
 activate(initialView());
 renderMini(Player.currentTrack);
 _listenForRestart();
-// Follow "Tracks on unavailable drives" (marks, auto-play skipping); the views
-// re-read their lists on 'soniqboom:availability-changed'.
+// Follow "Tracks on unavailable drives" and "Tracks that can't be played"
+// (marks, hidden rows, auto-play skipping); the views re-read their lists on
+// 'soniqboom:availability-changed' (the socket's availability_changed asks).
 Offline.init();

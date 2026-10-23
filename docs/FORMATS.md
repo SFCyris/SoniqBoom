@@ -14,11 +14,12 @@ picker, the meters each format gets, and the engines an install has.
 |---|---|---|---|
 | **SID** (`.sid`, `.psid`, `.rsid`) | Commodore 64, 1982 — named for its sound chip, the MOS 6581/8580 *Sound Interface Device* | The most collected chiptune format on Earth: the High Voltage SID Collection (HVSC) curates 50,000+ tunes | Three voices + one filter, yet composers like Rob Hubbard, Martin Galway and Chris Hülsbeck coaxed whole orchestras out of it. The 6581 vs 8580 chip revisions sound audibly different — endless scene debate. RSID variants are recognised by content. Rendered by **sidplayfp**; a tune written for two or three SID chips plays in mono, and Track Info shows the chip model a tune names. |
 
-Point gear → **Renderers → HVSC SID database** at HVSC's `DOCUMENTS` folder
-and press **Save & reload**. Every SID HVSC knows then gets its Songlengths
-length, matched by checksum wherever the file is, and the tunes inside that
-HVSC copy also get their STIL commentary. When no folder is set, a scan of an
-HVSC copy finds it by itself; to turn that off, set `"hvsc_autodetect": false`
+Under gear → **Renderers → HVSC SID database**, choose **Download from the
+internet** (the 6581.nl HVSC mirror, checked weekly) or **Local DOCUMENTS
+folder** with HVSC's `DOCUMENTS` folder, and press **Save & reload**. Every SID
+HVSC knows then gets its Songlengths length, matched by checksum wherever the
+file is, and its STIL commentary. With **Local DOCUMENTS folder** and no folder
+set, a scan of an HVSC copy finds it by itself; to turn that off, set `"hvsc_autodetect": false`
 in the `renderers` section of SoniqBoom.conf and restart. After updating the
 HVSC copy, **Re-extract SID metadata** in the same place (or **Metadata →
 HVSC (SID) → Rescan SID lengths**) applies it to the SIDs already in the

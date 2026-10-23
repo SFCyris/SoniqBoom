@@ -56,6 +56,36 @@ The duplicate swap is built once per snapshot and track write, from the
 unplayable ids or the duplicate groups (whichever are fewer).
 A root whose ``status`` flips calls the store's ``_on_scan_dirs_changed`` hook
 → ``notify_changed`` → the web clients get an ``availability_changed`` event.
+
+**Tracks that can't be played** — the sibling setting (store config
+``unplayable_tracks``, server-wide too): the tracks ``skip_rules.cant_play``
+names — reported broken by a listener (``health == "broken"``), undecodable
+(``defect == "corrupt"``) and refused twice by their renderer (``defect ==
+"unplayable"``, ``core/unplayable.py``).  Glitched and partial tracks play
+and are never among them; an empty package ("no tunes") has left the lists
+already.
+
+* ``mark`` (default) — listed with their badge (the row's ``health`` /
+  ``defect`` fields; health.js).  Auto-play passes them by (``skip_rules``).
+* ``hide`` — the same lists, counts and searches as offline Hide leave them
+  out (``hidden``: one id set, the union of both), with the same exceptions:
+  playlists, the queue, the duplicates view and folder views list them,
+  marked.  With "Hide duplicates" on, a group whose primary can't be played
+  is listed by its best member that can (``primary_swap``, as for offline).
+
+There is no ``show``: a defect is the file's, and the badge that says so is
+also what tells the listener why auto-play passes the track by.
+
+The ids are the store's maintained ``TrackStore._cant_play_ids`` (kept on
+every write: upsert, delete, field update, rebuild, index swap).  Their
+fields are browse-exempt — a mark moves no ``_browse_seq`` — so what keys on
+them is a content version (``cant_play_ids``): the set is frozen once per
+change of the store's ``_cant_play_gen`` and gets a new version only when its
+ids differ, so a re-upsert that keeps the ids keeps every memo keyed on it.
+While Hide is on, ``hidden`` / ``hide_token`` / ``swap_token`` / ``token``
+follow that version (the list memos key on the hidden set's identity, the
+HTTP aggregate cache and ``lib_gen`` on the tokens) and a change is
+announced like a root's (``notify_changed`` → ``availability_changed``).
 """
 from __future__ import annotations
 
@@ -71,6 +101,10 @@ log = logging.getLogger(__name__)
 MODE_KEY = "offline_tracks"
 MODES = ("mark", "hide", "show")
 DEFAULT_MODE = "mark"
+
+# Settings → "Tracks that can't be played" (``skip_rules.cant_play``).
+UNPLAY_KEY = "unplayable_tracks"
+UNPLAY_MODES = ("mark", "hide")
 
 KIND_DRIVE = "drive"
 KIND_SHARE = "share"
@@ -99,6 +133,87 @@ def mode(store=None) -> str:
         return normalize_mode(store.get_config(MODE_KEY, DEFAULT_MODE))
     except Exception:                                   # noqa: BLE001
         return DEFAULT_MODE
+
+
+def normalize_unplay_mode(value: Any) -> str:
+    v = str(value or "").strip().lower()
+    return v if v in UNPLAY_MODES else DEFAULT_MODE
+
+
+def unplay_mode(store=None) -> str:
+    """The setting "Tracks that can't be played": ``mark`` / ``hide``."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    try:
+        return normalize_unplay_mode(store.get_config(UNPLAY_KEY, DEFAULT_MODE))
+    except Exception:                                   # noqa: BLE001
+        return DEFAULT_MODE
+
+
+# ``cant_play_ids`` memo: the store, its ``_cant_play_gen``, the frozen ids and
+# their content version (moves only when the ids differ).
+_cp_lock = threading.Lock()
+_cp_memo: dict[str, Any] = {"store": None, "gen": None, "ids": frozenset(), "ver": 0}
+
+
+def cant_play_ids(store=None) -> tuple[frozenset, int]:
+    """``(ids, version)``: the tracks that can't be played
+    (``TrackStore._cant_play_ids``), frozen — the same object, and the same
+    version, until the ids themselves change.  O(1) while the store's
+    ``_cant_play_gen`` stays put; else one copy of the set (it holds only
+    the tracks that can't be played)."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    try:
+        gen, live = store.cant_play_ids()
+    except Exception:                                   # noqa: BLE001 — a stand-in store
+        return _EMPTY_OK, 0
+    m = _cp_memo
+    with _cp_lock:
+        if m["store"] is store and m["gen"] == gen:
+            return m["ids"], m["ver"]
+    # (one C-level copy under the GIL; ``gen`` was read first, so a write
+    # meanwhile leaves the memo at the older counter: the next call copies again)
+    ids = frozenset(live)
+    with _cp_lock:
+        if m["store"] is store and m["gen"] is not None and m["gen"] > gen:
+            return m["ids"], m["ver"]   # (another reader froze a newer state meanwhile)
+        if m["store"] is store and m["ids"] == ids:
+            m["gen"] = gen              # the same ids: the same object and version
+        else:
+            m.update(store=store, gen=gen, ids=ids if ids else _EMPTY_OK, ver=m["ver"] + 1)
+        return m["ids"], m["ver"]
+
+
+def _hidden_cant_play(store) -> tuple[frozenset | None, int | None]:
+    """The tracks that can't be played while "Tracks that can't be played:
+    Hide" leaves them out, and their version — ``(None, None)`` otherwise
+    (or while there are none)."""
+    if unplay_mode(store) != "hide":
+        return None, None
+    ids, ver = cant_play_ids(store)
+    return (ids, ver) if ids else (None, None)
+
+
+# One union per pair of sets (compared by identity: both are frozen and stay
+# the same objects until they change) — what ``hidden`` and the swap hand the
+# store, whose memos key on the object.
+_UNION_KEEP: dict[str, tuple] = {}
+
+
+def _union(slot: str, a: frozenset | None, b: frozenset | None) -> frozenset | None:
+    if not a:
+        return b or None
+    if not b:
+        return a
+    hit = _UNION_KEEP.get(slot)
+    if hit is not None and hit[0] is a and hit[1] is b:
+        return hit[2]
+    both = a | b
+    _UNION_KEEP[slot] = (a, b, both)
+    return both
 
 
 def _root_kind(path: str) -> str:
@@ -359,10 +474,20 @@ _BOOT = uuid.uuid4().hex[:8]
 
 def token(store=None) -> str:
     """What a web client compares to know its rows are stale: the setting,
-    the snapshot generation (of this server process) and the "Skip short
-    tunes" setting (``core/skip_rules``)."""
+    the snapshot generation (of this server process), the "Skip short
+    tunes" setting (``core/skip_rules``) and "Tracks that can't be played"
+    (with Hide on, the version of the ids it leaves out)."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    return _token(store, mode(store), snapshot(store))
+
+
+def _token(store, m: str, snap: "Snapshot") -> str:
     from soniqboom.core import skip_rules
-    return f"{mode(store)}:{_BOOT}:{snapshot(store).seq}:{skip_rules.token_part(store)}"
+    um = unplay_mode(store)
+    cp = f"h{cant_play_ids(store)[1]}" if um == "hide" else "m"
+    return f"{m}:{_BOOT}:{snap.seq}:{skip_rules.token_part(store)}:{cp}"
 
 
 # ── What the list endpoints use ──────────────────────────────────────────────
@@ -378,12 +503,14 @@ def _touch() -> None:
 
 def hidden(store=None) -> frozenset | None:
     """The ids a searched / listed result leaves out: the tracks that can't
-    play right now in ``hide`` mode, else None."""
+    play right now in ``hide`` mode, and the tracks that can't be played with
+    "Tracks that can't be played: Hide" (one set — the same object until
+    either part changes); None when nothing is left out."""
     _touch()
-    if mode(store) != "hide":
-        return None
-    u = snapshot(store).unavailable
-    return u or None
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    return _listed_hidden(store)
 
 
 def unplayable(store=None) -> frozenset | None:
@@ -413,18 +540,31 @@ _UNION_MEMO: dict = {}
 
 
 def hide_token(store=None):
-    """Part of every cache key of a list / count / aggregate that ``hide``
-    mode changes: the snapshot generation while tracks are hidden, else None."""
-    if mode(store) != "hide":
-        return None
-    snap = snapshot(store)
-    return snap.seq if snap and snap.unavailable else None
+    """Part of every cache key of a list / count / aggregate that a Hide
+    setting changes: the snapshot generation while offline tracks are
+    hidden, the version of the hidden tracks that can't be played while
+    those are (both: a pair), else None."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    off = None
+    if mode(store) == "hide":
+        snap = snapshot(store)
+        off = snap.seq if snap and snap.unavailable else None
+    _cp, ver = _hidden_cant_play(store)
+    if ver is None:
+        return off
+    return ("u", ver) if off is None else (off, ver)
 
 
 def primary_swap(store=None, dedup: bool | None = None):
     """The duplicate groups a deduped list shows by another member while
     their primary can't play (a ``store.PrimarySwap`` —
-    ``TrackStore.primary_swap``), in ``mark`` / ``hide`` mode; else None.
+    ``TrackStore.primary_swap``): the tracks that can't play right now in
+    offline ``mark`` / ``hide`` mode and, with "Tracks that can't be played:
+    Hide", the tracks that can't be played (``_swap_set``); a group none of
+    whose members plays is listed by a member the list shows when its
+    primary is hidden (``hidden``).  None when no group is swapped.
     ``dedup``: whether the caller's list hides duplicate copies — None reads
     the web lists' "Hide duplicates" setting (``filter_duplicates``)."""
     if store is None:
@@ -435,19 +575,59 @@ def primary_swap(store=None, dedup: bool | None = None):
             dedup = bool(store.get_config("filter_duplicates", False))
         except Exception:                               # noqa: BLE001
             dedup = False
-    if not dedup or mode(store) == "show":
+    if not dedup:
         return None
-    u = snapshot(store).unavailable
-    return store.primary_swap(u) if u else None
+    u = _swap_set(store)
+    if not u:
+        return None
+    return store.primary_swap(u, _listed_hidden(store))
+
+
+def _listed_hidden(store) -> frozenset | None:
+    """``hidden`` without its side effect (the probe-interest stamp)."""
+    off = snapshot(store).unavailable if mode(store) == "hide" else None
+    cp, _ver = _hidden_cant_play(store)
+    return _union("hidden", off, cp)
+
+
+def _swap_set(store) -> frozenset | None:
+    """What the duplicate swap stands in for: the tracks that can't play
+    right now (Mark / Hide) and — with "Tracks that can't be played: Hide" —
+    the tracks that can't be played."""
+    off = snapshot(store).unavailable if mode(store) != "show" else None
+    cp, _ver = _hidden_cant_play(store)
+    return _union("swap", off, cp)
 
 
 def swap_token(store=None):
     """Part of every cache key of a deduped count / aggregate that the swap
-    changes (``primary_swap``; Mark mode too, where ``hide_token`` is None):
-    the snapshot generation while a swap applies, else None."""
+    changes (``primary_swap``; offline Mark mode too, where ``hide_token`` is
+    None), else None while no swap applies.  It names each set the swap was
+    built from (``_swap_set``): the snapshot generation while the offline
+    tracks count, the version of the tracks that can't be played while those
+    do — so offline Mark and Show, which hand the swap different sets, never
+    share a key."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
     if primary_swap(store) is None:
         return None
-    return snapshot(store).seq
+    snap = snapshot(store)
+    off = snap.seq if mode(store) != "show" and snap.unavailable else None
+    _cp, ver = _hidden_cant_play(store)
+    return off if ver is None else (off, ver)
+
+
+def offline_marker(store=None) -> Callable[[dict], str | None] | None:
+    """What :func:`mark_rows` flags a row with, as a function (a track dict →
+    its ``offline`` kind or None) — None when it flags nothing: ``show`` mode,
+    or every root reachable.  For a caller that builds its rows itself
+    (``core/search_sets.rows``)."""
+    _touch()
+    if mode(store) == "show":
+        return None
+    snap = snapshot(store)
+    return snap.kind_of if snap.dead else None
 
 
 def mark_rows(rows, store=None, snap: Snapshot | None = None) -> list:
@@ -627,7 +807,9 @@ def state(store=None) -> dict:
         snap._roots = roots
     roots = [dict(r) for r in roots]
     from soniqboom.core import skip_rules
-    return {"mode": m, "token": f"{m}:{_BOOT}:{snap.seq}:{skip_rules.token_part(store)}",
+    return {"mode": m, "token": _token(store, m, snap),
+            "unplayable_mode": unplay_mode(store),
+            "cant_play": len(cant_play_ids(store)[0]),
             "seq": snap.seq, "skip_short_tunes": skip_rules.short_secs(store),
             "marks": skip_rules.marks_gen(),
             "tune_placeholders": skip_rules.placeholder_seconds(),
@@ -694,6 +876,13 @@ async def _broadcast_if_changed(force: bool = False) -> None:
         return
     if not force and t == _last_sent:
         return
+    if (not force and _last_sent is not None and getattr(store, "_batch_mode", False)
+            and t.rsplit(":", 1)[0] == _last_sent.rsplit(":", 1)[0]):
+        # Only the tracks that can't be played moved, during a scan (batch
+        # mode: it may find many): told once the batch is over (the watcher's
+        # next round), not after every commit.  The scan's end frame moves
+        # ``lib_gen`` as well.
+        return
     first = _last_sent is None
     _last_sent = t
     if first and not force:
@@ -744,11 +933,30 @@ def _in_use() -> bool:
         return True
 
 
+def _on_cant_play_changed() -> None:
+    """The store's tracks that can't be played changed (a mark, a defect
+    found or cleared, a rescan): with Hide on, the lists change — tell the
+    web clients once things have settled (``notify_changed``; nothing is
+    sent when the ids came out the same, the token compares them)."""
+    loop = _loop
+    if loop is None:
+        return
+    try:
+        from soniqboom.core.store import get_store
+        if unplay_mode(get_store()) != "hide":
+            return
+    except Exception:                                   # noqa: BLE001
+        return
+    notify_changed()
+
+
 def install(store, loop: asyncio.AbstractEventLoop | None = None) -> None:
-    """Hook the store's scan-dir changes and start the watcher (main startup)."""
+    """Hook the store's scan-dir changes and its tracks that can't be played,
+    and start the watcher (main startup)."""
     global _loop, _watch_task, _last_sent
     _loop = loop or asyncio.get_running_loop()
     store._on_scan_dirs_changed = notify_changed
+    store._on_cant_play_changed = _on_cant_play_changed
     try:
         _last_sent = token(store)
     except Exception:                                   # noqa: BLE001
@@ -775,4 +983,7 @@ def reset_for_tests() -> None:
         _memo.update(store=None, sig=None, snap=None)
         _members_memo.clear()
         _members_jobs.clear()
+    with _cp_lock:
+        _cp_memo.update(store=None, gen=None, ids=frozenset())
+    _UNION_KEEP.clear()
     _last_sent = None

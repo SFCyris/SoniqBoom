@@ -30,7 +30,7 @@ async def test_a_tune_hvsc_moved_keeps_its_rating_plays_and_playlist_entry(env):
     old_id = cat.track_id(old_rel)
     added = store.get_track(old_id)["added_at"]
     store.set_rating(old_id, 5)
-    store.record_play(old_id)
+    store.record_play(old_id, uid="")
     pl = store.create_playlist("qa-pl", "QA", [old_id])
     time.sleep(1.1)
     docs = env["web"] / "C64Music" / "DOCUMENTS"
@@ -47,7 +47,7 @@ async def test_a_tune_hvsc_moved_keeps_its_rating_plays_and_playlist_entry(env):
     new_id = cat.track_id(new_rel)
     assert store.get_track(old_id) is None and store.get_track(new_id) is not None, st
     assert store.get_rating(new_id) == 5
-    assert (store._play_stats.get(new_id) or {}).get("count") == 1
+    assert store.get_play_stats(new_id, uid="").get("count") == 1
     ids = store.get_playlist(pl["id"])["track_ids"]
     assert ids in ([new_id], [{"id": new_id}]), ids
     assert store.get_track(new_id)["added_at"] == added        # not "Recently added"

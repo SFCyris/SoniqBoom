@@ -2181,6 +2181,16 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
 # A player's / editor's stand-in for a missing song name — uade's MED player
 # reports "<no songtitle>", OctaMED stores "<unnamed>" — is no title.
 _PLACEHOLDER_TITLE_RE = re.compile(r"^<[a-z ]+>$")
+# The stand-ins a module's own header may hold as its song name (The Mod
+# Archive's MOD / XM uploads: "<unnamed>"), in any case — a tracker title is
+# read as none only when it is one of these.
+PLACEHOLDER_TITLES = frozenset({"<unnamed>", "<no songtitle>", "<untitled>", "<no name>"})
+
+
+def is_placeholder_title(title) -> bool:
+    """Is ``title`` one of ``PLACEHOLDER_TITLES`` (case and surrounding
+    blanks ignored)?"""
+    return isinstance(title, str) and title.strip().lower() in PLACEHOLDER_TITLES
 
 # Tracker formats (of the ones without a parser of their own) whose title is
 # the first bytes of the file: Scream Tracker 2, Grave's MOD, Imago Orpheus.
@@ -2436,6 +2446,10 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
 
     except Exception as exc:
         log.debug("Tracker header parse failed for %s: %s", path, exc)
+    # A stand-in stored as the song name ("<unnamed>", as The Mod Archive's
+    # MOD / XM uploads carry it) is no title: the file name is used instead.
+    if is_placeholder_title(title):
+        title = ""
 
     # Duration: in a scan worker, libopenmpt in-process
     # (``openmpt_vu.module_duration`` — the value ``openmpt123 --info``

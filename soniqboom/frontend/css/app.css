@@ -620,6 +620,11 @@ body::before {
   background: rgba(255,255,255,0.09);
 }
 #search-input::placeholder { color: var(--text2); }
+/* The field has its own clear button (#search-clear) — hide the browser's native
+   search-cancel ×, which painted a second × beside it.  (#browse-filter /
+   #group-filter-input have no custom clear, so they keep the native one.) */
+#search-input { -webkit-appearance: none; appearance: none; }
+#search-input::-webkit-search-cancel-button { -webkit-appearance: none; display: none; }
 
 .search-clear {
   position: absolute;
@@ -645,13 +650,25 @@ body::before {
   margin-left: auto;
 }
 
+/* One 28 px height for every header button — the search field's height — with
+   the glyph centred (they were 24–32 px: emoji vs text line boxes differ).
+   Direct children only: the user chip's inline sign-out button keeps its size. */
+.header-actions > button,
+.header-actions > a.header-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  box-sizing: border-box;
+  line-height: 1;
+}
 .header-actions button,
 .header-actions a.header-link {
   background: rgba(255,255,255,0.07);
   border: 1px solid var(--glass-border);
   border-radius: 6px;
   color: var(--text1);
-  padding: 5px 12px;
+  padding: 0 12px;
   cursor: pointer;
   font-size: 12px;
   transition: background 0.12s, color 0.12s;
@@ -671,16 +688,11 @@ body::before {
    as a deliberate icon alongside its emoji siblings. */
 .btn-help { font-weight: 700; }
 
-/* Admin gear button */
-#btn-admin {
-  background: none !important;
-  border: none !important;
-  padding: 4px 6px !important;
-  font-size: 17px !important;
-  color: var(--text2) !important;
-  line-height: 1;
-}
-#btn-admin:hover { color: var(--text0) !important; transform: rotate(30deg); transition: transform 0.3s, color 0.15s; }
+/* Admin gear button — boxed like its header siblings (it was the one bare
+   glyph in the row); the hover turn moves to the glyph so the box stays put. */
+#btn-admin { padding: 0 9px; font-size: 15px; }
+#btn-admin .btn-admin-gear { display: inline-block; transition: transform 0.3s; }
+#btn-admin:hover .btn-admin-gear { transform: rotate(30deg); }
 
 .scan-badge {
   font-size: 11px;
@@ -701,12 +713,11 @@ body::before {
 #sidebar #section-library  { min-height: 40px; overflow-y: auto; flex: 0 1 auto; }
 /* Folders and Playlists (`flex: 1`, basis 0) only get the space the other
    sections leave, so their min-height is all they keep in a short sidebar.
-   55 px = 12 px padding + the header (26–28 px, by the engine's font
-   metrics) + ~15 px of body: the first row's chevron centre is on screen
-   (clickable) and the rest scrolls.  At 40 px the header alone filled it (Firefox, with its
-   taller text, got a 5.5 px tree body at 900 px tall; every engine 0–2 px
-   at 800).  Where a section's share is already larger this changes nothing. */
-#sidebar #section-folders  { min-height: 55px; display: flex; flex-direction: column; flex: 1; }
+   66 px = 12 px padding + the header (26–28 px, by the engine's font
+   metrics) + one whole 26 px tree row; the rest scrolls.  (55 px showed only
+   ~16 px of the first row at 1440×900; 40 px, the header alone.)  Where a
+   section's share is already larger this changes nothing. */
+#sidebar #section-folders  { min-height: 66px; display: flex; flex-direction: column; flex: 1; }
 #sidebar #section-smart    { min-height: 40px; overflow-y: auto; flex: 0 1 auto; }
 
 #sidebar h3 {
@@ -739,10 +750,13 @@ body::before {
 #nav-library li {
   display: flex;
   align-items: center;
-  padding: 6px 14px;
+  padding: 5px 14px;   /* + the 1 px border below = the old 27 px row */
   cursor: pointer;
   color: var(--text1);
   border-radius: 5px;
+  /* Transparent border: the active item's 1 px border no longer makes it
+     2 px taller than the others (29 vs 27 px); the padding gave up that 1 px. */
+  border: 1px solid transparent;
   margin: 1px 6px;
   transition: background 0.1s, color 0.1s;
   font-size: 12.5px;
@@ -928,7 +942,8 @@ body::before {
    the generic `#sidebar section` rule (0,1,1) on the `flex` property. */
 #sidebar #section-playlists {
   flex: 1;
-  min-height: 55px;     /* header + ~15 px of list — see #section-folders */
+  min-height: 70px;     /* header + one whole row (the 29 px "No playlists yet"
+                           line; a playlist row is 25) — see #section-folders */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1063,6 +1078,29 @@ body::before {
   transition: background 0.12s;
 }
 .btn-export-csv:hover { background: rgba(107,200,240,0.22); }
+/* Search view: "Best match" — lit (aria-pressed) while the list is in the
+   search's own order; a click puts that order back after a column sort. */
+.btn-best-match {
+  background: rgba(107,200,240,0.06);
+  border: 1px solid rgba(107,200,240,0.22);
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11.5px;
+  padding: 4px 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-height: 24px;               /* WCAG 2.5.8 target size */
+  transition: background 0.12s;
+}
+.btn-best-match[hidden] { display: none; }
+.btn-best-match:hover { background: rgba(107,200,240,0.18); }
+.btn-best-match.active {
+  background: rgba(107,200,240,0.22);
+  border-color: rgba(107,200,240,0.6);
+  font-weight: 600;
+  cursor: default;
+}
 #browse-back:hover { text-decoration: underline; }
 /* Play all / Shuffle all — lead the browse header on track-list views. */
 .browse-play-btn {
@@ -1131,6 +1169,10 @@ body::before {
 
 #track-table {
   width: 100%;
+  /* Fixed layout fits the pane; the floor keeps Album Artist / Artist / Album
+     ≥ ~60 px in a narrow pane (≈1024 px window) — scroll sideways there rather
+     than crush them to 30 px.  (The ≤900 px stacked rows drop it.) */
+  min-width: 900px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -1173,6 +1215,18 @@ body::before {
   overflow: hidden;
   user-select: none;
 }
+/* Column-resize grip (library.js _initColResize) — a full-height strip on the
+   header cell's right edge; out of flow so it can't push the sort arrow onto a
+   second line or grow the header row.  (The <th> gets position:relative inline.) */
+#track-table th .col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+}
+#track-table th .col-resize-handle:hover { background: var(--glass-border); }
 #track-table th[data-sort] { cursor: pointer; }
 #track-table th[data-sort]:hover { color: var(--text1); }
 #track-table th.sorted { color: var(--accent); }
@@ -1194,7 +1248,7 @@ body::before {
   color: var(--accent);
 }
 
-.col-num          { width: 36px; }
+.col-num          { width: 44px; }   /* fixed layout: holds "1000" / the ▶ marker without clipping */
 .col-cover        { width: 36px; padding: 2px 4px; }
 /* The cover frame is a fixed 28×28 inline-block holding a format-emoji
    placeholder and the actual cover <img> as absolutely-positioned
@@ -1241,14 +1295,21 @@ body::before {
   transition: opacity 120ms ease;
 }
 .col-cover .row-cover-img.loaded { opacity: 1; }
+/* Fixed table layout: the fixed-px columns (+ .col-rating) take their widths,
+   Title takes 22 %, and Album Artist / Artist / Album (and Location, when shown)
+   share what is left equally — so the table always fits the pane and Title is
+   the same width in every flat-track view.  (Percentages on all four used to sum
+   past the pane with the px columns.) */
 .col-title        { width: 22%; }
-.col-album-artist { width: 16%; }
-.col-artist       { width: 16%; }
-.col-album        { width: 18%; }
-.col-track        { width: 54px; text-align: center; font-variant-numeric: tabular-nums; }
-.col-year         { width: 48px; }
-.col-dur          { width: 60px; text-align: right; }
-.col-format       { width: 96px; text-align: left; color: var(--text2); font-size: 11px; }
+.col-album-artist { width: auto; }
+.col-artist       { width: auto; }
+.col-album        { width: auto; }
+.col-track        { width: 70px; text-align: center; font-variant-numeric: tabular-nums; }
+.col-year         { width: 60px; }
+.col-dur          { width: 92px; text-align: right; }
+.col-format       { width: 104px; text-align: left; color: var(--text2); font-size: 11px; }
+/* (Track / Year / Duration are sized to their header label + sort arrow — with
+   the fixed layout a narrower column clipped "DURATIO", "19…".) */
 .col-location     { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text2); }
 
 #track-table tbody tr {
@@ -1299,6 +1360,8 @@ body::before {
 #track-table td.col-title { color: var(--text0); font-weight: 500; }
 #track-table td.col-dur { text-align: right; color: var(--text2); font-variant-numeric: tabular-nums; }
 #track-table td.col-num { color: var(--text2); }
+#track-table th.col-num,
+#track-table td.col-num { padding-left: 6px; padding-right: 4px; }   /* 34 px of text in the 44 px column: "9999" fits */
 
 /* Playing-row marker is the single most important state indicator in the
    track table — 8px disappeared on Retina (UX/UI #2). 11px stays inline
@@ -1368,9 +1431,13 @@ tr.skeleton td { pointer-events: none; }
 .vs-retry:hover { background: var(--accent-glow); }
 
 /* Group rows (Artists / Albums / … as a list). */
-#track-table tbody tr.group-row td.col-title { font-weight: 500; }
-#track-table tbody tr.group-row td.col-title.group-untagged { font-style: italic; color: var(--text2); }
-#track-table tbody tr.group-row td.col-dur { color: var(--text2); }
+/* Group lists (Artists / Albums / …): name + count, the header cells match. */
+#track-table:has(thead .group-name) { min-width: 0; }   /* (two columns: no floor needed) */
+#track-table .group-name  { width: auto; }
+#track-table .group-count { width: 120px; text-align: right; font-variant-numeric: tabular-nums; }
+#track-table tbody tr.group-row td.group-name { color: var(--text0); font-weight: 500; }
+#track-table tbody tr.group-row td.group-name.group-untagged { font-style: italic; color: var(--text2); }
+#track-table tbody tr.group-row td.group-count { color: var(--text2); }
 .skel-bar {
   display: inline-block;
   height: 10px;
@@ -1784,14 +1851,16 @@ a.crumb-link:hover { color: var(--accent); }
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 24px;
+  gap: 34px;
   position: relative;
   z-index: 1;
-  /* TODO: refactor to flex centring — the 34px nudge accounts for the
+  /* TODO: refactor to flex centring — the 24px nudge accounts for the
      time-stamp row pushing the seek bar visually downward.  Full fix is a
      row+spacer flex layout but that wants visual testing.  Tracked under
-     UX/UI #2 #13. */
-  margin-bottom: 34px;
+     UX/UI #2 #13.  (The 34px gap sets the waveform 10px lower than the
+     controls' old spacing; the nudge shrank by the same 10px, so the
+     controls keep their place.) */
+  margin-bottom: 24px;
 }
 /* ── Now Playing large art ─────────────────────────────────────────────── */
 .now-playing-art {
@@ -2151,7 +2220,14 @@ input[type="range"]:hover::-moz-range-thumb {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 12px;
+  /* Line the two rows up with the centre column's: the 36 px icon row with the
+     transport pill and the volume row with the waveform.  The rows are 36 + 21
+     px, so a 33 px gap puts their centres 61.5 px apart (transport → waveform),
+     and the 16 px bottom margin lifts the centred column by 8 px — the same kind
+     of nudge as .player-center's margin-bottom.  (Was gap 12 / no margin: the
+     icon row centred 19 px below the transport.) */
+  gap: 33px;
+  margin-bottom: 16px;
   flex-shrink: 0;
   /* Mirror .player-art-info's sizing (width:32%, max 420px) so the two flanks
      are SYMMETRIC and the flex:1 .player-center is truly centred in the bar.
@@ -2177,7 +2253,10 @@ input[type="range"]:hover::-moz-range-thumb {
   color: #6bc8f0;
   cursor: pointer;
   font-size: 17px;
-  padding: 7px 9px;
+  /* One 36 px box for every icon button (glyph metrics made them 28–41 px). */
+  height: 36px;
+  box-sizing: border-box;
+  padding: 0 9px;
   border-radius: 8px;
   transition: color 0.15s, text-shadow 0.15s, background 0.12s;
   white-space: nowrap;
@@ -2201,7 +2280,7 @@ input[type="range"]:hover::-moz-range-thumb {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  padding: 6px 10px;
+  padding: 0 10px;
   border-radius: 7px;
   border: 1px solid rgba(255,255,255,0.13);
 }
@@ -2302,7 +2381,12 @@ input[type="range"]:hover::-moz-range-thumb {
   flex: 1;
   letter-spacing: -0.2px;
 }
-#eq-preset {
+/* The preset select, Reset and × share one 28 px row height (they were 28 / 26 /
+   29); the footer's Volume-leveling select (#eq-rg) wears the same styling as
+   the preset select instead of the bare OS control. */
+#eq-preset, #eq-rg {
+  height: 28px;
+  box-sizing: border-box;
   background: rgba(255,255,255,0.07);
   border: 1px solid var(--glass-border);
   border-radius: 7px;
@@ -2312,8 +2396,10 @@ input[type="range"]:hover::-moz-range-thumb {
   cursor: pointer;
   outline: none;
 }
-#eq-preset:focus { border-color: var(--accent); }
+#eq-preset:focus, #eq-rg:focus { border-color: var(--accent); }
 #eq-reset, #eq-close {
+  height: 28px;
+  box-sizing: border-box;
   background: rgba(255,255,255,0.07);
   border: 1px solid var(--glass-border);
   border-radius: 7px;
@@ -2323,7 +2409,7 @@ input[type="range"]:hover::-moz-range-thumb {
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
 }
-#eq-close { font-size: 18px; padding: 3px 10px; }
+#eq-close { font-size: 18px; padding: 0; }   /* 28×28 — see "Close (×) buttons" */
 #eq-reset:hover, #eq-close:hover { background: rgba(255,255,255,0.14); color: var(--text0); }
 
 /* Body */
@@ -3096,7 +3182,8 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
   flex-wrap: wrap;
 }
 .admin-io-row button,
-.admin-io-row a.btn-secondary {
+.admin-io-row a.btn-secondary,
+.admin-log-toolbar button {
   background: rgba(255,255,255,0.06);
   border: 1px solid var(--glass-border);
   border-radius: 8px;
@@ -3107,7 +3194,8 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
   transition: background 0.12s;
 }
 .admin-io-row button:hover,
-.admin-io-row a.btn-secondary:hover { background: rgba(255,255,255,0.12); color: var(--text0); }
+.admin-io-row a.btn-secondary:hover,
+.admin-log-toolbar button:hover { background: rgba(255,255,255,0.12); color: var(--text0); }
 
 /* Reindex button */
 .btn-reindex {
@@ -4622,6 +4710,12 @@ tr.dragging { opacity: 0.4; }
   font-weight: 600;
   color: var(--text0);
   flex: 1;
+  /* One line, ellipsised: a long open-playlist name used to wrap to 4 lines in
+     its ~105 px slot and nearly double the header's height. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #btn-playlist-new {
   background: rgba(240,114,42,0.12);
@@ -4634,6 +4728,51 @@ tr.dragging { opacity: 0.4; }
   transition: background 0.12s;
 }
 #btn-playlist-new:hover { background: rgba(240,114,42,0.22); }
+#btn-playlist-import, .pl-share-btn, .pl-unsub-btn {
+  background: none;
+  border: 1px solid var(--border, rgba(255,255,255,0.14));
+  border-radius: 6px;
+  color: var(--text1);
+  font-size: 11px;
+  padding: 3px 9px;
+  margin-right: 6px;
+  cursor: pointer;
+}
+#btn-playlist-import:hover, .pl-share-btn:hover, .pl-unsub-btn:hover { color: var(--text0); }
+.pl-share-btn.active { color: var(--accent); border-color: rgba(240,114,42,0.45); }
+/* A shared playlist: the owner's "Shared", an imported one's "by <owner>". */
+.pl-shared-badge {
+  display: inline-block;
+  font-size: 9px;
+  line-height: 14px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 7px;
+  color: var(--accent);
+  border: 1px solid rgba(240,114,42,0.35);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.pl-shared-badge.pl-by { color: var(--text2); border-color: var(--border, rgba(255,255,255,0.18)); }
+.sidebar-playlist-item.pl-subscribed .pl-name { font-style: italic; }
+/* An imported (someone else's) playlist is read-only: no reorder, remove or add. */
+#playlist-panel.pl-readonly .queue-drag-handle,
+#playlist-panel.pl-readonly .queue-remove-btn,
+#playlist-panel.pl-readonly #pl-sel-bar,
+#playlist-panel.pl-readonly #playlist-drop-zone { display: none !important; }
+.pl-import-dialog { min-width: 320px; max-width: 460px; }
+.pl-import-hint { font-size: 12px; color: var(--text2); margin: 4px 0 10px; }
+.pl-import-list { max-height: 50vh; overflow-y: auto; margin-bottom: 12px; }
+.pl-import-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 2px;
+  font-size: 13px;
+  color: var(--text0);
+  cursor: pointer;
+}
+.pl-import-meta { margin-left: auto; font-size: 11px; color: var(--text2); white-space: nowrap; }
 #btn-playlist-close {
   background: none;
   border: none;
@@ -5797,7 +5936,7 @@ tr.dragging { opacity: 0.4; }
 }
 
 /* ── Rating stars ──────────────────────────────────────────────────────────── */
-.col-rating { width: 80px; text-align: center; white-space: nowrap; }
+.col-rating { width: 124px; text-align: center; white-space: nowrap; }   /* five 20 px stars + padding: the fixed table layout holds this, no wider */
 .col-rating .star {
   cursor: pointer;
   font-size: 14px;
@@ -6068,6 +6207,13 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
                             rows — checkbox rows used to collapse to ~15px while
                             number rows were ~24px, reading as cramped/ragged */
 }
+/* A muted aside inside a setting's label ("(off keeps a reset in place …)"). */
+.admin-setting-note { color: var(--text2); }
+/* Every other (native) checkbox in Settings — the Scan-ZIPs / Auto-refresh
+   inline options and the service switches' hidden inputs — takes the accent
+   instead of the browser's default blue.  (.admin-setting / .users-enabled
+   boxes are drawn with appearance:none below, so this doesn't touch them.) */
+#admin-panel input[type="checkbox"] { accent-color: var(--accent); }
 /* A setting with a status line under it (spans the row). */
 .admin-setting--sub { flex-wrap: wrap; }
 .admin-setting-sub { flex: 1 0 100%; font-size: 11px; color: var(--text2); line-height: 1.35; }
@@ -6275,7 +6421,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   font-size: 12px;
   color: var(--text1);
 }
-.about-version #about-version {
+.about-version #about-version, .about-version #about-db-version {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--accent);
   font-weight: 600;
@@ -6416,10 +6562,13 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 #nav-smart li {
   display: flex;
   align-items: center;
-  padding: 6px 14px;
+  padding: 5px 14px;   /* + the 1 px border below = the old 27 px row */
   cursor: pointer;
   color: var(--text1);
   border-radius: 5px;
+  /* Transparent border: the active item's 1 px border no longer makes it
+     2 px taller than the others (29 vs 27 px); the padding gave up that 1 px. */
+  border: 1px solid transparent;
   margin: 1px 6px;
   transition: background 0.1s, color 0.1s;
   font-size: 12.5px;
@@ -7776,6 +7925,7 @@ body.auth-blocked > #app {
   /* Bring sub-44 px controls up to WCAG 2.5.5 AAA touch target size. */
   .player-controls button,
   .header-actions button,
+  .header-actions > a.header-link,
   .btn-section-toggle,
   .btn-section-action,
   .btn-track-info {
@@ -7784,8 +7934,8 @@ body.auth-blocked > #app {
   }
   /* The 44 px header buttons make the Folders/Playlists header 54 px, so
      their floor grows by the same amount (see #section-folders). */
-  #sidebar #section-folders,
-  #sidebar #section-playlists { min-height: 83px; }
+  #sidebar #section-folders   { min-height: 94px; }
+  #sidebar #section-playlists { min-height: 98px; }
   /* Hide bitrate column first — meta-info, rarely actionable on the go. */
   #track-table th.col-bitrate,
   #track-table td.col-bitrate { display: none; }
@@ -7859,7 +8009,7 @@ body.auth-blocked > #app {
   #player-bar > * { min-width: 0; }
   .now-playing-art-info { flex: 1 1 100%; }
   .player-controls { flex: 1 1 auto; justify-content: center; }
-  .player-right { flex: 0 0 auto; gap: 8px; }
+  .player-right { flex: 0 0 auto; gap: 8px; margin-bottom: 0; }
 }
 @media (min-width: 901px) {
   #sidebar-toggle { display: none; }
@@ -7872,6 +8022,7 @@ body.auth-blocked > #app {
    tucked beneath it.  Skeleton rows in this band drop to a single
    title + a short duration cell. */
 @media (max-width: 900px) {
+  #track-table { min-width: 0; }
   #track-table td.col-title {
     /* Stack title + artist-and-duration meta below it.  CSS-only — no
        JS markup changes required; .col-artist / .col-dur cells remain
@@ -8717,6 +8868,9 @@ body.auth-blocked > #app {
   position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: cover; filter: brightness(0.82);
 }
+/* No cover (radio.js drops the src on a load error): show the wrap's plain
+   backdrop, not the browser's broken-image glyph — as .now-playing-art does. */
+#radio-art:not([src]) { display: none; }
 #radio-scope {
   position: absolute; inset: 0; width: 100%; height: 100%;
   pointer-events: none; mix-blend-mode: screen;
@@ -8799,8 +8953,9 @@ body.auth-blocked > #app {
 #section-stations h3 { display: flex; align-items: center; gap: 8px; }
 
 #nav-stations li {
-  display: flex; align-items: center; padding: 6px 14px; cursor: pointer;
+  display: flex; align-items: center; padding: 5px 14px; cursor: pointer;
   color: var(--text1); border-radius: 5px; margin: 1px 6px;
+  border: 1px solid transparent;   /* (as #nav-library li — active adds a border; 5+1 px = the old 6 px) */
   transition: background 0.1s, color 0.1s; font-size: 12.5px;
 }
 #nav-stations li:hover { background: rgba(255,255,255,0.06); color: var(--text0); }
@@ -8952,6 +9107,7 @@ body.auth-blocked > #app {
 :root[data-theme="light"] .ctrl-toggle { color: #1f5f80; }
 :root[data-theme="light"] .ctrl-toggle.on { color: #8a3a08; }
 :root[data-theme="light"] .browse-play-btn { border: 1px solid rgba(20, 90, 130, 0.7); }   /* ≥3:1 boundary */
+:root[data-theme="light"] .btn-best-match { color: #8a3a08; border-color: rgba(20, 90, 130, 0.7); }
 
 /* A short window (half-height browser, phone in landscape) must still reach Save. */
 .pl-modal-dialog { max-height: 86vh; overflow-y: auto; }
@@ -8975,3 +9131,51 @@ body.auth-blocked > #app {
   border: 1px solid color-mix(in srgb, var(--text2) 28%, transparent);
   flex-shrink: 0;
 }
+
+/* ── Close (×) buttons — one size, one style per context ─────────────────────
+   They came in eight sizes (22–44 px) and two looks.  Every panel / dialog close
+   is now a 28×28 box with the × centred: a borderless ghost button in the panel
+   and dialog headers, and the boxed button style only where it sits in a row of
+   boxed buttons (EQ header beside Reset; Track Info beside ◀ ▶, at their 30 px). */
+.btn-close,
+.welcome-close,
+.radio-close,
+#cast-close,
+.shortcuts-header button,
+#btn-queue-close,
+#btn-playlist-close,
+.playlist-close-btn,
+#eq-close,
+.ti-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  box-sizing: border-box;
+  font-size: 20px;
+  line-height: 1;
+}
+.btn-close,
+.welcome-close,
+#cast-close,
+.shortcuts-header button,
+#btn-queue-close,
+#btn-playlist-close,
+.playlist-close-btn {
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text2);
+}
+.btn-close:hover,
+.welcome-close:hover,
+#cast-close:hover,
+.shortcuts-header button:hover,
+#btn-queue-close:hover,
+#btn-playlist-close:hover,
+.playlist-close-btn:hover { color: var(--text0); background: rgba(255,255,255,0.08); }
+.radio-close { border-radius: 6px; }   /* (keeps the radio view's own colours) */
+.ti-close { width: 30px; height: 30px; }

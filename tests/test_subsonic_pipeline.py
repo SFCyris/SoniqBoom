@@ -434,7 +434,7 @@ def test_xml_endpoint_sweep_matches_elementtree(env, monkeypatch):
     S._ALBUM_LIST_CACHE.update(cat=None)
     env.folder_albums(True)
     env.store.set_rating("q1", 4)
-    env.store.record_play("q2")
+    env.store.record_play("q2", uid="u1")
     alb = env.ok("getAlbumList2.view", type="newest", size=50)["albumList2"]["album"]
     calls = [("ping.view", {}), ("getLicense.view", {}), ("getMusicFolders.view", {}),
              ("getOpenSubsonicExtensions.view", {}), ("getIndexes.view", {}),
@@ -658,8 +658,8 @@ def lib(monkeypatch, tmp_path):
     for r in rows:
         st.upsert_track(r)
     st.set_rating("tag1", 5)
-    st.record_play("tag1", at=1_700_000_100)
-    st._play_stats["comp1"] = {"count": 2}
+    st.record_play("tag1", at=1_700_000_100, uid="u1")
+    st._play_stats.setdefault("u1", {})["comp1"] = {"count": 2}
     st.set_config("subsonic_folder_albums", True)
     monkeypatch.setattr(S, "get_store", lambda: st)
     S._ALBUM_LIST_CACHE.update(cat=None)
@@ -841,7 +841,7 @@ def test_delete_and_readd_and_bulk_load_rebuild(lib):
     # A snapshot reload: new dicts under the same ids, write counters untouched.
     assert _song(lib, "tag1")["title"] == "Title tag1"
     tracks = {tid: dict(t, title=f"Reloaded {tid}") for tid, t in lib._tracks.items()}
-    lib.bulk_load(tracks, {}, dict(lib._ratings), dict(lib._play_stats), {}, [],
+    lib.bulk_load(tracks, {}, dict(lib._ratings), dict(lib._play_stats), {}, {},
                   dict(lib._scan_dirs), dict(lib._hash_lookups), dict(lib._config))
     lib.rebuild_indexes()
     assert _song(lib, "tag1")["title"] == "Reloaded tag1"
@@ -904,13 +904,13 @@ def test_per_user_fields_are_never_cached(lib):
     asyncio.run(subsonic_state.get_state().star("u1", "song", ["comp1"]))
     asyncio.run(subsonic_state.get_state().set_bookmark("u1", "comp1", position=777))
     lib.set_rating("comp1", 3)
-    lib.record_play("comp1", at=1_700_000_999)
+    lib.record_play("comp1", at=1_700_000_999, uid="u1")
     a1 = _song(lib, "comp1")
     assert a1["starred"] and a1["bookmarkPosition"] == 777 and a1["userRating"] == 3
     assert a1["playCount"] == 3 and a1["played"] == "2023-11-14T22:29:59Z"
     b1 = _song(lib, "comp1", bob)                                 # another user, same memo
     assert "starred" not in b1 and "bookmarkPosition" not in b1
-    assert b1["userRating"] == 3 and b1["playCount"] == 3        # library-wide ones
+    assert b1["userRating"] == 3 and b1["playCount"] == 0        # rating library-wide, plays per user
 
 
 def test_callers_cannot_corrupt_the_memo(lib):

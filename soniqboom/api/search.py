@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from soniqboom.api.tracks import json_bytes, json_route, public_track, public_tracks
-from soniqboom.core.data import ft_search, ft_search_dicts, get_track
+from soniqboom.core.data import _parse_tag_query, ft_search, ft_search_dicts, get_track
 from soniqboom.models.track import TrackMeta
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -109,6 +109,16 @@ def _parse_advanced_query(q: str) -> str | None:
     return " ".join(parts) if parts else None
 
 
+def search_predicates(q: str) -> dict:
+    """The search box's text ``q`` (advanced field operators or plain text) as
+    ``TrackStore.filter_tracks`` predicates — the one parse path of the search
+    lists (``/search``, ``/search/quick``, ``/search/page``, the search
+    shuffle ``/api/tracks/shuffled?q=``), identical to :func:`run_search`'s."""
+    advanced = _parse_advanced_query(q)
+    query = advanced or q.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
+    return _parse_tag_query(query)
+
+
 async def run_search(q: str, limit: int = 50) -> list[TrackMeta]:
     """Evaluate a query (advanced field-operators or plain text) → tracks.
 
@@ -141,7 +151,9 @@ async def search(
     q: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """Full-text search across artist, album, and title.
+    """Full-text search across artist, album, and title — the first ``limit``
+    matches, newest first (``/search/page?sort=added``, which pages all of
+    them; the web lists read ``/search/page``, Best match first).
     Also supports advanced syntax: artist:Ghost album:Impera year:>2020
 
     Tracks that can't play right now are flagged (``offline``) or, with
@@ -162,12 +174,126 @@ async def quick_search(
     limit: int = Query(8, ge=1, le=20),
 ):
     """Lightweight search for autocomplete preview — TrackMeta-shaped rows
-    (``tracks.public_track``), offline ones flagged or hidden as in ``/search``."""
+    (``tracks.public_track``), offline ones flagged or hidden as in ``/search``.
+    (The web app's preview reads ``/search/page?limit=8`` — the full results'
+    own rows and total.)"""
     from soniqboom.core import availability
     rows = public_tracks(await run_search_dicts(q, limit=limit,
                                                 exclude=availability.hidden(),
                                                 swap=availability.primary_swap()))
     return availability.mark_rows(rows)
+
+
+# ``sort`` keys a result set can be ordered by (``TrackStore._SORT_INDEX_MAP``,
+# the keys ``GET /api/tracks`` takes, and ``rank`` — Best match); anything
+# else is the default order.
+_PAGE_SORT_KEYS = frozenset(("added", "year", "duration", "bpm", "title", "artist",
+                             "album_artist", "album", "format", "rank"))
+
+
+@json_route(router, "/page")
+async def search_page(
+    q: str = Query(..., min_length=1),
+    rs: str | None = Query(None, max_length=64),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=5000),
+    sort: str | None = None,
+    order: str | None = None,
+    fields: str | None = None,
+    playable: bool = False,
+    after: str | None = None,
+    request: Request = None,
+):
+    """One page of a search's whole result set (``core/search_sets``).
+
+    The first request (no ``rs``) builds the set — every match — and answers
+    its first page with the exact ``total`` and the set's handle ``rs``; later
+    pages name it.  ``sort`` (``added`` ``year`` ``duration`` ``bpm``
+    ``title`` ``artist`` ``album_artist`` ``album`` ``format``) + ``order``
+    (``asc`` / ``desc``) order the WHOLE set by the sorted index All Tracks'
+    column sort uses (same keys, ties by id); ``added`` is newest first
+    (``/search``'s order).  Without ``sort`` (or ``sort=rank``) the default
+    order, Best match (``core/search_rank``; ``order`` does not apply) — or,
+    for a search without free text (only field operators), newest first;
+    ``ranked`` in the reply says which.  A handle that no longer holds — the
+    library changed, Hide or "Hide duplicates" changed, the server restarted
+    — is answered from a fresh set for ``q``: the reply then carries the new
+    ``rs`` and ``renewed: true`` (rows of the two sets don't mix).
+
+    ``fields=list``: rows without the fields no list reads
+    (``search_sets.LIST_DROP``).  Rows are flagged ``offline`` as in
+    ``/search``.  ``playable=1`` (the play queue): ``{tracks, next_offset,
+    ended}`` as ``GET /api/tracks?playable=1`` answers it (plus ``rs``,
+    ``total``, ``renewed``), each row with its position ``_pos``;
+    ``after=<ids>`` starts right after that track.
+
+    A page of at least ``search_sets.FINISH_MIN_LIMIT`` rows (a list's) also
+    starts reading the rest of its order in the background.  A request whose
+    client went away while its order was read answers 499 (what was read
+    stays with the set).
+
+    Reply: ``{rs, total, offset, sort, order, ranked, renewed, tracks}``."""
+    from soniqboom.core import availability, search_sets
+    from soniqboom.core.store import get_store
+    store = get_store()
+    preds = search_predicates(q)
+    sort_by = sort if sort in _PAGE_SORT_KEYS else None
+    if sort_by == search_sets.RANK:
+        sort_by = None                  # (the default order, by name)
+    sort_order = order if order in ("asc", "desc") else None
+    desc = store._is_descending(sort_by, sort_order)
+    gone = request.is_disconnected if request is not None else None
+    slim = fields == "list"
+    renewed = False
+    for attempt in range(search_sets.RETRIES + 1):
+        # A long read gives the event loop a turn between slices and starts
+        # over when the set stopped holding meanwhile; the last attempt reads
+        # without a turn, so a library that keeps changing (a scan writing on
+        # every turn of the loop) still gets an answer.  (Best match scores
+        # every member: its last attempt keeps the turns and answers from the
+        # set it started in — the next page renews it.)
+        last = attempt == search_sets.RETRIES
+        state = search_sets.State(store)
+        rset, again = search_sets.resolve(store, preds, rs=rs, sort_by=sort_by, state=state)
+        renewed = renewed or again
+        attr = rset.attr_for(store, sort_by)
+        ranked = attr == search_sets.RANK
+        sync = last and not ranked
+        state_of = None if last else (lambda: search_sets.State(store))     # noqa: E731
+        try:
+            if playable:
+                # (an anchor and a playable page read on past the rows they
+                # skip: the order is finished first)
+                ids = (search_sets.complete_sync(store, rset, attr, desc) if sync else
+                       await search_sets.complete(store, rset, attr, desc, state_of, gone))
+                start = offset
+                if after:
+                    at = search_sets.anchor(ids, after)
+                    if at is not None:
+                        start = at + 1
+
+                def fetch(off: int, lim: int, ids=ids) -> list:
+                    return search_sets.rows(store, ids[off:off + lim])
+                page = availability.player_page(fetch, start, limit, store)
+                if slim:
+                    page["tracks"] = [{k: v for k, v in r.items()
+                                       if k not in search_sets.LIST_DROP}
+                                      for r in page["tracks"]]
+                page.update(rs=rset.rs, total=rset.total, renewed=renewed, ranked=ranked)
+                return page
+            ids = (search_sets.page_ids_sync(store, rset, attr, desc, offset, limit) if sync else
+                   await search_sets.page_ids(store, rset, attr, desc, offset, limit, state_of, gone))
+        except search_sets.Gone:
+            return Response(status_code=499)
+        except search_sets.Stale:
+            rs = rset.rs if rs else None
+            renewed = renewed or bool(rs)
+            continue
+        if limit >= search_sets.FINISH_MIN_LIMIT:            # (a list page, not a preview)
+            search_sets.schedule_finish(store, rset, attr, desc)
+        return {"rs": rset.rs, "total": rset.total, "offset": offset, "sort": sort_by,
+                "order": None if ranked else ("desc" if desc else "asc"), "ranked": ranked,
+                "renewed": renewed, "tracks": search_sets.rows(store, ids, slim=slim)}
 
 
 @json_route(router, "/filter")

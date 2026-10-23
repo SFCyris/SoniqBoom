@@ -999,13 +999,20 @@ def _signed_in_or_fresh(request: Request) -> bool:
     return bool(cookie) and store.lookup_session(cookie) is not None
 
 
+def _persistence_db_version() -> int:
+    from soniqboom.core.persistence import DB_VERSION
+    return DB_VERSION
+
+
 @app.get("/api/health")
 async def health(request: Request):
     # Include the current service-toggle state in the health payload so
     # the run.sh / restart.sh banner can render "Services:" without
     # needing to parse the Python log.  Public — no PII, just on/off.
-    # ``version``: for a signed-in caller and for the server's own host
-    # (run.sh, the menu-bar app); null for anyone else.
+    # ``version`` / ``db_version`` (the library database's format,
+    # ``persistence.DB_VERSION`` — Settings → System → About): for a
+    # signed-in caller and for the server's own host (run.sh, the menu-bar
+    # app); null for anyone else.
     from soniqboom.config import (
         SERVICE_NAMES, SERVICE_LABELS, is_service_enabled,
     )
@@ -1020,6 +1027,7 @@ async def health(request: Request):
     return {
         "status":  "ok",
         "version": __version__ if show_version else None,
+        "db_version": _persistence_db_version() if show_version else None,
         "watcher": watch,
         "services": [
             {
@@ -1125,6 +1133,14 @@ def _availability_mode() -> str:
         return "mark"
 
 
+def _unplayable_mode() -> str:
+    try:
+        from soniqboom.core import availability
+        return availability.unplay_mode()
+    except Exception:
+        return "mark"
+
+
 def _catalogue_list_reads() -> bool:
     try:
         from soniqboom.core import modland_catalog
@@ -1177,6 +1193,8 @@ async def ui_config(request: Request = None):
         "filter_duplicates": await get_config("filter_duplicates", False),
         # Settings → "Tracks on unavailable drives": mark / hide / show.
         "offline_tracks": _availability_mode(),
+        # Settings → "Tracks that can't be played": mark / hide.
+        "unplayable_tracks": _unplayable_mode(),
         # Settings → "Skip short tunes": seconds (0 = off) — core/skip_rules.py.
         "skip_short_tunes": _skip_short_tunes(),
         "tune_placeholders": _tune_placeholders(),
@@ -1684,6 +1702,10 @@ async def _watch_for_restored_accounts() -> None:
             store = get_user_store()
             if store.count() == 0:
                 await asyncio.to_thread(store.check_restored)
+                if store.count():
+                    # (the first account — the plays made without one go to it)
+                    from soniqboom.api.users import claim_unowned_user_data
+                    claim_unowned_user_data()
         except asyncio.CancelledError:
             raise
         except Exception:                                   # noqa: BLE001
@@ -1960,6 +1982,10 @@ async def startup():
     _ss_phase("loading_users", "Loading user accounts")
     from soniqboom.core.users import init_user_store
     init_user_store(data_dir)
+    # Plays made while no account existed (or the data of a database converted
+    # before the first account) go to the legacy owner once there is one.
+    from soniqboom.api.users import claim_unowned_user_data
+    claim_unowned_user_data()
     _t = asyncio.create_task(_watch_for_restored_accounts(),
                              name="users_restored_watch")
     _BG_TASKS.add(_t)
@@ -1982,9 +2008,12 @@ async def startup():
 
     # Configure HVSC if the user pointed at a DOCUMENTS folder.  The
     # database loads lazily on first SID lookup, so this is cheap.
-    if settings.hvsc_docs_path:
+    # (With "Download from the internet" chosen, the downloaded documents are
+    # put in use once the online collections start — ``hvsc_download.start``.)
+    from soniqboom.core.online_hvsc import local_docs_path as _hvsc_local
+    if _hvsc_local():
         from soniqboom.core.hvsc import get_hvsc
-        get_hvsc().configure(settings.hvsc_docs_path)
+        get_hvsc().configure(_hvsc_local())
 
     # Rebuild conversion-cache metadata from disk so previously-rendered
     # SID / MIDI / tracker WAVs survive a restart — otherwise the next play
@@ -2337,6 +2366,14 @@ async def startup():
         await online_catalog.startup()
     except Exception:
         log.warning("Online collections startup failed", exc_info=True)
+    # The HVSC documents downloaded for the SID lookups (Settings → Renderers →
+    # HVSC SID database, "Download from the internet"): in use at once, the
+    # weekly check armed.
+    try:
+        from soniqboom.core import hvsc_download
+        hvsc_download.start()
+    except Exception:
+        log.warning("HVSC download startup failed", exc_info=True)
 
     # Which tracks can play right now (Settings → "Tracks on unavailable
     # drives"): follow scan-root status changes, re-probe local roots, and
@@ -3075,6 +3112,8 @@ def _background_writer_tasks() -> list:
         from soniqboom.core import online_catalog
         online_catalog.signal_stop()               # a running listing ends at its next request
         extra.extend(online_catalog.all_tasks())   # online collections' jobs / merges
+        from soniqboom.core import hvsc_download
+        extra.extend(hvsc_download.all_tasks())    # the HVSC documents' weekly check
         from soniqboom.api import stream as _stream_mod
         extra.extend(_stream_mod._INFO_READ_TASKS)  # Track Info reads, merge watchers
     except Exception:

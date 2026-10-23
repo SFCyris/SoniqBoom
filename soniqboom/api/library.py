@@ -99,6 +99,50 @@ async def _broadcast(data: dict) -> None:
             _ws_user_id.pop(ws, None)
 
 
+async def send_to_user(user_id: str, data: dict) -> int:
+    """Push *data* to the open library WebSockets of ONE account only — the
+    channel for anything carrying that user's own data (plays, history):
+    ``_broadcast`` reaches every signed-in page.  As ``_broadcast``: a 2 s
+    timeout per send, a socket whose session was revoked is closed (4401),
+    and a socket that failed is dropped.  Returns the sockets sent to."""
+    if not user_id:
+        return 0
+    targets = [ws for ws, uid in list(_ws_user_id.items()) if uid == user_id]
+
+    async def _send(ws):
+        try:
+            if not _verify_ws_session(ws):
+                try:
+                    await asyncio.wait_for(ws.close(code=4401), timeout=1.0)
+                except Exception:
+                    pass
+                return ws
+            await asyncio.wait_for(ws.send_json(data), timeout=2.0)
+            return None
+        except Exception:
+            return ws
+    results = await asyncio.gather(*(_send(ws) for ws in targets), return_exceptions=True)
+    dead = {r for r in results if r is not None and not isinstance(r, BaseException)}
+    if dead:
+        _ws_clients.difference_update(dead)
+        for ws in dead:
+            _ws_user_id.pop(ws, None)
+    return sum(1 for r in results if r is None)
+
+
+_USER_PUSHES: set = set()
+
+
+def push_to_user(user_id: str, data: dict) -> None:
+    """``send_to_user`` in the background (on the running loop): a caller
+    answering a request (a Subsonic scrobble) never waits for a slow page."""
+    if not user_id or not any(uid == user_id for uid in list(_ws_user_id.values())):
+        return
+    t = asyncio.get_running_loop().create_task(send_to_user(user_id, data))
+    _USER_PUSHES.add(t)
+    t.add_done_callback(_USER_PUSHES.discard)
+
+
 def _with_lib_gen(data: dict) -> dict:
     """A ``scan_progress`` frame with ``running`` false (a scan's completion,
     its embedding phase, a silent scan's end) and a ``catalogue_changed``
@@ -199,8 +243,10 @@ _GZIP_LEVEL = 6
 def _current_agg_seq():
     """What an aggregate cache entry is valid for: the store's browse
     sequence (``_browse_seq``), plus — while "Tracks on unavailable drives:
-    Hide" leaves tracks out, or a duplicate's copy stands in for a primary that
-    can't play — the availability generation (the counts follow both)."""
+    Hide" or "Tracks that can't be played: Hide" leaves tracks out, or a
+    duplicate's copy stands in for a primary that can't play — the
+    availability tokens (``hide_token`` / ``swap_token``: the counts follow
+    them; a mark moves no ``_browse_seq``)."""
     try:
         store = get_store()
         seq = int(getattr(store, "_browse_seq", getattr(store, "_mutation_seq", 0)))
@@ -319,8 +365,9 @@ def _dedup_on(store) -> bool:
 
 
 def _hidden(store):
-    """The ids the web lists leave out ("Tracks on unavailable drives: Hide"),
-    or None — the browse counts leave them out too."""
+    """The ids the web lists leave out ("Tracks on unavailable drives: Hide",
+    "Tracks that can't be played: Hide"), or None — the browse counts leave
+    them out too."""
     from soniqboom.core import availability
     return availability.hidden(store)
 
@@ -490,10 +537,13 @@ async def reindex(_admin=Depends(require_admin)):
 async def get_availability():
     """Settings → "Tracks on unavailable drives" and what it acts on: ``mode``
     (mark / hide / show), ``token`` (changes whenever the set of tracks that
-    can't play right now, or the mode, changes — clients re-read their lists
-    then; also pushed as the ``availability_changed`` WebSocket event),
+    can't play right now, or the mode, changes — and, with "Tracks that can't
+    be played: Hide", whenever those tracks change — clients re-read their
+    lists then; also pushed as the ``availability_changed`` WebSocket event),
     ``unavailable`` (how many tracks can't play right now) and the offline
-    ``roots`` (path, kind drive / share / catalogue, tracks, unavailable)."""
+    ``roots`` (path, kind drive / share / catalogue, tracks, unavailable);
+    ``unplayable_mode`` (mark / hide) and ``cant_play`` (how many tracks are
+    reported broken, corrupt or refused by their player)."""
     from soniqboom.core import availability
     return availability.state()
 
@@ -696,7 +746,7 @@ async def library_counts(request: Request):
     matching list endpoint, without its "[No Artist]"-style bucket row
     (``label``); ``scene_groups`` = the rows of ``/library/scene-groups``.
     Same mode as the lists ("Hide duplicates", "Tracks on unavailable
-    drives: Hide")."""
+    drives: Hide", "Tracks that can't be played: Hide")."""
     cached = _cache_get("counts")
     if cached is None:
         from soniqboom.core.data import track_count

@@ -22,6 +22,11 @@
  *    rows (``POST /api/tracks/meta/availability`` — their offline flags and
  *    their reported playback problems, ``health``) and fires
  *    ``soniqboom:availability-changed`` so the open view re-reads.
+ *  - follows the sibling setting "Tracks that can't be played" (``mode`` of
+ *    ``unplayable``: ``'mark' | 'hide'``) the same way: its Hide leaves the
+ *    tracks a row's playback-problem badge calls broken / corrupt / can't
+ *    play out of the lists, and the token moves whenever that set changes
+ *    while it is on (the event's ``unplayable`` / ``prevUnplayable``).
  *
  * Its own module (not utils.js / player.js): a page still on an older service
  * worker's cached copy of those must not fail to link a new named import.
@@ -74,7 +79,8 @@ export function offlineBadgeHTML(kind) {
     + `<span class="sr-only"> — can't play right now, ${SR_TEXT[k] || SR_TEXT.drive}</span></span>`;
 }
 
-const state = { mode: null, token: null, marks: null, busy: null, again: false, polling: false };
+const state = { mode: null, unplayable: null, token: null, marks: null, busy: null, again: false,
+                polling: false };
 const POLL_MS = 60000;
 
 function _apply(mode) {
@@ -160,7 +166,9 @@ async function refresh() {
         const j = await r.json();
         if (!j || typeof j.token !== 'string') continue;
         const prevMode = state.mode, prevToken = state.token;
+        const prevUnplayable = state.unplayable;
         _apply(j.mode || 'mark');
+        state.unplayable = j.unplayable_mode === 'hide' ? 'hide' : 'mark';
         if (j.skip_short_tunes !== undefined) _applyShort(j.skip_short_tunes, j.tune_placeholders);
         // A playback problem reported / cleared (anyone's): only the rows held
         // here — the queue — re-read their marks; no list changes.
@@ -175,13 +183,17 @@ async function refresh() {
         // (List positions moved — Hide mode's lists changed length, and with
         // duplicates hidden a group whose primary can't play is listed by
         // another member, at that member's place (Mark too): the queue's next
-        // page starts after its last list row, not at the old position.)
-        if (j.mode !== 'show' || prevMode !== 'show') {
+        // page starts after its last list row, not at the old position.
+        // "Tracks that can't be played: Hide" (now or before) changes the
+        // lists' length too.)
+        const unplayHide = state.unplayable === 'hide' || prevUnplayable === 'hide';
+        if (j.mode !== 'show' || prevMode !== 'show' || unplayHide) {
           try { Player.reanchorOrdered?.(); } catch (_) { /* older cached player.js */ }
         }
         await recheckQueue();
         document.dispatchEvent(new CustomEvent('soniqboom:availability-changed', {
-          detail: { mode: j.mode, prevMode, token: j.token, unavailable: j.unavailable || 0 },
+          detail: { mode: j.mode, prevMode, token: j.token, unavailable: j.unavailable || 0,
+                    unplayable: state.unplayable, prevUnplayable: prevUnplayable || state.unplayable },
         }));
         changed = true;
       } catch (_) { /* the next poll tries again */ }
@@ -195,10 +207,12 @@ async function refresh() {
 /**
  * Start following the setting.  ``mode``: the value the page already has (the
  * ui-config's ``offline_tracks``), applied at once so the player skips from the
- * first track.  Re-flags a queue restored from the last visit.
+ * first track; ``unplayable``: its ``unplayable_tracks`` ("Tracks that can't be
+ * played"), known before the first state read.  Re-flags a queue restored from the last visit.
  */
-async function init({ mode, skipShort, placeholders } = {}) {
+async function init({ mode, unplayable, skipShort, placeholders } = {}) {
   if (mode) _apply(mode);
+  if (unplayable === 'mark' || unplayable === 'hide') state.unplayable = unplayable;
   if (skipShort !== undefined) _applyShort(skipShort, placeholders);
   if (!state.polling) {
     state.polling = true;
@@ -212,5 +226,7 @@ async function init({ mode, skipShort, placeholders } = {}) {
 
 export const Offline = {
   get mode() { return state.mode; },
+  /** "Tracks that can't be played": ``'mark' | 'hide'`` (null until read). */
+  get unplayable() { return state.unplayable; },
   init, refresh, recheckQueue, recheckRows,
 };

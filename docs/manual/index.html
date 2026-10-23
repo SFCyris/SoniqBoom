@@ -263,9 +263,10 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <strong>Play all</strong> and <strong>Shuffle</strong> buttons in its header — browse
        to a genre, artist or album and start it playing in one click, or press <span class="kbd">P</span> to
        play and <span class="kbd">Shift</span>+<span class="kbd">P</span> to shuffle. A big genre or artist lists its
-       first 2,000 tracks and a search its first 200 matches — the header says so — while <strong>Shuffle</strong>
-       covers every match. Track lists of more than 40 rows, unsorted or sorted by title, artist, album or album
-       artist, and long group lists, show an <strong>A–Z rail</strong> down the left edge — click a letter to jump straight to that
+       first 2,000 tracks — the header says so — while <strong>Shuffle</strong> covers every match; a search lists
+       all of its matches (see <a href="#find">Search</a>). Track lists of more than 40 rows, unsorted or sorted by
+       title, artist, album or album artist (search results: sorted by one of these), and long group lists, show an
+       <strong>A–Z rail</strong> down the left edge — click a letter to jump straight to that
        part of the list. Right-click a track (or a selection) for <strong>Play</strong>, <strong>Play next</strong>,
        <strong>Add to queue</strong>, <strong>Add to playlist…</strong>, a row of rating stars, the
        <em>Problem</em> report, <strong>Go to artist</strong> or <strong>Go to album</strong> to pivot to
@@ -286,6 +287,10 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        Albums list to a cover grid and back. The browser's Back button goes up one level, and after a reload
        SoniqBoom reopens the sidebar view (Artists, Albums, the Galaxy, a smart view …) you had open.</p>
     <p>Click a column header to sort by it, and again to reverse; the sort is remembered in this browser.
+       Sorting ignores case and leading or trailing spaces, puts tracks with an empty value last (first when
+       reversed) and orders equal values the same way every time, so a list sorts the same whatever its size and
+       wherever it was opened from. Year and Duration sort by the number, with tracks that have none last; Track sorts
+       by disc and then track number, with tracks that have no track number last; Location sorts by the file's path.
        Right-click the header row to choose the columns (#, Cover, Title, Album Artist, Artist, Album, Track, Year,
        Duration, Type, Location and ★ — Location starts hidden), and drag a header's edge to change its width. A
        list of more than 5,000 tracks, such as All Tracks in a big library, sorts by Title, Album Artist, Artist,
@@ -331,12 +336,28 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>Type anything to search titles, artists, album artists, albums, composers, scene groups and games at once:
        every word you type must match, and a word of two or more characters matches the start of a word
        (<code>var</code> finds “Varga”), and case and accents don't matter (<code>oorni</code> finds “Öörni”). As you
-       type, a preview lists the first matching tracks (and, while a Stations list is open, matching radio stations
-       first — see <a href="#radio">Internet radio</a>):
+       type, a preview lists the first matching tracks and how many tracks match (and, while a Stations list is open,
+       matching radio stations first — see <a href="#radio">Internet radio</a>):
        <span class="kbd">↓</span> / <span class="kbd">↑</span> pick one and <span class="kbd">Enter</span> plays it;
-       otherwise <span class="kbd">Enter</span> opens the full results — the first 200 matches, while
-       <strong>Shuffle</strong> covers all of them. <span class="kbd">Esc</span> closes the preview and <b>×</b> clears
-       the box. The first time you click into the empty box, the common operators (<code>artist:</code>,
+       otherwise <span class="kbd">Enter</span> opens the full results. They list every match — the header gives the
+       exact number, e.g. <em>Search: crack — 18,432 matches</em> — and, like All Tracks, load as you scroll.
+       A new search lists its best matches first (<strong>Best match</strong>): a title that is exactly what you typed,
+       then tracks with all of your words as whole words in one field, then tracks where your words appear together,
+       in order, then tracks with all of your words in one field. A whole word counts more than the start of a word,
+       so searching <code>ghost</code> lists the artist Ghost before the title “Ghostbusters”. Among equal matches, a
+       match in the title counts more than one in the artist or album artist, which counts more than one in the
+       album, which counts more than one in the composer, scene group or game. Equal matches list newest first. A search made only of field operators
+       (<code>format:SID year:&gt;2020</code>) lists newest first; with words besides the operators, the operators
+       narrow the matches and the words rank them. The preview shows the first of the same matches. Click a column
+       header (Title, Artist, Album Artist, Album, Year, Duration or Type) to sort all of the matches by it, and click
+       it again to reverse the order; the <strong>Best match</strong> button in the results header puts the best
+       matches first again (for a search of only field operators it reads <strong>Newest first</strong>). Track and
+       Location sort a search of up to 2,000 matches. On a phone the results list best matches first, and the
+       number of matches says so. <strong>Play all</strong> and <strong>Shuffle</strong> play
+       all of the matches, and <span class="kbd">Shift</span>-click selects a range of rows as in All Tracks. When a
+       scan finishes, or which tracks can play changes while <em>Hide</em> is on, the open results are read again where
+       you are.
+       <span class="kbd">Esc</span> closes the preview and <b>×</b> clears the box. The first time you click into the empty box, the common operators (<code>artist:</code>,
        <code>album:</code>, <code>game:</code>, <code>year:</code>, <code>format:</code>) show as chips you can click. Narrow
        it with field operators — stack as many as you like:</p>
     <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC</pre>
@@ -354,14 +375,15 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <div class="note">Press <span class="kbd">/</span> anywhere to jump to the search box. A mistyped operator (an unknown <code>field:</code>) is flagged in the preview as <em>Unknown field</em> instead of silently returning nothing.</div>
 
     <h3>Smart views</h3>
-    <p>The sidebar's <strong>Smart</strong> section builds these on the fly from the library's play counts,
-       listening history and ratings — shared by every account, with plays from Subsonic apps counted too:</p>
+    <p>The sidebar's <strong>Smart</strong> section builds these on the fly. Listening history and play counts are
+       each account's own — plays from Subsonic apps count for the account the app signs in with — while ratings and
+       the library are shared by every account:</p>
     <div class="grid cols-3">
       <div class="card"><span class="ico">🕒</span><h4>Listening History</h4><p>The last 50 plays, most recent first.</p></div>
       <div class="card"><span class="ico">🔂</span><h4>Most Played</h4><p>The 100 highest play-counts, ranked.</p></div>
       <div class="card"><span class="ico">✨</span><h4>Recently Added</h4><p>The 100 newest tracks the scanner found.</p></div>
       <div class="card"><span class="ico">⭐</span><h4>Top Rated</h4><p>The 100 highest-rated tracks.</p></div>
-      <div class="card"><span class="ico">🆕</span><h4>Unplayed</h4><p>The 100 newest tracks nobody has played yet.</p></div>
+      <div class="card"><span class="ico">🆕</span><h4>Unplayed</h4><p>The 100 newest tracks you haven't played yet.</p></div>
       <div class="card"><span class="ico">♊</span><h4>Duplicates</h4><p>Likely duplicate tracks, grouped for cleanup — the 200 largest groups, best copy first, with their locations; <b>Export CSV</b> saves the list.</p></div>
     </div>
     <figure>
@@ -426,10 +448,19 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>Click a track in a playlist to play the playlist from there. <span class="kbd">⌘</span>/<span class="kbd">Ctrl</span>-click
        and <span class="kbd">Shift</span>-click select tracks, and <span class="kbd">Delete</span> or <b>Remove</b> takes
        them out. An amber <b>2×</b> marks a track that is in the playlist twice, and <b>⧉</b> the same song from
-       another location. Each account's playlists are its own — other accounts don't see them (playlists created
-       before accounts existed stay shared) — and read-only
-       accounts can't create or change playlists. To rename a playlist, long-press it on the
+       another location. Each account's playlists are its own — other accounts don't see them unless you share them
+       (below). Read-only accounts can make and change their own playlists too. To rename a playlist, long-press it on the
        <a href="#apps">phone page</a> and choose <b>✎ Rename</b>.</p>
+
+    <h3>Share and import playlists</h3>
+    <p>Open one of your playlists and press <b>Share</b> to make it available to every account on the server; a
+       <b>Shared</b> badge marks it in the sidebar. To use someone else's shared playlist, press <b>Import…</b> in the
+       Playlists panel and tick the playlists you want — they appear in your sidebar marked <b>by</b> and their owner's
+       user name. An imported playlist follows the owner's changes and can't be edited by you: play it, queue it or
+       <b>Unsubscribe</b> to remove it again (or untick it under <b>Import…</b>). When the owner stops sharing or deletes
+       the playlist, it disappears for everyone who imported it. Read-only accounts can import shared playlists but not
+       share their own. On the <a href="#apps">phone page</a>, <b>Import shared playlists…</b> does the same. In Subsonic
+       apps a shared playlist is a <em>public</em> one, and an imported one is listed with the playlists of your own.</p>
 
     <h3>Smart playlists — save a search</h3>
     <p>Any search can become a playlist that keeps itself up to date. Type a query — say
@@ -453,8 +484,9 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p class="sec-sub">A hand-picked demoscene &amp; chiptune station pack, plus the worldwide directory — HLS and classic streams alike, with live now-playing titles.</p>
     <p>The sidebar's <strong>Stations</strong> section plays live internet radio. It has three lists:</p>
     <ul>
-      <li><b>Favorites</b> — the server's starred stations, one list shared by every account (Subsonic apps see it
-        too). <i>Nectarine Demoscene Radio</i> is there to start.</li>
+      <li><b>Favorites</b> — your starred stations; each account has its own list (Subsonic apps see it too).
+        <i>Nectarine Demoscene Radio</i> is there to start. A station you added by hand plays for everyone it is shared
+        with — in a multi-room session, for example — but stays in your list only.</li>
       <li><b>Scene</b> — a curated pack of demoscene, chiptune, SID and game-music stations: SceneSat Radio,
         Nectarine Demoscene Radio, SLAY Radio, Kohina, Radio PARALAX, CVGM.net, Rainwave Chiptunes,
         Rainwave Game Music, OverClocked ReMix Radio, Keygen-FM and CGM UK DemoScene.</li>
@@ -580,6 +612,12 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        real name and length from the <strong>Songlengths</strong> and <strong>STIL</strong> databases — so
        <em>Tune&nbsp;3&nbsp;/&nbsp;6</em> reads <em>"Assembly"</em> rather than a bare number — with the full
        STIL commentary below and the chip model shown as a <strong>6581 / 8580</strong> badge.</p>
+    <p>The song lengths and STIL come from gear → <strong>Renderers → HVSC SID database</strong>. Choose
+       <strong>Download from the internet</strong> and SoniqBoom downloads them from the 6581.nl HVSC mirror
+       (about 9&nbsp;MB) and checks for a new HVSC release weekly — <strong>Check now</strong> checks at once, and the
+       card shows the date of the song-length list in use and when it was last checked. Or choose <strong>Local DOCUMENTS
+       folder</strong> and enter the HVSC <code>DOCUMENTS</code> folder on your computer. Either way your SID files are
+       matched by checksum, wherever they are in your library. Offline mode downloads nothing.</p>
     <p>Playing the file itself starts at its <em>default</em> tune, marked <b>default</b> in the picker: the start
        song a SID or SNDH file names, and for Amiga player formats (played by UADE), console rips and SC68 disks the
        first tune that isn't empty (tracker modules start at tune 1); a tune you pick plays that tune. On the
@@ -641,7 +679,9 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        (<code>getSimilarSongs</code>) or top songs; albums, folders, playlists, searches and the OpenSubsonic
        sonic-similarity lists still list them.
        The first time a track is passed by, a one-time message explains why. A Subsonic app that plays a track
-       marked <b>can't play</b> gets an error naming the reason.</p>
+       marked <b>can't play</b> gets an error naming the reason. To leave tracks marked <b>can't play</b>,
+       <b>corrupt</b> or <b>broken</b> out of the lists altogether, set <strong>System → Settings → Tracks that
+       can't be played</strong> to <b>Hide them</b>.</p>
 
     <h3>Equalizer &amp; visualizer</h3>
     <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
@@ -1038,7 +1078,8 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <code>/m</code> (an iPad gets the desktop UI, which also works at phone width), with Library, Search,
        <strong>Radio</strong>, Queue and Now&nbsp;Playing tabs plus a tap-to-expand mini-player and Settings behind the
        gear. <em>Library</em> browses All, Artists, Album Artists, Albums, Genres, Years and Playlists;
-       <em>Radio</em> has ★&nbsp;Favorites, Scene and Browse. Tap a track to play it, swipe it left to add it to the
+       <em>Radio</em> has ★&nbsp;Favorites, Scene and Browse; <em>Search</em> shows how many tracks match and
+       loads more of them as you scroll. Tap a track to play it, swipe it left to add it to the
        queue (in the queue and in a playlist, to remove it), and long-press it for <b>▶ Play Now</b>,
        <b>+ Add to Queue</b>, <b>♫ Add to Playlist…</b> and, with edit rights, <b>⚠︎ Report a problem…</b>.
        Long-press a playlist to <b>✎ Rename</b> or <b>🗑 Delete</b> it. Tune in <a href="#radio">internet radio</a>
@@ -1220,9 +1261,11 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
           and back when this collection is switched off while Modland's folder is in. A tune rated or played on both
           copies keeps each copy's own rating and play count; its playlist entries still move.</li>
       <li><strong>Use its song lengths and STIL for my own SID files</strong> (on by default): when no HVSC folder of
-          your own is set (gear → Renderers → HVSC), the downloaded song lengths and STIL comments serve your own SID
+          your own is in use (gear → Renderers → HVSC), the downloaded song lengths and STIL comments serve your own SID
           files too — matched by checksum, so a SID filed anywhere in your library finds its lengths and its STIL
-          comment. An HVSC folder of your own always takes precedence.</li>
+          comment. An HVSC folder of your own always takes precedence. With <strong>Download from the
+          internet</strong> chosen on the HVSC card too, the collection's own index check keeps those files up to
+          date and the card downloads nothing itself.</li>
       <li>The index is checked weekly by default (daily, every 2 weeks or monthly, or on demand with <strong>Refresh
           now</strong>); a check downloads it again only when HVSC has changed. Switching HVSC off removes its tunes
           and folder; ratings, play counts and playlist entries are kept for when you switch it on again.</li>
@@ -1311,14 +1354,19 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        off — handy for easing server load during busy listening.</p>
     <p>The Library tab's <strong>Library Health</strong> cards show how many tracks and scan folders are indexed and
        whether the search index is in order. If titles, artists or albums show the replacement character
-       <code>�</code>, <strong>Repair Garbled Metadata</strong> reads them again from the files:
+       <code>�</code>, or modules show a placeholder title such as <code>&lt;unnamed&gt;</code>,
+       <strong>Repair Garbled Metadata</strong> reads them again from the files (a placeholder title becomes the
+       file name):
        <strong>Scan for Garbled Titles</strong> counts them, <strong>Repair Now</strong> fixes them (<em>Only tracker /
        chiptune files</em> keeps it quick).</p>
 
     <h3>Back up &amp; restore</h3>
     <p>The admin panel's <strong>Backup</strong> tab exports your whole database to a single date-stamped file
        (<code>soniqboom-YYYY-MM-DD.sbz</code>) — a compressed snapshot of your track index and metadata, waveforms,
-       star ratings, play counts, playlists, listening history, your scan-folder list and library settings.
+       star ratings, every account's play counts, listening history, playlists and radio Favorites, your scan-folder
+       list and library settings. On restore, each account's data goes to the account with the same user name; data
+       of a user name with no account on the server is kept aside and joins the account an admin later creates with
+       that name (never one a visitor signs up for).
        <strong>↑ Import .sbz</strong> restores such a file into the running server: it replaces the library index, and
        changes made since the export are lost. When it is done, the tab shows <em>Import complete</em> with the number of
        tracks restored.
@@ -1340,6 +1388,12 @@ docker compose start</pre>
        <code>library.json</code> in the data folder, and start it again. Recent changes are kept in <code>library.aof</code>
        beside it until they are folded into the index, and are applied at the next start; if that file may be damaged
        too, delete it as well — those changes are then lost.</p>
+    <p>The library database carries a version number (<em>Database V2</em> in gear → System → About). When a new
+       SoniqBoom release finds a database of an older version, it first copies the files into
+       <code>backups/db-v1-&lt;date-time&gt;/</code> in the data folder — with a <code>README.txt</code> explaining how to go back —
+       and only then converts them; a backup that can't be made (too little disk space, for example) stops the start
+       with a message, and nothing is converted. Those copies are kept until you delete them. A database written by a
+       newer release than the one starting is refused rather than opened.</p>
     <div class="note">The backup holds your <em>library database</em>, not the audio files or SoniqBoom's settings. User
        accounts, saved play queues, and the favourites, album / artist ratings and bookmarks from Subsonic apps are kept
        in SoniqBoom's data folder (<code>users.json</code>, <code>subsonic_state.json</code> and <code>secret.key</code>),
@@ -1357,15 +1411,18 @@ docker compose start</pre>
     <h3>User accounts &amp; roles</h3>
     <p>Manage people in the admin panel's <strong>Users</strong> tab — add a user, set their role, enable or disable
        them, set a password, or remove them. You can't remove your own account, or demote or disable it while it is
-       the only enabled admin. Removing a user also removes their API keys and their Subsonic app favourites, album
-       and artist ratings, saved play queue and bookmarks. Three roles decide what each person can do:</p>
+       the only enabled admin. Removing a user also removes their API keys, listening history and play counts, favourite
+       stations, playlists (a shared one disappears for everyone who imported it), and their Subsonic app favourites,
+       album and artist ratings, saved play queue and bookmarks. Admins don't see other accounts' history, play counts,
+       favourites or private playlists. Three roles decide what each person can do:</p>
     <table>
       <thead><tr><th>Capability</th><th>Read-only</th><th>Edit</th><th>Admin</th></tr></thead>
       <tbody>
-        <tr><td>Browse &amp; play the whole library, build play history</td><td>✓</td><td>✓</td><td>✓</td></tr>
-        <tr><td>Rate tracks</td><td>—</td><td>✓</td><td>✓</td></tr>
-        <tr><td>Create &amp; manage playlists</td><td>—</td><td>✓</td><td>✓</td></tr>
-        <tr><td>Edit tags &amp; track info, report broken or glitched tracks, star radio stations</td><td>—</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Browse &amp; play the whole library, keep your own play history</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Your own radio Favorites, playlists, and importing shared playlists</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Share your playlists with every account</td><td>—</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Rate tracks (ratings are shared by every account)</td><td>—</td><td>✓</td><td>✓</td></tr>
+        <tr><td>Edit tags &amp; track info, report broken or glitched tracks</td><td>—</td><td>✓</td><td>✓</td></tr>
         <tr><td>Download original files in Subsonic apps</td><td>—</td><td>✓</td><td>✓</td></tr>
         <tr><td>Manage users, folders, settings &amp; backups</td><td>—</td><td>—</td><td>✓</td></tr>
       </tbody>
@@ -1422,11 +1479,11 @@ bash setup-admin.sh -user bob -disable                                 <span cla
       <div class="card"><span class="ico">🎛️</span><h4>SID fidelity</h4><p>In <strong>gear → Renderers → SID fidelity</strong>, dial in how the C64 chip is voiced: pick the <strong>6581</strong> or <strong>8580</strong> model (or <em>Auto</em>, which follows each tune), tick <em>Force model over tune's own choice</em> to use your model even for tunes that name one, and toggle filter emulation, filter curve and digiboost, then <strong>Save SID options</strong> — the next play of a tune uses the new sound. <em>SID duration</em> under <strong>System → Settings</strong> is the length of a SID without an HVSC entry, and also of a console chiptune whose file states no length. For SIDs, a change applies to those indexed after it; SIDs already in the library keep the length they were given when they were scanned.</p></div>
       <div class="card"><span class="ico">📈</span><h4>Scrobbling</h4><p>Admins: in <strong>gear → System → My Account</strong>, paste your <strong>ListenBrainz user token</strong> (from <a href="https://listenbrainz.org/profile" target="_blank" rel="noopener">listenbrainz.org/profile</a>) and/or your <strong>last.fm session key</strong>, then <strong>Save scrobble tokens</strong>. ListenBrainz logs plays as soon as the token is saved; last.fm also needs the server started with your last.fm API key and secret in the environment variables <code>SONIQBOOM_LASTFM_API_KEY</code> and <code>SONIQBOOM_LASTFM_API_SECRET</code>. Plays from the web player and from Subsonic apps are both scrobbled.</p></div>
       <div class="card"><span class="ico">📲</span><h4>Subsonic apps</h4><p>Copy your server URL from <strong>gear → System → Subsonic / OpenSubsonic API</strong> and sign in with your <strong>SoniqBoom username and password</strong>. Apps that sign in with a token (salt + hash) work with your SoniqBoom password too. You can optionally give them a separate <strong>Subsonic app password</strong>: click <em>Generate new password</em> under <strong>gear → System → My Account</strong> (or <strong>gear → Preferences</strong> for accounts without admin rights) and copy it into the app — it is shown once, and from then on token apps must use it. Apps that support OpenSubsonic API keys can sign in with a key instead: <em>Create key</em> in the same place, copy it into the app (also shown once), and <em>Revoke</em> it to sign that app out. In Subsonic apps, tracks that have no album are listed as albums named after their folder (<em>Group album-less tracks into folder albums</em> in the Subsonic panel, on by default); a folder shared by many artists, such as a compo pack, becomes one album per artist, and letter folders (<em>A</em>, <em>B</em> … or <em>A-F</em>) are grouped per artist under their parent folder and named after it, so an artist gets one album for the whole archive rather than one per letter. Turn the option off to reach those tracks only by browsing folders. Then see <a href="#apps">Listen anywhere</a>.</p></div>
-      <div class="card"><span class="ico">🧩</span><h4>What Subsonic apps see</h4><p>Apps list one music folder for each scan folder in your library. A file that holds several tunes (SID, NSF and similar) also lists its other tunes in album and folder views as “Title (Tune n/N)” — up to 60 per file; each of those entries plays that tune. Downloading the original file from an app needs an admin or edit account. An app can ask for MP3, Ogg or FLAC (and WAV for files SoniqBoom converts anyway), and for a maximum bit rate, which is met by encoding to MP3 or Ogg. Apps' internet-radio list is your <a href="#radio">radio Favorites</a>, played through SoniqBoom; an edit or admin account can add, change and remove stations from the app, which changes Favorites for everyone. Apps also see the artist of a SID, tracker, Amiga, Atari&nbsp;ST or AdLib tune as its composer, and an album's label as its record label. An app's artist page gets the biography and photo Track Info finds for that artist and, for a scene musician, the library's artists who share a scene group with them as similar artists. An admin can add, change and remove accounts from an app: its admin role makes an Admin, any role that changes content (download, playlist, jukebox …) an Edit account, and none a Read-only one; changing accounts or passwords from an app needs the main password (<code>u</code> with <code>p</code>, or HTTP Basic), not a token or API key. For app developers: SoniqBoom reports Subsonic API 1.16.1 with the OpenSubsonic extensions <code>songLyrics</code>, <code>formPost</code>, <code>indexBasedQueue</code>, <code>apiKeyAuthentication</code>, <code>topSongsByArtistId</code>, <code>transcoding</code>, <code>transcodeOffset</code>, <code>playbackReport</code> and <code>sonicSimilarity</code> — apps can report what is playing with <code>reportPlayback</code> and find similar tracks with <code>sonicSimilarity</code>; <code>f=jsonp</code> requests must send their own credentials (<code>u</code> with <code>p</code> or with <code>t</code> and <code>s</code>, an API key, or HTTP Basic) and never use the browser session; a request with no credentials gets Subsonic error 10.</p></div>
+      <div class="card"><span class="ico">🧩</span><h4>What Subsonic apps see</h4><p>Apps list one music folder for each scan folder in your library. A file that holds several tunes (SID, NSF and similar) also lists its other tunes in album and folder views as “Title (Tune n/N)” — up to 60 per file; each of those entries plays that tune. Downloading the original file from an app needs an admin or edit account. An app can ask for MP3, Ogg or FLAC (and WAV for files SoniqBoom converts anyway), and for a maximum bit rate, which is met by encoding to MP3 or Ogg. Apps' internet-radio list is the signed-in account's <a href="#radio">radio Favorites</a>, played through SoniqBoom; any account can add, change and remove stations of its own list from the app. Apps also see the artist of a SID, tracker, Amiga, Atari&nbsp;ST or AdLib tune as its composer, and an album's label as its record label. An app's artist page gets the biography and photo Track Info finds for that artist and, for a scene musician, the library's artists who share a scene group with them as similar artists. An admin can add, change and remove accounts from an app: its admin role makes an Admin, any role that changes content (download, playlist, jukebox …) an Edit account, and none a Read-only one; changing accounts or passwords from an app needs the main password (<code>u</code> with <code>p</code>, or HTTP Basic), not a token or API key. For app developers: SoniqBoom reports Subsonic API 1.16.1 with the OpenSubsonic extensions <code>songLyrics</code>, <code>formPost</code>, <code>indexBasedQueue</code>, <code>apiKeyAuthentication</code>, <code>topSongsByArtistId</code>, <code>transcoding</code>, <code>transcodeOffset</code>, <code>playbackReport</code> and <code>sonicSimilarity</code> — apps can report what is playing with <code>reportPlayback</code> and find similar tracks with <code>sonicSimilarity</code>; <code>f=jsonp</code> requests must send their own credentials (<code>u</code> with <code>p</code> or with <code>t</code> and <code>s</code>, an API key, or HTTP Basic) and never use the browser session; a request with no credentials gets Subsonic error 10.</p></div>
       <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart — use <strong>Restart now</strong> in the panel. While a service is off, its pages and API answer “not found”. On the server (from inside the SoniqBoom folder) you can do the same with <code>.venv/bin/soniqboom services list</code> and <code>… services enable</code> / <code>disable</code> followed by <code>subsonic</code>, <code>multiroom</code>, <code>cast</code> or <code>dlna_server</code> (in Docker: <code>docker compose exec soniqboom soniqboom services list</code>), then restart.</p></div>
       <div class="card"><span class="ico">📦</span><h4>Game names from archive names</h4><p>In <strong>gear → Metadata → Game names from archive names</strong>, <em>Game from archive names</em> (on by default) names a retro track's game after its archive when the archive's name is a known game of the track's platform, from the included title lists (Wikidata, No-Intro, the MAME software lists, ZXDB) and your HVSC copy. <strong>Download TOSEC</strong> and <strong>Download Redump</strong> add more titles on request. It applies right away and after each scan; turning it off removes only the names it added.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Retro genres</h4><p>A retro track whose file names no genre is listed under the genres SoniqBoom knows for it: what it is — <em>Game</em>, <em>Demo</em>, <em>Cracktro</em>, <em>Music Disk</em>, <em>Diskmag</em> or <em>Scene</em> — and its platform — <em>SID</em>, <em>Amiga</em>, <em>Atari ST</em>, <em>NES</em>, <em>SNES</em>, <em>Game Boy</em>, <em>Mega Drive</em>, <em>PlayStation</em>, <em>ZX Spectrum</em>, <em>AdLib</em>, <em>MIDI</em> and more. They come from the track's game (from any of its game sources), console-rip formats, Demozoo (the demo, cracktro, music disk, diskmag or game released the same year that uses the tune, and the party competition it entered — to add these, use <strong>Download / refresh index</strong> and then <strong>Apply to library</strong> in <strong>gear → Metadata → Scene groups (Demozoo)</strong>), its composer's Demozoo group, HVSC's <em>GAMES</em> and <em>DEMOS</em> folders and folder names such as <em>games</em>, <em>demos</em>, <em>intros</em>, <em>cracktros</em>, <em>musicdisks</em> or <em>parties</em> inside a music folder. In <strong>gear → Metadata → Retro genres</strong>, <em>Game and group names as genres</em> (on by default) also adds the game, the composer's scene groups and the party, so a Subsonic app can browse a game's or a group's tunes by genre; a large library then lists many more genres. A genre in the file's own tags (other than the format words SoniqBoom adds, such as <em>Chiptune</em> or <em>C64</em>), or one you type in Track Info, replaces them. Track Info, the Genres view, genre search (<code>genre:Cracktro</code>) and Subsonic apps list them: an app shows the first one as the song's genre and all of them where it shows several.</p></div>
-      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), turn <em>Use folder art</em> on or off and choose which filenames count as folder art, and toggle ZIP-archive scanning — <em>Scan ZIPs</em> for local folders and <em>Scan ZIPs on remote shares</em> for archives on FTP, SMB and WebDAV shares.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
+      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), turn <em>Use folder art</em> on or off and choose which filenames count as folder art, and toggle ZIP-archive scanning — <em>Scan ZIPs</em> for local folders and <em>Scan ZIPs on remote shares</em> for archives on FTP, SMB and WebDAV shares.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p><p><em>Tracks that can't be played</em> decides what happens to tracks marked <b>can't play</b> (refused the same way twice by their player), <b>corrupt</b> (no engine can decode them) or <b>broken</b> (reported by a listener) — see <a href="#playing">Playing music</a>. Tracks marked <b>glitched</b> or <b>partial</b> still play, and this setting never hides them. <strong>Mark them</strong> (the default) lists them with their badge; <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you open list them, marked; from there a track can still be played or its mark cleared. Either way shuffle, Instant Mix, More like this and the next track skip them, and a track you click still tries to play. While <em>Hide duplicates in search</em> is on, Hide lists a duplicate whose best copy can't be played by the best copy that can — or, when no copy can play right now, by a copy that is listed (one on a drive that isn't connected, marked offline). Open pages update by themselves when the setting changes or a track is marked or its mark is cleared. Both settings can hide at once: a track is left out when either one hides it. The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Dark is the default. Switch to light under <strong>gear → System → Settings → Theme</strong> and press <strong>Save Settings</strong> (accounts without admin rights: <strong>gear → Preferences → Theme</strong>, then <strong>Save</strong>); the choice is saved in this browser. The phone page follows your device's light or dark mode.</p></div>
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and Amiga, HVL, SC68 and PSF tracks show their length once they have played; AdLib and console chiptune rows still learn their length in the background. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>

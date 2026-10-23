@@ -1420,6 +1420,16 @@ def reset_hvsc_probe_cache() -> None:
     _hvsc_probed_roots.clear()
 
 
+def _hvsc_downloaded() -> bool:
+    """The HVSC card is set to "Download from the internet": a scan looks for
+    no DOCUMENTS folder (``hvsc.auto_configure`` would refuse it anyway)."""
+    try:
+        from soniqboom.core import online_hvsc
+        return online_hvsc.online_docs_chosen()
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 def _hvsc_online_only() -> bool:
     """The SID lookups use the online HVSC collection's documents (no HVSC
     folder of the user's own): a folder of their own found by a scan still
@@ -4300,7 +4310,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         if (getattr(_settings, "hvsc_autodetect", True)
                 and scan_root not in _hvsc_probed_roots):
             from soniqboom.core.hvsc import get_hvsc as _get_hvsc
-            if not _get_hvsc().is_configured() or _hvsc_online_only():
+            if (not _get_hvsc().is_configured() or _hvsc_online_only()) and not _hvsc_downloaded():
                 try:
                     sid_dirs = {
                         str(Path(str(p).split("::")[0]).parent)
@@ -7149,7 +7159,7 @@ async def _remote_scan_body(
     if (getattr(_settings, "hvsc_autodetect", True)
             and scan_root not in _hvsc_probed_roots):
         from soniqboom.core.hvsc import get_hvsc as _get_hvsc
-        if not _get_hvsc().is_configured() or _hvsc_online_only():
+        if (not _get_hvsc().is_configured() or _hvsc_online_only()) and not _hvsc_downloaded():
             try:
                 sid_rel_dirs = {
                     str(PurePosixPath("/" + str(fe.path).lstrip("/")).parent)

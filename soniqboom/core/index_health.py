@@ -4,7 +4,7 @@
 """Runtime index-integrity: a background drift sweep + cached health state.
 
 The TrackStore's derived indexes (``_tag_*``, ``_sorted_*``, ``_agg_*``,
-``_word_index``, ``_unplayed_ids``) are maintained incrementally on every
+``_word_index``) are maintained incrementally on every
 mutation.  If any mutation path mis-maintains one, it drifts out of sync with
 ``_tracks`` SILENTLY — producing fast-but-wrong results (e.g. a format filter
 returning 0) with no error, no hung request, and no log anomaly — until a
@@ -38,8 +38,8 @@ quiet library:
   strictly ascending, holds one entry per track (the primary list one per
   primary, the ``game:`` side list's tracks checked one by one) and every
   entry carries its track's current key — an entry whose track was written
-  after the copy is checked against the live list instead;
-* ``_unplayed_ids`` is checked against ``_play_stats`` slice by slice.
+  after the copy is checked against the live list instead.  (Plays feed no
+  index: a user's unplayed tracks are read from that user's play stats.)
 
 Nothing moves — no sequence bump, no memo dropped — when nothing drifted.
 Only the library being replaced (a load, an import), a scan starting, more
@@ -110,9 +110,7 @@ def _gate_seq(store) -> tuple:
     index reads (a health mark, STIL, cover art) moves neither.  A
     duration-only write (a play-time length backfill) moves only the second,
     and only ``_sorted_duration`` reads it: such a tick checks that list alone.
-    Plays (``_play_seq``) are left out: ``record_play`` maintains
-    ``_unplayed_ids`` itself, and a check after every listening session would
-    be ~10 s of sliced loop time at 680K tracks."""
+    Plays (``_play_seq``) are left out: they feed no index."""
     return (getattr(store, "_browse_seq", store._mutation_seq),
             getattr(store, "_duration_seq", 0))
 
@@ -243,7 +241,6 @@ class _Audit:
         st = self.store
         shadow = TrackStore()
         shadow._tracks = self.tracks                 # (read only)
-        shadow._play_stats = st._play_stats
         shadow.enter_batch_mode()
         shadow._mark_all_sorted_dirty()              # (its sorted lists are not built)
         self.shadow = shadow
@@ -443,33 +440,12 @@ class _Audit:
                 await self._turn()
         self._note(name, n, n if want is None else want, disorder + drifted)
 
-    async def _check_unplayed(self) -> None:
-        st, tracks = self.store, self.tracks
-        sample: list = []
-        ids = list(tracks)
-        for j in range(0, len(ids), 512):
-            plays, unplayed = st._play_stats, st._unplayed_ids
-            for tid in ids[j:j + 512]:
-                if tid in tracks and (tid in unplayed) != (tid not in plays):
-                    sample.append(tid)
-            if self._due():
-                await self._turn()
-        listed = list(st._unplayed_ids)
-        for j in range(0, len(listed), 512):
-            plays, unplayed = st._play_stats, st._unplayed_ids
-            for tid in listed[j:j + 512]:
-                if tid in unplayed and (tid not in tracks or tid in plays):
-                    sample.append(tid)
-            if self._due():
-                await self._turn()
-        self._note("_unplayed_ids", len(st._unplayed_ids), len(st._unplayed_ids), sample)
-
     # ── heal ──
 
     async def _heal(self) -> None:
         """Make the drifted indexes right again: the shadow's copy of a
         drifted tag / word / aggregate index or id set swapped in (at a moment
-        it is current), ``_unplayed_ids`` recomputed, the sorted lists rebuilt
+        it is current), the sorted lists rebuilt
         (the scanner's yielding rebuild) — then every memo and sequence moves
         (``_library_replaced``)."""
         from soniqboom.core.store import SORTED_LISTS, shadowed_index_attrs
@@ -487,8 +463,6 @@ class _Audit:
             setattr(self.shadow, attr, type(obj)())  # (the store's now: not freed below)
         if "_word_index" in swap:
             st._word_list_dirty = True              # (no account of what changed)
-        if "_unplayed_ids" in drifted:
-            st._unplayed_ids = {tid for tid in st._tracks if tid not in st._play_stats}
         st._library_replaced()
         self.healed = True
         if drifted & set(SORTED_LISTS):
@@ -555,7 +529,6 @@ class _Audit:
                     from soniqboom.core.store import SORTED_LISTS
                     for name in SORTED_LISTS:
                         await self._check_sorted(name)
-                    await self._check_unplayed()
                 else:
                     await self._check_sorted("_sorted_duration")
                 if self.mismatches:

@@ -33,11 +33,11 @@ def test_signed_tokens_are_masked_and_plain_paths_untouched():
 
 def test_aof_replay_of_a_backdated_play_keeps_the_newer_last_played():
     from soniqboom.core import merger
-    state = {"play_stats": {"t1": {"count": 3, "last_played": 2_000}}}
+    state = {"play_stats": {"u1": {"t1": {"count": 3, "last_played": 2_000}}}}
     apply = getattr(merger, "_apply_entry", None) or getattr(merger, "apply_entry", None)
     assert apply is not None
-    apply(state, {"op": "record_play", "id": "t1", "ts": 1_000})
-    assert state["play_stats"]["t1"] == {"count": 4, "last_played": 2_000}
+    apply(state, {"op": "record_play", "id": "t1", "ts": 1_000, "uid": "u1"})
+    assert state["play_stats"]["u1"]["t1"] == {"count": 4, "last_played": 2_000}
 
 
 def test_percent_encoded_names_and_cast_path_tokens_are_masked():
@@ -51,9 +51,10 @@ def test_back_dated_history_lands_in_play_order_live_and_on_replay():
     from soniqboom.core.store import TrackStore
     s = TrackStore()
     for tid, ts in (("a", 100), ("b", 300), ("c", 200)):
-        s.push_history({"track_id": tid, "ts": ts})
-    assert [e["track_id"] for e in s.get_history(10)] == ["b", "c", "a"]
+        s.push_history({"track_id": tid, "ts": ts}, uid="")
+    assert [e["track_id"] for e in s.get_history(10, uid="")] == ["b", "c", "a"]
     state = {}
     for tid, ts in (("a", 100), ("b", 300), ("c", 200)):
-        merger._apply_entry(state, {"op": "push_history", "data": {"track_id": tid, "ts": ts}})
-    assert [e["track_id"] for e in state["history"]] == ["a", "c", "b"]
+        merger._apply_entry(state, {"op": "push_history", "data": {"track_id": tid, "ts": ts},
+                                    "uid": ""})
+    assert [e["track_id"] for e in state["history"][""]] == ["a", "c", "b"]

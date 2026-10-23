@@ -10,7 +10,7 @@ Three station sources feed the Stations UI:
     radios) with stream URLs taken from each station's official site.
   * The community **Radio Browser** directory (api.radio-browser.info,
     public-domain data, no API key) for the world-wide country browser.
-  * The server-local **favorites** list (seeded with Nectarine).
+  * Each account's **favorites** list (by default Nectarine).
 
 Radio Browser etiquette implemented here: a descriptive User-Agent on
 every request, results cached on disk so the public mirror isn't hammered
@@ -427,17 +427,24 @@ async def _directory_search(name: str, fetch: int) -> list[dict]:
     return [dict(g) for g in rb]
 
 
-async def search_stations(q: str, limit: int = 30) -> list[dict]:
+async def search_stations(q: str, limit: int = 30, uid: str | None = None) -> list[dict]:
     """Search stations by name across the scene pack, favorites, and the
     Radio Browser directory.  Local (curated + favorite) matches rank first,
-    then directory matches by votes."""
+    then directory matches by votes.  Favourites: every user's directory
+    stations, but ``custom:`` ones (a user's own URL) only from user
+    ``uid``'s list when given."""
     q = (q or "").strip()
     if not q:
         return []
     ql = q.lower()
     out: list[dict] = []
     seen: set[str] = set()
-    for st in SCENE_PACK + get_favorites():
+    favs = all_favorites()
+    if uid is not None:
+        own = {f.get("sid") for f in get_favorites(uid)}
+        favs = [f for f in favs if not str(f.get("sid", "")).startswith("custom:")
+                or f.get("sid") in own]
+    for st in SCENE_PACK + favs:
         sid = st.get("sid")
         if not sid or sid in seen:
             continue
@@ -480,44 +487,208 @@ async def report_click(uuid: str) -> None:
         pass
 
 
-# ── Favorites ────────────────────────────────────────────────────────────────
+# ── Favorites (per user) ─────────────────────────────────────────────────────
+# Each account has its own list: ``radio/favorites/<key>.json`` holding
+# ``{"uid": <account id>, "favorites": [station, …]}`` (the key is the id when
+# it is a plain file name, else a digest of it — the kept-aside ``import:…``
+# buckets, the no-user list ``""``).  A user without a file has the default
+# list, Nectarine (``_default_favorites``) — written on its first change.
+# Station RESOLUTION (``resolve_station``, ``search_stations``, Subsonic
+# ``radioStream``, the relay, multi-room) reads the union of all lists
+# (``all_favorites``): a ``custom:`` station one user added still resolves
+# wherever it is referenced.  The shared ``radio/favorites.json`` of a version
+# before per-user lists goes to the legacy owner (``migrate_shared_favorites``).
 
-_FAVS_FILE = "favorites.json"
+_FAVS_FILE = "favorites.json"                   # (the shared list before per-user lists)
+_FAVS_DIR = "favorites"
+_SAFE_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
-def get_favorites() -> list[dict]:
-    return _read_json(_FAVS_FILE) or []
+def _favs_path(uid: str) -> Path:
+    import hashlib
+    key = uid if _SAFE_KEY.match(uid or "") else "x-" + hashlib.sha1(
+        (uid or "").encode("utf-8")).hexdigest()
+    d = _dir() / _FAVS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{key}.json"
 
 
-def add_favorite(station: dict) -> list[dict]:
-    favs = get_favorites()
+def _default_favorites() -> list[dict]:
+    nectarine = _scene_by_sid("scene:nectarine")
+    return [dict(nectarine)] if nectarine else []
+
+
+def _read_favs(uid: str) -> list[dict] | None:
+    """User ``uid``'s stored list, or None without a file."""
+    try:
+        doc = json.loads(_favs_path(uid).read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.warning("Stations: the favourites of %r could not be read", uid, exc_info=True)
+        return None
+    favs = doc.get("favorites") if isinstance(doc, dict) else doc
+    return [f for f in favs if isinstance(f, dict)] if isinstance(favs, list) else []
+
+
+def _write_favs(uid: str, favs: list[dict]) -> None:
+    p = _favs_path(uid)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"uid": uid, "favorites": favs}, ensure_ascii=False))
+    tmp.replace(p)
+
+
+def get_favorites(uid: str) -> list[dict]:
+    """User ``uid``'s favourite stations (``""``: no account) — the default
+    list when they never changed it."""
+    favs = _read_favs(uid)
+    return _default_favorites() if favs is None else favs
+
+
+def add_favorite(station: dict, *, uid: str) -> list[dict]:
+    favs = get_favorites(uid)
     if not any(f.get("sid") == station.get("sid") for f in favs):
         favs.append(station)
-        _write_json(_FAVS_FILE, favs)
+        _write_favs(uid, favs)
     return favs
 
 
-def remove_favorite(sid: str) -> list[dict]:
-    favs = [f for f in get_favorites() if f.get("sid") != sid]
-    _write_json(_FAVS_FILE, favs)
+def remove_favorite(sid: str, *, uid: str) -> list[dict]:
+    favs = [f for f in get_favorites(uid) if f.get("sid") != sid]
+    _write_favs(uid, favs)
     return favs
 
 
-def update_favorite(sid: str, station: dict) -> list[dict] | None:
-    """Replace the favourite ``sid`` with ``station`` IN PLACE — it keeps its
-    position in every list — with one atomic write.  ``None`` (and no write)
-    when ``sid`` isn't a favourite."""
-    favs = get_favorites()
+def update_favorite(sid: str, station: dict, *, uid: str) -> list[dict] | None:
+    """Replace user ``uid``'s favourite ``sid`` with ``station`` IN PLACE — it
+    keeps its position in every list — with one atomic write.  ``None`` (and
+    no write) when ``sid`` isn't one of theirs."""
+    favs = get_favorites(uid)
     for i, f in enumerate(favs):
         if isinstance(f, dict) and f.get("sid") == sid:
             favs[i] = station
-            _write_json(_FAVS_FILE, favs)
+            _write_favs(uid, favs)
             return favs
     return None
 
 
-def is_favorite(sid: str) -> bool:
-    return any(f.get("sid") == sid for f in get_favorites())
+def is_favorite(sid: str, *, uid: str) -> bool:
+    return any(f.get("sid") == sid for f in get_favorites(uid))
+
+
+def favorites_by_user() -> dict[str, list[dict]]:
+    """Every stored list, ``{account id (or kept-aside key, ""): stations}``
+    — for the backup (``.sbz``)."""
+    out: dict[str, list[dict]] = {}
+    d = _dir() / _FAVS_DIR                              # (read only: no file written)
+    for p in sorted(d.glob("*.json")) if d.is_dir() else ():
+        try:
+            doc = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(doc, dict) and isinstance(doc.get("uid"), str) \
+                and isinstance(doc.get("favorites"), list):
+            out[doc["uid"]] = [f for f in doc["favorites"] if isinstance(f, dict)]
+    return out
+
+
+def unmigrated_shared_favorites() -> list[dict] | None:
+    """The shared ``radio/favorites.json`` of a version before per-user
+    lists while no start migrated it yet (read only), else None."""
+    p = _dir() / _FAVS_FILE
+    try:
+        doc = json.loads(p.read_text())
+    except Exception:
+        return None
+    return [f for f in doc if isinstance(f, dict)] if isinstance(doc, list) else None
+
+
+def all_favorites() -> list[dict]:
+    """The union of every user's favourites (one per sid; the default list
+    too) — what station resolution reads.  For a ``custom:`` station the copy
+    in its creator's list wins (``creator``: the account that made it — its
+    URL is theirs to change; another user's copy of it may be stale or
+    edited), else the first copy."""
+    by_user = favorites_by_user()
+    out, seen = [], set()
+    for uid, favs in by_user.items():
+        for f in favs:
+            sid = f.get("sid")
+            if sid and sid not in seen and f.get("creator") == uid:
+                seen.add(sid)
+                out.append(f)
+    for favs in (*by_user.values(), _default_favorites()):
+        for f in favs:
+            sid = f.get("sid")
+            if sid and sid not in seen:
+                seen.add(sid)
+                out.append(f)
+    return out
+
+
+def set_favorites(uid: str, favs: list[dict]) -> None:
+    """Replace user ``uid``'s whole list (a backup restored)."""
+    _write_favs(uid, [f for f in favs if isinstance(f, dict)])
+
+
+def move_favorites(src: str, dst: str) -> bool:
+    """User ``src``'s stored list goes to ``dst``, merged after ``dst``'s own
+    (one entry per sid; ``dst`` without a list of its own gets ``src``'s as
+    it is, not added to the default one), and ``src``'s file is removed —
+    the plays' moves
+    (``user_data.claim_unowned`` / ``claim_pending``).  True when ``src`` had
+    a list."""
+    if src == dst:
+        return False
+    favs = _read_favs(src)
+    if favs is None:
+        return False
+    mine = _read_favs(dst)                  # (none: ``src``'s list replaces the default)
+    merged = list(mine or [])
+    have = {f.get("sid") for f in merged}
+    merged += [f for f in favs if f.get("sid") not in have]
+    _write_favs(dst, merged)
+    try:
+        _favs_path(src).unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def delete_favorites(uid: str) -> bool:
+    """Remove user ``uid``'s list (a deleted account).  True when it had one."""
+    try:
+        _favs_path(uid).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def migrate_shared_favorites(owner: str) -> bool:
+    """The shared ``radio/favorites.json`` (before per-user lists) becomes
+    ``owner``'s list (the legacy owner — ``""`` without accounts: moved to
+    the first account with the plays), added to a list ``owner`` already
+    has; the old file is kept as ``favorites.json.migrated``.  True when a
+    shared file was there."""
+    old = _dir() / _FAVS_FILE
+    if not old.is_file():
+        return False
+    shared = _read_json(_FAVS_FILE)
+    shared = [f for f in shared if isinstance(f, dict)] if isinstance(shared, list) else []
+    # (its custom stations are the owner's to change — ``all_favorites``)
+    shared = [{**f, "creator": owner} if str(f.get("sid", "")).startswith("custom:")
+              and owner and not f.get("creator") else f for f in shared]
+    mine = _read_favs(owner)
+    if mine is None:
+        merged = shared
+    else:
+        have = {f.get("sid") for f in mine}
+        merged = mine + [f for f in shared if f.get("sid") not in have]
+    _write_favs(owner, merged)
+    old.replace(old.with_name(_FAVS_FILE + ".migrated"))
+    log.info("Stations: the shared favourites (%d) are now the list of %s",
+             len(shared), owner or "the no-user bucket")
+    return True
 
 
 # ── Resolution + startup ─────────────────────────────────────────────────────
@@ -527,12 +698,13 @@ def _scene_by_sid(sid: str) -> dict | None:
 
 
 async def resolve_station(sid: str) -> dict | None:
-    """Find a station object by sid in scene pack, favorites, country caches,
-    or (for rb: sids) a live Radio Browser lookup as the last resort."""
+    """Find a station object by sid in scene pack, every user's favorites
+    (``all_favorites``), country caches, or (for rb: sids) a live Radio
+    Browser lookup as the last resort."""
     st = _scene_by_sid(sid)
     if st:
         return st
-    for f in get_favorites():
+    for f in all_favorites():
         if f.get("sid") == sid:
             return f
     for p in _dir().glob("country_*.json"):
@@ -556,13 +728,16 @@ async def resolve_station(sid: str) -> dict | None:
 
 
 async def ensure_ready(*, fetch: bool = False) -> None:
-    """Startup hook: seed favorites with Nectarine on first run.  The Radio
-    Browser country metadata is fetched when the world browser first asks
-    for it (``get_countries``); ``fetch`` fetches (or refreshes) it now."""
-    if _read_json(_FAVS_FILE) is None:
-        nectarine = _scene_by_sid("scene:nectarine")
-        _write_json(_FAVS_FILE, [nectarine] if nectarine else [])
-        log.info("Stations: favorites seeded with Nectarine")
+    """Startup hook: the shared favourites of a version before per-user lists
+    become the legacy owner's (``migrate_shared_favorites``; every user
+    without a list has the default one, Nectarine).  The Radio Browser
+    country metadata is fetched when the world browser first asks for it
+    (``get_countries``); ``fetch`` fetches (or refreshes) it now."""
+    try:
+        from soniqboom.core.store import get_store
+        migrate_shared_favorites(get_store().user_data_owner())
+    except Exception:                       # noqa: BLE001
+        log.warning("Stations: the shared favourites could not be migrated", exc_info=True)
     if not fetch:
         return
     try:

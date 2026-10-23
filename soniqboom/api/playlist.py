@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from soniqboom.core.data import (
@@ -18,7 +18,7 @@ from soniqboom.core.data import (
     update_playlist,
 )
 from soniqboom.core.store import get_store
-from soniqboom.api.users import current_user, require_user
+from soniqboom.api.users import current_user, listener_uid
 
 router = APIRouter(prefix="/playlists", tags=["playlists"])
 
@@ -35,6 +35,11 @@ class PlaylistUpdate(BaseModel):
     name: str | None = None
     track_ids: list[str | dict] | None = None
     query: str | None = None        # smart playlists: update the saved search
+    shared: bool | None = None      # offer it to every account (owner, not readonly)
+
+
+class Subscription(BaseModel):
+    subscribed: bool
 
 
 class TrackIds(BaseModel):
@@ -82,80 +87,140 @@ def _norm_entry(e):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 # ── Playlist visibility / ownership ─────────────────────────────────────────
-# All playlist endpoints honour ``owner_user_id``:
-#   * a signed-in user sees their own + any legacy (no-owner) playlists.
-#   * reads return 404 for someone else's playlist (don't leak existence).
-#   * writes require ownership OR admin role.
-# Pre-bootstrap installs (no users at all) keep the old "everything shared"
-# behaviour so single-tenant installs aren't disrupted on upgrade.
+# Every playlist is its owner's (``owner_user_id``; ``TrackStore`` "Playlist
+# ownership"): the signed-in user's list holds their own playlists and the
+# shared ones of others they subscribed to (Import).  Reads: the owner, or
+# anyone while it is shared; someone else's unshared playlist is a 404 —
+# admins included.  Writes (rename, tracks, delete, share): the owner only;
+# readonly accounts may keep their own playlists but not share them.
+# Before any account exists every playlist is the no-user bucket's ("").
 
 
-def _can_read(pl: dict, user) -> bool:
-    owner = pl.get("owner_user_id")
-    if owner is None:
-        return True
-    if user is None:
-        return False
-    return owner == user.id or user.role == "admin"
+def _can_read(pl: dict, uid: str) -> bool:
+    return get_store().playlist_readable(pl, uid)
 
 
-def _can_write(pl: dict, user) -> bool:
-    if user is None:
-        return False
-    if user.role == "readonly":
-        return False
-    owner = pl.get("owner_user_id")
-    if owner is None:
-        return True  # legacy/shared playlists editable by any non-readonly
-    return owner == user.id or user.role == "admin"
+def _can_write(pl: dict, uid: str) -> bool:
+    return get_store().playlist_owner(pl) == uid
+
+
+def _owner_name(owner: str) -> str:
+    """The owner's user name for the shared views (the name an account signs in
+    with — a display name is the user's to choose and could pose as another
+    account)."""
+    try:
+        from soniqboom.core.users import get_user_store
+        u = get_user_store().get(owner) if owner else None
+    except RuntimeError:
+        u = None
+    return u.username if u is not None else ""
+
+
+def _shown(pl: dict | None, uid: str) -> dict | None:
+    """A playlist as the API returns it to ``uid``: never who imported it
+    (the owner sees how many — ``subscriber_count``), and someone else's
+    playlist without its owner's id (``owner_name`` instead)."""
+    if pl is None:
+        return None
+    out = {k: v for k, v in pl.items() if k != "subscribers"}
+    if get_store().playlist_owner(pl) == uid:
+        out["subscriber_count"] = len(pl.get("subscribers") or ())
+    else:
+        out.pop("owner_user_id", None)
+    return out
+
+
+def _summary(p: dict, uid: str) -> dict:
+    own = get_store().playlist_owner(p) == uid
+    out = {
+        "id": p["id"],
+        "name": p["name"],
+        "track_count": len(p.get("track_ids", [])),
+        "query": p.get("query"),
+        "smart": bool(p.get("query")),
+        "shared": bool(p.get("shared")),
+        "subscribed": not own,          # someone else's, imported (read-only)
+        "read_only": not own,
+        "created_at": p.get("created_at"),
+        "updated_at": p.get("updated_at"),
+    }
+    if own:
+        out["owner_user_id"] = p.get("owner_user_id")
+        out["subscriber_count"] = len(p.get("subscribers") or ())
+    else:
+        out["owner_name"] = _owner_name(get_store().playlist_owner(p))
+    return out
 
 
 @router.get("")
-async def list_all_playlists(user = Depends(current_user)):
-    """Return playlists visible to the signed-in user (summary view)."""
-    playlists = await list_playlists(user_id=user.id if user else None)
-    return [
-        {
-            "id": p["id"],
-            "name": p["name"],
-            "track_count": len(p.get("track_ids", [])),
-            "query": p.get("query"),
-            "smart": bool(p.get("query")),
-            "owner_user_id": p.get("owner_user_id"),
-            "created_at": p.get("created_at"),
-            "updated_at": p.get("updated_at"),
-        }
-        for p in playlists
-    ]
+async def list_all_playlists(uid: str = Depends(listener_uid)):
+    """The signed-in user's playlists (summary view): their own, then the
+    shared ones they imported (``subscribed``, read-only)."""
+    playlists = await list_playlists(user_id=uid)
+    return [_summary(p, uid) for p in playlists]
 
 
 @router.post("", status_code=201)
-async def create_new_playlist(body: PlaylistCreate, user = Depends(require_user)):
-    """Create a new playlist owned by the signed-in user."""
-    if user.role == "readonly":
-        raise HTTPException(
-            403,
-            "Your account is read-only. Ask an admin to upgrade you to 'edit' "
-            "to create playlists.",
-        )
+async def create_new_playlist(body: PlaylistCreate, uid: str = Depends(listener_uid)):
+    """Create a new playlist owned by the signed-in user (readonly too)."""
     playlist_id = str(uuid.uuid4())
     playlist = await create_playlist(
         body.name,
         playlist_id=playlist_id,
         track_ids=[_norm_entry(e) for e in body.track_ids if _entry_id(e)],
-        owner_user_id=user.id,
+        owner_user_id=uid or None,
         query=(body.query or None),
     )
-    return playlist
+    return _shown(playlist, uid)
+
+
+@router.get("/shared")
+async def shared_playlists(uid: str = Depends(listener_uid)):
+    """The playlists other accounts share — the Import list: id, name, the
+    owner's name, track count, whether the caller subscribed."""
+    store = get_store()
+    out = []
+    for p in store.shared_playlists_for(uid):
+        out.append({
+            "id": p["id"], "name": p["name"],
+            "owner_name": _owner_name(store.playlist_owner(p)),
+            "track_count": len(p.get("track_ids", [])),
+            "smart": bool(p.get("query")),
+            "subscribed": uid in (p.get("subscribers") or ()),
+        })
+    out.sort(key=lambda r: (r["owner_name"].lower(), r["name"].lower()))
+    return out
+
+
+@router.put("/{playlist_id}/subscription")
+async def set_subscription(playlist_id: str, body: Subscription,
+                           uid: str = Depends(listener_uid)):
+    """Import (``subscribed`` true) a shared playlist of another account —
+    a read-only link that follows its owner's edits — or remove it again."""
+    if not uid:
+        raise HTTPException(403, "Sign in to import playlists.")
+    store = get_store()
+    pl = store.get_playlist(playlist_id)
+    known = pl is not None and (store.playlist_readable(pl, uid)
+                                or uid in (pl.get("subscribers") or ()))
+    if not known or store.set_playlist_subscription(
+            playlist_id, uid, body.subscribed) is None:
+        raise HTTPException(404, "Playlist not found")
+    return {"id": playlist_id, "subscribed": body.subscribed}
 
 
 @router.get("/{playlist_id}")
-async def read_playlist(playlist_id: str, user = Depends(current_user)):
+async def read_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
     """Return a playlist with full track metadata.  404s if the caller
-    doesn't own it (and it's not shared)."""
+    doesn't own it and it's not shared.  ``read_only`` / ``owner_name`` for
+    someone else's (shared) playlist."""
     playlist = await get_playlist(playlist_id)
-    if not playlist or not _can_read(playlist, user):
+    if not playlist or not _can_read(playlist, uid):
         raise HTTPException(404, "Playlist not found")
+    if not _can_write(playlist, uid):
+        playlist = {**playlist, "read_only": True,
+                    "owner_name": _owner_name(get_store().playlist_owner(playlist)),
+                    "subscribed": uid in (playlist.get("subscribers") or ())}
 
     q = playlist.get("query")
     if q:
@@ -164,7 +229,7 @@ async def read_playlist(playlist_id: str, user = Depends(current_user)):
         from soniqboom.api.search import run_search
         results = await run_search(q, limit=500)
         tracks = [t.model_dump() if hasattr(t, "model_dump") else t for t in results]
-        return {**playlist, "smart": True, "tracks": _mark_offline(tracks)}
+        return {**_shown(playlist, uid), "smart": True, "tracks": _mark_offline(tracks)}
 
     entries = playlist.get("track_ids", [])
     ids = [_entry_id(e) for e in entries]
@@ -186,7 +251,7 @@ async def read_playlist(playlist_id: str, user = Depends(current_user)):
             td.pop("embedding", None)
             td["subsong"] = sub
             tracks.append(td)
-    return {**playlist, "tracks": _mark_offline(tracks)}
+    return {**_shown(playlist, uid), "tracks": _mark_offline(tracks)}
 
 
 def _mark_offline(tracks: list) -> list:
@@ -223,9 +288,10 @@ def _mark_offline(tracks: list) -> list:
 @router.put("/{playlist_id}")
 async def update_existing_playlist(
     playlist_id: str, body: PlaylistUpdate,
-    user = Depends(require_user),
+    uid: str = Depends(listener_uid), user=Depends(current_user),
 ):
-    """Update playlist name and/or track list (owner or admin only).
+    """Update playlist name, track list and/or ``shared`` (owner only;
+    sharing not for readonly accounts — unsharing ends every subscription).
 
     When ``track_ids`` is supplied, every id is validated against the
     in-memory track store and unknown ids are pruned.  The response
@@ -233,13 +299,20 @@ async def update_existing_playlist(
     were silently removed (e.g. tracks deleted between fetch + save).
     """
     playlist = await get_playlist(playlist_id)
-    if not playlist or not _can_read(playlist, user):
+    if not playlist or not _can_read(playlist, uid):
         raise HTTPException(404, "Playlist not found")
-    if not _can_write(playlist, user):
+    if not _can_write(playlist, uid):
         raise HTTPException(403, "You can only edit your own playlists.")
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(422, "No fields to update")
+    shared = updates.pop("shared", None)
+    if shared is not None:
+        if shared and (user is None or user.role == "readonly"):
+            raise HTTPException(403, "Read-only accounts can't share playlists.")
+        get_store().set_playlist_shared(playlist_id, shared)
+        if not updates:
+            return _shown(await get_playlist(playlist_id), uid)
     # Validate + prune unknown track ids when the caller supplies them.
     # We accept-and-prune (rather than 400) so a stale client doesn't
     # block an otherwise valid edit — but we tell the client which ids
@@ -261,17 +334,18 @@ async def update_existing_playlist(
     if dropped:
         # Caller asked for a partial update — surface the dropped ids so
         # the UI can prompt for a rescan / reload.
-        return {**result, "dropped_ids": dropped}
-    return result
+        return {**_shown(result, uid), "dropped_ids": dropped}
+    return _shown(result, uid)
 
 
 @router.delete("/{playlist_id}")
-async def remove_playlist(playlist_id: str, user = Depends(require_user)):
-    """Delete a playlist (owner or admin only)."""
+async def remove_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
+    """Delete a playlist (owner only — a shared one goes for every
+    subscriber too)."""
     playlist = await get_playlist(playlist_id)
-    if not playlist or not _can_read(playlist, user):
+    if not playlist or not _can_read(playlist, uid):
         raise HTTPException(404, "Playlist not found")
-    if not _can_write(playlist, user):
+    if not _can_write(playlist, uid):
         raise HTTPException(403, "You can only delete your own playlists.")
     removed = await delete_playlist(playlist_id)
     if not removed:
@@ -280,12 +354,12 @@ async def remove_playlist(playlist_id: str, user = Depends(require_user)):
 
 
 @router.post("/{playlist_id}/tracks")
-async def add_tracks(playlist_id: str, body: TrackIds, user = Depends(require_user)):
-    """Append tracks to a playlist (owner or admin only)."""
+async def add_tracks(playlist_id: str, body: TrackIds, uid: str = Depends(listener_uid)):
+    """Append tracks to a playlist (owner only)."""
     playlist = await get_playlist(playlist_id)
-    if not playlist or not _can_read(playlist, user):
+    if not playlist or not _can_read(playlist, uid):
         raise HTTPException(404, "Playlist not found")
-    if not _can_write(playlist, user):
+    if not _can_write(playlist, uid):
         raise HTTPException(403, "You can only edit your own playlists.")
 
     existing = playlist.get("track_ids", [])
@@ -301,20 +375,20 @@ async def add_tracks(playlist_id: str, body: TrackIds, user = Depends(require_us
             new_entries.append(_norm_entry(e))
     merged = existing + new_entries
     result = await update_playlist(playlist_id, {"track_ids": merged})
-    return result
+    return _shown(result, uid)
 
 
 @router.delete("/{playlist_id}/tracks")
-async def remove_tracks(playlist_id: str, body: TrackIds, user = Depends(require_user)):
-    """Remove tracks from a playlist (owner or admin only)."""
+async def remove_tracks(playlist_id: str, body: TrackIds, uid: str = Depends(listener_uid)):
+    """Remove tracks from a playlist (owner only)."""
     playlist = await get_playlist(playlist_id)
-    if not playlist or not _can_read(playlist, user):
+    if not playlist or not _can_read(playlist, uid):
         raise HTTPException(404, "Playlist not found")
-    if not _can_write(playlist, user):
+    if not _can_write(playlist, uid):
         raise HTTPException(403, "You can only edit your own playlists.")
 
     existing = playlist.get("track_ids", [])
     drop = {_entry_key(e) for e in body.track_ids}
     filtered = [e for e in existing if _entry_key(e) not in drop]
     result = await update_playlist(playlist_id, {"track_ids": filtered})
-    return result
+    return _shown(result, uid)

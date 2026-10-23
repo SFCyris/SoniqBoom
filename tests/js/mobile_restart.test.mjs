@@ -60,3 +60,18 @@ test('the phone page starts listening once signed in', () => {
   const after = SRC.slice(SRC.indexOf('activate(initialView());'));
   assert.match(after.slice(0, 200), /_listenForRestart\(\);/);
 });
+
+test('an availability change re-reads the state (Hide leaves rows out on the phone too)', () => {
+  const e = env();
+  const avails = [];
+  _listenForRestart({ ...e.opts, avail: (m) => avails.push(m) });
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'scan_progress', running: true }) });
+  assert.equal(avails.length, 0);
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'availability_changed', token: 't', mode: 'mark' }) });
+  assert.equal(avails.length, 1);
+  assert.equal(avails[0].token, 't');
+  assert.equal(e.notes.length, 0);
+  // the default handler asks offline.js (imported by the phone's app.js) to re-read
+  assert.match(SRC, /avail = \(\) => Offline\.refresh\(\)/);
+  assert.match(SRC, /^import \{ Offline \} from '\.\.\/offline\.js';$/m);
+});

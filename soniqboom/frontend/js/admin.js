@@ -1806,7 +1806,7 @@ function _formatRebuildCompleteMsg(status) {
   return 'Rebuild complete.';
 }
 
-// ── Metadata repair (re-extract U+FFFD-tainted titles) ───────────────────────
+// ── Metadata repair (re-extract garbled / placeholder titles) ─────────────────
 //
 // Three buttons:
 //   Scan — counts candidates (cheap, in-memory; populates the preview).
@@ -1841,6 +1841,19 @@ let _syncRepairStatus = null;   // set by setupRepairControls; open() calls it f
     statusEl.textContent = text;
     statusEl.className   = `admin-msg ${type}`;
     statusEl.style.display = '';
+  }
+
+  // What a Scan found, by reason (repair-scan ``kinds``).
+  const _KIND_LABELS = {
+    garbled:     n => `${n} with the replacement character \uFFFD`,
+    placeholder: n => `${n} with a placeholder title such as “<unnamed>”`,
+    'bad-title': n => `${n} with a misread module title`,
+    cp437:       n => `${n} SID name${n === 1 ? '' : 's'} with misread accents`,
+  };
+  function _scanKinds(kinds) {
+    const parts = Object.entries(kinds || {}).sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => (_KIND_LABELS[k] || (c => `${c} other`))(n));
+    return parts.join(', ') || 'metadata to re-read';
   }
 
   function setRunningUI(running) {
@@ -1919,7 +1932,10 @@ let _syncRepairStatus = null;   // set by setupRepairControls; open() calls it f
       // error breakdown when applicable.
       if (p.total > 0 && p.finished_at) {
         const tag = p.cancelled ? 'Cancelled' : 'Done';
+        // Read without an error but left as they were (nothing to change).
+        const same = Math.max(0, (p.processed | 0) - (p.repaired | 0) - (p.errors | 0));
         const base = `${tag} — repaired ${p.repaired} of ${p.processed} track(s)`
+                   + (same ? `, ${same} with nothing to change` : '')
                    + ` (${p.errors} error${p.errors === 1 ? '' : 's'})`;
         const breakdown = p.errors > 0 ? _renderErrorBreakdown(p) : '';
         statusEl.innerHTML = base + breakdown + '.';
@@ -1959,7 +1975,7 @@ let _syncRepairStatus = null;   // set by setupRepairControls; open() calls it f
           .map(p => (p || '').split('/').pop()).join(', ');
         const more = lastScanCount > 5 ? `, +${lastScanCount - 5} more` : '';
         showStatus(
-          `Found ${lastScanCount} track(s) with U+FFFD in metadata`
+          `Found ${lastScanCount} track(s) to repair: ${_scanKinds(data.kinds)}`
           + ` (e.g. ${sample}${more}). Click “Repair Now” to re-extract.`,
           'ok',
         );
@@ -3757,6 +3773,8 @@ async function loadSettings() {
     _loadedDedupFolders = !!s.dedup_folders;
     const offlineEl = document.getElementById('setting-offline-tracks');
     if (offlineEl && ['mark', 'hide', 'show'].includes(s.offline_tracks)) offlineEl.value = s.offline_tracks;
+    const unplayEl = document.getElementById('setting-unplayable-tracks');
+    if (unplayEl && ['mark', 'hide'].includes(s.unplayable_tracks)) unplayEl.value = s.unplayable_tracks;
     const shortEl = document.getElementById('setting-skip-short-tunes');
     if (shortEl && [0, 5, 10, 20, 30].includes(Number(s.skip_short_tunes))) {
       shortEl.value = String(Number(s.skip_short_tunes));
@@ -3829,6 +3847,13 @@ async function loadAbout() {
     const res = await fetch('/api/health');
     const j   = await res.json();
     verEl.textContent = j.version || 'unknown';
+    // The library database's format (``persistence.DB_VERSION``).
+    const dbRow = document.getElementById('about-db-row');
+    const dbEl = document.getElementById('about-db-version');
+    if (dbRow && dbEl && j.db_version) {
+      dbEl.textContent = `V${j.db_version}`;
+      dbRow.hidden = false;
+    }
     // AGPL-3.0 §13: link the source of the version that is running.
     const src = document.getElementById('about-source');
     if (src && j.version) {
@@ -3866,6 +3891,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const filterDups = document.getElementById('setting-filter-duplicates')?.checked ?? false;
     const dedupFolders = document.getElementById('setting-dedup-folders')?.checked ?? false;
     const offlineTracks = document.getElementById('setting-offline-tracks')?.value || 'mark';
+    const unplayableTracks = document.getElementById('setting-unplayable-tracks')?.value || 'mark';
     const skipShort = Number(document.getElementById('setting-skip-short-tunes')?.value || 0);
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
@@ -3887,6 +3913,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         filter_duplicates: filterDups,
         dedup_folders: dedupFolders,
         offline_tracks: offlineTracks,
+        unplayable_tracks: unplayableTracks,
         skip_short_tunes: skipShort,
         use_folder_art: useFolderArt,
         folder_art_names: folderArtNames,
@@ -3911,8 +3938,9 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
       _loadedDedupFolders = dedupFolders;
       try { (await import('./library.js')).Library?.refreshCurrentFolderInPlace?.(); } catch { /* non-fatal */ }
     }
-    // "Tracks on unavailable drives": re-read the state now (the WebSocket
-    // event follows too) so the open view and the queue re-mark at once.
+    // "Tracks on unavailable drives" / "Tracks that can't be played": re-read
+    // the state now (the WebSocket event follows too) so the open view, the
+    // counts and the queue follow at once.
     try { (await import('./offline.js')).Offline?.refresh?.(); } catch { /* non-fatal */ }
     showMsg('admin-settings-msg', ['Settings saved.', ..._notes].join(' '), 'ok');
   } catch {
@@ -4359,6 +4387,52 @@ window.__sbPasswordDialog = styledPasswordDialog;
 
 // ── HVSC integration (Renderers tab) ─────────────────────────────────────
 
+// The card's source choice: "online" (downloaded, core/hvsc_download) or
+// "local" (the DOCUMENTS folder field).
+function _hvscSourceChoice() {
+  return document.getElementById('hvsc-source-online')?.checked ? 'online' : 'local';
+}
+
+// The saved choice and whether the online collection keeps the documents
+// (then the card checks nothing itself) — Check now only for a saved
+// "Download from the internet" the card runs.
+let _hvscSaved = { src: 'local', byCollection: false };
+
+function _hvscShowSource(src) {
+  const row = document.getElementById('hvsc-path-row');
+  const now = document.getElementById('btn-hvsc-download-now');
+  const info = document.getElementById('hvsc-download-info');
+  const own = src === 'online' && _hvscSaved.src === 'online' && !_hvscSaved.byCollection;
+  if (row) row.style.display = src === 'online' ? 'none' : '';
+  if (now) now.style.display = own ? '' : 'none';
+  if (info) info.style.display = (src === 'online' && _hvscSaved.src === 'online'
+                                  && info.textContent) ? '' : 'none';
+}
+
+function _hvscDate(sec) {
+  return sec ? new Date(sec * 1000).toLocaleDateString(undefined,
+    { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+}
+
+// The download's line under the buttons: which HVSC release, when checked,
+// or why the last check failed and when the next one is.
+function _hvscDownloadLine(s) {
+  const d = s.download || {};
+  if (s.source_setting !== 'online') return '';
+  if (d.by_collection) return 'Kept up to date by the HVSC online collection (Settings → Online collections).';
+  if (d.running) return 'Downloading from the HVSC mirror…';
+  if (d.offline && !d.checked_at) return 'Offline mode is on — nothing is downloaded.';
+  const parts = [];
+  if (d.index_date) parts.push(`Songlengths dated ${new Date(d.index_date + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`);
+  if (d.checked_at) parts.push(`checked ${_hvscDate(d.checked_at)}`);
+  if (d.error) parts.push(`last check failed: ${d.error}`);
+  if (d.next_at && (d.error || d.checked_at)) parts.push(`next check ${_hvscDate(d.next_at)}`);
+  return parts.length ? `From 6581.nl · ${parts.join(' · ')}.` : 'Not downloaded yet.';
+}
+
+let _hvscPoll = null;
+let _hvscPolls = 0;
+
 async function loadHvscStatus() {
   const pathEl   = document.getElementById('setting-hvsc-path');
   const statusEl = document.getElementById('hvsc-status');
@@ -4368,11 +4442,36 @@ async function loadHvscStatus() {
     const res = await api('/admin/hvsc/status');
     if (!res.ok) return;
     const s = await res.json();
-    pathEl.value = s.docs_path || '';
+    pathEl.value = s.local_path ?? s.docs_path ?? '';
+    const src = s.source_setting === 'online' ? 'online' : 'local';
+    _hvscSaved = { src, byCollection: !!(s.download || {}).by_collection };
+    const radio = document.getElementById(`hvsc-source-${src}`);
+    if (radio) radio.checked = true;
+    const info = document.getElementById('hvsc-download-info');
+    if (info) {
+      const line = _hvscDownloadLine(s);
+      info.textContent = line;
+      info.style.display = line ? '' : 'none';
+    }
+    _hvscShowSource(src);
+    // While the first download (or a Check now) runs: look again shortly —
+    // at most a minute, and only while the card is on screen.
+    clearTimeout(_hvscPoll);
+    const d = s.download || {};
+    const onScreen = !!document.getElementById('hvsc-section')?.offsetParent;
+    if (src === 'online' && !d.by_collection && !d.offline && onScreen && _hvscPolls < 30
+        && (d.running || (!s.enabled && !d.error))) {
+      _hvscPolls++;
+      _hvscPoll = setTimeout(loadHvscStatus, 2000);
+    } else {
+      _hvscPolls = 0;
+    }
     if (s.enabled && (s.songlengths || s.stil)) {
       statusEl.classList.remove('off');
       statusEl.classList.add('on');
-      statusEl.textContent = `${s.source === 'online' ? 'from the online HVSC collection' : 'loaded'} · ${s.songlengths.toLocaleString()} song lengths · ${s.stil.toLocaleString()} STIL entries`;
+      const from = s.source !== 'online' ? 'loaded'
+        : (s.source_setting === 'online' ? 'downloaded' : 'from the online HVSC collection');
+      statusEl.textContent = `${from} · ${s.songlengths.toLocaleString()} song lengths · ${s.stil.toLocaleString()} STIL entries`;
       // Surface the "fallback only" semantics on the SID-duration field
       // in the System tab so users understand HVSC is in charge.
       if (sidHint) {
@@ -4400,19 +4499,46 @@ async function loadHvscStatus() {
   } catch { /* ignore */ }
 }
 
+document.querySelectorAll('input[name="hvsc-source"]').forEach(r =>
+  r.addEventListener('change', () => _hvscShowSource(_hvscSourceChoice())));
+
+document.getElementById('btn-hvsc-download-now')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  showMsg('admin-hvsc-msg', 'Checking the HVSC mirror…', 'info');
+  try {
+    const res = await api('/admin/hvsc/download-now', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      showMsg('admin-hvsc-msg', `Check failed: ${data.error || data.detail || res.status}`, 'err');
+    } else if (data.unchanged) {
+      showMsg('admin-hvsc-msg', 'Up to date — HVSC has not changed since the last download.', 'ok');
+    } else {
+      showMsg('admin-hvsc-msg', `Downloaded — ${Number(data.tunes || 0).toLocaleString()} tunes with song lengths.`, 'ok');
+    }
+  } catch (err) {
+    showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+    await loadHvscStatus();
+  }
+});
+
 document.getElementById('btn-save-hvsc')?.addEventListener('click', async () => {
   const path = (document.getElementById('setting-hvsc-path')?.value || '').trim();
+  const source = _hvscSourceChoice();
   try {
     const res = await api('/admin/settings', {
       method: 'PUT',
-      body:   JSON.stringify({ renderers: { hvsc_docs_path: path } }),
+      body:   JSON.stringify({ renderers: { hvsc_source: source, hvsc_docs_path: path } }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       showMsg('admin-hvsc-msg', `Failed: ${data.detail || res.status}`, 'err');
       return;
     }
-    showMsg('admin-hvsc-msg', 'Saved. Reloading database…', 'info');
+    showMsg('admin-hvsc-msg', source === 'online'
+      ? 'Saved. Downloading the HVSC database…' : 'Saved. Reloading database…', 'info');
     await loadHvscStatus();
   } catch (err) {
     showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');

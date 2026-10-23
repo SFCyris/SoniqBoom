@@ -372,18 +372,28 @@ async def test_a_recorded_web_play_is_now_playing(monkeypatch):
     class _Users:
         def lookup_session(self, tok):
             return user if tok == "good" else None
+
+        def has_any(self):
+            return True
     monkeypatch.setattr(users_mod, "get_user_store", lambda: _Users())
     t = types.SimpleNamespace(id="np1", title="x", artist="y")
 
     async def get_track(x):
         return t
 
-    async def record_play(x):
+    played_as = []
+
+    async def record_play(x, *, uid):
+        played_as.append(uid)
         return {"play_count": 1}
     monkeypatch.setattr(tracks_api, "get_track", get_track)
     monkeypatch.setattr(tracks_api, "record_play", record_play)
     await tracks_api.mark_played("np1", sb_session="good")
     assert noted == [("u1", "np1", "SoniqBoom Web", {"from_scrobble": True})]
-    await tracks_api.mark_played("np1", sb_session=None)       # cookieless → nothing
-    await tracks_api.mark_played("np1", sb_session="bad")
+    from fastapi import HTTPException
+    for tok in (None, "bad"):                                   # accounts exist: refused
+        with pytest.raises(HTTPException) as ei:
+            await tracks_api.mark_played("np1", sb_session=tok)
+        assert ei.value.status_code == 401
     assert len(noted) == 1
+    assert played_as == ["u1"]                                  # nothing filed under nobody

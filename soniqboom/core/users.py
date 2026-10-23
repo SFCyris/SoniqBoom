@@ -1232,6 +1232,7 @@ class UserStore:
         password: str,
         role: Role,
         display_name: str | None = None,
+        self_registered: bool = False,
     ) -> User:
         validate_username(username)
         validate_password(password)
@@ -1250,6 +1251,7 @@ class UserStore:
             # Seed the Subsonic-compat field at creation time so token
             # auth works on first connect — no separate setup step.
             subsonic_password=password,
+            self_registered=bool(self_registered),
         )
         with self._lock:
             # (checked again under the lock: two creates of one name in two
@@ -2016,6 +2018,42 @@ def init_user_store(data_dir: Path) -> UserStore:
         old._persist_sessions = False
     _instance = UserStore(data_dir, persist_sessions=True)
     return _instance
+
+
+def legacy_owner_id(users) -> str | None:
+    """The account the listening data of a database without per-user data
+    goes to (``core/user_data``): the oldest admin by ``created_at`` (an
+    enabled one first), else the oldest account; None without accounts.
+    ``users``: ``User`` objects or stored user records."""
+    def _f(u, name, default=None):
+        return u.get(name, default) if isinstance(u, dict) else getattr(u, name, default)
+
+    def _created(u) -> float:
+        try:
+            return float(_f(u, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    cands = [u for u in users or () if isinstance(_f(u, "id"), str) and _f(u, "id")]
+    for pick in (lambda u: _f(u, "role") == "admin" and _f(u, "enabled", True) is not False,
+                 lambda u: _f(u, "role") == "admin",
+                 lambda u: True):
+        hit = [u for u in cands if pick(u)]
+        if hit:
+            return _f(min(hit, key=_created), "id")
+    return None
+
+
+def accounts_on_disk(data_dir: Path) -> list[dict]:
+    """The stored account records of ``users.json`` (else its backup
+    ``users.json.bak``), read without loading a store — nothing is moved
+    aside or written (the database upgrade at a start runs before the user
+    store is loaded; the command-line import has no store).  Empty when
+    neither file holds an account."""
+    for path in (data_dir / "users.json", data_dir / "users.json.bak"):
+        status, data, _exc = UserStore._read_users_file(path)
+        if status == "ok" and data.get("users"):
+            return list(data["users"])
+    return []
 
 
 def accounts_locked() -> bool:

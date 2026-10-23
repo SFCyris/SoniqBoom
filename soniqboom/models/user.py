@@ -51,6 +51,11 @@ class User:
     #          password (whether it is custom lives in UserStore._ss_custom,
     #          persisted as ``subsonic_password_custom``).
     subsonic_password: str | None = None
+    # Created by self-registration (``POST /api/auth/register``) rather than
+    # by an admin: a restored backup's data kept aside for a user name never
+    # attaches to such an account (``user_data.claim_pending``) — anyone may
+    # register any free name.  Absent in older records: False.
+    self_registered: bool = False
 
     def to_public(self) -> dict:
         """Fields safe to return over the API (no password hash)."""
@@ -84,4 +89,5 @@ class User:
             listenbrainz_token=d.get("listenbrainz_token"),
             lastfm_session_key=d.get("lastfm_session_key"),
             subsonic_password=d.get("subsonic_password"),
+            self_registered=d.get("self_registered") is True,
         )

@@ -374,7 +374,7 @@ async def test_a_member_reopened_under_its_new_name_keeps_its_user_data(env):
     store.delete_track_ids([new])
     store.upsert_tracks_batch([row])
     store.set_rating(old, 4)
-    store.record_play(old)
+    store.record_play(old, uid="")
     store.set_rating(tid, 2)
     store.create_playlist("pl", "Mix", [tid, old])
     st = await cat.reapply()                            # one entry again (parked)
@@ -382,7 +382,7 @@ async def test_a_member_reopened_under_its_new_name_keeps_its_user_data(env):
     assert old in (store.get_config(PARKED_PLAYLIST_IDS) or [])
     await _play(tid)                                    # opened by the current rules
     assert new in store._tracks and old not in store._tracks
-    assert store.get_rating(new) == 4 and store.get_play_stats(new)["count"] == 1
+    assert store.get_rating(new) == 4 and store.get_play_stats(new, uid="")["count"] == 1
     assert store.get_rating(old) == 0 and store.get_rating(tid) == 2
     assert store._playlists["pl"]["track_ids"] == [tid, new]
     assert old not in (store.get_config(PARKED_PLAYLIST_IDS) or [])

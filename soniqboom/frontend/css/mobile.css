@@ -449,6 +449,13 @@ input, select, textarea { touch-action: manipulation; }
 
 /* ── Search view ───────────────────────────────────────────────────────── */
 
+/* The number of matches above the results (the list reads them page by page). */
+.m-search-count {
+  padding: 8px 16px 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .m-search-bar {
   position: sticky; top: 0; z-index: 2;
   padding: 8px 16px;

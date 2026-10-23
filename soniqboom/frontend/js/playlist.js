@@ -27,6 +27,7 @@ import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, sub
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
 import { healthBadgeHTML } from './health.js';
+import { Auth } from './auth.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -47,11 +48,15 @@ const btnSelRm    = document.getElementById('pl-sel-remove');
 const btnSelClr   = document.getElementById('pl-sel-deselect');
 const sidebarList = document.getElementById('sidebar-playlist-list');
 const btnSideNew  = document.getElementById('btn-sidebar-playlist-new');
+const btnImport   = document.getElementById('btn-playlist-import');
+const btnShare    = document.getElementById('btn-playlist-share');
+const btnUnsub    = document.getElementById('btn-playlist-unsub');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let _playlists    = [];
 let _activeId     = null;
 let _activeTracks = [];
+let _activeRO     = false;   // the open playlist is someone else's (imported): no edits
 let _addDropdown  = null;
 
 // ── Selection state ───────────────────────────────────────────────────────────
@@ -212,13 +217,34 @@ function _renderSidebar() {
   }
   _playlists.forEach(pl => {
     const li = document.createElement('li');
-    li.className = 'sidebar-playlist-item' + (pl.id === _activeId ? ' active' : '');
+    li.className = 'sidebar-playlist-item' + (pl.id === _activeId ? ' active' : '')
+      + (pl.subscribed ? ' pl-subscribed' : '');
     li.dataset.id = pl.id;
     const cnt = pl.smart ? '⚡' : (pl.track_count ?? pl.tracks?.length ?? 0);
     const cntTitle = pl.smart ? 'Smart playlist — updates itself from a saved search' : '';
-    li.innerHTML = `<span class="pl-name">${esc(pl.name)}</span><span class="pl-count" title="${cntTitle}">${cnt}</span>`;
+    li.innerHTML = `<span class="pl-name">${esc(pl.name)}</span>${_sharedBadge(pl)}<span class="pl-count" title="${cntTitle}">${cnt}</span>`;
     li.addEventListener('click', () => { open(); _openPlaylist(pl.id, pl.name); });
     sidebarList.appendChild(li);
+  });
+}
+
+// A shared playlist's mark: the owner's own ("Shared") or an imported one
+// ("by <owner>", read-only).
+function _sharedBadge(pl) {
+  if (pl.subscribed) {
+    return `<span class="pl-shared-badge pl-by" title="Imported from ${esc(pl.owner_name || 'another user')} — read-only">by ${esc(pl.owner_name || '?')}</span>`;
+  }
+  return pl.shared ? '<span class="pl-shared-badge" title="Shared with every user">Shared</span>' : '';
+}
+
+// The signed-in account may share playlists (readonly accounts may not).
+function _canShare() { return !!(Auth.user && Auth.user.role !== 'readonly'); }
+
+async function _setSubscribed(id, subscribed) {
+  await _api(`/playlists/${id}/subscription`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subscribed }),
   });
 }
 
@@ -227,6 +253,8 @@ function _showListView() {
   _activeId     = null;
   _activeTracks = [];
   _clearSelection();
+  _activeRO = false;
+  panel.classList.remove('pl-readonly');
   hdrList.hidden   = false;
   hdrTracks.hidden = true;
   listEl.hidden    = false;
@@ -251,11 +279,11 @@ function _renderListView() {
     const cnt = pl.track_count ?? pl.tracks?.length ?? 0;
     row.innerHTML = `
       <div class="playlist-row-info">
-        <span class="playlist-row-name">${esc(pl.name)}</span>
+        <span class="playlist-row-name">${esc(pl.name)}</span>${_sharedBadge(pl)}
         <span class="playlist-row-count">${cnt} track${cnt !== 1 ? 's' : ''}</span>
       </div>
       <button class="pl-open-btn" title="Open playlist">&#9654;</button>
-      <button class="playlist-delete-btn" title="Delete" data-id="${pl.id}">&times;</button>
+      <button class="playlist-delete-btn" title="${pl.subscribed ? 'Unsubscribe' : 'Delete'}" data-id="${pl.id}">&times;</button>
     `;
     row.addEventListener('click', (e) => {
       if (e.target.closest('.playlist-delete-btn')) return;
@@ -263,6 +291,11 @@ function _renderListView() {
     });
     row.querySelector('.playlist-delete-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
+      if (pl.subscribed) {                     // someone else's: unsubscribe, never delete
+        try { await _setSubscribed(pl.id, false); await refresh(); }
+        catch (err) { Toast.error('Could not remove the imported playlist.'); }
+        return;
+      }
       // __sbConfirm is installed synchronously at module load (see top of
       // this file), so we don't fall back to the OS-native confirm() here.
       const ok = await window.__sbConfirm(
@@ -291,8 +324,10 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   // "0 tracks" empty-state that looks identical to a real empty playlist.
   let loadFailed = false;
   let loadedTracks = [];
+  let loadedData = null;
   try {
     const data   = await _api(`/playlists/${id}`);
+    loadedData   = data;
     loadedTracks = data.tracks || [];
   } catch (err) {
     loadFailed = true;
@@ -311,9 +346,21 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   // A's tracks under B's header) or panel.
   if (_activeId !== id) return;
   _activeTracks = loadedTracks;   // commit only after confirming we're still current
+  const summary = _playlists.find(p => p.id === id) || {};
+  _activeRO = !!(loadedData && loadedData.read_only);
+  panel.classList.toggle('pl-readonly', _activeRO);
+  if (btnShare) {
+    // (a readonly owner may still unshare a playlist shared before)
+    btnShare.hidden = _activeRO || (!_canShare() && !summary.shared);
+    btnShare.textContent = summary.shared ? 'Shared ✓' : 'Share';
+    btnShare.classList.toggle('active', !!summary.shared);
+  }
+  if (btnUnsub) btnUnsub.hidden = !_activeRO;
 
   plActiveNm.textContent = name;
-  plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
+  plActiveNm.title = name;   // (one ellipsised line — the full name on hover)
+  plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`
+    + (_activeRO && loadedData.owner_name ? ` · by ${loadedData.owner_name}` : '');
 
   hdrList.hidden   = true;
   hdrTracks.hidden = false;
@@ -585,6 +632,7 @@ tracksEl.addEventListener('click', async (e) => {
 
 // ── Drag start / end (reorder) ─────────────────────────────────────────────
 tracksEl.addEventListener('dragstart', (e) => {
+  if (_activeRO) { e.preventDefault(); return; }       // (an imported playlist: no reorder)
   const row = _plRowOf(e);
   if (!row) return;
   const i = parseInt(row.dataset.idx, 10);
@@ -637,6 +685,7 @@ tracksEl.addEventListener('dragleave', (e) => {
   if (!tracksEl.contains(e.relatedTarget)) dropZone.classList.remove('drag-active');
 });
 tracksEl.addEventListener('drop', async (e) => {
+  if (_activeRO) { e.preventDefault(); return; }
   const raw = e.dataTransfer.getData('application/x-soniqboom-pl-idx');
   if (raw || e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) {
     // ── Drop: reorder ──────────────────────────────────────────────────────
@@ -715,6 +764,7 @@ async function _probePlaylistDurations() {
 
 // ── Mutations ─────────────────────────────────────────────────────────────────
 async function _addTracks(playlistId, trackIds) {
+  if (playlistId === _activeId && _activeRO) return;  // (someone else's playlist)
   try {
     await _api(`/playlists/${playlistId}/tracks`, {
       method: 'POST',
@@ -735,6 +785,7 @@ async function _addTracks(playlistId, trackIds) {
 }
 
 async function _removeTrack(playlistId, track) {
+  if (_activeRO) return;
   const entry = _plEntry(track);
   const subKey = _plSubKey(track);
   const prev = _activeTracks.slice();      // rollback snapshot (2.6 optimistic)
@@ -761,7 +812,7 @@ async function _removeTrack(playlistId, track) {
 }
 
 async function _removeSelected() {
-  if (!_selectedIdxs.size || !_activeId) return;
+  if (!_selectedIdxs.size || !_activeId || _activeRO) return;
   // Multi-track delete is a destructive action.  Single-row removal stays
   // instant — the row's own "x" button is already an explicit gesture — but
   // sweeping out a multi-row selection (especially via Delete/Backspace)
@@ -913,6 +964,78 @@ btnClose2?.addEventListener('click', () => close());
 btnBack.addEventListener('click', () => _showListView());
 btnNew.addEventListener('click', (e) => { e.stopPropagation(); createPlaylist(); });
 btnSideNew?.addEventListener('click', (e) => { e.stopPropagation(); createPlaylist(); });
+btnImport?.addEventListener('click', (e) => { e.stopPropagation(); showImportDialog(); });
+btnShare?.addEventListener('click', async () => {
+  const id = _activeId;
+  const pl = _playlists.find(p => p.id === id);
+  if (!id || !pl) return;
+  try {
+    await _api(`/playlists/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shared: !pl.shared }),
+    });
+    Toast.info(pl.shared ? 'No longer shared — users who imported it lose it.'
+                         : 'Shared — every user can now import it (read-only).');
+    await refresh();
+  } catch (err) {
+    Toast.error('Could not change sharing.');
+  }
+});
+btnUnsub?.addEventListener('click', async () => {
+  const id = _activeId;
+  if (!id) return;
+  try { await _setSubscribed(id, false); _showListView(); await refresh(); }
+  catch (err) { Toast.error('Could not remove the imported playlist.'); }
+});
+
+// ── Import dialog: the playlists other users share, ticked = in my list ──────
+async function showImportDialog() {
+  let rows;
+  try { rows = await _api('/playlists/shared'); }
+  catch (err) { Toast.error("Couldn't load the shared playlists."); return; }
+  const backdrop = document.createElement('div');
+  backdrop.className = 'pl-modal-backdrop';
+  const dialog = document.createElement('div');
+  dialog.className = 'pl-modal-dialog pl-import-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-label', 'Import shared playlists');
+  dialog.innerHTML = `
+    <div class="pl-modal-title">Import shared playlists</div>
+    <div class="pl-import-hint">Ticked playlists appear in your list, read-only — they follow their owner's changes.</div>
+    <div class="pl-import-list"></div>
+    <div class="pl-modal-actions"><button class="pl-modal-btn pl-modal-ok">Done</button></div>`;
+  const list = dialog.querySelector('.pl-import-list');
+  if (!rows.length) {
+    list.innerHTML = '<div class="playlist-empty">No other user shares a playlist yet.</div>';
+  }
+  for (const r of rows) {
+    const lab = document.createElement('label');
+    lab.className = 'pl-import-row';
+    const cnt = r.smart ? 'smart' : `${r.track_count} track${r.track_count !== 1 ? 's' : ''}`;
+    lab.innerHTML = `<input type="checkbox"> <span class="pl-import-name"></span>
+      <span class="pl-import-meta"></span>`;
+    lab.querySelector('.pl-import-name').textContent = r.name;
+    lab.querySelector('.pl-import-meta').textContent = `by ${r.owner_name || '?'} · ${cnt}`;
+    const box = lab.querySelector('input');
+    box.checked = !!r.subscribed;
+    box.dataset.id = r.id;
+    box.addEventListener('change', async () => {
+      box.disabled = true;
+      try { await _setSubscribed(r.id, box.checked); await refresh(); }
+      catch (err) { box.checked = !box.checked; Toast.error('Could not change the import.'); }
+      box.disabled = false;
+    });
+    list.appendChild(lab);
+  }
+  backdrop.appendChild(dialog);
+  document.body.appendChild(backdrop);
+  const done = () => { backdrop.classList.add('pl-modal-out'); setTimeout(() => backdrop.remove(), 150); };
+  dialog.querySelector('.pl-modal-ok').addEventListener('click', done);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(); });
+  dialog.addEventListener('keydown', (e) => { if (e.key === 'Escape') done(); });
+  dialog.querySelector('.pl-modal-ok').focus();
+}
 
 // ── Panel visibility ──────────────────────────────────────────────────────────
 function open() {
@@ -956,8 +1079,9 @@ function _showAddDropdownWith(anchorEl, getEntries, onDone) {
   // late getBoundingClientRect() would then read all-zeros.
   const rect = anchorEl.getBoundingClientRect();
 
-  _api('/playlists').then(playlists => {
-    _playlists = playlists;
+  _api('/playlists').then(all => {
+    _playlists = all;
+    const playlists = all.filter(pl => !pl.read_only);   // (imported ones can't be edited)
     const dd = document.createElement('div');
     dd.className = 'playlist-add-dropdown';
     dd.style.cssText = 'position:fixed;z-index:9999';
@@ -1016,4 +1140,4 @@ refresh();
 Player.on('trackchange', () => _paintPlaying());
 Player.on('statechange', () => _paintPlaying());
 
-export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist };
+export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist, showImportDialog };

@@ -3072,11 +3072,20 @@ async def _serve_sid_progressive(
                 existing = await get_cached(full_key)
                 if existing is not None:
                     tmp.unlink(missing_ok=True)
+                    _unplayable.rendered_ok("sid")          # (ours was good too: below)
                     _spawn_sid_vu(full_key, existing, sid_path, subsong, int(duration))
                 elif await _progressive_render_silent(full_key, "sid", tmp):
                     pass          # streamed once, never cached; the next play reports it
                 else:
                     dest = await store_cached(full_key, "sid", tmp)   # MOVES tmp into cache
+                    # A good render, as the cache's own render paths judge
+                    # it: sidplayfp is proven (its refusal streak / breaker
+                    # ends) and, for a play that set its context before this
+                    # task was created (``stream_track``'s
+                    # ``_unplayable.set_play``), the track loses an automatic
+                    # mark.  A caller without one (the cast feed) only proves
+                    # sidplayfp.
+                    _unplayable.rendered_ok("sid")
                     log.info("progressive SID: cached %s (%d s)%s", full_key,
                              int(duration),
                              " — finished after the listener left"
