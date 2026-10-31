@@ -14,7 +14,7 @@
  */
 import { Player } from './player.js';
 import { Playlist } from './playlist.js';
-import { Toast } from './utils.js';
+import { Toast, artPlaceholderEmoji } from './utils.js';
 import { vizGroupEnabled } from './viz/engine.js';
 
 const REFILL_AT = 8;       // refill when this few tracks remain after current
@@ -37,13 +37,35 @@ function _overlayOpen() {
   return !$('radio-overlay')?.classList.contains('hidden');
 }
 
+// Covers sit over the track's format icon (🕹️ SID, 💾 tracker, 🔊 MP3 …): the
+// <img> shows once it has loaded (.loaded) and keeps its src when there is no
+// art, so app.js's art_ready handler re-asks it when the cover arrives later —
+// a network-share track's cover is read on its first play.  A track whose
+// art_ready already came (app.js __sbArtPending) asks past the browser's
+// cached "no art" answer (60 s) with a token of its own.
+function _artSrc(t, size) {
+  const id = encodeURIComponent(t.id);
+  const base = size === 'lg' ? `/api/art/${id}/lg.jpg?fallback=none` : `/api/art/${id}/sm.jpg?fallback=none`;
+  return window.__sbArtPending?.has(t.id) ? `${base}&_t=ready` : base;
+}
+function _watchArt(img) {
+  img.onload = () => img.classList.add('loaded');
+  img.onerror = () => img.classList.remove('loaded');
+}
+
 function _renderNow() {
   const t = Player.currentTrack;
   if (!t) return;
   const img = $('radio-art');
-  if (img) {
-    img.src = `/api/art/${encodeURIComponent(t.id)}/lg.jpg?fallback=none`;
-    img.onerror = () => { img.removeAttribute('src'); };
+  // Only on a new track: a play / pause re-render must not put back the bare
+  // URL over a cover art_ready has just re-asked.
+  if (img && img.dataset.tid !== t.id) {
+    img.dataset.tid = t.id;
+    img.classList.remove('loaded');
+    _watchArt(img);
+    img.src = _artSrc(t, 'lg');
+    const ph = $('radio-art-ph');
+    if (ph) ph.textContent = artPlaceholderEmoji(t);
   }
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v || ''; };
   set('radio-title', t.title || '—');
@@ -66,12 +88,11 @@ function _renderUpNext() {
   next.forEach((t, i) => {
     const li = document.createElement('li');
     li.innerHTML =
-      `<img class="radio-upnext-art" alt="" loading="lazy" decoding="async"
-            src="/api/art/${encodeURIComponent(t.id)}/sm.jpg?fallback=none">` +
+      `<span class="radio-upnext-thumb" aria-hidden="true">${esc(artPlaceholderEmoji(t))}` +
+      `<img class="radio-upnext-art" alt="" loading="lazy" decoding="async" src="${_artSrc(t, 'sm')}"></span>` +
       `<span class="radio-upnext-title">${esc(t.title || '—')}</span>` +
       `<span class="radio-upnext-artist">${esc(t.artist || '')}</span>`;
-    const im = li.querySelector('img');
-    im.onerror = () => { im.classList.add('noart'); im.removeAttribute('src'); };
+    _watchArt(li.querySelector('img'));
     li.title = 'Play now';
     // Jump to THIS row: the mix need not be contiguous (a hand-queued track may
     // sit among it), so find the row instead of computing an index.
@@ -247,10 +268,12 @@ async function maybeRefill(force = false) {
     if (!r.ok) return 0;
     const mix = await r.json();
     const have = new Set(Player.queue.map(t => t.id));
-    let added = 0;
+    const fresh = [];
     for (const t of (Array.isArray(mix) ? mix.slice(1) : [])) {
-      if (t && t.id && !have.has(t.id)) { Player.addToQueue(t, { auto: true }); have.add(t.id); added++; }
+      if (t && t.id && !have.has(t.id)) { fresh.push(t); have.add(t.id); }
     }
+    Player.addAllToQueue(fresh, { auto: true });
+    const added = fresh.length;
     if (added && _overlayOpen()) _renderUpNext();
     return added;
   } catch (_) {

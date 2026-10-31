@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -327,6 +328,7 @@ from soniqboom.core.data import (
 from soniqboom.core.metadata import extract_lyrics
 from soniqboom.models.track import TrackMeta
 from soniqboom.api.users import listener_uid as _listener_uid
+from soniqboom.api.users import optional_listener_uid as _optional_listener_uid
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
 
@@ -1226,8 +1228,9 @@ async def list_tracks(
     hide_dups = bool(store.get_config("filter_duplicates", False))
     swap = availability.primary_swap(store, dedup=hide_dups)
     if playable:
-        from soniqboom.core.data import _parse_tag_query
+        from soniqboom.core.data import _parse_tag_query, search_indexes_for
         parsed = _parse_tag_query(query)
+        await search_indexes_for(parsed)
         page = await availability.player_page_async(
             lambda off, lim: store.filter_tracks(
                 **parsed, limit=lim, offset=off, filter_duplicates=hide_dups,
@@ -1306,10 +1309,28 @@ async def shuffled_tracks(
     album: str | None = None,
     genre: str | None = None,
     scene_group: str | None = None,
+    composer: str | None = None,
+    game: str | None = None,
+    platform: str | None = None,
+    party: str | None = None,
+    compo: str | None = None,
     format: str | None = None,
     year_min: int | None = None,
     year_max: int | None = None,
+    track_min: int | None = None,
+    track_max: int | None = None,
+    disc_min: int | None = None,
+    disc_max: int | None = None,
+    length_min: int | None = None,
+    length_max: int | None = None,
+    rating_min: int | None = None,
+    rating_max: int | None = None,
+    plays_min: int | None = None,
+    plays_max: int | None = None,
+    added: str | None = None,
+    played: str | None = None,
     untagged: str | None = Query(None, pattern="^(artist|album_artist|album|genre)$"),
+    uid: str | None = _Depends(_optional_listener_uid),
 ):
     """One page of a seeded SHUFFLE ORDER over every track matching the filter.
 
@@ -1321,9 +1342,13 @@ async def shuffled_tracks(
     every matching track — not just the rows its list happens to have loaded —
     with no repeats until the set is exhausted.
 
+    ``plays`` / ``played`` (in ``q`` or as parameters) read the signed-in
+    user's plays; the user is then part of the order's key.
+
     Response: ``{"total", "seed", "offset", "tracks": [TrackMeta…]}``.
     """
     from soniqboom.core import shuffle_order
+    from soniqboom.core.data import with_uid
     from soniqboom.core.store import get_store
 
     store = get_store()
@@ -1335,14 +1360,29 @@ async def shuffled_tracks(
         # Identical parse path to /api/search so "shuffle these results" means
         # exactly the tracks the search would list (uncapped).
         from soniqboom.api.search import search_predicates
+        from soniqboom.core.data import search_indexes_for
         preds.update(search_predicates(q))
+        await search_indexes_for(preds)
     for name, val in (("artist", artist), ("album_artist", album_artist),
                       ("album", album), ("genre", genre),
                       ("scene_group", scene_group), ("format_", format),
+                      # (a scene browse view's entry — /library/composers …)
+                      ("composer_is", composer), ("game_is", game),
+                      ("platform", platform), ("party_is", party),
+                      ("compo_is", compo if party else None),
                       ("year_min", year_min), ("year_max", year_max),
+                      ("track_min", track_min), ("track_max", track_max),
+                      ("disc_min", disc_min), ("disc_max", disc_max),
+                      ("length_min", length_min), ("length_max", length_max),
+                      ("rating_min", rating_min), ("rating_max", rating_max),
+                      ("plays_min", plays_min), ("plays_max", plays_max),
+                      ("added", added), ("played", played),
                       ("untagged", untagged)):
         if val is not None and val != "":
             preds[name] = val
+    with_uid(preds, uid if isinstance(uid, str) else None)
+    from soniqboom.core.data import search_indexes_for
+    await search_indexes_for(preds)             # (the composer / party sets too)
 
     # A shuffle deals only what can play right now ("Tracks on unavailable
     # drives": Mark / Hide): the order is dealt without those tracks.  Like a
@@ -1442,6 +1482,97 @@ async def batch_tracks(body: dict):
     # play right now carry ``offline`` (never left out: the caller asked for them).
     return availability.mark_rows(public_tracks(get_store().get_tracks_batch(
         [tid for tid in ids[:5000] if isinstance(tid, str)])))
+
+
+# The playlist view's mini waveforms: at most this many ids per request (the
+# client asks for the rows on screen) and this many points per waveform.
+_WAVE_BATCH_MAX_IDS = 200
+_WAVE_BATCH_MAX_POINTS = 120
+
+
+def _if_present(path: Path, read, absent=None) -> tuple:
+    """In a worker thread: ``(True, read(path))`` when ``path`` exists, else
+    ``(False, absent)`` — the existence check is a stat, on a network drive a
+    round trip: never on the loop."""
+    if not path.exists():
+        return False, absent
+    return True, read(path)
+
+
+def _wave_thumb(stored, points: int) -> list[int] | None:
+    """A stored waveform reduced to ``points`` peaks, scaled 0..255 against its
+    own loudest point (a list thumb shows the shape, not the level); None for a
+    blank / malformed one."""
+    try:
+        vals = [abs(float(v)) for v in stored]
+    except (TypeError, ValueError):
+        return None
+    n = len(vals)
+    if not n:
+        return None
+    top = max(vals)
+    if not (top > 0) or math.isinf(top) or math.isnan(top):
+        return None
+    out = []
+    for i in range(points):
+        lo = (i * n) // points
+        hi = max(lo + 1, ((i + 1) * n) // points)
+        out.append(int(round(max(vals[lo:hi]) / top * 255)))
+    return out
+
+
+# The playlist rows' thumbnails (``batch_waveforms``): (track id, points) →
+# (the stored waveform the thumb was made from, the thumb), most recently used
+# last.  A new waveform is another object and a forgotten one is gone, so an
+# entry holds only while ``store.get_waveform`` returns the very same object.
+_THUMBS: "OrderedDict[tuple[str, int], tuple]" = OrderedDict()
+_THUMBS_MAX = 20_000
+
+
+def _thumb_of(tid: str, stored, points: int) -> list[int] | None:
+    key = (tid, points)
+    hit = _THUMBS.get(key)
+    if hit is not None and hit[0] is stored:
+        _THUMBS.move_to_end(key)
+        return hit[1]
+    thumb = _wave_thumb(stored, points)
+    _THUMBS[key] = (stored, thumb)
+    _THUMBS.move_to_end(key)
+    while len(_THUMBS) > _THUMBS_MAX:
+        _THUMBS.popitem(last=False)
+    return thumb
+
+
+@json_route(router, "/meta/waveforms", methods=("POST",))
+async def batch_waveforms(body: dict):
+    """The STORED waveforms of these tracks, thumb-sized, in one request — the
+    playlist rows' mini waveforms.  Never computes one (that's
+    ``GET /{id}/waveform``, which a play triggers): a track without a stored
+    waveform is simply absent from the answer.
+
+    Body ``{"ids": [...], "points": 48}`` (≤ 200 ids, 8..120 points).  Answer
+    ``{"points": n, "waveforms": {id: [0..255 × n]}}``."""
+    from soniqboom.core.store import get_store
+    ids = body.get("ids", []) if isinstance(body, dict) else []
+    if not isinstance(ids, list):
+        raise HTTPException(422, "ids must be a list")
+    try:
+        points = int(body.get("points", 48))
+    except (TypeError, ValueError, OverflowError):     # (Infinity / 1e400 too)
+        points = 48
+    points = max(8, min(_WAVE_BATCH_MAX_POINTS, points))
+    store = get_store()
+    out: dict[str, list[int]] = {}
+    for tid in ids[:_WAVE_BATCH_MAX_IDS]:
+        if not isinstance(tid, str) or tid in out:
+            continue
+        stored = store.get_waveform(tid)
+        if not stored:
+            continue
+        thumb = _thumb_of(tid, stored, points)
+        if thumb is not None and any(thumb):
+            out[tid] = thumb
+    return {"points": points, "waveforms": out}
 
 
 @json_route(router, "/meta/availability", methods=("POST",))
@@ -1621,6 +1752,10 @@ async def get_track_extended(track_id: str, request: Request):
         # header at scan time; None when the header didn't specify one.  Drives
         # a chip badge in the Track-Info header.
         "sid_model": getattr(track, "sid_model", None),
+        # The renderer that plays the file (its Settings → Renderers key,
+        # ``stream.renderer_key_for``: "sidplayfp", "uade123", …), or None —
+        # Track Info's Retro VFD names it.
+        "renderer": _renderer_key(track_id, track),
         # Known playback defect ("partial" | "corrupt" at scan, "empty" when a
         # package opened, "unplayable" when its renderer refused it twice —
         # with that renderer and when) + human context — drives the health
@@ -1631,6 +1766,18 @@ async def get_track_extended(track_id: str, request: Request):
         "defect_at": getattr(track, "defect_at", None),
     }
     return result
+
+
+def _renderer_key(track_id: str, track) -> "str | None":
+    """``stream.renderer_key_for`` on the stored row (as ``set_health`` names
+    it), else on the model's fields; None when it can't tell."""
+    try:
+        from soniqboom.api import stream as _stream
+        from soniqboom.core.store import get_store
+        row = get_store().get_track(track_id) or track.model_dump()
+        return _stream.renderer_key_for(row)
+    except Exception:                                   # noqa: BLE001 — a label is a nicety
+        return None
 
 
 _DEFAULT_TUNE_WAIT_S = 5.0     # bound of each background step (extract, probe)
@@ -1812,6 +1959,15 @@ async def _read_module_bytes_async(path_str: str) -> bytes | None:
     return await asyncio.get_event_loop().run_in_executor(None, _read_module_bytes, path_str)
 
 
+def _as_played(track_id: str) -> str:
+    """The track a play of ``track_id`` plays: the library file an online
+    collection's tune is (``stream._library_twin``), else itself — so its
+    meters, patterns, SID bytes and waveform are that file's (the tune's own
+    were never downloaded)."""
+    from soniqboom.api.stream import _library_twin
+    return _library_twin(track_id) or track_id
+
+
 @router.get("/{track_id}/patterns")
 async def get_patterns(track_id: str):
     """Return the tracker pattern grid, order list, row→time map, song
@@ -1820,6 +1976,7 @@ async def get_patterns(track_id: str):
     contract).  Drives the Track-Info "Patterns" and "Song message"
     sections.  Returns ``{"available": False}`` for non-tracker files,
     unreachable sources, or hosts without libopenmpt."""
+    track_id = _as_played(track_id)
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
@@ -1921,6 +2078,7 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
         get_vu_sidecar_path, _cache_path,
     )
 
+    track_id = _as_played(track_id)
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
@@ -1998,6 +2156,7 @@ async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
     user (read), SID-format tracks only, and a PSID/RSID magic re-check on the
     resolved bytes (415 for an Amiga SidMon ``*.sid``).  Bytes are immutable and
     tiny (a few KB) → a plain immutable-cached Response, no range needed."""
+    track_id = _as_played(track_id)
     track = await get_track(track_id)
     if not track:
         raise HTTPException(404, "Track not found")
@@ -2008,11 +2167,13 @@ async def get_sid_bytes(track_id: str, _user=_Depends(_require_user)):
     # the post-read length check (those members are tiny + fetched anyway).
     _pstr = str(track.path)
     if "::" not in _pstr and not is_remote_path(_pstr):
-        try:
-            if Path(_pstr).stat().st_size > 1024 * 1024:   # SIDs are < 64 KB
-                raise HTTPException(415, "File too large to be a SID")
-        except OSError:
-            pass
+        def _too_big() -> bool:                    # (a stat: off the loop)
+            try:
+                return Path(_pstr).stat().st_size > 1024 * 1024   # SIDs are < 64 KB
+            except OSError:
+                return False
+        if await asyncio.to_thread(_too_big):
+            raise HTTPException(415, "File too large to be a SID")
     loop = asyncio.get_event_loop()
     data = await _read_module_bytes_async(track.path)
     if not data:
@@ -2088,6 +2249,7 @@ async def upload_vu_sidecar(
     )
     from soniqboom.core.conversion_cache import get_sid_wav_path_for_upload
 
+    track_id = _as_played(track_id)
     if _client_tune_mismatch(track_id, subsong, tune):
         raise HTTPException(409, "client SID renderer is out of date — reload the page")
 
@@ -2226,6 +2388,7 @@ async def upload_sid_audio(
         get_conversion_cache_dir, sid_warm_eligible,
     )
 
+    track_id = _as_played(track_id)
     if _client_tune_mismatch(track_id, subsong, tune):
         raise HTTPException(409, "client SID renderer is out of date — reload the page")
 
@@ -2431,18 +2594,14 @@ async def get_chapters(track_id: str):
         from soniqboom.core.filesource import parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
-        if remote_path:
-            cached = get_cache().get_cached(scan_root, remote_path)
-            path = cached if cached and cached.exists() else None
-        else:
-            path = None
+        path = get_cache().get_cached(scan_root, remote_path) if remote_path else None
     else:
         path = Path(path_str)
-    if not path or not path.exists():
+    if not path:
         return {"id": track_id, "chapters": []}
     from soniqboom.core.chapters import extract_chapters
     loop = asyncio.get_event_loop()
-    chapters = await loop.run_in_executor(None, extract_chapters, path)
+    _present, chapters = await loop.run_in_executor(None, _if_present, path, extract_chapters, [])
     return {"id": track_id, "chapters": chapters}
 
 
@@ -2654,18 +2813,14 @@ async def resolve_lyrics(track_id: str, *, writeback: bool) -> dict:
         from soniqboom.core.filesource import parse_remote_path
         from soniqboom.core.remote_cache import get_cache
         scan_root, remote_path = parse_remote_path(path_str)
-        if remote_path:
-            cached = get_cache().get_cached(scan_root, remote_path)
-            path = cached if cached and cached.exists() else None
-        else:
-            path = None
+        path = get_cache().get_cached(scan_root, remote_path) if remote_path else None
     else:
         path = Path(path_str)
-        if not path.exists():
-            path = None
     embedded = None
     if path:
-        embedded = await loop.run_in_executor(None, extract_lyrics, path)
+        present, embedded = await loop.run_in_executor(None, _if_present, path, extract_lyrics)
+        if not present:
+            path = None
     if embedded:
         # Detect LRC synced format: lines starting with [mm:ss.xx]
         import re
@@ -2729,6 +2884,121 @@ def _sid_target_duration(track, subsong: int = 0) -> int:
 
 
 _WAVEFORM_PENDING = object()      # "the audio isn't rendered yet — ask again"
+
+# The waveform of a render still being written (``?partial=1``): as many
+# points as a finished one, those not rendered yet None.  Per render, what was
+# read so far is kept, so each ask reads only the bytes written since.
+_PARTIAL_POINTS = 200
+_PARTIAL_READ = 8 * 1024 * 1024
+_PARTIAL_STATE: "OrderedDict[str, dict]" = OrderedDict()
+_PARTIAL_STATE_MAX = 8
+_PARTIAL_LOCK = threading.Lock()
+
+
+def _wav_data_offset(head: bytes) -> "int | None":
+    """Where a WAV's samples start (after its ``data`` chunk header) — a
+    growing render's header may state any size, so the chunks are walked."""
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    i = 12
+    while i + 8 <= len(head):
+        cid, size = head[i:i + 4], int.from_bytes(head[i + 4:i + 8], "little")
+        if cid == b"data":
+            return i + 8
+        if size >= len(head):
+            return None
+        i += 8 + size + (size & 1)
+    return None
+
+
+def _pcm_peak(buf, bits: int, float_: bool) -> float:
+    """Largest |sample| of little-endian PCM ``buf`` (every channel), full
+    scale 1.0 — C-level ``max``/``min`` over a view, never a Python loop per
+    sample (numpy is not a dependency)."""
+    import sys
+    if bits == 24:                               # its top 16 bits are enough
+        n = len(buf) // 3
+        hi = bytearray(n * 2)
+        hi[0::2] = buf[1:n * 3:3]
+        hi[1::2] = buf[2:n * 3:3]
+        buf, bits = hi, 16
+    code, scale = (("f", 1.0) if float_ and bits == 32 else
+                   ("h", 32768.0) if bits == 16 else
+                   ("i", 2147483648.0) if bits == 32 else (None, 0))
+    if code is None or not buf:
+        return 0.0
+    if sys.byteorder == "little":
+        s = memoryview(buf).cast(code)
+    else:
+        import array
+        s = array.array(code)
+        s.frombytes(bytes(buf))
+        s.byteswap()
+    if not len(s):
+        return 0.0
+    return float(max(max(s), -min(s))) / scale
+
+
+def _partial_peaks(g: dict) -> "tuple[list | None, float]":
+    """``(points, progress)`` of growing render ``g`` (``stream.growing_render``):
+    each point's largest sample over its stretch of the whole render, None
+    where nothing is written yet, scaled to the loudest point so far;
+    ``progress`` 0..1 — no point drawn while its header isn't written yet.
+    ``(None, 0.0)`` when the file can't be read (it was just moved into the
+    cache: the next ask finds it there).  Blocking (file reads): run it in a
+    worker."""
+    ch, bits, fl = int(g["channels"]), int(g["bits"]), bool(g["float"])
+    fb = ch * bits // 8
+    total = int(g["total_frames"])
+    if fb <= 0 or total <= 0 or bits not in (16, 24, 32):
+        return None, 0.0
+    sk = f"{g['key']}|{g['path']}|{total}"
+    with _PARTIAL_LOCK:
+        st = _PARTIAL_STATE.get(sk)
+        if st is None:
+            st = {"off": None, "frames": 0, "peaks": [None] * _PARTIAL_POINTS,
+                  "lock": threading.Lock()}
+            _PARTIAL_STATE[sk] = st
+            while len(_PARTIAL_STATE) > _PARTIAL_STATE_MAX:
+                _PARTIAL_STATE.popitem(last=False)
+        _PARTIAL_STATE.move_to_end(sk)
+    P = _PARTIAL_POINTS
+    with st["lock"]:
+        try:
+            with open(g["path"], "rb") as f:
+                if st["off"] is None:
+                    head = f.read(4096)
+                    off = _wav_data_offset(head)
+                    if off is None:
+                        # (a render that has just begun: its header isn't
+                        # written yet — nothing drawn, asked again)
+                        return ([None] * P, 0.0) if len(head) < 4096 else (None, 0.0)
+                    st["off"] = off
+                size = os.fstat(f.fileno()).st_size
+                avail = min(total, max(0, (size - st["off"]) // fb))
+                while st["frames"] < avail:
+                    a = st["frames"]
+                    b = min(avail, a + max(1, _PARTIAL_READ // fb))
+                    f.seek(st["off"] + a * fb)
+                    data = f.read((b - a) * fb)
+                    b = a + len(data) // fb
+                    if b <= a:
+                        break
+                    peaks = st["peaks"]
+                    for p in range(a * P // total, min(P - 1, (b - 1) * P // total) + 1):
+                        lo = max(a, -(-p * total // P))
+                        hi = min(b, -(-(p + 1) * total // P))
+                        if hi <= lo:
+                            continue
+                        v = _pcm_peak(memoryview(data)[(lo - a) * fb:(hi - a) * fb], bits, fl)
+                        if peaks[p] is None or v > peaks[p]:
+                            peaks[p] = v
+                    st["frames"] = b
+        except OSError:
+            return None, 0.0
+        top = max((v for v in st["peaks"] if v is not None), default=0.0)
+        pts = [None if v is None else (v / top if top > 0 else 0.0) for v in st["peaks"]]
+        return pts, st["frames"] / total
 def _source_unreachable(path_str: str) -> bool:
     """True when a track's source can't be reached right now: its network
     share isn't connected, or its local scan root is marked ``unavailable``
@@ -2759,7 +3029,8 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
                                           uade_base: int = 0,
                                           uade_named: bool = False,
                                           appear_wait: float = 5.0,
-                                          finish_wait: float = 120.0):
+                                          finish_wait: float = 120.0,
+                                          partial_ok: bool = False):
     """WAV path of a rendered format's cached render, for the waveform.
 
     NEVER starts a render.  The waveform request is fired just before the
@@ -2780,6 +3051,11 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     ``uade_base`` is an Amiga module's subsong base, part of its key;
     ``uade_named`` is ``stream._render_ident``'s verdict (a verified Amiga
     module with a tracker extension renders through uade, not openmpt).
+
+    ``partial_ok``: a render still being written whose length is known (a
+    progressive SID stream, a live render — ``stream.growing_render``) is
+    returned as that dict at once instead of waited for: the caller draws
+    the part written so far (``_partial_peaks``).
     """
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
@@ -2794,8 +3070,8 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     if ext in _SID_EXTS:
         cands = [("sid", None, sid_duration), ("uade", None, None)]
     elif ext in _MIDI_EXTS:
-        from soniqboom.config import get_active_soundfont
-        sf = get_active_soundfont()
+        from soniqboom.config import active_soundfont_async
+        sf = await active_soundfont_async()
         cands = [("midi", str(sf) if sf else "", None)]
     elif ext in _HVL_EXTS:
         cands = [("hvl", None, None)]
@@ -2821,10 +3097,11 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     else:
         cands = [("tracker", None, None)]
     # MIDI / PSF / YM render one tune only — always keyed as subsong 0.
-    from soniqboom.api.stream import uade_cache_key
+    from soniqboom.api.stream import _gme_variant, uade_cache_key
     keys = [uade_cache_key(track_id, subsong, uade_base) if fmt == "uade" else
             _cache_key(track_id, fmt, subsong if fmt not in ("midi", "psf", "ym") else 0,
-                       sf, duration=dur) for fmt, sf, dur in cands]
+                       sf, duration=dur, variant=_gme_variant(ext) if fmt == "gme" else None)
+            for fmt, sf, dur in cands]
 
     async def _hit():
         for k in keys:
@@ -2862,6 +3139,7 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
         ev = _running()
     if ev is None:
         return _WAVEFORM_PENDING
+    from soniqboom.api.stream import growing_render
     # Follow the render to the cache — also across a hand-over: a SID
     # prewarm retired for a progressive play of the same tune ends its event
     # with nothing stored while the progressive render (a different event)
@@ -2871,12 +3149,22 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     finish_by = loop.time() + finish_wait
     settle_by = None                 # a finished live uade render being stored
     while True:
+        if partial_ok:
+            # (a render's growing file is made once it has prepared its
+            # source — a read from a share may take a while: looked for
+            # while it lasts)
+            g = growing_render(keys)
+            if g is not None:
+                return g
         remaining = finish_by - loop.time()
         if remaining <= 0:
             return _WAVEFORM_PENDING
         try:
-            await asyncio.wait_for(ev.wait(), timeout=remaining)
+            await asyncio.wait_for(ev.wait(),
+                                   timeout=min(remaining, 0.25) if partial_ok else remaining)
         except asyncio.TimeoutError:
+            if partial_ok and loop.time() < finish_by:
+                continue
             return _WAVEFORM_PENDING
         hit = await _hit()
         if hit is not None:
@@ -2954,10 +3242,18 @@ async def get_track_waveform(track_id: str, response: Response,
     render a bare play makes (a multi-tune file's default tune).  The stored
     per-track waveform belongs to that bare play, so another tune's is
     computed from its render and not stored.
+
+    ``partial=1`` (the web players): a rendered format still rendering, with
+    a known length, answers at once with the part rendered so far —
+    ``{"waveform": {"peaks": [...]}, "partial": true, "progress": 0..1}``,
+    points not rendered yet ``null`` — and the player asks again until an
+    answer without ``partial``.  Without it, such a request waits for the
+    render as before.
     """
     import asyncio
     from pathlib import Path as _Path
     from soniqboom.core.data import get_waveform, get_track, store_waveform
+    track_id = _as_played(track_id)
     from soniqboom.api.stream import (
         _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
         _ADLIB_EXTS, _GME_EXTS_STREAM,
@@ -3040,7 +3336,16 @@ async def get_track_waveform(track_id: str, response: Response,
             track_id, path_str, ext, sid_duration=_sid_dur, dreamcast=_dreamcast,
             subsong=tune_index(track_id, track, wire),
             uade_base=_uade_base_known(track_id, track) or 0,
-            uade_named=_uade_named)
+            uade_named=_uade_named,
+            partial_ok=bool(request is not None and isinstance(request, Request)
+                            and request.query_params.get("partial") == "1"))
+        if isinstance(wav_path, dict):
+            # Still rendering: the part written so far (never stored).
+            pts, progress = await asyncio.to_thread(_partial_peaks, wav_path)
+            if pts is None:
+                return {"waveform": None, "pending": True}
+            return {"waveform": {"peaks": pts}, "partial": True,
+                    "progress": round(progress, 4)}
         if wav_path is _WAVEFORM_PENDING:
             # The audio isn't rendered yet (and nothing is rendering it): say
             # so instead of rendering here — the player asks again once the

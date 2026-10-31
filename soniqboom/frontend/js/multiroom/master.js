@@ -648,6 +648,10 @@ function _tickProgress(p) {
   $('mr-ctrl-play').textContent = Player.audio.paused ? '▶' : '⏸';
 }
 
+// The badge names a role in the words the UI uses; the protocol's role
+// values ('master' / 'slave', also the badge's class) are unchanged.
+const _ROLE_LABEL = { master: 'Master', slave: 'Follower' };
+
 function _renderListeners() {
   const ul = $('mr-listener-list');
   ul.innerHTML = '';
@@ -657,7 +661,7 @@ function _renderListeners() {
     const li = document.createElement('li');
     li.innerHTML = `
       <span>${_esc(c.label)}${c.client_id === Sync.clientId ? ' (you)' : ''}</span>
-      <span class="mr-role-badge ${c.role}">${c.role}</span>`;
+      <span class="mr-role-badge ${_esc(c.role)}">${_esc(_ROLE_LABEL[c.role] || c.role)}</span>`;
     ul.appendChild(li);
   }
 }

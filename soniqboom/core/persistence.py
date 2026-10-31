@@ -1286,6 +1286,19 @@ def forget_derived_caches(store, *, drop_browse_disk: bool = False) -> None:
         log.debug("The Subsonic catalogue cache could not be reset", exc_info=True)
 
 
+def _build_search_indexes_after(store) -> None:
+    """Start building the search indexes ``rebuild_indexes(defer_search=True)``
+    left to build — on the running loop, else (no loop: a tool) at once."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        store._sx_ensure()
+        return
+    store._sx_task = loop.create_task(store.build_search_indexes_async(),
+                                      name="search-indexes")
+
+
 def populate_store(state: dict) -> None:
     """Populate the TrackStore singleton from a loaded snapshot state, and
     start every cache built from the previous library over
@@ -1323,7 +1336,10 @@ def populate_store(state: dict) -> None:
     track_count = len(state.get("tracks", {}))
     _ss_phase("building_indexes", "Building search indexes",
               f"{track_count:,} tracks")
-    store.rebuild_indexes()
+    # (the search box's own indexes follow in slices once the library is
+    # served — ``TrackStore.build_search_indexes_async``)
+    store.rebuild_indexes(defer_search=True)
+    _build_search_indexes_after(store)
     forget_derived_caches(store)
     elapsed = (time.monotonic() - t0) * 1000
     log.info(

@@ -1,0 +1,328 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   The full-screen visualizer (js/visualizer.js, #visualizer-canvas) and the
+   large now-playing art (app.js "Now Playing large art display",
+   #now-playing-art) — Modern and Retro hi-fi, the Style shared with the
+   equalizer, Stations, Playlists, the queue, the player bar, Track Info and the
+   lyrics panel (js/ui_style.js → :root[data-ui-style]).
+     Visualizer  — the --vz-* tokens below are read by visualizer.js (on a look
+                   / theme change) for the two modes that draw per look:
+                   'oscilloscope' (Modern: the mirrored accent waveform; Retro:
+                   one amber phosphor trace with persistence over a printed
+                   graticule — the canvas's background here) and 'analyser'
+                   (Modern: accent bars with peak caps; Retro: a VFD bar
+                   display — cyan segments, amber peak segments, glow).  The
+                   canvas carries data-vis-mode.
+     Art         — Modern: the cover with the title under it (the deck wrappers
+                   are display: contents).  Retro: a turntable on a metal plate
+                   — the cover as the record's label, the record turning
+                   (33⅓ rpm) while it plays (data-state="playing") with motion
+                   welcome (data-motion="on": the Now-playing visualizations;
+                   still with reduced motion), the tone arm on the record while
+                   playing — over a VFD strip with the title / artist / album
+                   and PLAY / PAUSE / 33⅓ RPM annunciators.  The display window
+                   stays dark glass in the light theme.
+   Loaded after app.css: the rules here override its "Now Playing large art"
+   block by specificity.  Text ≥ 4.5:1 on its surface (the annunciators are
+   decoration, aria-hidden).  Tokens mirror the player bar's --pb-* (VFD,
+   amber, plate) and the equalizer's LED/VFD colours.
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Visualizer tokens ─────────────────────────────────────────────────────── */
+#visualizer-canvas {
+  --vz-face: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  --vz-an-bar: var(--accent);
+  --vz-an-peak: var(--accent);
+  --vz-an-label: var(--text2);
+  --vz-an-off: 0;
+  --vz-an-glow: 0;
+}
+:root[data-ui-style="retro"] #visualizer-canvas {
+  --vz-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --vz-trace: #ffb12b;                 /* amber phosphor (the deck's amber) */
+  --vz-trace-core: #ffe7b8;
+  --vz-trace-glow: 0.2;                /* the wide stroke's alpha */
+  --vz-persist: 0.82;                  /* what a frame keeps of the last, per 1/60 s */
+  --vz-trace-level: 0.1;               /* the whole trace — as dim as Modern's behind the list */
+  --vz-grat: rgba(255, 177, 43, 0.045);
+  --vz-grat-axis: rgba(255, 177, 43, 0.1);
+  --vz-an-bar: #6ff7e9;                /* VFD cyan */
+  --vz-an-peak: #ffb12b;
+  --vz-an-label: #a3a9b2;
+  --vz-an-lit: 0.09;                   /* the lit segments' alpha — the list reads over them */
+  --vz-an-off: 0.04;                   /* the unlit segments' alpha */
+  --vz-an-glow: 0.08;                  /* the bloom layer's alpha */
+}
+:root[data-theme="light"][data-ui-style="retro"] #visualizer-canvas {
+  --vz-trace: #b35f00;
+  --vz-trace-core: #6b3600;
+  --vz-trace-glow: 0.16;
+  --vz-trace-level: 0.16;
+  --vz-grat: rgba(130, 76, 0, 0.06);
+  --vz-grat-axis: rgba(130, 76, 0, 0.13);
+  --vz-an-bar: #0b7d73;
+  --vz-an-peak: #b35f00;
+  --vz-an-label: #3f444c;
+  --vz-an-lit: 0.16;
+  --vz-an-off: 0.05;
+  --vz-an-glow: 0;                     /* a glow only lights a dark page */
+}
+
+/* The phosphor scope's graticule: 10 × 8 divisions, centre axes with minor
+   ticks (5 a division).  A background, so the trace's persistence (which fades
+   the canvas's own pixels) never fades it. */
+:root[data-ui-style="retro"] #visualizer-canvas[data-vis-mode="oscilloscope"] {
+  background:
+    linear-gradient(90deg, var(--vz-grat-axis) 1px, transparent 1px) 0 50% / 2% 9px repeat-x,
+    linear-gradient(180deg, var(--vz-grat-axis) 1px, transparent 1px) 50% 0 / 9px 2.5% repeat-y,
+    linear-gradient(var(--vz-grat-axis), var(--vz-grat-axis)) 0 50% / 100% 1px no-repeat,
+    linear-gradient(var(--vz-grat-axis), var(--vz-grat-axis)) 50% 0 / 1px 100% no-repeat,
+    linear-gradient(var(--vz-grat), var(--vz-grat)) 100% 0 / 1px 100% no-repeat,
+    linear-gradient(var(--vz-grat), var(--vz-grat)) 0 100% / 100% 1px no-repeat,
+    linear-gradient(90deg, var(--vz-grat) 1px, transparent 1px) 0 0 / 10% 100%,
+    linear-gradient(180deg, var(--vz-grat) 1px, transparent 1px) 0 0 / 100% 12.5%;
+}
+
+/* ── Now-playing art: shared ───────────────────────────────────────────────── */
+/* (app.css's ≤ 900 px player-bar block gives .now-playing-art-info
+   flex: 1 1 100%, which in this column took the whole height from the cover) */
+.now-playing-art .now-playing-art-info { flex: none; }
+
+/* ── Modern: the deck is only a wrapper ───────────────────────────────────── */
+.now-playing-art .np-deck,
+.now-playing-art .np-platter,
+.now-playing-art .np-record { display: contents; }
+.now-playing-art .np-tonearm,
+.now-playing-art .np-anns { display: none; }
+
+/* ── Retro hi-fi: a turntable over a VFD strip ────────────────────────────── */
+:root[data-ui-style="retro"] .now-playing-art {
+  --np-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --np-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --np-deck:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #34373c 0%, #25272b 60%, #1e2023 100%);
+  --np-deck-edge: #050506;
+  --np-vfd: #6ff7e9;
+  --np-vfd-dim: #46c9bd;
+  --np-vfd-off: #24524e;               /* an unlit annunciator */
+  --np-amber: #ffc865;
+  --np-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --np-arm: linear-gradient(90deg, #8d929a, #e3e6ea 45%, #a4a9b0 70%, #6b7077);
+  /* the deck's width: the plate's, the cover area's (aspect 1.3) and 600 px */
+  --np-w: max(120px, min(600px, calc(100cqw - 40px), calc((100cqh - 200px) * 1.3)));
+  container-type: size;
+  gap: 18px;
+  overflow: auto;
+  justify-content: safe center;
+  background: var(--np-plate);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-theme="light"][data-ui-style="retro"] .now-playing-art {
+  --np-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --np-deck:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.35) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #eef0f2 0%, #d6d9dd 60%, #c9ccd1 100%);
+  --np-deck-edge: #8c9096;
+}
+/* app.css gives browsers without backdrop-filter an opaque --bg1 overlay */
+@supports not (backdrop-filter: blur(1px)) {
+  :root[data-ui-style="retro"] .now-playing-art { background: var(--np-plate) !important; }
+}
+
+:root[data-ui-style="retro"] .now-playing-art .np-deck {
+  display: block;
+  position: relative;
+  flex: none;
+  width: var(--np-w);
+  aspect-ratio: 1.3;
+  border: 2px solid var(--np-deck-edge);
+  border-radius: 8px;
+  background: var(--np-deck);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 10px 30px rgba(0,0,0,0.55);
+}
+/* the platter: strobe dots round the rim */
+:root[data-ui-style="retro"] .now-playing-art .np-platter {
+  display: block;
+  position: absolute;
+  left: 5%;
+  top: 5%;
+  height: 90%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: repeating-conic-gradient(#8f949b 0 1.2deg, #232528 1.2deg 3.6deg);
+  box-shadow: 0 0 0 2px #0a0b0c, 0 6px 16px rgba(0,0,0,0.6);
+}
+/* the record: grooves, an edge, the label (the cover) and the spindle */
+:root[data-ui-style="retro"] .now-playing-art .np-record {
+  display: block;
+  position: absolute;
+  inset: 2.6%;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 0 23%, rgba(255,255,255,0.07) 23.5% 24.2%, transparent 24.7%),
+    repeating-radial-gradient(circle, #121214 0 1px, #1d1d20 1px 2.6px);
+  box-shadow: 0 0 0 1px #000, inset 0 0 0 4px #0b0b0c;
+  animation: np-spin 1.8s linear infinite;          /* 33⅓ rpm */
+  animation-play-state: paused;
+}
+:root[data-ui-style="retro"] .now-playing-art[data-state="playing"][data-motion="on"] .np-record {
+  animation-play-state: running;
+}
+@keyframes np-spin { to { transform: rotate(360deg); } }
+/* the label paper, seen when there's no cover */
+:root[data-ui-style="retro"] .now-playing-art .np-record::before {
+  content: "";
+  position: absolute;
+  left: 28%; top: 28%; width: 44%; height: 44%;
+  border-radius: 50%;
+  background: radial-gradient(circle, #b8452c 0 60%, #8f3320 61% 100%);
+}
+:root[data-ui-style="retro"] .now-playing-art .np-record::after {
+  content: "";
+  position: absolute;
+  left: 48.5%; top: 48.5%; width: 3%; height: 3%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #f2f3f5, #8b9097 70%);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.6);
+}
+:root[data-ui-style="retro"] .now-playing-art .np-record img {
+  position: absolute;
+  left: 28%; top: 28%; width: 44%; height: 44%;
+  max-width: none;
+  max-height: none;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.5);
+}
+/* the light on the record doesn't turn with it */
+:root[data-ui-style="retro"] .now-playing-art .np-platter::after {
+  content: "";
+  position: absolute;
+  inset: 2.6%;
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(from 20deg, transparent 0 6%, rgba(255,255,255,0.07) 11%, transparent 17%,
+                             transparent 50%, rgba(255,255,255,0.05) 61%, transparent 67%);
+}
+/* the tone arm: a rod hanging from its pivot (top right); on the record while
+   playing, parked beside it otherwise */
+:root[data-ui-style="retro"] .now-playing-art .np-tonearm {
+  display: block;
+  position: absolute;
+  right: 7%;
+  top: 9%;
+  width: 1.6%;
+  height: 70%;
+  border-radius: 3px;
+  background: var(--np-arm);
+  transform-origin: 50% 0;
+  transform: rotate(4deg);
+  transition: transform 0.9s ease-in-out;
+  box-shadow: 2px 3px 4px rgba(0,0,0,0.45);
+}
+:root[data-ui-style="retro"] .now-playing-art[data-state="playing"] .np-tonearm { transform: rotate(33deg); }
+:root[data-ui-style="retro"] .now-playing-art .np-tonearm::before {
+  content: "";
+  position: absolute;
+  left: 50%; top: 0;
+  width: 600%; aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #d8dbdf, #5d6168 60%, #2c2e32 100%);
+  box-shadow: 0 0 0 2px #0a0b0c, 0 3px 6px rgba(0,0,0,0.5);
+}
+:root[data-ui-style="retro"] .now-playing-art .np-tonearm::after {
+  content: "";
+  position: absolute;
+  left: 50%; bottom: -5%;
+  width: 380%; height: 9%;
+  transform: translateX(-50%) rotate(-14deg);
+  border-radius: 2px;
+  background: linear-gradient(180deg, #2f3236, #121315);
+  box-shadow: 0 0 0 1px #000;
+}
+
+/* the display: a VFD strip as wide as the deck */
+:root[data-ui-style="retro"] .now-playing-art .now-playing-art-info {
+  width: max(var(--np-w), min(300px, calc(100cqw - 40px)));
+  max-width: none;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px 16px 11px;
+  border: 2px solid #050607;
+  border-radius: 6px;
+  background: var(--np-vfd-glass);
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+  text-align: center;
+  font-family: var(--np-face);
+}
+:root[data-ui-style="retro"] .now-playing-art .np-anns {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  font: 700 10px/14px var(--np-face);
+  letter-spacing: 0.1em;
+  color: var(--np-vfd-off);
+}
+:root[data-ui-style="retro"] .now-playing-art[data-state="playing"] .np-ann-play,
+:root[data-ui-style="retro"] .now-playing-art[data-state="playing"][data-motion="on"] .np-ann-rpm {
+  color: var(--np-vfd);
+  text-shadow: 0 0 6px rgba(111,247,233,0.5);
+}
+@media (prefers-reduced-motion: reduce) {      /* the record stands still: no 33⅓ */
+  :root[data-ui-style="retro"] .now-playing-art[data-state="playing"][data-motion="on"] .np-ann-rpm {
+    color: var(--np-vfd-off);
+    text-shadow: none;
+  }
+}
+:root[data-ui-style="retro"] .now-playing-art[data-state="paused"] .np-ann-pause {
+  color: var(--np-amber);
+  text-shadow: 0 0 6px rgba(255,200,101,0.45);
+}
+:root[data-ui-style="retro"] .now-playing-art .np-title {
+  font-size: 20px;
+  letter-spacing: 0.03em;
+  color: var(--np-vfd);
+  text-shadow: 0 0 9px rgba(111,247,233,0.45);
+}
+:root[data-ui-style="retro"] .now-playing-art :is(.np-artist, .np-album) {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0.04em;
+}
+:root[data-ui-style="retro"] .now-playing-art .np-artist { font-size: 14px; color: var(--np-vfd-dim); }
+:root[data-ui-style="retro"] .now-playing-art .np-album {
+  font-size: 12px;
+  font-style: normal;
+  color: var(--np-amber);
+  text-shadow: 0 0 6px rgba(255,200,101,0.3);
+}
+
+/* A short pane (a landscape phone): the deck beside the display */
+@media (max-height: 560px) {
+  :root[data-ui-style="retro"] .now-playing-art {
+    flex-direction: row;
+    gap: 16px;
+    --np-w: max(120px, min(420px, calc((100cqh - 32px) * 1.3), calc(55cqw - 30px)));
+  }
+  :root[data-ui-style="retro"] .now-playing-art .now-playing-art-info {
+    width: max(160px, min(340px, calc(100cqw - var(--np-w) - 56px)));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-ui-style="retro"] .now-playing-art .np-record { animation: none; }
+  :root[data-ui-style="retro"] .now-playing-art .np-tonearm { transition: none; }
+}

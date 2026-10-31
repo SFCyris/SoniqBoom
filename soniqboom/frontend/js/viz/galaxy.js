@@ -143,6 +143,7 @@ export function mountGalaxy(host, { onPickFormat } = {}) {
   let _laidOut = false;     // galaxy stars/chips built at least once
   let clusters = [];
   let stars = [];
+  let _labels = [], _labelsKey = '', _labelsFor = null;   // placed cluster labels (_placeLabels)
   let t = 0;
   const { key: _sk0, asc: _sa0 } = _loadSort();
   let _sortKey = _sk0;      // 'count' | 'format'
@@ -547,11 +548,41 @@ export function mountGalaxy(host, { onPickFormat } = {}) {
       ctx.fill();
     }
     ctx.textAlign = 'center';
-    for (const c of clusters) {
-      ctx.font = `${10.5 * dpr}px sans-serif`;
-      ctx.fillStyle = `hsla(${c.hue}, 70%, 72%, 0.85)`;
-      ctx.fillText(c.fmt, c.cx * W, (c.cy - c.spread) * H - 6 * dpr);
+    ctx.font = `${10.5 * dpr}px sans-serif`;
+    for (const l of _placeLabels(W, H, dpr)) {
+      ctx.fillStyle = `hsla(${l.c.hue}, 70%, 72%, 0.85)`;
+      ctx.fillText(l.c.fmt, l.x, l.y);
     }
+  }
+
+  // Cluster labels never overlap.  Biggest cluster first: each label goes above
+  // its cluster, else below it; one that would still touch a label already
+  // placed (or leave the canvas) is not drawn — its legend chip names it.
+  // Labels don't move with the stars, so the placement is kept until the
+  // canvas size, pixel ratio or clusters change and a frame only draws the kept ones.
+  function _placeLabels(W, H, dpr) {
+    const key = `${W}x${H}@${dpr}`;   // (a move to a screen with another pixel ratio keeps the canvas size)
+    if (_labelsFor === clusters && _labelsKey === key) return _labels;
+    ctx.font = `${10.5 * dpr}px sans-serif`;
+    const pad = 3 * dpr;
+    const placed = [];
+    const order = clusters.slice().sort((a, b) => b.count - a.count);   // stable: ties keep list order
+    for (const c of order) {
+      const m = ctx.measureText(c.fmt);
+      const w = m.width;
+      const asc = m.fontBoundingBoxAscent || 10 * dpr, desc = m.fontBoundingBoxDescent || 3 * dpr;
+      const x = Math.min(Math.max(c.cx * W, w / 2 + pad), W - w / 2 - pad);   // kept inside the canvas
+      for (const y of [(c.cy - c.spread) * H - 6 * dpr, (c.cy + c.spread) * H + asc + 6 * dpr]) {
+        const b = { x0: x - w / 2 - pad, x1: x + w / 2 + pad, y0: y - asc - pad, y1: y + desc + pad };
+        if (b.x0 < 0 || b.x1 > W || b.y0 < 0 || b.y1 > H) continue;
+        if (placed.some((p) => p.x0 < b.x1 && b.x0 < p.x1 && p.y0 < b.y1 && b.y0 < p.y1)) continue;
+        b.c = c; b.x = x; b.y = y;
+        placed.push(b);
+        break;
+      }
+    }
+    _labels = placed; _labelsKey = key; _labelsFor = clusters;
+    return placed;
   }
   function freeze() {
     const dpr = Math.min(2, window.devicePixelRatio || 1), W = cv.width, H = cv.height;

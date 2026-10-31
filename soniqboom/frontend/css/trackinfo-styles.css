@@ -1,0 +1,681 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   The Track Info panel — js/trackinfo.js, markup #ti-overlay in index.html
+   Two looks, chosen by the Style switch shared with the equalizer, Stations,
+   Playlists and the queue (js/ui_style.js → :root[data-ui-style]).
+     Modern      — the glass panel (app.css "Track Info Panel"): the stats card
+                   and the tune list in the Stations / queue manner.
+     Retro hi-fi — a component's spec plate: the cover in a bezel over a VFD
+                   strip (format, length, chip, renderer, audio facts); the
+                   tags printed on a cassette J-card insert (the playlist
+                   view's card); the tunes of a multi-tune file as lamp keys
+                   (the station presets' keys: number, lamp lit for the loaded
+                   tune, its length).
+   Loaded after app.css: the rules here override its "Track Info Panel" block.
+   Light / dark follow :root[data-theme].  Every label ≥ 4.5:1 on its surface.
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Tokens (modern) ────────────────────────────────────────────────────────── */
+#ti-panel {
+  --ti-accent-text: #ff8a4a;            /* accent as text on the panel (≥ 4.5:1) */
+  --ti-card-bg:
+    radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--accent) 14%, transparent) 0%, transparent 55%),
+    radial-gradient(90% 120% at 100% 100%, rgba(107,200,240,0.08) 0%, transparent 60%),
+    var(--bg2);
+}
+:root[data-theme="light"] #ti-panel {
+  --ti-accent-text: #8a3a08;
+  --ti-card-bg:
+    radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--accent) 12%, transparent) 0%, transparent 55%),
+    radial-gradient(90% 120% at 100% 100%, rgba(30,120,170,0.08) 0%, transparent 60%),
+    var(--bg1);
+}
+
+/* ── Modern refinements ─────────────────────────────────────────────────────── */
+/* the stats under the art: a card tinted like the Stations card */
+#ti-panel .ti-stats {
+  background: var(--ti-card-bg);
+  border-color: var(--border-bright);
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.22);
+}
+:root[data-theme="light"] #ti-panel .ti-stats { box-shadow: 0 4px 14px rgba(0,0,0,0.08); }
+#ti-panel .ti-stat-row:first-child { color: var(--ti-accent-text); }
+#ti-panel .ti-stats-unplayable .ti-stat-row:first-child { color: var(--text2); }
+/* (Retro only: the VFD strip's extras) */
+#ti-panel .ti-vfd-len,
+#ti-panel .ti-vfd-specs { display: none; }
+
+#ti-panel .ti-tab-btn.active { color: var(--ti-accent-text); }
+#ti-panel .ti-tab-btn:focus-visible,
+#ti-panel :is(.ti-nav-btn, .ti-close, .ti-sub-abtn, .ti-sub-rbtn):focus-visible {
+  outline: 2px solid var(--state-focus); outline-offset: 1px;
+}
+#ti-panel .ti-value.ti-year-scene { color: var(--ti-accent-text); border-bottom-color: var(--ti-accent-text); }
+#ti-panel .ti-sid-chip { color: var(--ti-accent-text); }
+
+/* the tag / info editor (Edit tags, Edit info) and the artist note's link:
+   the panel's fields and buttons, not the browser's white ones */
+#ti-panel .ti-tagedit-input {
+  background: var(--bg2); color: var(--text0);
+  border: 1px solid var(--border-bright); border-radius: 6px;
+  font-family: inherit; line-height: 1.4;
+}
+#ti-panel .ti-tagedit-btn {
+  background: rgba(255,255,255,0.07); color: var(--text0);
+  border: 1px solid var(--border-bright); border-radius: 6px;
+  font-family: inherit; line-height: 1.4; cursor: pointer;
+}
+#ti-panel .ti-tagedit-btn:hover { background: rgba(255,255,255,0.12); }
+#ti-panel .ti-tagedit-btn.primary { background: var(--accent); border-color: var(--accent); color: #111; font-weight: 600; }   /* (dark on the accent: ≥ 4.5:1) */
+#ti-panel .ti-tagedit-btn.primary:hover { background: color-mix(in srgb, var(--accent) 85%, #fff); }
+#ti-panel .ti-tagedit-btn:disabled { opacity: 0.6; cursor: default; pointer-events: none; }
+#ti-panel #ti-artist-about a:not([style*="color"]) { color: var(--ti-accent-text); }
+:root[data-theme="light"] #ti-panel .ti-tagedit-input { background: var(--bg1); }
+:root[data-theme="light"] #ti-panel .ti-tagedit-btn { background: rgba(0,0,0,0.04); }
+:root[data-theme="light"] #ti-panel .ti-tagedit-btn:hover { background: rgba(0,0,0,0.08); }
+:root[data-theme="light"] #ti-panel .ti-tagedit-btn.primary { background: var(--accent); }
+:root[data-theme="light"] #ti-panel .ti-tagedit-btn.primary:hover { background: color-mix(in srgb, var(--accent) 85%, #000); }
+
+/* single-colour line icons (the editor's pencil, the shuffle key) */
+#ti-panel .ti-icon { display: inline-block; flex: none; vertical-align: -2px; }
+#ti-panel .ti-tagedit-btn > .ti-icon { margin-right: 6px; }
+#ti-panel .ti-sub-abtn-icon { display: inline-flex; align-items: center; justify-content: center; }
+/* "About <artist>": a section head like the others */
+#ti-panel #ti-artist-about { margin-top: 14px; }
+#ti-panel .ti-about-hdr { margin: 0 0 8px; }
+/* the pattern grid's cut right edge fades while channels lie past it */
+#ti-panel .ti-pat-gridwrap.ti-pat-more-r {
+  -webkit-mask:
+    linear-gradient(to right, #000 calc(100% - var(--ti-pat-sb, 0px) - 44px), transparent calc(100% - var(--ti-pat-sb, 0px))),
+    linear-gradient(#000, #000) right / calc(var(--ti-pat-sb, 0px) + 1px) 100% no-repeat;
+  mask:
+    linear-gradient(to right, #000 calc(100% - var(--ti-pat-sb, 0px) - 44px), transparent calc(100% - var(--ti-pat-sb, 0px))),
+    linear-gradient(#000, #000) right / calc(var(--ti-pat-sb, 0px) + 1px) 100% no-repeat;
+}
+/* (the mask clips outside the box: the focus ring drawn inside it, its right
+   side kept clear of the fade) */
+#ti-panel .ti-pat-gridwrap.ti-pat-more-r:focus-visible {
+  outline-offset: -2px !important;
+  -webkit-mask-size: auto, calc(var(--ti-pat-sb, 0px) + 3px) 100%;
+  mask-size: auto, calc(var(--ti-pat-sb, 0px) + 3px) 100%;
+}
+
+/* the tune list: rounded like the queue, the loaded tune marked by a bar */
+#ti-panel .ti-sub-list { border-radius: 10px; }
+#ti-panel .ti-sub-row:focus-visible { outline: 2px solid var(--state-focus); outline-offset: -2px; }
+#ti-panel .ti-sub-row.playing { box-shadow: inset 3px 0 0 var(--accent); }
+#ti-panel .ti-sub-row.playing :is(.ti-sub-name, .ti-sub-title) { color: var(--ti-accent-text); opacity: 1; }
+#ti-panel .ti-sub-def { color: var(--ti-accent-text); }
+#ti-panel .ti-sub-actions { flex-wrap: wrap; }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   Retro hi-fi — a spec plate, a VFD strip, a J-card insert, lamp keys
+   ══════════════════════════════════════════════════════════════════════════════ */
+:root[data-ui-style="retro"] #ti-panel {
+  --ti-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --ti-print: #cfd3d9;                  /* printed legends */
+  --ti-print-2: #a3a9b2;                /* secondary (≥ 4.5:1 on the plate and the keys) */
+  --ti-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --ti-plate-edge: #050506;
+  --ti-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --ti-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --ti-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --ti-key-solid: #26282c;
+  --ti-key-text: #cfd3d9;
+  --ti-key-text-2: #b8bec6;             /* secondary on a key (≥ 4.5:1 on every stop, hovered too) */
+  --ti-key-edge: #050506;
+  --ti-key-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 1px 0 rgba(255,255,255,0.05), 0 3px 4px rgba(0,0,0,0.5);
+  /* lamps: green = now playing, amber = engaged / held, unlit = neutral dark */
+  --ti-lamp-off: #141517;
+  --ti-lamp-off-shadow: inset 0 1px 1px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.06);
+  --ti-lamp-on: #3be16c;
+  --ti-lamp-hold: #ffb12b;              /* engaged; the loaded tune while paused */
+  --ti-legend-on: #ffb44a;              /* an amber legend on a key / the plate */
+  --ti-vfd: #6ff7e9;
+  --ti-vfd-dim: #46c9bd;
+  --ti-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --ti-amber: #ffb12b;
+  /* the J-card insert: charcoal kraft, cream print */
+  --ti-card: #2b2620;
+  --ti-ink: #f1e7cf;
+  --ti-ink-2: #cbbf9f;
+  --ti-rule: rgba(241, 231, 207, 0.09);
+  --ti-margin: rgba(226, 104, 82, 0.42);
+  --ti-ink-accent: #ffb44a;
+  --ti-ink-sel: var(--ti-ink);
+  background: var(--ti-surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid #000;
+  border-radius: 10px;
+  box-shadow: 0 28px 72px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.6);
+  color: var(--ti-print);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel {
+  --ti-print: #23262b;
+  --ti-print-2: #3f444c;
+  --ti-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --ti-plate-edge: #8c9096;
+  --ti-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --ti-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --ti-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --ti-key-solid: #d9dce0;
+  --ti-key-text: #23262b;
+  --ti-key-text-2: #3f444c;
+  --ti-key-edge: #8c9096;
+  --ti-key-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+  /* light: unlit is a recess, lit a deep colour in a dark ring — no glow */
+  --ti-lamp-off: rgba(0,0,0,0.15);
+  --ti-lamp-off-shadow: inset 0 1px 2px rgba(0,0,0,0.35);
+  --ti-lamp-on: #12a04a;
+  --ti-lamp-hold: #d27a00;
+  --ti-legend-on: #722a00;
+  /* a cream J-card, blue ballpoint */
+  --ti-card: #f4ecd6;
+  --ti-ink: #1f2f6b;
+  --ti-ink-2: #4a4537;
+  --ti-rule: rgba(31, 47, 107, 0.12);
+  --ti-margin: rgba(200, 60, 50, 0.40);
+  --ti-ink-accent: #722a00;
+  --ti-ink-sel: #8a4a00;                /* the title, a chosen box: the plate's amber ink */
+  border-color: #8c9096;
+  box-shadow: 0 22px 60px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -1px 0 rgba(0,0,0,0.18);
+}
+
+/* ── The header: keys and a display window ─────────────────────────────────── */
+:root[data-ui-style="retro"] #ti-panel .ti-nav {
+  background: none;
+  border-bottom: 1px solid rgba(0,0,0,0.35);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.05);
+}
+:root[data-ui-style="retro"] #ti-panel :is(.ti-nav-btn, .ti-close) {
+  border-radius: 4px;
+  border: 1px solid var(--ti-key-edge);
+  background: var(--ti-key-bg);
+  color: var(--ti-key-text);
+  box-shadow: var(--ti-key-shadow);
+}
+:root[data-ui-style="retro"] #ti-panel :is(.ti-nav-btn, .ti-close):hover:not(:disabled) { background: var(--ti-key-bg-hover); color: var(--ti-key-text); }
+:root[data-ui-style="retro"] #ti-panel :is(.ti-nav-btn, .ti-close):active:not(:disabled) {
+  background: var(--ti-key-pressed); transform: translateY(1px);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-nav-label {
+  align-self: stretch;
+  line-height: 26px;
+  padding: 0 12px;
+  border-radius: 5px;
+  background: var(--ti-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+  font-family: var(--ti-face); font-size: 12.5px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ti-vfd);
+  text-shadow: 0 0 6px rgba(111,247,233,0.45);
+}
+
+/* ── Left: the spec plate — cover in a bezel, the VFD strip ────────────────── */
+:root[data-ui-style="retro"] #ti-panel .ti-left {
+  background: none;
+  border-right: 1px solid rgba(0,0,0,0.40);
+  box-shadow: 1px 0 0 rgba(255,255,255,0.05);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-left {
+  border-right-color: rgba(0,0,0,0.16); box-shadow: 1px 0 0 rgba(255,255,255,0.6);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-art-box {
+  border-radius: 6px;
+  border: 3px solid #0a0b0c;
+  background: #0c0d0f;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 1px 0 rgba(255,255,255,0.08), 0 6px 14px rgba(0,0,0,0.5);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-art-box img { border-radius: 3px; }
+:root[data-ui-style="retro"] #ti-panel .ti-art-loading::after { border-radius: 3px; }
+
+/* The VFD: dark glass in both themes */
+:root[data-ui-style="retro"] #ti-panel .ti-stats {
+  gap: 4px;
+  padding: 9px 12px 9px;
+  border-radius: 6px;
+  background: var(--ti-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+  font-family: var(--ti-face);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-stat-row {
+  text-align: left;
+  font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ti-vfd-dim);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-stat-row[hidden] { display: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-stat-row:first-child {
+  display: flex; align-items: baseline; gap: 0; min-width: 0;
+  font-size: 15px; font-weight: 700; letter-spacing: 0.06em;
+  color: var(--ti-vfd);
+  text-shadow: 0 0 8px rgba(111,247,233,0.5);
+}
+:root[data-ui-style="retro"] #ti-panel #ti-format { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:root[data-ui-style="retro"] #ti-panel .ti-stats .surround-badge {
+  flex: none; border-radius: 2px; text-shadow: none;
+  color: var(--ti-vfd); background: transparent; border-color: rgba(111,247,233,0.45);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-vfd-len {
+  display: inline; flex: none; margin-left: auto; padding-left: 10px;
+  font-size: 16px; letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ti-amber);
+  text-shadow: 0 0 8px rgba(255,177,43,0.6);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-vfd-specs:not([hidden]) {
+  display: flex; flex-wrap: wrap; gap: 2px 14px;
+  color: var(--ti-vfd);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-vfd-spec[hidden] { display: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-vfd-k {
+  margin-right: 3px;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.16em;
+  color: var(--ti-vfd-dim);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-stats-unplayable .ti-stat-row:first-child { color: var(--ti-vfd-dim); text-shadow: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-stats-unplayable :is(.ti-vfd-len, .ti-vfd-specs:not([hidden])) { display: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-stat-row.ti-unplayable { color: #ff8a80; text-shadow: 0 0 6px rgba(255,90,70,0.45); }
+
+/* ── Right: the J-card insert ──────────────────────────────────────────────── */
+:root[data-ui-style="retro"] #ti-panel .ti-right {
+  margin: 12px 12px 12px 10px;
+  border-radius: 3px;
+  background: var(--ti-card);
+  box-shadow: 0 2px 0 rgba(0,0,0,0.35), 0 6px 18px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(0,0,0,0.18);
+  /* the theme's text tokens become the card's inks inside it */
+  --text0: var(--ti-ink);
+  --text1: var(--ti-ink-2);
+  --text2: var(--ti-ink-2);
+  --border: var(--ti-rule);
+  --border-bright: color-mix(in srgb, var(--ti-ink-2) 45%, transparent);
+  --row-hover: color-mix(in srgb, var(--ti-ink) 7%, transparent);
+  color: var(--ti-ink);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-right {
+  box-shadow: 0 2px 0 rgba(0,0,0,0.12), 0 6px 16px rgba(0,0,0,0.16), inset 0 0 0 1px rgba(0,0,0,0.10);
+}
+/* index tabs printed along the card's top, the fold under them */
+:root[data-ui-style="retro"] #ti-panel .ti-tabs {
+  background: none;
+  border-bottom: 1px dashed color-mix(in srgb, var(--ti-ink-2) 45%, transparent);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-tab-btn {
+  font-family: var(--ti-face); font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
+  color: var(--ti-ink-2);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-tab-btn:hover { color: var(--ti-ink); }
+:root[data-ui-style="retro"] #ti-panel .ti-tab-btn.active { color: var(--ti-ink); border-bottom-color: var(--ti-ink); }
+
+/* section heads and fields, printed: a rule under each line, a red margin
+   line between the legend and the entry */
+:root[data-ui-style="retro"] #ti-panel .ti-section-hdr {
+  font-family: var(--ti-face); font-size: 11px; letter-spacing: 0.16em;
+  color: var(--ti-ink-2);
+  border-bottom: 1px solid color-mix(in srgb, var(--ti-ink-2) 40%, transparent);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-field {
+  border-bottom: 1px solid var(--ti-rule);
+  background: linear-gradient(90deg, transparent 104px, var(--ti-margin) 104px 105px, transparent 105px) no-repeat;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-label {
+  font-family: var(--ti-face); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ti-ink-2);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-value { color: var(--ti-ink); }
+:root[data-ui-style="retro"] #ti-panel #ti-title { font-size: 13.5px; font-weight: 700; color: var(--ti-ink-sel); }
+:root[data-ui-style="retro"] #ti-panel .ti-value.ti-year-scene { color: var(--ti-ink-accent); border-bottom-color: var(--ti-ink-accent); }
+:root[data-ui-style="retro"] #ti-panel .ti-sid-chip {
+  font-family: var(--ti-face); letter-spacing: 0.1em;
+  color: var(--ti-ink-accent); border-color: color-mix(in srgb, var(--ti-ink-accent) 55%, transparent); border-radius: 2px;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-instrument { color: var(--ti-ink-2); }
+/* Playback problems, on the card */
+:root[data-ui-style="retro"] #ti-panel :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #ff8a80; }
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #8c0f08; }
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel :is(.track-health-glitched, .track-health-partial) { color: #5e3d00; }
+/* "Playback": No problem · Glitched · Broken, printed boxes — the chosen one inked */
+:root[data-ui-style="retro"] #ti-panel .ti-report { border-color: color-mix(in srgb, var(--ti-ink-2) 60%, transparent); border-radius: 3px; }
+:root[data-ui-style="retro"] #ti-panel .ti-report > button {
+  font-family: var(--ti-face); letter-spacing: 0.03em; text-transform: uppercase; font-size: 10px;
+  padding: 3px 7px;              /* the caps run wider: tighter, so the three fit the value column */
+  color: var(--ti-ink); border-right-color: color-mix(in srgb, var(--ti-ink-2) 60%, transparent);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-report > button[aria-pressed="true"] { background: var(--ti-ink-sel); color: var(--ti-card); }
+:root[data-ui-style="retro"] #ti-panel .ti-report > button:focus-visible { outline-color: var(--state-focus); }
+:root[data-ui-style="retro"] #ti-panel .ti-report-note { background: color-mix(in srgb, var(--ti-ink) 6%, var(--ti-card)); color: var(--ti-ink); border-color: color-mix(in srgb, var(--ti-ink-2) 60%, transparent); }
+/* The tag / info editor: write-in boxes and printed buttons on the card, Save inked */
+:root[data-ui-style="retro"] #ti-panel .ti-tagedit-input {
+  background: color-mix(in srgb, var(--ti-ink) 6%, var(--ti-card)); color: var(--ti-ink);
+  border-color: color-mix(in srgb, var(--ti-ink-2) 60%, transparent); border-radius: 2px;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-tagedit-btn {
+  background: transparent; color: var(--ti-ink);
+  border-color: color-mix(in srgb, var(--ti-ink-2) 60%, transparent); border-radius: 3px;
+  font-family: var(--ti-face); letter-spacing: 0.06em; text-transform: uppercase;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-tagedit-btn:hover { background: color-mix(in srgb, var(--ti-ink) 8%, transparent); }
+:root[data-ui-style="retro"] #ti-panel .ti-tagedit-btn.primary { background: var(--ti-ink); border-color: var(--ti-ink); color: var(--ti-card); }
+:root[data-ui-style="retro"] #ti-panel .ti-tagedit-btn.primary:hover { background: color-mix(in srgb, var(--ti-ink) 85%, var(--ti-card)); }
+:root[data-ui-style="retro"] #ti-panel #ti-artist-about a:not([style*="color"]) { color: var(--ti-ink-accent); }
+/* Scene tab chips: printed outlines (the card's tokens would fill them too dark) */
+:root[data-ui-style="retro"] #ti-panel .ti-scene-chip {
+  background: transparent; color: var(--ti-ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ti-ink-2) 55%, transparent);
+  border-radius: 2px;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-scene-chip:hover { background: var(--ti-ink); color: var(--ti-card); }
+/* STIL: liner notes on the card */
+:root[data-ui-style="retro"] #ti-panel .ti-stil-wrap {
+  background: none; border: 1px dashed color-mix(in srgb, var(--ti-ink-2) 45%, transparent); border-radius: 2px;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-stil-body { color: var(--ti-ink); }
+
+
+/* Follow / Scroller: keys with a lamp — amber while engaged */
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px 3px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--ti-key-edge);
+  background: var(--ti-key-bg);
+  box-shadow: var(--ti-key-shadow);
+  color: var(--ti-key-text);
+  font-family: var(--ti-face); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow::before {
+  content: ''; flex: none;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ti-lamp-off); box-shadow: var(--ti-lamp-off-shadow);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow:hover { background: var(--ti-key-bg-hover); color: var(--ti-key-text); border-color: var(--ti-key-edge); }
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow[aria-pressed="true"] {
+  background: var(--ti-key-pressed); color: var(--ti-key-text); border-color: var(--ti-key-edge);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow[aria-pressed="true"]::before {
+  background: var(--ti-lamp-hold);
+  box-shadow: 0 0 5px 1px color-mix(in srgb, var(--ti-lamp-hold) 55%, transparent);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-pat-follow[aria-pressed="true"] { box-shadow: inset 0 2px 3px rgba(0,0,0,0.25); }
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-pat-follow[aria-pressed="true"]::before { box-shadow: 0 0 0 1px rgba(0,0,0,0.45); }
+:root[data-ui-style="retro"] #ti-panel .ti-pat-follow:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+
+/* ── Left, under the VFD: the signal path, its stages printed in a row ─────── */
+:root[data-ui-style="retro"] #ti-panel .ti-left { overflow-y: auto; scrollbar-width: thin; }   /* (a short window: the path stays in reach) */
+:root[data-ui-style="retro"] #ti-panel .ti-left > #ti-section-signal { align-self: stretch; margin: 0; flex: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-left > #ti-section-signal .ti-section-hdr {
+  display: block; margin: 0 0 7px; padding: 0 0 5px;
+  font-weight: 700; color: var(--ti-print-2);
+  border-bottom: 1px solid rgba(0,0,0,0.40);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.05);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-left > #ti-section-signal .ti-section-hdr {
+  border-bottom-color: rgba(0,0,0,0.16); box-shadow: 0 1px 0 rgba(255,255,255,0.6);
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain {
+  height: auto;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--ti-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain > svg { display: none; }
+/* the chain's step list (a screen-reader mirror in Modern) is the display */
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain > .viz-sr-only {
+  position: static; width: auto; height: auto; margin: 0; padding: 0;
+  overflow: visible; clip: auto; white-space: normal;
+  display: flex; flex-wrap: wrap; align-items: center; row-gap: 3px;
+  list-style: none;
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li {
+  display: inline-flex; align-items: center;
+  font-family: var(--ti-face); font-size: 12px; font-weight: 700; line-height: 18px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ti-vfd-dim);
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li:not(:last-child)::after {
+  content: '\203A'; content: '\203A' / '';
+  margin: 0 6px; color: var(--ti-vfd-dim); opacity: 0.7; text-shadow: none;
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li.active {
+  color: var(--ti-amber); text-shadow: 0 0 8px rgba(255,177,43,0.6);
+}
+/* the output stage: a speaker drawn in the stage's colour (its emoji kept for screen readers) */
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li:last-child { font-size: 0; letter-spacing: 0; }
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li:last-child::after {
+  content: ''; width: 15px; height: 13px; background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 13'%3E%3Cpath d='M1 4.5h3l4-3.5v11l-4-3.5H1z'/%3E%3Cpath d='M10.5 4a3.2 3.2 0 0 1 0 5M12.5 2a6 6 0 0 1 0 9' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 13'%3E%3Cpath d='M1 4.5h3l4-3.5v11l-4-3.5H1z'/%3E%3Cpath d='M10.5 4a3.2 3.2 0 0 1 0 5M12.5 2a6 6 0 0 1 0 9' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+:root[data-ui-style="retro"] #ti-panel #ti-signal-chain li.active:last-child::after { filter: drop-shadow(0 0 4px rgba(255,177,43,0.6)); }
+
+/* ── The cover window without a cover: the format's glyph moves to the top
+   corner and the LED columns run below it, brighter (no art to show through) ── */
+:root[data-ui-style="retro"] #ti-panel .ti-art-box:not(.ti-has-art):has(> .vu-meters.in-modal:not([hidden])) .ti-art-placeholder {
+  position: absolute; top: 8px; left: 10px;
+  width: auto; height: auto;
+  font-size: 30px;
+  filter: drop-shadow(0 0 6px rgba(107,200,240,0.55));
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-art-box:not(.ti-has-art):has(> .vu-meters.in-modal:not([hidden])) .ti-art-placeholder { filter: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-art-box:not(.ti-has-art) > .vu-meters.in-modal:not([hidden]) {
+  padding-top: 50px;
+  opacity: 0.85;
+}
+
+/* ── The tunes: a keypad on a plate inset in the card ──────────────────────── */
+:root[data-ui-style="retro"] #ti-panel #ti-section-subsongs {
+  /* back to the plate's legends inside the keypad */
+  --text0: var(--ti-print);
+  --text1: var(--ti-print-2);
+  --text2: var(--ti-print-2);
+  --border: rgba(0,0,0,0.35);
+  margin: 2px -10px 20px;
+  padding: 10px 10px 9px;
+  border-radius: 6px;
+  background: var(--ti-surface);
+  border: 1px solid var(--ti-plate-edge);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 5px rgba(0,0,0,0.35);
+  color: var(--ti-print);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel #ti-section-subsongs {
+  --border: rgba(0,0,0,0.16);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 2px 5px rgba(0,0,0,0.15);
+}
+:root[data-ui-style="retro"] #ti-panel #ti-section-subsongs .ti-section-hdr {
+  color: var(--ti-print); border-bottom-color: var(--border);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-count { font-family: var(--ti-face); letter-spacing: 0.06em; color: var(--ti-print-2); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-abtn {
+  border-radius: 4px;
+  border: 1px solid var(--ti-key-edge);
+  background: var(--ti-key-bg);
+  color: var(--ti-key-text);
+  font-family: var(--ti-face); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  box-shadow: var(--ti-key-shadow);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-abtn:hover { background: var(--ti-key-bg-hover); color: var(--ti-legend-on); border-color: var(--ti-key-edge); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-abtn:active {
+  background: var(--ti-key-pressed); transform: translateY(1px);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-note { font-family: var(--ti-face); letter-spacing: 0.04em; color: var(--ti-print); }
+
+:root[data-ui-style="retro"] #ti-panel .ti-sub-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 7px;
+  max-height: 252px;
+  padding: 3px 3px 6px;
+  border: 0; border-radius: 0;
+}
+/* a key: lamp + number, the length; the default / short marks and the STIL
+   title under them */
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: 18px 14px;
+  grid-template-areas: "lamp n len" "info info info";
+  align-items: center;
+  column-gap: 6px; row-gap: 3px;
+  padding: 6px 8px 7px;
+  border: 1px solid var(--ti-key-edge);
+  border-radius: 4px;
+  background: var(--ti-key-bg);
+  box-shadow: var(--ti-key-shadow);
+  color: var(--ti-key-text);
+  font-family: var(--ti-face);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row:hover { background: var(--ti-key-bg-hover); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 2px; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing {
+  background: var(--ti-key-pressed);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+  transform: translateY(1px);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-eq {
+  grid-area: lamp;
+  visibility: visible;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ti-lamp-off);
+  box-shadow: var(--ti-lamp-off-shadow);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-eq i { display: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing .ti-sub-eq {
+  background: var(--ti-lamp-on);
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--ti-lamp-on) 65%, transparent), 0 0 1px #fff inset;
+}
+/* paused: the loaded tune's lamp holds amber */
+:root[data-ui-style="retro"] body.sb-paused #ti-panel .ti-sub-row.playing .ti-sub-eq {
+  background: var(--ti-lamp-hold);
+  box-shadow: 0 0 5px 1px color-mix(in srgb, var(--ti-lamp-hold) 55%, transparent);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-sub-row.playing .ti-sub-eq,
+:root[data-theme="light"][data-ui-style="retro"] body.sb-paused #ti-panel .ti-sub-row.playing .ti-sub-eq {
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-name { display: contents; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-dot { display: none; }
+/* "Tune" stays for screen readers reading the list line by line */
+:root[data-ui-style="retro"] #ti-panel .ti-sub-word {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-n {
+  grid-area: n;
+  font-size: 15px; font-weight: 700; line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ti-key-text);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-len {
+  grid-area: len;
+  font-size: 11.5px; line-height: 18px; letter-spacing: 0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ti-key-text-2);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-info {
+  grid-area: info;
+  min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 10.5px; line-height: 14px; letter-spacing: 0.03em;
+  color: var(--ti-key-text-2);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-info > :first-child { margin-left: 0; }
+:root[data-ui-style="retro"] #ti-panel :is(.ti-sub-def, .ti-sub-short) {
+  display: inline-block; margin: 0 4px 0 0; padding: 0 3px;
+  border-radius: 2px;
+  font-size: 9px; font-weight: 700; line-height: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+  vertical-align: 1px;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-def { color: var(--ti-legend-on); border-color: color-mix(in srgb, var(--ti-legend-on) 55%, transparent); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-short { color: var(--ti-key-text-2); border-color: color-mix(in srgb, var(--ti-key-text-2) 60%, transparent); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-title,
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing .ti-sub-title { color: var(--ti-key-text-2); opacity: 1; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing .ti-sub-n { color: var(--ti-legend-on); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row--short :is(.ti-sub-n, .ti-sub-len) { color: var(--ti-key-text-2); }
+/* the key's own ▶ / ＋ / ☰: over its lower line while pointed at or focused */
+:root[data-ui-style="retro"] #ti-panel .ti-sub-rowacts {
+  position: absolute; right: 3px; bottom: 3px;
+  gap: 1px; padding: 1px;
+  border-radius: 3px;
+  background: var(--ti-key-solid);
+  box-shadow: 0 0 0 1px var(--ti-key-edge);
+  opacity: 0; pointer-events: none;
+}
+:root[data-ui-style="retro"] #ti-panel :is(.ti-sub-row:hover, .ti-sub-row:focus-visible, .ti-sub-row:focus-within) .ti-sub-rowacts { opacity: 1; pointer-events: auto; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing:not(:hover):not(:focus-within) .ti-sub-rowacts { opacity: 0; pointer-events: none; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-rbtn { color: var(--ti-key-text); font-size: 11px; padding: 1px 4px; border-radius: 2px; }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-rbtn:hover { color: var(--ti-legend-on); background: rgba(0,0,0,0.25); }
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-sub-rbtn:hover { background: rgba(0,0,0,0.08); }
+/* no hover to show them: a third line on every key */
+@media (hover: none) {
+  :root[data-ui-style="retro"] #ti-panel .ti-sub-row {
+    grid-template-rows: 18px 14px auto;
+    grid-template-areas: "lamp n len" "info info info" "acts acts acts";
+  }
+  :root[data-ui-style="retro"] #ti-panel .ti-sub-rowacts,
+  :root[data-ui-style="retro"] #ti-panel .ti-sub-row.playing:not(:hover):not(:focus-within) .ti-sub-rowacts {
+    grid-area: acts; position: static; justify-content: flex-start; gap: 4px;
+    background: none; box-shadow: none; opacity: 1; pointer-events: auto;
+  }
+  :root[data-ui-style="retro"] #ti-panel .ti-sub-rbtn { min-width: 24px; min-height: 24px; }
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-foot { font-family: var(--ti-face); letter-spacing: 0.06em; color: var(--ti-print-2); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-jump { text-transform: uppercase; font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em; color: var(--ti-print-2); }
+:root[data-ui-style="retro"] #ti-panel .ti-sub-jump input {
+  border-radius: 4px; border: 2px solid #050607;
+  background: var(--ti-vfd-glass); color: var(--ti-vfd);
+  font-family: var(--ti-face); font-size: 13px; font-weight: 700; letter-spacing: 0.08em;
+  box-shadow: inset 0 2px 5px rgba(0,0,0,0.8);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-sub-jump input::placeholder { color: var(--ti-vfd-dim); opacity: 1; }
+
+/* ── Narrow windows (both looks): the cover and its facts above the tabs ─── */
+@media (max-width: 600px) {
+  #ti-panel { width: 100%; max-width: calc(100vw - 16px); max-height: 92vh; border-radius: 14px; }
+  #ti-panel .ti-nav { padding: 10px 12px; gap: 6px; }
+  #ti-panel .ti-body { flex-direction: column; min-height: 0; }
+  #ti-panel .ti-left {
+    width: auto; flex-direction: row; align-items: flex-start; gap: 12px;
+    padding: 12px; border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  #ti-panel .ti-art-box { width: 112px; height: 112px; }
+  #ti-panel .ti-art-placeholder { font-size: 54px; }
+  #ti-panel .ti-stats { flex: 1 1 auto; min-width: 0; }
+  #ti-panel .ti-right { min-height: 0; }
+  #ti-panel :is(.ti-meta-pane, .ti-scene-pane) { padding: 14px 14px 22px; }
+  #ti-panel .ti-lyrics-pane { padding: 18px 16px 24px; }
+  #ti-panel .ti-label { flex: 0 0 84px; min-width: 0; overflow-wrap: anywhere; }
+  #ti-panel .ti-tab-btn { padding: 10px 12px 8px; }
+  :root[data-ui-style="retro"] #ti-panel .ti-art-box:not(.ti-has-art):has(> .vu-meters.in-modal:not([hidden])) .ti-art-placeholder { top: 4px; left: 6px; font-size: 20px; }
+  :root[data-ui-style="retro"] #ti-panel .ti-art-box:not(.ti-has-art) > .vu-meters.in-modal:not([hidden]) { padding-top: 30px; }
+  :root[data-ui-style="retro"] #ti-panel .ti-left { border-right: 0; border-bottom: 1px solid rgba(0,0,0,0.40); box-shadow: 0 1px 0 rgba(255,255,255,0.05); }
+  :root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-left { border-bottom-color: rgba(0,0,0,0.16); box-shadow: 0 1px 0 rgba(255,255,255,0.6); }
+  :root[data-ui-style="retro"] #ti-panel .ti-right { margin: 8px; }
+  :root[data-ui-style="retro"] #ti-panel .ti-field { background-position: -26px 0; }
+  :root[data-ui-style="retro"] #ti-panel #ti-section-subsongs { margin-left: -6px; margin-right: -6px; }
+  :root[data-ui-style="retro"] #ti-panel .ti-sub-list { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+}
+
+/* Reduced motion: the keys don't travel when pressed */
+@media (prefers-reduced-motion: reduce) {
+  :root[data-ui-style="retro"] #ti-panel :is(.ti-sub-row.playing, .ti-sub-abtn:active, .ti-nav-btn:active, .ti-close:active) { transform: none; }
+}

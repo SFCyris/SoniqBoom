@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 import anyio
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 from soniqboom.api.users import listener_uid
@@ -988,8 +988,161 @@ async def _producer_with_reconnect(stream: dict, st: dict, set_info):
         await asyncio.sleep(min(2 ** attempt * 0.5, 8.0))
 
 
+# ── The relay as a file (WebKit) ──────────────────────────────────────────────
+# WebKit plays an endless stream but gives the page's Web Audio graph (the live
+# scope, the equalizer) none of its samples; a file it does.  So for
+# ``file=1`` (the web player in WebKit asks for it) an MP3 / AAC station is
+# answered as a file of ``_AS_FILE_SIZE`` bytes that serves byte ranges: every
+# range is the live stream from now on, as long as the range; the last
+# ``_AS_FILE_END`` bytes are zeros (a read of the "end" of the file for its
+# tags is answered at once).  A larger size sends WebKit through the "file"
+# reading ranges further and further on (seen from 2**32), and a VBR header
+# (Xing / Info / VBRI) at the start would give it the length of the file it
+# came from — that frame is dropped.  A range from byte N > 0 leaves out the
+# first N bytes of the recent audio a stream starts with (it was read already).
+_AS_FILE_SIZE = 2_000_000_000
+_AS_FILE_END = 64 * 1024
+_AS_FILE_TYPES = ("audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3", "audio/mpeg3",
+                  "audio/aac", "audio/aacp", "audio/x-aac", "audio/x-aacp")
+_MP3_KBPS = {  # (MPEG-1, MPEG-2/2.5) Layer III bitrates by index
+    1: (32, 8), 2: (40, 16), 3: (48, 24), 4: (56, 32), 5: (64, 40), 6: (80, 48),
+    7: (96, 56), 8: (112, 64), 9: (128, 80), 10: (160, 96), 11: (192, 112),
+    12: (224, 128), 13: (256, 144), 14: (320, 160)}
+_MP3_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+
+
+def _mp3_frame_len(h: bytes) -> int:
+    """The length of the MPEG Layer III frame whose 4-byte header is ``h``
+    (0: not one)."""
+    if len(h) < 4 or h[0] != 0xFF or (h[1] & 0xE0) != 0xE0 or (h[1] >> 1) & 3 != 1:
+        return 0
+    ver, bi, si = (h[1] >> 3) & 3, h[2] >> 4, (h[2] >> 2) & 3
+    if ver == 1 or bi not in _MP3_KBPS or si == 3:
+        return 0
+    kbps = _MP3_KBPS[bi][0 if ver == 3 else 1]
+    rate = _MP3_RATES[ver][si]
+    return (144 if ver == 3 else 72) * kbps * 1000 // rate + ((h[2] >> 1) & 1)
+
+
+def _id3v2_len(head: bytes) -> int:
+    """The length of the ID3v2 tag ``head`` starts with (0: none; -1: more
+    bytes needed to tell)."""
+    if not head.startswith(b"ID3"):
+        return 0 if len(head) >= 3 or not b"ID3".startswith(head) else -1
+    if len(head) < 10:
+        return -1
+    size = 0
+    for b in head[6:10]:
+        size = (size << 7) | (b & 0x7F)
+    return 10 + size + (10 if head[5] & 0x10 else 0)
+
+
+async def _without_vbr_header(chunks):
+    """``chunks`` without an ID3v2 tag and a first MP3 frame that is a VBR
+    header at their start (closing ``chunks`` when it is closed)."""
+    head = b""
+    try:
+        async for chunk in chunks:
+            if head is None:
+                yield chunk
+                continue
+            head += chunk
+            tag = _id3v2_len(head)
+            if tag < 0 or len(head) < tag + 4:
+                continue
+            head = head[tag:]
+            n = _mp3_frame_len(head[:4])
+            if n and len(head) < n:
+                continue
+            if n and any(vbr in head[4:n] for vbr in (b"Xing", b"Info", b"VBRI")):
+                head = head[n:]
+            if head:
+                yield head
+            head = None
+        if head:
+            yield head
+    finally:
+        await chunks.aclose()
+
+
+async def _skipping(chunks, n: int):
+    """``chunks`` without their first ``n`` bytes (closing ``chunks`` when it
+    is closed)."""
+    try:
+        async for chunk in chunks:
+            if n >= len(chunk):
+                n -= len(chunk)
+                continue
+            yield chunk[n:] if n else chunk
+            n = 0
+    finally:
+        await chunks.aclose()
+
+
+async def _first_bytes(chunks, n: int):
+    """The first ``n`` bytes of ``chunks``, then their end."""
+    left = n
+    try:
+        async for chunk in chunks:
+            if len(chunk) >= left:
+                yield chunk[:left]
+                return
+            left -= len(chunk)
+            yield chunk
+    finally:
+        await chunks.aclose()
+
+
+def _as_file_response(range_hdr: "str | None", hub: StationHub) -> Response:
+    """The live stream of ``hub`` answered as a file (see ``_AS_FILE_SIZE``)."""
+    total = _AS_FILE_SIZE
+    first, last, ranged = 0, total - 1, False
+    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", range_hdr or "")
+    if m and (m.group(1) or m.group(2)):
+        ranged = True
+        if not m.group(1):                                   # bytes=-N
+            first = max(0, total - int(m.group(2)))
+        else:
+            first = int(m.group(1))
+            if m.group(2):
+                last = min(int(m.group(2)), total - 1)
+        if first >= total or last < first:
+            hub.release_unused()
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    n = last - first + 1
+    headers = {**hub.headers, "Accept-Ranges": "bytes", "Content-Length": str(n),
+               "Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    if ranged:
+        headers["Content-Range"] = f"bytes {first}-{last}/{total}"
+    status = 206 if ranged else 200
+    if first >= total - _AS_FILE_END:
+        hub.release_unused()                 # (answered without the stream)
+        return Response(content=bytes(n), status_code=status, media_type=hub.media_type,
+                        headers=headers)
+    burst = hub.burst_size              # (read before subscribing: what it will send first)
+    live = hub.stream()
+    if hub.media_type.split(";")[0].strip().lower() in _AS_FILE_TYPES[:5]:   # the MP3 ones
+        live = _without_vbr_header(live)
+    if first > 0:
+        # A later range of the same "file" (WebKit reads its start, then the
+        # rest from where it stopped): the recent audio every stream starts
+        # with was mostly read already — its first ``first`` bytes (counted
+        # as the first answer sent them: without a leading tag / VBR frame)
+        # are left out instead of played again.
+        live = _skipping(live, min(first, burst))
+    return StreamingResponse(_first_bytes(live, n), status_code=status,
+                             media_type=hub.media_type, headers=headers)
+
+
 @router.get("/relay/{sid:path}")
-async def relay(sid: str, v: int = Query(0, ge=0)):
+async def relay_route(sid: str, request: Request, v: int = Query(0, ge=0),
+                      file: int = Query(0, ge=0, le=1)):
+    """``relay`` — ``file=1``: answered as a file (``_AS_FILE_SIZE``)."""
+    return await relay(sid, v, as_file=bool(file), range_hdr=request.headers.get("range"))
+
+
+async def relay(sid: str, v: int = 0, *, as_file: bool = False,
+                range_hdr: "str | None" = None):
     """Stream a station through the server, SHARED via a StationHub.
 
     The first listener of a given (sid, v) opens ONE upstream connection (or one
@@ -1030,6 +1183,8 @@ async def relay(sid: str, v: int = Query(0, ge=0)):
         return hub
 
     hub = await _hub_registry.get_or_create(key, _build)
+    if as_file and hub.media_type.split(";")[0].strip().lower() in _AS_FILE_TYPES:
+        return _as_file_response(range_hdr, hub)
     # A live, endless stream: tell a buffering reverse proxy (nginx) to pass
     # bytes through as they arrive instead of holding them in its buffer.
     return StreamingResponse(hub.stream(), media_type=hub.media_type,

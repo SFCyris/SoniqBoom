@@ -41,6 +41,8 @@ const FACTORY = new Function('env', `
   const _RENDERED = new Set(['SID', 'PSID', 'MOD', 'TFMX', 'XM']);
   const _isRenderedTrack = (t) => !!t && _RENDERED.has(String(t.format || '').toUpperCase());
   function _streamUrlFor(id) { return '/api/stream/' + id; }
+  // (the streaming-quality cap: env.quality(t) → {format, maxBitRate} | null)
+  function _qualityParams(t) { return env.quality ? env.quality(t) : null; }
   function _renderTextOnlyConvertBadge(text) { env.badge.label = text; }
   function _showConvertBadge() { env.badge.shown = true; }
   function _hideConvertBadge() { env.badge.shown = false; }

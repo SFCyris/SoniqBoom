@@ -616,12 +616,12 @@ def local_docs_path() -> str:
     return (getattr(settings, "hvsc_docs_path", "") or "").strip()
 
 
-def apply_docs_fallback() -> None:
+def apply_docs_fallback() -> bool:
     """Point the SID lookups (``core/hvsc``) at the downloaded documents when
     no local HVSC folder is in use and either the HVSC card downloads them
     (``hvsc_source`` "online", ``core/hvsc_download``) or the collection is on
     with its "Use for my own SID files" option; undo it when that no longer
-    holds."""
+    holds.  True when the library apply was scheduled (new documents)."""
     global _fallback_active
     from soniqboom.core.hvsc import get_hvsc
     hv = get_hvsc()
@@ -636,7 +636,7 @@ def apply_docs_fallback() -> None:
     if want:
         sig = _docs_signature(docs)
         if hv.docs_path == ours and _fallback_active and sig == _applied_sig:
-            return                   # these very documents are in use already
+            return False             # these very documents are in use already
         if hv.docs_path != ours:
             hv.configure(ours)
             log.info("HVSC: song lengths and STIL from the downloaded HVSC documents")
@@ -644,11 +644,12 @@ def apply_docs_fallback() -> None:
             hv.reload()
         _fallback_active = True
         _set_applied(sig)
-        _apply_to_library()          # the SIDs already in the library take them
+        return _apply_to_library()   # the SIDs already in the library take them
     elif hv.docs_path == ours:
         hv.configure(local or None)
         _fallback_active = False
         _set_applied(None)
+    return False
 
 
 _applied_sig = None
@@ -684,12 +685,15 @@ def fallback_active() -> bool:
 _apply_again = False
 
 
-def _apply_to_library() -> None:
+def _apply_to_library() -> bool:
     """Join the (new) documents onto every SID of the library — the user's
-    own included — in the background.  Callable from any thread."""
+    own included — in the background.  Callable from any thread.  While the
+    HVSC card downloads the documents (``hvsc_download.wanted``) the apply's
+    progress is the card's (``hvsc_download.apply_*``).  True when
+    scheduled."""
     loop = HVSC_ONLINE._loop
     if loop is None or loop.is_closed():
-        return
+        return False
 
     def _spawn() -> None:
         global _apply_again
@@ -700,15 +704,26 @@ def _apply_to_library() -> None:
 
         async def _run() -> None:
             global _apply_again
-            from soniqboom.core import hvsc_apply
+            from soniqboom.core import hvsc_apply, hvsc_download
             while True:
                 _apply_again = False
+                card = hvsc_download.wanted()
+                job = hvsc_download.apply_started() if card else None
                 try:
-                    res = await hvsc_apply.apply_hvsc_to_library()
+                    res = await hvsc_apply.apply_hvsc_to_library(
+                        progress=hvsc_download.apply_reporter(job) if card else None)
                     log.info("HVSC: the downloaded documents applied to the library (%s)", res)
-                except Exception:                       # noqa: BLE001
+                    if card:
+                        hvsc_download.apply_finished(res, job=job, **hvsc_apply.loaded_counts())
+                except asyncio.CancelledError:
+                    if card:
+                        hvsc_download.apply_failed(RuntimeError("stopped"), job=job)
+                    raise
+                except Exception as exc:                # noqa: BLE001
                     log.warning("HVSC apply after the downloaded documents changed failed",
                                 exc_info=True)
+                    if card:
+                        hvsc_download.apply_failed(exc, job=job)
                 if not _apply_again:
                     break
         t = loop.create_task(_run(), name="online-hvsc.apply-library")
@@ -717,7 +732,8 @@ def _apply_to_library() -> None:
     try:
         loop.call_soon_threadsafe(_spawn)
     except RuntimeError:
-        pass
+        return False
+    return True
 
 
 # ── Ratings, plays and playlist entries between the two HVSC copies ─────────

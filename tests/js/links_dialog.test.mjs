@@ -5,7 +5,8 @@
 // modal dialog: opening it puts focus inside, Escape closes it with focus
 // inside (the page's shortcut handler leaves a focused dialog's keys alone, so
 // the dialog handles its own), Tab / Shift+Tab stay inside, and closing puts
-// focus back on its button.  Source checks (the browser checks are in the
+// focus back on its button (on the header's ⋯ in a narrow window, where the globe
+// is folded into that menu).  Source checks (the browser checks are in the
 // verification scripts).
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,7 +22,9 @@ const block = SRC.slice(SRC.indexOf("const _linksOverlay = document.getElementBy
 test('Escape closes the dialog from inside it, and focus returns to its button', () => {
   assert.match(block, /_linksOverlay\.addEventListener\('keydown'/);
   assert.match(block, /if \(e\.key === 'Escape'\) \{ e\.preventDefault\(\); e\.stopPropagation\(\); closeLinks\(\); return; \}/);
-  assert.match(block, /_btnLinks\.focus\(/);
+  // (its button — or the header's ⋯ when the globe is folded into it in a narrow window)
+  assert.match(block, /const back = _btnLinks\.getClientRects\(\)\.length \? _btnLinks : document\.getElementById\('btn-more'\);/);
+  assert.match(block, /back\?\.focus\(/);
 });
 
 test('opening focuses inside; Tab wraps within the dialog', () => {

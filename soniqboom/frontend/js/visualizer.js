@@ -9,10 +9,15 @@
  * non-interactive (pointer-events: none). Opacity transitions in/out with playback.
  *
  * Modes (cycled via the V key):
- *   - 'oscilloscope' — time-domain waveform
+ *   - 'oscilloscope' — time-domain waveform (Retro hi-fi: one amber phosphor
+ *                      trace with persistence over a printed graticule)
  *   - 'crt'          — retro phosphor-green CRT scope (persistence trail,
  *                      graticule grid, travelling scanline, bloom)
  *   - 'spectrogram'  — scrolling frequency spectrogram (waterfall)
+ *   - 'analyser'     — spectrum analyser: a bar per band (1/3 octave, octaves
+ *                      on a narrow pane) with peak hold and printed band labels;
+ *                      Modern = soft accent bars, Retro hi-fi = a VFD bar
+ *                      display (segments, amber peak segments, glow)
  *   - 'hyperspace'   — neon vortex tunnel with rotating geometric objects flying past
  *   - 'synthwave'    — neon Tron grid + reactive sun + beat lightning + spectrum spires
  *   - 'globe'        — wireframe globe rotating behind a colourful frequency-bar halo
@@ -21,9 +26,23 @@
  *                      hue cycles slowly, additive blob blending makes the wax glow
  *   - 'raccoon'      — front-facing raccoon head; mouth opens with the music as if singing,
  *                      pupils dilate on bass kicks, gentle head bob, occasional blink
+ *
+ * Every mode exists in both looks of the shared UI style (js/ui_style.js);
+ * only 'oscilloscope' and 'analyser' draw differently in Retro hi-fi.  Their
+ * colours are the --vz-* tokens on #visualizer-canvas (css/visualizer-
+ * styles.css), re-read on a look / theme change; the canvas carries
+ * data-vis-mode for the CSS (the Retro graticule is its background).
+ * Reduced motion: the visualizer shows one still frame (taken 400 ms after it
+ * starts, while the canvas is still transparent) instead of animating.
  */
 import { Player } from './player.js';
 import { vizGroupEnabled } from './viz/engine.js';
+import { getUiStyle, onUiStyleChange } from './ui_style.js';
+import { cssAlpha } from './eq/engine.js';
+// The analyser's bands + ballistics and the phosphor trace are shared with the
+// phone's Now Playing display.
+import { AN_THIRDS, AN_OCTAVES, bandBins, readBands, stepBands } from './viz/bands.js';
+import { createPhosphor } from './viz/phosphor.js';
 
 const canvas = document.getElementById('visualizer-canvas');
 const ctx2d  = canvas.getContext('2d');
@@ -31,11 +50,19 @@ let rafId    = null;
 
 // ── Mode management ─────────────────────────────────────────────────────────
 const MODES = [
-  'oscilloscope', 'crt', 'spectrogram',
+  'oscilloscope', 'crt', 'spectrogram', 'analyser',
   'hyperspace', 'synthwave', 'globe', 'cosmic', 'lavalamp', 'raccoon',
 ];
 let _mode = localStorage.getItem('sb_vis_mode') || 'oscilloscope';
 if (!MODES.includes(_mode)) _mode = 'oscilloscope';
+let _look = getUiStyle();          // 'modern' | 'retro'
+// Retro hi-fi keeps to the modes that are hi-fi instruments — an oscilloscope,
+// a spectrum analyser, a CRT scope; a Modern-only mode chosen there stays saved
+// and shows as the oscilloscope here.
+const RETRO_MODES = ['oscilloscope', 'analyser', 'crt'];
+const _modes = () => (_look === 'retro' ? RETRO_MODES : MODES);
+const _eff = () => (_modes().includes(_mode) ? _mode : 'oscilloscope');
+canvas.dataset.visMode = _eff();
 
 // Reusable buffers — allocating per frame pegs Chromium's GC and makes the
 // oscilloscope appear laggy on Edge in particular.
@@ -168,6 +195,37 @@ let _raccoonStepPhase = 0;     // 0..2π running cadence (drives leg cycle + bob
 let _raccoonSwayPhase = 0;     // 0..2π body sway (counter-phase tail swing)
 let _raccoonStreaks = null;    // radial speed-line pool [{angle, r, speed}, …]
 
+
+// Spectrum analyser.  It reads its own fan-out analyser on Player.analyser's
+// output (fftSize 4096: ≈ 11.7 Hz bins, the main analyser's 256 put every band
+// below 300 Hz in one bin) — connected only while this mode draws, released by
+// _anRelease() on stop / suspend / another mode.  Bands are ISO 1/3-octave
+// (25 Hz … 20 kHz) or, on a pane narrower than AN_NARROW_PX, octaves.
+// (AN_THIRDS / AN_OCTAVES, the dB range and the ballistics: viz/bands.js)
+const AN_FFT = 4096;
+const AN_NARROW_PX = 640;      // a pane narrower than this (CSS px) gets octave bands
+let _anTap = null;             // our AnalyserNode
+let _anFrom = null;            // the Player.analyser it is connected to (null = not connected)
+let _anSpec = null;            // Float32Array — dB per bin
+let _anBins = null;            // per band: [sum?, a, b] (bins a…b summed, or bin a interpolated × b)
+let _anBinsKey = '';
+let _anTarget = null, _anLevel = null, _anPeak = null, _anHold = null;
+let _anSt = null;              // the four as viz/bands.js stepBands' state
+let _anLastTs = 0;
+let _anGeom = null;            // layout + cached static layer (null = rebuild)
+let _anLayer = null, _anBloom = null;   // the canvases behind _anGeom.layer / .bloom
+// The Retro oscilloscope's phosphor trace: the last 24 traces, dropped below α 0.03.
+const _phosphor = createPhosphor({ keep: 24, minAlpha: 0.03 });   // (viz/phosphor.js)
+
+// Look tokens (the --vz-* custom properties on the canvas), read once per look
+// / theme; null = read again.
+let _tok = null;
+
+// Reduced motion: what the still frame shows (null = not frozen).
+let _frozenKey = null;
+let _freezeTimer = 0;
+let _clearTimer = 0;           // stop()'s clear after the fade-out
+
 function _resetModeState() {
   _spectroColumn = 0;
   _spectroImageData = null;
@@ -221,18 +279,31 @@ function _resetModeState() {
   _raccoonStepPhase = 0;
   _raccoonSwayPhase = 0;
   _raccoonStreaks = null;
+  _phosphor.reset();
+  _anReset();
 }
 
 function setMode(mode) {
   if (!MODES.includes(mode)) mode = 'oscilloscope';
   _mode = mode;
   localStorage.setItem('sb_vis_mode', mode);
+  _showMode();
+}
+
+// The canvas shows the effective mode: a clean canvas, the analyser's tap
+// only while it draws; a still frame again under reduced motion.
+function _showMode() {
+  const mode = _eff();
+  canvas.dataset.visMode = mode;
+  if (mode !== 'analyser') _anRelease();
   _resetModeState();
   ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  if (_frozenKey) _freeze();       // reduced motion: a still of the new mode
 }
 
 function toggleMode() {
-  const next = MODES[(MODES.indexOf(_mode) + 1) % MODES.length];
+  const list = _modes();
+  const next = list[(list.indexOf(_eff()) + 1) % list.length];
   setMode(next);
   return next;
 }
@@ -245,6 +316,7 @@ function toggleMode() {
 // single-line waveform, but it distorts the circular/perspective modes
 // (globe, cosmic, synthwave, raccoon) which expect a sane aspect ratio.
 const MAX_VIS_PIXELS = 1280 * 320;  // ≈ 409,600 — same budget as before
+let _pxPerCss = 1;                 // canvas px per CSS px (≤ 1 under the cap) — line widths, text
 function resize() {
   const parent = canvas.parentElement;
   if (!parent) return;
@@ -254,6 +326,7 @@ function resize() {
   const scale = Math.min(1, Math.sqrt(MAX_VIS_PIXELS / (parentW * parentH)));
   const targetW = Math.max(1, Math.floor(parentW * scale));
   const targetH = Math.max(1, Math.floor(parentH * scale));
+  _pxPerCss = targetW / parentW;
   if (canvas.width !== targetW || canvas.height !== targetH) {
     canvas.width  = targetW;
     canvas.height = targetH;
@@ -267,6 +340,8 @@ function resize() {
     _lavaBgCanvas = null;      // cached bg depends on canvas size
     _raccoonStreaks = null;    // speed-line pool depends on canvas size
     _oscStrokeGrad = null;     // oscilloscope gradient is bound to canvas H
+    _anGeom = null;            // analyser bands / segments / labels follow the size
+    if (_frozenKey) _freeze(); // a resize clears the bitmap: take the still again
   }
 }
 
@@ -312,14 +387,17 @@ function _buildColorMap() {
 _buildColorMap();
 
 // ── Draw one frame ────────────────────────────────────────────────────────────
+let _drawCount = 0;                // frames drawn (the reduced-motion still checks one was)
 function draw() {
   rafId = requestAnimationFrame(draw);
+  _drawCount++;
   const analyser = Player.analyser;
   if (!analyser) { clear(); return; }
 
-  switch (_mode) {
+  switch (_eff()) {
     case 'crt':         _drawCrt(analyser);         break;
     case 'spectrogram': _drawSpectrogram(analyser); break;
+    case 'analyser':    _drawAnalyser(analyser);    break;
     case 'hyperspace':  _drawHyperspace(analyser);  break;
     case 'synthwave':   _drawSynthwave(analyser);   break;
     case 'globe':       _drawGlobe(analyser);       break;
@@ -327,7 +405,10 @@ function draw() {
     case 'lavalamp':    _drawLavaLamp(analyser);    break;
     case 'raccoon':     _drawRaccoon(analyser);     break;
     case 'oscilloscope':
-    default:            _drawOscilloscope(analyser); break;
+    default:
+      if (_look === 'retro') _drawPhosphorScope(analyser);
+      else                   _drawOscilloscope(analyser);
+      break;
   }
 }
 
@@ -382,6 +463,8 @@ function _drawOscilloscope(analyser) {
 // and a soft bloom.  Same time-domain data as ``_drawOscilloscope`` — this
 // is purely a stylistic mode, no extra analyser reads.
 let _crtScan = 0;
+const _CRT_GREEN = { fade: 'rgba(1,8,3,0.22)', grid: 'rgba(80,255,140,0.05)', trace: 'rgba(90,255,150,0.95)', glow: 'rgba(80,255,140,0.85)', scan: 'rgba(120,255,170,0.045)' };
+const _CRT_AMBER = { clear: true, grid: 'rgba(255,177,43,0.012)', trace: 'rgba(255,186,64,0.2)', glow: 'rgba(255,150,30,0.16)', scan: 'rgba(255,200,120,0.01)' };
 function _drawCrt(analyser) {
   const W = canvas.width;
   const H = canvas.height;
@@ -392,14 +475,25 @@ function _drawCrt(analyser) {
   analyser.getByteTimeDomainData(_timeBuf);
   const buf = _timeBuf;
 
+  // Green phosphor; Retro hi-fi's is amber, the deck's colour.
+  const ph = _look === 'retro' ? _CRT_AMBER : _CRT_GREEN;
+
   // Phosphor persistence: fade the previous frame toward black instead of
-  // clearing.  The faint green tint in the fade gives the classic glow
+  // clearing.  The faint tint in the fade gives the classic glow
   // afterimage.  (We do NOT clearRect — that's what makes it a CRT.)
-  ctx2d.fillStyle = 'rgba(1,8,3,0.22)';
-  ctx2d.fillRect(0, 0, W, H);
+  // Retro hi-fi draws it faint on a clear canvas each frame, as its
+  // oscilloscope: behind the list the rows must stay readable.  (The faintness
+  // is in its colours: WebKit ignored globalAlpha on the blurred trace, and a
+  // destination-out fade let a trace redrawn in place pile up to opaque.)
+  if (ph.clear) {
+    ctx2d.clearRect(0, 0, W, H);
+  } else {
+    ctx2d.fillStyle = ph.fade;
+    ctx2d.fillRect(0, 0, W, H);
+  }
 
   // Graticule grid (cheap: a handful of 1px lines).
-  ctx2d.strokeStyle = 'rgba(80,255,140,0.05)';
+  ctx2d.strokeStyle = ph.grid;
   ctx2d.lineWidth = 1;
   const cols = 12, rows = 8;
   ctx2d.beginPath();
@@ -418,15 +512,15 @@ function _drawCrt(analyser) {
     i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
   }
   ctx2d.lineWidth = 2;
-  ctx2d.strokeStyle = 'rgba(90,255,150,0.95)';
+  ctx2d.strokeStyle = ph.trace;
   ctx2d.shadowBlur = 12;
-  ctx2d.shadowColor = 'rgba(80,255,140,0.85)';
+  ctx2d.shadowColor = ph.glow;
   ctx2d.stroke();
   ctx2d.shadowBlur = 0;
 
   // Travelling scanline.
   _crtScan = (_crtScan + H * 0.012) % H;
-  ctx2d.fillStyle = 'rgba(120,255,170,0.045)';
+  ctx2d.fillStyle = ph.scan;
   ctx2d.fillRect(0, _crtScan, W, 2);
 }
 
@@ -465,6 +559,240 @@ function _drawSpectrogram(analyser) {
   }
 
   _spectroColumn += scrollW;
+}
+
+// ── Look tokens ─────────────────────────────────────────────────────────────
+// Colours of the looks that draw per style (css/visualizer-styles.css: Modern on
+// #visualizer-canvas, Retro hi-fi under :root[data-ui-style="retro"], light
+// theme overrides).  Re-read after a look / theme change (_restyle).
+function _tokens() {
+  if (_tok) return _tok;
+  const cs = getComputedStyle(canvas);
+  const str = (name, dflt) => (cs.getPropertyValue(name) || '').trim() || dflt;
+  const num = (name, dflt) => { const v = parseFloat(str(name, '')); return Number.isFinite(v) ? v : dflt; };
+  const trace = str('--vz-trace', '#ffb12b');
+  _tok = {
+    face: str('--vz-face', 'sans-serif'),
+    trace,
+    traceCore: str('--vz-trace-core', '#ffe3a8'),
+    traceGlow: cssAlpha(trace, num('--vz-trace-glow', 0.2)),
+    persist: Math.min(0.97, Math.max(0, num('--vz-persist', 0.82))),
+    level: Math.min(1, Math.max(0, num('--vz-trace-level', 1))),   // the whole trace's strength
+    bar: str('--vz-an-bar', '#f0722a'),
+    peak: str('--vz-an-peak', '#f0722a'),
+    lit: num('--vz-an-lit', 1),
+    off: num('--vz-an-off', 0),
+    label: str('--vz-an-label', '#b5bccb'),
+    glow: num('--vz-an-glow', 0),
+  };
+  return _tok;
+}
+
+function _timeData(analyser) {
+  if (!_timeBuf || _timeBuf.length !== analyser.fftSize) _timeBuf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(_timeBuf);
+  return _timeBuf;
+}
+
+// ── Phosphor scope (the oscilloscope in Retro hi-fi) ────────────────────────
+// One amber trace across the middle, a crisp hot core over a wide soft glow.
+// Persistence (viz/phosphor.js): the last traces are kept (24, y per sample + when) and
+// drawn again, older ones fainter — alpha = --vz-persist ^ (age / 16.7 ms), so
+// the afterglow lasts as long at any frame rate and fades out completely (a
+// destination-out fade of the canvas stalls at 1–10/255 from 8-bit rounding).
+// The canvas is cleared each frame and stays transparent: the page and the
+// printed graticule (the canvas's CSS background in this look) show through.
+function _drawPhosphorScope(analyser) {
+  _phosphor.draw(ctx2d, canvas.width, canvas.height, _timeData(analyser), _tokens(), _pxPerCss, performance.now());
+}
+
+// ── Spectrum analyser ───────────────────────────────────────────────────────
+// A bar per band, rising at once and falling at AN_FALL; a peak marker held
+// AN_HOLD_MS above it, then falling at AN_PEAK_FALL.  Band level = the power
+// of the band's FFT bins (summed — a real 1/3-octave filter bank's reading;
+// a band narrower than a bin reads the bin at its centre, scaled by its width)
+// between AN_FLOOR_DB and AN_CEIL_DB.  Modern: accent bars fading downwards,
+// a thin cap for the peak.  Retro hi-fi: a VFD bar display — lit segments over
+// the unlit ones, amber peak segments, a low-resolution glow (dark theme).
+// The unlit segments and the band labels are a cached layer (_anGeom.layer).
+function _anReset() {
+  _anTarget = _anLevel = _anPeak = _anHold = null;
+  _anLastTs = 0;
+}
+
+function _anTapFor(analyser) {
+  if (_anFrom === analyser && _anTap) return _anTap;
+  _anRelease();
+  try {
+    if (!_anTap || _anTap.context !== analyser.context) {
+      _anTap = analyser.context.createAnalyser();
+      _anTap.fftSize = AN_FFT;
+      _anTap.smoothingTimeConstant = 0;          // the bars have their own ballistics
+    }
+    analyser.connect(_anTap);
+    _anFrom = analyser;
+  } catch (_) { _anFrom = null; return null; }
+  return _anTap;
+}
+
+function _anRelease() {
+  if (_anFrom && _anTap) { try { _anFrom.disconnect(_anTap); } catch (_) {} }
+  _anFrom = null;
+}
+
+// Which bins make up each band (for this band set at this sample rate).
+function _anBinsFor(freqs, rate) {
+  const key = `${freqs.length}@${rate}`;
+  if (_anBins && _anBinsKey === key) return _anBins;
+  _anBins = bandBins(freqs, rate, AN_FFT);
+  _anBinsKey = key;
+  return _anBins;
+}
+
+function _anRead(tap, freqs, target) {
+  if (!_anSpec || _anSpec.length !== tap.frequencyBinCount) _anSpec = new Float32Array(tap.frequencyBinCount);
+  tap.getFloatFrequencyData(_anSpec);
+  readBands(_anSpec, _anBinsFor(freqs, tap.context.sampleRate), freqs.length, target);
+}
+
+// Geometry + the static layer, for this canvas size and look.
+function _anLayout() {
+  const W = canvas.width, H = canvas.height;
+  const k = _pxPerCss;
+  const cssW = W / k;
+  const T = _tokens();
+  const retro = _look === 'retro';
+  const freqs = cssW < AN_NARROW_PX ? AN_OCTAVES : AN_THIRDS;
+  const n = freqs.length;
+  const padX = Math.round(Math.max(16, cssW * 0.04) * k);
+  const labelH = Math.round(20 * k);
+  const top = Math.round(H * 0.12);
+  const base = H - labelH - Math.round(4 * k);            // the bars' bottom edge
+  const slot = (W - 2 * padX) / n;
+  const barW = Math.max(1, Math.floor(slot * (retro ? 0.72 : 0.6)));
+  const xs = new Float32Array(n);
+  for (let i = 0; i < n; i++) xs[i] = Math.round(padX + slot * i + (slot - barW) / 2);
+  // Retro: segments every `pitch` px, `segH` lit — patterns aligned to the base
+  const pitch = Math.max(3, Math.round(5 * k));
+  const segH = Math.max(2, Math.round(pitch * 0.62));
+  const rows = retro ? Math.max(4, Math.floor((base - top) / pitch)) : 0;
+  const G = { W, H, k, retro, freqs, n, xs, barW, top, base, pitch, segH, rows,
+              plotH: base - top, layer: null, lit: null, peak: null, grad: null, bloom: null, bloomG: null };
+
+  // (the layer / bloom canvases are reused across rebuilds — a resize drag
+  // rebuilds on every ResizeObserver callback)
+  const layer = _anLayer || (_anLayer = document.createElement('canvas'));
+  if (layer.width !== W || layer.height !== H) { layer.width = W; layer.height = H; }
+  const g = layer.getContext('2d');
+  g.clearRect(0, 0, W, H);
+  if (retro) {
+    const seg = (color) => {
+      const c = document.createElement('canvas');
+      c.width = 1; c.height = pitch;
+      const cg = c.getContext('2d');
+      cg.fillStyle = color;
+      cg.fillRect(0, pitch - segH, 1, segH);
+      const pat = ctx2d.createPattern(c, 'repeat');
+      pat.setTransform(new DOMMatrix([1, 0, 0, 1, 0, base % pitch]));   // tiles end on the base
+      return pat;
+    };
+    G.lit = seg(cssAlpha(T.bar, T.lit));
+    G.peak = seg(cssAlpha(T.peak, Math.min(1, T.lit * 2.5)));   // (as faint as the bars: the list reads over both)
+    if (T.off > 0) {
+      g.fillStyle = seg(cssAlpha(T.bar, T.off));
+      for (let i = 0; i < n; i++) g.fillRect(xs[i], base - rows * pitch, barW, rows * pitch);
+    }
+    if (T.glow > 0) {
+      const bw = Math.max(1, Math.round(W / 4)), bh = Math.max(1, Math.round(H / 4));
+      G.bloom = _anBloom || (_anBloom = document.createElement('canvas'));
+      if (G.bloom.width !== bw || G.bloom.height !== bh) { G.bloom.width = bw; G.bloom.height = bh; }
+      G.bloomG = G.bloom.getContext('2d');
+    }
+  } else {
+    const gr = ctx2d.createLinearGradient(0, top, 0, base);
+    gr.addColorStop(0, cssAlpha(T.bar, 0.78));
+    gr.addColorStop(1, cssAlpha(T.bar, 0.16));
+    G.grad = gr;
+    G.peak = cssAlpha(T.peak, 0.95);
+    g.fillStyle = cssAlpha(T.label, 0.22);
+    g.fillRect(xs[0], base + Math.round(1 * k), xs[n - 1] + barW - xs[0], Math.max(1, Math.round(k)));
+  }
+  // band labels: every band with octave bands, the octave centres with thirds
+  g.fillStyle = cssAlpha(T.label, retro ? 0.35 : 0.85);
+  g.font = `${retro ? 600 : 500} ${Math.round(11 * k)}px ${T.face}`;
+  g.textAlign = 'center';
+  g.textBaseline = 'bottom';
+  for (let i = 0; i < n; i++) {
+    const f = freqs[i];
+    if (freqs === AN_THIRDS && !AN_OCTAVES.includes(f)) continue;
+    const txt = f >= 1000 ? `${f / 1000}k` : `${Math.floor(f)}`;
+    g.fillText(txt, xs[i] + barW / 2, H - Math.round(2 * k));
+  }
+  G.layer = layer;
+  _anGeom = G;
+  return G;
+}
+
+function _drawAnalyser(analyser) {
+  const G = (_anGeom && _anGeom.W === canvas.width && _anGeom.H === canvas.height) ? _anGeom : _anLayout();
+  const n = G.n;
+  if (!_anLevel || _anLevel.length !== n) {
+    _anTarget = new Float32Array(n); _anLevel = new Float32Array(n);
+    _anPeak = new Float32Array(n); _anHold = new Float64Array(n);
+  }
+  const tap = _anTapFor(analyser);
+  if (tap) _anRead(tap, G.freqs, _anTarget); else _anTarget.fill(0);
+  const now = performance.now();
+  const dt = _anLastTs ? Math.min(100, now - _anLastTs) / 1000 : 1 / 60;
+  _anLastTs = now;
+  if (!_anSt || _anSt.level !== _anLevel) _anSt = { target: _anTarget, level: _anLevel, peak: _anPeak, hold: _anHold };
+  stepBands(_anSt, dt, now);                       // (viz/bands.js)
+
+  ctx2d.clearRect(0, 0, G.W, G.H);
+  ctx2d.drawImage(G.layer, 0, 0);
+  const { xs, barW, base } = G;
+  if (G.retro) {
+    const { pitch, rows } = G;
+    const bg = G.bloomG;
+    if (bg) { bg.setTransform(1, 0, 0, 1, 0, 0); bg.clearRect(0, 0, G.bloom.width, G.bloom.height); bg.setTransform(0.25, 0, 0, 0.25, 0, 0); }
+    ctx2d.fillStyle = G.lit;
+    if (bg) bg.fillStyle = _tok.bar;
+    for (let i = 0; i < n; i++) {
+      const lit = Math.round(_anLevel[i] * rows);
+      if (!lit) continue;
+      ctx2d.fillRect(xs[i], base - lit * pitch, barW, lit * pitch);
+      if (bg) bg.fillRect(xs[i] - 2, base - lit * pitch, barW + 4, lit * pitch);
+    }
+    ctx2d.fillStyle = G.peak;
+    if (bg) bg.fillStyle = _tok.peak;
+    for (let i = 0; i < n; i++) {
+      const pk = Math.round(_anPeak[i] * rows);
+      if (pk <= Math.round(_anLevel[i] * rows)) continue;
+      ctx2d.fillRect(xs[i], base - pk * pitch, barW, pitch);
+      if (bg) bg.fillRect(xs[i] - 2, base - pk * pitch, barW + 4, pitch);
+    }
+    if (bg) {
+      ctx2d.save();
+      ctx2d.globalCompositeOperation = 'lighter';
+      ctx2d.globalAlpha = _tok.glow;
+      ctx2d.imageSmoothingEnabled = true;
+      ctx2d.drawImage(G.bloom, 0, 0, G.bloom.width, G.bloom.height, 0, 0, G.W, G.H);
+      ctx2d.restore();
+    }
+  } else {
+    const h = G.plotH;
+    const cap = Math.max(2, Math.round(2 * G.k));
+    ctx2d.fillStyle = G.grad;
+    for (let i = 0; i < n; i++) {
+      const bh = Math.round(_anLevel[i] * h);
+      if (bh) ctx2d.fillRect(xs[i], base - bh, barW, bh);
+    }
+    ctx2d.fillStyle = G.peak;
+    for (let i = 0; i < n; i++) {
+      const ph = Math.round(_anPeak[i] * h);
+      if (ph > Math.round(_anLevel[i] * h) + cap) ctx2d.fillRect(xs[i], base - ph - cap, barW, cap);
+    }
+  }
 }
 
 // ── Hyperspace — neon vortex tunnel + flying geometric objects ──────────────
@@ -2505,6 +2833,8 @@ function _drawRaccoon(analyser) {
 function clear() {
   ctx2d.clearRect(0, 0, canvas.width, canvas.height);
   _spectroColumn = 0;
+  _phosphor.reset();
+  _anReset();
 }
 
 // ── Visibility tracking ────────────────────────────────────────────────────
@@ -2518,7 +2848,7 @@ let _canvasVisible = true;        // assume visible until the observer says othe
 let _wantRunning   = false;       // what Player told us — the "intent" layer
 
 function _shouldRun() {
-  return _wantRunning && _pageVisible && _canvasVisible;
+  return _wantRunning && _pageVisible && _canvasVisible && !_covered;
 }
 
 function _resume() {
@@ -2527,16 +2857,35 @@ function _resume() {
 
 function _suspend() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  _anRelease();
 }
 
 document.addEventListener('visibilitychange', () => {
   _pageVisible = !document.hidden;
+  if (_pageVisible && _refreezeOnShow && _userPrefersStillVisualizer()) {
+    _refreezeOnShow = false;
+    if (Player.playing) start();
+  }
   if (_pageVisible) _resume(); else _suspend();
 });
 // iOS Safari sometimes fires pagehide/pageshow for app-switch / BFCache
 // paths that don't reliably fire visibilitychange. Belt-and-suspenders.
 window.addEventListener('pagehide',  () => { _pageVisible = false; _suspend(); });
 window.addEventListener('pageshow',  () => { _pageVisible = !document.hidden; if (_pageVisible) _resume(); });
+
+// The large now-playing art (app.js) covers the whole pane: nothing to draw under it.
+let _covered = false;
+{
+  const art = document.getElementById('now-playing-art');
+  if (art) {
+    const sync = () => {
+      _covered = !art.hidden;
+      if (_covered) _suspend(); else _resume();
+    };
+    new MutationObserver(sync).observe(art, { attributes: true, attributeFilter: ['hidden'] });
+    _covered = !art.hidden;
+  }
+}
 
 // Cheap & reliable — an IntersectionObserver fires once when the canvas
 // enters / exits the viewport.  Cheaper than polling getBoundingClientRect.
@@ -2560,14 +2909,58 @@ function _userPrefersStillVisualizer() {
   return _reduceMotionMQ.matches === true;
 }
 
-// React to runtime toggles (macOS Reduce Motion can be flipped while the
-// app is open) — without this the rAF loop kept running until the next
-// trackchange / statechange.
-function _onReduceMotionChange() {
-  if (_userPrefersStillVisualizer()) {
-    canvas.style.opacity = '0';
+// Reduced motion freezes, it never hides: the canvas shows ONE still frame.
+// The loop runs FREEZE_AFTER_MS while the canvas is invisible (opacity 0 with
+// its fade transition off — the fade would show the frames being drawn; a
+// just-connected analyser holds no audio yet; the persistence / peak-hold
+// modes need a few frames), then stops and the frame is shown at once.
+// _frozenKey says what the still shows; a new track, mode, look, theme or
+// canvas size takes it again (start / setMode / _restyle / resize), stop()
+// drops it.  No frame drawn meanwhile (a hidden tab) → taken again when the
+// page shows (_refreezeOnShow).
+const FREEZE_AFTER_MS = 400;
+let _refreezeOnShow = false;
+function _freezeKeyNow() {
+  const t = Player.stationMode ? Player.station : Player.currentTrack;
+  const theme = document.documentElement.getAttribute('data-theme') || '';
+  return `${t ? (t.id ?? t.url ?? '') : ''}:${t && t.subsong != null ? t.subsong : ''}|${_mode}|${_look}|${theme}|${canvas.width}x${canvas.height}`;
+}
+function _freeze() {
+  clearTimeout(_freezeTimer);
+  clearTimeout(_clearTimer);
+  _refreezeOnShow = false;
+  _frozenKey = _freezeKeyNow();
+  canvas.style.transition = 'none';
+  canvas.style.opacity = '0';
+  _wantRunning = true;
+  const drawn = _drawCount;
+  _resume();
+  _freezeTimer = setTimeout(() => {
+    _freezeTimer = 0;
     _wantRunning = false;
     _suspend();
+    if (_drawCount === drawn) { _frozenKey = null; _refreezeOnShow = true; return; }
+    _frozenKey = _freezeKeyNow();     // a resize during the wait is in this frame
+    canvas.style.opacity = '0.9';
+  }, FREEZE_AFTER_MS);
+}
+
+// React to runtime toggles (macOS Reduce Motion can be flipped while the
+// app is open) — without this the rAF loop kept running until the next
+// trackchange / statechange.  Turned on: the frame on screen stays, still.
+function _onReduceMotionChange() {
+  if (_userPrefersStillVisualizer()) {
+    if (_wantRunning && !_freezeTimer) {
+      _wantRunning = false;
+      _suspend();
+      _frozenKey = _freezeKeyNow();
+    }
+  } else if (_frozenKey || _freezeTimer || _refreezeOnShow) {
+    clearTimeout(_freezeTimer);
+    _freezeTimer = 0;
+    _frozenKey = null;
+    _refreezeOnShow = false;
+    if (Player.playing) start();
   }
 }
 if (_reduceMotionMQ.addEventListener) {
@@ -2581,26 +2974,59 @@ function start() {
   // Now-playing viz gate: the full-screen oscilloscope/CRT/spectrogram is the
   // most prominent now-playing visualization, so the "Enable visualizations"
   // master switch and the "Now-playing" group toggle must turn it off (they
-  // previously only governed the smaller embeds + VU meter).  Off → same
-  // fully-hidden state as reduced-motion.
-  if (!vizGroupEnabled('nowPlaying') || _userPrefersStillVisualizer()) {
+  // previously only governed the smaller embeds + VU meter).  Off → hidden.
+  if (!vizGroupEnabled('nowPlaying')) {
     canvas.style.opacity = '0';
     _wantRunning = false;
     _suspend();
     return;
   }
+  // Reduced motion → a still frame (kept while it still shows the same thing).
+  if (_userPrefersStillVisualizer()) {
+    if (_freezeTimer) return;
+    if (_frozenKey && _frozenKey === _freezeKeyNow()) { canvas.style.opacity = '0.9'; return; }
+    _freeze();
+    return;
+  }
+  clearTimeout(_clearTimer);
+  canvas.style.transition = '';
   canvas.style.opacity = '0.9';
   _wantRunning = true;
   _resume();
 }
 
 function stop() {
+  canvas.style.transition = '';
   canvas.style.opacity = '0';
   _wantRunning = false;
+  clearTimeout(_freezeTimer);
+  _freezeTimer = 0;
+  _frozenKey = null;
+  _refreezeOnShow = false;
   _suspend();
-  // Fade out then clear
-  setTimeout(clear, 650);
+  // Fade out then clear (unless it starts again first — a still frame taken
+  // meanwhile must not be wiped)
+  clearTimeout(_clearTimer);
+  _clearTimer = setTimeout(clear, 650);
 }
+
+// The shared UI style or the theme changed: new tokens, a new analyser layer,
+// a clean canvas (the phosphor scope's persistence must not keep the other
+// look's frame); a still frame is taken again.
+function _restyle() {
+  _look = getUiStyle();
+  _tok = null;
+  _anGeom = null;
+  if (canvas.dataset.visMode !== _eff()) { _showMode(); return; }   // a Modern-only mode ↔ the oscilloscope
+  const m = _eff();
+  if (m !== 'oscilloscope' && m !== 'analyser' && m !== 'crt') return;   // the others look the same
+  _phosphor.reset();
+  ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  if (_frozenKey) _freeze();
+}
+onUiStyleChange(_restyle);
+new MutationObserver(_restyle)
+  .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 // Auto-start/stop with playback
 Player.on('statechange', ({ playing }) => playing ? start() : stop());
@@ -2615,4 +3041,20 @@ window.addEventListener('sb:viz-settings', () => {
   else if (Player.playing) start();
 });
 
-export const Visualizer = { start, stop, toggleMode, setMode, get mode() { return _mode; } };
+export const Visualizer = {
+  start, stop, toggleMode, setMode,
+  get mode() { return _eff(); },
+  get modes() { return _modes().slice(); },
+  // debug / verification: the analyser's bands, levels and peaks (0…1)
+  analyserState() {
+    return {
+      freqs: _anGeom ? _anGeom.freqs.slice() : null,
+      level: _anLevel ? Array.from(_anLevel) : null,
+      peak: _anPeak ? Array.from(_anPeak) : null,
+      connected: !!_anFrom,
+      frozen: !!_frozenKey && !_freezeTimer,
+      geom: _anGeom && { xs: Array.from(_anGeom.xs), barW: _anGeom.barW, base: _anGeom.base,
+                         top: _anGeom.top, pitch: _anGeom.pitch, rows: _anGeom.rows, retro: _anGeom.retro },
+    };
+  },
+};

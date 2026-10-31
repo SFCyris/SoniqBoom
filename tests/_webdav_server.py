@@ -171,6 +171,8 @@ class DavServer:
                 t0 = time.monotonic()
                 sent = 0
                 try:
+                    if not fs.stat().st_mode & 0o444:          # mode 0 fails as root too
+                        raise PermissionError(13, "unreadable", str(fs))
                     with open(fs, "rb") as fh:
                         fh.seek(start)
                         left = end - start + 1

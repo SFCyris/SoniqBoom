@@ -524,6 +524,8 @@ class _Audit:
             try:
                 self._alive()
                 if self.full:
+                    # (the search indexes a start builds after it: complete first)
+                    await st.search_indexes_ready()
                     await self._build_shadow()
                     await self._compare_shadowed()
                     from soniqboom.core.store import SORTED_LISTS

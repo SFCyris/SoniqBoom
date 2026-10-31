@@ -384,22 +384,28 @@ class HVSC:
                 return None
             rel = t_rel[len(prefix):] if prefix not in ("", "/") else t_rel
             return rel or None
-        # Local: resolve both to absolute real paths for a robust compare —
-        # the root once (cached), and a track path already under it (a scan
-        # root is resolved, so its tracks are) by a prefix strip: two
-        # ``realpath`` calls per SID were seconds over a 60K-tune collection.
+        # Local: a string compare — the track path against the root as given
+        # and as its real path (resolved once, cached).  Never a filesystem
+        # call per track: this runs on the event loop for every SID of the
+        # library (``hvsc_apply``), and a ``realpath`` of a file on a mounted
+        # share is a network round trip per path component — tens of minutes
+        # of a stalled server over a 60K-tune collection.  A scan indexes its
+        # tracks under the resolved root and never follows a symlinked
+        # folder, so a track in the tree has a path under the root.
         try:
             if self._real_root_for != root:
                 self._real_root = os.path.realpath(root)
                 self._real_root_for = root
-            real_root = self._real_root
-            if track_path.startswith(real_root.rstrip(os.sep) + os.sep):
-                rel = track_path[len(real_root.rstrip(os.sep)) + 1:]
-            else:
-                rel = os.path.relpath(os.path.realpath(track_path), real_root)
+            track = os.path.normpath(track_path)
+            rel = None
+            for r in (self._real_root, os.path.normpath(root)):
+                r = r.rstrip(os.sep)
+                if track.startswith(r + os.sep):
+                    rel = track[len(r) + 1:]
+                    break
         except (ValueError, OSError):
             return None
-        if rel.startswith(".."):
+        if not rel:
             return None
         return "/" + rel.replace(os.sep, "/")
 

@@ -1,0 +1,617 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ── Player bar + VU meter — Modern and Retro hi-fi ────────────────────────
+   The look is the shared UI style (js/ui_style.js → <html data-ui-style>);
+   the theme is <html data-theme>.  Markup: index.html #player-bar.  The
+   waveform's colours are read from --pb-wave-on / --pb-wave-off on
+   #player-bar (app.js _refreshAccentColor, re-read on a look / theme change);
+   the Retro needle meters are drawn by js/player/vu_needles.js into
+   #vu-needles.  Loaded after app.css: the rules here override its player-bar
+   rules by specificity.  Heights of the transport row (42 px), the icon row
+   (36 px) and the volume row stay as in app.css, so the rows keep lining up
+   (.player-center gap 34 / margin-bottom 24, .player-right gap 33 / 16). */
+
+/* ── Modern ─────────────────────────────────────────────────────────────── */
+#player-bar {
+  --pb-wave-on: var(--accent);
+  --pb-wave-off: rgba(255,255,255,0.32);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+}
+:root[data-theme="light"] #player-bar {
+  --pb-wave-off: rgba(0,0,0,0.22);     /* white bars were invisible on the light glass */
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+}
+:root[data-theme="light"] #player-bar .player-controls {
+  background: linear-gradient(to bottom, rgba(255,255,255,0.75), rgba(255,255,255,0.45));
+  border-color: rgba(0,0,0,0.10);
+  box-shadow: 0 3px 12px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.9);
+}
+
+/* The twin needle meters exist only in Retro (vu_needles.js keeps them hidden
+   otherwise). */
+.vu-needles {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+.vu-needles[hidden] { display: none; }
+.vu-needle {
+  position: absolute;
+  display: block;
+  box-sizing: content-box;              /* the 2 px bezel sits outside the drawn face */
+  margin: -2px 0 0 -2px;
+  border: 2px solid #0a0b0c;
+  border-radius: 4px 4px 3px 3px;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.08), 0 3px 8px rgba(0,0,0,0.5);
+  background: #f2d9a2;
+}
+
+/* ── Retro hi-fi: a cassette deck / CD player ───────────────────────────── */
+:root[data-ui-style="retro"] #player-bar {
+  --pb-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --pb-print: #cfd3d9;
+  --pb-print-2: #a3a9b2;
+  --pb-plate: linear-gradient(180deg, #282a2e 0%, #1d1f22 50%, #17181b 100%);
+  --pb-plate-edge: #050506;
+  --pb-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --pb-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --pb-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --pb-key-text: #cfd3d9;
+  --pb-key-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 2px 3px rgba(0,0,0,0.45);
+  --pb-well: rgba(0,0,0,0.38);
+  --pb-vfd: #6ff7e9;
+  --pb-vfd-dim: #46c9bd;
+  --pb-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --pb-amber: #ffb12b;
+  --pb-lcd-glass:
+    linear-gradient(180deg, rgba(255,255,255,0.05) 0%, transparent 30%),
+    radial-gradient(130% 180% at 50% 0%, #2b1c06 0%, #1a1104 55%, #0d0802 100%);
+  --pb-lamp-off: #3b1712;
+  --pb-focus: var(--state-focus, #6bc8f0);   /* blue, as everywhere: amber means "on" here */
+  --pb-wave-on: #ffb12b;
+  --pb-wave-off: rgba(255,177,43,0.26);
+  background: var(--pb-plate);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-top: 1px solid #000;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+}
+:root[data-theme="light"][data-ui-style="retro"] #player-bar {
+  --pb-print: #23262b;
+  --pb-print-2: #3f444c;
+  --pb-plate: linear-gradient(180deg, #dcdee2 0%, #cacdd2 50%, #c0c3c8 100%);
+  --pb-plate-edge: #8c9096;
+  --pb-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --pb-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --pb-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --pb-key-text: #23262b;
+  --pb-key-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+  --pb-well: rgba(0,0,0,0.10);
+  --pb-lamp-off: #5a2a22;
+  --pb-focus: #1a1d22;
+  border-top-color: #8c9096;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+/* app.css gives browsers without backdrop-filter an opaque --bg1 bar (!important) */
+@supports not (backdrop-filter: blur(1px)) {
+  :root[data-ui-style="retro"] #player-bar { background: var(--pb-plate) !important; }
+}
+/* A metal plate, not a blurred cover behind glass */
+:root[data-ui-style="retro"] #player-art-bg { display: none; }
+
+/* Cover: a framed window */
+:root[data-ui-style="retro"] #player-bar .art-thumb {
+  border: 2px solid #0a0b0c;
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06), 0 1px 0 rgba(255,255,255,0.08);
+  background: #0c0d0f;
+}
+
+:root[data-theme="light"][data-ui-style="retro"] #player-bar .art-thumb {
+  border-color: #8c9096;
+  background: linear-gradient(180deg, #a9adb3, #9a9ea5);
+  box-shadow: inset 0 2px 5px rgba(0,0,0,0.35), 0 1px 0 rgba(255,255,255,0.7);
+}
+
+/* The display: a VFD on dark tinted glass (dark in both themes) */
+:root[data-ui-style="retro"] #player-bar .player-meta {
+  flex: 1 1 auto;
+  padding: 7px 10px 6px;
+  border-radius: 5px;
+  background: var(--pb-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+}
+:root[data-ui-style="retro"] #player-bar .meta-title {
+  font-family: var(--pb-face);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--pb-vfd);
+  text-shadow: 0 0 8px rgba(111,247,233,0.45);
+}
+:root[data-ui-style="retro"] #player-bar .meta-tags {
+  font-family: var(--pb-face);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: #ffc865;
+  text-shadow: 0 0 6px rgba(255,200,101,0.35);
+}
+:root[data-ui-style="retro"] #player-bar a.meta-link { color: #ffc865; }
+:root[data-ui-style="retro"] #player-bar a.meta-link:hover { color: #fff1d6; border-bottom-color: #ffc865; }
+:root[data-ui-style="retro"] #player-bar .meta-path-crumb,
+:root[data-ui-style="retro"] #player-bar a.crumb-link,
+:root[data-ui-style="retro"] #player-bar .crumb-file {
+  font-family: var(--pb-face);
+  letter-spacing: 0.03em;
+  color: var(--pb-vfd-dim);
+}
+:root[data-ui-style="retro"] #player-bar a.crumb-link:hover { color: var(--pb-vfd); }
+:root[data-ui-style="retro"] #player-bar .btn-track-info {
+  color: var(--pb-print-2);
+  text-shadow: none;
+}
+:root[data-ui-style="retro"] #player-bar .btn-track-info:hover { color: var(--pb-print); text-shadow: none; }
+
+/* Transport: chunky keys in a recessed well */
+:root[data-ui-style="retro"] #player-bar .player-controls {
+  gap: 5px;
+  padding: 2px 10px;
+  border-radius: 6px;
+  background: var(--pb-well);
+  border: 1px solid var(--pb-plate-edge);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.06);
+}
+:root[data-ui-style="retro"] #player-bar .player-controls button {
+  width: 40px;
+  height: 32px;
+  border-radius: 4px;
+  background: var(--pb-key-bg);
+  border: 1px solid var(--pb-plate-edge);
+  color: var(--pb-key-text);
+  box-shadow: var(--pb-key-shadow);
+  font-size: 12px;
+}
+:root[data-ui-style="retro"] #player-bar .player-controls button:hover {
+  background: var(--pb-key-bg-hover);
+  color: var(--pb-key-text);
+}
+:root[data-ui-style="retro"] #player-bar .player-controls button:active {
+  background: var(--pb-key-pressed);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55);
+  transform: translateY(1px);
+}
+/* Play / pause: the big key, its legend lit amber */
+:root[data-ui-style="retro"] #player-bar .player-controls .btn-play-pause {
+  width: 54px;
+  height: 36px;
+  font-size: 15px;
+  color: var(--pb-amber);
+  text-shadow: 0 0 8px rgba(255,177,43,0.55);
+}
+:root[data-ui-style="retro"] #player-bar .player-controls .btn-play-pause:hover { color: var(--pb-amber); }
+:root[data-theme="light"][data-ui-style="retro"] #player-bar .player-controls .btn-play-pause,
+:root[data-theme="light"][data-ui-style="retro"] #player-bar .player-controls .btn-play-pause:hover {
+  color: #8a4a00;
+  text-shadow: none;
+}
+:root[data-ui-style="retro"] #player-bar .player-controls button:focus-visible,
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle:focus-visible {
+  outline: 2px solid var(--pb-focus) !important;
+  outline-offset: 2px;
+}
+:root[data-ui-style="retro"] #player-bar.radio-mode .radio-target {
+  font-family: var(--pb-face);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pb-print-2);
+}
+
+/* Time readouts: VFD digits in small windows */
+:root[data-ui-style="retro"] #player-bar #time-cur,
+:root[data-ui-style="retro"] #player-bar #time-dur {
+  min-width: 42px;
+  padding: 2px 4px;
+  margin: -3px 0;                     /* the window overhangs; the row keeps its 13 px */
+  line-height: 13px;
+  border-radius: 3px;
+  text-align: center;
+  font-family: var(--pb-face);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--pb-vfd);
+  text-shadow: 0 0 6px rgba(111,247,233,0.5);
+  background: var(--pb-vfd-glass);
+  border: 1px solid #050607;
+}
+
+/* The waveform: an amber LCD strip (the canvas's own glass once it has been
+   placed over the seek bar — app.js _resizeWaveformCanvas) */
+:root[data-ui-style="retro"] #player-bar:not(.radio-mode) #waveform-canvas[style] {
+  background: var(--pb-lcd-glass);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px #000, 0 1px 0 1px rgba(255,255,255,0.06);
+}
+:root[data-ui-style="retro"] #player-bar #seek-bar {
+  background: linear-gradient(to right,
+    var(--pb-amber) 0%, var(--pb-amber) var(--pct, 0%),
+    rgba(255,177,43,0.18) var(--pct, 0%), rgba(255,177,43,0.18) 100%);
+}
+/* With room beside the meters, the seek row spans them: the waveform from the
+   left meter's outer bezel to the right one's (--pb-span, set by
+   vu_needles.js _spanSeek), the time windows outside it — a base a little
+   wider than the meters + transport above it. */
+:root[data-ui-style="retro"] #player-bar .player-progress.span-meters {
+  display: grid;
+  grid-template-columns: 1fr var(--pb-span) 1fr;
+  column-gap: 8px;
+  max-width: none;
+}
+:root[data-ui-style="retro"] #player-bar .player-progress.span-meters > #time-cur { justify-self: end; }
+:root[data-ui-style="retro"] #player-bar .player-progress.span-meters > #time-dur { justify-self: start; }
+:root[data-ui-style="retro"] #player-bar .player-progress.span-meters > #seek-bar { width: 100%; min-width: 0; }
+
+/* The playhead: a lit cursor across the strip */
+:root[data-ui-style="retro"] #player-bar #seek-bar::-webkit-slider-thumb {
+  width: 4px;
+  height: 30px;
+  border-radius: 1px;
+  background: #fff3d6;
+  box-shadow: 0 0 6px 1px rgba(255,177,43,0.85);
+}
+:root[data-ui-style="retro"] #player-bar #seek-bar:hover::-webkit-slider-thumb { background: #fff; transform: none; }
+:root[data-ui-style="retro"] #player-bar #seek-bar::-moz-range-thumb {
+  width: 4px;
+  height: 30px;
+  border-radius: 1px;
+  background: #fff3d6;
+  box-shadow: 0 0 6px 1px rgba(255,177,43,0.85);
+}
+:root[data-ui-style="retro"] #player-bar #seek-bar:hover::-moz-range-thumb { background: #fff; transform: none; }
+
+/* Radio mode: LIVE lamp + ticker in a VFD window over the seek row */
+:root[data-ui-style="retro"] #player-bar.radio-mode .radio-nowplaying {
+  inset: -9px 0;
+  border-radius: 4px;
+  background: var(--pb-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.8);
+}
+:root[data-ui-style="retro"] #player-bar .radio-live {
+  font-family: var(--pb-face);
+  letter-spacing: 0.14em;
+  color: #ff6a4d;
+  text-shadow: 0 0 6px rgba(255,75,43,0.7);
+}
+:root[data-ui-style="retro"] #player-bar .radio-ticker {
+  font-family: var(--pb-face);
+  letter-spacing: 0.04em;
+  color: var(--pb-vfd);
+  text-shadow: 0 0 6px rgba(111,247,233,0.45);
+}
+
+/* Right side: small hardware keys with a lamp */
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle {
+  position: relative;
+  width: 38px;                        /* one key width, whatever the legend */
+  flex: none;
+  padding: 0;
+  color: var(--pb-key-text);
+  text-shadow: none;
+  background: var(--pb-key-bg);
+  border: 1px solid var(--pb-plate-edge);
+  border-radius: 4px;
+  box-shadow: var(--pb-key-shadow);
+}
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle::before {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  width: 10px;
+  height: 2px;
+  margin-left: -5px;
+  border-radius: 1px;
+  background: transparent;            /* a lamp shows only on a key that is on */
+  pointer-events: none;
+}
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle:hover {
+  color: var(--pb-key-text);
+  background: var(--pb-key-bg-hover);
+  text-shadow: none;
+}
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle:active {
+  background: var(--pb-key-pressed);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55);
+}
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle.on,
+:root[data-ui-style="retro"] #player-bar #btn-eq.on,
+:root[data-ui-style="retro"] #player-bar #btn-cast.is-casting {
+  color: var(--pb-amber);
+  background: var(--pb-key-bg);
+  border-color: var(--pb-plate-edge);
+  text-shadow: 0 0 6px rgba(255,177,43,0.5);
+  box-shadow: var(--pb-key-shadow);
+}
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle.on::before,
+:root[data-ui-style="retro"] #player-bar #btn-cast.is-casting::before {
+  background: var(--pb-amber);
+  box-shadow: 0 0 5px 1px rgba(255,177,43,0.75);
+}
+:root[data-ui-style="retro"] #player-bar #btn-cast.is-casting::after {   /* the casting pulse, in the key's shape */
+  border-color: var(--pb-amber);
+  border-radius: 6px;
+}
+:root[data-theme="light"][data-ui-style="retro"] #player-bar #btn-cast.is-casting::after { border-color: #8a4a00; }
+:root[data-theme="light"][data-ui-style="retro"] #player-bar :is(.ctrl-toggle.on, #btn-eq.on, #btn-cast.is-casting) {
+  color: #8a4a00;
+  text-shadow: none;
+}
+:root[data-theme="light"][data-ui-style="retro"] #player-bar :is(.ctrl-toggle.on, #btn-cast.is-casting)::before {
+  background: #d27a00;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
+}
+/* A key that can't be used now (Lyrics without lyrics): a solid key with a
+   faded legend — the meter never shows through a key */
+:root[data-ui-style="retro"] #player-bar .ctrl-toggle.disabled {
+  opacity: 1;
+  color: color-mix(in srgb, var(--pb-key-text) 30%, transparent);
+}
+:root[data-ui-style="retro"] #player-bar #btn-eq {
+  font-family: var(--pb-face);
+  letter-spacing: 0.1em;
+}
+:root[data-ui-style="retro"] #player-bar .cast-active-pill {
+  border-radius: 4px;
+  font-family: var(--pb-face);
+  letter-spacing: 0.04em;
+}
+
+/* Volume: a ribbed fader cap in a slot, a printed legend */
+/* The speaker glyph keeps its box (the row keeps its height); the legend is
+   printed over it. */
+:root[data-ui-style="retro"] #player-bar .volume-wrap > span {
+  position: relative;
+  visibility: hidden;
+}
+:root[data-ui-style="retro"] #player-bar .volume-wrap > span::before {
+  content: 'VOL';
+  visibility: visible;
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  font: 700 10px var(--pb-face);
+  letter-spacing: 0.14em;
+  color: var(--pb-print-2);
+}
+:root[data-ui-style="retro"] #player-bar #volume-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #050506, #1b1c1f);
+  box-shadow: inset 0 1px 2px #000, 0 1px 0 rgba(255,255,255,0.08);
+}
+:root[data-theme="light"][data-ui-style="retro"] #player-bar #volume-bar {
+  background: linear-gradient(180deg, #55595f, #7d8187);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.7);
+}
+:root[data-ui-style="retro"] #player-bar #volume-bar::-webkit-slider-thumb {
+  width: 14px;
+  height: 22px;
+  border-radius: 2px;
+  border: 1px solid #050506;
+  background:
+    linear-gradient(90deg, transparent 6px, #ffb12b 6px 8px, transparent 8px),
+    repeating-linear-gradient(90deg, #e3e6ea 0 1px, #8d9196 1px 3px);
+  box-shadow: 0 2px 3px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.5);
+}
+:root[data-ui-style="retro"] #player-bar #volume-bar:hover::-webkit-slider-thumb { transform: none; }
+:root[data-ui-style="retro"] #player-bar #volume-bar::-moz-range-thumb {
+  width: 14px;
+  height: 22px;
+  border-radius: 2px;
+  border: 1px solid #050506;
+  background:
+    linear-gradient(90deg, transparent 6px, #ffb12b 6px 8px, transparent 8px),
+    repeating-linear-gradient(90deg, #e3e6ea 0 1px, #8d9196 1px 3px);
+  box-shadow: 0 2px 3px rgba(0,0,0,0.6);
+}
+:root[data-ui-style="retro"] #player-bar #volume-bar:hover::-moz-range-thumb { transform: none; }
+
+/* Touch / narrow: the bigger hit targets of app.css, in the Retro shapes */
+@media (hover: none), (max-width: 1024px) {
+  :root[data-ui-style="retro"] #player-bar #seek-bar::-webkit-slider-thumb { width: 10px; height: 34px; border-radius: 2px; }
+  :root[data-ui-style="retro"] #player-bar #seek-bar::-moz-range-thumb { width: 10px; height: 34px; border-radius: 2px; }
+  :root[data-ui-style="retro"] #player-bar #volume-bar::-webkit-slider-thumb { width: 18px; height: 26px; }
+  :root[data-ui-style="retro"] #player-bar #volume-bar::-moz-range-thumb { width: 18px; height: 26px; }
+}
+/* Tablet width: the icon row is wider than its column and lay over the
+   transport (shuffle / repeat under the icons) — the column keeps its share
+   and the icons scroll sideways inside it, as at phone width below. */
+@media (min-width: 601px) and (max-width: 1024px) {
+  #player-bar .player-right { min-width: 0; }
+  /* (a range input's own width, ~129 px, pushed the duration out of the
+     centre column and under the mute glyph at ≈601–700 px) */
+  #player-bar .player-progress #seek-bar { flex: 1 1 0; width: 0; min-width: 0; }
+  #player-bar .player-extra-controls {
+    justify-content: flex-start;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 4px;                     /* room for the focus rings the scroller clips */
+    margin: -4px;
+  }
+  #player-bar .player-extra-controls::-webkit-scrollbar { display: none; }
+}
+/* The side with more buttons fades out (app.js sets .more-l / .more-r) */
+#player-bar .player-extra-controls.more-r { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
+#player-bar .player-extra-controls.more-l { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }
+#player-bar .player-extra-controls.more-l.more-r { -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
+/* Phone width (the desktop shell; phones normally get /m): the icon row was
+   wider than its column and lay over the transport — give the right column a
+   row of its own, the icons scrolling sideways if they still don't fit. */
+@media (max-width: 600px) {
+  #player-bar .player-right {
+    order: 3;
+    flex: 1 1 100%;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    align-items: stretch;
+    gap: 6px;
+    margin-bottom: 0;
+    /* the keys and the volume share a row while both fit (it saves a row) */
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 12px;
+  }
+  #player-bar .player-right > .player-extra-controls { flex: 0 1 auto; max-width: 100%; }
+  #player-bar .player-right > .volume-wrap { flex: 1 1 140px; width: auto; min-width: 140px; }
+  #player-bar .player-extra-controls {
+    justify-content: flex-start;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 4px;                     /* room for the focus rings the scroller clips */
+    margin: -4px;
+  }
+  /* The meter's channel labels would sit under the volume row */
+  #player-bar .vu-meters .vu-col-label,
+  #player-bar .vu-meters .vu-col-pan { display: none; }
+  #player-bar .player-extra-controls::-webkit-scrollbar { display: none; }
+  :root[data-ui-style="retro"] #player-bar .player-meta { padding: 4px 6px; }
+  :root[data-ui-style="retro"] #player-bar #time-cur,
+  :root[data-ui-style="retro"] #player-bar #time-dur { min-width: 34px; padding: 0 2px; }
+}
+
+/* ── VU meter, Retro: per-voice LED columns (the needles: vu_needles.js) ──
+   The SAME --vu-level data as the Modern bars / circuit (app.js _drawVU):
+   each column is a ladder of LED segments — green, amber over 58 %, red over
+   82 % — lit up to the level, the rest unlit lenses.  LED columns read at any
+   voice count (4 … 32) where a row of tiny needles would not. */
+:root[data-ui-style="retro"] .vu-meters,
+:root[data-ui-style="retro"] .vu-meters[data-style="circuit"] {
+  opacity: 0.55;
+  gap: 3px;
+  padding: 6px 10px 0;
+  background: none;
+  border-radius: 0;
+}
+:root[data-ui-style="retro"] .vu-meters.in-modal { opacity: 0.4; padding: 8px 10px 8px; }   /* over Track Info's cover: the art shows through */
+:root[data-ui-style="retro"] .vu-meters .vu-bar,
+:root[data-ui-style="retro"] .vu-meters[data-style="circuit"] .vu-bar {
+  width: auto;
+  align-self: stretch;
+  margin: 0;
+  border: 0;
+  border-radius: 1px;
+  box-shadow: none;
+  transition: none;
+  background: linear-gradient(to top, #2fd35a 0 58%, #ffb12b 58% 82%, #ff3b2b 82% 100%);
+  /* segments ∩ level: lit up to --vu-level, faint lenses above it */
+  -webkit-mask:
+    repeating-linear-gradient(to top, #000 0 4px, transparent 4px 6px),
+    linear-gradient(to top, #000 calc(var(--vu-level, 0) * 100%), rgba(0,0,0,0.12) calc(var(--vu-level, 0) * 100%));
+  -webkit-mask-composite: source-in;
+  mask:
+    repeating-linear-gradient(to top, #000 0 4px, transparent 4px 6px),
+    linear-gradient(to top, #000 calc(var(--vu-level, 0) * 100%), rgba(0,0,0,0.12) calc(var(--vu-level, 0) * 100%));
+  mask-composite: intersect;
+}
+:root[data-theme="light"][data-ui-style="retro"] .vu-meters { opacity: 0.75; }
+:root[data-theme="light"][data-ui-style="retro"] .vu-meters.in-modal { opacity: 0.375; }
+:root[data-ui-style="retro"] .vu-meters .vu-bar:not(.vu-animated),
+:root[data-ui-style="retro"] .vu-meters[data-style="circuit"] .vu-bar:not(.vu-animated) {
+  flex: 1 1 auto;
+  height: auto !important;
+  min-height: 0;
+  animation: none;
+}
+/* No Web Audio: app.css's pulse moves the height; the segments stay lit */
+:root[data-ui-style="retro"] .vu-meters .vu-bar.vu-animated {
+  -webkit-mask: repeating-linear-gradient(to top, #000 0 4px, transparent 4px 6px);
+  mask: repeating-linear-gradient(to top, #000 0 4px, transparent 4px 6px);
+}
+:root[data-ui-style="retro"] .vu-meters[data-style="circuit"] .vu-bar::before,
+:root[data-ui-style="retro"] .vu-meters[data-style="circuit"] .vu-bar::after { content: none; }
+:root[data-ui-style="retro"] .vu-meters .vu-col-label {
+  font-family: "DIN Alternate", "DIN Condensed", Bahnschrift, "Arial Narrow", sans-serif;
+  letter-spacing: 0.08em;
+  color: var(--pb-print-2, #a3a9b2);
+}
+
+/* ── Retro: the meter as a level display inside the title's VFD ──────────
+   app.js _placeVUContainer parks #vu-meters in .player-meta in Retro (the
+   track-info modal still borrows it for its cover).  Under the title lines on
+   a wide bar; beside them where the bar gives the title its own row. */
+:root[data-ui-style="retro"] #player-bar .player-meta > .vu-meters {
+  position: relative;
+  inset: auto;
+  height: 40px;
+  margin-top: 6px;
+  padding: 0;
+  gap: 2px;
+  opacity: 1;
+  z-index: auto;
+}
+:root[data-ui-style="retro"] #player-bar .player-meta > .vu-meters .vu-col-label,
+:root[data-ui-style="retro"] #player-bar .player-meta > .vu-meters .vu-col-pan { display: none; }
+@media (max-width: 900px) {
+  :root[data-ui-style="retro"] #player-bar .player-meta:has(> .vu-meters:not([hidden])) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(64px, 36%, 180px);
+    column-gap: 10px;
+    align-items: center;
+  }
+  :root[data-ui-style="retro"] #player-bar .player-meta > :not(.vu-meters) { grid-column: 1; }
+  :root[data-ui-style="retro"] #player-bar .player-meta > .vu-meters {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    align-self: stretch;
+    height: auto;
+    min-height: 30px;
+    margin-top: 0;
+  }
+}
+
+/* ── Retro: the ⋯ menus (header and player bar) as a lit control panel ──── */
+:root[data-ui-style="retro"] .hdr-more-menu {
+  --pb-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  border-radius: 6px;
+  border: 1px solid #050506;
+  background: linear-gradient(180deg, #2a2c30, #1c1e21);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 10px 28px rgba(0,0,0,0.55);
+}
+:root[data-ui-style="retro"] .hdr-more-item {
+  font-family: var(--pb-face);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #cfd3d9;
+  border-radius: 4px;
+}
+:root[data-ui-style="retro"] .hdr-more-item:hover,
+:root[data-ui-style="retro"] .hdr-more-item:focus-visible { background: rgba(255,255,255,0.06); }
+:root[data-ui-style="retro"] .hdr-more-ico { color: #a3a9b2; font-weight: 400; }
+:root[data-ui-style="retro"] .hdr-more-item.on .hdr-more-ico { color: #ffb12b; }
+:root[data-ui-style="retro"] .hdr-more-who {
+  font-family: var(--pb-face);
+  letter-spacing: 0.04em;
+  color: #6ff7e9;
+}
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-menu {
+  border-color: #8c9096;
+  background: linear-gradient(180deg, #e3e5e8, #cfd2d6);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 10px 24px rgba(0,0,0,0.25);
+}
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-item { color: #23262b; }
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-item:hover,
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-item:focus-visible { background: rgba(0,0,0,0.06); }
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-ico { color: #3f444c; }
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-item.on .hdr-more-ico { color: #8a4a00; }
+:root[data-theme="light"][data-ui-style="retro"] .hdr-more-who { color: #0b6f68; }

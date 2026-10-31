@@ -189,8 +189,13 @@ def test_stored_cover_urls_go_through_the_static_path():
 
 def test_vu_and_waveform_readers_treat_204_as_nothing_here():
     s = (FRONTEND / "js" / "app.js").read_text(encoding="utf-8")
-    assert "if (!res.ok || res.status === 204) {\n      const reason = res.headers.get('X-VU-Unavailable');" in s
+    # the /vu reader is shared by the desktop and the phone (js/vu/vumr.js)
+    vu = (FRONTEND / "js" / "vu" / "vumr.js").read_text(encoding="utf-8")
+    assert "if (!res.ok || res.status === 204) {\n        const reason = res.headers.get('X-VU-Unavailable');" in vu
+    assert "return _vuFetch.fetch(trackId, subsong, opts);" in s
     assert "if (!res.ok || res.status === 204) {          // 204: no waveform for this track" in s
+    phone = (FRONTEND / "js" / "mobile" / "views" / "np_visuals.js").read_text(encoding="utf-8")
+    assert ".then(r => (r.ok && r.status !== 204) ? r.json() : null)" in phone
 
 
 def test_art_refresh_matches_the_static_path():

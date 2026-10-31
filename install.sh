@@ -100,7 +100,7 @@ _clean_bundled_siblings(){  # <binary> <dir>: rm the binary's transitive @loader
 _clean_renderers(){
   local bindir removed=0 name bin
   bindir="$(brew --prefix 2>/dev/null || echo /usr/local)/bin"
-  for name in zxtune123 sidplayfp psgplay uade123 sc68; do
+  for name in zxtune123 sidplayfp psgplay uade123 sc68 kssrender; do
     bin="$bindir/$name"
     if [ -L "$bin" ]; then
       warn "  $name is Homebrew-managed (symlink) — skipping (use 'brew reinstall $name')"
@@ -152,8 +152,8 @@ Usage: install.sh [--slim] [--clean | --rebuild | --help]
   --help        Show this message.
 
 --clean/--rebuild affect ONLY the renderers install.sh builds from source —
-zxtune123, sidplayfp, psgplay (+ their bundled libraries), on Linux also the
-source-built uade123/sc68, and the build-on-first-use ym2wav/hvl2wav.
+zxtune123, sidplayfp, psgplay (+ their bundled libraries), kssrender, on Linux
+also the source-built uade123/sc68, and the build-on-first-use ym2wav/hvl2wav.
 Homebrew-managed players (macOS: fluidsynth, openmpt123, adplay, sc68, uade123)
 are left untouched; use `brew reinstall <name>` to rebuild those.
 EOF
@@ -742,6 +742,55 @@ else
     info "psgplay: $(command -v psgplay || echo "$PSG_DEST/psgplay")"
   else
     warn "psgplay build failed — Atari ST SNDH files won't play (re-run install.sh to retry)"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kssrender (MSX / Sega Master System KSS) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# Our own small renderer on libkss (soniqboom/native/kssrender), pinned to the
+# commit the Docker image builds.  Plain C (needs git and a C compiler), a few
+# seconds.  Without it KSS plays through libgme, which leaves out the MSX FM
+# chips (MSX-MUSIC / MSX-AUDIO).  A kssrender of another version or libkss
+# commit is rebuilt.
+section "kssrender (MSX / Master System KSS)"
+LIBKSS_COMMIT="$(sed -n 's/^ARG LIBKSS_COMMIT=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+if [ -z "$LIBKSS_COMMIT" ]; then   # (no Dockerfile: build.sh's own pin)
+  LIBKSS_COMMIT="$(sed -n 's/^LIBKSS_COMMIT="\${LIBKSS_COMMIT:-\([0-9a-f]*\)}"$/\1/p' \
+    "$SCRIPT_DIR/soniqboom/native/kssrender/build.sh" | head -1)"
+fi
+KSS_VERSION="$(sed -n 's/^#define KSSRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/kssrender/kssrender.c" | head -1)"
+KSS_BUILT=0
+if [ -n "$LIBKSS_COMMIT" ] && [ -n "$KSS_VERSION" ] && command -v kssrender &>/dev/null \
+    && kssrender --version 2>/dev/null \
+       | grep -qF "kssrender $KSS_VERSION (libkss ${LIBKSS_COMMIT:0:12})"; then
+  info "kssrender already installed: $(command -v kssrender)"
+else
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    KSS_DEST="$(brew --prefix)/bin"
+  else
+    KSS_DEST="/usr/local/bin"
+  fi
+  KSS_TMP="$(mktemp -d)"
+  if LIBKSS_COMMIT="$LIBKSS_COMMIT" sh "$SCRIPT_DIR/soniqboom/native/kssrender/build.sh" "$KSS_TMP" >"$KSS_TMP.log" 2>&1 \
+      && [ -x "$KSS_TMP/kssrender" ]; then
+    if [ -w "$KSS_DEST" ]; then
+      cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" && KSS_BUILT=1
+    elif command -v sudo &>/dev/null; then
+      sudo cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" && KSS_BUILT=1
+    fi
+  fi
+  if [ "$KSS_BUILT" != 1 ] && [ -s "$KSS_TMP.log" ]; then
+    tail -n 5 "$KSS_TMP.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$KSS_TMP" "$KSS_TMP.log"
+  if [ "$KSS_BUILT" = 1 ]; then
+    info "kssrender: $KSS_DEST/kssrender"
+  elif command -v kssrender &>/dev/null; then
+    warn "kssrender build failed — the kssrender already installed ($(command -v kssrender)) stays"
+  else
+    warn "kssrender build failed — KSS files play through libgme (without the MSX FM chips)"
   fi
 fi
 

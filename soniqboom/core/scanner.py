@@ -3355,11 +3355,23 @@ async def _run_duplicate_detection_async() -> None:
     if not snap:
         return
     all_tracks: list[dict] = []
+    from soniqboom.core import source_twins
     from soniqboom.core.catalogue import is_catalogue_path
     for i in range(0, len(snap), 20_000):
-        # Catalogue tracks (core/catalogue.py) are never grouped: left out.
-        all_tracks.extend({k: t.get(k) for k in _DUP_INPUT_FIELDS} for t in snap[i : i + 20_000]
-                          if not is_catalogue_path(t.get("path")))
+        # Catalogue tracks (core/catalogue.py) are never grouped — but a tune
+        # that is a library file (its twin, core/source_twins.py) joins it, and
+        # one still annotated from an earlier group (no longer a twin) is
+        # annotated again on its own.  Marked ``online``: the worker can't
+        # tell a catalogue path.
+        for t in snap[i : i + 20_000]:
+            if not is_catalogue_path(t.get("path")):
+                all_tracks.append({k: t.get(k) for k in _DUP_INPUT_FIELDS})
+            elif (own := source_twins.own_of(t.get("id"))) is not None:
+                all_tracks.append({**{k: t.get(k) for k in _DUP_INPUT_FIELDS},
+                                   "twin_of": own, "online": True})
+            elif (t.get("duplicate_group_id") is not None
+                    or t.get("is_duplicate_primary") is False):
+                all_tracks.append({**{k: t.get(k) for k in _DUP_INPUT_FIELDS}, "online": True})
         await asyncio.sleep(0)
     del snap
 
@@ -3606,7 +3618,7 @@ _POST_SCAN_INDEX_FIELDS = frozenset(("start_subsong", "default_subsong"))
 _SMALL_COMMIT = 2500     # commit deltas up to this size merge into the live sorted indexes
 _DRILL_WRITE_CHUNK = 25  # folder-click refresh: rows per store write (a loop turn after each)
 _DUP_INPUT_FIELDS = ("id", "title", "artist", "album_artist", "duration", "format",
-                     "bitrate", "added_at")   # what compute_duplicate_groups reads
+                     "bitrate", "added_at", "path")   # what compute_duplicate_groups reads
 _DUP_INCR_MAX = 20_000   # deltas up to this size re-group duplicates incrementally
 
 
@@ -3679,15 +3691,27 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
     store = get_store()
     if store._batch_mode or "_sorted_duration" in store._dirty_sorted:
         return False
+    from soniqboom.core import source_twins
+    from soniqboom.core.catalogue import is_catalogue_path
     keys: set[str] = set()
     untitled: set[str] = set()
+    tunes: set[str] = set()             # online-collection tunes: twins, or no longer
     for tid, old in delta.items():
-        if old is not None:
+        if old is not None and not is_catalogue_path(old.get("path")):
             k = group_key_for(old)
             if k:
                 keys.add(k)
         cur = store._tracks.get(tid)
-        if cur is not None:
+        if cur is not None and is_catalogue_path(cur.get("path")):
+            tunes.add(tid)
+            own = store._tracks.get(source_twins.own_of(tid) or "")
+            if own is not None:
+                k = group_key_for(own)
+                if k:
+                    keys.add(k)
+                else:
+                    untitled.add(own["id"])
+        elif cur is not None:
             k = group_key_for(cur)
             if k:
                 keys.add(k)
@@ -3719,7 +3743,22 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
         t = store._tracks.get(tid)
         if t is not None:
             members[tid] = t
-    annotations = compute_duplicate_groups(list(members.values()))
+    # The twins of the library files re-grouped here go with them; a tune that
+    # stopped being a twin is re-annotated on its own (no group).
+    rows = list(members.values())
+    for own_id in list(members):
+        for cid in source_twins.twins_of(own_id):
+            t = store._tracks.get(cid)
+            if t is not None and cid not in tunes:
+                rows.append({**t, "twin_of": own_id, "online": True})
+    for cid in tunes:
+        t = store._tracks.get(cid)
+        if t is None:
+            continue
+        own = source_twins.own_of(cid)
+        rows.append({**t, "twin_of": own, "online": True} if own in members
+                    else {**t, "online": True})
+    annotations = compute_duplicate_groups(rows)
     updated = await _apply_duplicate_annotations(annotations)
     log.info("Duplicate detection (incremental): %d group key(s), %d candidate(s), "
              "%d track(s) re-grouped, %d annotation(s) changed",
@@ -4151,11 +4190,12 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
 
     loop = asyncio.get_event_loop()
 
-    _registered0 = set(get_store()._scan_dirs)
+    _res = await _resolve_all(directories)
+    _registered0 = set(get_store()._scan_dirs)      # (after the await: current)
     if scope or light:
         # A watcher / automatic scan of a root the user removed meanwhile
         # (queued before the removal) must not re-register and re-index it.
-        directories = [d for d in directories if str(Path(d).resolve()) in _registered0]
+        directories = [d for d in directories if _res[d] in _registered0]
         if scope:
             scope = {r: v for r, v in scope.items() if r in _registered0}
 
@@ -4176,7 +4216,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     _known_archives = None
     _content_relisted: list[str] = []
     _fp = _listing_fingerprint()
-    _full_roots = [] if scope else [str(Path(x).resolve()) for x in directories]
+    _full_roots = [] if scope else [_res[x] for x in directories]
     _light: list[str] = []
     if light and _full_roots:
         # Only roots last enumerated in full under the SAME discovery rules
@@ -4259,10 +4299,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     # WS event lets the frontend refresh the OPEN folder in place rather than
     # resetting the whole tree to root.
     for _d in directories:
-        try:
-            _rd = str(Path(_d).resolve())
-        except OSError:
-            _rd = str(_d)
+        _rd = _res[_d]
         if _rd not in _progress.last_dirs:
             _progress.last_dirs.append(_rd)
     log.info("Scan started: %d files across %d root(s)", total, len(dir_files))
@@ -5194,8 +5231,9 @@ def _reset_scan_state() -> None:
     path left open is unwound (as ``_drain_scan_queue`` does after a crash)."""
     global _pause_event, _scan_count, _scan_task, _progress, _prog_batch_entered
     global _current_scan_dirs, _current_scan_scoped, _current_scan_light
-    global _loud_running, _busy_loud, _busy_changed, _busy_shown
+    global _loud_running, _busy_loud, _busy_changed, _busy_shown, _twin_task
     _loud_running = 0
+    _twin_task = None
     _busy_loud = _busy_changed = _busy_shown = False
     _busy_dirs.clear()
     _pause_event = None
@@ -5306,6 +5344,11 @@ async def _regroup_duplicates_now(*, background: bool = False) -> None:
         if store._batch_mode or "_sorted_duration" in store._dirty_sorted:
             _ensure_dup_runner()
             return
+        # Online-collection tunes that are library files follow the library
+        # (core/source_twins.py): what changed is marked before it is taken
+        # (recomputed only when a write or the collections may have moved it).
+        from soniqboom.core import source_twins
+        await source_twins.refresh_async(store, regroup=False, if_stale=True)
         delta, overflow = store.take_dup_dirty()
         if not delta and not overflow:
             _clear_dup_pending(store)
@@ -5343,6 +5386,51 @@ def _on_dup_dirty() -> None:
     if not store.get_config(_DUP_PENDING_KEY):
         store.set_config(_DUP_PENDING_KEY, True)
     _ensure_dup_runner()
+
+
+_twin_task: "asyncio.Task | None" = None
+
+
+def _on_twin_dirty() -> None:
+    """Store callback: a write may have changed the online-collection twins
+    (``TrackStore._twin_touch``) — a checksum or a Modland place found after
+    the scan, which no duplicate re-grouping may follow.  Recompute them once
+    things are quiet (a scan's end or the runner's re-grouping does it first
+    when one follows: then nothing is left to do)."""
+    global _twin_task
+    t = _twin_task
+    if t is not None and not t.done() and not t.cancelling():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return                                  # not on the loop (replay, a thread)
+    _twin_task = loop.create_task(_twin_refresh_when_quiet(), name="twin-refresh")
+    # (however it ends — fresh, failed, cancelled even before it started — a
+    # later write that may change the twins asks again)
+    store = get_store()
+    _twin_task.add_done_callback(lambda _t: setattr(store, "_twin_told", False))
+
+
+async def _twin_refresh_when_quiet() -> None:
+    from soniqboom.core import source_twins
+    store = get_store()
+    while True:                                 # (writes during a pass: once more)
+        await asyncio.sleep(_DUP_REGROUP_SETTLE_S)
+        while (_scan_task is not None and not _scan_task.done()) or store._batch_mode:
+            await asyncio.sleep(2)
+        before = source_twins._last
+        try:
+            await source_twins.refresh_async(store, regroup=True, if_stale=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                       # noqa: BLE001
+            log.exception("Collection twins: refresh failed")
+            return
+        if not source_twins._stale(store):
+            return
+        if source_twins._last is before:
+            return                              # (its compute failed — logged: no retry loop)
 
 
 def _ensure_dup_runner() -> None:
@@ -5383,6 +5471,12 @@ def install_dup_regroup() -> None:
     window, an interrupted first scan) are healed by one full pass."""
     store = get_store()
     store._on_dup_dirty = _on_dup_dirty
+    store._on_twin_dirty = _on_twin_dirty
+    try:
+        from soniqboom.core import source_twins
+        source_twins.install(asyncio.get_running_loop())
+    except RuntimeError:
+        pass                                    # not on the loop (tests, a thread)
     if store.get_config(_DUP_PENDING_KEY):
         saved = store.get_config(_DUP_PENDING_DELTA_KEY)
         if saved:
@@ -5465,6 +5559,7 @@ async def stop_background_writers(extra=(), timeout: float = 3.0) -> int:
     tasks: set = set(extra)
     tasks.add(_scan_task)
     tasks.add(_dup_runner_task)
+    tasks.add(_twin_task)
     tasks.update(_scene_autoapply_tasks)
     try:
         from soniqboom.core import art_backfill, folder_album, game_titles, genre_derive, repair
@@ -5630,6 +5725,15 @@ def schedule_startup_enrichment() -> None:
         t.add_done_callback(_scene_autoapply_tasks.discard)
     except Exception:                               # noqa: BLE001
         log.debug("render-length startup pass failed", exc_info=True)
+    try:
+        # Lengths of network-share MP3 / Ogg files stored from the scan's
+        # front window by earlier versions, corrected once per share
+        # (``core/partial_length.py``; a share not connected yet is checked
+        # after its next scan).
+        from soniqboom.core import partial_length
+        partial_length.schedule_backfill()
+    except Exception:                               # noqa: BLE001
+        log.debug("length backfill startup pass failed", exc_info=True)
     try:
         from soniqboom.core import scene_metadata, repair
         from soniqboom.core.store import get_store
@@ -5890,6 +5994,21 @@ def full_scan_active() -> bool:
             or any(q_scope is None and not q_light for _d, _cb, q_scope, q_light in _scan_queue))
 
 
+async def _resolve_all(paths) -> "dict":
+    """``{path: str(Path(path).resolve())}`` (the path itself when that
+    fails) — computed in a worker thread: a ``realpath`` stats every
+    component, and on a network drive each is a round trip."""
+    def _work():
+        out = {}
+        for p in paths:
+            try:
+                out[p] = str(Path(p).resolve())
+            except (OSError, RuntimeError):
+                out[p] = str(p)
+        return out
+    return await asyncio.to_thread(_work)
+
+
 def is_scanning(path: str | None = None) -> bool:
     """Check if a path (or any path) is currently being scanned or queued."""
     if path is None:
@@ -5929,7 +6048,8 @@ async def start_scan(
     directories = [d for d in directories if not _catalogue.is_catalogue_root(d)]
     if not directories and not scope:
         return _scan_task
-    norm_dirs = frozenset(str(Path(d).resolve()) for d in directories)
+    _res = await _resolve_all([*directories, *(scope or ())])
+    norm_dirs = frozenset(_res[d] for d in directories)
 
     if scope:
         # Changed paths are normalized LEXICALLY (never ``resolve()``d): a
@@ -5938,7 +6058,7 @@ async def start_scan(
         nscope = {}
         full_roots: list[str] = []
         for r, paths in scope.items():
-            nr = str(Path(r).resolve())
+            nr = _res[r]
             pre = nr.rstrip(os.sep) + os.sep
             keep = frozenset(q for q in (os.path.normpath(os.path.abspath(x)) for x in paths)
                              if q == nr or q.startswith(pre))
@@ -6901,6 +7021,14 @@ async def start_remote_scan(
     # due (a completed scan that listed files proves the share reachable).
     backfill_due = (bool(plan.get("walked"))
                     and _queue_remote_album_backfill(scan_root, plan))
+    if plan.get("walked"):
+        # Lengths stored from a front window by earlier versions
+        # (``core/partial_length.py``): checked once per root.
+        try:
+            from soniqboom.core import partial_length
+            partial_length.after_remote_scan(scan_root, plan)
+        except Exception:                               # noqa: BLE001
+            log.debug("length backfill check failed", exc_info=True)
     if _lib_changed or backfill_due:
         _spawn_scene_autoapply()
     else:
@@ -7510,7 +7638,8 @@ async def _remote_scan_body(
     # fetch.  4× the base is enough for the long-tail of Hi-Res FLACs
     # with 1–3 MB embedded cover art; anything past that is almost
     # certainly multi-MB art for which the full fetch wins anyway.
-    _GROWING_BUDGET_MULTIPLIERS = (1, 4)
+    from soniqboom.core.metadata import HEADER_BUDGET_MULTIPLIERS
+    _GROWING_BUDGET_MULTIPLIERS = HEADER_BUDGET_MULTIPLIERS
 
     async def _fetch_zip_member(remote_path: str) -> bytes:
         """Fetch one member of a remote archive (.zip/.lha/.lzh): download the
@@ -7565,6 +7694,42 @@ async def _remote_scan_body(
         return await loop.run_in_executor(
             None, lambda: source.read_file(remote_path, lane="scan"),
         )
+
+    async def _fix_window_length(meta, remote_path: str, head: bytes, size: int) -> None:
+        """Replace ``meta.duration`` when the front window ``head`` of a
+        ``size``-byte file capped it (``core/partial_length.py``): an MP3
+        without a frame count is re-computed from the listing size and the
+        ID3v2 tag size; an Ogg Vorbis / Opus file gets the length of its
+        last page, read from its end (``OGG_TAIL`` bytes) — not from a
+        source without real range reads (its ``read_at`` reads the whole
+        file).  When that end read fails the window length is kept, logged,
+        and the root's length backfill is due again
+        (``partial_length.note_pending``).  A result over
+        ``partial_length._MAX_LENGTH_S`` is not believed."""
+        from soniqboom.core import partial_length as _pl
+        from soniqboom.core.tag_window import supports_ranges
+        ext = os.path.splitext(remote_path.lower())[1]
+        if ext == _pl.MP3_EXT:
+            full = _pl.mp3_length(head, size, meta.duration or 0, meta.bitrate or 0)
+        elif ext in _pl.OGG_EXTS and supports_ranges(source):
+            off = max(0, size - _pl.OGG_TAIL)
+            try:
+                tail = await loop.run_in_executor(
+                    None, lambda: source.read_at(remote_path, off, _pl.OGG_TAIL, lane="scan"))
+            except Exception as exc:                    # noqa: BLE001
+                log.warning("Length of %s: reading its end failed (%s) — keeping the "
+                            "length of its first %d KB until the length backfill "
+                            "reads it", remote_path, exc, len(head) // 1024)
+                _pl.note_pending(scan_root_hash)
+                return
+            full = _pl.ogg_length(head, tail)
+            if full is None:
+                log.debug("Length of %s: no Vorbis / Opus end page — keeping the "
+                          "window length", remote_path)
+        else:
+            return
+        if full and (meta.duration or 0) < full <= _pl._MAX_LENGTH_S:
+            meta.duration = full
 
     # One-way latch flipped when the extraction is given up: remaining
     # queued tasks must not keep DOWNLOADING files nobody can extract
@@ -7772,6 +7937,10 @@ async def _remote_scan_body(
                     meta.mtime = listing_mtime
                 if listing_size > 0:
                     meta.file_size = listing_size
+                if was_partial and file_data is not None and listing_size > len(file_data):
+                    # A length mutagen measured over the front window only
+                    # (CBR MP3, Ogg) becomes the whole file's.
+                    await _fix_window_length(meta, remote_path, file_data, listing_size)
                 if parent_dir not in hash_map:
                     new_hashes = await store_hash_lookups_batch([parent_dir])
                     hash_map.update(new_hashes)
@@ -8100,7 +8269,8 @@ async def refresh_subtree_under_root(
 
     loop = asyncio.get_event_loop()
     store = get_store()
-    sub = str(Path(subdir).resolve())
+    _res = await _resolve_all([subdir, root])
+    sub = _res[subdir]
 
     _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
@@ -8119,7 +8289,7 @@ async def refresh_subtree_under_root(
     # (from the root's cached sorted browse rows when they are in step — a
     # binary search instead of visiting every track of the root per click)
     from soniqboom.api.fstree import cached_ids_under
-    _ids = cached_ids_under(store, path_hash(str(Path(root).resolve())), prefix)
+    _ids = cached_ids_under(store, path_hash(_res[root]), prefix)
     for tid in (_ids if _ids is not None else await get_track_ids_for_scan_root(root)):
         t = store._tracks.get(tid)
         if t:
@@ -8136,7 +8306,7 @@ async def refresh_subtree_under_root(
     to_scan = [s for s in files_strs if s not in fresh]
 
     added = updated = errors = 0
-    _root_keys = {root, str(Path(root).resolve())}
+    _root_keys = {root, _res[root]}
     return await _drill_down_apply(store, root, sub, to_scan, existing, found, walk_errors,
                                    _failed_archives, _old_versions, len(files_strs), loop,
                                    registered=bool(_root_keys & set(store._scan_dirs)),
@@ -8169,7 +8339,10 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
 
     gone = [t["id"] for p_str, t in existing.items()
             if p_str not in found and not _in_failed_archive(p_str, _failed_archives)]
-    _sub_resolved = str(Path(sub).expanduser().resolve())
+    def _sub_state() -> "tuple[str, bool]":
+        # (a realpath and a stat — a network drive: off the loop)
+        return str(Path(sub).expanduser().resolve()), bool(gone) and Path(sub).is_dir()
+    _sub_resolved, _sub_dir = await asyncio.to_thread(_sub_state)
     prune = False
     if _sub_resolved in walk_errors:
         # Incomplete listing (a read error under this subtree) — don't prune, or
@@ -8178,7 +8351,7 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
             "Drill-down refresh %s: scan hit read errors, file listing is "
             "incomplete — skipping prune (a clean scan will reconcile).", sub,
         )
-    elif gone and Path(sub).is_dir():
+    elif gone and _sub_dir:
         cap = max(20, len(existing) // 3)
         if len(gone) <= cap:
             prune = True

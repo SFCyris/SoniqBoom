@@ -123,7 +123,8 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     if e in _TRACKER_EXTS:
         return _cache_key(track_id, "tracker", subsong=subsong)
     if e in _GME_EXTS:
-        return _cache_key(track_id, "gme", subsong=subsong)
+        from soniqboom.api.stream import _gme_variant
+        return _cache_key(track_id, "gme", subsong=subsong, variant=_gme_variant(e))
     return None
 
 
@@ -205,7 +206,7 @@ async def materialize_source(
             from soniqboom.api.stream import _get_or_extract_zip_member
             return await _get_or_extract_zip_member(f"{outer}::{member}", track_id)
         p = Path(outer)
-        return p if p.exists() else None
+        return p if await asyncio.to_thread(p.exists) else None   # (a stat: off the loop)
     except Exception:
         # Non-fatal: the caller degrades (renderer FileNotFoundError → 410,
         # prewarm → skip).  Keep the traceback at warning so a genuine
@@ -255,7 +256,7 @@ async def _render_input(track_id: str, track_path: str,
         from soniqboom.api.stream import _bare_play_track, _probe_family, tune_index
         from soniqboom.core.data import get_track
         _track = await get_track(track_id)
-        if not subsong and path_obj.exists():
+        if not subsong and await asyncio.to_thread(path_obj.exists):
             _track = await _bare_play_track(track_id, _track, path_obj,
                                             _probe_family(src_ext, False, path_obj))
         subsong = tune_index(track_id, _track, subsong or None)
@@ -287,12 +288,12 @@ async def prepare_live_source(
             or ext in _GME_EXTS):
         return None
     path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
-    if not path_obj.exists():
+    if not await asyncio.to_thread(path_obj.exists):       # (a stat: off the loop)
         return None
     from soniqboom.api import stream as _st
     from soniqboom.core.conversion_cache import _cache_key, get_cached
     if src_ext in _SID_EXTS:
-        if not _st._is_c64_sid(path_obj):
+        if not await asyncio.to_thread(_st._is_c64_sid, path_obj):
             return None
         from soniqboom.config import settings
         target_dur = int(getattr(settings, "sid_default_duration", 180))
@@ -301,8 +302,8 @@ async def prepare_live_source(
             return None
         return await _st.sid_wav_feed(path_obj, subsong, target_dur, key)
     if src_ext in _MIDI_EXTS:
-        from soniqboom.config import get_active_soundfont
-        sf = get_active_soundfont()
+        from soniqboom.config import active_soundfont_async
+        sf = await active_soundfont_async()
         sfp = str(sf) if sf else ""
         key = _cache_key(track_id, "midi", soundfont_path=sfp)
         return await _st.live_wav_feed(
@@ -317,10 +318,12 @@ async def prepare_live_source(
             render_fn=lambda: _st._render_uade(path_obj, subsong=subsong, live_key=key,
                                                subsong_base=base),
             cache_kw={"variant": _st.uade_cache_variant(subsong, base)})
-    key = _cache_key(track_id, "gme", subsong=subsong)
+    var = _st._gme_variant(src_ext)
+    key = _cache_key(track_id, "gme", subsong=subsong, variant=var)
     return await _st.live_wav_feed(
         track_id, format_type="gme", subsong=subsong, key=key,
-        render_fn=lambda: _st._render_gme(path_obj, subsong=subsong, live_key=key))
+        render_fn=lambda: _st._render_gme(path_obj, subsong=subsong, live_key=key),
+        cache_kw={"variant": var} if var else None)
 
 
 async def prepare_source_for_stream(
@@ -368,8 +371,8 @@ async def prepare_source_for_stream(
 
     if src_ext in _MIDI_EXTS:
         from soniqboom.api.stream import _render_midi
-        from soniqboom.config import get_active_soundfont
-        sf = get_active_soundfont()
+        from soniqboom.config import active_soundfont_async
+        sf = await active_soundfont_async()
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="midi", subsong=0,
             render_fn=lambda: _render_midi(path_obj),
@@ -412,9 +415,10 @@ async def prepare_source_for_stream(
         return cached_path, "wav"
 
     if src_ext in _GME_EXTS:
-        from soniqboom.api.stream import _render_gme
+        from soniqboom.api.stream import _gme_variant, _render_gme
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="gme", subsong=subsong,
+            variant=_gme_variant(src_ext),
             render_fn=lambda: _render_gme(path_obj, subsong=subsong),
         )
         return cached_path, "wav"

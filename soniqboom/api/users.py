@@ -276,6 +276,19 @@ async def listener_uid(user: User | None = Depends(current_user)) -> str:
     return ""
 
 
+async def optional_listener_uid(user: User | None = Depends(current_user)) -> str | None:
+    """:func:`listener_uid` for a request that only MAY read plays (the
+    search box's ``plays:`` / ``played:``): None instead of a 401 when
+    accounts exist and nobody is signed in."""
+    if user is not None:
+        return user.id
+    try:
+        store = get_user_store()
+    except RuntimeError:
+        return ""
+    return None if store.has_any() else ""
+
+
 def require_role(*allowed: Role):
     """Build a FastAPI dependency that lets through only listed roles."""
     async def _dep(user: User = Depends(require_user)) -> User:
@@ -560,6 +573,10 @@ async def register(body: RegisterBody, request: Request, response: Response):
         if "already taken" in msg.lower():
             raise HTTPException(400, "Username unavailable.")
         raise HTTPException(400, msg)
+    # Signing up signs the new account in: recorded like a password sign-in
+    # (last sign-in, Subsonic token seed) so the Users list doesn't show
+    # "Never signed in" for an account with a live session.
+    user = await asyncio.to_thread(store.authenticate, body.username, body.password) or user
     token, expiry = _issue_session(store, user.id, user.password_hash)
     _set_session_cookie(response, request, token)
     log.info("user '%s' self-registered (role=readonly)", user.username)

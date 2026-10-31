@@ -255,7 +255,11 @@ _state_lock = threading.RLock()
 # in a song-end loop stop where it first repeats (a 65:56 render of a 5:02
 # tune was played — and its length written back — while it stayed cached);
 # rev 1 was a 16-bit 44.1 kHz render that never shipped.
-_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1, "tracker": 2}
+# adlib / imf 1: rendered at the OPL chip's own 49,716 Hz and resampled
+# (``stream._adlib_cmd``), not interpolated to 44.1 kHz by the emulator; 2:
+# without the header sizes adplay writes after the audio into a pipe (a click
+# at the end — ``stream.ADPLAY_TAIL_FILTER``).
+_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1, "tracker": 2, "adlib": 2, "imf": 2}
 
 
 def _cache_key(
@@ -598,6 +602,7 @@ async def get_cached(cache_key: str) -> Path | None:
             _lru.pop(cache_key, None)
             return None
         path = Path(entry["path"])
+        fmt = entry.get("format_type") or ""
     # The file check runs on the playback threads, never on the loop: the
     # cache may sit on a NAS data dir (``core.playback_io``).
     from soniqboom.core import playback_io
@@ -612,7 +617,45 @@ async def get_cached(cache_key: str) -> Path | None:
         # Off-loop purge so a slow filesystem doesn't block the request.
         await asyncio.to_thread(_purge_entry, cache_key)
         return None
+    if await _silent_leftover(cache_key, fmt, path):
+        return None
     return path
+
+
+# Renders cached before silent ones were refused (``refuse_silent``) — by an
+# earlier version — can still be silent.  Each render's first hit in a run is
+# judged once (``core.silence.wav_audible``: music costs one read of its first
+# audible block): a silent one is dropped, so the tune renders again — with
+# this version's renderer it may well be audible; a render that is silent
+# again is refused then (``refuse_silent`` → the 422).  ``_judged`` holds the
+# keys found audible (or that can't be judged) this run.
+_judged: set[str] = set()
+_JUDGED_MAX = 200_000
+
+
+async def _silent_leftover(cache_key: str, format_type: str, path: Path) -> bool:
+    """Is the cached render ``cache_key`` silent?  Then it is dropped (with
+    any VU sidecar beside it): the caller renders it again."""
+    if format_type in _SILENCE_EXEMPT or cache_key in _judged:
+        return False
+    from soniqboom.core import playback_io
+    from soniqboom.core.silence import wav_audible
+    try:
+        audible = await playback_io.run(playback_io.mount_key(path), wav_audible, path)
+    except Exception:
+        audible = None
+    if audible is not False:
+        if len(_judged) >= _JUDGED_MAX:
+            _judged.clear()
+        _judged.add(cache_key)
+        return False
+    await asyncio.to_thread(_purge_entry, cache_key)
+    try:
+        path.with_suffix(".vu").unlink(missing_ok=True)
+    except OSError:
+        pass
+    log.info("Cached render %s is silent — removed, it renders again", cache_key)
+    return True
 
 
 async def store_cached(
@@ -764,11 +807,14 @@ def _unlink_cached(path_str: str) -> None:
     immediately.  ``get_vu_sidecar_path`` locates these now-WAV-less sidecars by
     their deterministic path (``_find_orphan_sidecar``), and ``clear_cache``
     removes them on an explicit wipe, so they can't accumulate unbounded.
+    A tracker render's ``<wav>.peak`` (``stream.render_peak`` — cheap to
+    measure again) goes with the WAV.
     """
-    try:
-        Path(path_str).unlink(missing_ok=True)
-    except Exception:
-        pass
+    for p in (Path(path_str), Path(path_str).with_suffix(".peak")):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _purge_entry(cache_key: str) -> None:

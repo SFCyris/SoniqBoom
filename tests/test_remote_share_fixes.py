@@ -952,8 +952,22 @@ async def test_the_hvsc_join_of_an_unfinished_scan_is_made_up_by_the_next(blank,
     (lib / "Sids" / "a.sid").write_bytes(_psid(b"Tune A"))
     (lib / "Sids" / "b.sid").write_bytes(_psid(b"Tune B"))
     _age(lib)
-    monkeypatch.setattr(hvsc, "get_hvsc", lambda: _Hvsc())
-    real = hvsc_apply.apply_hvsc_to_library
+    joining = {"on": False}
+
+    class _JoinOnlyHvsc(_Hvsc):
+        # Only the join knows the lengths: a scan's extraction reads HVSC
+        # too, and on Linux its pool workers are forks that see this patch.
+        def lookup_durations_by_md5(self, md5):
+            return super().lookup_durations_by_md5(md5) if joining["on"] else None
+    monkeypatch.setattr(hvsc, "get_hvsc", lambda: _JoinOnlyHvsc())
+    _real_join = hvsc_apply.apply_hvsc_to_library
+
+    async def real(*, reload=False, ids=None):
+        joining["on"] = True
+        try:
+            return await _real_join(reload=reload, ids=ids)
+        finally:
+            joining["on"] = False
     state = {"how": "raise"}
 
     async def spy(*, reload=False, ids=None):

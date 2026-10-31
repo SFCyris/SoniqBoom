@@ -16,6 +16,7 @@ endpoints:
   POST /dlna/cm/control     - ConnectionManager:1 SOAP control (minimal)
   SUB  /dlna/cds/event      - GENA eventing (SUBSCRIBE/UNSUBSCRIBE; NOTIFY on
                               library change, carrying SystemUpdateID)
+  GET  /dlna/art/<id>.jpg   - a track's cover for control points (550 px JPEG)
 
 The router mounts at the app root (NOT under /api/) so the URLs
 exactly match what the SSDP LOCATION header advertises, and so the
@@ -31,19 +32,27 @@ Browse hierarchy:
         ├── all                         (every track in flat list)
         ├── albums                      (one container per album)
         │   └── al:<b64(album)>         (tracks of one album)
-        └── artists                     (one container per album_artist)
-            └── ar:<b64(album_artist)>  (that artist's albums)
-                └── aa:<b64(artist)>:<b64(album)>  (tracks of one album)
+        ├── artists                     (one container per album_artist)
+        │   └── ar:<b64(album_artist)>  (that artist's albums)
+        │       └── aa:<b64(artist)>:<b64(album)>  (tracks of one album)
+        ├── genres                      (one container per genre)
+        │   └── ge:<b64(genre)>         (tracks of one genre)
+        ├── folders                     (one container per library folder)
+        │   └── fo:<root hash>[:<b64(rel path)>]  (subfolders, then tracks)
+        └── playlists                   (the playlists shared with every account)
+            └── pl:<id>                 (its entries: items pi:<id>:<index>)
 
-    ObjectID name tokens are URL-safe base64 of the album / artist NAME
-    (reversible, so no server-side hash→name map is needed).
+    ObjectID name tokens are URL-safe base64 of the album / artist /
+    genre NAME or folder path (reversible, so no server-side hash→name
+    map is needed).
 
-Each track returns a DIDL-Lite ``<item>`` whose ``<res>`` URL points
+Each track returns a DIDL-Lite ``<item>`` whose ``<res>`` URLs point
 at the existing ``/cast/{token}/<filename>.<ext>`` anonymous byte
 server — same tokens the Cast / DLNA / AirPlay sender uses for its
 outgoing direction.  Browse-time URLs use the user-less anonymous
-token form (no ``uid`` claim) and a shorter 15-minute TTL so the
-exposure window is bounded.
+token form (no ``uid`` claim, ``origin="dlna"``) and a shorter
+15-minute TTL so the exposure window is bounded.  Covers come from
+``/dlna/art/<track id>.jpg`` (``upnp:albumArtURI``).
 """
 from __future__ import annotations
 
@@ -368,44 +377,55 @@ _DIDL_NS_BOILERPLATE = (
     'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"'
 )
 
+# A file the stream endpoint serves as it is (``stream.NATIVE``: MP3, FLAC,
+# WAV, Ogg Vorbis, Opus) is offered as it is.  Anything else — every rendered
+# format (SID, MIDI, trackers, AdLib, Atari ST, PSF, console and Amiga
+# formats), MP4/ALAC and the rarer containers — is offered as these, in this
+# order: lossless first, MP3 for the renderers without FLAC.  A control point
+# plays the first its renderer takes.
+_TRANSCODE_RES = (("flac", None), ("mp3", 320))
 
-def _track_to_didl_item(track: dict, base_url: str, parent_id: str = "music") -> str:
-    """Render a single track row as a DIDL-Lite ``<item>``.
+# Browse / Search links live a day: a control point queues a whole album or
+# playlist with the links it browsed, and plays and seeks in them for hours.
+# (Anyone on the network may browse for fresh ones — the Media Server is
+# anonymous — so a short life protects nothing.)
+_LINK_TTL_S = 24 * 3600
 
-    The ``<res>`` URL points at the existing anonymous cast byte server
-    with a fresh signed token.  Tokens are user-less (no ``uid`` claim)
-    so DLNA controllers — which never authenticate to us — get exactly
-    the access scope the operator agreed to when they enabled the
-    Media Server.
 
-    ``parent_id`` is the ObjectID of the container this item is being
-    returned under (``music/all``, ``al:<b64>``, ``aa:<b64>:<b64>`` …).
-    ContentDirectory:1 §2.7.1 requires an item's ``parentID`` to match
-    the container that lists it; strict controllers use it to anchor the
-    item back into the tree, so a constant ``"music"`` breaks descent.
-    """
+def _native_ext(track: dict) -> str:
+    """The file's extension (an archive member's own) when the stream
+    endpoint serves it as it is, else ``""``."""
+    from soniqboom.api.stream import NATIVE
+    name = (track.get("path") or "").rpartition("::")[2]
+    ext = ("." + name.rpartition(".")[2].lower()) if "." in name else ""
+    return ext if ext in NATIVE else ""
+
+
+def _features(codec: str, *, seekable: bool) -> str:
+    """The protocolInfo's DLNA field for a link in ``codec`` — the
+    ``contentFeatures`` its answer carries.  WAV here is the RIFF file, not
+    DLNA's LPCM profile (raw ``audio/L16``), so it names no profile."""
+    from soniqboom.core.cast_codecs import content_features
+    f = content_features(codec, seekable=seekable)
+    if codec == "wav":
+        f = ";".join(p for p in f.split(";") if not p.startswith("DLNA.ORG_PN="))
+    return f or "*"
+
+
+def _res(track: dict, base_url: str, *, codec: "str | None", ext: str, mime: str,
+         bitrate: "int | None", subsong: "int | None", dur_attr: str) -> str:
+    """One ``<res>``: a fresh anonymous link to the cast byte server for the
+    track — in ``codec`` (None: the file as it is, ``ext``)."""
     from soniqboom.core import cast_tokens
-    from soniqboom.core.cast_codecs import CODECS
-
-    track_id = track.get("id") or ""
-    title    = track.get("title")  or "Unknown Track"
-    artist   = (track.get("album_artist") or track.get("artist") or "Unknown Artist")
-    album    = track.get("album")  or "Unknown Album"
-    duration = float(track.get("duration") or 0)
-    src_fmt  = (track.get("format") or "").lower()
-    # Map library format → codec spec (defaults to mp3 mime if unknown)
-    codec_key = src_fmt if src_fmt in CODECS else "mp3"
-    spec = CODECS.get(codec_key, CODECS["mp3"])
-
-    # Mint anonymous, short-TTL token.  15 min = enough for one
-    # full track + Range re-fetches; not enough for a stolen-URL
-    # attacker to play a whole album.
     token = cast_tokens.issue_token(
-        track_id=track_id,
-        codec=None,           # native delivery — let the renderer pick
-        ttl_seconds=15 * 60,
+        track_id=track.get("id") or "",
+        codec=codec,
+        bitrate_kbps=bitrate,
+        subsong=subsong,
+        ttl_seconds=_LINK_TTL_S,
+        origin="dlna",
     )
-    filename = cast_tokens.safe_filename(track, spec.url_ext)
+    filename = cast_tokens.safe_filename(track, ext)
     # URL-encode the filename so spaces and any other URL-unsafe chars
     # become %20 etc.  ``safe_filename`` already stripped CR/LF and
     # non-ASCII; this layer covers spaces + parens + the handful of
@@ -414,34 +434,149 @@ def _track_to_didl_item(track: dict, base_url: str, parent_id: str = "music") ->
     # because they treat the space as an HTTP header delimiter.
     safe_path = urllib.parse.quote(filename, safe="._-()")
     url = f"{base_url.rstrip('/')}/cast/{token}/{safe_path}"
+    # A transcode's first play is encoded while it runs: no length, no seeking.
+    features = _features(codec or ext.lstrip("."), seekable=codec is None)
+    return (f'<res protocolInfo="http-get:*:{mime}:{features}"{dur_attr}>'
+            f'{_xescape(url)}</res>')
 
-    # Duration: HH:MM:SS.fff per DLNA spec
-    h  = int(duration // 3600)
-    m  = int((duration % 3600) // 60)
-    s  = duration - (h * 3600 + m * 60)
-    dur_str = f"{h:d}:{m:02d}:{s:06.3f}"
+
+def _art_uri(track: dict, base_url: str) -> str:
+    """``upnp:albumArtURI`` of a track that has a cover we know of — an
+    embedded one the scan found, or one already cached (its own, or its
+    folder's picture) — else empty: a listing never offers a link that
+    would answer 404, and never makes the server fetch an online-collection
+    tune's cover."""
+    from soniqboom.core import art_cache, catalogue
+    from soniqboom.core.store import get_store
+    tid = track.get("id") or ""
+    if not tid or get_store().is_art_absent(tid):
+        return ""
+    known = bool(track.get("cover_art"))
+    if not known and not catalogue.is_catalogue_path(track.get("path") or ""):
+        from soniqboom.api.art import _folder_art_cache_key
+        dh = track.get("dir_hash")
+        known = (art_cache.art_exists(tid, "lg") or art_cache.art_exists(tid, "full")
+                 or bool(dh and art_cache.art_exists(_folder_art_cache_key(dh), "full")))
+    if not known:
+        return ""
+    url = f"{base_url.rstrip('/')}/dlna/art/{urllib.parse.quote(tid, safe='')}.jpg"
+    return f'<upnp:albumArtURI dlna:profileID="JPEG_MED">{_xescape(url)}</upnp:albumArtURI>'
+
+
+def _track_to_didl_item(track: dict, base_url: str, parent_id: str = "music",
+                        *, item_id: "str | None" = None,
+                        subsong: "int | None" = None) -> str:
+    """Render a single track row as a DIDL-Lite ``<item>``.
+
+    Each ``<res>`` URL points at the existing anonymous cast byte server
+    with a fresh signed token.  Tokens are user-less (no ``uid`` claim)
+    so DLNA controllers — which never authenticate to us — get exactly
+    the access scope the operator agreed to when they enabled the
+    Media Server.  A file the stream endpoint serves as it is is offered
+    as it is; any other as FLAC and MP3 (``_TRANSCODE_RES``), which the
+    stream endpoint encodes while a render still runs, so it starts at once.
+
+    ``parent_id`` is the ObjectID of the container this item is being
+    returned under (``music/all``, ``al:<b64>``, ``aa:<b64>:<b64>`` …).
+    ContentDirectory:1 §2.7.1 requires an item's ``parentID`` to match
+    the container that lists it; strict controllers use it to anchor the
+    item back into the tree, so a constant ``"music"`` breaks descent.
+    ``item_id`` (default: the track id) and ``subsong`` (the tune, a wire
+    index; None: the file's default) are a playlist entry's — titled and
+    timed as that tune, numbered as the web player numbers it.
+    """
+    from soniqboom.api.stream import NATIVE
+    from soniqboom.core import subsonic_index as _sx
+    from soniqboom.core.cast_codecs import CODECS
+
+    title    = track.get("title")  or "Unknown Track"
+    artist   = (track.get("album_artist") or track.get("artist") or "Unknown Artist")
+    album    = track.get("album")  or "Unknown Album"
+    duration = float(track.get("duration") or 0)
+    if subsong is not None:
+        title = f"{title} (tune {_sx.wire_tune(track, subsong) + 1})"
+        duration = _sx.wire_length(track, subsong)
+
+    # Duration: H:MM:SS.fff per DLNA spec; left out when it isn't known.
+    dur_attr = ""
+    if duration > 0:
+        h  = int(duration // 3600)
+        m  = int((duration % 3600) // 60)
+        s  = duration - (h * 3600 + m * 60)
+        dur_attr = f' duration="{h:d}:{m:02d}:{s:06.3f}"'
+
+    ext = _native_ext(track)
+    if ext:
+        res = _res(track, base_url, codec=None, ext=ext.lstrip("."),
+                   mime=NATIVE[ext].split(";")[0], bitrate=None,
+                   subsong=subsong, dur_attr=dur_attr)
+    else:
+        res = "".join(_res(track, base_url, codec=c, ext=CODECS[c].url_ext,
+                           mime=CODECS[c].content_type, bitrate=br,
+                           subsong=subsong, dur_attr=dur_attr)
+                      for c, br in _TRANSCODE_RES)
 
     return (
-        f'<item id="{_xescape(track_id)}" parentID="{_xescape(parent_id)}" restricted="1">'
+        f'<item id="{_xescape(item_id or track.get("id") or "")}" '
+        f'parentID="{_xescape(parent_id)}" restricted="1">'
         f'<dc:title>{_xescape(title)}</dc:title>'
         f'<dc:creator>{_xescape(artist)}</dc:creator>'
         f'<upnp:artist>{_xescape(artist)}</upnp:artist>'
         f'<upnp:album>{_xescape(album)}</upnp:album>'
+        f'{_art_uri(track, base_url)}'
         f'<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
-        f'<res protocolInfo="http-get:*:{spec.content_type}:*" '
-        f'duration="{dur_str}">{_xescape(url)}</res>'
+        f'{res}'
         f'</item>'
     )
 
 
-def _container(id_: str, parent: str, title: str, child_count: int) -> str:
+def _container(id_: str, parent: str, title: str, child_count: int,
+               cls: str = "object.container", art: str = "") -> str:
+    """A DIDL-Lite ``<container>`` (``art``: an ``upnp:albumArtURI`` element)."""
     return (
         f'<container id="{_xescape(id_)}" parentID="{_xescape(parent)}" '
         f'childCount="{child_count}" restricted="1">'
         f'<dc:title>{_xescape(title)}</dc:title>'
-        f'<upnp:class>object.container</upnp:class>'
+        f'{art}'
+        f'<upnp:class>{cls}</upnp:class>'
         f'</container>'
     )
+
+
+_ALBUM_CLS    = "object.container.album.musicAlbum"
+_ARTIST_CLS   = "object.container.person.musicArtist"
+_GENRE_CLS    = "object.container.genre.musicGenre"
+_FOLDER_CLS   = "object.container.storageFolder"
+_PLAYLIST_CLS = "object.container.playlistContainer"
+
+
+def _album_art(store, rep_id: "str | None", base_url: str) -> str:
+    """An album container's cover: its representative track's."""
+    t = store.get_track(rep_id) if rep_id else None
+    return _art_uri(t, base_url) if t else ""
+
+
+@router.api_route("/dlna/art/{track_id}.jpg", methods=["GET", "HEAD"], include_in_schema=False)
+async def dlna_art(track_id: str):
+    """A track's cover (550 px JPEG) for DLNA control points, which never
+    sign in — offered only for what the Media Server lists (``_dlna_store``)
+    and only while the server isn't locked.  An online-collection tune's
+    cover is served only once it is cached (never fetched for this)."""
+    from soniqboom.api.art import cover_thumb
+    from soniqboom.core import catalogue
+    from soniqboom.core.users import accounts_locked
+    if accounts_locked():
+        raise HTTPException(503, "The server is locked.")
+    track = _dlna_store().get_track(track_id)
+    if not track:
+        raise HTTPException(404, "No such track.")
+    data = await cover_thumb(
+        track_id, "lg", resolve=not catalogue.is_catalogue_path(track.get("path") or ""))
+    if not data:
+        raise HTTPException(404, "No cover.")
+    return FResponse(content=data, media_type="image/jpeg",
+                     headers={"Cache-Control": "public, max-age=3600",
+                              "transferMode.dlna.org": "Interactive"})
 
 
 # ── ContentDirectory Browse action ─────────────────────────────────────────
@@ -450,7 +585,7 @@ def _container(id_: str, parent: str, title: str, child_count: int) -> str:
 async def cds_control(request: Request):
     """ContentDirectory:1 SOAPAction dispatcher.
 
-    Only Browse + Get*Capabilities + GetSystemUpdateID are implemented;
+    Browse, Search, Get*Capabilities and GetSystemUpdateID are implemented;
     every other action returns a 401 ``Invalid Action`` SOAP fault."""
     raw = await request.body()
     action, args = _parse_soap_body(raw)
@@ -461,7 +596,8 @@ async def cds_control(request: Request):
                               {"SearchCaps": "dc:title,upnp:artist,upnp:album,dc:creator"})
 
     if action == "GetSortCapabilities":
-        # Also empty — we return tracks in library/insertion order.
+        # Empty: SortCriteria is not applied (each container keeps its own
+        # order — albums by disc and track, the rest as the store lists them).
         return _soap_response(_UPNP_CDS_NS, action, {"SortCaps": ""})
 
     if action == "GetSystemUpdateID":
@@ -564,13 +700,20 @@ async def _do_browse(args: dict[str, str], request: Request) -> FResponse:
 
     Object-ID hierarchy:
       "0"       → root (single child: music)
-      "music"   → music container (all / albums / artists)
+      "music"   → music container (all / albums / artists / genres /
+                  folders / playlists)
       "music/all"          → flat list of every track
       "music/albums"       → list of album containers
       "music/artists"      → list of artist containers
+      "music/genres"       → list of genre containers
+      "music/folders"      → the library folders (fo: containers)
+      "music/playlists"    → the shared playlists (pl: containers)
       "al:<b64>"           → tracks of one album (by album name)
       "ar:<b64>"           → that album-artist's albums (aa: containers)
       "aa:<b64>:<b64>"     → tracks of one (album_artist, album)
+      "ge:<b64>"           → tracks of one genre
+      "fo:<hash>[:<b64>]"  → a folder's subfolders, then its tracks
+      "pl:<id>"            → a shared playlist's entries (pi:<id>:<index>)
 
     BrowseFlag = "BrowseMetadata" returns just the object itself;
     "BrowseDirectChildren" returns its children paginated by
@@ -605,63 +748,327 @@ async def _do_browse(args: dict[str, str], request: Request) -> FResponse:
                           await _browse_children(obj_id, start, req_cnt, base_url))
 
 
-async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
-    """Return the single object's DIDL-Lite (BrowseMetadata mode)."""
-    if obj_id in ("0", "music", "music/all", "music/albums", "music/artists"):
-        title = {
-            "0":              "SoniqBoom",
-            "music":          "Music",
-            "music/all":      "All Tracks",
-            "music/albums":   "Albums",
-            "music/artists":  "Artists",
-        }[obj_id]
-        # Just the container as a single item
-        result = (
-            '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '>'
-            + _container(obj_id, "-1" if obj_id == "0" else "0", title, 0)
-            + '</DIDL-Lite>'
-        )
-        return {
-            "Result":         result,
-            "NumberReturned": "1",
-            "TotalMatches":   "1",
-            "UpdateID":       str(_system_update_id),
-        }
-    # Album / artist / artist-album container metadata — some controllers fetch
-    # this before BrowseDirectChildren; return it as the container itself.
-    if obj_id.startswith(("al:", "ar:", "aa:")):
-        if obj_id.startswith("aa:"):
-            try:
-                _, b_artist, b_album = obj_id.split(":", 2)
-            except ValueError:
-                b_artist = b_album = ""
-            title = _dec_name(b_album) or "[Unknown Album]"
-            parent = "ar:" + b_artist
-        elif obj_id.startswith("al:"):
-            title = _dec_name(obj_id[3:]) or "[Unknown Album]"
-            parent = "music/albums"
-        else:  # ar:
-            title = _dec_name(obj_id[3:]) or "[No Album Artist]"
-            parent = "music/artists"
-        result = (
-            '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '>'
-            + _container(obj_id, parent, title, 0)
-            + '</DIDL-Lite>'
-        )
-        return {
-            "Result":         result,
-            "NumberReturned": "1",
-            "TotalMatches":   "1",
-            "UpdateID":       str(_system_update_id),
-        }
+# Fixed containers: ObjectID → (parentID, title).
+_FIXED = {
+    "0":               ("-1",    "SoniqBoom"),
+    "music":           ("0",     "Music"),
+    "music/all":       ("music", "All Tracks"),
+    "music/albums":    ("music", "Albums"),
+    "music/artists":   ("music", "Artists"),
+    "music/genres":    ("music", "Genres"),
+    "music/folders":   ("music", "Folders"),
+    "music/playlists": ("music", "Playlists"),
+}
+_MUSIC_CHILDREN = ("music/all", "music/albums", "music/artists",
+                   "music/genres", "music/folders", "music/playlists")
 
-    # Unknown object → empty result
+
+def _didl(parts: "list[str]", returned: int, total: int) -> dict[str, str]:
+    """A Browse / Search answer of the DIDL-Lite fragments ``parts``."""
     return {
-        "Result":         '<DIDL-Lite ' + _DIDL_NS_BOILERPLATE + '></DIDL-Lite>',
-        "NumberReturned": "0",
-        "TotalMatches":   "0",
+        "Result":         "<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">" + "".join(parts)
+                          + "</DIDL-Lite>",
+        "NumberReturned": str(returned),
+        "TotalMatches":   str(total),
         "UpdateID":       str(_system_update_id),
     }
+
+
+def _name_filter(field: str, name: str) -> dict:
+    """``filter_tracks`` arguments for one tag value — for an empty one the
+    tracks without that tag (the "[Unknown …]" bucket), never the library."""
+    return {field: name} if name else {"untagged": field}
+
+
+def _split_aa(obj_id: str) -> "tuple[str, str]":
+    """``(album artist, album)`` of an ``aa:`` ObjectID."""
+    try:
+        _, b_artist, b_album = obj_id.split(":", 2)
+    except ValueError:
+        b_artist = b_album = ""
+    return _dec_name(b_artist), _dec_name(b_album)
+
+
+def _agg_count(rows: "list[dict]", key: str, name: str, *, fold: bool = False) -> int:
+    """The ``count`` of the aggregate row named ``name`` (0: none)."""
+    want = name.lower() if fold else name
+    for d in rows:
+        got = d.get(key) or ""
+        if (got.lower() if fold else got) == want:
+            return int(d.get("count", 0) or 0)
+    return 0
+
+
+def _child_count(store, obj_id: str) -> int:
+    """How many children Browse lists for ``obj_id`` (blocking).  A folder's
+    subfolders count once each, an album artist's albums once each."""
+    if obj_id == "0":
+        return 1
+    if obj_id == "music":
+        return len(_MUSIC_CHILDREN)
+    if obj_id == "music/all":
+        return store.track_count()
+    if obj_id == "music/albums":
+        return len(store.aggregate_albums())
+    if obj_id == "music/artists":
+        return len(store.aggregate_album_artists())
+    if obj_id == "music/genres":
+        return len(store.aggregate_genres())
+    if obj_id == "music/folders":
+        return len(_folder_roots(store))
+    if obj_id == "music/playlists":
+        return len(_shared_playlists())
+    if obj_id.startswith("al:"):
+        return _agg_count(store.aggregate_albums(), "album", _dec_name(obj_id[3:]))
+    if obj_id.startswith("aa:"):
+        artist, album = _split_aa(obj_id)
+        return _agg_count(store.aggregate_albums(None, artist), "album", album)
+    if obj_id.startswith("ar:"):
+        return len(store.aggregate_albums(None, _dec_name(obj_id[3:])))
+    if obj_id.startswith("ge:"):
+        return _agg_count(store.aggregate_genres(), "genre", _dec_name(obj_id[3:]), fold=True)
+    if obj_id.startswith("fo:"):
+        hit = _folder_of(store, obj_id)
+        if hit is None:
+            return 0
+        listing = _folder_listing(store, *hit)
+        return len(listing.subs) + len(listing.files)
+    if obj_id.startswith("pl:"):
+        pl = _shared_playlist(obj_id[3:])
+        return len(_visible_entries(store, pl)) if pl is not None else 0
+    return 0
+
+
+async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
+    """Return the single object's DIDL-Lite (BrowseMetadata mode): a
+    container (some controllers fetch this before BrowseDirectChildren) or
+    a track item.  Unknown objects → an empty result."""
+    store = _dlna_store()
+    if obj_id in _FIXED:
+        parent, title = _FIXED[obj_id]
+        n = await asyncio.to_thread(_child_count, store, obj_id)
+        return _didl([_container(obj_id, parent, title, n)], 1, 1)
+    if obj_id.startswith(("al:", "ar:", "aa:", "ge:")):
+        if obj_id.startswith("aa:"):
+            album = _split_aa(obj_id)[1]
+            title, parent, cls = (album or "[Unknown Album]",
+                                  "ar:" + obj_id.split(":", 2)[1], _ALBUM_CLS)
+        elif obj_id.startswith("al:"):
+            title, parent, cls = (_dec_name(obj_id[3:]) or "[Unknown Album]",
+                                  "music/albums", _ALBUM_CLS)
+        elif obj_id.startswith("ge:"):
+            title, parent, cls = (_dec_name(obj_id[3:]) or "[No Genre]",
+                                  "music/genres", _GENRE_CLS)
+        else:  # ar:
+            title, parent, cls = (_dec_name(obj_id[3:]) or "[No Album Artist]",
+                                  "music/artists", _ARTIST_CLS)
+        n = await asyncio.to_thread(_child_count, store, obj_id)
+        return _didl([_container(obj_id, parent, title, n, cls)], 1, 1)
+    if obj_id.startswith("fo:"):
+        def _folder_meta() -> "str | None":
+            hit = _folder_of(store, obj_id)
+            if hit is None:
+                return None
+            root, rel = hit
+            parent = ("music/folders" if not rel else
+                      _folder_id(root["hash"], rel.rpartition("/")[0]))
+            title = rel.rpartition("/")[2] if rel else root["title"]
+            return _container(obj_id, parent, title, _child_count(store, obj_id), _FOLDER_CLS)
+        part = await asyncio.to_thread(_folder_meta)
+        if part is not None:
+            return _didl([part], 1, 1)
+    elif obj_id.startswith("pl:"):
+        pl = _shared_playlist(obj_id[3:])
+        if pl is not None:
+            n = await asyncio.to_thread(_child_count, store, obj_id)
+            return _didl([_container(obj_id, "music/playlists", pl.get("name") or "Playlist",
+                                     n, _PLAYLIST_CLS)], 1, 1)
+    elif obj_id.startswith("pi:"):
+        entry = _playlist_entry(store, obj_id)
+        if entry is not None:
+            pl_id, track, sub = entry
+            item = await asyncio.to_thread(
+                _track_to_didl_item, track, base_url, "pl:" + pl_id,
+                item_id=obj_id, subsong=sub)
+            return _didl([item], 1, 1)
+    else:
+        track = store.get_track(obj_id)
+        if track:
+            item = await asyncio.to_thread(_track_to_didl_item, track, base_url, "music/all")
+            return _didl([item], 1, 1)
+    return _didl([], 0, 0)
+
+
+# ── Folders ────────────────────────────────────────────────────────────────
+# The library's folders as the index knows them (the web folder tree's
+# in-memory path caches, ``api/fstree`` — never a disk or network listing):
+#   fo:<root path hash>                  a library folder (scan root)
+#   fo:<root path hash>:<b64(rel path)>  a folder inside it
+# A folder lists its subfolders, then its tracks (an archive's tunes in the
+# folder that holds the archive, as the web player lists them).
+
+def _folder_roots(store) -> "list[dict]":
+    """The library folders the Media Server shows (hidden online
+    collections left out), with the titles controllers display."""
+    from soniqboom.config import settings
+    aliases = getattr(settings, "folder_aliases", None) or {}
+    shares = getattr(settings, "network_shares", None) or {}
+    out = []
+    for d in store.list_scan_dirs():
+        path = d.get("path") or ""
+        h = d.get("path_hash")
+        if not path or not h:
+            continue
+        share = shares.get(d.get("network_share_id") or "") or {}
+        name = path.rstrip("/").rpartition("/")[2] or path
+        title = (d.get("label") or aliases.get(path) or share.get("alias") or name)
+        out.append({"hash": h, "path": path, "title": title})
+    out.sort(key=lambda r: r["title"].lower())
+    return out
+
+
+def _folder_id(root_hash: str, rel: str) -> str:
+    return f"fo:{root_hash}:{_enc_name(rel)}" if rel else f"fo:{root_hash}"
+
+
+def _folder_of(store, obj_id: str) -> "tuple[dict, str] | None":
+    """``(root, rel)`` of a folder ObjectID, or None (not a shown root)."""
+    h, _, b_rel = obj_id[3:].partition(":")
+    roots = _folder_roots(store)
+    for gone in [k for k in _ROOT_IDS if k not in {r["hash"] for r in roots}]:
+        _ROOT_IDS.pop(gone, None)
+    root = next((r for r in roots if r["hash"] == h), None)
+    if root is None:
+        return None
+    rel = _dec_name(b_rel).strip("/") if b_rel else ""
+    return root, rel
+
+
+# Track ids of a library folder's shaped path cache, in its path order —
+# keyed on the cache's own list object (kept referenced here, so its
+# identity is stable): rebuilt only when the folder tree rebuilt it.
+_ROOT_IDS: dict[str, tuple] = {}
+
+
+def _root_rows(root: dict) -> "tuple[list[str], list[str]]":
+    """``(paths, ids)`` of a library folder's tracks in path order (blocking)."""
+    from soniqboom.api import fstree
+    from soniqboom.core import catalogue
+    from soniqboom.core.store import get_store
+    store = get_store()                      # the caches are the folder tree's own
+    if catalogue.is_catalogue_root(root["path"]):
+        return fstree._catalogue_sorted(store, root["hash"])
+    paths, dicts = fstree._get_or_build_scan_root_sorted(store, root["hash"])
+    memo = _ROOT_IDS.get(root["hash"])
+    if memo is None or memo[0] is not dicts:
+        memo = _ROOT_IDS[root["hash"]] = (dicts, [d.get("id") for d in dicts])
+    return paths, memo[1]
+
+
+class _Listing:
+    """A folder's ``subs`` (``(name, lo, hi)``: its path rows ``paths[lo:hi]``)
+    and ``files`` (the ids of the tracks directly in it that the store shows)."""
+    __slots__ = ("paths", "prefix", "subs", "files")
+
+    def __init__(self, paths, prefix, subs, files) -> None:
+        self.paths, self.prefix, self.subs, self.files = paths, prefix, subs, files
+
+    def direct_count(self, lo: int, hi: int, name: str) -> int:
+        """How many entries (subfolders + tracks) subfolder ``name`` lists."""
+        from bisect import bisect_left
+        paths, prefix = self.paths, f"{self.prefix}{name}/"
+        plen, n, i = len(prefix), 0, lo
+        while i < hi:
+            head = paths[i][plen:].split("::", 1)[0]
+            slash = head.find("/")
+            if slash > 0:
+                nxt = bisect_left(paths, f"{prefix}{head[:slash]}/\U0010FFFF", i, hi)
+                i = nxt if nxt > i else i + 1
+            else:
+                i += 1
+            n += 1
+        return n
+
+
+def _folder_listing(store, root: dict, rel: str) -> _Listing:
+    """A folder's subfolders and tracks (blocking).  Bisect-skips each
+    subfolder's subtree, so a big tree costs O(subfolders · log n) plus its
+    own tracks."""
+    from bisect import bisect_left
+    from soniqboom.core.filesource import is_remote_path
+    paths, ids = _root_rows(root)
+    base = (f"{root['path']}:/" if is_remote_path(root["path"])
+            else root["path"].rstrip("/") + "/")
+    prefix = base + (rel + "/" if rel else "")
+    plen, n = len(prefix), len(paths)
+    i = bisect_left(paths, prefix)
+    subs: list[tuple[str, int, int]] = []
+    files: list[str] = []
+    while i < n and paths[i].startswith(prefix):
+        head = paths[i][plen:].split("::", 1)[0]
+        slash = head.find("/")
+        if slash > 0:
+            child = head[:slash]
+            # Past the whole subtree (U+10FFFF sorts after any name; ``i + 1``
+            # guarantees progress) — see fstree._local_children_from_store.
+            nxt = bisect_left(paths, f"{prefix}{child}/\U0010FFFF", i)
+            nxt = nxt if nxt > i else i + 1
+            subs.append((child, i, nxt))
+            i = nxt
+        else:
+            files.append(ids[i])
+            i += 1
+    subs.sort(key=lambda s: s[0].lower())
+    # Only tracks the store still has and shows (the path cache may hold
+    # one removed since), so paging and the totals agree.
+    files = [f for f, t in zip(files, store.get_tracks_batch(files)) if t]
+    return _Listing(paths, prefix, subs, files)
+
+
+# ── Playlists ──────────────────────────────────────────────────────────────
+# Only the playlists their owners share with every account
+# (``store.playlist_offered`` — the same rule the Import list follows): the
+# Media Server answers anyone on the network, without signing in.
+#   pl:<playlist id>          a shared playlist
+#   pi:<playlist id>:<index>  one entry of it (a track, or one tune of it)
+
+def _shared_playlists() -> "list[dict]":
+    from soniqboom.core.store import get_store
+    store = get_store()
+    pls = [p for p in store.list_playlists() if store.playlist_offered(p)]
+    pls.sort(key=lambda p: ((p.get("name") or "").lower(), p.get("id") or ""))
+    return pls
+
+
+def _shared_playlist(pl_id: str) -> "dict | None":
+    from soniqboom.core.store import get_store
+    store = get_store()
+    pl = store.get_playlist(pl_id) if pl_id else None
+    return pl if pl is not None and store.playlist_offered(pl) else None
+
+
+def _visible_entries(store, pl: dict) -> "list[tuple[int, dict, int | None]]":
+    """``(index, track, tune)`` of a playlist's entries whose track the store
+    still has and shows — what Browse lists and counts."""
+    from soniqboom.api.playlist import _entry_id, _entry_sub
+    entries = pl.get("track_ids") or []
+    tracks = store.get_tracks_batch([_entry_id(e) or "" for e in entries])
+    return [(i, t, _entry_sub(e)) for i, (e, t) in enumerate(zip(entries, tracks)) if t]
+
+
+def _playlist_entry(store, obj_id: str) -> "tuple[str, dict, int | None] | None":
+    """``(playlist id, track, tune)`` of a ``pi:`` ObjectID, or None."""
+    from soniqboom.api.playlist import _entry_id, _entry_sub
+    pl_id, _, idx = obj_id[3:].rpartition(":")
+    pl = _shared_playlist(pl_id)
+    if pl is None or not idx.isdigit():
+        return None
+    entries = pl.get("track_ids") or []
+    i = int(idx)
+    if i >= len(entries):
+        return None
+    track = store.get_track(_entry_id(entries[i]) or "")
+    return (pl_id, track, _entry_sub(entries[i])) if track else None
 
 
 def _enc_name(name: str) -> str:
@@ -697,150 +1104,193 @@ async def _list_track_items(store, filt: dict, start: int, count: int, base_url:
     return await asyncio.to_thread(_render)
 
 
+# An album longer than this is listed in the store's order, unsorted.
+_ALBUM_SORT_MAX = 5000
+
+
+def _num(v) -> int:
+    """A disc / track number as an int ("3/12" → 3); 0 when there is none."""
+    try:
+        return int(float(str(v).split("/", 1)[0]))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+async def _album_items(store, filt: dict, start: int, count: int, base_url: str,
+                       parent_id: str) -> "tuple[int, list[str]]":
+    """``(total, items)`` of an album in disc and track order (the order
+    Subsonic lists it in), paginated."""
+    def _album() -> "tuple[int, list[str]] | None":
+        rows = store.filter_tracks(limit=_ALBUM_SORT_MAX + 1, **filt)
+        if len(rows) > _ALBUM_SORT_MAX:
+            return None
+        rows.sort(key=lambda t: (_num(t.get("disc_number")), _num(t.get("track_number")),
+                                 (t.get("title") or "").lower()))
+        return len(rows), [_track_to_didl_item(t, base_url, parent_id)
+                           for t in rows[start:start + count]]
+    got = await asyncio.to_thread(_album)
+    if got is not None:
+        return got
+    total = await asyncio.to_thread(_child_count, store, parent_id)
+    return total, await _list_track_items(store, filt, start, count, base_url, parent_id)
+
+
 async def _browse_children(
     obj_id: str, start: int, count: int, base_url: str,
 ) -> dict[str, str]:
     """Return paginated children of ``obj_id`` as DIDL-Lite."""
-    get_store = _dlna_store
-
-    didl_parts: list[str] = ["<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">"]
+    store = _dlna_store()
+    parts: list[str] = []
     total = 0
-    returned = 0
+
+    def _page(rows: list) -> list:
+        return rows[start:start + count]
 
     if obj_id == "0":
         # Root → single Music container
-        didl_parts.append(_container(
-            "music", "0", "Music",
-            get_store().track_count(),
-        ))
         total = 1
-        returned = 1 if start == 0 else 0
-        if returned == 0:
-            didl_parts = ["<DIDL-Lite " + _DIDL_NS_BOILERPLATE + ">"]
+        if start == 0:
+            parts.append(_container("music", "0", "Music", len(_MUSIC_CHILDREN)))
     elif obj_id == "music":
-        # Music → All / Albums / Artists.  Real child counts so a controller
-        # doesn't render Albums/Artists as "0 items" and refuse to descend.
-        store = get_store()
-        n_albums  = len(await asyncio.to_thread(store.aggregate_albums))
-        n_artists = len(await asyncio.to_thread(store.aggregate_album_artists))
-        children = [
-            ("music/all",     "All Tracks", store.track_count()),
-            ("music/albums",  "Albums",     n_albums),
-            ("music/artists", "Artists",    n_artists),
-        ]
+        # Music → All / Albums / Artists / Genres / Folders / Playlists.  Real
+        # child counts so a controller doesn't render one as "0 items" and
+        # refuse to descend.
+        children = await asyncio.to_thread(
+            lambda: [(cid, _child_count(store, cid)) for cid in _MUSIC_CHILDREN])
         total = len(children)
-        for i, (cid, ctitle, ccount) in enumerate(children):
-            if i < start: continue
-            if returned >= count: break
-            didl_parts.append(_container(cid, "music", ctitle, ccount))
-            returned += 1
+        for cid, ccount in _page(children):
+            parts.append(_container(cid, "music", _FIXED[cid][1], ccount))
     elif obj_id == "music/all":
         # Flat list of every track — paginated.  store.filter_tracks
         # is synchronous and on a 270 K-track library walks the in-memory
         # sorted index; that's a 30-200 ms scan on the dev box and
         # blocks the asyncio loop for every other request landing
-        # during the Browse window.  Push it to the default executor
-        # so concurrent /cast/{token}/ streams don't stall.
-        store = get_store()
+        # during the Browse window.  Push it (and the row rendering — a
+        # token mint per row) to the default executor so concurrent
+        # /cast/{token}/ streams don't stall.
         total = await asyncio.to_thread(store.track_count)
-
-        def _fetch_page() -> list[dict]:
-            try:
-                return store.filter_tracks(limit=count, offset=start)
-            except TypeError:
-                all_tracks = store.filter_tracks(limit=start + count)
-                return all_tracks[start:start + count]
-        tracks = await asyncio.to_thread(_fetch_page)
-
-        # DIDL-Lite rendering for each track is also CPU-bound at large
-        # ``count`` (string concat + html.escape + token mint per row).
-        # 500 rows is ~30 ms; off-loop it as well so concurrent requests
-        # aren't held while we render Browse.
-        def _render_rows() -> list[str]:
-            return [_track_to_didl_item(t, base_url, "music/all") for t in tracks]
-        rendered = await asyncio.to_thread(_render_rows)
-        for row in rendered:
-            didl_parts.append(row)
-            returned += 1
+        parts += await _list_track_items(store, {}, start, count, base_url, "music/all")
     elif obj_id == "music/albums":
         # One container per album → ``al:<base64(album)>``.
-        store = get_store()
-        rows = await asyncio.to_thread(store.aggregate_albums)
-        total = len(rows)
-        for d in rows[start:start + count]:
-            name = d.get("album") or ""
-            didl_parts.append(_container(
-                "al:" + _enc_name(name), "music/albums",
-                name or "[Unknown Album]", int(d.get("count", 0) or 0)))
-            returned += 1
+        def _albums() -> tuple[int, list[str]]:
+            rows = store.aggregate_albums()
+            return len(rows), [
+                _container("al:" + _enc_name(d.get("album") or ""), "music/albums",
+                           d.get("album") or "[Unknown Album]", int(d.get("count", 0) or 0),
+                           _ALBUM_CLS, _album_art(store, d.get("track_id"), base_url))
+                for d in _page(rows)]
+        total, rows = await asyncio.to_thread(_albums)
+        parts += rows
     elif obj_id == "music/artists":
-        # One container per album-artist → ``ar:<base64(album_artist)>``.
-        store = get_store()
-        rows = await asyncio.to_thread(store.aggregate_album_artists)
+        # One container per album-artist → ``ar:<base64(album_artist)>``;
+        # its children are its albums.
+        def _artists() -> tuple[int, list[str]]:
+            rows = store.aggregate_album_artists()
+            out = []
+            for d in _page(rows):
+                name = d.get("album_artist") or ""
+                cid = "ar:" + _enc_name(name)
+                out.append(_container(cid, "music/artists", name or "[No Album Artist]",
+                                      _child_count(store, cid), _ARTIST_CLS))
+            return len(rows), out
+        total, rows = await asyncio.to_thread(_artists)
+        parts += rows
+    elif obj_id == "music/genres":
+        # One container per genre → ``ge:<base64(genre)>``.
+        rows = await asyncio.to_thread(store.aggregate_genres)
         total = len(rows)
-        for d in rows[start:start + count]:
-            name = d.get("album_artist") or ""
-            didl_parts.append(_container(
-                "ar:" + _enc_name(name), "music/artists",
-                name or "[No Album Artist]", int(d.get("count", 0) or 0)))
-            returned += 1
+        for d in _page(rows):
+            name = d.get("genre") or ""
+            parts.append(_container("ge:" + _enc_name(name), "music/genres",
+                                    name or "[No Genre]", int(d.get("count", 0) or 0),
+                                    _GENRE_CLS))
+    elif obj_id == "music/folders":
+        # One container per library folder → ``fo:<root hash>``.
+        def _roots() -> tuple[int, list[str]]:
+            roots = _folder_roots(store)
+            return len(roots), [
+                _container(_folder_id(r["hash"], ""), "music/folders", r["title"],
+                           _child_count(store, _folder_id(r["hash"], "")), _FOLDER_CLS)
+                for r in _page(roots)]
+        total, rows = await asyncio.to_thread(_roots)
+        parts += rows
+    elif obj_id == "music/playlists":
+        def _playlists() -> tuple[int, list[str]]:
+            pls = _shared_playlists()
+            return len(pls), [
+                _container("pl:" + (p.get("id") or ""), "music/playlists",
+                           p.get("name") or "Playlist", len(_visible_entries(store, p)),
+                           _PLAYLIST_CLS)
+                for p in _page(pls)]
+        total, rows = await asyncio.to_thread(_playlists)
+        parts += rows
     elif obj_id.startswith("ar:"):
         # Artist → that album-artist's ALBUMS (containers ``aa:<artist>:<album>``).
-        store = get_store()
         artist = _dec_name(obj_id[3:])
-        rows = await asyncio.to_thread(store.aggregate_albums, None, artist)
-        total = len(rows)
-        for d in rows[start:start + count]:
-            album = d.get("album") or ""
-            didl_parts.append(_container(
-                "aa:" + _enc_name(artist) + ":" + _enc_name(album), obj_id,
-                album or "[Unknown Album]", int(d.get("count", 0) or 0)))
-            returned += 1
+
+        def _artist_albums() -> tuple[int, list[str]]:
+            rows = store.aggregate_albums(None, artist)
+            return len(rows), [
+                _container("aa:" + _enc_name(artist) + ":" + _enc_name(d.get("album") or ""),
+                           obj_id, d.get("album") or "[Unknown Album]",
+                           int(d.get("count", 0) or 0), _ALBUM_CLS,
+                           _album_art(store, d.get("track_id"), base_url))
+                for d in _page(rows)]
+        total, rows = await asyncio.to_thread(_artist_albums)
+        parts += rows
     elif obj_id.startswith("aa:"):
         # Artist + album → tracks (disambiguated, so same-named albums by
-        # different artists don't bleed together).
-        store = get_store()
-        try:
-            _, b_artist, b_album = obj_id.split(":", 2)
-        except ValueError:
-            b_artist = b_album = ""
-        artist, album = _dec_name(b_artist), _dec_name(b_album)
-        agg = await asyncio.to_thread(store.aggregate_albums, None, artist)
-        total = next((int(d.get("count", 0) or 0)
-                      for d in agg if (d.get("album") or "") == album), 0)
-        for row in await _list_track_items(
-                store, {"album_artist": artist, "album": album},
-                start, count, base_url, obj_id):
-            didl_parts.append(row)
-            returned += 1
-        if total == 0:
-            total = start + returned
+        # different artists don't bleed together), in disc and track order.
+        artist, album = _split_aa(obj_id)
+        total, rows = await _album_items(
+            store, {**_name_filter("album_artist", artist), **_name_filter("album", album)},
+            start, count, base_url, obj_id)
+        parts += rows
     elif obj_id.startswith("al:"):
-        # Album (top level) → tracks, by album name only.
-        store = get_store()
-        album = _dec_name(obj_id[3:])
-        agg = await asyncio.to_thread(store.aggregate_albums)
-        total = next((int(d.get("count", 0) or 0)
-                      for d in agg if (d.get("album") or "") == album), 0)
-        for row in await _list_track_items(
-                store, {"album": album}, start, count, base_url, obj_id):
-            didl_parts.append(row)
-            returned += 1
-        if total == 0:
-            total = start + returned
-    else:
-        # Unknown obj_id — empty
-        total = 0
+        # Album (top level) → tracks, by album name only, in disc and track order.
+        total, rows = await _album_items(
+            store, _name_filter("album", _dec_name(obj_id[3:])), start, count, base_url, obj_id)
+        parts += rows
+    elif obj_id.startswith("ge:"):
+        # Genre → its tracks.
+        genre = _dec_name(obj_id[3:])
+        total = await asyncio.to_thread(_child_count, store, obj_id)
+        parts += await _list_track_items(store, _name_filter("genre", genre),
+                                         start, count, base_url, obj_id)
+        total = total or start + len(parts)
+    elif obj_id.startswith("fo:"):
+        # Folder → its subfolders, then its tracks.
+        def _folder() -> tuple[int, list[str]]:
+            hit = _folder_of(store, obj_id)
+            if hit is None:
+                return 0, []
+            root, rel = hit
+            listing = _folder_listing(store, root, rel)
+            subs, files = listing.subs, listing.files
+            out = [_container(_folder_id(root["hash"], f"{rel}/{name}" if rel else name),
+                              obj_id, name, listing.direct_count(lo, hi, name), _FOLDER_CLS)
+                   for name, lo, hi in subs[start:start + count]]
+            ids = files[max(0, start - len(subs)):max(0, start + count - len(subs))]
+            out += [_track_to_didl_item(t, base_url, obj_id)
+                    for t in store.get_tracks_batch(ids) if t]
+            return len(subs) + len(files), out
+        total, rows = await asyncio.to_thread(_folder)
+        parts += rows
+    elif obj_id.startswith("pl:"):
+        # Shared playlist → its entries in order (``pi:<id>:<index>``).
+        pl = _shared_playlist(obj_id[3:])
+        if pl is not None:
+            def _entries() -> tuple[int, list[str]]:
+                shown = _visible_entries(store, pl)
+                return len(shown), [
+                    _track_to_didl_item(t, base_url, obj_id, item_id=f"pi:{obj_id[3:]}:{i}",
+                                        subsong=sub)
+                    for i, t, sub in _page(shown)]
+            total, rows = await asyncio.to_thread(_entries)
+            parts += rows
+    # (Unknown obj_id: empty)
 
-    didl_parts.append("</DIDL-Lite>")
-    result = "".join(didl_parts)
-
-    return {
-        "Result":         result,
-        "NumberReturned": str(returned),
-        "TotalMatches":   str(total),
-        "UpdateID":       str(_system_update_id),
-    }
+    return _didl(parts, len(parts), total)
 
 
 # ── ConnectionManager control + event stubs ────────────────────────────────

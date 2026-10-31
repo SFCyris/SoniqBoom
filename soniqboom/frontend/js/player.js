@@ -79,10 +79,17 @@ export const Player = (() => {
         // The × hides with its badge, which would drop keyboard focus to
         // <body>: move it to Play (which starts the track again).
         const hadFocus = _convertBadge.contains(document.activeElement);
-        _cancelPendingStart();
+        _onBadgeCancel();
         if (hadFocus) document.getElementById('btn-play')?.focus();
       });
     }
+  }
+  // The badge's × (either layout): waiting for a streaming-quality
+  // conversion to seek, only the seek is called off — the track plays on
+  // where it is; else the start of the track is stopped.
+  function _onBadgeCancel() {
+    if (_convertSeekWaiting) _cancelConvertSeek();
+    else _cancelPendingStart();
   }
   function _hideConvertBadge() {
     // UI-only cleanup — does NOT stop the transcode poll.
@@ -307,7 +314,7 @@ export const Player = (() => {
       cancelBtn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        _cancelPendingStart();
+        _onBadgeCancel();
       });
       _convertBadge.appendChild(label);
       _convertBadge.appendChild(bar);
@@ -935,7 +942,9 @@ export const Player = (() => {
     _nextPreload = { id: next.id, subsong: nextSub, url: null, abort };
     // No ``pg``: a preload is not a play start of this page (the server would
     // count it as one and retire the page's prewarms / the current render).
-    fetch(`/api/stream/${next.id}${nextSub !== null ? `?subsong=${nextSub}` : ''}`,
+    const preQs = new URLSearchParams(_qualityParams(next) || {});
+    if (nextSub !== null) preQs.set('subsong', String(nextSub));
+    fetch(`/api/stream/${next.id}${preQs.toString() ? `?${preQs}` : ''}`,
           { signal: abort.signal })
       .then(res => {
         if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1339,12 +1348,16 @@ export const Player = (() => {
         return f;
       });
 
-      // Restore saved gains before first connection
+      // Restore saved gains before first connection.  ``sb_eq`` is the
+      // equalizer's settings object {gains, style, trim} (an older build
+      // stored the bare gains array — both are read).
       try {
-        const saved = localStorage.getItem('sb_eq');
-        if (saved) {
-          const gains = JSON.parse(saved);
-          gains.forEach((g, i) => { if (eqFilters[i]) eqFilters[i].gain.value = g; });
+        const saved = JSON.parse(localStorage.getItem('sb_eq') || 'null');
+        const gains = Array.isArray(saved) ? saved : (saved && Array.isArray(saved.gains) ? saved.gains : null);
+        if (gains) {
+          gains.forEach((g, i) => {
+            if (eqFilters[i] && Number.isFinite(g)) eqFilters[i].gain.value = g;
+          });
         }
       } catch (_) {}
 
@@ -1380,12 +1393,132 @@ export const Player = (() => {
         ctx.addEventListener('statechange', () => {
           if (!ctx) return;
           if ((ctx.state === 'suspended' || ctx.state === 'interrupted')
-              && audio && !audio.paused) {
+              && ((audio && !audio.paused) || _extPlaying())) {
             ctx.resume().catch(() => {});
           }
         });
       } catch (_) { /* engine without EventTarget support — visibility handler still covers tab cases */ }
     }
+    // The EQ graph exists now: equalizer.js puts its pre-gain, bypass and
+    // gains on the new nodes (they were built from the saved gains alone).
+    if (ctx && eqFilters.length) emit('eqready', { filters: eqFilters });
+  }
+
+  // ── EQ panel taps ─────────────────────────────────────────────────────────
+  // Analysers for the equalizer panel: ``pre`` on the pre-gain output (before
+  // the EQ filters) and ``post`` on the ReplayGain output (what is played) for
+  // the spectrum, and ``peaks`` — one per channel, behind a splitter, because
+  // an analyser mixes its input down to mono — for the clip lamp.  All are
+  // fan-outs like ``vuAnalyser`` (nothing heard changes), connected only while
+  // the panel is open: eqTaps() on open, releaseEqTaps() on close.
+  let _eqTaps = null;
+  function eqTaps() {
+    if (!ctx || !eqPreGain || !replayGain) return null;
+    try {
+      if (!_eqTaps) {
+        const mk = (smoothing) => {
+          const a = ctx.createAnalyser();
+          a.fftSize = 4096;
+          a.smoothingTimeConstant = smoothing;
+          a.minDecibels = -110;
+          a.maxDecibels = 0;
+          return a;
+        };
+        _eqTaps = {
+          pre: mk(0.5), post: mk(0.5), peaks: [mk(0), mk(0)],
+          split: ctx.createChannelSplitter(2), connected: false,
+        };
+      }
+      if (!_eqTaps.connected) {
+        const t = _eqTaps;
+        eqPreGain.connect(t.pre);
+        replayGain.connect(t.post);
+        replayGain.connect(t.split);
+        t.split.connect(t.peaks[0], 0);
+        t.split.connect(t.peaks[1], 1);
+        t.connected = true;
+      }
+    } catch (_) { releaseEqTaps(); return null; }
+    return _eqTaps;
+  }
+  function releaseEqTaps() {
+    const t = _eqTaps;
+    if (!t) return;
+    try { eqPreGain.disconnect(t.pre); } catch (_) {}
+    try { replayGain.disconnect(t.post); } catch (_) {}
+    try { replayGain.disconnect(t.split); } catch (_) {}
+    try { t.split.disconnect(); } catch (_) {}
+    t.connected = false;
+  }
+
+  // ── Stereo VU taps (the Retro player bar's twin needle meters) ─────────────
+  // One analyser per channel behind a splitter on the main analyser's output —
+  // what is heard, the crossfade tail (_xfRouteTail) included; an analyser
+  // passes its input through and mixes down to mono, hence the splitter — read
+  // as time-domain samples.  A 2-channel "speakers" gain in front of the
+  // splitter up-mixes a mono source to both sides (a splitter alone leaves
+  // channel 1 silent: a mono SID showed on L only).  Fan-outs like
+  // ``vuAnalyser``, connected only while the needles show: vuTaps() when they
+  // start, releaseVuTaps() when they stop.
+  let _vuTaps = null;
+  // Another element routed through this graph at the EQ's input — the phone's
+  // radio (mobile/radio-player.js) — so the equalizer, the analyser and the VU
+  // taps follow it.  Like ``source``, one MediaElementSource per element, for
+  // good: that element plays only through the graph from then on.  False when
+  // there's no graph.  (Call it from a user gesture: it may create the context.)
+  const _extSources = new WeakMap();
+  const _extEls = new Set();             // (the routed elements: one plays → keep the context running)
+  const _extPlaying = () => { for (const el of _extEls) if (!el.paused) return true; return false; };
+  function routeExternalAudio(el) {
+    _initAudioContext();
+    if (!ctx || !eqPreGain || !el) return false;
+    try {
+      if (!_extSources.has(el)) {
+        const s = ctx.createMediaElementSource(el);
+        s.connect(eqPreGain);
+        _extSources.set(el, s);
+        _extEls.add(el);
+      }
+      if (replayGain) replayGain.gain.value = 1.0;     // this player's track's gain
+      if (ctx.state !== 'running') ctx.resume().catch(() => {});
+      return true;
+    } catch (_) { return false; }
+  }
+  function vuTaps() {
+    const from = analyser || replayGain;
+    if (!ctx || !from) return null;
+    try {
+      if (!_vuTaps) {
+        const mk = () => {
+          const a = ctx.createAnalyser();
+          a.fftSize = 1024;
+          a.smoothingTimeConstant = 0;
+          return a;
+        };
+        const up = ctx.createGain();
+        up.channelCount = 2;
+        up.channelCountMode = 'explicit';
+        up.channelInterpretation = 'speakers';
+        _vuTaps = { from, up, split: ctx.createChannelSplitter(2), ch: [mk(), mk()], connected: false };
+      }
+      if (!_vuTaps.connected) {
+        const t = _vuTaps;
+        t.from.connect(t.up);
+        t.up.connect(t.split);
+        t.split.connect(t.ch[0], 0);
+        t.split.connect(t.ch[1], 1);
+        t.connected = true;
+      }
+    } catch (_) { releaseVuTaps(); return null; }
+    return _vuTaps;
+  }
+  function releaseVuTaps() {
+    const t = _vuTaps;
+    if (!t) return;
+    try { t.from.disconnect(t.up); } catch (_) {}
+    try { t.up.disconnect(); } catch (_) {}
+    try { t.split.disconnect(); } catch (_) {}
+    t.connected = false;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1446,6 +1579,38 @@ export const Player = (() => {
    *  call time); the service worker's offline match ignores the query, so it
    *  never splits the download cache.
    */
+  // ── Streaming quality (per device) ─────────────────────────────────────
+  // ``sb_stream_quality``: '' / 'original' (the file as it is — the default)
+  // or a bitrate cap in kbps ('320', '192', '128', '96').  With a cap, ordinary
+  // audio files (not the retro renders, not internet radio, not a track
+  // downloaded for offline, not in a multi-room room — ``setQualityOff``)
+  // are asked for with ``maxBitRate=N``: the server converts a file above the
+  // cap — a live encode at once, cached for seeks and replays — and sends one
+  // at or below it as it is.
+  const QUALITY_KEY = 'sb_stream_quality';
+  const QUALITY_KBPS = new Set([320, 192, 128, 96]);
+  // The ordinary audio formats (core/metadata.py labels: "Ogg Vorbis", "DSD64" …).
+  const _CAPPABLE_FORMAT_RE = /^(MP3|FLAC|WAV|WAVE|AIFF?|ALAC|AAC|M4A|MP4|OGG|OGG VORBIS|VORBIS|OPUS|DSD\d*|DSF|DFF|APE|MONKEY'?S AUDIO|WV|WAVPACK|WMA|MPC|MUSEPACK|TTA|TAK)$/;
+  let _qualityOff = false;
+  // The cap the current track's stream was asked with (null: the original) —
+  // a setting changed meanwhile applies from the next track, also to seeks.
+  let _curCap = null;
+  function _qualityKbps() {
+    if (_qualityOff) return 0;
+    let v = 0;
+    try { v = parseInt(localStorage.getItem(QUALITY_KEY) || '0', 10); } catch (_) { /* private mode */ }
+    return QUALITY_KBPS.has(v) ? v : 0;
+  }
+  function _qualityParams(t) {
+    const kbps = _qualityKbps();
+    if (!kbps || !t || !t.id || _stationMode || _isDownloaded(t.id) || _isRenderedTrack(t)) return null;
+    const fmts = String(t.format || '').toUpperCase().split('/').map(x => x.trim());
+    if (!fmts.some(f => _CAPPABLE_FORMAT_RE.test(f))) return null;
+    // (a bitrate cap only: the server sends a file at or below it as it is,
+    // and converts one above it — to MP3 for lossless, in its own codec else)
+    return { maxBitRate: String(kbps) };
+  }
+
   function _streamUrl(id, params = {}) {
     let url = `/api/stream/${id}`;
     const qs = new URLSearchParams(params);
@@ -1579,11 +1744,33 @@ export const Player = (() => {
     const m = String(val).match(/(-?\d+(\.\d+)?)/);
     return m ? parseFloat(m[1]) : null;
   }
+  // An overloaded tracker render (its 32-bit float mix peaks past full scale)
+  // plays turned down by exactly its overshoot — render-status ``peak``,
+  // ``_watchRenderLength`` — whatever the ReplayGain mode, on top of any
+  // ReplayGain.  Peaks seen this page load are kept, so a replay starts at the
+  // right level; a first play gets it once the render is complete.
+  const _renderPeaks = new Map();         // `${id}~${subsong}` → peak (linear)
+  function _peakKey(t) {
+    return t ? `${t.id}~${Number.isInteger(t.subsong) ? t.subsong : ''}` : '';
+  }
+  function _renderGainFor(t) {
+    const p = t ? _renderPeaks.get(_peakKey(t)) : undefined;
+    return (p && p > 1) ? 1 / p : 1.0;
+  }
+  function _noteRenderPeak(t, peak) {
+    if (!t || !(peak > 0) || !Number.isFinite(peak)) return;
+    _renderPeaks.set(_peakKey(t), peak);
+    if (_renderPeaks.size > 500) _renderPeaks.delete(_renderPeaks.keys().next().value);
+    if (_track && _track.id === t.id) { try { _applyReplayGain(_track); } catch (_) {} }
+  }
+
   function _applyReplayGain(track) {
     if (!replayGain) return;             // Web Audio not initialised yet
+    if (_extAudio) { replayGain.gain.value = 1.0; return; }   // the phone's radio plays through it
     const mode = _getRgMode();
+    const render = _renderGainFor(track);
     if (mode === 'off' || !track) {
-      replayGain.gain.value = 1.0;
+      replayGain.gain.value = render;
       return;
     }
     const albumDb   = _parseRgDb(track.replaygain_album_gain);
@@ -1613,8 +1800,8 @@ export const Player = (() => {
            : ((albumPeak !== null && albumPeak !== undefined) ? albumPeak : null);
     }
     if (db === null || db === undefined) {
-      // No tags — leave the chain at unity gain.  Graceful no-op.
-      replayGain.gain.value = 1.0;
+      // No tags — leave the chain at unity gain (but an overloaded render's).
+      replayGain.gain.value = render;
       return;
     }
     // Convert dB → linear: 10^(dB/20).
@@ -1630,7 +1817,7 @@ export const Player = (() => {
     linear = Math.max(0.001, Math.min(linear, 3.98));
     // Defence in depth: a non-finite value would throw on gain.value assignment.
     if (!Number.isFinite(linear)) linear = 1.0;
-    replayGain.gain.value = linear;
+    replayGain.gain.value = linear * render;
   }
 
   // ── Internet-radio station mode ────────────────────────────────────────────
@@ -1793,6 +1980,7 @@ export const Player = (() => {
     const _fmtUp  = (track.format || '').toUpperCase();
     const _native = _nativeForThisBrowser(_fmtUp);
     _isTranscoded  = false;
+    _curCap = null;                // (_streamUrlFor sets it for this track's stream)
     // _needsConvert covers ALL non-native formats: both server-transcoded
     // (DSD/ALAC/AIFF) and rendered (SID/MIDI/tracker).  Used only to gate
     // the "Converting…" badge timer, not the seek path.
@@ -2415,6 +2603,7 @@ export const Player = (() => {
     params.set('priority', next ? 'next' : 'ahead');
     if (Number.isInteger(t.subsong)) params.set('subsong', String(t.subsong));
     if (t.path) params.set('path', t.path);
+    for (const [k, v] of Object.entries(_qualityParams(t) || {})) params.set(k, v);
     params.set('pw', PREWARM_PAGE_ID);
     return `/api/stream/${t.id}/prewarm?${params}`;
   }
@@ -2541,6 +2730,7 @@ export const Player = (() => {
   const RENDER_LENGTH_POLL_MS = 2000;
   const RENDER_LENGTH_SLACK_SEC = 1.5;
   const RENDER_LENGTH_BUDGET_MS = 5 * 60 * 1000;
+  const RENDER_PEAK_QUICK_MS = 3000;
   function _watchRenderLength(t, seq) {
     if (!t || !_isRenderedTrack(t)) return;
     const fmt = String(t.format || '').toUpperCase();
@@ -2562,6 +2752,7 @@ export const Player = (() => {
         const exact = (j && Number(j.duration_seconds)) || 0;
         const bogus = !isFinite(d) || d <= 0 || (exact > 0 ? d > exact + 30 : d > PROVISIONAL_LENGTH_SEC);
         if (j && j.state === 'complete') {
+          if (Number(j.peak) > 0) _noteRenderPeak(t, Number(j.peak));
           if (exact > 0) {
             _metaDuration = exact;
             // A tune other than the file's default one carries no stored
@@ -2590,7 +2781,10 @@ export const Player = (() => {
           // keeps seeking on.
           _provisional = j.provisional === true || bogus;
         }
-        await new Promise((res) => setTimeout(res, RENDER_LENGTH_POLL_MS));
+        // Quick at first: a tracker render completes in well under a second,
+        // and its peak (above) is wanted before much of it has played.
+        const quick = Date.now() < until - RENDER_LENGTH_BUDGET_MS + RENDER_PEAK_QUICK_MS;
+        await new Promise((res) => setTimeout(res, quick ? 250 : RENDER_LENGTH_POLL_MS));
       }
       if (current()) _provisional = false;   // budget spent — trust the element again
     })();
@@ -2703,6 +2897,14 @@ export const Player = (() => {
     }
 
     _seekOffset = 0;
+    // A streaming-quality stream still being converted comes from a live
+    // encode the browser can't jump around in (WebKit stalls on a far seek):
+    // a place not buffered yet waits for the converted file, which then plays
+    // from there with Range (_seekWhenConverted).
+    if (_cappedLive() && !_isBuffered(targetSec)) {
+      _seekWhenConverted(targetSec);
+      return;
+    }
     // ``audio.readyState`` < HAVE_METADATA means the browser doesn't know
     // the duration yet — setting ``audio.currentTime`` is silently clamped
     // to 0 and the user lands at the start.  This is the DSD-first-play
@@ -2723,6 +2925,82 @@ export const Player = (() => {
     // Cached file path served with HTTP Range — native ``audio.currentTime``
     // triggers a server-side byte-range GET.  No URL reload needed.
     audio.currentTime = targetSec;
+  }
+
+  // ── Seeking in a streaming-quality stream not converted yet ─────────────
+  // The current track plays capped (``_qualityParams``) from a live encode:
+  // the element knows no length (the converted file isn't cached yet).
+  function _cappedLive() {
+    return !!(_track && trackId === _track.id && _curCap)
+      && !(isFinite(audio.duration) && audio.duration > 0);
+  }
+  function _isBuffered(sec) {
+    const b = audio.buffered;
+    for (let i = 0; i < b.length; i++) if (b.start(i) <= sec && sec < b.end(i) - 0.5) return true;
+    return false;
+  }
+  // Ask the server for the converted file (one byte of it: 206 once it is
+  // cached — a live answer, 200, is dropped at once and asked again a second
+  // later; no ``pg``: it is no play start), then play it from ``targetSec``.
+  // A newer seek, another track or the badge's × ends the wait.
+  const CONVERT_SEEK_WAIT_MS = 120000;
+  let _convertSeekRun = 0;
+  let _convertSeekWaiting = false;      // the badge's × then cancels only the seek
+  function _cancelConvertSeek() {
+    _convertSeekRun++;
+    _convertSeekWaiting = false;
+    _hideConvertBadge();
+  }
+  async function _seekWhenConverted(targetSec) {
+    const run = ++_convertSeekRun;
+    const seq = _playSeq, id = trackId, t = _track;
+    const stale = () => run !== _convertSeekRun || seq !== _playSeq || trackId !== id;
+    const qs = new URLSearchParams(_curCap || {});
+    if (Number.isInteger(t.subsong)) qs.set('subsong', String(t.subsong));
+    if (t.path) qs.set('path', t.path);
+    const probe = `/api/stream/${encodeURIComponent(id)}?${qs}`;
+    _convertSeekWaiting = true;
+    _showConvertBadge();
+    const until = Date.now() + CONVERT_SEEK_WAIT_MS;
+    for (;;) {
+      const ac = new AbortController();
+      let ready = false;
+      try {
+        const r = await fetch(probe, { headers: { Range: 'bytes=0-0' }, cache: 'no-store',
+                                       credentials: 'same-origin', signal: ac.signal });
+        ready = r.status === 206;
+      } catch (_) { /* offline / aborted: asked again */ }
+      ac.abort();
+      if (stale()) return;
+      if (ready) break;
+      if (Date.now() > until) {
+        _convertSeekWaiting = false;
+        _hideConvertBadge();
+        Toast.error('This track is still being converted — try the seek again in a moment.');
+        return;
+      }
+      await new Promise((res) => setTimeout(res, 1000));
+      if (stale()) return;
+    }
+    _convertSeekWaiting = false;
+    // (paused meanwhile: it stays paused — at the new place)
+    const wasPlaying = !audio.paused;
+    // (a one-shot seek on the file's metadata — the new source's 'loadstart'
+    // drops ``_pendingSeekSec``, as in the render recovery)
+    const at = () => Math.min(targetSec, (isFinite(audio.duration) && audio.duration > 0)
+      ? audio.duration - 0.1 : targetSec);
+    const seekOnMeta = () => { if (!stale()) { try { audio.currentTime = at(); } catch (_) {} } };
+    audio.addEventListener('loadedmetadata', seekOnMeta, { once: true });
+    audio.src = _freshUrl(_streamUrlFor(id));
+    audio.load();
+    if (wasPlaying) {
+      try {
+        await audio.play();
+        // (an engine that dropped the one-shot: land there now)
+        if (!stale() && Math.abs((audio.currentTime || 0) - at()) > 2) audio.currentTime = at();
+      } catch (_) { audio.removeEventListener('loadedmetadata', seekOnMeta); }
+    }
+    if (!stale()) _hideConvertBadge();
   }
 
   async function playPause() {
@@ -4011,6 +4289,30 @@ export const Player = (() => {
     _saveQueueSoon();
   }
 
+  // Several tracks, in order — the same as addToQueue for each, with one copy of
+  // the queue and one queuechange (adding thousands one by one copied the queue
+  // and re-rendered the queue panel per track).  With opts.auto each goes behind
+  // what is already lined up next, exactly as one by one.
+  function addAllToQueue(tracks, opts = {}) {
+    const list = Array.from(tracks || []);
+    if (!list.length) return;
+    const q = opts.auto ? queue.slice() : null;
+    for (const track of list) {
+      if (track && typeof track === 'object') {
+        if (opts.auto) _auto.add(track); else _manual.add(track);
+        if (track.id) _shufExtras.add(track.id);
+      }
+      if (q) {                      // (each placed as addToQueue would, on one copy)
+        let at = queueIdx + 1;
+        while (at < q.length && (_auto.has(q[at]) || _manual.has(q[at]))) at++;
+        q.splice(at, 0, track);
+      }
+    }
+    queue = q || [...queue, ...list];
+    emit('queuechange', { queue, queueIdx });
+    _saveQueueSoon();
+  }
+
   // The radio mix that is actually UP NEXT: the run of mix / hand-queued rows
   // right after the current track.  A mix row the listener dragged far down the
   // queue must not count, or the radio would think it still has plenty queued.
@@ -4172,6 +4474,10 @@ export const Player = (() => {
     _extAudio = !!v;
     if (_extAudio) _cancelCrossfade();   // (the output went elsewhere: no tail fading on here)
     if (_extAudio) _noteStart();     // the phone's radio took the output
+    if (_extAudio && replayGain) replayGain.gain.value = 1.0;   // (routeExternalAudio's listener)
+    // Back to the library: its track's gain again (routeExternalAudio held it
+    // at 1 — also for a tune-in that never went live and left the track loaded).
+    if (!_extAudio) { try { _applyReplayGain(_track); } catch (_) { /* never fatal */ } }
   }
 
   function toggleRepeat() {
@@ -4251,7 +4557,14 @@ export const Player = (() => {
       _resumeSeek = null;
       if (r.seq === _playSeq && isFinite(audio.duration) && audio.duration > r.sec + 1) {
         try { audio.currentTime = r.sec; } catch (_) { /* race with track change */ }
+      } else if (r.seq === _playSeq && r.sec > 1 && _cappedLive()) {
+        _seekWhenConverted(r.sec);          // (a capped stream not converted yet)
       }
+    }
+    if (_pendingSeekSec !== null && _cappedLive()) {
+      const at = _pendingSeekSec;
+      _pendingSeekSec = null;
+      _seekWhenConverted(at);
     }
     if (_pendingSeekSec !== null && isFinite(audio.duration) && audio.duration > 0) {
       const target = Math.min(_pendingSeekSec, audio.duration - 0.1);
@@ -4492,7 +4805,8 @@ export const Player = (() => {
     for (const idx of idxs) {
       const t = queue[idx];
       if (!t || !t.id) continue;
-      if (_isNativeFormat(t.format)) {
+      // (a streaming-quality cap: the server prepares the MP3 — prewarm below)
+      if (_isNativeFormat(t.format) && !_qualityParams(t)) {
         // Cheap browser-cache warmup — only worth doing for N+1, skip N+2
         // since the first track's loadstart will trigger native preload.
         if (idx !== n1) continue;
@@ -4729,6 +5043,10 @@ export const Player = (() => {
     if (_track && _track.id === id && Number.isInteger(_track.subsong)) {
       params.subsong = String(_track.subsong);
     }
+    if (_track && _track.id === id) {
+      _curCap = _qualityParams(_track);
+      Object.assign(params, _curCap);
+    }
     return _streamUrl(id, params);
   }
 
@@ -4868,7 +5186,7 @@ export const Player = (() => {
       // failure report is said after all)
       setTimeout(() => _codecRetryEnd(seq, false), 30000);
       const wasAt = audio.currentTime || 0;
-      audio.src = _streamUrl(id, { force_transcode: '1' });
+      audio.src = _streamUrl(id, { force_transcode: '1', ...(_curCap || {}) });
       audio.load();
       const _onReady = () => {
         audio.removeEventListener('canplay', _onReady);
@@ -5034,6 +5352,10 @@ export const Player = (() => {
     get ctx()            { return ctx; },
     get eqFilters()      { return eqFilters; },
     get eqPreGain()      { return eqPreGain; },
+    // The EQ band definitions {freq, type, Q} (exist before the graph does).
+    get eqBandDefs()     { return EQ_BAND_DEFS.map(d => ({ ...d })); },
+    eqTaps, releaseEqTaps,
+    vuTaps, releaseVuTaps, routeExternalAudio,
     get replayGain()     { return replayGain; },
     get currentTrackId() { return trackId; },
     // The track the now-playing markers show: the current one, unless its
@@ -5050,6 +5372,21 @@ export const Player = (() => {
     get audio()          { return audio; },
     // This page's ``pw=`` tag for prewarm requests made elsewhere (row hover).
     get prewarmId()      { return PREWARM_PAGE_ID; },
+    // Streaming quality (per device; '' = the original file): read / set —
+    // a new setting applies from the next track.  ``setQualityOff``: this
+    // page always plays the original (a multi-room room).
+    get streamQuality() {
+      try { return localStorage.getItem(QUALITY_KEY) || ''; } catch (_) { return ''; }
+    },
+    setStreamQuality(v) {
+      const n = parseInt(v, 10);
+      try {
+        if (QUALITY_KBPS.has(n)) localStorage.setItem(QUALITY_KEY, String(n));
+        else localStorage.removeItem(QUALITY_KEY);
+      } catch (_) { /* private mode: the original */ }
+      emit('qualitychange', { quality: QUALITY_KBPS.has(n) ? String(n) : '' });
+    },
+    setQualityOff(on) { _qualityOff = !!on; },
     getAudioContext()    { return ctx; },
     getSourceNode()      { return source; },
     fmt,
@@ -5066,7 +5403,7 @@ export const Player = (() => {
                       ordNext: _ordNext, shufNext: _shufNext, ended: _srcEnded,
                       hasMore: _srcHasMore() } : null;
     },
-    addToQueue, playNext, insertAfterTrack, removeFromQueue, moveInQueue,
+    addToQueue, addAllToQueue, playNext, insertAfterTrack, removeFromQueue, moveInQueue,
     playStation, stopStation, updateStationArt, setStationNowPlaying,
     get stationMode() { return _stationMode; },
     get station()     { return _station; },

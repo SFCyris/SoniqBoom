@@ -2141,6 +2141,8 @@ class OnlineCatalogue:
                     return self.status()
                 self._status.update(state="ready" if self.enabled() else "off", phase="",
                                     last_result=res, shrink_refused=False)
+                from soniqboom.core import source_twins
+                source_twins.schedule()      # tunes came or went: library twins
                 return self.status()
         finally:
             if me is not None:
@@ -2629,6 +2631,8 @@ class OnlineCatalogue:
             log.warning("%s merge of %s failed", self.label, track_id, exc_info=True)
         finally:
             self._merging.discard(track_id)
+            from soniqboom.core import source_twins
+            source_twins.schedule()          # its file_md5 may make it a library twin
 
 
 def _iso_date(value) -> str | None:

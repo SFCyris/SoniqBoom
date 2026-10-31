@@ -19,6 +19,17 @@
  *   Same track ID added twice     → amber "2×" pill (mistake indicator)
  *   Same song, different location → muted "⧉" icon (info indicator)
  *
+ * The open playlist: a header (playlist/hero.js — cover mosaic, who shares it,
+ * name, tracks · length · format mix, Play / Shuffle / Share / ⋯ / Style) over
+ * rows with a cover, title + artist, a format chip, a mini waveform (the
+ * stored one — playlist/waves.js; the playing row shows its progress in it)
+ * and the length.  Two looks, Modern and Retro hi-fi (a cassette J-card),
+ * shared with the equalizer and Stations (ui_style.js) — the CSS is
+ * css/playlist-styles.css.  Reordering shows a drop line and animates the
+ * rows to their new places; imported and smart playlists can't be reordered.
+ * The waveform painter, the glide, the drop line and the touch long-press are
+ * shared with the queue panel (playlist/listkit.js).
+ *
  * Exports: Playlist singleton
  */
 import { Player } from './player.js';
@@ -28,6 +39,14 @@ import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
 import { healthBadgeHTML } from './health.js';
 import { Auth } from './auth.js';
+import { getUiStyle, onUiStyleChange } from './ui_style.js';
+import { vizGroupEnabled } from './viz/engine.js';
+import { createHero, fmtShort, fmtFamily } from './playlist/hero.js';
+import { createWaveStore } from './playlist/waves.js';
+import {
+  createWavePainter, rowTops, flipFrom, clearFlip, createDropLine, gapAt, bindLongPressDrag,
+  fmtDur, esc, NARROW_WAVES,
+} from './playlist/listkit.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const panel       = document.getElementById('playlist-panel');
@@ -52,11 +71,24 @@ const btnImport   = document.getElementById('btn-playlist-import');
 const btnShare    = document.getElementById('btn-playlist-share');
 const btnUnsub    = document.getElementById('btn-playlist-unsub');
 
+// The open playlist's header (cover mosaic, name, stats, actions, Style).
+const _hero = createHero({
+  panel, after: hdrTracks, shareBtn: btnShare, unsubBtn: btnUnsub,
+  onPlay: () => _heroPlay(),
+  onShuffle: () => _heroShuffle(),
+  menuItems: () => _heroMenuItems(),
+});
+panel.dataset.plStyle = getUiStyle();
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let _playlists    = [];
 let _activeId     = null;
 let _activeTracks = [];
 let _activeRO     = false;   // the open playlist is someone else's (imported): no edits
+let _activeSmart  = false;   // a smart playlist (a saved search): no reorder / remove
+let _activeData   = null;    // GET /playlists/{id} of the open playlist (owner_name, subscriber_count…)
+let _queuedFrom   = null;    // the playlist whose Play / row click made the current queue
+let _queuedObjs   = new Set(); // …and the entry objects it handed the player (identity)
 let _addDropdown  = null;
 
 // ── Selection state ───────────────────────────────────────────────────────────
@@ -64,9 +96,7 @@ let _selectedIdxs = new Set();   // selected row indices
 let _anchorIdx    = null;        // Shift-click anchor
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function esc(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+// (esc / fmtDur: playlist/listkit.js)
 
 // Inline styled confirm — installed synchronously so playlist.js never falls
 // back to the OS-native ``confirm()`` (which is blocking, ugly, and ignores
@@ -119,11 +149,6 @@ function _inlineConfirm(message, { title = 'Confirm', okLabel = 'OK' } = {}) {
 // property isn't already set.
 if (!window.__sbConfirm) {
   window.__sbConfirm = _inlineConfirm;
-}
-function fmtDur(sec) {
-  if (!sec) return '';
-  const m = Math.floor(sec / 60), s = Math.floor(sec % 60).toString().padStart(2, '0');
-  return `${m}:${s}`;
 }
 async function _api(path, opts = {}) {
   const res = await fetch(`/api${path}`, opts);
@@ -254,7 +279,11 @@ function _showListView() {
   _activeTracks = [];
   _clearSelection();
   _activeRO = false;
-  panel.classList.remove('pl-readonly');
+  _activeSmart = false;
+  _activeData = null;
+  panel.classList.remove('pl-readonly', 'pl-smart', 'plx-open');
+  _hero.hide();
+  _hideDropLine();
   hdrList.hidden   = false;
   hdrTracks.hidden = true;
   listEl.hidden    = false;
@@ -348,12 +377,18 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   _activeTracks = loadedTracks;   // commit only after confirming we're still current
   const summary = _playlists.find(p => p.id === id) || {};
   _activeRO = !!(loadedData && loadedData.read_only);
+  _activeSmart = !!(loadedData && (loadedData.smart || loadedData.query)) || !!summary.smart;
+  _activeData = loadedData;
   panel.classList.toggle('pl-readonly', _activeRO);
+  panel.classList.toggle('pl-smart', _activeSmart);
+  panel.classList.add('plx-open');
+  if (_focusPanel) _waves.forgetMissing();   // (opened again: tracks played since may have one now)
   if (btnShare) {
     // (a readonly owner may still unshare a playlist shared before)
     btnShare.hidden = _activeRO || (!_canShare() && !summary.shared);
     btnShare.textContent = summary.shared ? 'Shared ✓' : 'Share';
     btnShare.classList.toggle('active', !!summary.shared);
+    btnShare.setAttribute('aria-pressed', String(!!summary.shared));
   }
   if (btnUnsub) btnUnsub.hidden = !_activeRO;
 
@@ -420,8 +455,13 @@ function _makePlRow() {
         <div class="queue-track-titlerow"><span class="queue-track-title"></span></div>
         <span class="queue-track-artist"></span>
       </div>
+      <span class="plx-fmt"></span>
+      <span class="plx-wave-wrap" aria-hidden="true"><canvas class="plx-wave"></canvas></span>
       <span class="queue-track-dur"></span>
       <button class="queue-remove-btn" title="Remove from playlist">&times;</button>`;
+  row.classList.add('plx-row');
+  row.__wave = row.querySelector('.plx-wave');
+  row.__fmt = row.querySelector('.plx-fmt');
   // The cover fades in on a successful decode; on error the <img> STAYS (it's
   // opacity:0, so the placeholder shows through and no broken glyph renders)
   // and just drops ``loaded``.  Keeping it in the DOM is what lets remote
@@ -457,7 +497,7 @@ function _fillPlRow(row, i) {
   // A playlist lists every entry ("Tracks on unavailable drives: Hide" never
   // drops one): an entry that can't play right now is marked instead.
   const offKind = offlineKind(track);
-  row.className = 'queue-row'
+  row.className = 'queue-row plx-row'
     + (isCurrent  ? ' playing'  : '')
     + (_selectedIdxs.has(i) ? ' selected' : '')
     + (isIdDup    ? ' dup-id'   : '')
@@ -482,6 +522,16 @@ function _fillPlRow(row, i) {
   if (row.__titleHtml !== titleHtml) { titleRow.innerHTML = titleHtml; row.__titleHtml = titleHtml; }
   row.querySelector('.queue-track-artist').textContent = track.artist || track.album_artist || '';
   row.querySelector('.queue-track-dur').textContent = fmtDur(track.duration);
+  // Format chip + mini waveform (the playing row: with its progress).
+  const fl = fmtShort(track), fam = fmtFamily(track);
+  if (row.__fmtTxt !== fl || row.__fmtFam !== fam) {
+    row.__fmt.textContent = fl;
+    row.__fmt.className = `plx-fmt plx-fam-${fam}`;
+    row.__fmt.title = track.format || fl;
+    row.__fmtTxt = fl; row.__fmtFam = fam;
+  }
+  row.__trk = track;
+  _paintWave(row, track, isCurrent ? _curPct : -1);
 
   // ── Cover: always ask /api/art (``track.cover_art`` is only set when art was
   // extracted at scan time; the endpoint extracts on demand).  ``fallback=none``
@@ -510,9 +560,60 @@ const _plVL = createVirtualList({
   setSpacer: (el, px) => { el.style.height = px + 'px'; },
 });
 
+// ── Mini waveforms ────────────────────────────────────────────────────────────
+// The stored waveforms of the rows on screen, asked in one batch; a row whose
+// answer arrives is repainted in place.
+const _waves = createWaveStore({
+  onReady(ids) {
+    if (!_plVL.active) return;
+    const got = new Set(ids);
+    for (const row of _plVL.rows()) {
+      const t = _activeTracks[+row.dataset.idx];
+      if (t && got.has(t.id)) _paintWave(row, t, _isCurrentEntry(t) ? _curPct : -1);
+    }
+  },
+});
+let _curPct = 0;              // the playing entry's progress 0..1 (player timeupdate)
+// A subsong entry gets the placeholder: the stored waveform is the file's
+// default tune's.
+const _painter = createWavePainter({ store: _waves, colorsFrom: panel, prefix: 'plx', stored: (t) => _plSubKey(t) === null });
+
+// Layout / look / theme changed: measure + read the colours again, repaint.
+function _waveRelayout() {
+  _painter.invalidate(_plVL.active ? _plVL.rows() : []);
+  if (!_plVL.active) return;
+  for (const row of _plVL.rows()) {
+    const t = _activeTracks[+row.dataset.idx];
+    if (t) _paintWave(row, t, _isCurrentEntry(t) ? _curPct : -1);
+  }
+}
+
+// Paint ``row``'s mini waveform.
+function _paintWave(row, track, progress = -1) { _painter.paint(row, track, progress); }
+
+// The rendered rows of the playing entry (an entry in the list twice: both).
+function _playingRows() {
+  const out = [];
+  if (!_plVL.active) return out;
+  for (const row of _plVL.rows()) if (row.classList.contains('playing')) out.push(row);
+  return out;
+}
+
+// Animated touches (the progress sheen, Retro's turning reel) only while
+// visualizations are on and motion is welcome; and only while it plays.
+const _rmq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+function _syncMotion() {
+  panel.classList.toggle('plx-anim', vizGroupEnabled('nowPlaying') && !(_rmq && _rmq.matches));
+  panel.classList.toggle('plx-is-playing', !!Player.playing && !Player.startFailed);
+}
+window.addEventListener('sb:viz-settings', _syncMotion);
+if (_rmq && _rmq.addEventListener) _rmq.addEventListener('change', _syncMotion);
+
 // Move the now-playing marker on the rendered rows (a track change), and show
 // a length the player has learnt meanwhile (rendered formats).
 function _paintPlaying() {
+  _syncMotion();
+  _paintHeroPlaying();
   if (!_plVL.active) return;
   for (const row of _plVL.rows()) {
     const track = _activeTracks[+row.dataset.idx];
@@ -522,6 +623,7 @@ function _paintPlaying() {
     if (row.classList.contains('playing') === on) continue;
     row.classList.toggle('playing', on);
     row.querySelector('.queue-playing-icon').textContent = on ? '▶' : '';
+    if (track) _paintWave(row, track, on ? _curPct : -1);
   }
 }
 
@@ -529,6 +631,7 @@ function _paintPlaying() {
 // that was just opened starts at its first row; edits keep the scroll position.
 function _renderTracks(opts = {}) {
   _updateSelBar();
+  _renderHero();
 
   if (!_activeTracks.length) {
     _plVL.reset();
@@ -546,52 +649,20 @@ function _renderTracks(opts = {}) {
   _probePlaylistDurations();
 }
 
+// A click on a row focuses the list (not in the Tab order), so Delete / ⌫ after
+// a mouse selection reaches the panel's key handler below.
+tracksEl.tabIndex = -1;
+
 // ── Delegated row events ───────────────────────────────────────────────────────
 function _plRowOf(e) {
   const row = e.target.closest('.queue-row');
   return row && tracksEl.contains(row) && row.dataset.idx != null ? row : null;
 }
 
-// ── Touch long-press to begin drag ────────────────────────────────────────
-// Mirror queue.js: drag starts only after a 350 ms hold on the handle, and
-// only after the finger hasn't moved more than 8 px.  Movement before the
-// timer fires cancels — protects against accidental swipe drags during
-// scroll on touch screens.
-let _lpTimer = null, _lpStartX = 0, _lpStartY = 0, _lpRow = null;
-tracksEl.addEventListener('touchstart', (e) => {
-  if (e.touches.length !== 1 || !e.target.closest('.queue-drag-handle')) return;
-  const row = _plRowOf(e);
-  if (!row) return;
-  _lpRow = row;
-  _lpStartX = e.touches[0].clientX;
-  _lpStartY = e.touches[0].clientY;
-  clearTimeout(_lpTimer);
-  _lpTimer = setTimeout(() => {
-    _lpTimer = null;
-    row.draggable = true;
-    try { navigator.vibrate?.(8); } catch (_) {}
-  }, 350);
-}, { passive: true });
-tracksEl.addEventListener('touchmove', (e) => {
-  if (!_lpTimer) return;
-  const t = e.touches[0];
-  if (!t) return;
-  if (Math.hypot(t.clientX - _lpStartX, t.clientY - _lpStartY) > 8) {
-    clearTimeout(_lpTimer);
-    _lpTimer = null;
-  }
-}, { passive: true });
-tracksEl.addEventListener('touchend', () => {
-  if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-  const row = _lpRow;
-  _lpRow = null;
-  if (row) setTimeout(() => { row.draggable = false; }, 0);
-});
-tracksEl.addEventListener('touchcancel', () => {
-  if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-  if (_lpRow) _lpRow.draggable = false;
-  _lpRow = null;
-});
+// ── Touch long-press to begin drag (playlist/listkit.js) ─────────────────
+// A 350 ms hold on the handle, without moving more than 8 px, makes the row
+// draggable — a swipe that scrolls never starts a drag on a touch screen.
+bindLongPressDrag(tracksEl, _plRowOf);
 
 // ── Click: play / select / remove ───────────────────────────────────────────
 tracksEl.addEventListener('click', async (e) => {
@@ -626,13 +697,18 @@ tracksEl.addEventListener('click', async (e) => {
   } else {
     // Plain click, nothing selected → play
     _anchorIdx = i;
+    _noteQueued();
     Player.setQueue(_activeTracks, i);
   }
 });
 
 // ── Drag start / end (reorder) ─────────────────────────────────────────────
+// Own, ordinary playlists only: an imported one is read-only and a smart one's
+// order is its saved search's.
+function _canReorder() { return !!_activeId && !_activeRO && !_activeSmart; }
+
 tracksEl.addEventListener('dragstart', (e) => {
-  if (_activeRO) { e.preventDefault(); return; }       // (an imported playlist: no reorder)
+  if (!_canReorder()) { e.preventDefault(); return; }
   const row = _plRowOf(e);
   if (!row) return;
   const i = parseInt(row.dataset.idx, 10);
@@ -648,8 +724,40 @@ tracksEl.addEventListener('dragstart', (e) => {
   }
 });
 
+// The drop line: where the dragged rows will land (a gap between two rows).
+const _dropLine = createDropLine(panel);
+let _dropGap = -1;            // insert before this index (0..count); -1 = none
+
+function _hideDropLine() { _dropLine.hide(); _dropGap = -1; }
+
+// The gap the pointer points at: before the row under it (upper half) or after
+// it (lower half); below the last row → the end.  null = not over the list.
+function _gapAt(e) {
+  const row = _plRowOf(e);
+  if (row) return gapAt(e, row, null, _activeTracks.length);
+  let last = null;
+  for (const r of _plVL.rows()) if (!last || +r.dataset.idx > +last.dataset.idx) last = r;
+  return gapAt(e, null, last, _activeTracks.length);
+}
+
+// A drop into the dragged block itself (or right next to a contiguous one)
+// changes nothing.
+function _isNoopGap(gap) {
+  if (!_dragIdxs || !_dragIdxs.size) return false;
+  const idx = [..._dragIdxs].sort((a, b) => a - b);
+  const contiguous = idx[idx.length - 1] - idx[0] === idx.length - 1;
+  return contiguous && gap >= idx[0] && gap <= idx[idx.length - 1] + 1;
+}
+
+function _showDropLine(g) {
+  if (!g || _isNoopGap(g.gap)) { _hideDropLine(); return; }
+  _dropGap = g.gap;
+  _dropLine.show(g.y, tracksEl);
+}
+
 function _endPlDrag() {
   _dragIdxs = null;
+  _hideDropLine();
   tracksEl.querySelectorAll('.queue-row.dragging, .queue-row.dragging-over')
     .forEach(r => r.classList.remove('dragging', 'dragging-over'));
   // Drop the transient draggable flag (set during a touch long-press) so the
@@ -658,69 +766,81 @@ function _endPlDrag() {
 }
 tracksEl.addEventListener('dragend', _endPlDrag);
 
-// Library tracks dropped on the list add them; playlist rows dropped on a row
-// reorder.  (The list may have scrolled — and recycled the dragged row — while
-// dragging, so the drop goes by the indices carried in the drag data.)
+// Rows glide to their new places after a reorder (FLIP): remember where each
+// entry's row was, re-render, then animate every moved row from there.
+function _rowTops() { return rowTops(_plVL.rows()); }
+function _clearFlip() { clearFlip(_plVL.rows()); }
+function _flipFrom(before) { flipFrom(_plVL.rows(), before, tracksEl, !!(_rmq && _rmq.matches)); }
+
+// Library tracks dropped on the list add them; playlist rows dropped between
+// rows reorder.  (The list may have scrolled — and recycled the dragged row —
+// while dragging, so the drop goes by the indices carried in the drag data.)
 tracksEl.addEventListener('dragover', (e) => {
   const types = e.dataTransfer.types;
   if (types.includes('application/x-soniqboom-pl-idx')) {
-    const row = _plRowOf(e);
-    if (!row) return;
+    if (!_canReorder()) return;
+    const g = _gapAt(e);
+    if (!g) { _hideDropLine(); return; }
     e.preventDefault();
-    if (!row.classList.contains('dragging-over')) {
-      tracksEl.querySelectorAll('.queue-row.dragging-over')
-        .forEach(r => r.classList.remove('dragging-over'));
-      row.classList.add('dragging-over');
-    }
+    e.dataTransfer.dropEffect = 'move';
+    _showDropLine(g);
     return;
   }
-  if (_activeId && types.includes('application/x-soniqboom-track')) {
+  if (_activeId && !_activeRO && !_activeSmart && types.includes('application/x-soniqboom-track')) {
     e.preventDefault();
     dropZone.classList.add('drag-active');
   }
 });
 tracksEl.addEventListener('dragleave', (e) => {
-  const row = _plRowOf(e);
-  if (row && !row.contains(e.relatedTarget)) row.classList.remove('dragging-over');
-  if (!tracksEl.contains(e.relatedTarget)) dropZone.classList.remove('drag-active');
+  // (Chromium often leaves relatedTarget null between two rows: go by where the
+  // pointer is, so the line doesn't flicker from row to row.)
+  const r = tracksEl.getBoundingClientRect();
+  const out = e.clientX < r.left || e.clientX >= r.right || e.clientY < r.top || e.clientY >= r.bottom;
+  if (out || (e.relatedTarget && !tracksEl.contains(e.relatedTarget))) {
+    dropZone.classList.remove('drag-active');
+    _hideDropLine();
+  }
 });
 tracksEl.addEventListener('drop', async (e) => {
-  if (_activeRO) { e.preventDefault(); return; }
+  if (_activeRO || _activeSmart) { e.preventDefault(); _endPlDrag(); return; }
   const raw = e.dataTransfer.getData('application/x-soniqboom-pl-idx');
   if (raw || e.dataTransfer.types.includes('application/x-soniqboom-pl-idx')) {
     // ── Drop: reorder ──────────────────────────────────────────────────────
     e.preventDefault();
-    const row = _plRowOf(e);
-    if (row) row.classList.remove('dragging-over');
-    if (!row || !raw || !_activeId) { _endPlDrag(); return; }
-    const i = parseInt(row.dataset.idx, 10);
+    const g = _gapAt(e);
+    const gap = g ? g.gap : _dropGap;
+    // (No drag of ours in flight — the list re-rendered meanwhile, or the rows
+    // came from another tab — so the carried indices may name other entries.)
+    if (gap < 0 || !raw || !_activeId || !_dragIdxs) { _endPlDrag(); return; }
 
     let fromIndices;
     try { fromIndices = JSON.parse(raw); }
     catch { _endPlDrag(); return; }
     if (!Array.isArray(fromIndices)) fromIndices = [fromIndices];
-
-    const fromSet = new Set(fromIndices);
-    if (fromSet.has(i)) { _endPlDrag(); return; }   // dropped onto a dragged row — no-op
+    fromIndices = fromIndices.filter(i => Number.isInteger(i) && i >= 0 && i < _activeTracks.length);
+    if (!fromIndices.length || _isNoopGap(gap)) { _endPlDrag(); return; }
 
     // Keep a snapshot for rollback so we can revert the local order if
     // the server PUT fails — the optimistic UI shouldn't lie to the user
     // about what was persisted.
     const previousOrder = _activeTracks.slice();
-
-    // Extract items being moved and the rest
+    const fromSet  = new Set(fromIndices);
     const toInsert = fromIndices.map(idx => _activeTracks[idx]);
     const rest     = _activeTracks.filter((_, idx) => !fromSet.has(idx));
-    // Adjust insertion point: each dragged item before `i` shifts the target left
-    const shift    = fromIndices.filter(idx => idx < i).length;
-    const insertAt = Math.max(0, Math.min(rest.length, i - shift));
+    // Each dragged row above the gap shifts the insertion point up by one.
+    const insertAt = Math.max(0, Math.min(rest.length, gap - fromIndices.filter(idx => idx < gap).length));
     rest.splice(insertAt, 0, ...toInsert);
-    _activeTracks = rest;
+    if (rest.every((t, k) => t === previousOrder[k])) { _endPlDrag(); return; }
 
+    const tops = _rowTops();
+    _activeTracks = rest;
     _clearSelection();
     _endPlDrag();
+    _renderTracks();
+    _flipFrom(tops);
+    const id = _activeId;
     try {
-      await _api(`/playlists/${_activeId}`, {
+      await _api(`/playlists/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ track_ids: _activeTracks.map(_plEntry) }),
@@ -728,11 +848,10 @@ tracksEl.addEventListener('drop', async (e) => {
     } catch (err) {
       // Revert the optimistic local order and re-render so the displayed
       // state matches what's actually on the server.
-      _activeTracks = previousOrder;
+      if (_activeId === id) { _activeTracks = previousOrder; _clearFlip(); _renderTracks(); }
       console.warn('Drag-reorder save failed:', err);
       Toast.error("Reorder couldn't be saved — order reverted.");
     }
-    _renderTracks();
     return;
   }
   // ── Drop: library tracks onto the list → add ───────────────────────────
@@ -762,9 +881,138 @@ async function _probePlaylistDurations() {
   }
 }
 
+// ── Header (hero) ─────────────────────────────────────────────────────────────
+// Who shares it: an imported one names its owner; the owner's own shared one
+// says how many listeners imported it (never who — the API doesn't say).
+function _heroKicker() {
+  const d = _activeData || {};
+  const summary = _playlists.find(p => p.id === _activeId) || {};
+  const parts = [_activeSmart ? 'Smart playlist' : 'Playlist'];
+  if (_activeRO) {
+    parts.push(`shared by ${d.owner_name || summary.owner_name || 'another user'}`, 'imported');
+  } else if (summary.shared) {
+    const n = Number(d.subscriber_count ?? summary.subscriber_count ?? 0) || 0;
+    parts.push(n ? `shared · ${n} listener${n !== 1 ? 's' : ''} imported it` : 'shared · not imported yet');
+  }
+  return parts.join(' · ');
+}
+
+// The player's queue is still the one this playlist handed it (another list's
+// play replaces it with other objects) and its current entry is one of ours.
+function _playingHere() {
+  if (!_activeId || _queuedFrom !== _activeId || !Player.currentTrack) return false;
+  const q = Player.queue || [];
+  if (!(_queuedObjs.has(Player.currentTrack) || q.some(t => _queuedObjs.has(t)))) return false;
+  return _activeTracks.some(t => _isCurrentEntry(t));
+}
+function _noteQueued() {
+  _queuedFrom = _activeId;
+  _queuedObjs = new Set(_activeTracks);
+}
+
+function _renderHero() {
+  if (!_activeId) return;
+  _hero.render({
+    name: plActiveNm.textContent,
+    tracks: _activeTracks,
+    kicker: _heroKicker(),
+    playingHere: _playingHere(),
+    playing: Player.playing,
+    style: getUiStyle(),
+  });
+}
+function _paintHeroPlaying() {
+  if (_activeId) _hero.setPlaying(_playingHere(), Player.playing);
+}
+
+function _heroPlay() {
+  if (!_activeTracks.length) return;
+  if (_playingHere()) { Player.playPause(); return; }
+  _noteQueued();
+  Player.setQueue(_activeTracks, 0, { explicit: false });
+}
+function _heroShuffle() {
+  if (!_activeTracks.length) return;
+  _noteQueued();
+  Player.setQueue(_activeTracks, 0, { shuffle: true });
+}
+
+function _heroMenuItems() {
+  const id = _activeId;
+  if (!id) return [];
+  const items = [];
+  if (_activeTracks.length) {
+    items.push({ label: 'Add all to queue', run: () => {
+      Player.addAllToQueue(_activeTracks);
+      Toast.ok(`Added ${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''} to the queue.`);
+    } });
+  }
+  items.push({ label: 'Export as M3U…', run: () => _exportPlaylist(id, 'm3u8') });
+  items.push({ label: 'Export as XSPF…', run: () => _exportPlaylist(id, 'xspf') });
+  if (_activeRO) {
+    if (btnUnsub) items.push({ label: 'Unsubscribe', danger: true, run: () => btnUnsub.click() });
+    return items;
+  }
+  items.push({ label: 'Rename…', run: async () => {
+    const pl = _playlists.find(p => p.id === id);
+    const name = await _promptName('Rename playlist', { okLabel: 'Rename', value: pl ? pl.name : plActiveNm.textContent });
+    if (!name || !name.trim() || _activeId !== id) return;
+    try {
+      await _api(`/playlists/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      plActiveNm.textContent = name.trim();
+      plActiveNm.title = name.trim();
+      await refresh();
+    } catch (err) {
+      Toast.error('Could not rename the playlist.');
+    }
+  } });
+  items.push({ label: 'Delete playlist…', danger: true, run: async () => {
+    const pl = _playlists.find(p => p.id === id);
+    const ok = await window.__sbConfirm(
+      `Delete "${pl ? pl.name : plActiveNm.textContent}"?`,
+      { title: 'Delete Playlist', okLabel: 'Delete' },
+    );
+    if (!ok) return;
+    try {
+      await _api(`/playlists/${id}`, { method: 'DELETE' });
+      if (_activeId === id) _showListView();
+      await refresh();
+    } catch (err) {
+      Toast.error('Could not delete playlist — the server rejected the request.');
+    }
+  } });
+  return items;
+}
+
+// The look (Modern / Retro hi-fi) is the shared UI style (js/ui_style.js).
+function _applyStyle(style) {
+  panel.dataset.plStyle = style;
+  _waveRelayout();
+  if (_plVL.active) _plVL.remeasure();
+}
+onUiStyleChange(_applyStyle);
+
+// The theme (light / dark) changes the waveform colours.
+new MutationObserver(() => _waveRelayout())
+  .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+if (typeof ResizeObserver !== 'undefined') {
+  let _lastW = 0;
+  new ResizeObserver((ents) => {
+    const w = Math.round(ents[0]?.contentRect?.width || 0);
+    if (w && w !== _lastW) { _lastW = w; _waveRelayout(); }
+  }).observe(tracksEl);
+}
+// The narrow-window rule resizes the waveform while the list keeps its width.
+try { window.matchMedia(NARROW_WAVES).addEventListener('change', () => _waveRelayout()); } catch (_) { /* old engine */ }
+
 // ── Mutations ─────────────────────────────────────────────────────────────────
 async function _addTracks(playlistId, trackIds) {
-  if (playlistId === _activeId && _activeRO) return;  // (someone else's playlist)
+  // (someone else's playlist, or a smart one — its saved search picks its tracks)
+  if (playlistId === _activeId && (_activeRO || _activeSmart)) return;
   try {
     await _api(`/playlists/${playlistId}/tracks`, {
       method: 'POST',
@@ -785,7 +1033,7 @@ async function _addTracks(playlistId, trackIds) {
 }
 
 async function _removeTrack(playlistId, track) {
-  if (_activeRO) return;
+  if (_activeRO || _activeSmart) return;
   const entry = _plEntry(track);
   const subKey = _plSubKey(track);
   const prev = _activeTracks.slice();      // rollback snapshot (2.6 optimistic)
@@ -812,7 +1060,7 @@ async function _removeTrack(playlistId, track) {
 }
 
 async function _removeSelected() {
-  if (!_selectedIdxs.size || !_activeId || _activeRO) return;
+  if (!_selectedIdxs.size || !_activeId || _activeRO || _activeSmart) return;
   // Multi-track delete is a destructive action.  Single-row removal stays
   // instant — the row's own "x" button is already an explicit gesture — but
   // sweeping out a multi-row selection (especially via Delete/Backspace)
@@ -863,7 +1111,7 @@ function _updateSidebarActive() {
 }
 
 // ── Custom name prompt (no browser dialog) ────────────────────────────────────
-function _promptName(title = 'New playlist name') {
+function _promptName(title = 'New playlist name', { okLabel = 'Create', value = '' } = {}) {
   return new Promise((resolve) => {
     const backdrop = document.createElement('div');
     backdrop.className = 'pl-modal-backdrop';
@@ -874,12 +1122,14 @@ function _promptName(title = 'New playlist name') {
       <input class="pl-modal-input" type="text" placeholder="Name…" autocomplete="off" spellcheck="false" maxlength="120">
       <div class="pl-modal-actions">
         <button class="pl-modal-btn pl-modal-cancel">Cancel</button>
-        <button class="pl-modal-btn pl-modal-ok">Create</button>
+        <button class="pl-modal-btn pl-modal-ok"></button>
       </div>
     `;
+    dialog.querySelector('.pl-modal-ok').textContent = okLabel;
     backdrop.appendChild(dialog);
     document.body.appendChild(backdrop);
     const input  = dialog.querySelector('.pl-modal-input');
+    if (value) { input.value = value; input.select(); }
     const btnOk  = dialog.querySelector('.pl-modal-ok');
     const btnCan = dialog.querySelector('.pl-modal-cancel');
     input.focus();
@@ -918,7 +1168,7 @@ async function createPlaylist() {
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
 dropZone.addEventListener('dragover', (e) => {
-  if (!_activeId) return;
+  if (!_activeId || _activeRO || _activeSmart) return;
   if (e.dataTransfer.types.includes('application/x-soniqboom-track')) {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
@@ -931,7 +1181,7 @@ dropZone.addEventListener('dragleave', (e) => {
 dropZone.addEventListener('drop', async (e) => {
   e.preventDefault();
   dropZone.classList.remove('drag-active');
-  if (!_activeId) return;
+  if (!_activeId || _activeRO || _activeSmart) return;
   try {
     const data = JSON.parse(e.dataTransfer.getData('application/x-soniqboom-track'));
     const tracks = Array.isArray(data) ? data : [data];
@@ -989,7 +1239,128 @@ btnUnsub?.addEventListener('click', async () => {
   catch (err) { Toast.error('Could not remove the imported playlist.'); }
 });
 
-// ── Import dialog: the playlists other users share, ticked = in my list ──────
+// ── Playlist files: export (⋯ menu) and import (the Import dialog) ─────────
+// GET /api/playlists/{id}/export?format=m3u8|xspf answers with the file as an
+// attachment; POST /api/playlists/import makes a new playlist from a file's
+// text and says which entries it didn't find (core/playlist_files.py).
+async function _exportPlaylist(id, format) {
+  let blob, name = `playlist.${format}`;
+  try {
+    const res = await fetch(`/api/playlists/${encodeURIComponent(id)}/export?format=${format}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cd = res.headers.get('content-disposition') || '';
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="([^"]+)"/i);
+    if (m) { try { name = decodeURIComponent(m[1]); } catch (_) { name = m[1]; } }
+    blob = await res.blob();
+  } catch (err) {
+    Toast.error("Couldn't export the playlist.");
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+const _IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+// The file's text: UTF-16 with its BOM, UTF-8 (M3U8, XSPF), else
+// Windows-1252 (an older M3U).
+async function _readPlaylistFile(file) {
+  const buf = await file.arrayBuffer();
+  const b = new Uint8Array(buf, 0, Math.min(2, buf.byteLength));
+  if (b.length === 2 && ((b[0] === 0xff && b[1] === 0xfe) || (b[0] === 0xfe && b[1] === 0xff))) {
+    return new TextDecoder(b[0] === 0xff ? 'utf-16le' : 'utf-16be').decode(buf);
+  }
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch (_) { return new TextDecoder('windows-1252').decode(buf); }
+}
+
+async function _importPlaylistFile(file, out) {
+  out.hidden = false;
+  out.textContent = `Reading ${file.name}…`;
+  if (file.size > _IMPORT_MAX_BYTES) {
+    out.textContent = 'This file is too large to be a playlist (over 5 MB).';
+    return;
+  }
+  let res, body;
+  try {
+    const content = await _readPlaylistFile(file);
+    res = await fetch('/api/playlists/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, content }),
+    });
+    body = await res.json().catch(() => null);
+  } catch (err) {
+    out.textContent = "Couldn't import the file — the server didn't answer.";
+    return;
+  }
+  const detail = body && body.detail;
+  if (!res.ok) {
+    const msg = typeof detail === 'string' ? detail
+      : (detail && detail.message)
+      || (Array.isArray(detail) ? "This file can't be read as a playlist (too large or not text)."
+                                : `Couldn't import the file (error ${res.status}).`);
+    out.textContent = msg;
+    if (detail && Array.isArray(detail.unmatched)) _listUnmatched(out, detail.unmatched, detail.unmatched_count);
+    return;
+  }
+  const pl = body.playlist || {};
+  out.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'pl-import-done';
+  head.textContent = `Made “${pl.name}”: ${body.matched.toLocaleString()} of ${body.total.toLocaleString()} track${body.total !== 1 ? 's' : ''} found.`;
+  out.appendChild(head);
+  if (body.truncated) {
+    const t = document.createElement('div');
+    t.className = 'pl-import-hint';
+    t.textContent = 'The file lists more than 20,000 tracks — the first 20,000 were read.';
+    out.appendChild(t);
+  }
+  if (body.unmatched_count) _listUnmatched(out, body.unmatched, body.unmatched_count);
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'pl-modal-btn pl-modal-cancel pl-import-open';
+  open.textContent = 'Open the playlist';
+  open.addEventListener('click', () => {
+    out.closest('.pl-modal-backdrop')?.querySelector('.pl-modal-ok')?.click();
+    if (pl.id) _openPlaylist(pl.id, pl.name);
+  });
+  out.appendChild(open);
+  await refresh();
+}
+
+function _listUnmatched(out, rows, count) {
+  const hint = document.createElement('div');
+  hint.className = 'pl-import-hint';
+  hint.textContent = `Not found (${count.toLocaleString()}):`;
+  const ul = document.createElement('ul');
+  ul.className = 'pl-import-missing';
+  for (const r of rows) {
+    const li = document.createElement('li');
+    const what = document.createElement('span');
+    what.textContent = r.entry;
+    what.title = r.entry;
+    const why = document.createElement('span');
+    why.className = 'pl-import-meta';
+    why.textContent = r.reason;
+    li.append(what, why);
+    ul.appendChild(li);
+  }
+  if (count > rows.length) {
+    const li = document.createElement('li');
+    li.className = 'pl-import-meta';
+    li.textContent = `…and ${(count - rows.length).toLocaleString()} more`;
+    ul.appendChild(li);
+  }
+  out.append(hint, ul);
+}
+
+// ── Import dialog: a playlist file, and the playlists other users share
+//    (ticked = in my list) ─────────────────────────────────────────────────
 async function showImportDialog() {
   let rows;
   try { rows = await _api('/playlists/shared'); }
@@ -999,12 +1370,28 @@ async function showImportDialog() {
   const dialog = document.createElement('div');
   dialog.className = 'pl-modal-dialog pl-import-dialog';
   dialog.setAttribute('role', 'dialog');
-  dialog.setAttribute('aria-label', 'Import shared playlists');
+  dialog.setAttribute('aria-label', 'Import playlists');
   dialog.innerHTML = `
-    <div class="pl-modal-title">Import shared playlists</div>
+    <div class="pl-modal-title">Import playlists</div>
+    <div class="pl-import-section">A playlist file</div>
+    <div class="pl-import-hint">An M3U, M3U8 or XSPF file — its tracks are found in your library by file, folder or artist and title.</div>
+    <div class="pl-import-file">
+      <button type="button" class="pl-modal-btn pl-modal-cancel pl-import-choose">Choose a file…</button>
+      <input type="file" class="pl-import-input" accept=".m3u,.m3u8,.xspf,audio/x-mpegurl,audio/mpegurl,application/xspf+xml" hidden>
+    </div>
+    <div class="pl-import-result" role="status" aria-live="polite" hidden></div>
+    <div class="pl-import-section">Shared by other users</div>
     <div class="pl-import-hint">Ticked playlists appear in your list, read-only — they follow their owner's changes.</div>
     <div class="pl-import-list"></div>
     <div class="pl-modal-actions"><button class="pl-modal-btn pl-modal-ok">Done</button></div>`;
+  const fileInput = dialog.querySelector('.pl-import-input');
+  const result = dialog.querySelector('.pl-import-result');
+  dialog.querySelector('.pl-import-choose').addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files && fileInput.files[0];
+    fileInput.value = '';               // (the same file can be chosen again)
+    if (f) _importPlaylistFile(f, result);
+  });
   const list = dialog.querySelector('.pl-import-list');
   if (!rows.length) {
     list.innerHTML = '<div class="playlist-empty">No other user shares a playlist yet.</div>';
@@ -1081,7 +1468,8 @@ function _showAddDropdownWith(anchorEl, getEntries, onDone) {
 
   _api('/playlists').then(all => {
     _playlists = all;
-    const playlists = all.filter(pl => !pl.read_only);   // (imported ones can't be edited)
+    // (imported ones can't be edited; a smart one's saved search picks its tracks)
+    const playlists = all.filter(pl => !pl.read_only && !pl.smart);
     const dd = document.createElement('div');
     dd.className = 'playlist-add-dropdown';
     dd.style.cssText = 'position:fixed;z-index:9999';
@@ -1137,7 +1525,30 @@ function _closeAddDropdown() {
 refresh();
 
 // A track change only moves the now-playing marker on the rows shown.
-Player.on('trackchange', () => _paintPlaying());
+let _waveRecheck = [];
+Player.on('trackchange', () => {
+  _curPct = 0;
+  _paintPlaying();
+  // A track's first play stores its waveform: ask again for it a little later.
+  _waveRecheck.forEach(clearTimeout);
+  const id = Player.currentTrack && Player.currentTrack.id;
+  if (!id) return;
+  // (The same steps as the player bar's own waveform retries, ~1 min in all.)
+  _waveRecheck = [5000, 15000, 30000, 60000].map(ms => setTimeout(() => {
+    if (_waves.state(id) !== null) return;
+    _waves.forget(id);
+    for (const row of _playingRows()) {
+      if (row.__trk && row.__trk.id === id) _paintWave(row, row.__trk, _curPct);
+    }
+  }, ms));
+});
 Player.on('statechange', () => _paintPlaying());
+// The playing row's progress inside its mini waveform (≈4 Hz, no timer).
+Player.on('timeupdate', (d) => {
+  _curPct = d && d.duration ? Math.max(0, Math.min(1, d.current / d.duration)) : 0;
+  if (panel.classList.contains('hidden') || tracksEl.hidden) return;
+  for (const row of _playingRows()) if (row.__trk) _paintWave(row, row.__trk, _curPct);
+});
+_syncMotion();
 
 export const Playlist = { toggle, refresh, open, close, showAddDropdown, showAddDropdownForEntries, createPlaylist, showImportDialog };

@@ -1,0 +1,689 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ── Stations view — Modern and Retro hi-fi ────────────────────────────────
+   The look is the shared UI style (js/ui_style.js → <html data-ui-style>);
+   the theme is <html data-theme>.  Markup: js/stations.js (card, grid,
+   presets), js/stations/dial.js (tuner), js/stations/live.js (scope, mini
+   meter, signal meter — it reads the --st-scope-* colours below).  Loaded
+   after app.css: the rules here override its older #st-now / .st-row ones. */
+
+#stations-view {
+  container: st / inline-size;
+  --st-radius: 16px;
+  --st-text: var(--text0);
+  --st-text-2: var(--text1);
+  --st-text-3: var(--text2);
+  --st-accent-text: #ff8a4a;
+  --st-card-bg:
+    radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 55%),
+    radial-gradient(90% 120% at 100% 100%, rgba(107,200,240,0.10) 0%, transparent 60%),
+    var(--bg2);
+  --st-card-border: var(--border-bright);
+  --st-chip-bg: rgba(255,255,255,0.06);
+  --st-chip-border: rgba(255,255,255,0.12);
+  --st-tile-bg: var(--bg2);
+  --st-tile-hover: var(--bg3);
+  --st-scope-a: #f0722a;
+  --st-scope-b: #6bc8f0;
+  --st-scope-grid: rgba(255,255,255,0.10);
+  --st-scope-trace: #50ff8c;
+  --st-scope-glow: rgba(80,255,140,0.55);
+  --st-dial-gap: 120px;
+  --st-glass-bg: linear-gradient(180deg, var(--bg1), var(--bg2));
+  --st-glass-border: var(--border-bright);
+  --st-tick: rgba(255,255,255,0.28);
+  --st-tick-major: rgba(255,255,255,0.55);
+  --st-name: var(--text1);
+  --st-name-on: var(--text0);
+  --st-needle: var(--accent);
+  --st-needle-glow: color-mix(in srgb, var(--accent) 55%, transparent);
+  --st-sig-on: var(--accent);
+  --st-sig-off: rgba(255,255,255,0.16);
+  --st-live: #c62b31;          /* white LIVE on it ≥ 5:1 */
+  --st-fav: var(--accent);     /* the favourite ★ */
+  color: var(--st-text);
+}
+:root[data-theme="light"] #stations-view {
+  --st-accent-text: #8a3a08;
+  --st-card-bg:
+    radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--accent) 14%, transparent) 0%, transparent 55%),
+    radial-gradient(90% 120% at 100% 100%, rgba(30,120,170,0.10) 0%, transparent 60%),
+    var(--bg1);
+  --st-chip-bg: rgba(0,0,0,0.04);
+  --st-chip-border: rgba(0,0,0,0.16);
+  --st-tile-bg: var(--bg1);
+  --st-tile-hover: var(--bg2);
+  --st-scope-a: #d4561a;
+  --st-scope-b: #1f7fb0;
+  --st-scope-grid: rgba(0,0,0,0.12);
+  --st-glass-bg: linear-gradient(180deg, #ffffff, var(--bg2));
+  --st-tick: rgba(0,0,0,0.30);
+  --st-tick-major: rgba(0,0,0,0.62);
+  --st-needle: #d4561a;
+  --st-needle-glow: rgba(212,86,26,0.35);
+  --st-sig-on: #b84a12;
+  --st-sig-off: rgba(0,0,0,0.16);
+  --st-live: #c0262c;
+  --st-fav: #8a3a08;
+}
+
+#stations-view .st-glyph { font-size: 0.5em; line-height: 1; }
+
+/* ── Header: the location ────────────────────────────────────────────── */
+.st-top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin: 0 0 12px;
+}
+#stations-view #st-crumbs { margin: 0; min-width: 0; flex: 1 1 auto; }
+
+/* ── Now-playing card ───────────────────────────────────────────────────── */
+#stations-view #st-now {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "art main side";
+  align-items: center;
+  gap: 22px;
+  min-height: 0;
+  padding: 20px 22px;
+  margin: 0 0 14px;
+  border-radius: var(--st-radius);
+  background: var(--st-card-bg);
+  border: 1px solid var(--st-card-border);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+}
+#stations-view #st-now.st-now-empty { opacity: 1; }
+.st-np-art { grid-area: art; position: relative; }
+.st-np-img {
+  display: flex; align-items: center; justify-content: center;
+  width: 132px; height: 132px; border-radius: 14px; object-fit: cover;
+  font-size: 104px; background: color-mix(in srgb, var(--st-text) 6%, transparent);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(255,255,255,0.06);
+}
+.st-now-empty .st-np-img { opacity: 0.6; box-shadow: none; }
+.st-live-badge {
+  position: absolute; left: 8px; top: 8px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px 2px 7px; border-radius: 999px;
+  background: var(--st-live); color: #fff;
+  font-size: 10.5px; font-weight: 800; letter-spacing: 0.08em;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+}
+.st-live-badge::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; background: #fff;
+  animation: st-live-dot 1.6s ease-in-out infinite;
+}
+@keyframes st-live-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+#st-now[data-state="paused"] .st-live-badge,
+#st-now[data-state="connecting"] .st-live-badge { background: #5c6170; }
+#st-now[data-state="paused"] .st-live-badge::before,
+#st-now[data-state="connecting"] .st-live-badge::before { animation: none; opacity: 0.6; }
+
+.st-np-main { grid-area: main; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.st-np-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.st-np-station {
+  font-size: 13px; font-weight: 600; color: var(--st-text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.st-np-freq { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--st-text-3); flex: 0 0 auto; }
+.st-np-lamps { display: none; }
+#stations-view .st-now-title {
+  margin: 0;
+  font-size: 26px; line-height: 1.2; font-weight: 700; color: var(--st-text);
+  white-space: normal;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.st-now-empty .st-now-title { font-size: 18px; font-weight: 600; color: var(--st-text-2); }
+.st-np-artist { font-size: 15px; color: var(--st-accent-text); font-weight: 600; min-height: 0; }
+.st-np-artist:empty, .st-np-extra:empty { display: none; }
+.st-np-extra { font-size: 12.5px; color: var(--st-text-3); }
+.st-np-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.st-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 22px; padding: 0 9px; border-radius: 999px;
+  background: var(--st-chip-bg); border: 1px solid var(--st-chip-border);
+  font-size: 11.5px; font-weight: 600; color: var(--st-text-2); white-space: nowrap;
+}
+.st-chip-q { color: var(--st-text); }
+a.st-chip-link { text-decoration: none; }
+a.st-chip-link:hover { color: var(--st-text); border-color: var(--st-text-3); }
+a.st-chip-link:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+
+/* Signal meter: five bars (Modern), a needle (Retro) */
+.st-signal { display: inline-flex; align-items: center; height: 22px; margin-left: 2px; }
+.st-sig-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 16px; }
+.st-sig-bars i { width: 4px; border-radius: 1px; background: var(--st-sig-off); }
+.st-sig-bars i:nth-child(1) { height: 20%; }
+.st-sig-bars i:nth-child(2) { height: 40%; }
+.st-sig-bars i:nth-child(3) { height: 60%; }
+.st-sig-bars i:nth-child(4) { height: 80%; }
+.st-sig-bars i:nth-child(5) { height: 100%; }
+.st-signal[data-level="1"] .st-sig-bars i:nth-child(-n+1),
+.st-signal[data-level="2"] .st-sig-bars i:nth-child(-n+2),
+.st-signal[data-level="3"] .st-sig-bars i:nth-child(-n+3),
+.st-signal[data-level="4"] .st-sig-bars i:nth-child(-n+4),
+.st-signal[data-level="5"] .st-sig-bars i:nth-child(-n+5) { background: var(--st-sig-on); }
+.st-signal[data-level="1"] .st-sig-bars i:nth-child(1) { background: #e5484d; }
+.st-sig-meter { display: none; }
+
+.st-scope { display: block; width: 100%; height: 46px; margin-top: 10px; }
+.st-now-empty .st-scope { opacity: 0.6; }
+
+.st-np-side { grid-area: side; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.st-ring {
+  position: relative;
+  width: 76px; height: 76px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; cursor: pointer; color: #fff;
+  background: radial-gradient(circle at 50% 40%, color-mix(in srgb, var(--accent) 92%, #fff) 0%, var(--accent) 60%, #b84a12 100%);
+  box-shadow: 0 8px 22px color-mix(in srgb, var(--accent) 40%, transparent), inset 0 1px 0 rgba(255,255,255,0.35);
+  transition: transform 0.12s ease, box-shadow 0.15s ease;
+}
+.st-ring svg { width: 32px; height: 32px; fill: currentColor; position: relative; z-index: 1; }
+.st-ring::before {          /* the ring: a turning arc while on air */
+  content: ''; position: absolute; inset: -6px; border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 55%, color-mix(in srgb, var(--accent) 85%, transparent) 85%, transparent 100%);
+  -webkit-mask: radial-gradient(circle, transparent 0 calc(50% - 3px), #000 calc(50% - 2px));
+          mask: radial-gradient(circle, transparent 0 calc(50% - 3px), #000 calc(50% - 2px));
+  opacity: 0; transition: opacity 0.2s;
+}
+.st-ring.on::before { opacity: 1; animation: st-ring-turn 2.4s linear infinite; }
+@keyframes st-ring-turn { to { transform: rotate(360deg); } }
+.st-ring:hover:not(:disabled) { transform: scale(1.04); }
+.st-ring:active:not(:disabled) { transform: scale(0.97); }
+.st-ring:disabled { opacity: 0.45; cursor: default; box-shadow: none; }
+.st-ring:focus-visible { outline: 3px solid var(--state-focus); outline-offset: 6px; }
+:root[data-theme="light"] .st-ring { background: radial-gradient(circle at 50% 40%, #e0682c 0%, #c4521a 60%, #9a3d0e 100%); }
+
+.st-np-btns { display: flex; gap: 6px; }
+#stations-view .st-np-btns .st-btn {
+  width: 34px; height: 34px; padding: 0; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1; color: var(--st-text-2);
+}
+#stations-view .st-np-btns .st-btn:hover { color: var(--st-text); }
+#stations-view .st-btn:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 2px; }
+.st-star svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+#stations-view .st-np-btns .st-star.on { color: var(--st-fav); border-color: color-mix(in srgb, var(--st-fav) 60%, transparent); }
+#stations-view .st-star.on svg { fill: currentColor; }
+
+/* ── Tuner dial ─────────────────────────────────────────────────────────── */
+.st-dial { display: flex; align-items: stretch; gap: 8px; margin: 0 0 16px; }
+.st-dial-step {
+  flex: 0 0 auto; width: 34px; border-radius: 10px;
+  border: 1px solid var(--st-glass-border); background: var(--st-tile-bg);
+  color: var(--st-text-2); font-size: 22px; line-height: 1; cursor: pointer;
+}
+.st-dial-step:hover:not(:disabled) { color: var(--st-text); background: var(--st-tile-hover); }
+.st-dial-step:disabled { opacity: 0.4; cursor: default; }
+.st-dial-step:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+.st-dial-glass {
+  position: relative; flex: 1 1 auto; min-width: 0;
+  height: 96px; border-radius: 12px;
+  overflow-x: auto; overflow-y: hidden;
+  background: var(--st-glass-bg);
+  border: 1px solid var(--st-glass-border);
+  scrollbar-width: thin;
+  touch-action: pan-x pan-y;
+  cursor: ew-resize;
+  user-select: none; -webkit-user-select: none;
+}
+.st-dial-glass:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 2px; }
+.st-dial-track { position: relative; height: 100%; min-width: 100%; }
+.st-dial-scale {
+  position: absolute; bottom: 22px; height: 16px;
+  background-image:
+    repeating-linear-gradient(90deg, var(--st-tick-major) 0 2px, transparent 2px calc(var(--st-tick) * 4)),
+    repeating-linear-gradient(90deg, var(--st-tick) 0 1px, transparent 1px var(--st-tick));
+  background-size: 100% 100%, 100% 55%;
+  background-position: var(--st-tick) 0, 0 100%;
+  background-repeat: no-repeat;
+}
+.st-dial-mhz {
+  position: absolute; top: 100%; margin-top: 3px; transform: translateX(-50%);
+  font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--st-text-3);
+}
+.st-dial-unit {
+  position: absolute; right: 100%; margin-right: 22px; top: 100%; margin-top: 3px;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em; color: var(--st-text-3);
+}
+.st-dial-names { position: absolute; inset: 0; z-index: 3; pointer-events: none; }   /* the printed names sit over the needle */
+.st-dial-name {
+  position: absolute; top: 8px; transform: translateX(-50%);
+  max-width: calc(var(--st-dial-gap) * 2 - 18px);
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; line-height: 16px; color: var(--st-name);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer; pointer-events: auto;
+}
+.st-dial-name.alt { top: 30px; }
+.st-dial-name:hover { color: var(--st-name-on); background: var(--st-chip-bg); }
+.st-dial-name.sel { color: var(--st-name-on); background: var(--bg2); box-shadow: inset 0 0 0 1px var(--st-chip-border); }
+:root[data-theme="light"] .st-dial-name.sel { background: #fff; }
+.st-dial-name.on { color: var(--st-accent-text); }
+.st-dial-needle {
+  position: absolute; top: 4px; bottom: 6px; left: 0; width: 2px; margin-left: -1px;
+  background: var(--st-needle);
+  box-shadow: 0 0 8px 1px var(--st-needle-glow);
+  border-radius: 2px;
+  pointer-events: none;
+  transition: transform 0.65s cubic-bezier(0.25, 0.9, 0.3, 1), opacity 0.2s;
+  z-index: 2;
+}
+.st-dial-needle.st-instant, .st-dial-needle.st-dragging { transition: none; }
+.st-dial-needle.st-parked { opacity: 0.35; }
+.st-dial-empty {
+  display: none; position: absolute; inset: 0; align-items: center; justify-content: center;
+  font-size: 12.5px; color: var(--st-text-3);
+}
+.st-dial-none .st-dial-empty { display: flex; }
+.st-dial-none .st-dial-track { display: none; }
+.st-dial-none .st-dial-glass { cursor: default; }
+@media (prefers-reduced-motion: reduce) {
+  .st-dial-needle { transition: none; }
+  .st-ring.on::before { animation: none; }
+}
+
+/* ── Station cards ──────────────────────────────────────────────────────── */
+.st-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+.st-card {
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
+  min-width: 0; padding: 10px 12px; border-radius: 12px;
+  background: var(--st-tile-bg); border: 1px solid var(--border);
+  cursor: pointer; transition: background 0.12s, border-color 0.12s, transform 0.12s;
+}
+.st-card:hover { background: var(--st-tile-hover); border-color: var(--border-bright); }
+.st-card:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 2px; }
+.st-card-art {
+  width: 52px; height: 52px; flex: 0 0 auto; border-radius: 10px; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 56px; background: color-mix(in srgb, var(--st-text) 6%, transparent);
+}
+.st-card-art img { width: 100%; height: 100%; object-fit: cover; }
+.st-card-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.st-card-name {
+  font-size: 13.5px; font-weight: 600; line-height: 1.25; color: var(--st-text);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere;
+}
+.st-card-fav { color: var(--st-fav); }
+.st-card-genre, .st-card-meta {
+  font-size: 11.5px; color: var(--st-text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.st-card-genre { color: var(--st-text-2); }
+.st-card-meter { display: none; align-items: flex-end; gap: 2px; height: 18px; flex: 0 0 auto; }
+.st-card-meter i {
+  width: 3px; height: 100%; border-radius: 1px; background: var(--st-sig-on);
+  transform-origin: bottom; transform: scaleY(0.25);
+}
+.st-card.playing .st-card-meter { display: inline-flex; }
+#stations-view.st-viz-off .st-card-meter { display: none; }   /* Visualizations (now playing) off */
+.st-card.playing {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--st-tile-bg));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.st-card.playing .st-card-name { color: var(--st-accent-text); }
+#stations-view .st-row-group { border-radius: 10px; }
+
+/* ── Retro hi-fi: a 70s/80s receiver ────────────────────────────────────── */
+:root[data-ui-style="retro"] #stations-view {
+  --st-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --st-print: #cfd3d9;
+  --st-print-2: #a3a9b2;
+  --st-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --st-plate-edge: #050506;
+  --st-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --st-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --st-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --st-key-text: #cfd3d9;
+  --st-vfd: #6ff7e9;
+  --st-vfd-dim: #46c9bd;
+  --st-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --st-amber: #ffb12b;
+  /* lamps: amber = engaged / selected, green = signal / tuned / playing,
+     red = live / peak (the LIVE badge), unlit = neutral dark */
+  --st-lamp-off: #101113;
+  --st-lamp-off-shadow: inset 0 1px 1px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.07);
+  --st-lamp-green: #3be16c;
+  --st-lamp-amber: #ffb12b;
+  --st-lamp-ring: 0 0 0 0 transparent;
+  --st-lamp-glow: 0 0 6px 1px;
+  --st-fav: var(--st-lamp-amber);
+  --st-text: var(--st-print);
+  --st-text-2: var(--st-print-2);
+  --st-text-3: var(--st-print-2);
+  --st-accent-text: #ffb44a;
+  --st-chip-bg: rgba(0,0,0,0.35);
+  --st-chip-border: #050506;
+  --st-tile-bg: var(--st-plate);
+  --st-tile-hover: linear-gradient(180deg, #313439 0%, #24262a 100%);
+  --st-scope-trace: #6ff7e9;
+  --st-scope-glow: rgba(111,247,233,0.6);
+  --st-scope-grid: rgba(111,247,233,0.10);
+  --st-dial-gap: 128px;
+  /* the backlit glass dial: warm light behind smoked glass */
+  --st-glass-bg:
+    linear-gradient(180deg, rgba(255,255,255,0.07) 0%, transparent 18%, transparent 82%, rgba(0,0,0,0.35) 100%),
+    radial-gradient(120% 220% at 50% 120%, #4a2e0c 0%, #2a1906 45%, #140c03 100%);
+  --st-glass-border: #000;
+  --st-tick: rgba(255,214,150,0.55);
+  --st-tick-major: rgba(255,226,180,0.92);
+  --st-name: #e7c48c;
+  --st-name-on: #fff1d6;
+  --st-needle: #ff4b2b;
+  --st-needle-glow: rgba(255,75,43,0.75);
+  --st-sig-on: #3be16c;
+  --st-sig-off: rgba(255,255,255,0.12);
+}
+:root[data-theme="light"][data-ui-style="retro"] #stations-view {
+  --st-print: #23262b;
+  --st-print-2: #3f444c;
+  --st-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --st-plate-edge: #8c9096;
+  --st-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --st-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --st-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --st-key-text: #23262b;
+  --st-lamp-off: rgba(0,0,0,0.15);
+  --st-lamp-off-shadow: inset 0 1px 2px rgba(0,0,0,0.35);
+  --st-lamp-amber: #d27a00;
+  --st-lamp-ring: 0 0 0 1px rgba(0,0,0,0.45);
+  --st-lamp-glow: 0 0 0 0;
+  --st-fav: #9c5400;            /* the ★ glyph on silver: ≥ 3:1 */
+  --st-accent-text: #722a00;
+  --st-chip-bg: rgba(255,255,255,0.35);
+  --st-chip-border: #8c9096;
+  --st-tile-hover: linear-gradient(180deg, #e8eaed 0%, #d2d5da 100%);
+  --st-sig-off: rgba(0,0,0,0.16);
+  --st-sig-on: #1d8f3e;
+}
+
+/* Printed legends */
+:root[data-ui-style="retro"] #stations-view :is(.st-np-station, .st-chip, .st-dial-name, .st-dial-mhz, .st-dial-unit, .st-crumb, .st-crumb-here, .st-tab, .st-presets-cap, .st-preset) {
+  font-family: var(--st-face);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+:root[data-ui-style="retro"] #stations-view #st-crumbs { color: var(--st-print-2); }
+:root[data-ui-style="retro"] #stations-view .st-crumb { color: var(--st-print-2); }
+/* station names as printed: title case, so long ones stay tellable apart */
+:root[data-ui-style="retro"] #stations-view .st-card-name { font-family: var(--st-face); letter-spacing: 0.02em; }
+:root[data-ui-style="retro"] #stations-view .st-crumb-here { color: var(--st-print); }
+
+/* The faceplate */
+:root[data-ui-style="retro"] #stations-view #st-now {
+  --st-radius: 10px;
+  background: var(--st-plate);
+  border: 1px solid var(--st-plate-edge);
+  box-shadow: 0 18px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.6);
+  padding: 18px 20px;
+}
+:root[data-theme="light"][data-ui-style="retro"] #stations-view #st-now {
+  box-shadow: 0 14px 30px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -1px 0 rgba(0,0,0,0.18);
+}
+:root[data-ui-style="retro"] .st-np-img {
+  border-radius: 6px; width: 120px; height: 120px; font-size: 94px;
+  border: 3px solid #0a0b0c;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 1px 0 rgba(255,255,255,0.08), 0 4px 10px rgba(0,0,0,0.5);
+  background: #0c0d0f;
+}
+:root[data-ui-style="retro"] .st-live-badge {
+  left: auto; right: -6px; top: -6px; border-radius: 3px; padding: 2px 7px;
+  font-family: var(--st-face); letter-spacing: 0.14em;
+  background: #2a0b08; color: #ff6a4d; border: 1px solid #000;
+  box-shadow: 0 0 10px rgba(255,75,43,0.45), inset 0 0 6px rgba(255,75,43,0.35);
+}
+:root[data-ui-style="retro"] .st-live-badge::before { background: #ff4b2b; box-shadow: 0 0 6px #ff4b2b; }
+:root[data-ui-style="retro"] #st-now[data-state="paused"] .st-live-badge,
+:root[data-ui-style="retro"] #st-now[data-state="connecting"] .st-live-badge { background: #1a1210; color: #b88f86; box-shadow: none; }
+:root[data-ui-style="retro"] #st-now[data-state="paused"] .st-live-badge::before,
+:root[data-ui-style="retro"] #st-now[data-state="connecting"] .st-live-badge::before { background: #0b0b0c; box-shadow: 0 0 0 1px rgba(184,143,134,0.45); }
+/* The display window: VFD on dark glass, in both themes */
+:root[data-ui-style="retro"] .st-np-main {
+  padding: 12px 14px 10px; border-radius: 6px;
+  background: var(--st-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.07);
+  --st-text: var(--st-vfd); --st-text-2: var(--st-vfd-dim); --st-text-3: var(--st-vfd-dim);
+  --st-accent-text: #ffc865;
+  --st-chip-bg: rgba(111,247,233,0.06); --st-chip-border: rgba(111,247,233,0.28);
+}
+:root[data-ui-style="retro"] .st-np-station { color: var(--st-vfd); text-shadow: 0 0 6px rgba(111,247,233,0.5); }
+:root[data-ui-style="retro"] .st-np-freq {
+  font-family: var(--st-face); font-size: 15px; font-weight: 700; color: var(--st-amber);
+  text-shadow: 0 0 8px rgba(255,177,43,0.6);
+}
+:root[data-ui-style="retro"] #stations-view .st-now-title {
+  font-family: var(--st-face); font-weight: 700; letter-spacing: 0.03em;
+  color: var(--st-vfd); text-shadow: 0 0 10px rgba(111,247,233,0.45);
+}
+:root[data-ui-style="retro"] .st-np-artist { font-family: var(--st-face); letter-spacing: 0.05em; text-shadow: 0 0 8px rgba(255,200,101,0.35); }
+:root[data-ui-style="retro"] .st-np-lamps { display: inline-flex; gap: 10px; margin-left: auto; flex: 0 0 auto; }
+:root[data-ui-style="retro"] .st-lamp {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--st-face); font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--st-vfd-dim);
+}
+:root[data-ui-style="retro"] .st-lamp::before {     /* on the dark glass in both themes */
+  content: ''; width: 7px; height: 7px; border-radius: 50%;
+  background: #101113; box-shadow: inset 0 1px 1px rgba(0,0,0,0.7), 0 0 0 1px rgba(111,247,233,0.10);
+}
+:root[data-ui-style="retro"] #st-now:is([data-state="live"], [data-state="paused"]) .st-lamp-tuned::before,
+:root[data-ui-style="retro"] #st-now[data-state="live"] .st-lamp-stereo::before {
+  background: #3be16c; box-shadow: 0 0 6px 1px rgba(59,225,108,0.7);
+}
+:root[data-ui-style="retro"] .st-scope {
+  height: 52px; border-radius: 4px;
+  background: rgba(0,0,0,0.35); box-shadow: inset 0 0 0 1px rgba(111,247,233,0.12);
+}
+:root[data-ui-style="retro"] .st-chip { border-radius: 3px; height: 20px; font-size: 10.5px; }
+
+/* Signal: an analogue needle meter */
+:root[data-ui-style="retro"] .st-sig-bars { display: none; }
+:root[data-ui-style="retro"] .st-signal { height: auto; margin-left: 0; }
+:root[data-ui-style="retro"] .st-np-meta .st-signal { display: none; }   /* shown in the side column */
+:root[data-ui-style="retro"] .st-sig-meter {
+  position: relative; display: block; width: 120px; height: 66px; overflow: hidden;   /* 116×62 inside the border */
+  border-radius: 4px 4px 3px 3px; border: 2px solid #0a0b0c;
+  background: radial-gradient(140% 120% at 50% 110%, #fff2cf 0%, #f2d9a2 55%, #c79a52 100%);
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.45), 0 1px 0 rgba(255,255,255,0.08);
+}
+:root[data-ui-style="retro"] .st-sig-face { position: absolute; inset: 0; width: 100%; height: 100%; }
+.st-sig-arc { fill: none; stroke: #2a2116; stroke-width: 1.2; }
+.st-sig-red { fill: none; stroke: #c3120c; stroke-width: 3; }
+.st-sig-ticks line { stroke: #2a2116; stroke-width: 1.3; }
+.st-sig-face text { font: 700 9px var(--st-face, sans-serif); fill: #2a2116; }
+:root[data-ui-style="retro"] .st-sig-needle {
+  position: absolute; left: 50%; top: 14px; width: 2px; height: 58px; margin-left: -1px;
+  background: linear-gradient(180deg, #c3120c, #2a0a06);
+  transform-origin: 50% 100%;
+  transform: rotate(calc(-50deg + var(--sig, 0) * 100deg));
+  transition: transform 0.6s cubic-bezier(0.3, 1.4, 0.5, 1);
+  border-radius: 1px;
+}
+:root[data-ui-style="retro"] .st-sig-cap {
+  position: absolute; left: 0; right: 0; bottom: 4px; text-align: center;
+  font-family: var(--st-face); font-size: 9px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
+  color: #2a2116;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-ui-style="retro"] .st-sig-needle { transition: none; }
+}
+/* The side column: signal meter, then a chunky play/pause key */
+#stations-view .st-np-side > .st-signal-side { display: none; }
+:root[data-ui-style="retro"] #stations-view .st-np-side > .st-signal-side { display: block; }
+:root[data-ui-style="retro"] .st-ring {
+  width: 64px; height: 64px; color: var(--st-key-text);
+  background:
+    repeating-conic-gradient(from 0deg, rgba(255,255,255,0.06) 0 4deg, rgba(0,0,0,0.10) 4deg 8deg),
+    radial-gradient(circle at 50% 35%, #55595f 0%, #2d3034 55%, #17181a 100%);
+  border: 2px solid #050506;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.18);
+}
+:root[data-ui-style="retro"] .st-ring svg { width: 24px; height: 24px; }
+:root[data-ui-style="retro"] .st-ring::before {
+  inset: -7px;
+  background: conic-gradient(from 0deg, rgba(255,177,43,0) 0 60%, rgba(255,177,43,0.9) 88%, rgba(255,177,43,0) 100%);
+}
+:root[data-ui-style="retro"] .st-ring.on { color: var(--st-amber); }
+:root[data-theme="light"][data-ui-style="retro"] .st-ring {
+  background:
+    repeating-conic-gradient(from 0deg, rgba(255,255,255,0.35) 0 4deg, rgba(0,0,0,0.06) 4deg 8deg),
+    radial-gradient(circle at 50% 35%, #ffffff 0%, #d6d9dd 55%, #a9adb3 100%);
+  border-color: #6d7177; box-shadow: 0 3px 8px rgba(0,0,0,0.3), inset 0 1px 0 #fff;
+}
+:root[data-theme="light"][data-ui-style="retro"] .st-ring.on { color: #7a3d00; }
+:root[data-ui-style="retro"] #stations-view .st-np-btns .st-btn,
+:root[data-ui-style="retro"] .st-dial-step {
+  border-radius: 4px; background: var(--st-key-bg); border: 1px solid var(--st-plate-edge);
+  color: var(--st-key-text);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 2px 3px rgba(0,0,0,0.45);
+}
+:root[data-ui-style="retro"] #stations-view .st-np-btns .st-btn:hover,
+:root[data-ui-style="retro"] .st-dial-step:hover:not(:disabled) { background: var(--st-key-bg-hover); color: var(--st-key-text); }
+:root[data-ui-style="retro"] #stations-view .st-np-btns .st-star.on { color: var(--st-fav); border-color: var(--st-plate-edge); }
+/* the details dialog (on the page, outside the view) */
+:root[data-ui-style="retro"] #st-info-fav.on { color: #ffb12b; border-color: #ffb12b; }
+:root[data-theme="light"][data-ui-style="retro"] #st-info-fav.on { color: #9c5400; border-color: #9c5400; }
+:root[data-theme="light"][data-ui-style="retro"] :is(#stations-view .st-np-btns .st-btn, .st-dial-step) {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+}
+
+/* Presets: chunky keys with lamps (favourites 1–8) */
+.st-presets[hidden] { display: none; }
+:root[data-ui-style="retro"] .st-presets {
+  display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap;
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 8px;
+  background: var(--st-plate); border: 1px solid var(--st-plate-edge);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+.st-presets-cap {
+  align-self: center; margin-right: 6px;
+  font-size: 11px; font-weight: 700; color: var(--st-print-2);
+}
+.st-preset {
+  flex: 1 1 0; min-width: 72px; max-width: 150px;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 6px 9px 7px; border-radius: 4px; cursor: pointer;
+  background: var(--st-key-bg); border: 1px solid var(--st-plate-edge); color: var(--st-key-text);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 1px 0 rgba(255,255,255,0.05), 0 3px 4px rgba(0,0,0,0.5);
+  font-size: 10.5px; font-weight: 700; text-align: left;
+}
+.st-preset:hover:not(:disabled) { background: var(--st-key-bg-hover); }
+.st-preset:active:not(:disabled), .st-preset.on {
+  background: var(--st-key-pressed); transform: translateY(1px);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+}
+.st-preset:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 2px; }
+.st-preset:disabled { cursor: default; opacity: 0.7; }
+.st-preset-n { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.st-preset-n::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--st-lamp-off); box-shadow: var(--st-lamp-off-shadow);
+}
+.st-preset.on .st-preset-n::before {      /* the selected key: amber */
+  background: var(--st-lamp-amber);
+  box-shadow: var(--st-lamp-ring), var(--st-lamp-glow) color-mix(in srgb, var(--st-lamp-amber) 65%, transparent);
+}
+.st-preset-name {
+  max-width: 100%; color: var(--st-print-2);
+  /* up to two lines, in the station's own capitals (uppercase cut 3 of 8) */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+  overflow: hidden; overflow-wrap: anywhere; line-height: 1.2;
+  text-transform: none; letter-spacing: 0.02em;
+}
+:root[data-theme="light"] .st-preset { box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25); }
+:root[data-theme="light"] .st-preset.on { box-shadow: inset 0 2px 3px rgba(0,0,0,0.30), 0 1px 0 rgba(255,255,255,0.6); }
+
+/* The backlit dial */
+:root[data-ui-style="retro"] .st-dial-glass {
+  height: 104px; border-radius: 6px; border: 3px solid #0a0b0c;
+  box-shadow: inset 0 0 18px rgba(255,170,60,0.18), inset 0 2px 6px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.08);
+  cursor: ew-resize;
+}
+:root[data-ui-style="retro"] .st-dial-scale { bottom: 26px; height: 18px; }
+:root[data-ui-style="retro"] .st-dial-mhz { color: #ffe3b8; font-size: 11.5px; text-shadow: 0 0 6px rgba(255,190,90,0.6); }
+:root[data-ui-style="retro"] .st-dial-unit { color: #ffd79a; }
+:root[data-ui-style="retro"] .st-dial-name { font-size: 11px; color: var(--st-name); text-shadow: 0 0 6px rgba(255,180,70,0.35); }
+:root[data-ui-style="retro"] .st-dial-name:hover,
+:root[data-ui-style="retro"] .st-dial-name.sel { background: rgba(40,24,6,0.82); box-shadow: inset 0 0 0 1px rgba(255,200,120,0.25); color: var(--st-name-on); }
+:root[data-ui-style="retro"] .st-dial-name.on { color: #fff6e4; text-shadow: 0 0 8px rgba(255,200,110,0.9); }
+:root[data-ui-style="retro"] .st-dial-needle {
+  width: 3px; margin-left: -1.5px; top: 2px; bottom: 2px; border-radius: 1px;
+  background: linear-gradient(180deg, #ff7a52, #ff3b1c 50%, #ff7a52);
+}
+:root[data-ui-style="retro"] .st-dial-empty { color: #e7c48c; font-family: var(--st-face); letter-spacing: 0.1em; text-transform: uppercase; }
+
+/* Cards on the plate */
+:root[data-ui-style="retro"] .st-card {
+  border-radius: 6px; border: 1px solid var(--st-plate-edge);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 2px 4px rgba(0,0,0,0.35);
+}
+:root[data-ui-style="retro"] .st-card-art { border-radius: 4px; border: 2px solid #0a0b0c; background: #0c0d0f; }
+:root[data-ui-style="retro"] .st-card-name { font-size: 12.5px; }
+:root[data-ui-style="retro"] .st-card.playing {      /* now playing: green */
+  border-color: #1f6b38;
+  background: var(--st-plate);
+  box-shadow: 0 0 0 1px rgba(59,225,108,0.55), 0 0 14px rgba(59,225,108,0.16), inset 0 1px 0 rgba(255,255,255,0.07);
+}
+:root[data-ui-style="retro"] .st-card.playing .st-card-name { color: var(--st-print); }
+:root[data-ui-style="retro"] .st-card-meter i { background: var(--st-lamp-green); box-shadow: 0 0 4px rgba(59,225,108,0.6); }
+:root[data-theme="light"][data-ui-style="retro"] .st-card-meter i { background: #1d8f3e; box-shadow: none; }
+:root[data-theme="light"][data-ui-style="retro"] .st-card.playing { border-color: #0b7a36; box-shadow: 0 0 0 1px rgba(11,122,54,0.7), inset 0 1px 0 rgba(255,255,255,0.7); }
+:root[data-ui-style="retro"] #stations-view :is(.st-tab) { border-radius: 4px; background: var(--st-key-bg); border-color: var(--st-plate-edge); color: var(--st-key-text); font-size: 11px; }
+:root[data-ui-style="retro"] #stations-view .st-tab.on { background: var(--st-key-pressed); color: var(--st-accent-text); }
+:root[data-ui-style="retro"] #stations-view .st-row-group { background: var(--st-plate); border: 1px solid var(--st-plate-edge); margin-bottom: 4px; border-radius: 6px; }
+:root[data-ui-style="retro"] #stations-view .st-row-group .st-row-name { color: var(--st-print); font-family: var(--st-face); letter-spacing: 0.06em; text-transform: uppercase; }
+:root[data-ui-style="retro"] #stations-view .st-row-group .st-row-meta { color: var(--st-print-2); }
+
+/* ── Narrow panes (the view's own width, not the viewport's) ────────────── */
+@container st (max-width: 760px) {
+  #stations-view #st-now { gap: 16px; padding: 16px; }
+  .st-np-img { width: 96px; height: 96px; font-size: 76px; }
+  :root[data-ui-style="retro"] .st-np-img { width: 92px; height: 92px; font-size: 72px; }
+  #stations-view .st-now-title { font-size: 21px; }
+}
+/* Still one row (art · display · controls), tighter: the faceplate, the
+   presets and the dial fit above the player bar of a phone-width window. */
+@container st (max-width: 600px) {
+  #stations-view #st-now, :root[data-ui-style="retro"] #stations-view #st-now { gap: 12px; padding: 12px; align-items: start; }
+  .st-np-img { width: 72px; height: 72px; font-size: 56px; }
+  :root[data-ui-style="retro"] .st-np-img { width: 72px; height: 72px; font-size: 56px; }
+  :root[data-ui-style="retro"] .st-np-main { padding: 9px 11px 8px; }
+  #stations-view .st-now-title { font-size: 18px; }
+  .st-np-artist { font-size: 14px; }
+  .st-np-meta { margin-top: 5px; }
+  .st-scope, :root[data-ui-style="retro"] .st-scope { height: 40px; margin-top: 7px; }
+  .st-np-side { gap: 8px; }
+  .st-ring, :root[data-ui-style="retro"] .st-ring { width: 56px; height: 56px; }
+  #stations-view .st-np-btns .st-btn { width: 30px; height: 30px; font-size: 14px; }
+  .st-np-btns { gap: 4px; }
+  .st-grid { grid-template-columns: 1fr; }
+  :root[data-ui-style="retro"] .st-np-lamps { display: none; }
+  :root[data-ui-style="retro"] .st-sig-meter { zoom: 0.82; }
+  :root[data-ui-style="retro"] .st-presets { padding: 8px; gap: 5px; }
+  .st-presets-cap { display: none; }            /* (the group is labelled; a row saved) */
+  .st-preset { min-width: calc(25% - 4px); padding: 5px 8px 6px; }
+}
+/* Phone width: the controls go under the art and the display, across */
+@container st (max-width: 440px) {
+  #stations-view #st-now {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "art main" "side side";
+  }
+  .st-np-img, :root[data-ui-style="retro"] .st-np-img { width: 56px; height: 56px; font-size: 44px; }
+  .st-np-side { flex-direction: row; justify-content: space-between; align-items: center; }
+}
+

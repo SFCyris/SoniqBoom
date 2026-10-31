@@ -175,6 +175,8 @@ def negotiate_codec(
 #   bit 1: TimeSeekRange supported          (0=no, 1=yes)
 # Almost every renderer wants OP=01 (byte-range).
 _DLNA_OP_RANGE_ONLY = "01"
+# A stream without a length (a render encoded while it runs): no seeking.
+_DLNA_OP_NONE = "00"
 
 # DLNA.ORG_FLAGS — 32-bit hex right-padded to 24 nibbles (long form).
 #
@@ -191,7 +193,7 @@ _DLNA_OP_RANGE_ONLY = "01"
 _DLNA_FLAGS_DEFAULT = "01300000000000000000000000000000"
 
 
-def content_features(codec: str) -> str:
+def content_features(codec: str, *, seekable: bool = True) -> str:
     """Build the contentFeatures.dlna.org header value for ``codec``.
 
     Header form (per DLNA Guidelines 7.4.1.3):
@@ -199,7 +201,8 @@ def content_features(codec: str) -> str:
 
     Profile omitted entirely when the codec has no canonical PN
     (FLAC, OGG, OPUS, ALAC) — Sonos / LG accept this; older Samsung
-    sets prefer it explicit (LPCM, MP3 always emitted).
+    sets prefer it explicit (LPCM, MP3 always emitted).  ``seekable``
+    False (a stream without a length) declares ``DLNA.ORG_OP=00``.
     """
     spec = CODECS.get(codec.lower())
     if spec is None:
@@ -207,15 +210,16 @@ def content_features(codec: str) -> str:
     parts = []
     if spec.dlna_profile:
         parts.append(f"DLNA.ORG_PN={spec.dlna_profile}")
-    parts.append(f"DLNA.ORG_OP={_DLNA_OP_RANGE_ONLY}")
+    parts.append(f"DLNA.ORG_OP={_DLNA_OP_RANGE_ONLY if seekable else _DLNA_OP_NONE}")
     parts.append(f"DLNA.ORG_FLAGS={_DLNA_FLAGS_DEFAULT}")
     return ";".join(parts)
 
 
-def dlna_response_headers(codec: str, *, transfer_mode: str = "Streaming") -> dict[str, str]:
+def dlna_response_headers(codec: str, *, transfer_mode: str = "Streaming",
+                          seekable: bool = True) -> dict[str, str]:
     """Return the full set of DLNA headers to attach to a byte-stream
     response.  Safe to attach unconditionally — non-DLNA clients
-    ignore them.
+    ignore them.  ``seekable``: see ``content_features``.
 
     ``transfer_mode`` must be one of:
 
@@ -224,7 +228,7 @@ def dlna_response_headers(codec: str, *, transfer_mode: str = "Streaming") -> di
       * ``"Background"`` — file downloads (sync to disk).
     """
     return {
-        "contentFeatures.dlna.org":     content_features(codec),
+        "contentFeatures.dlna.org":     content_features(codec, seekable=seekable),
         "transferMode.dlna.org":        transfer_mode,
         "realTimeInfo.dlna.org":        "DLNA.ORG_TLAG=*",
     }

@@ -3685,10 +3685,12 @@ if FRONTEND_DIR.exists():
     #
     # Regex tightened to catch Vivaldi / Opera GX / Firefox Focus mobile builds
     # which only carry "Mobile" (not "Mobile Safari" literally).  iPads under
-    # iPadOS 13+ spoof as "Macintosh" by default — they fall through to
-    # desktop, which is what we want (more screen real estate available).
+    # iPadOS 13+ send a "Macintosh" user agent by default, so they get
+    # index.html here and its head script (``sbTouchDevice``: Macintosh +
+    # touch points, or a coarse primary pointer) sends them to /m.  That
+    # script repeats this regex, for a page the service worker served offline.
     _MOBILE_UA_RE = __import__("re").compile(
-        r"\bAndroid\b|\biPhone\b|\biPod\b|\bMobile\b|Opera Mini|IEMobile|FxiOS|EdgiOS",
+        r"\bAndroid\b|\biPhone\b|\biPod\b|\biPad\b|\bMobile\b|Opera Mini|IEMobile|FxiOS|EdgiOS",
         __import__("re").IGNORECASE,
     )
 
@@ -3711,8 +3713,9 @@ if FRONTEND_DIR.exists():
             return RedirectResponse("/m", status_code=302)
         if pinned == "desktop":
             return _shell_file(request, FRONTEND_DIR / "index.html")
-        # First visit: route phones to the mobile shell.  iPads + desktops
-        # still get the rich UI because the regex deliberately excludes them.
+        # No pinned choice: phones (and an iPad / Android tablet user agent)
+        # go to the mobile shell; an iPad asking for the desktop site is sent
+        # on by index.html's head script.
         ua = request.headers.get("user-agent", "")
         if _MOBILE_UA_RE.search(ua):
             return RedirectResponse("/m", status_code=302)

@@ -118,8 +118,10 @@ def _build_cmd(
     protocol: str | None = None,
     bit_depth: int | None = None,
     stdin_wav: bool = False,
+    gain: float = 1.0,
 ) -> list[str]:
-    """Build the ffmpeg command for a streaming transcode.
+    """Build the ffmpeg command for a streaming transcode (``gain`` < 1: an
+    overloaded render's ``stream.render_gain``, applied first).
 
     ``codec`` is the target codec: mp3 / flac / ogg / opus / aac / wav.
     ``protocol``, when provided, lets us pick the right container per
@@ -166,6 +168,8 @@ def _build_cmd(
     # for FLAC/WAV outputs this can reduce file size — the modulator
     # noise is uncorrelated and uncompressible.
     filters: list[str] = []
+    if gain < 1.0:
+        filters.append(f"volume={gain:.6f}")
     if src_ext in _DSD_EXTS:
         # Full DSD → PCM filter chain.  The highpass strips DC bias the
         # delta-sigma demodulator leaves on near-silence DSD segments
@@ -290,6 +294,7 @@ async def render_stream(
     protocol: str | None = None,
     bit_depth: int | None = None,
     src_feed: "AsyncIterator[bytes] | None" = None,
+    gain: float = 1.0,
 ) -> AsyncIterator[bytes]:
     """Yield chunks of transcoded audio as ffmpeg produces them.
 
@@ -337,6 +342,7 @@ async def render_stream(
         src_path, codec=codec, bitrate_kbps=bitrate_kbps,
         sample_rate=sample_rate, ffmpeg_path=ffmpeg_path,
         protocol=protocol, bit_depth=bit_depth, stdin_wav=src_feed is not None,
+        gain=gain,
     )
     log.debug("stream-as-render spawning: %s", " ".join(cmd))
 

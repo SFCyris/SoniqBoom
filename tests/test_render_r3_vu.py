@@ -226,9 +226,12 @@ async def test_real_uade_fifo_pass_matches_the_file_dump(tmp_path):
 # ── r3-ren-8: a pass that ran without a result says "skipped" ──────────────
 
 def _wav(path: Path, seconds: float) -> Path:
+    """A cached render stand-in: an audible square wave (a silent cached
+    render is dropped on its first hit — ``conversion_cache._silent_leftover``)."""
     frames = int(seconds * 44100)
-    path.write_bytes(stream._build_wav_header(44100, 2, frames, bits_per_sample=16)
-                     + b"\0" * (frames * 4))
+    pcm = b"".join((b"\x00\x10\x00\x10" if (i // 50) % 2 else b"\x00\xf0\x00\xf0")
+                   for i in range(frames))
+    path.write_bytes(stream._build_wav_header(44100, 2, frames, bits_per_sample=16) + pcm)
     return path
 
 

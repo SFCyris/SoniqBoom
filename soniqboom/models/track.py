@@ -197,6 +197,13 @@ class TrackMeta(BaseModel):
     # by the Demozoo apply only; read by the derived genres below.
     scene_use: list[str] | None = None
     scene_party: str | None = None
+    # The party competition it entered there ("Oldskool Music"), its place
+    # in it (1 = won; None: not known) and the competition's number of
+    # entries — written with ``scene_party`` by the Demozoo apply, read by
+    # the Scene view's party lists and the track list's Compo column.
+    scene_compo: str | None = None
+    scene_place: int | None = None
+    scene_compo_entries: int | None = None
     # Genres SoniqBoom derives for a retro track whose file names no genre
     # (core/genre_derive.py): category ("Game", "Demo", "Cracktro", "Scene"
     # …), platform ("SID", "Amiga", "Atari ST", "NES" …) and — with the

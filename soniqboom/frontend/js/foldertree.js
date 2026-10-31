@@ -370,6 +370,51 @@ function onSelect(fn) {
   _onSelect = fn;
 }
 
+// Is folder ``p`` folder ``base`` or inside it?  (A folder inside an archive
+// is a child of the archive's folder: ``…/Mixed/pack.zip::inner``.)
+function _within(p, base) {
+  return p === base || p.startsWith(base.endsWith('/') ? base : base + '/');
+}
+
+/**
+ * "Find folder": open the tree down to folder ``path`` — every folder on the
+ * way expanded as a click would — select it, scroll it into view and show it
+ * (the select callback, awaited).  Resolves true once it is shown; false when
+ * no root holds it, a folder on the way isn't listed (or can't be browsed:
+ * an offline drive), so the caller can show the folder without the tree.
+ */
+async function reveal(path) {
+  if (!path) return false;
+  if (wrap.style.display === 'none') {         // (the Folders section collapsed)
+    wrap.style.display = '';
+    toggle.classList.remove('collapsed');
+  }
+  let li = [...treeEl.querySelectorAll(':scope > li.tree-root')]
+    .filter((x) => _within(path, x.dataset.path))
+    .sort((a, b) => b.dataset.path.length - a.dataset.path.length)[0];
+  if (!li) return false;
+  while (li.dataset.path !== path) {
+    const row = li.querySelector(':scope > .tree-node');
+    if (!row || !row.__expand) return false;
+    if (!row.__isOpen()) await row.__expand();
+    if (!row.__isOpen()) return false;         // offline, nothing below, or the listing failed
+    const next = [...li.querySelectorAll(':scope > .tree-children > li[data-path]')]
+      .find((c) => _within(path, c.dataset.path));
+    if (!next) return false;
+    li = next;
+  }
+  const row = li.querySelector(':scope > .tree-node');
+  if (!row || (li.classList.contains('tree-unavailable') && !li.classList.contains('tree-catalogue'))) {
+    return false;
+  }
+  document.querySelectorAll('.tree-node.active').forEach((n) => n.classList.remove('active'));
+  row.classList.add('active');
+  try { row.scrollIntoView({ block: 'nearest' }); } catch (_) { /* detached */ }
+  if (row.__expand && !row.__isOpen()) row.__expand();
+  await _onSelect(path);
+  return true;
+}
+
 // Collapse/expand whole folders section
 toggle.addEventListener('click', () => {
   const collapsed = wrap.style.display === 'none';
@@ -390,4 +435,4 @@ function setScanActive(on) {
   _setScanningClass(on);
 }
 
-export const FolderTree = { refresh, addRoot, onSelect, setScanActive };
+export const FolderTree = { refresh, addRoot, onSelect, setScanActive, reveal };

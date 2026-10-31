@@ -8,6 +8,12 @@ import { artPlaceholderEmoji, staticArtUrl } from '../../utils.js';
 import { offlineKind, offlineBadge } from '../../offline.js';
 import { healthBadge, canReport, mark as healthMark, isUnplayable } from '../../health.js';
 
+// "1 track", "2 tracks", "1,234 tracks" — a count with its noun.
+export function countNoun(n, one, many = `${one}s`) {
+  const k = Number(n) || 0;
+  return `${k.toLocaleString()} ${k === 1 ? one : many}`;
+}
+
 export function esc(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -127,6 +133,11 @@ export function buildTrackRow(track, opts = {}) {
   meta.appendChild(title);
   meta.appendChild(artist);
   content.appendChild(meta);
+  // The album column (shown where the list is wide — a tablet; mobile.css).
+  const album = document.createElement('span');
+  album.className = 'm-row-album';
+  album.textContent = track.album || '';
+  content.appendChild(album);
 
   if (opts.trailing) content.appendChild(opts.trailing);
 
@@ -158,7 +169,7 @@ export function trackActions(track, ctx) {
     { label: '⚠︎ Report a problem…', onSelect: () => reportSheet(track, ctx) },
   ] : [];
   return [
-    { label: '▶ Play Now', onSelect: () => {
+    { label: '\u25B6\uFE0E Play Now', onSelect: () => {
       ctx.player.setQueue([track], 0);
     }},
     { label: '+ Add to Queue', onSelect: () => {

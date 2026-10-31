@@ -191,11 +191,12 @@ def locate_moov(read_hdr, file_size: int):
     return None
 
 
-def mp4_window(source, path: str, file_size: int = 0) -> bytes | None:
+def mp4_window(source, path: str, file_size: int = 0, *, lane: str = "scan") -> bytes | None:
     """``ftyp`` + an empty ``mdat`` + ``moov`` of an MP4 file: mutagen walks
     atoms sequentially and reads only ``ftyp`` and ``moov`` for tags, so the
-    audio is never fetched."""
-    front = source.read_at(path, 0, MP4_FRONT, lane="scan")
+    audio is never fetched.  ``lane``: the share's read lane (the cover
+    backfill reads ahead of the background passes)."""
+    front = source.read_at(path, 0, MP4_FRONT, lane=lane)
     if not front or len(front) < 8:
         return None
     if not file_size:
@@ -212,7 +213,7 @@ def mp4_window(source, path: str, file_size: int = 0) -> bytes | None:
         hdr_reads[0] += 1
         if hdr_reads[0] > MAX_HDR_READS:      # corrupt / pathological layout
             return b""
-        return source.read_at(path, off, 16, lane="scan")
+        return source.read_at(path, off, 16, lane=lane)
 
     loc = locate_moov(read_hdr, file_size)
     if loc is None:
@@ -229,7 +230,7 @@ def mp4_window(source, path: str, file_size: int = 0) -> bytes | None:
     if moov_off + moov_size <= len(front):
         moov_bytes = front[moov_off:moov_off + moov_size]
     else:
-        moov_bytes = source.read_at(path, moov_off, moov_size, lane="scan")
+        moov_bytes = source.read_at(path, moov_off, moov_size, lane=lane)
     if not moov_bytes or len(moov_bytes) < 8:
         return None
 

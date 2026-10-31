@@ -9,6 +9,7 @@ without caring that the backing store is in-process.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import logging
 import re
@@ -425,6 +426,7 @@ async def ft_search(
     offset: int = 0,
     sort_by: str | None = None,
     sort_order: str | None = None,
+    uid: str | None = None,
 ) -> list[TrackMeta]:
     """Search using the in-memory inverted index.
 
@@ -433,11 +435,14 @@ async def ft_search(
 
     ``sort_by`` / ``sort_order`` are forwarded to
     :py:meth:`TrackStore.filter_tracks` to select which pre-computed sorted
-    index drives the paginated walk.  Default (None) preserves the
-    historical "newest first" ordering.
+    index drives the paginated walk.  Default (None): newest first — for a
+    search box ``artist:`` filter without free text, its album-artist
+    matches first (``TrackStore.album_artist_first``).  ``uid``: whose plays the query's
+    ``plays`` / ``played`` read (``with_uid``).
     """
     store = get_store()
-    parsed = _parse_tag_query(query)
+    parsed = with_uid(_parse_tag_query(query), uid)
+    await search_indexes_for(parsed)
     hide_dups = bool(store.get_config("filter_duplicates", False))
     dicts = store.filter_tracks(**parsed, limit=limit, offset=offset,
                                 filter_duplicates=hide_dups,
@@ -463,6 +468,7 @@ async def ft_search_dicts(
     exclude: "frozenset[str] | set[str] | None" = None,
     untagged: str | None = None,
     swap=None,
+    uid: str | None = None,
 ) -> list[dict]:
     """Like :func:`ft_search`, but returns the store's plain dicts directly —
     no ``TrackMeta`` round-trip.
@@ -483,9 +489,11 @@ async def ft_search_dicts(
 
     ``untagged``: only tracks whose tag of that name is blank (the
     "[No Artist]"-style drill-down — ``TrackStore.filter_tracks``).
+    ``uid``: whose plays the query's ``plays`` / ``played`` read.
     """
     store = get_store()
-    parsed = _parse_tag_query(query)
+    parsed = with_uid(_parse_tag_query(query), uid)
+    await search_indexes_for(parsed)
     hide_dups = bool(store.get_config("filter_duplicates", False))
     return store.filter_tracks(**parsed, limit=limit, offset=offset,
                                filter_duplicates=hide_dups,
@@ -500,9 +508,147 @@ async def ft_search_dicts(
 # stray free-text "}").  An unescaped "{" (never in _esc_tag output) also ends
 # the scan: without that, every ``@x:{`` of an unterminated query scanned to the
 # end of the string — quadratic (9 s for 60 KB of ``@a:{\}``; now ~3 ms).
-_TAG_RE = re.compile(r'@(\w+):\{((?:\\.|[^\\{}])*)\}', re.DOTALL)
-_YEAR_RE = re.compile(r'@year:\[([^\]]+)\]')
+# A ``-`` right before the ``@`` at the start of a term (``-@format:{MP3}``)
+# makes it an exclusion; an escaped ``\-`` (free text) never does.
+_TAG_RE = re.compile(r'(?:(?<!\S)(-))?@(\w+):\{((?:\\.|[^\\{}])*)\}', re.DOTALL)
+# Numeric ranges: ``@year:[lo hi]``, ``@track:[lo hi]``, ``@disc:[lo hi]``,
+# ``@length:[lo hi]`` (whole seconds), ``@rating:[lo hi]``, ``@plays:[lo hi]``,
+# ``@bitdepth:[lo hi]``, ``@samplerate:[lo hi]`` (Hz), ``@bitrate:[lo hi]`` (kbps),
+# ``@bpm:[lo hi]``, ``@tunes:[lo hi]``, ``@channels:[lo hi]``.
+_RANGE_FIELDS = ("year|track|disc|length|rating|plays|bitdepth|samplerate|bitrate"
+                 "|bpm|tunes|channels")
+_RANGE_RE = re.compile(r'(?:(?<!\S)(-))?@(' + _RANGE_FIELDS + r'):\[([^\]]+)\]')
 _UNESCAPE_RE = re.compile(r'\\(.)', re.DOTALL)
+# Several values of one operator (``format:flac,alac``): a group of terms
+# joined by ``|`` in parentheses — ``(@format:{FLAC} | @format:{ALAC})``.
+_TERM = r'@\w+:(?:\{(?:\\.|[^\\{}])*\}|\[[^\]]+\])'
+_GROUP_RE = re.compile(r'\(\s*(' + _TERM + r'(?:\s*\|\s*' + _TERM + r')+)\s*\)', re.DOTALL)
+
+# Tag-query field → ``TrackStore.filter_tracks`` kwarg.
+_FIELD_MAP = {
+    "artist_tag": "artist",
+    "album_artist_tag": "album_artist",
+    "artist_match": "artist_match",          # search box artist: → a word start in the name
+    "album_artist_match": "album_artist_match",
+    "album_tag": "album",                    # an album's page: the exact album
+    "album_match": "album_match",            # search box album: → a word start in the name
+    "game_tag": "game",          # search box game: → game (SID/Atari: title) prefix
+    "genre": "genre",
+    "format": "format_",
+    "dir_hash": "dir_hash",
+    "scan_root_hash": "scan_root_hash",
+    "added": "added",                        # time specs (core/search_values)
+    "played": "played",
+    "text": "query",                         # (only as an exclusion: ``-@text:{word}``)
+    # the search box's other operators (``store.SEARCH_PREDICATES``)
+    "genre_match": "genre_match",            # search box genre: → a word start
+    "folder": "folder",
+    "path": "path_match",
+    "group": "group_match",
+    "party": "party",
+    "status": "status",
+    "composer": "composer_match",
+    "title": "title_match",
+    "lossless": "lossless",
+    "source": "source",
+    "phrase": "phrase",                      # a quoted run of the free text (a tuple)
+    "chip": "chip",
+    "dup": "dup",
+    "has": "has",
+}
+
+# Predicates that read one user's plays: the query needs that user's id
+# (``with_uid``).
+_UID_PREDICATES = ("plays_min", "plays_max", "played")
+
+
+def _range_bounds(field: str, inner: str) -> dict:
+    """``@field:[lo hi]``'s inside as ``{field_min, field_max}`` (inclusive
+    ints; a missing / open / unreadable bound is left out).  ``(`` / ``)``
+    mark exclusive bounds (RediSearch syntax) — every range field holds
+    integers (years, numbers, whole seconds, stars, plays), so they are
+    bumped by ±1 to inclusive ones (the code before stripped the bracket but
+    kept the value inclusive, so ``>2020`` quietly matched 2020 itself)."""
+    out: dict = {}
+    parts = inner.split()
+    if len(parts) != 2:
+        return out
+    lo, hi = parts
+    if lo not in ("-inf", "("):
+        try:
+            out[f"{field}_min"] = int(lo[1:]) + 1 if lo.startswith("(") else int(lo)
+        except ValueError:
+            pass
+    if hi not in ("+inf", ")"):
+        try:
+            # an exclusive upper bound is ``(N`` (RediSearch, as
+            # ``api.search`` emits ``year:<N``) or a legacy ``N)``
+            if hi.startswith("("):
+                out[f"{field}_max"] = int(hi[1:]) - 1
+            elif hi.endswith(")"):
+                out[f"{field}_max"] = int(hi[:-1]) - 1
+            else:
+                out[f"{field}_max"] = int(hi)
+        except ValueError:
+            pass
+    return out
+
+
+def needs_uid(preds: dict) -> bool:
+    """Do the ``filter_tracks`` predicates ``preds`` read a user's plays
+    (``plays_*`` / ``played``, an exclusion's or a several-values group's
+    too)?"""
+    if any(preds.get(k) is not None for k in _UID_PREDICATES):
+        return True
+    if any(k in _UID_PREDICATES for item in preds.get("negate") or () for k, _v in item):
+        return True
+    return any(k in _UID_PREDICATES for group in preds.get("anyof") or ()
+               for item in group for k, _v in item)
+
+
+def and_predicates(preds: dict, more: dict) -> dict:
+    """``preds`` with the predicates ``more`` (None values skipped) added so
+    that a track must match both: a predicate ``preds`` gives with another
+    value becomes a one-entry ``anyof`` group (as ``_parse_tag_query`` reads
+    the same operator twice); ``negate`` and ``anyof`` entries are joined."""
+    out = dict(preds)
+    negate = list(out.get("negate") or ())
+    groups = list(out.get("anyof") or ())
+    for k, v in more.items():
+        if v is None:
+            continue
+        if k == "negate":
+            negate.extend(v)
+        elif k == "anyof":
+            groups.extend(v)
+        elif out.get(k) is not None and out[k] != v:
+            groups.append((((k, v),),))
+        else:
+            out[k] = v
+    if negate:
+        out["negate"] = tuple(dict.fromkeys(negate))
+    if groups:
+        out["anyof"] = tuple(dict.fromkeys(groups))
+    return out
+
+
+def with_uid(preds: dict, uid: str | None) -> dict:
+    """``preds`` with ``uid`` — whose plays they read — added (key ``uid``)
+    when they read any (``needs_uid``) and ``uid`` is not None; so every
+    cache key built from the predicates (result sets, shuffle orders, walks)
+    holds the user only where the results depend on the user."""
+    if uid is not None and needs_uid(preds):
+        preds["uid"] = uid
+    return preds
+
+
+async def search_indexes_for(preds: dict) -> None:
+    """Wait for the search indexes a start is still building when ``preds``
+    read one (``TrackStore.needs_search_indexes``) — the loop serves the
+    other requests meanwhile."""
+    store = get_store()
+    if store.needs_search_indexes(preds):
+        await store.search_indexes_ready()
 
 
 def _parse_tag_query(query: str) -> dict:
@@ -514,14 +660,57 @@ def _parse_tag_query(query: str) -> dict:
       @artist_match:{value}      -> artist_match="value"   (search box artist:)
       @album_artist_match:{value} -> album_artist_match="value"
       @album_tag:{value}         -> album="value"
+      @album_match:{value}       -> album_match="value"    (search box album:)
       @game_tag:{value}          -> game="value"
       @genre:{value}             -> genre="value"
       @format:{value}            -> format_="value"
       @dir_hash:{value}          -> dir_hash="value"
       @scan_root_hash:{value}    -> scan_root_hash="value"
+      @added:{spec}              -> added="spec"           (core/search_values)
+      @played:{spec}             -> played="spec"
+      @genre_match:{value}       -> genre_match="value"    (search box genre:)
+      @folder:{v} @path:{v}      -> folder="v", path_match="v"
+      @group:{v} @party:{v}      -> group_match="v", party="v"
+      @status:{v} @source:{v}    -> status="v", source="v"
+      @composer:{v} @title:{v}   -> composer_match="v", title_match="v"
+      @lossless:{yes|no}         -> lossless="yes"
+      @phrase:{words}            -> phrase=("words", …)    (every quoted run)
+      @chip:{v} @has:{v} @dup:{v} -> chip="v", has="v", dup="yes"
       @year:[min max]            -> year_min=min, year_max=max
+      @track:[min max]           -> track_min=min, track_max=max
+      @disc:[min max]            -> disc_min=min, disc_max=max
+      @length:[min max]          -> length_min=min, length_max=max (seconds)
+      @rating:[min max]          -> rating_min=min, rating_max=max
+      @plays:[min max]           -> plays_min=min, plays_max=max
+      @bitdepth:[min max]        -> bitdepth_min=min, bitdepth_max=max
+      @samplerate:[min max]      -> samplerate_min=…, samplerate_max=… (Hz)
+      @bitrate:[min max]         -> bitrate_min=min, bitrate_max=max (kbps)
+      @bpm:[min max] @tunes:[…] @channels:[…] -> bpm_min/max, tunes_*, channels_*
+      (@a:{x} | @a:{y} | …)      -> anyof: several values (see below)
+      -<any term above>          -> an exclusion (see below)
+      -@text:{word}              -> an excluded free-text word
       *                          -> all tracks
       plain text                 -> query="text"
+
+    Exclusions (a term with a ``-`` right before its ``@``, at the start of
+    a term) become ``negate``: a tuple with one entry per excluded term,
+    each its predicates as a tuple of ``(kwarg, value)`` pairs — e.g.
+    ``-@format:{MP3} -@text:{live}`` → ``negate=((("format_", "MP3"),),
+    (("query", "live"),))``.  The store leaves out every track any entry
+    matches.
+
+    A term whose predicate was already given with another value — the same
+    operator twice (``folder:music folder:live``, ``year:1990 year:2000``)
+    — must match too: it becomes a one-entry ``anyof`` group (a range adds
+    to an earlier one when their bounds differ in kind: ``year:>1990
+    year:<2000`` is one range).
+
+    A group of terms in parentheses joined by ``|`` — several values of one
+    search-box operator — becomes one ``anyof`` group, a tuple of entries
+    shaped like ``negate``'s: ``(@format:{FLAC} | @format:{ALAC})`` →
+    ``anyof=(((("format_", "FLAC"),), (("format_", "ALAC"),)),)``.  A track
+    matches a group when it matches any of its entries; every group must
+    match.
 
     Tag values arrive backslash-escaped (``search._esc_tag``): each ends at its
     first unescaped ``}`` and every ``\\x`` reads back as ``x``, for all fields.
@@ -530,62 +719,82 @@ def _parse_tag_query(query: str) -> dict:
         return {}
 
     kwargs: dict = {}
-    remaining = query
+    negate: list[tuple] = []
+    anyof: list[tuple] = []
+    spans: list[tuple[int, int]] = []           # (the terms, cut out of the free text)
 
-    _FIELD_MAP = {
-        "artist_tag": "artist",
-        "album_artist_tag": "album_artist",
-        "artist_match": "artist_match",          # search box artist: → a word start in the name
-        "album_artist_match": "album_artist_match",
-        "album_tag": "album",
-        "game_tag": "game",          # search box game: → game (SID/Atari: title) prefix
-        "genre": "genre",
-        "format": "format_",
-        "dir_hash": "dir_hash",
-        "scan_root_hash": "scan_root_hash",
-    }
+    for match in _GROUP_RE.finditer(query):
+        inner = match.group(1)
+        entries: list[tuple] = []
+        for m in _TAG_RE.finditer(inner):
+            kwarg_name = _FIELD_MAP.get(m.group(2))
+            if kwarg_name and kwarg_name != "query":
+                entries.append(((kwarg_name, _UNESCAPE_RE.sub(r'\1', m.group(3))),))
+        for m in _RANGE_RE.finditer(inner):
+            bounds = _range_bounds(m.group(2), m.group(3))
+            if bounds:
+                entries.append(tuple(sorted(bounds.items())))
+        if entries:
+            anyof.append(tuple(dict.fromkeys(entries)))
+        spans.append(match.span())
+    group_starts = [a for a, _b in spans]                # (in order: finditer)
+    group_ends = [b for _a, b in spans]
+
+    def _grouped(m) -> bool:
+        i = bisect.bisect_right(group_starts, m.start()) - 1
+        return i >= 0 and m.start() < group_ends[i]
+
+    def _add(items: dict) -> None:
+        # The same operator again: both must match — a value differing
+        # from one already given becomes a one-entry group.
+        if any(k in kwargs and kwargs[k] != v for k, v in items.items()):
+            anyof.append((tuple(sorted(items.items())),))
+        else:
+            kwargs.update(items)
 
     for match in _TAG_RE.finditer(query):
-        field, value = match.group(1), match.group(2)
+        if _grouped(match):
+            continue
+        neg, field, value = match.group(1), match.group(2), match.group(3)
         value = _UNESCAPE_RE.sub(r'\1', value)
         kwarg_name = _FIELD_MAP.get(field)
-        if kwarg_name:
-            kwargs[kwarg_name] = value
-        remaining = remaining.replace(match.group(0), "")
+        if kwarg_name == "phrase":
+            # (every quoted run is its own phrase: a tuple of them)
+            if neg:
+                negate.append((("phrase", (value,)),))
+            else:
+                kwargs["phrase"] = tuple(dict.fromkeys((*kwargs.get("phrase", ()), value)))
+        elif kwarg_name and neg:
+            negate.append(((kwarg_name, value),))
+        elif kwarg_name and kwarg_name != "query":
+            _add({kwarg_name: value})
+        spans.append(match.span())
 
-    for match in _YEAR_RE.finditer(query):
-        parts = match.group(1).split()
-        if len(parts) == 2:
-            lo, hi = parts
-            # ``(`` / ``)`` mark exclusive bounds (RediSearch syntax).  The
-            # previous code stripped the bracket but kept the value inclusive,
-            # so ``>2020`` quietly matched 2020 itself.  Years are integers,
-            # so bump by ±1 to convert exclusive → inclusive.
-            if lo not in ("-inf", "("):
-                try:
-                    if lo.startswith("("):
-                        kwargs["year_min"] = int(lo[1:]) + 1
-                    else:
-                        kwargs["year_min"] = int(lo)
-                except ValueError:
-                    pass
-            if hi not in ("+inf", ")"):
-                try:
-                    # an exclusive upper bound is ``(N`` (RediSearch, as
-                    # ``api.search`` emits ``year:<N``) or a legacy ``N)``
-                    if hi.startswith("("):
-                        kwargs["year_max"] = int(hi[1:]) - 1
-                    elif hi.endswith(")"):
-                        kwargs["year_max"] = int(hi[:-1]) - 1
-                    else:
-                        kwargs["year_max"] = int(hi)
-                except ValueError:
-                    pass
-        remaining = remaining.replace(match.group(0), "")
+    for match in _RANGE_RE.finditer(query):
+        if _grouped(match):
+            continue
+        bounds = _range_bounds(match.group(2), match.group(3))
+        if match.group(1):
+            if bounds:
+                negate.append(tuple(sorted(bounds.items())))
+        elif bounds:
+            _add(bounds)
+        spans.append(match.span())
 
+    pieces, at = [], 0
+    for start, end in sorted(spans):
+        if start >= at:
+            pieces.append(query[at:start])
+            at = end
+    pieces.append(query[at:])
+    remaining = "".join(pieces)
     text = _UNESCAPE_RE.sub(r'\1', remaining.strip())
     if text and text != "*":
         kwargs["query"] = text
+    if negate:
+        kwargs["negate"] = tuple(dict.fromkeys(negate))
+    if anyof:
+        kwargs["anyof"] = tuple(dict.fromkeys(anyof))
 
     return kwargs
 

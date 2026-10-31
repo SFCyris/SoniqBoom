@@ -1,0 +1,720 @@
+[
+{
+"text": "vnv nation",
+"ops": [],
+"excl": [],
+"free": "vnv nation"
+},
+{
+"text": "artist:vnv year: 1990 - 1999 nation -live",
+"ops": [
+"artist:vnv"
+],
+"excl": [
+"-live"
+],
+"free": "year: 1990 - 1999 nation"
+},
+{
+"text": "vnv year:>= 2000",
+"ops": [
+"year:>=2000"
+],
+"excl": [],
+"free": "vnv"
+},
+{
+"text": "vnv year:< 2000",
+"ops": [
+"year:<2000"
+],
+"excl": [],
+"free": "vnv"
+},
+{
+"text": "year:1990 - 1999 x",
+"ops": [
+"year:1990-1999"
+],
+"excl": [],
+"free": "x"
+},
+{
+"text": "back on track: 2",
+"ops": [],
+"excl": [],
+"free": "back on track: 2"
+},
+{
+"text": "bitrate:128 kbps x",
+"ops": [
+"bitrate:128kbps"
+],
+"excl": [],
+"free": "x"
+},
+{
+"text": "format:flac, alac -live foo",
+"ops": [
+"format:flac, alac"
+],
+"excl": [
+"-live"
+],
+"free": "foo"
+},
+{
+"text": "\"song year:1999 remaster",
+"ops": [],
+"excl": [],
+"free": "\"song year:1999 remaster"
+},
+{
+"text": "foo -\"live at\" bar",
+"ops": [],
+"excl": [
+"-\"live at\""
+],
+"free": "foo bar"
+},
+{
+"text": "Dwayne \"The Rock\" Johnson",
+"ops": [],
+"excl": [],
+"free": "Dwayne \"The Rock\" Johnson"
+},
+{
+"text": "Re:Cycle",
+"ops": [],
+"excl": [],
+"free": "Re:Cycle"
+},
+{
+"text": "multi-track:2 - 3",
+"ops": [
+"track:2"
+],
+"excl": [],
+"free": "multi- - 3"
+},
+{
+"text": "xartist:y z",
+"ops": [],
+"excl": [],
+"free": "xartist:y z"
+},
+{
+"text": "foo-artist:x bar",
+"ops": [
+"artist:x"
+],
+"excl": [],
+"free": "foo- bar"
+},
+{
+"text": "artist:\"vnv nat",
+"ops": [
+"artist:\"vnv"
+],
+"excl": [],
+"free": "nat"
+},
+{
+"text": "artist:ab\"cd ef",
+"ops": [
+"artist:ab"
+],
+"excl": [],
+"free": "\"cd ef"
+},
+{
+"text": "genre:metal,\"hard rock\" -genre:pop",
+"ops": [
+"-genre:pop",
+"genre:metal,\"hard rock\""
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "Pokémon game:\"last ninja\"",
+"ops": [
+"game:\"last ninja\""
+],
+"excl": [],
+"free": "Pokémon"
+},
+{
+"text": "a-ha -- --x -!!!",
+"ops": [],
+"excl": [],
+"free": "a-ha -- --x -!!!"
+},
+{
+"text": "track:3/12 love",
+"ops": [
+"track:3/12"
+],
+"excl": [],
+"free": "love"
+},
+{
+"text": ":5:00-1999-1999alac",
+"ops": [],
+"excl": [],
+"free": ":5:00-1999-1999alac"
+},
+{
+"text": "-livebitrate:length:foo:baralacflac,128é",
+"ops": [],
+"excl": [
+"-livebitrate:length:foo:baralacflac,128é"
+],
+"free": ""
+},
+{
+"text": "length:title:-1999,format:track::foo:bar",
+"ops": [
+"length:title:-1999,format:track::foo:bar"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "128year:éa-ha-1999128< ",
+"ops": [],
+"excl": [],
+"free": "128year:éa-ha-1999128<"
+},
+{
+"text": "128length:éartist:--xalac",
+"ops": [],
+"excl": [],
+"free": "128length:éartist:--xalac"
+},
+{
+"text": "year:year:",
+"ops": [
+"year:year:"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "-éartist:",
+"ops": [],
+"excl": [
+"-éartist:"
+],
+"free": ""
+},
+{
+"text": "-1999 -1999-live--xbitrate:alac-",
+"ops": [],
+"excl": [
+"-1999",
+"-1999-live--xbitrate:alac-"
+],
+"free": ""
+},
+{
+"text": ",flac,artist:kbpstrack:-1999128",
+"ops": [
+"artist:kbpstrack:-1999128"
+],
+"excl": [],
+"free": ",flac,"
+},
+{
+"text": "1990:--xtrack:",
+"ops": [],
+"excl": [],
+"free": "1990:--xtrack:"
+},
+{
+"text": "\" 5:00-alac,artist:",
+"ops": [],
+"excl": [],
+"free": "\" 5:00-alac,artist:"
+},
+{
+"text": "-live5:00",
+"ops": [],
+"excl": [
+"-live5:00"
+],
+"free": ""
+},
+{
+"text": "a-hatitle:",
+"ops": [],
+"excl": [],
+"free": "a-hatitle:"
+},
+{
+"text": ",a-hatrack:artist:kbpsartist:bitrate:bitrate:",
+"ops": [],
+"excl": [],
+"free": ",a-hatrack:artist:kbpsartist:bitrate:bitrate:"
+},
+{
+"text": "flac,a-ha",
+"ops": [],
+"excl": [],
+"free": "flac,a-ha"
+},
+{
+"text": "a-ha1990track:-live128bitrate:5:00",
+"ops": [],
+"excl": [],
+"free": "a-ha1990track:-live128bitrate:5:00"
+},
+{
+"text": "\" track:, artist:1990",
+"ops": [],
+"excl": [],
+"free": "\" track:, artist:1990"
+},
+{
+"text": "title:format:->=title:artist:year:-1999",
+"ops": [
+"title:format:->=title:artist:year:-1999"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "flac,length:kbps:bitrate:-1999alacbitrate:",
+"ops": [
+"length:kbps:bitrate:-1999alacbitrate:"
+],
+"excl": [],
+"free": "flac,"
+},
+{
+"text": "5:00format:1990128a-hatitle:a-ha",
+"ops": [],
+"excl": [],
+"free": "5:00format:1990128a-hatitle:a-ha"
+},
+{
+"text": "bitrate:artist:\"foo:bar-live",
+"ops": [
+"bitrate:artist:"
+],
+"excl": [],
+"free": "\"foo:bar-live"
+},
+{
+"text": "artist:bitrate:length:a-ha",
+"ops": [
+"artist:bitrate:length:a-ha"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "é128-livetitle:year:format:bitrate:-1999",
+"ops": [],
+"excl": [],
+"free": "é128-livetitle:year:format:bitrate:-1999"
+},
+{
+"text": "artist:5:00é ",
+"ops": [
+"artist:5:00é"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": ",a-hatrack:track:track:bitrate:-live128",
+"ops": [],
+"excl": [],
+"free": ",a-hatrack:track:track:bitrate:-live128"
+},
+{
+"text": "artist:évnv",
+"ops": [
+"artist:évnv"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "é-1999format:-live",
+"ops": [],
+"excl": [],
+"free": "é-1999format:-live"
+},
+{
+"text": "--x-liveformat:a-halength:",
+"ops": [],
+"excl": [],
+"free": "--x-liveformat:a-halength:"
+},
+{
+"text": "format:,---xé-< ",
+"ops": [
+"format:,---xé-<"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "length:< 128",
+"ops": [
+"length:<128"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "bitrate:kbpsa-haflac,étrack:",
+"ops": [
+"bitrate:kbpsa-haflac,étrack:"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "year:title:title:year:alac",
+"ops": [
+"year:title:title:year:alac"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "-< >=a-ha",
+"ops": [],
+"excl": [],
+"free": "-< >=a-ha"
+},
+{
+"text": "1990--xéflac,",
+"ops": [],
+"excl": [],
+"free": "1990--xéflac,"
+},
+{
+"text": "alaclength:< track:",
+"ops": [],
+"excl": [],
+"free": "alaclength:< track:"
+},
+{
+"text": "-flac,:",
+"ops": [],
+"excl": [
+"-flac,:"
+],
+"free": ""
+},
+{
+"text": "éétrack:\"bitrate:bitrate:< ",
+"ops": [],
+"excl": [],
+"free": "éétrack:\"bitrate:bitrate:< "
+},
+{
+"text": "track:\"",
+"ops": [
+"track:\""
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "-1999-year:year:length:",
+"ops": [
+"year:year:length:"
+],
+"excl": [
+"-1999-"
+],
+"free": ""
+},
+{
+"text": "vnvalac-liveformat:",
+"ops": [],
+"excl": [],
+"free": "vnvalac-liveformat:"
+},
+{
+"text": "vnvformat:",
+"ops": [],
+"excl": [],
+"free": "vnvformat:"
+},
+{
+"text": " kbps< >=alac",
+"ops": [],
+"excl": [],
+"free": "kbps< >=alac"
+},
+{
+"text": "format:-liveyear:artist:flac,vnv",
+"ops": [
+"format:-liveyear:artist:flac,vnv"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": ",year:artist:é128track:flac,",
+"ops": [
+"year:artist:é128track:flac,"
+],
+"excl": [],
+"free": ","
+},
+{
+"text": "< ,",
+"ops": [],
+"excl": [],
+"free": "< ,"
+},
+{
+"text": "format:track:track:-1999",
+"ops": [
+"format:track:track:-1999"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "vnv< year:< < >=",
+"ops": [
+"year:<"
+],
+"excl": [],
+"free": "vnv< < >="
+},
+{
+"text": "foo:bar vnv",
+"ops": [],
+"excl": [],
+"free": "foo:bar vnv"
+},
+{
+"text": "kbpsflac,",
+"ops": [],
+"excl": [],
+"free": "kbpsflac,"
+},
+{
+"text": "1990foo:bar",
+"ops": [],
+"excl": [],
+"free": "1990foo:bar"
+},
+{
+"text": "flac,-live",
+"ops": [],
+"excl": [],
+"free": "flac,-live"
+},
+{
+"text": "ékbps",
+"ops": [],
+"excl": [],
+"free": "ékbps"
+},
+{
+"text": "a-ha-liveartist:étrack:",
+"ops": [],
+"excl": [],
+"free": "a-ha-liveartist:étrack:"
+},
+{
+"text": "track:128",
+"ops": [
+"track:128"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "\"1990",
+"ops": [],
+"excl": [],
+"free": "\"1990"
+},
+{
+"text": " a-ha< >=-live-1999-1999",
+"ops": [],
+"excl": [],
+"free": "a-ha< >=-live-1999-1999"
+},
+{
+"text": "--x:track:alac5:00",
+"ops": [],
+"excl": [],
+"free": "--x:track:alac5:00"
+},
+{
+"text": "artist:,étrack:flac,artist:",
+"ops": [
+"artist:,étrack:flac,artist:"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": ">=title:flac,",
+"ops": [
+"title:flac,"
+],
+"excl": [],
+"free": ">="
+},
+{
+"text": "ékbpsflac,\"artist:vnv,format:",
+"ops": [
+"artist:vnv,format:"
+],
+"excl": [],
+"free": "ékbpsflac,\""
+},
+{
+"text": "ébitrate:alaclength:5:00 kbps",
+"ops": [],
+"excl": [],
+"free": "ébitrate:alaclength:5:00 kbps"
+},
+{
+"text": "flac,- a-hakbps",
+"ops": [],
+"excl": [],
+"free": "flac,- a-hakbps"
+},
+{
+"text": "bitrate:1281990foo:bar",
+"ops": [
+"bitrate:1281990foo:bar"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "5:00bitrate:bitrate:a-ha--live bitrate:",
+"ops": [],
+"excl": [],
+"free": "5:00bitrate:bitrate:a-ha--live bitrate:"
+},
+{
+"text": "format:flac,vnv",
+"ops": [
+"format:flac,vnv"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "year:>=track:\"--xlength:title:-1999",
+"ops": [
+"year:>=track:"
+],
+"excl": [],
+"free": "\"--xlength:title:-1999"
+},
+{
+"text": "\"bitrate:--x1990a-ha",
+"ops": [],
+"excl": [],
+"free": "\"bitrate:--x1990a-ha"
+},
+{
+"text": "alacflac,kbps >=--x--x",
+"ops": [],
+"excl": [],
+"free": "alacflac,kbps >=--x--x"
+},
+{
+"text": "-1999 track:--xyear:\"",
+"ops": [
+"track:--xyear:"
+],
+"excl": [
+"-1999"
+],
+"free": "\""
+},
+{
+"text": "éyear:kbps>=\"-livevnv,",
+"ops": [],
+"excl": [],
+"free": "éyear:kbps>=\"-livevnv,"
+},
+{
+"text": "foo:bar-liveartist:128format:a-ha-1999",
+"ops": [],
+"excl": [],
+"free": "foo:bar-liveartist:128format:a-ha-1999"
+},
+{
+"text": "artist:5:00--x",
+"ops": [
+"artist:5:00--x"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "-5:00format:foo:bar",
+"ops": [],
+"excl": [
+"-5:00format:foo:bar"
+],
+"free": ""
+},
+{
+"text": "128title:",
+"ops": [],
+"excl": [],
+"free": "128title:"
+},
+{
+"text": "title:128:128128",
+"ops": [
+"title:128:128128"
+],
+"excl": [],
+"free": ""
+},
+{
+"text": "vnvtrack:kbpsbitrate:bitrate:--xflac,\"",
+"ops": [],
+"excl": [],
+"free": "vnvtrack:kbpsbitrate:bitrate:--xflac,\""
+},
+{
+"text": ">=artist:5:00",
+"ops": [
+"artist:5:00"
+],
+"excl": [],
+"free": ">="
+},
+{
+"text": ":>=year:length:-",
+"ops": [
+"year:length:-"
+],
+"excl": [],
+"free": ":>="
+},
+{
+"text": "5:00vnv:>=",
+"ops": [],
+"excl": [],
+"free": "5:00vnv:>="
+},
+{
+"text": "alacé5:00length:a-hafoo:bar",
+"ops": [],
+"excl": [],
+"free": "alacé5:00length:a-hafoo:bar"
+}
+]

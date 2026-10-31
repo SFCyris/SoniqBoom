@@ -37,6 +37,15 @@ order, which is also what a search without free text lists (a pure filter
 such as ``format:SID year:>2020`` is not ranked).  The order is complete and
 deterministic: no two tracks compare equal.
 
+A scoped search (``SCOPES``: the phone's TITLE / ARTIST / ALBUM / GENRE /
+GAME keys, ``GET /api/search/page?rank_by=<operator>``) has no free text —
+its words are an operator's values (``title:"space"``).  It is ranked by those
+values (``scope_terms``) with the same comparisons, judged on the fields that
+operator matches only (``Ranker(terms, scope)``: title for ``title``, artist
+and album artist for ``artist``, …) and with words cut as the operator cuts
+them; the other fields add nothing, and a value a track holds twice counts
+once.  Without ``rank_by`` an operator only filters, as above.
+
 Cost: a dict lookup per field per track once a field value was seen in this
 ranking (``Ranker`` memoises each distinct value: artists, albums and
 repeated titles are analysed once) and a few substring tests to skip the
@@ -46,7 +55,8 @@ slice and merges them as far as a page needs.
 """
 from __future__ import annotations
 
-from soniqboom.core.store import _SPLIT_RE, _added_value, _tokenize_text, fold_token
+from soniqboom.core.store import (_SPLIT_RE, _WORD_CUT_RE, _added_value, _game_key,
+                                  _game_title_hit, _tokenize_text, fold_token)
 
 W_TITLE = 8
 W_ARTIST = 4
@@ -59,6 +69,25 @@ FIELDS = (("title", W_TITLE), ("artist", W_ARTIST), ("album_artist", W_ARTIST),
           ("album", W_ALBUM), ("composer", W_OTHER), ("scene_group", W_OTHER),
           ("game", W_OTHER))
 
+# (field, weight) of the list fields scored per name: ``game_aliases``.
+LISTS = (("game_aliases", W_OTHER),)
+
+# The scopes a search without free text can be ranked by (``rank_by``):
+# operator → (the predicate that holds its values — ``api.search.
+# search_predicates`` —, the string fields and the list fields its predicate
+# matches, with their weights).  ``genre:`` matches a track's genres
+# (``store.track_genres``: derived, then its own); ``game:`` the game and its
+# other names — and the title of a tune the predicate matches by its title
+# (``store._game_title_hit``: ``_GAME_TITLE_FIELDS`` for that track).
+SCOPES = {
+    "title": ("title_match", (("title", W_TITLE),), ()),
+    "artist": ("artist_match", (("artist", W_ARTIST), ("album_artist", W_ARTIST)), ()),
+    "album": ("album_match", (("album", W_ALBUM),), ()),
+    "genre": ("genre_match", (), (("genre_derived", W_OTHER), ("genre", W_OTHER))),
+    "game": ("game", (("game", W_ALBUM),), (("game_aliases", W_ALBUM),)),
+}
+_GAME_TITLE_FIELDS = (("game", W_ALBUM), ("title", W_ALBUM))
+
 _MISSING = object()
 
 
@@ -66,6 +95,46 @@ def query_terms(text: str | None) -> list[str]:
     """The terms of a search's free text, as the search matches them
     (``TrackStore._resolve_query``): lower-cased words, accents folded."""
     return [fold_token(t) for t in _tokenize_text(text or "")]
+
+
+def _scope_words(v: str) -> list[str]:
+    """The words of an operator's value or of a field value as the operators
+    match them (``store._field_word_hits`` / ``_word_hits``): lower case,
+    accents folded, cut at every character that is no letter or digit
+    ("Rock’n’Roll" → rock, n, roll)."""
+    return [w for w in _WORD_CUT_RE.split(_game_key(v)) if w]
+
+
+def _game_words(v: str) -> list[str]:
+    """``_scope_words`` without a leading "the" (the ``game:`` operator finds
+    a game with and without its article)."""
+    w = _scope_words(v)
+    return w[1:] if len(w) > 1 and w[0] == "the" else w
+
+
+def scope_terms(preds: dict, scope: str | None) -> list[str]:
+    """The terms a search is ranked by for the scope ``scope`` (a ``SCOPES``
+    key): the values of its predicate in ``preds`` — the operator's first
+    value and every further one that must match too (an ``anyof`` group of
+    one entry of that predicate: ``title:"lost" title:"space"``; a group of
+    alternatives, ``title:a,b``, ranks nothing) — as the operator reads their
+    words (``_scope_words``).  ``[]`` for no such scope, a search with free
+    text (its free text ranks it) or no value of that operator."""
+    spec = SCOPES.get(scope) if scope else None
+    if spec is None or preds.get("query") or preds.get("phrase"):
+        return []
+    pred = spec[0]
+    values = []
+    if preds.get(pred) is not None:
+        values.append(preds[pred])
+    for group in preds.get("anyof") or ():
+        if len(group) == 1 and len(group[0]) == 1 and group[0][0][0] == pred:
+            values.append(group[0][0][1])
+    split = _game_words if scope == "game" else _scope_words
+    terms: list[str] = []
+    for v in values:
+        terms += split(str(v))
+    return terms
 
 
 def _words(v: str) -> list[str]:
@@ -79,14 +148,26 @@ def _words(v: str) -> list[str]:
 class Ranker:
     """Scores tracks for the terms ``terms`` (``query_terms``): ``key(t)`` is
     the score, ``sort_key(tid, t)`` the full, unique key of the order (larger
-    first)."""
+    first).  ``scope`` (a ``SCOPES`` key; ``terms`` from ``scope_terms``):
+    only that operator's fields are scored, cut into words as the operator
+    cuts them, and a value a track holds twice (an album artist equal to the
+    artist, a genre both derived and its own) counts once; None (or an
+    unknown key): every field the text search reads (``FIELDS``, ``LISTS``)."""
 
-    __slots__ = ("terms", "uterms", "multi", "_memo")
+    __slots__ = ("terms", "uterms", "multi", "fields", "lists", "split", "title_game",
+                 "dedup", "_memo")
 
-    def __init__(self, terms: list[str]) -> None:
+    def __init__(self, terms: list[str], scope: str | None = None) -> None:
         self.terms = list(terms)
         self.uterms = tuple(dict.fromkeys(terms))
         self.multi = len(self.terms) >= 2
+        spec = SCOPES.get(scope) if scope else None
+        self.fields = spec[1] if spec else FIELDS
+        self.lists = spec[2] if spec else LISTS
+        self.split = (_words if spec is None else
+                      _game_words if scope == "game" else _scope_words)
+        self.title_game = scope == "game"
+        self.dedup = spec is not None
         self._memo: dict = {}
 
     # ── one field value ──────────────────────────────────────────────────
@@ -99,7 +180,7 @@ class Ranker:
         r = None
         low = v.lower()
         if not low.isascii() or any(q in low for q in self.uterms):
-            words = _words(v)
+            words = self.split(v)
             m = []
             hit = False
             for q in self.uterms:
@@ -126,7 +207,13 @@ class Ranker:
         title_full = whole_w = phrase_w = cover_w = cover_ex = full_w = total = 0
         memo = self._memo
         get = t.get
-        for name, w in FIELDS:
+        fields = self.fields
+        seen = None
+        if self.dedup:                          # (a scope)
+            seen = set()
+            if self.title_game and _game_title_hit(t):
+                fields = _GAME_TITLE_FIELDS
+        for name, w in fields:
             v = get(name)
             if not v or v.__class__ is not str:
                 continue
@@ -135,6 +222,11 @@ class Ranker:
                 r = self._field(v)
             if r is None:
                 continue
+            if seen is not None:
+                k = v.strip().lower()
+                if k in seen:
+                    continue
+                seen.add(k)
             m, ph, full, s = r
             if full:
                 if w == W_TITLE and name == "title":
@@ -150,9 +242,11 @@ class Ranker:
                 if ex == len(m) and w > whole_w:
                     whole_w = w
             total += w * s
-        aliases = get("game_aliases")
-        if aliases and isinstance(aliases, (list, tuple)):
-            for v in aliases:
+        for lname, w in self.lists:
+            names = get(lname)
+            if not names or not isinstance(names, (list, tuple)):
+                continue
+            for v in names:
                 if not v or v.__class__ is not str:
                     continue
                 r = memo.get(v, _MISSING)
@@ -160,18 +254,23 @@ class Ranker:
                     r = self._field(v)
                 if r is None:
                     continue
+                if seen is not None:
+                    k = v.strip().lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
                 m, ph, full, s = r
-                if full and W_OTHER > full_w:
-                    full_w = W_OTHER
-                if ph and W_OTHER > phrase_w:
-                    phrase_w = W_OTHER
+                if full and w > full_w:
+                    full_w = w
+                if ph and w > phrase_w:
+                    phrase_w = w
                 if 0 not in m:
                     ex = m.count(2)
-                    if W_OTHER > cover_w or (W_OTHER == cover_w and ex > cover_ex):
-                        cover_w, cover_ex = W_OTHER, ex
-                    if ex == len(m) and W_OTHER > whole_w:
-                        whole_w = W_OTHER
-                total += W_OTHER * s
+                    if w > cover_w or (w == cover_w and ex > cover_ex):
+                        cover_w, cover_ex = w, ex
+                    if ex == len(m) and w > whole_w:
+                        whole_w = w
+                total += w * s
         if cover_ex > 15:
             cover_ex = 15
         if total > 0xFFFFFF:
@@ -195,10 +294,11 @@ def _phrase(words: list[str], terms: list[str]) -> bool:
     return False
 
 
-def rank(store, ids, terms: list[str]) -> list[str]:
-    """``ids`` in Best match order for ``terms`` (in one go — tests, small
-    sets; ``core/search_sets`` scores large sets a slice at a time)."""
-    r = Ranker(terms)
+def rank(store, ids, terms: list[str], scope: str | None = None) -> list[str]:
+    """``ids`` in Best match order for ``terms`` (``scope``: as ``Ranker``'s;
+    in one go — tests, small sets; ``core/search_sets`` scores large sets a
+    slice at a time)."""
+    r = Ranker(terms, scope)
     tracks = store._tracks
     rows = [r.sort_key(tid, tracks[tid]) for tid in ids if tid in tracks]
     rows.sort(reverse=True)

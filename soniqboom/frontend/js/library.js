@@ -6,11 +6,13 @@
  * Exports: Library singleton
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel } from './utils.js';
+import { artPlaceholderEmoji, ADLIB_FORMAT_NAMES, CHIP_FORMAT_NAMES, isRenderOnlyDuration, probeAdlibDurations, surroundLabel, parseLRC, compoLabel, compoPlaceLabel } from './utils.js';
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadge, Offline } from './offline.js';
 import { listTuneCount, tunesBadge } from './tunes.js';
 import { healthBadge, canReport, mark as healthMark, isUnplayable } from './health.js';
+import { onUiStyleChange } from './ui_style.js';
+import { FolderTree } from './foldertree.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -239,8 +241,22 @@ const simBtn           = document.getElementById('btn-similar');
 const browseFilterWrap  = document.getElementById('browse-filter-wrap');
 const browseFilter      = document.getElementById('browse-filter');
 const groupFilterBar    = document.getElementById('group-filter-bar');
+const sceneTabsEl       = document.getElementById('scene-tabs');
 const groupFilterLabel  = document.getElementById('group-filter-label');
 const groupFilterInput  = document.getElementById('group-filter-input');
+
+// The Scene view's lists (showScene, further down) — read by _applyCounts and
+// renderGroupList too.
+const _FACETS = {
+  composer:    { url: 'composers',    count: 'composers',    title: 'Composer',    label: 'Composers' },
+  game:        { url: 'games',        count: 'games',        title: 'Game',        label: 'Games' },
+  platform:    { url: 'platforms',    count: 'platforms',    title: 'Platform',    label: 'Platforms' },
+  party:       { url: 'parties',      count: 'parties',      title: 'Party',       label: 'Parties' },
+  scene_group: { url: 'scene-groups', count: 'scene_groups', title: 'Scene group', label: 'Scene groups', tab: 'Groups' },
+};
+const _SCENE_TAB_KEY = 'sb_scene_tab';
+let _sceneCounts = {};       // the lists' sizes from the last counts reply
+let _sceneTab = null;        // the Scene list the group view on screen shows (null: none)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentTracks = [];
@@ -579,7 +595,7 @@ let _lastClickIdx = -1;
 let _gridView = false;
 
 // ── Column visibility state ────────────────────────────────────────────────────
-const ALL_COLS = ['col-num','col-cover','col-title','col-album-artist','col-artist','col-album','col-track','col-year','col-dur','col-format','col-location','col-rating'];
+const ALL_COLS = ['col-num','col-cover','col-title','col-album-artist','col-artist','col-album','col-compo','col-track','col-year','col-dur','col-format','col-location','col-rating'];
 const COL_LABELS = {
   'col-num':          '#',
   'col-cover':        'Cover',
@@ -587,6 +603,7 @@ const COL_LABELS = {
   'col-album-artist': 'Album Artist',
   'col-artist':       'Artist',
   'col-album':        'Album',
+  'col-compo':        'Compo',
   'col-track':        'Track',
   'col-year':         'Year',
   'col-dur':          'Duration',
@@ -598,6 +615,34 @@ const COL_LABELS = {
 // ── Ratings cache (loaded per view) ───────────────────────────────────────
 let _ratingsCache = {};  // track_id → rating (0-5)
 let _hiddenCols = new Set(JSON.parse(localStorage.getItem('sb_hidden_cols') || '["col-location"]'));
+// A list loaded whole (a folder, a playlist): a column empty in every row is
+// left out — Album Artist for a folder of chip tunes; a paged list (All
+// Tracks, a search) keeps its columns, so they don't come and go as it scrolls.
+const _EMPTY_COL_FIELDS = { 'col-album-artist': 'album_artist', 'col-album': 'album', 'col-track': 'track_number', 'col-year': 'year' };
+let _emptyCols = new Set();
+// The Compo column (the Demozoo party competition and place): by default
+// ('auto') shown in a list loaded whole that has a track with a party; the
+// column menu turns it on everywhere ('on' — paged lists too) or off
+// ('off').  A party's own list groups its rows by compo (showFacetTracks).
+const COMPO_COL_KEY = 'sb_compo_col';
+let _compoHas = false;        // the list on screen (loaded whole) has a party's track
+let _compoGrouped = false;    // the list on screen is a party's, grouped by compo
+let _compoGroupNext = false;  // (set by showFacetTracks for the renderTracks it calls)
+function _compoPref() {
+  try { return localStorage.getItem(COMPO_COL_KEY) || 'auto'; } catch (_) { return 'auto'; }
+}
+function _compoColHidden() {
+  const p = _compoPref();
+  return p === 'off' || (p !== 'on' && !_compoHas);
+}
+function _emptyColumns(tracks) {
+  const out = new Set();
+  if (!Array.isArray(tracks) || !tracks.length || tracks._isWindowedStore) return out;
+  for (const [cls, f] of Object.entries(_EMPTY_COL_FIELDS)) {
+    if (tracks.every((t) => !t || t[f] == null || t[f] === '')) out.add(cls);
+  }
+  return out;
+}
 
 // ── Location / alias state ──────────────────────────────────────────────────
 let _aliasMap = {};           // { "/abs/path": "alias", ... }
@@ -724,6 +769,7 @@ function _showSkeletonRows(count = 18) {
       <td class="col-album-artist"><span class="skel-bar" style="width:${50 + Math.random() * 50|0}px"></span></td>
       <td class="col-artist"><span class="skel-bar" style="width:${40 + Math.random() * 50|0}px"></span></td>
       <td class="col-album"><span class="skel-bar" style="width:${50 + Math.random() * 60|0}px"></span></td>
+      <td class="col-compo"><span class="skel-bar" style="width:${50 + Math.random() * 50|0}px"></span></td>
       <td class="col-track"><span class="skel-bar" style="width:20px"></span></td>
       <td class="col-year"><span class="skel-bar" style="width:28px"></span></td>
       <td class="col-dur"><span class="skel-bar" style="width:32px"></span></td>
@@ -780,13 +826,29 @@ function _applyCounts(c) {
   const all = c.visible ?? c.tracks;
   if (Number.isFinite(all)) _updateNavBadge('all', all);
   for (const k of _NAV_COUNT_KEYS) if (Number.isFinite(c[k])) _updateNavBadge(k, c[k]);
-  // The Scene-groups facet shows only once the library carries scene data.
-  const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
-  if (li && c.scene_groups > 0) {
-    li.hidden = false;
-    _updateNavBadge('scene_groups', c.scene_groups);
+  // The Scene view shows once the library has an entry in any of its lists
+  // (composers, games, platforms, parties, scene groups), and goes again when
+  // the last one goes — unless it is open.  A null count: not known yet (the
+  // server is still building what it reads after a start) — asked again.
+  let unknown = false, any = false;
+  for (const f of Object.values(_FACETS)) {
+    const n = c[f.count];
+    if (n === null) { unknown = true; continue; }
+    if (!Number.isFinite(n)) continue;
+    _sceneCounts[f.count] = n;
+    if (n > 0) any = true;
+  }
+  const li = document.querySelector('#nav-library li[data-view="scene"]');
+  if (li && (any || !unknown)) li.hidden = !any && !li.classList.contains('active');
+  if (_sceneTab && !groupFilterBar.hidden) _paintSceneTabs();
+  if (unknown && _facetCountRetries < 20) {
+    _facetCountRetries++;
+    setTimeout(() => _refreshNavCounts({ reuse: true }), 3000);
+  } else if (!unknown) {
+    _facetCountRetries = 0;
   }
 }
+let _facetCountRetries = 0;
 
 // Resolves to the counts (or null on failure); one request at a time, and one
 // more after it when asked again meanwhile — unless ``reuse``: then a request
@@ -852,6 +914,7 @@ const _CANONICAL_ROW_HTML = `
     <td class="col-album-artist"></td>
     <td class="col-artist"></td>
     <td class="col-album"></td>
+    <td class="col-compo"></td>
     <td class="col-track"></td>
     <td class="col-year"></td>
     <td class="col-dur"></td>
@@ -907,6 +970,7 @@ const _SKELETON_ROW_HTML = `
       <td class="col-album-artist"><span class="skel-bar" style="width:80px"></span></td>
       <td class="col-artist"><span class="skel-bar" style="width:80px"></span></td>
       <td class="col-album"><span class="skel-bar" style="width:90px"></span></td>
+      <td class="col-compo"><span class="skel-bar" style="width:80px"></span></td>
       <td class="col-track"><span class="skel-bar" style="width:20px"></span></td>
       <td class="col-year"><span class="skel-bar" style="width:28px"></span></td>
       <td class="col-dur"><span class="skel-bar" style="width:32px"></span></td>
@@ -939,7 +1003,7 @@ function _fillFailedRow(tr, i) {
       <td class="col-cover"><span class="vs-fail-frame"></span></td>
       <td class="col-title">Couldn’t load these tracks <button type="button" class="vs-retry">Retry</button></td>
       <td class="col-album-artist"></td><td class="col-artist"></td><td class="col-album"></td>
-      <td class="col-track"></td><td class="col-year"></td><td class="col-dur"></td>
+      <td class="col-compo"></td><td class="col-track"></td><td class="col-year"></td><td class="col-dur"></td>
       <td class="col-format"></td><td class="col-location"></td><td class="col-rating"></td>`;
 }
 
@@ -1108,7 +1172,13 @@ function _fillTrackRow(tr, t, i) {
   const arTd = cells[4];
   arTd.classList.toggle('col-empty', !unscan && !hasAr);
   arTd.title = t.artist || '';
-  arTd.textContent = unscan ? '' : (t.artist || '—');
+  if (unscan) {
+    arTd.textContent = '';
+  } else if (hasAr) {
+    arTd.innerHTML = `<span class="cell-link" data-action="artist">${esc(t.artist)}</span>`;
+  } else {
+    arTd.textContent = '—';
+  }
 
   // col-album
   const alTd = cells[5];
@@ -1122,17 +1192,34 @@ function _fillTrackRow(tr, t, i) {
     alTd.textContent = '—';
   }
 
+  // col-compo: "Revision 2019 · Oldskool Music · 2nd of 9" (in a party's own
+  // list without the party); the first of a compo's rows starts its group
+  const cpTd = cells[6];
+  const cp = unscan ? '' : compoLabel(t, { party: !_compoGrouped });
+  cpTd.title = cp;
+  if (cp && t.scene_compo) {
+    // the competition's name opens that compo's tracks (_showCompoTracks)
+    const place = compoPlaceLabel(t);
+    cpTd.innerHTML = (_compoGrouped ? '' : `${esc(t.scene_party)} \u00b7 `)
+      + `<span class="cell-link" data-action="compo">${esc(t.scene_compo)}</span>`
+      + (place ? ` \u00b7 ${esc(place)}` : '');
+  } else {
+    // (a party's track whose competition isn't known: a dash)
+    cpTd.textContent = cp || (!unscan && t.scene_party ? '—' : '');
+  }
+  tr.classList.toggle('compo-group-first', !!t._compoGroupFirst && _compoGrouped);
+
   // col-track / col-year
-  cells[6].textContent = trackStr;
-  cells[7].textContent = t.year || '';
+  cells[7].textContent = trackStr;
+  cells[8].textContent = t.year || '';
 
   // col-dur
-  const durTd = cells[8];
+  const durTd = cells[9];
   durTd.classList.toggle('col-empty', !unscan && !t.duration);
   durTd.textContent = unscan ? '' : fmtDur(t.duration);
 
   // col-format
-  const fmtBadge = cells[9].firstElementChild;
+  const fmtBadge = cells[10].firstElementChild;
   fmtBadge.className = `fmt-badge fmt-${_fmtClass(t.format)}`;
   fmtBadge.textContent = t.format || '';
   // Surround marker (5.1 / 7.1 / …) — only real multichannel PCM audio, never
@@ -1152,12 +1239,12 @@ function _fillTrackRow(tr, t, i) {
   }
 
   // col-location
-  const locTd = cells[10];
+  const locTd = cells[11];
   locTd.title = _exposeLocalFiles ? (t.path || '') : '';
   locTd.textContent = _displayPath(t.path || '');
 
   // col-rating — innerHTML required because stars use nested elements
-  _paintStars(cells[11], rating);
+  _paintStars(cells[12], rating);
 }
 
 // Persist rating + bring focus back into the star group after a change.
@@ -1219,10 +1306,14 @@ const _trackThead = document.querySelector('#track-table thead');
 let _theadH = 0;
 function _measureThead() { _theadH = _trackThead ? _trackThead.offsetHeight : 0; }
 
+// The spacer row spans exactly the shown columns: with table-layout: fixed a
+// wider span adds empty columns that take a share of the width (a blank band
+// on the right once columns are hidden).  _applyColVisibility keeps it.
+let _spacerSpan = 11;
 function _makeSpacerRow() {
   const sp = document.createElement('tr');
   sp.className = 'vs-spacer';
-  sp.innerHTML = `<td colspan="11" style="height:0;padding:0;border:none"></td>`;
+  sp.innerHTML = `<td colspan="${_spacerSpan}" style="height:0;padding:0;border:none"></td>`;
   return sp;
 }
 function _setSpacerRow(sp, px) { sp.firstElementChild.style.height = px + 'px'; }
@@ -1293,8 +1384,10 @@ document.addEventListener('themechange', () => {
 // always render as a proper sortable track
 // list with the group header / filter chrome cleared, wherever the search was
 // launched.  ``_searchCtx`` = the set on screen ``{q, rs, total, sort, order,
-// client, ranked}`` (``sort`` / ``order``: the server's column order, null = the
-// default; ``ranked``: the default is Best match;
+// client, ranked, artistFirst}`` (``sort`` / ``order``: the server's column
+// order, null = the default; ``ranked``: the default is Best match;
+// ``artistFirst``: the default lists album-artist matches first — an
+// ``artist:`` search without free text;
 // ``client``: ``{key, asc}`` while the list is re-sorted in the browser — a column
 // the server can't sort, the whole set in hand; ``gen``: the nav token the list
 // was rendered under — any view entry since, a new search included, makes a
@@ -1459,7 +1552,7 @@ async function showSearch(q) {
   }
   if (gen !== _browseNavGen) return 'superseded';
   const ctx = { q, rs: head.rs, total: head.total || 0, sort: null, order: null, client: null,
-                ranked: head.ranked !== false };
+                ranked: head.ranked !== false, artistFirst: head.artist_first === true };
   _installSearch(ctx, ctx.total ? _newSearchStore(ctx, head) : []);
   return 'ok';
 }
@@ -1484,7 +1577,7 @@ async function _searchReread(seed = null) {
     if (gone()) return 'gone';
     if (!head || !Array.isArray(head.tracks)) return 'failed';
     const nctx = { ...ctx, rs: head.rs, total: head.total || 0, sort: null, order: null,
-                   ranked: head.ranked !== false };
+                   ranked: head.ranked !== false, artistFirst: head.artist_first === true };
     if (nctx.total <= CHUNK_SIZE && head.tracks.length === nctx.total) {
       const { key, asc } = ctx.client;
       _installSearch(nctx, _sortRows(head.tracks, key, asc), { keepScroll: true });
@@ -1517,6 +1610,9 @@ async function _searchReread(seed = null) {
   if (!head || typeof head.total !== 'number' || !Array.isArray(head.tracks)) return 'failed';
   const nctx = { ...ctx, rs: head.rs, total: head.total };
   if (typeof head.ranked === 'boolean') nctx.ranked = head.ranked;
+  // (whether the default order lists album-artist matches first: read from an
+  // answer in that order)
+  if (!nctx.sort && typeof head.artist_first === 'boolean') nctx.artistFirst = head.artist_first;
   if (!nctx.total) {
     _installSearch(nctx, [], { keepScroll: true });
     return 'ok';
@@ -1590,7 +1686,8 @@ function _onSearchSortClick(th, key) {
 
 // "Best match" in the search view's header: lit while the list is in the
 // search's default order (Best match — or newest first for a search without
-// free text, and then it says so); a click on it while a column orders the list
+// free text, album-artist matches first for an ``artist:`` one, and then it
+// says so); a click on it while a column orders the list
 // puts the default order back (the column's arrow goes).  (``_bestMatchBtn``:
 // declared with the sort state.)
 function _paintBestMatchBtn(ctx) {
@@ -1604,7 +1701,8 @@ function _paintBestMatchBtn(ctx) {
   const b = _bestMatchBtn;
   if (b.parentNode !== browseHdr) browseHdr.insertBefore(b, browseBack);
   const on = !!ctx && !ctx.sort && !ctx.client;
-  const label = ctx && ctx.ranked === false ? 'Newest first' : 'Best match';
+  const label = ctx && ctx.artistFirst ? 'Album artist first'
+    : ctx && ctx.ranked === false ? 'Newest first' : 'Best match';
   b.textContent = label;
   b.hidden = !ctx || !ctx.total;
   b.classList.toggle('active', on);
@@ -1643,6 +1741,7 @@ function _resortSearch(key, asc, head = null) {
     nctx.rs = head.rs;
     nctx.total = head.total;
     if (typeof head.ranked === 'boolean') nctx.ranked = head.ranked;
+    if (!key && typeof head.artist_first === 'boolean') nctx.artistFirst = head.artist_first;
     if (nctx.total !== ctx.total) {                // (answered from a renewed set)
       browseCrumb.textContent = browseCrumb.title = _searchHeadText(nctx.q, nctx.total);
     }
@@ -1753,6 +1852,8 @@ function _currentListPlace() {
 // mark may have changed) — and keep the user's place: the same rows at the top
 // of the viewport, the selection, the keyboard row (see _planListPlace).
 async function renderTracks(tracks, { keepScroll = false } = {}) {
+  _compoGrouped = _compoGroupNext;     // (a party's list: rows grouped by compo)
+  _compoGroupNext = false;
   keepScroll = keepScroll && _trackVL.active && tracks.length > 0;
   const place = keepScroll ? _currentListPlace() : null;
   _leaveGalaxy();          // switching to a table view exits the galaxy
@@ -1843,6 +1944,8 @@ async function renderTracks(tracks, { keepScroll = false } = {}) {
   }
 
   _updateSelectionBar();
+  _emptyCols = _emptyColumns(tracks);
+  _compoHas = Array.isArray(tracks) && !tracks._isWindowedStore && tracks.some((t) => t && t.scene_party);
   _applyColVisibility();
   _updateAzRail();
 }
@@ -1900,7 +2003,9 @@ function _ensureAzRail() {
   const rail = document.createElement('div');
   rail.id = 'az-rail';
   rail.hidden = true;
-  _AZ.forEach(ch => {
+  // '#' (titles that start with a digit or sign) at the foot, as on a phone's
+  // index — at the head it sat beside the list's own "#" column.
+  [..._AZ.slice(1), _AZ[0]].forEach(ch => {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'az-letter'; b.tabIndex = -1; b.textContent = ch;
     b.addEventListener('click', () => _jumpToLetter(ch));
@@ -2005,7 +2110,7 @@ async function _fetchVisibleRatings() {
     for (const row of _trackVL.rows()) {
       const id = row.dataset.id;
       if (!id || !fetched.has(id)) continue;
-      const ratingTd = row.children[11];   // col-rating is index 11
+      const ratingTd = row.querySelector('td.col-rating');
       if (ratingTd) _paintStars(ratingTd, _ratingsCache[id] || 0);
     }
   } catch { /* non-fatal */ }
@@ -2106,13 +2211,17 @@ tbody.addEventListener('click', (e) => {
     return;
   }
 
-  // Clickable metadata cells (album artist / album)
+  // Clickable metadata cells (album artist / artist / album)
   const cellLink = e.target.closest('.cell-link');
   if (cellLink) {
     e.stopPropagation();
     const action = cellLink.dataset.action;
     if (action === 'album-artist' && t.album_artist) {
-      showAlbums(null, t.album_artist, 'album_artist');
+      showNameAlbums(t.album_artist);
+    } else if (action === 'artist' && t.artist) {
+      _searchArtist(t.artist);
+    } else if (action === 'compo' && t.scene_party && t.scene_compo) {
+      _showCompoTracks(t.scene_party, t.scene_compo);
     } else if (action === 'album' && t.album) {
       showAlbumTracks(t.artist, t.album_artist, t.album,
         () => showAlbums(t.artist, t.album_artist, t.album_artist ? 'album_artist' : 'artist'));
@@ -2241,7 +2350,7 @@ function _showTrackContextMenu(x, y, i) {
     _closeCtxMenu();
   });
   addItem('Add to queue', () => {
-    targets.forEach(tr => Player.addToQueue(tr));
+    Player.addAllToQueue(targets);
     _closeCtxMenu();
   });
   addItem('Add to playlist…', async (el) => {
@@ -2309,9 +2418,12 @@ function _showTrackContextMenu(x, y, i) {
   }
   // Navigation — pivot from this track to its whole artist / album.  Single
   // selection only (a bulk "go to" is ambiguous).  Back returns to this view.
-  if (!multi && (t.artist || t.album)) {
+  if (!multi && (t.artist || t.album || _folderOfTrack(t))) {
     if (t.artist) addItem('Go to artist', () => _goToArtist(t));
     if (t.album)  addItem('Go to album',  () => _goToAlbum(t));
+    if (_folderOfTrack(t)) {
+      addItem('Find folder', () => { _closeCtxMenu(); _findInFolder(t); });
+    }
     addSep();
   }
   addItem('Get info', () => {
@@ -2482,7 +2594,7 @@ const selCount = document.getElementById('sel-count');
 
 if (document.getElementById('sel-queue')) {
   document.getElementById('sel-queue').addEventListener('click', () => {
-    [..._selected].forEach(i => Player.addToQueue(currentTracks[i]));
+    Player.addAllToQueue([..._selected].map(i => currentTracks[i]));
     _selected.clear(); _refreshSelectionClasses(); _updateSelectionBar();
   });
 }
@@ -2564,6 +2676,11 @@ function locateNowPlaying() {
     idx = currentTracks.findIndex(t => t && t.id === id);
   }
   if (idx < 0) { window.Toast?.info?.('The playing track isn’t in this list.'); return; }
+  _focusAndPulse(idx);
+}
+
+// Put the keyboard focus on row ``idx``, centre it and pulse it.
+function _focusAndPulse(idx) {
   _focusedIdx = idx;
   // Center the row in the viewport (renders the window synchronously).
   _trackVL.scrollToIndex(idx, 'center');
@@ -2573,6 +2690,41 @@ function locateNowPlaying() {
     r.classList.add('locate-pulse');
     setTimeout(() => r.classList.remove('locate-pulse'), 1400);
   }
+}
+
+// The folder track ``t`` lies in, as the folder tree names it: a network
+// share's ``root:/dir/file`` is ``root/dir`` there; a file at an archive's top
+// is in the archive's folder, one in a folder inside it in ``archive.zip::dir``.
+// '' when there is none (no path).
+function _folderOfTrack(t) {
+  let p = (t && t.path) || '';
+  if (!p) return '';
+  const scheme = p.indexOf('://');
+  if (scheme > 0) {
+    const cut = p.indexOf(':/', scheme + 3);       // (the share root's end)
+    if (cut > 0) p = p.slice(0, cut) + (p[cut + 2] === '/' ? '' : '/') + p.slice(cut + 2);
+  }
+  const slash = p.lastIndexOf('/');
+  return slash > 0 && slash > scheme + 2 ? p.slice(0, slash) : '';
+}
+
+// "Find folder": open the track's folder in the folder tree (each folder on
+// the way expanded), show it, and focus + pulse the track's row in it — where
+// a search result or a playlist entry lives.
+async function _findInFolder(t) {
+  const folder = _folderOfTrack(t);
+  if (!folder) return;
+  let shown = false;
+  try { shown = await FolderTree.reveal(folder); } catch (_) { shown = false; }
+  if (!shown) await showFolder(folder);           // (the tree doesn't reach it now: the list still does)
+  if (_currentBrowsePath !== folder) return;      // (the listener went elsewhere meanwhile)
+  const idx = typeof currentTracks?.findIndex === 'function'
+    ? currentTracks.findIndex((x) => x && x.id === t.id) : -1;
+  if (idx >= 0) _focusAndPulse(idx);
+  else if (t.is_duplicate_primary === false) {
+    window.Toast?.info?.('This copy isn’t listed in its folder because duplicate copies are hidden '
+                         + '(Settings → Hide duplicates when browsing folders).');
+  } else window.Toast?.info?.('The track isn’t listed in its folder.');
 }
 
 function playFrom(idx, o = {}) {
@@ -2858,12 +3010,13 @@ const FULL_HEADERS = `
   <th class="col-num">#</th>
   <th class="col-cover" aria-label="Cover"></th>
   <th class="col-title"        data-sort="title"        aria-sort="none">Title</th>
-  <th class="col-album-artist" data-sort="album_artist" aria-sort="none">Album Artist</th>
+  <th class="col-album-artist" data-sort="album_artist" aria-sort="none"><span class="th-full">Album Artist</span><span class="th-short">Alb. Artist</span></th>
   <th class="col-artist"       data-sort="artist"       aria-sort="none">Artist</th>
   <th class="col-album"        data-sort="album"        aria-sort="none">Album</th>
+  <th class="col-compo"        title="The party competition — its place in it (Demozoo)">Compo</th>
   <th class="col-track"        data-sort="track_number" aria-sort="none">Track</th>
   <th class="col-year"         data-sort="year"         aria-sort="none">Year</th>
-  <th class="col-dur"          data-sort="duration"     aria-sort="none">Duration</th>
+  <th class="col-dur"          data-sort="duration"     aria-sort="none"><span class="th-full">Duration</span><span class="th-short">Time</span></th>
   <th class="col-format"       data-sort="format"       aria-sort="none">Type</th>
   <th class="col-location"     data-sort="path"         aria-sort="none">Location</th>
   <th class="col-rating">★</th>`.trim();
@@ -2886,11 +3039,12 @@ function setGroupHeader(label) {
   // groups…" bar on screen for the whole fetch.  renderGroupList re-shows it
   // with this view's own label + count once the data lands.
   if (groupFilterBar) { groupFilterBar.hidden = true; if (groupFilterInput) groupFilterInput.value = ''; }
+  _sceneTab = null;            // (showFacet sets it again for a Scene list)
   if (!trackTableHead) return;
   // Same two cells as the group rows below (_makeGroupRow): the label sits right
   // above the names and the count column has a fixed width, instead of one
   // 12-column cell over rows that began with empty number + cover columns.
-  trackTableHead.innerHTML = `<th class="group-name" colspan="11" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`
+  trackTableHead.innerHTML = `<th class="group-name" colspan="12" style="font-weight:600;padding:6px 10px">${esc(label)}</th>`
     + '<th class="group-count" aria-label="Count"></th>';
 }
 
@@ -2948,15 +3102,21 @@ function _applyColVisibility() {
   // 12 full-subtree querySelectorAll ~60×/s on the fling hot path.)
   const table = document.getElementById('track-table');
   if (!table) return;
-  let changed = false;
+  let changed = false, shown = 0;
   ALL_COLS.forEach(cls => {
     // In duplicates view, force Location column visible regardless of user prefs.
-    const hidden = (cls === 'col-location' && _dupViewActive) ? false : _hiddenCols.has(cls);
+    const hidden = cls === 'col-compo' ? _compoColHidden()
+      : (cls === 'col-location' && _dupViewActive) ? false : (_hiddenCols.has(cls) || _emptyCols.has(cls));
+    if (!hidden) shown++;
     if (table.classList.contains('hide-' + cls) !== hidden) {
       table.classList.toggle('hide-' + cls, hidden);
       changed = true;
     }
   });
+  if (shown !== _spacerSpan) {
+    _spacerSpan = shown;
+    for (const td of table.querySelectorAll('tr.vs-spacer > td')) td.colSpan = shown;
+  }
   // A hidden / shown column (the cover above all) changes the row height.
   if (changed) {
     _measureThead();
@@ -2972,13 +3132,26 @@ _colMenu.style.cssText = 'position:fixed;z-index:999;background:var(--bg3);borde
 document.body.appendChild(_colMenu);
 
 function _showColMenu(x, y) {
-  _colMenu.innerHTML = ALL_COLS.map(cls => `
-    <label style="display:flex;align-items:center;gap:8px;padding:5px 14px;cursor:pointer;font-size:12.5px;color:var(--text1);white-space:nowrap">
-      <input type="checkbox" data-col="${cls}" ${_hiddenCols.has(cls) ? '' : 'checked'}>
-      ${COL_LABELS[cls]}
-    </label>`).join('');
+  // (a column left out because it is empty in this list can't be shown here)
+  _colMenu.innerHTML = ALL_COLS.map(cls => {
+    const empty = _emptyCols.has(cls);
+    const shown = cls === 'col-compo' ? !_compoColHidden() : !(_hiddenCols.has(cls) || empty);
+    return `
+    <label style="display:flex;align-items:center;gap:8px;padding:5px 14px;cursor:${empty ? 'default' : 'pointer'};font-size:12.5px;color:var(--${empty ? 'text2' : 'text1'});white-space:nowrap"${empty ? ' title="Empty in this list"' : ''}>
+      <input type="checkbox" data-col="${cls}" ${shown ? 'checked' : ''}${empty ? ' disabled' : ''}>
+      ${COL_LABELS[cls]}${empty ? ' <span style="font-size:11px">(empty here)</span>' : ''}
+    </label>`;
+  }).join('');
   _colMenu.querySelectorAll('input').forEach(cb => {
     cb.addEventListener('change', () => {
+      if (cb.dataset.col === 'col-compo') {
+        // (on: automatic where this list has compos, else shown everywhere;
+        // off: hidden everywhere)
+        const v = !cb.checked ? 'off' : (_compoHas && _compoPref() !== 'on' ? 'auto' : 'on');
+        try { localStorage.setItem(COMPO_COL_KEY, v); } catch (_) { /* private mode */ }
+        _applyColVisibility();
+        return;
+      }
       if (cb.checked) _hiddenCols.delete(cb.dataset.col);
       else _hiddenCols.add(cb.dataset.col);
       localStorage.setItem('sb_hidden_cols', JSON.stringify([..._hiddenCols]));
@@ -3048,17 +3221,26 @@ function _initColResize() {
   _restoreColWidths();
 }
 
+// Kept by column (``{"col-title": "240px", …}``) — a column added later
+// (Compo) moves no other column's width.  A list kept by position (before
+// that) is left out.
 function _saveColWidths() {
-  const ths = trackTableHead.querySelectorAll('th');
-  const widths = [...ths].map(th => th.style.width || '');
+  const widths = {};
+  for (const th of trackTableHead.querySelectorAll('th')) {
+    const cls = [...th.classList].find((c) => c.startsWith('col-'));
+    if (cls && th.style.width) widths[cls] = th.style.width;
+  }
   localStorage.setItem('sb_col_widths', JSON.stringify(widths));
 }
 
 function _restoreColWidths() {
   try {
-    const saved = JSON.parse(localStorage.getItem('sb_col_widths') || '[]');
-    const ths = trackTableHead.querySelectorAll('th');
-    saved.forEach((w, i) => { if (ths[i] && w) ths[i].style.width = w; });
+    const saved = JSON.parse(localStorage.getItem('sb_col_widths') || '{}');
+    if (!saved || Array.isArray(saved)) return;
+    for (const th of trackTableHead.querySelectorAll('th')) {
+      const cls = [...th.classList].find((c) => c.startsWith('col-'));
+      if (cls && saved[cls]) th.style.width = saved[cls];
+    }
   } catch (_) {}
 }
 
@@ -3338,6 +3520,43 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
   _setViewReload(`albums\0${artist || ''}\0${albumArtist || ''}`, () => showAlbums(artist, albumArtist, backView));
 }
 
+// The albums of a name clicked as an album artist (a track list's Album Artist
+// cell, the player's "Album Artist" link): the albums whose album artist is
+// that name AND the albums whose artist is — many files carry no album-artist
+// tag, so the album-artist albums alone are a fraction of what the Artists
+// view lists for the same name.  An album in both lists once (the larger
+// count), each drilling in by the scope it came from.
+async function showNameAlbums(name) {
+  const _gen = ++_browseNavGen;
+  setGroupHeader('Album');
+  _showSkeletonRows(12);
+  const retry = () => showNameAlbums(name);
+  const [byAa, byArtist] = await Promise.all([
+    _viewData(_gen, API('/library/albums', { album_artist: name }), retry),
+    _viewData(_gen, API('/library/albums', { artist: name }), retry),
+  ]);
+  if (!byAa || !byArtist || _gen !== _browseNavGen) return;
+  const merged = new Map();
+  for (const item of [...byArtist, ...byAa]) {
+    const key = item.label ? '\0untagged' : String(item.album || '').toLowerCase();
+    const have = merged.get(key);
+    if (!have || (item.count || 0) > (have.count || 0)) merged.set(key, item);
+  }
+  const albums = [...merged.values()].sort((a, b) =>
+    String(a.album || '').localeCompare(String(b.album || ''), undefined, { sensitivity: 'base' }));
+  if (albums.length === 0) { showArtistTracks(name, () => showArtists()); return; }
+  setBrowseHeader(name, () => showArtists(), false);   // group/grid view — not a track list
+  renderGroupList(albums, 'album', 'count', 'Tracks', (item) => {
+    const backTo = () => showNameAlbums(name);
+    if (item.label || !item.album) {
+      showUntaggedTracks('album', '[No Album]', backTo, item.count);
+    } else {
+      showAlbumTracks(item.artist, item.album_artist, item.album, backTo);
+    }
+  });
+  _setViewReload(`name-albums\0${name}`, () => showNameAlbums(name));
+}
+
 // The untagged drill's fetch ceiling (its rows go into the play queue whole).
 const _UNTAGGED_LIMIT = 5000;
 
@@ -3453,7 +3672,9 @@ function _snapshotCurrentView() {
     const wasHidden = browseHdr.hidden;
     const wasPlayable = !_playAllBtn || !_playAllBtn.hidden;   // a "0 results" header has no Play all / Shuffle
     const backOnClick = browseBack.onclick;
+    const grouped = _compoGrouped;        // (a party's list: grouped by compo again)
     return () => {
+      _compoGroupNext = grouped;
       renderTracks(snap);
       _viewQueueSource = snapSrc;
       if (wasHidden) hideBrowseHeader();
@@ -3461,6 +3682,14 @@ function _snapshotCurrentView() {
     };
   }
   return () => showAll();
+}
+
+// An Artist cell's link: the search box's ``artist:`` search for the name —
+// the tracks whose artist or album artist is that name, album artist first
+// (search.js runs it, the box showing the query).  A value can't hold a quote.
+function _searchArtist(name) {
+  const q = `artist:"${String(name).replace(/"/g, ' ').trim()}"`;
+  document.dispatchEvent(new CustomEvent('sb:search-for', { detail: { q } }));
 }
 
 function _goToArtist(t) {
@@ -3545,38 +3774,147 @@ async function showYears() {
   _setViewReload('years', () => showYears());
 }
 
-async function showSceneGroups() {
-  const _gen = ++_browseNavGen;
-  hideBrowseHeader();
-  setGroupHeader('Scene group');
-  _hideGridToggle();
-  _showSkeletonRows(12);
-  const groups = await _viewData(_gen, API('/library/scene-groups'), () => showSceneGroups());
-  if (!groups || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  _updateNavBadge('scene_groups', groups.length);
-  renderGroupList(groups, 'scene_group', 'count', 'Tracks',
-                  (item) => showSceneGroupTracks(item.scene_group, item.count));
-  _setViewReload('scene-groups', () => showSceneGroups());
+// ── The Scene view: Composers / Games / Platforms / Parties / Scene groups ──
+// One sidebar entry ("Scene", shown once the library has an entry in any of its
+// lists — _applyCounts) and a key per list over the group list (#scene-tabs,
+// in the group filter bar).  GET /api/library/<url> → [{<facet>: name, count}];
+// a row opens its tracks (/api/search/filter?<facet>=name — matched as the
+// list counts them).  The list last chosen is kept per device (sb_scene_tab).
+
+// The Scene view at its list: ``facet``, else the one last chosen here, else
+// the first the library has entries in.
+function showScene(facet) {
+  if (!_FACETS[facet]) {
+    let saved = null;
+    try { saved = localStorage.getItem(_SCENE_TAB_KEY); } catch (_) { /* private mode */ }
+    const has = (k) => (_sceneCounts[_FACETS[k].count] || 0) > 0;
+    // (before the first counts reply — a reload's restore — the saved list
+    // is taken as it is; an empty one still shows the keys to the others)
+    const known = Object.keys(_sceneCounts).length > 0;
+    facet = (saved && _FACETS[saved] && (has(saved) || !known)) ? saved
+      : (Object.keys(_FACETS).find(has) || 'composer');
+  }
+  return showFacet(facet);
 }
 
-async function showSceneGroupTracks(scene_group, total = 0) {
+async function showFacet(facet) {
+  const f = _FACETS[facet];
+  if (!f) return;
+  const _gen = ++_browseNavGen;
+  hideBrowseHeader();
+  setGroupHeader(f.title);
+  _sceneTab = facet;                       // (setGroupHeader cleared it)
+  try { localStorage.setItem(_SCENE_TAB_KEY, facet); } catch (_) { /* private mode */ }
+  _hideGridToggle();
+  _showSkeletonRows(12);
+  const rows = await _viewData(_gen, API(`/library/${f.url}`), () => showFacet(facet));
+  if (!rows || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
+  _sceneCounts[f.count] = rows.length;
+  renderGroupList(rows, facet, 'count', 'Tracks',
+                  (item) => showFacetTracks(facet, item[facet], item.count));
+  _setViewReload(`scene\0${facet}`, () => showFacet(facet));
+}
+// (kept: callers of the Scene groups list before it joined the Scene view)
+function showSceneGroups() { return showFacet('scene_group'); }
+
+// One competition of a party (the Compo column's link): its entries in
+// placing order; Back opens the whole party.
+async function _showCompoTracks(party, compo) {
   const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
   restoreFullHeader();
-  setBrowseHeader(`Scene group: ${scene_group}`, () => showSceneGroups());
+  setBrowseHeader(`Party: ${party} \u00b7 ${compo}`, () => showFacetTracks('party', party));
   _showSkeletonRows();
-  // Keeps the drill-down list consistent with the group-row count the user just
-  // clicked — the biggest scene groups here run ~1.7K tracks, well under
-  // _DRILL_LIMIT, so the whole group renders and _noteDrillCap stays silent.
-  const tracks = await _viewData(_gen, API('/search/filter', { scene_group, limit: _DRILL_LIMIT }), () => showSceneGroupTracks(scene_group, total));
+  const params = { party, compo };
+  const tracks = await _viewData(_gen, API('/search/filter', { ...params, limit: _DRILL_LIMIT }),
+                                 () => _showCompoTracks(party, compo));
   if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
+  _compoGroupNext = true;                // (labels without the party: it is in the header)
   renderTracks(tracks);
-  _setCappedSource(tracks.length, _DRILL_LIMIT, total, { scene_group },
-                   { url: '/api/search/filter', params: { scene_group } },
-                   `Scene group: ${scene_group}`);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, 0, params,
+                   { url: '/api/search/filter', params }, `${party} \u00b7 ${compo}`);
+  _setViewReload(`compo\0${party}\0${compo}`, () => _showCompoTracks(party, compo));
+}
+
+async function showFacetTracks(facet, name, total = 0) {
+  const f = _FACETS[facet];
+  if (!f) return;
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader(`${f.title}: ${name}`, () => showFacet(facet));
+  _showSkeletonRows();
+  const params = { [facet]: name };
+  const tracks = await _viewData(_gen, API('/search/filter', { ...params, limit: _DRILL_LIMIT }),
+                                 () => showFacetTracks(facet, name, total));
+  if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
+  if (facet === 'party') {
+    // (the server lists a party's tracks compo by compo, by place: the first
+    // of each compo starts its group)
+    let prev = null;
+    for (const t of tracks) {
+      const key = (t && t.scene_compo) || '';
+      t._compoGroupFirst = key !== prev;
+      prev = key;
+    }
+    _compoGroupNext = true;
+  }
+  renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, total, params,
+                   { url: '/api/search/filter', params }, `${f.title}: ${name}`);
   _noteDrillCap(tracks.length, total);
-  _setViewReload(`scene-group\0${scene_group}`, () => showSceneGroupTracks(scene_group, total));
+  _setViewReload(`${facet}\0${name}`, () => showFacetTracks(facet, name, total));
+}
+
+// The keys over a Scene list: one per list with entries (and the open one),
+// the open one pressed; ←/→ move between them (a tablist).
+function _paintSceneTabs() {
+  if (!sceneTabsEl) return;
+  if (!_sceneTab) { sceneTabsEl.hidden = true; return; }
+  // (a repaint — a counts reply — keeps the keyboard on the key it was on)
+  const focused = sceneTabsEl.contains(document.activeElement) ? document.activeElement.dataset.facet : null;
+  sceneTabsEl.textContent = '';
+  for (const [facet, f] of Object.entries(_FACETS)) {
+    const n = _sceneCounts[f.count];
+    if (facet !== _sceneTab && !(n > 0)) continue;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'scene-tab';
+    b.setAttribute('role', 'tab');
+    b.dataset.facet = facet;
+    const on = facet === _sceneTab;
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
+    b.textContent = f.tab || f.label;
+    if (Number.isFinite(n)) {
+      const c = document.createElement('span');
+      c.className = 'scene-tab-count';
+      c.textContent = n.toLocaleString();
+      b.appendChild(c);
+    }
+    sceneTabsEl.appendChild(b);
+  }
+  sceneTabsEl.hidden = false;
+  if (focused) sceneTabsEl.querySelector(`.scene-tab[data-facet="${focused}"]`)?.focus();
+}
+if (sceneTabsEl) {
+  sceneTabsEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.scene-tab');
+    if (b && b.dataset.facet !== _sceneTab) showFacet(b.dataset.facet);
+  });
+  sceneTabsEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const tabs = [...sceneTabsEl.querySelectorAll('.scene-tab')];
+    const i = tabs.indexOf(document.activeElement);
+    if (i < 0) return;
+    e.preventDefault();
+    const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+    showFacet(next.dataset.facet).then(() => {
+      sceneTabsEl.querySelector(`.scene-tab[data-facet="${next.dataset.facet}"]`)?.focus();
+    });
+  });
 }
 
 // ── Library Galaxy view (viz #6) ──────────────────────────────────────────
@@ -4018,8 +4356,9 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
     _hideGridToggle();
   }
 
-  // Show/hide the browse filter boxes (sidebar + content area)
-  if (showFilter && items.length > 0) {
+  // Show/hide the browse filter boxes (sidebar + content area) — a Scene list
+  // keeps its bar even when empty: its keys switch to the other lists.
+  if (showFilter && (items.length > 0 || _sceneTab)) {
     // Sidebar filter (legacy): stays HIDDEN — the content-area bar below is the
     // one visible filter (it duplicated it, half-clipped in the sidebar).  The
     // input is kept because the bar drives the filter through it (input event).
@@ -4032,7 +4371,7 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
         : nameKey === 'album' ? 'Albums'
         : nameKey === 'genre' ? 'Genres'
         : nameKey === 'year' ? 'Years'
-        : nameKey === 'scene_group' ? 'Scene groups'
+        : _FACETS[nameKey] ? _FACETS[nameKey].label
         : nameKey.charAt(0).toUpperCase() + nameKey.slice(1);
       groupFilterLabel.textContent = `${items.length.toLocaleString()} ${viewLabel}`;
       groupFilterInput.value = '';
@@ -4046,8 +4385,13 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
       // ``preventScroll`` keeps the freshly-opened group view from
       // jumping if the filter input was previously below the viewport.
       // (Not on a reload: the listener is busy elsewhere, e.g. in Settings.)
-      if (!_reloadingView) setTimeout(() => groupFilterInput.focus({ preventScroll: true }), 50);
+      // (Nor when a Scene key has it: ←/→ go on from there.)
+      if (!_reloadingView) setTimeout(() => {
+        if (sceneTabsEl && sceneTabsEl.contains(document.activeElement)) return;
+        groupFilterInput.focus({ preventScroll: true });
+      }, 50);
     }
+    _paintSceneTabs();
   } else {
     browseFilterWrap.hidden = true;
     if (groupFilterBar) groupFilterBar.hidden = true;
@@ -4082,7 +4426,7 @@ function _makeGroupRow() {
   // user's hide-col-* choices don't apply to a group list — hiding Duration used
   // to blank the counts.  The header (setGroupHeader) has the same two cells.
   tr.innerHTML = `
-      <td class="group-name" colspan="11"></td>
+      <td class="group-name" colspan="12"></td>
       <td class="group-count"></td>`;
   return tr;
 }
@@ -4406,11 +4750,7 @@ function _closeSimilar() {
   if (simPanel && !simPanel.hidden) simPanel.hidden = true;
 }
 function _closeLyrics() {
-  if (!lyricsPanel.hidden) {
-    lyricsPanel.hidden = true;
-    lyricsBtn.classList.remove('on');
-    _stopLyricsSync();
-  }
+  _hideLyricsPanel();
 }
 
 // Listen for other panels opening — close ours
@@ -4458,17 +4798,40 @@ Player.on('trackchange', () => markPlayingRow());
 Player.on('statechange', () => markPlayingRow());
 
 // ── Lyrics panel ──────────────────────────────────────────────────────────────
+// The looks are css/lyrics-styles.css, keyed on the shared UI style
+// (ui_style.js → :root[data-ui-style]) and on #lyrics-panel[data-lyrics]:
+//   loading | synced | plain | empty | error | radio
+// Retro hi-fi shows synced lyrics as a VFD teleprompter (the current line lit in
+// the middle of the window) and plain ones as a printed lyric sheet; Modern is
+// the glass panel.  Only lyrics with LRC timestamps follow the music.
 
 const lyricsBtn     = document.getElementById('btn-lyrics');
 const lyricsPanel   = document.getElementById('lyrics-panel');
 const lyricsBody    = document.getElementById('lyrics-body');
 const lyricsContent = document.getElementById('lyrics-content');
 const lyricsSource  = document.getElementById('lyrics-source');
+const lyricsClose   = document.getElementById('btn-lyrics-close');
+const lyricsLive    = document.getElementById('lyrics-live');
+const lyricsCounter = document.getElementById('lyrics-counter');
+const _lyricsRmq    = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+
+lyricsBtn.setAttribute('aria-controls', 'lyrics-panel');
+lyricsBtn.setAttribute('aria-expanded', 'false');
 
 // ── Lyrics panel resize handle ───────────────────────────────────────────────
+// Drag the left edge, or focus it and press ←/→ (16 px a step).
 {
   const handle = document.getElementById('lyrics-resize');
   if (handle && lyricsPanel) {
+    const MIN_W = 200, MAX_W = 700;
+    const setW = (w, save) => {
+      w = Math.max(MIN_W, Math.min(MAX_W, Math.round(w)));
+      lyricsPanel.style.width = w + 'px';
+      handle.setAttribute('aria-valuenow', String(w));
+      if (save) { try { localStorage.setItem('sb_lyrics_w', lyricsPanel.style.width); } catch (_) {} }
+    };
+    handle.setAttribute('aria-valuemin', String(MIN_W));
+    handle.setAttribute('aria-valuemax', String(MAX_W));
     let startX, startW;
     handle.addEventListener('pointerdown', (e) => {
       e.preventDefault();
@@ -4480,17 +4843,28 @@ const lyricsSource  = document.getElementById('lyrics-source');
     handle.addEventListener('pointermove', (e) => {
       if (!handle.hasPointerCapture(e.pointerId)) return;
       // Dragging left = wider panel (panel is on the right side)
-      const w = Math.max(200, Math.min(700, startW - (e.clientX - startX)));
-      lyricsPanel.style.width = w + 'px';
+      setW(startW - (e.clientX - startX), false);
     });
-    handle.addEventListener('pointerup', (e) => {
+    const endDrag = (e) => {
+      if (!handle.classList.contains('dragging')) return;
       handle.classList.remove('dragging');
-      handle.releasePointerCapture(e.pointerId);
-      localStorage.setItem('sb_lyrics_w', lyricsPanel.style.width);
+      if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+      setW(lyricsPanel.offsetWidth, true);
+    };
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+    handle.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (e.altKey || e.metaKey || e.ctrlKey) return;
+      e.preventDefault();
+      e.stopPropagation();                 // arrows are app-wide shortcuts (volume)
+      setW(lyricsPanel.offsetWidth + (e.key === 'ArrowLeft' ? 16 : -16), true);
     });
     // Restore saved width
-    const saved = localStorage.getItem('sb_lyrics_w');
-    if (saved) lyricsPanel.style.width = saved;
+    let saved = null;
+    try { saved = localStorage.getItem('sb_lyrics_w'); } catch (_) {}
+    if (saved && parseInt(saved, 10) > 0) setW(parseInt(saved, 10), false);
+    else handle.setAttribute('aria-valuenow', '450');
   }
 }
 
@@ -4504,119 +4878,343 @@ const _NO_LYRICS_FMTS = new Set([
 let _lyricsTrackId   = null;   // track ID we fetched lyrics for
 let _lyricsLines     = null;   // array of { time: seconds|null, text }
 let _lyricsSynced    = false;  // true if timestamps available
+let _lyricsLineEls   = [];     // the .lyrics-line elements, by line index
+let _lyricsTimed     = [];     // indexes of the lines that carry a timestamp
 
-/**
- * Parse LRC format into structured lines.
- * Input: "[00:12.34] Some lyrics line\n[00:16.00] Next line"
- * Returns: [{ time: 12.34, text: "Some lyrics line" }, ...]
- */
-function _parseLRC(raw) {
-  const lines = [];
-  const re = /^\[(\d{1,2}):(\d{2})[.:](\d{2,3})\]\s*(.*)/;
-  for (const line of raw.split('\n')) {
-    const m = line.match(re);
-    if (m) {
-      const mins = parseInt(m[1], 10);
-      const secs = parseInt(m[2], 10);
-      const ms   = m[3].length === 2 ? parseInt(m[3], 10) * 10 : parseInt(m[3], 10);
-      lines.push({ time: mins * 60 + secs + ms / 1000, text: m[4] });
-    } else if (line.trim()) {
-      lines.push({ time: null, text: line.trim() });
-    }
-  }
-  return lines;
+// LRC parsing is shared with Track Info's Lyrics tab (utils.js parseLRC).
+const _parseLRC = parseLRC;
+
+function _parsePlain(text) {
+  return text.split('\n').map(line => ({ time: null, text: line }));
+}
+
+function _lyricsRetro() { return document.documentElement.dataset.uiStyle === 'retro'; }
+
+/** Say `msg` to screen readers (one polite line; empty = nothing). */
+function _lyricsSay(msg) {
+  if (!lyricsLive || lyricsPanel.hidden || !msg) return;
+  lyricsLive.textContent = '';
+  // a fresh text node after a clear, so the same line said twice is said again
+  setTimeout(() => { lyricsLive.textContent = msg; }, 30);
 }
 
 /**
- * Render lyrics lines into the panel DOM.
+ * A state instead of lyrics: loading / empty / error / radio.  `msg` is the
+ * line shown (the classes .lyrics-loading / .lyrics-empty as before).
  */
-function _renderLyrics(lines, synced) {
+function _setLyricsState(state, msg, say = false) {
+  const refocus = _lyricsFocusInText();
+  _stopLyricsSync();
+  _lyricsLines  = null;
+  _lyricsSynced = false;
+  _lyricsLineEls = [];
+  _lyricsTimed   = [];
+  lyricsPanel.dataset.lyrics = state;
+  lyricsContent.removeAttribute('role');
+  lyricsContent.removeAttribute('aria-label');
+  lyricsBody.removeAttribute('tabindex');
+  lyricsBody.removeAttribute('role');
+  lyricsBody.removeAttribute('aria-label');
+  lyricsBody.scrollTop = 0;
+  if (lyricsCounter) lyricsCounter.textContent = '';
   lyricsContent.innerHTML = '';
-  _lyricsLines  = lines;
-  _lyricsSynced = synced;
+  const div = document.createElement('div');
+  div.className = state === 'loading' ? 'lyrics-loading' : 'lyrics-empty';
+  div.textContent = msg;
+  lyricsContent.appendChild(div);
+  if (refocus && lyricsClose) lyricsClose.focus();
+  if (say) _lyricsSay(msg);
+}
+
+/** True while the keyboard focus is on the lyrics themselves (a line or the
+ *  focusable text) — a re-render then hands it on instead of dropping it. */
+function _lyricsFocusInText() {
+  const a = document.activeElement;
+  return !!a && (a === lyricsBody || lyricsContent.contains(a));
+}
+
+/**
+ * Render lyrics lines into the panel DOM.  `synced` lyrics without a single
+ * timed line are shown as plain ones (nothing to follow).
+ */
+function _renderLyrics(lines, synced, track = null) {
+  const refocus = _lyricsFocusInText();
+  lyricsContent.innerHTML = '';
+  _lyricsLineEls = [];
+  _lyricsTimed   = [];
 
   if (!lines || lines.length === 0) {
-    lyricsContent.innerHTML = '<div class="lyrics-empty">No lyrics available</div>';
+    if (refocus && lyricsClose) lyricsClose.focus();
+    _setLyricsState('empty', 'No lyrics available', true);
     return;
   }
+  synced = !!synced && lines.some(ln => ln.time !== null);
+  _lyricsLines  = lines;
+  _lyricsSynced = synced;
+  lyricsPanel.dataset.lyrics = synced ? 'synced' : 'plain';
+  lyricsBody.scrollTop = 0;
 
+  const frag = document.createDocumentFragment();
+  if (!synced) {
+    // The printed sheet's heading (Retro hi-fi shows it; Modern hides it).
+    const head = document.createElement('div');
+    head.className = 'lyrics-sheet-head';
+    const t = document.createElement('div');
+    t.className = 'lyrics-sheet-title';
+    t.textContent = (track && track.title) || '';
+    const a = document.createElement('div');
+    a.className = 'lyrics-sheet-artist';
+    a.textContent = (track && (track.artist || track.album_artist)) || '';
+    head.append(t, a);
+    if (t.textContent || a.textContent) frag.appendChild(head);
+  }
   lines.forEach((ln, i) => {
     const div = document.createElement('div');
-    div.className = 'lyrics-line' + (synced && ln.time !== null ? ' synced' : '');
+    const timed = synced && ln.time !== null;
+    div.className = 'lyrics-line' + (timed ? ' synced' : '') + (!ln.text ? ' lyrics-gap' : '');
     div.textContent = ln.text || '';
     div.dataset.idx = i;
-    if (synced && ln.time !== null) {
-      div.addEventListener('click', () => {
-        const track = Player.currentTrack;
-        if (track && track.duration > 0) {
-          Player.seek((ln.time / track.duration) * 100);
-        }
-      });
+    if (timed) {
+      // A line plays from its time (click, or Enter / Space when focused).
+      div.setAttribute('role', 'button');
+      div.tabIndex = -1;
+      if (!ln.text) div.setAttribute('aria-label', 'Instrumental');
+      _lyricsTimed.push(i);
     }
-    lyricsContent.appendChild(div);
+    _lyricsLineEls.push(div);
+    frag.appendChild(div);
   });
+  lyricsContent.appendChild(frag);
 
-  if (synced) _startLyricsSync();
+  if (synced) {
+    lyricsContent.setAttribute('role', 'group');
+    lyricsContent.setAttribute('aria-label', 'Synced lyrics. Up and Down move through the lines, Enter plays from a line.');
+    lyricsBody.removeAttribute('tabindex');
+    lyricsBody.removeAttribute('role');
+    lyricsBody.removeAttribute('aria-label');
+    _lyricsLineEls[_lyricsTimed[0]].tabIndex = 0;
+    // (lyrics landing after the panel closed start following on the next open)
+    if (!lyricsPanel.hidden) _startLyricsSync();
+    if (refocus) {
+      const to = _lyricsLineEls.find(el => el.tabIndex === 0);
+      if (to) to.focus({ preventScroll: true });
+    }
+  } else {
+    lyricsContent.removeAttribute('role');
+    lyricsContent.removeAttribute('aria-label');
+    // The text scrolls with the keyboard too.
+    lyricsBody.tabIndex = 0;
+    lyricsBody.setAttribute('role', 'group');
+    lyricsBody.setAttribute('aria-label', 'Lyrics text');
+    if (lyricsCounter) lyricsCounter.textContent = '';
+    if (refocus) lyricsBody.focus({ preventScroll: true });
+  }
 }
 
 /**
- * Lyrics sync — driven by Player's timeupdate event (fires ~4×/sec).
- * More reliable than rAF because it uses the exact same time values
- * that drive the seek bar and time display.
+ * Lyrics sync — driven by Player's timeupdate event (fires ~4×/sec) and
+ * `seeked` (a seek re-syncs at once).  More reliable than rAF because it uses
+ * the exact same time values that drive the seek bar and time display.
+ * Pausing stops the ticks, so the lit line stays where the music stopped.
  *
- * Player.on() has no off(), so we register ONE persistent listener
+ * Player.on() has no off(), so we register ONE persistent listener per event
  * and gate it with _lyricsSyncActive.
  */
 let _lyricsSyncLastActive = -1;
 let _lyricsSyncActive     = false;
+let _lyricsHoldUntil      = 0;      // the user scrolled / browsed: don't follow until then
+let _lyricsRecenter       = false;  // a follow was held back — catch up when the hold ends
+let _lyricsSayTimer       = null;
 
-// Single persistent listener — registered once, gated by _lyricsSyncActive
-Player.on('timeupdate', ({ current }) => {
-  if (!_lyricsSyncActive || !_lyricsLines || !_lyricsSynced) return;
-
-  const t = current;
-  if (typeof t !== 'number' || isNaN(t)) return;
-
+function _lyricsActiveAt(t) {
   // Find the active line: last line whose time <= current playback position
   let active = -1;
   for (let i = 0; i < _lyricsLines.length; i++) {
     if (_lyricsLines[i].time !== null && _lyricsLines[i].time <= t) active = i;
   }
-  if (active === _lyricsSyncLastActive) return;
+  return active;
+}
+
+/** Light the active line: .active, .past, .near (its neighbours), aria-current. */
+function _paintLyricsActive(active) {
+  for (let i = 0; i < _lyricsLineEls.length; i++) {
+    const el = _lyricsLineEls[i];
+    const ln = _lyricsLines[i];
+    if (!el || !ln) continue;
+    const on = i === active;
+    el.classList.toggle('active', on);
+    el.classList.toggle('past', ln.time !== null && i < active);
+    el.classList.toggle('near', !on && active >= 0 && Math.abs(i - active) === 1);
+    if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
+  }
+  if (lyricsCounter) {
+    const pos = _lyricsTimed.indexOf(active);
+    lyricsCounter.textContent = `${pos < 0 ? 0 : pos + 1}/${_lyricsTimed.length}`;
+  }
+  // The keyboard's way in follows the lit line while focus is elsewhere.
+  if (!lyricsContent.contains(document.activeElement)) {
+    const target = _lyricsLineEls[active >= 0 && _lyricsLines[active].time !== null ? active : _lyricsTimed[0]];
+    for (const i of _lyricsTimed) _lyricsLineEls[i].tabIndex = _lyricsLineEls[i] === target ? 0 : -1;
+  }
+}
+
+function _lyricsHeld() { return performance.now() < _lyricsHoldUntil; }
+
+/** Scroll `el` to the middle of the window. */
+function _lyricsScrollTo(el, behavior) {
+  if (!el || lyricsPanel.hidden) return;
+  const br = lyricsBody.getBoundingClientRect();
+  const er = el.getBoundingClientRect();
+  if (!br.height) return;
+  const top = lyricsBody.scrollTop + (er.top - br.top) - (lyricsBody.clientHeight - er.height) / 2;
+  lyricsBody.scrollTo({ top: Math.max(0, top), behavior });
+}
+
+/**
+ * Bring the active line (before the first line: the first timed one) to the
+ * middle.  `how`: 'tick' (line by line), 'seek', 'snap' (open / look / size —
+ * no animation).  Retro glides every line (the teleprompter); Modern keeps
+ * its instant line-by-line step and glides only big jumps; reduced motion
+ * never glides.
+ */
+function _lyricsFollow(active, prev, how) {
+  if (_lyricsHeld()) { _lyricsRecenter = true; return; }
+  _lyricsRecenter = false;
+  const idx = active >= 0 ? active : _lyricsTimed[0];
+  let behavior;
+  if (how === 'snap' || (_lyricsRmq && _lyricsRmq.matches)) behavior = 'instant';
+  else if (_lyricsRetro()) behavior = 'smooth';
+  else behavior = (prev < 0 || Math.abs(active - prev) >= 3) ? 'smooth' : 'instant';
+  _lyricsScrollTo(_lyricsLineEls[idx], behavior);
+}
+
+function _lyricsSync(t, how = 'tick') {
+  if (!_lyricsSyncActive || !_lyricsLines || !_lyricsSynced) return;
+  if (typeof t !== 'number' || isNaN(t)) return;
+  const active = _lyricsActiveAt(t);
+  if (active === _lyricsSyncLastActive && how === 'tick') {
+    if (_lyricsRecenter && !_lyricsHeld()) _lyricsFollow(active, active, 'seek');
+    return;
+  }
   const prevActive = _lyricsSyncLastActive;
   _lyricsSyncLastActive = active;
+  if (active !== prevActive || how === 'snap') _paintLyricsActive(active);
+  _lyricsFollow(active, prevActive, how);
+}
 
-  const lineEls = lyricsContent.querySelectorAll('.lyrics-line');
-  for (let i = 0; i < lineEls.length; i++) {
-    const el = lineEls[i];
-    const ln = _lyricsLines[i];
-    if (!ln) continue;
-    el.classList.toggle('active', i === active);
-    el.classList.toggle('past', ln.time !== null && i < active);
-  }
-
-  // Scroll active line into view (centered).  Smooth scroll for big jumps
-  // (seek / scrub) where the animation provides spatial context; instant
-  // scroll for line-by-line progression so the highlight doesn't visibly
-  // trail the audio on fast verses.
-  if (active >= 0 && lineEls[active]) {
-    const bigJump = prevActive < 0 || Math.abs(active - prevActive) >= 3;
-    lineEls[active].scrollIntoView({
-      block: 'center',
-      behavior: bigJump ? 'smooth' : 'instant',
-    });
-  }
+// Single persistent listeners — registered once, gated by _lyricsSyncActive
+Player.on('timeupdate', ({ current }) => _lyricsSync(current, 'tick'));
+Player.on('seeked', ({ current }) => {
+  if (!_lyricsSyncActive) return;
+  _lyricsHoldUntil = 0;                 // a seek always brings the lit line back
+  _lyricsSync(current, 'seek');
+  // Say the line a seek from the lyrics landed on (Enter / a click on a line) —
+  // once it settles, never per tick; other seeks (seek bar, resume, a repeat)
+  // leave it to aria-current.
+  clearTimeout(_lyricsSayTimer);
+  if (!lyricsPanel.contains(document.activeElement)) return;
+  _lyricsSayTimer = setTimeout(() => {
+    const ln = _lyricsLines && _lyricsLines[_lyricsSyncLastActive];
+    if (_lyricsSyncActive && ln && ln.text) _lyricsSay(ln.text);
+  }, 450);
+});
+Player.on('statechange', ({ playing }) => {
+  lyricsPanel.classList.toggle('lyr-paused', !playing);
 });
 
 function _startLyricsSync() {
   _lyricsSyncLastActive = -1;
   _lyricsSyncActive = true;
+  _lyricsHoldUntil = 0;
+  _lyricsSync(Player.currentTime, 'snap');
 }
 
 function _stopLyricsSync() {
   _lyricsSyncActive = false;
   _lyricsSyncLastActive = -1;
+  _lyricsRecenter = false;
+  clearTimeout(_lyricsSayTimer);
 }
+
+function _lyricsSeekToLine(i) {
+  const ln = _lyricsLines && _lyricsLines[i];
+  const track = Player.currentTrack;
+  if (!ln || ln.time === null || !track || !(track.duration > 0)) return;
+  Player.seek((ln.time / track.duration) * 100);
+}
+
+// A click on a timed line plays from it.
+lyricsContent.addEventListener('click', (e) => {
+  const el = e.target.closest('.lyrics-line.synced');
+  if (el && _lyricsSynced) _lyricsSeekToLine(+el.dataset.idx);
+});
+
+// Keys on the synced lines: ↑/↓ (Home/End) move through them, Enter / Space
+// play from the focused one.  Browsing holds the follow for a few seconds.
+lyricsContent.addEventListener('keydown', (e) => {
+  if (!_lyricsSynced || e.altKey || e.metaKey || e.ctrlKey) return;
+  const el = e.target.closest('.lyrics-line.synced');
+  if (!el) return;
+  const at = _lyricsTimed.indexOf(+el.dataset.idx);
+  let next = -1;
+  if (e.key === 'ArrowDown') next = Math.min(_lyricsTimed.length - 1, at + 1);
+  else if (e.key === 'ArrowUp') next = Math.max(0, at - 1);
+  else if (e.key === 'Home') next = 0;
+  else if (e.key === 'End') next = _lyricsTimed.length - 1;
+  else if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+    e.preventDefault();
+    e.stopPropagation();
+    _lyricsSeekToLine(+el.dataset.idx);
+    return;
+  } else return;
+  e.preventDefault();
+  e.stopPropagation();
+  const to = _lyricsLineEls[_lyricsTimed[next]];
+  for (const i of _lyricsTimed) _lyricsLineEls[i].tabIndex = _lyricsLineEls[i] === to ? 0 : -1;
+  to.focus({ preventScroll: true });
+  _lyricsHoldUntil = performance.now() + 4000;
+  _lyricsScrollTo(to, (_lyricsRmq && _lyricsRmq.matches) ? 'instant' : 'smooth');
+});
+
+// Scrolling by hand (wheel, touch, keys on the plain text) holds the follow.
+const _lyricsHold = () => { _lyricsHoldUntil = performance.now() + 3000; };
+lyricsBody.addEventListener('wheel', _lyricsHold, { passive: true });
+lyricsBody.addEventListener('touchmove', _lyricsHold, { passive: true });
+// a press on the body itself (its scrollbar, the space around the lines)
+lyricsBody.addEventListener('pointerdown', (e) => { if (e.target === lyricsBody) _lyricsHold(); });
+lyricsBody.addEventListener('keydown', (e) => {
+  // The focused plain text scrolls natively; keep these keys from the
+  // app-wide shortcuts (arrows = volume, Space = play/pause).
+  if (e.target !== lyricsBody) return;
+  if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar'].includes(e.key)) {
+    e.stopPropagation();
+    _lyricsHold();
+  }
+});
+
+// Escape closes the panel (focus goes back to the Lyrics button).  Space /
+// Enter on the panel's <button>s stay theirs (app.js's Space = play/pause).
+lyricsPanel.addEventListener('keydown', (e) => {
+  if ((e.key === ' ' || e.key === 'Enter') && e.target.tagName === 'BUTTON') {
+    e.stopPropagation();
+    return;
+  }
+  if (e.key !== 'Escape' || e.defaultPrevented) return;
+  e.stopPropagation();
+  _hideLyricsPanel({ focusBtn: true });
+});
+lyricsClose?.addEventListener('click', () => _hideLyricsPanel({ focusBtn: true }));
+
+// A look switch, or a new panel size, re-wraps the lines: put the lit one back
+// in the middle at once.
+const _lyricsResnap = () => {
+  if (lyricsPanel.hidden || !_lyricsSyncActive || _lyricsHeld()) return;
+  requestAnimationFrame(() => {
+    if (_lyricsSyncActive) _lyricsFollow(_lyricsSyncLastActive, _lyricsSyncLastActive, 'snap');
+  });
+};
+onUiStyleChange(_lyricsResnap);
+if (typeof ResizeObserver === 'function') new ResizeObserver(_lyricsResnap).observe(lyricsBody);
 
 /**
  * Fetch and display lyrics for the given track.
@@ -4624,9 +5222,14 @@ function _stopLyricsSync() {
 async function _loadLyrics(track) {
   if (!track) return;
   _lyricsTrackId = track.id;
-  lyricsContent.innerHTML = '<div class="lyrics-loading">Loading lyrics...</div>';
   lyricsSource.textContent = '';
-  _stopLyricsSync();
+  if (track.station) {
+    // An internet-radio stream has no track to look up.  A station emits
+    // trackchange on every song / cover update: say it once.
+    if (lyricsPanel.dataset.lyrics !== 'radio') _setLyricsState('radio', 'No lyrics for internet radio', true);
+    return;
+  }
+  _setLyricsState('loading', 'Loading lyrics...');
 
   try {
     const res = await fetch(`/api/tracks/${track.id}/lyrics`);
@@ -4637,23 +5240,44 @@ async function _loadLyrics(track) {
     if (_lyricsTrackId !== track.id) return;
 
     if (!data.lyrics) {
-      lyricsContent.innerHTML = '<div class="lyrics-empty">No lyrics found</div>';
+      _setLyricsState('empty', 'No lyrics found', true);
       lyricsSource.textContent = '';
       return;
     }
 
     lyricsSource.textContent = data.source || '';
     const lines = data.synced ? _parseLRC(data.lyrics) : _parsePlain(data.lyrics);
-    _renderLyrics(lines, data.synced);
+    _renderLyrics(lines, data.synced, track);
+    if (_lyricsLines) _lyricsSay(_lyricsSynced ? 'Synced lyrics loaded' : 'Lyrics loaded');
   } catch {
     if (_lyricsTrackId === track.id) {
-      lyricsContent.innerHTML = '<div class="lyrics-empty">Could not load lyrics</div>';
+      _setLyricsState('error', 'Could not load lyrics', true);
     }
   }
 }
 
-function _parsePlain(text) {
-  return text.split('\n').map(line => ({ time: null, text: line }));
+/** Open the panel for `track` (a reopen for the same track follows the music again). */
+function _showLyricsPanel(track) {
+  _firePanelOpen('lyrics');          // closes queue, playlist, similar
+  lyricsPanel.hidden = false;
+  lyricsBtn.classList.add('on');
+  lyricsBtn.setAttribute('aria-expanded', 'true');
+  lyricsPanel.classList.toggle('lyr-paused', !Player.playing);
+  if (_lyricsTrackId !== track.id || track.station || lyricsPanel.dataset.lyrics === 'error') {
+    _loadLyrics(track);
+  } else if (_lyricsSynced && _lyricsLines) {
+    _startLyricsSync();
+  }
+}
+
+function _hideLyricsPanel({ focusBtn = false } = {}) {
+  if (lyricsPanel.hidden) return;
+  const hadFocus = lyricsPanel.contains(document.activeElement);
+  lyricsPanel.hidden = true;
+  lyricsBtn.classList.remove('on');
+  lyricsBtn.setAttribute('aria-expanded', 'false');
+  _stopLyricsSync();
+  if ((focusBtn || hadFocus) && typeof lyricsBtn.focus === 'function') lyricsBtn.focus();
 }
 
 /**
@@ -4670,11 +5294,7 @@ function _updateLyricsBtn(track) {
     lyricsBtn.classList.add('disabled');
     lyricsBtn.title = 'No lyrics';
     // Close the panel if it was open
-    if (!lyricsPanel.hidden) {
-      lyricsPanel.hidden = true;
-      lyricsBtn.classList.remove('on');
-      _stopLyricsSync();
-    }
+    _hideLyricsPanel();
   } else {
     lyricsBtn.classList.remove('disabled');
     lyricsBtn.title = 'Lyrics';
@@ -4687,16 +5307,8 @@ lyricsBtn.addEventListener('click', () => {
   const track = Player.currentTrack;
   if (!track) return;
 
-  if (lyricsPanel.hidden) {
-    _firePanelOpen('lyrics');          // closes queue, playlist, similar
-    lyricsPanel.hidden = false;
-    lyricsBtn.classList.add('on');
-    if (_lyricsTrackId !== track.id) _loadLyrics(track);
-  } else {
-    lyricsPanel.hidden = true;
-    lyricsBtn.classList.remove('on');
-    _stopLyricsSync();
-  }
+  if (lyricsPanel.hidden) _showLyricsPanel(track);
+  else _hideLyricsPanel();
 });
 
 // When track changes, update button state and reload lyrics if panel is open.
@@ -5119,7 +5731,19 @@ function refreshSmartOnPlay() {
   // fires only while the genuine History / Most-Played smart list is on screen.
   if (browseHdr.hidden || _smartViewToken !== _browseNavGen) return;
   if (_smartViewKey === 'history')          showSmart('history', 'Listening History');
-  else if (_smartViewKey === 'most-played') showSmart('most-played', 'Most Played');
+  else if (_smartViewKey === 'most-played' && !_playingFromList()) showSmart('most-played', 'Most Played');
+}
+
+// Most Played is sorted by play count, so a counted play moves the track up the
+// list: re-sorted while the listener plays from it, the playing row jumps and
+// the rows that play next (the queue keeps the order it started in) no longer
+// follow it on screen — the play looks random.  So it keeps its order while a
+// track it lists is playing, and re-sorts when it is opened again.
+function _playingFromList() {
+  const cur = Player.currentTrack;
+  if (!cur || !cur.id || !currentTracks) return false;
+  for (let i = 0; i < currentTracks.length; i++) if (currentTracks[i] && currentTracks[i].id === cur.id) return true;
+  return false;
 }
 
 
@@ -5322,7 +5946,7 @@ function patchTrackDuration(id, seconds, subsong = null) {
   const cur = (+t.duration) || 0;
   if (Math.abs(seconds - cur) < 0.5) return;   // already the right value — no-op
   t.duration = seconds;
-  const durTd = row.cells[8];             // col-dur
+  const durTd = row.cells[9];             // col-dur
   if (durTd) {
     durTd.classList.remove('col-empty');
     durTd.textContent = fmtDur(seconds);
@@ -5355,6 +5979,11 @@ function patchTrack(id, fields) {
     for (const arr of list._chunks.values()) arr.forEach(apply);
   } else if (Array.isArray(list)) {
     list.forEach(apply);
+    // an edit can fill a column left out as empty
+    if (_emptyCols.size && Object.values(_EMPTY_COL_FIELDS).some((f) => f in fields)) {
+      _emptyCols = _emptyColumns(list);
+      _applyColVisibility();
+    }
   }
   if (!tbody) return;
   // A windowed row is read from its loaded chunk directly — indexing the store
@@ -5436,8 +6065,8 @@ async function _reflagShownRows() {
 
 export const Library = {
   patchTrackDuration, patchTrack, refreshAvailability,
-  showAll, showArtists, showAlbumArtists, showAlbums, showAlbumTracks,
-  showGenres, showYears, showSceneGroups, showGalaxy, showFolder, renderTracks,
+  showAll, showArtists, showAlbumArtists, showAlbums, showNameAlbums, showAlbumTracks,
+  showGenres, showYears, showSceneGroups, showScene, showFacet, showFacetTracks, showGalaxy, showFolder, renderTracks,
   showSearch,
   // The search results on screen: re-read in place (a scan finished, …).
   isInSearchView: () => !!_searchCtx,

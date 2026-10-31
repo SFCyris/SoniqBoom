@@ -69,6 +69,7 @@ renderers are built from the upstream sources and versions named in the
 | [libao](https://xiph.org/ao/) | GPL-2.0-or-later | Audio output library a source-built UADE links (Linux source build and the Docker image, Debian `libao4`). |
 | [AdPlay](https://github.com/adplug/adplay-unix) with the [AdPlug](https://github.com/adplug/adplug) library | AdPlay: GPL-2.0-or-later; AdPlug: LGPL-2.1-or-later | AdLib / OPL FM formats (IMF, ROL, CMF, D00, RAD, …), rendered with AdPlug's Nuked OPL3 emulator. Debian package in the Docker image; Homebrew or distribution package with `install.sh`. |
 | [psgplay](https://github.com/frno7/psgplay) | GPL-2.0 (some files LGPL-2.1 / MIT; see its `licence/` folder) | Atari ST SNDH playback. Built by `install.sh` and the Docker build from a pinned source revision. |
+| [libkss](https://github.com/digital-sound-antiques/libkss) (in `kssrender`) | ISC (libkss); MIT (its emu2149, emu2212, emu2413, emu8950 and emu76489 sound-chip cores); public domain (its kmz80 Z80 core). Its kss-drivers are not included. Each licence text is in the image under `/usr/local/share/doc/third-party/libkss/`. | MSX and Sega Master System KSS playback through `kssrender` (`soniqboom/native/kssrender`, AGPL-3.0-or-later). Built by `install.sh` and the Docker build from a pinned libkss revision. |
 | [sc68](https://sourceforge.net/projects/sc68/) | GPL-2.0-or-later (sc68 2.2.1) | Native Atari ST `.sc68` disks. Homebrew package on macOS; sc68 2.2.1 built from source on Linux (when the distribution has no package) and in the Docker image. |
 | [zxtune / zxtune123](https://github.com/vitamin-caig/zxtune) | zxtune's own code: LGPL-3.0. The `zxtune123` binary also contains third-party code under GPL-3.0 (Highly Experimental), GPL-2.0 (DeSmuME in vio2sf, Mupen64Plus in lazyusf2), GPL-2.0-or-later (libsidplayfp), MPL-2.0 (mGBA), LGPL, BSD/MIT-style licences, the Boost Software License (Boost.Program_options, linked statically) and the unRAR licence, whose source may not be used to re-create the RAR compression algorithm. Each licence text is in the image under `/usr/local/share/doc/third-party/zxtune/`. | PSF console-music family (PSF/PSF2, USF, GSF, 2SF, NCSF, SSF, DSF), MED 2–4 modules, and VGM / VGZ files that use sound chips libgme does not play. Official prebuilt r5112 on Linux and in the Docker image; built from source on macOS against Homebrew's [Boost](https://www.boost.org) (BSL-1.0), whose libraries are copied next to the binary. |
 | [lhasa](https://github.com/fragglet/lhasa) (`lha`) | ISC | Last resort for an LHA archive the in-process readers cannot read. Installed by `install.sh` where the package manager has it; optional, and not in the Docker image. |
@@ -150,8 +151,9 @@ carries, next to the SoniqBoom source zip:
 
 - `soniqboom-<version>-third-party-sources.tar` — the upstream source code of
   the programs the image builds or downloads (psgplay with its submodules,
-  zxtune, libgme, sc68, UADE, bencodetools, libzakalwe, libresidfp, libsidplayfp,
-  sidplayfp and libopenmpt) at the exact versions pinned
+  libkss with the submodules it is built with, zxtune, libgme, sc68, UADE,
+  bencodetools, libzakalwe, libresidfp, libsidplayfp, sidplayfp and libopenmpt)
+  at the exact versions pinned
   in the [Dockerfile](Dockerfile), and of the libsidplayfp the browser uses at
   the version pinned in `soniqboom/native/sidwasm/build.sh`, collected by
   [`scripts/collect_third_party_sources.sh`](scripts/collect_third_party_sources.sh).

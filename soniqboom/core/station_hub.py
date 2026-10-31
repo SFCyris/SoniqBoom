@@ -300,6 +300,13 @@ class StationHub:
         self._subs.add(q)
         return q, burst
 
+    def release_unused(self) -> None:
+        """For a caller that got the hub (``registry.get_or_create`` cancelled
+        its teardown) and answered without subscribing: with no subscriber,
+        the teardown is due as after the last one left."""
+        if not self._subs and not self._closed:
+            self._schedule_teardown()
+
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs.discard(q)
         if not self._subs and not self._closed:
@@ -319,6 +326,11 @@ class StationHub:
                 yield item
         finally:
             self.unsubscribe(q)
+
+    @property
+    def burst_size(self) -> int:
+        """Bytes a new subscriber is sent first (the recent audio buffered)."""
+        return self._ring_bytes if self._burst else 0
 
     @property
     def subscriber_count(self) -> int:

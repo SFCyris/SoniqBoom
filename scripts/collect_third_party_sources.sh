@@ -62,6 +62,20 @@ git_snapshot() {   # git_snapshot <repo> <ref> <component> — recursive clone i
 # psgplay — pinned commit, with its submodules
 git_snapshot https://github.com/frno7/psgplay.git "$(arg PSGPLAY_COMMIT)" psgplay
 
+# libkss (kssrender) — pinned commit with the submodules the image builds:
+# the chip cores and kmz80, never kss-drivers (not under libkss's licence,
+# not built — soniqboom/native/kssrender/build.sh)
+LIBKSS_COMMIT="$(arg LIBKSS_COMMIT)"
+LIBKSS_DIR="$WORK/libkss-$LIBKSS_COMMIT"
+git clone -q https://github.com/digital-sound-antiques/libkss.git "$LIBKSS_DIR"
+git -C "$LIBKSS_DIR" checkout -q "$LIBKSS_COMMIT"
+git -C "$LIBKSS_DIR" submodule update -q --init modules/emu2149 modules/emu2212 \
+    modules/emu2413 modules/emu8950 modules/emu76489 modules/kmz80
+find "$LIBKSS_DIR" -name .git -prune -exec rm -rf {} +
+tar -C "$WORK" -czf "$OUT/libkss-$LIBKSS_COMMIT.tar.gz" "libkss-$LIBKSS_COMMIT"
+record "libkss-$LIBKSS_COMMIT.tar.gz" libkss "$LIBKSS_COMMIT" \
+    https://github.com/digital-sound-antiques/libkss.git
+
 # zxtune — the image installs the official zxtune123 build of this revision
 ZXREV="$(arg ZXTUNE_REV)"
 fetch "https://github.com/vitamin-caig/zxtune/archive/refs/tags/${ZXREV}.tar.gz" \

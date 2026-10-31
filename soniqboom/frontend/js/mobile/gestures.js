@@ -11,7 +11,8 @@
 
 const LONG_PRESS_MS = 500;
 const MOVE_TOLERANCE = 8;          // px — cancels long-press if exceeded
-const SWIPE_TRIGGER_PCT = 0.30;    // fraction of row width to commit a swipe
+const SWIPE_TRIGGER_PCT = 0.30;    // fraction of row width to commit a swipe…
+const SWIPE_TRIGGER_MAX = 160;     // …but never more px than this (a tablet row is ~1,000 px wide)
 const SWIPE_AXIS_LOCK   = 10;      // px before deciding horiz vs vert
 
 /**
@@ -151,7 +152,8 @@ function _bindRowGestures(el, resolve) {
 
     if (axis === 'h' && opts.onSwipeAction) {
       const width = row.getBoundingClientRect().width;
-      if (Math.abs(dx) >= width * SWIPE_TRIGGER_PCT) {
+      // (leftwards only — the row never moves right, so a right swipe does nothing)
+      if (-dx >= Math.min(width * SWIPE_TRIGGER_PCT, SWIPE_TRIGGER_MAX)) {
         // Animate fully out, then fire action
         content.style.transition = 'transform 0.18s ease-out';
         content.style.transform = `translateX(-${width}px)`;

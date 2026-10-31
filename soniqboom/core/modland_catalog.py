@@ -2895,6 +2895,8 @@ async def _run_job(name: str, body) -> dict:
                 return status()
             _status.update(state="ready" if enabled() else "off", phase="",
                            last_result=res, shrink_refused=False)
+            from soniqboom.core import source_twins
+            source_twins.schedule()          # tunes came or went: library twins
             return status()
     finally:
         if me is not None:
@@ -3653,3 +3655,5 @@ async def _merge(track_id: str, local: Path) -> None:
         log.warning("Modland catalogue merge of %s failed", track_id, exc_info=True)
     finally:
         _merging.discard(track_id)
+        from soniqboom.core import source_twins
+        source_twins.schedule()              # its file_md5 may make it a library twin

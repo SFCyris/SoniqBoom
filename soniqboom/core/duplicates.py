@@ -172,10 +172,28 @@ def compute_duplicate_groups(
 
     for t in tracks:
         tid = t.get("id", "")
-        key = group_key_for(t)           # "" = untitled (untagged file): never grouped
+        # "" = untitled (untagged file): never grouped.  An online collection's
+        # tune (``online`` / ``twin_of`` — set by the callers: a scan worker
+        # has no catalogue roots to tell by its path) is never grouped by its
+        # tags, only with the file it is (below).
+        key = "" if (t.get("online") or t.get("twin_of")) else group_key_for(t)
         key_for_track[tid] = key
         if key:
             groups.setdefault(key, []).append(t)
+    # An online collection's tune that is a library file (``twin_of``: that
+    # file's id — ``core/source_twins.py``) joins the file's group; a file
+    # with no group (unique, or untitled) forms one with its twins.
+    by_id = {t.get("id", ""): t for t in tracks}
+    for t in tracks:
+        own = t.get("twin_of")
+        if not own or own not in by_id:
+            continue
+        key = key_for_track.get(own) or f"twin|{own}"
+        if key not in groups:
+            groups[key] = [by_id[own]]
+            key_for_track[own] = key
+        groups[key].append(t)
+        key_for_track[t.get("id", "")] = key
 
     # Step 2: for each group, score formats and pick primary.  Hoist the
     # ``_pick_primary`` + best-score computation out of the per-track loop
@@ -227,15 +245,21 @@ def compute_duplicate_groups(
 
 def primary_sort_key(t: dict) -> tuple:
     """The order a duplicate group's primary is picked by — the smallest key
-    wins: highest format_score → highest bitrate → earliest added → track id
-    (a total order: the pick never depends on the order the group's tracks
-    were listed in, so the full and the incremental pass agree).  Also picks
-    the copy that stands in for a primary that can't play right now
-    (``TrackStore.primary_swap``)."""
+    wins: the library's own files before an online collection's tunes
+    (``core/source_twins.py``) → highest format_score → highest bitrate →
+    earliest added → track id (a total order: the pick never depends on the
+    order the group's tracks were listed in, so the full and the incremental
+    pass agree).  Also picks the copy that stands in for a primary that can't
+    play right now (``TrackStore.primary_swap``)."""
+    from soniqboom.core.catalogue import is_catalogue_path
     score   = format_quality_score(t.get("format", ""), t.get("bitrate"))
     bitrate = t.get("bitrate") or 0
     added   = t.get("added_at") or 0
-    return (-score, -bitrate, added, t.get("id") or "")  # negative for descending
+    # (``online`` / ``twin_of``: a row marked by the caller — in a scan worker
+    # the catalogue roots aren't registered and the path can't tell)
+    online  = 1 if (t.get("online") or t.get("twin_of")
+                    or is_catalogue_path(t.get("path"))) else 0
+    return (online, -score, -bitrate, added, t.get("id") or "")  # negative for descending
 
 
 def _pick_primary(group: list[dict]) -> dict:

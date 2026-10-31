@@ -1671,3 +1671,42 @@ test('a tune is judged before its fade; a plain play by the tune it plays', () =
   // An MP3 tagged like an Amiga module is still ordinary audio.
   assert.equal(p.skipReason({ id: 'x', format: 'MP3', path: '/m/remix.mp3', genre: ['Amiga', 'Module'], duration: 5 }), '');
 });
+
+test('adding many tracks at once is adding them one by one, with one queuechange', async () => {
+  const extra = (pfx, n) => Array.from({ length: n }, (_, i) => ({ id: `${pfx}-${i}`, title: pfx }));
+  for (const auto of [false, true]) {
+    const one = makePlayer({ server: makeServer(3000) });
+    const all = makePlayer({ server: makeServer(3000) });
+    for (const p of [one, all]) {
+      p.setQueue(rows(0, 30), 4, { source: { ...SOURCE(3000), offset: 0 } });
+      await p.settle();
+      p.playNext({ id: 'mine-1', title: 'Mine' });       // a hand-queued "play next" in between
+      p.addToQueue({ id: 'mix-0', title: 'mix' }, { auto: true });
+    }
+    const opts = auto ? { auto: true } : {};
+    for (const t of extra('add', 50)) one.addToQueue(t, opts);
+    const n0 = all.env.events.filter(([n]) => n === 'queuechange').length;
+    all.addAllToQueue(extra('add', 50), opts);
+    assert.deepEqual(all.ids(), one.ids(), auto ? 'auto order' : 'manual order');
+    assert.equal(all.env.events.filter(([n]) => n === 'queuechange').length, n0 + 1);
+    assert.equal(all.autoAhead, one.autoAhead);
+    all.addAllToQueue([]);                                  // nothing added: no event
+    assert.equal(all.env.events.filter(([n]) => n === 'queuechange').length, n0 + 1);
+    // shuffle passes take the added tracks in, as one by one
+    one.toggleShuffle(); all.toggleShuffle();
+    await one.settle(); await all.settle();
+    assert.deepEqual([...all.ids()].sort(), [...one.ids()].sort());
+  }
+  // the edge cases: a track already queued, queued again in the same batch
+  const one = makePlayer({ server: makeServer(3000) });
+  const all = makePlayer({ server: makeServer(3000) });
+  const x = { id: 'x', title: 'X' };
+  for (const p of [one, all]) {
+    p.setQueue([{ id: 'cur', title: 'C' }, x], 0);
+    await p.settle();
+  }
+  const a = { id: 'a', title: 'A' };
+  for (const t of [a, x]) one.addToQueue(t, { auto: true });
+  all.addAllToQueue([a, x], { auto: true });
+  assert.deepEqual(all.ids(), one.ids());
+});

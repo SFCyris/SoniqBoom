@@ -195,6 +195,8 @@ class FtpServer:
                                 server.abort_retrs -= 1
                                 cut = server.abort_after
                         try:
+                            if not os.stat(p).st_mode & 0o444:     # mode 0 fails as root too
+                                raise PermissionError(13, "unreadable", str(p))
                             with open(p, "rb") as fh:
                                 fh.seek(offset)
                                 while True:
@@ -238,6 +240,8 @@ class FtpServer:
                         server.listed.append(arg if arg and not arg.startswith("-") else self.cwd)
                         conn = self.data_conn()
                         out = []
+                        if not p.stat().st_mode & 0o444:          # mode 0 fails as root too
+                            raise PermissionError(13, "unreadable", str(p))
                         for c in sorted(p.iterdir()):
                             st = c.stat()
                             mod = time.strftime("%Y%m%d%H%M%S", time.gmtime(st.st_mtime))

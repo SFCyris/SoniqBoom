@@ -108,3 +108,81 @@ def test_both_present_serves_frontend_and_manual_without_error(repo_root, tmp_pa
         assert paths.count(p) == 1, p
     assert _errors(out) == []
     assert out["hits"]["/some/spa/route"] == [200, "text/html; charset=utf-8"]
+
+
+# ── / picks the interface: ?ui= pins it, the cookie wins, phones go to /m ────
+
+_UA_IPHONE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
+_UA_IPAD_DESKTOP = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                    "(KHTML, like Gecko) Version/17.5 Safari/605.1.15")
+_UA_IPAD = ("Mozilla/5.0 (iPad; CPU OS 12_5 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/12.1 Safari/605.1.15")
+_UA_ANDROID_TABLET = ("Mozilla/5.0 (Linux; Android 14; SM-X710) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_UA_WINDOWS = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+@pytest.fixture
+def site():
+    from fastapi.testclient import TestClient
+    from soniqboom import main
+    return TestClient(main.app)          # (no lifespan: only the routes); fresh cookies per test
+
+
+def _get(site, path, ua, cookie=None):
+    headers = {"User-Agent": ua}
+    if cookie:
+        headers["Cookie"] = cookie
+    return site.get(path, headers=headers, follow_redirects=False)
+
+
+@pytest.mark.parametrize("ua", [_UA_IPHONE, _UA_IPAD, _UA_ANDROID_TABLET])
+def test_phone_and_tablet_user_agents_go_to_m_unpinned(site, ua):
+    r = _get(site, "/", ua)
+    assert r.status_code == 302 and r.headers["location"] == "/m"
+    assert "set-cookie" not in r.headers            # auto-detection never pins
+
+
+@pytest.mark.parametrize("ua", [_UA_IPAD_DESKTOP, _UA_WINDOWS])
+def test_desktop_user_agents_get_index_with_the_detection_script(site, ua):
+    # An iPad asking for the desktop site sends a Macintosh UA: the server serves
+    # index.html, whose head script tells it apart (tests/js/ui_detect.test.mjs).
+    r = _get(site, "/", ua)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert "set-cookie" not in r.headers
+    assert "[ui-detect:begin]" in r.text and "function sbTouchDevice" in r.text
+    assert 'id="btn-phone-ui"' in r.text and 'href="/?ui=mobile"' in r.text
+    # the script comes before the first stylesheet and the import map
+    assert r.text.index("[ui-detect:begin]") < r.text.index('<link rel="stylesheet"')
+    assert r.text.index("[ui-detect:begin]") < r.text.index('<script type="importmap">')
+
+
+@pytest.mark.parametrize("ua", [_UA_IPHONE, _UA_IPAD_DESKTOP, _UA_WINDOWS])
+def test_ui_query_pins_the_choice(site, ua):
+    r = _get(site, "/?ui=desktop", ua)
+    assert r.status_code == 200 and "[ui-detect:begin]" in r.text
+    ck = r.headers["set-cookie"]
+    assert ck.startswith("sb_ui=desktop;") and "Max-Age=31536000" in ck and "Path=/" in ck
+    assert "samesite=lax" in ck.lower()
+    r = _get(site, "/?ui=mobile", ua)
+    assert r.status_code == 302 and r.headers["location"] == "/m"
+    assert r.headers["set-cookie"].startswith("sb_ui=mobile;")
+    # anything else is not a choice
+    r = _get(site, "/?ui=tablet", ua)
+    assert "set-cookie" not in r.headers
+
+
+def test_pinned_cookie_beats_the_user_agent(site):
+    r = _get(site, "/", _UA_IPHONE, cookie="sb_ui=desktop")
+    assert r.status_code == 200 and 'id="btn-phone-ui"' in r.text
+    r = _get(site, "/", _UA_WINDOWS, cookie="sb_ui=mobile")
+    assert r.status_code == 302 and r.headers["location"] == "/m"
+
+
+def test_the_phone_shell_never_pins(site):
+    for ua in (_UA_IPHONE, _UA_IPAD_DESKTOP, _UA_WINDOWS):
+        r = _get(site, "/m", ua)
+        assert r.status_code == 200 and "set-cookie" not in r.headers
+        assert 'id="m-desktop-link"' in r.text and 'href="/?ui=desktop"' in r.text

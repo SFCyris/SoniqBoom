@@ -16,9 +16,11 @@ const ROOT = resolve(HERE, '../..');
 const read = (p) => readFileSync(resolve(ROOT, p), 'utf8');
 
 test('every Amiga VU re-ask comes before the server drops the queued pass', () => {
-  const app = read('soniqboom/frontend/js/app.js');
-  const m = app.match(/const _AMIGA_VU_RETRY_MS = \[([\d,\s]+)\];/);
-  assert.ok(m, '_AMIGA_VU_RETRY_MS not found');
+  // (one ladder, vu/vumr.js, for the desktop player bar and the phone)
+  const vu = read('soniqboom/frontend/js/vu/vumr.js');
+  const m = vu.match(/export const AMIGA_VU_RETRY_MS = \[([\d,\s]+)\];/);
+  assert.ok(m, 'AMIGA_VU_RETRY_MS not found');
+  assert.match(read('soniqboom/frontend/js/app.js'), /const _AMIGA_VU_RETRY_MS = AMIGA_VU_RETRY_MS;/);
   const ladder = m[1].split(',').map((x) => Number(x.trim())).filter((x) => x > 0);
   const py = read('soniqboom/api/stream.py');
   const f = py.match(/^_UADE_VU_POLL_FRESH_S\s*=\s*([\d.]+)/m);
@@ -103,11 +105,12 @@ test('the SID worker reports the tune it rendered in both of its results', () =>
   assert.match(read('soniqboom/frontend/js/sid-wasm-player.js'), /tune: Number\.isInteger\(tune\) \? tune : null/);
 });
 
-test('the spectrum label says why no per-voice meters come, in the server\'s words for it', () => {
+test('the spectrum label says why no per-voice meters come, in the server\'s words for it', async () => {
   const app = read('soniqboom/frontend/js/app.js');
-  const src = (app.match(/function _vuFallbackText\([\s\S]*?\n}\n/) || [])[0];
-  assert.ok(src, '_vuFallbackText not found');
-  const make = (isAdmin) => new Function('Auth', `${src}; return _vuFallbackText;`)({ isAdmin });
+  // The words are vu/vumr.js's (shared with the phone); the desktop passes Auth.isAdmin.
+  const { vuFallbackText } = await import('../../soniqboom/frontend/js/vu/vumr.js');
+  assert.match(app, /function _vuFallbackText\(format, reason\) \{\n  return vuFallbackText\(format, reason, Auth\.isAdmin\);\n\}/);
+  const make = (isAdmin) => (f, r) => vuFallbackText(f, r, isAdmin);
   const admin = make(true), user = make(false);
   assert.equal(admin('TFMX Pro', 'off'), 'Spectrum — per-voice meters are turned off (Settings → Renderers)');
   assert.equal(user('TFMX Pro', 'off'), 'Spectrum — per-voice meters are turned off on this server',
@@ -123,7 +126,7 @@ test('the spectrum label says why no per-voice meters come, in the server\'s wor
   assert.deepEqual([...sent].sort(), ['off', 'skipped', 'unsupported']);
   for (const r of sent) assert.notEqual(user('X', r), user('X', ''), `reason ${r} has its own words`);
   // The reason is carried from the header to both label paths.
-  assert.match(app, /reason \? \{ unavailable: true, reason: /);
+  assert.match(read('soniqboom/frontend/js/vu/vumr.js'), /reason \? \{ unavailable: true, reason: /);
   assert.match(app, /return _end\(true, fetched\.reason\)/);
   assert.match(app, /_addFallbackLabel\(fmtLabel, willPoll, vuUnavailable \? fetched0\.reason : ''\)/);
 });
@@ -331,4 +334,70 @@ test('"Tracks that can\'t be played: Hide" rebuilds the open list and the phone 
   assert.equal(changes('glitched', { health: null }), false);        // glitched plays: no list change
   assert.equal(changes('broken', { health: 'broken' }), false);     // a new note only
   assert.equal(changes('glitched', { health: 'broken' }), true);
+});
+
+test('the phone shell is always Retro hi-fi: the desktop Style never reaches it', async () => {
+  // mobile.html fixes <html data-ui-style="retro"> in its markup (no script
+  // reads sb_ui_style); the shell neither imports ui_style.js nor offers a Style
+  // switch; and ui_style.js, should a shared module load it there, keeps the
+  // fixed look — no switch, no write, another tab's choice not followed.  The
+  // reels turn only while playing and never with reduced motion.
+  const html = read('soniqboom/frontend/mobile.html').replace(/<!--[\s\S]*?-->/g, '');
+  assert.match(html, /<html lang="en" data-ui-style="retro" data-ui-style-fixed="retro">/);
+  const head = html.slice(0, html.indexOf('</head>'));
+  assert.doesNotMatch(head, /sb_ui_style|setAttribute\('data-ui-style'/);
+  const app = read('soniqboom/frontend/js/mobile/app.js').replace(/\/\/.*$/gm, '');
+  assert.doesNotMatch(app, /ui_style\.js/);
+  const set = read('soniqboom/frontend/js/mobile/views/settings.js');
+  assert.doesNotMatch(set, /bindUiStyleSwitch|set-style|data-ui-style/);
+
+  // ui_style.js under a fixed page, with stand-ins for the browser globals.
+  const store = new Map([['sb_ui_style', 'modern']]);
+  const listeners = {};
+  const root = { dataset: { uiStyleFixed: 'retro' } };
+  const saved = ['window', 'document', 'localStorage', 'CustomEvent'].map((k) => [k, globalThis[k]]);
+  globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
+  globalThis.window = { addEventListener: (t, fn) => { (listeners[t] ||= []).push(fn); } };
+  globalThis.document = { documentElement: root, dispatchEvent() {} };
+  globalThis.CustomEvent = class { constructor(t, o) { this.type = t; this.detail = o && o.detail; } };
+  try {
+    const url = new URL('../../soniqboom/frontend/js/ui_style.js?fixed', import.meta.url);
+    const ui = await import(url.href);
+    assert.equal(ui.getUiStyle(), 'retro');
+    assert.equal(root.dataset.uiStyle, 'retro');
+    assert.equal(ui.setUiStyle('modern'), false);
+    assert.equal(ui.getUiStyle(), 'retro');
+    assert.equal(store.get('sb_ui_style'), 'modern', 'the phone wrote the desktop page\'s Style');
+    let told = 0; ui.onUiStyleChange(() => { told++; });
+    store.set('sb_ui_style', 'modern');
+    for (const fn of listeners.storage || []) fn({ key: 'sb_ui_style' });
+    assert.equal(ui.getUiStyle(), 'retro');
+    assert.equal(told, 0);
+  } finally {
+    for (const [k, v] of saved) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; }
+  }
+
+  const mcss = read('soniqboom/frontend/css/mobile.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.match(mcss, /\.m-np-reel i \{[^}]*animation-play-state: paused;/);
+  assert.match(mcss, /\.m-np\[data-state="playing"\] \.m-np-reel i \{ animation-play-state: running; \}/);
+  assert.match(mcss, /@media \(prefers-reduced-motion: reduce\) \{\s*\.m-np-reel i \{ animation: none; \}/);
+});
+
+test('the phone\'s keys, rows and switches are finger-sized (≥ 44 px)', () => {
+  const css = read('soniqboom/frontend/css/mobile.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  // the shared key rule sets the floor for every key the phone draws
+  const key = css.match(/\.m-key, \.m-settings-btn[^{]*\{([^}]*)\}/);
+  assert.ok(key, 'the shared key rule not found');
+  for (const cls of ['.m-tab', '.m-group-chip', '.m-mp-play', '.m-mp-next', '.m-mp-cast', '.m-preset', '.m-crumb-back',
+                     '.m-sheet-actions li', '.m-sheet-cancel', '.m-desktop-link']) {
+    assert.ok(key[0].includes(cls), `${cls} is not in the shared key rule`);
+  }
+  assert.match(key[1], /min-width: 44px;/);
+  assert.match(key[1], /min-height: 44px;/);
+  const px = (sel, prop) => Number(((css.match(new RegExp(`${sel.replace(/[.[\]()]/g, '\\$&')}\\s*\\{([^}]*)\\}`)) || [])[1] || '')
+    .match(new RegExp(`(?:^|[;\\s])${prop}:\\s*(\\d+)px`)) ?.[1]);
+  assert.ok(px('.m-row-handle', 'height') >= 44 && px('.m-row-handle', 'width') >= 44, 'the drag grip is under 44 px');
+  assert.ok(px('.m-radio-fav', 'height') >= 44 && px('.m-radio-fav', 'width') >= 44, 'the station star is under 44 px');
+  assert.ok(px('.m-settings-select', 'min-height') >= 44, 'the selector is under 44 px');
+  assert.ok(px('.m-search-input, .m-radio-search input', 'height') >= 44, 'the search field is under 44 px');
 });

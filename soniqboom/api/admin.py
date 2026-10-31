@@ -600,8 +600,11 @@ async def admin_add_dir(body: dict, _tok: str = Depends(_require_token)):
     raw = (body.get("path") or "").strip()
     if not raw:
         raise HTTPException(400, "path is required")
-    path = str(Path(raw).expanduser().resolve())
-    if not Path(path).is_dir():
+    def _check() -> "tuple[str, bool]":       # (a realpath and a stat: off the loop)
+        p = str(Path(raw).expanduser().resolve())
+        return p, Path(p).is_dir()
+    path, is_dir = await asyncio.to_thread(_check)
+    if not is_dir:
         raise HTTPException(400, f"Directory not found: {path}")
     await upsert_scan_dir(path)
 
@@ -896,10 +899,10 @@ async def admin_reindex(_tok: str = Depends(_require_token)):
 async def admin_scan(body: dict | None = None, _tok: str = Depends(_require_token)):
     """Start a scan. Body: { "dirs": [...] } or omit to scan all registered folders."""
     if body and body.get("dirs"):
-        dirs = [
+        dirs = await asyncio.to_thread(lambda: [
             d if _is_remote(d) else str(Path(d).expanduser().resolve())
             for d in body["dirs"]
-        ]
+        ])
     else:
         scan_dir_docs = await list_scan_dirs()
         dirs = [d["path"] for d in scan_dir_docs]
@@ -1010,6 +1013,17 @@ async def metadata_repair_status(_tok: str = Depends(_require_token)):
     """
     from soniqboom.core.repair import get_progress as _rep_progress
     return _rep_progress().to_dict()
+
+
+@router.get("/length-backfill/status")
+async def length_backfill_status(_tok: str = Depends(_require_token)):
+    """Status of the one-time length backfill of network-share MP3 / Ogg
+    tracks (``core/partial_length.py`` ``get_status``): whether it runs, the
+    share it is reading (shown without credentials), the checked / fixed /
+    skipped / unreachable counts for that share and the whole run, and the
+    last finished run's summary (``last``, None before one).  Read-only."""
+    from soniqboom.core.partial_length import get_status
+    return get_status()
 
 
 @router.post("/metadata/repair-scan")
@@ -1803,8 +1817,9 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
 
     proto = (body.get("protocol") or "").strip().lower()
     host = (body.get("host") or "").strip()
-    if proto not in ("smb", "ftp", "webdav", "webdavs"):
-        raise HTTPException(400, "protocol must be 'smb', 'ftp', 'webdav', or 'webdavs'")
+    if proto not in ("smb", "ftp", "webdav", "webdavs", "httpindex"):
+        raise HTTPException(400, "protocol must be 'smb', 'ftp', 'webdav', 'webdavs' "
+                                 "or 'httpindex'")
 
     share_name = (body.get("share") or "").strip()
     remote_path = (body.get("remote_path") or "/").strip()
@@ -1813,12 +1828,12 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
     alias = (body.get("alias") or "").strip()
     base_url = (body.get("base_url") or "").strip()
 
-    if proto in ("webdav", "webdavs"):
-        # WebDAV identifies a share by its full base URL.  Validate the URL
+    if proto in ("webdav", "webdavs", "httpindex"):
+        # WebDAV (and a web folder listing) identifies a share by its full base URL.  Validate the URL
         # shape and synthesize host / share / remote_path so downstream
         # code (scan_root, share-id) gets a uniform record.
         if not base_url:
-            raise HTTPException(400, "base_url is required for WebDAV")
+            raise HTTPException(400, "base_url is required for WebDAV and web folders")
         # The scan root (and every track path ``<root>:<path>``) is the base
         # URL: stored with a lowercase scheme + host and without a trailing
         # slash, so the root boundary is always ``…/Music:/x`` rather than
@@ -1853,7 +1868,7 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
         "alias": alias,
         "auto_connect": True,
     }
-    if proto in ("webdav", "webdavs"):
+    if proto in ("webdav", "webdavs", "httpindex"):
         share_conf["base_url"] = base_url
     from soniqboom.core import catalogue as _catalogue
     from soniqboom.core.filesource import scan_root_for_share as _srfs
@@ -1992,12 +2007,12 @@ async def test_share(body: dict, _tok: str = Depends(_require_token)):
     proto = (body.get("protocol") or "").strip().lower()
     host  = (body.get("host") or "").strip()
     base_url = (body.get("base_url") or "").strip()
-    if proto in ("webdav", "webdavs"):
+    if proto in ("webdav", "webdavs", "httpindex"):
         if not base_url:
-            raise HTTPException(400, "base_url is required for WebDAV")
+            raise HTTPException(400, "base_url is required for WebDAV and web folders")
         base_url, parts, url_user, url_pass = _normalize_webdav_url(base_url)
         host = parts.netloc
-    if not proto or (proto not in ("webdav", "webdavs") and not host):
+    if not proto or (proto not in ("webdav", "webdavs", "httpindex") and not host):
         raise HTTPException(400, "protocol and host are required")
 
     share_conf: dict = {
@@ -2010,7 +2025,7 @@ async def test_share(body: dict, _tok: str = Depends(_require_token)):
     if base_url:
         share_conf["base_url"] = base_url
     password = body.get("password") or ""
-    if proto in ("webdav", "webdavs") and url_user and not share_conf["username"]:
+    if proto in ("webdav", "webdavs", "httpindex") and url_user and not share_conf["username"]:
         share_conf["username"], password = url_user, password or url_pass
 
     try:
@@ -2503,6 +2518,7 @@ _PROBE_RENDERER_SPECS = (
     ("openmpt123", "openmpt123_path"), ("uade123", "uade123_path"),
     ("adplay", "adplay_path"), ("psgplay", "psgplay_path"),
     ("sc68", "sc68_path"), ("zxtune123", "zxtune123_path"),
+    ("kssrender", "kssrender_path"),
 )
 
 
@@ -2568,6 +2584,7 @@ _VERSION_PATTERNS = {
     "psgplay": r"version\s+v?(\d[\w.\-]*)",
     "sc68": r"version\s+v?(\d[\w.\-]*)",
     "zxtune123": r"zxtune123\s+(r\d\w*)",
+    "kssrender": r"kssrender\s+v?(\d[\w.\-]*)",
 }
 _VERSION_ANY = r"(?<![\w.])v?(\d+(?:\.\d+)+[\w.\-+]*|r\d+\w*)"
 
@@ -2870,6 +2887,7 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         "psgplay": _check(settings.psgplay_path, "psgplay"),
         "sc68": _check(settings.sc68_path, "sc68"),
         "zxtune123": _check(settings.zxtune123_path, "zxtune123"),
+        "kssrender": _check(settings.kssrender_path, "kssrender"),
         # Clean keys — they double as the frontend's element-id suffixes
         # (renderer-icon-<key>); the "bundled" note lives in the label.
         "ym2wav": _bundled("ym2wav"),
@@ -2885,7 +2903,7 @@ async def check_renderers(_tok: str = Depends(_require_token)):
     # latency is one slow probe, not their sum.
     _probe_keys = [
         k for k in ("sidplayfp", "fluidsynth", "openmpt123", "uade123",
-                    "adplay", "psgplay", "sc68", "zxtune123")
+                    "adplay", "psgplay", "sc68", "zxtune123", "kssrender")
         if _status[k].get("installed") and _status[k].get("path")
     ]
     if _probe_keys:
@@ -3001,12 +3019,13 @@ def _safe_soundfont_filename(name: str, *, require_ext: bool = True) -> str:
 @router.get("/soundfonts")
 async def list_soundfonts(_tok: str = Depends(_require_token)):
     """List all soundfonts in the soundfonts directory."""
-    from soniqboom.config import get_soundfonts_dir, get_active_soundfont
+    from soniqboom.config import get_soundfonts_dir, get_active_soundfont, missing_soundfont
 
     import unicodedata
 
     sf_dir = get_soundfonts_dir()
     active = get_active_soundfont()
+    missing = missing_soundfont()
     # Filesystem listings on HFS+ are NFD-form while config-derived names
     # round-trip through ``_safe_soundfont_filename`` (NFC).  Normalise both
     # sides before comparing so the active flag isn't wrong on case-folded
@@ -3023,7 +3042,9 @@ async def list_soundfonts(_tok: str = Depends(_require_token)):
                 "active": display_name == active_name,
                 "path": str(f),
             })
-    return {"soundfonts": fonts, "active": active_name}
+    # ``missing``: the chosen SoundFont's path when it can't be found — MIDI
+    # tunes then refuse to play rather than use another SoundFont.
+    return {"soundfonts": fonts, "active": active_name, "missing": missing}
 
 
 @router.post("/soundfonts/active")
@@ -3473,15 +3494,18 @@ async def get_logs(
 async def hvsc_status(_tok: str = Depends(_require_token)):
     """Report whether HVSC is currently configured and how many entries
     the database has loaded.  Used by the Renderers tab status pill."""
+    from soniqboom.core import hvsc_download
     from soniqboom.core.hvsc import get_hvsc
     h = get_hvsc()
-    await asyncio.to_thread(h._ensure_loaded)     # (parses several MB: off the loop)
+    if not hvsc_download.busy():
+        # (parses several MB: off the loop — and not again by every poll of
+        # a check under way, whose apply reads the documents itself)
+        await asyncio.to_thread(h._ensure_loaded)
     try:
         from soniqboom.core import online_hvsc
         online = online_hvsc.fallback_active()
     except Exception:                                   # noqa: BLE001
         online = False
-    from soniqboom.core import hvsc_download
     return {
         "enabled":     h.is_configured(),
         # The online HVSC collection's documents are no folder of the user's
@@ -3501,9 +3525,12 @@ async def hvsc_status(_tok: str = Depends(_require_token)):
 @router.post("/hvsc/download-now")
 async def hvsc_download_now(_tok: str = Depends(_require_token)):
     """"Check now" for the downloaded HVSC documents (``core/hvsc_download``):
-    one conditional download from the HVSC mirror at once."""
+    one conditional download from the HVSC mirror, started at once in the
+    background — ``{"started": True, "job": n}`` (its progress in
+    ``/hvsc/status`` → ``download.progress``), ``{"busy": True}`` while a
+    check runs, or ``{"error": …}`` when none can run."""
     from soniqboom.core import hvsc_download
-    return await hvsc_download.refresh(manual=True)
+    return hvsc_download.check_now()
 
 
 @router.post("/hvsc/cleanup-orphans")
@@ -3615,10 +3642,29 @@ async def hvsc_rescan_sids(_tok: str = Depends(_require_token)):
     scanner's HVSC probe cache so a freshly-dropped DOCUMENTS folder is
     re-detected on the next scan.
     """
-    from soniqboom.core.hvsc_apply import apply_hvsc_to_library
+    from soniqboom.core import hvsc_download
+    from soniqboom.core.hvsc import get_hvsc
+    from soniqboom.core.hvsc_apply import apply_hvsc_to_library, loaded_counts
     from soniqboom.core.scanner import reset_hvsc_probe_cache
+    if not get_hvsc().is_configured():
+        reset_hvsc_probe_cache()
+        return await apply_hvsc_to_library(reload=True)     # (its "not configured" answer)
+    if hvsc_download.busy():
+        # (one pass at a time: the running one — a download's apply or an
+        # earlier click — already joins the documents onto every SID)
+        return {"busy": True, "updated": 0,
+                "message": "The HVSC database is being applied already — see its progress above."}
     reset_hvsc_probe_cache()
-    return await apply_hvsc_to_library(reload=True)
+    # Its progress is the HVSC card's (``hvsc_download.progress``).
+    job = hvsc_download.apply_started(kind="reextract")
+    try:
+        res = await apply_hvsc_to_library(reload=True,
+                                          progress=hvsc_download.apply_reporter(job))
+    except BaseException as exc:
+        hvsc_download.apply_failed(exc, job=job)
+        raise
+    hvsc_download.apply_finished(res, job=job, **loaded_counts())
+    return res
 
 
 # ── Settings panel ───────────────────────────────────────────────────────────
@@ -3658,6 +3704,7 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "psgplay_path": settings.psgplay_path,
             "sc68_path": settings.sc68_path,
             "zxtune123_path": settings.zxtune123_path,
+            "kssrender_path": settings.kssrender_path,
             "uade123_path": settings.uade123_path,
             "gme_path": settings.gme_path,
             "adplay_path": settings.adplay_path,
@@ -3765,7 +3812,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                    "sid_model", "sid_model_force", "sid_filter",
                    "sid_filter_curve", "sid_digiboost",
                    "psgplay_path", "sc68_path", "zxtune123_path",
-                   "uade123_path", "gme_path", "adplay_path"):
+                   "uade123_path", "gme_path", "adplay_path", "kssrender_path"):
             if k in body["renderers"]:
                 val = body["renderers"][k]
                 if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
@@ -3833,10 +3880,20 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                     from soniqboom.core.hvsc_apply import apply_hvsc_to_library
 
                     async def _apply_new_hvsc() -> None:
+                        # (its progress on the HVSC card, as a download's)
+                        from soniqboom.core.hvsc_apply import loaded_counts
+                        job = hvsc_download.apply_started(kind="apply", follow=False)
                         try:
-                            await apply_hvsc_to_library(reload=False)
-                        except Exception:
+                            res = await apply_hvsc_to_library(
+                                reload=False, progress=hvsc_download.apply_reporter(job))
+                        except Exception as exc:
+                            hvsc_download.apply_failed(exc, job=job)
                             log.exception("HVSC apply after a path change failed")
+                        except BaseException as exc:
+                            hvsc_download.apply_failed(exc, job=job)
+                            raise
+                        else:
+                            hvsc_download.apply_finished(res, job=job, **loaded_counts())
                     _t = asyncio.create_task(_apply_new_hvsc(), name="hvsc-apply")
                     _spawn_catalogue_tune_counts()
                     _BG_TASKS.add(_t)

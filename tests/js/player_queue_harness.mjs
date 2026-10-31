@@ -64,7 +64,7 @@ const FACTORY = new Function('env', `
   ${extractCore()}
   return {
     setQueue, playSource, next, prev, _advance, toggleShuffle, toggleRepeat,
-    addToQueue, playNext, removeFromQueue, moveInQueue, setRadioActive,
+    addToQueue, addAllToQueue, playNext, removeFromQueue, moveInQueue, setRadioActive,
     snapshotQueue, restoreQueue, clearAutoUpcoming,
     setOfflineSkip: (on) => { _offlineSkip = !!on; },
     setSkipShort: (secs, placeholders) => { _shortSecs = Number(secs) > 0 ? Number(secs) : 0;

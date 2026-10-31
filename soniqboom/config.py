@@ -657,6 +657,9 @@ class Settings(BaseSettings):
     sc68_path:          str = _local_conf.get("renderers", {}).get("sc68_path", "")
     # zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF).
     zxtune123_path:     str = _local_conf.get("renderers", {}).get("zxtune123_path", "")
+    # kssrender (libkss) — MSX / Sega Master System KSS, built from source by
+    # install.sh (soniqboom/native/kssrender); without it KSS plays through libgme.
+    kssrender_path:     str = _local_conf.get("renderers", {}).get("kssrender_path", "")
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
@@ -831,11 +834,21 @@ def seed_default_soundfont() -> Path | None:
 
 
 def get_active_soundfont() -> Path | None:
-    """Return the active soundfont path, or None."""
+    """Return the active soundfont path, or None.
+
+    The chosen one (``renderers.soundfont_path``) when it can be read, else a
+    file of the same name in the SoundFonts folder (the same SoundFont moved
+    there) — never another SoundFont in its place: a chosen one that can't
+    be found is None (``missing_soundfont`` names it).  With none chosen, the
+    first SoundFont in the folder by name."""
     if settings.soundfont_path:
         p = Path(settings.soundfont_path)
         if p.exists():
             return p
+        same = get_soundfonts_dir() / p.name
+        if p.name and same.is_file():
+            return same
+        return None
     # Try to find any .sf2/.sf3 in soundfonts dir
     sf_dir = get_soundfonts_dir()
     for sf in sorted(sf_dir.glob("*.sf2")):
@@ -844,6 +857,21 @@ def get_active_soundfont() -> Path | None:
     for sf in sorted(sf_dir.glob("*.sf3")):
         if sf.is_file():
             return sf
+    return None
+
+
+async def active_soundfont_async() -> Path | None:
+    """``get_active_soundfont`` off the event loop (its stats may reach an
+    external or network drive)."""
+    import asyncio
+    return await asyncio.to_thread(get_active_soundfont)
+
+
+def missing_soundfont() -> str | None:
+    """The chosen SoundFont's path when it can't be found (neither where it
+    was chosen nor by name in the SoundFonts folder), else None."""
+    if settings.soundfont_path and get_active_soundfont() is None:
+        return str(settings.soundfont_path)
     return None
 
 

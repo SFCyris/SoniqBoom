@@ -66,9 +66,18 @@ let _trackInfoP = null;
 const loadTrackInfo = () => (_trackInfoP ||= import('./trackinfo.js').then(m => m.TrackInfo));
 let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
-import { artPlaceholderEmoji, TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES,
-         ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, isUadeAmigaTrack,
+import { artPlaceholderEmoji, isUadeAmigaTrack,
          Toast, trapFocus, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
+// The per-voice VU meter's data (sidecar parse / fetch, eligibility, levels,
+// label thinning, re-ask ladders) — shared with the phone's Now Playing.
+import { parseVUMR, createVumrFetcher, vuEligible, vuKeyOf, vuLabelStep,
+         vumrLevelsAt, fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS,
+         SID_VU_RETRY_MS, AMIGA_VU_RETRY_MS, AMIGA_VU_SETTLE_S,
+         AMIGA_VU_SETTLE_POLL_MS, AMIGA_VU_SETTLE_MAX_WAITS } from './vu/vumr.js';
+// The shared Modern / Retro hi-fi look: the waveform's colours follow it, and
+// the Retro player bar adds twin needle meters to the VU meter.
+import { getUiStyle, onUiStyleChange } from './ui_style.js';
+import { createVuNeedles } from './player/vu_needles.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -88,7 +97,7 @@ watchBootLoads(LibSync, () => _rereadLibrary());
 // user is waiting on the folder listing.  NEVER touches the playing audio
 // element's stream — only metadata/preparation fetches.  Invoked at the
 // top of the FolderTree.onSelect callback.  ``_waveformFetchAbort`` and
-// ``_vuFetchAbort`` are module-scope ``let``s declared elsewhere in this
+// ``_vuFetch`` are module-scope bindings declared elsewhere in this
 // file; this function only runs at user-navigation time, well after module
 // init, so their bindings are always live by then.
 function _cancelAncillaryFetches() {
@@ -96,10 +105,7 @@ function _cancelAncillaryFetches() {
     try { _waveformFetchAbort.abort(); } catch (_) {}
     _waveformFetchAbort = null;
   }
-  if (_vuFetchAbort) {
-    try { _vuFetchAbort.abort(); } catch (_) {}
-    _vuFetchAbort = null;
-  }
+  _vuFetch.abort();
   try {
     if (Player && typeof Player.cancelAncillaryFetches === 'function') {
       Player.cancelAncillaryFetches();
@@ -174,6 +180,16 @@ if ('serviceWorker' in navigator) {
         const AUTO_WINDOW_MS = 12000;
         const consider = (worker) => {
           if (!worker || !navigator.serviceWorker.controller) return;
+          // Refresh was pressed and the page reloaded before the new version
+          // took over: finish what the listener asked for (once).
+          let asked = false;
+          try { asked = sessionStorage.getItem('sb_sw_update_asked') === '1';
+                sessionStorage.removeItem('sb_sw_update_asked'); } catch {}
+          if (asked) {
+            _applyUpdate(worker);
+            setTimeout(() => _showUpdatePrompt(worker), 5000);
+            return;
+          }
           let autoTried = false;
           try { autoTried = sessionStorage.getItem('sb_sw_autoupdate') === '1'; } catch {}
           const fresh = (typeof performance !== 'undefined')
@@ -227,23 +243,36 @@ function _audioBusy() {
 
 // Skip-waiting the freshly-installed SW and reload ONCE as soon as it takes
 // control of the page, so the new JS/CSS is picked up.  Shared by the idle
-// auto-update path (consider() above) and the banner's Refresh button.
-let _swApplying = false;
+// auto-update path (consider() above) and the banner's Refresh button (which
+// may ask again: the first ask may have gone to a worker a newer one replaced).
+let _swReloadArmed = false;
 function _applyUpdate(worker) {
-  if (_swApplying || !worker) return;
-  _swApplying = true;
-  navigator.serviceWorker.addEventListener(
-    'controllerchange', () => window.location.reload(), { once: true },
-  );
+  if (!worker) return;
+  if (!_swReloadArmed) {
+    _swReloadArmed = true;
+    navigator.serviceWorker.addEventListener(
+      'controllerchange', () => window.location.reload(), { once: true },
+    );
+  }
   worker.postMessage({ type: 'SKIP_WAITING' });
 }
+
+// The update the banner applies: the one it was shown for, or a newer one
+// that arrived while it was up (another deploy / server restart).
+let _promptWorker = null;
+// Reload anyway this long after Refresh when the new version hasn't taken
+// over: its activation may wait on a request of the old one (the reload ends
+// those), and the new page activates or offers the newest version.
+const _UPDATE_RELOAD_MS = 4000;
 
 // A small, dismissible banner shown when a newer build's SW is waiting AND
 // audio is playing (so we don't auto-reload mid-song).  Clicking Refresh
 // applies the update via _applyUpdate — a single click.
 let _updatePromptShown = false;
 function _showUpdatePrompt(worker) {
-  if (_updatePromptShown || !worker) return;
+  if (!worker) return;
+  _promptWorker = worker;
+  if (_updatePromptShown) return;
   _updatePromptShown = true;
   const bar = document.createElement('div');
   bar.id = 'sb-update-prompt';   // utils.js docks toasts above it while it is up
@@ -270,10 +299,19 @@ function _showUpdatePrompt(worker) {
     'background:none;color:#fff;border:none;font-size:18px;line-height:1;'
     + 'cursor:pointer;opacity:0.8;'
   );
-  refresh.addEventListener('click', () => {
+  refresh.addEventListener('click', async () => {
     refresh.disabled = true;
     refresh.textContent = 'Updating…';
-    _applyUpdate(worker);
+    let w = _promptWorker;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      w = (reg && reg.waiting) || w;     // the newest installed version
+    } catch (_) { /* the one the banner knows */ }
+    _applyUpdate(w);
+    setTimeout(() => {
+      try { sessionStorage.setItem('sb_sw_update_asked', '1'); } catch {}
+      window.location.reload();
+    }, _UPDATE_RELOAD_MS);
   });
   // Toasts already up move above the banner, and back down once it goes.
   // (``?.``: an older cached utils.js has no redock.)
@@ -327,14 +365,34 @@ const WAVE_H = 44; // visual height of waveform — much taller than the 3px see
 // (which forces a synchronous style/layout recalc and was contributing to
 // Firefox audio-thread underruns and Chromium oscilloscope stutter).
 let _accentColor = '#f0722a';
-const _DIM_COLOR = 'rgba(255,255,255,0.32)';
+let _dimColor = 'rgba(255,255,255,0.32)';
 let _lastSplitBar = -1;
 let _cachedBarGeom = null; // { w, h, barCount, barW, gap }
 
+// Played / not-yet-played bar colours: ``--pb-wave-on`` / ``--pb-wave-off`` on
+// #player-bar (css/player-styles.css — the accent in Modern, an amber LCD in
+// Retro hi-fi), else the accent and a dim white.
 function _refreshAccentColor() {
-  const v = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
-  if (v) _accentColor = v;
+  const bar = document.getElementById('player-bar');
+  const cs = getComputedStyle(bar || document.documentElement);
+  const on = cs.getPropertyValue('--pb-wave-on').trim()
+    || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  const off = cs.getPropertyValue('--pb-wave-off').trim();
+  if (on) _accentColor = on;
+  _dimColor = off || 'rgba(255,255,255,0.32)';
 }
+
+// A look or theme change recolours the waveform, and re-fits it: the Retro
+// time readouts are wider, so the seek bar it lies on is narrower.
+function _restyleWaveform() {
+  _refreshAccentColor();
+  if (!waveformCanvas || !waveformCanvas.style.width) return;   // never placed yet
+  _resizeWaveformCanvas();
+  if (_waveformData) _drawWaveform(parseFloat(seekBar.value) || 0);
+}
+onUiStyleChange(() => requestAnimationFrame(_restyleWaveform));
+new MutationObserver(() => requestAnimationFrame(_restyleWaveform))
+  .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 function _resizeWaveformCanvas() {
   if (!waveformCanvas) return;
@@ -391,7 +449,7 @@ function _drawWaveform(pct = 0) {
     const barH = amp * halfH; if (barH < 1) continue;
     waveformCtx.fillRect(i * stride, yMid - barH / 2, barW, barH);
   }
-  waveformCtx.fillStyle = _DIM_COLOR;
+  waveformCtx.fillStyle = _dimColor;
   for (let i = splitBar; i < barCount; i++) {
     const amp  = _waveformData[i];
     const barH = amp * halfH; if (barH < 1) continue;
@@ -402,9 +460,21 @@ function _drawWaveform(pct = 0) {
 // ``subsong``: the tune that is playing (a multi-tune SID / Amiga file renders
 // each tune on its own) — the waveform is that tune's.  No subsong (a plain
 // play of the file): the tune the server plays for it, its default.
-async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
+// ``again``: the next ask for a waveform drawn while its audio renders — the
+// bars drawn so far stay up until the answer replaces them.
+async function _fetchWaveform(trackId, subsong = null, attempt = 0, again = false) {
   const ss = Number.isInteger(subsong) ? subsong : null;
   const progressEl = document.querySelector('.player-progress');
+  if (!again) { _wavePartialProgress = -1; _wavePartialStill = 0; _wavePartialAsks = 0; }
+  // No waveform after all (an answer without one, a failure): bars drawn
+  // while the audio rendered must not stay up.
+  const blank = () => {
+    _waveformData = null; _cachedBarGeom = null; _lastSplitBar = -1;
+    if (waveformCtx && waveformCanvas) {
+      waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+    }
+    progressEl?.classList.remove('has-waveform');
+  };
   // Clear the OLD track's waveform immediately so the canvas blanks the
   // moment the user clicks a new song — otherwise the prior song's bars
   // stay painted (via the 4Hz timeupdate redraw loop) for the entire
@@ -414,13 +484,15 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
   // data draws cleanly (same reason as the v17 fix when fresh data lands
   // — without resetting, the first paint at the same split position as
   // the prior frame gets no-op-skipped).
-  _waveformData  = null;
-  _cachedBarGeom = null;
-  _lastSplitBar  = -1;
-  if (waveformCtx && waveformCanvas) {
-    waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+  if (!again) {
+    _waveformData  = null;
+    _cachedBarGeom = null;
+    _lastSplitBar  = -1;
+    if (waveformCtx && waveformCanvas) {
+      waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+    }
+    progressEl?.classList.remove('has-waveform');
   }
-  progressEl?.classList.remove('has-waveform');
 
   // Abort any waveform fetch still in flight from the prior track / call
   // so its connection slot frees immediately and its late response can't
@@ -463,18 +535,31 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
     // gets reused varies per session).  ``no-cache`` forces a
     // revalidation hit; combined with the backend's ``Cache-Control:
     // no-store`` header on this endpoint the body is always fresh.
-    const res  = await fetch(`/api/tracks/${trackId}/waveform${ss !== null ? `?subsong=${ss}` : ''}`,
+    // ``partial=1``: while the audio renders, the part rendered so far.
+    const res  = await fetch(`/api/tracks/${trackId}/waveform?partial=1${ss !== null ? `&subsong=${ss}` : ''}`,
                              ctrl ? { cache: 'no-cache', signal: ctrl.signal }
                                   : { cache: 'no-cache' });
     if (!isStillCurrent()) return;  // user advanced; discard late response
     if (!res.ok || res.status === 204) {          // 204: no waveform for this track
-      _waveformData = null; progressEl?.classList.remove('has-waveform'); return;
+      blank(); return;
     }
     const data = await res.json();
     if (!isStillCurrent()) return;
     // A rendered track (SID, Amiga, tracker…) whose audio isn't rendered yet:
     // the server no longer renders just for the waveform — ask again shortly.
     if (data && data.pending) {
+      if (again && _waveformData) {
+        // (between two answers of a render being drawn — e.g. its file was
+        // just moving into the cache: the bars drawn so far stay, ask again)
+        const fast = ++_wavePartialStill < _WAVEFORM_PARTIAL_STALL;
+        if (fast || attempt < _WAVEFORM_RETRY_MS.length) {
+          _waveformRetryTimer = setTimeout(() => {
+            _waveformRetryTimer = null;
+            if (isStillCurrent()) _fetchWaveform(trackId, ss, fast ? attempt : attempt + 1, true);
+          }, fast ? _WAVEFORM_PARTIAL_MS : _WAVEFORM_RETRY_MS[attempt]);
+        }
+        return;
+      }
       if (attempt < _WAVEFORM_RETRY_MS.length) {
         _waveformRetryTimer = setTimeout(() => {
           _waveformRetryTimer = null;
@@ -537,7 +622,26 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
       const curPct = parseFloat(seekBar.value) || 0;
       _drawWaveform(curPct);
     } else {
-      progressEl?.classList.remove('has-waveform');
+      blank();
+    }
+    if (!(data && data.partial)) _wavePartialProgress = -1;     // (the whole waveform, or none)
+    if (data && data.partial) {
+      // Still rendering (points not rendered yet are null → no bar): ask
+      // again — while the render moves on; a render that stopped moving is
+      // asked on the slow schedule.
+      const p = Number(data.progress) || 0;
+      // (a render running past the length it was expected to have stays at
+      // 1 until it ends: still moving)
+      _wavePartialStill = (p > _wavePartialProgress || p >= 1) ? 0 : _wavePartialStill + 1;
+      _wavePartialProgress = p;
+      const fast = _wavePartialStill < _WAVEFORM_PARTIAL_STALL
+                   && ++_wavePartialAsks <= _WAVEFORM_PARTIAL_MAX;
+      if (fast || attempt < _WAVEFORM_RETRY_MS.length) {
+        _waveformRetryTimer = setTimeout(() => {
+          _waveformRetryTimer = null;
+          if (isStillCurrent()) _fetchWaveform(trackId, ss, fast ? attempt : attempt + 1, true);
+        }, fast ? _WAVEFORM_PARTIAL_MS : _WAVEFORM_RETRY_MS[attempt]);
+      }
     }
   } catch (err) {
     // Swallow AbortError: an intentional cancel (track change / folder
@@ -545,8 +649,15 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
     // track-change canvas-clear above) owns the display now.  Only real
     // fetch failures blank the waveform.
     if (!(err && err.name === 'AbortError')) {
-      _waveformData = null;
-      progressEl?.classList.remove('has-waveform');
+      blank();
+    } else if (_waveformFetchAbort === null && _wavePartialProgress >= 0 && !_waveformRetryTimer
+               && _waveformStoppedFor !== trackId && isStillCurrent()) {
+      // A waveform being drawn while its audio renders, its ask cancelled by
+      // a folder change (not by a newer ask, nor a failed play): ask on.
+      _waveformRetryTimer = setTimeout(() => {
+        _waveformRetryTimer = null;
+        if (isStillCurrent()) _fetchWaveform(trackId, ss, attempt, true);
+      }, _WAVEFORM_PARTIAL_MS);
     }
   } finally {
     if (_waveformFetchAbort === ctrl) _waveformFetchAbort = null;
@@ -555,6 +666,12 @@ async function _fetchWaveform(trackId, subsong = null, attempt = 0) {
 
 // Re-ask schedule for a waveform whose audio was still being rendered.
 const _WAVEFORM_RETRY_MS = [2000, 4000, 8000, 15000, 30000];
+// A waveform drawn while its audio renders: asked again this often, until the
+// render has not moved for this many asks.
+const _WAVEFORM_PARTIAL_MS = 1000;
+const _WAVEFORM_PARTIAL_STALL = 20;
+const _WAVEFORM_PARTIAL_MAX = 900;            // (15 minutes of asks at most)
+let _wavePartialProgress = -1, _wavePartialStill = 0, _wavePartialAsks = 0;
 
 // A track that failed to play will not get rendered audio from this attempt —
 // stop re-asking for its waveform (each re-ask holds a connection up to 5 s).
@@ -568,7 +685,9 @@ Player.on('error', ({ track, error } = {}) => {
     clearTimeout(_waveformRetryTimer);
     _waveformRetryTimer = null;
     if (_waveformFetchAbort) { try { _waveformFetchAbort.abort(); } catch (_) {} _waveformFetchAbort = null; }
-    if (!_waveformData) _waveformStoppedFor = track.id;
+    // (no waveform, or only the part drawn while it rendered: asked again
+    // when the track does play)
+    if (!_waveformData || _wavePartialProgress >= 0) _waveformStoppedFor = track.id;
   }
 });
 // The "now playing" equaliser icons (the list row, Track Info's tune row)
@@ -580,7 +699,7 @@ Player.on('statechange', ({ playing } = {}) => {
 Player.on('statechange', ({ playing } = {}) => {
   if (!playing || !_waveformStoppedFor) return;
   const cur = Player.currentTrack;
-  if (cur && cur.id === _waveformStoppedFor && !_waveformData) _fetchWaveform(cur.id, cur.subsong);
+  if (cur && cur.id === _waveformStoppedFor && (!_waveformData || _wavePartialProgress >= 0)) _fetchWaveform(cur.id, cur.subsong);
   else _waveformStoppedFor = null;
 });
 
@@ -589,30 +708,51 @@ Player.on('statechange', ({ playing } = {}) => {
 // layout read + DPR-scaled canvas rebuild.  Coalesce to a single pass per
 // frame.
 let _resizePending = false;
-window.addEventListener('resize', () => {
-  if (!_waveformData) return;
+function _onSeekResize() {
+  // A placed canvas follows the seek bar even without a waveform: Retro
+  // hi-fi paints it as the LCD strip's glass.
+  if (!_waveformData && !(waveformCanvas && waveformCanvas.style.width)) return;
   if (_resizePending) return;
   _resizePending = true;
   requestAnimationFrame(() => {
     _resizePending = false;
     _resizeWaveformCanvas();
-    _drawWaveform(parseFloat(seekBar.value));
+    if (_waveformData) _drawWaveform(parseFloat(seekBar.value));
   });
-});
+}
+window.addEventListener('resize', _onSeekResize);
+// The seek bar also changes width without a window resize (the Retro row
+// spanning the meters, a look switch) — the canvas follows it.
+if ('ResizeObserver' in window && seekBar) new ResizeObserver(_onSeekResize).observe(seekBar);
 
 // ── VU Meters for tracker/module playback ─────────────────────────────────────
 const vuContainer = document.getElementById('vu-meters');
+// Retro hi-fi: twin L/R needle meters beside the transport for the tracks
+// WITHOUT this meter — ordinary audio (MP3, FLAC, …); a tracker / chip tune
+// keeps its LED columns only (js/player/vu_needles.js).  _initVU, _stopVU and
+// _placeVUContainer call its sync(); it follows the look, size and playback
+// itself.  It reads the level before the volume setting (the slider's value).
+const _vuNeedles = createVuNeedles({
+  host: document.getElementById('vu-needles'),
+  bar: document.getElementById('player-bar'),
+  player: Player,
+  volume: () => parseFloat(volBar.value),
+  show: () => {
+    const t = Player.currentTrack;
+    return !!t && !t.station && !_vuEligible(t) && _nowPlayingVizOn();
+  },
+  fallback: () => {
+    if (!_vuTapBuf || !_vuChannelCount) return null;
+    let m = 0;
+    for (let i = 0; i < _vuChannelCount; i++) if (_vuTapBuf[i] > m) m = _vuTapBuf[i];
+    return [m, m];
+  },
+});
+window.SoniqBoom.vuNeedles = _vuNeedles;   // debug / verification handle
 let _vuAnalyser = null;
 let _vuBars = [];
 let _vuAnimFrame = null;
 let _vuChannelCount = 0;
-
-// Re-use the shared tracker format set (plus SID for VU meters)
-// Formats that get a player-bar VU/spectrum visualization.  Trackers get
-// per-voice VUMR; SID + libgme console chiptunes + AdPlug AdLib/OPL render
-// fine but have no VUMR sidecar, so they fall back to the FFT spectrum (their
-// /vu has no meters (204)).  Without listing them here the gate hid the visual entirely.
-const _TRACKER_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID', ...CHIP_FORMAT_NAMES]);
 
 // Read the opt-in VU render style ('bars' | 'circuit') from the shared viz
 // settings.  Read directly from localStorage to avoid an import cycle with
@@ -710,6 +850,13 @@ function _initVU(channelCount, opts) {
   vuContainer.dataset.style = (useVUMR && _readVuStyle() === 'circuit')
     ? 'circuit' : 'bars';
 
+  // Channel numbers that don't fit their column (many channels, a narrow
+  // meter) thin out to every 2nd / 4th / 8th / 16th channel, the others
+  // marked with a dot — a mixing desk's scale; above 48 channels never
+  // closer than every 8th.  (They overlapped into an unreadable strip.)
+  const labelStep = vuLabelStep(_vuChannelCount, hostWidth);
+  vuContainer.dataset.labelStep = String(labelStep);
+
   for (let i = 0; i < _vuChannelCount; i++) {
     const col = document.createElement('div');
     col.className = 'vu-col';
@@ -727,7 +874,13 @@ function _initVU(channelCount, opts) {
     if (preset !== 'mini') {
       const label = document.createElement('div');
       label.className = 'vu-col-label';
-      label.textContent = preset === 'roomy' ? `CH:${i + 1}` : `${i + 1}`;
+      const n = i + 1;
+      if (labelStep > 1 && n !== 1 && n % labelStep !== 0) {
+        label.classList.add('vu-col-dot');
+        label.textContent = '·';
+      } else {
+        label.textContent = preset === 'roomy' ? `CH:${n}` : `${n}`;
+      }
       col.appendChild(label);
 
       // Pan circles only meaningful with real VUMR data and only
@@ -836,41 +989,20 @@ function _drawVU() {
     _vuTapBuf = new Float32Array(Math.max(1, _vuChannelCount));
   }
 
-  // VUMR (real per-channel) path — index by audio.currentTime.
+  // VUMR (real per-channel) path — index by audio.currentTime (vu/vumr.js:
+  // the level with a mild 0.7 gamma, as the FFT path).
   if (_vumr) {
     const t = (Player && typeof Player.currentTime === 'number')
               ? Player.currentTime : 0;
-    const frameIdx = Math.min(
-      _vumr.frames - 1,
-      Math.max(0, Math.floor(t * _vumr.rateHz)),
-    );
-    const base = frameIdx * _vumr.channels;
-    for (let ch = 0; ch < _vuChannelCount; ch++) {
-      const raw = _vumr.samples[base + ch] / 255;
-      // Mild gamma so quiet hits register visually without compressing
-      // the loud end.  0.7 matches the FFT path for visual consistency.
-      const level = Math.pow(raw, 0.7);
-      _vuTapBuf[ch] = level;
-      _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
-    }
-    _vuTapEmit();
-    return;
+    vumrLevelsAt(_vumr, t, _vuTapBuf, _vuChannelCount);
+  } else {
+    // FFT-spectrum fallback path.
+    if (!_vuAnalyser || !_vuBuffer) return;
+    _vuAnalyser.getByteFrequencyData(_vuBuffer);
+    fftColumnLevels(_vuBuffer, _vuChannelCount, _vuTapBuf);
   }
-
-  // FFT-spectrum fallback path.
-  if (!_vuAnalyser || !_vuBuffer) return;
-  _vuAnalyser.getByteFrequencyData(_vuBuffer);
-  const bufLen = _vuBuffer.length;
-  const binsPerChannel = Math.floor(bufLen / _vuChannelCount);
   for (let ch = 0; ch < _vuChannelCount; ch++) {
-    const start = ch * binsPerChannel;
-    const end = start + binsPerChannel;
-    let sum = 0;
-    for (let i = start; i < end && i < bufLen; i++) sum += _vuBuffer[i];
-    const avg = sum / binsPerChannel / 255;
-    const level = Math.pow(avg, 0.7);
-    _vuTapBuf[ch] = level;
-    _vuBars[ch].style.setProperty('--vu-level', level.toFixed(3));
+    _vuBars[ch].style.setProperty('--vu-level', _vuTapBuf[ch].toFixed(3));
   }
   _vuTapEmit();
 }
@@ -960,6 +1092,7 @@ function _stopVU() {
   _vuAnalyser = null;
   _vuBuffer = null;
   _vumr = null;   // clear the cached sidecar so the next track gets a fresh fetch
+  _vuNeedles.sync();   // hidden with the meter (the container is hidden above)
 }
 
 // ── Per-channel VU sidecar (VUMR v1) ─────────────────────────────────
@@ -971,102 +1104,31 @@ function _stopVU() {
 // visualiser and label it honestly so the user knows what they're
 // looking at.
 //
-// VUMR binary layout (see docs/vu-cache-format.md):
-//   0..4   "VUMR"
-//   4      version (0x01)
-//   5      channels N (1..32)
-//   6      flags  (reserved)
-//   7      reserved
-//   8..12  sample_rate_hz (uint32 LE)
-//   12..16 frame_count    (uint32 LE)
-//   16..16+N        pan per channel (uint8: 0=center, 1=left, 2=right)
-//   16+N..end       mono amplitude (frames * channels * uint8)
+// The sidecar's layout, its parse and the /vu request: vu/vumr.js (shared
+// with the phone's Now Playing).
 
 let _vumr = null;   // { channels, rateHz, frames, samples (Uint8Array), pan (Uint8Array) }
 let _vuFallbackLabel = null;   // <div> appended below bars when in FFT mode
 
-const _VUMR_MAGIC_STR = 'VUMR';
+// FFT fallback bar count (vu/vumr.js).  32 bars hit the sweet spot: visually
+// rich, fits even narrow player widths at ~25 px per bar on a 800-px-wide player.
+const _FFT_FALLBACK_BARS = FFT_FALLBACK_BARS;
 
-// FFT fallback bar count.  Fixed regardless of track.channels — the
-// fallback is an honest spectrum analyzer, not a faux per-voice
-// meter.  32 bars hit the sweet spot: visually rich, fits even narrow
-// player widths at ~25 px per bar on a 800-px-wide player.
-const _FFT_FALLBACK_BARS = 32;
+function _parseVUMR(arrayBuf) { return parseVUMR(arrayBuf); }
 
-function _parseVUMR(arrayBuf) {
-  const dv = new DataView(arrayBuf);
-  if (arrayBuf.byteLength < 16) return null;
-  const magic = String.fromCharCode(
-    dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3),
-  );
-  if (magic !== _VUMR_MAGIC_STR) return null;
-  const version = dv.getUint8(4);
-  if (version !== 1) return null;
-  const channels = dv.getUint8(5);
-  const rateHz   = dv.getUint32(8, true);
-  const frames   = dv.getUint32(12, true);
-  if (channels < 1 || channels > 32) return null;
-  if (rateHz < 1 || rateHz > 240) return null;
-  const headerSize = 16 + channels;
-  const expectedTotal = headerSize + frames * channels;
-  if (arrayBuf.byteLength < expectedTotal) return null;
-  const pan     = new Uint8Array(arrayBuf, 16, channels);
-  const samples = new Uint8Array(arrayBuf, headerSize, frames * channels);
-  return { channels, rateHz, frames, pan, samples };
-}
-
-// AbortController for the in-flight VUMR (tracker channel-VU sidecar)
-// fetch.  Aborted on track change (a fresh _fetchVUMR supersedes it) and on
-// folder navigation (_cancelAncillaryFetches) to free the connection slot.
-let _vuFetchAbort = null;
+// The /vu reader (vu/vumr.js createVumrFetcher): one request in flight —
+// aborted on track change (a fresh _fetchVUMR supersedes it) and on folder
+// navigation (_cancelAncillaryFetches) to free the connection slot.
 // _fetchVUMR's answer when the server says no sidecar is coming for this track
 // — ``{unavailable: true, reason}``, from a 204 carrying ``X-VU-Unavailable``:
 // 'off' (per-voice Amiga meters are switched off), 'unsupported' (this uade
 // build can't make them) or 'skipped' (this tune's pass ran without a result)
-// — as opposed to null, "not yet / try later".
-
-async function _fetchVUMR(trackId, subsong, { start = true } = {}) {
-  if (!trackId) return null;
-  // Abort any prior VUMR fetch still in flight so its slot frees and its
-  // late response can't return into a track the user already left.
-  if (_vuFetchAbort) {
-    try { _vuFetchAbort.abort(); } catch (_) {}
-  }
-  const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
-  _vuFetchAbort = ctrl;
-  try {
-    // A multi-subsong module renders a distinct VU sidecar per tune; pass the
-    // playing subsong (a picked tune, 0 included) so the meters match it.  No
-    // subsong — a plain play of the file — is the tune the server plays for
-    // it, its default (not always tune 1).
-    const qs = new URLSearchParams();
-    if (Number.isInteger(subsong)) qs.set('subsong', String(subsong));
-    // ``start=0``: answer from the cache only — a miss must not start the
-    // Amiga per-voice pass (a second full uade render).  The re-ask ladder
-    // asks for it once the track has played a few seconds, so a track skipped
-    // right away never costs that pass.
-    if (!start) qs.set('start', '0');
-    const q = qs.toString();
-    const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${q ? `?${q}` : ''}`,
-                            ctrl ? { credentials: 'include', signal: ctrl.signal }
-                                 : { credentials: 'include' });
-    // 204 = no meters for this tune (yet): the reason header, if any, says
-    // they won't come; without one the retry ladder asks again.
-    if (!res.ok || res.status === 204) {
-      const reason = res.headers.get('X-VU-Unavailable');
-      return reason ? { unavailable: true, reason: reason.trim().toLowerCase() } : null;
-    }
-    const buf = await res.arrayBuffer();
-    return _parseVUMR(buf);
-  } catch (err) {
-    // AbortError and real failures both fall back to the FFT visualiser
-    // (null contract), so a single null return covers both — but keep the
-    // branch explicit for parity with the other two fetches.
-    if (err && err.name === 'AbortError') return null;
-    return null;
-  } finally {
-    if (_vuFetchAbort === ctrl) _vuFetchAbort = null;
-  }
+// — as opposed to null, "not yet / try later".  ``start=0``: answer from the
+// cache only — a miss must not start the Amiga per-voice pass (the re-ask
+// ladder asks for it once the track has played a few seconds).
+const _vuFetch = createVumrFetcher();
+function _fetchVUMR(trackId, subsong, opts) {
+  return _vuFetch.fetch(trackId, subsong, opts);
 }
 
 function _buildPanCircle(panValue) {
@@ -1105,14 +1167,7 @@ let _vuFallbackFormat = '';
 // The spectrum label's words when no per-voice meters will come: why, when the
 // server said (``X-VU-Unavailable``), else "not available for <format>".
 function _vuFallbackText(format, reason) {
-  if (reason === 'off') {
-    return Auth.isAdmin
-      ? 'Spectrum — per-voice meters are turned off (Settings → Renderers)'
-      : 'Spectrum — per-voice meters are turned off on this server';
-  }
-  if (reason === 'skipped') return 'Spectrum — per-voice meters not available for this tune';
-  if (reason === 'unsupported') return 'Spectrum — per-voice meters not available on this server';
-  return `Spectrum — per-voice meters not available for ${format}`;
+  return vuFallbackText(format, reason, Auth.isAdmin);
 }
 // ``pending``: a per-voice sidecar may still arrive (a re-ask ladder is
 // polling for it) — say it is loading, not that there is none.  ``reason``:
@@ -1234,7 +1289,16 @@ function _placeVUContainer() {
     // circuits, the class is in a consistent state with the
     // container's actual position.
     vuContainer.classList.remove('in-modal');
-    if (_playerBarEl && vuContainer.parentNode !== _playerBarEl) {
+    // Retro hi-fi: the meter is a level display inside the title's VFD
+    // (player-styles.css); Modern: behind the whole bar.
+    const meta = getUiStyle() === 'retro' && _playerBarEl
+      ? _playerBarEl.querySelector('.player-meta') : null;
+    if (meta) {
+      if (vuContainer.parentNode !== meta) {
+        meta.appendChild(vuContainer);
+        parentChanged = true;
+      }
+    } else if (_playerBarEl && vuContainer.parentNode !== _playerBarEl) {
       const artInfo = _playerBarEl.querySelector('.player-art-info');
       if (artInfo) _playerBarEl.insertBefore(vuContainer, artInfo);
       else         _playerBarEl.appendChild(vuContainer);
@@ -1256,6 +1320,8 @@ function _placeVUContainer() {
     const useVUMR = !!_vumr;
     _initVU(_vuChannelCount, { useVUMR, vumr: _vumr });
   }
+  // The Retro needles show only while the meter is in the player bar.
+  _vuNeedles.sync();
 }
 
 // Listen for modal open / close / render — dispatched from
@@ -1274,6 +1340,8 @@ if (_tiOverlayEl) {
     _placeVUContainer();
   });
 }
+// A look switch moves the meter between the bar and the title's VFD.
+onUiStyleChange(() => _placeVUContainer());
 
 /** Init the VU meters for tracker / SID formats; tear down otherwise. */
 // Which "<trackId>:<subsong>" the VU meter is currently showing/retrying.  The
@@ -1297,7 +1365,7 @@ let _vuKey = '';
 // start with a shorter grace (≈8 s + ~23 s render ≈ 31 s typical), but the pass
 // is serialised behind a Semaphore(1), so a few queued tunes can push it minutes
 // out.  Poll long and back off — a 204 is cheap, a dead meter is not.
-const _SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 60000, 60000];
+const _SID_VU_RETRY_MS = SID_VU_RETRY_MS;          // (vu/vumr.js)
 // Amiga modules: the server builds the sidecar once the render is cached — 4 s
 // later (a head start for the next track's prewarm), one more uade pass
 // (0.2–6.4 s on the local fixtures) — so it lands some 5–12 s after the first
@@ -1307,20 +1375,15 @@ const _SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 6
 // stream.py), so every rung stays under it with room for fetch latency and
 // timer drift (tests/js/frontend_contracts.test.mjs checks the two against
 // each other).  Cumulative ~3/6/9/12/15/19/24/32/44/59/74/89/104/119/134/149/
-// 164 s after the pass was asked for.
-const _AMIGA_VU_RETRY_MS = [3000, 3000, 3000, 3000, 3000, 4000, 5000, 8000, 12000,
-                            15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000];
+// 164 s after the pass was asked for.  (The ladder itself: vu/vumr.js.)
+const _AMIGA_VU_RETRY_MS = AMIGA_VU_RETRY_MS;
 // The Amiga pass is asked for only once the track has played this long (the
 // player's next-track prewarm settle): a track skipped sooner never costs it.
-const _AMIGA_VU_SETTLE_S = 3;
-const _AMIGA_VU_SETTLE_POLL_MS = 1000;
-const _AMIGA_VU_SETTLE_MAX_WAITS = 3600;   // an hour paused in the first seconds
+const _AMIGA_VU_SETTLE_S = AMIGA_VU_SETTLE_S;
+const _AMIGA_VU_SETTLE_POLL_MS = AMIGA_VU_SETTLE_POLL_MS;
+const _AMIGA_VU_SETTLE_MAX_WAITS = AMIGA_VU_SETTLE_MAX_WAITS;   // an hour paused in the first seconds
 
-function _vuKeyOf(track) {
-  if (!track) return '';
-  const ss = Number.isInteger(track.subsong) ? track.subsong : 0;
-  return `${track.id}:${ss}`;
-}
+function _vuKeyOf(track) { return vuKeyOf(track); }
 
 // Set to the _vuKey the in-browser render has already painted + uploaded, so
 // the server-poll fallback stops (no redundant re-fetch / meter re-init flicker).
@@ -1584,6 +1647,18 @@ async function _generateSidVUClient(track, key) {
   }
 }
 
+// Eligibility for the per-voice meter: static tracker/SID/chip names PLUS the
+// families whose format names can't live in a static set — the ~175 exotic
+// uade Amiga players carry dynamic names ('Sonic Arranger', 'TFMX Pro', …; the
+// genre pair is the reliable signal), Atari ST (SNDH/YM/SC68) and the PSF
+// consoles.  They either have real per-voice sidecars (uade) or get the honest
+// FFT spectrum (_handleVU) — the old gate stopped them BEFORE the sidecar was
+// even tried, so a Sonic Arranger track showed nothing even though its VUMR
+// sidecar existed.  Every other track gets the Retro needles instead.
+function _vuEligible(track) {
+  return vuEligible(track);                     // (vu/vumr.js)
+}
+
 async function _handleVU(track) {
   _vuLastTrack = track;                            // remembered for the viz re-gate
   const key = _vuKeyOf(track);
@@ -1597,19 +1672,7 @@ async function _handleVU(track) {
   // work are _handleVU's own siblings of that call.)
   if (!_nowPlayingVizOn()) { _stopVU(); _removeFallbackLabel(); return; }
   const primary = String(track.format || '').split('/')[0].trim();
-  // Eligibility: static tracker/SID/chip names PLUS the families whose
-  // format names can't live in a static set — the ~175 exotic uade
-  // Amiga players carry dynamic names ('Sonic Arranger', 'TFMX Pro',
-  // …; the genre pair is the reliable signal), Atari ST (SNDH/YM/SC68)
-  // and the PSF consoles.  They either have real per-voice sidecars
-  // (uade) or get the honest FFT spectrum below — the old gate stopped
-  // them BEFORE the sidecar was even tried, so a Sonic Arranger track
-  // showed nothing even though its VUMR sidecar existed.
-  const vuEligible = _TRACKER_FORMATS.has(primary)
-      || isUadeAmigaTrack(track)
-      || ATARI_FORMAT_NAMES.has(primary)
-      || PSF_FORMAT_NAMES.has(primary);
-  if (!vuEligible) {
+  if (!_vuEligible(track)) {
     _stopVU();
     _removeFallbackLabel();
     return;
@@ -1884,7 +1947,7 @@ async function startRadio(seed) {
     Player.clearAutoUpcoming?.();                // leftovers of an earlier session
     // {auto}: the mix plays NEXT (ahead of whatever was already queued) and is
     // the app's pick, not the listener's — a later shuffle deal may replace it.
-    rest.forEach(t => { if (t && t.id) Player.addToQueue(t, { auto: true }); });
+    Player.addAllToQueue(rest.filter(t => t && t.id), { auto: true });
     RadioMode.start(seed);                       // session bar + radio-mode overlay
   } catch (e) {
     window.Toast?.error?.('Could not start radio. Try again.');
@@ -1906,7 +1969,10 @@ const btnSaveSmart   = document.getElementById('search-save-smart');
 function _syncSaveSmart() {
   if (btnSaveSmart && _searchInputEl) btnSaveSmart.hidden = !_searchInputEl.value.trim();
 }
-if (_searchInputEl) _searchInputEl.addEventListener('input', _syncSaveSmart);
+if (_searchInputEl) {
+  _searchInputEl.addEventListener('input', _syncSaveSmart);
+  _searchInputEl.addEventListener('sb:search-set', _syncSaveSmart);
+}
 _syncSaveSmart();
 if (btnSaveSmart) btnSaveSmart.addEventListener('click', async () => {
   const q = (_searchInputEl?.value || '').trim();
@@ -2091,7 +2157,7 @@ function _buildMetaTags(track) {
     link.textContent = name;
     link.addEventListener('click', (e) => {
       e.preventDefault();
-      if (type === 'album_artist') Library.showAlbums(null, name, 'album_artist');
+      if (type === 'album_artist') Library.showNameAlbums(name);
       else Library.showAlbums(name, null, 'artist');
     });
     span.appendChild(lab);
@@ -2270,7 +2336,12 @@ Player.on('cue', _paintCued);
 Player.on('queuechange', _paintCued);
 
 // The player-bar cover (+ the glows behind the bar, sidebar and header).
-function _paintBarArt(track) {
+// ``bust`` re-asks past a cached "no art" answer: a remote (FTP / SMB) track's
+// cover is fetched on its first play, so the bar's first request can come back
+// empty — the server's art_ready for this track repaints it (connectWS).
+let _barArtTrack = null;
+function _paintBarArt(track, bust = false) {
+  _barArtTrack = track;
   // Always try the art API — it extracts embedded + folder art lazily.
   // ``fallback=none`` tells the server to return a cacheable 204 (no
   // body) instead of the generic grey placeholder JPEG when the track
@@ -2282,12 +2353,14 @@ function _paintBarArt(track) {
   // (regression D14: folder-open latency went from ~50 ms to several
   // seconds for big SID/MOD directories).
   {
-    const artSrc = staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg?fallback=none`;
+    const t = bust ? `_t=${Date.now()}` : '';
+    const withT = (u) => (t && u ? `${u}${u.includes('?') ? '&' : '?'}${t}` : u);
+    const artSrc = withT(staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg?fallback=none`);
     // Glows use the placeholder branch (no fallback=none) so the
     // background-image URL the browser stores at cache key
     // ``/api/art/X?size=sm`` is the visible-grey JPEG.  If the IMG
     // path errors (204 — no art) we strip the glow classes; if it 200s we paint them.
-    const glowSrc = staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg`;
+    const glowSrc = withT(staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg`);
     const reqGen = ++_artRenderGen;
     const _renderEmojiFallback = () => {
       playerArt.innerHTML = `<span class="art-placeholder">${artPlaceholderEmoji(track)}</span>`;
@@ -2427,12 +2500,81 @@ playerArt.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _openSongOverview(); }
 });
 
-// Click large art to dismiss
-if (npArt) npArt.addEventListener('click', () => { npArt.hidden = true; });
+// The large art opens from the player bar's record button or N; a click on it closes it.
+const npArtBtn = document.getElementById('btn-np-art');
+function _paintNpArtBtn() {
+  if (!npArtBtn) return;
+  npArtBtn.classList.toggle('on', !npArt.hidden);
+  npArtBtn.setAttribute('aria-pressed', String(!npArt.hidden));
+}
+// While it is up, what it covers in #content is inert (no Tab / Enter behind it).
+function _setNpArtCovering(on) {
+  for (const el of npArt.parentElement?.children || []) {
+    if (el !== npArt && el.id !== 'visualizer-canvas') el.inert = on;
+  }
+}
+function closeNowPlayingArt() {
+  if (!npArt || npArt.hidden) return;
+  npArt.hidden = true;
+  _setNpArtCovering(false);
+  _paintNpArtBtn();
+}
+function toggleNowPlayingArt() {
+  if (!npArt) return;
+  if (!npArt.hidden) { closeNowPlayingArt(); return; }
+  _showNowPlayingArt(Player.currentTrack);
+  if (!npArt.hidden) _setNpArtCovering(true);
+  _paintNpArtBtn();
+}
+if (npArt) npArt.addEventListener('click', closeNowPlayingArt);
+npArtBtn?.addEventListener('click', toggleNowPlayingArt);
+
+// The player bar's icon row scrolls sideways when it doesn't fit (601–1024 px
+// and phone width, player-styles.css): a plain wheel scrolls it, a focused
+// button comes fully into view, and .more-l / .more-r fade the side with more.
+{
+  const row = document.querySelector('#player-bar .player-extra-controls');
+  if (row) {
+    const paint = () => {
+      const max = row.scrollWidth - row.clientWidth;
+      row.classList.toggle('more-l', max > 1 && row.scrollLeft > 1);
+      row.classList.toggle('more-r', max > 1 && row.scrollLeft < max - 1);
+    };
+    row.addEventListener('wheel', (e) => {
+      if (row.scrollWidth <= row.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      e.preventDefault();
+      row.scrollLeft += e.deltaY;
+    }, { passive: false });
+    row.addEventListener('focusin', (e) => {
+      if (row.scrollWidth > row.clientWidth) e.target.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    });
+    row.addEventListener('scroll', paint, { passive: true });
+    new ResizeObserver(paint).observe(row);
+    paint();
+  }
+}
+// Another view chosen (one of #content's views shown / hidden — not a badge): it closes.
+const _NP_ART_VIEWS = new Set(['track-list-wrap', 'album-grid', 'stations-view', 'galaxy-view', 'browse-header']);
+if (npArt?.parentElement) {
+  new MutationObserver((recs) => {
+    if (!npArt.hidden && recs.some(r => _NP_ART_VIEWS.has(r.target.id))) closeNowPlayingArt();
+  }).observe(npArt.parentElement, { subtree: true, attributes: true, attributeFilter: ['hidden'] });
+  // (list views reuse the same table — a pick in the sidebar closes it too)
+  document.getElementById('sidebar')?.addEventListener('click', closeNowPlayingArt, true);
+}
+
+// ``/api/art/{id}[?…]`` asking for ``size`` (replacing a size it names); any other URL as is.
+function _artUrlAtSize(u, size) {
+  if (typeof u !== 'string' || !/\/api\/art\//.test(u)) return u;
+  return /[?&]size=/.test(u) ? u.replace(/([?&])size=[^&#]*/, `$1size=${size}`)
+                             : `${u}${u.includes('?') ? '&' : '?'}size=${size}`;
+}
 
 function _showNowPlayingArt(track) {
   if (!track) return;
-  const src = staticArtUrl(track.cover_art) || `/api/art/${track.id}/lg.jpg`;
+  // The large size: a stored cover_art URL names the thumbnail (sm) unless asked.
+  const src = staticArtUrl(_artUrlAtSize(track.cover_art, 'lg'))
+    || (track.id ? `/api/art/${track.id}/lg.jpg` : '');
   // Reset to placeholder state, fade in real art when it decodes, drop
   // the src on error so the browser's broken-image glyph never paints.
   // (Previously a 404 left the broken-image icon on the dialog
@@ -2443,10 +2585,16 @@ function _showNowPlayingArt(track) {
     npArtImg.removeAttribute('src');
     npArtImg.classList.remove('loaded');
   };
-  npArtImg.src = src;
-  npTitle.textContent = track.title || '';
-  npArtistEl.textContent = track.album_artist || track.artist || '';
-  npAlbum.textContent = track.album || '';
+  if (src) npArtImg.src = src; else npArtImg.removeAttribute('src');
+  if (track.station) {                       // the song on air, then the station (not its tags)
+    npTitle.textContent = track.song || track.title || '';
+    npArtistEl.textContent = track.songArtist || (track.song ? '' : track.artist) || '';
+    npAlbum.textContent = track.song ? (track.stationName || '') : '';
+  } else {
+    npTitle.textContent = track.title || '';
+    npArtistEl.textContent = track.album_artist || track.artist || '';
+    npAlbum.textContent = track.album || '';
+  }
   npArt.hidden = false;
 }
 
@@ -2454,6 +2602,17 @@ function _showNowPlayingArt(track) {
 Player.on('trackchange', (track) => {
   if (!npArt.hidden) _showNowPlayingArt(track);
 });
+
+// Retro hi-fi shows the art as a turntable (css/visualizer-styles.css): the
+// record turns while it plays and the Now-playing visualizations are on.
+function _syncNpArtState() {
+  if (Player.currentTrack?.station && !Player.stationMode) closeNowPlayingArt();   // station stopped
+  npArt.dataset.state = Player.playing ? 'playing' : 'paused';
+  npArt.dataset.motion = _nowPlayingVizOn() ? 'on' : 'off';
+}
+Player.on('statechange', _syncNpArtState);
+window.addEventListener('sb:viz-settings', _syncNpArtState);
+_syncNpArtState();
 
 volBar.value = parseFloat(localStorage.getItem('sb_volume') ?? '0.8');
 
@@ -2516,7 +2675,7 @@ const views = {
   albums:        () => Library.showAlbums(),
   genres:        () => Library.showGenres(),
   years:         () => Library.showYears(),
-  scene_groups:  () => Library.showSceneGroups(),
+  scene:         () => Library.showScene(),
   galaxy:        () => Library.showGalaxy(),
 };
 
@@ -2530,10 +2689,11 @@ const smartViews = {
   'duplicates':     () => Library.showDuplicates(),
 };
 
-/** Deactivate all sidebar nav items across all sections. */
-function _deactivateAllNav() {
+/** Deactivate all sidebar nav items across all sections (``keepTree``: not
+ *  the folder tree's — a folder pick has just marked its row). */
+function _deactivateAllNav(keepTree = false) {
   document.querySelectorAll('#nav-library li, #nav-smart li').forEach(x => x.classList.remove('active'));
-  document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
+  if (!keepTree) document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
 }
 
 // Keyboard activation for the role="link" sidebar entries — without this,
@@ -2603,6 +2763,8 @@ _bindNav('#nav-smart',   smartViews);
 let _bootRestoreView = false;
 try {
   const saved = JSON.parse(localStorage.getItem('sb_last_view') || 'null');
+  // (Scene groups became a list of the Scene view)
+  if (saved && saved.view === 'scene_groups') saved.view = 'scene';
   if (saved && saved.view && saved.view !== 'all') {
     const sel = saved.section === 'smart'
       ? `#nav-smart li[data-view="${saved.view}"]`
@@ -2640,8 +2802,6 @@ function _refreshSceneGroupsFacet() {
 // bailing the instant the facet reveals — or when the ladder is exhausted (a
 // library with no demoscene music, where the facet correctly stays hidden).
 function _pollSceneGroupsFacet(delays) {
-  const li = document.querySelector('#nav-library li[data-view="scene_groups"]');
-  if (li && !li.hidden) return;                 // already revealed — nothing to do
   _refreshSceneGroupsFacet().then((revealed) => {
     if (revealed || !delays.length) return;
     setTimeout(() => _pollSceneGroupsFacet(delays.slice(1)), delays[0]);
@@ -2760,7 +2920,7 @@ FolderTree.onSelect(async (path) => {
   // priority over background metadata refreshes.  Never touches the
   // playing audio stream.
   _cancelAncillaryFetches();
-  _deactivateAllNav();
+  _deactivateAllNav(true);
   const share = _resolveRemoteShareFromPath(path);
   if (share && /^(ftp|smb|https?|webdavs?):\/\//i.test(share)) {
     // Track the last-viewed remote share so the visibility-change
@@ -2801,6 +2961,25 @@ if (scanBadge) {
 // handler unconditionally is fine — clicks are only reachable when the drawer
 // is active.  Sets a ``.sidebar-open`` class on <body> so both the sidebar
 // transform and the scrim opacity toggle off the same flag.
+// Compact layout (≤900 px): the player bar wraps into rows and grows (auto
+// height), but the queue / playlist panels, the sidebar drawer and its scrim
+// and the update prompt stand on ``--player-h`` (152 px, ``auto`` ≤600 px) —
+// they lay over the bar's title row.  There it carries the bar's real height;
+// above it the stylesheet's value is back (the bar's own height is set from it).
+(() => {
+  const bar = document.getElementById('player-bar');
+  if (!bar || typeof ResizeObserver !== 'function') return;
+  const mq = window.matchMedia('(max-width: 900px)');
+  const root = document.documentElement;
+  const sync = () => {
+    if (mq.matches) root.style.setProperty('--player-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+    else root.style.removeProperty('--player-h');
+  };
+  new ResizeObserver(sync).observe(bar);
+  mq.addEventListener?.('change', sync);
+  sync();
+})();
+
 (() => {
   const toggleBtn = document.getElementById('sidebar-toggle');
   const sidebar   = document.getElementById('sidebar');
@@ -3349,6 +3528,8 @@ function _rebustMissingArt() {
       u.searchParams.set('_t', Date.now());
       img.src = u.pathname + u.search;
     });
+    // (the player bar keeps no <img> once it shows the placeholder)
+    if (_barArtTrack && playerArt.querySelector('.art-placeholder')) _paintBarArt(_barArtTrack, true);
   } catch (_) { /* ignore */ }
 }
 
@@ -3372,6 +3553,10 @@ function connectWS() {
       pending.add(msg.track_id);
       if (pending.size > 8000) pending.clear();   // bound it
       _bustArtImg(msg.track_id);
+      // The player bar dropped its <img> for the placeholder: paint it again.
+      if (_barArtTrack && _barArtTrack.id === msg.track_id && playerArt.querySelector('.art-placeholder')) {
+        _paintBarArt(_barArtTrack, true);
+      }
       return;
     }
     if (msg.event === 'art_refresh') {
@@ -3699,7 +3884,9 @@ if (_btnLinks && _linksOverlay) {
     if (_linksOverlay.classList.contains('hidden')) return;
     _linksOverlay.classList.add('hidden');
     if (_linksOverlay.contains(document.activeElement) || document.activeElement === document.body) {
-      try { _btnLinks.focus({ preventScroll: true }); } catch (_) {}
+      // (in a narrow window the globe is folded into the header's ⋯ menu)
+      const back = _btnLinks.getClientRects().length ? _btnLinks : document.getElementById('btn-more');
+      try { back?.focus({ preventScroll: true }); } catch (_) {}
     }
   };
   _btnLinks.addEventListener('click', () => {
@@ -3799,6 +3986,136 @@ if (_welcomeOverlay) {
 }
 // Header "?" re-opens the guide any time — a persistent discoverability entry.
 document.getElementById('btn-welcome')?.addEventListener('click', _openWelcome);
+
+// ── ⋯ menus of folded keys (narrow window) ──────────────────────────────────
+// Keys that don't fit fold into a ⋯ menu (app.css): the header's user chip, "?",
+// 📖 and 🌐 at ≤900 px (Save search too at ≤600 px), the player bar's radio,
+// download, now-playing view and Cast at ≤1100 px.  Each item presses its
+// folded key (data-press), so the behaviour stays the key's own; focus goes back
+// to ⋯ first, so a dialog the item opens hands focus back to ⋯ when it closes.
+// ``beforeOpen`` brings the items up to date; ``place`` positions the menu.
+function _bindFoldMenu(btn, menu, { beforeOpen, place } = {}) {
+  // (shown, usable items only: [hidden] ones, ones the width leaves out and
+  // disabled ones are out)
+  const items = () => [...menu.querySelectorAll('[role="menuitem"]')]
+    .filter((el) => !el.hidden && !el.disabled && el.getClientRects().length > 0);
+  const outside = (e) => {
+    if (!menu.contains(e.target) && !btn.contains(e.target)) close();
+  };
+  // (a wider window shows the keys again; the menu goes with ⋯)
+  const onResize = () => { if (!btn.getClientRects().length) close(); else place?.(); };
+  function close(focusBtn = false) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    window.removeEventListener('resize', onResize);
+    if (focusBtn) btn.focus();
+  }
+  function open(focusLast = false) {
+    beforeOpen?.();
+    menu.hidden = false;
+    place?.();
+    btn.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    window.addEventListener('resize', onResize);
+    const list = items();
+    (focusLast ? list[list.length - 1] : list[0])?.focus();
+  }
+  btn.addEventListener('click', () => (menu.hidden ? open() : close(true)));
+  // A menu button's keys: Space / Enter / ↓ open on the first item, ↑ on the
+  // last (stopped here — the page's Space plays and its arrows are the volume).
+  btn.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (![' ', 'Enter', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
+    e.preventDefault(); e.stopPropagation();
+    if (menu.hidden) open(e.key === 'ArrowUp');
+    else close(true);
+  });
+  menu.addEventListener('click', (e) => {
+    const item = e.target.closest('[role="menuitem"]');
+    if (!item) return;
+    close(true);
+    if (item.dataset.press) document.getElementById(item.dataset.press)?.click();
+  });
+  menu.addEventListener('keydown', (e) => {
+    const list = items();
+    const i = list.indexOf(document.activeElement);
+    // (The keys the menu owns stop here: the page's shortcuts — arrows are the
+    // volume, Space plays — must not act on them too.)
+    let to = null;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(true); return; }
+    if (e.key === 'ArrowDown') to = list[(i + 1) % list.length];
+    else if (e.key === 'ArrowUp') to = list[(i - 1 + list.length) % list.length];
+    else if (e.key === 'Home') to = list[0];
+    else if (e.key === 'End') to = list[list.length - 1];
+    else if (e.key === ' ' || e.key === 'Enter') {
+      e.stopPropagation();
+      // (a link doesn't take Space; the User guide item is one)
+      if (e.key === ' ' && document.activeElement?.tagName === 'A') { e.preventDefault(); document.activeElement.click(); }
+      return;
+    }
+    // Any other key (Tab, a shortcut letter) closes the menu onto ⋯ and goes on
+    // from there — the item it leaves is about to be hidden.
+    else {
+      if (!['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(e.key)) close(true);
+      return;
+    }
+    e.preventDefault(); e.stopPropagation();
+    to?.focus();
+  });
+}
+{
+  const btn = document.getElementById('btn-more');
+  const menu = document.getElementById('hdr-more-menu');
+  if (btn && menu) _bindFoldMenu(btn, menu, {
+    beforeOpen() {
+      const chip = document.getElementById('user-chip');
+      const name = document.getElementById('user-chip-name')?.textContent || '';
+      const signedIn = !!chip && !chip.hidden;
+      const who = document.getElementById('hdr-more-who');
+      const out = document.getElementById('hdr-more-logout');
+      who.hidden = !signedIn;
+      who.textContent = signedIn ? `Signed in as ${name}` : '';
+      out.hidden = !signedIn;
+      if (signedIn) out.setAttribute('aria-label', `Sign out ${name}`);
+      // Save search: there while a search is typed (as its key is)
+      const save = document.getElementById('hdr-more-save');
+      if (save) save.hidden = !!document.getElementById('search-save-smart')?.hidden;
+    },
+  });
+}
+{
+  const btn = document.getElementById('btn-bar-more');
+  const menu = document.getElementById('bar-more-menu');
+  // At body level: inside #app (its own stacking context) the side panels —
+  // queue, playlists, at body level — covered it.
+  if (menu) document.body.appendChild(menu);
+  if (btn && menu) _bindFoldMenu(btn, menu, {
+    // Each item carries its key's icon and state: a lamp while the key is on,
+    // unavailable while the key is.
+    beforeOpen() {
+      for (const item of menu.querySelectorAll('[data-press]')) {
+        const key = document.getElementById(item.dataset.press);
+        // (only the keys this width folds away: a key in the bar stays there)
+        item.hidden = !key || key.hidden || key.getClientRects().length > 0;
+        if (!key) continue;
+        item.disabled = key.disabled || key.classList.contains('disabled');
+        const ico = item.querySelector('.hdr-more-ico');
+        if (ico) ico.innerHTML = key.innerHTML;
+        const on = key.classList.contains('on') || key.classList.contains('is-casting')
+          || key.getAttribute('aria-pressed') === 'true';
+        item.classList.toggle('on', on);
+      }
+    },
+    // Above the ⋯ key, its right edge on the key's (the bar clips overflow).
+    place() {
+      const r = btn.getBoundingClientRect();
+      menu.style.right = `${Math.max(8, window.innerWidth - r.right)}px`;
+      menu.style.bottom = `${window.innerHeight - r.top + 6}px`;
+    },
+  });
+}
 // Empty-state CTA → jump straight to Library settings to add a folder.  Delegate
 // on the stable #track-empty container, NOT the button directly: renderTracks
 // rebuilds the empty state via ``emptyEl.innerHTML = …``, which would recreate a
@@ -3867,6 +4184,10 @@ document.addEventListener('keydown', (e) => {
       _linksOverlay.classList.add('hidden');
       return;
     }
+    if (npArt && !npArt.hidden && !document.body.classList.contains('ti-open')) {
+      closeNowPlayingArt();
+      return;
+    }
     return; // let other handlers handle their own Escape
   }
 
@@ -3925,6 +4246,13 @@ document.addEventListener('keydown', (e) => {
 
   // V — toggle visualizer mode (oscilloscope / spectrogram)
   if (e.code === 'KeyV') { loadVisualizer().then(V => V.toggleMode()); return; }
+
+  // N — show / hide the large now-playing art
+  if (e.code === 'KeyN') {
+    // Not under Track Info or the shortcut sheet (it would open unseen)
+    if (!document.body.classList.contains('ti-open') && _shortcutsOverlay.classList.contains('hidden')) toggleNowPlayingArt();
+    return;
+  }
 
   // E — toggle EQ
   if (e.code === 'KeyE') { Equalizer.toggle(); return; }

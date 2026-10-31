@@ -135,8 +135,9 @@ def issue_token(
     sample_rate: int | None = None,
     user_id: str | int | None = None,
     target_id: str | None = None,
-    subsong: int = 0,
+    subsong: int | None = None,
     ttl_seconds: int = _TOKEN_TTL_SECONDS,
+    origin: str | None = None,
 ) -> str:
     """Mint a fresh signed token.  All fields except ``track_id`` are
     optional — defaults preserve the existing ``/api/stream`` behaviour.
@@ -146,6 +147,11 @@ def issue_token(
     claims so a cast renderer's URL fetch picks the same sub-tune the
     user clicked in the web UI — without it, every SID with ``subsong=3``
     queued to a Chromecast would play track 0 instead.
+
+    ``origin`` (``"dlna"``: a DLNA Media Server browse link) is carried as
+    the ``o`` claim; the byte server serves such a link through the stream
+    endpoint (``cast_stream``).  With an origin, ``subsong`` None is the
+    file's default tune and any other value — 0 included — that tune.
 
     The returned string is URL-safe (base64url, no padding) and contains
     no separators apart from the two ``.`` between header / body / sig
@@ -166,7 +172,12 @@ def issue_token(
     if sample_rate:  claims["sr"]  = int(sample_rate)
     if user_id is not None:  claims["uid"] = str(user_id)
     if target_id:    claims["tg"]  = str(target_id)
-    if subsong:      claims["sn"]  = int(subsong)
+    if origin:
+        claims["o"] = str(origin)
+        if subsong is not None:
+            claims["sn"] = int(subsong)
+    elif subsong:
+        claims["sn"] = int(subsong)
 
     header_b64 = _b64url(b'{"alg":"HS256","typ":"SBC"}')
     body_b64   = _b64url(

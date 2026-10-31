@@ -1,0 +1,424 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ── Phone Now Playing: meters and visuals (Retro hi-fi) ────────────────────
+   Linked after mobile.css.  The markup is nowplaying.js's, the behaviour
+   np_visuals.js's: the meter display between the cassette and the VFD (.m-npm:
+   a printed legend — METER / SPECTRUM / SCOPE, the PEAK lamp, the tape
+   counter — over a dark display glass that a tap steps through), the waveform
+   in the seek slot (.m-npw), the source annunciator on the VFD.  The tokens
+   are the cassette deck's (mobile.css --np-*, on .m-np).  Every rule is under
+   #m-view-nowplaying: it outranks the deck's own rules (mobile.css) without
+   depending on the Style attribute. */
+
+/* Portrait — one sizing for phones and tablets.  --npv-avail is the view's
+   height: between the top bar and the mini player, or the tab bar where the
+   mini player steps aside (mobile.css sets --mini-h 0 there).  --npv-rest is
+   everything in the view but the cassette and the display glass (the view's
+   padding, deck legend, VFD with a one-line title, seek, keys, gaps) — measured,
+   per layout below.  The cassette gives way first when the view is short, down
+   to --npv-cas-min wide, keeping --npv-glass-res for the glass; the glass
+   (--npm-h, --npm-min … --npm-max) takes what is left.  The deck is held to
+   the view (max-height) and only the glass gives (to 48 px): a second title
+   line or a font with other metrics never pushes the keys off the screen. */
+#m-view-nowplaying .m-np {
+  --npv-avail: calc(100vh - var(--topbar-h) - var(--tabbar-h) - var(--mini-h) - var(--safe-top) - var(--safe-bottom));
+  --npv-avail: calc(100dvh - var(--topbar-h) - var(--tabbar-h) - var(--mini-h) - var(--safe-top) - var(--safe-bottom));
+  --npv-pt: 12px;                       /* the view's padding above / below the deck */
+  --npv-pb: 24px;
+  --npv-rest: 400px;
+  --npv-glass-res: 80px;
+  --npv-cas-min: 220px;
+  --npv-deck-in: calc(min(100vw - 24px, 440px) - 30px);         /* the deck's inner width */
+  --npv-cas-w: min(var(--npv-deck-in), max(var(--npv-cas-min), calc((var(--npv-avail) - var(--npv-rest) - var(--npv-glass-res)) * 1.6)));
+  --npm-min: 48px;
+  --npm-max: 132px;
+}
+#m-view-nowplaying .m-np-cassette {
+  width: var(--npv-cas-w);
+  align-self: center;
+}
+@media (orientation: portrait) {
+  #m-view-nowplaying .m-np { padding-top: var(--npv-pt); padding-bottom: var(--npv-pb); }
+  #m-view-nowplaying .m-np-deck { max-height: calc(var(--npv-avail) - var(--npv-pt) - var(--npv-pb)); }
+  #m-view-nowplaying .m-np-deck > *,
+  #m-view-nowplaying .m-np-deck::before,
+  #m-view-nowplaying .m-npm-legend { flex-shrink: 0; }
+  #m-view-nowplaying .m-np-deck > .m-npm { flex-shrink: 1; min-height: 0; }
+  #m-view-nowplaying .m-npm-glass { flex: 0 1 auto; min-height: 48px; }
+}
+#m-view-nowplaying .m-npm {
+  --npm-h: clamp(var(--npm-min), calc(var(--npv-avail) - var(--npv-rest) - var(--npv-cas-w) / 1.6), var(--npm-max));   /* the glass */
+  --npm-face: var(--np-face, "DIN Alternate", "DIN Condensed", Bahnschrift, "Arial Narrow", sans-serif);
+  --npm-led-g: #2fd35a;                /* LED ladder: green, amber over 58 %, red over 82 % (as the desktop) */
+  --npm-led-a: #ffb12b;
+  --npm-led-r: #ff3b2b;
+  --npm-on: var(--np-amber, #ffb12b);  /* a lit legend */
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+@media (prefers-color-scheme: light) {
+  #m-view-nowplaying .m-npm { --npm-on: #723000; }
+}
+
+/* The printed legend: the three displays (the one shown lit), PEAK, counter */
+/* (the legends are keys: each a 44 px tall target over --npm-lg-h of the
+   layout — it reaches up over the gap above, not into the glass below) */
+#m-view-nowplaying .m-npm-legend {
+  --npm-lg-h: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--npm-lg-h);
+  padding: 0 2px;
+  font: 700 11px/1 var(--npm-face);
+  letter-spacing: 0.12em;
+  color: var(--np-print-2, #a3a9b2);
+  white-space: nowrap;
+}
+#m-view-nowplaying .m-npm-mode {
+  position: relative;
+  z-index: 3;                       /* over the cassette's sheen */
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  min-width: 44px;
+  height: 44px;
+  margin: calc(var(--npm-lg-h) + 4px - 44px) 0 -4px;
+  padding: calc(44px - var(--npm-lg-h) - 4px) 2px 4px 11px;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  text-align: left;
+  -webkit-user-select: none;
+  user-select: none;
+}
+#m-view-nowplaying .m-npm-mode::before {           /* a lamp before each legend */
+  content: "";
+  position: absolute;
+  left: 2px; top: calc(100% - 4px - var(--npm-lg-h) / 2);
+  width: 6px; height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--np-lamp-off, #3b1712);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6);
+}
+#m-view-nowplaying .m-npm-mode.on { color: var(--npm-on); }
+#m-view-nowplaying .m-npm-mode.on::before {
+  background: var(--np-amber, #ffb12b);
+  box-shadow: 0 0 5px var(--np-amber, #ffb12b), 0 0 2px #fff3d6;
+}
+#m-view-nowplaying .m-npm-peak {
+  position: relative;
+  margin-left: auto;
+  padding-left: 9px;
+}
+#m-view-nowplaying .m-npm-peak::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 50%;
+  width: 6px; height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: #4a1d17;
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6);
+}
+#m-view-nowplaying .m-npm-peak.on::before {
+  background: #ff3b1f;
+  box-shadow: 0 0 6px rgba(255,59,31,0.9), 0 0 2px #ffd9cf;
+}
+#m-view-nowplaying .m-npm[data-view="needles"] .m-npm-peak { visibility: hidden; }   /* the faces have their own */
+/* The tape counter: three number wheels in a window */
+#m-view-nowplaying .m-npm-count {
+  display: inline-flex;
+  gap: 1px;
+  padding: 1px;
+  border-radius: 2px;
+  background: #050506;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.9), 0 1px 0 rgba(255,255,255,0.10);
+}
+#m-view-nowplaying .m-npm-count i {
+  display: block;
+  width: 10px;
+  padding: 2px 0 1px;
+  font: 700 11px/1 var(--npm-face);
+  font-style: normal;
+  letter-spacing: 0;
+  text-align: center;
+  color: #f2f2ee;
+  background: linear-gradient(180deg, #0b0b0c, #26272a 45%, #26272a 55%, #0b0b0c);
+}
+
+/* The display glass: the whole of it is the key that steps the display */
+#m-view-nowplaying .m-npm-glass {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: var(--npm-h);
+  padding: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  border: 1px solid #000;
+  background: var(--np-vfd-glass, #061517);
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.85), 0 1px 0 rgba(255,255,255,0.10);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+#m-view-nowplaying .m-npm-glass:active { box-shadow: inset 0 3px 10px rgba(0,0,0,0.95), 0 1px 0 rgba(255,255,255,0.06); }
+#m-view-nowplaying .m-npm-cvs {
+  position: absolute;
+  left: 0; top: 0;
+  display: block;
+  pointer-events: none;
+}
+#m-view-nowplaying .m-npm[data-view="leds"] .m-npm-cvs { display: none; }
+/* The scope's printed graticule (8 × 4 divisions, a brighter centre line) */
+#m-view-nowplaying .m-npm[data-view="scope"] .m-npm-glass {
+  background:
+    linear-gradient(rgba(111,247,233,0.16), rgba(111,247,233,0.16)) 0 50% / 100% 1px no-repeat,
+    repeating-linear-gradient(90deg, rgba(111,247,233,0.07) 0 1px, transparent 1px 12.5%),
+    repeating-linear-gradient(180deg, rgba(111,247,233,0.07) 0 1px, transparent 1px 25%),
+    var(--np-vfd-glass, #061517);
+}
+#m-view-nowplaying .m-npm-note {
+  position: absolute;
+  left: 8px; right: 8px; top: 4px;
+  font: 600 11px/1.2 var(--npm-face);
+  letter-spacing: 0.04em;
+  color: var(--np-vfd-dim, #46c9bd);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+#m-view-nowplaying .m-npm-said {           /* announces the display picked (screen readers only) */
+  position: absolute;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* LED columns: one per voice (or the 32 spectrum columns), lit in whole
+   segments up to --vu-level (np_visuals.js), a peak segment held above */
+#m-view-nowplaying .m-npm-leds {
+  --lab-h: 0px;
+  position: absolute;
+  inset: 17px 8px 5px;
+  display: none;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 2px;
+  pointer-events: none;
+}
+#m-view-nowplaying .m-npm-leds[data-labels="on"] { --lab-h: 12px; gap: 3px; }
+#m-view-nowplaying .m-npm[data-view="leds"] .m-npm-leds { display: grid; }
+#m-view-nowplaying .m-npm-col {
+  position: relative;
+  min-width: 0;
+  contain: layout style;
+  background:
+    repeating-linear-gradient(to top, rgba(111,247,233,0.075) 0 3px, transparent 3px 4px)
+    0 calc(100% - var(--lab-h)) / 100% calc(var(--npm-rows, 8) * 4px) no-repeat;
+}
+#m-view-nowplaying .m-npm-lit {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: var(--lab-h);
+  height: calc(var(--vu-level, 0) * var(--npm-rows, 8) * 4px);
+  background: linear-gradient(to top, var(--npm-led-g) 0 58%, var(--npm-led-a) 58% 82%, var(--npm-led-r) 82% 100%)
+              0 100% / 100% calc(var(--npm-rows, 8) * 4px) no-repeat;
+  -webkit-mask: repeating-linear-gradient(to top, #000 0 3px, transparent 3px 4px);
+          mask: repeating-linear-gradient(to top, #000 0 3px, transparent 3px 4px);
+}
+#m-view-nowplaying .m-npm-pk {
+  position: absolute;
+  left: 0; right: 0;
+  height: 3px;
+  bottom: calc(var(--lab-h) + var(--vu-peak, 0) * var(--npm-rows, 8) * 4px - 4px);
+  background: #ffe0a8;
+  box-shadow: 0 0 4px rgba(255,177,43,0.8);
+  opacity: min(1, calc(var(--vu-peak, 0) * 1000));
+}
+#m-view-nowplaying .m-npm-lab {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  font: 700 9px/12px var(--npm-face);
+  letter-spacing: 0.02em;
+  color: var(--np-vfd-dim, #46c9bd);
+  white-space: nowrap;
+}
+#m-view-nowplaying .m-npm-lab.dot { opacity: 0.6; }
+
+/* Visualizations off: a key in place of the display (it turns them on) */
+#m-view-nowplaying .m-npm-off {
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--np-edge, #050506);
+  background: var(--np-key-bg, #2a2c30);
+  box-shadow: var(--np-key-shadow, none);
+  color: var(--np-key-text, #cfd3d9);
+  font: 700 11px/1 var(--npm-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+#m-view-nowplaying .m-npm-off[hidden] { display: none; }
+#m-view-nowplaying .m-npm[data-viz="off"] .m-npm-legend,
+#m-view-nowplaying .m-npm[data-viz="off"] .m-npm-glass { display: none; }
+
+/* The VFD's source annunciator (format · voices, LIVE) */
+#m-view-nowplaying .m-np-ann-src {
+  color: var(--np-vfd, #6ff7e9);
+  text-shadow: 0 0 5px rgba(111,247,233,0.45);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+#m-view-nowplaying .m-np-ann-src:empty { display: none; }
+#m-view-nowplaying .m-np[data-src="radio"] .m-np-ann-src { color: var(--np-live, #ff6b5e); text-shadow: 0 0 5px rgba(255,107,94,0.5); }
+
+/* The waveform in the seek slot: unplayed dim, played amber (the second canvas,
+   clipped at the tape position --np-pos); the ribbed fader cap rides over it */
+#m-view-nowplaying .m-npw {
+  grid-column: 2; grid-row: 1;
+  position: relative;
+  align-self: center;
+  height: 30px;
+  border-radius: 3px;
+  background: var(--np-vfd-glass, #061517);
+  box-shadow: inset 0 1px 4px rgba(0,0,0,0.85), 0 1px 0 rgba(255,255,255,0.08);
+  pointer-events: none;
+}
+#m-view-nowplaying .m-npw[hidden] { display: none; }
+#m-view-nowplaying .m-npw canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  display: block;
+}
+#m-view-nowplaying .m-npw canvas + canvas { clip-path: inset(0 calc((1 - var(--np-pos, 0)) * 100%) 0 0); }
+#m-view-nowplaying .m-np-scrubber { position: relative; z-index: 1; }
+#m-view-nowplaying .m-np.has-wave .m-np-scrubber { background: none; }
+
+/* ── Shorter phones (360 × 740 and the like): room for the display ─────── */
+@media (orientation: portrait) and (max-height: 780px) {
+  #m-view-nowplaying .m-np { gap: 10px; --npv-pt: 8px; }
+  #m-view-nowplaying .m-np-deck { gap: 9px; padding-top: 10px; padding-bottom: 12px; }
+  #m-view-nowplaying .m-np-deck::before { display: none; }
+  #m-view-nowplaying .m-np-btn,
+  #m-view-nowplaying .m-np-btn.primary { height: 52px; }
+  #m-view-nowplaying .m-np-modes .m-np-btn { height: 46px; padding-top: 10px; }
+  #m-view-nowplaying .m-np { --npv-rest: 339px; --npv-cas-min: 180px; }
+}
+
+/* ── Landscape phone: the display beside the VFD, over shuffle / repeat; its
+   legend shows the display picked (a tap: the next), PEAK and the counter ── */
+@media (orientation: landscape) and (max-height: 540px) {
+  #m-view-nowplaying .m-np-cassette { width: var(--np-art-w); }
+  #m-view-nowplaying .m-np-deck { grid-template-areas: "cas meta npm" "cas seek seek" "cas keys modes"; }
+  #m-view-nowplaying .m-npm { grid-area: npm; align-self: stretch; gap: 4px; --npm-h: auto; }
+  #m-view-nowplaying .m-npm-glass { flex: 1 1 auto; height: auto; min-height: 48px; }
+  #m-view-nowplaying .m-npm-legend { --npm-lg-h: 24px; gap: 6px; letter-spacing: 0.06em; }
+  #m-view-nowplaying .m-npm-mode:not(.on) { display: none; }
+  #m-view-nowplaying .m-npm-note { top: 2px; left: 5px; }
+  #m-view-nowplaying .m-npm-leds { inset: 15px 5px 3px; }
+}
+/* Sideways the deck fills the view (a tune list below: all but a peek of it),
+   the display and the VFD taking the height of the first row. */
+@media (orientation: landscape) and (max-height: 540px) {
+  #m-view-nowplaying .m-np-deck {
+    flex: 1 0 auto;
+    min-height: calc(var(--np-avail) - 40px);
+    grid-template-rows: minmax(0, 1fr) auto auto;
+  }
+  #m-view-nowplaying .m-np-vfd { align-self: stretch; display: flex; flex-direction: column; justify-content: center; }
+}
+/* A phone held sideways (under 428 px tall): the mini player steps aside
+   (mobile.css) and shuffle / repeat / cast get a row of their own. */
+@media (orientation: landscape) and (max-height: 427.98px) {
+  #m-view-nowplaying .m-np-deck {
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto auto auto;
+    grid-template-areas: "cas meta npm" "cas seek seek" "cas keys keys" "cas modes modes";
+  }
+  #m-view-nowplaying .m-np-title { -webkit-line-clamp: 2; }
+  #m-view-nowplaying .m-np-modes .m-np-btn { width: auto; flex: 1 1 0; }
+}
+@media (orientation: landscape) and (max-height: 380px) {
+  #m-view-nowplaying .m-npm-legend { --npm-lg-h: 26px; }
+  #m-view-nowplaying #m-np-cast { padding-top: 12px; }
+  #m-view-nowplaying #m-np-cast svg { width: 14px; height: 14px; }
+}
+
+/* ── iPad portrait (≥ 700 px wide, ≥ 900 px tall): a bigger deck, a tall display ── */
+@media (min-width: 700px) and (min-height: 900px) and (orientation: portrait) {
+  #m-view-nowplaying .m-np {
+    padding-left: 32px; padding-right: 32px; gap: 20px;
+    --npv-pt: 24px; --npv-pb: 32px;
+    --npv-rest: 485px;
+    /* the cassette: 86 % of the deck's inside (the deck 680 px, 32 px of view
+       padding each side, 46 px of its own), less on a shorter iPad */
+    --npv-deck-in: calc((min(100vw - 64px, 680px) - 46px) * 0.86);
+    --npv-cas-min: 300px;
+    --npv-glass-res: 150px;
+    --npm-min: 150px; --npm-max: 320px;
+  }
+  #m-view-nowplaying .m-np-deck { max-width: 680px; padding: 18px 22px 22px; gap: 16px; border-radius: 26px; }
+  #m-view-nowplaying .m-np-deck::before { font-size: 12px; }
+  #m-view-nowplaying .m-npm-legend { --npm-lg-h: 18px; }
+  #m-view-nowplaying .m-np-title { font-size: 24px; }
+  #m-view-nowplaying .m-npm-lab { font-size: 11px; line-height: 14px; }
+  #m-view-nowplaying .m-npm-leds[data-labels="on"] { --lab-h: 14px; }
+  #m-view-nowplaying .m-npm-note { font-size: 12px; top: 6px; left: 12px; }
+  #m-view-nowplaying .m-np-artist { font-size: 17px; }
+  #m-view-nowplaying .m-np-btn,
+  #m-view-nowplaying .m-np-btn.primary { height: 68px; font-size: 24px; }
+  #m-view-nowplaying .m-np-modes .m-np-btn { height: 58px; }
+  #m-view-nowplaying .m-np-tunes { max-width: 680px; }
+}
+
+/* ── iPad landscape (≥ 1000 px wide, ≥ 700 px tall): the display beside the
+   deck — cassette, VFD, seek and keys on the left, the display filling the
+   right-hand column ── */
+@media (min-width: 1000px) and (min-height: 700px) and (orientation: landscape) {
+  #m-view-nowplaying .m-np { padding: 20px 28px 28px; }
+  #m-view-nowplaying .m-np-deck {
+    display: grid;
+    max-width: 1240px;
+    grid-template-columns: minmax(360px, 0.9fr) minmax(0, 1.1fr);
+    grid-template-areas: "cas npm" "meta npm" "seek npm" "keys npm" "modes npm";
+    grid-template-rows: auto auto auto auto 1fr;
+    column-gap: 24px;
+    row-gap: 12px;
+    padding: 18px 22px 22px;
+    border-radius: 26px;
+    align-items: start;
+  }
+  #m-view-nowplaying .m-np-deck::before { position: absolute; top: 6px; left: 0; right: 0; font-size: 11px; }
+  #m-view-nowplaying .m-np-deck { position: relative; padding-top: 26px; }
+  #m-view-nowplaying .m-np-cassette { grid-area: cas; justify-self: center; width: min(100%, max(300px, calc((var(--npv-avail) - 400px) * 1.6))); }
+  #m-view-nowplaying .m-npm-lab { font-size: 11px; line-height: 14px; }
+  #m-view-nowplaying .m-npm-leds[data-labels="on"] { --lab-h: 14px; }
+  #m-view-nowplaying .m-npm-note { font-size: 12px; top: 6px; left: 12px; }
+  #m-view-nowplaying .m-np-vfd { grid-area: meta; }
+  #m-view-nowplaying .m-np-scrubber-wrap { grid-area: seek; }
+  #m-view-nowplaying .m-np-transport { grid-area: keys; }
+  #m-view-nowplaying .m-np-transport.m-np-modes { grid-area: modes; }
+  #m-view-nowplaying .m-npm { grid-area: npm; align-self: stretch; --npm-h: auto; }
+  #m-view-nowplaying .m-npm-glass { flex: 1 1 auto; height: auto; min-height: 260px; }
+  #m-view-nowplaying .m-npm-legend { --npm-lg-h: 18px; }
+  #m-view-nowplaying .m-np-title { font-size: 22px; }
+  #m-view-nowplaying .m-np-btn,
+  #m-view-nowplaying .m-np-btn.primary { height: 64px; font-size: 22px; }
+  #m-view-nowplaying .m-np-modes .m-np-btn { height: 54px; }
+  #m-view-nowplaying .m-np-tunes { max-width: 1240px; }
+}

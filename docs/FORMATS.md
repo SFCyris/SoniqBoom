@@ -88,7 +88,7 @@ Rendered by **libgme** (Game Music Emu), except the VGM files noted below.
 | **GBS** (`.gbs`) | Game Boy, 1989 | Four voices of the most recognisable handheld sound ever made | |
 | **VGM / VGZ** (`.vgm`, `.vgz`) | Sega Master System / Genesis + arcade, format from 2005 | Chip-register logging across dozens of sound chips; the vgmrips community archives thousands of sets | Yamaha YM2612 FM = the Genesis "growl". libgme plays the Sega PSG (SN76489) and YM2612 logs; a log that uses any other chip — YM2413, YM2151, the NES APU, the AY-3-8910 and the rest — is rendered by **ZXTune**. |
 | **AY** (`.ay`) | ZX Spectrum / Amstrad CPC | The Eastern-European demoscene's chip of choice (AY-3-8910) | |
-| **KSS, SAP, GYM, HES** | MSX, Atari 8-bit, Genesis, PC Engine | Each platform's native music-rip format | Packed GYM files (GYMX) are unpacked automatically. KSS rips play their PSG and SCC voices (the SN76489 for a Sega Master System / Game Gear rip); FM parts such as MSX-MUSIC and MSX-AUDIO aren't emulated. |
+| **KSS, SAP, GYM, HES** | MSX, Atari 8-bit, Genesis, PC Engine | Each platform's native music-rip format | Packed GYM files (GYMX) are unpacked automatically. KSS rips play every sound chip their music uses — PSG, SCC, MSX-MUSIC and MSX-AUDIO, and the SN76489 for a Sega Master System / Game Gear rip — through kssrender (libkss); where kssrender isn't installed, libgme plays their PSG and SCC voices only. |
 
 ## PSF family (later console rips)
 

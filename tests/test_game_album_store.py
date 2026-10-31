@@ -128,10 +128,11 @@ def test_album_source_round_trips_through_aof_replay(tmp_path):
 # ── search ───────────────────────────────────────────────────────────────────
 
 def test_game_operator_is_its_own_prefix_predicate():
-    """``game:`` is a prefix match on album OR title; ``album:`` stays exact."""
+    """``game:`` is a prefix match on album OR title; ``album:`` is its own
+    word-start predicate (``album_match``)."""
     from soniqboom.api.search import _parse_advanced_query
     assert _parse_advanced_query('game:"Gold of the Aztecs"') == r"@game_tag:{Gold\ of\ the\ Aztecs}"
-    assert _parse_advanced_query('album:"Gold of the Aztecs"') == r"@album_tag:{Gold\ of\ the\ Aztecs}"
+    assert _parse_advanced_query('album:"Gold of the Aztecs"') == r"@album_match:{Gold\ of\ the\ Aztecs}"
     assert _parse_advanced_query("game:Turrican format:ProTracker") == \
         "@game_tag:{Turrican} @format:{PROTRACKER}"
     assert _parse_advanced_query("game:x") is not None

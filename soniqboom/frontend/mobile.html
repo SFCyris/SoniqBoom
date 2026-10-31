@@ -2,14 +2,17 @@
 <!-- SPDX-FileCopyrightText: 2026 S.F. Cyris -->
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
-<html lang="en">
+<!-- The phone page is always Retro hi-fi (css/mobile.css): data-ui-style-fixed
+     keeps js/ui_style.js — loaded by any shared module — from switching it to
+     the desktop page's Style or writing that choice. -->
+<html lang="en" data-ui-style="retro" data-ui-style-fixed="retro">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="SoniqBoom">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="theme-color" content="#1d1f22">
   <meta name="format-detection" content="telephone=no">
   <title>SoniqBoom</title>
   <link rel="manifest" href="/assets/manifest.webmanifest">
@@ -19,23 +22,25 @@
   <link rel="apple-touch-icon" sizes="167x167" href="/assets/icons/apple-touch-icon-167.png">
   <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-touch-icon-152.png">
   <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-touch-icon-120.png">
-  <link rel="stylesheet" href="/assets/css/mobile.css?v=25">
+  <link rel="stylesheet" href="/assets/css/mobile.css?v=32">
+  <!-- Now Playing's meters and visuals (js/mobile/views/np_visuals.js) -->
+  <link rel="stylesheet" href="/assets/css/mobile-visuals.css?v=2">
 </head>
 <body>
   <div id="m-app">
 
     <!-- ── Top bar (per-view title) ─────────────────────────────────────── -->
     <header id="m-topbar">
-      <span id="m-topbar-title">Library</span>
-      <button id="m-settings-btn" class="m-settings-btn" aria-label="Settings">⚙</button>
-      <!-- Escape hatch: the auto-redirect at / pins ``sb_ui=mobile`` so a
-           phone that landed here once stays here.  This link lets the
-           user opt back into the desktop UI (useful on iPads forced to
-           mobile by a quirky UA, or for testing). -->
+      <span class="m-brand" aria-hidden="true">Soniq<br>Boom</span>
+      <span class="m-topbar-vfd"><span id="m-topbar-title">Library</span></span>
+      <button id="m-settings-btn" class="m-settings-btn" aria-label="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+      <!-- The desktop interface, pinned (sb_ui=desktop) so auto-detection at /
+           doesn't send this browser back here; shown on a large display only
+           (both sides >= 428 px: iPads, Plus / Pro Max phones; css/mobile.css). -->
       <a id="m-desktop-link"
          href="/?ui=desktop"
          class="m-desktop-link"
-         title="Switch to desktop site">
+         title="Switch to the desktop interface">
         Desktop site
       </a>
     </header>
@@ -51,14 +56,14 @@
     </main>
 
     <!-- ── Mini player (above tab bar) ──────────────────────────────────── -->
-    <div id="m-miniplayer" class="m-miniplayer hidden" role="button" aria-label="Open Now Playing">
+    <div id="m-miniplayer" class="m-miniplayer hidden" role="button" aria-label="Open Now Playing" data-state="stop">
       <div id="m-mp-art" class="m-mp-art"><span class="m-mp-art-ph"></span></div>
-      <div class="m-mp-meta">
+      <div class="m-mp-meta m-vfd">
         <div id="m-mp-title" class="m-mp-title">—</div>
         <div id="m-mp-artist" class="m-mp-artist"></div>
       </div>
-      <button id="m-mp-play" class="m-mp-play" aria-label="Play/Pause">▶</button>
-      <button id="m-mp-next" class="m-mp-next" aria-label="Next">⏭</button>
+      <button id="m-mp-play" class="m-mp-play" aria-label="Play/Pause">▶&#xFE0E;</button>
+      <button id="m-mp-next" class="m-mp-next" aria-label="Next">⏭&#xFE0E;</button>
       <!-- UX-3 P0: mobile shell now has a cast affordance.  The button
            opens the same picker overlay the desktop shell uses (#btn-cast
            is a synonym so cast_picker.js wires both transparently).
@@ -135,19 +140,19 @@
     <!-- ── Bottom tab bar ───────────────────────────────────────────────── -->
     <nav id="m-tabs" aria-label="Sections">
       <button class="m-tab active" data-view="library"    aria-label="Library" aria-current="page">
-        <span class="m-tab-icon">🎵</span><span class="m-tab-label">Library</span>
+        <span class="m-tab-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg></span><span class="m-tab-label">Library</span>
       </button>
       <button class="m-tab" data-view="search"     aria-label="Search">
-        <span class="m-tab-icon">🔍</span><span class="m-tab-label">Search</span>
+        <span class="m-tab-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-5-5"/></svg></span><span class="m-tab-label">Search</span>
       </button>
       <button class="m-tab" data-view="radio"      aria-label="Radio">
-        <span class="m-tab-icon">📻</span><span class="m-tab-label">Radio</span>
+        <span class="m-tab-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="8" width="20" height="13" rx="2"/><path d="M6 8l12-5"/><circle cx="16" cy="14.5" r="3"/><path d="M5 12h5M5 15h5M5 18h5"/></svg></span><span class="m-tab-label">Radio</span>
       </button>
       <button class="m-tab" data-view="queue"      aria-label="Queue">
-        <span class="m-tab-icon">≡</span><span class="m-tab-label">Queue</span>
+        <span class="m-tab-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h13M3 12h13M3 18h9"/><path d="M17 15v6l4-3z"/></svg></span><span class="m-tab-label">Queue</span>
       </button>
       <button class="m-tab" data-view="nowplaying" aria-label="Now Playing">
-        <span class="m-tab-icon">♪</span><span class="m-tab-label">Now</span>
+        <span class="m-tab-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8" cy="12" r="2.5"/><circle cx="16" cy="12" r="2.5"/><path d="M8 9.5h8M6 19l2-3h8l2 3"/></svg></span><span class="m-tab-label">Now</span>
       </button>
     </nav>
 
@@ -170,7 +175,7 @@
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous" playsinline></audio>
 
-  <script type="module" src="/assets/js/mobile/app.js?v=28"></script>
+  <script type="module" src="/assets/js/mobile/app.js?v=30"></script>
   <!-- Same cast picker the desktop shell loads.  Picker is a classic
        script that wires itself to #btn-cast on either route. -->
   <script src="/assets/js/cast_picker.js?v=2" defer></script>

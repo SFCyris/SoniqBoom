@@ -145,6 +145,16 @@ RUN set -eux; \
       || echo "NOTE: psgplay build failed — Atari ST SNDH (.sndh) disabled." ; \
     rm -rf /tmp/psgplay
 
+# kssrender — MSX / Sega Master System KSS (soniqboom/native/kssrender): libkss
+# at a pinned commit with its chip cores (MIT) and kmz80 (public domain), never
+# its kss-drivers submodule (not under libkss's licence).
+ARG LIBKSS_COMMIT=2ed958823237d054da1ca7965620d8e62a0f9a1d
+RUN set -eux; \
+    LIBKSS_COMMIT="$LIBKSS_COMMIT" LICENSE_DIR=/out/share/doc/third-party/libkss \
+      sh /src/native/kssrender/build.sh /out/bin \
+      || echo "NOTE: kssrender build failed — KSS plays through libgme." ; \
+    strip --strip-unneeded /out/bin/kssrender 2>/dev/null || true
+
 # zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF).
 # Official prebuilt; fetch the arch that matches the build — BOTH x86_64 and
 # arm64 are published on storage.zxtune.ru (built against glibc 2.35; Debian 13
@@ -331,6 +341,8 @@ COPY --from=openmpt /out/ /out/
 ARG ALLOW_MISSING_RENDERERS=0
 RUN set -eu; \
     req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav \
+         /out/bin/kssrender \
+         /out/share/doc/third-party/libkss/libkss-LICENSE.md /out/share/doc/third-party/libkss/kmz80.txt \
          /out/bin/sidplayfp /out/lib/libsidplayfp.so /out/lib/libresidfp.so \
          /out/share/doc/third-party/libresidfp/COPYING /out/share/doc/third-party/libresidfp/AUTHORS \
          /out/share/doc/third-party/libsidplayfp/COPYING /out/share/doc/third-party/libsidplayfp/AUTHORS.md \
@@ -402,7 +414,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123/
-# sidplayfp/openmpt123 onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
+# sidplayfp/openmpt123/kssrender onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
 # no runtime compiler); libsidplayfp / libresidfp / libstilview into /usr/local/lib,
 # libopenmpt into /usr/local/lib/<multiarch>;
 # uade's libzakalwe/bencodetools .so + its eagleplayer/score data into /usr/local;
@@ -430,6 +442,15 @@ ARG ALLOW_MISSING_RENDERERS=0
 RUN --mount=type=bind,source=scripts/openmpt_selftest.py,target=/tmp/openmpt_selftest.py \
     python -B -I /tmp/openmpt_selftest.py --prefix /usr/local/lib \
         --linked /usr/lib/*-linux-gnu/libavformat.so.[0-9]* \
+    || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
+         && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2; }
+
+# ── Gate: AdLib and KSS tunes must render ────────────────────────────────────
+# A synthesized IMF through adplay and a synthesized KSS through kssrender must
+# each come out audible — a renderer that starts but can't read its format
+# fails the build.
+RUN --mount=type=bind,source=scripts/render_selftest.py,target=/tmp/render_selftest.py \
+    python -B -I /tmp/render_selftest.py \
     || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
          && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2; }
 

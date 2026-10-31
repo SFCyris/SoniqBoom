@@ -64,12 +64,24 @@ def _durations_equal(a, b) -> bool:
     return all(abs(float(x) - float(y)) < 0.01 for x, y in zip(a, b))
 
 
+def loaded_counts() -> dict:
+    """``{"songlengths": n, "stil": n}`` of the HVSC documents loaded."""
+    from soniqboom.core.hvsc import get_hvsc
+    h = get_hvsc()
+    return {"songlengths": len(getattr(h, "_songlengths", None) or {}),
+            "stil": len(getattr(h, "_stil", None) or {})}
+
+
 async def apply_hvsc_to_library(*, reload: bool = False,
-                                ids: "set[str] | None" = None) -> dict:
+                                ids: "set[str] | None" = None,
+                                progress=None) -> dict:
     """Join HVSC durations (by cached MD5) + STIL (by HVSC-relative path) onto
     every SID track — or only the SID tracks in ``ids`` (a scan's own changed
     tracks).  Returns a stats dict.  No-op (``updated: 0``) when HVSC isn't
-    configured."""
+    configured.  ``progress(stage, done, total, **counts)``, when given, is
+    told how far it is: "matching" (``done`` of ``total`` SID tracks, with
+    the documents' ``songlengths`` / ``stil`` counts) and "saving" (``total``
+    changed tracks being written) — on the loop, about every 0.25 s."""
     from soniqboom.core.store import get_store
     from soniqboom.core.hvsc import get_hvsc, _file_md5
     hvsc = get_hvsc()
@@ -85,6 +97,20 @@ async def apply_hvsc_to_library(*, reload: bool = False,
     preload = getattr(hvsc, "_ensure_loaded", None)
     if callable(preload):
         await loop.run_in_executor(None, preload)
+    counts = loaded_counts()
+    told = 0.0
+
+    def _tell(stage: str, done: int, total: int, *, force: bool = False) -> None:
+        nonlocal told
+        if progress is None:
+            return
+        now = time.monotonic()
+        if force or now - told >= 0.25:
+            told = now
+            try:
+                progress(stage, done, total, **counts)
+            except Exception:                           # noqa: BLE001
+                log.debug("HVSC apply: progress not reported", exc_info=True)
 
     # Reuse the maintained _tag_format index (keyed lowercase) instead of
     # materializing + scanning all 270k metas — O(|SID bucket|).
@@ -93,6 +119,8 @@ async def apply_hvsc_to_library(*, reload: bool = False,
     # (a track no longer stored is skipped by the join below)
     tids = [tid for tid in ids if tid in bucket] if ids is not None else list(bucket)
     sid_track_ids: list[str] = []
+    n_all = len(tids)
+    _tell("matching", 0, n_all, force=True)
 
     # ── Resolve each track's whole-file MD5 (cached → compute → fetch) ──
     skipped_missing = 0
@@ -143,15 +171,18 @@ async def apply_hvsc_to_library(*, reload: bool = False,
                 skipped_unreadable += 1
                 return t, None, False
         p = Path(path_str)
-        if not p.is_file():
-            skipped_missing += 1
-            return t, None, False
         async with io_sem:
             try:
-                md5 = await loop.run_in_executor(None, _file_md5, p)
+                # (the existence check too in the worker: a stat on a mounted
+                # share is a network round trip — never on the loop)
+                md5 = await loop.run_in_executor(
+                    None, lambda: _file_md5(p) if p.is_file() else None)
             except Exception:
                 skipped_unreadable += 1
                 return t, None, False
+        if md5 is None:
+            skipped_missing += 1
+            return t, None, False
         return t, md5, True
 
     # ── Build patches — idempotent: only include fields that actually change ──
@@ -208,9 +239,12 @@ async def apply_hvsc_to_library(*, reload: bool = False,
         else:
             needs_io.append(store._meta_dict(tid))
         if time.perf_counter() - t0 >= _SLICE_S:
+            # (matched so far: every track looked at but those still to read)
+            _tell("matching", len(sid_track_ids) - len(needs_io), n_all)
             await asyncio.sleep(_PAUSE_S)
             t0 = time.perf_counter()
     scanned = len(sid_track_ids)
+    io_done = 0
     # Valid durations of a track without HVSC lengths — kept so its
     # conversion-cache entries survive — from its stored fields (which the
     # join doesn't write for it): read at the reconcile below.
@@ -223,9 +257,13 @@ async def apply_hvsc_to_library(*, reload: bool = False,
             if t["id"] not in hvsc_md5:
                 # (the copy read before the files: the track as joined)
                 no_lengths[t["id"]] = (t.get("hvsc_lengths"), t.get("duration"))
+        io_done += len(part)
+        _tell("matching", scanned - len(needs_io) + io_done, n_all)
         await asyncio.sleep(_PAUSE_S)
+    _tell("matching", n_all, n_all, force=True)
 
     if updates:
+        _tell("saving", 0, len(updates), force=True)
         # On the loop thread (the store has no lock — a write from a worker
         # thread could race a scan's index maintenance), in chunks with yields
         # and batch mode for a bulk change: the shared chunked writer.

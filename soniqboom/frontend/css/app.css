@@ -170,7 +170,10 @@
   .now-playing-art,
   #ti-panel,
   #selection-bar,
-  .playlist-add-dropdown { animation: none !important; }
+  .playlist-add-dropdown,
+  #eq-panel .eq-band { animation: none !important; }
+  /* the EQ knobs' springy grow on drag */
+  #eq-panel .eq-band { transition-property: box-shadow, opacity !important; }
   /* Lyrics line transitions are pure parallax: colour shift + scale up
      of the active line.  Reduced-motion users should see the highlight
      instantly without the scale/translate easing. */
@@ -688,6 +691,65 @@ body::before {
    as a deliberate icon alongside its emoji siblings. */
 .btn-help { font-weight: 700; }
 
+/* The phone / iPad interface link: only on a touch-primary device or once the
+   desktop interface is pinned (index.html's head script sets the attributes). */
+#btn-phone-ui { display: none; font-size: 14px; padding: 0 9px; }
+:root[data-sb-touch] #btn-phone-ui,
+:root[data-sb-ui-pinned="desktop"] #btn-phone-ui { display: inline-flex; }
+/* (a finger-sized key on the touch devices it is there for, at any width) */
+:root[data-sb-touch] #btn-phone-ui { min-width: 44px; min-height: 44px; align-items: center; justify-content: center; }
+
+/* The ⋯ menu that holds the user chip, ?, 📖 and 🌐 in a narrow window (the
+   ≤900 px block below shows it and hides those keys). */
+#btn-more { display: none; font-size: 18px; padding: 0 9px; }
+.hdr-more-menu[hidden] { display: none; }
+/* (two ids: #header > *:not(#header-glow) makes the header's children relative) */
+#header > #hdr-more-menu { position: absolute; top: calc(100% + 4px); right: 8px; z-index: 5; }
+.hdr-more-menu {
+  min-width: 210px; max-width: calc(100vw - 16px); padding: 4px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-bright);
+  border-radius: 10px;
+  box-shadow: var(--glass-shadow);
+  display: flex; flex-direction: column;
+}
+.hdr-more-who {
+  padding: 8px 12px 6px; font-size: 12px; color: var(--text2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hdr-more-item {
+  display: flex; align-items: center; gap: 10px; min-height: 44px;
+  padding: 0 12px; border: none; border-radius: 6px; background: none;
+  color: var(--text0); font: inherit; font-size: 14px; text-align: left;
+  text-decoration: none; cursor: pointer;
+}
+.hdr-more-item:hover, .hdr-more-item:focus-visible { background: var(--row-hover); }
+.hdr-more-item[hidden] { display: none; }
+.hdr-more-item:disabled { opacity: 0.45; }
+.hdr-more-ico { width: 20px; text-align: center; font-weight: 700; flex: none; }
+#hdr-more-save { display: none; }   /* (≤600 px only — the ⚡ key is in the bar above that) */
+.hdr-more-ico svg { display: block; margin: 0 auto; }
+.hdr-more-item.on .hdr-more-ico { color: var(--accent); }
+
+/* The player bar's ⋯: radio, download, now-playing view and Cast fold into its
+   menu at ≤1100 px (the icon row ran out of room and scrolled them away).  The
+   menu sits above the ⋯ key (app.js places it; the bar clips its overflow). */
+#btn-bar-more { display: none; font-size: 18px; }
+.bar-more-menu { position: fixed; z-index: 650; }   /* over the side panels (600), under the EQ / Track Info overlays */
+@media (max-width: 1100px) {
+  #player-bar :is(#btn-radio, #btn-download, #btn-np-art, #btn-cast) { display: none; }
+  #player-bar #btn-bar-more { display: flex; }
+}
+/* 601–900 px: the keys share their column with the transport (185–280 px) —
+   Lyrics and Playlists fold too, and the equalizer at ≤720 px; at ≤600 px the
+   keys get a row of their own and come back. */
+@media (min-width: 601px) and (max-width: 900px) {
+  #player-bar :is(#btn-lyrics, #btn-playlist) { display: none; }
+}
+@media (min-width: 601px) and (max-width: 720px) {
+  #player-bar #btn-eq { display: none; }
+}
+
 /* Admin gear button — boxed like its header siblings (it was the one bare
    glyph in the row); the hover turn moves to the glyph so the box stays put. */
 #btn-admin { padding: 0 9px; font-size: 15px; }
@@ -1018,6 +1080,32 @@ body::before {
   white-space: nowrap;
   min-width: 80px;
 }
+/* The Scene view's keys (library.js _paintSceneTabs): one per list, the open
+   one pressed.  The bar wraps them onto their own line when narrow. */
+#group-filter-bar:has(#scene-tabs:not([hidden])) { flex-wrap: wrap; row-gap: 6px; }
+#scene-tabs[hidden] { display: none; }
+#scene-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+.scene-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text1);
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--glass-border);
+  border-radius: 7px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.scene-tab:hover { background: rgba(255,255,255,0.09); color: var(--text0); }
+.scene-tab[aria-selected="true"] {
+  color: var(--accent);
+  border-color: rgba(240,114,42,0.55);
+  background: rgba(240,114,42,0.12);
+}
+.scene-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.scene-tab-count { font-size: 10px; color: var(--text2); font-variant-numeric: tabular-nums; }
 .group-filter-search {
   flex: 1;
   max-width: 320px;
@@ -1186,12 +1274,21 @@ body::before {
 #track-table.hide-col-album-artist .col-album-artist,
 #track-table.hide-col-artist .col-artist,
 #track-table.hide-col-album .col-album,
+#track-table.hide-col-compo .col-compo,
 #track-table.hide-col-track .col-track,
 #track-table.hide-col-year .col-year,
 #track-table.hide-col-dur .col-dur,
 #track-table.hide-col-format .col-format,
 #track-table.hide-col-location .col-location,
 #track-table.hide-col-rating .col-rating { display: none !important; }
+
+/* Column headings with a short form for a narrow list (Album Artist → Alb.
+   Artist, Duration → Time) — the long ones were cut to "ALBUM A". */
+#track-table th .th-short { display: none; }
+@media (max-width: 1100px) {
+  #track-table th .th-full { display: none; }
+  #track-table th .th-short { display: inline; }
+}
 
 #track-table thead {
   position: sticky;
@@ -1304,6 +1401,7 @@ body::before {
 .col-album-artist { width: auto; }
 .col-artist       { width: auto; }
 .col-album        { width: auto; }
+.col-compo        { width: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text1); }
 .col-track        { width: 70px; text-align: center; font-variant-numeric: tabular-nums; }
 .col-year         { width: 60px; }
 .col-dur          { width: 92px; text-align: right; }
@@ -1472,13 +1570,17 @@ tr.skeleton td { pointer-events: none; }
 
 /* ── Clickable metadata cells ─────────────────────────────────────────────── */
 td.col-album-artist .cell-link,
-td.col-album .cell-link {
+td.col-artist .cell-link,
+td.col-album .cell-link,
+td.col-compo .cell-link {
   cursor: pointer;
   border-bottom: 1px solid transparent;
   transition: color 0.1s, border-color 0.1s;
 }
 td.col-album-artist .cell-link:hover,
-td.col-album .cell-link:hover {
+td.col-artist .cell-link:hover,
+td.col-album .cell-link:hover,
+td.col-compo .cell-link:hover {
   color: var(--accent);
   border-bottom-color: var(--accent-dim);
 }
@@ -2337,13 +2439,17 @@ input[type="range"]:hover::-moz-range-thumb {
 }
 
 /* ── Equalizer overlay ───────────────────────────────────────────────────── */
+/* Shared layout first, then each look under #eq-panel[data-eq-style="…"]
+   (its colours as --eq-* tokens: the canvas renderer, js/eq/<style>.js,
+   reads them from the panel). */
+/* The scrim is a plain tint: the panel's own glass does the blurring (a
+   second, full-window backdrop blur under a panel that redraws every frame
+   halved the frame rate in measurement). */
 #eq-overlay {
   position: fixed;
   inset: 0;
   z-index: 700;
-  background: rgba(0,0,0,0.65);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: rgba(0,0,0,0.55);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2351,215 +2457,741 @@ input[type="range"]:hover::-moz-range-thumb {
 #eq-overlay.hidden { display: none; }
 
 #eq-panel {
-  background: var(--panel-bg);
-  backdrop-filter: blur(40px) saturate(180%);
-  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  position: relative;
+  box-sizing: border-box;
+  width: 780px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  padding: 22px 24px 16px;
+  border-radius: 22px;
   border: 1px solid var(--glass-border);
-  border-radius: 20px;
-  box-shadow: 0 24px 64px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,255,255,0.04) inset;
-  padding: 28px 32px 34px;
-  width: 740px;
-  max-width: 96vw;
-  animation: eq-in 0.2s ease;
+  background: var(--eq-surface, var(--panel-bg));
+  backdrop-filter: blur(36px) saturate(170%);
+  -webkit-backdrop-filter: blur(36px) saturate(170%);
+  box-shadow: var(--eq-shadow, 0 24px 64px rgba(0,0,0,0.75));
+  outline: none;
+  animation: eq-in 0.22s ease;
 }
+/* The panel takes focus on open (so B works at once); it is a container, not a
+   control — no ring around the whole panel. */
+#eq-panel:focus-visible { outline: none !important; }
 @keyframes eq-in {
-  from { opacity: 0; transform: scale(0.94) translateY(-10px); }
+  from { opacity: 0; transform: scale(0.96) translateY(-8px); }
   to   { opacity: 1; transform: none; }
 }
 
-/* Header */
+/* Header: title + what's playing, then the actions */
 .eq-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 30px;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+.eq-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 180px;
+  min-width: 0;
 }
 .eq-title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 700;
   color: var(--text0);
-  flex: 1;
   letter-spacing: -0.2px;
 }
-/* The preset select, Reset and × share one 28 px row height (they were 28 / 26 /
-   29); the footer's Volume-leveling select (#eq-rg) wears the same styling as
-   the preset select instead of the bare OS control. */
-#eq-preset, #eq-rg {
+.eq-np {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.eq-np b { color: var(--text1); font-weight: 600; }
+.eq-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* The preset button, Bypass, Reset and × share one 28 px row height; the
+   footer's buttons and Volume-leveling select (#eq-rg) wear the same styling. */
+#eq-preset, #eq-rg, #eq-bypass, #eq-reset, #eq-close, #eq-autogain {
   height: 28px;
   box-sizing: border-box;
-  background: rgba(255,255,255,0.07);
+  background: var(--eq-btn-bg, rgba(255,255,255,0.07));
   border: 1px solid var(--glass-border);
-  border-radius: 7px;
+  border-radius: 8px;
   color: var(--text1);
+  font: inherit;
   font-size: 12px;
-  padding: 5px 10px;
+  font-weight: 600;
+  padding: 0 12px;
   cursor: pointer;
   outline: none;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.15s;
 }
-#eq-preset:focus, #eq-rg:focus { border-color: var(--accent); }
-#eq-reset, #eq-close {
-  height: 28px;
-  box-sizing: border-box;
-  background: rgba(255,255,255,0.07);
-  border: 1px solid var(--glass-border);
-  border-radius: 7px;
-  color: var(--text1);
-  font-size: 12px;
-  padding: 5px 12px;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s;
-}
+#eq-rg { font-weight: 500; padding: 0 10px; min-width: 110px; }
 #eq-close { font-size: 18px; padding: 0; }   /* 28×28 — see "Close (×) buttons" */
-#eq-reset:hover, #eq-close:hover { background: rgba(255,255,255,0.14); color: var(--text0); }
-
-/* Body */
-.eq-body {
-  display: flex;
-  gap: 16px;
-  align-items: flex-start;
+#eq-preset:hover, #eq-bypass:hover, #eq-reset:hover, #eq-close:hover, #eq-autogain:not(:disabled):hover {
+  background: var(--eq-btn-hover, rgba(255,255,255,0.14));
+  color: var(--text0);
+}
+#eq-rg:focus, #eq-preset:focus-visible { border-color: var(--accent); }
+#eq-autogain:disabled { opacity: 0.45; cursor: default; }
+#eq-bypass[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
-/* ReplayGain (volume-leveling) mode selector in the EQ panel footer */
+/* Preset menu (listbox with a small curve per preset) */
+.eq-preset-wrap { position: relative; }
+#eq-preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 128px;
+  justify-content: space-between;
+}
+.eq-preset-caret {
+  width: 0; height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0.7;
+}
+.eq-preset-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 5;
+  min-width: 196px;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  border-radius: 12px;
+  border: 1px solid var(--glass-border);
+  background: var(--panel-bg);
+  box-shadow: 0 14px 40px rgba(0,0,0,0.45);
+  outline: none;
+}
+.eq-preset-list.hidden { display: none; }
+.eq-preset-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text1);
+  cursor: pointer;
+  user-select: none;
+}
+.eq-preset-list li:hover, .eq-preset-list li.eq-active { background: var(--row-hover); color: var(--text0); }
+.eq-preset-list li.eq-active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent); }
+.eq-preset-list li[aria-selected="true"] { color: var(--accent); font-weight: 600; }
+.eq-preset-icon { width: 40px; height: 14px; flex-shrink: 0; overflow: visible; }
+.eq-preset-icon path { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.eq-preset-list li:not([aria-selected="true"]) .eq-preset-icon path { stroke: var(--text2); }
+
+/* The graph: canvas (grid, spectrum, curve) + one knob per band on top */
+.eq-stage {
+  position: relative;
+  height: 264px;
+  margin-top: 16px;
+  touch-action: pan-y;           /* the knobs take the touch drags (none) */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: ns-resize;
+}
+.eq-canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.eq-knobs { position: absolute; inset: 0; pointer-events: none; }
+.eq-band {
+  position: absolute;
+  left: 0; top: 0;
+  width: 14px; height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  pointer-events: auto;
+  cursor: grab;
+  outline: none;
+  touch-action: none;
+}
+.eq-band::before {               /* a finger-sized hit area around the dot */
+  content: '';
+  position: absolute;
+  inset: -12px;
+  border-radius: 50%;
+}
+.eq-band.eq-dragging { cursor: grabbing; }
+.eq-band:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 4px; }
+.eq-readout {
+  position: absolute;
+  left: 0; top: 0;
+  transform: translate(-50%, calc(-100% - 16px));
+  padding: 4px 9px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s;
+  color: var(--text0);
+  background: var(--eq-readout-bg, rgba(12,14,18,0.88));
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+.eq-readout.eq-show { opacity: 1; }
+.eq-readout.eq-below { transform: translate(-50%, 16px); }
+
+/* Band labels under the graph (frequency + gain), placed under each knob */
+.eq-labels { position: relative; height: 34px; margin-top: 2px; }
+.eq-band-label {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  line-height: 1.25;
+  pointer-events: none;
+}
+.eq-band-label .eq-freq { font-size: 11px; font-weight: 600; color: var(--text2); }
+.eq-band-label .eq-db-val { font-size: 11.5px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text1); }
+.eq-band-label[data-sign="pos"] .eq-db-val { color: var(--eq-pos-text, var(--accent)); }
+.eq-band-label[data-sign="neg"] .eq-db-val { color: var(--eq-cut, #6aa8ff); }
+
+/* Footer: clip lamp + pre-gain, volume leveling */
 .eq-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  margin-top: 16px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 8px;
   padding-top: 12px;
   border-top: 1px solid var(--border, rgba(255, 255, 255, 0.1));
 }
-.eq-rg-label {
-  font-size: 13px;
-  opacity: 0.85;
-}
-#eq-rg {
-  min-width: 110px;
-}
-
-/* dB scale */
-.eq-scale {
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  /* Total height = db-val label (20px) + gap (10px) + track (200px) + gap (10px) + freq label (18px) */
-  /* We only need to span the track itself: from just below db-val+gap to just above freq+gap */
-  height: 200px;
-  margin-top: 30px; /* skip db-val (20px) + gap (10px) */
-  align-items: flex-end;
-  flex-shrink: 0;
-}
-.eq-scale span {
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text2);
-  line-height: 1;
-  min-width: 26px;
-  text-align: right;
-}
-
-/* Bands row */
-.eq-bands {
-  display: flex;
-  justify-content: space-around;
-  gap: 0;
-  flex: 1;
-}
-
-/* Band column */
-.eq-band {
-  display: flex;
-  flex-direction: column;
+.eq-gainstage, .eq-leveling { display: flex; align-items: center; gap: 10px; }
+.eq-rg-label { font-size: 13px; opacity: 0.85; }
+.eq-pregain { font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.eq-clip {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  flex: 1;
-}
-
-/* dB value label */
-.eq-db-val {
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 700;
-  color: var(--text2);
-  text-align: center;
-  height: 20px;
-  line-height: 20px;
-  min-width: 38px;
-  transition: color 0.12s;
-}
-
-/* ── Custom vertical track ───────────────────────────────────────────────── */
-.eq-track {
-  position: relative;
-  width: 44px;
-  height: 200px;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
   border-radius: 6px;
-  background: rgba(255,255,255,0.07);
-  cursor: pointer;
-  user-select: none;
-  touch-action: none;
-  flex-shrink: 0;
-}
-
-/* 0 dB centre line */
-.eq-track::before {
-  content: '';
-  position: absolute;
-  left: 6px;
-  right: 6px;
-  top: 100px;         /* exactly half of 200px */
-  height: 1px;
-  background: rgba(255,255,255,0.22);
-  border-radius: 1px;
-  pointer-events: none;
-}
-
-/* Coloured fill between 0 dB line and thumb */
-.eq-fill {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 6px;
-  border-radius: 3px;
-  background: var(--accent);
-  pointer-events: none;
-  transition: background 0.12s;
-}
-
-/* Draggable thumb */
-.eq-thumb {
-  position: absolute;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  background: var(--text0);
-  border: 2px solid rgba(255,255,255,0.35);
-  box-shadow: 0 2px 14px rgba(0,0,0,0.6);
-  cursor: grab;
-  pointer-events: none;   /* track handles events, thumb is visual-only */
-  transition: background 0.1s, box-shadow 0.1s, transform 0.05s;
-  /* Start at 0 dB (top: 100px) set by JS */
-}
-.eq-track:hover .eq-thumb {
-  background: var(--accent);
-  border-color: var(--accent);
-  box-shadow: 0 0 18px rgba(240,114,42,0.5);
-}
-.eq-track:active .eq-thumb {
-  cursor: grabbing;
-  transform: translate(-50%, -50%) scale(1.15);
-}
-
-/* Frequency label */
-.eq-freq {
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
   color: var(--text2);
-  text-align: center;
+  border: 1px solid var(--glass-border);
+  background: var(--eq-btn-bg, rgba(255,255,255,0.05));
+  transition: background 0.1s, color 0.1s, box-shadow 0.2s;
+}
+.eq-clip::before {
+  content: '';
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--eq-lamp-off, rgba(255,255,255,0.2));
+}
+.eq-clip[data-on="true"] {
+  color: #fff;
+  background: #d93d42;
+  border-color: #ff6b6b;
+  box-shadow: 0 0 14px rgba(229,72,77,0.7);
+}
+.eq-clip[data-on="true"]::before { background: #fff; box-shadow: 0 0 6px #fff; }
+
+/* Bypassed: the knobs stay where they are, dimmed */
+#eq-panel.eq-bypassed .eq-band { opacity: 0.4; filter: saturate(0.2); }
+#eq-panel.eq-bypassed .eq-band-label .eq-db-val { opacity: 0.5; }
+
+/* ── Modern look ── */
+#eq-panel[data-eq-style="modern"] {
+  --eq-accent: var(--accent);
+  --eq-amber: #ffb347;
+  --eq-glow: #ff9a4a;
+  --eq-cut: #6aa8ff;
+  --eq-grid: rgba(255,255,255,0.055);
+  --eq-grid-strong: rgba(255,255,255,0.16);
+  --eq-label: var(--text2);
+  --eq-spec-pre: rgba(190,205,235,0.07);
+  --eq-spec-pre-line: rgba(220,228,245,0.30);
+  --eq-spec-post: var(--accent);
+  --eq-ghost: rgba(255,255,255,0.42);
+  --eq-plot-bg: rgba(255,255,255,0.022);
+  --eq-line: var(--accent);
+  --eq-line-mid: #ffb347;
+  --eq-surface:
+    radial-gradient(120% 70% at 0% 0%, rgba(240,114,42,0.12), transparent 55%),
+    radial-gradient(90% 60% at 100% 100%, rgba(255,179,71,0.06), transparent 60%),
+    linear-gradient(180deg, rgba(28,32,40,0.80), rgba(13,15,20,0.88));
+  --eq-shadow: 0 30px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05) inset;
+}
+#eq-panel[data-eq-style="modern"] .eq-band {
+  background: radial-gradient(circle at 38% 32%, #fff 0 35%, #ffe7d6 60%, #ffd2b0 100%);
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 0 12px 1px color-mix(in srgb, var(--accent) 50%, transparent),
+    0 2px 5px rgba(0,0,0,0.4);
+  transition: box-shadow 0.18s ease, transform 0.18s cubic-bezier(.34,1.56,.64,1), opacity 0.15s;
+}
+#eq-panel[data-eq-style="modern"] .eq-band:hover,
+#eq-panel[data-eq-style="modern"] .eq-band:focus-visible,
+#eq-panel[data-eq-style="modern"] .eq-band.eq-dragging {
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 0 0 9px color-mix(in srgb, var(--accent) 20%, transparent),
+    0 0 28px 7px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 2px 5px rgba(0,0,0,0.4);
+}
+#eq-panel[data-eq-style="modern"] .eq-band.eq-dragging { transform: scale(1.18); }
+#eq-panel[data-eq-style="modern"] .eq-band.eq-settle { animation: eq-settle 0.45s cubic-bezier(.3,.7,.4,1); }
+@keyframes eq-settle {
+  0%   { transform: scale(1.18); }
+  40%  { transform: scale(0.9); }
+  70%  { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+#eq-panel[data-eq-style="modern"] .eq-readout {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="modern"] {
+  --eq-amber: #f59e0b;
+  --eq-glow: #f0722a;
+  --eq-cut: #1d58b8;             /* text on the light glass: ≥ 4.5:1 */
+  --eq-pos-text: #b03f06;
+  --eq-line: #d4560c;            /* the curve line: ≥ 3:1 */
+  --eq-line-mid: #a96200;
+  --eq-grid: rgba(0,0,0,0.06);
+  --eq-grid-strong: rgba(0,0,0,0.17);
+  --eq-spec-pre: rgba(40,55,80,0.06);
+  --eq-spec-pre-line: rgba(30,40,60,0.35);
+  --eq-ghost: rgba(0,0,0,0.42);
+  --eq-plot-bg: rgba(0,0,0,0.025);
+  --eq-btn-bg: rgba(0,0,0,0.04);
+  --eq-btn-hover: rgba(0,0,0,0.09);
+  --eq-lamp-off: rgba(0,0,0,0.2);
+  --eq-readout-bg: rgba(255,255,255,0.96);
+  --eq-surface:
+    radial-gradient(120% 70% at 0% 0%, rgba(240,114,42,0.10), transparent 55%),
+    linear-gradient(180deg, rgba(255,255,255,0.86), rgba(244,246,249,0.92));
+  --eq-shadow: 0 30px 70px rgba(0,0,0,0.22), 0 0 0 1px rgba(255,255,255,0.6) inset;
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="modern"] .eq-band {
+  background: radial-gradient(circle at 38% 32%, #fff 0 45%, #fff3ea 100%);
+}
+
+/* The look switch (header) — both looks */
+.eq-style-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 28px;
+  box-sizing: border-box;
+  padding: 2px;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: var(--eq-btn-bg, rgba(255,255,255,0.07));
+}
+.eq-style-cap {
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  margin-right: 2px;
+  padding: 0 7px 0 6px;
+  border-right: 1px solid var(--glass-border);   /* a caption, not a third choice */
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+}
+.eq-style-toggle button {
+  height: 22px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text1);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
-  height: 18px;
-  line-height: 18px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.eq-style-toggle button:hover { color: var(--text0); }
+.eq-style-toggle button[aria-checked="true"] {
+  color: var(--text0);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.eq-style-toggle button:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+
+/* Retro's preset buttons + Display switch: only in that look */
+.eq-retro-row { display: none; }
+
+/* ── Retro hi-fi look ── */
+/* A 1980s graphic equaliser: brushed-metal faceplate (black in the dark
+   theme, silver in the light one), slider caps in slots, LED columns, a VFD
+   strip (js/eq/retro.js draws the slots, LEDs and display on the canvas). */
+#eq-panel[data-eq-style="retro"] {
+  --eq-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --eq-print: #cfd3d9;            /* printed legends */
+  --eq-print-2: #a3a9b2;          /* secondary legends (≥ 4.5:1 on the plate) */
+  --eq-print-dim: rgba(207,211,217,0.42);
+  --eq-plate: #1d1f22;            /* the faceplate's mid tone (contrast reference) */
+  --eq-slot: #030304;
+  --eq-slot-edge: rgba(255,255,255,0.13);
+  --eq-led-green: #3be16c;
+  --eq-led-amber: #ffb12b;
+  --eq-led-red: #ff3d33;
+  --eq-led-off: 0.15;
+  --eq-led-window: rgba(0,0,0,0.62);
+  --eq-bloom: 0.55;
+  --eq-vfd: #6ff7e9;
+  --eq-vfd-dim: #38cdbf;
+  --eq-vfd-glass: #071c1e;
+  --eq-vfd-glass-2: #020b0c;
+  --eq-vfd-bezel: #08090a;
+  --eq-lamp-off: #3b1712;
+  --eq-cut: #63cfff;
+  --eq-pos-text: #ffb44a;
+  --eq-cap-index: var(--accent);
+  --eq-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --eq-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --eq-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --eq-key-edge: #050506;
+  --eq-key-text: var(--eq-print);
+  --eq-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.018) 0 2px, transparent 2px 7px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --eq-shadow: 0 30px 80px rgba(0,0,0,0.65), inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.6);
+  border-radius: 10px;
+  border-color: #000;
+  /* An opaque plate: no glass blur to composite under a panel that redraws */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+#eq-panel[data-eq-style="retro"] .eq-title {
+  font-family: var(--eq-face);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--eq-print);
+}
+#eq-panel[data-eq-style="retro"] .eq-np { color: var(--eq-print-2); }
+#eq-panel[data-eq-style="retro"] .eq-np b { color: var(--eq-print); }
+#eq-panel[data-eq-style="retro"] .eq-stage { height: 304px; }
+
+/* Keys: chunky hardware buttons, pressed in when on */
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-reset, #eq-close, #eq-autogain, #eq-rg, #eq-vfd, .eq-preset-row button) {
+  background: var(--eq-key-bg);
+  border: 1px solid var(--eq-key-edge);
+  border-radius: 4px;
+  color: var(--eq-key-text);
+  font-family: var(--eq-face);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 1px 0 rgba(255,255,255,0.05), 0 2px 3px rgba(0,0,0,0.45);
+}
+#eq-panel[data-eq-style="retro"] #eq-close { font-size: 18px; letter-spacing: 0; }
+#eq-panel[data-eq-style="retro"] #eq-rg { text-transform: none; letter-spacing: 0.02em; font-size: 12px; }
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-reset, #eq-close, #eq-autogain, #eq-vfd, .eq-preset-row button):not(:disabled):hover,
+#eq-panel[data-eq-style="retro"] #eq-rg:hover {
+  background: var(--eq-key-bg-hover);
+  color: var(--eq-key-text);
+}
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-reset, #eq-close, #eq-autogain, #eq-vfd, .eq-preset-row button):not(:disabled):active,
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-vfd)[aria-pressed="true"],
+#eq-panel[data-eq-style="retro"] #eq-preset-row button[aria-checked="true"] {
+  background: var(--eq-key-pressed);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+  transform: translateY(1px);
+}
+#eq-panel[data-eq-style="retro"] #eq-rg:focus-visible,
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-reset, #eq-close, #eq-autogain, #eq-vfd, .eq-preset-row button):focus-visible {
+  outline: 2px solid var(--state-focus);
+  outline-offset: 2px;
+}
+/* Indicator lamps — the Retro legend: amber = engaged / selected (Bypass, the
+   preset in use, Display), green = signal / now playing, red = peak / alert
+   (CLIP); an unlit lamp is plain dark */
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-vfd, .eq-preset-row button) {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px 0 9px;
+}
+#eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-vfd, .eq-preset-row button)::before {
+  content: '';
+  flex-shrink: 0;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--eq-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6);
+  transition: background 0.08s, box-shadow 0.15s;
+}
+#eq-panel[data-eq-style="retro"] #eq-bypass[aria-pressed="true"] { color: var(--eq-led-amber); border-color: var(--eq-key-edge); }
+#eq-panel[data-eq-style="retro"] #eq-bypass[aria-pressed="true"]::before {
+  background: var(--eq-led-amber);
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--eq-led-amber) 70%, transparent), 0 0 1px #fff inset;
+}
+#eq-panel[data-eq-style="retro"] #eq-preset-row button[aria-checked="true"]::before,
+#eq-panel[data-eq-style="retro"] #eq-vfd[aria-pressed="true"]::before {
+  background: var(--eq-led-amber);
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--eq-led-amber) 70%, transparent), 0 0 1px #fff inset;
+}
+/* Light theme: a lit lamp is a deep colour in a dark ring (a glow doesn't show
+   on a silver plate — lit lamps vanished while unlit ones looked lit) */
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] :is(#eq-bypass[aria-pressed="true"], #eq-vfd[aria-pressed="true"], #eq-preset-row button[aria-checked="true"])::before {
+  background: #d27a00;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] .eq-clip[data-on="true"]::before {
+  background: #c8321f;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.45);
+}
+
+/* The look switch on the plate: a recessed two-way switch */
+#eq-panel[data-eq-style="retro"] .eq-style-toggle {
+  background: rgba(0,0,0,0.38);
+  border-color: var(--eq-key-edge);
+  border-radius: 5px;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+}
+#eq-panel[data-eq-style="retro"] .eq-style-cap,
+#eq-panel[data-eq-style="retro"] .eq-style-toggle button {
+  font-family: var(--eq-face);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--eq-print-2);
+}
+#eq-panel[data-eq-style="retro"] .eq-style-toggle button { border-radius: 3px; }
+#eq-panel[data-eq-style="retro"] .eq-style-toggle button:hover { color: var(--eq-print); }
+#eq-panel[data-eq-style="retro"] .eq-style-toggle button[aria-checked="true"] {
+  color: var(--eq-key-text);
+  background: var(--eq-key-bg);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 1px 2px rgba(0,0,0,0.6);
+}
+
+/* Slider caps: ribbed, with an index line, gliding in the slots */
+#eq-panel[data-eq-style="retro"] .eq-band {
+  width: 30px; height: 16px;
+  margin: -8px 0 0 -15px;
+  border-radius: 3px;
+  background:
+    linear-gradient(180deg, transparent 7px, var(--eq-cap-index) 7px 9px, transparent 9px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.20) 0 1px, rgba(255,255,255,0.34) 1px 2px, transparent 2px 3px),
+    linear-gradient(180deg, #f1f2f4, #c4c8ce 46%, #9ea3aa 54%, #d3d6db);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.7),
+    0 3px 0 -1px #5b5f66,
+    0 5px 9px rgba(0,0,0,0.55);
+  transition: box-shadow 0.15s ease, opacity 0.15s;
+}
+#eq-panel[data-eq-style="retro"] .eq-band:hover,
+#eq-panel[data-eq-style="retro"] .eq-band.eq-dragging {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.7),
+    0 3px 0 -1px #5b5f66,
+    0 5px 9px rgba(0,0,0,0.55),
+    0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent),
+    0 0 14px 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+#eq-panel[data-eq-style="retro"] .eq-band.eq-settle { animation: eq-retro-settle 0.2s ease-out; }
+@keyframes eq-retro-settle {
+  0%   { filter: brightness(1.18); }
+  100% { filter: none; }
+}
+#eq-panel[data-eq-style="retro"] .eq-band::before { border-radius: 6px; }
+#eq-panel[data-eq-style="retro"] .eq-readout {
+  font-family: var(--eq-face);
+  letter-spacing: 0.06em;
+  color: var(--eq-vfd);
+  background: #031110;
+  border: 1px solid #000;
+  border-radius: 4px;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--eq-vfd) 55%, transparent);
+  box-shadow: inset 0 0 10px rgba(0,0,0,0.6), 0 6px 18px rgba(0,0,0,0.4);
+}
+
+/* Printed band legends and the gain under each slot */
+#eq-panel[data-eq-style="retro"] .eq-band-label .eq-freq {
+  font-family: var(--eq-face);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--eq-print);
+}
+#eq-panel[data-eq-style="retro"] .eq-band-label .eq-db-val {
+  font-family: var(--eq-face);
+  font-size: 11px;
+  color: var(--eq-print-2);
+}
+#eq-panel[data-eq-style="retro"] .eq-band-label[data-sign="pos"] .eq-db-val { color: var(--eq-pos-text); }
+#eq-panel[data-eq-style="retro"] .eq-band-label[data-sign="neg"] .eq-db-val { color: var(--eq-cut); }
+
+/* Preset keys with lamps, then the Display switch */
+#eq-panel[data-eq-style="retro"] .eq-preset-wrap { display: none; }
+#eq-panel[data-eq-style="retro"] .eq-retro-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 6px;
+}
+.eq-preset-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.eq-row-cap {
+  margin-right: 4px;
+  font-family: var(--eq-face);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--eq-print-2);
+}
+#eq-panel[data-eq-style="retro"] :is(.eq-preset-row button, #eq-vfd) { height: 28px; cursor: pointer; }
+/* No preset matches the bands: the printed "Custom" beside the keys */
+.eq-row-custom {
+  font-family: var(--eq-face);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--eq-pos-text);
+  padding: 0 4px;
+}
+.eq-row-custom[hidden] { display: none; }
+/* Bypassed: the metal caps darken (a see-through cap would show the slot) */
+#eq-panel[data-eq-style="retro"].eq-bypassed .eq-band { opacity: 1; filter: brightness(0.55) saturate(0.2); }
+
+/* Gain stage: CLIP as a red LED with a printed legend */
+#eq-panel[data-eq-style="retro"] .eq-foot { border-top-color: rgba(0,0,0,0.55); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
+#eq-panel[data-eq-style="retro"] .eq-clip {
+  padding: 0 2px;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  font-family: var(--eq-face);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  color: var(--eq-print);
+  gap: 7px;
+}
+#eq-panel[data-eq-style="retro"] .eq-clip::before {
+  width: 9px; height: 9px;
+  background: var(--eq-lamp-off);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.08);
+}
+#eq-panel[data-eq-style="retro"] .eq-clip[data-on="true"] { background: none; border: 0; box-shadow: none; color: var(--eq-clip-text, #ff7a70); }
+#eq-panel[data-eq-style="retro"] .eq-clip[data-on="true"]::before {
+  background: var(--eq-led-red);
+  box-shadow: 0 0 8px 2px color-mix(in srgb, var(--eq-led-red) 75%, transparent), 0 0 1px #fff inset;
+}
+#eq-panel[data-eq-style="retro"] .eq-pregain { font-family: var(--eq-face); letter-spacing: 0.04em; color: var(--eq-print-2); }
+#eq-panel[data-eq-style="retro"] .eq-rg-label {
+  font-family: var(--eq-face);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--eq-print-2);
+  opacity: 1;
+}
+
+/* Light theme: a silver plate, black caps, the same dark display glass */
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] {
+  --eq-print: #23262b;
+  --eq-print-2: #3f444c;
+  --eq-print-dim: rgba(35,38,43,0.45);
+  --eq-plate: #c9ccd1;
+  --eq-slot: #101113;
+  --eq-slot-edge: rgba(255,255,255,0.85);
+  --eq-led-window: #121315;
+  --eq-led-off: 0.2;
+  --eq-bloom: 0.42;
+  --eq-lamp-off: rgba(0,0,0,0.15);
+  --eq-cut: #083f7a;
+  --eq-pos-text: #722a00;
+  --eq-clip-text: #8c0f08;
+  --eq-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --eq-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --eq-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --eq-key-edge: #8c9096;
+  --eq-key-text: #23262b;
+  --eq-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.18) 0 2px, transparent 2px 7px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --eq-shadow: 0 30px 70px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -1px 0 rgba(0,0,0,0.18);
+  border-color: #8c9096;
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] .eq-band {
+  background:
+    linear-gradient(180deg, transparent 7px, var(--eq-cap-index) 7px 9px, transparent 9px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.45) 0 1px, rgba(255,255,255,0.10) 1px 2px, transparent 2px 3px),
+    linear-gradient(180deg, #4a4d52, #2a2c30 48%, #1a1b1e 54%, #34363a);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.22),
+    0 3px 0 -1px #0e0f10,
+    0 5px 8px rgba(0,0,0,0.35);
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] .eq-style-toggle { background: rgba(0,0,0,0.10); box-shadow: inset 0 1px 2px rgba(0,0,0,0.25), 0 1px 0 rgba(255,255,255,0.7); }
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] :is(#eq-bypass, #eq-reset, #eq-close, #eq-autogain, #eq-rg, #eq-vfd, .eq-preset-row button) {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+}
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] #eq-bypass[aria-pressed="true"] { color: #5e3300; }
+:root[data-theme="light"] #eq-panel[data-eq-style="retro"] .eq-foot { border-top-color: rgba(0,0,0,0.22); box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+
+/* Narrow windows and phones */
+@media (max-width: 760px) {
+  #eq-panel { padding: 16px 14px 12px; border-radius: 18px; }
+  .eq-actions { width: 100%; }
+  .eq-preset-wrap { flex: 1 1 auto; }
+  #eq-preset { width: 100%; }
+  .eq-stage { height: 220px; }
+}
+@media (max-width: 480px) {
+  .eq-stage { height: 196px; margin-top: 12px; }
+  .eq-band-label .eq-freq { font-size: 10px; }
+  .eq-band-label .eq-db-val { font-size: 10.5px; }
+  .eq-foot { flex-direction: column; align-items: stretch; }
+  .eq-gainstage, .eq-leveling { justify-content: space-between; }
+  .eq-style-toggle { order: -1; flex: 1 1 100%; }
+  .eq-style-toggle button { flex: 1 1 0; }
+}
+@media (pointer: coarse) {
+  .eq-band { width: 20px; height: 20px; margin: -10px 0 0 -10px; }
+}
+@media (max-width: 760px) {
+  #eq-panel[data-eq-style="retro"] .eq-stage { height: 264px; }
+}
+/* The canvas' narrow layout (a stage under 520 px; engine.js sets
+   data-eq-narrow): slimmer caps in 4 px slots (retro.js) */
+#eq-panel[data-eq-style="retro"][data-eq-narrow] .eq-band { width: 22px; height: 14px; margin: -7px 0 0 -11px; }
+#eq-panel[data-eq-style="retro"][data-eq-narrow] .eq-band-label .eq-freq { font-size: 10px; letter-spacing: 0.02em; }
+#eq-panel[data-eq-style="retro"][data-eq-narrow] .eq-band-label .eq-db-val { font-size: 10px; }
+#eq-panel[data-eq-style="retro"][data-eq-narrow] .eq-preset-row button { padding: 0 8px 0 7px; gap: 5px; }
+@media (max-width: 480px) {
+  #eq-panel[data-eq-style="retro"] .eq-stage { height: 240px; }
 }
 
 /* ── Admin overlay ────────────────────────────────────────────────────────── */
@@ -3967,6 +4599,7 @@ body.ti-open {
   font-family: "SF Mono", "Menlo", "Monaco", monospace;
 }
 .ti-instrument {
+  flex: none;            /* (overflow: hidden lets a flex item shrink below its text: a long list squashed its rows instead of scrolling) */
   font-size: 10px;
   color: var(--text2);
   padding: 2px 0;
@@ -4760,7 +5393,7 @@ tr.dragging { opacity: 0.4; }
 #playlist-panel.pl-readonly .queue-remove-btn,
 #playlist-panel.pl-readonly #pl-sel-bar,
 #playlist-panel.pl-readonly #playlist-drop-zone { display: none !important; }
-.pl-import-dialog { min-width: 320px; max-width: 460px; }
+.pl-import-dialog { min-width: 340px; max-width: 520px; }
 .pl-import-hint { font-size: 12px; color: var(--text2); margin: 4px 0 10px; }
 .pl-import-list { max-height: 50vh; overflow-y: auto; margin-bottom: 12px; }
 .pl-import-row {
@@ -4773,6 +5406,23 @@ tr.dragging { opacity: 0.4; }
   cursor: pointer;
 }
 .pl-import-meta { margin-left: auto; font-size: 11px; color: var(--text2); white-space: nowrap; }
+.pl-import-section { font-size: 12px; font-weight: 600; color: var(--text0); margin-top: 6px; }
+.pl-import-file { margin-bottom: 10px; }
+.pl-import-result { font-size: 12px; color: var(--text1); margin-bottom: 12px; }
+.pl-import-result[hidden] { display: none; }
+.pl-import-done { color: var(--text0); margin-bottom: 6px; }
+.pl-import-missing {
+  list-style: none;
+  max-height: 22vh;
+  overflow-y: auto;
+  margin: 0 0 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.pl-import-missing li { display: flex; gap: 8px; padding: 2px 0; min-width: 0; }
+.pl-import-missing li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl-import-open { margin-top: 4px; }
 #btn-playlist-close {
   background: none;
   border: none;
@@ -5249,6 +5899,10 @@ tr.dragging { opacity: 0.4; }
   text-overflow: clip;
 }
 .vu-meters[data-preset="roomy"] .vu-col-label { font-size: 10px; }
+/* A thinned-out scale (app.js labelStep): numbers overflow their narrow
+   column centred over it instead of being clipped; the rest are dots. */
+.vu-meters:not([data-label-step="1"]) .vu-col-label { overflow: visible; display: flex; justify-content: center; }
+.vu-col-label.vu-col-dot { opacity: 0.55; }
 
 .vu-col-pan {
   font-size: 8px;
@@ -5989,6 +6643,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .ti-report > button {
   background: transparent; color: var(--text1); border: 0; border-right: 1px solid var(--glass-border, var(--bg4));
   padding: 2px 9px; font: inherit; font-size: 12px; cursor: pointer;
+  white-space: nowrap;           /* "No problem" on one line, never "NO / PROBLEM" */
 }
 .ti-report > button:last-child { border-right: 0; }
 .ti-report > button[aria-pressed="true"] { background: var(--accent); color: #111; font-weight: 600; }   /* (dark on the accent: ≥ 4.5:1) */
@@ -6843,6 +7498,14 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   margin-right: 2px;
 }
 
+/* A party's list: the first entry of each competition starts its group */
+/* (an inset shadow, not a border: every row keeps the virtual list's one height) */
+#track-table tbody tr.compo-group-first > td {
+  box-shadow: inset 0 2px 0 rgba(240,114,42,0.35);
+}
+#track-table tbody tr.compo-group-first td.col-compo { color: var(--text0); font-weight: 600; }
+:root[data-theme="light"] #track-table tbody tr.compo-group-first > td { box-shadow: inset 0 2px 0 rgba(138,58,8,0.4); }
+
 /* Non-primary tracks are slightly dimmed to emphasize the primary */
 #track-table tbody tr.dup-variant {
   opacity: 0.65;
@@ -6931,10 +7594,13 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   text-underline-offset: 2px;
 }
 .admin-hint a:hover { text-decoration-thickness: 2px; }
+/* The chosen SoundFont can't be found (admin.js loadSoundfonts) */
+.admin-hint.sf-missing-note { margin: 0 0 8px; color: var(--danger); font-weight: 600; }
 /* The light admin panel: hint text on --text2 (4.5:1 on every light
    surface) and links in a darker orange (5.1:1 on --bg2 and lighter). */
 :root[data-theme="light"] .admin-hint { color: var(--text2); }
 :root[data-theme="light"] .admin-hint a { color: #a8480c; }
+:root[data-theme="light"] .admin-hint.sf-missing-note { color: #b42318; }
 
 /* ── External sources (Admin → Library): one card per archive ───────────── */
 .ext-intro { margin-top: 0; }
@@ -7688,12 +8354,125 @@ body.auth-blocked > #app {
 .hvsc-status.on  { color: #6bc8f0; }
 .hvsc-status.off { color: var(--text2); }
 :root[data-theme="light"] .hvsc-status.on { color: #1e5274; }
+.hvsc-status.busy { color: var(--accent); }
 .hvsc-status::before {
   content: '';
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+}
+
+/* The HVSC check under way (admin.js _hvscRenderJob): the three steps
+   (✓ done / ● now / ○ to do — shape and weight, not colour alone), a title
+   with the percentage, the bar (determinate, or a moving band while the size
+   is unknown — a still, dimmed full bar under reduced motion) and the bytes /
+   tracks line; then how it ended, with Retry. */
+.hvsc-job {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-bright);
+  border-radius: 8px;
+  background: var(--row-hover);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.hvsc-steps {
+  list-style: none;
+  margin: 0 0 2px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+  color: var(--text2);
+}
+/* (the glyphs aren't read out — each step's state is, from its .sr-only) */
+.hvsc-steps li::before { content: '○ '; content: '○ ' / ''; }
+.hvsc-steps li[data-state="done"]::before { content: '✓ '; content: '✓ ' / ''; }
+.hvsc-steps li[data-state="now"]::before { content: '● '; content: '● ' / ''; color: var(--accent); }
+.hvsc-steps li[data-state="now"] { color: var(--text0); font-weight: 600; }
+.hvsc-steps li[data-state="done"] { color: var(--text1); }
+.hvsc-job-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.hvsc-job-title {
+  font-size: 13px;
+  color: var(--text0);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.hvsc-job-pct {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text0);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.hvsc-job-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--border-bright);
+}
+.hvsc-job-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.hvsc-job-bar.indeterminate .hvsc-job-fill {
+  position: absolute;
+  left: 0;
+  width: 35%;
+  animation: hvsc-job-sweep 1.4s ease-in-out infinite;
+}
+@keyframes hvsc-job-sweep {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(290%); }
+}
+.hvsc-job-detail {
+  font-size: 12px;
+  color: var(--text1);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.hvsc-job-detail:empty { display: none; }
+.hvsc-outcome {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+.hvsc-outcome > span { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.hvsc-outcome::before { flex: none; }
+.hvsc-outcome-btn { flex: none; }
+/* (no clicks while a check runs — and it shows) */
+#hvsc-section button:disabled { opacity: 0.5; }
+/* (light theme: the result colours darkened to a 4.5:1 contrast) */
+:root[data-theme="light"] .admin-msg.ok   { color: #1d6b43; }
+:root[data-theme="light"] .admin-msg.warn { color: #7a5200; }
+:root[data-theme="light"] .admin-msg.err  { color: #a52a22; }
+.hvsc-job:focus, .hvsc-outcome:focus { outline: none; }
+.hvsc-job:focus-visible, .hvsc-outcome:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .hvsc-job-fill { transition: none; }
+  /* (still stripes, not a full bar that reads as finished) */
+  .hvsc-job-bar.indeterminate .hvsc-job-fill {
+    animation: none;
+    width: 100%;
+    background: repeating-linear-gradient(-45deg, var(--accent) 0 6px, transparent 6px 12px);
+    opacity: 0.7;
+  }
 }
 
 /* ── Skeleton screen for the track list ──────────────────────────────── */
@@ -7944,6 +8723,13 @@ body.auth-blocked > #app {
 /* Compact layout: sidebar becomes an off-canvas drawer toggled by the
    hamburger button.  The drawer overlays the content rather than
    re-flowing, so the table keeps its width. */
+/* 901–1200 px: the left flank is ~290–380 px, and a full-height cover left the
+   title (and the Retro meter in it) under 100 px — a smaller cover gives them
+   the room; the flanks keep their widths, so the transport stays centred. */
+@media (min-width: 901px) and (max-width: 1200px) {
+  .player-art-info .art-thumb { width: 104px; height: 104px; }
+  .player-art-info .art-thumb .art-placeholder { font-size: 54px; }
+}
 @media (max-width: 900px) {
   #sidebar {
     position: fixed;
@@ -8007,7 +8793,12 @@ body.auth-blocked > #app {
     padding: 8px 12px;
   }
   #player-bar > * { min-width: 0; }
-  .now-playing-art-info { flex: 1 1 100%; }
+  /* Cover, title and ⓘ get a row of their own (the 32 % / 260 px flank left
+     the title a few px wide), with a small cover — the bar-height one would
+     fill the row, and at ≤600 px --player-h is auto, which voids its size. */
+  .player-art-info { flex: 1 1 100%; width: auto; min-width: 0; max-width: none; }
+  .player-art-info .art-thumb { width: 48px; height: 48px; }
+  .player-art-info .art-thumb .art-placeholder { font-size: 26px; }
   .player-controls { flex: 1 1 auto; justify-content: center; }
   .player-right { flex: 0 0 auto; gap: 8px; margin-bottom: 0; }
 }
@@ -8040,6 +8831,35 @@ body.auth-blocked > #app {
   .track-skeleton .skel-row .skel-cell-title  { flex: 1 1 auto; }
 }
 
+/* Compact layout (≤900 px, as the sidebar drawer): with the ≤1024 px 44 px
+   keys the header's key row left the search field 44–89 px while a search was
+   typed at 761–820 px, 44 px below ~600 px (and pushed the gear off-screen
+   below ~490 px).  The search field gets the room: the user chip, ?, 📖 and 🌐 fold
+   into the ⋯ menu (app.js), Save search keeps only its ⚡ and the scan badge
+   floats under the header. */
+@media (max-width: 900px) {
+  #header .search-wrap { flex: 1 1 0; min-width: 0; }
+  #header .header-actions { flex: none; }
+  #header .header-actions > #user-chip,
+  #btn-welcome, #btn-docs, #btn-links { display: none; }
+  #btn-more { display: inline-flex; }
+  #search-save-smart .hdr-label { display: none; }
+  /* The suggestions span the window under the header, not the narrow field
+     (fixed: #header's backdrop-filter makes the header their box, full width) */
+  #header .search-preview { position: fixed; top: calc(var(--header-h) + 4px); left: 8px; right: 8px; margin-top: 0; }
+  /* …and paint over the scan badge below (both header children are z 1 via
+     #header > *, and .header-actions comes later) */
+  #header > div.search-wrap:not(#header-glow) { z-index: 2; }
+  /* (a pill under the header's right end — in the key row it left the search
+     field none; .header-actions is relative via #header > *) */
+  #header .header-actions > .scan-badge {
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 4;
+    max-width: calc(100vw - 16px); overflow: hidden; text-overflow: ellipsis;
+    background: linear-gradient(rgba(240,114,42,0.14), rgba(240,114,42,0.14)), var(--panel-bg);
+    box-shadow: var(--glass-shadow);
+  }
+}
+
 /* Phone-width fallback (rare — phones usually hit /m, but a user who
    forced ?ui=desktop still lands here).  Compress the header, hide the
    admin overlay's heavy padding, and let dialogs use the full viewport. */
@@ -8052,9 +8872,11 @@ body.auth-blocked > #app {
     padding: 0 8px;
     gap: 6px;
   }
-  #header .header-search { flex: 1 1 0; min-width: 0; }
   #header .header-actions { gap: 4px; }
   #header .logo-text { display: none; }
+  /* Save search is a ⋯ menu item here (its ⚡ key left a phone's field ~75 px) */
+  #search-save-smart { display: none; }
+  #hdr-more-save:not([hidden]) { display: flex; }
   #admin-overlay {
     width: 100vw;
     height: 100vh;
@@ -8069,6 +8891,8 @@ body.auth-blocked > #app {
   /* Drop more columns: title + artist + duration only. */
   #track-table th.col-album,
   #track-table td.col-album,
+  #track-table th.col-compo,
+  #track-table td.col-compo,
   #track-table th.col-track,
   #track-table td.col-track { display: none; }
   #track-table { font-size: 13px; }
@@ -8864,13 +9688,21 @@ body.auth-blocked > #app {
   border-radius: 12px; overflow: hidden;
   background: #1a1d22 url('data:image/svg+xml;utf8,') center/cover;
 }
+/* The cover over the track's format icon (radio.js): the <img> shows once it
+   has loaded — with no art, or until a network-share cover arrives, the icon
+   shows (never the browser's broken-image glyph). */
+#radio-art-ph {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: clamp(56px, 12vmin, 150px); line-height: 1;
+  opacity: 0.55;
+}
 #radio-art {
   position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: cover; filter: brightness(0.82);
+  opacity: 0; transition: opacity 0.2s;
 }
-/* No cover (radio.js drops the src on a load error): show the wrap's plain
-   backdrop, not the browser's broken-image glyph — as .now-playing-art does. */
-#radio-art:not([src]) { display: none; }
+#radio-art.loaded { opacity: 1; }
 #radio-scope {
   position: absolute; inset: 0; width: 100%; height: 100%;
   pointer-events: none; mix-blend-mode: screen;
@@ -8908,11 +9740,17 @@ body.auth-blocked > #app {
   display: flex; align-items: center; gap: 10px;
   padding: 5px 8px; border-radius: 8px; cursor: pointer; font-size: 13px;
 }
-.radio-upnext-art {
-  width: 30px; height: 30px; flex-shrink: 0;
-  border-radius: 6px; object-fit: cover; background: #1a1d22;
+.radio-upnext-thumb {
+  position: relative; width: 30px; height: 30px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; overflow: hidden; background: #1a1d22;
+  font-size: 16px; line-height: 1;
 }
-.radio-upnext-art.noart { visibility: hidden; }
+.radio-upnext-art {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; opacity: 0;
+}
+.radio-upnext-art.loaded { opacity: 1; }
 #radio-upnext-list li:hover { background: rgba(255, 255, 255, 0.06); }
 .radio-upnext-title { flex: 1; color: #cfd3da; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .radio-upnext-artist { color: #828a98; flex-shrink: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -9108,6 +9946,12 @@ body.auth-blocked > #app {
 :root[data-theme="light"] .ctrl-toggle.on { color: #8a3a08; }
 :root[data-theme="light"] .browse-play-btn { border: 1px solid rgba(20, 90, 130, 0.7); }   /* ≥3:1 boundary */
 :root[data-theme="light"] .btn-best-match { color: #8a3a08; border-color: rgba(20, 90, 130, 0.7); }
+/* (Modern only: Retro hi-fi draws its keys in frame-styles.css) */
+:root[data-theme="light"]:not([data-ui-style="retro"]) .scene-tab { background: rgba(0,0,0,0.035); border-color: rgba(0,0,0,0.22); }
+:root[data-theme="light"]:not([data-ui-style="retro"]) .scene-tab:hover { background: rgba(0,0,0,0.07); }
+:root[data-theme="light"]:not([data-ui-style="retro"]) .scene-tab[aria-selected="true"] {
+  color: #8a3a08; border-color: rgba(138,58,8,0.6); background: rgba(240,114,42,0.12);
+}
 
 /* A short window (half-height browser, phone in landscape) must still reach Save. */
 .pl-modal-dialog { max-height: 86vh; overflow-y: auto; }

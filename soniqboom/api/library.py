@@ -564,8 +564,11 @@ async def add_library_dir(body: dict, _admin=Depends(require_admin)):
     raw = body.get("path", "").strip()
     if not raw:
         raise HTTPException(400, "path is required")
-    path = str(Path(raw).expanduser().resolve())
-    if not Path(path).is_dir():
+    def _check() -> "tuple[str, bool]":       # (a realpath and a stat: off the loop)
+        p = str(Path(raw).expanduser().resolve())
+        return p, Path(p).is_dir()
+    path, is_dir = await asyncio.to_thread(_check)
+    if not is_dir:
         raise HTTPException(400, f"Directory not found: {path}")
     await upsert_scan_dir(path)
 
@@ -599,7 +602,7 @@ async def remove_library_dir(body: dict, _admin=Depends(require_admin)):
     raw = body.get("path", "").strip()
     if not raw:
         raise HTTPException(400, "path is required")
-    path = str(Path(raw).expanduser().resolve())
+    path = await asyncio.to_thread(lambda: str(Path(raw).expanduser().resolve()))
     await delete_scan_dir(path)
     try:
         from soniqboom.core import watcher
@@ -621,7 +624,8 @@ async def scan_library(body: dict | None = None, _admin=Depends(require_admin)):
     - Otherwise scan all registered dirs.
     """
     if body and body.get("dirs"):
-        dirs = [str(Path(d).expanduser().resolve()) for d in body["dirs"]]
+        dirs = await asyncio.to_thread(
+            lambda: [str(Path(d).expanduser().resolve()) for d in body["dirs"]])
     else:
         scan_dir_docs = await list_scan_dirs()
         dirs = [d["path"] for d in scan_dir_docs]
@@ -744,14 +748,24 @@ async def library_counts(request: Request):
     ``tracks`` / ``visible`` as ``GET /api/tracks/count``; ``artists``,
     ``album_artists``, ``albums``, ``genres``, ``years`` = the rows of the
     matching list endpoint, without its "[No Artist]"-style bucket row
-    (``label``); ``scene_groups`` = the rows of ``/library/scene-groups``.
+    (``label``); ``scene_groups`` = the rows of ``/library/scene-groups``;
+    ``composers`` / ``games`` / ``platforms`` / ``parties`` = the rows of the
+    scene browse views (``/library/composers`` …) — ``composers`` and
+    ``parties`` null while a start still builds the search indexes.
     Same mode as the lists ("Hide duplicates", "Tracks on unavailable
     drives: Hide", "Tracks that can't be played: Hide")."""
     cached = _cache_get("counts")
+    store = get_store()
+    kw = {"primary_only": _dedup_on(store), "exclude": _hidden(store), "swap": _swap(store)}
+    # (the scene browse views follow writes the counts' key may not see — a
+    # party or composer found later: read from the store's own memo each time)
+    facets = {name: (None if facet in _SX_FACETS and store._sx_todo is not None
+                     else len(store.aggregate_facet(facet, **kw)))
+              for facet, name in _FACET_LISTS.items()}
+    if cached is not None and any(cached.get(n) != v for n, v in facets.items()):
+        cached = None
     if cached is None:
         from soniqboom.core.data import track_count
-        store = get_store()
-        kw = {"primary_only": _dedup_on(store), "exclude": _hidden(store), "swap": _swap(store)}
 
         def rows(agg) -> int:
             return sum(1 for r in agg if not r.get("label"))
@@ -766,6 +780,11 @@ async def library_counts(request: Request):
             "years": rows(store.aggregate_years(**kw)),
             "scene_groups": len(store.aggregate_scene_group(**kw)),
         }
+        # (composers / parties read search indexes a start may still be
+        # building: unknown — null — until then, never a wait here)
+        cached.update(facets)
+        if any(v is None for v in facets.values()):
+            return JSONResponse(cached, headers={"Cache-Control": "no-store"})
         _cache_set("counts", cached)
     return _etag_response(request, "counts", cached)
 
@@ -863,6 +882,37 @@ async def list_formats(request: Request):
                                          exclude=_hidden(store), swap=_swap(store))
         _cache_set("formats", cached)
     return _etag_response(request, "formats", cached)
+
+
+# The scene browse views: store facet → list name (``/library/<name>``, the
+# counts key).  Each row is ``{<facet>: name, count}``; the drill-down is
+# ``/search/filter?<facet>=name`` (``store.FACETS``).
+_FACET_LISTS = {"composer": "composers", "game": "games", "platform": "platforms",
+                "party": "parties"}
+_SX_FACETS = frozenset(("composer", "party"))
+
+
+def _facet_route(facet: str, name: str):
+    async def list_facet(request: Request):
+        store = get_store()
+        if facet in _SX_FACETS:
+            await store.search_indexes_ready()
+        # (the store's memo knows when the list changed — some of its writes
+        # move no ``_current_agg_seq``; the same rows object while it holds)
+        rows = store.aggregate_facet(facet, primary_only=_dedup_on(store),
+                                     exclude=_hidden(store), swap=_swap(store))
+        entry = _AGG_CACHE.get(name)
+        if entry is None or entry[1] is not rows:
+            _cache_set(name, rows)
+        return _etag_response(request, name, rows)
+    list_facet.__name__ = f"list_{name}"
+    list_facet.__doc__ = (f"The {name} of the library with track counts — "
+                          f"``[{{{facet}, count}}]``, sorted by name (``store.aggregate_facet``).")
+    router.add_api_route(f"/{name}", list_facet, methods=["GET"])
+
+
+for _facet, _name in _FACET_LISTS.items():
+    _facet_route(_facet, _name)
 
 
 @router.get("/scene-groups")

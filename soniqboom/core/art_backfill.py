@@ -44,6 +44,11 @@ _MP4_EXTS = {".m4a", ".mp4", ".aac", ".m4b", ".m4p"}
 _DEFAULT_FRONT = 1024 * 1024      # fallback front budget for non-MP4 formats
 
 _MAX_CONCURRENCY = 4
+# The share's lane for the range reads: a cover is asked for by what is on
+# screen (a list row, the player, Track Info), so they go before the
+# background passes' reads ("scan": length fill-in, enrichment) and after
+# playback ("stream").  (An archive member's whole-file fetch stays "scan".)
+_LANE = "browse"
 _NEG_COOLDOWN_S = 300.0           # don't retry a failed backfill for 5 minutes
 _NEG_MAX = 1024                   # prune the failure map past this many entries
 
@@ -213,14 +218,14 @@ def _fetch_remote_cover(path_str: str, file_size: int, ext: str):
     # Front-cover formats: ID3v2 (MP3) / FLAC PICTURE / Ogg comment header.
     from soniqboom.core.metadata import HEADER_BUDGET
     budget = HEADER_BUDGET.get(ext) or _DEFAULT_FRONT
-    front = source.read_partial(remote_path, budget, lane="scan")
+    front = source.read_partial(remote_path, budget, lane=_LANE)
     return _cover_from_bytes(front, ext)
 
 
 def _extract_mp4_cover(source, remote_path: str, file_size: int):
     """Locate the moov atom (front or end), fetch just it, extract covr."""
     from soniqboom.core.tag_window import mp4_window
-    compact = mp4_window(source, remote_path, file_size)
+    compact = mp4_window(source, remote_path, file_size, lane=_LANE)
     if compact is None:
         return None, None
     return _cover_from_bytes(compact, ".m4a")

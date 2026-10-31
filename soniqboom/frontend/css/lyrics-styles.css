@@ -1,0 +1,407 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   The lyrics panel — js/library.js "Lyrics panel", markup index.html #lyrics-panel
+   Two looks, the Style shared with the equalizer, Stations, Playlists, the queue
+   and the player bar (js/ui_style.js → :root[data-ui-style]); what the panel
+   shows is #lyrics-panel[data-lyrics] = loading | synced | plain | empty | error
+   | radio.
+     Modern      — the glass side panel: the lit line tinted with an accent bar,
+                   the lines before it dimmed, soft fades at the window's edges.
+     Retro hi-fi — on a brushed-metal plate (silver in the light theme):
+                   synced lyrics on a VFD teleprompter — the current line lit in
+                   the middle of the window, its neighbours dimmer, SYNC / PAUSE
+                   annunciators and a line counter; plain lyrics as a printed
+                   lyric sheet; loading as a VFD message; no lyrics (and
+                   internet radio, an error) as a short line on unlit glass.
+   Loaded after app.css: the rules here override its "Lyrics panel" block by
+   specificity.  Text ≥ 4.5:1 on its surface where it is read (the edge fades of
+   the synced window are decoration).  Focus rings stay blue (--state-focus).
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Modern ────────────────────────────────────────────────────────────────── */
+#lyrics-panel {
+  --ly-tint: rgba(240, 114, 42, 0.16);
+  border-left-color: var(--glass-border);
+}
+#lyrics-panel .lyrics-header {
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 9px 16px;
+  border-bottom: 1px solid var(--border);
+}
+#lyrics-panel .lyrics-header h3 {
+  flex: 1; min-width: 0;
+  font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none;
+  color: var(--text0);
+}
+/* where the lyrics came from, as a chip */
+#lyrics-panel .lyrics-source {
+  flex: none; max-width: 55%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 8px;
+  border: 1px solid var(--border-bright);
+  border-radius: 999px;
+  font-size: 11px; line-height: 16px;
+  color: var(--text2);
+  opacity: 1;
+}
+#lyrics-panel .lyrics-source:empty { display: none; }
+#lyrics-panel .lyrics-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  width: 28px; height: 28px; padding: 0;
+  box-sizing: border-box;
+  background: none; border: none; border-radius: 6px;
+  color: var(--text2);
+  font-size: 20px; line-height: 1;
+  cursor: pointer;
+}
+#lyrics-panel .lyrics-close:hover { color: var(--text0); background: rgba(255, 255, 255, 0.09); }
+:root[data-theme="light"] #lyrics-panel .lyrics-close:hover { background: rgba(0, 0, 0, 0.06); }
+#lyrics-panel .lyrics-close:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+
+/* The window: what scrolls is #lyrics-body inside it.  A size container, so a
+   synced list can pad itself by half the window's height (cqh) and centre its
+   first and last lines. */
+#lyrics-panel .lyrics-window {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex; flex-direction: column;
+  container-type: size;
+}
+#lyrics-panel .lyrics-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 10px 12px 14px;
+  overflow-x: hidden;
+}
+#lyrics-panel .lyrics-body:focus-visible { outline: 2px solid var(--state-focus); outline-offset: -2px; }
+#lyrics-panel .lyrics-anns,
+#lyrics-panel .lyrics-sheet-head { display: none; }
+
+#lyrics-panel .lyrics-line {
+  padding: 3px 10px 3px 10px;
+  border-radius: 6px;
+  color: var(--text1);
+}
+#lyrics-panel .lyrics-line.lyrics-gap { min-height: 0.9em; }
+/* a timed blank line (an instrumental break) shows a note */
+#lyrics-panel .lyrics-line.synced.lyrics-gap::before { content: "\266A"; }
+#lyrics-panel .lyrics-line.synced:hover { background: var(--row-hover); }
+#lyrics-panel .lyrics-line.active,
+#lyrics-panel .lyrics-line.active:hover {
+  color: var(--text0);
+  background: var(--ly-tint);
+  border-left-color: var(--accent);
+  text-shadow: 0 0 8px rgba(240, 114, 42, 0.25);
+}
+/* the lines already sung: dimmer, still ≥ 4.5:1 */
+#lyrics-panel .lyrics-line.past { color: var(--text1); opacity: 0.75; }
+#lyrics-panel .lyrics-line:focus-visible { outline: 2px solid var(--state-focus); outline-offset: -2px; }
+:root[data-theme="light"] #lyrics-panel { --ly-tint: rgba(240, 114, 42, 0.14); }
+:root[data-theme="light"] #lyrics-panel .lyrics-line.active { text-shadow: none; }
+
+/* Synced: fades at the edges, room to centre the last lines */
+#lyrics-panel[data-lyrics="synced"] .lyrics-body {
+  padding-bottom: 40cqh;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 22px, #000 calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 0, #000 22px, #000 calc(100% - 28px), transparent 100%);
+}
+#lyrics-panel :is(.lyrics-loading, .lyrics-empty) { padding: 28px 8px; opacity: 1; }
+
+/* Phone-width desktop page: the panel takes the row (no 450 px squeeze of the
+   list beside it) — a saved drag width never pushes it past the screen. */
+@media (max-width: 600px) {
+  #lyrics-panel:not([hidden]) {
+    flex: 1 1 0;
+    width: auto !important;
+    min-width: 0;
+    max-width: none;
+  }
+  #main-layout:has(> #lyrics-panel:not([hidden])) > #content { flex: 0 0 0; min-width: 0; visibility: hidden; }
+  #lyrics-panel .lyrics-resize { display: none; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   Retro hi-fi
+   ══════════════════════════════════════════════════════════════════════════════ */
+:root[data-ui-style="retro"] #lyrics-panel {
+  --ly-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --ly-serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --ly-print: #cfd3d9;                  /* printed legends */
+  --ly-print-2: #a3a9b2;                /* secondary (≥ 4.5:1 on the plate) */
+  --ly-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --ly-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --ly-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --ly-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --ly-key-edge: #050506;
+  --ly-vfd: #6ff7e9;
+  --ly-vfd-dim: #46c9bd;
+  --ly-vfd-off: #3d968d;                /* lines away from the lit one (≥ 4.5:1 on the glass) */
+  --ly-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  /* the printed sheet: a charcoal insert with cream type */
+  --ly-card: #2b2620;
+  --ly-ink: #f1e7cf;
+  --ly-ink-2: #cbbf9f;
+  --ly-rule: rgba(241, 231, 207, 0.22);
+  background: var(--ly-surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-left-color: #000;
+  color: var(--ly-print);
+}
+:root[data-theme="light"][data-ui-style="retro"] #lyrics-panel {
+  --ly-print: #23262b;
+  --ly-print-2: #3f444c;
+  --ly-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --ly-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --ly-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --ly-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --ly-key-edge: #8c9096;
+  /* a cream insert, black print */
+  --ly-card: #f4ecd6;
+  --ly-ink: #24211b;
+  --ly-ink-2: #5a5244;
+  --ly-rule: rgba(36, 33, 27, 0.30);
+  border-left-color: #8c9096;
+}
+/* app.css gives browsers without backdrop-filter an opaque --bg1 panel (!important) */
+@supports not (backdrop-filter: blur(1px)) {
+  :root[data-ui-style="retro"] #lyrics-panel { background: var(--ly-surface) !important; }
+}
+
+/* Panel chrome on the plate: printed legends, a hardware key */
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-header {
+  padding: 10px 10px 10px 16px;
+  border-bottom: 0;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-header h3 {
+  font-family: var(--ly-face); font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--ly-print);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-source {
+  border: 0; border-radius: 0; padding: 0;
+  font-family: var(--ly-face); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ly-print-2);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-close {
+  width: 26px; height: 24px;
+  border: 1px solid var(--ly-key-edge); border-radius: 4px;
+  background: var(--ly-key-bg);
+  color: var(--ly-print);
+  font-size: 17px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-close:hover { background: var(--ly-key-bg-hover); color: var(--ly-print); }
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-close:active {
+  background: var(--ly-key-pressed);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  transform: translateY(1px);
+}
+:root[data-theme="light"][data-ui-style="retro"] #lyrics-panel .lyrics-close {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-resize:hover,
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-resize.dragging { background: var(--ly-vfd-dim); }
+
+/* The window: VFD glass, dark in both themes (synced lyrics and loading; the
+   empty states' unlit glass below) */
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-window {
+  margin: 0 12px 12px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--ly-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+:root[data-theme="light"][data-ui-style="retro"] #lyrics-panel .lyrics-window {
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+/* glass: faint scan lines and a glare at the top */
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-window::after {
+  content: "";
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, transparent 28%),
+    repeating-linear-gradient(180deg, rgba(0, 0, 0, 0.16) 0 1px, transparent 1px 3px);
+  pointer-events: none;
+  z-index: 2;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-body {
+  padding: 12px 12px 14px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 247, 233, 0.22) transparent;
+}
+
+/* States: a VFD message (loading; the others unlit, below) */
+:root[data-ui-style="retro"] #lyrics-panel :is(.lyrics-loading, .lyrics-empty) {
+  padding: 34px 8px;
+  font-family: var(--ly-face); font-size: 12px; font-weight: 700;
+  letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--ly-vfd-dim);
+  opacity: 1;
+  text-shadow: 0 0 6px rgba(111, 247, 233, 0.35);
+}
+/* Nothing to show (no lyrics, internet radio, an error): the display stays
+   unlit — dark glass sized to the message, the message printed on it */
+:root[data-ui-style="retro"] #lyrics-panel:is([data-lyrics="empty"], [data-lyrics="radio"], [data-lyrics="error"]) .lyrics-window {
+  flex: none;
+  container-type: normal;
+  background: radial-gradient(120% 160% at 50% 0%, #15181a 0%, #0c0e0f 60%, #08090a 100%);
+}
+:root[data-ui-style="retro"] #lyrics-panel:is([data-lyrics="empty"], [data-lyrics="radio"], [data-lyrics="error"]) .lyrics-window::after {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0%, transparent 40%);
+}
+:root[data-ui-style="retro"] #lyrics-panel:is([data-lyrics="empty"], [data-lyrics="radio"], [data-lyrics="error"]) .lyrics-body { padding: 0 12px; }
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-empty {
+  padding: 16px 4px;
+  color: #8f9a9a;                       /* unlit (≥ 4.5:1 on the dark glass) */
+  text-shadow: none;
+}
+
+/* ── Synced: the teleprompter ──────────────────────────────────────────────── */
+/* the reading band across the middle, with cue marks at both ends */
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-window::before {
+  content: "";
+  position: absolute; left: 0; right: 0; top: 50%;
+  height: 46px;
+  transform: translateY(-50%);
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='7' height='10'%3E%3Cpath d='M0 0l7 5-7 5z' fill='%2346c9bd'/%3E%3C/svg%3E") 4px 50% / 7px 10px no-repeat,
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='7' height='10'%3E%3Cpath d='M7 0L0 5l7 5z' fill='%2346c9bd'/%3E%3C/svg%3E") calc(100% - 4px) 50% / 7px 10px no-repeat,
+    linear-gradient(90deg, transparent 0%, rgba(111, 247, 233, 0.06) 10%, rgba(111, 247, 233, 0.06) 90%, transparent 100%);
+  border-block: 1px solid rgba(111, 247, 233, 0.10);
+  pointer-events: none;
+  z-index: 1;
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-body {
+  padding: calc(50cqh - 18px) 18px 50cqh;
+  text-align: center;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 26%, #000 74%, transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 0, #000 26%, #000 74%, transparent 100%);
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-body::-webkit-scrollbar { display: none; }
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-content {
+  font-family: var(--ly-face);
+  line-height: 1.35;
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line {
+  padding: 5px 4px;
+  border: 0; border-radius: 3px;
+  background: none;
+  font-size: 15px; font-weight: 600; letter-spacing: 0.03em;
+  color: var(--ly-vfd-off);
+  text-shadow: none;
+  transition: color 0.3s, text-shadow 0.3s;
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line.synced:hover { color: var(--ly-vfd-dim); background: rgba(111, 247, 233, 0.05); }
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line.past { opacity: 1; }
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line.near { color: var(--ly-vfd-dim); }
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line.active,
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-line.active:hover {
+  color: var(--ly-vfd);
+  background: none;
+  font-size: 17px; font-weight: 700;
+  text-shadow: 0 0 6px rgba(111, 247, 233, 0.6), 0 0 18px rgba(111, 247, 233, 0.3);
+}
+
+/* annunciators and the line counter along the top of the glass */
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="synced"] .lyrics-anns {
+  position: absolute; top: 7px; left: 10px; right: 10px;
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--ly-face); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.16em; line-height: 12px;
+  pointer-events: none;
+  z-index: 3;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-ann { color: var(--ly-vfd-off); }
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-ann-sync,
+:root[data-ui-style="retro"] #lyrics-panel.lyr-paused .lyrics-ann-pause {
+  color: var(--ly-vfd);
+  text-shadow: 0 0 6px rgba(111, 247, 233, 0.65);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-counter {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.08em;
+  color: var(--ly-vfd-dim);
+}
+
+/* ── Plain: a printed lyric sheet (nothing follows the music) ──────────────── */
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-window {
+  border: 0;
+  border-radius: 2px;
+  background:
+    radial-gradient(140% 90% at 20% 0%, rgba(255, 255, 255, 0.05), transparent 60%),
+    var(--ly-card);
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35), 0 6px 18px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+:root[data-theme="light"][data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-window {
+  background:
+    radial-gradient(140% 90% at 20% 0%, rgba(255, 255, 255, 0.45), transparent 60%),
+    var(--ly-card);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.15), 0 5px 14px rgba(0, 0, 0, 0.22), inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+/* paper, not glass: no scan lines — a fold across the middle instead */
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-window::after {
+  background: linear-gradient(180deg, transparent calc(50% - 1px), rgba(0, 0, 0, 0.10) calc(50% - 1px), rgba(255, 255, 255, 0.05) 50%, transparent calc(50% + 2px));
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-body {
+  padding: 16px 20px 22px;
+  scrollbar-color: color-mix(in srgb, var(--ly-ink-2) 45%, transparent) transparent;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-sheet-head {
+  display: block;
+  margin: 0 0 14px;
+  padding-bottom: 10px;
+  border-bottom: 3px double var(--ly-rule);
+  line-height: 1.25;
+  white-space: normal;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-sheet-head::before {
+  content: "Lyrics";
+  display: block;
+  font-family: var(--ly-face); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--ly-ink-2);
+  margin-bottom: 4px;
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-sheet-title {
+  font-family: var(--ly-serif); font-size: 19px; font-style: italic; font-weight: 600;
+  color: var(--ly-ink);
+}
+:root[data-ui-style="retro"] #lyrics-panel .lyrics-sheet-artist {
+  margin-top: 2px;
+  font-family: var(--ly-face); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--ly-ink-2);
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-content {
+  font-family: var(--ly-serif);
+  font-size: 14px; line-height: 1.6;
+  color: var(--ly-ink);
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-line {
+  padding: 0;
+  border: 0;
+  color: var(--ly-ink);
+}
+:root[data-ui-style="retro"] #lyrics-panel[data-lyrics="plain"] .lyrics-line.lyrics-gap { min-height: 0.8em; }
+
+/* Reduced motion: no glide (app.css already drops the lines' transitions;
+   library.js scrolls without animation) */
+@media (prefers-reduced-motion: reduce) {
+  #lyrics-panel .lyrics-body { scroll-behavior: auto; }
+}

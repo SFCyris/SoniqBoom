@@ -3,7 +3,10 @@
 
 /**
  * queue.js — Mobile queue view: drag handle reorder, swipe to remove,
- * tap to play.  Subscribes to Player queuechange to stay in sync.
+ * tap to play.  Subscribes to Player queuechange to stay in sync.  The header
+ * is a tape counter: the time the queue still plays (the playing track's rest
+ * and every track after it; "+" when a length is unknown or the queue's list
+ * goes on).
  */
 import { Player } from '../../player.js';
 import { attachRowGestures, attachDragReorder } from '../gestures.js';
@@ -14,13 +17,18 @@ export function mountQueue(root, ctx) {
   let _dragCleanup     = null;
 
   root.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface)">
-      <span id="m-queue-count" style="font-size:14px;color:var(--text-dim)"></span>
-      <button id="m-queue-clear" style="font-size:14px;color:var(--accent);min-height:44px;padding:0 8px">Clear</button>
+    <div class="m-queue-head">
+      <div class="m-queue-counter" id="m-queue-counter">
+        <span class="m-queue-counter-label" aria-hidden="true">Time left</span>
+        <span class="m-tape-counter" id="m-queue-left-digits" aria-hidden="true"></span>
+        <span class="sr-only" id="m-queue-left"></span>
+      </div>
+      <span class="m-queue-count" id="m-queue-count"></span>
+      <button id="m-queue-clear" class="m-key m-queue-clear" type="button">Clear</button>
     </div>
-    <div id="m-queue-offer" style="display:none;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);font-size:14px">
-      <span id="m-queue-offer-text" style="flex:1;min-width:0;overflow-wrap:anywhere;color:var(--text-dim)"></span>
-      <button id="m-queue-offer-btn" type="button" style="font-size:14px;color:var(--accent);min-height:44px;padding:0 8px">Resume</button>
+    <div id="m-queue-offer" class="m-queue-offer" style="display:none">
+      <span id="m-queue-offer-text" class="m-queue-offer-text"></span>
+      <button id="m-queue-offer-btn" class="m-key m-key-lit" type="button">Resume</button>
     </div>
     <ul class="m-list" id="m-queue-list"></ul>
     <div class="m-empty hidden" id="m-queue-empty">Queue is empty.<br><br>Tap a track in the Library or Search to start playing.</div>
@@ -33,6 +41,53 @@ export function mountQueue(root, ctx) {
   const offerEl  = root.querySelector('#m-queue-offer');
   const offerTxt = root.querySelector('#m-queue-offer-text');
   const offerBtn = root.querySelector('#m-queue-offer-btn');
+  const ctrDigits = root.querySelector('#m-queue-left-digits');
+  const ctrSr    = root.querySelector('#m-queue-left');
+
+  // ── Tape counter ────────────────────────────────────────────────────────
+  // ``_after``: seconds of the tracks after the playing one (summed per render),
+  // ``_unknown``: one of them (or the playing one) has no length, or the queue's
+  // list goes on; the playing track's rest comes from timeupdate.
+  let _after = 0, _unknown = false, _curDur = 0, _curPos = 0, _shown = '', _curItem = null;
+  function sumAhead() {
+    const q = Player.queue, idx = Player.queueIdx;
+    let sec = 0, unknown = false;
+    for (let i = Math.max(0, idx + 1); i < q.length; i++) {
+      const d = Number(q[i] && q[i].duration) || 0;
+      if (d > 0) sec += d; else unknown = true;
+    }
+    const cur = q[idx];
+    if (cur !== _curItem) { _curItem = cur; _curPos = 0; }   // (another track: its own position)
+    _curDur = Number(cur && cur.duration) || 0;
+    if (cur && !(_curDur > 0)) unknown = true;
+    const src = Player.queueSource;
+    _after = sec;
+    _unknown = unknown || !!(src && src.hasMore);
+    paintCounter();
+  }
+  function paintCounter() {
+    // (an empty queue: the counter at zero)
+    const empty = !Player.queue.length || Player.queueIdx < 0;
+    const left = empty ? 0 : Math.max(0, Math.round(_after + Math.max(0, _curDur - _curPos)));
+    const unknown = !empty && _unknown;
+    const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), sec = left % 60;
+    const txt = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+      + (unknown ? '+' : '');
+    if (txt === _shown) return;               // (timeupdate fires several times a second)
+    _shown = txt;
+    ctrDigits.replaceChildren(...[...txt].map((ch) => {
+      const d = document.createElement('i');
+      d.textContent = ch;
+      if (ch === ':' || ch === '+') d.className = 'sep';
+      return d;
+    }));
+    ctrSr.textContent = `Time left ${h ? `${h} h ` : ''}${m} min ${sec} s${unknown ? ' or more' : ''}`;
+  }
+  Player.on('timeupdate', ({ current, duration }) => {
+    _curPos = Number(current) || 0;
+    if (Number(duration) > 0) _curDur = Number(duration);
+    if (root.classList.contains('active')) paintCounter();
+  });
 
   // A queue saved on another device, on offer until something plays (the
   // "Resume the queue from …?" toast times out; this row stays).
@@ -65,6 +120,7 @@ export function mountQueue(root, ctx) {
     const q   = Player.queue;
     const idx = Player.queueIdx;
     countEl.textContent = q.length ? `${q.length} track${q.length === 1 ? '' : 's'}` : '';
+    sumAhead();
 
     if (!q.length) {
       emptyEl.classList.remove('hidden');
@@ -74,10 +130,7 @@ export function mountQueue(root, ctx) {
 
     q.forEach((t, i) => {
       const dur = document.createElement('span');
-      dur.className = 'm-row-artist';
-      dur.style.flexShrink = '0';
-      dur.style.fontSize = '12px';
-      dur.style.marginRight = '4px';
+      dur.className = 'm-row-artist m-row-trail';
       dur.textContent = fmtDur(t.duration);
 
       const row = buildTrackRow(t, { trailing: dur, showHandle: true });
@@ -101,8 +154,7 @@ export function mountQueue(root, ctx) {
     const src = Player.queueSource;
     if (src && src.hasMore && Player.queueIdx >= Player.queue.length - 1) {
       const more = document.createElement('div');
-      more.className = 'm-row-artist';
-      more.style.cssText = 'padding:14px 16px;text-align:center';
+      more.className = 'm-row-artist m-queue-more';
       more.textContent = src.mode === 'shuffled' ? 'Shuffling the rest of the list\u2026' : 'Loading the next tracks\u2026';
       listEl.appendChild(more);
     }

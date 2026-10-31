@@ -260,6 +260,7 @@ def status() -> dict:
     return {**_status, "names": names, "exists": exists,
             "games": _game_rows(db) if exists else None,
             "uses": _use_rows(db) if exists else None,
+            "compos": _compo_rows(db) if exists else None,
             "auto_apply": auto_apply_enabled(),
             "size": db.stat().st_size if exists else 0}
 
@@ -294,6 +295,44 @@ def _use_rows(db: Path) -> int | None:
             con.close()
     except Exception:                                       # noqa: BLE001
         return None
+
+
+def _compo_rows(db: Path) -> int | None:
+    """Music productions with a known party competition; None for an index
+    built before the competitions were kept (refreshing it adds them)."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if not (_has_table(con, "music_use") and _has_column(con, "music_use", "compo")):
+                return None
+            # (one row per composer: a tune of two composers counts once)
+            return con.execute("SELECT COUNT(*) FROM (SELECT DISTINCT ptoks, party, compo, place "
+                               "FROM music_use WHERE compo != '')").fetchone()[0]
+        finally:
+            con.close()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(r[1] == column for r in con.execute(f"PRAGMA table_info({table})"))
+
+
+def _place(position, ranking) -> int | None:
+    """A placing's place as a number: the first number of Demozoo's
+    ``ranking`` — the place shown in the results ("1", "=2" for a tie,
+    "3-4"); an empty or number-less ranking (unranked, "DQ") is no place.
+    ``position`` (the results' sort order, not a place) only stands in for a
+    ranking column the dump lacks."""
+    v = ranking if ranking is not None else position
+    if v is None or v == r"\N":
+        return None
+    m = re.search(r"\d+", str(v))
+    if m:
+        n = int(m.group())
+        if 0 < n < 10000:
+            return n
+    return None
 
 
 def _has_table(con: sqlite3.Connection, name: str) -> bool:
@@ -343,24 +382,30 @@ def _demozoo_game(rows: list[tuple[frozenset, str]], ytoks: frozenset,
     return name if tk == key or tk.startswith(key + " ") else None
 
 
-def _demozoo_use(rows: list[tuple[frozenset, str, str]], ytoks: frozenset
-                 ) -> tuple[list[str] | None, str | None]:
-    """``(scene_use, scene_party)`` of a track whose composer's music
-    productions are ``rows`` (``(title _year_toks, kinds csv, party)``,
-    table ``music_use``): from the productions with EXACTLY the track's
-    title tokens — the kinds all of them share, the party all of them name.
-    ``(None, None)`` when no production has that title."""
+def _demozoo_use(rows: list[tuple], ytoks: frozenset
+                 ) -> tuple[list[str] | None, str | None, tuple | None]:
+    """``(scene_use, scene_party, compo)`` of a track whose composer's music
+    productions are ``rows`` (``(title _year_toks, kinds csv, party[,
+    (compo, place, entries)])``, table ``music_use``): from the productions
+    with EXACTLY the track's title tokens — the kinds all of them share, the
+    party all of them name, the competition entry (``(name, place,
+    entries)``) all of them name.  ``(None, None, None)`` when no production
+    has that title."""
     if not ytoks:
-        return None, None
-    hits = [(k, p) for ptoks, k, p in rows if ptoks == ytoks]
+        return None, None, None
+    hits = [r[1:] for r in rows if r[0] == ytoks]
     if not hits:
-        return None, None
+        return None, None, None
     kinds = set((hits[0][0] or "").split(",")) - {""}
-    for k, _p in hits[1:]:
-        kinds &= set((k or "").split(",")) - {""}
-    parties = {p or "" for _k, p in hits}
+    for h in hits[1:]:
+        kinds &= set((h[0] or "").split(",")) - {""}
+    parties = {h[1] or "" for h in hits}
     party = parties.pop() if len(parties) == 1 else ""
-    return (sorted(kinds) or None), (party or None)
+    compos = {h[2] if len(h) > 2 else None for h in hits}
+    compo = compos.pop() if len(compos) == 1 and party else None
+    if compo is not None and not compo[0]:
+        compo = None
+    return (sorted(kinds) or None), (party or None), compo
 
 
 def _norm(s: object) -> str:
@@ -408,7 +453,10 @@ def _parse_dump(path: Path):
     packs_of: dict[str, list[str]] = {}         # member production_id → [pack production_id]
     party_name: dict[str, str] = {}             # party id → name
     comp_party: dict[str, str] = {}             # competition id → party id
+    comp_name: dict[str, str] = {}              # competition id → name ("Oldskool Music")
     placed_in: dict[str, list[str]] = {}        # production_id → [competition id]
+    place_of: dict[tuple, int | None] = {}      # (production_id, competition id) → place
+    comp_entries: dict[str, int] = {}           # competition id → number of placings
     cur: str | None = None
     cols: list[str] | None = None
     idx: dict[str, int] = {}
@@ -422,7 +470,7 @@ def _parse_dump(path: Path):
                                                 _PROD_SOUNDTRACK, _PROD_TYPES,
                                                 _PROD_TYPE, *_USE_TABLES)):
                         cur = m.group(1)
-                        cols = [c.strip() for c in m.group(2).split(",")]
+                        cols = [c.strip().strip('"') for c in m.group(2).split(",")]
                         idx = {c: i for i, c in enumerate(cols)}
                 continue
             if line.startswith("\\."):
@@ -458,10 +506,17 @@ def _parse_dump(path: Path):
                 ii, pi = idx.get("id"), idx.get("party_id")
                 if ii is not None and pi is not None:
                     comp_party[parts[ii]] = parts[pi]
+                    ni = idx.get("name")
+                    if ni is not None:
+                        comp_name[parts[ii]] = (_unesc(parts[ni]) or "").strip()
             elif cur == _PLACING:
                 pi, ci = idx.get("production_id"), idx.get("competition_id")
                 if pi is not None and ci is not None:
                     placed_in.setdefault(parts[pi], []).append(parts[ci])
+                    comp_entries[parts[ci]] = comp_entries.get(parts[ci], 0) + 1
+                    place_of[(parts[pi], parts[ci])] = _place(
+                        parts[idx["position"]] if "position" in idx else None,
+                        parts[idx["ranking"]] if "ranking" in idx else None)
             elif cur == _PROD_SOUNDTRACK:
                 # ``production_id`` = the DEMO/intro; ``soundtrack_id`` = the
                 # MUSIC it uses.  Invert to music→[demos] for the "featured in"
@@ -657,7 +712,7 @@ def _parse_dump(path: Path):
         ks = sorted({k for k in (use_kind(type_name.get(t)) for t in tids) if k})
         if ks:
             kind_of[pid] = ",".join(ks)
-    music_uses: list[tuple[str, str, str, str]] = []
+    music_uses: list[tuple[str, str, str, str, str, int | None, int | None]] = []
     for music_id, nicks in prod_nicks.items():
         if prod_super and prod_super.get(music_id, "music") != "music":
             continue
@@ -670,14 +725,23 @@ def _parse_dump(path: Path):
             for user in (*soundtrack_of.get(music_id, ()), *packs_of.get(music_id, ())):
                 if prod_yr.get(user) == yr and user in kind_of:
                     kinds.update(kind_of[user].split(","))
-        parties = {party_name.get(comp_party.get(c, ""), "")
-                   for c in placed_in.get(music_id, ())} - {""}
+        comps = placed_in.get(music_id, ())
+        parties = {party_name.get(comp_party.get(c, ""), "") for c in comps} - {""}
         party = next(iter(parties)) if len(parties) == 1 else ""
+        # The competition it entered — when it entered ONE (at that party) —
+        # with its place and the competition's number of entries.
+        compo, place, entries = "", None, None
+        if party and len(set(comps)) == 1:
+            c = comps[0]
+            compo = comp_name.get(c, "")
+            if compo:
+                place, entries = place_of.get((music_id, c)), comp_entries.get(c)
         ytoks_str = " ".join(sorted(ytoks))
         rids = {nick_rel.get(n) for n in nicks} - {None}
         for rid in sorted(rids):
             if not _isgroup(rel.get(rid, {})):
-                music_uses.append((rid, ytoks_str, ",".join(sorted(kinds)), party))
+                music_uses.append((rid, ytoks_str, ",".join(sorted(kinds)), party,
+                                   compo, place, entries))
     return unique, ambig, prod_years, prod_soundtrack, music_games, music_uses
 
 
@@ -773,15 +837,16 @@ def refresh_index(dump_path: Path | None = None) -> dict:
             con.executemany("INSERT INTO music_game VALUES (?,?,?)", _mg_rows)
             con.execute("DROP TABLE IF EXISTS music_use")
             con.execute("CREATE TABLE music_use "
-                        "(releaser_id INTEGER, ptoks TEXT, kinds TEXT, party TEXT)")
+                        "(releaser_id INTEGER, ptoks TEXT, kinds TEXT, party TEXT, "
+                        " compo TEXT, place INTEGER, entries INTEGER)")
             con.execute("CREATE INDEX ix_music_use_rid ON music_use(releaser_id)")
             _mu_rows = []
-            for rid, ptoks, kinds, party in music_uses:
+            for rid, ptoks, kinds, party, compo, place, entries in music_uses:
                 try:
-                    _mu_rows.append((int(rid), ptoks, kinds, party))
+                    _mu_rows.append((int(rid), ptoks, kinds, party, compo, place, entries))
                 except (TypeError, ValueError):
                     continue
-            con.executemany("INSERT INTO music_use VALUES (?,?,?,?)", _mu_rows)
+            con.executemany("INSERT INTO music_use VALUES (?,?,?,?,?,?,?)", _mu_rows)
             con.commit()
         finally:
             con.close()
@@ -901,6 +966,9 @@ def collect_updates(tracks: list[dict] | None = None,
             upd["scene_use"] = None
         if t.get("scene_party"):
             upd["scene_party"] = None
+        for f in ("scene_compo", "scene_place", "scene_compo_entries"):
+            if t.get(f) is not None:
+                upd[f] = None
     # Handle lookups depend only on the artist string and the index: memoised
     # across applies (``_memos``), so a re-join after a scan re-queries only
     # artists it has not seen.
@@ -921,6 +989,7 @@ def collect_updates(tracks: list[dict] | None = None,
         ).fetchone() is not None
         has_games = _has_table(con, "music_game")
         has_uses = _has_table(con, "music_use")
+        has_compos = has_uses and _has_column(con, "music_use", "compo")
         for t in (store.all_tracks() if tracks is None else tracks):
             if not is_retro_format(t.get("format")):
                 continue
@@ -1067,21 +1136,35 @@ def collect_updates(tracks: list[dict] | None = None,
             # How the tune was used (``_demozoo_use``) — an index built before
             # the ``music_use`` table leaves the fields as they are.
             if has_uses:
-                use = party = None
+                use = party = compo = None
                 utoks = _year_toks(t.get("title"))
                 if utoks:
                     urows = use_cache.get(rid)
                     if urows is None:
-                        urows = [(frozenset((p or "").split()), k or "", pa or "")
-                                 for p, k, pa in con.execute(
-                                     "SELECT ptoks, kinds, party FROM music_use "
-                                     "WHERE releaser_id = ?", (rid,))]
+                        if has_compos:
+                            urows = [(frozenset((p or "").split()), k or "", pa or "",
+                                      (c or "", pl, en))
+                                     for p, k, pa, c, pl, en in con.execute(
+                                         "SELECT ptoks, kinds, party, compo, place, entries "
+                                         "FROM music_use WHERE releaser_id = ?", (rid,))]
+                        else:
+                            urows = [(frozenset((p or "").split()), k or "", pa or "")
+                                     for p, k, pa in con.execute(
+                                         "SELECT ptoks, kinds, party FROM music_use "
+                                         "WHERE releaser_id = ?", (rid,))]
                         use_cache[rid] = urows
-                    use, party = _demozoo_use(urows, utoks)
+                    use, party, compo = _demozoo_use(urows, utoks)
                 if (t.get("scene_use") or None) != use:
                     updates["scene_use"] = use
                 if (t.get("scene_party") or None) != party:
                     updates["scene_party"] = party
+                # (an index built before the competitions were kept leaves them)
+                if has_compos:
+                    name, place, entries = compo or (None, None, None)
+                    for f, v in (("scene_compo", name or None), ("scene_place", place),
+                                 ("scene_compo_entries", entries if name else None)):
+                        if t.get(f) != v:
+                            updates[f] = v
             if updates:
                 batch.append((t["id"], updates))
     finally:
@@ -2077,6 +2160,9 @@ def reset_enrichment() -> tuple[int, list[tuple[str, dict]]]:
             upd["scene_use"] = None
         if t.get("scene_party"):
             upd["scene_party"] = None
+        for f in ("scene_compo", "scene_place", "scene_compo_entries"):
+            if t.get(f) is not None:
+                upd[f] = None
         if ((t.get("composer") or "").strip()
                 and not (t.get("artist") or "").strip()
                 and is_retro_format(t.get("format"))

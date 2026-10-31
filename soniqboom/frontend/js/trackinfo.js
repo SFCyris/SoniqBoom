@@ -12,12 +12,13 @@
  *   TrackInfo.openSingle(track)        — open panel for a single track
  */
 import { Player }              from './player.js';
-import { artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
+import { compoLabel, parseLRC, artPlaceholderEmoji, trapFocus, isUadeAmigaTrack, ATARI_FORMAT_NAMES, PSF_FORMAT_NAMES, canEditTags, MODULE_FORMAT_NAMES, isModuleFamily, surroundLabel,
          subsongStart, subsongStartOf, subsongWireToTune, subsongTuneToWire } from './utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from './tunes.js';
 import { healthOf, healthBadge, reportedLine, foundLine, canReport, mark as healthMark, isUnplayable } from './health.js';
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
+import { onUiStyleChange, getUiStyle } from './ui_style.js';
 
 // ── Chapters (E-18) ────────────────────────────────────────────────────────
 
@@ -114,7 +115,40 @@ function _mountSignalChainFor(track) {
   } else {
     _signalChain.rebuild();
   }
+  host.querySelector('ol')?.setAttribute('role', 'list');   // (shown as a list in Retro, unbulleted)
 }
+
+// Retro: the signal path sits in the left column under the VFD strip (the
+// cover and its facts end far above the card's bottom) and reads as a row of
+// printed stages — the chain's own step list, shown (css/trackinfo-styles.css),
+// its lit stage following the drawing's.  Modern, and the stacked phone-width
+// panel, keep it last on the Info pane.
+const _stackedMq = window.matchMedia ? window.matchMedia('(max-width: 600px)') : null;
+function _placeSignalSection() {
+  const section = document.getElementById('ti-section-signal');
+  const left = document.querySelector('#ti-panel .ti-left');
+  const pane = document.getElementById('ti-meta-pane');
+  if (!section || !left || !pane) return;
+  const home = getUiStyle() === 'retro' && !_stackedMq?.matches ? left : pane;
+  if (section.parentElement !== home) home.appendChild(section);
+  _syncSignalStage();
+}
+function _syncSignalStage() {
+  const host = document.getElementById('ti-signal-chain');
+  if (!host || getUiStyle() !== 'retro') return;
+  const nodes = [...host.querySelectorAll('.viz-node')];
+  const lit = nodes.findIndex((n) => n.classList.contains('active'));
+  host.querySelectorAll('.viz-sr-only > li').forEach((li, i) => li.classList.toggle('active', i === lit));
+}
+{
+  const host = document.getElementById('ti-signal-chain');
+  if (host && typeof MutationObserver === 'function') {
+    new MutationObserver(_syncSignalStage).observe(host, { subtree: true, attributes: true, attributeFilter: ['class'] });
+  }
+}
+_placeSignalSection();
+onUiStyleChange(_placeSignalSection);
+_stackedMq?.addEventListener?.('change', _placeSignalSection);
 
 // Live re-gate: toggling the now-playing viz while the modal is open must hide
 // the WHOLE "Signal path" section (header + canvas) or re-mount it on re-enable.
@@ -180,7 +214,14 @@ function _fmtBitrate(bps) {
     ? `${(kbps / 1000).toFixed(1)} Mbps`   // lossless: e.g. "16.9 Mbps"
     : `${kbps} kbps`;
 }
+// A SID's ``channels`` counts its SID chips (1, or 2 / 3 for a 2SID / 3SID
+// tune); each chip has three voices — the voices the meter shows.
+function _sidVoices(n) { return n > 0 ? n * 3 : null; }
 function _fmtChannels(n, track) {
+  if (track && track.format === 'SID') {
+    const v = _sidVoices(n);
+    return v ? `${v} voices` : '—';
+  }
   // Module-family "channels" are VOICES (tracker channels, chip voices),
   // not a speaker layout — an 8-channel ScreamTracker module is 8 voices
   // mixed to stereo, not 7.1 Surround.  Speaker-layout labels only apply
@@ -315,7 +356,7 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
       if (chips) linksHtml = `<div style="margin-top:6px">${chips}</div>`;
     }
     host.innerHTML =
-      `<h4 style="margin:0 0 6px;font-size:13px;opacity:.85">About ${esc(info.title || artist)}</h4>` +
+      `<h4 class="ti-section-hdr ti-about-hdr">About ${esc(info.title || artist)}</h4>` +
       `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>` +
       linksHtml;
     host.hidden = false;
@@ -552,6 +593,10 @@ const _TAG_FIELDS = [
   ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
   ['album_artist', 'Album artist'], ['game', 'Game'], ['genre', 'Genre'], ['year', 'Year'],
 ];
+// The editor buttons' pencil, drawn in the button's own colour.
+const _PENCIL_SVG = '<svg class="ti-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">'
+  + '<path d="M10.8 2.2l3 3L5.5 13.5 2 14l.5-3.5z"/><path d="M9.3 3.7l3 3"/></svg>';
 function _renderTagEdit(track) {
   const wrap = document.getElementById('ti-tagedit-wrap');
   if (!wrap) return;
@@ -568,8 +613,8 @@ function _renderTagEdit(track) {
   if (!remote && canEditTags(track)) {
     const btn = document.createElement('button');
     btn.id = 'ti-edit-tags';
-    btn.textContent = '✏️ Edit tags';
-    btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+    btn.className = 'ti-tagedit-btn';
+    btn.innerHTML = `${_PENCIL_SVG}<span>Edit tags</span>`;
     btn.addEventListener('click', () => _showTagForm(track, wrap));
     wrap.appendChild(btn);
     return;
@@ -587,8 +632,8 @@ function _renderTagEdit(track) {
   // at all.
   const btn = document.createElement('button');
   btn.id = 'ti-edit-info';
-  btn.textContent = '✏️ Edit info';
-  btn.style.cssText = 'font-size:12px;padding:4px 10px;opacity:.85';
+  btn.className = 'ti-tagedit-btn';
+  btn.innerHTML = `${_PENCIL_SVG}<span>Edit info</span>`;
   btn.addEventListener('click', () => _showInfoForm(track, wrap));
   wrap.appendChild(btn);
 }
@@ -606,6 +651,7 @@ const _META_FIELDS = [
 function _showInfoForm(track, wrap) {
   wrap.innerHTML = '';
   const form = document.createElement('div');
+  form.className = 'ti-tagedit-form';
   form.style.cssText = 'display:grid;grid-template-columns:92px 1fr;gap:6px 10px;align-items:center;font-size:12.5px';
   const inputs = {};
   for (const [key, label] of _META_FIELDS) {
@@ -617,6 +663,7 @@ function _showInfoForm(track, wrap) {
     inp.value = key === 'genre'
       ? (Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || ''))
       : (track[key] ?? '');
+    inp.className = 'ti-tagedit-input';
     inp.style.cssText = 'font-size:12.5px;padding:4px 8px;min-width:0';
     inputs[key] = inp;
     form.append(lab, inp);
@@ -624,10 +671,12 @@ function _showInfoForm(track, wrap) {
   const row = document.createElement('div');
   row.style.cssText = 'grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;margin-top:4px';
   const save = document.createElement('button');
+  save.className = 'ti-tagedit-btn primary';
   save.textContent = 'Save'; save.style.cssText = 'font-size:12px;padding:4px 12px';
   const cancel = document.createElement('button');
+  cancel.className = 'ti-tagedit-btn';
   cancel.textContent = 'Cancel';
-  cancel.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.7';
+  cancel.style.cssText = 'font-size:12px;padding:4px 12px';
   cancel.addEventListener('click', () => _renderTagEdit(track));
   row.append(save, cancel);
   // One-click revert for a stamped year with a preserved original.
@@ -635,7 +684,8 @@ function _showInfoForm(track, wrap) {
       && track.year_file != null) {
     const rev = document.createElement('button');
     rev.textContent = `↺ Revert year to file (${track.year_file})`;
-    rev.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.85';
+    rev.className = 'ti-tagedit-btn';
+    rev.style.cssText = 'font-size:12px;padding:4px 12px';
     rev.addEventListener('click', () => _saveYear(track, wrap, { revert: true }));
     row.appendChild(rev);
   }
@@ -729,6 +779,7 @@ async function _saveYear(track, wrap, body) {
 function _showTagForm(track, wrap) {
   wrap.innerHTML = '';
   const form = document.createElement('div');
+  form.className = 'ti-tagedit-form';
   form.style.cssText = 'display:grid;grid-template-columns:90px 1fr;gap:6px 10px;align-items:center;font-size:12.5px';
   const inputs = {};
   for (const [key, label] of _TAG_FIELDS) {
@@ -740,6 +791,7 @@ function _showTagForm(track, wrap) {
     inp.value = key === 'genre'
       ? (Array.isArray(track.genre) ? track.genre.join(', ') : (track.genre || ''))
       : (track[key] ?? '');
+    inp.className = 'ti-tagedit-input';
     inp.style.cssText = 'font-size:12.5px;padding:4px 8px;min-width:0';
     inputs[key] = inp;
     form.appendChild(lab); form.appendChild(inp);
@@ -747,11 +799,13 @@ function _showTagForm(track, wrap) {
   const row = document.createElement('div');
   row.style.cssText = 'grid-column:1/-1;display:flex;gap:8px;margin-top:4px';
   const save = document.createElement('button');
+  save.className = 'ti-tagedit-btn primary';
   save.textContent = 'Save tags';
   save.style.cssText = 'font-size:12px;padding:4px 12px';
   const cancel = document.createElement('button');
+  cancel.className = 'ti-tagedit-btn';
   cancel.textContent = 'Cancel';
-  cancel.style.cssText = 'font-size:12px;padding:4px 12px;opacity:.7';
+  cancel.style.cssText = 'font-size:12px;padding:4px 12px';
   cancel.addEventListener('click', () => _renderTagEdit(track));
   save.addEventListener('click', async () => {
     const body = {};
@@ -939,6 +993,8 @@ function _render(track) {
   }
   _show('ti-composer',     track.composer);
   _show('ti-year',         track.year);
+  // The party it was released at — its competition and place (Demozoo).
+  _show('ti-party',        compoLabel(track) || null);
   // Mark a non-file year from its PERSISTED provenance (the Demozoo backfill or
   // a manual edit both store year_source), so the accent marker + tooltip are
   // right the moment the panel opens — no wait on the scene fetch.  _loadScene
@@ -990,6 +1046,9 @@ function _render(track) {
       : '';
   }
   _show('ti-duration', track.duration, _fmt);
+  // (Retro's VFD strip: the length by the format name — css/trackinfo-styles.css)
+  const _vfdLen = document.getElementById('ti-vfd-len');
+  if (_vfdLen) _vfdLen.textContent = track.duration > 0 ? _fmt(track.duration) : '';
   _show('ti-bpm',      track.bpm);
   _show('ti-comment',  track.comment);
   // Scene provenance from the Modland MD5 join (admin → Scene metadata) —
@@ -1015,6 +1074,7 @@ function _render(track) {
   _show('ti-channels',    track.channels,    v => _fmtChannels(v, track));
   _show('ti-bitrate',     track.bitrate,     _fmtBitrate);
   _show('ti-file-size',   track.file_size,   _fmtSize);
+  _syncStatRows(isUnplayable(track));
   // (A catalogue tune listed by the first build carries added_at 1 — it sorts
   // as the oldest — and has no meaningful "added" date: the row is hidden.)
   _show('ti-added',       (track.added_at || 0) > 86400 ? track.added_at : null, _fmtDate);
@@ -1226,12 +1286,14 @@ function _subRowHtml(tune) {
   const len = (st && Array.isArray(st.lengths)) ? _subFmtLen(st.lengths[tune - 1]) : '';
   const title = (st && st.stilTitles) ? st.stilTitles[tune - 1] : '';
   const titleHtml = title
-    ? ` <span class="ti-sub-title" title="${_escHtml(title)}">· ${_escHtml(title)}</span>`
+    ? ` <span class="ti-sub-title" title="${_escHtml(title)}"><span class="ti-sub-dot">· </span>${_escHtml(title)}</span>`
     : '';
   const shortSr = short ? `, ${len}, skipped when playing through (under ${_subShortSecs()} s)` : '';
   return `<div class="ti-sub-row${short ? ' ti-sub-row--short' : ''}" role="listitem" data-wire="${wire}" tabindex="0" aria-label="Tune ${tune}${isDef ? ' (default)' : ''}${title ? ': ' + _escHtml(title) : ''}${shortSr}">`
     + `<span class="ti-sub-eq" aria-hidden="true"><i></i><i></i><i></i></span>`
-    + `<span class="ti-sub-name">Tune ${tune}${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${short ? ` <span class="ti-sub-short" title="Under ${_subShortSecs()} s — skipped when playing through; click to play it">short</span>` : ''}${titleHtml}</span>`
+    // (The word and the number are their own spans: Retro shows the number
+    // alone on a lamp key, the rest on the line under it.)
+    + `<span class="ti-sub-name"><span class="ti-sub-word">Tune </span><span class="ti-sub-n">${tune}</span><span class="ti-sub-info">${isDef ? ' <span class="ti-sub-def">default</span>' : ''}${short ? ` <span class="ti-sub-short" title="Under ${_subShortSecs()} s — skipped when playing through; click to play it">short</span>` : ''}${titleHtml}</span></span>`
     + `<span class="ti-sub-len">${len}</span>`
     + `<span class="ti-sub-rowacts">`
     +   `<button type="button" class="ti-sub-rbtn" data-act="play" tabindex="-1" aria-label="Play tune ${tune}" title="Play">&#9654;</button>`
@@ -1267,7 +1329,30 @@ function _renderSubsongPicker(track, count, defaultTrack1, lengths, stilTitles, 
   if (moreEl) moreEl.textContent = count > SUB_CAP ? `+ ${count - SUB_CAP} more — use “jump to #”` : '';
   _subSection.hidden = false;
   _highlightPlayingSubsong();
+  // (A re-render of the same file's list — new marks, a default tune found
+  // — leaves the list where the user scrolled it.)
+  if (_subRevealFor !== track.id) { _subRevealFor = track.id; _subRevealPending = true; }
+  if (_subRevealPending) _revealPlayingSub();
 }
+
+// Scroll the tune list (only the list, never the pane) to the loaded tune's
+// row / key: once when the file's list first shows (or, if the Info pane was
+// hidden then, when it shows), when the player moves to another of its tunes,
+// and when the look changes (rows ↔ a grid of keys put it somewhere else).
+let _subRevealFor = null;               // the track whose list was revealed
+let _subRevealPending = false;          // …still to do (the list wasn't laid out)
+function _revealPlayingSub() {
+  if (!_subListEl || _subSection.hidden || !_subListEl.clientHeight) return;
+  _subRevealPending = false;
+  const row = _subListEl.querySelector('.ti-sub-row.playing');
+  if (!row) return;
+  const top = row.offsetTop - _subListEl.offsetTop;
+  const h = _subListEl.clientHeight;
+  if (top < _subListEl.scrollTop || top + row.offsetHeight > _subListEl.scrollTop + h) {
+    _subListEl.scrollTop = Math.max(0, top - Math.round((h - row.offsetHeight) / 2));
+  }
+}
+onUiStyleChange(() => { if (isOpen()) _revealPlayingSub(); });
 
 // The header's tune count, the "Add all" label and the note under the header,
 // with "Skip short tunes" on: how many tunes are passed by, or — when this
@@ -1400,7 +1485,7 @@ document.getElementById('ti-sub-addall')?.addEventListener('click', () => {
   const st = _subState; if (!st) return;
   const wires = _subPlayableWires();
   if (!wires.length) { _subNothingToPlay(); return; }
-  wires.forEach(w => Player.addToQueue(_subVirtual(st.track, w)));
+  Player.addAllToQueue(wires.map(w => _subVirtual(st.track, w)));
   const left = st.count - wires.length;
   window.Toast?.ok?.(left ? `Added ${wires.length} tunes to the queue — ${left} short left out`
                           : `Added all ${wires.length} tunes to the queue`);
@@ -1422,7 +1507,7 @@ document.addEventListener('soniqboom:availability-changed', () => {
   const st = _subState;
   if (st && isOpen()) _renderSubsongPicker(st.track, st.count, st.start, st.lengths, st.stilTitles, st.def);
 });
-Player.on?.('trackchange', () => _highlightPlayingSubsong());
+Player.on?.('trackchange', () => { _highlightPlayingSubsong(); if (isOpen()) _revealPlayingSub(); });
 Player.on?.('statechange', () => _highlightPlayingSubsong());
 
 // ── HVSC STIL commentary + SID chip badge ─────────────────────────────────────
@@ -1432,9 +1517,15 @@ Player.on?.('statechange', () => _highlightPlayingSubsong());
 // picker rows via _parseStilTitles.
 const _stilSection = document.getElementById('ti-section-stil');
 const _stilBody    = document.getElementById('ti-stil-body');
+// STIL lines its fields up in a fixed-width column ("  TITLE:", " ARTIST:")
+// and indents a field's wrapped lines under it: shown flush left, each line
+// where the source breaks it.
+function _stilText(blob) {
+  return String(blob).replace(/\r\n?/g, '\n').replace(/^[ \t]+/gm, '').trim();
+}
 function _renderStil(blob) {
   if (!_stilSection || !_stilBody) return;
-  const text = (typeof blob === 'string') ? blob.trim() : '';
+  const text = (typeof blob === 'string') ? _stilText(blob) : '';
   if (!text) { _stilSection.hidden = true; _stilBody.textContent = ''; return; }
   _stilBody.textContent = text;
   _stilSection.hidden = false;
@@ -1447,9 +1538,24 @@ const _sidChipEl    = document.getElementById('ti-sidchip');
 function _renderSidChip(model) {
   if (!_sidChipField || !_sidChipEl) return;
   const m = (typeof model === 'string') ? model.trim() : '';
+  _vfdSpec('chip', m);
   if (!m) { _sidChipField.style.display = 'none'; _sidChipEl.textContent = ''; return; }
   _sidChipEl.textContent = m;
   _sidChipField.style.display = '';
+}
+
+// Retro's VFD strip under the art: the chip (above) and the renderer that
+// plays the file (/extended ``renderer``) on one line, hidden while neither
+// is known.  (The chip there is aria-hidden — the SID chip row says it.)
+function _vfdSpec(which, value) {
+  const item = document.getElementById(`ti-vfd-${which}-item`);
+  const el = document.getElementById(`ti-vfd-${which}`);
+  const row = document.getElementById('ti-vfd-specs');
+  if (!item || !el || !row) return;
+  const v = (typeof value === 'string') ? value.trim() : '';
+  el.textContent = v;
+  item.hidden = !v;
+  row.hidden = [...row.querySelectorAll('.ti-vfd-spec')].every((i) => i.hidden);
 }
 
 // Playback problems (health.js) — a "Status" row at the top of Track Info with
@@ -1509,10 +1615,28 @@ function _renderHealth(track) {
     _reportHelp.textContent = _REPORT_HELP + (n > 1 ? ` Applies to the whole file (all ${n} tunes).` : '');
   }
 }
+// The audio facts under the cover show only what is known: a part with no
+// value is left out with its separator ("16 channels", not "16 channels · —"),
+// a row with nothing known is hidden — as are the audio facts of a track
+// that doesn't play (the note says why instead; its size stays).
+const _STAT_ROWS = [['ti-bit-depth', 'ti-sample-rate'], ['ti-channels', 'ti-bitrate'], ['ti-file-size']];
+function _syncStatRows(bad) {
+  for (const ids of _STAT_ROWS) {
+    const audio = ids[0] !== 'ti-file-size';
+    const parts = ids.map((id) => document.getElementById(id)).filter(Boolean);
+    const row = parts[0]?.closest('.ti-stat-row');
+    if (!row) continue;
+    const known = parts.map((el) => !el.classList.contains('ti-empty') && el.textContent.trim() !== '—');
+    parts.forEach((el, i) => { el.hidden = !known[i]; });
+    const sep = row.querySelector('.ti-stat-sep');
+    if (sep) sep.hidden = !known.every(Boolean);
+    row.hidden = (bad && audio) || !known.some(Boolean);
+  }
+}
 // A track that doesn't play (health.js isUnplayable: no engine decodes it,
 // an archive that can't be opened, one its renderer refused twice, a
 // package with no tune in it): the box
-// under the art says so in place of the audio facts ("— / —", "— · —"), and
+// under the art says so in place of the audio facts, and
 // no decode path is drawn.
 function _unplayableWord(t) {
   if (t.defect === 'empty') return 'No playable tunes';
@@ -1537,7 +1661,7 @@ function _renderPlayability(track) {
   const box = fmtRow ? fmtRow.parentElement : null;
   const rows = ['ti-bit-depth', 'ti-channels']
     .map((id) => document.getElementById(id)?.closest('.ti-stat-row')).filter(Boolean);
-  rows.forEach((r) => { r.hidden = bad; });
+  _syncStatRows(bad);
   let note = document.getElementById('ti-unplayable');
   if (bad && !note && box && rows[0]) {
     note = document.createElement('div');
@@ -1633,10 +1757,12 @@ async function _loadExtendedInfo(track) {
     // instead of showing the previous track's tunes.
     if (_subSection) { _subSection.hidden = true; }
     _subState = null;
+    _subRevealFor = null;                 // (its list shows the loaded tune again)
     // STIL panel + chip badge are SID-only extras — clear them up-front so a
     // non-SID track (or the early-return below) never shows the prior track's.
     _renderStil(null);
     _renderSidChip(null);
+    _vfdSpec('renderer', null);
 
     // Beyond the static tracker/SID/MIDI names: exotic-Amiga uade formats
     // (dynamic names, genre-keyed), Atari ST, and PSF console rips all
@@ -1676,12 +1802,16 @@ async function _loadExtendedInfo(track) {
         const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/extended`,
                                 _c ? { signal: _c.signal } : undefined);
         const data = await res.json();
+        if (_extendedFor !== track.id) return;          // a reply for an earlier track
 
         // Channels
         const chField = document.getElementById('ti-field-channels-ext');
         const chEl = document.getElementById('ti-channels-ext');
+        const chLabel = chField.querySelector('.ti-label');
+        const isSid = track.format === 'SID';
+        if (chLabel) chLabel.textContent = isSid ? 'Voices' : 'Channels';
         if (data.channels) {
-            chEl.textContent = data.channels;
+            chEl.textContent = isSid ? _sidVoices(data.channels) : data.channels;
             chField.style.display = '';
         } else {
             chField.style.display = 'none';
@@ -1725,6 +1855,7 @@ async function _loadExtendedInfo(track) {
         }
         _renderStil(data.stil);
         _renderSidChip(data.sid_model);
+        _vfdSpec('renderer', data.renderer);
 
         // Instruments
         const instField = document.getElementById('ti-field-instruments');
@@ -1759,6 +1890,8 @@ async function _loadChipTunes(track) {
                                 _c ? { signal: _c.signal } : undefined);
         if (!res.ok) return;
         const data = await res.json();
+        if (_extendedFor !== track.id) return;
+        _vfdSpec('renderer', data.renderer);
         const count = (data.subsongs > 1) ? data.subsongs
             : (track.subsongs > 1 ? track.subsongs : 0);
         const defaultTrack = data.default_track ?? subsongStartOf(track);
@@ -2022,6 +2155,29 @@ function _renderPatternGrid() {
   _patGridEl.innerHTML = html;
   const tbody = _patGridEl.tBodies[0];
   _pat.rowEls = tbody ? Array.from(tbody.rows) : [];
+  _patResized();
+}
+
+// Channels past the grid's right edge: the cut edge fades (css
+// .ti-pat-more-r) so it reads as "scroll for more" — short of the vertical
+// scrollbar (--ti-pat-sb, its width), which stays whole.
+function _patEdges() {
+  if (!_patWrapEl) return;
+  const w = _patWrapEl;
+  const max = w.scrollWidth - w.clientWidth;
+  w.classList.toggle('ti-pat-more-r', max > 1 && w.scrollLeft < max - 1);
+}
+function _patResized() {
+  if (!_patWrapEl) return;
+  const w = _patWrapEl;
+  const cs = getComputedStyle(w);
+  const sb = w.offsetWidth - w.clientWidth - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
+  w.style.setProperty('--ti-pat-sb', `${Math.max(0, Math.round(sb))}px`);
+  _patEdges();
+}
+if (_patWrapEl) {
+  _patWrapEl.addEventListener('scroll', _patEdges, { passive: true });
+  if (typeof ResizeObserver === 'function') new ResizeObserver(_patResized).observe(_patWrapEl);
 }
 
 function _setPlayheadRow(r) {
@@ -2147,6 +2303,7 @@ function _switchTab(tab) {
   }
   if (tab === 'lyrics') _loadLyrics(_queue[_idx]);
   else if (tab === 'scene') _loadScene(_queue[_idx]);
+  else if (_subRevealPending) _revealPlayingSub();
 }
 
 tabInfo.addEventListener('click',   () => _switchTab('info'));
@@ -2159,18 +2316,9 @@ function _setLyricsState(html) {
   lyricsPane.innerHTML = `<div id="ti-lyrics-state" class="ti-lyrics-state">${html}</div>`;
 }
 
+// The lyrics panel's parser ([offset:] applied, ID tags dropped) — timed lines only, in time order.
 function _parseLRC(text) {
-  const lines = [];
-  for (const line of text.split('\n')) {
-    const m = line.match(/^\[(\d{1,2}):(\d{2})[.:](\d{2,3})\]\s*(.*)/);
-    if (m) {
-      const min = parseInt(m[1], 10);
-      const sec = parseInt(m[2], 10);
-      const ms  = m[3].length === 2 ? parseInt(m[3], 10) * 10 : parseInt(m[3], 10);
-      lines.push({ time: min * 60 + sec + ms / 1000, text: m[4] });
-    }
-  }
-  return lines.sort((a, b) => a.time - b.time);
+  return parseLRC(text).filter(l => l.time != null).sort((a, b) => a.time - b.time);
 }
 
 function _showLyrics(data) {
@@ -2381,6 +2529,12 @@ function open(queue, idx) {
     requestAnimationFrame(() => {
       try { _focusTrapRelease = trapFocus(panel || overlay); }
       catch (_) { _focusTrapRelease = null; }
+      // Focus moves in, so keys stop reaching what the overlay covers (the
+      // lyrics panel's line keys / Esc acted behind it).
+      const root = panel || overlay;
+      if (root && !root.contains(document.activeElement)) {
+        (document.getElementById('ti-close') || root).focus({ preventScroll: true });
+      }
     });
   } catch (_) {}
 }

@@ -11,6 +11,20 @@ const amiga = (over = {}) => ({ id: 'a1', title: 'Intro', format: 'TFMX', durati
 const sid = (over = {}) => ({ id: 's1', title: 'Uridium', format: 'SID', duration: 180, ...over });
 
 // ── URLs carry the tune that is playing ───────────────────────────────────────
+test('a streaming-quality cap rides on the prewarm (the server prepares that MP3)', () => {
+  const c = makeCore();
+  const plain = new URL(c._prewarmUrl({ id: 'f', format: 'FLAC' }, true), 'http://h');
+  assert.equal(plain.searchParams.get('format'), null);
+  c.env.quality = (t) => (t.format === 'FLAC' ? { format: 'mp3', maxBitRate: '128' } : null);
+  const capped = new URL(c._prewarmUrl({ id: 'f', format: 'FLAC' }, true), 'http://h');
+  assert.equal(capped.searchParams.get('format'), 'mp3');
+  assert.equal(capped.searchParams.get('maxBitRate'), '128');
+  assert.equal(capped.searchParams.get('priority'), 'next');
+  const sidUrl = new URL(c._prewarmUrl({ id: 's', format: 'SID', subsong: 1 }, true), 'http://h');
+  assert.equal(sidUrl.searchParams.get('format'), null);
+});
+
+
 test('prewarm asks for the queued tune, not the file default', () => {
   const c = makeCore();
   const u2 = new URL(c._prewarmUrl({ id: 'x', subsong: 2, path: '/m/a.sid' }, true), 'http://h');

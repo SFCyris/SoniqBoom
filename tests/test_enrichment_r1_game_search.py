@@ -57,7 +57,7 @@ def test_album_predicate_stays_exact(store):
 
 def test_parse_emits_a_game_term_not_an_album_alias():
     assert search_api._parse_advanced_query("game:uridium") == "@game_tag:{uridium}"
-    assert search_api._parse_advanced_query("album:uridium") == "@album_tag:{uridium}"
+    assert search_api._parse_advanced_query("album:uridium") == "@album_match:{uridium}"
     # One parse path: every advanced query goes through data._parse_tag_query.
     from soniqboom.core.data import _parse_tag_query
     kw = _parse_tag_query(search_api._parse_advanced_query('game:"Uridium 2" format:SID'))
@@ -68,7 +68,10 @@ async def test_search_endpoints_resolve_game_prefix(store):
     assert _ids(await search_api.run_search_dicts("game:uridium")) == {"u2", "u2l", "ualb"}
     assert _ids(await search_api.run_search_dicts('game:"Uridium 2"')) == {"u2", "u2l"}
     assert _ids(await search_api.run_search_dicts("game:zombie")) == {"za1", "za2"}
-    assert _ids(await search_api.run_search_dicts("album:zombie")) == set()
+    # album: is a word start in the album name (the album "Zombie Attack"),
+    # never the title the game: operator also reads
+    assert _ids(await search_api.run_search_dicts("album:zombie")) == {"za1", "za2"}
+    assert _ids(await search_api.run_search_dicts("album:uridium")) == {"ualb"}
     models = await search_api.run_search("game:uridium")          # smart playlists
     assert {m.id for m in models} == {"u2", "u2l", "ualb"}
     quick = await search_api.quick_search(q="game:zombie", limit=8)   # TrackMeta-shaped dicts

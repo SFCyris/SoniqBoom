@@ -3244,13 +3244,17 @@ async def search3(
     # — the web search box's syntax, parsed by the same code: songs by the
     # predicates, artists / albums by the free-text remainder only (an
     # operator-only query matches no artists / albums, never all of them).
+    # ``plays:`` / ``played:`` read the authenticated user's plays; a ``-``
+    # term (``-format:mp3``, ``nightwish -live``) excludes songs; a quoted
+    # run of words (``"song of myself"``) must be a phrase of one field.
     adv_kw: dict | None = None
-    if q and ":" in q:
+    if q and (":" in q or "-" in q or '"' in q):
         from soniqboom.api.search import _parse_advanced_query
         adv = _parse_advanced_query(q)
         if adv:
-            from soniqboom.core.data import _parse_tag_query
-            adv_kw = _parse_tag_query(adv)
+            from soniqboom.core.data import _parse_tag_query, search_indexes_for, with_uid
+            adv_kw = with_uid(_parse_tag_query(adv), getattr(user, "id", None))
+            await search_indexes_for(adv_kw)
     text = (adv_kw.get("query") or "").lower() if adv_kw is not None else q
     ctx = _song_ctx(store, user)
     if adv_kw is not None:
@@ -5395,7 +5399,7 @@ async def get_playlist(
         # Smart playlist — evaluate the saved search live (same engine as the
         # native API) so Subsonic clients see the computed tracks too.
         from soniqboom.api.search import run_search
-        _results = await run_search(pl["query"], limit=500)
+        _results = await run_search(pl["query"], limit=500, uid=getattr(user, "id", None))
         entry_tracks = [r.model_dump() if hasattr(r, "model_dump") else r for r in _results]
         from soniqboom.core.catalogue_view import hidden_ids
         _hid = hidden_ids(store)

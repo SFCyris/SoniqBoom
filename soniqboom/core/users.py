@@ -839,9 +839,10 @@ class UserStore:
             return self._load()
 
     def disk_signature(self) -> tuple:
-        """``(inode, size, mtime_ns, ctime_ns)`` of users.json and of
+        """``(inode, size, mtime_ns, ctime_ns, mode)`` of users.json and of
         users.json.bak (None for a file that can't be stat'ed): changes when
-        either file is written, replaced, chmod'ed or chown'ed."""
+        either file is written, replaced, chmod'ed or chown'ed (the mode
+        because Linux stamps ctime from a coarse clock)."""
         out = []
         for path in (self._path, self._bak_path):
             try:
@@ -849,7 +850,7 @@ class UserStore:
             except OSError:
                 out.append(None)
                 continue
-            out.append((st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            out.append((st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode))
         return tuple(out)
 
     def adopt_from_disk(self, sessions: bool = True) -> bool:
@@ -931,7 +932,9 @@ class UserStore:
             st = path.stat()
         except OSError:
             return None
-        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        # The mode too: Linux stamps ctime from a coarse clock, so a chmod
+        # right after a write can leave every time unchanged.
+        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
 
     _UNSET = object()
 

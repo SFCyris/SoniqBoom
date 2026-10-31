@@ -9,6 +9,9 @@ import { Auth }   from '../auth.js';
 import { artPlaceholderEmoji, Toast, staticArtUrl } from '../utils.js';
 import { Offline } from '../offline.js';
 import { Health, nothingToPlayText } from '../health.js';
+// The phone page is always Retro hi-fi: mobile.html fixes <html data-ui-style>
+// (data-ui-style-fixed — js/ui_style.js, should a shared module load it, keeps
+// it and never writes the desktop page's Style).
 // UX-3 P0: mobile shell exposes the same globals desktop does so the
 // classic-script cast_picker.js can read currentTrackId + emit toasts.
 window.SoniqBoom = window.SoniqBoom || {};
@@ -93,6 +96,11 @@ function activate(viewName) {
     if (on) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
   });
   topbarTitle.textContent = v.title;
+  // (Settings has no tab key: the gear shows it pressed)
+  if (settingsBtn) {
+    settingsBtn.classList.toggle('active', viewName === 'settings');
+    if (viewName === 'settings') settingsBtn.setAttribute('aria-current', 'page'); else settingsBtn.removeAttribute('aria-current');
+  }
 
   if (!_mounted[viewName]) {
     v.mount(v.el, { showSheet, toast: showToast, navigate: activate });
@@ -120,6 +128,8 @@ function initialView() {
 }
 
 // ── Mini-player wiring ────────────────────────────────────────────────────
+// (U+FE0E: drawn as text in the key's legend colour — iOS shows ⏸ as an emoji)
+const PLAY_GLYPH = '\u25B6\uFE0E', PAUSE_GLYPH = '\u23F8\uFE0E';
 function renderMini(track) {
   // Radio takes precedence: while a station plays it's the active source.
   if (MobileRadio.active) { renderMiniStation(MobileRadio.station); return; }
@@ -138,11 +148,13 @@ function renderMini(track) {
   }
   if (cued) {
     track = cued;
-    miniPlay.textContent = '▶';
+    miniPlay.textContent = PLAY_GLYPH;
+    mini.dataset.state = 'stop';
     const dur = Number(cued.duration) || 0;
     miniProg.style.width = `${dur > 0 ? Math.min(100, ((Player.cuedSec || 0) / dur) * 100) : 0}%`;
   }
   mini.classList.remove('hidden');
+  delete mini.dataset.src;
   miniTitle.textContent  = track.title  || '—';
   miniArtist.textContent = track.artist || track.album_artist || '';
 
@@ -168,6 +180,7 @@ function renderMini(track) {
 
 function renderMiniStation(st) {
   mini.classList.remove('hidden');
+  mini.dataset.src = 'radio';
   miniTitle.textContent  = (st && st.name) || 'Radio';
   miniArtist.textContent = 'Internet radio';
   miniArt.innerHTML = '';
@@ -304,7 +317,8 @@ Player.on('cue', _renderMiniCued);
 Player.on('queuechange', _renderMiniCued);
 Player.on('statechange', ({ playing }) => {
   if (MobileRadio.active) return;         // radio owns the transport while active
-  miniPlay.textContent = playing ? '⏸' : '▶';
+  miniPlay.textContent = playing ? PAUSE_GLYPH : PLAY_GLYPH;
+  mini.dataset.state = playing ? 'playing' : 'paused';    // (the play key's lamp, mobile.css)
   // 'trackchange' fires before the source is on the element, so the very first
   // play of a session found nothing resumable and left the mini hidden: show
   // it once playback has actually started.
@@ -323,7 +337,10 @@ Player.on('timeupdate', ({ pct }) => {
 // Radio drives the mini-player when a station is the active source.
 MobileRadio.on('change', () => renderMini(Player.currentTrack));
 MobileRadio.on('state',  () => {
-  if (MobileRadio.active) miniPlay.textContent = MobileRadio.playing ? '⏸' : '▶';
+  if (MobileRadio.active) {
+    miniPlay.textContent = MobileRadio.playing ? PAUSE_GLYPH : PLAY_GLYPH;
+    mini.dataset.state = MobileRadio.playing ? 'playing' : 'paused';
+  }
 });
 
 miniPlay.addEventListener('click', (e) => {
@@ -364,6 +381,7 @@ function showSheet({ title = 'Actions', actions = [] }) {
   });
 
   _sheetOpener = document.activeElement;     // focus goes back here when the sheet closes
+  _swallowClick = _pressDown;                // (opened while a finger is still down: a long-press)
   sheet.classList.remove('hidden');
   sheetBg.classList.remove('hidden');
   (sheetList.firstElementChild || sheet.querySelector('#m-sheet-cancel'))?.focus?.();
@@ -381,6 +399,29 @@ function hideSheet() {
 }
 
 sheetBg.addEventListener('click',     hideSheet);
+// A sheet opened by a long-press: the release of that press can arrive as a
+// click on whatever now lies under the finger — the backdrop (the sheet closed
+// at once) or one of the actions (Chromium's touch emulation does this).  That
+// one click is dropped; the next press is the user's.
+let _pressDown = false, _swallowClick = false, _swallowTimer = 0;
+document.addEventListener('pointerdown', () => {
+  _pressDown = true;
+  _swallowClick = false;                 // (a new press: its click is the user's)
+}, true);
+window.addEventListener('pointerup', () => {
+  _pressDown = false;
+  // No click came after the release (a real phone usually sends none after a
+  // long-press): stop waiting for it.
+  if (_swallowClick) { clearTimeout(_swallowTimer); _swallowTimer = setTimeout(() => { _swallowClick = false; }, 400); }
+}, true);
+window.addEventListener('pointercancel', () => { _pressDown = false; _swallowClick = false; }, true);
+for (const el of [sheet, sheetBg]) {
+  el.addEventListener('click', (e) => {
+    if (!_swallowClick) return;
+    _swallowClick = false;
+    e.stopPropagation(); e.preventDefault();
+  }, true);
+}
 sheetCancel.addEventListener('click', hideSheet);
 
 // ── Toast ─────────────────────────────────────────────────────────────────

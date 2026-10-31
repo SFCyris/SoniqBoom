@@ -140,9 +140,21 @@ def register_root(root: str, *, key: str, label: str,
         _refresh_keys()
 
 
+# Moves with every change of the registry (``generation``).
+_gen = 0
+
+
+def generation() -> int:
+    """A counter that moves whenever a root is registered or unregistered —
+    what a cache of results that read the registry keys on (the search box's
+    ``source:``)."""
+    return _gen
+
+
 def _refresh_keys() -> None:
-    global _prefixes, _root_hashes, _root_list
+    global _prefixes, _root_hashes, _root_list, _gen
     import hashlib
+    _gen += 1
     lst = tuple(_roots.values())
     _root_list = lst
     _prefixes = tuple(x.prefix for x in lst)

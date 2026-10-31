@@ -247,6 +247,23 @@ def test_a_fork_while_the_pipe_is_made_does_not_hold_it_open(monkeypatch):
     assert took < 1.5, f"the end of the pipe took {took:.1f}s (held by the fork)"
 
 
+@pytest.mark.parametrize("on_uvloop", [False, True])
+def test_a_start_with_a_preexec_fn_keeps_its_own_pipe(on_uvloop):
+    """A ``preexec_fn`` (``spawn`` adds one on Linux) runs the at-fork hooks
+    in the child before it makes the pipe its stdout: that end survives them
+    (they close every other pipe's)."""
+    async def main():
+        p = await forksafe.spawn_pipe_stdout("/bin/echo", "hello", preexec_fn=lambda: None)
+        try:
+            out = await asyncio.wait_for(p.stdout.read(), 10)
+            await p.wait()
+        finally:
+            forksafe.close_stdout(p)
+        return out, p.returncode
+    got = _on_uvloop(main) if on_uvloop else asyncio.run(main())
+    assert got == (b"hello\n", 0)
+
+
 def test_cancelled_while_connecting_stays_a_cancel_and_kills_the_child():
     async def main():
         results, before = [], _open_fds()

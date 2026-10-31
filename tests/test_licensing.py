@@ -20,7 +20,8 @@ def test_collector_reads_every_pin_from_the_dockerfile():
     used = set(re.findall(r"\$\(arg (\w+)\)", COLLECTOR))
     assert used == {"PSGPLAY_COMMIT", "ZXTUNE_REV", "SC68_URL", "SC68_SHA256",
                     "UADE_URL", "UADE_SHA256", "BENCODETOOLS_REF", "LIBZAKALWE_REF",
-                    "LIBGME_URL", "LIBGME_SHA256", "LIBOPENMPT_VERSION", "LIBOPENMPT_SHA256"}
+                    "LIBGME_URL", "LIBGME_SHA256", "LIBOPENMPT_VERSION", "LIBOPENMPT_SHA256",
+                    "LIBKSS_COMMIT"}
     # (the SID chain's pins are read in a loop: ``arg "${key}_VERSION"``)
     assert 'for c in libresidfp:RESIDFP libsidplayfp:LIBSIDPLAYFP sidplayfp:SIDPLAYFP' in COLLECTOR
     used |= {f"{k}_{f}" for k in ("RESIDFP", "LIBSIDPLAYFP", "SIDPLAYFP") for f in ("VERSION", "SHA256")}
@@ -36,6 +37,12 @@ def test_dockerfile_uses_the_pins_it_declares():
     assert "${ZXTUNE_REV}/linux/${ZXARCH}/zxtune_${ZXTUNE_REV}_linux_" in DOCKERFILE
     assert '"$SC68_URL"' in DOCKERFILE
     assert '"$UADE_URL"' in DOCKERFILE
+    # kssrender builds the libkss commit the collector bundles (build.sh's own
+    # default — for a build without the Dockerfile — is the same commit).
+    assert 'LIBKSS_COMMIT="$LIBKSS_COMMIT"' in DOCKERFILE
+    kss_default = re.search(r'LIBKSS_COMMIT="\$\{LIBKSS_COMMIT:-(\w+)\}"',
+                            (ROOT / "soniqboom/native/kssrender/build.sh").read_text())
+    assert kss_default and kss_default.group(1) == _docker_args()["LIBKSS_COMMIT"]
     # A missing tag must fail the step, not silently build the default branch.
     assert 'git checkout -q "$BENCODETOOLS_REF" \\' in DOCKERFILE
     assert 'git checkout -q "$LIBZAKALWE_REF" &&' in DOCKERFILE

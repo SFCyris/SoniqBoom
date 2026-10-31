@@ -1,41 +1,149 @@
 /* SPDX-FileCopyrightText: 2026 S.F. Cyris */
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 
-/* ── SoniqBoom mobile — touch-first shell ───────────────────────────────── */
+/* ── SoniqBoom mobile — touch-first shell, always Retro hi-fi ───────────────
+   The phone page is one device: mobile.html fixes <html data-ui-style="retro">
+   (data-ui-style-fixed — the desktop page's Style doesn't change it).  The
+   chrome is a brushed plate with hardware keys and lamps (amber = on), the
+   displays are cyan VFD glass (dark in both schemes), and the lists are the
+   printed insert of a cassette (a J-card: ruled lines, a margin rule).  Tokens
+   follow the desktop's Retro panels (css/queue-styles.css --qx-*,
+   css/player-styles.css --pb-*); the Now Playing blocks keep their own --np-*. */
 
 :root {
-  --bg:        #0a0a0a;
-  --surface:   #16161a;
-  --surface-2: #1f1f25;
-  --border:    #2a2a32;
-  --text:      #f0f0f3;
-  --text-dim:  #9899a6;
-  --accent:    #8adbff;
-  --warm:      #ff895c;
-  --danger:    #ff5e5e;
+  --hx-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --hx-print:   #cfd3d9;               /* printed legends on the plate */
+  --hx-print-2: #a3a9b2;               /* secondary (≥ 4.5:1 on plate and keys) */
+  --hx-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --hx-plate-flat: #1d1f22;
+  --hx-edge:   #050506;
+  --hx-groove: rgba(0,0,0,0.45);       /* a line cut in the plate… */
+  --hx-sheen:  rgba(255,255,255,0.08); /* …and its lit edge */
+  --hx-well:   rgba(0,0,0,0.24);       /* a recessed panel */
+  --hx-key-bg:      linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --hx-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --hx-key-text:    #cfd3d9;
+  --hx-key-shadow:  inset 0 1px 0 rgba(255,255,255,0.13), 0 2px 3px rgba(0,0,0,0.45);
+  --hx-key-shadow-in: inset 0 2px 4px rgba(0,0,0,0.6);
+  --hx-glyph:   #ffb12b;               /* the play key's glyph */
+  --hx-amber:   #ffb12b;               /* a lamp that is on */
+  --hx-lamp-off: #5a2418;
+  --hx-lamp-on: var(--hx-amber);
+  --hx-lamp-glow: 0 0 6px #ffb12b, 0 0 2px #fff3d6;
+  --hx-led-ok:  #3be16c;
+  --hx-led-bad: #ff5e4e;
+  --hx-live:    #ff6b5e;
+  --hx-vfd:      #6ff7e9;
+  --hx-vfd-dim:  #46c9bd;
+  --hx-vfd-off:  #3d968d;              /* an unlit annunciator (≥ 4.5:1 on the glass) */
+  --hx-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --hx-vfd-glow:  0 0 6px rgba(111,247,233,0.45);
+  --hx-vfd-shadow: inset 0 2px 8px rgba(0,0,0,0.85), 0 1px 0 rgba(255,255,255,0.10);
+  --hx-slot: linear-gradient(180deg, #050506, #1b1c1f);
+  /* the J-card */
+  --hx-card:   #1a1917;
+  --hx-card-2: #262420;                /* a pressed row, the header band */
+  --hx-ink:    #ece6d6;
+  --hx-ink-2:  #b3ac9b;
+  --hx-rule:   rgba(236,230,214,0.10);
+  --hx-margin: #7a4426;                /* the margin rule */
+  --hx-play-ink:  #ffc65c;             /* the playing row */
+  --hx-play-band: rgba(255,177,43,0.10);
+  --hx-star: #ffb12b;
+  --hx-link: #7fd3f5;
+  --hx-focus: #4ea8de;                 /* focus rings stay blue: amber means "on" */
+
+  /* The shell's older names, in this look (the badges, the auth card, …) */
+  --bg:        #111214;
+  --surface:   #1d1f22;
+  --surface-2: #26282c;
+  --border:    rgba(0,0,0,0.55);
+  --text:      #ece6d6;
+  --text-dim:  #b3ac9b;
+  --accent:    #ffb12b;
+  --warm:      #ff9a6b;
+  --danger:    #ff6b5e;
 }
 
-/* Light-mode palette — mirrors desktop app.css.  Keeps accent identity but
-   flips the surfaces and bumps text-dim so body copy clears WCAG AA. */
+/* Light scheme: a silver plate, light keys and a cream insert; the display
+   glass stays dark. */
 @media (prefers-color-scheme: light) {
   :root {
-    --bg:        #f5f6f8;
-    --surface:   #ffffff;
-    --surface-2: #eef0f3;
-    --border:    rgba(0,0,0,0.10);
-    --text:      #1a1d22;
-    --text-dim:  #555c6b;
-    --accent:    #2b89c0;
-    --warm:      #c4490d;
-    --danger:    #c43030;
+    --hx-print:   #23262b;
+    --hx-print-2: #3f444c;
+    --hx-plate:
+      repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+      repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+      linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+    --hx-plate-flat: #c9ccd1;
+    --hx-edge:   #8c9096;
+    --hx-groove: rgba(0,0,0,0.16);
+    --hx-sheen:  rgba(255,255,255,0.75);
+    --hx-well:   rgba(0,0,0,0.06);
+    --hx-key-bg:      linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+    --hx-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+    --hx-key-text:    #23262b;
+    --hx-key-shadow:  inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+    --hx-key-shadow-in: inset 0 2px 3px rgba(0,0,0,0.28);
+    --hx-glyph:   #8a3a00;
+    /* a lit lamp: a deep colour in a dark ring (a glow doesn't show on silver);
+       an unlit one: a plain dark dimple */
+    --hx-lamp-off: rgba(0,0,0,0.15);
+    --hx-lamp-on: #d27a00;
+    --hx-lamp-glow: 0 0 0 1px rgba(0,0,0,0.45);
+    --hx-slot: linear-gradient(180deg, #55595f, #7d8187);
+    --hx-card:   #f4ecd6;
+    --hx-card-2: #e8dcbd;
+    --hx-ink:    #23262b;
+    --hx-ink-2:  #4f4a3e;
+    --hx-rule:   rgba(31,47,107,0.16);  /* blue ruled lines */
+    --hx-margin: #c0392b;                /* a red margin rule */
+    --hx-play-ink:  #8a3a00;
+    --hx-play-band: rgba(255,177,43,0.20);
+    --hx-star: #8a3a00;
+    --hx-link: #0f4372;
+    --hx-focus: #1d5f99;
+
+    --bg:        #b9bcc1;
+    --surface:   #c9ccd1;
+    --surface-2: #d9dce0;
+    --border:    rgba(0,0,0,0.16);
+    --text:      #23262b;
+    --text-dim:  #4f4a3e;
+    --accent:    #8a3a00;
+    --warm:      #8f3508;
+    --danger:    #9a1f18;
+  }
+}
+
+/* More contrast: the secondary legends print like the primary ones, the
+   rules and edges darken, the brushing goes. */
+@media (prefers-contrast: more) {
+  :root {
+    --hx-print-2: var(--hx-print);
+    --hx-ink-2:   var(--hx-ink);
+    --hx-vfd-dim: var(--hx-vfd);
+    --hx-rule:    rgba(236,230,214,0.30);
+    --hx-plate:   linear-gradient(180deg, #24262a, #17181b);
+    --text-dim:   var(--text);
+  }
+}
+@media (prefers-contrast: more) and (prefers-color-scheme: light) {
+  :root {
+    --hx-rule:  rgba(31,47,107,0.40);
+    --hx-edge:  #3f444c;
+    --hx-plate: linear-gradient(180deg, #e4e6e9, #c9ccd1);
   }
 }
 
 :root {
 
-  --topbar-h:    52px;
-  --tabbar-h:    56px;
-  --mini-h:      64px;
+  --topbar-h:    56px;
+  --tabbar-h:    62px;
+  --mini-h:      68px;
   --row-h:       60px;
 
   --safe-top:    env(safe-area-inset-top, 0px);
@@ -62,9 +170,9 @@ html, body {
      copy/paste keep working — see the chrome-only suppression below. */
 }
 
-/* Suppress text selection on chrome (top bar, tab bar, buttons) without
+/* Suppress text selection on chrome (top bar, tab bar, keys) without
    stripping it from content like track names and lyrics. */
-.topbar, .tabbar, button, .row-handle, .mini-now-playing {
+#m-topbar, #m-tabs, #m-miniplayer, button, .m-row-handle, .m-sheet-actions li {
   -webkit-user-select: none;
   user-select: none;
 }
@@ -79,13 +187,85 @@ html, body {
   }
 }
 :focus-visible {
-  outline: 2px solid var(--accent) !important;
+  outline: 2px solid var(--hx-focus) !important;
   outline-offset: 2px !important;
 }
 
 button, input { font: inherit; color: inherit; }
 button { background: none; border: 0; padding: 0; cursor: pointer; touch-action: manipulation; }
 input, select, textarea { touch-action: manipulation; }
+
+/* ── Hardware keys and lamps (shared by every view) ────────────────────────
+   A key: a raised face with a printed legend; pressed, it sinks in.  A lamp
+   (::before) is dark red when off and amber when on.  Every key is at least
+   44 × 44 px. */
+.m-key, .m-settings-btn, .m-desktop-link, .m-crumb-back, .m-empty .m-retry,
+.m-mp-play, .m-mp-next, .m-mp-cast, .m-group-chip, .m-tab, .m-preset,
+.m-sheet-actions li, .m-sheet-cancel, .cast-icon-btn, .cast-stop-btn,
+.cast-error-btn, .cast-list-item, .auth-submit {
+  position: relative;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 6px;
+  border: 1px solid var(--hx-edge);
+  background: var(--hx-key-bg);
+  box-shadow: var(--hx-key-shadow);
+  color: var(--hx-key-text);
+  font-family: var(--hx-face);
+  transition: transform 0.08s ease;
+}
+.m-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+:is(.m-key, .m-settings-btn, .m-desktop-link, .m-crumb-back, .m-empty .m-retry,
+    .m-mp-play, .m-mp-next, .m-mp-cast, .m-group-chip, .m-tab, .m-preset,
+    .m-sheet-actions li, .m-sheet-cancel, .cast-icon-btn, .cast-stop-btn,
+    .cast-error-btn, .cast-list-item, .auth-submit):active {
+  background: var(--hx-key-pressed);
+  box-shadow: var(--hx-key-shadow-in);
+  transform: translateY(1px);
+}
+@media (prefers-reduced-motion: reduce) {
+  :is(.m-key, .m-settings-btn, .m-desktop-link, .m-crumb-back, .m-empty .m-retry,
+      .m-mp-play, .m-mp-next, .m-mp-cast, .m-group-chip, .m-tab, .m-preset,
+      .m-sheet-actions li, .m-sheet-cancel, .cast-icon-btn, .cast-stop-btn,
+      .cast-error-btn, .cast-list-item, .auth-submit):active { transform: none; }
+}
+/* (a pointer that hovers: a little brighter — never the only cue) */
+@media (hover: hover) {
+  :is(.m-key, .m-settings-btn, .m-desktop-link, .m-crumb-back, .m-group-chip,
+      .m-tab, .m-preset, .m-sheet-actions li, .m-sheet-cancel):hover { filter: brightness(1.08); }
+}
+/* A lamp on a key: .m-key-lit / .m-mp-play / .m-group-chip / .m-tab / .m-preset */
+:is(.m-key-lit, .m-mp-play, .m-mp-cast, .m-group-chip, .m-tab, .m-preset, .m-tuner-play)::before {
+  content: "";
+  position: absolute;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--hx-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.12);
+  pointer-events: none;
+}
+.m-key-lit::before, .m-tuner-play::before { top: 5px; left: 50%; margin-left: -3px; }
+.m-key-lit { padding-top: 6px; }
+
+/* The VFD window: dark glass, a cyan glow */
+.m-vfd {
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+}
 
 /* ── App shell layout ──────────────────────────────────────────────────── */
 
@@ -98,36 +278,99 @@ input, select, textarea { touch-action: manipulation; }
   background: var(--bg);
 }
 
+/* The top bar: the brand printed on the plate, the view's name in a display,
+   the Settings key (gear) and the Desktop site key (large displays only). */
 #m-topbar {
   grid-area: top;
+  position: relative;
+  z-index: 3;
   height: calc(var(--topbar-h) + var(--safe-top));
-  padding: var(--safe-top) 16px 0;
+  padding: var(--safe-top) calc(10px + var(--safe-right)) 0 calc(10px + var(--safe-left));
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  font-weight: 600;
-  font-size: 17px;
+  gap: 8px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
+  box-shadow: inset 0 -1px 0 var(--hx-sheen), 0 2px 6px rgba(0,0,0,0.25);
+  color: var(--hx-print);
 }
-#m-topbar-title { flex: 1 1 auto; min-width: 0; overflow: hidden;
-                  text-overflow: ellipsis; white-space: nowrap; }
+.m-brand {
+  flex: none;
+  font: 700 11px/1.05 var(--hx-face);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-topbar-vfd {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 12px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+}
+#m-topbar-title {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 700 17px/1 var(--hx-face);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+}
+/* an annunciator printed in the glass (unlit) */
+.m-topbar-vfd::after {
+  content: "HI-FI";
+  content: "HI-FI" / "";
+  flex: none;
+  font: 700 11px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  color: var(--hx-vfd-off);
+}
+.m-settings-btn {
+  flex: 0 0 auto;
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.m-settings-btn.active { background: var(--hx-key-pressed); box-shadow: var(--hx-key-shadow-in); color: var(--hx-glyph); }
+.m-settings-btn svg, .m-tab-icon svg {
+  width: 20px; height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .m-desktop-link {
   flex: 0 0 auto;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--accent, #4ea8de);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  line-height: 1.1;
+  text-align: center;
   text-decoration: none;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid transparent;
-  white-space: nowrap;
+  max-width: 6.5em;            /* DESKTOP / SITE on two lines */
 }
-.m-desktop-link:active,
-.m-desktop-link:hover {
-  background: rgba(78, 168, 222, 0.08);
-  border-color: rgba(78, 168, 222, 0.3);
+/* The desktop interface is offered on a large display only: both sides at
+   least 428 px (iPads, Plus / Pro Max phones) — the mini player's rule. */
+@media (max-width: 427.98px), (max-height: 427.98px) {
+  .m-desktop-link { display: none; }
+}
+@media (max-width: 379px) {
+  .m-brand { display: none; }
+  .m-topbar-vfd::after { display: none; }
 }
 
 #m-content {
@@ -148,34 +391,50 @@ input, select, textarea { touch-action: manipulation; }
   padding-right: var(--safe-right);
 }
 .m-view.active { display: block; }
+/* The lists sit on the insert; Settings on the plate */
+#m-view-library, #m-view-search, #m-view-queue, #m-view-radio { background: var(--hx-card); }
+#m-view-settings { background: var(--hx-plate); }
 
-/* ── Tab bar ───────────────────────────────────────────────────────────── */
+/* ── Tab bar: a row of function keys, the shown section's lamp lit ─────── */
 
 #m-tabs {
   grid-area: tabs;
   display: flex;
+  gap: 6px;
   height: calc(var(--tabbar-h) + var(--safe-bottom));
-  padding-bottom: var(--safe-bottom);
-  background: var(--surface);
-  border-top: 1px solid var(--border);
+  padding: 6px calc(8px + var(--safe-right)) calc(6px + var(--safe-bottom)) calc(8px + var(--safe-left));
+  background: var(--hx-plate);
+  border-top: 1px solid var(--hx-edge);
+  box-shadow: inset 0 1px 0 var(--hx-sheen);
 }
 
 .m-tab {
   flex: 1 1 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  color: var(--text-dim);
-  gap: 2px;
-  min-height: 44px;
-  transition: color 0.15s;
+  gap: 4px;
+  padding: 4px 2px 0;
+  color: var(--hx-print-2);
 }
-.m-tab.active { color: var(--accent); }
-.m-tab-icon  { font-size: 20px; line-height: 1; }
-.m-tab-label { font-size: 10px; letter-spacing: 0.02em; }
+.m-tab::before { top: 6px; right: 7px; }
+.m-tab.active {
+  background: var(--hx-key-pressed);
+  box-shadow: var(--hx-key-shadow-in);
+  color: var(--hx-print);
+}
+.m-tab.active::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+.m-tab-icon  { display: flex; line-height: 1; }
+.m-tab-label {
+  font: 700 11px/1 var(--hx-face);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
 
-/* ── Mini player ───────────────────────────────────────────────────────── */
+/* ── Mini player: the deck strip — cover, display, keys, the tape run ──── */
 
 .m-miniplayer {
   grid-area: mini;
@@ -184,30 +443,48 @@ input, select, textarea { touch-action: manipulation; }
   /* art · title · ▶ · ⏭ · cast (#btn-cast, cast_picker.js) — the cast button
      needs its own column, or it wraps onto a row of its own and pushes the
      progress bar out of sight under the tab bar. */
-  grid-template-columns: 48px minmax(0, 1fr) 44px 44px 44px;
-  grid-template-rows: 1fr 2px;
+  grid-template-columns: 48px minmax(0, 1fr) 48px 44px 44px;
+  grid-template-rows: 1fr 4px;
   align-items: center;
   column-gap: 8px;
   row-gap: 4px;
-  padding: 8px 12px 0;
-  background: var(--surface-2);
-  border-top: 1px solid var(--border);
+  padding: 8px calc(10px + var(--safe-right)) 0 calc(10px + var(--safe-left));
+  background: var(--hx-plate);
+  border-top: 1px solid var(--hx-edge);
+  box-shadow: inset 0 1px 0 var(--hx-sheen);
+  color: var(--hx-print);
+  cursor: pointer;
 }
 .m-miniplayer.hidden { display: none; }
+/* Now Playing on a phone (the shorter side under 428 px): the deck has the
+   transport and its own cast key (#m-np-cast), so the mini player steps aside
+   and its height goes to the deck (--mini-h 0: the deck's sizing, the toasts'
+   and the pill's offsets).  On a larger phone or a tablet it stays. */
+@media (max-width: 427.98px), (max-height: 427.98px) {
+  :root:has(#m-view-nowplaying.active) { --mini-h: 0px; }
+  #m-app:has(#m-view-nowplaying.active) > #m-miniplayer { display: none; }
+}
+@media (orientation: landscape) and (max-height: 427.98px) {
+  /* (the rail's mini player took the home-indicator inset) */
+  #m-view-nowplaying { padding-bottom: var(--safe-bottom); }
+}
 
 .m-mp-art {
   position: relative;
   width: 48px; height: 48px;
-  border-radius: 6px;
+  border-radius: 4px;
   overflow: hidden;
-  background: var(--surface);
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: 0 1px 0 var(--hx-sheen);
   display: flex; align-items: center; justify-content: center;
   font-size: 24px;
 }
 /* Layered placeholder + cover img.  Matches the desktop player and
    library-row pattern so the "no cover" state reads the same on every
-   surface: glowing-blue format glyph behind a transparent <img> that
-   only becomes visible when a real bitmap decodes. */
+   surface: a glowing format glyph behind a transparent <img> that only
+   becomes visible when a real bitmap decodes.  (The rows and the mini player
+   glow the glyph with a text-shadow — cheaper than a filter per row.) */
 .m-mp-art > span,
 .m-row-art > span,
 .m-np-art > span {
@@ -221,6 +498,12 @@ input, select, textarea { touch-action: manipulation; }
           drop-shadow(0 0 10px rgba(107,200,240,0.45));
   pointer-events: none;
   user-select: none;
+}
+.m-mp-art > span,
+.m-row-art > span {
+  color: var(--hx-vfd);
+  filter: none;
+  text-shadow: 0 0 5px rgba(111,247,233,0.75), 0 0 12px rgba(111,247,233,0.35);
 }
 .m-mp-art img,
 .m-row-art img,
@@ -237,34 +520,63 @@ input, select, textarea { touch-action: manipulation; }
 .m-row-art img.loaded,
 .m-np-art img.loaded { opacity: 1; }
 
-.m-mp-meta { min-width: 0; overflow: hidden; }
-.m-mp-title  { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.m-mp-artist { font-size: 12px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-mp-meta {
+  min-width: 0;
+  height: 48px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0 10px;
+}
+.m-mp-title  {
+  font: 700 15px/1.2 var(--hx-face);
+  letter-spacing: 0.02em;
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.m-mp-artist {
+  font: 600 13px/1.2 var(--hx-face);
+  letter-spacing: 0.03em;
+  color: var(--hx-vfd-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 .m-mp-play, .m-mp-next, .m-mp-cast {
-  width: 44px; height: 44px;
+  width: 44px; height: 46px;
   display: flex; align-items: center; justify-content: center;
   font-size: 18px;
-  color: var(--text);
-  border-radius: 50%;
 }
-.m-mp-play:active, .m-mp-next:active, .m-mp-cast:active { background: var(--surface); }
+.m-mp-play { width: 48px; padding-top: 6px; color: var(--hx-glyph); font-size: 20px; }
+.m-mp-play::before { top: 5px; left: 50%; margin-left: -3px; }
+.m-miniplayer[data-state="playing"] .m-mp-play::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+/* the cast key's lamp: lit while casting (cast_picker.js .is-casting) */
+.m-mp-cast { padding-top: 6px; }
+.m-mp-cast::before { top: 5px; left: 50%; margin-left: -3px; }
+.m-mp-cast.is-casting::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+.m-mp-next { color: var(--hx-key-text); }
+.m-miniplayer[data-src="radio"] .m-mp-next { opacity: 0.45; }   /* a station has no next */
 
+/* The tape run: an amber LED row in a slot */
 #m-mp-progress {
   grid-column: 1 / -1;
-  height: 2px;
-  background: var(--border);
+  height: 4px;
+  border-radius: 2px;
+  background: var(--hx-slot);
+  overflow: hidden;
 }
 #m-mp-progress-fill {
   height: 100%;
   width: 0%;
-  background: var(--accent);
+  background: repeating-linear-gradient(90deg, var(--hx-amber) 0 5px, transparent 5px 7px);
   transition: width 0.2s linear;
 }
+.m-miniplayer[data-src="radio"] #m-mp-progress-fill { width: 100% !important; opacity: 0.35; }
 
-/* ── List rows (Library/Search/Queue) ──────────────────────────────────── */
+/* ── List rows (Library/Search/Queue/Radio): lines on the insert ───────── */
 
-.m-list { list-style: none; margin: 0; padding: 0; }
+.m-list { list-style: none; margin: 0; padding: 0; background: var(--hx-card); }
 
 .m-row {
   position: relative;
@@ -272,14 +584,20 @@ input, select, textarea { touch-action: manipulation; }
   align-items: center;
   gap: 12px;
   height: var(--row-h);
-  padding: 0 16px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  padding: 0 14px 0 11px;
+  border-left: 3px solid var(--hx-margin);
+  border-bottom: 1px solid var(--hx-rule);
+  background: var(--hx-card);
+  color: var(--hx-ink);
   touch-action: pan-y;            /* allow vertical scroll, intercept horizontal */
   overflow: hidden;
 }
-.m-row.playing { background: linear-gradient(90deg, rgba(138,219,255,0.10), transparent); }
-.m-row:active { background: var(--surface); }
+.m-row.playing {
+  background: linear-gradient(var(--hx-play-band), var(--hx-play-band)), var(--hx-card);   /* (opaque: the content inherits it) */
+  border-left-color: var(--hx-amber);
+}
+.m-row.playing .m-row-title { color: var(--hx-play-ink); }
+.m-row:active { background: var(--hx-card-2); }
 /* Long library track lists (262k tracks accumulate as you infinite-scroll):
    let the browser skip layout/paint for off-screen rows entirely.  Rows are a
    fixed --row-h, so contain-intrinsic-size keeps the scroll height exact (no
@@ -290,13 +608,15 @@ input, select, textarea { touch-action: manipulation; }
   contain-intrinsic-size: auto var(--row-h);
 }
 
+/* The cover / format glyph in a small bezel */
 .m-row-art {
   position: relative;
   width: 44px; height: 44px;
   flex-shrink: 0;
-  border-radius: 4px;
+  border-radius: 3px;
   overflow: hidden;
-  background: var(--surface);
+  border: 1px solid rgba(0,0,0,0.6);
+  background: var(--hx-vfd-glass);
   display: flex; align-items: center; justify-content: center;
   font-size: 22px;
 }
@@ -304,8 +624,26 @@ input, select, textarea { touch-action: manipulation; }
    see the consolidated selector list above .m-mp-art. */
 
 .m-row-meta { flex: 1 1 auto; min-width: 0; }
-.m-row-title  { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.m-row-artist { font-size: 13px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-row-title  {
+  font: 600 16px/1.25 var(--hx-face);
+  letter-spacing: 0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.m-row-artist {
+  font: 500 14px/1.25 var(--hx-face);
+  letter-spacing: 0.02em;
+  color: var(--hx-ink-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* The length, like a counter; the album (a wide list only) */
+.m-row-trail {
+  flex-shrink: 0;
+  margin-right: 2px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+.m-row-album { display: none; }
+.m-row-chev { flex-shrink: 0; color: var(--hx-ink-2); font-size: 22px; line-height: 1; }
 
 /* Defect badge in a track row — the title flexes so the text ellipsises while
    the badge stays visible.  Only ``--badged`` rows take the flex layout. */
@@ -323,10 +661,9 @@ input, select, textarea { touch-action: manipulation; }
   align-items: center;
   gap: 3px;
   padding: 0 7px;
-  border-radius: 5px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.7;
+  border-radius: 3px;
+  font: 700 11px/1.7 var(--hx-face);
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   white-space: nowrap;
   border: 1px solid transparent;
@@ -363,10 +700,9 @@ input, select, textarea { touch-action: manipulation; }
   align-items: center;
   gap: 3px;
   padding: 0 7px;
-  border-radius: 5px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.7;
+  border-radius: 3px;
+  font: 700 11px/1.7 var(--hx-face);
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   white-space: nowrap;
   color: var(--text);
@@ -379,10 +715,12 @@ input, select, textarea { touch-action: manipulation; }
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 
+/* The drag grip, printed (a finger-wide strip at the row's end) */
 .m-row-handle {
-  width: 32px; height: 44px;
+  width: 44px; height: 44px;
+  margin-right: -10px;
   display: flex; align-items: center; justify-content: center;
-  color: var(--text-dim);
+  color: var(--hx-ink-2);
   font-size: 20px;
   flex-shrink: 0;
   touch-action: none;             /* drag-reorder owns this gesture */
@@ -397,7 +735,7 @@ input, select, textarea { touch-action: manipulation; }
   will-change: transform;
 }
 
-/* Swipe reveal — destructive action behind row */
+/* Swipe reveal — the action printed on a band behind the row */
 .m-row-swipe-bg {
   position: absolute;
   inset: 0;
@@ -405,146 +743,718 @@ input, select, textarea { touch-action: manipulation; }
   justify-content: flex-end;
   align-items: center;
   padding-right: 24px;
-  background: var(--danger);
-  color: white;
-  font-weight: 600;
+  background: #b3261e;
+  color: #fff;
+  font: 700 14px/1 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   z-index: 0;
 }
-.m-row-swipe-bg.queue { background: var(--accent); color: var(--bg); }
+.m-row-swipe-bg.queue { background: #ffb12b; color: #1a1917; }
 
 .m-row-content { position: relative; z-index: 1; background: inherit; }
 
 /* Drag-reorder visual states */
-.m-row.dragging { opacity: 0.85; box-shadow: 0 6px 18px rgba(0,0,0,0.5); z-index: 5; }
+.m-row.dragging { opacity: 0.9; background: var(--hx-card-2); box-shadow: 0 6px 18px rgba(0,0,0,0.5); z-index: 5; }
 .m-row.drop-above::before {
   content: '';
   position: absolute; left: 0; right: 0; top: -1px; height: 2px;
-  background: var(--accent);
+  background: var(--hx-amber);
 }
 .m-row.drop-below::after {
   content: '';
   position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
-  background: var(--accent);
+  background: var(--hx-amber);
 }
 
-/* ── Empty / loading states ────────────────────────────────────────────── */
+/* The queue numbers its lines (a programme); the playing one lit */
+#m-queue-list { counter-reset: m-q; }
+#m-queue-list .m-row { counter-increment: m-q; }
+#m-queue-list .m-row-content::before {
+  content: counter(m-q);
+  flex: none;
+  min-width: 2ch;
+  text-align: right;
+  font: 700 14px/1 var(--hx-face);
+  font-variant-numeric: tabular-nums;
+  color: var(--hx-ink-2);
+}
+#m-queue-list .m-row.playing .m-row-content::before { color: var(--hx-play-ink); }
+.m-queue-more { padding: 14px 16px; text-align: center; }
+
+/* ── Empty / loading states: a message in a display ────────────────────── */
 
 .m-empty, .m-loading {
-  padding: 48px 24px;
+  margin: 28px 16px;
+  padding: 18px 16px;
   text-align: center;
-  color: var(--text-dim);
-  font-size: 14px;
+  border-radius: 6px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  font: 600 15px/1.45 var(--hx-face);
+  letter-spacing: 0.03em;
+}
+/* An error: red on the glass */
+.m-empty[data-kind="error"] {
+  background: radial-gradient(120% 160% at 50% 0%, #2b0d0b 0%, #170605 60%, #0c0303 100%);
+  color: #ff8a7a;
+  text-shadow: 0 0 6px rgba(255,107,94,0.45);
+}
+/* Loading: a segment runs along under the word */
+.m-loading::after {
+  content: "";
+  display: block;
+  width: 120px; height: 6px;
+  margin: 10px auto 0;
+  background: linear-gradient(90deg, transparent 0 35%, var(--hx-vfd) 35% 65%, transparent 65%) 0 0 / 300% 100%;
+  -webkit-mask: repeating-linear-gradient(90deg, #000 0 8px, transparent 8px 12px);
+          mask: repeating-linear-gradient(90deg, #000 0 8px, transparent 8px 12px);
+  box-shadow: none;
+  animation: m-seek 1.2s linear infinite;
+}
+@keyframes m-seek { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .m-loading::after { animation: none; background: var(--hx-vfd-off); }
 }
 .m-empty .m-retry {
   display: block;
   margin: 14px auto 0;
-  min-height: 44px;
   padding: 0 20px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2);
-  color: var(--text);
-  font: inherit;
+  font: 700 13px/1 var(--hx-face);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-shadow: none;
 }
 
 /* ── Search view ───────────────────────────────────────────────────────── */
 
-/* The number of matches above the results (the list reads them page by page). */
+/* The number of matches above the results (the list reads them page by page):
+   the insert's header band. */
 .m-search-count {
-  padding: 8px 16px 4px;
-  font-size: 12px;
-  color: var(--text-dim);
+  padding: 9px 16px 8px 14px;
+  border-left: 3px solid var(--hx-margin);
+  border-bottom: 1px solid var(--hx-rule);
+  background: var(--hx-card-2);
+  font: 700 12px/1.2 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--hx-ink-2);
 }
 
 .m-search-bar {
   position: sticky; top: 0; z-index: 2;
-  padding: 8px 16px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
 }
-.m-search-input {
+/* The field is a display: cyan type on the glass, an amber caret */
+.m-search-input, .m-radio-search input {
   width: 100%;
-  height: 40px;
-  padding: 0 12px;
-  border-radius: 8px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 16px;            /* prevents iOS zoom */
+  height: 44px;
+  padding: 0 12px 0 40px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2346c9bd' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M21 21l-5-5'/%3E%3C/svg%3E") 12px 50% / 18px 18px no-repeat,
+    var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  caret-color: var(--hx-amber);
+  font: 600 17px/1 var(--hx-face);   /* ≥ 16 px: no iOS zoom */
+  letter-spacing: 0.03em;
   -webkit-appearance: none;
+  appearance: none;
+}
+:is(.m-search-input, .m-radio-search input)::placeholder { color: var(--hx-vfd-off); opacity: 1; }
+:is(.m-search-input, .m-radio-search input)::-webkit-search-cancel-button { filter: invert(0.7) sepia(1) hue-rotate(130deg); }
+
+/* The Search bar (mobile/views/search.js): the field with its own × key, the
+   scope keys (a radiogroup, the Library's selector keys) and FILTERS, then a
+   key per filter applied.  The scope keys scroll sideways where they don't
+   fit (the edge with more keys fades); on a narrow phone FILTERS shares the
+   field's row, from 1100 px the field and all the keys share one row. */
+.m-search-bar { display: flex; flex-direction: column; gap: 6px; }
+.m-search-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "field field" "scopes filters";
+  gap: 6px;
+  min-width: 0;
+}
+.m-search-field { grid-area: field; position: relative; min-width: 0; }
+.m-search-scopes { grid-area: scopes; }
+.m-search-filters-btn { grid-area: filters; }
+@media (max-width: 599px) {
+  .m-search-row { grid-template-areas: "field filters" "scopes scopes"; }
+  /* (narrower keys: the next one shows at the edge) */
+  .m-search-scopes .m-search-scope { padding: 0 10px 0 20px; }
+  .m-search-scopes .m-search-scope::before { left: 8px; }
+}
+@media (min-width: 1100px) {
+  .m-search-row { grid-template-columns: minmax(240px, 1fr) auto auto; grid-template-areas: "field scopes filters"; }
+}
+/* A short landscape phone: tighter rows, the results keep more lines */
+@media (orientation: landscape) and (max-height: 500px) {
+  .m-search-bar { padding-top: 6px; padding-bottom: 6px; gap: 4px; }
+  .m-search-row { gap: 4px 6px; }
+}
+.m-search-field .m-search-input { padding-right: 48px; }
+.m-search-field .m-search-input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; display: none; }
+.m-search-clear {
+  position: absolute;
+  top: 0; right: 0;
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  font: 400 26px/1 var(--hx-face);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  border-radius: 0 5px 5px 0;
+}
+.m-search-clear:active { color: var(--hx-amber); }
+.m-search-clear[hidden], .m-search-applied[hidden] { display: none; }
+.m-search-scopes, .m-search-applied {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  /* (room for the keys' shadows inside the scroller) */
+  padding: 1px 1px 3px;
+  margin: -1px -1px -3px;
+}
+.m-search-scopes.m-fade-r { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 36px), transparent); }
+.m-search-scopes.m-fade-l { -webkit-mask-image: linear-gradient(90deg, transparent, #000 36px); mask-image: linear-gradient(90deg, transparent, #000 36px); }
+.m-search-scopes.m-fade-l.m-fade-r { -webkit-mask-image: linear-gradient(90deg, transparent, #000 36px, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(90deg, transparent, #000 36px, #000 calc(100% - 36px), transparent); }
+/* (the filters applied wrap: CLEAR FILTERS always in sight) */
+.m-search-applied { flex-wrap: wrap; overflow: visible; }
+.m-search-scopes::-webkit-scrollbar, .m-search-applied::-webkit-scrollbar { display: none; }
+.m-search-filters-btn { padding: 0 14px 0 26px; }
+/* (its lamp: lit while a filter is applied) */
+.m-search-filters-btn::before {
+  content: "";
+  position: absolute;
+  left: 11px; top: 50%;
+  width: 6px; height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--hx-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.12);
+  pointer-events: none;
+}
+.m-search-filters-btn.m-search-filters-on::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+.m-search-chip {
+  flex: none;
+  gap: 8px;
+  padding: 0 10px 0 14px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.m-search-chip-x { font: 400 20px/1 var(--hx-face); color: var(--hx-glyph); }
+.m-search-chip-clear { padding: 0 14px; }
+
+/* Before a search: what the keys do, on a display */
+.m-search-intro {
+  margin: 16px;
+  padding: 16px 18px;
+  border-radius: 6px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  font: 600 15px/1.45 var(--hx-face);
+  letter-spacing: 0.02em;
+}
+.m-search-intro-title {
+  font: 700 16px/1.2 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-shadow: var(--hx-vfd-glow);
+}
+.m-search-intro-text, .m-search-intro-ops { margin: 8px 0 0; }
+.m-search-intro-ops { color: var(--hx-vfd-dim); }
+.m-search-intro-ops span { white-space: nowrap; color: var(--hx-vfd); margin-right: 10px; }
+@media (min-width: 700px) {
+  .m-search-intro { max-width: 640px; margin: 24px auto; }
 }
 
-/* ── Now Playing view ──────────────────────────────────────────────────── */
+/* The filter sheet: the action sheet's plate, a section per field — its name
+   printed on the plate, a row of selector keys (the chosen one lit); Year
+   also has From / To displays. */
+.m-fsheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 10px;
+  padding: 0 2px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+.m-fsec-label {
+  margin: 0 0 6px 2px;
+  font: 700 12px/1.2 var(--hx-face);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-fsec-keys { display: flex; flex-wrap: wrap; gap: 6px; }
+.m-fyear { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 8px; }
+.m-fyear-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font: 700 12px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-fyear-in {
+  width: 5.5em;
+  height: 44px;
+  padding: 0 10px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  caret-color: var(--hx-amber);
+  font: 600 17px/1 var(--hx-face);    /* ≥ 16 px: no iOS zoom */
+  letter-spacing: 0.06em;
+  text-align: center;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.m-fyear-in::placeholder { color: var(--hx-vfd-off); opacity: 1; text-transform: uppercase; font-size: 13px; letter-spacing: 0.12em; }
+.m-fsheet-foot { flex: none; display: flex; gap: 8px; margin-top: 10px; }
+.m-fsheet-foot .m-key { flex: 1 1 0; min-height: 52px; }
 
+/* ── Now Playing view: a portable cassette player ─────────────────────────
+   The tokens follow the desktop's Retro panels (css/player-styles.css
+   --pb-*, css/playlist-styles.css --plx-*): a brushed plate, keys with lamps,
+   a cyan VFD, amber "on".  The cover is the cassette's label; the reels in its
+   window turn while it plays (paused: still; reduced motion: never) and the
+   tape moves from the left reel to the right one as the track runs
+   (--np-pos).  The display glass stays dark in the light scheme.  The meter
+   display, the waveform and the sizing of the deck by the view's height:
+   css/mobile-visuals.css. */
 .m-np {
+  --np-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --np-print: #cfd3d9;                 /* printed legends */
+  --np-print-2: #a3a9b2;               /* secondary (≥ 4.5:1 on plate and keys) */
+  --np-plate:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --np-plate-flat: #1d1f22;
+  --np-edge: #050506;
+  --np-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --np-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --np-key-text: #cfd3d9;
+  --np-key-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 2px 3px rgba(0,0,0,0.45);
+  --np-play: #ffb12b;                  /* the play key's glyph */
+  --np-vfd: #6ff7e9;
+  --np-vfd-dim: #46c9bd;
+  --np-vfd-ghost: rgba(111,247,233,0.16);   /* an unlit annunciator */
+  --np-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --np-live: #ff6b5e;
+  --np-amber: #ffb12b;
+  --np-lamp-off: #3b1712;
+  --np-groove: linear-gradient(180deg, #050506, #1b1c1f);
+  --np-shell: linear-gradient(180deg, #2a2a2e 0%, #1a1a1d 55%, #121214 100%);
+  --np-shell-2: #26262a;
+  --np-shell-edge: #000;
+  --np-screw: #7b7f86;
+  --np-label: #2b2620;                 /* a charcoal kraft label (no cover) */
+  --np-label-rule: rgba(241,231,207,0.07);
+  --np-window: rgba(6,6,8,0.80);
+  --np-tape: #4a2d18;
+  --np-hub: #ece7da;
   display: flex;
   flex-direction: column;
   align-items: center;
   min-height: 100%;          /* grows (and the view scrolls) with a tune list */
-  padding: 16px 24px 24px;
-  gap: 16px;
+  padding: 12px 12px 24px;
+  gap: 14px;
+}
+@media (prefers-color-scheme: light) {
+  .m-np {
+    --np-print: #23262b;
+    --np-print-2: #3f444c;
+    --np-plate:
+      repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+      repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+      linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+    --np-plate-flat: #c9ccd1;
+    --np-edge: #8c9096;
+    --np-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+    --np-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+    --np-key-text: #23262b;
+    --np-key-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+    --np-play: #8a3a00;
+    --np-lamp-off: rgba(0,0,0,0.15);
+    --np-groove: linear-gradient(180deg, #55595f, #7d8187);
+    --np-shell: linear-gradient(180deg, #f3f0e8 0%, #e2ded3 55%, #d3cfc4 100%);
+    --np-shell-2: #e6e2d8;
+    --np-shell-edge: #8c9096;
+    --np-screw: #9a9da3;
+    --np-label: #f4ecd6;                 /* a cream label */
+    --np-label-rule: rgba(31,47,107,0.10);
+  }
+}
+
+/* The faceplate */
+.m-np-deck {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 440px;
+  padding: 12px 14px 16px;
+  border-radius: 20px;
+  border: 1px solid var(--np-edge);
+  background: var(--np-plate);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 10px 28px rgba(0,0,0,0.45);
+  color: var(--np-print);
+  font-family: var(--np-face);
+}
+.m-np-deck::before {
+  content: "SONIQBOOM \00B7  STEREO CASSETTE PLAYER";
+  content: "SONIQBOOM \00B7  STEREO CASSETTE PLAYER" / "";
+  font: 700 10px/1 var(--np-face);
+  letter-spacing: 0.2em;
+  color: var(--np-print-2);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* The cassette: shell with four screws, the label (cover), the reel window,
+   the head opening below; a glass sheen over it all */
+.m-np-cassette {
+  display: block;
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1.6 / 1;           /* nothing in flow: WebKit sizes it by the ratio */
+  border-radius: 10px;
+  background:
+    radial-gradient(circle 5px at 3.4% 6%,  var(--np-screw) 0 2.5px, rgba(0,0,0,0.55) 3px 4px, transparent 4.5px),
+    radial-gradient(circle 5px at 96.6% 6%, var(--np-screw) 0 2.5px, rgba(0,0,0,0.55) 3px 4px, transparent 4.5px),
+    radial-gradient(circle 5px at 3.4% 94%, var(--np-screw) 0 2.5px, rgba(0,0,0,0.55) 3px 4px, transparent 4.5px),
+    radial-gradient(circle 5px at 96.6% 94%, var(--np-screw) 0 2.5px, rgba(0,0,0,0.55) 3px 4px, transparent 4.5px),
+    var(--np-shell);
+  box-shadow: 0 0 0 1px var(--np-shell-edge), 0 6px 14px rgba(0,0,0,0.45),
+              inset 0 1px 0 rgba(255,255,255,0.12);
+}
+.m-np-cassette::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  background: linear-gradient(155deg, rgba(255,255,255,0.12) 0%, transparent 38%);
+  pointer-events: none;
+}
+.m-np-cassette::after {
+  content: "";
+  position: absolute;
+  left: 22%; right: 22%; bottom: 0;
+  height: 11.5%;
+  background:
+    radial-gradient(circle 4px at 20% 58%, rgba(0,0,0,0.85) 0 3px, transparent 3.5px),
+    radial-gradient(circle 4px at 80% 58%, rgba(0,0,0,0.85) 0 3px, transparent 3.5px),
+    radial-gradient(circle 3px at 50% 62%, rgba(0,0,0,0.70) 0 2px, transparent 2.5px),
+    var(--np-shell-2);
+  clip-path: polygon(7% 0, 93% 0, 100% 100%, 0 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
 }
 .m-np-art {
-  position: relative;
-  width: min(80vw, 360px);
-  aspect-ratio: 1 / 1;
-  border-radius: 12px;
+  position: absolute;
+  left: 5.5%; right: 5.5%;
+  top: 10.4%; bottom: 19.2%;
   overflow: hidden;
-  background: var(--surface);
   display: flex; align-items: center; justify-content: center;
-  font-size: 96px;
-  box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+  border-radius: 5px;
+  font-size: 40px;
+  background:
+    repeating-linear-gradient(180deg, transparent 0 13px, var(--np-label-rule) 13px 14px),
+    var(--np-label);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
 }
-.m-np-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.m-np-title  { font-size: 20px; font-weight: 600; text-align: center; }
-.m-np-artist { font-size: 15px; color: var(--text-dim); text-align: center; }
+.m-np-art img { object-position: 50% 30%; }
+/* The format glyph (no cover) sits on the label above the window */
+.m-np-art > span { bottom: 56%; }
 
-.m-np-scrubber-wrap { width: 100%; }
-.m-np-scrubber {
+.m-np-tape {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: absolute;
+  z-index: 1;
+  left: 20%; right: 20%;
+  top: 40%; height: 34%;
+  padding: 0 4%;
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, transparent calc(80% - 1px), rgba(74,45,24,0.9) calc(80% - 1px) calc(80% + 1px), transparent calc(80% + 1px)),
+    var(--np-window);
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.8), 0 0 0 2px rgba(0,0,0,0.55), 0 0 0 3px rgba(255,255,255,0.10);
+}
+/* A reel: the tape pack (its radius follows --np-pos: full → empty on the
+   left, empty → full on the right; a station sits in the middle) round a hub */
+.m-np-reel {
+  --pos: var(--np-pos, 0);
+  --pack: calc(40% + 60% * (1 - var(--pos)));
+  position: relative;
+  height: 90%;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, var(--np-tape) calc(var(--pack) - 2%), transparent var(--pack));
+}
+.m-np-reel + .m-np-reel { --pack: calc(40% + 60% * var(--pos)); }
+.m-np[data-src="radio"] .m-np-reel { --pos: 0.5; }
+.m-np-reel i {
+  position: absolute;
+  inset: 30%;
+  border-radius: 50%;
+  background: var(--np-hub);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill-rule='evenodd' d='M0 12a12 12 0 1 0 24 0a12 12 0 1 0 -24 0z M4.5 12a7.5 7.5 0 1 0 15 0a7.5 7.5 0 1 0 -15 0z'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(60 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(120 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(180 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(240 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(300 12 12)'/%3E%3C/svg%3E") center / contain no-repeat;
+          mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill-rule='evenodd' d='M0 12a12 12 0 1 0 24 0a12 12 0 1 0 -24 0z M4.5 12a7.5 7.5 0 1 0 15 0a7.5 7.5 0 1 0 -15 0z'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(60 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(120 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(180 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(240 12 12)'/%3E%3Crect x='10.9' y='4' width='2.2' height='3.4' transform='rotate(300 12 12)'/%3E%3C/svg%3E") center / contain no-repeat;
+  animation: m-np-reel 2.4s linear infinite;
+  animation-play-state: paused;
+}
+.m-np[data-state="playing"] .m-np-reel i { animation-play-state: running; }
+@keyframes m-np-reel { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .m-np-reel i { animation: none; }
+}
+
+/* The VFD strip: PLAY / PAUSE / STOP + SHUF / RPT annunciators, title, artist */
+.m-np-vfd {
+  display: block;
+  padding: 8px 12px 10px;
+  border-radius: 6px;
+  border: 1px solid #000;
+  background: var(--np-vfd-glass);
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.85), 0 1px 0 rgba(255,255,255,0.10);
+  color: var(--np-vfd);
+}
+.m-np-ann {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+  font: 700 11px/1 var(--np-face);
+  letter-spacing: 0.14em;
+  white-space: nowrap;
+}
+.m-np-ann-state, .m-np-ann-flag { flex: none; }
+.m-np-ann-state { color: var(--np-vfd); text-shadow: 0 0 5px rgba(111,247,233,0.55); }
+.m-np-ann-flag { color: var(--np-vfd-ghost); }
+.m-np-ann-flag[data-ann="shuffle"] { margin-left: auto; }
+.m-np[data-shuffle="on"] .m-np-ann-flag[data-ann="shuffle"],
+.m-np:is([data-repeat="all"], [data-repeat="one"]) .m-np-ann-flag[data-ann="repeat"] {
+  color: var(--np-vfd);
+  text-shadow: 0 0 5px rgba(111,247,233,0.55);
+}
+.m-np[data-repeat="one"] .m-np-ann-flag[data-ann="repeat"]::after { content: " 1"; }
+.m-np-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  text-align: left;
+  font: 700 19px/1.25 var(--np-face);
+  letter-spacing: 0.02em;
+  color: var(--np-vfd);
+  text-shadow: 0 0 6px rgba(111,247,233,0.45);
+}
+.m-np-artist {
+  margin-top: 3px;
+  min-height: 1.25em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font: 600 14px/1.25 var(--np-face);
+  letter-spacing: 0.03em;
+  color: var(--np-vfd-dim);
+}
+
+/* Time windows round a ribbed seek slot.  The times let taps through to the
+   slot; its played part is amber (--np-pct, nowplaying.js setScrub). */
+.m-np-scrubber-wrap {
   width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
+}
+.m-np-times { display: contents; pointer-events: none; }
+#m-np-cur,
+#m-np-dur {
+  grid-row: 1;
+  min-width: 56px;
+  padding: 6px 6px 5px;
+  border-radius: 4px;
+  border: 1px solid #000;
+  background: var(--np-vfd-glass);
+  box-shadow: inset 0 1px 4px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.08);
+  text-align: center;
+  font: 700 14px/1 var(--np-face);
+  letter-spacing: 0.04em;
+  color: var(--np-vfd);
+  text-shadow: 0 0 5px rgba(111,247,233,0.45);
+  white-space: nowrap;
+}
+#m-np-cur { grid-column: 1; }
+#m-np-dur { grid-column: 3; }
+#m-np-dur:empty { visibility: hidden; }     /* a station: no length */
+.m-np[data-src="radio"] #m-np-cur {
+  color: var(--np-live);
+  text-shadow: 0 0 5px rgba(255,107,94,0.5);
+}
+/* The slot is 36 px of the layout (30–32 on a phone held sideways); the input
+   reaches 4–7 px past it above and below (into the gaps), so a finger finds
+   it over a 44 px height. */
+.m-np-scrubber {
+  display: block;
+  grid-column: 2; grid-row: 1;
+  width: 100%;
+  height: 44px;
+  margin: -4px 0;
   -webkit-appearance: none;
   appearance: none;
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
+  background:
+    linear-gradient(var(--np-amber), var(--np-amber)) 0 50% / var(--np-pct, 0%) 2px no-repeat,
+    var(--np-groove) 0 50% / 100% 6px no-repeat;
   outline: none;
 }
 .m-np-scrubber::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 18px; height: 18px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 0;
+  width: 16px; height: 30px;
+  border-radius: 2px;
+  border: 1px solid #050506;
+  background:
+    linear-gradient(90deg, transparent 6px, #ffb12b 6px 8px, transparent 8px),
+    repeating-linear-gradient(90deg, #e3e6ea 0 1px, #8d9196 1px 3px);
+  box-shadow: 0 2px 3px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.5);
 }
-.m-np-times { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+.m-np-scrubber::-moz-range-track { background: transparent; }
+.m-np-scrubber::-moz-range-thumb {
+  width: 16px; height: 30px;
+  border-radius: 2px;
+  border: 1px solid #050506;
+  background:
+    linear-gradient(90deg, transparent 6px, #ffb12b 6px 8px, transparent 8px),
+    repeating-linear-gradient(90deg, #e3e6ea 0 1px, #8d9196 1px 3px);
+  box-shadow: 0 2px 3px rgba(0,0,0,0.6);
+}
+.m-np-scrubber:disabled { opacity: 0.45; }
 
+/* Keys with lamps: play (lit while playing), shuffle / repeat (lit when on) */
 .m-np-transport {
   display: flex;
   align-items: center;
-  gap: 24px;
-  margin-top: 8px;
+  gap: 8px;
+  width: 100%;
 }
 .m-np-btn {
-  width: 56px; height: 56px;
+  position: relative;
+  flex: 1 1 0;
+  height: 60px;
+  min-width: 0;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 50%;
-  font-size: 22px;
-  color: var(--text);
+  padding-top: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--np-edge);
+  background: var(--np-key-bg);
+  box-shadow: var(--np-key-shadow);
+  color: var(--np-key-text);
+  font-size: 20px;
+  transition: transform 0.12s ease, background-color 0.12s ease;
 }
-.m-np-btn:active { background: var(--surface); }
 .m-np-btn.primary {
-  width: 72px; height: 72px;
-  background: var(--accent);
-  color: var(--bg);
-  font-size: 28px;
+  flex-grow: 1.35;
+  height: 60px;
+  color: var(--np-play);
+  font-size: 24px;
+}
+.m-np-btn:active {
+  background: var(--np-key-pressed);
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.6);
+  transform: translateY(1px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .m-np-btn { transition: none; }
+  .m-np-btn:active { transform: none; }
+}
+/* (a plain list: an id inside :is() would outrank the lit rules below) */
+.m-np-btn.primary::before,
+.m-np-btn[aria-pressed]::before,
+.m-np-btn.m-np-cast::before {
+  content: "";
+  position: absolute;
+  top: 7px; left: 50%;
+  width: 6px; height: 6px;
+  margin-left: -3px;
+  border-radius: 50%;
+  background: var(--np-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6);
+}
+.m-np[data-state="playing"] .m-np-btn.primary::before,
+.m-np-btn[aria-pressed="true"]::before,
+.m-np-btn.m-np-cast[data-casting="on"]::before {
+  background: var(--np-amber);
+  box-shadow: 0 0 6px var(--np-amber), 0 0 2px #fff3d6;
+}
+@media (prefers-color-scheme: light) {
+  .m-np[data-state="playing"] .m-np-btn.primary::before,
+  .m-np-btn[aria-pressed="true"]::before,
+  .m-np-btn.m-np-cast[data-casting="on"]::before {
+    background: var(--hx-lamp-on);
+    box-shadow: var(--hx-lamp-glow);
+  }
+}
+/* Shuffle / repeat: smaller keys with a printed legend under the glyph */
+.m-np-modes .m-np-btn {
+  flex-direction: column;
+  gap: 3px;
+  height: 52px;
+  padding-top: 12px;
+  font-size: 17px;
+  line-height: 1;
+}
+.m-np-modes .m-np-btn::after {
+  font: 700 11px/1 var(--np-face);
+  letter-spacing: 0.14em;
+  color: var(--np-print-2);
+}
+#m-np-shuffle::after { content: "SHUFFLE"; content: "SHUFFLE" / ""; }
+#m-np-repeat::after  { content: "REPEAT";  content: "REPEAT" / ""; }
+/* Cast: only where the mini player (and its cast key) steps aside — above */
+#m-np-cast { display: none; }
+#m-np-cast::after { content: "CAST"; content: "CAST" / ""; }
+#m-np-cast svg { display: block; width: 17px; height: 17px; }
+@supports selector(:has(a)) {
+  @media (max-width: 427.98px), (max-height: 427.98px) {
+    #m-np-cast { display: flex; }
+  }
 }
 
-/* Tunes of a multi-tune file (SID, Amiga module, console rip): tap to play. */
-.m-np-tunes { width: 100%; max-width: 480px; }
+/* Tunes of a multi-tune file (SID, Amiga module, console rip): tap to play —
+   a list on the plate. */
+.m-np-tunes { width: 100%; max-width: 440px; }
 .m-np-tunes[hidden] { display: none; }
 .m-np-tunes-hdr {
-  font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  font-size: 13px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+  font-family: var(--np-face);
   color: var(--text-dim);
   padding: 0 4px 6px;
 }
@@ -554,11 +1464,11 @@ input, select, textarea { touch-action: manipulation; }
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
+  border: 1px solid var(--np-edge);
+  border-radius: 8px;
+  background: var(--np-plate);
 }
-.m-np-tune-item { border-bottom: 1px solid var(--border); }
+.m-np-tune-item { border-bottom: 1px solid rgba(0,0,0,0.35); }
 .m-np-tune-item:last-child { border-bottom: 0; }
 .m-np-tune {
   display: flex; align-items: center; gap: 8px;
@@ -566,28 +1476,97 @@ input, select, textarea { touch-action: manipulation; }
   padding: 0 14px;
   border: 0;
   background: none;
-  color: var(--text);
+  color: var(--np-print);
   font: inherit; font-size: 15px;
+  font-family: var(--np-face);
+  letter-spacing: 0.02em;
   text-align: left;
 }
-.m-np-tune:active { background: var(--surface-2); }
+.m-np-tune:active { background: rgba(0,0,0,0.18); }
 .m-np-tune-name { flex: 1 1 auto; }
 .m-np-tune-def {
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
-  color: var(--text-dim);
-  border: 1px solid var(--border); border-radius: 4px;
+  color: var(--np-print-2);
+  border: 1px solid var(--np-print-2); border-radius: 4px;
   padding: 1px 5px;
 }
-.m-np-tune-len { color: var(--text-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
-.m-np-tune.playing { color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.m-np-tune-len { color: var(--np-print-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.m-np-tune.playing {
+  color: var(--np-print);
+  background: rgba(255,177,43,0.12);
+  box-shadow: inset 3px 0 0 var(--np-amber);
+}
 .m-np-tune.playing .m-np-tune-name { font-weight: 600; }
 
-/* ── Action sheet (long-press menu) ────────────────────────────────────── */
+/* Landscape phone: the cassette on the left, display, seek and keys beside
+   it, so the keys need no scrolling.  --np-art-w (the cassette width) and
+   --np-left (its left edge) are on :root: the Buffering pill and the toasts
+   dock over that column (see below).  The tab keys stand in a rail on the
+   left here (--rail-w, further down), so both follow the content width. */
+@media (orientation: landscape) and (max-height: 540px) {
+  :root {
+    --np-avail: calc(100vh - var(--topbar-h) - var(--mini-h) - var(--tabbar-h) - var(--safe-top) - var(--safe-bottom) - 24px);
+    --np-avail: calc(100dvh - var(--topbar-h) - var(--mini-h) - var(--tabbar-h) - var(--safe-top) - var(--safe-bottom) - 24px);
+    --np-art-w: max(160px, min(calc((100vw - var(--rail-w) - var(--safe-left) - var(--safe-right)) * 0.38),
+                               calc((var(--np-avail) - 20px) * 1.6)));
+    --np-left: calc(var(--rail-w) + var(--safe-left) + 25px);
+  }
+  .m-np { padding: 8px 12px 12px; }
+  .m-np-deck {
+    display: grid;
+    width: 100%;
+    max-width: none;
+    padding: 10px 12px;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "cas meta meta" "cas seek seek" "cas keys modes";
+    align-items: center;
+    column-gap: 12px;
+    row-gap: 12px;
+  }
+  .m-np-deck::before { display: none; }
+  .m-np-cassette { grid-area: cas; width: var(--np-art-w); }
+  .m-np-vfd { grid-area: meta; padding: 6px 10px 7px; }
+  .m-np-scrubber-wrap { grid-area: seek; }
+  .m-np-transport { grid-area: keys; }
+  .m-np-transport.m-np-modes { grid-area: modes; }
+  .m-np-ann { margin-bottom: 4px; gap: 8px; letter-spacing: 0.1em; }
+  .m-np-title { -webkit-line-clamp: 1; font-size: 17px; }
+  .m-np-scrubber { margin: -6px 0; }
+  .m-np-btn,
+  .m-np-btn.primary { height: 48px; }
+  .m-np-modes .m-np-btn { height: 48px; padding-top: 10px; width: 76px; flex: 0 0 auto; }
+
+  /* The right-hand column is all display and keys: the pill and the toasts
+     sit over the cassette instead (same top offsets as portrait). */
+  body:has(#m-view-nowplaying.active) .sb-toast-host {
+    left: calc(var(--np-left) + var(--np-art-w) / 2) !important;
+    width: calc(var(--np-art-w) - 16px);
+  }
+  #m-content:has(> #m-view-nowplaying.active) ~ .m-badge {
+    left: calc(var(--np-left) + var(--np-art-w) / 2);
+    max-width: calc(var(--np-art-w) - 16px);
+  }
+}
+/* A shorter landscape phone (360 / 375 px tall): no annunciator row (the
+   lamps show the same) and lower keys. */
+@media (orientation: landscape) and (max-height: 380px) {
+  .m-np { padding-top: 6px; padding-bottom: 6px; }
+  .m-np-deck { padding: 8px 12px; row-gap: 7px; }
+  .m-np-ann { display: none; }
+  .m-np-scrubber { margin: -7px 0; }
+  .m-np-btn,
+  .m-np-btn.primary,
+  .m-np-modes .m-np-btn { height: 44px; }
+  .m-np-modes .m-np-btn { padding-top: 8px; }
+}
+
+/* ── Action sheet (long-press menu): a plate with a display and a column of
+   keys; on a tablet it stays phone-wide, centred. ─────────────────────── */
 
 .m-sheet-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgba(0, 0, 0, 0.55);
   z-index: 100;
   animation: m-fade-in 0.15s ease;
 }
@@ -595,46 +1574,80 @@ input, select, textarea { touch-action: manipulation; }
 
 .m-sheet {
   position: fixed;
-  left: 8px; right: 8px;
+  left: calc(8px + var(--safe-left)); right: calc(8px + var(--safe-right));
   bottom: calc(8px + var(--safe-bottom));
+  max-width: 560px;
+  max-height: calc(100dvh - var(--safe-top) - var(--safe-bottom) - 24px);
+  margin: 0 auto;
   z-index: 101;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 10px 10px;
   border-radius: 14px;
-  background: var(--surface);
+  border: 1px solid var(--hx-edge);
+  background: var(--hx-plate);
+  color: var(--hx-print);
   overflow: hidden;
   animation: m-slide-up 0.2s ease;
-  box-shadow: 0 -8px 32px rgba(0,0,0,0.6);
+  box-shadow: inset 0 1px 0 var(--hx-sheen), 0 -8px 32px rgba(0,0,0,0.6);
 }
 .m-sheet.hidden { display: none; }
+/* (a grip cut in the plate) */
+.m-sheet::before {
+  content: "";
+  position: absolute;
+  top: 7px; left: 50%;
+  width: 40px; height: 4px;
+  margin-left: -20px;
+  border-radius: 2px;
+  background: var(--hx-groove);
+  box-shadow: 0 1px 0 var(--hx-sheen);
+}
 
 .m-sheet-header {
-  padding: 14px 20px 8px;
-  font-size: 13px;
-  color: var(--text-dim);
-  font-weight: 500;
-  border-bottom: 1px solid var(--border);
+  flex: none;
+  padding: 10px 12px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  font: 700 15px/1.3 var(--hx-face);
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
 }
-.m-sheet-actions { list-style: none; margin: 0; padding: 0; }
+.m-sheet-actions {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
 .m-sheet-actions li {
-  padding: 16px 20px;
-  font-size: 16px;
-  border-bottom: 1px solid var(--border);
+  flex: none;
   min-height: 52px;
+  padding: 12px 16px;
   display: flex;
   align-items: center;
+  font: 600 16px/1.3 var(--hx-face);
+  letter-spacing: 0.02em;
+  cursor: pointer;
 }
-.m-sheet-actions li:last-child { border-bottom: 0; }
-.m-sheet-actions li:active { background: var(--surface-2); }
 .m-sheet-actions li.danger { color: var(--danger); }
 
 .m-sheet-cancel {
+  flex: none;
   width: 100%;
-  padding: 16px;
-  margin-top: 8px;
-  background: var(--surface-2);
-  color: var(--accent);
-  font-size: 16px;
-  font-weight: 600;
   min-height: 52px;
+  margin-top: 10px;
+  font: 700 14px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
 }
 
 @keyframes m-fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -653,12 +1666,17 @@ input, select, textarea { touch-action: manipulation; }
 .sb-toast-host {
   bottom: calc(var(--mini-h) + var(--tabbar-h) + var(--safe-bottom) + 16px) !important;
   top: auto !important;
-  width: 92vw;
+  width: min(92vw, 560px);
 }
 body:has(#m-view-nowplaying.active) .sb-toast-host {
   top: calc(var(--topbar-h) + var(--safe-top) + 56px) !important;
   bottom: auto !important;
 }
+/* While a sheet or the cast picker is open the toast steps out of sight (it is
+   back when the sheet closes), so it can't cover the sheet's keys or take a
+   press meant for them — the Filters sheet sits inside the Search view, so a
+   z-index alone can't put it above a toast on <body>. */
+body:has(.m-sheet:not(.hidden), #cast-overlay:not(.hidden)) .sb-toast-host { visibility: hidden !important; }
 .sb-toast-host * {
   pointer-events: none !important;
   max-width: 100% !important;
@@ -669,12 +1687,44 @@ body:has(#m-view-nowplaying.active) .sb-toast-host {
 .sb-toast-host .sb-toast-action * {
   pointer-events: auto !important;
 }
+/* A toast is a message on a display (an error: red on the glass); the offer's
+   buttons are keys.  (!important: utils.js styles each toast inline.) */
+.sb-toast-host .sb-toast {
+  border: 1px solid #000;
+  border-radius: 6px !important;
+  background: var(--hx-vfd-glass) !important;
+  box-shadow: var(--hx-vfd-shadow), 0 6px 18px rgba(0,0,0,0.5) !important;
+  color: var(--hx-vfd) !important;
+  text-shadow: var(--hx-vfd-glow);
+  font: 600 15px/1.35 var(--hx-face) !important;
+  letter-spacing: 0.02em;
+}
+.sb-toast-host [role="alert"] .sb-toast {
+  background: radial-gradient(120% 160% at 50% 0%, #2b0d0b 0%, #170605 60%, #0c0303 100%) !important;
+  color: #ff8a7a !important;
+  text-shadow: 0 0 6px rgba(255,107,94,0.45);
+}
+.sb-toast-host .sb-toast-action button {
+  min-width: 44px !important;
+  min-height: 44px !important;
+  padding: 0 12px !important;
+  border: 1px solid var(--hx-edge) !important;
+  border-radius: 5px !important;
+  background: var(--hx-key-bg) !important;
+  box-shadow: var(--hx-key-shadow);
+  color: var(--hx-key-text) !important;
+  text-shadow: none;
+  font: 700 13px/1 var(--hx-face) !important;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.sb-toast-host .sb-toast-action button:active { background: var(--hx-key-pressed) !important; box-shadow: var(--hx-key-shadow-in); }
 
 /* ── Render / transcode badges ─────────────────────────────────────────────
    The shared player.js looks up #converting-badge / #buffering-badge by id and
    drives the early "Rendering…" hint for blocking SID/MIDI/tracker/AdLib/GME
    renders.  mobile.html doesn't load app.css, so style them here.  Float just
-   above the mini-player as a pill. */
+   above the mini-player as a pill: a small display with a lit annunciator. */
 .m-badge {
   position: fixed;
   left: 50%;
@@ -683,16 +1733,26 @@ body:has(#m-view-nowplaying.active) .sb-toast-host {
   display: flex;
   align-items: center;
   gap: 10px;
-  max-width: 84vw;
-  background: rgba(0, 0, 0, 0.88);
-  color: #fff;
-  padding: 9px 16px;
-  border-radius: 18px;
-  font-size: 13px;
-  line-height: 1.2;
+  max-width: min(84vw, 520px);
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  padding: 9px 14px 9px 12px;
+  border-radius: 6px;
+  font: 600 14px/1.2 var(--hx-face);
+  letter-spacing: 0.03em;
   z-index: 190;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--hx-vfd-shadow), 0 4px 16px rgba(0, 0, 0, 0.45);
   animation: m-fade-in 0.15s ease;
+}
+.m-badge::before {
+  content: "";
+  flex: none;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--hx-amber);
+  box-shadow: var(--hx-lamp-glow);
 }
 .m-badge[hidden] { display: none; }
 /* On Now Playing the slot above the mini-player is the transport (shuffle/
@@ -715,13 +1775,15 @@ body:has(#m-view-nowplaying.active) .sb-toast-host {
 .m-badge .progress-cancel {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 17px;
+  color: var(--hx-vfd-dim);
+  font-size: 18px;
   line-height: 1;
-  /* A finger-sized target (~36px) without growing the pill: the padding is taken
-     back by the negative margin. */
-  padding: 10px 11px;
-  margin: -10px -11px -10px -4px;
+  /* A finger-sized target (44 px) without growing the pill: the padding is
+     taken back by the negative margin. */
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  margin: -14px -12px -14px -6px;
   cursor: pointer;
   pointer-events: auto;   /* stays tappable where the pill body passes taps through */
 }
@@ -733,173 +1795,539 @@ body:has(#m-view-nowplaying.active) .sb-toast-host {
   position: relative;
   width: 90px;
   height: 5px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  background: var(--hx-slot);
   overflow: hidden;
 }
 .m-badge .progress-fill {
   position: absolute;
   inset: 0 auto 0 0;
   width: 0;
-  background: var(--accent, #f0722a);
-  border-radius: 3px;
+  background: repeating-linear-gradient(90deg, var(--hx-amber) 0 5px, transparent 5px 7px);
   transition: width 0.3s ease;
 }
-.m-badge .progress-eta { font-size: 11px; opacity: 0.75; white-space: nowrap; }
+.m-badge .progress-eta { font-size: 12px; opacity: 0.85; white-space: nowrap; }
 
-/* ── Settings ──────────────────────────────────────────────────────────── */
+/* ── Settings: engraved sections, recessed panels, lamps and switches ──── */
 
-.m-settings { padding: 16px; }
-.m-settings-section { margin-bottom: 24px; }
+.m-settings { padding: 16px calc(12px) 24px; color: var(--hx-print); }
+.m-settings-section { margin-bottom: 22px; }
 .m-settings-section h3 {
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font: 700 12px/1 var(--hx-face);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-dim);
+  letter-spacing: 0.16em;
+  color: var(--hx-print-2);
   margin: 0 0 8px;
   padding: 0 4px;
 }
+.m-settings-section h3::after {         /* the rule engraved after the legend */
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hx-groove);
+  box-shadow: 0 1px 0 var(--hx-sheen);
+}
 .m-settings-card {
-  background: var(--surface);
-  border-radius: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--hx-edge);
+  background: var(--hx-well);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.45), 0 1px 0 var(--hx-sheen);
   overflow: hidden;
 }
 .m-settings-row {
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--hx-groove);
+  box-shadow: 0 1px 0 var(--hx-sheen);
   font-size: 15px;
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  min-height: 48px;
+  min-height: 52px;
   align-items: center;
 }
-.m-settings-row:last-child { border-bottom: 0; }
-.m-settings-row .label { color: var(--text-dim); flex-shrink: 0; }
+.m-settings-row:last-child { border-bottom: 0; box-shadow: none; }
+.m-settings-row .label { color: var(--hx-print); flex-shrink: 0; }
 .m-settings-row .value {
-  color: var(--text);
+  color: var(--hx-print);
   text-align: right;
   word-break: break-word;
   min-width: 0;
 }
-.m-settings-row.column { flex-direction: column; align-items: flex-start; }
+.m-settings-row.column { flex-direction: column; align-items: flex-start; gap: 6px; }
+.m-settings-row.column > .label {
+  font: 700 12px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-settings-row .value a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;            /* (a finger-sized link) */
+  color: var(--hx-link);
+}
+.m-settings-row .value code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
 /* A toggle row's label must be allowed to wrap: with flex-shrink:0 a long label
-   pushes the checkbox out of the card (overflow:hidden) on a 320px phone. */
+   pushes the switch out of the card (overflow:hidden) on a 320px phone. */
+label.m-settings-row { cursor: pointer; }
 label.m-settings-row .label { flex-shrink: 1; min-width: 0; }
-label.m-settings-row .label small { display: block; margin-top: 3px; font-size: 12px; opacity: 0.85; }
-/* A toggle row is a <label>, so the whole row is the touch target; the box itself
-   still gets a finger-sized, accent-coloured control instead of the 13px default. */
+label.m-settings-row .label small {
+  display: block; margin-top: 4px;
+  font-size: 13px; line-height: 1.4;
+  color: var(--hx-print-2);
+}
+/* Server readouts: a number in a small display; a status with its LED */
+.m-set-vfd {
+  display: inline-block;
+  padding: 5px 9px;
+  border-radius: 4px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: inset 0 1px 4px rgba(0,0,0,0.8), 0 1px 0 var(--hx-sheen);
+  color: var(--hx-vfd) !important;
+  text-shadow: var(--hx-vfd-glow);
+  font: 700 15px/1 var(--hx-face);
+  letter-spacing: 0.05em;
+  font-variant-numeric: tabular-nums;
+}
+.m-set-lamp {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 8px;
+  font: 700 13px/1 var(--hx-face) !important;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.m-set-lamp::before {
+  content: "";
+  flex: none;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--hx-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6);
+}
+.m-set-lamp[data-state="ok"]::before { background: var(--hx-led-ok); box-shadow: 0 0 6px var(--hx-led-ok); }
+.m-set-lamp[data-state="off"]::before { background: var(--hx-led-bad); box-shadow: 0 0 6px var(--hx-led-bad); }
+.m-set-lamp[data-state="wait"]::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+.m-set-path { font-size: 14px; text-align: left !important; overflow-wrap: anywhere; }
+
+/* A toggle is a slide switch: a metal knob in a slot, its lamp amber when on
+   (drawn as backgrounds — a checkbox takes no ::before in every engine).  The
+   row is a <label>, so the whole row is the touch target. */
 .m-settings-row input[type="checkbox"] {
-  width: 22px;
-  height: 22px;
+  -webkit-appearance: none;
+  appearance: none;
   flex-shrink: 0;
+  width: 54px;
+  height: 30px;
   margin: 0 0 0 12px;
-  accent-color: var(--accent);
+  border-radius: 6px;
+  border: 1px solid var(--hx-edge);
+  background:
+    repeating-linear-gradient(90deg, rgba(0,0,0,0.16) 0 1px, transparent 1px 4px) 6px 50% / 16px 14px no-repeat,
+    linear-gradient(180deg, #f1f3f5, #a9adb3) 2px 50% / 24px 24px no-repeat,
+    radial-gradient(circle at 41px 50%, var(--hx-lamp-off) 0 3.5px, transparent 4px),
+    var(--hx-slot);
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.7), 0 1px 0 var(--hx-sheen);
+  cursor: pointer;
+  transition: background-position 0.15s ease;
+}
+.m-settings-row input[type="checkbox"]:checked {
+  background:
+    repeating-linear-gradient(90deg, rgba(0,0,0,0.16) 0 1px, transparent 1px 4px) calc(100% - 6px) 50% / 16px 14px no-repeat,
+    linear-gradient(180deg, #f1f3f5, #a9adb3) calc(100% - 2px) 50% / 24px 24px no-repeat,
+    radial-gradient(circle at 13px 50%, #fff3d6 0 1.5px, var(--hx-amber) 2px 3.5px, rgba(255,177,43,0.35) 4px 7px, transparent 8px),
+    var(--hx-slot);
+}
+.m-settings-row input[type="checkbox"]:disabled { opacity: 0.5; }
+@media (prefers-reduced-motion: reduce) {
+  .m-settings-row input[type="checkbox"] { transition: none; }
 }
 .m-settings-row.column .value { text-align: left; width: 100%; }
+/* A selector key with a chevron (the engine's own select ignores min-height in
+   WebKit: drawn here, so the touch target is really 44 px tall) */
 .m-settings-select {
   flex-shrink: 0;
   margin-left: 12px;
-  min-height: 36px;
-  padding: 4px 28px 4px 10px;
-  font-size: 15px;
-  color: var(--text);
-  /* (the engine's own select ignores min-height in WebKit: drawn here, with
-     a chevron, so the touch target is really 36 px tall) */
+  min-height: 44px;
+  padding: 4px 30px 4px 12px;
+  font: 700 14px/1 var(--hx-face);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hx-key-text);
   -webkit-appearance: none;
   appearance: none;
-  background-color: var(--surface-2);
-  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
-                    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
-  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
-  background-size: 5px 5px;
-  background-repeat: no-repeat;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--hx-print-2) 50%) calc(100% - 16px) 52% / 5px 5px no-repeat,
+    linear-gradient(135deg, var(--hx-print-2) 50%, transparent 50%) calc(100% - 11px) 52% / 5px 5px no-repeat,
+    var(--hx-key-bg);
+  border: 1px solid var(--hx-edge);
+  border-radius: 6px;
+  box-shadow: var(--hx-key-shadow);
 }
 .m-settings-select:disabled { opacity: 0.6; }
 
-/* ── Library group nav ─────────────────────────────────────────────────── */
+/* ── Library group nav: selector keys, the chosen one's lamp lit ───────── */
 
 .m-group-bar {
   position: sticky; top: 0; z-index: 2;
   display: flex;
-  gap: 4px;
+  gap: 6px;
   padding: 8px 12px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.25);
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
 }
+.m-group-bar::-webkit-scrollbar { display: none; }
 .m-group-chip {
-  padding: 6px 14px;
-  border-radius: 14px;
-  font-size: 13px;
-  color: var(--text-dim);
-  background: var(--surface-2);
-  white-space: nowrap;
-  min-height: 28px;
   flex-shrink: 0;
+  padding: 0 14px 0 24px;
+  font: 700 13px/1 var(--hx-face);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+  white-space: nowrap;
 }
-.m-group-chip.active { background: var(--accent); color: var(--bg); font-weight: 600; }
+.m-group-chip::before { left: 10px; top: 50%; margin-top: -3px; }
+.m-group-chip.active {
+  background: var(--hx-key-pressed);
+  box-shadow: var(--hx-key-shadow-in);
+  color: var(--hx-print);
+}
+.m-group-chip.active::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
 
+/* Inside a group: a back key and where you are, on a display */
 .m-crumb-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 16px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  font-size: 14px;
+  padding: 8px 12px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
 }
 .m-crumb-back {
-  width: 32px; height: 32px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 50%;
-  font-size: 18px;
-  color: var(--accent);
+  width: 44px; height: 44px;
   flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+  line-height: 1;
 }
-.m-crumb-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
+.m-crumb-text {
+  flex: 1; min-width: 0;
+  height: 40px;
+  line-height: 38px;
+  padding: 0 12px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  font: 700 16px/38px var(--hx-face);
+  letter-spacing: 0.04em;
+}
 
-/* ── Top-bar settings gear (Settings moved off the bottom tab bar) ───────── */
-.m-settings-btn {
-  flex: 0 0 auto;
-  background: none; border: none; color: var(--text-dim);
-  font-size: 20px; line-height: 1; padding: 4px 8px; margin-left: 6px;
+/* ── Queue header: a tape counter of the time left, the count, Clear ───── */
+
+.m-queue-head {
+  position: sticky; top: 0; z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 64px;
+  padding: 8px 12px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.25);
+  color: var(--hx-print);
+}
+.m-queue-counter { display: flex; flex-direction: column; gap: 4px; }
+.m-queue-counter-label {
+  font: 700 11px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+/* The counter: white figures on black drums, each in its own window */
+.m-tape-counter {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 4px;
+  border: 1px solid #000;
+  background: #0b0b0c;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.9), 0 1px 0 var(--hx-sheen);
+}
+.m-tape-counter i {
+  font-style: normal;
+  width: 15px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #303033 0%, #141415 42%, #0a0a0a 50%, #141415 58%, #2a2a2d 100%);
+  color: #f2f1ea;
+  font: 700 17px/1 var(--hx-face);
+  font-variant-numeric: tabular-nums;
+}
+.m-tape-counter i.sep { width: 7px; background: none; color: #a3a9b2; }
+.m-queue-count {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  font: 700 13px/1.2 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-queue-clear { flex: none; }
+/* A queue saved on another device: a display with a lit Resume key */
+.m-queue-offer {
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
+}
+.m-queue-offer-text {
+  flex: 1; min-width: 0;
+  padding: 8px 10px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  font: 600 14px/1.3 var(--hx-face);
+  overflow-wrap: anywhere;
+}
+.m-queue-offer .m-key-lit::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+
+/* ── Radio view: the tuner (display + dial + keys), preset keys, the band
+   keys, then the stations on the insert ─────────────────────────────── */
+
+.m-tuner-now {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-groove);
+  box-shadow: 0 1px 0 var(--hx-sheen);
+}
+.m-tuner-now[hidden], .m-presets[hidden] { display: none; }
+.m-tuner-vfd {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px 6px;
+}
+.m-tuner-ann {
+  display: flex;
+  gap: 10px;
+  font: 700 11px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  color: var(--hx-vfd-off);
+}
+.m-tuner-ann > span:last-child { margin-left: auto; }
+.m-tuner-state { color: var(--hx-vfd); text-shadow: var(--hx-vfd-glow); }
+.m-tuner-now[data-state="live"] .m-tuner-state { color: var(--hx-live); text-shadow: 0 0 5px rgba(255,107,94,0.55); }
+.m-tuner-now[data-state="live"] .m-tuner-state + .m-tuner-flag { color: var(--hx-vfd); text-shadow: var(--hx-vfd-glow); }
+.m-tuner-name {
+  margin-top: 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 700 19px/1.2 var(--hx-face);
+  letter-spacing: 0.03em;
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+}
+/* The dial: a printed MHz scale, the needle at the station's place */
+.m-tuner-dial { position: relative; height: 24px; margin-top: 4px; }
+.m-tuner-scale {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 0 1%;
+  background:
+    repeating-linear-gradient(90deg, var(--hx-vfd-off) 0 1px, transparent 1px 10px) 0 0 / 100% 5px no-repeat,
+    repeating-linear-gradient(90deg, var(--hx-vfd-dim) 0 1px, transparent 1px 50px) 0 0 / 100% 9px no-repeat;
+  font: 600 11px/1 var(--hx-face);
+  color: var(--hx-vfd-dim);
+}
+.m-tuner-scale i { font-style: normal; }
+.m-tuner-needle {
+  position: absolute;
+  top: -3px; bottom: 12px;
+  left: calc(var(--f, 0.5) * 100%);
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--hx-live);
+  box-shadow: 0 0 6px rgba(255,107,94,0.85);
+  transition: left 0.6s cubic-bezier(0.3, 0.7, 0.3, 1);
+}
+@media (prefers-reduced-motion: reduce) { .m-tuner-needle { transition: none; } }
+.m-tuner-keys { flex: none; display: flex; flex-direction: column; gap: 6px; }
+.m-tuner-keys .m-key { width: 52px; flex: 1 1 0; padding: 0; font-size: 18px; letter-spacing: 0; }
+.m-tuner-play { padding-top: 6px !important; color: var(--hx-glyph); }
+.m-tuner-now[data-state="live"] .m-tuner-play::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+
+/* Preset keys: number + station, the playing one lit */
+.m-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px 12px 10px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-groove);
+  box-shadow: 0 1px 0 var(--hx-sheen);
+}
+.m-preset {
+  min-height: 50px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  padding: 5px 8px;
+  text-align: left;
+}
+.m-preset::before { top: 7px; right: 7px; }
+.m-preset b { font: 700 15px/1 var(--hx-face); color: var(--hx-print); }
+.m-preset span {
+  max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 600 11px/1.15 var(--hx-face);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.m-preset.playing { background: var(--hx-key-pressed); box-shadow: var(--hx-key-shadow-in); }
+/* On the Favorites tab the list below is the presets already */
+#m-view-radio[data-tab="favorites"] .m-presets { display: none; }
+.m-preset.playing::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+
+.m-radio-search { padding: 8px 12px; background: var(--hx-plate); border-bottom: 1px solid var(--hx-edge); }
+.m-radio-search input { font-size: 17px; }
+.m-radio-row .m-row-art img {
+  width: 100%; height: 100%; object-fit: cover;
+}
+/* the ☆ / ★ — printed on the insert, a finger-sized target */
+.m-radio-fav {
+  flex-shrink: 0;
+  width: 44px; height: 44px;
+  margin-right: -8px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--hx-star);
+  font-size: 22px; line-height: 1;
   cursor: pointer;
 }
-.m-settings-btn:active { color: var(--accent); }
-
-/* ── Radio view ─────────────────────────────────────────────────────────── */
-.m-radio-search { padding: 8px 12px; background: var(--bg); }
-.m-radio-search input {
-  width: 100%; box-sizing: border-box;
-  padding: 10px 14px; border-radius: 12px;
-  background: var(--surface-2); border: none; color: var(--text);
-  font-size: 15px;
-}
-.m-radio-row .m-row-art img {
-  width: 100%; height: 100%; object-fit: cover; border-radius: 8px;
-}
-.m-radio-fav {
-  flex-shrink: 0; background: none; border: none;
-  color: var(--accent); font-size: 22px; line-height: 1;
-  padding: 6px 10px; cursor: pointer; align-self: center;
-}
-.m-radio-row.playing .m-row-title { color: var(--accent); }
+.m-radio-fav:active { background: var(--hx-card-2); border-radius: 6px; }
+.m-radio-row.playing .m-row-title { color: var(--hx-play-ink); }
 
 /* ── Playlists (in the Library view) ────────────────────────────────────── */
-.m-pl-new .m-row-title,
-.m-pl-new .m-row-art > span { color: var(--accent); }
+.m-pl-new .m-row-title, .m-pl-import .m-row-title {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 15px;
+}
+.m-pl-new .m-row-art > span, .m-pl-import .m-row-art > span { color: var(--hx-amber); text-shadow: 0 0 6px rgba(255,177,43,0.6); }
 
 .hidden { display: none !important; }
+
+/* ── Cast picker (cast_picker.js; the desktop styles it in app.css, which
+   this page doesn't load): a sheet over the mini player, like the action
+   sheet. ──────────────────────────────────────────────────────────────── */
+#cast-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 8px calc(8px + var(--safe-right)) calc(8px + var(--safe-bottom)) calc(8px + var(--safe-left));
+  background: rgba(0,0,0,0.55);
+}
+#cast-panel {
+  width: 100%;
+  max-width: 560px;
+  max-height: calc(100dvh - var(--safe-top) - var(--safe-bottom) - 24px);
+  overflow-y: auto;
+  padding: 10px;
+  border-radius: 14px;
+  border: 1px solid var(--hx-edge);
+  background: var(--hx-plate);
+  box-shadow: inset 0 1px 0 var(--hx-sheen), 0 -8px 32px rgba(0,0,0,0.6);
+  color: var(--hx-print);
+  animation: m-slide-up 0.2s ease;
+}
+.cast-header { display: flex; align-items: center; gap: 6px; }
+#cast-title {
+  flex: 1; min-width: 0;
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+  font: 700 15px/1.2 var(--hx-face);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.cast-icon-btn { width: 44px; height: 44px; font-size: 20px; line-height: 1; }
+.cast-active, .cast-state { margin-top: 10px; padding: 12px; border-radius: 8px; background: var(--hx-well); text-align: center; }
+.cast-active-row { display: flex; align-items: center; gap: 10px; text-align: left; }
+.cast-active-info { flex: 1; min-width: 0; }
+.cast-active-label, .cast-state-hint { font-size: 13px; color: var(--hx-print-2); }
+.cast-active-name, .cast-state-text { font: 700 16px/1.3 var(--hx-face); }
+.cast-state-icon { font-size: 26px; }
+.cast-stop-btn, .cast-error-btn { padding: 0 14px; margin-top: 8px; font: 700 13px/1 var(--hx-face); letter-spacing: 0.1em; text-transform: uppercase; }
+.cast-spinner {
+  width: 22px; height: 22px; margin: 0 auto 8px;
+  border-radius: 50%;
+  border: 2px solid var(--hx-groove);
+  border-top-color: var(--hx-amber);
+  animation: auth-spin 0.8s linear infinite;
+}
+.cast-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.cast-list-item {
+  width: 100%;
+  min-height: 56px;
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 14px;
+  text-align: left;
+}
+.cast-list-item.is-active { background: var(--hx-key-pressed); box-shadow: var(--hx-key-shadow-in); }
+.cast-item-icon svg { width: 20px; height: 20px; display: block; }
+.cast-item-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.cast-item-name { font: 700 16px/1.2 var(--hx-face); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-item-meta { font-size: 13px; color: var(--hx-print-2); }
+.cast-item-state { font: 700 12px/1 var(--hx-face); letter-spacing: 0.1em; text-transform: uppercase; color: var(--hx-glyph); }
+.cast-pref { margin-top: 10px; padding: 0 4px; }
+.cast-pref summary { min-height: 44px; display: flex; align-items: center; font: 700 13px/1 var(--hx-face); letter-spacing: 0.12em; text-transform: uppercase; color: var(--hx-print-2); cursor: pointer; }
+.cast-pref-options { display: flex; flex-direction: column; gap: 4px; }
+.cast-pref-options label { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.cast-pref-hint { font-size: 13px; color: var(--hx-print-2); margin-left: auto; }
 
 /* ── Auth overlay (login / register) ──────────────────────────────────────
    The mobile shell reuses the shared auth.js overlay (identical markup + flow
    to desktop), but desktop's overlay styles live in app.css — which the mobile
-   route never loads.  These rules restyle that overlay with the mobile palette
-   so an unauthenticated visitor gets a usable sign-in card instead of a bare,
+   route never loads.  These rules restyle that overlay as the same device —
+   a plate with the brand on a display, the fields on glass, an amber key — so
+   an unauthenticated visitor gets a usable sign-in card instead of a bare,
    unstyled form.  Class/id names mirror auth.js's _ensureOverlay() markup. */
 body.auth-blocked { overflow: hidden; }
 .auth-overlay {
@@ -909,10 +2337,7 @@ body.auth-blocked { overflow: hidden; }
   display: flex;
   align-items: center;
   justify-content: center;
-  background:
-    radial-gradient(circle at 35% 25%, rgba(138,219,255,0.10) 0%, transparent 60%),
-    radial-gradient(circle at 70% 80%, rgba(255,137,92,0.08) 0%, transparent 55%),
-    var(--bg);
+  background: var(--bg);
   padding:
     max(16px, var(--safe-top))  max(16px, var(--safe-right))
     max(16px, var(--safe-bottom)) max(16px, var(--safe-left));
@@ -927,59 +2352,80 @@ body.auth-blocked { overflow: hidden; }
 .auth-card {
   width: 100%;
   max-width: 400px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--hx-plate);
+  border: 1px solid var(--hx-edge);
   border-radius: 14px;
-  padding: 28px 24px 22px;
-  box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+  padding: 22px 20px 20px;
+  color: var(--hx-print);
+  box-shadow: inset 0 1px 0 var(--hx-sheen), 0 12px 40px rgba(0,0,0,0.45);
 }
-.auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
-.auth-brand-icon { font-size: 28px; filter: drop-shadow(0 0 8px rgba(138,219,255,0.45)); }
-.auth-brand-name { font-size: 18px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; }
-.auth-title { font-size: 20px; color: var(--text); margin: 0 0 16px; font-weight: 600; }
+.auth-brand {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: var(--hx-vfd-glass);
+  box-shadow: var(--hx-vfd-shadow);
+}
+.auth-brand-icon { font-size: 26px; }
+.auth-brand-name {
+  font: 700 18px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--hx-vfd);
+  text-shadow: var(--hx-vfd-glow);
+}
+.auth-title { font: 700 20px/1.2 var(--hx-face); letter-spacing: 0.04em; color: var(--hx-print); margin: 0 0 16px; }
 .auth-form { display: flex; flex-direction: column; gap: 14px; }
 .auth-field { display: flex; flex-direction: column; gap: 5px; }
-.auth-field > span { font-size: 12px; color: var(--text-dim); }
-.auth-field > span em { font-style: italic; opacity: 0.7; }
+.auth-field > span {
+  font: 700 12px/1 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--hx-print-2);
+}
+.auth-field > span em { font-style: italic; opacity: 0.85; text-transform: none; }
 .auth-field input {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text);
+  background: var(--hx-vfd-glass);
+  border: 1px solid #000;
+  border-radius: 5px;
+  box-shadow: var(--hx-vfd-shadow);
+  color: var(--hx-vfd);
+  caret-color: var(--hx-amber);
   padding: 12px 14px;
+  min-height: 48px;
   font-size: 16px;                /* 16px minimum blocks iOS focus auto-zoom */
   outline: none;
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color 0.15s;
 }
-.auth-field input:focus { border-color: var(--accent); }
+.auth-field input:focus { border-color: var(--hx-focus); }
 .auth-field-password { position: relative; }
-.auth-field-password input { padding-right: 48px; }
+.auth-field-password input { padding-right: 52px; }
 .auth-pw-toggle {
-  position: absolute; right: 6px; bottom: 4px;
+  position: absolute; right: 2px; bottom: 2px;
+  width: 44px; height: 44px;
   background: none; border: none;
-  font-size: 18px; line-height: 1; padding: 8px;
-  cursor: pointer; opacity: 0.7;
+  font-size: 18px; line-height: 1;
+  cursor: pointer; opacity: 0.8;
 }
 .auth-submit {
   margin-top: 6px;
-  background: var(--accent);
-  color: #0a0a0a;                 /* dark on the accent in both schemes: 12.9:1 dark, 5.1:1 light */
-  border: none;
-  border-radius: 10px;
+  min-height: 50px;
   padding: 14px 16px;
-  font-size: 16px; font-weight: 700;
+  color: var(--hx-glyph);
+  font: 700 15px/1 var(--hx-face);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   cursor: pointer;
-  transition: opacity 0.1s, transform 0.05s;
-  position: relative;
 }
-.auth-submit:active { transform: translateY(1px); }
 .auth-submit:disabled { opacity: 0.5; cursor: not-allowed; }
 .auth-submit.busy { color: transparent; }
 .auth-submit.busy::after {
   content: ''; position: absolute; inset: 0; margin: auto;
   width: 18px; height: 18px;
-  border: 2px solid rgba(128,128,128,0.4);
-  border-top-color: #0a0a0a;
+  border: 2px solid var(--hx-groove);
+  border-top-color: var(--hx-amber);
   border-radius: 50%;
   animation: auth-spin 0.6s linear infinite;
 }
@@ -987,29 +2433,143 @@ body.auth-blocked { overflow: hidden; }
 .auth-error {
   margin-top: 4px;
   padding: 10px 12px;
-  background: rgba(255,94,94,0.15);
-  color: var(--danger);
-  border: 1px solid rgba(255,94,94,0.32);
-  border-radius: 10px;
-  font-size: 13px;
+  border-radius: 5px;
+  border: 1px solid #000;
+  background: radial-gradient(120% 160% at 50% 0%, #2b0d0b 0%, #170605 60%, #0c0303 100%);
+  color: #ff8a7a;
+  font: 600 14px/1.35 var(--hx-face);
 }
 .auth-switch { margin-top: 14px; display: flex; justify-content: center; }
 .auth-link {
   background: none; border: none;
-  color: var(--accent); font-size: 13px;
-  cursor: pointer; padding: 6px 8px;
+  color: var(--hx-link); font-size: 14px;
+  cursor: pointer;
+  min-height: 44px; padding: 0 10px;
 }
 .auth-bootstrap-hint {
   margin-top: 14px;
   padding: 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-size: 12px; color: var(--text-dim); line-height: 1.55;
+  background: var(--hx-well);
+  border: 1px solid var(--hx-edge);
+  border-radius: 8px;
+  font-size: 13px; color: var(--hx-print-2); line-height: 1.55;
 }
 .auth-bootstrap-hint code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 11px; color: var(--text);
-  background: var(--bg); padding: 2px 6px; border-radius: 4px;
+  font-size: 12px; color: var(--hx-vfd);
+  background: #061517; padding: 2px 6px; border-radius: 4px;
   word-break: break-all;
+}
+
+/* ── Landscape phone: the tab keys stand in a rail on the left (the lists get
+   the height back), a lower top bar; the keys stay ≥ 44 px ─────────────── */
+@media (orientation: landscape) and (max-height: 540px) {
+  :root { --topbar-h: 48px; --tabbar-h: 0px; --rail-w: 68px; }
+  .m-topbar-vfd { height: 36px; }
+  .m-group-bar, .m-search-bar, .m-crumb-bar, .m-radio-search { padding-top: 6px; padding-bottom: 6px; }
+  .m-queue-head { min-height: 58px; padding-top: 6px; padding-bottom: 6px; }
+  .m-tuner-now { padding-top: 6px; padding-bottom: 6px; }
+  .m-presets { grid-template-columns: repeat(8, minmax(0, 1fr)); padding-top: 6px; padding-bottom: 6px; }
+  .m-sheet { max-height: calc(100dvh - 16px); }
+}
+
+/* ── Tablet (iPad portrait and up): a roomier device — legends beside the
+   key glyphs, the album as a column, two-column settings and stations, all
+   eight presets on one row ─────────────────────────────────────────────── */
+@media (min-width: 700px) and (min-height: 600px) {
+  :root { --topbar-h: 64px; --tabbar-h: 68px; }
+  #m-topbar { gap: 12px; padding-left: calc(16px + var(--safe-left)); padding-right: calc(16px + var(--safe-right)); }
+  .m-brand { font-size: 12px; }
+  .m-topbar-vfd { height: 44px; padding: 0 16px; }
+  #m-topbar-title { font-size: 20px; }
+  .m-desktop-link { max-width: none; padding: 0 14px; font-size: 12px; }
+
+  #m-tabs { gap: 10px; padding-left: calc(16px + var(--safe-left)); padding-right: calc(16px + var(--safe-right)); }
+  .m-tab { flex-direction: row; gap: 10px; padding: 0 10px; }
+  .m-tab::before { top: 50%; margin-top: -3px; right: auto; left: 12px; }
+  .m-tab-icon svg { width: 22px; height: 22px; }
+  .m-tab-label { font-size: 13px; letter-spacing: 0.12em; }
+
+  .m-miniplayer { padding-left: calc(16px + var(--safe-left)); padding-right: calc(16px + var(--safe-right)); column-gap: 12px; }
+  .m-mp-title { font-size: 17px; }
+  .m-mp-artist { font-size: 14px; }
+
+  .m-row { padding: 0 20px 0 17px; gap: 16px; }
+  .m-row-content { gap: 16px; }
+  .m-row-title { font-size: 17px; }
+  .m-row-album {
+    display: block;   /* (not for groups, nor inside one album: library.js data-album) */
+    flex: 0 1 32%;
+    min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font: 500 15px/1.25 var(--hx-face);
+    letter-spacing: 0.02em;
+    color: var(--hx-ink-2);
+  }
+  .m-list[data-album="off"] .m-row-album { display: none; }
+  .m-row-trail { min-width: 3.4em; text-align: right; font-size: 15px; }
+  .m-group-bar, .m-search-bar, .m-crumb-bar, .m-radio-search, .m-queue-head, .m-queue-offer,
+  .m-tuner-now, .m-presets { padding-left: 20px; padding-right: 20px; }
+  .m-group-chip { padding: 0 18px 0 28px; font-size: 14px; }
+  .m-group-chip::before { left: 12px; }
+  .m-search-count { padding-left: 17px; }
+  .m-empty, .m-loading { max-width: 560px; margin: 40px auto; }
+
+  .m-presets { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+  .m-tuner-name { font-size: 22px; }
+  .m-tuner-keys { flex-direction: row; align-items: stretch; }
+  .m-tuner-keys .m-key { width: 60px; }
+  /* stations side by side: two columns of lines on the insert */
+  #radio-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  .m-settings { max-width: 1100px; margin: 0 auto; padding: 24px 24px 32px; columns: 2 340px; column-gap: 24px; }
+  .m-settings-section { break-inside: avoid; }
+}
+@media (min-width: 1100px) and (min-height: 600px) {
+  #radio-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ── The tab-key rail (phone and tablet landscape) ─────────────────────────
+   The keys in a column on the left (in reach of the left thumb), the top bar,
+   content and mini player beside it; the mini player takes the home-indicator
+   inset the tab bar took. */
+@media (orientation: landscape) and (max-height: 540px),
+       (orientation: landscape) and (min-width: 1000px) and (min-height: 700px) {
+  #m-app {
+    grid-template-columns: calc(var(--rail-w) + var(--safe-left)) minmax(0, 1fr);
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas: "tabs top" "tabs content" "tabs mini";
+  }
+  #m-tabs {
+    flex-direction: column;
+    justify-content: center;
+    gap: 8px;
+    height: auto;
+    padding: calc(8px + var(--safe-top)) 8px calc(8px + var(--safe-bottom)) calc(8px + var(--safe-left));
+    border-top: 0;
+    border-right: 1px solid var(--hx-edge);
+    box-shadow: inset -1px 0 0 var(--hx-sheen);
+  }
+  .m-tab { flex: 1 1 0; max-height: 84px; flex-direction: column; gap: 5px; padding: 6px 2px 0; }
+  .m-tab::before { top: 6px; right: 7px; left: auto; margin-top: 0; }
+  #m-topbar { padding-left: 12px; }
+  .m-miniplayer {
+    padding-left: 12px;
+    height: calc(var(--mini-h) + var(--safe-bottom));
+    padding-bottom: var(--safe-bottom);
+    grid-template-rows: 1fr 4px;
+  }
+  .m-view { padding-left: 0; }
+  /* no mini player (nothing loaded): the content keeps clear of the home indicator */
+  #m-app:has(> #m-miniplayer.hidden) .m-view { padding-bottom: var(--safe-bottom); }
+}
+/* ── Tablet landscape: a wider rail ───────────────────────────────────────── */
+@media (orientation: landscape) and (min-width: 1000px) and (min-height: 700px) {
+  :root { --tabbar-h: 0px; --rail-w: 112px; }
+  #m-tabs { gap: 10px; padding-left: calc(12px + var(--safe-left)); padding-right: 12px; }
+  .m-tab { flex: 0 0 84px; gap: 6px; }
+  .m-tab::before { top: 8px; right: 9px; }
+  .m-tab-icon svg { width: 26px; height: 26px; }
+  .m-tab-label { font-size: 12px; }
+  #m-topbar, .m-miniplayer { padding-left: 16px; }
 }

@@ -14,11 +14,13 @@
  */
 import { Player } from '../../player.js';
 import { attachRowGestures, attachListGestures, attachDragReorder } from '../gestures.js';
-import { fmtDur, esc, trackActions, playlistEntry } from './_common.js';
-import { artPlaceholderEmoji, probeAdlibDurations, staticArtUrl } from '../../utils.js';
+import { fmtDur, esc, trackActions, playlistEntry, countNoun } from './_common.js';
+import { artPlaceholderEmoji, probeAdlibDurations, staticArtUrl, compoLabel } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
 import { offlineKind, offlineBadge, Offline } from '../../offline.js';
 import { healthBadge } from '../../health.js';
+
+const countTracks = (n) => countNoun(n, 'track');   // "1 track", "2 tracks"
 
 const PAGE_SIZE = 100;
 
@@ -32,6 +34,7 @@ function _nowPlayingId() {
 export function mountLibrary(root, ctx) {
   // ── State ────────────────────────────────────────────────────────────
   let group   = 'all';        // 'all' | 'artists' | 'album_artists' | 'albums' | 'genres' | 'years'
+                              // | 'composers' | 'games' | 'platforms' | 'parties' | 'playlists'
   let crumb   = null;         // when set, we're inside a group → showing tracks
   let tracks  = [];
   let groupItems = [];
@@ -57,6 +60,10 @@ export function mountLibrary(root, ctx) {
       <button class="m-group-chip"        data-g="albums">Albums</button>
       <button class="m-group-chip"        data-g="genres">Genres</button>
       <button class="m-group-chip"        data-g="years">Years</button>
+      <button class="m-group-chip hidden" data-g="composers">Composers</button>
+      <button class="m-group-chip hidden" data-g="games">Games</button>
+      <button class="m-group-chip hidden" data-g="platforms">Platforms</button>
+      <button class="m-group-chip hidden" data-g="parties">Parties</button>
       <button class="m-group-chip"        data-g="playlists">Playlists</button>
     </div>
     <div class="m-crumb-bar hidden" id="lib-crumb">
@@ -93,8 +100,9 @@ export function mountLibrary(root, ctx) {
       <div class="m-row-content">
         <div class="m-row-art"><span></span><img alt="" decoding="async"></div>
         <div class="m-row-meta"><div class="m-row-title"></div><div class="m-row-artist"></div></div>
-        <span class="m-row-artist m-row-trail" style="flex-shrink:0;font-size:12px;margin-right:4px"></span>
-        <span class="m-row-chev" style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
+        <span class="m-row-album"></span>
+        <span class="m-row-artist m-row-trail"></span>
+        <span class="m-row-chev" aria-hidden="true">›</span>
         <div class="m-row-handle">☰</div>
       </div>`;
     // No cover (204) / not decoded: the img stays transparent over the glyph.
@@ -112,6 +120,7 @@ export function mountLibrary(root, ctx) {
     emptyEl.textContent = crumb
       ? 'Couldn’t load this list — go back and open it again.'
       : 'Couldn’t load this list — tap its chip again to retry.';
+    emptyEl.dataset.kind = 'error';          // (shown red on the display, mobile.css)
     emptyEl.classList.remove('hidden');
   }
 
@@ -162,8 +171,8 @@ export function mountLibrary(root, ctx) {
       row.classList.remove('playing', 'track-offline');
       setArt(row, emojiFor(group), '');
       setTitle(row, display);
-      const count = item.count ? `${item.count}` : '';
-      row.querySelector('.m-row-meta .m-row-artist').textContent = count + (count ? ' tracks' : '');
+      row.querySelector('.m-row-meta .m-row-artist').textContent = item.count ? countTracks(item.count) : '';
+      row.querySelector('.m-row-album').textContent = '';
       show(row.querySelector('.m-row-trail'), false);
       show(row.querySelector('.m-row-chev'), true);
       show(row.querySelector('.m-row-handle'), false);
@@ -178,7 +187,11 @@ export function mountLibrary(root, ctx) {
     // Art: the emoji placeholder always paints; the cover fades in over it.
     setArt(row, artPlaceholderEmoji(t), staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : ''));
     setTitle(row, t.title || '—', healthBadge(t), offlineKind(t));
-    row.querySelector('.m-row-meta .m-row-artist').textContent = t.artist || t.album_artist || '';
+    // (a party's list: the compo and place beside the artist)
+    const compo = crumb && crumb.field === 'party' ? compoLabel(t, { party: false }) : '';
+    const who = t.artist || t.album_artist || '';
+    row.querySelector('.m-row-meta .m-row-artist').textContent = compo ? (who ? `${compo} · ${who}` : compo) : who;
+    row.querySelector('.m-row-album').textContent = t.album || '';
     const trail = row.querySelector('.m-row-trail');
     trail.textContent = fmtDur(t.duration);
     show(trail, true);
@@ -202,6 +215,8 @@ export function mountLibrary(root, ctx) {
 
   function showList(kind, count) {
     mode = kind;
+    // The album column (a wide list): not for groups, nor inside one album.
+    listEl.dataset.album = (kind === 'groups' || (crumb && crumb.field === 'album')) ? 'off' : 'on';
     measureChrome();
     vl.setCount(count);
     vl.render(true);
@@ -251,6 +266,29 @@ export function mountLibrary(root, ctx) {
     }
     return null;
   });
+
+  // The scene browse chips (Composers / Games / Platforms / Parties) show once
+  // the library has an entry for them (GET /api/library/counts; a null count:
+  // the server is still building what it reads after a start — asked again).
+  const SCENE_CHIPS = ['composers', 'games', 'platforms', 'parties'];
+  async function revealSceneChips(tries = 0) {
+    let c = null;
+    try {
+      const res = await fetch('/api/library/counts');
+      c = res.ok ? await res.json() : null;
+    } catch (_) { /* offline: the chips stay as they are */ }
+    if (!c) return;
+    let unknown = false;
+    for (const g of SCENE_CHIPS) {
+      const n = c[g];
+      if (n === null) { unknown = true; continue; }
+      const chip = groupBar.querySelector(`.m-group-chip[data-g="${g}"]`);
+      if (chip && Number.isFinite(n)) chip.classList.toggle('hidden', n <= 0 && group !== g);
+    }
+    clearTimeout(chipRetry);                 // (one retry chain at a time)
+    if (unknown && tries < 20) chipRetry = setTimeout(() => revealSceneChips(tries + 1), 3000);
+  }
+  let chipRetry = null;
 
   // ── Group chip switching ─────────────────────────────────────────────
   groupBar.addEventListener('click', (e) => {
@@ -318,6 +356,10 @@ export function mountLibrary(root, ctx) {
   function render() {
     cleanupGestures();
     viewGen++;
+    // (the top of a list — a scan or an enrichment may have brought the
+    // first Scene entries since: the chips are asked again)
+    if (!crumb) revealSceneChips();
+    delete emptyEl.dataset.kind;
     vl.reset();
     mode = null;
     listEl.innerHTML = '';
@@ -388,6 +430,23 @@ export function mountLibrary(root, ctx) {
       </div>`;
     impRow.addEventListener('click', importSheet);
     listEl.appendChild(impRow);
+    // A playlist file (M3U, M3U8, XSPF): a new playlist of the tracks found.
+    const fileRow = document.createElement('div');
+    fileRow.className = 'm-row m-pl-import';
+    fileRow.innerHTML = `<div class="m-row-content">
+        <div class="m-row-art"><span>⇩</span></div>
+        <div class="m-row-meta"><div class="m-row-title">Import a playlist file…</div>
+          <div class="m-row-artist">M3U, M3U8 or XSPF</div></div>
+      </div>
+      <input type="file" accept=".m3u,.m3u8,.xspf,audio/x-mpegurl,audio/mpegurl,application/xspf+xml" hidden>`;
+    const fileInput = fileRow.querySelector('input');
+    fileRow.addEventListener('click', (e) => { if (e.target !== fileInput) fileInput.click(); });
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      if (f) importFile(f);
+    });
+    listEl.appendChild(fileRow);
 
     pls.forEach(p => {
       const row = document.createElement('div');
@@ -400,20 +459,24 @@ export function mountLibrary(root, ctx) {
           <div class="m-row-art"><span>${p.smart ? '⚡' : '🎵'}</span></div>
           <div class="m-row-meta">
             <div class="m-row-title">${esc(p.name || 'Playlist')}</div>
-            <div class="m-row-artist">${p.track_count || 0} tracks${p.smart ? ' · smart' : ''}${sub}</div>
+            <div class="m-row-artist">${countTracks(p.track_count || 0)}${p.smart ? ' · smart' : ''}${sub}</div>
           </div>
-          <span style="color:var(--text-dim);font-size:18px;flex-shrink:0">›</span>
+          <span class="m-row-chev" aria-hidden="true">›</span>
         </div>`;
       const cleanup = attachRowGestures(row, {
         onTap: () => {
           crumb = { label: p.name, playlistId: p.id, smart: !!p.smart, readOnly: !!p.read_only };
           render();
         },
-        onLongPress: () => ctx.showSheet({ title: p.name || 'Playlist', actions: p.subscribed ? [
-          { label: '✕ Remove from my list', danger: true, onSelect: () => setSubscribed(p, false) },
-        ] : [
-          { label: '✎ Rename', onSelect: () => renamePlaylist(p) },
-          { label: '🗑 Delete', danger: true, onSelect: () => deletePlaylist(p) },
+        onLongPress: () => ctx.showSheet({ title: p.name || 'Playlist', actions: [
+          { label: '⇪ Export as M3U', onSelect: () => exportPlaylist(p, 'm3u8') },
+          { label: '⇪ Export as XSPF', onSelect: () => exportPlaylist(p, 'xspf') },
+          ...(p.subscribed ? [
+            { label: '✕ Remove from my list', danger: true, onSelect: () => setSubscribed(p, false) },
+          ] : [
+            { label: '✎ Rename', onSelect: () => renamePlaylist(p) },
+            { label: '🗑 Delete', danger: true, onSelect: () => deletePlaylist(p) },
+          ]),
         ]}),
       });
       _gestureCleanups.push(cleanup);
@@ -448,6 +511,64 @@ export function mountLibrary(root, ctx) {
       label: `${p.subscribed ? '☑' : '☐'}  ${p.name}  ·  by ${p.owner_name || '?'}`,
       onSelect: async () => { await setSubscribed(p, !p.subscribed); importSheet(); },
     }))});
+  }
+
+  // The playlist as a file to save (GET /api/playlists/{id}/export).
+  async function exportPlaylist(p, format) {
+    let blob, name = `playlist.${format}`;
+    try {
+      const res = await fetch(`/api/playlists/${encodeURIComponent(p.id)}/export?format=${format}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const cd = res.headers.get('content-disposition') || '';
+      const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="([^"]+)"/i);
+      if (m) { try { name = decodeURIComponent(m[1]); } catch (_) { name = m[1]; } }
+      blob = await res.blob();
+    } catch { ctx.toast("Couldn't export the playlist", 'error'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  // A new playlist from a playlist file (POST /api/playlists/import): its
+  // text as UTF-8, else Windows-1252 (an older M3U).
+  async function importFile(file) {
+    if (file.size > 5 * 1024 * 1024) { ctx.toast('This file is too large to be a playlist', 'error'); return; }
+    let res, body;
+    try {
+      const buf = await file.arrayBuffer();
+      const b = new Uint8Array(buf, 0, Math.min(2, buf.byteLength));
+      let content;
+      if (b.length === 2 && ((b[0] === 0xff && b[1] === 0xfe) || (b[0] === 0xfe && b[1] === 0xff))) {
+        content = new TextDecoder(b[0] === 0xff ? 'utf-16le' : 'utf-16be').decode(buf);
+      } else {
+        try { content = new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+        catch (_) { content = new TextDecoder('windows-1252').decode(buf); }
+      }
+      res = await fetch('/api/playlists/import', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, content }),
+      });
+      body = await res.json().catch(() => null);
+    } catch { ctx.toast("Couldn't import the file", 'error'); return; }
+    if (!res.ok) {
+      const d = body && body.detail;
+      ctx.toast(typeof d === 'string' ? d : (d && d.message) || "Couldn't import the file", 'error');
+      return;
+    }
+    ctx.toast(`Made "${body.playlist.name}": ${body.matched} of ${body.total} found`);
+    render();
+    // The entries not found, in a sheet (reason beside each).
+    if (body.unmatched_count) {
+      const more = body.unmatched_count - body.unmatched.length;
+      ctx.showSheet({ title: `Not found (${body.unmatched_count})`, actions: [
+        ...body.unmatched.map(u => ({ label: `${u.entry} — ${u.reason}`, onSelect: () => {} })),
+        ...(more > 0 ? [{ label: `…and ${more} more`, onSelect: () => {} }] : []),
+      ]});
+    }
   }
 
   async function createPlaylist() {
@@ -672,6 +793,10 @@ export function mountLibrary(root, ctx) {
     albums:        'album',
     genres:        'genre',
     years:         'year_min',
+    composers:     'composer',
+    games:         'game',
+    platforms:     'platform',
+    parties:       'party',
   };
   async function loadGroupList() {
     const gen = viewGen;
@@ -682,6 +807,10 @@ export function mountLibrary(root, ctx) {
       albums:        '/api/library/albums',
       genres:        '/api/library/genres',
       years:         '/api/library/years',
+      composers:     '/api/library/composers',
+      games:         '/api/library/games',
+      platforms:     '/api/library/platforms',
+      parties:       '/api/library/parties',
     };
     try {
       const res = await fetch(endpointMap[group]);
@@ -737,6 +866,7 @@ export function mountLibrary(root, ctx) {
   function emojiFor(g) {
     return ({
       artists: '🎤', album_artists: '🎤', albums: '💿', genres: '🏷', years: '📅',
+      composers: '🎼', games: '🎮', platforms: '🕹', parties: '🎉',
     })[g] || '🎵';
   }
 

@@ -1,0 +1,398 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   The queue panel — js/queue.js
+   Two looks, the shared UI style (js/ui_style.js → :root[data-ui-style]; the
+   equalizer and Settings switch it).
+     Modern      — card rows: cover, title + artist, format chip, mini waveform
+                   (the playing row's progress in it), length; an "Up next" line.
+     Retro hi-fi — a programme list on a brushed-metal faceplate (silver in the
+                   light theme): numbered keys whose lamp is lit (green) for the
+                   playing track, the header as a VFD with the time left on a
+                   tape counter, Shuffle / Repeat lit amber when on.
+   The rows reuse the playlist view's pieces (css/playlist-styles.css): the
+   .plx-fmt chip, .plx-wave-wrap / .plx-wave, the .plx-dropline, the tape
+   counter's .plx-cnt-dig / .plx-cnt-sep and @keyframes plx-sheen.
+   Light / dark follow :root[data-theme].  Every label ≥ 4.5:1 on its surface.
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Tokens (modern, dark) ──────────────────────────────────────────────────── */
+#queue-panel {
+  --qx-wave: rgba(168, 173, 182, 0.80);
+  --qx-wave-played: #f0722a;
+  --qx-wave-rest: rgba(168, 173, 182, 0.38);
+  --qx-wave-ph: rgba(181, 188, 203, 0.12);    /* no stored waveform: a faint flat bar */
+  --qx-wave-head: #ffffff;
+  --qx-on: #f0722a;                     /* an active Shuffle / Repeat */
+  /* the format chips' families (the playlist view's colours) */
+  --plx-f-lossless: #6fcf8c;
+  --plx-f-lossy: #9fc8f6;
+  --plx-f-sid: #40d0d0;
+  --plx-f-tracker: #f0722a;
+  --plx-f-chip: #c8b4ec;
+  --plx-f-midi: #ec8bc6;
+  --plx-f-other: #b5bccb;
+}
+:root[data-theme="light"] #queue-panel {
+  --qx-wave: rgba(58, 64, 80, 0.62);
+  --qx-wave-played: #c4520f;
+  --qx-wave-rest: rgba(58, 64, 80, 0.28);
+  --qx-wave-ph: rgba(58, 64, 80, 0.10);
+  --qx-wave-head: #1a1d22;
+  --qx-on: #8a3a08;
+  --plx-f-lossless: #1d6b3a;
+  --plx-f-lossy: #1f4f8f;
+  --plx-f-sid: #0b6767;
+  --plx-f-tracker: #8a3a08;
+  --plx-f-chip: #5b2d8a;
+  --plx-f-midi: #8a1d5a;
+  --plx-f-other: #3d4250;
+}
+
+/* A wider drawer: the rows carry a chip and a waveform */
+#queue-panel { width: min(460px, 100vw); }
+/* Phone-width desktop page: the player bar is in the page flow there
+   (--player-h: auto), so the drawer runs to the bottom and its list scrolls. */
+@media (max-width: 600px) {
+  #queue-panel { bottom: 0; }
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+#queue-panel .queue-header { padding: 12px 12px 10px 16px; }
+#queue-panel .queue-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.qx-summary[hidden] { display: none; }
+.qx-summary {
+  flex-shrink: 0;
+  padding: 8px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.qx-vfd {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 0;
+  font-size: 12px; color: var(--text1);
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+.qx-cap {
+  margin-right: 8px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text2);
+}
+.qx-upnext { color: var(--text0); font-weight: 600; }
+.qx-left[hidden] { display: none; }
+.qx-left::before { content: "\00b7"; margin: 0 6px; color: var(--text2); }
+.qx-counter { display: none; }
+.qx-anns { margin-left: auto; display: inline-flex; gap: 6px; padding-left: 8px; }
+/* Modern names only what is on */
+.qx-ann { display: none; }
+.qx-ann.on {
+  display: inline-block;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; line-height: 14px;
+  padding: 1px 6px; border-radius: 4px;
+  color: var(--qx-on);
+  border: 1px solid color-mix(in srgb, var(--qx-on) 50%, transparent);
+}
+.qx-from[hidden] { display: none; }
+.qx-from {
+  margin-top: 3px;
+  font-size: 12px; color: var(--text2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.qx-from-text { color: var(--text1); }
+
+/* ── Rows (a virtual list: every row is the same height) ───────────────────── */
+#queue-list { position: relative; }
+#queue-rows { flex: none; }
+#queue-status[hidden] { display: none; }
+#queue-rows .qx-row { padding: 6px 8px 6px 4px; gap: 8px; }
+#queue-rows .qx-row .queue-row-art { width: 36px; height: 36px; border-radius: 5px; }
+#queue-rows .queue-track-titlerow { height: 16px; display: flex; align-items: center; gap: 0; min-width: 0; }
+#queue-rows .queue-track-title { line-height: 16px; flex: 0 1 auto; min-width: 0; }
+#queue-rows .queue-track-artist { line-height: 14px; margin-top: 2px; }
+#queue-rows :is(.track-health-badge, .track-offline-badge) { line-height: 13px; }
+#queue-rows .qr-subsong { line-height: 13px; }
+:root[data-theme="light"] #queue-rows .qr-subsong { color: #8a3a08; border-color: rgba(138, 58, 8, 0.45); }
+/* Playback-problem badges: ≥ 4.5:1 on the queue's glass too */
+#queue-rows :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #ff7d72; }
+:root[data-theme="light"] #queue-rows :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #a3190f; }
+#queue-rows .queue-track-dur { min-width: 34px; text-align: right; }
+/* the handle the rows are dragged by: ≥ 3:1 at rest too */
+#queue-rows .qx-row .queue-drag-handle { opacity: 0.8; }
+:root[data-theme="light"] #queue-rows .qx-row .queue-drag-handle { opacity: 1; }
+#queue-rows .qx-row.dragging { opacity: 0.35; }
+.qx-num { display: none; }
+/* the chip on the playing row's tint (dark): a darker ground keeps it ≥ 4.5:1 */
+:root:not([data-theme="light"]) #queue-rows .queue-row.playing .plx-fmt { background: rgba(0, 0, 0, 0.30); }
+
+/* The playing row's waveform: a slow sheen while it plays (visualizations on,
+   motion welcome — queue.js sets .qx-anim / .qx-is-playing). */
+#queue-panel.qx-anim.qx-is-playing .queue-row.playing .plx-wave-wrap::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.22) 50%, transparent 100%) no-repeat;
+  background-size: 35% 100%;
+  animation: plx-sheen 2.6s linear infinite;
+  pointer-events: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   Retro hi-fi — a programme list on a brushed-metal faceplate
+   ══════════════════════════════════════════════════════════════════════════════ */
+:root[data-ui-style="retro"] #queue-panel {
+  --qx-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --qx-print: #cfd3d9;                  /* printed legends */
+  --qx-print-2: #a3a9b2;                /* secondary (≥ 4.5:1 on the plate) */
+  --qx-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.07) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #2a2c30 0%, #1d1f22 45%, #17181b 100%);
+  --qx-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --qx-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --qx-key-pressed: linear-gradient(180deg, #17181a, #222427);
+  --qx-key-edge: #050506;
+  /* lamps: green = the playing track, amber = a function engaged,
+     unlit = neutral dark */
+  --qx-lamp-off: #101113;
+  --qx-lamp-off-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.7), 0 1px 0 rgba(255, 255, 255, 0.07);
+  --qx-lamp-on: #3be16c;
+  --qx-lamp-ring: 0 0 0 0 transparent;
+  --qx-lamp-glow: 0 0 6px 1px color-mix(in srgb, var(--qx-lamp-on) 65%, transparent);
+  --qx-amber: #ffb12b;
+  --qx-vfd: #6ff7e9;
+  --qx-vfd-dim: #46c9bd;
+  --qx-vfd-off: #3d968d;                /* an unlit annunciator (≥ 4.5:1 on the glass) */
+  --qx-vfd-glass: radial-gradient(120% 160% at 50% 0%, #0b2628 0%, #061517 60%, #030c0d 100%);
+  --qx-wave: rgba(207, 211, 217, 0.62);
+  --qx-wave-played: #ffb12b;
+  --qx-wave-rest: rgba(207, 211, 217, 0.30);
+  --qx-wave-ph: rgba(255, 177, 43, 0.13);      /* no stored waveform: unlit amber LCD cells */
+  --qx-wave-ph-cells: 48;                       /* (waves.js WAVE_POINTS: the bars' pitch) */
+  --qx-wave-head: #fff3d6;
+  background: var(--qx-surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-left-color: #000;
+  color: var(--qx-print);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-panel {
+  --qx-print: #23262b;
+  --qx-print-2: #3f444c;
+  --qx-surface:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.30) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(180deg, rgba(0,0,0,0.035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #dfe1e4 0%, #c9ccd1 50%, #bfc2c7 100%);
+  --qx-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --qx-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --qx-key-pressed: linear-gradient(180deg, #b9bcc1, #cfd2d6);
+  --qx-key-edge: #8c9096;
+  --qx-lamp-off: rgba(0, 0, 0, 0.15);
+  --qx-lamp-off-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
+  --qx-lamp-on: #12a04a;
+  --qx-lamp-ring: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  --qx-lamp-glow: 0 0 0 0 transparent;
+  --qx-wave: rgba(35, 38, 43, 0.55);
+  --qx-wave-played: #8a3a00;
+  --qx-wave-rest: rgba(35, 38, 43, 0.26);
+  --qx-wave-ph: rgba(110, 62, 0, 0.18);
+  --qx-wave-head: #23262b;
+  --plx-f-lossless: #14532c;
+  --plx-f-lossy: #173d70;
+  --plx-f-sid: #0a4f4f;
+  --plx-f-tracker: #6e2e05;
+  --plx-f-chip: #4a2272;
+  --plx-f-midi: #6e1747;
+  --plx-f-other: #2f333c;
+  border-left-color: #8c9096;
+}
+
+/* Panel chrome on the plate: printed legends, hardware keys */
+:root[data-ui-style="retro"] #queue-panel .queue-header { border-bottom-color: rgba(0, 0, 0, 0.35); }
+:root[data-ui-style="retro"] #queue-panel .queue-title {
+  font-family: var(--qx-face); font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--qx-print);
+}
+:root[data-ui-style="retro"] #queue-panel #queue-count { font-family: var(--qx-face); color: var(--qx-print-2); letter-spacing: 0.04em; }
+:root[data-ui-style="retro"] #queue-panel #btn-queue-close { color: var(--qx-print); }
+:root[data-ui-style="retro"] #queue-panel #btn-queue-clear,
+:root[data-ui-style="retro"] #queue-panel #btn-queue-offer {
+  border-radius: 4px;
+  border: 1px solid var(--qx-key-edge);
+  background: var(--qx-key-bg);
+  color: var(--qx-print);
+  font-family: var(--qx-face); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+:root[data-ui-style="retro"] #queue-panel #btn-queue-clear:hover,
+:root[data-ui-style="retro"] #queue-panel #btn-queue-offer:hover { background: var(--qx-key-bg-hover); filter: none; }
+:root[data-ui-style="retro"] #queue-panel #btn-queue-clear:active,
+:root[data-ui-style="retro"] #queue-panel #btn-queue-offer:active {
+  background: var(--qx-key-pressed);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  transform: translateY(1px);
+}
+:root[data-ui-style="retro"] #queue-panel .queue-offer { color: var(--qx-print); border-bottom-color: rgba(0, 0, 0, 0.35); font-family: var(--qx-face); letter-spacing: 0.04em; }
+
+/* The VFD: up next + the time left on a tape counter, Shuffle / Repeat
+   annunciators — dark glass in both themes */
+:root[data-ui-style="retro"] #queue-panel .qx-summary {
+  padding: 10px 12px 10px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.35);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+:root[data-ui-style="retro"] #queue-panel .qx-vfd {
+  align-items: center;
+  gap: 6px 0;
+  padding: 8px 10px 7px;
+  border-radius: 6px;
+  background: var(--qx-vfd-glass);
+  border: 2px solid #050607;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.07);
+  font-family: var(--qx-face);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--qx-vfd);
+}
+:root[data-ui-style="retro"] #queue-panel .qx-cap { color: var(--qx-vfd-dim); font-size: 10.5px; letter-spacing: 0.16em; }
+:root[data-ui-style="retro"] #queue-panel .qx-upnext {
+  color: var(--qx-vfd); font-size: 14px; font-weight: 700;
+  text-shadow: 0 0 8px rgba(111, 247, 233, 0.45);
+}
+/* the words stay for screen readers; the counter shows the time */
+:root[data-ui-style="retro"] #queue-panel .qx-left {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+:root[data-ui-style="retro"] #queue-panel .qx-counter {
+  display: inline-flex; align-items: center; gap: 1px;
+  margin-left: auto; padding: 2px 3px;
+  background: #0b0b0c;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.85), 0 1px 0 rgba(255, 255, 255, 0.10);
+  letter-spacing: 0;
+}
+:root[data-ui-style="retro"] #queue-panel .qx-counter[hidden] { display: none; }
+/* a lower bound (lengths not known yet, more tracks to come) */
+:root[data-ui-style="retro"] #queue-panel .qx-counter.qx-more::after {
+  content: "+"; padding: 0 1px 0 2px;
+  font-size: 12px; font-weight: 700; line-height: 16px; color: #f4f4f2;
+}
+:root[data-ui-style="retro"] #queue-panel .qx-counter .plx-cnt-dig { font-family: var(--qx-face); }
+:root[data-ui-style="retro"] #queue-panel .qx-anns { flex-basis: 100%; margin-left: 0; padding-left: 0; gap: 14px; }
+:root[data-ui-style="retro"] #queue-panel .qx-ann {
+  display: inline-block;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.16em; line-height: 12px;
+  padding: 0; border: 0;
+  color: var(--qx-vfd-off);
+}
+:root[data-ui-style="retro"] #queue-panel .qx-ann.on {      /* engaged: amber */
+  color: var(--qx-amber);
+  text-shadow: 0 0 6px rgba(255, 177, 43, 0.65);
+}
+:root[data-ui-style="retro"] #queue-panel .qx-from {
+  margin-top: 7px;
+  font-family: var(--qx-face); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--qx-print-2);
+}
+:root[data-ui-style="retro"] #queue-panel .qx-from-cap { font-weight: 700; letter-spacing: 0.16em; }
+:root[data-ui-style="retro"] #queue-panel .qx-from-text { color: var(--qx-print); text-transform: none; letter-spacing: 0.03em; }
+
+/* The programme: rows on the plate, a numbered key with a lamp per track */
+:root[data-ui-style="retro"] #queue-rows .qx-row {
+  border-bottom-color: rgba(0, 0, 0, 0.30);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .qx-row {
+  border-bottom-color: rgba(0, 0, 0, 0.14);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+:root[data-ui-style="retro"] #queue-rows .qx-row.playing {
+  background: color-mix(in srgb, var(--qx-lamp-on) 7%, transparent);
+  border-left-color: var(--qx-lamp-on);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .qx-row.playing {
+  background: rgba(255, 255, 255, 0.35);
+  border-left-color: #0b7a36;           /* the edge a darker green than the lamp: ≥ 3:1 */
+}
+:root[data-ui-style="retro"] #queue-rows .queue-playing-icon { display: none; }
+:root[data-ui-style="retro"] #queue-rows .qx-num {
+  display: inline-flex; align-items: center; justify-content: flex-end; gap: 5px;
+  flex: none;
+  min-width: calc(var(--qx-numw, 2ch) + 25px);
+  height: 22px; padding: 0 6px 0 5px;
+  border-radius: 3px;
+  background: var(--qx-key-bg);
+  border: 1px solid var(--qx-key-edge);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), 0 1px 0 rgba(255, 255, 255, 0.05), 0 2px 3px rgba(0, 0, 0, 0.45);
+  font-family: var(--qx-face); font-size: 11.5px; font-weight: 700; line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--qx-print);
+}
+:root[data-ui-style="retro"] #queue-rows .qx-num::before {
+  content: ""; flex: none; margin-right: auto;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--qx-lamp-off);
+  box-shadow: var(--qx-lamp-off-shadow);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .qx-num {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+:root[data-ui-style="retro"] #queue-rows .qx-row.playing .qx-num {
+  background: var(--qx-key-pressed);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.55), 0 1px 0 rgba(255, 255, 255, 0.06);
+  transform: translateY(1px);
+}
+:root[data-ui-style="retro"] #queue-rows .qx-row.playing .qx-num::before {
+  background: var(--qx-lamp-on);
+  box-shadow: var(--qx-lamp-ring), var(--qx-lamp-glow);
+}
+:root[data-ui-style="retro"] #queue-rows .queue-track-title {
+  font-family: var(--qx-face); font-size: 13px; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--qx-print);
+}
+:root[data-ui-style="retro"] #queue-rows :is(.queue-track-artist, .queue-track-dur) {
+  font-family: var(--qx-face); letter-spacing: 0.03em; color: var(--qx-print-2);
+}
+:root[data-ui-style="retro"] #queue-rows :is(.queue-drag-handle, .queue-remove-btn) { color: var(--qx-print-2); }
+:root[data-ui-style="retro"] #queue-rows .queue-remove-btn:hover { color: var(--danger); }
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .queue-remove-btn:hover { color: #a3190f; }
+/* Rows the queue passes by, and offline ones: the title dimmed (the badge says why) */
+:root[data-ui-style="retro"] #queue-rows :is(.queue-row.queue-skipped, .queue-row.track-offline) .queue-track-title { color: var(--qx-print-2); }
+:root[data-ui-style="retro"] #queue-rows .queue-row.track-offline :is(.queue-track-artist, .queue-track-dur) { opacity: 1; }
+:root[data-ui-style="retro"] #queue-rows .qr-subsong { color: var(--qx-print); border-color: color-mix(in srgb, var(--qx-print-2) 70%, transparent); font-family: var(--qx-face); letter-spacing: 0.04em; }
+/* Playback-problem badges on the plate */
+:root[data-ui-style="retro"] #queue-rows :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #ff8a80; }
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows :is(.track-health-broken, .track-health-corrupt, .track-health-empty, .track-health-unplayable) { color: #8c0f08; }
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows :is(.track-health-glitched, .track-health-partial) { color: #5e3d00; }
+:root[data-ui-style="retro"] #queue-rows .queue-row-art { border-radius: 2px; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); }
+:root[data-ui-style="retro"] #queue-rows .plx-fmt {
+  font-family: var(--qx-face); letter-spacing: 0.08em;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.30);
+  border-color: rgba(0, 0, 0, 0.45);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .plx-fmt {
+  background: rgba(255, 255, 255, 0.45);
+  border-color: rgba(0, 0, 0, 0.25);
+}
+:root[data-ui-style="retro"] #queue-rows .plx-wave-wrap {
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.28);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+:root[data-theme="light"][data-ui-style="retro"] #queue-rows .plx-wave-wrap {
+  background: rgba(255, 255, 255, 0.35);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+:root[data-ui-style="retro"] #queue-panel :is(#queue-status, .queue-drop-zone) {
+  font-family: var(--qx-face); letter-spacing: 0.06em; color: var(--qx-print-2);
+}
+:root[data-ui-style="retro"] #queue-panel .queue-drop-zone { border-top-color: rgba(0, 0, 0, 0.35); }
+
+/* Reduced motion: no sheen, no gliding drop line (the rows' glide is skipped
+   in queue.js) */
+@media (prefers-reduced-motion: reduce) {
+  #queue-panel .plx-wave-wrap::after { animation: none !important; }
+  #queue-panel .plx-dropline { transition: none; }
+}

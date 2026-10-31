@@ -585,6 +585,21 @@ def _find_renderer(configured_path: str, binary_name: str) -> str | None:
     return shutil.which(binary_name)
 
 
+def _gme_variant(ext: str) -> "str | None":
+    """The cache variant of a ``gme`` render of a file with suffix ``ext``: a
+    KSS file kssrender plays (``_render_kss`` — with the MSX FM chips libgme
+    lacks) is another render than libgme's, so a libgme render cached before
+    is not reused."""
+    if ext == ".kss" and _find_renderer(settings.kssrender_path, "kssrender"):
+        return "kss1"
+    return None
+
+
+def _gme_renderer_name(ext: str) -> str:
+    """``X-Rendered`` / the renderer key of a ``gme``-family play."""
+    return "kssrender" if _gme_variant(ext) else "gme"
+
+
 def _cleanup_paths(*paths: Path | None):
     """Remove temp files after response is sent."""
     for p in paths:
@@ -1361,9 +1376,34 @@ def _render_has_audio(path: Path) -> bool:
     return size > len(head)               # a data chunk past 4 KB of header
 
 
+def _kill_render_proc(proc) -> None:
+    """SIGKILL a renderer process — and, for one started as a group of its own
+    (``new_session``: a shell pipeline, ``_adlib_cmd``), every process in that
+    group: killing only the shell leaves the pipeline's commands running."""
+    if getattr(proc, "_sb_group", False):
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    proc.kill()
+
+
+async def _spawn_render(cmd: list[str], *, new_session: bool = False, **kw):
+    """``forksafe.spawn`` of a renderer; ``new_session``: in a process group
+    of its own, which ``_kill_render_proc`` kills whole."""
+    if new_session:
+        kw["start_new_session"] = True
+    proc = await forksafe.spawn(*cmd, **kw)
+    if new_session:
+        proc._sb_group = True
+    return proc
+
+
 async def _await_renderer(
     cmd: list[str], tmp_path: Path, *, timeout: float, kind: str,
-    require_audio: bool = True,
+    require_audio: bool = True, new_session: bool = False,
 ) -> None:
     """Run a renderer subprocess with a timeout and check its exit status.
 
@@ -1381,6 +1421,8 @@ async def _await_renderer(
     An exit 0 with no audio in ``tmp_path`` (``_render_has_audio``) is a 422
     too — unless ``require_audio`` is False, for a caller that inspects an
     empty result itself (AdLib tells a missing bank from a corrupt file).
+    ``new_session``: ``cmd`` is a pipeline, killed as a group
+    (``_kill_render_proc``).
     """
     async with _render_sem:
         # Capture stderr (was DEVNULL): a renderer's own diagnostics are the
@@ -1388,8 +1430,8 @@ async def _await_renderer(
         # listener can act on) apart from "the renderer/infra broke" (a 502).
         # ``communicate`` drains the pipe concurrently so a chatty renderer
         # (ffmpeg) can't deadlock on a full 64K stderr buffer.
-        proc = await forksafe.spawn(
-            *cmd,
+        proc = await _spawn_render(
+            cmd, new_session=new_session,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1424,7 +1466,7 @@ async def _await_renderer(
             # source that ``store_cached`` will have already moved).
             if proc.returncode is None:
                 try:
-                    proc.kill()
+                    _kill_render_proc(proc)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=2.0)
                     except (asyncio.TimeoutError, Exception):
@@ -2057,7 +2099,7 @@ async def _tune_audible_run(family: str, path: Path, index: int, *, base: int = 
     return None
 
 
-async def _cached_default_ok(track_id: str, family: str) -> bool:
+async def _cached_default_ok(track_id: str, family: str, ext: str = "") -> bool:
     """Is the first tune's render already cached, long enough and audible —
     a real tune, no probe needed?  (A render cached before silent renders
     were refused may be silence, so it is judged here too: one read of the
@@ -2065,7 +2107,8 @@ async def _cached_default_ok(track_id: str, family: str) -> bool:
     from soniqboom.core.conversion_cache import get_cached
     from soniqboom.core.silence import MIN_TUNE_SECONDS, wav_audible
     key = (uade_cache_key(track_id, 0) if family == "uade"
-           else _ck(track_id, family, subsong=0))
+           else _ck(track_id, family, subsong=0,
+                    variant=_gme_variant(ext) if family == "gme" else None))
     wav = await get_cached(key)
     if wav is None:
         return False
@@ -2114,7 +2157,7 @@ async def _probe_default_tune(track_id: str, track, path: Path, family: str) -> 
     unsure: "int | None" = None         # a candidate that can't be told
     no_slot = False
     t_wait = time.monotonic()
-    if start == 0 and await _cached_default_ok(track_id, family):
+    if start == 0 and await _cached_default_ok(track_id, family, path.suffix.lower()):
         chosen = 0                                      # the first tune's render is music
     else:
         slot = _render_sem if family != "gme" else None
@@ -3409,6 +3452,13 @@ async def _render_gme(path: Path, subsong: int = 0, *,
     duration = settings.sid_default_duration   # shares the chiptune default
     from soniqboom.core import gme_render
     loop = asyncio.get_event_loop()
+    if path.suffix.lower() == ".kss":
+        kss = _find_renderer(settings.kssrender_path, "kssrender")
+        if kss:
+            # libkss plays the MSX sound chips libgme lacks (FM-PAC / OPLL,
+            # MSX-AUDIO) and the KSCC / KSSX files it renders as silence.
+            return await _render_kss(kss, path, subsong, duration, live_key=live_key,
+                                     expected_seconds=expected_seconds)
     if (path.suffix.lower() in (".vgm", ".vgz")
             and await _pb(gme_render.vgm_needs_other_engine, path)):
         # A chip libgme can't play would render silence (GitHub #27).
@@ -3485,6 +3535,30 @@ async def _render_gme(path: Path, subsong: int = 0, *,
     finally:
         if unpacked_tmp is not None:
             unpacked_tmp.unlink(missing_ok=True)
+
+
+# A KSS song plays until libkss sees it loop (or it falls silent for 3 s), at
+# most the chiptune default length, and ends with this fade (as libgme's).
+_KSS_FADE_MS = 8000
+
+
+async def _render_kss(binary: str, path: Path, subsong: int, duration: float, *,
+                      live_key: "str | None" = None,
+                      expected_seconds: float = 0.0) -> Path:
+    """Render KSS song ``subsong`` (the tune number libgme counts, which is
+    the KSS song number) with ``kssrender`` (libkss — soniqboom/native/
+    kssrender) to a temp WAV, 44.1 kHz stereo; ``live_key``: as a live render
+    (``_tail_render``), played while it renders."""
+    tmp_wav = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".wav", delete=False)
+    tmp_wav.close()
+    max_s = max(5, min(int(duration or 0) or 180, 3600))
+    cmd = [binary, "-s", str(max(0, min(int(subsong), 255))), "-r", "44100",
+           "-m", str(max_s), "-f", str(_KSS_FADE_MS), str(path), tmp_wav.name]
+    if live_key:
+        return await _tail_render(cmd, Path(tmp_wav.name), live_key, kind="KSS",
+                                  timeout=max_s + 60, expected_seconds=expected_seconds)
+    await _await_renderer(cmd, Path(tmp_wav.name), timeout=max_s + 60, kind="KSS")
+    return Path(tmp_wav.name)
 
 
 async def _render_gme_live(data: bytes, subsong: int, duration: float, live_key: str,
@@ -3758,31 +3832,133 @@ _ADLIB_MAX_SUBSONG_PROBE = 16
 _ADLIB_BANK_PARENT_LEVELS = 4
 
 
+# The OPL chips run at 49,716 Hz (14.318 MHz / 288).  Nuked OPL3 asked for
+# 44.1 kHz interpolates its native output linearly, which dulls the top octave
+# and adds images (measured: −24.8 dB error against a high-quality resample of
+# the native render, vs −53.5 dB rendered native and resampled — ALLOYRUN.A2M,
+# 2026-10-28).  So adplay renders at the chip's rate and ffmpeg resamples to
+# 44.1 kHz with the best resampler it has (soxr when built in, else its own at
+# a long filter), TPDF-dithered back to 16 bits.
+_OPL_NATIVE_RATE = 49716
+_SOXR_OK: "bool | None" = None
+
+
+def _ffmpeg_has_soxr() -> bool:
+    """Does this ffmpeg build carry the SoX resampler?  Probed once.
+    Blocking."""
+    global _SOXR_OK
+    if _SOXR_OK is None:
+        try:
+            r = forksafe.run(
+                [settings.ffmpeg_path or "ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-nostdin", "-f", "lavfi", "-i", "sine=f=1000:sample_rate=49716:d=0.1",
+                 "-af", "aresample=44100:resampler=soxr", "-f", "null", "-"],
+                capture_output=True, timeout=15)
+            _SOXR_OK = r.returncode == 0
+        except Exception:
+            _SOXR_OK = False
+    return _SOXR_OK
+
+
+def _opl_resample_filter() -> str:
+    """The ffmpeg filter that takes a native-rate OPL render to 44.1 kHz."""
+    if _ffmpeg_has_soxr():
+        return "aresample=44100:resampler=soxr:precision=28:dither_method=triangular_hp"
+    return "aresample=44100:filter_size=64:phase_shift=10:dither_method=triangular_hp"
+
+
+# adplay's disk writer patches its WAV header's two sizes when it closes; into
+# a pipe it can't seek, so it writes them (data size, RIFF size — 8 bytes)
+# after the audio, where they play as a click (measured: a peak of -18 dBFS on
+# a -29 dBFS tune).  This filter passes the stream on as it comes and leaves
+# out its last 8 bytes when they are exactly those sizes.
+ADPLAY_TAIL_FILTER = (
+    "import os,struct\n"
+    "def w(x):\n"
+    " while x: x=x[os.write(1,x):]\n"
+    "n=0;h=b''\n"
+    "while True:\n"
+    " b=os.read(0,65536)\n"
+    " if not b: break\n"
+    " h+=b;n+=len(b)\n"
+    " if len(h)>8: w(h[:-8]);h=h[-8:]\n"
+    "d=n-52\n"
+    "if not(len(h)==8 and d>=0 and h in (struct.pack('<II',d,d+36),"
+    "struct.pack('<II',d+36,d))): w(h)\n")
+
+
+def _adlib_cmd(binary: str, path: Path, subsong: int, out: str) -> list[str]:
+    """The command that renders one AdLib subsong to the 44.1 kHz WAV ``out``:
+    adplay at the OPL chip's own rate, through ``ADPLAY_TAIL_FILTER``, into
+    ffmpeg's resampler (run as a process group of its own — ``new_session`` —
+    so stopping the render kills them all; killing the shell alone would leave
+    them running.  adplay ending — a tune it can't read included — ends
+    ffmpeg's input).  adplay writes the WAV to ``/dev/fd/3`` — the pipe — and its own
+    stdout goes nowhere: Debian's adplay 1.8 prints blank lines to stdout even
+    with ``-q``, which would land in the WAV.  With no ffmpeg found, or in the
+    macOS app (no interpreter for the filter), adplay alone at 44.1 kHz."""
+    import shlex
+    import shutil
+    import sys
+    play = [binary, "-q", "-O", "disk", "-e", _ADLIB_OPL_EMULATOR, "--stereo"]
+    if subsong > 0:
+        play += ["-s", str(subsong)]     # multi-song AdLib formats (RAD, .adl, …)
+    ffmpeg = shutil.which(settings.ffmpeg_path or "ffmpeg")
+    from soniqboom.core.merger import _is_bundled
+    if not ffmpeg or _is_bundled():
+        # (the macOS app has no Python interpreter to run the tail filter:
+        # ``sys.executable`` is the app itself)
+        return play + ["-d", out, "-f", "44100", str(path)]
+    resample = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-f", "wav", "-ignore_length", "1", "-i", "pipe:0",
+                "-af", _opl_resample_filter(), "-c:a", "pcm_s16le", "-map_metadata", "-1",
+                "-fflags", "+bitexact", "-flags:a", "+bitexact", "-f", "wav", out]
+    q = shlex.quote
+    script = (" ".join(q(a) for a in
+                       play + ["-d", "/dev/fd/3", "-f", str(_OPL_NATIVE_RATE), str(path)])
+              + " 3>&1 >/dev/null 2>&1 | " + q(sys.executable) + " -I -c "
+              + q(ADPLAY_TAIL_FILTER) + " | exec " + " ".join(q(a) for a in resample))
+    return ["/bin/sh", "-c", script]
+
+
 async def _render_adlib_one(binary: str, path: Path, subsong: int,
                             live_key: str | None = None, *,
                             expected_seconds: float = 0.0,
                             min_audible_seconds: float = 0.0) -> Path:
-    """Render a single AdLib/OPL subsong to a fresh temp WAV (no audio check).
-    ``live_key``: as a live render, copied into a live WAV as adplay writes it
+    """Render a single AdLib/OPL subsong to a fresh temp WAV (no audio check),
+    at the chip's own rate resampled to 44.1 kHz (``_adlib_cmd``).
+    ``live_key``: as a live render, copied into a live WAV as it is written
     (``_tail_render``, which takes ``expected_seconds`` / ``min_audible_seconds``)."""
     tmp_wav = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".wav", delete=False)
     tmp_wav.close()
-    cmd = [binary, "-O", "disk", "-d", tmp_wav.name,
-           "-e", _ADLIB_OPL_EMULATOR, "-f", "44100", "--stereo"]
-    if subsong > 0:
-        cmd += ["-s", str(subsong)]      # multi-song AdLib formats (RAD, .adl, …)
-    cmd.append(str(path))
-    if live_key:
-        return await _tail_render(cmd, Path(tmp_wav.name), live_key, kind="adlib",
-                                  timeout=_ADLIB_DEFAULT_TIMEOUT_S, require_audio=False,
-                                  expected_seconds=expected_seconds,
-                                  min_audible_seconds=min_audible_seconds)
-    await _await_renderer(
-        cmd, Path(tmp_wav.name),
-        timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
-        require_audio=False,    # ``_render_adlib`` tells a missing bank from a corrupt file
-    )
-    return Path(tmp_wav.name)
+    if _SOXR_OK is None:
+        await asyncio.to_thread(_ffmpeg_has_soxr)
+    cmd = _adlib_cmd(binary, path, subsong, tmp_wav.name)
+    piped = cmd[0] == "/bin/sh"
+    try:
+        if live_key:
+            return await _tail_render(cmd, Path(tmp_wav.name), live_key, kind="adlib",
+                                      timeout=_ADLIB_DEFAULT_TIMEOUT_S, require_audio=False,
+                                      expected_seconds=expected_seconds,
+                                      min_audible_seconds=min_audible_seconds,
+                                      new_session=piped)
+        await _await_renderer(
+            cmd, Path(tmp_wav.name),
+            timeout=_ADLIB_DEFAULT_TIMEOUT_S, kind="adlib",
+            require_audio=False,    # ``_render_adlib`` tells a missing bank from a corrupt file
+            new_session=piped,
+        )
+        return Path(tmp_wav.name)
+    except HTTPException as exc:
+        # Through the resampler, a tune adplay decoded nothing of (a missing
+        # bank, an unsupported variant) fails in ffmpeg instead of leaving a
+        # header-only WAV: answer that WAV, so ``_render_adlib`` says why as
+        # it does for adplay alone.  A timeout stays a timeout.
+        if not piped or exc.status_code == 504:
+            raise
+        empty = Path(tmp_wav.name)
+        empty.write_bytes(_build_wav_header(44100, 2, 0, bits_per_sample=16))
+        return empty
 
 
 def _wav_audio_seconds(wav_path: Path) -> float:
@@ -4002,21 +4178,27 @@ async def _render_adlib(path: Path, subsong: int = 0, *,
     # DOSBox Raw OPL: adplay's auto-detect only handles DRO v2; the older DRO v1
     # (no version field) it rejects as "unknown filetype".  Losslessly rewrite a
     # v1 capture as v2 (OPL register stream preserved verbatim) and render that.
-    render_path, dro_tmp = path, None
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(12)
-    except OSError:
-        head = b""
-    if head[:8] == b"DBRAWOPL" and not _dro_is_v2(head):
+    def _dro_prepare() -> "tuple[Path, Path | None]":
+        """(what adplay renders, the v2 rewrite to remove or None) — reads the
+        source: on the playback pool, never on the loop (a network drive)."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(12)
+        except OSError:
+            head = b""
+        if head[:8] != b"DBRAWOPL" or _dro_is_v2(head):
+            return path, None
+        tmp = None
         try:
             v2 = _dro_v1_to_v2(path.read_bytes())   # may raise — no temp file created yet
             with tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".dro", delete=False) as t:
-                dro_tmp = Path(t.name)              # register NOW so the finally always cleans up
+                tmp = Path(t.name)                  # register NOW so the finally always cleans up
                 t.write(v2)
-            render_path = dro_tmp
+            return tmp, tmp
         except Exception as exc:        # noqa: BLE001 — fall back to raw file
             log.warning("DRO v1→v2 transcode failed for %s: %s", path, exc)
+            return path, tmp
+    render_path, dro_tmp = await _pb_at(path, _dro_prepare)
 
     try:
         # adplay exits 0 even when AdPlug can't decode the tune (e.g. a Sierra
@@ -4657,9 +4839,21 @@ async def _render_midi(path: Path, *, live_key: str | None = None) -> Path:
     if not binary:
         raise HTTPException(501, "FluidSynth not installed")
 
-    from soniqboom.config import get_active_soundfont
-    soundfont = get_active_soundfont()
+    from soniqboom.config import get_active_soundfont, missing_soundfont
+
+    def _soundfont():
+        # (stats — the SoundFont may be on an external or network drive: off
+        # the loop, and looked up once)
+        sf = get_active_soundfont()
+        return sf, (None if sf else missing_soundfont())
+    soundfont, gone = await _pb(_soundfont)
     if not soundfont:
+        if gone:
+            # (the name only: every listener reads this, the server's path is
+            # the admin's — Renderers → Soundfonts says where it was)
+            raise HTTPException(503, f"The chosen SoundFont “{Path(gone).name}” can't be "
+                                     "found — reconnect its drive, or choose another one "
+                                     "under gear → Renderers → Soundfonts.")
         raise HTTPException(501, "No soundfont available — upload one in Admin settings")
 
     tmp_wav = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".wav", delete=False)
@@ -5360,7 +5554,8 @@ async def _tail_render(cmd: list[str], src: Path, live_key: "str | None", *, kin
                        exact: bool = False, min_audible_seconds: float = 0.0,
                        stop_after_s: float = 0.0, fade_s: float = 0.0,
                        max_expected_s: "float | None" = None,
-                       float_out: bool = False, rate: int = 44100) -> Path:
+                       float_out: bool = False, rate: int = 44100,
+                       new_session: bool = False) -> Path:
     """Run renderer ``cmd``, which writes a WAV (16-bit PCM, or 32-bit float
     with ``float_out``) to ``src`` as it
     renders, and copy its audio into a live WAV (``_LiveWav`` registered
@@ -5499,9 +5694,9 @@ async def _tail_render(cmd: list[str], src: Path, live_key: "str | None", *, kin
                         min_audible_seconds=min_audible_seconds,
                         max_expected_s=max_expected_s, float_=float_out, rate=rate)
         async with _render_sem:
-            proc = await forksafe.spawn(
-                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                env=env)
+            proc = await _spawn_render(
+                cmd, new_session=new_session,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env)
 
             async def _drain_stderr():
                 try:
@@ -5542,7 +5737,7 @@ async def _tail_render(cmd: list[str], src: Path, live_key: "str | None", *, kin
                     proc_wait.cancel()
                 if proc.returncode is None:
                     try:
-                        proc.kill()
+                        _kill_render_proc(proc)
                         await asyncio.wait_for(proc.wait(), timeout=2.0)
                     except Exception:
                         pass
@@ -6287,7 +6482,11 @@ def _spawn_uade_vu(key: str, src_path: Path, subsong: int,
             if ev is not None:
                 await ev.wait()
             wav = await get_cached(key)
-            if wav is None or wav.with_suffix(".vu").exists() or not Path(src_path).exists():
+
+            def _vu_wanted() -> bool:
+                # (stats — the source may be on a network drive: off the loop)
+                return not wav.with_suffix(".vu").exists() and Path(src_path).exists()
+            if wav is None or not await _pb_at(src_path, _vu_wanted):
                 return
             _pin(key)
             pinned = True
@@ -6301,8 +6500,8 @@ def _spawn_uade_vu(key: str, src_path: Path, subsong: int,
                 # the source may be gone (an unpinned remote-cache entry, a
                 # moved file) — a vanished source must not read as "this uade
                 # build can't dump".
-                if (wav.with_suffix(".vu").exists() or not Path(src_path).exists()
-                        or not _uade_vu_still_wanted(poll_key)):
+                if (not _uade_vu_still_wanted(poll_key)
+                        or not await _pb_at(src_path, _vu_wanted)):
                     return
                 attempted = True
                 dump = await _uade_vu_dump(binary, Path(src_path), subsong, wav, base=base)
@@ -6451,7 +6650,7 @@ async def _serve_live_body(request: Request, *, track_id: str, format_type: str,
                            subsong: int, key: str, render_fn,
                            cache_kw: "dict | None" = None, web_session: bool,
                            background, xf: "_Xform | None", rendered: str,
-                           after_render=None, safari_waits: bool = False) -> Response:
+                           after_render=None) -> Response:
     """Serve a track whose render can be played while it runs (a live render:
     ``_LiveWav``): cache hit → the file with Range; otherwise attach to (or
     start) the render and, once it is audible, play the growing WAV — first
@@ -6482,11 +6681,9 @@ async def _serve_live_body(request: Request, *, track_id: str, format_type: str,
     (soundfont, variant).  ``after_render(cached_path)`` (a coroutine
     function: the duration backfill) runs once the render is cached — before
     the answer on the blocking path, in the background after a progressive
-    start.  ``rendered`` names the renderer (``X-Rendered``).  ``safari_waits``:
-    Safari / WebKit waits for the finished file even with a known length —
-    WebKit asks for the file's last bytes before it starts and gives up
-    (error 4, for good) when a growing file can't answer within ~9 s; for a
-    renderer that finishes in seconds (openmpt123) waiting is the safe way."""
+    start.  ``rendered`` names the renderer (``X-Rendered``).  WebKit reads the
+    end of a WAV's audio before it plays: the stream route lays its WAVs out
+    so that read is answered at once (``_WEBKIT_ALIGN``)."""
     from soniqboom.core.conversion_cache import known_silent
     transform = xf is not None and xf.active
     task, cached, live = await _live_attach(
@@ -6498,7 +6695,6 @@ async def _serve_live_body(request: Request, *, track_id: str, format_type: str,
     if (not transform and cached is None and live is not None
             and request.method == "GET"
             and not live["complete"].is_set() and not known_silent(key)
-            and not (safari_waits and _is_safari(request))
             and ((web_session and (live["expected_size"] > 0
                                    or (open_ended and not _is_safari(request))))
                  or (not web_session and live.get("exact")
@@ -7280,7 +7476,7 @@ def renderer_key_for(track: "dict | None") -> "str | None":
                       (_SNDH_EXTS, "psgplay"), (_YM_EXTS, "ym2wav"),
                       (_SC68_EXTS, "sc68"), (_UADE_EXTS, "uade123"),
                       (_ADLIB_EXTS | {".imf"}, "adplay"), (_TRACKER_EXTS, "openmpt123"),
-                      (_GME_EXTS_STREAM, "gme")):
+                      (_GME_EXTS_STREAM, _gme_renderer_name(ext))):
         if ext in exts:
             return key
     if ext == ".dsf" and str(track.get("format") or "").upper().startswith("DSF (DREAMCAST"):
@@ -7613,6 +7809,336 @@ def _is_safari(request: Request) -> bool:
     if "Safari" not in ua:
         return False
     return not any(t in ua for t in ("Chrome", "Chromium", "Edg/", "OPR/"))
+
+
+# ── WebKit: an aligned WAV ────────────────────────────────────────────────────
+# Before it plays a WAV, WebKit's media stack reads from the 16 KB boundary at
+# or before the end of the ``data`` chunk to the end of the file (the chunks
+# after the audio).  A render still running can't answer that until it ends
+# (a cold SID waited ~9 s), and WebKit gives up on a file whose answer takes
+# much longer.  So the web player in WebKit is served every rendered /
+# transcoded WAV with two ``JUNK`` chunks added: one after the 12-byte RIFF
+# preamble, sized so the audio ends on a ``_WEBKIT_ALIGN`` boundary, and
+# ``_WEBKIT_TRAILER`` bytes after the audio (an empty one is refused).  That
+# read then starts where the audio ends and asks for the trailer alone, which
+# is answered at once.  The RIFF size counts both; the ``data`` chunk — and
+# so the duration — is unchanged.  The layout depends on the WAV's size
+# alone, so every answer for one URL (the growing render's, the finished
+# file's) describes the same file.
+_WEBKIT_ALIGN = 64 * 1024
+_WEBKIT_TRAILER = 8 * 1024
+_RIFF_PREAMBLE = 12
+# Stream URL → the size of the WAV last served for it (most recent last).
+_webkit_totals: "OrderedDict[str, int]" = OrderedDict()
+_WEBKIT_TOTALS_MAX = 1024
+
+
+def _is_webkit(request: Request) -> bool:
+    """True for a WebKit browser or web view — Safari, every iOS / iPadOS
+    browser, a home-screen web app (whose UA lacks "Safari") — not Chrome,
+    Edge, Opera or Firefox on other systems."""
+    ua = request.headers.get("user-agent", "")
+    return "AppleWebKit" in ua and not any(
+        t in ua for t in ("Chrome", "Chromium", "Edg/", "OPR/", "Android"))
+
+
+def _webkit_layout(total: int) -> "tuple[int, int]":
+    """``(junk, padded_total)`` for a WAV of ``total`` bytes (even): the size
+    of the ``JUNK`` chunk after the preamble, and the served size."""
+    junk = 8 + (-(total + 8)) % _WEBKIT_ALIGN
+    return junk, total + junk + _WEBKIT_TRAILER
+
+
+def _junk_chunk(size: int) -> bytes:
+    return b"JUNK" + (size - 8).to_bytes(4, "little") + bytes(size - 8)
+
+
+class _WebKitWavMap:
+    """The bytes ``first``–``last`` (inclusive) of the WebKit layout of a WAV
+    of ``total`` bytes, from that WAV's own bytes read from ``real_start``
+    on: ``feed`` each piece read, then ``finish``.  The preamble's RIFF size
+    is raised by the added chunks (when it states a size)."""
+
+    def __init__(self, total: int, first: int, last: int, real_start: int) -> None:
+        self.total = total
+        self.junk, self.padded = _webkit_layout(total)
+        self.last = last
+        self.vpos = first                 # next byte of the layout to give
+        self.rpos = real_start            # the WAV's offset of the next byte fed
+        self.head = bytearray()           # the preamble, held for the RIFF size
+
+    def _added(self, lo: int, hi: int) -> bytes:
+        """The layout's bytes ``lo``–``hi - 1`` that the added chunks hold."""
+        out = bytearray()
+        a, b = _RIFF_PREAMBLE, _RIFF_PREAMBLE + self.junk
+        if lo < b and hi > a:
+            out += _junk_chunk(self.junk)[max(lo, a) - a:min(hi, b) - a]
+        t = self.total + self.junk
+        if hi > t:
+            out += _junk_chunk(_WEBKIT_TRAILER)[max(lo, t) - t:hi - t]
+        return bytes(out)
+
+    def _give(self, v0: int, data: bytes) -> bytes:
+        """``data`` (the layout's bytes from ``v0``), clipped to what is
+        still to give."""
+        lo, hi = max(self.vpos, v0), min(self.last + 1, v0 + len(data))
+        if hi <= lo:
+            return b""
+        self.vpos = hi
+        return data[lo - v0:hi - v0]
+
+    def _flush_head(self) -> bytes:
+        head = bytes(self.head)
+        self.head = bytearray()
+        if len(head) >= 8 and head[:4] == b"RIFF":
+            riff = int.from_bytes(head[4:8], "little")
+            if 0 < riff < 0xFFFFFFFF:
+                riff = min(riff + self.junk + _WEBKIT_TRAILER, 0xFFFFFFFE)
+                head = head[:4] + riff.to_bytes(4, "little") + head[8:]
+        return self._give(0, head)
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        if self.rpos < _RIFF_PREAMBLE:
+            k = min(len(data), _RIFF_PREAMBLE - self.rpos)
+            self.head += data[:k]
+            self.rpos += k
+            data = data[k:]
+            if self.rpos < _RIFF_PREAMBLE:
+                return b""
+            out += self._flush_head()
+        if data:
+            v0 = self.rpos + self.junk
+            if self.vpos < v0:            # the added chunk before these bytes
+                out += self._give(self.vpos, self._added(self.vpos, min(v0, self.last + 1)))
+            out += self._give(v0, data)
+            self.rpos += len(data)
+        return bytes(out)
+
+    def finish(self) -> bytes:
+        """The rest: the held preamble of a short read, and the added bytes
+        after the last ones fed — when the WAV's own bytes ended short (a
+        render that ended early), only the JUNK chunk before them, never the
+        trailer in their place (the answer is short, as without the layout)."""
+        out = bytearray(self._flush_head() if self.head else b"")
+        if self.vpos <= self.last:
+            hi = self.last + 1
+            if self.rpos < self.total:
+                hi = min(hi, max(self.rpos, _RIFF_PREAMBLE) + self.junk)
+            if hi > self.vpos:
+                out += self._give(self.vpos, self._added(self.vpos, hi))
+        return bytes(out)
+
+
+def _webkit_real_range(first: int, last: int, total: int) -> "tuple[int, int] | None":
+    """The WAV's own bytes (inclusive) the layout's ``first``–``last`` need —
+    the whole preamble when its RIFF size (bytes 4–7) is among them, as that
+    is rewritten; None when the added chunks alone hold them."""
+    junk, _ = _webkit_layout(total)
+    lo = hi = None
+    if first < _RIFF_PREAMBLE:
+        lo, hi = 0, (last if last < 4 else _RIFF_PREAMBLE - 1)
+    s, e = max(first, _RIFF_PREAMBLE + junk), min(last, total + junk - 1)
+    if s <= e:
+        lo = s - junk if lo is None else lo
+        hi = e - junk
+    return None if lo is None else (lo, hi)
+
+
+def _webkit_pad_wanted(request: Request) -> bool:
+    """A GET of the web player (session cookie, no Subsonic auth) in WebKit."""
+    try:
+        q = request.query_params
+        return (request.method == "GET" and _is_webkit(request)
+                and bool(request.cookies.get("sb_session"))
+                and not (q.get("u") or q.get("s") or q.get("t")))
+    except Exception:                                   # noqa: BLE001 — a stand-in request
+        return False
+
+
+def _webkit_url_key(request: Request) -> str:
+    return f"{request.url.path}?{request.url.query}"
+
+
+def _webkit_note_total(key: str, total: int) -> None:
+    _webkit_totals[key] = total
+    _webkit_totals.move_to_end(key)
+    while len(_webkit_totals) > _WEBKIT_TOTALS_MAX:
+        _webkit_totals.popitem(last=False)
+
+
+def _single_range(range_hdr: str) -> "tuple[int | None, int | None] | None":
+    """``(first, last)`` of a one-range ``bytes=`` header (``first`` None:
+    a suffix of ``last`` bytes; ``last`` None: open-ended) — None for
+    another unit, several ranges or an invalid one."""
+    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", range_hdr or "")
+    if m is None or (not m.group(1) and not m.group(2)):
+        return None
+    first = int(m.group(1)) if m.group(1) else None
+    last = int(m.group(2)) if m.group(2) else None
+    if first is not None and last is not None and last < first:
+        return None
+    return first, last
+
+
+def _set_request_header(request: Request, name: bytes, value: str) -> None:
+    """Replace a request header (the handlers read them from
+    ``request.headers``, rebuilt from the scope)."""
+    request.scope["headers"] = [(k, v) for k, v in request.scope["headers"]
+                                if k.lower() != name] + [(name, value.encode())]
+    request.__dict__.pop("_headers", None)
+
+
+def _set_request_range(request: Request, value: str) -> None:
+    _set_request_header(request, b"range", value)
+
+
+class _WebKitAlignedWav(Response):
+    """``inner`` (an answer of the stream route) in the WebKit layout, for
+    the layout's bytes ``first``–``last`` (None: to the end; ``ranged``: the
+    client asked for a range).  Only a 200 / 206 ``audio/wav`` answer of a
+    renderer or transcoder (``X-Rendered`` / ``X-Transcoded``) that states
+    its size and starts where it was asked to (``real_start``), of the size
+    the request was planned for (``total``, None: not known yet), is
+    rewritten; any other passes unchanged."""
+
+    def __init__(self, inner: Response, key: str, *, first: int, last: "int | None",
+                 ranged: bool, real_start: int, total: "int | None") -> None:
+        self.inner = inner
+        self.key = key
+        self.first, self.last, self.ranged = first, last, ranged
+        self.real_start, self.total = real_start, total
+        self.status_code = getattr(inner, "status_code", 200)
+        self.raw_headers = getattr(inner, "raw_headers", [])
+        self.background = None
+
+    async def __call__(self, scope, receive, send) -> None:
+        st: dict = {"map": None}
+
+        async def _send(msg):
+            if msg["type"] == "http.response.start":
+                st["map"] = self._start(msg)
+                await send(msg)
+                return
+            m = st["map"]
+            if m is None or msg["type"] != "http.response.body":
+                await send(msg)
+                return
+            more = msg.get("more_body", False)
+            body = m.feed(bytes(msg.get("body", b"")))
+            if not more:
+                body += m.finish()
+            await send({"type": "http.response.body", "body": body, "more_body": more})
+
+        await self.inner(scope, receive, _send)
+
+    def _start(self, msg: dict) -> "_WebKitWavMap | None":
+        hdrs = {k.lower(): v for k, v in msg.get("headers", [])}
+        status = msg.get("status")
+        if (status not in (200, 206)
+                or not hdrs.get(b"content-type", b"").startswith(b"audio/wav")
+                or not (b"x-rendered" in hdrs or b"x-transcoded" in hdrs)
+                or b"content-length" not in hdrs):
+            return None
+        try:
+            length = int(hdrs[b"content-length"])
+            if status == 206:
+                m = re.fullmatch(rb"bytes (\d+)-(\d+)/(\d+)", hdrs.get(b"content-range", b""))
+                rstart, rend, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            else:
+                rstart, rend, total = 0, length - 1, length
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if total % 2 or total < 64:
+            return None                   # a RIFF chunk starts on an even byte
+        _webkit_note_total(self.key, total)
+        if ((self.total is not None and total != self.total)
+                or rstart != self.real_start or (status == 206) != self.ranged):
+            return None                   # not the answer planned for: as it is
+        junk, padded = _webkit_layout(total)
+        last = padded - 1 if self.last is None else min(self.last, padded - 1)
+        # As far as the bytes read reach (the added chunks after the WAV's end
+        # are known), never past them.
+        if rend < total - 1:              # (the whole preamble: its JUNK too)
+            last = min(last, rend + junk if rend >= _RIFF_PREAMBLE - 1 else rend)
+        if last < self.first:
+            return None
+        new = []
+        for k, v in msg["headers"]:
+            lk = k.lower()
+            if lk in (b"content-length", b"content-range"):
+                continue
+            if lk == b"etag" and v.endswith(b'"'):
+                v = v[:-1] + b'-wk"'            # other bytes than the file's: another tag
+            new.append((k, v))
+        new.append((b"content-length", str(last - self.first + 1).encode()))
+        if self.ranged:
+            new.append((b"content-range", f"bytes {self.first}-{last}/{padded}".encode()))
+        new.append((b"x-webkit-layout", b"1"))
+        msg["headers"] = new
+        return _WebKitWavMap(total, self.first, last, rstart)
+
+
+def _webkit_aligned(handler):
+    """Decorator of the stream route: its WAV answers in the WebKit layout
+    for the web player in WebKit (see ``_WEBKIT_ALIGN``)."""
+    @functools.wraps(handler)
+    async def wrapper(*args, **kwargs):
+        request = kwargs.get("request")
+        if request is None or not _webkit_pad_wanted(request):
+            return await handler(*args, **kwargs)
+        key = _webkit_url_key(request)
+        total = _webkit_totals.get(key)
+        if_range = (request.headers.get("if-range") or "").strip()
+        if if_range.endswith('-wk"'):        # our tag for the layout: the file's own
+            _set_request_header(request, b"if-range", if_range[:-4] + '"')
+        hdr = request.headers.get("range")
+        rng = _single_range(hdr) if hdr else None
+        if hdr and rng is None:
+            return await handler(*args, **kwargs)      # several ranges: as they are
+        if total is None:
+            # The first answer for this URL tells the size; only a read from
+            # the start can be laid out before it is known.
+            if rng is not None and rng[0] != 0:
+                return await handler(*args, **kwargs)
+            if rng is not None and rng[1] is not None and 4 <= rng[1] < _RIFF_PREAMBLE - 1:
+                _set_request_range(request, f"bytes=0-{_RIFF_PREAMBLE - 1}")
+            resp = await handler(*args, **kwargs)
+            if not isinstance(resp, Response):
+                return resp
+            return _WebKitAlignedWav(resp, key, first=0, last=rng[1] if rng else None,
+                                     ranged=rng is not None, real_start=0, total=None)
+        junk, padded = _webkit_layout(total)
+        if rng is None:
+            first, last = 0, padded - 1
+        else:
+            first, last = rng
+            if first is None:                           # bytes=-N
+                first, last = max(0, padded - last), padded - 1
+            last = padded - 1 if last is None else min(last, padded - 1)
+        if first >= padded:
+            if not _cast_internal_bypass_ctx.get():
+                await _require_stream_auth(request, kwargs.get("sb_session"),
+                                           None, None, None, None)
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{padded}"})
+        real = _webkit_real_range(first, last, total)
+        if real is None:                                # the added chunks alone
+            if not _cast_internal_bypass_ctx.get():
+                await _require_stream_auth(request, kwargs.get("sb_session"),
+                                           None, None, None, None)
+            m = _WebKitWavMap(total, first, last, total)
+            body = m.finish()
+            return Response(content=body, status_code=206, media_type="audio/wav", headers={
+                "Content-Range": f"bytes {first}-{last}/{padded}",
+                "Accept-Ranges": "bytes", "X-WebKit-Layout": "1"})
+        if rng is not None:
+            _set_request_range(request, f"bytes={real[0]}-{real[1]}")
+        resp = await handler(*args, **kwargs)
+        if not isinstance(resp, Response):
+            return resp
+        return _WebKitAlignedWav(resp, key, first=first, last=last, ranged=rng is not None,
+                                 real_start=real[0] if rng is not None else 0, total=total)
+    return wrapper
 
 
 def _safari_lacks_ogg(request: Request) -> bool:
@@ -10483,6 +11009,7 @@ async def _render_to_transcoded_flac(
     codec: str | None = None, bitrate_kbps: int | None = None,
     progress_key: str | None = None,
     source_duration: float | None = None,
+    gain: float = 1.0,
 ) -> Path:
     """Run ffmpeg to produce a cached transcode for non-native sources.
 
@@ -10493,7 +11020,8 @@ async def _render_to_transcoded_flac(
     ``codec`` overrides ``settings.transcode_format`` (used by the
     OpenSubsonic transcoding extension — client asks for mp3 instead
     of flac, etc.).  ``bitrate_kbps`` caps the output bitrate for
-    lossy codecs.  ``target_rate`` sets the output sample rate.
+    lossy codecs.  ``target_rate`` sets the output sample rate.  ``gain``
+    (< 1): an overloaded render's ``render_gain``.
 
     ``progress_key`` and ``source_duration`` together enable live
     progress reporting — ffmpeg's ``-progress pipe:1`` output is parsed
@@ -10509,9 +11037,9 @@ async def _render_to_transcoded_flac(
     # Codec, rate clamp, bitrate, the DSD filter chain and FLAC level — the
     # same arguments the live time-offset pipe uses (``_ffmpeg_encode_args``).
     # Built before the temp exists, so a cancel here can't leak one.
-    enc_args = await _ffmpeg_encode_args(
+    enc_args = _gain_args(await _ffmpeg_encode_args(
         fmt, bitrate_kbps=bitrate_kbps, target_rate=target_rate,
-        src_is_dsd=path.suffix.lower() in _DSD_EXTS, label=path.name)
+        src_is_dsd=path.suffix.lower() in _DSD_EXTS, label=path.name), gain)
     tmp_out = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=f".{fmt}", delete=False)
     tmp_out.close()
     out = Path(tmp_out.name)
@@ -10723,8 +11251,9 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
                             target_rate: int | None = None, *,
                             codec: str | None = None,
                             bitrate_kbps: int | None = None,
-                            copy: bool = False, src_feed=None):
-    """Yield chunks from a live ffmpeg transcode of ``path``.
+                            copy: bool = False, src_feed=None, gain: float = 1.0):
+    """Yield chunks from a live ffmpeg transcode of ``path`` (``gain`` < 1:
+    an overloaded render's ``render_gain``).
 
     seek_sec > 0 uses a fast pre-input seek (-ss before -i) so a client can
     start a transcoded stream at any position (Subsonic ``timeOffset``)
@@ -10760,9 +11289,9 @@ async def _transcode_stream(path: Path, seek_sec: float = 0.0,
     if copy:
         cmd += ["-c:a", "copy"]
     else:
-        cmd += await _ffmpeg_encode_args(
+        cmd += _gain_args(await _ffmpeg_encode_args(
             fmt, bitrate_kbps=bitrate_kbps, target_rate=target_rate,
-            src_is_dsd=Path(path).suffix.lower() in _DSD_EXTS, label=Path(path).name)
+            src_is_dsd=Path(path).suffix.lower() in _DSD_EXTS, label=Path(path).name), gain)
     cmd += ["-f", fmt, "pipe:1"]
     proc = await forksafe.spawn(
         *cmd,
@@ -10884,6 +11413,8 @@ async def render_status(
         is_cache_ready, _cache_key, find_shorter_sid_entry, sid_warm_eligible,
         key_matches,
     )
+    # A collection tune that plays a library file reports that file's render.
+    track_id = _library_twin(track_id) or track_id
     # The same per-tune length (and so the same cache key) as the SID stream
     # branch, so the UI never reads a stale global default while playback
     # honours HVSC.  O(1): the start song as already known (never a file read
@@ -10957,6 +11488,13 @@ async def render_status(
                         break
         if size and size > _WAV_HEADER_LEN:
             out["duration_seconds"] = (size - _WAV_HEADER_LEN) / bps
+        # A tracker render's true peak (32-bit float may pass full scale): the
+        # player turns an overloaded one down by exactly its overshoot.
+        tpath = _peek_cached_path(_ck(track_id, "tracker", subsong=idx))
+        if tpath is not None:
+            peak = await asyncio.to_thread(render_peak, tpath)
+            if peak is not None:
+                out["peak"] = round(peak, 6)
     return out
 
 
@@ -11275,8 +11813,8 @@ async def _do_prewarm_render(
             # Live renders from here on (MIDI, PSF, SNDH, AdLib, libgme, uade):
             # a click while one is still running attaches and plays the
             # growing file.
-            from soniqboom.config import get_active_soundfont
-            sf = get_active_soundfont()
+            from soniqboom.config import active_soundfont_async
+            sf = await active_soundfont_async()
             _key = _ck(track_id, "midi", 0, str(sf) if sf else "")
             await get_or_render(
                 track_id=track_id, format_type="midi", subsong=0,
@@ -11358,11 +11896,12 @@ async def _do_prewarm_render(
                                                   live_key=_key),
             )
         elif ext in _GME_EXTS_STREAM:
-            _key = _ck(track_id, "gme", subsong=subsong)
+            _var = _gme_variant(ext)
+            _key = _ck(track_id, "gme", subsong=subsong, variant=_var)
             _exp = (0.0 if ext == ".gym" else _stored_render_seconds(
                 track, subsong, track_id, placeholder=float(settings.sid_default_duration)))
             await get_or_render(
-                track_id=track_id, format_type="gme", subsong=subsong,
+                track_id=track_id, format_type="gme", subsong=subsong, variant=_var,
                 render_fn=lambda: _render_gme(file_path, subsong=subsong, live_key=_key,
                                               expected_seconds=_exp),
             )
@@ -11492,14 +12031,14 @@ async def _prewarm_render_then_encode(track_id: str, file_path: Path, ext: str,
     if not xf.codec or not renders:
         return
     source_key, wav = renders[-1]
-    variant = _cc.rendered_transcode_variant(source_key)
+    variant, gain = await _rendered_transcode_variant(source_key, wav)
     _cc.pin(source_key)                 # (the WAV stays while it is encoded)
     try:
         await _cc.get_or_render(
             track_id=track_id, format_type="transcoded", subsong=0,
             codec=xf.codec, bitrate=xf.bitrate or None, variant=variant,
             render_fn=lambda: _render_to_transcoded_flac(
-                Path(wav), codec=xf.codec, bitrate_kbps=xf.bitrate or None))
+                Path(wav), codec=xf.codec, bitrate_kbps=xf.bitrate or None, gain=gain))
     finally:
         _cc.unpin(source_key)
 
@@ -11554,6 +12093,8 @@ async def prewarm(
     file_path: str | None = Query(default=None, alias="path"),
     pw: str | None = Query(default=None, max_length=64),
     hover: bool = Query(default=False),
+    target_format: str | None = Query(default=None, alias="format", max_length=16),
+    max_bitrate_kbps: int = Query(default=0, alias="maxBitRate", ge=0, le=2_500_000),
     sb_session: str | None = Cookie(default=None),
     u: str | None = Query(default=None),
     p: str | None = Query(default=None),
@@ -11578,8 +12119,12 @@ async def prewarm(
     track took it over.
     With the ``render_prewarm`` setting off, rendered formats (retro, Amiga)
     are skipped; conversions (DSD, ALAC, AIFF, …) are still prepared.
+    ``format`` / ``maxBitRate``: the play will ask for that conversion (the
+    web player's streaming-quality setting) — prepared for a file the browser
+    plays as it is too.
     """
     await _require_stream_auth(request, sb_session, u, p, s, t)
+    track_id = _library_twin(track_id) or track_id     # a collection tune that is a library file
     track = await get_track(track_id)
     if not track:
         if file_path:
@@ -11588,8 +12133,15 @@ async def prewarm(
             raise _track_missing(track_id)
 
     ext, uade_named = _render_ident(track.path, track)
-    # Native formats need no server-side prewarm.
-    if ext in NATIVE and not uade_named:
+    # (called as a function — Subsonic, tests — the hints keep their defaults)
+    target_format = target_format if isinstance(target_format, str) else None
+    max_bitrate_kbps = max_bitrate_kbps if isinstance(max_bitrate_kbps, int) else 0
+    want = (target_format or "").strip().lower()
+    constrained = bool(max_bitrate_kbps) or (want not in ("", "raw"))
+    # Native formats need no server-side prewarm — unless the play asks for a
+    # conversion (``_do_prewarm`` → ``_serve_plan``: nothing for a file that
+    # is served as it is all the same).
+    if ext in NATIVE and not uade_named and not constrained:
         return {"status": "skipped", "reason": "native (no transcode needed)"}
     if getattr(track, "defect", None) == _unplayable.DEFECT and subsong is None:
         # Its renderer refused it twice (core/unplayable.py): nothing to
@@ -11620,7 +12172,9 @@ async def prewarm(
         if not catalogue.permit_prewarm(track.path, who):
             return {"status": "skipped", "reason": "catalogue download limit"}
     return _schedule_prewarm(track_id, track, explicit_wire(subsong, request), prio, who,
-                             ext, named=True, serve=_prewarm_serve(request),
+                             ext, named=True,
+                             serve=_prewarm_serve(request, target_format=target_format,
+                                                  max_bitrate_kbps=max_bitrate_kbps),
                              hover=bool(hover))
 
 
@@ -12974,6 +13528,109 @@ def _catalogue_split(path_str: str) -> tuple[str, str]:
 # (``timeOffset``).  Unconstrained requests — every web-UI play — never reach
 # any of this: they keep the direct / Range / progressive paths unchanged.
 
+# ── Overloaded tracker renders ───────────────────────────────────────────────
+# libopenmpt mixes in 32-bit float, and a loud module's mix can peak above full
+# scale; the render keeps those peaks (byte for byte openmpt123's output).
+# Where the audio meets an integer stage — the browser's output, a transcode —
+# such a render is turned down by exactly its overshoot (1 / peak): never a
+# limiter, nothing at all for a render within full scale.  The peak is measured
+# once per render (``_PEAK_SIDECAR`` beside the cached WAV) — 0.34 s for 3 min.
+_PEAK_SIDECAR = ".peak"
+_PEAKS: "OrderedDict[tuple, float]" = OrderedDict()
+_PEAKS_MAX = 512
+_PEAKS_LOCK = threading.Lock()          # (read from worker threads)
+
+
+def _note_peak(memo_key: tuple, peak: float) -> None:
+    with _PEAKS_LOCK:
+        _PEAKS[memo_key] = peak
+        while len(_PEAKS) > _PEAKS_MAX:
+            _PEAKS.popitem(last=False)
+
+
+def render_peak(path: "Path | str") -> "float | None":
+    """The true sample peak (linear, 1.0 = full scale) of a 32-bit float WAV
+    render — None for any other WAV, or one that can't be read.  Kept in
+    ``<wav>.peak`` and in memory, both tied to the file's size and mtime.
+    Blocking."""
+    from soniqboom.core.silence import wav_layout
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    memo_key = (str(p), st.st_size, st.st_mtime_ns)
+    with _PEAKS_LOCK:
+        got = _PEAKS.get(memo_key)
+    if got is not None:
+        return got
+    side = p.with_suffix(_PEAK_SIDECAR)
+    try:
+        if side.stat().st_mtime_ns >= st.st_mtime_ns:
+            peak = float(side.read_text().strip())
+            _note_peak(memo_key, peak)
+            return peak
+    except (OSError, ValueError):
+        pass
+    lay = wav_layout(p)
+    if lay is None or lay[0] != 3 or lay[2] != 32:
+        return None
+    _tag, _ch, _bits, off, length = lay
+    import array as _array
+    peak = 0.0
+    step = 1 << 22
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(off)
+            left = length - length % 4
+            while left > 0:
+                buf = fh.read(min(step, left))
+                if not buf:
+                    break
+                left -= len(buf)
+                a = _array.array("f")
+                a.frombytes(buf[: len(buf) - len(buf) % 4])
+                if a:
+                    peak = max(peak, max(a), -min(a))
+    except OSError:
+        return None
+    if not math.isfinite(peak):
+        return None
+    try:
+        side.write_text(f"{peak:.6f}\n")
+    except OSError:
+        pass
+    _note_peak(memo_key, peak)
+    return peak
+
+
+def render_gain(path: "Path | str") -> float:
+    """The gain that brings a render overloaded past full scale back to it
+    (``1 / peak``), else 1.0.  Blocking."""
+    peak = render_peak(path)
+    return 1.0 / peak if peak and peak > 1.0 else 1.0
+
+
+def _gain_args(args: "list[str]", gain: float) -> "list[str]":
+    """ffmpeg output ``args`` with ``gain`` (< 1) applied first in the filter
+    chain (merged into an ``-af`` already there)."""
+    if not gain < 1.0:
+        return args
+    vol = f"volume={gain:.6f}"
+    out = list(args)
+    if "-af" in out:
+        i = out.index("-af") + 1
+        out[i] = f"{vol},{out[i]}"
+        return out
+    return ["-af", vol] + out
+
+
+def _gain_variant(gain: float) -> str:
+    """The transcode-key suffix of a render's ``render_gain`` (``""`` at 1.0),
+    so a transcode made before the gain was applied is never reused."""
+    return f"-g{gain:.5f}" if gain < 1.0 else ""
+
+
 class _Xform:
     """What a client asked to change about a RENDERED track's audio: another
     codec (``format=``), a bitrate cap (kbps) and/or a start offset (s).
@@ -13227,7 +13884,8 @@ async def _exactly(gen, total: int):
 def _live_transcode_response(src: Path, xf: _Xform, headers: dict,
                              background, *, copy: bool = False,
                              target_rate: int | None = None, src_feed=None,
-                             src_seconds: float | None = None) -> Response:
+                             src_seconds: float | None = None,
+                             gain: float = 1.0) -> Response:
     """Stream ``src`` from ``xf.seek`` seconds through a live ffmpeg pipe in
     ``xf.codec`` (``copy``: remux an already-transcoded file without
     re-encoding).  First bytes in well under a second, no Content-Length —
@@ -13243,7 +13901,7 @@ def _live_transcode_response(src: Path, xf: _Xform, headers: dict,
         hdrs["X-Time-Offset"] = f"{xf.seek:.3f}"
     body = _transcode_stream(src, xf.seek, target_rate, codec=xf.codec,
                              bitrate_kbps=xf.bitrate or None, copy=copy,
-                             src_feed=src_feed)
+                             src_feed=src_feed, gain=gain)
     est = _estimated_transcode_length(src, xf, copy, target_rate, src_seconds)
     if est is not None:
         hdrs["Content-Length"] = str(est)
@@ -13254,13 +13912,25 @@ def _live_transcode_response(src: Path, xf: _Xform, headers: dict,
         headers=hdrs, background=background)
 
 
+async def _rendered_transcode_variant(source_key: str, wav: "Path | str | None") -> "tuple[str, float]":
+    """``(variant, gain)`` of a transcode of the render of ``source_key`` (the
+    finished WAV ``wav``; None: looked up): the render's variant, and the gain
+    an overloaded tracker render is played at (``render_gain``) with its tag
+    — as ``_serve_rendered`` keys and makes it.  No finished render: gain 1."""
+    from soniqboom.core.conversion_cache import get_cached, rendered_transcode_variant
+    if wav is None:
+        wav = await get_cached(source_key)
+    gain = await asyncio.to_thread(render_gain, wav) if wav is not None else 1.0
+    return rendered_transcode_variant(source_key) + _gain_variant(gain), gain
+
+
 async def _cached_rendered_transcode(track_id: str, xf: _Xform, source_key: str) -> "Path | None":
     """The cached transcode ``_serve_rendered`` would serve for the render of
     ``source_key`` in ``xf``'s codec / bitrate, if there is one."""
-    from soniqboom.core.conversion_cache import get_cached, rendered_transcode_variant
+    from soniqboom.core.conversion_cache import get_cached
+    variant, _gain = await _rendered_transcode_variant(source_key, None)
     return await get_cached(_ck(track_id, "transcoded", 0, codec=xf.codec,
-                                bitrate=xf.bitrate or None,
-                                variant=rendered_transcode_variant(source_key)))
+                                bitrate=xf.bitrate or None, variant=variant))
 
 
 async def _serve_rendered_transcode_hit(request: Request, path: Path, xf: _Xform,
@@ -13282,23 +13952,25 @@ async def _transcode_growing_render(request: Request, *, track_id: str, feed, xf
     growing WAV (``feed``, read from byte 0); once the render is cached
     (``rendered()`` — an awaitable of ``(path, hit)``), the transcode cache
     entry is filled from it in the background (``_fill_transcode_in_background``),
-    so later requests — seeks, replays — get that file with Range."""
-    from soniqboom.core.conversion_cache import get_or_render, rendered_transcode_variant
-    variant = rendered_transcode_variant(source_key)
-    tkey = _ck(track_id, "transcoded", 0, codec=xf.codec,
-               bitrate=xf.bitrate or None, variant=variant)
+    so later requests — seeks, replays — get that file with Range.  (The live
+    encode can't know an overloaded render's peak yet; the cached one is made
+    at its gain, as ``_serve_rendered`` makes it.)"""
+    from soniqboom.core.conversion_cache import get_or_render
 
     async def _fill_once_rendered():
         try:
             wav, _ = await rendered()
         except Exception:
             return          # the render failed: the stream has said so
+        variant, gain = await _rendered_transcode_variant(source_key, wav)
+        tkey = _ck(track_id, "transcoded", 0, codec=xf.codec,
+                   bitrate=xf.bitrate or None, variant=variant)
         _fill_transcode_in_background(
             tkey, lambda: get_or_render(
                 track_id=track_id, format_type="transcoded", subsong=0,
                 codec=xf.codec, bitrate=xf.bitrate or None, variant=variant,
                 render_fn=lambda: _render_to_transcoded_flac(
-                    wav, codec=xf.codec, bitrate_kbps=xf.bitrate or None)),
+                    wav, codec=xf.codec, bitrate_kbps=xf.bitrate or None, gain=gain)),
             source_key=source_key)
     _bg_keep(asyncio.ensure_future(_fill_once_rendered()))
     hdrs = dict(headers or {})
@@ -13376,18 +14048,17 @@ async def _serve_rendered(request: Request, wav_path: Path, *, headers: dict,
                                           headers=headers, background=background)
     if not xf.codec:
         return await _wav_offset_response(request, wav_path, xf.seek, headers, background)
-    from soniqboom.core.conversion_cache import (
-        get_or_render, get_cached, pin, unpin, rendered_transcode_variant,
-    )
+    from soniqboom.core.conversion_cache import get_or_render, get_cached, pin, unpin
     hdrs = dict(headers or {})
     hdrs.update({"X-Transcoded": "1", "X-Original-Codec": "wav",
                  "X-Target-Codec": xf.codec})
+    # An overloaded tracker render goes out at exactly full scale.
+    variant, gain = await _rendered_transcode_variant(source_key, wav_path)
     if xf.seek > 0:
         pin(source_key)
         return _live_transcode_response(
             wav_path, xf, hdrs,
-            _compose_backgrounds(BackgroundTask(unpin, source_key), background))
-    variant = rendered_transcode_variant(source_key)
+            _compose_backgrounds(BackgroundTask(unpin, source_key), background), gain=gain)
     tkey = _ck(track_id, "transcoded", 0, codec=xf.codec,
                bitrate=xf.bitrate or None, variant=variant)
     out = await get_cached(tkey)
@@ -13404,13 +14075,13 @@ async def _serve_rendered(request: Request, wav_path: Path, *, headers: dict,
             track_id=track_id, format_type="transcoded", subsong=0,
             codec=xf.codec, bitrate=xf.bitrate or None, variant=variant,
             render_fn=lambda: _render_to_transcoded_flac(
-                wav, codec=xf.codec, bitrate_kbps=xf.bitrate or None)),
+                wav, codec=xf.codec, bitrate_kbps=xf.bitrate or None, gain=gain)),
         source_key=source_key)
     hdrs["X-Transcode-Cache"] = "miss"
     pin(source_key)
     return _live_transcode_response(
         wav, xf, hdrs,
-        _compose_backgrounds(BackgroundTask(unpin, source_key), background))
+        _compose_backgrounds(BackgroundTask(unpin, source_key), background), gain=gain)
 
 
 async def _source_kbps(track, path: Path, ext: str) -> int:
@@ -14311,6 +14982,8 @@ async def _serve_plan(request, track, path: Path, ext: str, *,
         _want = (target_format or "").strip().lower()
         eff_codec = (_want if _want in ("mp3", "ogg")
                      else _LOSSY_SRC_CODEC.get(ext, "mp3"))
+        if eff_codec == "ogg" and not _want and _old_safari_ogg:
+            eff_codec = "mp3"           # (a Safari that can't play Ogg)
     eff_mime = TRANSCODE_MIME.get(eff_codec, "audio/flac")
     # The bitrate the encoder gets — and the cache key carries, so an
     # mp3@128 and an mp3@320 of the same track never share an entry.
@@ -14369,6 +15042,7 @@ async def _serve_plan(request, track, path: Path, ext: str, *,
 
 
 @router.get("/{track_id}")
+@_webkit_aligned
 async def stream_track(
     track_id: str,
     request: Request,
@@ -14411,6 +15085,9 @@ async def stream_track(
     # set the same flag after authenticating the caller themselves.
     if not _cast_internal_bypass_ctx.get():
         await _require_stream_auth(request, sb_session, u, p, s, t)
+    # An online collection's tune that is a library file plays that file — and
+    # is that file for the bookkeeping below (its renders are the file's).
+    track_id = _library_twin(track_id) or track_id
     # Who listens (renders this request reads record it), and — for a play
     # start (``_is_play_start``) — that this listener now plays this track:
     # renders it left become stoppable at once (``_abandon_state``), and a
@@ -14653,8 +15330,8 @@ async def stream_track(
                 background=_bg, xf=xf, track_id=track_id, source_key=full_key,
             )
         if ext in _MIDI_EXTS:
-            from soniqboom.config import get_active_soundfont
-            sf = get_active_soundfont()
+            from soniqboom.config import active_soundfont_async
+            sf = await active_soundfont_async()
             _sfp = str(sf) if sf else ""
             _key = _ck(track_id, "midi", 0, _sfp)
             # Played while fluidsynth renders it (length unknown until the end).
@@ -14800,15 +15477,16 @@ async def stream_track(
                                                   subsong=subsong, authoritative=True)
             # Played while openmpt123 renders it, once it proves audible — a
             # long module never waits for (or depends on caching) its whole
-            # render; Safari / WebKit takes the finished file (a few seconds).
+            # render.
             return await _serve_live(
                 request, track_id=track_id, format_type="tracker", subsong=subsong,
                 key=_key,
                 render_fn=lambda: _render_tracker(path, subsong=subsong, live_key=_key),
                 web_session=_web_session, background=_bg, xf=xf, rendered="openmpt123",
-                after_render=_after, safari_waits=True)
+                after_render=_after)
         if ext in _GME_EXTS_STREAM:
-            _key = _ck(track_id, "gme", subsong=subsong)
+            _var = _gme_variant(ext)
+            _key = _ck(track_id, "gme", subsong=subsong, variant=_var)
             # A GYM's stored length is its frame count, not the render's.
             _exp = (0.0 if ext == ".gym" else _stored_render_seconds(
                 track, subsong, track_id, placeholder=float(settings.sid_default_duration)))
@@ -14829,8 +15507,9 @@ async def stream_track(
                 request, track_id=track_id, format_type="gme", subsong=subsong, key=_key,
                 render_fn=lambda: _render_gme(path, subsong=subsong, live_key=_key,
                                               expected_seconds=_exp),
-                web_session=_web_session, background=_bg, xf=xf, rendered="gme",
-                after_render=_after)
+                cache_kw={"variant": _var} if _var else None,
+                web_session=_web_session, background=_bg, xf=xf,
+                rendered=_gme_renderer_name(ext), after_render=_after)
 
         # What to serve: the file as is, the in-flight WAV or a transcode
         # (``_serve_plan`` — the next-track prewarm asks the same question).
@@ -14941,6 +15620,56 @@ def _peek_cached_size(cache_key: str) -> int | None:
         return None
 
 
+def growing_render(keys) -> "dict | None":
+    """A render of one of ``keys`` (conversion-cache keys) still being written
+    whose final length is known — a progressive SID stream
+    (``_SID_PROG_RENDERS``) or a live render of known length
+    (``_UADE_LIVE``): ``{"key", "path", "total_frames", "channels", "bits",
+    "float"}``, for the waveform drawn while it renders
+    (``tracks._partial_peaks``).  None otherwise.  Dict lookups only."""
+    for k in keys:
+        rd = _SID_PROG_RENDERS.get(k)
+        if rd is not None and rd.get("tmp") is not None and not rd["done_ev"].is_set():
+            return {"key": k, "path": str(rd["tmp"]),
+                    "total_frames": rd["data_bytes"] // (_SID_WAV_CHANNELS * _SID_WAV_BITS // 8),
+                    "channels": _SID_WAV_CHANNELS, "bits": _SID_WAV_BITS, "float": False}
+        live = _UADE_LIVE.get(k)
+        if (live is not None and not live["complete"].is_set()
+                and live.get("expected_size", 0) > _WAV_HEADER_LEN):
+            fb = int(live["channels"]) * int(live["bits"]) // 8
+            if fb > 0:
+                return {"key": k, "path": str(live["path"]),
+                        "total_frames": (live["expected_size"] - _WAV_HEADER_LEN) // fb,
+                        "channels": live["channels"], "bits": live["bits"],
+                        "float": bool(live.get("float"))}
+    return None
+
+
+def _library_twin(track_id: str) -> "str | None":
+    """The library track that plays in place of online-collection tune
+    ``track_id``: its twin (``core/source_twins.py`` — the same file in a
+    library folder or share) when that file can play now, else None.  Its
+    renders, caches and status are the library track's; nothing is fetched
+    from the collection."""
+    from soniqboom.core import availability, source_twins
+    own = source_twins.own_of(track_id)
+    if not own:
+        return None
+    from soniqboom.core.store import get_store
+    if get_store()._tracks.get(own) is None or availability.offline_kinds([own]):
+        return None
+    return own
+
+
+def _peek_cached_path(cache_key: str) -> "Path | None":
+    """Path of a finished conversion-cache entry, without touching its LRU
+    position or the disk; None when not cached."""
+    from soniqboom.core import conversion_cache as _cc
+    with _cc._state_lock:
+        ent = _cc._meta.get(cache_key)
+    return Path(ent["path"]) if ent and ent.get("path") else None
+
+
 @router.head("/{track_id}")
 async def stream_track_head(
     track_id: str,
@@ -14967,6 +15696,7 @@ async def stream_track_head(
     streams it with its exact length: the tune's target seconds)."""
     if not _cast_internal_bypass_ctx.get():
         await _require_stream_auth(request, sb_session, u, p, s, t)
+    track_id = _library_twin(track_id) or track_id     # a collection tune that is a library file
     track = await get_track(track_id)
     if not track:
         raise _track_missing(track_id)
@@ -15024,8 +15754,8 @@ async def stream_track_head(
                             duration=_sid_target_seconds(track, subsong, start_song)),
                         uade_cache_key_known(track_id, subsong, track)]
             elif ext in _MIDI_EXTS:
-                from soniqboom.config import get_active_soundfont
-                _sf = get_active_soundfont()
+                from soniqboom.config import active_soundfont_async
+                _sf = await active_soundfont_async()
                 keys = [_ck(track_id, "midi", 0, str(_sf) if _sf else "")]
             elif ext in _PSF_STREAM_EXTS and not uade_named:
                 keys = [_ck(track_id, "psf", 0)]
@@ -15036,8 +15766,9 @@ async def stream_track_head(
                         _ck(track_id, "psf", 0)]
             else:
                 keys = [uade_cache_key_known(track_id, subsong, track)]
-                keys += [_ck(track_id, fmt, subsong=subsong) for fmt in
-                         ("tracker", "hvl", "sndh", "sc68", "gme", "adlib", "imf")]
+                keys += [_ck(track_id, fmt, subsong=subsong,
+                             variant=_gme_variant(ext) if fmt == "gme" else None)
+                         for fmt in ("tracker", "hvl", "sndh", "sc68", "gme", "adlib", "imf")]
                 keys.append(_inflight_cache_key(track_id, None))
             for k in ([] if undecided else keys):
                 size = _peek_cached_size(k)

@@ -9,6 +9,12 @@ import { enterMaster, leaveMaster } from './master.js';
 import { enterSlave, leaveSlave } from './slave.js';
 import { Auth } from '../auth.js';
 import { Offline } from '../offline.js';
+import { Player } from '../player.js';
+
+// A room plays the original files: its listeners join a track part-way in and
+// keep in step by seeking, which a converted stream (the streaming-quality
+// setting of this device) can't do at once.
+Player.setQualityOff(true);
 
 const $ = (id) => document.getElementById(id);
 const LABEL_KEY = 'sb_mr_label';

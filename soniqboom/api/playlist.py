@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from soniqboom.core.data import (
     create_playlist,
@@ -17,6 +20,7 @@ from soniqboom.core.data import (
     list_playlists,
     update_playlist,
 )
+from soniqboom.core import playlist_files
 from soniqboom.core.store import get_store
 from soniqboom.api.users import current_user, listener_uid
 
@@ -44,6 +48,13 @@ class Subscription(BaseModel):
 
 class TrackIds(BaseModel):
     track_ids: list[str | dict]
+
+
+class PlaylistFile(BaseModel):
+    """A playlist file to import: its text (the browser reads the file) and
+    its file name (the playlist's name when the file names none)."""
+    filename: str = Field("", max_length=1024)
+    content: str = Field(..., max_length=playlist_files.MAX_IMPORT_BYTES)
 
 
 # ── Playlist entries ─────────────────────────────────────────────────────────
@@ -174,6 +185,57 @@ async def create_new_playlist(body: PlaylistCreate, uid: str = Depends(listener_
     return _shown(playlist, uid)
 
 
+_SNAPSHOT_SLICE = 20_000
+
+
+@router.post("/import", status_code=201)
+async def import_playlist_file(body: PlaylistFile, uid: str = Depends(listener_uid)):
+    """A new playlist (the signed-in user's) from an M3U / M3U8 / XSPF file:
+    each entry matched to a library track by its path, its file name and
+    folders, or its artist and title (``core/playlist_files``).  The reply:
+    ``playlist`` (as ``POST /playlists``), ``total`` entries, ``matched``,
+    ``by`` (how many each way), ``unmatched`` (up to 200: line, entry,
+    reason) and ``unmatched_count``.  A file with no entry found makes no
+    playlist (422)."""
+    try:
+        name, entries, truncated = playlist_files.parse(body.content, body.filename)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not entries:
+        raise HTTPException(422, "This file lists no tracks.")
+    # (the library as matching reads it — taken here: the store is the loop's —
+    # in slices that let the loop serve between them (~250 ms in all for 300K
+    # tracks); the matching then runs in a thread)
+    from soniqboom.core import catalogue
+    store = get_store()
+    items = list(store._tracks.items())
+    rows: list = []
+    for i in range(0, len(items), _SNAPSHOT_SLICE):
+        if i:
+            await asyncio.sleep(0)
+        rows.extend(playlist_files.LibraryRow(
+            id=tid, path=t.get("path") or "", artist=t.get("artist") or "",
+            title=t.get("title") or "", duration=float(t.get("duration") or 0),
+            primary=t.get("is_duplicate_primary") is not False,
+            collection=catalogue.is_catalogue_path(t.get("path")),
+            tunes=int(t.get("subsongs") or 0), group=t.get("duplicate_group_id") or "")
+            for tid, t in items[i:i + _SNAPSHOT_SLICE])
+    result = await asyncio.to_thread(
+        lambda: playlist_files.import_entries(
+            playlist_files.playlist_name(name, body.filename), entries,
+            playlist_files.Matcher(rows), truncated))
+    if not result.entries:
+        raise HTTPException(422, {"message": "None of the file's tracks is in the library.",
+                                  "total": result.total, "unmatched": result.unmatched,
+                                  "unmatched_count": result.unmatched_count})
+    playlist = await create_playlist(result.name, playlist_id=str(uuid.uuid4()),
+                                     track_ids=result.entries, owner_user_id=uid or None)
+    return {"playlist": _shown(playlist, uid), "total": result.total,
+            "matched": len(result.entries), "by": result.by,
+            "unmatched": result.unmatched, "unmatched_count": result.unmatched_count,
+            "truncated": result.truncated}
+
+
 @router.get("/shared")
 async def shared_playlists(uid: str = Depends(listener_uid)):
     """The playlists other accounts share — the Import list: id, name, the
@@ -225,9 +287,10 @@ async def read_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
     q = playlist.get("query")
     if q:
         # Smart playlist — tracks are computed live from the saved search, so it
-        # auto-updates as the library grows. Same query engine as /api/search.
+        # auto-updates as the library grows. Same query engine as /api/search
+        # (``plays:`` / ``played:`` read the viewer's plays).
         from soniqboom.api.search import run_search
-        results = await run_search(q, limit=500)
+        results = await run_search(q, limit=500, uid=uid)
         tracks = [t.model_dump() if hasattr(t, "model_dump") else t for t in results]
         return {**_shown(playlist, uid), "smart": True, "tracks": _mark_offline(tracks)}
 
@@ -252,6 +315,36 @@ async def read_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
             td["subsong"] = sub
             tracks.append(td)
     return {**_shown(playlist, uid), "tracks": _mark_offline(tracks)}
+
+
+@router.get("/{playlist_id}/export")
+async def export_playlist(playlist_id: str,
+                          format: str = Query("m3u8", pattern="^(m3u8|m3u|xspf)$"),
+                          uid: str = Depends(listener_uid)):
+    """The playlist as a file to save (``Content-Disposition: attachment``):
+    ``m3u8`` / ``m3u`` (extended M3U, UTF-8) or ``xspf`` — every entry in
+    order, a smart playlist's tracks as it lists them now
+    (``core/playlist_files``).  The same reads as ``GET /playlists/{id}``."""
+    pl = await read_playlist(playlist_id, uid)
+    rows = []
+    for t in pl.get("tracks") or ():
+        d = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+        sub = d.get("subsong")
+        rows.append((d, sub + 1 if isinstance(sub, int) and not isinstance(sub, bool) else None))
+    name = pl.get("name") or "Playlist"
+    # (the share roots: where a stored share path's root ends — a password in
+    # an old root may hold ``:/``; its user name and password are left out)
+    roots = [sd.get("path") or "" for sd in get_store()._scan_dirs.values()]
+    if format == "xspf":
+        body, ext, mime = playlist_files.export_xspf(name, rows, roots), "xspf", "application/xspf+xml"
+    else:
+        body, ext, mime = playlist_files.export_m3u(name, rows, roots), format, "audio/x-mpegurl"
+    fname = playlist_files.safe_filename(name, ext)
+    from urllib.parse import quote
+    ascii_name = fname.encode("ascii", "replace").decode().replace("?", "_").replace('"', "_")
+    return Response(content=body.encode("utf-8"), media_type=f"{mime}; charset=utf-8", headers={
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(fname)}",
+        "Cache-Control": "no-store"})
 
 
 def _mark_offline(tracks: list) -> list:

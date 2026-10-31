@@ -568,8 +568,10 @@ def test_index_generation_moves_with_every_index_write():
 
 def test_seq_exempt_fields_feed_no_index():
     # Otherwise a write to one would change an index without moving
-    # ``index_generation`` and a rebuild could swap in stale indexes.
+    # ``index_generation`` and a rebuild could swap in stale indexes (the
+    # search box's own indexes too).
     assert store_mod._SEQ_EXEMPT_FIELDS.isdisjoint(store_mod._INDEXED_FIELDS)
+    assert store_mod._SEQ_EXEMPT_FIELDS.isdisjoint(store_mod._SEARCH_INDEX_FIELDS)
 
 
 # ── r4-enr-9: the deep-page memo never pins a replaced list ──────────────────

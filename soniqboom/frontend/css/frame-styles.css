@@ -1,0 +1,155 @@
+/* SPDX-FileCopyrightText: 2026 S.F. Cyris
+   SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ── The frame around the panels — Retro hi-fi ─────────────────────────────
+   The header, the sidebar and the list's toolbar in the shared UI style
+   (js/ui_style.js → <html data-ui-style>): a light touch so the cabinet frames
+   the instruments — a plain plate for the header, engraved section headings,
+   the chosen sidebar entry marked by a lamp instead of a filled pill, and the
+   list's Play all / Shuffle as hardware keys.  The track list itself keeps its
+   modern density.  Loaded after app.css: these rules override its own by
+   specificity.  Lamp legend (as in the player bar, equalizer, Stations and
+   queue): amber = engaged / selected, green = signal / now playing, red =
+   live / peak / alert; an unlit lamp is plain dark. */
+
+:root[data-ui-style="retro"] {
+  --fr-face: "DIN Alternate", "DIN Condensed", Bahnschrift, "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --fr-lamp: #ffb12b;
+  --fr-lamp-glow: 0 0 5px 1px rgba(255,177,43,0.7);
+  --fr-key-bg: linear-gradient(180deg, #3b3e43, #26282c 55%, #1e2023);
+  --fr-key-bg-hover: linear-gradient(180deg, #45494f, #2d3034 55%, #232528);
+  --fr-key-edge: #050506;
+  --fr-key-text: #cfd3d9;
+  --fr-key-shadow: inset 0 1px 0 rgba(255,255,255,0.13), 0 2px 3px rgba(0,0,0,0.45);
+  --fr-play: #ffb12b;
+}
+:root[data-theme="light"][data-ui-style="retro"] {
+  --fr-lamp: #d27a00;
+  --fr-lamp-glow: 0 0 0 1px rgba(0,0,0,0.45);
+  --fr-key-bg: linear-gradient(180deg, #f4f5f7, #d9dce0 55%, #c8cbd0);
+  --fr-key-bg-hover: linear-gradient(180deg, #ffffff, #e3e6ea 55%, #d2d5da);
+  --fr-key-edge: #8c9096;
+  --fr-key-text: #23262b;
+  --fr-key-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.25);
+  --fr-play: #8a4a00;
+}
+
+/* Header: a plain plate with a faint brushed grain (no frosted glass) */
+:root[data-ui-style="retro"] #header {
+  background:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #24262a, #1b1d20);
+  border-bottom-color: #050506;
+  box-shadow: inset 0 -1px 0 rgba(255,255,255,0.05);
+}
+:root[data-theme="light"][data-ui-style="retro"] #header {
+  background:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.18) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #e2e4e7, #d0d3d7);
+  border-bottom-color: #8c9096;
+  box-shadow: inset 0 -1px 0 rgba(255,255,255,0.6);
+}
+
+/* Sidebar section headings: engraved in the panels' face */
+:root[data-ui-style="retro"] #sidebar h3 {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+/* The chosen entry: its lamp lit beside plain text (not an orange pill) */
+:root[data-ui-style="retro"] :is(#nav-library, #nav-smart, #nav-stations) li.active,
+:root[data-ui-style="retro"] .sidebar-playlist-item.active {
+  position: relative;
+  background: none;
+  border-color: transparent;
+  color: var(--text0);
+  font-weight: 600;
+}
+:root[data-ui-style="retro"] :is(#nav-library, #nav-smart, #nav-stations) li.active::before,
+:root[data-ui-style="retro"] .sidebar-playlist-item.active::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin-top: -2.5px;
+  border-radius: 50%;
+  background: var(--fr-lamp);
+  box-shadow: var(--fr-lamp-glow);
+  pointer-events: none;
+}
+
+/* The list's Play all / Shuffle: hardware keys, the play legend lit amber */
+:root[data-ui-style="retro"] .browse-play-btn {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fr-key-text);
+  background: var(--fr-key-bg);
+  border: 1px solid var(--fr-key-edge);
+  border-radius: 4px;
+  box-shadow: var(--fr-key-shadow);
+}
+:root[data-ui-style="retro"] .browse-play-btn:hover { background: var(--fr-key-bg-hover); }
+:root[data-ui-style="retro"] .browse-play-btn:active {
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.5);
+  transform: translateY(1px);
+}
+:root[data-ui-style="retro"] #browse-play-all { color: var(--fr-play); }
+
+/* The Scene view's keys: hardware keys, the open list's lamp lit amber */
+:root[data-ui-style="retro"] .scene-tab {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 11px;
+  color: var(--fr-key-text);
+  background: var(--fr-key-bg);
+  border: 1px solid var(--fr-key-edge);
+  border-radius: 4px;
+  box-shadow: var(--fr-key-shadow);
+}
+:root[data-ui-style="retro"] .scene-tab:hover { background: var(--fr-key-bg-hover); }
+/* (a lamp only on the key that is on — the lamp legend's toolbar rule) */
+:root[data-ui-style="retro"] .scene-tab[aria-selected="true"] {
+  color: var(--fr-key-text);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.5);
+}
+:root[data-ui-style="retro"] .scene-tab[aria-selected="true"]::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fr-lamp);
+  box-shadow: var(--fr-lamp-glow);
+}
+:root[data-ui-style="retro"] .scene-tab-count { color: inherit; opacity: 0.7; letter-spacing: 0; }
+
+/* The folder tree's chosen folder: plain text with its lamp just left of it
+   (in the node's margin, before the chevron) */
+:root[data-ui-style="retro"] .tree-node.active {
+  position: relative;
+  overflow: visible;   /* the lamp sits in the margin; .tree-label still ellipsises */
+  background: none;
+  color: var(--text0);
+}
+:root[data-ui-style="retro"] .tree-node.active .tree-label,
+:root[data-ui-style="retro"] .tree-root > .tree-node.active .tree-label { color: var(--text0); font-weight: 600; }
+:root[data-ui-style="retro"] .tree-node.active .tree-icon { color: var(--fr-lamp); }
+:root[data-ui-style="retro"] .tree-node.active::before {
+  content: '';
+  position: absolute;
+  left: -3px;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin-top: -2.5px;
+  border-radius: 50%;
+  background: var(--fr-lamp);
+  box-shadow: var(--fr-lamp-glow);
+  pointer-events: none;
+}

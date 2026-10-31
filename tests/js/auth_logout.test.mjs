@@ -24,6 +24,7 @@ function makeLogout(answers, { clockStep = 0 } = {}) {
   const calls = [];
   const toasts = [];
   const reloads = [];
+  const chipSyncs = [];
   let now = 0;
   const env = {
     fetch: async (url, init) => {
@@ -37,10 +38,11 @@ function makeLogout(answers, { clockStep = 0 } = {}) {
     Toast: { error: (m) => toasts.push(m) },
     STATE: { user: { id: 'u' } },
     location: { reload: () => reloads.push(1) },
+    _syncUserChip: () => chipSyncs.push(env.STATE.user),   // the header chip follows the sign-out
   };
   const body = `${fn('logout')}; return logout;`;
   const logout = new Function(...Object.keys(env), body)(...Object.values(env));
-  return { logout, calls, toasts, reloads, env };
+  return { logout, calls, toasts, reloads, env, chipSyncs };
 }
 
 test('a sign-out answered 503 during a restart is sent again until it lands', async () => {
@@ -58,6 +60,7 @@ test('an immediate success signs out at once', async () => {
   await t.logout();
   assert.equal(t.calls.length, 1);
   assert.equal(t.reloads.length, 1);
+  assert.deepEqual(t.chipSyncs, [null]);   // the header chip was hidden with the user gone
 });
 
 test('a server still restarting after ~30 s: the page stays signed in and says so', async () => {

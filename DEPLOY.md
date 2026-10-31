@@ -40,7 +40,7 @@ docker --version
 
 > **Skip the build?** A prebuilt multi-arch image (Intel/AMD + 64-bit ARM) is published at
 > `ghcr.io/sfcyris/soniqboom:latest`; each release is also tagged with its version
-> (for example `:1.14.5`, and `:1.14` for the newest 1.14.x). In `docker-compose.yml`,
+> (for example `:2.0.0`, and `:2.0` for the newest 2.0.x). In `docker-compose.yml`,
 > comment out `build: .` and uncomment the `image:` line (there's a comment marking the
 > spot), then use `docker compose pull && docker compose up -d` at step 3 — it starts in
 > seconds instead of compiling the players. Building from source (below) is only needed
@@ -113,10 +113,11 @@ Find the machine's IP address:
 | **Windows** | `ipconfig`  → look for "IPv4 Address" |
 
 Say it prints `192.168.1.50` — then on your phone's browser open
-**`http://192.168.1.50:8080`** and sign in. (SoniqBoom auto-switches to a touch layout
-on phones. For the full layout, tap **Desktop site** at the top of the phone layout or
-open `http://192.168.1.50:8080/?ui=desktop`; `http://192.168.1.50:8080/?ui=mobile`
-switches back. iPads with Safari's default settings get the full layout.)
+**`http://192.168.1.50:8080`** and sign in. (SoniqBoom starts on a touch layout on
+phones and iPads. On an iPad or a large phone, tap **Desktop site** at the top for the
+full layout, and the 📱 button in its header to come back. In any browser,
+`http://192.168.1.50:8080/?ui=desktop` and `http://192.168.1.50:8080/?ui=mobile`
+switch, and the choice is remembered.)
 
 Subsonic apps (Amperfy, Symfonium, DSub, …) connect to the same address,
 `http://192.168.1.50:8080`, with your SoniqBoom username and password. The multi-room
@@ -149,8 +150,9 @@ well: `dpkg --print-architecture` must print `arm64`. If it prints `armhf`, the 
 
 **Build on the machine you'll run it on** and you never have to think about architecture.
 Several players are compiled from source during the build — the C64 SID chain
-(`sidplayfp` with reSIDfp), `libgme`, `psgplay`, the Amiga `uade123`, the Atari-ST
-`sc68` and the bundled HivelyTracker and ST-Sound engines (`hvl2wav`, `ym2wav`) — and
+(`sidplayfp` with reSIDfp), `libgme`, `psgplay`, `kssrender` (MSX KSS, libkss), the Amiga
+`uade123`, the Atari-ST `sc68` and the bundled HivelyTracker and ST-Sound engines
+(`hvl2wav`, `ym2wav`) — and
 compiling them for a *different* CPU than your own (cross-building) can fail.
 The build then stops and lists the missing players. Build on a machine of the target CPU;
 or pass `--build-arg SLIM=1` to leave out `uade123` and `sc68` (AHX, the Amiga "exotica"
@@ -569,11 +571,12 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
 - **Renderers degrade gracefully.** If a format won't play, the player names the package
   it needs; everything else keeps working. The image includes every player: ffmpeg,
   FluidSynth and adplay from Debian; libopenmpt / openmpt123 0.8.9, sidplayfp 3.1.0
-  (with the reSIDfp engine), libgme 0.6.5, psgplay, sc68 and `uade123` (Amiga AHX and
-  the ~175 Amiga "exotica" players) compiled from source; the prebuilt zxtune123; and
-  the bundled ST-Sound (`.ym`) and HivelyTracker (`.hvl`) engines.
-  The image build stops if any of them is missing (unless built with
-  `--build-arg ALLOW_MISSING_RENDERERS=1`). gear → **Renderers → Renderer Status** shows
+  (with the reSIDfp engine), libgme 0.6.5, psgplay, sc68, `kssrender` (MSX KSS, built
+  from libkss) and `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled
+  from source; the prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and
+  HivelyTracker (`.hvl`) engines.
+  The image build stops if any of them is missing, or if adplay or kssrender renders its
+  short test tune as silence (unless built with `--build-arg ALLOW_MISSING_RENDERERS=1`). gear → **Renderers → Renderer Status** shows
   each one and the version it reports.
 - **LHA archives.** The image reads `.lha` / `.lzh` archives with its built-in readers —
   header levels 0–3 and the methods `-lh0-`, `-lh1-`, `-lh4-` … `-lh7-`, `-lz4-`, `-lz5-`

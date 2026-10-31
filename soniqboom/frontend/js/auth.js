@@ -181,6 +181,7 @@ async function _handleSubmit(e) {
     }
     const data = await res.json();
     STATE.user = data.user;
+    _syncUserChip();
     // The password leaves the page with the sign-in: nothing keeps it in the
     // DOM (an extension, a later script, devtools) once it was sent.
     _clearPassword(overlay);
@@ -446,6 +447,7 @@ async function _retryNow() {
     const user = (await me.json().catch(() => ({}))).user;
     if (user) {
       STATE.user = user;
+      _syncUserChip();
       _hide();
       STATE._readyResolve?.(user);
       STATE._readyResolve = null;
@@ -522,6 +524,7 @@ async function boot() {
     STATE.authStatus = await st.json().catch(() => ({}));
     if (me.ok) {
       STATE.user = (await me.json()).user;
+      _syncUserChip();
       _signedInOnce = true;
       STATE._readyResolve?.(STATE.user);
       STATE._readyResolve = null;
@@ -587,6 +590,7 @@ function _promptReauth() {
   if (_reauthInFlight) return _reauthInFlight;
   _reauthInFlight = (async () => {
     STATE.user = null;
+    _syncUserChip();
     STATE.ready = new Promise(res => { STATE._readyResolve = res; });
     // Capture the focused element so we can restore focus after sign-in.
     const focusedBefore = document.activeElement;
@@ -666,6 +670,7 @@ async function logout() {
     await new Promise(r => setTimeout(r, Math.min(Math.max(after, 1), 5) * 1000));
   }
   STATE.user = null;
+  _syncUserChip();
   location.reload();
 }
 
@@ -685,6 +690,20 @@ async function changePassword(currentPassword, newPassword) {
   }
   Toast.ok('Password updated.');
 }
+
+// The header's "signed in as" chip (index.html #user-chip): follows every
+// change of the signed-in user — the start, a sign-in, a sign-out, a session
+// that ended.  Hidden while nobody is signed in.
+function _syncUserChip() {
+  const chip = document.getElementById('user-chip');
+  const name = document.getElementById('user-chip-name');
+  if (!chip || !name) return;
+  const u = STATE.user;
+  chip.hidden = !u;
+  name.textContent = u ? (u.display_name || u.username) : '—';
+  chip.title = u ? `Signed in as ${u.username} (${u.role})` : '';
+}
+document.getElementById('user-chip-logout')?.addEventListener('click', () => logout());
 
 export const Auth = {
   boot,

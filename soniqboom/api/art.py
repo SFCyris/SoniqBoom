@@ -599,6 +599,43 @@ def _etag_response(
     )
 
 
+async def cover_thumb(track_id: str, bucket: str, *, resolve: bool = True) -> bytes | None:
+    """A track's cover as the ``bucket`` (``sm`` / ``lg``) JPEG thumbnail: the
+    cached one, else made from the cached full cover — or, with ``resolve``,
+    from the cover ``_resolve_full_art`` finds (the thumbnail is then cached).
+    None when there is none (``resolve`` False: none cached)."""
+    thumb = await art_cache.get_art(track_id, bucket)
+    if thumb:
+        return thumb
+    if resolve:
+        full, _mime = await _resolve_full_art(track_id)
+    else:
+        full = await art_cache.get_art(track_id, "full")
+    if not full:
+        return None
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, resize_cover, full, _SIZE_MAP[bucket])
+    if data:
+        t = loop.create_task(art_cache.store_art(track_id, data, bucket))
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_art_write_done)
+    return data or None
+
+
+def _read_if_present(path: Path, read) -> tuple:
+    """In a worker thread: ``(present, data, mime, failed)`` — whether
+    ``path`` exists (on a network drive a stat is a round trip: never on the
+    loop) and, when it does, ``read()``'s ``(data, mime)`` or whether it
+    raised."""
+    if not path.exists():
+        return False, None, None, False
+    try:
+        data, mime = read()
+    except Exception:
+        return True, None, None, True
+    return True, data, mime, False
+
+
 async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, None]:
     """Return full-size cover bytes and mime, trying filesystem cache then file extraction.
 
@@ -690,38 +727,26 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
                 # the is_remote backfill covers the not-yet-cached case).
                 arc_rel, member = split_member(remote_path)
                 local_path = cache.get_cached(scan_root, arc_rel)
-                if local_path and local_path.exists():
-                    data, mime = await loop.run_in_executor(
-                        None, lambda: _extract_cover_from_zip(f"{local_path}::{member}")
-                    )
+                if local_path:
+                    _p, data, mime, _f = await loop.run_in_executor(
+                        None, _read_if_present, local_path,
+                        lambda: _extract_cover_from_zip(f"{local_path}::{member}"))
             else:
                 local_path = cache.get_cached(scan_root, remote_path)
-                if local_path and local_path.exists():
-                    data, mime = await loop.run_in_executor(
-                        None, _extract_cover, local_path
-                    )
+                if local_path:
+                    _p, data, mime, _f = await loop.run_in_executor(
+                        None, _read_if_present, local_path, lambda: _extract_cover(local_path))
         except Exception:
             pass
     elif '::' in path_str:
         outer_zip = Path(path_str.split('::')[0])
-        if outer_zip.exists():
-            source_present = True
-            try:
-                data, mime = await loop.run_in_executor(
-                    None, lambda: _extract_cover_from_zip(path_str, raise_on_error=True)
-                )
-            except Exception:
-                read_failed = True
+        source_present, data, mime, read_failed = await loop.run_in_executor(
+            None, _read_if_present, outer_zip,
+            lambda: _extract_cover_from_zip(path_str, raise_on_error=True))
     else:
         path = Path(path_str)
-        if path.exists():
-            source_present = True
-            try:
-                data, mime = await loop.run_in_executor(
-                    None, lambda: _extract_cover(path, raise_on_error=True)
-                )
-            except Exception:
-                read_failed = True
+        source_present, data, mime, read_failed = await loop.run_in_executor(
+            None, _read_if_present, path, lambda: _extract_cover(path, raise_on_error=True))
 
     if data:
         # Clear any prior absent-sentinel — the source must have been
@@ -913,6 +938,54 @@ def _bg_art_write_done(t: "asyncio.Task") -> None:
         log.warning("Art cache write failed: %s", t.exception())
 
 
+# Network-share covers copied in the background for a revalidated "no cover
+# yet" answer (``_fill_remote_art_later``): track id → when, at most once per
+# ``_BG_RESOLVE_EVERY_S`` per track (a list revalidates each row every 60 s).
+_bg_resolved: dict[str, float] = {}
+_BG_RESOLVE_EVERY_S = 60.0
+_BG_RESOLVED_MAX = 20_000
+
+
+async def _fill_remote_art_later(track_id: str, track) -> None:
+    """For a revalidated "no cover yet" of network-share ``track``: start the
+    embedded cover's backfill, or — when its folder's cover is already in the
+    art cache — copy that one in the background (``_resolve_full_art``)."""
+    if getattr(track, "cover_art", None):
+        from soniqboom.core.art_backfill import request_backfill
+        request_backfill(track)                 # (coalesced; backs off after a failure)
+        return
+    dir_hash = getattr(track, "dir_hash", None)
+    if dir_hash and await art_cache.get_art(_folder_art_cache_key(dir_hash), "full"):
+        _resolve_in_background(track_id)
+
+
+def _resolve_in_background(track_id: str) -> None:
+    """``_resolve_full_art`` off the request: it caches what it finds and
+    sends ``art_ready``."""
+    now = time.monotonic()
+    last = _bg_resolved.get(track_id)
+    if last is not None and now - last < _BG_RESOLVE_EVERY_S:
+        return
+    if len(_bg_resolved) >= _BG_RESOLVED_MAX:
+        for k in [k for k, v in _bg_resolved.items() if now - v >= _BG_RESOLVE_EVERY_S]:
+            del _bg_resolved[k]
+        if len(_bg_resolved) >= _BG_RESOLVED_MAX:
+            _bg_resolved.clear()
+    _bg_resolved[track_id] = now
+    try:
+        t = asyncio.get_running_loop().create_task(_resolve_full_art(track_id))
+    except RuntimeError:
+        return
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_resolve_done)
+
+
+def _bg_resolve_done(t: "asyncio.Task") -> None:
+    _bg_tasks.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        log.debug("Background cover lookup failed: %s", t.exception())
+
+
 def _persist_and_notify(track_id: str, data: bytes) -> None:
     """Cache freshly-extracted art (full + thumbs), update the DB cover ref, and
     THEN broadcast ``art_ready`` so list/grid ``<img>`` elements refresh.
@@ -1006,6 +1079,7 @@ async def cover_art(
     # through to a track-less ETag keeps the previous behaviour intact for
     # the 404 path.
     mtime = _art_cached_mtime(track_id, size)
+    track = None
     if mtime is None:
         # No cached art yet → derive a freshness stamp from the source so
         # If-None-Match works on the first request.  Use the SAME folder-aware
@@ -1029,6 +1103,15 @@ async def cover_art(
     # --- ETag: return 304 if client already has this version ----------------
     if_none_match = request.headers.get("if-none-match")
     if if_none_match and if_none_match == etag:
+        if mtime is None and track is not None and is_remote_path(track.path):
+            # The client holds "no cover yet" for a network-share track, and
+            # this ETag stays the same until its cover is cached — so what
+            # would cache it must still start here, or a list that once got
+            # the empty answer never gets the cover: the embedded cover's
+            # backfill (when the scan saw one; it sends ``art_ready``), or the
+            # folder's cover already cached for another of its tracks.  Never
+            # a share listing per revalidation.
+            await _fill_remote_art_later(track_id, track)
         return Response(status_code=304, headers={"ETag": etag})
 
     # --- Thumbnails (sm / lg) ----------------------------------------------

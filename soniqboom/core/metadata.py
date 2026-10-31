@@ -451,6 +451,12 @@ HEADER_BUDGET: dict[str, int | None] = {
     ".mid":  None,         # SMF parsed sequentially
     ".midi": None,
 }
+# The remote scan's growing partial-fetch ladder (``scanner._process_one``):
+# the front window is ``HEADER_BUDGET[ext]`` times each of these in turn,
+# then the whole file.  The largest window a partial read can have been is
+# therefore ``HEADER_BUDGET[ext] * max(HEADER_BUDGET_MULTIPLIERS)`` — the
+# window-capped length backfill (``core/partial_length.py``) relies on that.
+HEADER_BUDGET_MULTIPLIERS: tuple[int, ...] = (1, 4)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

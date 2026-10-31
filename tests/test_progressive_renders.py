@@ -504,11 +504,13 @@ async def test_sndh_streams_while_rendering_to_every_client_with_its_exact_lengt
         r = await c.get("/api/stream/sn1?u=a&p=b")
         assert r.status_code == 200 and r.headers["x-cache"] == "miss-progressive"
         assert r.headers["content-length"] == str(total) and _pcm(r.content) == _pcm(ref_bytes)
-        # Safari's range probe: two bytes against the final size, no waiting
+        # Safari's range probe: two bytes against the final size (of the
+        # WebKit layout, stream._WEBKIT_ALIGN), no waiting
         r = await c.get("/api/stream/sn2", cookies={"sb_session": "x"},
                         headers={"User-Agent": SAFARI, "Range": "bytes=0-1"})
         assert r.status_code == 206 and r.content == b"RI"
-        assert r.headers["content-range"] == f"bytes 0-1/{total}"
+        assert r.headers["content-range"] == f"bytes 0-1/{stream._webkit_layout(total)[1]}"
+        assert r.headers["x-webkit-layout"] == "1"
         key = stream._ck("sn2", "sndh", subsong=0)
         for _ in range(200):                # its render finishes and is cached
             if await conversion_cache.get_cached(key) is not None:
@@ -517,6 +519,57 @@ async def test_sndh_streams_while_rendering_to_every_client_with_its_exact_lengt
         r = await c.get("/api/stream/sn2", headers={"Range": f"bytes={total - 100}-"})
         assert r.status_code == 206 and r.headers["x-cache"] == "hit"
         assert r.content == ref_bytes[-100:]
+
+
+@_needs("psgplay", SNDH)
+@pytest.mark.asyncio
+async def test_webkit_reads_the_end_of_a_running_render_at_once(monkeypatch, tmp_path):
+    """WebKit's read from the end of the audio (stream._WEBKIT_ALIGN) is the
+    trailer alone, answered while the render still runs; the growing file and
+    the finished one are the same layout, the same audio."""
+    ref = await stream._render_sndh(SNDH)
+    ref_bytes = ref.read_bytes()
+    ref.unlink()
+    total = len(ref_bytes)
+    junk, padded = stream._webkit_layout(total)
+    riff = int.from_bytes(ref_bytes[4:8], "little") + junk + stream._WEBKIT_TRAILER
+    want = (ref_bytes[:4] + riff.to_bytes(4, "little") + ref_bytes[8:12]
+            + stream._junk_chunk(junk) + ref_bytes[12:]
+            + stream._junk_chunk(stream._WEBKIT_TRAILER))
+    data_end = total + junk
+    assert data_end % stream._WEBKIT_ALIGN == 0 and len(want) == padded
+    tracks = {"sw": _T("sw", SNDH, 0.0, fmt="SNDH")}
+    app, _ = _app(monkeypatch, tmp_path, tracks)
+    monkeypatch.setattr(stream, "_backfill_rendered_duration", _noop)
+    key = stream._ck("sw", "sndh", subsong=0)
+    web = {"User-Agent": SAFARI}
+    async with _client(app) as c:
+        r = await c.get("/api/stream/sw", cookies={"sb_session": "x"},
+                        headers={**web, "Range": "bytes=0-1"})
+        assert r.status_code == 206 and r.content == b"RI"
+        assert r.headers["content-range"] == f"bytes 0-1/{padded}"
+        t0 = time.monotonic()
+        r = await c.get("/api/stream/sw", cookies={"sb_session": "x"},
+                        headers={**web, "Range": f"bytes={data_end}-{padded - 1}"})
+        assert time.monotonic() - t0 < 1.0
+        assert await conversion_cache.get_cached(key) is None     # still rendering
+        assert r.status_code == 206 and r.content == want[data_end:]
+        assert r.headers["content-range"] == f"bytes {data_end}-{padded - 1}/{padded}"
+        r = await c.get("/api/stream/sw", cookies={"sb_session": "x"},
+                        headers={**web, "Range": f"bytes=0-{data_end - 1}"})
+        assert r.status_code == 206 and r.content == want[:data_end]
+        for _ in range(200):
+            if await conversion_cache.get_cached(key) is not None:
+                break
+            await asyncio.sleep(0.05)
+        r = await c.get("/api/stream/sw", cookies={"sb_session": "x"},
+                        headers={**web, "Range": "bytes=2-70000"})
+        assert r.headers["x-cache"] == "hit" and r.content == want[2:70001]
+        # Chromium: the file as it is
+        r = await c.get("/api/stream/sw", cookies={"sb_session": "x"},
+                        headers={"User-Agent": CHROME, "Range": "bytes=0-1"})
+        assert r.headers["content-range"] == f"bytes 0-1/{total}"
+        assert "x-webkit-layout" not in r.headers
 
 
 @_needs("fluidsynth", SOUNDFONT)
@@ -680,6 +733,10 @@ async def test_a_silent_live_render_is_still_the_422(monkeypatch, tmp_path):
     from soniqboom.core import gme_render
     if not gme_render.is_available():
         pytest.skip("libgme missing")
+    # libgme's render (silent: the tune is MSX FM only); kssrender plays it
+    real_find = stream._find_renderer
+    monkeypatch.setattr(stream, "_find_renderer",
+                        lambda path, name: None if name == "kssrender" else real_find(path, name))
     app, _ = _app(monkeypatch, tmp_path, {"ks0": _T("ks0", KSS_SILENT, 180.0, fmt="KSS")})
     async with _client(app) as c:
         r = await c.get("/api/stream/ks0", cookies={"sb_session": "x"},

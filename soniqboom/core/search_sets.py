@@ -11,7 +11,10 @@ from the first page on.  Pages are slices of ORDERS of the set:
 * the default order, Best match (``RANK``) — every member scored for the
   search's free text (``core/search_rank``: field weights, whole word over
   prefix, every term in one field, the exact title and the phrase first),
-  ties newest first.  Scored once per set, ``RANK_SLICE`` tracks at a time
+  ties newest first.  A scoped search (``rank_by``: the phone's scope keys —
+  an operator's values and no free text) is ranked by those values, on that
+  operator's fields (``search_rank.SCOPES``); the scope is part of the set's
+  key.  Scored once per set, ``RANK_SLICE`` tracks at a time
   with a turn for the event loop between slices (every member before the
   first page: any of them may be the best), the sorted slices then merged as
   far as a page needs; kept, it holds as long as the set does (any write that
@@ -21,6 +24,11 @@ from the first page on.  Pages are slices of ORDERS of the set:
   ``_sorted_added_at`` (with duplicates hidden and no stand-ins:
   ``_sorted_added_at_primary``) read from its end, the order ``/api/search``
   lists;
+* album-artist matches first (``FIRST``, the default of an ``artist:``
+  search without free text whose set holds both album-artist matches and
+  others — ``TrackStore.album_artist_first``): those members newest first,
+  then the rest newest first (``_FirstOrder``: two orders of the newest-first
+  index, read one after the other);
 * a column order (``sort`` = a ``TrackStore._SORT_INDEX_MAP`` key, ``order``
   asc / desc): the sorted index All Tracks' column sort pages, read in that
   direction keeping the set's ids (``TrackStore.result_order``).  The keys and
@@ -88,6 +96,10 @@ RETRIES = 3
 # The Best match order's name among a set's orders (``sort=rank``, and the
 # default order of a search with free text).
 RANK = "rank"
+# The default order of an ``artist:`` filter without free text whose set
+# holds album-artist matches and others: those first, then the rest, each
+# newest first (``TrackStore.album_artist_first``; ``_FirstOrder``).
+FIRST = "album_artist_first"
 # Members a Best match order scores per slice before the event loop gets a
 # turn (~1.5–2.5 µs a track at 680K tracks: ~6–10 ms a slice).
 RANK_SLICE = 4096
@@ -99,7 +111,7 @@ MERGE_SLICE = 8192
 # reads them from a row.  Everything else a stored row has is kept — the row,
 # the queue, the player and Track Info's first paint read it.
 LIST_DROP = frozenset(("embedding", "stil", "instruments", "patterns", "sid_md5",
-                       "file_md5", "songdb_fields", "scene_use", "scene_party",
+                       "file_md5", "songdb_fields", "scene_use",
                        "dir_hash", "scan_root_hash", "index_vals", "index_fields"))
 _FULL_DROP = frozenset(("embedding",))
 
@@ -195,7 +207,7 @@ class _RankOrder:
         self.desc = False
         self.exact = False              # (one direction only: never read reversed)
         self.task: asyncio.Task | None = None
-        self.ranker = search_rank.Ranker(rset.terms)
+        self.ranker = search_rank.Ranker(rset.terms, rset.scope)
         self.todo = list(rset.ids)
         self.n = len(self.todo)
         self.pos = 0
@@ -264,14 +276,82 @@ class _RankOrder:
         return self.out[offset:offset + limit]
 
 
+class _FirstOrder:
+    """A set's ``FIRST`` order: its album-artist matches (``ResultSet.first``)
+    then the rest, each in newest-first order — two ``_Order``s of the
+    newest-first index, the second read once the first is complete.  One
+    direction only (never read reversed)."""
+
+    __slots__ = ("attr", "desc", "parts", "views", "ids", "task", "exact")
+
+    def __init__(self, store, rset: "ResultSet") -> None:
+        import types
+        self.attr = FIRST
+        self.desc = False
+        self.exact = False
+        self.task: asyncio.Task | None = None
+        head = rset.first
+        rest = rset.ids - head
+        # (each part's own view of a set: what ``_finish`` reads)
+        self.views = [types.SimpleNamespace(ids=p, total=len(p), orders={}) for p in (head, rest)]
+        self.parts = [_Order(store, p, rset.default_attr, True) for p in (head, rest)]
+        self.ids: list[str] | None = None
+        self._join()
+
+    def _join(self) -> None:
+        a, b = self.parts
+        if a.ids is not None and b.ids is not None:
+            self.ids = a.ids + b.ids
+
+    def _current(self) -> int | None:
+        for i, p in enumerate(self.parts):
+            if p.ids is None:
+                return i
+        return None
+
+    def valid(self, store) -> bool:
+        return all(p.valid(store) for p in self.parts)
+
+    def held(self) -> int:
+        return sum(p.held() for p in self.parts)
+
+    def _read(self) -> list[str]:
+        a, b = self.parts
+        if a.ids is None:
+            return a.walk.out
+        return a.ids + (b.ids if b.ids is not None else b.walk.out)
+
+    def ready(self, need: int) -> bool:
+        return self.ids is not None or len(self._read()) >= need
+
+    def step(self, store, rset: "ResultSet") -> None:
+        i = self._current()
+        if i is not None:
+            self.parts[i].step(store, self.views[i])
+        self._join()
+
+    def run(self, store, rset: "ResultSet", need: int) -> None:
+        for i, p in enumerate(self.parts):
+            if p.ids is None:
+                have = len(self.parts[0].ids) if i == 1 else 0
+                p.run(store, self.views[i], max(1, need - have))
+                if p.ids is None:
+                    break
+        self._join()
+
+    def partial(self, offset: int, limit: int) -> list[str]:
+        return self._read()[offset:offset + limit]
+
+
 class ResultSet:
     """The ids a search lists (``ids``, ``total``) and the orders read so far."""
 
     __slots__ = ("rs", "key", "store", "seq", "dedup", "exclude", "swap", "ids",
-                 "total", "orders", "default_attr", "terms")
+                 "total", "orders", "default_attr", "terms", "dyn", "first", "scope")
 
     def __init__(self, key: tuple, state: State, ids, default_attr: str,
-                 terms: list[str] | None = None) -> None:
+                 terms: list[str] | None = None, dyn: tuple | None = None,
+                 first: set | None = None, scope: str | None = None) -> None:
         self.rs = secrets.token_urlsafe(6)
         self.key = key
         self.store = state.store
@@ -286,6 +366,16 @@ class ResultSet:
         # terms (``search_rank.query_terms``) — None: the set is not ranked.
         self.default_attr = default_attr
         self.terms = terms or None
+        # ``dyn``: what the ids also depend on besides the browse state
+        # (``TrackStore.volatile_key``: ratings, plays, the clock) when made.
+        self.dyn = dyn
+        # ``first``: the members the default order lists first (``FIRST``) —
+        # None: that order is the newest-first index.
+        self.first = first
+        # ``scope``: the ``search_rank.SCOPES`` key whose values ``terms``
+        # are and whose fields Best match scores (``rank_by``) — None: the
+        # free text's terms, every field.
+        self.scope = scope if self.terms else None
 
     def holds(self, state: State) -> bool:
         """Made in this browse state (see the module docstring)."""
@@ -298,21 +388,26 @@ class ResultSet:
         return all(o.valid(store) for (a, _d), o in self.orders.items() if a == attr)
 
     def held(self) -> int:
-        return self.total + sum(o.held() for o in self.orders.values())
+        return (self.total + (len(self.first) if self.first else 0)
+                + sum(o.held() for o in self.orders.values()))
 
     def clone(self, state: State, drop_attr: str) -> "ResultSet":
         """The same ids under a new handle, without the orders of
         ``drop_attr`` (stale while the set is not)."""
-        c = ResultSet(self.key, state, self.ids, self.default_attr, self.terms)
+        c = ResultSet(self.key, state, self.ids, self.default_attr, self.terms, self.dyn,
+                      self.first, self.scope)
         c.orders = {k: o for k, o in self.orders.items() if k[0] != drop_attr}
         return c
 
     def attr_for(self, store, sort_by: str | None) -> str:
         """The order a request for ``sort_by`` reads: ``RANK`` (no column, or
-        ``rank``) for a ranked set, the newest-first index (``added``, or a
-        set without free text), else the column's sorted index."""
+        ``rank``) for a ranked set, ``FIRST`` (no column) for a set with
+        album-artist matches first, the newest-first index (``added``, or
+        another set without free text), else the column's sorted index."""
         if not sort_by or sort_by == RANK:
-            return RANK if self.terms else self.default_attr
+            if self.terms:
+                return RANK
+            return FIRST if self.first else self.default_attr
         if sort_by == "added":
             return self.default_attr
         return store._sort_index_attr(sort_by, filter_duplicates=self.dedup and self.swap is None)
@@ -374,36 +469,70 @@ def drop_all(store) -> None:
         _forget(store, rs)
 
 
-def search_key(preds: dict, dedup: bool) -> tuple:
+def search_key(preds: dict, dedup: bool, scope: str | None = None) -> tuple:
     """The predicates of a search (``api.search.search_predicates``) as a
-    set's lookup key: "crack" and "Crack" share a set."""
+    set's lookup key: "crack" and "Crack" share a set.  A search that reads
+    one user's plays carries that user (``uid``) among its predicates, so two
+    users never share its set.  ``scope``: the scope it is ranked by
+    (``resolve``'s ``rank_by`` when it applies) — another order, another
+    set."""
     items = []
     for k, v in sorted(preds.items()):
         if isinstance(v, str):
             v = " ".join(v.lower().split()) if k == "query" else v
         items.append((k, v))
-    return (tuple(items), bool(dedup))
+    key = (tuple(items), bool(dedup))
+    return key + (scope,) if scope else key
 
 
-def _build(store, preds: dict, state: State, key: tuple) -> ResultSet:
+def _build(store, preds: dict, state: State, key: tuple, scope: str | None = None,
+           scope_terms: list[str] | None = None) -> ResultSet:
     ids = store.result_ids(filter_duplicates=state.dedup, exclude=state.exclude,
                            swap=state.swap, **preds)
     default_attr = store._sort_index_attr(None, filter_duplicates=state.dedup and state.swap is None)
     from soniqboom.core import search_rank
-    return ResultSet(key, state, ids, default_attr, search_rank.query_terms(preds.get("query")))
+    terms = search_rank.query_terms(preds.get("query"))
+    if not terms and scope:
+        terms = list(scope_terms or ())
+    else:
+        scope = None
+    first = None
+    if not terms:
+        hits = store.album_artist_first(preds)
+        if hits is not None:
+            first = ids & hits
+            if not first or len(first) == len(ids):
+                first = None                    # (all or none: the plain order)
+    return ResultSet(key, state, ids, default_attr, terms, store.volatile_key(preds), first,
+                     scope)
 
 
 def resolve(store, preds: dict, rs: str | None = None, sort_by: str | None = None,
-            state: State | None = None) -> tuple[ResultSet, bool]:
+            state: State | None = None, rank_by: str | None = None) -> tuple[ResultSet, bool]:
     """The set to answer a request for the search ``preds`` (``rs``: the
     handle the client has) with — ``(set, renewed)``.  ``rs`` itself while it
     holds for this browse state and its order of ``sort_by`` is valid; else
     the newest kept set for the search that does, a copy of it without a
     stale order, or a new set.  ``renewed``: the answer comes from another set
-    than ``rs`` (always False without ``rs``)."""
+    than ``rs`` (always False without ``rs``).
+
+    A search whose results also hang on ratings, plays or the clock
+    (``rating:``, ``plays:`` / ``played:``, a relative ``added:``:
+    ``TrackStore.volatile_key``) keeps paging the set its handle names — its
+    rows don't shift under the list or the play queue while tracks are
+    played — but a request without that handle gets a set made since the
+    last such change (or this minute).
+
+    ``rank_by`` (a ``search_rank.SCOPES`` key — the phone's scope): a search
+    without free text that has values of that operator is ranked by them
+    (``search_rank.scope_terms``), on that operator's fields; otherwise
+    (another key, free text, no such value) it is ignored."""
     if state is None:
         state = State(store)
-    key = search_key(preds, state.dedup)
+    from soniqboom.core import search_rank
+    sterms = search_rank.scope_terms(preds, rank_by)
+    scope = rank_by if sterms else None
+    key = search_key(preds, state.dedup, scope)
     owner = _kept(store)
     if owner:
         sets = store._result_sets
@@ -414,7 +543,7 @@ def resolve(store, preds: dict, rs: str | None = None, sort_by: str | None = Non
                 cands.append(c)
         k = store._result_set_keys.get(key)
         c = sets.get(k) if k else None
-        if c is not None and c not in cands:
+        if c is not None and c not in cands and c.dyn == store.volatile_key(preds):
             cands.append(c)
         held = [c for c in cands if c.holds(state)]
         for cand in held:
@@ -427,7 +556,7 @@ def resolve(store, preds: dict, rs: str | None = None, sort_by: str | None = Non
             cand = held[0].clone(state, held[0].attr_for(store, sort_by))
             _keep(store, cand)
             return cand, bool(rs)
-    rset = _build(store, preds, state, key)
+    rset = _build(store, preds, state, key, scope, sterms)
     if owner:
         _keep(store, rset)
     return rset, bool(rs)
@@ -436,11 +565,12 @@ def resolve(store, preds: dict, rs: str | None = None, sort_by: str | None = Non
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 def _order(store, rset: ResultSet, attr: str, desc: bool) -> _Order:
-    if attr == RANK:
+    if attr in (RANK, FIRST):
         desc = False
     o = rset.orders.get((attr, desc))
     if o is None:
-        o = _RankOrder(store, rset) if attr == RANK else _Order(store, rset.ids, attr, desc)
+        o = (_RankOrder(store, rset) if attr == RANK else
+             _FirstOrder(store, rset) if attr == FIRST else _Order(store, rset.ids, attr, desc))
         rset.orders[(attr, desc)] = o
         if _kept(store) and rset.rs in store._result_sets:
             _trim(store, rset)
@@ -512,7 +642,7 @@ async def _ensure(store, rset: ResultSet, o, need: int, state_of, gone=None) -> 
 
 def _slice(rset: ResultSet, attr: str, desc: bool, offset: int, limit: int) -> list[str] | None:
     """The page from a complete order of ``attr`` in either direction, or None."""
-    if attr == RANK:
+    if attr in (RANK, FIRST):
         desc = False
     o = rset.orders.get((attr, desc))
     if o is not None and o.ids is not None:
@@ -603,7 +733,7 @@ def schedule_finish(store, rset: ResultSet, attr: str, desc: bool) -> None:
         return
     if _slice(rset, attr, desc, 0, 0) is not None:
         return
-    if attr == RANK:
+    if attr in (RANK, FIRST):
         desc = False
     o = rset.orders.get((attr, desc))
     if o is None or o.ids is not None or o.task is not None:

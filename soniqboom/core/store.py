@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections import Counter, deque
+from collections import ChainMap, Counter, deque
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -39,6 +39,7 @@ def normalise_year(y):
     return y
 
 from soniqboom.core import catalogue as _catalogue
+from soniqboom.core.search_values import path_texts as _path_texts
 from soniqboom.core.folder_album import spc_name_completes as _spc_name_completes
 from soniqboom.core.folder_album import _ARTIST_PLACEHOLDERS
 from soniqboom.core.retro import chip_family as _chip_family
@@ -173,6 +174,41 @@ _SCALAR_TAG_INDEXES = (
 # Name tag indexes (``_name_keys``): a multi-artist tag is indexed under its
 # whole value AND each of its artists.
 _NAME_TAG_INDEXES = (("artist", "_tag_artist"), ("album_artist", "_tag_album_artist"))
+# Number → ids indexes (``_ordinal``) of the search box's ``track:`` / ``disc:``
+# operators: field → attribute.  A track without a number is in none.
+_ORDINAL_INDEXES = (("track_number", "_tag_track_number"),
+                    ("disc_number", "_tag_disc_number"))
+
+
+def _ordinal(v) -> int | None:
+    """A track / disc number field as the ``_ORDINAL_INDEXES`` key: a positive
+    int (an int, an integral float, or a string of digits — "3" or "3/12"
+    reads 3), else None (no number; 0 is how a tag leaves it unset)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    if isinstance(v, float):
+        return int(v) if v.is_integer() and v > 0 else None
+    if isinstance(v, str):
+        head = v.strip().split("/", 1)[0].strip()
+        if head.isascii() and head.isdigit():
+            n = int(head)
+            return n if n > 0 else None
+    return None
+
+
+def _ordinal_hits(idx: dict[int, set[str]], lo: int | None, hi: int | None) -> set[str]:
+    """The ids of ordinal index ``idx`` whose number lies in ``lo..hi``
+    (inclusive; None: open at that end).  An exact number is its live set
+    (callers must not change it); a range the union of the numbers in it."""
+    if lo is not None and lo == hi:
+        return idx.get(lo, set())
+    out: set[str] = set()
+    for n, ids in idx.items():
+        if (lo is None or n >= lo) and (hi is None or n <= hi):
+            out |= ids
+    return out
 # The separator ``core/metadata.py`` joins a tag's several artists with
 # (``metadata.NAME_SEP``; equal to ``subsonic_index.NAME_SEP``).
 NAME_SEP = " \u2022 "
@@ -451,6 +487,7 @@ _N_SORTED = len(SORTED_LISTS)
 _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
                    | frozenset(f for f, _ in _SCALAR_TAG_INDEXES)
                    | frozenset(f for f, _ in _NAME_TAG_INDEXES)
+                   | frozenset(f for f, _ in _ORDINAL_INDEXES)
                    | frozenset(("duplicate_group_id", "genre", "genre_derived",
                                 "scene_group", "game"))
                    | frozenset().union(*(f for f, _ in _SORTED_SPECS.values())))
@@ -478,7 +515,11 @@ _BROWSE_EXTRA_FIELDS = frozenset(("bitrate", "game_source", "user_edited"))
 # ``duration``, which the duration order keys on via ``_duration_seq``
 # (``_browse_duration_only``) — leaves ``_browse_seq`` alone.  An ALLOWLIST, like ``_SEQ_EXEMPT_FIELDS``: a
 # change to any other field — one added later included — bumps it.  Disjoint
-# from ``_INDEXED_FIELDS | _BROWSE_EXTRA_FIELDS`` (test-guarded).
+# from ``_INDEXED_FIELDS | _BROWSE_EXTRA_FIELDS`` (test-guarded).  (The search
+# box's ``length:`` reads ``duration`` too: its caches key on ``_duration_seq``
+# — ``TrackStore.volatile_key``.  Its other operators read some of these —
+# health, defect, scene_party, the technical fields — through the search
+# indexes, ``_SEARCH_INDEXES``, whose caches key on ``_search_seq``.)
 _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     # a listener's playback-problem mark (core/skip_rules) and the health badge
     "health", "health_note", "health_by", "health_at", "health_renderer",
@@ -487,7 +528,8 @@ _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s",
     "hvsc_lengths", "stil", "sid_md5", "sid_model",
     # enrichment join keys and provenance (the values they set are indexed)
-    "file_md5", "scene_path", "scene_use", "scene_party", "year_source", "year_file",
+    "file_md5", "scene_path", "scene_use", "scene_party", "scene_compo", "scene_place",
+    "scene_compo_entries", "year_source", "year_file",
     "album_source", "songdb_fields",
     "game_by_tag", "game_by_modland", "game_by_demozoo", "game_by_songdb",
     "game_by_modland_filename", "game_by_archive", "game_by_folder",
@@ -495,7 +537,7 @@ _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     "replaygain_track_gain", "replaygain_track_peak", "replaygain_album_gain",
     "replaygain_album_peak", "is_lossless", "sample_rate", "channels", "bit_depth",
     "format_score", "instruments", "patterns", "label", "comment", "isrc",
-    "track_number", "total_tracks", "disc_number", "total_discs",
+    "total_tracks", "total_discs",
 ))
 
 # Inputs of the duplicate grouping (``duplicates.group_key_for`` + the primary
@@ -511,6 +553,14 @@ _DUP_OUTPUT_FIELDS = frozenset(("duplicate_group_id", "is_duplicate_primary", "f
 _SWAP_FIELDS = frozenset(("duplicate_group_id", "is_duplicate_primary", "format", "bitrate",
                           "added_at", "id"))
 _DUP_DIRTY_MAX = 20_000     # more pending changes than this → one full pass instead
+# What the online-collection twins (``core/source_twins.compute``) read of a
+# track: what names a library file's twin (its Modland place, its SID's
+# checksum, its own checksum), whether it is a collection tune (its path) and
+# ``duplicates.primary_sort_key``'s fields (which library copy is the twin).
+# A write that may change them moves ``_twin_gen`` (``_twin_touch``).
+_TWIN_KEYS = ("scene_path", "sid_md5", "file_md5")
+_TWIN_FIELDS = frozenset((*_TWIN_KEYS, "path", "format", "bitrate", "added_at"))
+_TWIN_WATCH = _TWIN_FIELDS | {"is_duplicate_primary"}
 
 # The post-scan enrichment passes (Modland, song database, Demozoo, game from
 # archive name, album from folder name) re-join only the tracks written since
@@ -777,6 +827,13 @@ INDEX_ATTRS = (
     # tracks that can't be played (``skip_rules.cant_play``).
     "_nonprimary_ids", "_untagged_artist", "_untagged_album_artist",
     "_untagged_album", "_untagged_genre", "_tag_year", "_cant_play_ids",
+    # Track / disc number → ids (the ``track:`` / ``disc:`` operators).
+    "_tag_track_number", "_tag_disc_number",
+    # The search box's other operators (``_SEARCH_INDEXES``; kept beside the
+    # browse indexes, on ``_search_seq``).
+    "_tag_party", "_tag_status", "_tag_composer", "_words_title", "_tag_lossless",
+    "_tag_bitdepth", "_tag_samplerate", "_tag_bitrate", "_tag_tunes", "_tag_chip",
+    "_tag_channels", "_tag_has", "_tag_folder", "_tag_foldername", "_path_text",
 )
 
 
@@ -837,6 +894,252 @@ def _scene_group_keys(scene_group: object) -> list[str]:
     if not isinstance(scene_group, str) or not scene_group:
         return []
     return [g.strip().lower() for g in scene_group.split(_SCENE_GROUP_SEP) if g.strip()]
+
+
+# ── Search indexes (the search box's operators — internal/SEARCH-FILTERS-PLAN) ──
+# Key → ids indexes over fields that are mostly browse-exempt (a health mark,
+# a defect, the party, the technical fields): NOT in ``_INDEXED_FIELDS``, so
+# they are kept by their own code (``_sx_index`` / ``_sx_unindex`` /
+# ``_sx_snapshot`` + ``_sx_apply``) and every change moves ``_search_seq``
+# instead of the browse clock.  All are ``INDEX_ATTRS`` (the audit, the async
+# swap, ``clear_indexes``).
+
+# Cuts a folded text into the words a word-start match starts at: every
+# character that is no letter or digit ends a word (``_word_start_in``).
+_WORD_CUT_RE = re.compile(r"[\W_]+")
+
+
+def _sx_words(v) -> set[str]:
+    """The words of text ``v`` for a word-start match: ``_game_key`` (lower
+    case, accents folded, runs of spaces as one) cut at every character that
+    is no letter or digit ("Rock’n’Roll" → rock, n, roll)."""
+    if not isinstance(v, str) or not v:
+        return set()
+    return {w for w in _WORD_CUT_RE.split(_game_key(v)) if w}
+
+
+def _sx_int(v) -> list:
+    """A positive whole number field as its index key (``[n]``), else ``[]``."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return []
+    if v != v or v <= 0 or v == math.inf:              # (NaN, unset, inf)
+        return []
+    return [int(v) if isinstance(v, int) else int(math.floor(v + 0.5))]
+
+
+def kbps(bps) -> int | None:
+    """A bitrate in bits per second as Track Info shows it: whole kbps,
+    rounded (``round(bps / 1000)``); None when unknown."""
+    if isinstance(bps, bool) or not isinstance(bps, (int, float)) or bps != bps or bps <= 0:
+        return None
+    if bps == math.inf:
+        return None
+    return int(math.floor(bps / 1000 + 0.5))
+
+
+_LOSSLESS_FMT = None
+
+
+def _lossless_keys(t: dict) -> list:
+    """``["yes"]`` for a track with the lossless badge (``is_lossless``; a
+    row without one: what its format gives — ``metadata._is_lossless_format``),
+    else ``[]`` (``lossless:no`` is every other track)."""
+    v = t.get("is_lossless")
+    if not isinstance(v, bool):
+        global _LOSSLESS_FMT
+        if _LOSSLESS_FMT is None:
+            from soniqboom.core.metadata import _is_lossless_format
+            _LOSSLESS_FMT = _is_lossless_format
+        v = _LOSSLESS_FMT(t.get("format"))
+    return ["yes"] if v else []
+
+
+# The ``health`` / ``defect`` values ``status:`` reads.
+_STATUS_HEALTH = frozenset(("broken", "glitched"))
+_STATUS_DEFECTS = frozenset(("corrupt", "partial", "unplayable", "empty"))
+
+
+def _status_keys(t: dict) -> list:
+    out = []
+    h = t.get("health")
+    if isinstance(h, str) and h.strip().lower() in _STATUS_HEALTH:
+        out.append(h.strip().lower())
+    d = t.get("defect")
+    if isinstance(d, str) and d.strip().lower() in _STATUS_DEFECTS:
+        out.append(d.strip().lower())
+    return out
+
+
+def _tunes_keys(t: dict) -> list:
+    """``[n]`` for a file of two or more tunes (``subsongs``); ``[]`` for one
+    of a single tune or without tune data (``tunes:1`` is every other track
+    — ``_tunes_ids``)."""
+    n = t.get("subsongs")
+    return [n] if isinstance(n, int) and not isinstance(n, bool) and n >= 2 else []
+
+
+def _chip_keys(t: dict) -> list:
+    """The ``chip:`` keys of a SID tune: its SID model(s) (``sid_model``
+    "6581", "8580", "6581/8580") and ``2sid`` / ``3sid`` for a file with two /
+    three chips (``channels``)."""
+    out = []
+    m = t.get("sid_model")
+    if isinstance(m, str):
+        out.extend(p.strip().lower() for p in m.split("/") if p.strip())
+    if (t.get("format") or "").upper() == "SID":
+        ch = t.get("channels")
+        if ch in (2, 3):
+            out.append(f"{ch}sid")
+    return out
+
+
+def _has_keys(t: dict) -> list:
+    """``has:`` keys: ``stil`` (HVSC STIL text), ``game`` (a game name).
+    (No ``cover``: ``cover_art`` is also filled when a track's art — a
+    folder image too — is first shown, and cleared by a rescan, so it says
+    nothing stable about the file.)"""
+    out = []
+    if t.get("stil"):
+        out.append("stil")
+    g = t.get("game")
+    if isinstance(g, str) and g.strip():
+        out.append("game")
+    return out
+
+
+def _facet_key(v) -> str:
+    """A scene browse view's key of a name: lower-cased, runs of whitespace
+    as one space (as ``filter_tracks(game=…)`` reads a game name)."""
+    return " ".join(str(v).split()).lower()
+
+
+def _display_name(spellings: Counter, fallback: str) -> str:
+    """The name a browse row shows for a key its tracks spell several ways:
+    the most common spelling, then one with capitals, then the first in
+    sort order — the same row name on every read."""
+    if not spellings:
+        return fallback
+    if len(spellings) == 1:
+        name = next(iter(spellings))
+    else:
+        name = max(spellings, key=lambda n: (spellings[n], n != n.lower(), [-ord(c) for c in n]))
+    return " ".join(name.split())
+
+
+def _lower_key(v) -> list:
+    if isinstance(v, str):
+        k = v.strip().lower()
+        if k:
+            return [k]
+    return []
+
+
+# (attr, fields read, keys of a track).  ``_tag_folder`` (folder text → ids),
+# ``_tag_foldername`` (each folder's name → ids) and ``_path_text`` (id →
+# path text), all from ``path``, are kept beside these: one
+# ``search_values.path_texts`` per track gives them.
+_SEARCH_INDEXES: tuple = (
+    ("_tag_party", frozenset(("scene_party",)), lambda t: _lower_key(t.get("scene_party"))),
+    ("_tag_status", frozenset(("health", "defect")), _status_keys),
+    ("_tag_composer", frozenset(("composer",)), lambda t: _name_keys(t.get("composer"))),
+    ("_words_title", frozenset(("title",)), lambda t: _sx_words(t.get("title"))),
+    ("_tag_lossless", frozenset(("is_lossless", "format")), _lossless_keys),
+    ("_tag_bitdepth", frozenset(("bit_depth",)), lambda t: _sx_int(t.get("bit_depth"))),
+    ("_tag_samplerate", frozenset(("sample_rate",)), lambda t: _sx_int(t.get("sample_rate"))),
+    ("_tag_bitrate", frozenset(("bitrate",)),
+     lambda t: [] if (k := kbps(t.get("bitrate"))) is None else [k]),
+    ("_tag_tunes", frozenset(("subsongs",)), _tunes_keys),
+    ("_tag_chip", frozenset(("sid_model", "channels", "format")), _chip_keys),
+    ("_tag_channels", frozenset(("channels",)), lambda t: _sx_int(t.get("channels"))),
+    ("_tag_has", frozenset(("stil", "game")), _has_keys),
+)
+_SEARCH_INDEX_ATTRS = tuple(a for a, _f, _k in _SEARCH_INDEXES) + (
+    "_tag_folder", "_tag_foldername", "_path_text")
+# Held while the search indexes a start left to build are added to
+# (``TrackStore._sx_add_slice``): the loop's slices or another thread's
+# ``_sx_ensure`` — never two at once.  (Module level: a store stays copyable.)
+_SX_LOCK = threading.Lock()
+_SEARCH_INDEX_FIELDS = frozenset().union(*(f for _a, f, _k in _SEARCH_INDEXES)) | {"path"}
+assert set(_SEARCH_INDEX_ATTRS) <= set(INDEX_ATTRS)
+# (a seq-exempt field moves no clock — ``index_generation`` would miss a write
+# to it: no search index may read one; test-guarded)
+assert _SEARCH_INDEX_FIELDS.isdisjoint(_SEQ_EXEMPT_FIELDS)
+
+
+# The search box's predicates beyond the browse ones: ``filter_tracks`` /
+# ``_candidate_ids`` keyword arguments resolved by ``_search_ids``.
+SEARCH_PREDICATES = frozenset((
+    "anyof", "genre_match", "folder", "path_match", "group_match", "party", "status",
+    "composer_match", "title_match", "lossless", "bitdepth_min", "bitdepth_max",
+    "samplerate_min", "samplerate_max", "bitrate_min", "bitrate_max", "source",
+    "phrase", "bpm_min", "bpm_max", "tunes_min", "tunes_max", "chip", "dup",
+    "channels_min", "channels_max", "has",
+    # the scene browse views' drill-downs (exact names — ``aggregate_facet``)
+    "composer_is", "party_is", "game_is", "platform",
+    # one competition of a party (with ``party_is``: the compo link)
+    "compo_is",
+))
+# The ones that read a search index (their results follow ``_search_seq``).
+_SX_PREDICATES = SEARCH_PREDICATES - {"anyof", "genre_match", "group_match", "source",
+                                      "phrase", "bpm_min", "bpm_max", "dup",
+                                      "game_is", "platform", "compo_is"}
+# The scene browse views (``TrackStore.aggregate_facet``): the row key each
+# list names its entries by, and the ``filter_tracks`` predicate that opens one.
+FACETS = {"composer": "composer_is", "party": "party_is", "game": "game_is",
+          "platform": "platform"}
+# (each view, the track field it reads — ``_facet_touch``)
+_FACET_FIELDS = (("composer", "composer"), ("party", "scene_party"), ("game", "game"),
+                 ("platform", "format"))
+
+
+def _check_predicates(more: dict) -> None:
+    """Raise TypeError for a keyword that is no search predicate."""
+    bad = more.keys() - SEARCH_PREDICATES
+    if bad:
+        raise TypeError(f"unexpected predicate(s): {', '.join(sorted(bad))}")
+
+
+def _word_start_in(text: str, q: str) -> bool:
+    """Does ``q`` occur in ``text`` at a word start (at the start, or after a
+    character that is no letter or digit)?  A ``q`` that starts with such a
+    character (``/music``) brings its own boundary: anywhere."""
+    if q and not q[0].isalnum():
+        return q in text
+    i = text.find(q)
+    while i != -1:
+        if i == 0 or not text[i - 1].isalnum():
+            return True
+        i = text.find(q, i + 1)
+    return False
+
+
+def _path_source(path) -> str:
+    """Where a track comes from (``source:``): a registered online
+    collection's key (``catalogue.key_of``), ``smb`` / ``ftp`` / ``webdav``
+    for a network share, else ``local``."""
+    root = _catalogue.root_of(path)
+    if root is not None:
+        key = _catalogue.key_of(root)
+        if key:
+            return key
+    s = str(path or "")[:10].lower()
+    if s.startswith("smb://"):
+        return "smb"
+    if s.startswith("ftp://"):
+        return "ftp"
+    if s.startswith(("http://", "https://", "webdav://", "webdavs://")):
+        return "webdav"
+    return "local"
+
+
+def _path_keys(path) -> tuple[str, str]:
+    """``(folder text, path text)`` of a track path (``search_values.path_texts``)."""
+    return _path_texts(path, _game_key)
+
+
+def _folder_names(folder: str) -> set[str]:
+    """The folder names in folder text ``folder`` (``_tag_foldername`` keys)."""
+    return {n for n in folder.split("/") if n} if folder else set()
 
 
 def modland_artist_kept(old: dict, new: dict, *, absent_md5_is_same: bool = False) -> bool:
@@ -1131,6 +1434,9 @@ def _carry_enrichment(old: dict, new: dict) -> None:
                     # the Demozoo use / party: keyed on composer + title too
                     ("scene_use", same_artist and same_title),
                     ("scene_party", same_artist and same_title),
+                    ("scene_compo", same_artist and same_title),
+                    ("scene_place", same_artist and same_title),
+                    ("scene_compo_entries", same_artist and same_title),
                     # derived genres: the next derived-genre pass recomputes
                     # them from the rescanned track (core/genre_derive.py) —
                     # carried so an unchanged file is no change
@@ -1401,6 +1707,13 @@ class TrackStore:
         self._dup_dirty: dict[str, dict | None] = {}
         self._dup_dirty_overflow = False
         self._on_dup_dirty = None           # callback: the pending set became non-empty
+        # Moves with every write that may change the online-collection twins
+        # (``_twin_touch``): ``source_twins`` recomputes them only then.  The
+        # first move after a recompute calls ``_on_twin_dirty`` (no arguments;
+        # ``scanner._on_twin_dirty``); a recompute resets ``_twin_told``.
+        self._twin_gen = 0
+        self._on_twin_dirty = None
+        self._twin_told = False
         # Enrichment change log (see _ENRICH_EXEMPT_FIELDS): track id → the
         # number of its latest change, oldest first.  Changes up to
         # ``_enrich_floor`` are no longer listed (dropped at the cap); a new
@@ -1494,6 +1807,10 @@ class TrackStore:
         self._untagged_album: set[str] = set()
         self._untagged_genre: set[str] = set()
         self._tag_year: dict[Any, set[str]] = {}
+        # Track / disc number → ids (``_ORDINAL_INDEXES``, keyed ``_ordinal``):
+        # the search box's ``track:`` / ``disc:`` operators.
+        self._tag_track_number: dict[int, set[str]] = {}
+        self._tag_disc_number: dict[int, set[str]] = {}
         # The tracks that can't be played (``skip_rules.cant_play``: reported
         # broken, corrupt, refused twice by their renderer) — what Settings →
         # "Tracks that can't be played: Hide" leaves out (core/availability).
@@ -1506,6 +1823,27 @@ class TrackStore:
         self._cant_play_ids: set[str] = set()
         self._cant_play_gen: int = 0
         self._on_cant_play_changed: Callable[[], None] | None = None
+        # The search box's own indexes (``_SEARCH_INDEXES``): key → ids, plus
+        # the folder text → ids (``folder:``) and id → whole path text
+        # (``path:``).  ``_search_seq`` moves with every change to them (and
+        # with an index swap); ``_sx_keys`` counts, per index, the keys that
+        # appeared or vanished (a version, never reset) — what ``_sx_names``
+        # memoises its folded key lists on (``_sx_memo``).
+        for _attr in _SEARCH_INDEX_ATTRS:
+            setattr(self, _attr, {})
+        self._search_seq: int = 0
+        self._sx_keys: dict[str, int] = {}
+        self._sx_memo: dict[str, tuple] = {}
+        # A start builds the search indexes after the library is up
+        # (``rebuild_indexes(defer_search=True)``): ``_sx_todo`` (the track
+        # ids, None once built) from ``_sx_pos`` on are still to add — in
+        # slices on the loop (``build_search_indexes_async``), or at once by
+        # the first reader (``_sx_ensure``).  Writes meanwhile index their
+        # tracks as always (adding a track twice changes nothing).
+        self._sx_todo: list | None = None
+        self._sx_pos = 0
+        self._sx_skip = False                   # (a deferring rebuild's loop)
+        self._sx_task = None                    # (the slices' task, kept referenced)
 
         # ── Pre-computed aggregations ────────────────────────────────────
         self._agg_artists: Counter[str] = Counter()
@@ -1535,6 +1873,11 @@ class TrackStore:
         # set it was computed without, value, the primary swap it used) — see
         # ``_agg_x_get``.
         self._agg_x_cache: dict[str, tuple[int, Any, Any, Any]] = {}
+        # ``_facet_sets`` / ``aggregate_facet``: (stamp, value) per key; a
+        # write that changes a field a scene browse view reads moves that
+        # view's counter (``_facet_touch``)
+        self._facet_memo: dict[str, tuple[tuple, Any]] = {}
+        self._facet_gen: dict[str, int] = {}
         # ``primary_swap`` memo: (the unplayable set, the swap or None, {group
         # key: (its primaries, their stand-in)}), and the groups written since
         # it was built (``_swap_touch``; None: build it all again).
@@ -1551,6 +1894,9 @@ class TrackStore:
         # name, descending) → walk (which holds the exclude set and the swap:
         # an id is not reused while its entry lives).
         self._filter_walk_memo: dict[tuple, _FilterWalk] = {}
+        # ``filter_tracks`` walk key → (browse stamp, the album-artist-first
+        # split (head, rest) or None) — ``_first_split_page``.
+        self._first_split_memo: dict[tuple, tuple] = {}
         # Search result sets (``core/search_sets.py``), least recently used
         # first: handle → set, and (predicates, duplicates hidden) → the handle
         # of the newest set for them.  Kept by the owner thread only
@@ -1862,6 +2208,7 @@ class TrackStore:
         # read the sorted lists) with no write of its own.
         self._browse_seq += 1
         self._filter_walk_memo.clear()
+        self._first_split_memo.clear()
         self._drop_result_sets()
 
     def browse_changed(self) -> None:
@@ -1871,6 +2218,7 @@ class TrackStore:
         track write (the Subsonic visibility of a catalogue)."""
         self._browse_seq += 1
         self._filter_walk_memo.clear()
+        self._first_split_memo.clear()
         self._primary_order_memo.clear()
         self._excluded_order_memo.clear()
         self._drop_result_sets()
@@ -1880,8 +2228,11 @@ class TrackStore:
         self._word_fresh.clear()
         self._word_gone.clear()
         self._word_list_full = self._word_list_dirty
-        # (an index swap installs another ``_cant_play_ids``)
+        # (an index swap installs another ``_cant_play_ids`` and other search
+        # indexes)
         self._cant_play_gen += 1
+        self._search_seq += 1
+        self._sx_memo.clear()
 
     def _cant_play_moved(self) -> None:
         """``_cant_play_ids`` changed (a write added or removed an id): move
@@ -1965,9 +2316,15 @@ class TrackStore:
                 self._tag_year[year] = {tid}
             else:
                 ys.add(tid)
+        for field, attr in _ORDINAL_INDEXES:
+            n = _ordinal(t.get(field))
+            if n is not None:
+                getattr(self, attr).setdefault(n, set()).add(tid)
         if _cant_play(t):
             self._cant_play_ids.add(tid)
             self._cant_play_moved()
+        if not self._sx_skip:
+            self._sx_index(tid, t)
 
         if not self._batch_mode:
             # Lexical sort keys for the column-header sort (windowed view).
@@ -2072,9 +2429,12 @@ class TrackStore:
                 ys.discard(tid)
                 if not ys:
                     del self._tag_year[year]
+        for field, attr in _ORDINAL_INDEXES:
+            self._ordinal_del(getattr(self, attr), _ordinal(t.get(field)), tid)
         if tid in self._cant_play_ids:
             self._cant_play_ids.discard(tid)
             self._cant_play_moved()
+        self._sx_unindex(tid, t)
 
         if not self._batch_mode:
             # Same lexical key derivation as ``_index_track`` — must match
@@ -2158,6 +2518,16 @@ class TrackStore:
         key = value.strip().lower() if isinstance(value, str) else str(value)
         if key:
             idx.setdefault(key, set()).add(tid)
+
+    @staticmethod
+    def _ordinal_del(idx: dict[int, set[str]], n: int | None, tid: str) -> None:
+        """Take ``tid`` out of ordinal index ``idx`` under number ``n``."""
+        if n is not None:
+            s = idx.get(n)
+            if s:
+                s.discard(tid)
+                if not s:
+                    del idx[n]
 
     @staticmethod
     def _tag_del(idx: dict[str, set[str]], value: str, tid: str) -> None:
@@ -2354,6 +2724,222 @@ class TrackStore:
                     self._tag_year[ny] = {tid}
                 else:
                     ys.add(tid)
+        for field, attr in _ORDINAL_INDEXES:
+            if field in changed:
+                on, nn = _ordinal(old.get(field)), _ordinal(t.get(field))
+                if on != nn:
+                    idx = getattr(self, attr)
+                    self._ordinal_del(idx, on, tid)
+                    if nn is not None:
+                        idx.setdefault(nn, set()).add(tid)
+
+    # ── Search indexes (``_SEARCH_INDEXES``) ─────────────────────────────
+
+    def _sx_add(self, attr: str, idx: dict, keys, tid: str) -> None:
+        for k in keys:
+            s = idx.get(k)
+            if s is None:
+                idx[k] = {tid}
+                self._sx_keys[attr] = self._sx_keys.get(attr, 0) + 1
+            else:
+                s.add(tid)
+
+    def _sx_del(self, attr: str, idx: dict, keys, tid: str) -> None:
+        for k in keys:
+            s = idx.get(k)
+            if s:
+                s.discard(tid)
+                if not s:
+                    del idx[k]
+                    self._sx_keys[attr] = self._sx_keys.get(attr, 0) + 1
+
+    def _sx_index(self, tid: str, t: dict) -> None:
+        """Add track ``t`` to the search indexes (``_sx_add``, inlined: this
+        runs for every track of an index rebuild)."""
+        counts = self._sx_keys
+        for attr, _fields, keys in _SEARCH_INDEXES:
+            ks = keys(t)
+            if ks:
+                idx = getattr(self, attr)
+                for k in ks:
+                    s = idx.get(k)
+                    if s is None:
+                        idx[k] = {tid}
+                        counts[attr] = counts.get(attr, 0) + 1
+                    else:
+                        s.add(tid)
+        folder, full = _path_keys(t.get("path"))
+        if full:
+            self._path_text[tid] = full
+        if folder:
+            s = self._tag_folder.get(folder)
+            if s is None:
+                self._tag_folder[folder] = {tid}
+                counts["_tag_folder"] = counts.get("_tag_folder", 0) + 1
+            else:
+                s.add(tid)
+            names = self._tag_foldername
+            for k in _folder_names(folder):
+                s = names.get(k)
+                if s is None:
+                    names[k] = {tid}
+                    counts["_tag_foldername"] = counts.get("_tag_foldername", 0) + 1
+                else:
+                    s.add(tid)
+        self._search_seq += 1
+
+    def _sx_finished(self) -> None:
+        if self._sx_todo is not None:
+            log.info("Search indexes built for %d tracks", len(self._sx_todo))
+        self._sx_todo = None
+
+    def _sx_add_slice(self, todo: list, end: int) -> None:
+        """Add ``todo[_sx_pos:end]`` to the search indexes (``_SX_LOCK`` held)."""
+        get = self._tracks.get
+        for tid in todo[self._sx_pos:end]:
+            t = get(tid)
+            if t is not None:
+                self._sx_index(tid, t)
+        self._sx_pos = end
+        if end >= len(todo):
+            self._sx_finished()
+
+    def _sx_ensure(self) -> None:
+        """Finish the search indexes a start left to build (``rebuild_indexes``'
+        ``defer_search``) before they are read.  The loop's thread adds the
+        rest at once; another thread waits for the loop's slices (two threads
+        adding to one index could lose a track) — at most 30 s, then adds it."""
+        todo = self._sx_todo
+        if todo is None:
+            return
+        if not self._memo_ok():
+            t0 = time.monotonic()
+            while self._sx_todo is not None and time.monotonic() - t0 < 30.0:
+                time.sleep(0.01)
+        with _SX_LOCK:
+            todo = self._sx_todo
+            if todo is not None:
+                self._sx_add_slice(todo, len(todo))
+
+    async def build_search_indexes_async(self, chunk: int = 1000) -> None:
+        """Build the search indexes a start left to build, ``chunk`` tracks
+        (about 10 ms) at a time, yielding to the loop between slices."""
+        import asyncio
+        import gc
+        todo = self._sx_todo
+        while todo is not None and self._sx_todo is todo:
+            was = gc.isenabled()
+            gc.disable()            # (millions of small sets: no full collections per slice)
+            try:
+                with _SX_LOCK:
+                    if self._sx_todo is todo:
+                        self._sx_add_slice(todo, min(self._sx_pos + chunk, len(todo)))
+            finally:
+                if was:
+                    gc.enable()
+            await asyncio.sleep(0)
+
+    def needs_search_indexes(self, preds: dict) -> bool:
+        """Do these ``filter_tracks`` predicates read a search index that a
+        start is still building?  (Then an async caller awaits
+        ``search_indexes_ready`` first — the loop serves meanwhile — instead
+        of the first read finishing them at once.)"""
+        if self._sx_todo is None or not preds:
+            return False
+        return bool(preds.get("anyof")) or any(preds.get(k) is not None for k in _SX_PREDICATES)
+
+    async def search_indexes_ready(self, timeout: float = 30.0) -> None:
+        """Wait for the search indexes a start left to build (then, past
+        ``timeout``, finish them at once)."""
+        import asyncio
+        t0 = time.monotonic()
+        while self._sx_todo is not None and time.monotonic() - t0 < timeout:
+            await asyncio.sleep(0.05)
+        self._sx_ensure()
+
+    def _sx_unindex(self, tid: str, t: dict) -> None:
+        """Take track ``t`` out of the search indexes."""
+        for attr, _fields, keys in _SEARCH_INDEXES:
+            ks = keys(t)
+            if ks:
+                self._sx_del(attr, getattr(self, attr), ks, tid)
+        folder, _full = _path_keys(t.get("path"))
+        self._path_text.pop(tid, None)
+        if folder:
+            self._sx_del("_tag_folder", self._tag_folder, (folder,), tid)
+            self._sx_del("_tag_foldername", self._tag_foldername, _folder_names(folder), tid)
+        self._search_seq += 1
+
+    def _sx_snapshot(self, t: dict, changed) -> list:
+        """The search-index keys of stored track ``t`` that a write of the
+        fields ``changed`` may move — taken before the write
+        (``_sx_apply`` moves them after it)."""
+        out = [(attr, keys, set(keys(t))) for attr, fields, keys in _SEARCH_INDEXES
+               if not fields.isdisjoint(changed)]
+        if "path" in changed:
+            out.append(("path", None, _path_keys(t.get("path"))))
+        return out
+
+    def _sx_apply(self, tid: str, t: dict, snap: list) -> None:
+        """Move track ``tid`` (now ``t``) in the search indexes from the keys
+        ``_sx_snapshot`` took before the write to its keys now."""
+        moved = False
+        for attr, keys, old in snap:
+            if attr == "path":
+                folder, full = _path_keys(t.get("path"))
+                if (folder, full) == old:
+                    continue
+                moved = True
+                if old[0] != folder:
+                    if old[0]:
+                        self._sx_del("_tag_folder", self._tag_folder, (old[0],), tid)
+                    if folder:
+                        self._sx_add("_tag_folder", self._tag_folder, (folder,), tid)
+                    on, nn = _folder_names(old[0]), _folder_names(folder)
+                    self._sx_del("_tag_foldername", self._tag_foldername, on - nn, tid)
+                    self._sx_add("_tag_foldername", self._tag_foldername, nn - on, tid)
+                if full:
+                    self._path_text[tid] = full
+                else:
+                    self._path_text.pop(tid, None)
+                continue
+            new = set(keys(t))
+            if new == old:
+                continue
+            moved = True
+            idx = getattr(self, attr)
+            self._sx_del(attr, idx, old - new, tid)
+            self._sx_add(attr, idx, new - old, tid)
+        if moved:
+            self._search_seq += 1
+
+    def _sx_names(self, attr: str) -> list:
+        """``[(folded key, key)]`` of search index ``attr`` (``_game_key``),
+        memoised per index object and key-change count (``_sx_keys``) — the
+        list a word-start walk reads.  Kept only by the owner thread."""
+        idx = getattr(self, attr)
+        stamp = (id(idx), self._sx_keys.get(attr, 0), len(idx))
+        memo = self._sx_memo.get(attr)
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        names = [(_game_key(k), k) for k in idx if isinstance(k, str)]
+        if self._memo_ok():
+            self._sx_memo[attr] = (stamp, names)
+        return names
+
+    def _sx_sorted(self, attr: str) -> list:
+        """The keys of search index ``attr``, sorted (a prefix lookup bisects
+        them) — memoised like ``_sx_names``."""
+        idx = getattr(self, attr)
+        stamp = (id(idx), self._sx_keys.get(attr, 0), len(idx))
+        mkey = attr + ":sorted"
+        memo = self._sx_memo.get(mkey)
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        keys = sorted(idx)
+        if self._memo_ok():
+            self._sx_memo[mkey] = (stamp, keys)
+        return keys
 
     def _apply_field_changes(self, tid: str, t: dict, changed: dict) -> None:
         """Write the (already diffed, non-empty) ``changed`` fields onto
@@ -2362,17 +2948,25 @@ class TrackStore:
             self._write_watch(tid, t)
         if not _DUP_FIELDS.isdisjoint(changed):
             self._note_dup_dirty(tid, t)
+        if not _TWIN_WATCH.isdisjoint(changed):
+            self._twin_touch(t, ChainMap(changed, t))   # (the values after the write)
+        self._facet_touch(t, changed, partial=True)
         if not changed.keys() <= _ENRICH_EXEMPT_FIELDS:
             self._note_enrich(tid)
         if not _SWAP_FIELDS.isdisjoint(changed):
             self._swap_touch(t.get("duplicate_group_id"))
             self._swap_touch(changed.get("duplicate_group_id"))
+        # (the search indexes' fields are mostly browse-exempt: kept here,
+        # not by ``_reindex_changed`` — their keys before the write first)
+        sx = self._sx_snapshot(t, changed) if not _SEARCH_INDEX_FIELDS.isdisjoint(changed) else None
         if _INDEXED_FIELDS.isdisjoint(changed):
             t.update(changed)                   # e.g. cover_art, file_md5, defect
         else:
             old = dict(t)
             t.update(changed)
             self._reindex_changed(tid, old, t, changed)
+        if sx is not None:
+            self._sx_apply(tid, t, sx)
         if not _CANT_PLAY_FIELDS.isdisjoint(changed):
             # (browse-exempt fields: no ``_reindex_changed`` for them alone)
             ids = self._cant_play_ids
@@ -2429,8 +3023,14 @@ class TrackStore:
         self._library_replaced()
         self._scan_dirs_changed()
 
-    def rebuild_indexes(self) -> None:
+    def rebuild_indexes(self, *, defer_search: bool = False) -> None:
         """Rebuild all indexes from current data.
+
+        ``defer_search`` (the start): the search box's own indexes
+        (``_SEARCH_INDEXES``, ``folder:`` / ``title:`` / ``status:`` …) are
+        left to build after it — ``build_search_indexes_async`` in slices on
+        the loop, or whatever reads them first (``_sx_ensure``) at once —
+        so the library is served about 10 µs a track sooner.
 
         Runs in batch mode so the 9 sorted indexes are built by one O(N log N)
         ``sort()`` at the end rather than N × ``bisect.insort`` (which is
@@ -2443,11 +3043,16 @@ class TrackStore:
         self.clear_indexes()
         self.enter_batch_mode()
         self._mark_all_sorted_dirty()           # (every list is built anew: nothing to record)
+        self._sx_skip = defer_search
         try:
             for tid, t in self._tracks.items():
                 self._index_track(tid, t)
         finally:
+            self._sx_skip = False
             self.exit_batch_mode()
+        if defer_search:
+            self._sx_pos = 0
+            self._sx_todo = list(self._tracks)
         self._rebuild_word_list()
         self._build_sim_token_index()
         # Every index is new (and usually ``_tracks`` too — ``bulk_load``):
@@ -2469,6 +3074,8 @@ class TrackStore:
         self._duration_seq += 1
         self._play_seq += 1
         self._rating_seq += 1
+        self._twin_gen += 1
+        self._facet_memo.clear()
         self._agg_cache.clear()
         self._agg_x_cache.clear()
         self._primary_swap_memo = None
@@ -2485,7 +3092,9 @@ class TrackStore:
         are read from that user's play stats, ``list_unplayed``).  An index
         rebuild that yields while it builds from a snapshot
         (``data.rebuild_indexes``) compares it before and after, and must not
-        install indexes built from a snapshot a write has outdated."""
+        install indexes built from a snapshot a write has outdated.  (The
+        search indexes read no seq-exempt field: every write that changes one
+        moves ``_mutation_seq`` too.)"""
         return (self._mutation_seq, self._duration_seq)
 
     def verify_indexes(self) -> dict:
@@ -2524,7 +3133,9 @@ class TrackStore:
 
     def _diff_indexes(self, expected: "TrackStore") -> dict:
         """Diff this store's live indexes against a freshly-built ``expected``
-        shadow.  Pure comparison, no mutation."""
+        shadow.  Pure comparison, no mutation (but the search indexes a start
+        is still building are finished first: ``_sx_ensure``)."""
+        self._sx_ensure()
         indexes: dict[str, dict] = {}
         mismatches: list[dict] = []
         for attr in INDEX_ATTRS:
@@ -2552,6 +3163,7 @@ class TrackStore:
     def clear_indexes(self) -> None:
         """Clear all indexes (first phase of rebuild, can be followed by
         batched ``index_tracks_batch`` calls)."""
+        self._sx_todo = None                    # (nothing left to add to them)
         self._word_index.clear()
         self._word_list_dirty = True
         self._word_list_full = True
@@ -2568,8 +3180,14 @@ class TrackStore:
         self._untagged_album.clear()
         self._untagged_genre.clear()
         self._tag_year.clear()
+        self._tag_track_number.clear()
+        self._tag_disc_number.clear()
         self._cant_play_ids.clear()
         self._cant_play_gen += 1
+        for attr in _SEARCH_INDEX_ATTRS:
+            getattr(self, attr).clear()
+        self._search_seq += 1
+        self._sx_memo.clear()
         for tag_idx in (
             self._tag_artist, self._tag_album_artist, self._tag_album,
             self._tag_genre, self._tag_format, self._tag_dir_hash,
@@ -2764,6 +3382,8 @@ class TrackStore:
             self._restore_mark(track)
         track.update(game_follow(track))
         self._note_dup_upsert(tid, old, track)
+        self._twin_touch(old, track)
+        self._facet_touch(old, track)
         self._note_enrich(tid)
         if old:
             self._unindex_track(tid, old)
@@ -2790,6 +3410,8 @@ class TrackStore:
                 self._restore_mark(t)          # (a file that came back keeps its mark)
                 t.update(game_follow(t))
             self._note_dup_upsert(tid, old, t)
+            self._twin_touch(old, t)
+            self._facet_touch(old, t)
             self._note_enrich(tid)
             self._tracks[tid] = t
             self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
@@ -2908,6 +3530,7 @@ class TrackStore:
         self._excluded_order_memo.clear()
         self._browse_seq += 1                   # (as ``_sorted_rebuilt``)
         self._filter_walk_memo.clear()
+        self._first_split_memo.clear()
         self._drop_result_sets()
         if names is not None and not _ALL_SORTED <= set(names):
             for name in list(names):
@@ -2971,6 +3594,8 @@ class TrackStore:
             self._write_watch(track_id, t)
         del self._tracks[track_id]
         self._note_dup_dirty(track_id, t)
+        self._twin_touch(t, None)
+        self._facet_touch(t, None)
         self._note_enrich(track_id)
         self._unindex_track(track_id, t)
         self._waveforms.pop(track_id, None)
@@ -2990,6 +3615,8 @@ class TrackStore:
             t = self._tracks.pop(tid, None)
             if t:
                 self._note_dup_dirty(tid, t)
+                self._twin_touch(t, None)
+                self._facet_touch(t, None)
                 self._note_enrich(tid)
                 self._unindex_track(tid, t)
                 self._waveforms.pop(tid, None)
@@ -3007,13 +3634,15 @@ class TrackStore:
 
     # ── Duplicate-relevant change tracking ───────────────────────────────
 
-    def _note_dup_dirty(self, tid: str, old: "dict | None") -> None:
+    def _note_dup_dirty(self, tid: str, old: "dict | None", *, twin: bool = False) -> None:
         """Record ``tid``'s duplicate-relevant values BEFORE a change (None =
         a new track).  The first record per track wins until it is taken.
-        Catalogue tracks (``core/catalogue.py``) are never grouped."""
+        Catalogue tracks (``core/catalogue.py``) are never grouped — except a
+        tune that is (or stops being) a library file's twin
+        (``core/source_twins.py``, ``twin``)."""
         if self._dup_dirty_overflow or tid in self._dup_dirty:
             return
-        if old is not None and _catalogue.is_catalogue_path(old.get("path")):
+        if not twin and old is not None and _catalogue.is_catalogue_path(old.get("path")):
             return
         first = not self._dup_dirty
         if len(self._dup_dirty) >= _DUP_DIRTY_MAX:
@@ -3037,6 +3666,64 @@ class TrackStore:
                 or any(old.get(k) != new.get(k) for k in _DUP_FIELDS)
                 or any(old.get(k) != new.get(k) for k in _DUP_OUTPUT_FIELDS)):
             self._note_dup_dirty(tid, old)
+
+    def _facet_touch(self, old: "dict | None", new: "dict | None",
+                     partial: bool = False) -> None:
+        """Move the counter of each scene browse view (``_facet_sets``) whose
+        field the write of a track from ``old`` to ``new`` (None: added /
+        deleted) changes.  ``partial``: ``new`` holds only the changed fields
+        (a field update) — a field it lacks kept its value."""
+        gen = self._facet_gen
+        for facet, field in _FACET_FIELDS:
+            a = old.get(field) if old is not None else None
+            if new is None:
+                b = None
+            else:
+                b = new.get(field, a) if partial else new.get(field)
+            if a != b:
+                gen[facet] = gen.get(facet, 0) + 1
+
+    def _twin_touch(self, old: "dict | None", new: "dict | None") -> None:
+        """Move ``_twin_gen`` when the write of a track from ``old`` to ``new``
+        (None: added / deleted) may change the online-collection twins
+        (``core/source_twins.compute``): a collection tune that came, went or
+        got its own checksum, or whose "hidden copy" mark was lost (a twin's
+        annotation the map re-marks); a library file that names a twin
+        (``_TWIN_KEYS``) and changed what ``compute`` reads of it
+        (``_TWIN_FIELDS``)."""
+        if old is None or new is None:
+            t = new if old is None else old
+            if t is not None and (_catalogue.is_catalogue_path(t.get("path"))
+                                  or any(t.get(k) for k in _TWIN_KEYS)):
+                self._twin_moved()
+            return
+        p_old, p_new = old.get("path"), new.get("path")
+        if (_catalogue.is_catalogue_path(p_new)
+                or (p_old != p_new and _catalogue.is_catalogue_path(p_old))):
+            if (p_old != p_new
+                    or old.get("file_md5") != new.get("file_md5")
+                    or (old.get("is_duplicate_primary") is False
+                        and new.get("is_duplicate_primary") is not False)):
+                self._twin_moved()
+            return
+        # (spelled out: this runs for every track a scan commits)
+        if not (old.get("scene_path") or old.get("sid_md5") or old.get("file_md5")
+                or new.get("scene_path") or new.get("sid_md5") or new.get("file_md5")):
+            return
+        for k in _TWIN_FIELDS:
+            if old.get(k) != new.get(k):
+                self._twin_moved()
+                return
+
+    def _twin_moved(self) -> None:
+        self._twin_gen += 1
+        cb = self._on_twin_dirty
+        if cb is not None and not self._twin_told:
+            self._twin_told = True
+            try:
+                cb()
+            except Exception:                     # noqa: BLE001 — never fail a write
+                log.debug("twin-dirty callback failed", exc_info=True)
 
     def take_dup_dirty(self) -> "tuple[dict[str, dict | None], bool]":
         """Hand over (and reset) the pending duplicate-relevant changes:
@@ -3529,12 +4216,27 @@ class TrackStore:
         format_: str | None = None,
         year_min: int | None = None,
         year_max: int | None = None,
+        track_min: int | None = None,
+        track_max: int | None = None,
+        disc_min: int | None = None,
+        disc_max: int | None = None,
         dir_hash: str | None = None,
         scan_root_hash: str | None = None,
         query: str | None = None,
         game: str | None = None,
         artist_match: str | None = None,
         album_artist_match: str | None = None,
+        album_match: str | None = None,
+        length_min: int | None = None,
+        length_max: int | None = None,
+        added: str | None = None,
+        rating_min: int | None = None,
+        rating_max: int | None = None,
+        plays_min: int | None = None,
+        plays_max: int | None = None,
+        played: str | None = None,
+        negate: tuple | None = None,
+        uid: str | None = None,
         limit: int = 200,
         offset: int = 0,
         filter_duplicates: bool = False,
@@ -3543,8 +4245,13 @@ class TrackStore:
         exclude: "set[str] | frozenset[str] | None" = None,
         untagged: str | None = None,
         swap: PrimarySwap | None = None,
+        **more,
     ) -> list[dict]:
         """Filter tracks by tag and/or range criteria, intersecting results.
+
+        The predicates are :meth:`_candidate_ids`'s (``negate``: exclusions,
+        ``uid``: whose plays ``plays_*`` / ``played`` read; ``more``: the
+        search box's other operators, ``SEARCH_PREDICATES``).
 
         ``exclude``: ids no page may contain (the catalogue tracks Subsonic
         clients must not see — ``core/catalogue_view.py``; the tracks
@@ -3562,7 +4269,10 @@ class TrackStore:
 
         ``sort_by`` selects which pre-computed sorted index drives the page
         walk: one of ``title``, ``artist``, ``album``, ``format``, ``year``,
-        ``duration``, ``bpm``, or ``added`` (default).  ``sort_order`` is
+        ``duration``, ``bpm``, or ``added`` (default).  With no ``sort_by``,
+        a search box ``artist:`` filter without free text lists its
+        album-artist matches first (``album_artist_first``), each part in the
+        default order.  ``sort_order`` is
         ``"asc"`` or ``"desc"`` — falsy / unknown values default to ``desc``
         for ``added`` (newest first, historical) and ``asc`` for everything
         else (the natural reading order for a column header click).
@@ -3578,24 +4288,47 @@ class TrackStore:
         # A deeper page of a list walked before resumes that walk
         # (``_FilterWalk``) instead of resolving the predicates and walking the
         # index from its start again.
-        wkey = (artist, album_artist, album, genre, scene_group, format_, year_min, year_max,
-                dir_hash, scan_root_hash, query, game, artist_match, album_artist_match,
-                untagged, bool(filter_duplicates), id(exclude), id(swap), attr, descending)
+        # (Ratings, plays and the clock move no browse state: the key holds
+        # what such predicates also read — ``volatile_key``.)
+        preds = dict(
+            artist=artist, album_artist=album_artist, album=album, genre=genre,
+            scene_group=scene_group, format_=format_,
+            year_min=year_min, year_max=year_max,
+            track_min=track_min, track_max=track_max,
+            disc_min=disc_min, disc_max=disc_max,
+            dir_hash=dir_hash, scan_root_hash=scan_root_hash, query=query,
+            game=game, artist_match=artist_match, album_artist_match=album_artist_match,
+            album_match=album_match, length_min=length_min, length_max=length_max,
+            added=added, rating_min=rating_min, rating_max=rating_max,
+            plays_min=plays_min, plays_max=plays_max, played=played,
+            negate=negate, uid=uid, untagged=untagged)
+        if more:
+            _check_predicates(more)
+            for k in sorted(more):
+                preds[k] = more[k]
+        # (names and values: the search predicates are a sparse set, and two
+        # operators can share a value — ``folder:x`` / ``title:x``)
+        wkey = (*preds.items(), self.volatile_key(preds),
+                bool(filter_duplicates), id(exclude), id(swap), attr, descending)
+        if sort_by is None and (preds.get("artist_match") is not None or preds.get("anyof")):
+            # (the default order of an ``artist:`` filter: album-artist
+            # matches first — ``album_artist_first``)
+            spare: list = []
+            page = self._first_split_page(preds, attr, descending, wkey, limit, offset,
+                                          filter_duplicates, exclude, swap, spare)
+            if page is not None:
+                return page
+        else:
+            spare = []
         owner = self._memo_ok()
         walk = self._filter_walk_get(wkey, attr, exclude, swap) if owner else None
         if walk is not None:
             result = walk.member
             idx = walk.idx
         else:
-            result = self._candidate_ids(
-                artist=artist, album_artist=album_artist, album=album, genre=genre,
-                scene_group=scene_group, format_=format_,
-                year_min=year_min, year_max=year_max,
-                dir_hash=dir_hash, scan_root_hash=scan_root_hash, query=query,
-                game=game, artist_match=artist_match, album_artist_match=album_artist_match,
-                untagged=untagged, filter_duplicates=filter_duplicates,
-                swap=swap,
-            )
+            # (the candidates the split just resolved, when it found none)
+            result = spare[0] if spare else self._candidate_ids(
+                **preds, filter_duplicates=filter_duplicates, swap=swap)
             if result is None and (exclude or swap is not None):
                 return self._paginate_excluding(limit, offset, exclude,
                                                 filter_duplicates=filter_duplicates,
@@ -3637,6 +4370,101 @@ class TrackStore:
         else:                       # (the walk's ``collected[offset:offset + limit]``)
             page = order[:need if need > 0 else 1][offset:offset + limit]
         return [self._meta_dict(tid) for tid in page if tid in self._tracks]
+
+    def album_artist_first(self, preds: dict) -> set[str] | None:
+        """The album-artist matches a search's default order lists first:
+        for a search without free text (no ``query`` / ``phrase``) with a
+        positive ``artist_match`` (the search box's ``artist:`` — also several
+        values, an ``anyof`` group of ``artist_match`` entries only), the ids
+        whose album artist has the value at a word start (``_word_hits``);
+        else None.  (The order: these, then the other matches, each part
+        newest first — ``filter_tracks`` with no ``sort_by``,
+        ``search_sets``' default order.)"""
+        if preds.get("query") or preds.get("phrase"):
+            return None
+        values = []
+        if preds.get("artist_match") is not None:
+            values.append(preds["artist_match"])
+        for group in preds.get("anyof") or ():
+            if group and all(len(e) == 1 and e[0][0] == "artist_match" for e in group):
+                values.extend(e[0][1] for e in group)
+        if not values:
+            return None
+        out: set[str] = set()
+        for v in dict.fromkeys(values):
+            out |= self._word_hits("_tag_album_artist", v)
+        return out
+
+    def _first_split_page(self, preds: dict, attr: str, descending: bool,
+                          wkey: tuple, limit: int, offset: int, filter_duplicates: bool,
+                          exclude, swap, spare: list) -> list[dict] | None:
+        """A ``filter_tracks`` page of the order "album-artist matches
+        (``album_artist_first``), then the others" (each part in the order of
+        ``attr``) — or None when there is no such split (not an ``artist:``
+        filter, or the candidates are all, or none, of them: the plain
+        order).  The split is kept per ``wkey`` until the next browse write
+        (``_first_split_memo``), the parts' walks like ``filter_tracks``'.
+        With no split, the candidates it resolved (``_candidate_ids``, before
+        ``exclude``) are put in ``spare`` for the plain order."""
+        memo = self._first_split_memo
+        stamp = (self._browse_seq, self._primary_order_key(attr))
+        try:
+            got = memo.get(wkey)
+        except TypeError:                       # (an unhashable predicate value)
+            got = None
+        if got is not None and got[0] == stamp:
+            parts = got[1]
+            memo[wkey] = memo.pop(wkey)         # (most recently used last)
+        else:
+            parts = None
+            first = self.album_artist_first(preds)
+            if first is not None:
+                result = self._candidate_ids(**preds, filter_duplicates=filter_duplicates,
+                                             swap=swap)
+                raw = result
+                if result and exclude:
+                    result = result.difference(exclude)
+                head = (result & first) if result else None
+                if head and len(head) != len(result):
+                    parts = (head, result - head)
+                else:
+                    spare.append(raw)
+            if self._memo_ok():
+                try:
+                    memo.pop(wkey, None)
+                    while len(memo) >= _FILTER_WALK_MAX:
+                        memo.pop(next(iter(memo)))
+                    memo[wkey] = (stamp, parts)
+                except TypeError:
+                    pass
+        if parts is None:
+            return None
+        need = offset + limit
+        ids = self._part_order(wkey, 0, parts[0], attr, descending, exclude, swap, need)
+        if len(ids) < need:
+            ids = ids + self._part_order(wkey, 1, parts[1], attr, descending, exclude,
+                                         swap, need - len(ids))
+        return [self._meta_dict(tid) for tid in ids[offset:need] if tid in self._tracks]
+
+    def _part_order(self, wkey: tuple, part: int, ids: set, attr: str, descending: bool,
+                    exclude, swap, need: int) -> list[str]:
+        """The first ``need`` ids of ``ids`` in the order of sorted index
+        ``attr`` — sorted directly when few, else a walk kept like
+        ``filter_tracks``' (key: ``wkey`` and the part)."""
+        idx = getattr(self, attr)
+        if len(ids) <= max(_SMALL_CANDIDATE_SET, len(idx) // 64):
+            lst = self._sort_candidates(ids, attr, descending)
+            if lst is not None:
+                return lst[:need]
+        key = (*wkey[:-2], ("album_artist_first", part), attr, descending)
+        owner = self._memo_ok()
+        walk = self._filter_walk_get(key, attr, exclude, swap) if owner else None
+        if walk is None:
+            walk = _FilterWalk(idx, self._primary_order_key(attr), exclude, swap, ids,
+                               descending)
+            if owner:
+                self._filter_walk_put(key, walk)
+        return walk.upto(need)[:need]
 
     def _filter_walk_get(self, key: tuple, attr: str, exclude, swap) -> "_FilterWalk | None":
         """The kept ``filter_tracks`` order for ``key`` if it still holds — the
@@ -3773,6 +4601,10 @@ class TrackStore:
         format_: str | None = None,
         year_min: int | None = None,
         year_max: int | None = None,
+        track_min: int | None = None,
+        track_max: int | None = None,
+        disc_min: int | None = None,
+        disc_max: int | None = None,
         dir_hash: str | None = None,
         scan_root_hash: str | None = None,
         query: str | None = None,
@@ -3780,9 +4612,21 @@ class TrackStore:
         game: str | None = None,
         artist_match: str | None = None,
         album_artist_match: str | None = None,
+        album_match: str | None = None,
+        length_min: int | None = None,
+        length_max: int | None = None,
+        added: str | None = None,
+        rating_min: int | None = None,
+        rating_max: int | None = None,
+        plays_min: int | None = None,
+        plays_max: int | None = None,
+        played: str | None = None,
+        negate: tuple | None = None,
+        uid: str | None = None,
         filter_duplicates: bool = False,
         swap: PrimarySwap | None = None,
         own: bool = False,
+        **more,
     ) -> set[str] | None:
         """THE predicate → candidate-id-set resolver (single source of truth).
 
@@ -3804,7 +4648,36 @@ class TrackStore:
         ``artist`` / ``album_artist`` are exact (case-insensitive) names (an
         artist's page); ``artist_match`` / ``album_artist_match`` (the search
         box's ``artist:`` / ``album_artist:``) match a word start in a name
-        (``_name_word_hits``).
+        (``_name_word_hits``, its folded names memoised — ``_word_hits``).
+        ``track_min`` / ``track_max`` and ``disc_min`` / ``disc_max`` (the
+        search box's ``track:`` / ``disc:``) keep the tracks whose track / disc
+        number lies in that inclusive range (None: open at that end); a track
+        without a number never matches (``_ordinal``).
+        ``album_match`` (the search box's ``album:``) matches a word start in
+        the album name like ``artist_match``.
+        ``format_`` is an exact (case-insensitive) format name; a value that
+        names no format of the library is read as a file extension (``mod``
+        → ProTracker, ``m4a`` → AAC and ALAC — ``search_values.
+        format_names_for_ext``), else as a family (``tracker`` / ``trackers``,
+        ``chiptune``, ``lossless``, ``lossy``, ``other`` —
+        ``retro.coarse_family``, the Galaxy's families); else nothing matches
+        (``_format_ids``).
+        ``length_min`` / ``length_max``: the length in whole seconds
+        (``floor(duration)``, as the lists show it) in that inclusive range; a
+        track of unknown length (0) never matches.
+        ``added`` / ``played``: a time spec (``search_values.when_range``,
+        resolved against the clock now) — when the track was added / when user
+        ``uid`` last played it; a track without ``added_at`` never matches
+        ``added``.  ``rating_min`` / ``rating_max``: the global star rating in
+        that inclusive range, an unrated track counting as 0.  ``plays_min`` /
+        ``plays_max``: how often user ``uid`` played the track (never: 0).
+        Without a ``uid`` (no user) every play count is 0 and ``played``
+        matches nothing.
+        ``negate``: exclusions — a tuple of entries, each a tuple of
+        ``(predicate, value)`` pairs resolved like these predicates (with this
+        ``uid``); every track any entry matches is left out.  Exclusions only
+        (no other predicate): every track but those (None when they match
+        nothing).
         ``album`` is an exact (case-insensitive) match; ``game`` (the search
         box's ``game:`` operator) is a case-insensitive PREFIX match on the
         ``game`` field — any format: a retro track's game (header, Modland,
@@ -3819,7 +4692,29 @@ class TrackStore:
         as in plain search (``game:pokemon`` finds "Pokémon", ``game:"real evil
         180s"`` finds "real evil      180s").  A walk of the distinct games
         (``_tag_game``) plus bisect ranges over the title lists.
+
+        ``more``: the search box's other operators (``SEARCH_PREDICATES`` —
+        ``_search_ids``): ``anyof`` (several values, ``key:a,b``: groups of
+        entries like ``negate``'s; a track matches a group when it matches
+        any of its entries), ``genre_match`` / ``group_match`` / ``party`` /
+        ``composer_match`` / ``title_match`` (a word start in the genre, the
+        scene group, the demoparty, the composer, the title), ``folder`` (a
+        word start in the folder path) and ``path_match`` (text anywhere in
+        the path; ``search_values.path_texts`` — credentials never),
+        ``status`` (``search_values.STATUSES``), ``lossless`` (``yes`` /
+        ``no``), ``bitdepth_*`` / ``samplerate_*`` (Hz) / ``bitrate_*``
+        (kbps, ``kbps``) inclusive ranges — unknown never matches —,
+        ``source`` (``search_values.SOURCES`` — ``_source_ids``), ``phrase``
+        (quoted runs of the free text, each as consecutive words in one field
+        — ``_phrase_hits``, checked on the other predicates' candidates, or on
+        its words' tracks alone), ``bpm_*`` (rounded BPM), ``tunes_*`` (tunes
+        of a file, 1 without tune data), ``channels_*`` inclusive ranges,
+        ``chip`` (``6581`` / ``8580`` / ``2sid`` / ``3sid``), ``dup``
+        (``yes``: in a duplicate group of two or more tracks; ``no``: in
+        none) and ``has`` (``stil`` / ``game``).
         """
+        if more:
+            _check_predicates(more)
         sets: list[set[str]] = []
         live: list[set[str]] = []           # the index sets among them (``own``)
         if artist:
@@ -3829,9 +4724,11 @@ class TrackStore:
             sets.append(self._tag_album_artist.get(album_artist.lower(), set()))
             live.append(sets[-1])
         if artist_match is not None:
-            sets.append(_name_word_hits(self._tag_artist, artist_match))
+            # The search box's ``artist:`` — the album artist or the artist.
+            sets.append(self._word_hits("_tag_album_artist", artist_match)
+                        | self._word_hits("_tag_artist", artist_match))
         if album_artist_match is not None:
-            sets.append(_name_word_hits(self._tag_album_artist, album_artist_match))
+            sets.append(self._word_hits("_tag_album_artist", album_artist_match))
         if album:
             sets.append(self._tag_album.get(album.lower(), set()))
             live.append(sets[-1])
@@ -3842,8 +4739,12 @@ class TrackStore:
             sets.append(self._tag_scene_group.get(scene_group.lower(), set()))
             live.append(sets[-1])
         if format_:
-            sets.append(self._tag_format.get(str(format_).strip().lower(), set()))
-            live.append(sets[-1])
+            fset, exact = self._format_ids(format_)
+            sets.append(fset)
+            if exact:
+                live.append(sets[-1])
+        if album_match is not None:
+            sets.append(self._word_hits("_tag_album", album_match))
         if dir_hash:
             sets.append(self._tag_dir_hash.get(dir_hash, set()))
             live.append(sets[-1])
@@ -3854,6 +4755,12 @@ class TrackStore:
             lo = year_min if year_min is not None else -999999
             hi = year_max if year_max is not None else 999999
             sets.append(set(_sorted_range(self._sorted_year, lo, hi)))
+        for lo, hi, idx in ((track_min, track_max, self._tag_track_number),
+                            (disc_min, disc_max, self._tag_disc_number)):
+            if lo is not None or hi is not None:
+                sets.append(_ordinal_hits(idx, lo, hi))
+                if lo is not None and lo == hi:         # (the live set of that number)
+                    live.append(sets[-1])
         if query:
             q_ids = self._resolve_query(query)
             if q_ids is not None:
@@ -3898,15 +4805,50 @@ class TrackStore:
             # live set — nothing below changes it in place).
             sets.append(self._untagged_ids(untagged))
             live.append(sets[-1])
+        if length_min is not None or length_max is not None:
+            sets.append(self._length_ids(length_min, length_max))
+        if added is not None:
+            sets.append(self._added_ids(added))
+        if rating_min is not None or rating_max is not None:
+            sets.append(self._rating_ids(rating_min, rating_max))
+        if plays_min is not None or plays_max is not None:
+            sets.append(self._plays_ids(uid, plays_min, plays_max))
+        if played is not None:
+            sets.append(self._played_ids(uid, played))
+        phrases = None
+        if more:
+            for hit, is_live in self._search_ids(more, uid):
+                sets.append(hit)
+                if is_live:
+                    live.append(hit)
+            phrases = more.get("phrase")
+            if phrases and not sets:
+                # (a phrase alone — an exclusion's; its memoised set)
+                sets.append(self._phrase_ids(phrases[0]))
+                live.append(sets[-1])
+                phrases = phrases[1:]
 
         if not sets:
-            return None
-
-        result = sets[0]
-        for s in sets[1:]:
-            result = result & s
-            if not result:
-                return set()
+            neg = self._negated_ids(negate, uid) if negate else None
+            if not neg:
+                return None
+            result = self._tracks.keys() - neg            # (exclusions only)
+        else:
+            result = sets[0]
+            for s in sets[1:]:
+                result = result & s
+                if not result:
+                    return set()
+            if phrases:
+                for p in phrases:
+                    result = result & self._phrase_ids(p)     # (a new set)
+                    if not result:
+                        return set()
+            neg = self._negated_ids(negate, uid) if negate else None
+            if neg:
+                result = result - neg                     # (a new set: never a live one)
+                if not result:
+                    return set()
 
         if filter_duplicates:
             # The copies the list hides, as one set difference (in C) — the
@@ -3918,6 +4860,587 @@ class TrackStore:
         if own and any(result is s for s in live):
             result = set(result)
         return result
+
+    # ── Search-box predicates (``_candidate_ids``; values: core/search_values) ──
+
+    def _word_hits(self, attr: str, value) -> set[str]:
+        """:func:`_name_word_hits` over the name index ``attr``
+        (``_tag_artist`` / ``_tag_album_artist`` / ``_tag_album``) — the same
+        hits, with each name's folded key (``_game_key``) memoised until the
+        next browse write or a change in the number of names (a scan batch
+        adds names before its one browse write), instead of folded again
+        for every search.  The ids are read from the live index."""
+        index = getattr(self, attr)
+        mkey = "word_fold:" + attr
+        memo = self._agg_cache_get(mkey)
+        if memo is None or memo[0] != len(index):
+            memo = self._agg_cache_set(mkey, (len(index), [(_game_key(k), k) for k in index]))
+        q = _game_key(value)
+        hits: set[str] = set()
+        if not q:
+            return hits
+        for folded, key in memo[1]:
+            i = folded.find(q)
+            while i != -1:
+                if i == 0 or not folded[i - 1].isalnum():
+                    tids = index.get(key)
+                    if tids:
+                        hits.update(tids)
+                    break
+                i = folded.find(q, i + 1)
+        return hits
+
+    def _format_ids(self, value) -> tuple[set[str], bool]:
+        """The ids ``format_`` = ``value`` selects and whether that is the
+        live ``_tag_format`` set of one format (callers must not change it):
+        the format of that name (any case); else, when ``value`` is a file
+        extension, every format files with that extension are given (with
+        "DSD" its quality tiers DSD64, DSD128, … — ``dsd`` itself also names
+        "DSD" and every tier); else, when it is a family
+        word (``search_values.FAMILIES``), every format of that family
+        (``retro.coarse_family``; unopened online-collection packages are no
+        format of any family); else none."""
+        from soniqboom.core import search_values
+        key = str(value).strip().lower()
+        idx = self._tag_format
+        hit = idx.get(key)
+        names = {"dsd"} if key == "dsd" else None        # (DSD: with its tiers)
+        if hit is not None and names is None:
+            return hit, True
+        if names is None:
+            names = search_values.format_names_for_ext(key)
+        if names is not None:
+            if "dsd" in names:
+                names |= {k for k in idx if re.fullmatch(r"dsd\d+", k)}
+            out: set[str] = set()
+            for n in names:
+                out |= idx.get(n, set())
+            return out, False
+        fam = search_values.FAMILIES.get(key)
+        if fam is None:
+            return set(), False
+        out = set()
+        for k in self._format_family_keys().get(fam, ()):
+            out |= idx.get(k, set())
+        return out, False
+
+    def _format_family_keys(self) -> dict[str, list[str]]:
+        """``{family: [_tag_format keys]}`` — each format's family from the
+        format name a member carries (``retro.coarse_family`` reads the
+        stored spelling); memoised until the next browse write."""
+        cached = self._agg_cache_get("format_family_keys")
+        if cached is not None:
+            return cached
+        from soniqboom.core.catalogue import is_package_format
+        from soniqboom.core.retro import coarse_family
+        fams: dict[str, list[str]] = {}
+        tracks = self._tracks
+        for key, tids in self._tag_format.items():
+            if not key or not tids or is_package_format(key):
+                continue
+            t = tracks.get(next(iter(tids)))
+            name = (t.get("format") if t else None) or key
+            fams.setdefault(coarse_family(name), []).append(key)
+        return self._agg_cache_set("format_family_keys", fams)
+
+    def _length_ids(self, lo: int | None, hi: int | None) -> set[str]:
+        """Ids whose length in whole seconds (``floor(duration)``) lies in
+        ``lo..hi`` (inclusive; None: open) — a bisect range of
+        ``_sorted_duration``; an unknown length (keyed ``_NO_VALUE_KEY``,
+        last) never matches."""
+        lst = self._sorted_duration
+        if lo is None or lo <= 0:
+            i = bisect.bisect_right(lst, (0, "\uffff"))          # (length > 0)
+        else:
+            i = bisect.bisect_left(lst, (lo,))
+        j = bisect.bisect_left(lst, (_NO_VALUE_KEY if hi is None else hi + 1,))
+        return {tid for _, tid in lst[i:j]}
+
+    def _when_bounds(self, spec) -> tuple[float | None, float | None] | None:
+        from soniqboom.core import search_values
+        return search_values.when_range(spec, time.time()) if isinstance(spec, str) else None
+
+    def _added_ids(self, spec) -> set[str]:
+        """Ids added within time spec ``spec`` (``search_values.when_range``,
+        now) — a bisect range of ``_sorted_added_at``; a track without
+        ``added_at`` (keyed 0) never matches, nor does any for a spec that
+        is none."""
+        rng = self._when_bounds(spec)
+        if rng is None:
+            return set()
+        lo, hi = rng
+        lst = self._sorted_added_at
+        i = (bisect.bisect_right(lst, (0, "\uffff")) if lo is None or lo <= 0
+             else bisect.bisect_left(lst, (lo,)))
+        j = len(lst) if hi is None else bisect.bisect_left(lst, (hi,))
+        return {tid for _, tid in lst[i:j]}
+
+    def _rating_ids(self, lo: int | None, hi: int | None) -> set[str]:
+        """Ids whose global star rating lies in ``lo..hi`` (inclusive; None:
+        open), an unrated track counting as 0 — a pass over the rated tracks,
+        plus every unrated one when the range holds 0."""
+        lo = -math.inf if lo is None else lo
+        hi = math.inf if hi is None else hi
+        return self._count_hits(self._ratings, lambda r: r, lo, hi)
+
+    def _plays_ids(self, uid: str | None, lo: int | None, hi: int | None) -> set[str]:
+        """Ids user ``uid`` played ``lo..hi`` times (inclusive; None: open;
+        never played: 0) — a pass over the user's play stats, plus every
+        unplayed track when the range holds 0.  No user (``uid`` None): every
+        count is 0."""
+        lo = -math.inf if lo is None else lo
+        hi = math.inf if hi is None else hi
+        stats = self.play_stats_view(uid) if isinstance(uid, str) else {}
+        return self._count_hits(stats, lambda st: st.get("count") if isinstance(st, dict) else 0,
+                                lo, hi)
+
+    def _count_hits(self, mapping: dict, count, lo: float, hi: float) -> set[str]:
+        """Ids of tracks whose number — ``count(mapping[tid])`` for the tracks
+        in ``mapping`` (a rating, a play count), 0 for every other track —
+        lies in ``lo..hi``: one pass over ``mapping``, plus every track
+        without a number above 0 when the range holds 0."""
+        tracks = self._tracks
+        zero = lo <= 0 <= hi
+        some: set[str] = set()              # (tracks with a number above 0)
+        out: set[str] = set()
+        for tid, v in mapping.items():
+            n = count(v)
+            if isinstance(n, (int, float)) and n > 0:
+                if zero:
+                    some.add(tid)
+                if lo <= n <= hi and tid in tracks:
+                    out.add(tid)
+        if zero:
+            rest = tracks.keys() - some
+            rest |= out
+            return rest
+        return out
+
+    def _played_ids(self, uid: str | None, spec) -> set[str]:
+        """Ids user ``uid`` last played within time spec ``spec``
+        (``search_values.when_range``, now) — a pass over the user's play
+        stats.  No user, or a spec that is none: nothing."""
+        rng = self._when_bounds(spec)
+        if rng is None or not isinstance(uid, str):
+            return set()
+        lo, hi = rng
+        lo = -math.inf if lo is None else lo
+        hi = math.inf if hi is None else hi
+        tracks = self._tracks
+        out = set()
+        for tid, st in self.play_stats_view(uid).items():
+            at = st.get("last_played") if isinstance(st, dict) else None
+            if isinstance(at, (int, float)) and at > 0 and lo <= at < hi and tid in tracks:
+                out.add(tid)
+        return out
+
+    def _search_ids(self, more: dict, uid: str | None):
+        """``(ids, live)`` for each search-box predicate in ``more``
+        (``SEARCH_PREDICATES``, None values skipped) — ``live``: the set is an
+        index's own (callers must not change it)."""
+        get = more.get
+        if self._sx_todo is not None and any(get(k) is not None for k in _SX_PREDICATES):
+            self._sx_ensure()                   # (a start may still be building them)
+        for group in get("anyof") or ():
+            # (several values: any entry; an entry of no predicate would be
+            # every track — the group then filters nothing)
+            out: set[str] = set()
+            for entry in group:
+                hit = self._candidate_ids(**dict(entry), uid=uid)
+                if hit is None:
+                    out = None
+                    break
+                out |= hit
+            if out is not None:
+                yield out, False
+        v = get("genre_match")
+        if v is not None:
+            yield self._word_hits("_tag_genre", v), False
+        v = get("group_match")
+        if v is not None:
+            yield self._word_hits("_tag_scene_group", v), False
+        for name, attr in (("party", "_tag_party"), ("composer_match", "_tag_composer")):
+            v = get(name)
+            if v is not None:
+                yield self._sx_word_hits(attr, v), False
+        v = get("folder")
+        if v is not None:
+            yield self._folder_hits(v), False
+        v = get("title_match")
+        if v is not None:
+            yield self._title_hits(v), False
+        v = get("path_match")
+        if v is not None:
+            q = _game_key(v)
+            yield ({tid for tid, p in self._path_text.items() if q in p} if q else set()), False
+        v = get("status")
+        if v is not None:
+            if v == "cantplay":
+                yield self._cant_play_ids, True
+            else:
+                yield self._tag_status.get(str(v).lower(), set()), True
+        v = get("lossless")
+        if v is not None:
+            yes = self._tag_lossless.get("yes", set())
+            if str(v).lower() == "yes":
+                yield yes, True
+            else:
+                yield self._tracks.keys() - yes, False
+        for name, attr in (("bitdepth", "_tag_bitdepth"), ("samplerate", "_tag_samplerate"),
+                           ("bitrate", "_tag_bitrate")):
+            lo, hi = get(name + "_min"), get(name + "_max")
+            if lo is not None or hi is not None:
+                yield _ordinal_hits(getattr(self, attr), lo, hi), lo is not None and lo == hi
+        v = get("source")
+        if v is not None:
+            yield self._source_ids(v), False
+        lo, hi = get("bpm_min"), get("bpm_max")
+        if lo is not None or hi is not None:
+            yield self._bpm_ids(lo, hi), False
+        lo, hi = get("tunes_min"), get("tunes_max")
+        if lo is not None or hi is not None:
+            yield self._tunes_ids(lo, hi), False
+        lo, hi = get("channels_min"), get("channels_max")
+        if lo is not None or hi is not None:
+            yield _ordinal_hits(self._tag_channels, lo, hi), lo is not None and lo == hi
+        for name, attr in (("chip", "_tag_chip"), ("has", "_tag_has")):
+            v = get(name)
+            if v is not None:
+                yield getattr(self, attr).get(str(v).lower(), set()), True
+        v = get("dup")
+        if v is not None:
+            yes = str(v).lower() == "yes"
+            yield self._dup_ids(yes), yes
+        for name, facet in (("composer_is", "composer"), ("party_is", "party"),
+                            ("game_is", "game"), ("platform", "platform")):
+            v = get(name)
+            if v is not None:
+                yield self._facet_sets(facet).get(_facet_key(v), (None, set()))[1], True
+        v = get("compo_is")
+        if v is not None:
+            # (the party's tracks — or every track — of that competition name)
+            key = _facet_key(v)
+            pv = get("party_is")
+            base = (self._facet_sets("party").get(_facet_key(pv), (None, set()))[1]
+                    if pv is not None else self._tracks.keys())
+            yield {tid for tid in base
+                   if _facet_key((self._tracks.get(tid) or {}).get("scene_compo") or "") == key}, False
+
+    def _sx_word_hits(self, attr: str, value) -> set[str]:
+        """The ids of every key of search index ``attr`` in which ``value``
+        starts a word — case, accents and runs of whitespace ignored, like
+        ``_word_hits`` (folded keys: ``_sx_names``)."""
+        q = _game_key(value)
+        hits: set[str] = set()
+        if not q:
+            return hits
+        idx = getattr(self, attr)
+        for folded, key in self._sx_names(attr):
+            if q in folded and _word_start_in(folded, q):
+                tids = idx.get(key)
+                if tids:
+                    hits |= tids
+        return hits
+
+    def _folder_hits(self, value) -> set[str]:
+        """The ids of the tracks with ``value`` at a word start in their
+        folder text (``search_values.path_texts``): a value without ``/``
+        walks the folder names (``_tag_foldername``); one with ``/`` — a run
+        of folders, maybe ending in ``/`` — the folder texts
+        (``_tag_folder``, each read with a closing ``/``)."""
+        q = _game_key(value)
+        if not q:
+            return set()
+        if "/" not in q:
+            return self._sx_word_hits("_tag_foldername", value)
+        idx = self._tag_folder
+        hits: set[str] = set()
+        for folded, key in self._sx_names("_tag_folder"):
+            if _word_start_in(folded + "/", q):
+                tids = idx.get(key)
+                if tids:
+                    hits |= tids
+        return hits
+
+    def _title_hits(self, value) -> set[str]:
+        """The ids of the tracks whose title has ``value`` at a word start
+        (``_field_word_hits`` over ``_words_title``)."""
+        return self._field_word_hits("_words_title", value, lambda t: (t.get("title"),))
+
+    def _field_word_hits(self, attr: str, value, texts) -> set[str]:
+        """The ids of the tracks with ``value`` at a word start in one of
+        their texts ``texts(t)`` (the title): each word of ``value`` (``_sx_words``) starts a word of the
+        track (``attr``: word → ids, its keys bisected — ``_sx_sorted``), and
+        a value of several words or with other characters is then found as a
+        whole at a word start of one folded text (``_word_start_in``)."""
+        q = _game_key(value)
+        words = [w for w in _WORD_CUT_RE.split(q) if w]
+        if not words:
+            return set()
+        keys = self._sx_sorted(attr)
+        idx = getattr(self, attr)
+        n = len(keys)
+        result: set[str] | None = None
+        for w in dict.fromkeys(words):
+            got: set[str] = set()
+            i = bisect.bisect_left(keys, w)
+            while i < n and keys[i].startswith(w):
+                got |= idx.get(keys[i], ())
+                i += 1
+            result = got if result is None else result & got
+            if not result:
+                return set()
+        if len(words) == 1 and words[0] == q:
+            return result
+        tracks = self._tracks
+        seen: dict[str, bool] = {}              # (a text once per call: titles
+        out = set()                             #  repeat)
+        for tid in result:
+            t = tracks.get(tid)
+            if t is None:
+                continue
+            for x in texts(t):
+                if not isinstance(x, str):
+                    continue
+                hit = seen.get(x)
+                if hit is None:
+                    hit = seen[x] = _word_start_in(_game_key(x), q)
+                if hit:
+                    out.add(tid)
+                    break
+        return out
+
+    def _tunes_ids(self, lo: int | None, hi: int | None) -> set[str]:
+        """Ids of the files with ``lo..hi`` tunes (inclusive; None: open): the
+        multi-tune files of ``_tag_tunes`` in the range, and — when it holds
+        1 — every file of a single tune or without tune data."""
+        out = set(_ordinal_hits(self._tag_tunes, None if lo is None or lo < 2 else lo, hi))
+        if (lo is None or lo <= 1) and (hi is None or hi >= 1):
+            memo = self._sx_memo.get("tunes:multi")
+            if memo is None or memo[0] != self._search_seq:
+                multi: set[str] = set()
+                for ids in self._tag_tunes.values():
+                    multi |= ids
+                memo = (self._search_seq, multi)
+                if self._memo_ok():
+                    self._sx_memo["tunes:multi"] = memo
+            out |= self._tracks.keys() - memo[1]
+        return out
+
+    def _bpm_ids(self, lo: int | None, hi: int | None) -> set[str]:
+        """Ids whose BPM rounded to a whole number (``floor(bpm + 0.5)``) lies
+        in ``lo..hi`` (inclusive; None: open) — a bisect range of
+        ``_sorted_bpm`` (while a scan batch defers its rebuild: a pass over
+        the tracks); no BPM, or one that rounds to 0, never matches."""
+        lo = 1 if lo is None or lo < 1 else lo                # (a BPM rounds to 1 or more)
+        if hi is not None and hi < lo:
+            return set()
+        if "_sorted_bpm" in self._dirty_sorted:
+            # (a scan batch defers the list's rebuild: read the tracks)
+            out = set()
+            for tid, t in self._tracks.items():
+                v = _bpm_value(t)
+                if v is not None and v != _NO_VALUE_KEY and v >= lo - 0.5 and (
+                        hi is None or v < hi + 0.5):
+                    out.add(tid)
+            return out
+        lst = self._sorted_bpm
+        i = bisect.bisect_left(lst, (lo - 0.5,))
+        j = bisect.bisect_left(lst, (_NO_VALUE_KEY if hi is None else hi + 0.5,))
+        return {tid for _, tid in lst[i:j]}
+
+    def _dup_ids(self, yes: bool) -> set[str]:
+        """The members of a duplicate group of two or more tracks
+        (``_tag_dup_group``; memoised per browse state — that memo itself:
+        callers must not change it) — or, not ``yes``, every other track (a
+        new set)."""
+        dup = self._agg_cache_get("dup_member_ids")
+        if dup is None:
+            dup = set()
+            for tids in self._tag_dup_group.values():
+                if len(tids) >= 2:
+                    dup |= tids
+            dup = self._agg_cache_set("dup_member_ids", dup)
+        if yes:
+            return dup
+        return self._tracks.keys() - dup
+
+    def _phrase_ids(self, text: str) -> set[str]:
+        """Every track holding the phrase ``text`` (``_phrase_hits``) —
+        tested on the tracks with each of its words, every one but the last
+        a whole word (``_word_index``), the last a word's start; memoised per
+        phrase until the next browse write (the memo: never to be changed)."""
+        from soniqboom.core import search_rank
+        terms = search_rank.query_terms(text)
+        if not terms:
+            return set()
+        mkey = "phrase:" + " ".join(terms)
+        hit = self._agg_cache_get(mkey)
+        if hit is not None:
+            return hit
+        cand: set[str] | None = None
+        for w in dict.fromkeys(terms[:-1]):
+            ids = self._word_index.get(w)
+            if not ids:
+                return self._agg_cache_set(mkey, set())
+            cand = set(ids) if cand is None else cand & ids
+        last = self._resolve_query(terms[-1]) or set()
+        cand = last if cand is None else cand & last
+        return self._agg_cache_set(mkey, self._phrase_hits(cand, (text,)) if cand else set())
+
+    def _phrase_hits(self, ids, phrases) -> set[str]:
+        """The ids of ``ids`` holding every phrase of ``phrases`` (quoted runs
+        of the free text) as consecutive words, in order, in one field —
+        ``search_rank``'s phrase test (``_phrase``: every word whole but the
+        last, which may be a word's start) over the fields the text search
+        reads (``search_rank.FIELDS`` and ``game_aliases``).  Each distinct
+        value is tested once per call; an ASCII value first by a regular
+        expression no value it rejects could pass (the words in order with
+        only separators between them)."""
+        from soniqboom.core import search_rank
+        terms = [t for t in (search_rank.query_terms(p) for p in phrases) if t]
+        if not terms:
+            return set(ids)
+        words, phrase = search_rank._words, search_rank._phrase
+        tests = []
+        for ts in terms:
+            rx = re.compile(r"(?<![^\W_])" + r"[\W_]+".join(map(re.escape, ts)))
+            tests.append((ts, rx.search))
+        memo: dict[str, int] = {}               # value → bit mask of the phrases it holds
+        full = (1 << len(tests)) - 1
+
+        def mask(v: str) -> int:
+            m = memo.get(v)
+            if m is None:
+                low = v.lower()
+                m = 0
+                ascii_ = low.isascii()
+                ws = None
+                for i, (ts, search) in enumerate(tests):
+                    if ascii_ and search(low) is None:
+                        continue
+                    if ws is None:
+                        ws = words(v)
+                    if phrase(ws, ts):
+                        m |= 1 << i
+                memo[v] = m
+            return m
+
+        fields = [name for name, _w in search_rank.FIELDS]
+        tracks = self._tracks
+        out = set()
+        for tid in ids:
+            t = tracks.get(tid)
+            if t is None:
+                continue
+            got = 0
+            for f in fields:
+                v = t.get(f)
+                if v and v.__class__ is str:
+                    got |= mask(v)
+                    if got == full:
+                        break
+            if got != full:
+                for v in t.get("game_aliases") or ():
+                    if v and isinstance(v, str):
+                        got |= mask(v)
+            if got == full:
+                out.add(tid)
+        return out
+
+    def _source_ids(self, value) -> set[str]:
+        """The ids of the tracks of source ``value`` (``search_values.SOURCES``'s
+        values: a collection key, ``ftp`` / ``smb`` / ``webdav``, ``share``,
+        ``collection``, ``local``) — each scan root classified once by a
+        member's path (``_path_source``), tracks without a scan root one by
+        one; memoised per browse state and catalogue registry."""
+        from soniqboom.core import search_values
+        gen = _catalogue.generation()
+        memo = self._agg_cache_get("source_map")
+        if memo is None or memo[0] != gen:
+            roots: dict[str, list[str]] = {}
+            rooted: set[str] = set()
+            tracks = self._tracks
+            for key, tids in self._tag_scan_root_hash.items():
+                if not tids:
+                    continue
+                t = tracks.get(next(iter(tids)))
+                src = _path_source(t.get("path") if t else "")
+                roots.setdefault(src, []).append(key)
+                rooted |= tids
+            loose: dict[str, set[str]] = {}
+            if len(rooted) != len(tracks):
+                for tid in tracks.keys() - rooted:
+                    loose.setdefault(_path_source(tracks[tid].get("path")), set()).add(tid)
+            memo = self._agg_cache_set("source_map", (gen, roots, loose))
+        _gen, roots, loose = memo
+        v = str(value).lower()
+        if v == "share":
+            want = search_values.SHARE_SOURCES
+        elif v == "collection":
+            want = search_values.COLLECTION_SOURCES
+        else:
+            want = (v,)
+        out: set[str] = set()
+        idx = self._tag_scan_root_hash
+        for src in want:
+            for key in roots.get(src, ()):
+                out |= idx.get(key, set())
+            out |= loose.get(src, set())
+        return out
+
+    def _negated_ids(self, negate, uid: str | None) -> set[str] | None:
+        """The ids the exclusions ``negate`` (``_candidate_ids``) match — the
+        union of each entry's predicates resolved with ``uid``; an entry that
+        resolves to no predicate (a word too short to search) excludes
+        nothing.  May be a live index set (one entry): never to be changed."""
+        out: set[str] | None = None
+        owned = False
+        for entry in negate:
+            hit = self._candidate_ids(**dict(entry), uid=uid)
+            if not hit:
+                continue
+            if out is None:
+                out = hit
+            elif owned:
+                out |= hit
+            else:
+                out = out | hit
+                owned = True
+        return out
+
+    def volatile_key(self, preds: dict) -> tuple:
+        """What the result of the search predicates ``preds`` (``filter_tracks``
+        kwargs, its ``negate`` entries included) depends on besides the browse
+        state (``_browse_seq``) — for every cache of results: the rating clock
+        for ``rating_*``, the play clock for ``plays_*`` / ``played``, the
+        duration clock for ``length_*`` (a length backfill moves only
+        ``_duration_seq``), and the minute for a relative ``added`` /
+        ``played`` (``<30d``), the search-index clock (``_search_seq``) for a
+        predicate that reads a search index (``_SX_PREDICATES``: health marks,
+        defects, technical fields … change without a browse write) and the
+        catalogue registry (``catalogue.generation``) for ``source``; None for
+        each the predicates don't read.  (The user, ``uid``, is a
+        predicate.)  The entries of ``anyof`` groups count like ``negate``'s."""
+        from soniqboom.core import search_values
+        items = [preds, *(dict(e) for e in (preds.get("negate") or ()))]
+        for group in preds.get("anyof") or ():
+            items.extend(dict(e) for e in group)
+        rating = plays = length = rel = sx = src = False
+        for d in items:
+            rating = rating or d.get("rating_min") is not None or d.get("rating_max") is not None
+            plays = plays or any(d.get(k) is not None for k in ("plays_min", "plays_max", "played"))
+            length = length or d.get("length_min") is not None or d.get("length_max") is not None
+            rel = rel or search_values.is_relative(d.get("added")) or \
+                search_values.is_relative(d.get("played"))
+            sx = sx or any(d.get(k) is not None for k in _SX_PREDICATES)
+            src = src or d.get("source") is not None
+        return (self._rating_seq if rating else None,
+                self._play_seq if plays else None,
+                self._duration_seq if length else None,
+                int(time.time() // 60) if rel else None,
+                self._search_seq if sx else None,
+                _catalogue.generation() if src else None)
 
     def _paginate_excluding(self, limit: int, offset: int, exclude, *,
                             filter_duplicates: bool = False,
@@ -4779,6 +6302,121 @@ class TrackStore:
         if exclude or swap is not None:
             return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
+
+    def _facet_sets(self, facet: str) -> dict:
+        """``{key: (display name, ids)}`` of a scene browse view (``FACETS``):
+
+        * ``composer`` — ``_tag_composer``'s single names (a "A • B" credit
+          counts under A and under B, as the Artists view lists them);
+        * ``party`` — ``_tag_party`` (the Demozoo party a tune was released at);
+        * ``game`` — each track's own ``game`` (not its aliases, which
+          ``_tag_game`` also holds — a game is listed once);
+        * ``platform`` — the platform of each retro format
+          (``genre_derive.platform_genre``: SID, Amiga, NES …), formats without
+          one left out.
+
+        Callers must not change the id sets (some are the live index sets).
+        Kept until a write changes the field the view reads (``_facet_touch``)
+        or its index is rebuilt; the search indexes a start builds are
+        finished first.  A row's name: its tracks' most common spelling (of a
+        few of them — ``_display_name``)."""
+        if facet in ("composer", "party") and self._sx_todo is not None:
+            self._sx_ensure()
+        base = {"composer": self._tag_composer, "party": self._tag_party,
+                "game": self._tag_game, "platform": self._tag_format}.get(facet)
+        # (the index object too: a rebuild replaces it — and the live sets
+        # ``composer`` / ``party`` hand out with it)
+        stamp = (self._facet_gen.get(facet, 0), id(base))
+        memo = self._facet_memo.get(facet)
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        out: dict = {}
+        if facet in ("composer", "party"):
+            idx = base
+            field = "composer" if facet == "composer" else "scene_party"
+            for key, tids in idx.items():
+                if not tids or (facet == "composer" and NAME_SEP in key):
+                    continue
+                fk = _facet_key(key)
+                spellings: Counter = Counter()
+                # (the same few tracks on every rebuild: the lowest ids)
+                for tid in (tids if len(tids) <= 8 else heapq.nsmallest(8, tids)):
+                    raw = (self._tracks.get(tid) or {}).get(field)
+                    if not isinstance(raw, str):
+                        continue
+                    if NAME_SEP not in raw:          # (one name: the key's own)
+                        spellings[raw.strip()] += 1
+                        continue
+                    for part in raw.split(NAME_SEP):
+                        if part.strip().lower() == key:     # (the index's key form)
+                            spellings[part.strip()] += 1
+                name = _display_name(spellings, key)
+                hit = out.get(fk)
+                # (two keys that differ only in their spaces: one entry)
+                out[fk] = (name, tids) if hit is None else (hit[0], hit[1] | tids)
+        elif facet == "game":
+            names: dict = {}
+            for tids in list(self._tag_game.values()):
+                for tid in tids:
+                    t = self._tracks.get(tid)
+                    g = t.get("game") if t else None
+                    if not isinstance(g, str) or not g.strip():
+                        continue
+                    key = _facet_key(g)
+                    hit = out.get(key)
+                    if hit is None:
+                        out[key] = hit = (key, set())
+                        names[key] = Counter()
+                    if tid not in hit[1]:
+                        hit[1].add(tid)
+                        names[key][" ".join(g.split())] += 1
+            for key, (_k, tids) in list(out.items()):
+                out[key] = (_display_name(names[key], key), tids)
+        elif facet == "platform":
+            from soniqboom.core.genre_derive import platform_genre
+            for tids in self._tag_format.values():
+                if not tids:
+                    continue
+                t = self._tracks.get(next(iter(tids)))
+                plat = platform_genre(t.get("format")) if t else None
+                if not plat:
+                    continue
+                hit = out.setdefault(_facet_key(plat), (plat, set()))
+                hit[1].update(tids)
+        else:
+            raise ValueError(f"no such browse view: {facet}")
+        if self._memo_ok():
+            self._facet_memo[facet] = (stamp, out)
+        return out
+
+    def aggregate_facet(self, facet: str, primary_only: bool = False, exclude=None,
+                        swap: PrimarySwap | None = None) -> list[dict]:
+        """``[{<facet>: name, count}]`` of a scene browse view (``FACETS``),
+        sorted by name — the counts its drill-down (``filter_tracks(<FACETS
+        predicate>=name, …)``) lists, in the same mode as ``aggregate_scene_group``
+        (``primary_only``: hidden duplicates left out; ``exclude`` / ``swap``)."""
+        hide_dups = primary_only
+        if not hide_dups:
+            swap = None
+        sets = self._facet_sets(facet)
+        key = f"{facet}:rows:{int(hide_dups)}"     # (one entry per mode: a new
+        memo = self._facet_memo.get(key)             #  exclude / swap replaces it)
+        # (with duplicates hidden, a re-grouping moves which copy counts)
+        seq = self._browse_seq if hide_dups else None
+        if (memo is not None and memo[0][0] is sets and memo[0][1] is exclude
+                and memo[0][2] is swap and memo[0][3] == seq):
+            return memo[1]
+        rows: list[dict] = []
+        for name, tids in sets.values():
+            count = self._bucket_count(tids, hide_dups, exclude, swap)
+            if count is None:
+                count = self._count_primaries(tids) if hide_dups else len(tids)
+            if count:
+                rows.append({facet: name, "count": count})
+        rows.sort(key=lambda r: (r[facet].lower(), r[facet]))
+        if self._memo_ok():
+            self._facet_memo[key] = ((sets, exclude, swap, seq), rows)
+        return rows
 
     def aggregate_formats(self, primary_only: bool = False, exclude=None,
                           swap: PrimarySwap | None = None) -> list[dict]:

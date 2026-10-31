@@ -533,7 +533,13 @@ async def spawn(program, *args, **kwargs):
         pre = _pdeathsig_preexec()
         if pre is not None:
             kwargs["preexec_fn"] = pre
-    proc = await _spawn(program, *args, **kwargs)
+    out = kwargs.get("stdout")
+    if isinstance(out, int) and out in _PIPE_WRITE_ENDS:
+        _handing.fd = out                    # set last: nothing forks before the start's own fork
+    try:
+        proc = await _spawn(program, *args, **kwargs)
+    finally:
+        _handing.fd = None
     _register(proc, program)
     return proc
 
@@ -598,8 +604,13 @@ async def _spawn(program, *args, **kwargs):
 # A Python ``os.fork`` in that window (the scanner's process pool on Linux)
 # would hand the child a copy that is never exec'd away, and the reader would
 # not see the end of the pipe until that child exits — the child closes them.
+# Except the one ``spawn`` is handing to the child it starts right now
+# (``_handing.fd``, this thread, cleared by that fork): a start with a
+# ``preexec_fn`` (``spawn`` adds one on Linux) runs these hooks in the child
+# before it makes that end its stdout.
 _PIPE_WRITE_ENDS: set[int] = set()
 _pipe_lock = threading.Lock()
+_handing = threading.local()
 
 
 def _pipe_lock_acquire() -> None:
@@ -607,17 +618,22 @@ def _pipe_lock_acquire() -> None:
 
 
 def _pipe_lock_release() -> None:
+    _handing.fd = None                       # handed to the first fork only
     _pipe_lock.release()
 
 
 def _close_pipe_write_ends_in_child() -> None:
     global _pipe_lock
+    keep = getattr(_handing, "fd", None)
     for fd in _PIPE_WRITE_ENDS:
+        if fd == keep:
+            continue
         try:
             os.close(fd)
         except OSError:
             pass
     _PIPE_WRITE_ENDS.clear()
+    _handing.fd = None
     _pipe_lock = threading.Lock()
 
 

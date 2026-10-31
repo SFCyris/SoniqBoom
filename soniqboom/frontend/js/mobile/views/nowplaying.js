@@ -12,30 +12,77 @@ import { artPlaceholderEmoji, subsongStart, subsongStartOf, subsongWireToTune,
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur } from './_common.js';
 import { healthBadge } from '../../health.js';
+import { mountNpVisuals } from './np_visuals.js';
 
 export function mountNowPlaying(root, ctx) {
+  // A portable cassette player's face (Retro hi-fi, the phone's only look —
+  // css/mobile.css): the cover as the cassette's label with the reels in its
+  // window, title / artist on a VFD strip, time windows round a ribbed seek
+  // slot, keys with lamps.  .m-np carries the state the CSS needs: data-state
+  // (playing | paused | stop), data-src="radio", data-shuffle, data-repeat,
+  // --np-pos (0…1, how far the tape has run).  The meter display (.m-npm), the
+  // waveform in the seek slot (.m-npw), the tape counter and the reels' speed:
+  // np_visuals.js (css/mobile-visuals.css).  The cast key (#m-np-cast) shows
+  // only where the mini player — which has the other one — steps aside while
+  // Now Playing is open (a phone, css/mobile.css); it works the mini player's
+  // (#btn-cast, cast_picker.js) and mirrors its state.
   root.innerHTML = `
-    <div class="m-np">
-      <div class="m-np-art" id="m-np-art"><span></span></div>
-      <div>
-        <div class="m-np-title"  id="m-np-title">No track playing</div>
-        <div class="m-np-artist" id="m-np-artist"></div>
-      </div>
-      <div class="m-np-scrubber-wrap">
-        <input class="m-np-scrubber" id="m-np-scrubber" type="range" min="0" max="100" value="0" step="0.1">
-        <div class="m-np-times">
-          <span id="m-np-cur">0:00</span>
-          <span id="m-np-dur">0:00</span>
+    <div class="m-np" data-state="stop">
+      <div class="m-np-deck">
+        <div class="m-np-cassette">
+          <div class="m-np-art" id="m-np-art"><span></span></div>
+          <div class="m-np-tape" aria-hidden="true">
+            <span class="m-np-reel"><i></i></span>
+            <span class="m-np-reel"><i></i></span>
+          </div>
         </div>
-      </div>
-      <div class="m-np-transport">
-        <button class="m-np-btn"         id="m-np-prev"    aria-label="Previous">⏮</button>
-        <button class="m-np-btn primary" id="m-np-play"    aria-label="Play/Pause">▶</button>
-        <button class="m-np-btn"         id="m-np-next"    aria-label="Next">⏭</button>
-      </div>
-      <div class="m-np-transport" style="gap:32px">
-        <button class="m-np-btn" id="m-np-shuffle" aria-label="Shuffle">⇄</button>
-        <button class="m-np-btn" id="m-np-repeat"  aria-label="Repeat">↻</button>
+        <div class="m-npm" id="m-npm" data-mode="meter" data-viz="on">
+          <div class="m-npm-legend" role="group" aria-label="Meter display picker">
+            <button type="button" class="m-npm-mode" data-mode="meter" aria-pressed="false">METER</button>
+            <button type="button" class="m-npm-mode" data-mode="spectrum" aria-pressed="false">SPECTRUM</button>
+            <button type="button" class="m-npm-mode" data-mode="scope" aria-pressed="false">SCOPE</button>
+            <span class="m-npm-peak" id="m-npm-peak" aria-hidden="true">PEAK</span>
+            <span class="m-npm-count" id="m-npm-count" aria-hidden="true"><i>0</i><i>0</i><i>0</i></span>
+          </div>
+          <button type="button" class="m-npm-glass" id="m-npm-glass" aria-label="Meter display" aria-describedby="m-npm-desc">
+            <span class="m-npm-leds" id="m-npm-leds"></span>
+            <canvas class="m-npm-cvs" id="m-npm-cvs"></canvas>
+            <span class="m-npm-note" id="m-npm-note"></span>
+          </button>
+          <button type="button" class="m-npm-off" id="m-npm-off" hidden>Meters off · tap to turn them on</button>
+          <span class="m-npm-said" id="m-npm-desc" hidden></span>
+          <span class="m-npm-said" id="m-npm-said" role="status" aria-live="polite"></span>
+        </div>
+        <div class="m-np-vfd">
+          <div class="m-np-ann" aria-hidden="true">
+            <span class="m-np-ann-state" id="m-np-ann-state">STOP</span>
+            <span class="m-np-ann-src" id="m-np-ann-src"></span>
+            <span class="m-np-ann-flag" data-ann="shuffle">SHUF</span>
+            <span class="m-np-ann-flag" data-ann="repeat">RPT</span>
+          </div>
+          <div class="m-np-meta">
+            <div class="m-np-title"  id="m-np-title">No track playing</div>
+            <div class="m-np-artist" id="m-np-artist"></div>
+          </div>
+        </div>
+        <div class="m-np-scrubber-wrap">
+          <div class="m-npw" id="m-npw" aria-hidden="true" hidden><canvas></canvas><canvas></canvas></div>
+          <input class="m-np-scrubber" id="m-np-scrubber" type="range" min="0" max="100" value="0" step="0.1" aria-label="Position">
+          <div class="m-np-times">
+            <span id="m-np-cur">0:00</span>
+            <span id="m-np-dur">0:00</span>
+          </div>
+        </div>
+        <div class="m-np-transport">
+          <button class="m-np-btn"         id="m-np-prev"    aria-label="Previous">⏮&#xFE0E;</button>
+          <button class="m-np-btn primary" id="m-np-play"    aria-label="Play/Pause">▶&#xFE0E;</button>
+          <button class="m-np-btn"         id="m-np-next"    aria-label="Next">⏭&#xFE0E;</button>
+        </div>
+        <div class="m-np-transport m-np-modes">
+          <button class="m-np-btn" id="m-np-shuffle" aria-label="Shuffle" aria-pressed="false">⇄</button>
+          <button class="m-np-btn" id="m-np-repeat"  aria-label="Repeat" aria-pressed="false">↻</button>
+          <button class="m-np-btn m-np-cast" id="m-np-cast" aria-label="Cast to device (Beta)" aria-haspopup="dialog" aria-expanded="false" data-casting="off"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg></button>
+        </div>
       </div>
       <section class="m-np-tunes" id="m-np-tunes" aria-labelledby="m-np-tunes-hdr" hidden>
         <div class="m-np-tunes-hdr" id="m-np-tunes-hdr">Tunes <span class="m-np-tunes-count" id="m-np-tunes-count"></span></div>
@@ -44,6 +91,9 @@ export function mountNowPlaying(root, ctx) {
     </div>
   `;
 
+  const np       = root.querySelector('.m-np');
+  const annState = root.querySelector('#m-np-ann-state');
+  const annSrc   = root.querySelector('#m-np-ann-src');
   const art      = root.querySelector('#m-np-art');
   const titleEl  = root.querySelector('#m-np-title');
   const artistEl = root.querySelector('#m-np-artist');
@@ -60,6 +110,52 @@ export function mountNowPlaying(root, ctx) {
   const tuneList = root.querySelector('#m-np-tune-list');
 
   let _scrubbing = false;
+  let _showingStation = false;      // the times say "● LIVE" (renderStation)
+
+  // The scrubber's position also fills the played part of its track (--np-pct)
+  // and, in Retro, sets how much tape sits on each reel (--np-pos on .m-np).
+  function setScrub(v) {
+    const pct = Math.min(100, Math.max(0, Number(v) || 0));
+    scrub.value = String(pct);
+    scrub.style.setProperty('--np-pct', `${pct}%`);
+    np.style.setProperty('--np-pos', String(pct / 100));
+    if (visuals) visuals.position(pct / 100);
+  }
+  let visuals = null;
+
+  // The VFD's source annunciator: the format (a tracker's voice count after
+  // it), LIVE for a station; empty with nothing loaded.
+  function paintSource(t) {
+    let txt = '';
+    if (MobileRadio.active) txt = 'LIVE';
+    else if (t) {
+      // a long player name ("Sonic Arranger") gives way to the file's type
+      const f = String(t.format || '').split('/')[0].trim().toUpperCase();
+      const ext = (String(t.path || '').split('::').pop().match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
+      txt = f.length <= 8 ? f : (ext ? ext.toUpperCase() : f.split(/\s+/)[0].slice(0, 8));
+      const ch = Number(t.channels) || 0;
+      if (txt && ch > 2 && ch <= 64) txt += ` ${ch}CH`;
+    }
+    if (annSrc.textContent !== txt) annSrc.textContent = txt;
+  }
+
+  // (U+FE0E: drawn as text in the key's legend colour — iOS shows ⏸ / ▶ as emoji)
+  const PLAY_GLYPH = '\u25B6\uFE0E', PAUSE_GLYPH = '\u23F8\uFE0E';
+
+  // What the transport does: the play key's glyph; for the CSS the play lamp
+  // and the reels (data-state), the VFD's PLAY / PAUSE / STOP, the radio source.
+  // ``playing`` = the Player's statechange value (read from the source otherwise).
+  function paintState(playing) {
+    const radio = MobileRadio.active;
+    if (radio) playing = MobileRadio.playing;
+    else if (typeof playing !== 'boolean') playing = Player.playing;
+    const loaded = radio || !!Player.currentTrack || !!Player.cuedTrack;
+    const state = playing ? 'playing' : (loaded ? 'paused' : 'stop');
+    playBtn.textContent = playing ? PAUSE_GLYPH : PLAY_GLYPH;
+    np.dataset.state = state;
+    annState.textContent = state === 'playing' ? `${PLAY_GLYPH} PLAY` : state === 'paused' ? '❚❚ PAUSE' : '■ STOP';
+    if (radio) np.dataset.src = 'radio'; else delete np.dataset.src;
+  }
 
   function renderStation(st) {
     titleEl.textContent  = (st && st.name) || 'Radio';
@@ -74,14 +170,24 @@ export function mountNowPlaying(root, ctx) {
       img.src = st.favicon;
     }
     // Live stream — no seekable position.
-    scrub.value = '0'; scrub.disabled = true;
+    setScrub(0); scrub.disabled = true;
     curEl.textContent = '● LIVE'; durEl.textContent = '';
+    _showingStation = true;
+    paintSource(null);
   }
 
   function renderTrack(t) {
+    paintState();
     // Radio is the active source while a station plays.
     if (MobileRadio.active) { renderStation(MobileRadio.station); return; }
     scrub.disabled = false;
+    // A station stopped: its "● LIVE" goes (the next timeupdate fills the times in).
+    if (_showingStation) {
+      _showingStation = false;
+      setScrub(0);
+      curEl.textContent = '0:00';
+      durEl.textContent = fmtDur(Number(t && t.duration) || 0) || '0:00';
+    }
     // Nothing loaded, but a queue waits for ▶ (restored after a reload, or
     // resumed from another device): show that track at the position ▶ starts.
     const cued = t ? null : (Player.cuedTrack || null);
@@ -89,18 +195,19 @@ export function mountNowPlaying(root, ctx) {
       t = cued;
       const sec = Player.cuedSec || 0;
       const dur = Number(cued.duration) || 0;
-      scrub.value = String(dur > 0 ? Math.min(100, (sec / dur) * 100) : 0);
+      setScrub(dur > 0 ? (sec / dur) * 100 : 0);
       curEl.textContent = fmtDur(sec) || '0:00';
       durEl.textContent = fmtDur(dur);
     }
     _shownCuedKey = cued ? `${cued.id}~${cued.subsong ?? ''}` : null;
+    paintSource(t);
     if (!t) {
       titleEl.textContent  = 'No track playing';
       artistEl.textContent = '';
       // Layered placeholder with the default 🔊 glyph (no track to ask
       // ``artPlaceholderEmoji`` about format).
       art.innerHTML = '<span>\u{1F50A}</span>';
-      scrub.value = '0'; curEl.textContent = '0:00'; durEl.textContent = '0:00';
+      setScrub(0); curEl.textContent = '0:00'; durEl.textContent = '0:00';
       return;
     }
     // A picked tune of a multi-tune file: its number after the title (the
@@ -276,13 +383,13 @@ export function mountNowPlaying(root, ctx) {
 
   Player.on('statechange', ({ playing }) => {
     if (MobileRadio.active) return;         // radio owns the transport while active
-    playBtn.textContent = playing ? '⏸' : '▶';
+    paintState(playing);
   });
 
   Player.on('timeupdate', ({ current, duration, pct }) => {
     if (MobileRadio.active) return;
     if (!_scrubbing) {
-      scrub.value = String(pct || 0);
+      setScrub(pct);
       curEl.textContent = fmtDur(current);
     }
     durEl.textContent = fmtDur(duration);
@@ -291,7 +398,7 @@ export function mountNowPlaying(root, ctx) {
   // Radio drives the view + play button while a station is the active source.
   MobileRadio.on('change', () => { renderTrack(Player.currentTrack); renderTunes(Player.currentTrack); });
   MobileRadio.on('state',  () => {
-    if (MobileRadio.active) playBtn.textContent = MobileRadio.playing ? '⏸' : '▶';
+    if (MobileRadio.active) paintState();
   });
 
   // Scrubber: pointerdown locks, input previews, change commits
@@ -299,7 +406,7 @@ export function mountNowPlaying(root, ctx) {
   scrub.addEventListener('input', () => {
     // Preview the time without committing
     const pct = parseFloat(scrub.value);
-    const dur = parseFloat(durEl.textContent) || 0; // not reliable; use Player
+    setScrub(pct);                          // the fill / tape follow the finger
     curEl.textContent = fmtDur((pct / 100) * (Player.currentTrack?.duration || 0));
   });
   scrub.addEventListener('change', () => {
@@ -317,9 +424,16 @@ export function mountNowPlaying(root, ctx) {
   });
   prevBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.prev(); });
   nextBtn.addEventListener('click', () => { if (!MobileRadio.active) Player.next(); });
+  // On = aria-pressed (the CSS colours the key / lights its lamp) and the
+  // VFD's SHUF / RPT annunciators (data-shuffle / data-repeat on .m-np).
   const paintShuffle = () => {
-    shufBtn.style.color = Player.shuffle ? 'var(--accent)' : 'var(--text)';
     shufBtn.setAttribute('aria-pressed', Player.shuffle ? 'true' : 'false');
+    np.dataset.shuffle = Player.shuffle ? 'on' : 'off';
+  };
+  const paintRepeat = (mode = Player.repeatMode || 'none') => {
+    repBtn.setAttribute('aria-pressed', mode === 'none' ? 'false' : 'true');
+    repBtn.textContent = (mode === 'one') ? '↻¹' : '↻';
+    np.dataset.repeat = mode;
   };
   Player.on('shufflechange', paintShuffle);
   paintShuffle();      // a restored queue may already have shuffle on
@@ -329,13 +443,30 @@ export function mountNowPlaying(root, ctx) {
   });
   repBtn.addEventListener('click', () => {
     const mode = Player.toggleRepeat();
-    repBtn.style.color = (mode === 'none') ? 'var(--text)' : 'var(--accent)';
-    repBtn.textContent = (mode === 'one') ? '↻¹' : '↻';
+    paintRepeat(mode);
     ctx.toast(`Repeat: ${mode}`);
   });
+
+  // The deck's cast key: the mini player's (#btn-cast) does the work — the
+  // picker opens, its focus returns here — and its state shows here too.
+  const castBtn = root.querySelector('#m-np-cast');
+  const miniCast = document.getElementById('btn-cast');
+  if (castBtn && miniCast) {
+    castBtn.addEventListener('click', () => miniCast.click());
+    const mirror = () => {
+      castBtn.setAttribute('aria-expanded', miniCast.getAttribute('aria-expanded') === 'true' ? 'true' : 'false');
+      castBtn.dataset.casting = miniCast.classList.contains('is-casting') ? 'on' : 'off';
+      if (miniCast.title) castBtn.title = miniCast.title; else castBtn.removeAttribute('title');
+    };
+    new MutationObserver(mirror).observe(miniCast, { attributes: true, attributeFilter: ['class', 'aria-expanded', 'title'] });
+    mirror();
+  } else if (castBtn) castBtn.remove();
+
+  visuals = mountNpVisuals({ root, np, ctx });
 
   // Initial paint
   renderTrack(Player.currentTrack);
   renderTunes(Player.currentTrack);
-  playBtn.textContent = (MobileRadio.active ? MobileRadio.playing : Player.playing) ? '⏸' : '▶';
+  paintRepeat();
+  paintState();
 }

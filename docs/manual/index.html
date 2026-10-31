@@ -52,6 +52,7 @@
   <a href="#start"><span class="n">02</span>Install</a>
   <a href="#library"><span class="n">03</span>Library</a>
   <a href="#find"><span class="n">04</span>Find anything</a>
+  <a href="#search-options" class="sub">Search options</a>
   <a href="#playlists"><span class="n">05</span>Playlists</a>
   <a href="#radio"><span class="n">06</span>Internet radio</a>
   <a href="#playing"><span class="n">07</span>Now playing</a>
@@ -83,7 +84,7 @@
     <figure>
       <div class="frame">
         <div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/01-library.png" alt="The SoniqBoom library view showing a large mixed collection with format badges">
+        <img src="img/01-library.png" alt="The SoniqBoom library view in the Modern style: All Tracks listing tunes of many formats with their format labels, and the player bar playing a 22-channel FastTracker 2 module with a level bar for each channel">
       </div>
       <figcaption>The <b>library</b> — a six-figure collection, every track tagged with its true format.</figcaption>
     </figure>
@@ -102,7 +103,7 @@
       <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD) and the common lossy codecs: MP3, AAC, Ogg Vorbis, Opus and Musepack.</p></div>
       <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Per-channel VU meters, a live spectrum fallback, an animated decode signal-chain, and the Library Galaxy star-field.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Scene origins</h4><p>Retro modules matched by fingerprint against Modland fill in the original scene author and the tune's provenance path.</p></div>
-      <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares straight from the admin panel — no operating-system mount required.</p></div>
+      <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares and web folders straight from the admin panel — no operating-system mount required.</p></div>
       <div class="card"><span class="ico">🌐</span><h4>Modland catalogue</h4><p>One switch lists Modland's module archive — hundreds of thousands of tunes — in your library; a tune is downloaded only when it is needed — to play it or to read its details.</p></div>
       <div class="card"><span class="ico">📱</span><h4>OpenSubsonic API</h4><p>Connect Amperfy, Symfonium, DSub, Feishin and the wider Subsonic app ecosystem to your server.</p></div>
       <div class="card"><span class="ico">📻</span><h4>Internet radio</h4><p>A curated demoscene &amp; chiptune station pack plus the worldwide directory — HLS and classic streams alike, with live now-playing titles and cover art.</p></div>
@@ -134,7 +135,7 @@ bash <span class="k">run.sh</span>            <span class="c"># starts the serve
     <div class="note"><b>The installer sets up every renderer for you.</b> One run of
       <code>install.sh</code> installs <code>sidplayfp</code> (SID), <code>fluidsynth</code> (MIDI),
       <code>libopenmpt</code> (trackers), <code>uade</code> (AHX + Amiga exotica), <code>libgme</code> (console
-      chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>) and <code>zxtune123</code> (the PSF console-rip family, MED&nbsp;2–4 modules and VGM files that use a chip libgme lacks) — Homebrew packages and source builds on macOS; on
+      chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>), <code>zxtune123</code> (the PSF console-rip family, MED&nbsp;2–4 modules and VGM files that use a chip libgme lacks) and <code>kssrender</code> (MSX KSS music, built from the libkss sources on every system; it needs a C compiler and git) — Homebrew packages and source builds on macOS; on
       Linux your distribution's packages (apt, dnf, pacman or zypper), the prebuilt <code>zxtune123</code> and
       source builds of <code>psgplay</code>, <code>uade</code> and <code>sc68</code> where the distribution has none, plus
       <code>lha</code> from lhasa for LHA archives where the distribution packages it. On Linux, <code>sidplayfp</code>
@@ -232,11 +233,11 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
   <!-- ── LIBRARY ──────────────────────────────────────────────────── -->
   <section id="library">
     <h2 class="sec"><span class="num">03</span>Browse your library</h2>
-    <p class="sec-sub">All Tracks, Artists, Album Artists, Albums, Genres, Years, Scene groups and the Library Galaxy — plus folder trees that mirror your shares, and instant search.</p>
+    <p class="sec-sub">All Tracks, Artists, Album Artists, Albums, Genres, Years, the Scene view and the Library Galaxy — plus folder trees that mirror your shares, and instant search.</p>
 
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/04-folders.png" alt="Folder tree with FTP, SMB, and local sources expanded"></div>
+        <img src="img/04-folders.png" alt="Folder tree with the HVSC and Modland online collections expanded"></div>
       <figcaption>The <b>folder tree</b> mirrors every source — local disks and FTP / SMB / WebDAV shares alike.</figcaption>
     </figure>
     <p><strong>Folders.</strong> Each music folder and share is a root of the sidebar's folder tree (🌐 marks a share).
@@ -267,10 +268,14 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        all of its matches (see <a href="#find">Search</a>). Track lists of more than 40 rows, unsorted or sorted by
        title, artist, album or album artist (search results: sorted by one of these), and long group lists, show an
        <strong>A–Z rail</strong> down the left edge — click a letter to jump straight to that
-       part of the list. Right-click a track (or a selection) for <strong>Play</strong>, <strong>Play next</strong>,
+       part of the list (<b>#</b>, at its foot, jumps to titles that start with a digit or sign). In a list
+       shown whole — a folder or a playlist — a column with nothing in any row (such as Album Artist for a folder
+       of chip tunes) is left out; in a window 1100&nbsp;px wide or less <b>Album Artist</b> and
+       <b>Duration</b> are headed <b>Alb. Artist</b> and <b>Time</b>. Right-click a track (or a selection) for <strong>Play</strong>, <strong>Play next</strong>,
        <strong>Add to queue</strong>, <strong>Add to playlist…</strong>, a row of rating stars, the
        <em>Problem</em> report, <strong>Go to artist</strong> or <strong>Go to album</strong> to pivot to
-       everything by that artist or on that album, and <strong>Get info</strong> for Track Info. And the
+       everything by that artist or on that album, <strong>Find folder</strong> to open the track's folder in the
+       folder tree with the track marked (handy for a search result), and <strong>Get info</strong> for Track Info. And the
        <strong>◎ Locate</strong> button on the player bar —
        or the <span class="kbd">G</span> key — scrolls the list back to whatever's playing, which is marked with
        a small animated equalizer. If part of a long list can't be loaded from the server, its rows say so and
@@ -281,12 +286,17 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <span class="kbd">K</span> move the keyboard focus and <span class="kbd">Enter</span> plays the focused row);
        <span class="kbd">⌘</span>/<span class="kbd">Ctrl</span>-click and <span class="kbd">Shift</span>-click select
        several, and with two or more selected a bar offers <b>▶ Play</b>, <b>+ Queue</b>, <b>+ Playlist</b> and
-       <b>× Clear</b>. Click an Album Artist or Album cell to open it. Artists, Album Artists, Albums, Genres and Years
+       <b>× Clear</b>. Click an Album Artist or Album cell to open it; click an Artist cell to search for that artist (<code>artist:"name"</code>: the tracks whose artist or album artist is that name). Artists, Album Artists, Albums, Genres and Years
        list each name with its number of tracks and a filter box above the list; tracks without the tag are under
        <em>[No Artist]</em>, <em>[No Album Artist]</em> or <em>[No Album]</em>. The <b>⊞</b> button switches an
        Albums list to a cover grid and back. The browser's Back button goes up one level, and after a reload
        SoniqBoom reopens the sidebar view (Artists, Albums, the Galaxy, a smart view …) you had open.</p>
-    <p>Click a column header to sort by it, and again to reverse; the sort is remembered in this browser.
+    <p>The <b>Compo</b> column shows the party competition a tune entered and its place — <em>Revision 2019 · Oldskool
+       Music · 2nd of 9</em> — and appears by itself in a party's list and in a folder or other list loaded whole that
+       holds such tunes; to see it in All Tracks and search results too, or to hide it, right-click the header row.
+       Click a competition's name in it to list that competition's entries in placing order (<b>← Back</b> returns
+       to the whole party). Track Info shows the same as <em>Party</em>.
+       Click a column header to sort by it, and again to reverse; the sort is remembered in this browser.
        Sorting ignores case and leading or trailing spaces, puts tracks with an empty value last (first when
        reversed) and orders equal values the same way every time, so a list sorts the same whatever its size and
        wherever it was opened from. Year and Duration sort by the number, with tracks that have none last; Track sorts
@@ -320,11 +330,30 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <figcaption>The <b>Library Galaxy</b> — formats as constellations, with live per-format counts.</figcaption>
     </figure>
 
-    <h3>Scene groups</h3>
-    <p>Once the Demozoo index has been applied (<strong>gear → Metadata → Scene groups (Demozoo)</strong>), the
-       sidebar's Library list gains <strong>Scene groups</strong>: every demoscene group with the number of its
-       tracks — click one for its tracks, with <strong>Play all</strong> and <strong>Shuffle</strong>. The item stays
-       hidden while the library holds no scene-group data.</p>
+    <h3>Scene: composers, games, platforms, parties and groups</h3>
+    <p>When the library has composer tags, games, retro platforms, demoparties or demoscene groups, the sidebar's
+       Library list gains <strong>Scene</strong>. It lists one kind of entry at a time, and the keys above the list
+       switch between them:</p>
+    <ul>
+      <li><strong>Composers</strong> — each composer, with the number of tracks. A tune credited to two composers
+        (<em>Rob Hubbard • Ben Daglish</em>) counts under each of them.</li>
+      <li><strong>Games</strong> — each game a tune is the music of, from the file's own tags, Modland, Demozoo,
+        the UADE song database or the game lists.</li>
+      <li><strong>Platforms</strong> — the computer, console or sound chip a retro tune is for: SID (the C64's chip),
+        Amiga, Atari ST, NES, SNES, PlayStation, AdLib, MIDI and more — the same names as its platform genre.</li>
+      <li><strong>Parties</strong> — the demoparty a tune was released at (from Demozoo). A party's tracks are
+        grouped by the competition they entered (<em>Oldskool Music</em>, <em>Tracked Music</em> …), each in
+        placing order — 1st, 2nd, 3rd — with the tracks of no known competition last.</li>
+      <li><strong>Groups</strong> — the demoscene groups of the composers (from Demozoo).</li>
+    </ul>
+    <p>A key shows only when its list has entries. Click an entry for its tracks, with <strong>Play all</strong> and
+       <strong>Shuffle</strong>; <b>← Back</b> returns to the list. The filter box above a list narrows it, and the
+       Scene view opens on the list you used last in this browser. Parties and Groups fill in once the Demozoo index
+       has been applied (<strong>gear → Metadata → Scene groups (Demozoo)</strong>); when that card says to refresh
+       the index for party competitions, <strong>Download / refresh index</strong> and then <strong>Apply to
+       library</strong> add them. On the
+       <a href="#apps">phone page</a>, the Library's <b>Composers</b>, <b>Games</b>, <b>Platforms</b> and
+       <b>Parties</b> keys list the same.</p>
   </section>
 
   <!-- ── FIND ─────────────────────────────────────────────────────── -->
@@ -353,26 +382,93 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        it again to reverse the order; the <strong>Best match</strong> button in the results header puts the best
        matches first again (for a search of only field operators it reads <strong>Newest first</strong>). Track and
        Location sort a search of up to 2,000 matches. On a phone the results list best matches first, and the
-       number of matches says so. <strong>Play all</strong> and <strong>Shuffle</strong> play
+       number of matches says so — also with the <a href="#mobile-search">Title, Artist, Album, Genre or Game</a> key,
+       where the best match is judged on that field. <strong>Play all</strong> and <strong>Shuffle</strong> play
        all of the matches, and <span class="kbd">Shift</span>-click selects a range of rows as in All Tracks. When a
        scan finishes, or which tracks can play changes while <em>Hide</em> is on, the open results are read again where
        you are.
        <span class="kbd">Esc</span> closes the preview and <b>×</b> clears the box. The first time you click into the empty box, the common operators (<code>artist:</code>,
-       <code>album:</code>, <code>game:</code>, <code>year:</code>, <code>format:</code>) show as chips you can click. Narrow
-       it with field operators — stack as many as you like:</p>
-    <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC</pre>
+       <code>album:</code>, <code>game:</code>, <code>year:</code>, <code>format:</code>, <code>added:</code>,
+       <code>length:</code>, <code>rating:</code>) show as chips you can click. Narrow it with field operators — stack
+       as many as you like, and put <code>-</code> in front of one to leave its matches out:</p>
+    <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC  <span class="a">-</span>live</pre>
+    <p>Every operator, with examples, is listed under <a href="#search-options">Search options</a> below.</p>
+    <div class="note">Press <span class="kbd">/</span> anywhere to jump to the search box. A mistyped operator (an unknown <code>field:</code>) is flagged in the preview as <em>Unknown field</em> instead of silently returning nothing.</div>
+
+    <h3 id="search-options">Search options</h3>
+    <p>An operator is a name, a colon and a value, with no space after the colon: <code>year:1990</code>. Operator
+       names work in any case (<code>Artist:</code>). Quote a value that contains spaces:
+       <code>artist:"The Ghost Inside"</code>. Everything that isn't an operator is searched as words, as above, and
+       every operator and word must match — the same operator twice too (<code>folder:music folder:live</code>).
+       Several values separated by commas match any of them: <code>format:flac,alac</code> (a space after the comma
+       is fine; quote a value that contains a comma). A value an operator can't read — <code>year:abc</code>,
+       <code>track:remix</code>, <code>length:long</code>, <code>status:fine</code> — is searched as words instead,
+       and so is a <code>word:value</code> whose word is no operator. The same operators work in <strong>Play all</strong>,
+       <strong>Shuffle</strong>, <a href="#playlists">smart playlists</a> (<b>⚡ Save search</b>) and in the search of
+       Subsonic apps.</p>
     <table>
       <thead><tr><th>Operator</th><th>Matches</th></tr></thead>
       <tbody>
-        <tr><td><code>artist:</code> <code>album_artist:</code></td><td>The start of any word of an artist's name; case, accents and extra spaces are ignored — <code>artist:marcin</code> and <code>artist:sidder</code> both find “Marcin Romanowski (Sidder)”.</td></tr>
-        <tr><td><code>album:</code> <code>genre:</code></td><td>The whole album or genre name, case ignored — <code>album:Impera</code>, <code>genre:"Synth Pop"</code>.</td></tr>
+        <tr><td><code>artist:</code> <code>album_artist:</code></td><td>The start of any word of an artist's name; case, accents and extra spaces are ignored — <code>artist:marcin</code> and <code>artist:sidder</code> both find “Marcin Romanowski (Sidder)”. <code>artist:</code> looks at the album artist and the artist, <code>album_artist:</code> at the album artist only. A search of operators only with <code>artist:</code> lists the tracks whose album artist matches first, then those where only the artist does, each newest first — the button beside the search title says <b>Album artist first</b>.</td></tr>
+        <tr><td><code>album:</code></td><td>The start of any word of the album's name, like <code>artist:</code> — <code>album:imagin</code> finds “Imaginaerum”, <code>album:"once more"</code> finds “Once More with Feeling”. (An album's own page lists exactly that album.)</td></tr>
+        <tr><td><code>genre:</code></td><td>The start of any word of a genre the track is listed under, like <code>artist:</code> — <code>genre:metal</code> finds “Heavy Metal”, <code>genre:"synth pop"</code> finds “Synth Pop”. (A genre's own page lists exactly that genre.)</td></tr>
+        <tr><td><code>title:</code> <code>composer:</code></td><td>The start of any word of the title / the composer, like <code>artist:</code> — <code>title:"song of"</code> finds “Song of Myself”, <code>composer:hubbard</code> finds “Rob Hubbard”.</td></tr>
         <tr><td><code>game:</code></td><td>A game: matches the start of any name of a track's game — for a retro tune the names its file header, Modland, Demozoo, the song database, a Modland file name, its archive's name and its folder name give it, or an album you set; for any other music file its GAME tag; or a game you typed — and, for a C64 SID or Atari ST tune whose game is unknown or only taken from its folder name or a Modland file name — not one you typed or cleared — the start of its title; case, accents, extra spaces and a leading “The” are ignored — <code>game:uridium</code> finds the game “Uridium” and a SID titled “Uridium 2”, <code>game:"last ninja"</code> also finds “The Last Ninja”, <code>game:"the last ninja"</code> also finds “Last Ninja 2”, and <code>game:pokemon</code> also finds “Pokémon Gold”.</td></tr>
-        <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;2000</code> · <code>year:&gt;=2020</code> · <code>year:&lt;=1999</code> · <code>year:1985-1990</code> · <code>year:2000-</code> · <code>year:-1990</code></td><td>Exact year, after a year, before a year (<code>year:&lt;2000</code> is up to 1999), from / up to and including a year, or a range — open at either end.</td></tr>
-        <tr><td><code>format:FLAC</code> · <code>format:SID</code> · <code>format:"FastTracker 2"</code></td><td>One format, named as in the Type column (case ignored) — <code>format:ProTracker</code> for <code>.mod</code> files, <code>format:AAC</code> or <code>format:ALAC</code> for <code>.m4a</code>, <code>format:DSD64</code>.</td></tr>
+        <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;2000</code> · <code>year:&gt;=2020</code> · <code>year:&lt;=1999</code> · <code>year:1985-1990</code> · <code>year:2000-</code> · <code>year:-1990</code></td><td>Exact year, after a year, before a year (<code>year:&lt;2000</code> is up to 1999), from / up to and including a year, or a range — open at either end. Spaces around <code>&gt;</code> or the dash are fine (<code>year: 1990 - 2000</code>).</td></tr>
+        <tr><td><code>track:3</code> · <code>track:1-5</code> · <code>track:&gt;10</code> · <code>track:&lt;=4</code> · <code>track:5-</code> · <code>disc:2</code></td><td>The track number or the disc number (<code>disk:</code> works the same as <code>disc:</code>), in the same forms as <code>year:</code> — <code>disc:2 track:3</code> finds track 3 of disc 2 of every album; <code>track:3/12</code> reads as <code>track:3</code>. A track without a track (or disc) number in its tags never matches.</td></tr>
+        <tr><td><code>format:FLAC</code> · <code>format:"FastTracker 2"</code> · <code>format:mod</code> · <code>format:chiptune</code></td><td>A format, named as in the Type column (case ignored; <code>type:</code> works the same). A value that is no format name is read as a file extension — <code>format:mod</code> finds ProTracker modules, <code>format:xm</code> FastTracker 2, <code>format:m4a</code> AAC and ALAC, <code>format:dsf</code> DSD files of every tier (<code>.dsf</code>, <code>.dff</code>, <code>.wsd</code>) and Dreamcast DSF — and otherwise as a family, as in the <a href="#library">Library Galaxy</a>: <code>format:tracker</code> (or <code>trackers</code>), <code>format:chiptune</code>, <code>format:lossless</code>, <code>format:lossy</code>, <code>format:other</code>. A format name always wins: <code>format:sid</code> is the SID format, <code>format:dsd64</code> one DSD tier, and <code>format:dsd</code> every DSD tier.</td></tr>
+        <tr><td><code>length:3:30</code> · <code>length:&gt;5:00</code> · <code>length:&lt;30s</code> · <code>length:3:00-4:00</code> · <code>length:&gt;=1h</code></td><td>The track's length as the Duration column shows it (whole seconds), in the same forms as <code>year:</code>. Write a length as seconds (<code>90</code> or <code>90s</code>), minutes (<code>5m</code>), hours (<code>1h</code>), <code>m:ss</code> (<code>1:30</code>) or <code>h:mm:ss</code> (<code>1:02:03</code>). <code>length:3:30</code> finds 3:30 to 3:30.99, <code>length:&lt;30s</code> finds up to 0:29, <code>length:3:00-4:00</code> finds 3:00 to 4:00.99. A track whose length is unknown never matches.</td></tr>
+        <tr><td><code>added:&lt;30d</code> · <code>added:&gt;1y</code> · <code>added:2026</code> · <code>added:2026-10</code> · <code>added:2026-10-23</code> · <code>added:2026-01-2026-06</code> · <code>added:&gt;2026-06-01</code></td><td>When the track was added to the library. <code>&lt;</code> and a time counts back from now: <code>added:&lt;30d</code> is the last 30 days (<code>added:30d</code> means the same), <code>added:&gt;2w</code> longer ago than two weeks — <code>h</code> hours, <code>d</code> days, <code>w</code> weeks, <code>m</code> months (30 days), <code>y</code> years (365 days). A year, a month (<code>2026-10</code>) or a day (<code>2026-10-23</code>), in the server's time zone: that period; with <code>&gt;</code> after it, <code>&lt;</code> before it, <code>&gt;=</code> from its start, <code>&lt;=</code> up to its end; <code>2026-01-2026-06</code> from January through June, <code>2026-</code> from 2026 on, <code>-2025</code> up to the end of 2025.</td></tr>
+        <tr><td><code>rating:5</code> · <code>rating:&gt;=4</code> · <code>rating:1-3</code> · <code>rating:0</code> · <code>rating:unrated</code></td><td>The track's star rating (0 to 5), in the same forms as <code>year:</code>. An unrated track counts as 0: <code>rating:0</code> and <code>rating:unrated</code> list the unrated tracks, and <code>rating:&lt;3</code> includes them — <code>rating:1-2</code> lists only rated ones. Ratings are shared by every account.</td></tr>
+        <tr><td><code>plays:0</code> · <code>plays:&gt;10</code> · <code>plays:1-3</code></td><td>How often <em>you</em> played the track (the account you're signed in with), in the same forms as <code>year:</code> — <code>plays:0</code> lists the tracks you have never played.</td></tr>
+        <tr><td><code>played:&lt;7d</code> · <code>played:&gt;6m</code> · <code>played:2026-10</code></td><td>When <em>you</em> last played the track, in the same forms as <code>added:</code> — <code>played:&lt;7d</code> is the last week, <code>played:&gt;6m</code> longer ago than six months. A track you have never played never matches.</td></tr>
+        <tr><td><code>folder:itunes</code> · <code>folder:"music/itunes"</code> · <code>path:.flac</code> · <code>path:smb://nas</code></td><td><code>folder:</code> — the start of any word of a folder the track is in, at any level (<code>folder:"music/itunes"</code>: those two folders, one in the other); <code>path:</code> — text anywhere in the track's whole path: its folders, its file name and, for a network share, the share's address (<code>path:.flac</code>, <code>path:"live 2019/"</code>). Case and accents are ignored. A user name or password saved in a share's address is never searched.</td></tr>
+        <tr><td><code>group:fairlight</code> · <code>party:revision</code></td><td>The start of any word of a scene group the composer belonged to / of the demoparty a tune was released at, as shown in Track Info.</td></tr>
+        <tr><td><code>status:broken</code> · <code>status:glitched</code> · <code>status:cantplay</code> · <code>status:corrupt</code> · <code>status:partial</code> · <code>status:unplayable</code> · <code>status:empty</code></td><td>Tracks with that badge: <code>broken</code> and <code>glitched</code> — marked by a listener; <code>corrupt</code> — no player can read the file; <code>partial</code> — plays with some parts substituted; <code>unplayable</code> — the “can't play” badge; <code>empty</code> — the “no tunes” badge (a package that holds no tune); <code>cantplay</code> — broken, corrupt or can't play, the tracks Settings → <b>Tracks that can't be played</b> covers. With that setting on <b>Hide</b>, the search box leaves those tracks out of its results, so there <code>status:broken</code> finds them only with <b>Mark</b>.</td></tr>
+        <tr><td><code>lossless:yes</code> · <code>lossless:no</code></td><td>Tracks with / without the lossless badge (FLAC, ALAC, WAV, AIFF, WavPack, DSD …). <code>lossless:no</code> also lists modules, SID tunes and every other format that isn't lossless audio.</td></tr>
+        <tr><td><code>bitdepth:24</code> · <code>samplerate:&gt;48000</code> · <code>samplerate:44.1k</code> · <code>bitrate:&lt;192</code> · <code>bitrate:320</code></td><td>The bit depth, the sample rate in Hz and the bitrate in kbps as Track Info shows them, in the same forms as <code>year:</code>. A sample rate may be written in kHz: <code>44.1k</code>, <code>96khz</code>, or a number under 1000 (<code>samplerate:44.1</code> is 44,100 Hz). A track whose value is unknown never matches.</td></tr>
+        <tr><td><code>source:hvsc</code> · <code>source:aminet</code> · <code>source:sceneorg</code> · <code>source:modland</code> · <code>source:ftp</code> · <code>source:smb</code> · <code>source:webdav</code> · <code>source:share</code> · <code>source:collection</code> · <code>source:local</code></td><td>Where a track comes from: an online collection (HVSC, Aminet, scene.org — <code>source:scene.org</code> works too — or Modland), a network share by its kind (FTP, SMB, WebDAV), any network share (<code>share</code>), any online collection (<code>collection</code>), or a folder on this computer or a drive attached to it (<code>local</code>).</td></tr>
+        <tr><td><code>format:flac,alac</code> · <code>genre:metal,"hard rock"</code> · <code>-format:mp3,aac</code></td><td>Several values: any of them matches; with a <code>-</code>, each is left out.</td></tr>
+        <tr><td><code>-format:mp3</code> · <code>-genre:podcast</code> · <code>-live</code> · <code>-"live at"</code></td><td>A <code>-</code> at the start of an operator or a word leaves out what it matches, the way it would match without the dash: <code>nightwish -live</code> finds Nightwish without the tracks with a word starting “live” (“Live”, “Lively”); <code>-"live at"</code> leaves out the tracks with the phrase “live at”. A search of only exclusions lists every track except those. A dash inside a word (<code>a-ha</code>, <code>x-ray</code>) or a value (<code>year:-1990</code>) is no exclusion.</td></tr>
         <tr><td><code>artist:"The Ghost Inside"</code></td><td>Quote any value containing spaces.</td></tr>
+        <tr><td><code>"song of myself"</code></td><td>Quoted words in the search text are a phrase: those words next to each other, in this order, in one field — the title, artist, album artist, album, composer, scene group or game. The last word may be the start of a word (<code>"song of my</code> while you type). Without quotes the words may be anywhere.</td></tr>
+        <tr><td><code>bpm:120-130</code> · <code>tunes:&gt;1</code> · <code>channels:&gt;4</code></td><td>The tempo in BPM (rounded to a whole number), the number of tunes in a file (a file without several tunes counts as one) and the number of channels — for a tracker module its channels, for a SID tune its number of SID chips — in the same forms as <code>year:</code>. A track whose value is unknown never matches.</td></tr>
+        <tr><td><code>chip:6581</code> · <code>chip:8580</code> · <code>chip:2sid</code> · <code>chip:3sid</code></td><td>C64 SID tunes for the 6581 or the 8580 chip (a tune made for both matches either), or for two or three SID chips.</td></tr>
+        <tr><td><code>dup:yes</code> · <code>dup:no</code></td><td>Tracks that are / aren't one of a group of <a href="#library">duplicates</a> (the <b>Duplicates</b> smart view's groups).</td></tr>
+        <tr><td><code>has:stil</code> · <code>has:game</code></td><td>C64 SID tunes with HVSC's STIL comments / tracks with a game name.</td></tr>
       </tbody>
     </table>
-    <div class="note">Press <span class="kbd">/</span> anywhere to jump to the search box. A mistyped operator (an unknown <code>field:</code>) is flagged in the preview as <em>Unknown field</em> instead of silently returning nothing.</div>
+    <p><b>Examples</b></p>
+    <table>
+      <thead><tr><th>Search</th><th>Finds</th></tr></thead>
+      <tbody>
+        <tr><td><code>format:sid year:1985-1989 -genre:game</code></td><td>C64 SID tunes from 1985 through 1989, without those in a genre with a word starting “game” (“Game”, “Game Boy”).</td></tr>
+        <tr><td><code>added:&lt;7d -format:mp3</code></td><td>Everything added in the last week except MP3 files.</td></tr>
+        <tr><td><code>rating:&gt;=4 plays:0</code></td><td>Tracks rated four stars or more that you have never played.</td></tr>
+        <tr><td><code>length:&lt;0:30 format:chiptune</code></td><td>Chiptunes shorter than 30 seconds — jingles and short game cues.</td></tr>
+        <tr><td><code>artist:nightwish track:3</code></td><td>The third track of every Nightwish album.</td></tr>
+        <tr><td><code>album:imagin -live</code></td><td>Tracks of albums with a word starting “imagin” (“Imaginaerum”), without those with a word starting “live”.</td></tr>
+        <tr><td><code>format:tracker played:&lt;30d</code></td><td>Tracker modules (ProTracker, FastTracker 2, Impulse Tracker, …) you played in the last 30 days.</td></tr>
+        <tr><td><code>format:mod -artist:unknown</code></td><td><code>.mod</code> files without an artist name that has a word starting “unknown”.</td></tr>
+        <tr><td><code>format:lossless length:&gt;10:00 added:2026</code></td><td>Lossless tracks longer than ten minutes, added in 2026.</td></tr>
+        <tr><td><code>plays:&gt;20 played:&gt;6m</code></td><td>Your old favourites: played more than 20 times, but not in the last six months.</td></tr>
+        <tr><td><code>game:uridium -format:sid</code></td><td>Uridium music in any format but SID.</td></tr>
+        <tr><td><code>-rating:0 rating:&lt;=2</code></td><td>Tracks rated one or two stars.</td></tr>
+        <tr><td><code>status:broken -format:mp3</code></td><td>Tracks a listener marked broken, except MP3 files.</td></tr>
+        <tr><td><code>source:hvsc composer:hubbard</code></td><td>Rob Hubbard's tunes from the HVSC online collection.</td></tr>
+        <tr><td><code>format:flac,alac bitdepth:24 samplerate:&gt;48000</code></td><td>Hi-res FLAC and ALAC files: 24-bit, above 48 kHz.</td></tr>
+        <tr><td><code>folder:itunes -lossless:yes</code></td><td>Everything in an iTunes folder that isn't lossless.</td></tr>
+        <tr><td><code>group:fairlight year:&lt;1995</code></td><td>Tunes by Fairlight members from before 1995.</td></tr>
+        <tr><td><code>genre:metal,rock played:&lt;30d</code></td><td>Metal and rock — “Heavy Metal” and “Hard Rock” too — you played in the last 30 days.</td></tr>
+        <tr><td><code>source:share bitrate:&lt;128</code></td><td>Low-bitrate files on your network shares.</td></tr>
+        <tr><td><code>status:cantplay source:local</code></td><td>Files in your local folders that can't be played.</td></tr>
+        <tr><td><code>"song of myself" -format:mp3</code></td><td>Tracks with the phrase “song of myself” in one field, except MP3 files.</td></tr>
+        <tr><td><code>chip:6581 tunes:&gt;1 year:1985-1989</code></td><td>SID tunes for the 6581 with several tunes in the file, from 1985 through 1989.</td></tr>
+        <tr><td><code>bpm:120-130 genre:house,techno</code></td><td>House and techno between 120 and 130 BPM.</td></tr>
+        <tr><td><code>dup:yes -lossless:yes</code></td><td>Duplicates that aren't lossless — candidates to clean up.</td></tr>
+        <tr><td><code>artist:hubbard has:stil</code></td><td>Rob Hubbard's SID tunes with STIL comments, those where he is the album artist first.</td></tr>
+      </tbody>
+    </table>
 
     <h3>Smart views</h3>
     <p>The sidebar's <strong>Smart</strong> section builds these on the fly. Listening history and play counts are
@@ -405,7 +501,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        playing. While a radio runs, shuffle stays off — the radio picks the order.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/23-radiomode.png" alt="The radio view: large album art overlaid with a live green oscilloscope, the current track title, transport controls, an up-next list, and Save-as-playlist and Stop-radio buttons"></div>
+        <img src="img/23-radiomode.png" alt="The radio view: the cover area overlaid with a live green oscilloscope, the current track title, transport controls, an up-next list, and Save-as-playlist and Stop-radio buttons"></div>
       <figcaption><b>Radio view</b> — the cover with a live oscilloscope, what's playing, and what's next.</figcaption>
     </figure>
 
@@ -420,11 +516,13 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <figcaption><b>More like this</b> — the closest matches to the selected track, scored.</figcaption>
     </figure>
 
-    <div class="note"><b>🌐 Find music.</b> The globe button in the top bar opens curated links to
+    <div class="note"><b>🌐 Find music.</b> The globe button in the top bar (in a window 900&nbsp;px wide or less, <b>⋯ → Find music</b>) opens curated links to
       chiptune and demoscene archives — <a href="https://www.hvsc.de/" target="_blank" rel="noopener">HVSC</a>,
       <a href="https://modarchive.org/" target="_blank" rel="noopener">The Mod Archive</a>, the
-      <a href="http://sndh.atari.org/" target="_blank" rel="noopener">SNDH</a> Atari archive and more.
-      Download what you like, drop it in a scan folder, and SoniqBoom indexes it.</div>
+      <a href="http://sndh.atari.org/" target="_blank" rel="noopener">SNDH</a> Atari archive and more; each card
+      opens the archive's website in a new tab. Files you download there play once they are in one of your
+      <a href="#start">music folders</a> and the library has scanned them. HVSC, Modland, Aminet and scene.org can also be listed in the library
+      without downloading them first — see <a href="#online-collections">Online collections</a>.</div>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/13-findmusic.png" alt="The Find music panel listing archive cards: HVSC, The Mod Archive, SNDH, ZXART, AMP and demoscene sites"></div>
@@ -449,8 +547,41 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        and <span class="kbd">Shift</span>-click select tracks, and <span class="kbd">Delete</span> or <b>Remove</b> takes
        them out. An amber <b>2×</b> marks a track that is in the playlist twice, and <b>⧉</b> the same song from
        another location. Each account's playlists are its own — other accounts don't see them unless you share them
-       (below). Read-only accounts can make and change their own playlists too. To rename a playlist, long-press it on the
-       <a href="#apps">phone page</a> and choose <b>✎ Rename</b>.</p>
+       (below). Read-only accounts can make and change their own playlists too. To rename or delete an open playlist,
+       use its <b>⋯</b> menu; on the <a href="#apps">phone page</a>, long-press it and choose <b>✎ Rename</b>.</p>
+
+    <h3>The playlist view</h3>
+    <p>An open playlist starts with a header: a mosaic of the first four different covers in it (one cover when
+       there are fewer, the main format's symbol when there are none), who shares it — <em>shared by</em> its owner
+       for one you imported, or how many listeners imported one of yours — its name, the number of tracks, the total
+       length and the formats it holds (for example <em>FLAC 6 · SID 3 · MOD 2</em>), with a bar coloured by kind of
+       format — lossless, lossy, SID, tracker, chip, MIDI — showing the mix. <b>Play</b> starts it from the top and turns into <b>Pause</b> while it plays; <b>Shuffle</b> plays
+       it in random order; <b>Share</b> (your own playlists) or <b>Unsubscribe</b> (imported ones) work as described
+       below; the <b>⋯</b> menu adds the whole playlist to the queue, saves it as a file (<b>Export as M3U…</b>,
+       <b>Export as XSPF…</b>), renames it or deletes it.</p>
+    <p>Each row shows the cover, title and artist, the format (left out in a narrow window), the length and a
+       small waveform of the track. A track shows its waveform once it has been played or readied to play next;
+       until then — and for a single tune picked from a multi-tune file — an empty strip stands in. The row that
+       is playing fills its waveform as the track goes on. To move tracks, drag them by the handle at the left of
+       a row: a line shows where they will land, and the rows slide into their new places. Imported and smart
+       playlists can't be reordered, and tracks can't be added to or removed from them.</p>
+    <p>In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> the playlist is a cassette insert: the name in a handwritten style,
+       the total length on a tape counter, and a turning tape reel beside the track that is playing. Both styles
+       follow the light and dark themes. With <b>Visualizations</b> switched off, or when your system asks for
+       reduced motion, the reel and the waveform's shimmer stay still; the waveforms and the playing track's
+       progress still show.</p>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/26-playlist-view.png" alt="An open playlist in the Modern style: the playlist's cover, its name, thirteen tracks, fifty-nine minutes and the format mix with a coloured bar, Pause, Shuffle and Share buttons, the Style switch, and rows of SID, MOD, AHX and TFMX tunes with format labels, small waveforms and lengths"></div>
+        <figcaption>An open playlist in the Modern style — the playing row fills its waveform.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/26b-playlist-view-retro.png" alt="The same playlist in the Retro hi-fi style: a cassette insert with the cover taped on, a handwritten-style name and the total length on a tape counter, metal buttons, and rows on a brushed-metal plate with a tape reel beside the playing track"></div>
+        <figcaption>Retro hi-fi: the playlist as a cassette insert.</figcaption>
+      </figure>
+    </div>
 
     <h3>Share and import playlists</h3>
     <p>Open one of your playlists and press <b>Share</b> to make it available to every account on the server; a
@@ -462,15 +593,33 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        share their own. On the <a href="#apps">phone page</a>, <b>Import shared playlists…</b> does the same. In Subsonic
        apps a shared playlist is a <em>public</em> one, and an imported one is listed with the playlists of your own.</p>
 
+    <h3>Playlist files — M3U and XSPF</h3>
+    <p>To bring a playlist from another player, press <b>Import…</b> in the Playlists panel and <b>Choose a file…</b>
+       under <em>A playlist file</em>: an M3U, M3U8 or XSPF file. SoniqBoom makes a new playlist named after the file's
+       own title, or after the file name. It finds each track in your library by its path, then by its file name and
+       the folders around it, so a playlist from another computer, another drive or Windows still matches, and then by
+       artist and title. A length in the file must agree within 5 seconds. When several tracks fit equally well and
+       nothing tells them apart, the entry is left out rather than guessed. The dialog says how many tracks it found
+       and lists the ones it didn't, with the reason.</p>
+    <p>To take a playlist elsewhere, open it and choose <b>Export as M3U…</b> or <b>Export as XSPF…</b> in the
+       <b>⋯</b> menu; a smart playlist exports the tracks it lists now. Each entry is the file's path on the
+       server, or a share file's address without its user name or password, so another player on the same computer
+       can open it. A file exported here and imported again finds the same tracks, a single tune of a multi-tune
+       file included (an online-collection tune that is also a file in your folders comes back as your file). A
+       smart playlist exports up to the 500 tracks it lists. On the <a href="#apps">phone page</a>, <b>Import a playlist file…</b> sits at the top of the
+       playlists, and a long press on a playlist offers the exports.</p>
+
     <h3>Smart playlists — save a search</h3>
     <p>Any search can become a playlist that keeps itself up to date. Type a query — say
        <code>format:SID year:&gt;1988</code> — and press <b>⚡ Save search</b>, which appears next to the search box
        while it holds text. Name it, and it appears under <strong>Playlists</strong> with a ⚡ marker. Opening it
        re-runs the saved search — up to 500 matching tracks — so new tracks that match are included automatically;
-       a smart playlist can't be edited by hand. Smart playlists work in Subsonic apps too.</p>
+       a smart playlist can't be edited by hand. Every <a href="#search-options">search option</a> works in a saved
+       search; <code>plays:</code> and <code>played:</code> read the plays of whoever opens the playlist. Smart
+       playlists work in Subsonic apps too.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/20-savesearch.png" alt="The search bar with the query format:SID year:>1988 typed and the Save search button visible in the header"></div>
+        <img src="img/20-savesearch.png" alt="The search bar with the query format:SID artist:Hubbard typed and the Save search button visible in the header"></div>
       <figcaption>Type a query, press <b>⚡ Save search</b> — it becomes a self-updating playlist.</figcaption>
     </figure>
 
@@ -502,19 +651,48 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        search box searches your library alone.</p>
     <p>Click a station to play it. In the web app SoniqBoom relays the stream through your server, so stations play
        in the browser whatever they're built on — classic Icecast / SHOUTcast, modern <b>HLS</b>, or a
-       <code>.pls</code> / <code>.m3u</code> playlist that just points at the real stream; the phone page plays a station straight from the station's server when the
-       phone can, and through the relay otherwise. Playback starts at the highest quality your browser supports and steps down
+       <code>.pls</code> / <code>.m3u</code> playlist that just points at the real stream; on the phone page a station plays through the relay while Now&nbsp;Playing's
+       <a href="#mobile-meters">meters</a> are on, and straight from the station's server when they are off (through the
+       relay when the phone can't play it directly). Playback starts at the highest quality your browser supports and steps down
        automatically if the stream can't keep up; stations that offer several qualities appear once, under one
        name. The player shows the station and the track that's on air (the phone page shows the station's name and
-       logo), and with an edit or admin account the
-       <b>★ button</b> adds it to Favorites or removes it.</p>
+       logo), and the <b>★ button</b> on the now-playing card adds it to your Favorites or removes it.</p>
+    <p><strong>The Stations view.</strong> At the top, the <b>now-playing card</b> shows the station's logo with a
+       <b>LIVE</b> badge, the song on air in large type with its artist below (and the album and year when the cover
+       lookup finds them), the stream's codec and bitrate, the station's Radio Browser votes, plays today and
+       country when the directory has them, and a <b>signal meter</b>: it rises with the audio buffered ahead (full at
+       three seconds or more) and drops while the station is tuning in, the stream stalls or rebuffers, or playback
+       had to step down to a lower quality. Under the song, a <b>live strip</b> draws the stream itself —
+       a scrolling level strip in Modern, an oscilloscope trace in Retro hi-fi. The big round button pauses and
+       resumes; beside it are <b>★</b>, <b>⏹</b> (stop) and <b>ⓘ</b> (station details). With nothing playing, the round
+       button plays the station the dial's needle points at (after a stop, the first one).</p>
+    <p>Below the card, the <b>tuner dial</b> lays the open list's stations along a radio scale (88–108 MHz), with
+       a needle on the one that plays. Click a name — or anywhere on the scale for the nearest station — drag the
+       needle and let go, or scroll sideways over the dial (once the dial has focus, the mouse wheel tunes too;
+       otherwise it scrolls the page); <b>‹</b> / <b>›</b> beside it tune the neighbouring station. With the keyboard, <span class="kbd">Tab</span> to the dial, then <span class="kbd">←</span> /
+       <span class="kbd">→</span> one station, <span class="kbd">Page Up</span> / <span class="kbd">Page Down</span>
+       five, <span class="kbd">Home</span> / <span class="kbd">End</span> the first / last: the needle moves at once
+       and the station tunes in when you stop; <span class="kbd">Enter</span> tunes in straight away. A long list
+       scrolls sideways along the dial. On a page with no stations of its own (World's continents and countries) the
+       dial keeps the list the playing station came from. The list itself is a grid of station cards — logo, name,
+       genre, codec and bitrate — and the playing station's card is marked, with a small live meter.</p>
+    <p>In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> the view is a 70s/80s receiver: a brushed-metal faceplate (silver in the light theme) with the song on a glowing
+       display, <b>TUNED</b> and <b>STEREO</b> lamps, a needle signal meter, a backlit glass dial and your first eight
+       Favorites as numbered <b>preset keys</b> — the lamp of the one playing is lit. The live strip and the card's
+       meter follow the visualization settings: they stand still with <em>reduce motion</em>, and while
+       <em>Enable visualizations</em> or <em>Now-playing</em> is off the strip stays blank and the card's meter is hidden.</p>
     <p><strong>Switch stations.</strong> While a station plays, the player bar shows <b>● LIVE</b> and a scrolling
        now-playing line in place of the seek bar, and <b>◀◀</b> / <b>▶▶</b> switch to the previous / next station of
-       the list you started it from — their names show beside the buttons.</p>
+       the list you started it from — their names show beside the buttons — and the dial's needle follows.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/24-stations.png" alt="The Stations view: the Scene list of demoscene and chiptune stations with codec and stream counts, a now-playing card at the top showing SceneSat Radio with its current track, and a station search box in the header"></div>
+        <img src="img/24-stations.png" alt="The Stations view in the Modern style: a now-playing card showing Nectarine Demoscene Radio with its current track, the tuner dial, and the Scene list of demoscene and chiptune stations with codec and stream counts, four of them marked as favourites"></div>
       <figcaption>The <b>Stations</b> view — the Scene pack playing, each station listed once with its qualities.</figcaption>
+    </figure>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/24b-stations-retro.png" alt="The same view in the Retro hi-fi style: a tuner with a display showing the station and its current track, TUNED and STEREO lamps, a needle signal meter, the favourites as numbered preset keys with the playing one lit, and a backlit glass dial above the station cards"></div>
+      <figcaption>Retro hi-fi: the Stations view as a tuner, the favourites on its preset keys.</figcaption>
     </figure>
     <p><strong>Live now-playing.</strong> In the web app, as each song changes, the current track's title appears in the player —
        split into artist and song when the station provides it — read from classic ICY stream metadata
@@ -531,7 +709,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        one you're hearing marked.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/25-stationinfo.png" alt="The station details panel for SceneSat Radio showing tags, a website link, the current track title, and a list of streams from MP3 320 kbps down to AAC+ 48 kbps with the playing one marked"></div>
+        <img src="img/25-stationinfo.png" alt="The station details panel for Nectarine Demoscene Radio showing tags, a website link, the current track title, and a list of streams from MP3 192 kbps down to MP3 64 kbps with the playing one marked"></div>
       <figcaption><b>Station details</b> — tags, website, the live track, and the full quality ladder.</figcaption>
     </figure>
   </section>
@@ -557,19 +735,25 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        and pattern counts, instrument names, and the embedded text messages trackers are famous for.
        A live <strong>signal path</strong> sketches how the playing track reaches your speakers — naming the
        renderer for SID, the classic tracker formats, HivelyTracker, AHX, MIDI, NSF, SPC and DSD files,
-       and a decode step for other formats; it shows while the <em>Now-playing</em> visualizations are on.</p>
+       and a decode step for other formats; it shows while the <em>Now-playing</em> visualizations are on (in Retro hi-fi
+       as a row of labelled steps, the active one lit).</p>
     <div class="fig-2">
       <figure>
         <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-          <img src="img/07-trackinfo.jpg" alt="Track info modal for a 16-channel ScreamTracker 3 module with per-channel VU meters"></div>
-        <figcaption>A 16-channel <b>ScreamTracker 3</b> module — VU per channel, module details, signal path.</figcaption>
+          <img src="img/07-trackinfo.jpg" alt="Track Info in the Modern style for a 22-channel FastTracker 2 module: a VU bar per channel over the cover, the format, channel count and size, the module details and the pattern grid following the song"></div>
+        <figcaption>A 22-channel <b>FastTracker 2</b> module — VU per channel, module details, pattern grid.</figcaption>
       </figure>
       <figure>
         <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-          <img src="img/08-tracker64.jpg" alt="A 64-channel Impulse Tracker module with per-channel VU meters"></div>
-        <figcaption>A <b>64-channel</b> Impulse Tracker module — its first 32 channels metered at once.</figcaption>
+          <img src="img/07b-trackinfo-retro.jpg" alt="The same module's Track Info in the Retro hi-fi style: an LED column per channel in a bezel, a display strip with the format, length, renderer and channel count, and the module details and pattern grid on a spec plate"></div>
+        <figcaption><b>Retro hi-fi</b>: an LED column per channel, the format and renderer on a display strip.</figcaption>
       </figure>
     </div>
+    <figure style="max-width:460px;margin:24px auto">
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/08-tracker64.jpg" alt="A 58-channel Impulse Tracker module with per-channel VU meters"></div>
+      <figcaption>A <b>58-channel</b> Impulse Tracker module — its first 32 channels metered at once.</figcaption>
+    </figure>
     <div class="note">C64 SID tunes of up to ten minutes get a three-voice meter, built in the background the first
       time a tune plays (the spectrum shows until it is ready), and Amiga player formats played by UADE, AHX included, get per-voice
       meters from an extra background pass (<a href="#settings">Playback preparation</a>) for tunes of up to seven
@@ -578,8 +762,13 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       PSF family — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled as such; MIDI files and ordinary audio files show no meter. Prefer a different look? Set
       <b>VU meter style</b> to <b>Circuit board</b> under <strong>gear → System → Settings → Visualizations</strong>
       (<strong>gear → Preferences</strong> for accounts without admin rights) — a skin driven by the same live
-      per-channel levels. The same group's <em>Enable visualizations</em> and <em>Now-playing</em> switches turn the
-      meters, the signal path and the visualizer off on this device.</div>
+      per-channel levels. In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> each channel (or spectrum band) is an LED
+      column instead. Ordinary audio files (MP3, FLAC, …), which have no per-channel meter, get twin needle meters
+      in Retro hi-fi when there is room beside the transport keys — <b>L</b> and <b>R</b>, the music's level whatever the volume
+      setting — either side of the transport keys; their red <b>PEAK</b> lamp lights when the music comes within
+      half a dB of full scale. With reduced motion the needles show one still reading. The same group's
+      <em>Enable visualizations</em> and <em>Now-playing</em> switches turn the meters, the signal path and the
+      visualizer off on this device.</div>
 
     <h3>The pattern view — watch the module play</h3>
     <p><strong>Track Info</strong> opens with the <b>ⓘ</b> button on the player bar, <span class="kbd">I</span> or a
@@ -612,12 +801,46 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        real name and length from the <strong>Songlengths</strong> and <strong>STIL</strong> databases — so
        <em>Tune&nbsp;3&nbsp;/&nbsp;6</em> reads <em>"Assembly"</em> rather than a bare number — with the full
        STIL commentary below and the chip model shown as a <strong>6581 / 8580</strong> badge.</p>
+    <p>Track Info follows the <a href="#ui-style">style</a> the equalizer, Stations, playlists and the queue share.
+       In <b>Retro hi-fi</b> the panel is a component's spec plate: the cover sits in a bezel above a display strip
+       (beside it in a narrow window) with the format, the length, the SID chip and — for a tracker, SID, MIDI, Amiga,
+       Atari&nbsp;ST, PSF-family or multi-tune console tune — the renderer that plays it, then the audio details;
+       the header's track line shows in a display window, and the tags are printed on a cassette insert. The tune
+       picker becomes a keypad of numbered keys, each with its length when it is known (and its STIL name): the
+       lamp of the tune that's playing is lit, amber while it's paused. Click a key — or move to it with
+       <span class="kbd">Tab</span> and press <span class="kbd">Enter</span> — to play that tune, and the lit key
+       pauses and resumes it; point at a key for its <b>▶</b>, <b>+</b> and <b>☰</b> (on a touch screen they are
+       always on the key). Both styles come in the light and the dark theme.</p>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/31-tunepicker.png" alt="Track Info in the Modern style for the HVSC SID Commando: a three-voice SID meter, the 6581 chip badge, and the tune picker of its 19 tunes with their lengths and STIL names, the default tune playing, Play all, Add all, Playlist and shuffle buttons, Jump to, and the STIL commentary below"></div>
+        <figcaption>The <b>tune picker</b> for a 19-tune HVSC SID — names and lengths from Songlengths and STIL.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/31b-tunepicker-retro.png" alt="The same tune picker in the Retro hi-fi style: a keypad of numbered keys, each with its length, the playing tune's lamp lit green and marked default, a display strip with the format, length, SID chip and renderer, and the STIL commentary below"></div>
+        <figcaption><b>Retro hi-fi</b>: the tunes as a keypad, the playing tune's lamp lit.</figcaption>
+      </figure>
+    </div>
     <p>The song lengths and STIL come from gear → <strong>Renderers → HVSC SID database</strong>. Choose
        <strong>Download from the internet</strong> and SoniqBoom downloads them from the 6581.nl HVSC mirror
        (about 9&nbsp;MB) and checks for a new HVSC release weekly — <strong>Check now</strong> checks at once, and the
        card shows the date of the song-length list in use and when it was last checked. Or choose <strong>Local DOCUMENTS
        folder</strong> and enter the HVSC <code>DOCUMENTS</code> folder on your computer. Either way your SID files are
        matched by checksum, wherever they are in your library. Offline mode downloads nothing.</p>
+    <p>While a download runs, the card shows its three steps — <em>Download</em>, <em>Install</em> and
+       <em>Apply to your SID tracks</em> — with a progress bar: the percentage and megabytes of the file being downloaded
+       (the song lengths, then the STIL commentary), or the megabytes so far when the mirror doesn't say the size, then
+       how many of your SID tracks have been matched. The new song lengths and STIL are applied to your SID tracks
+       straight away; there is nothing else to click. When it ends, the card says how: <em>Done</em> with the number of
+       song lengths and STIL entries in use and of SID tracks they were applied to, <em>Already up to date</em>, that
+       offline mode is on, or why the download failed (the mirror couldn't be reached, stopped sending data for a
+       minute, refused or couldn't answer) with a <strong>Retry</strong> button — the database downloaded before stays
+       in use meanwhile. If applying to your SID tracks fails, <strong>Apply to SID tracks</strong> tries again. The
+       progress follows the server, so it is still there after you close Settings or reload the page; <strong>Check
+       now</strong> and <strong>Re-extract SID metadata</strong> wait until it is over. <strong>Re-extract SID
+       metadata</strong> shows its progress and result in the same place.</p>
     <p>Playing the file itself starts at its <em>default</em> tune, marked <b>default</b> in the picker: the start
        song a SID or SNDH file names, and for Amiga player formats (played by UADE), console rips and SC68 disks the
        first tune that isn't empty (tracker modules start at tune 1); a tune you pick plays that tune. On the
@@ -684,21 +907,92 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        can't be played</strong> to <b>Hide them</b>.</p>
 
     <h3>Equalizer &amp; visualizer</h3>
-    <p>A built-in 10-band graphic <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
-       toggle it with <span class="kbd">E</span> or the <b>EQ</b> button, pick a preset (Flat, Bass Boost, Rock, Pop,
-       Jazz, Classical, Vocal) or drag the bands by hand, and <b>Reset</b> to start over. Its <b>Volume leveling</b>
-       menu evens out loudness with the ReplayGain tags in your files — <b>Per album</b> (the default),
-       <b>Per track</b> or <b>Off</b>. A
+    <p>A built-in 10-band <strong>equalizer</strong> (32 Hz–16 kHz, ±12 dB) shapes the sound band by band —
+       toggle it with <span class="kbd">E</span> or the <b>EQ</b> button. The panel names the track that is playing
+       and draws the equalizer's curve over that track's live spectrum. In the <b>Modern</b> style the bright trace
+       is the sound after the equalizer, the faint dotted trace the track as it comes in, and the glow under each
+       band's knob follows that band's level.</p>
+    <ul>
+      <li><b>Style</b> — the <b>Style</b> switch at the top of the panel chooses the look of the whole app (see
+        <a href="#ui-style">Style</a>):
+        <b>Modern</b> (the curve with a knob per band) or <b>Retro hi-fi</b>, a classic graphic equalizer. In
+        Retro hi-fi each band is a slider in its slot, with an LED column beside it that shows the music's level in
+        that band — green, amber, red, with a peak segment that falls back slowly. Above the sliders, a glowing
+        <b>Display</b> strip shows the curve over the spectrum; the <b>Display</b> key turns it on or off. The
+        presets are keys with lamps under the sliders: the lamp of the preset in use is lit, and <b>Custom</b> shows
+        when the bands match none of them.</li>
+      <li><b>Adjust a band</b> — drag its knob (in Retro hi-fi, its slider) up or down (0.5 dB steps; a readout shows the value and the band), or
+        drag up or down anywhere in the band's column. Double-click a knob to set it to 0 dB; the mouse wheel over a
+        knob moves it in 0.5 dB steps. With the keyboard, <span class="kbd">Tab</span> to a knob, then
+        <span class="kbd">↑</span>/<span class="kbd">↓</span> ±0.5 dB, <span class="kbd">Page Up</span>/<span class="kbd">Page Down</span>
+        ±3 dB, <span class="kbd">Home</span>/<span class="kbd">End</span> −12 / +12 dB, <span class="kbd">Enter</span>
+        or <span class="kbd">Space</span> 0 dB.</li>
+      <li><b>Presets</b> — Flat, Bass Boost, Rock, Pop, Jazz, Classical and Vocal (in the Modern menu each with a
+        small picture of its curve); the bands glide to the new setting. <b>Reset</b> sets every band to 0 dB and the pre-gain back to
+        automatic.</li>
+      <li><b>Bypass</b> (or <span class="kbd">B</span> while the panel has focus) plays the track with every band flat,
+        at the same level, so you can compare; press it again — or close the panel — to hear the equalizer again.
+        Moving a band or picking a preset also ends the bypass.</li>
+      <li><b>Pre-gain and CLIP</b> — when bands are boosted, the input is lowered by the curve's highest point
+        (shown as <b>Pre-gain</b>), so the boost has headroom. The <b>CLIP</b> lamp lights when the output goes past
+        full scale; <b>Auto pre-gain</b> then lowers the pre-gain by that much. The extra lowering stays until
+        <b>Reset</b>.</li>
+    </ul>
+    <p>The <b>Volume leveling</b> menu evens out loudness with the ReplayGain tags in your files — <b>Per album</b>
+       (the default), <b>Per track</b> or <b>Off</b>. The moving spectrum follows the same settings as the other
+       visuals: with <em>reduce motion</em> it stands still, and with <em>Enable visualizations</em> or
+       <em>Now-playing</em> switched off only the curve is drawn (in Retro hi-fi the LED columns stay dark). A
        full-width <strong>visualizer</strong> plays behind the track list and cycles through its modes with
-       <span class="kbd">V</span> — oscilloscope, retro CRT scope, scrolling spectrogram, hyperspace tunnel,
-       synthwave grid, wireframe globe, cosmic eye, lava lamp, and a singing raccoon. The visuals respect your
-       system's <em>reduce motion</em> setting, pause when the tab is hidden, and stay off while
-       <em>Enable visualizations</em> or <em>Now-playing</em> is switched off.</p>
+       <span class="kbd">V</span> — oscilloscope, retro CRT scope, scrolling spectrogram, spectrum analyser,
+       hyperspace tunnel, synthwave grid, wireframe globe, cosmic eye, lava lamp, and a singing raccoon; it
+       starts with the mode you used last. In Retro hi-fi it cycles through the oscilloscope, the spectrum
+       analyser and the CRT scope only; a mode only Modern has shows as the oscilloscope there. The <b>spectrum analyser</b> shows a bar per band — thirds of an
+       octave from 25&nbsp;Hz to 20&nbsp;kHz, whole octaves in a narrow window, the octaves' frequencies printed
+       underneath — with a peak mark that stays a moment above each bar and then falls. In the <b>Retro hi-fi</b>
+       <a href="#ui-style">style</a> the oscilloscope is an amber phosphor trace with a short afterglow over a
+       printed grid, the analyser a faint cyan display of lit segments with amber peak segments and the CRT scope
+       a faint amber trace — dim enough to read the list through. The visuals respect your system's <em>reduce motion</em> setting
+       (the visualizer then shows one still picture), pause when the tab is hidden, and stay off while
+       <em>Enable visualizations</em> or <em>Now-playing</em> is switched off.
+       The player bar's record button (or <span class="kbd">N</span>) shows the playing track's cover large over
+       the list, with its title, artist and album; click it, press <span class="kbd">N</span> again or <span class="kbd">Esc</span> to close it; it also closes when you pick another view.
+       In Retro hi-fi the cover is the label of a record turning on a turntable, under a display with the title,
+       artist and album; it stands still while paused, with <em>reduce motion</em>, or with the
+       <em>Now-playing</em> visualizations off.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/11-equalizer.png" alt="The graphic equalizer open over the player, with frequency-band sliders and preset buttons"></div>
-      <figcaption>The graphic <b>equalizer</b> — shape the sound band by band, or pick a preset.</figcaption>
+        <img src="img/11-equalizer.png" alt="The equalizer open over the player in the Modern style: the Rock preset's response curve with a knob per band over the live spectrum of the playing track, the Style switch, preset menu, Bypass, Reset, CLIP lamp, pre-gain and Volume leveling"></div>
+      <figcaption>The <b>equalizer</b> — drag the knobs on the curve, or pick a preset; the spectrum behind it is the track that is playing.</figcaption>
     </figure>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/11b-equalizer-retro.png" alt="The equalizer in the Retro hi-fi style: a slider per band in its slot with an LED level column beside it, a cyan display strip with the curve over the spectrum, preset keys with the Rock key's lamp lit, and the Display key"></div>
+      <figcaption>The <b>Retro hi-fi</b> style — sliders set the bands, the LEDs beside them follow the music.</figcaption>
+    </figure>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/28-visualizer.png" alt="The full-width visualizer in its spectrum-analyser mode in the Modern style: orange bars with peak marks across the track list, octave frequencies printed underneath"></div>
+        <figcaption>The <b>spectrum analyser</b> over the track list — press <span class="kbd">V</span> to change mode.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/28b-visualizer-retro.png" alt="The spectrum analyser in the Retro hi-fi style: cyan columns of lit segments with amber peak segments across the track list"></div>
+        <figcaption><b>Retro hi-fi</b>: lit cyan segments with amber peaks.</figcaption>
+      </figure>
+    </div>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/29-nowplaying.png" alt="Now playing in the Modern style: the playing track's cover shown large in place of the list (here the placeholder of a tune without cover art), with the title and artist under it"></div>
+        <figcaption><b>Now playing</b> — the record button or <span class="kbd">N</span> shows the cover large.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/29b-nowplaying-retro.png" alt="Now playing in the Retro hi-fi style: a record on a turntable with its tonearm, the cover (here a placeholder) as its label, under a display with PLAY, the title and the artist"></div>
+        <figcaption><b>Retro hi-fi</b>: the cover as a record's label on a turntable.</figcaption>
+      </figure>
+    </div>
     <div class="note"><b>No network pause between tracks.</b> In the last 20 seconds of a track, the next one in the
        queue is fetched ahead of time, so playback moves straight into it without waiting on the network. With a
        <em>Crossfade</em> length set (<strong>gear → System → Settings</strong>, or <strong>gear → Preferences</strong>
@@ -708,19 +1002,33 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        (retro and Amiga tracks show <em>Rendering…</em> after a second); these settings are saved in this
        browser.</div>
 
-    <p><strong>Player bar.</strong> The seek bar shows the track's waveform once it is known (for a retro tune, once it
-       has rendered). Your keyboard's media keys, the lock screen and your system's media controls show the playing
-       track and play, pause and skip, and while SoniqBoom is on screen the display stays awake as music plays.</p>
+    <p><strong>Player bar.</strong> The seek bar shows the track's waveform once it is known. For a SID, tracker,
+       Amiga, chip, AdLib, PSF or SNDH tune of known length it fills in from the left while the tune renders; other
+       rendered tunes show it once they have rendered. Your keyboard's media keys, the lock screen and your system's media controls show the playing
+       track and play, pause and skip, and while SoniqBoom is on screen the display stays awake as music plays.
+       In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> the player bar looks like a cassette deck: the title
+       and artist glow on a display window — for a tracker, SID or chip tune with an LED column per channel under
+       them (beside them in a narrow window) — the times sit in small display windows, the waveform is an amber strip
+       with a lit playhead, the transport and toolbar buttons are hardware keys (a lamp lights on a key that is
+       switched on) and the volume is a ribbed fader. In either style, in a window 1100&nbsp;px wide or less the radio, download,
+       now-playing and cast buttons move into the toolbar's <b>⋯</b> menu, between 601 and 900&nbsp;px the
+       lyrics and playlists buttons too, and between 601 and 720&nbsp;px the equalizer button.</p>
 
     <h3>Time-synced lyrics</h3>
     <p>Lyrics come from the file's own tags or, when it has none, from LRCLib or lyrics.ovh — the one that has been
        answering faster is asked first, the other only when it finds nothing; synced lyrics scroll line-by-line with playback. SID, tracker, chiptune, Amiga, Atari&nbsp;ST, PSF and
        AdLib tunes show only lyrics stored in the file — MIDI files are looked up online too. Open them with the
-       <b>Lyrics</b> button in the player toolbar (a side panel — drag its edge to resize it) or the <em>Lyrics</em>
+       <b>Lyrics</b> button in the player toolbar (a side panel — drag its edge to resize it, or focus the edge and press <span class="kbd">←</span> / <span class="kbd">→</span>) or the <em>Lyrics</em>
        tab of Track Info. With <em>Save fetched lyrics to files</em> (gear → Metadata → Lyrics,
        off by default) lyrics opened in SoniqBoom's own player by an edit or admin account are written into a
        local file that has none; a lookup from a Subsonic app or a read-only account never writes
        to a file.</p>
+    <p>In the panel, click a synced line (or move to it with <span class="kbd">↑</span> / <span class="kbd">↓</span> and press <span class="kbd">Enter</span>)
+       to jump there in the track; scrolling the lyrics yourself pauses the follow for a few seconds. <b>×</b> closes the
+       panel, and so does <span class="kbd">Esc</span> while the keyboard focus is in it. In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> synced lyrics run on a
+       display window like a teleprompter: the current line glows in the middle, the lines around it are dimmer,
+       and <em>SYNC</em> / <em>PAUSE</em> lamps and a line counter sit along the top. Lyrics without timestamps
+       are shown as a printed lyric sheet with the track's title and artist, and stay put while the music plays.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/09-lyrics.jpg" alt="Time-synced lyrics scrolling with the track"></div>
@@ -761,7 +1069,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <em>Game from archive names</em> is on.</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/22-tagedit.png" alt="The Track Info panel showing the About-the-artist card with a Wikipedia bio and portrait, and the open tag-editing form with Save tags and Cancel buttons"></div>
+        <img src="img/22-tagedit.png" alt="The Track Info panel showing the About-the-artist card with a Wikipedia bio and portrait, and the open Edit info form with Save and Cancel buttons"></div>
       <figcaption><b>Track Info</b> — the artist's story from Wikipedia, and tags you can fix in place.</figcaption>
     </figure>
 
@@ -890,6 +1198,32 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <strong>gear → Preferences</strong>, or Settings on the phone page; this browser only) and anything can come
        round again — it applies the next time you turn shuffle on. <span class="kbd">R</span> or <b>↻</b> cycles
        repeat: off, all, one.</p>
+    <p>The <b>Queue</b> panel (<span class="kbd">Q</span>, or <b>☰</b> in the player) opens at the track that is
+       playing. Its header says how many tracks will play after it and how much playing time is left, the rest of
+       the current track included — with a <b>+</b> when some lengths aren't known yet or more tracks are still to
+       come from the list. Tracks the queue passes by aren't counted. It also says where the queue came from (for
+       example <em>from Search: nightwish</em>) when it was started from a search or another long list, and whether
+       Shuffle and Repeat are on. Each row shows the cover, title and artist, the format (left out in a narrow
+       window), a small waveform and the length. As in a playlist, an empty strip stands in until a track has a
+       waveform (and for a single tune of a multi-tune file), and the playing row fills its waveform as the track
+       goes on. Click a row to play it and use its <b>×</b> to take it out. While you drag a row, a line shows
+       where it will land, and the rows slide into their new places.</p>
+    <p>In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> the queue is a programme on a metal faceplate: each track has a numbered key whose lamp lights while it
+       plays, and a display shows the tracks to come, the time left on a tape counter and the Shuffle and Repeat
+       lamps. With <b>Visualizations</b> switched off, or when your system asks for reduced motion, the waveform's
+       shimmer stays still; the playing track's progress still shows.</p>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/27-queue.png" alt="The Queue panel in the Modern style: Up next with the number of tracks and the time left, and rows with covers, format labels, small waveforms and lengths, the playing row filling its waveform"></div>
+        <figcaption>The queue in the Modern style.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/27b-queue-retro.png" alt="The same queue in the Retro hi-fi style: a display with the tracks to come, a tape counter and Shuffle and Repeat lamps, and rows on a brushed-metal plate with numbered keys, the playing track's lamp lit"></div>
+        <figcaption>Retro hi-fi: the queue as a programme with numbered keys.</figcaption>
+      </figure>
+    </div>
 
     <h3>Keyboard shortcuts</h3>
     <p>Press <span class="kbd">?</span> (outside a text box) for a shortcut sheet inside the app; the <b>?</b> button in
@@ -908,6 +1242,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <tr><td><span class="kbd">Q</span></td><td>Toggle the queue</td><td><span class="kbd">E</span></td><td>Equalizer</td></tr>
       <tr><td><span class="kbd">V</span></td><td>Cycle the visualizer</td><td><span class="kbd">I</span></td><td>Track info</td></tr>
       <tr><td><span class="kbd">P</span></td><td>Play all in the current list</td><td><span class="kbd">Shift</span><span class="kbd">P</span></td><td>Shuffle all in the current list</td></tr>
+      <tr><td><span class="kbd">N</span></td><td>Show / hide the now-playing cover</td><td></td><td></td></tr>
     </tbody></table>
 
     <p class="muted" style="margin:16px 0 2px"><strong>Browse &amp; select</strong></p>
@@ -915,7 +1250,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <tr><td><span class="kbd">J</span> / <span class="kbd">K</span></td><td>Move down / up the track list</td><td><span class="kbd">Enter</span></td><td>Play the focused track</td></tr>
       <tr><td><span class="kbd">A</span></td><td>Add the focused track to the queue</td><td><span class="kbd">/</span></td><td>Focus the search box</td></tr>
       <tr><td><span class="kbd">?</span></td><td>Show the shortcut sheet</td><td><span class="kbd">G</span></td><td>Locate the playing track</td></tr>
-      <tr><td><span class="kbd">Esc</span></td><td>Close Track Info, the shortcut sheet or Find music; leave the radio view</td><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>Previous / next track in Track Info</td></tr>
+      <tr><td><span class="kbd">Esc</span></td><td>Close Track Info, the shortcut sheet, the now-playing cover or Find music; leave the radio view</td><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>Previous / next track in Track Info</td></tr>
     </tbody></table>
 
     <p class="muted" style="margin:16px 0 2px"><strong>Jump to a view</strong></p>
@@ -944,7 +1279,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
         <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>~175 custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
         <tr><td><strong>Atari ST</strong></td><td>SNDH, YM, SC68</td><td>psgplay / bundled StSound engine (outside Docker it is built on first play and needs a C++ compiler) / sc68</td></tr>
         <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF and their mini variants (MiniPSF, MiniUSF …)</td><td>zxtune123 (a <code>.psf</code> without a PSF header is Amiga SoundFactory: uade123)</td></tr>
-        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme (VGM/VGZ using a chip other than the Sega PSG and YM2612 — YM2413, YM2151, NES APU, AY-3-8910 …: zxtune123)</td></tr>
+        <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme (VGM/VGZ using a chip other than the Sega PSG and YM2612 — YM2413, YM2151, NES APU, AY-3-8910 …: zxtune123; KSS — MSX and Sega Master System / Game Gear music, with the MSX-MUSIC, MSX-AUDIO and SCC sound chips: kssrender, or libgme where kssrender isn't installed)</td></tr>
         <tr><td><strong>AdLib / OPL FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM, AMD</td><td>AdPlug (<code>adplay</code>, Nuked OPL3)</td></tr>
       </tbody>
     </table>
@@ -1002,8 +1337,12 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       Besides sending audio out, SoniqBoom can announce itself as a <strong>DLNA Media Server</strong> so UPnP
       controllers on your network (some smart TVs and receivers) can browse and play your library. Turn it on in
       <a href="#settings">gear → <b>System → Services</b></a>; while it is on, any controller on the same network can
-      browse your library under <em>Music → All Tracks</em>, <em>Albums</em> and <em>Artists</em> (album artists, then
-      their albums), search it, and play any track without signing in. Controllers find it through SSDP on UDP
+      browse your library under <em>Music → All Tracks</em>, <em>Albums</em>, <em>Artists</em> (album artists, then
+      their albums), <em>Genres</em>, <em>Folders</em> (your library folders, then their subfolders and tracks) and
+      <em>Playlists</em> (the playlists their owners share with every account), with covers where a track has one,
+      search it, and play any track without signing in. SID, MIDI, tracker modules, AdLib, Atari&nbsp;ST, PSF,
+      console chiptunes and the Amiga formats are offered as FLAC and as MP3 (in that order) and start at once; the first time a tune plays in FLAC or in MP3, the player can't skip
+      ahead within it. Controllers find it through SSDP on UDP
       port&nbsp;1900, so a firewall on the server must let that port through.</div>
   </section>
 
@@ -1031,11 +1370,12 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <li>As master you browse <b>Tracks</b>, <b>Playlists</b> and <b>Albums</b>, search, and control playback —
         play/pause, next/previous, shuffle and repeat; <b>Up next</b> shows the room's queue. The queue passes by the
         same tracks the main player does — offline, reported broken or undecodable, and short tunes while
-        <em>Skip short tunes</em> is on. The <b>Listeners</b> panel shows every device that has joined.</li>
+        <em>Skip short tunes</em> is on. The <b>Listeners</b> panel shows every device that has joined, marked
+        <b>Master</b> or <b>Follower</b>.</li>
     </ol>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/16-multiroom-master.png" alt="The multi-room master view — now playing with transport controls, a Tracks / Playlists / Albums library, a Listeners panel showing the master and one listener, and an Up Next queue"></div>
+        <img src="img/16-multiroom-master.png" alt="The multi-room master view — now playing with transport controls, a Tracks / Playlists / Albums library, a Listeners panel showing the master and one follower, and an Up Next queue"></div>
       <figcaption>The <b>master</b> view — pick and control the music; the <b>Listeners</b> panel shows every connected device.</figcaption>
     </figure>
 
@@ -1049,7 +1389,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     </ol>
     <figure style="max-width:380px;margin:24px auto">
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/17-multiroom-listener.png" alt="The multi-room listener view — the current track, a progress bar, and a live Sync drift meter reading -2 ms"></div>
+        <img src="img/17-multiroom-listener.png" alt="The multi-room listener view — the current track, a progress bar, and a live Sync drift meter reading +0 ms"></div>
       <figcaption>A <b>listener</b> follows the master — the <b>Sync</b> meter shows the drift in milliseconds.</figcaption>
     </figure>
 
@@ -1073,24 +1413,140 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <div class="card"><span class="ico">⬇️</span><h4>Installable PWA</h4><p>Add SoniqBoom to your home screen or dock for a full-screen, app-like experience.</p></div>
     </div>
 
-    <h3>On your phone</h3>
-    <p>Open SoniqBoom on a phone and it takes you to the dedicated <strong>touch-first page</strong> at
-       <code>/m</code> (an iPad gets the desktop UI, which also works at phone width), with Library, Search,
+    <h3>On your phone and iPad</h3>
+    <p>Open SoniqBoom on a phone or an iPad (or another touch-screen tablet) and it starts on the dedicated
+       <strong>touch-first page</strong> at <code>/m</code>, with Library, Search,
        <strong>Radio</strong>, Queue and Now&nbsp;Playing tabs plus a tap-to-expand mini-player and Settings behind the
        gear. <em>Library</em> browses All, Artists, Album Artists, Albums, Genres, Years and Playlists;
-       <em>Radio</em> has ★&nbsp;Favorites, Scene and Browse; <em>Search</em> shows how many tracks match and
-       loads more of them as you scroll. Tap a track to play it, swipe it left to add it to the
+       <em>Radio</em> has ★&nbsp;Favorites, Scene and Browse; <em>Search</em> looks in the field you
+       pick and narrows by filters (see below), shows how many tracks match and loads more of them as you scroll. Tap a track to play it, swipe it left to add it to the
        queue (in the queue and in a playlist, to remove it), and long-press it for <b>▶ Play Now</b>,
        <b>+ Add to Queue</b>, <b>♫ Add to Playlist…</b> and, with edit rights, <b>⚠︎ Report a problem…</b>.
        Long-press a playlist to <b>✎ Rename</b> or <b>🗑 Delete</b> it. Tune in <a href="#radio">internet radio</a>
-       streamed straight to your phone, and <strong>sign in right on the phone</strong>. The <em>Desktop site</em>
-       link switches that browser to the full desktop UI and keeps it there; open <code>/?ui=mobile</code> to
-       switch that browser back to the phone page (opening <code>/m</code> shows it without changing which page <code>/</code> opens). <a href="#cast">Casting</a> is reachable from the
-       mobile mini-player too (<span class="badge beta">Beta</span>).</p>
+       streamed straight to your phone, and <strong>sign in right on the phone</strong>. On an iPad or another large
+       display (both sides at least 428&nbsp;px — also the largest phones held upright), the top bar's
+       <b>Desktop site</b> key switches that browser to the desktop interface and keeps it there; on a smaller phone
+       the key isn't shown. On the desktop interface of a phone or tablet, or in a browser switched to the desktop interface,
+       the header's <b>📱</b> button (<em>Phone &amp; iPad interface</em>) switches back to the phone page and keeps it
+       there; opening <code>/?ui=mobile</code> or <code>/?ui=desktop</code> does the same. In a window 900&nbsp;px wide or less the desktop
+       top bar keeps search and the gear (and 📱 on a touch screen), <b>Save search</b> shows as ⚡, and its <b>⋯</b>
+       menu holds the account (with <b>Sign out</b>), <b>Welcome &amp; tips</b>, the <b>User guide</b> and <b>Find music</b>;
+       at 600&nbsp;px or less <b>Save search</b> is in that menu too. A computer with a mouse or
+       trackpad starts on the desktop interface, also with a touch screen. Opening <code>/m</code> shows the phone
+       page without changing which interface <code>/</code> opens. <a href="#cast">Casting</a> is reachable from the
+       mobile mini-player too, and from Now&nbsp;Playing's <b>Cast</b> key where the mini-player steps aside (<span class="badge beta">Beta</span>).</p>
+    <p id="mobile-search">Under the phone's search field, keys choose where the words you type are looked for:
+       <b>All</b>, <b>Title</b>, <b>Artist</b>, <b>Album</b>, <b>Genre</b> or <b>Game</b> (the chosen key's lamp
+       lights). With <b>Artist</b>, <code>vnv nation</code> finds the same tracks as typing
+       <code>artist:"vnv nation"</code>; the field keeps what you typed, and a name with quotes, a colon or a comma
+       works as typed. Changing the key searches again at once, and the number of matches names the field. With
+       one of these keys the matches list best match first for your words in that field: with <b>Title</b>,
+       <code>space</code> lists the title “Space” before “Lost in Space”, and both before “Spacebaby”; with
+       <b>Artist</b>, <code>beek</code> lists the artist or album artist Beek before “Tron Beekveld Erwin”. Equal
+       matches list newest first. Filters alone, without words, list newest first.
+       <a href="#search-options">Field operators</a> you type still work and combine with the key, which applies to
+       the other words; a word starting with <code>-</code> still leaves matches out. <b>Filters</b> opens a panel of
+       filters: year (a decade, or From / To), format (a family or one of your library's formats), when the track
+       was added, rating and length, plus SID chip, channels and multi-tune files when your library has retro
+       formats. Each filter shows as a key under the field — tap it to remove that filter, or <b>Clear filters</b>
+       to remove them all — and a filter searches on its own too, without words. The <b>×</b> in the field clears
+       the words. Tapping a key while you type keeps the keyboard up; the Search key on the keyboard shows the
+       results. The page remembers the chosen key and the filters on that device.</p>
+    <p>The phone page always has the <b>Retro hi-fi</b> look, in every view; the <a href="#ui-style">Style</a> switch
+       of the desktop page doesn't change it. The page is one hi-fi component: the top bar is a metal plate with the
+       view's name on a display, the tab bar a row of keys whose lamp lights for the view you are in, and the
+       mini-player a strip with the title on a display and Play, Next and Cast keys (Play's lamp lights while a
+       track plays, Cast's while you cast; the position runs as an amber light bar). Lists — tracks, albums, playlists, search results,
+       the queue and the stations — are lines printed on a cassette insert; the playing line is lit amber. The
+       Library's All / Artists / Albums … choices and Radio's ★&nbsp;Favorites / Scene / Browse are keys with lamps,
+       the search field is a display, and messages (loading, nothing found, an error in red) show on a display
+       too. The <em>Queue</em> starts with a <b>tape counter</b> of the time the queue still plays (a <b>+</b> when
+       a length isn't known or more tracks follow). <em>Radio</em> shows the station that plays on a tuner display —
+       LIVE or PAUSE, its format, a dial whose needle stands at its place in the list — with Play/Pause and Stop
+       keys, and your first eight favourites as numbered <b>preset keys</b> (they show with Scene and Browse; on
+       Favorites the list itself is your favourites). Settings is a panel with lamps for the
+       server and the folders, and switches with a lamp for the on/off choices; the gear key stays pressed while
+       Settings is open. The long-press menu and the cast
+       picker slide up as a plate of keys. The page follows your device's light or dark mode (light: a silver plate
+       and a cream insert; the displays stay dark). With reduced motion the loading light stands still, the dial
+       needle jumps instead of sweeping and the keys don't move when pressed.</p>
+    <p>Now&nbsp;Playing shows a portable cassette player: the cover is the cassette's label, the reels
+       in its window turn while a track plays and the tape winds from one reel to the other as it runs; the title,
+       artist and PLAY / PAUSE / STOP, SHUF and RPT sit on a display, the time on two small windows beside the
+       position slider (<b>● LIVE</b> for a station), and Play, Shuffle and Repeat are keys whose lamp lights while
+       they are on. With reduced motion the reels stay still. Turned sideways, the cassette sits beside the
+       controls. On a phone the mini-player steps aside while Now&nbsp;Playing is open — the cassette and the
+       meter display get its room — and a <b>Cast</b> key joins Shuffle and Repeat (its lamp lights while you cast);
+       the mini-player is back as soon as you press another tab key. Where the page is at least 428&nbsp;px wide and
+       428&nbsp;px tall — the largest phones and an iPad — the mini-player stays, with its own Cast key.</p>
+    <p id="mobile-meters">Under the cassette, Now&nbsp;Playing has a <strong>meter display</strong>. <b>Meter</b> shows one LED
+       column per voice for a tracker module, SID, chiptune, Amiga, Atari or PSF tune, numbered by voice, with a
+       peak segment held above each column (until the tune's per-voice levels are ready it shows a spectrum and
+       says so), and two needle meters, left and right, for any other audio (MP3, FLAC, …). <b>Spectrum</b> shows a
+       bar per octave band (third-octave bands on a wide screen) with peaks, and <b>Scope</b> shows the waveform as
+       an oscilloscope trace. <strong>Tap the display</strong> to step to the next one, or tap a legend above it —
+       <b>METER</b>, <b>SPECTRUM</b>, <b>SCOPE</b> — to pick that one (the lit legend is the one that's on; tapping it
+       steps to the next); <strong>touch and hold</strong> the display to pick one from a list or to <b>Turn meters off</b>
+       (a <em>Meters off</em> key then takes its place; tap it to turn them back on). The <b>PEAK</b> lamp lights on the
+       loudest moments (with the needle meters, each meter face has its own) and the counter beside it counts like a cassette deck's. The display remembers your pick on
+       that device. The position slider shows the track's waveform, the played part lit; the display line names
+       the format (<b>LIVE</b> for a station), and the reels turn at a cassette's speed, the emptier reel faster. A
+       station shows the needle meters, the spectrum and the scope too: while the meters are on, it plays through your
+       server so they can follow it; with them off it plays straight from the station's server, and turning them on
+       or off tunes it in again (a moment's break; a paused station when it plays on). On an iPhone or iPad (and in
+       Safari) this is for MP3 and AAC stations; any other station, and one SoniqBoom's server can't play, shows
+       the meters at rest and says there is no level reading. With reduced motion the display
+       shows a still reading instead of moving. Sideways on a phone the display sits beside the title, with only its lit legend
+       showing; on an iPad (at <code>/m</code>) it is larger, and beside the cassette and controls when the iPad is held
+       sideways.</p>
+    <p>Every key and line is at least 44&nbsp;px tall for a finger, and so is the position slider's touch area. Opened at <code>/m</code> on an iPad (or any screen at least
+       700&nbsp;px wide and 600&nbsp;px tall), the page uses the room: the keys carry their label beside the symbol, track lists show the
+       album as a column, Settings and the stations take two columns (the stations three on a wide screen) and all eight
+       presets sit on one row. Held sideways — an iPad or a phone — the tab keys stand in a column on the left, so
+       the lists keep their height.</p>
+    <div class="fig-2" style="max-width:640px;margin:28px auto">
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/32-mobile-library-retro.png" alt="The phone page's Library: the top bar with LIBRARY on a display, the All / Artists / Album Artists keys with the All lamp lit, the tracks as lines on a cassette insert with the playing one lit amber, the mini-player strip and the row of tab keys"></div>
+        <figcaption>The Library on the phone.</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/33-mobile-radio-retro.png" alt="The phone page's Radio: a tuner display with the playing station, LIVE, its format and a dial with a red needle, Pause and Stop keys, eight numbered preset keys, the Favorites / Scene / Browse keys and the stations as lines on the insert"></div>
+        <figcaption>Radio: the tuner and the preset keys.</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/34-mobile-queue-retro.png" alt="The phone page's Queue: a tape counter with the time left, the number of tracks and a Clear key, then the numbered tracks with the playing one lit"></div>
+        <figcaption>The queue with its tape counter.</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/36-mobile-nowplaying-retro.png" alt="The phone page's Now Playing: a portable cassette player with the reels in the cassette's window, the meter display with one LED column per voice of a tracker module under the METER, SPECTRUM and SCOPE legends, a display with PLAY, the format and the title, time windows beside the waveform in the position slider, Previous, Play and Next keys, and Shuffle, Repeat and Cast keys with lamps above the tab keys"></div>
+        <figcaption>Now&nbsp;Playing — a portable cassette player with the meter display.</figcaption>
+      </figure>
+    </div>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/35-mobile-ipad-retro.png" alt="The phone page on an iPad held sideways: the tab keys in a column on the left, the Library with an album column, the mini-player strip along the bottom"></div>
+      <figcaption>The same page on an iPad held sideways — the tab keys in a column, the album as a column of the list.</figcaption>
+    </figure>
+    <div class="fig-2 fig-lp" style="margin:28px auto">
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/37-ipad-nowplaying-meters.png" alt="Now Playing on an iPad held sideways: the cassette player, the title display, the waveform position slider and the keys on the left, and the meter display on the right with a tall LED column per voice of a 10-channel Impulse Tracker module, peak segments held above them"></div>
+        <figcaption>Now&nbsp;Playing on an iPad held sideways — an LED column per voice of a tracker module.</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/38-ipad-nowplaying-spectrum.png" alt="Now Playing on an iPad held upright: the cassette player, under it the spectrum analyser with a bar per octave band and peak marks, the title display, the waveform position slider and the keys"></div>
+        <figcaption>Held upright, with the spectrum analyser.</figcaption>
+      </figure>
+    </div>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
         <img src="img/14-mobile.png" alt="The SoniqBoom desktop UI in a narrow phone-width browser, showing the track list and the player transport"></div>
-      <figcaption>The <b>desktop UI at phone width</b> — what an iPad, or a browser switched to the <em>Desktop site</em>, shows.</figcaption>
+      <figcaption>The <b>desktop UI at phone width</b> — what a phone shows when opened with <code>/?ui=desktop</code>.</figcaption>
     </figure>
     <h3>Take it offline</h3>
     <p>In the desktop player, press the <b>⤓ download button</b> in the player toolbar to keep the current track in
@@ -1103,8 +1559,13 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        no download button.)</p>
     <figure>
       <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/21-transport.png" alt="The player toolbar with the new controls: radio, download for offline, equalizer, more-like-this, lyrics, cast, playlists and queue"></div>
-      <figcaption>The <b>player toolbar</b> — radio 📻, offline download ⤓ and more-like-this ◆ sit beside shuffle, repeat and EQ.</figcaption>
+        <img src="img/21-transport.png" alt="The player bar in the Modern style: the cover, title and artist, the transport keys, the waveform seek bar, and the toolbar with shuffle, repeat, radio, download for offline, equalizer, lyrics, now playing, cast, playlists and queue, with a level bar for each channel of the playing module behind it"></div>
+      <figcaption>The <b>player toolbar</b> — radio 📻 and offline download ⤓ sit beside shuffle, repeat and EQ.</figcaption>
+    </figure>
+    <figure>
+      <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+        <img src="img/21b-transport-retro.png" alt="The player bar in the Retro hi-fi style playing an MP3: the title and artist on a display, twin L and R needle meters either side of the metal transport keys, time counters beside an amber waveform, the toolbar as metal keys with lamps and a VOL fader"></div>
+      <figcaption><b>Retro hi-fi</b>: an MP3 playing, with L and R needle meters beside the transport keys (a tracker or chip tune shows an LED column per channel in the title display instead).</figcaption>
     </figure>
 
     <p>Multi-user accounts and roles, last.fm and ListenBrainz scrobbling, and a light/dark theme are all built
@@ -1116,7 +1577,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <h2 class="sec"><span class="num">13</span>Manage your library &amp; users</h2>
     <p class="sec-sub">Add network shares, keep the index fresh, back up your data, and decide who can do what — all from the admin panel (gear icon, top-right).</p>
 
-    <h3>Add a network share — FTP, SMB or WebDAV</h3>
+    <h3>Add a network share — FTP, SMB, WebDAV or a web folder</h3>
     <p>In the admin panel's <strong>Music Folders</strong> section, switch from <em>Local Path</em> to the
        <strong>Network Share</strong> tab and pick a protocol:</p>
     <table>
@@ -1125,6 +1586,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
         <tr><td><strong>SMB</strong></td><td>Host, share name and path — with a username and password, or tick <em>Guest access</em>.</td></tr>
         <tr><td><strong>FTP</strong></td><td>Host and remote path — with a username and password, or tick <em>Anonymous</em>.</td></tr>
         <tr><td><strong>WebDAV</strong> (http / https)</td><td>A base URL — the server itself (<code>https://dav.example.com</code>) or a folder on it (<code>https://cloud.example.com/remote.php/dav/files/USERNAME/Music</code>) — with a username and password, or tick <em>Public (no auth)</em>.</td></tr>
+        <tr><td><strong>Web folder</strong> (http / https listing)</td><td>The URL of a folder whose files a web server lists on a page (an Apache, nginx, lighttpd or Caddy folder listing, <code>python -m http.server</code>) — with a username and password if the server asks for them, or tick <em>Public (no auth)</em>. SoniqBoom reads it: it lists the folders and files that page links to on the same server and downloads the files it plays.</td></tr>
       </tbody>
     </table>
     <p>Add an optional alias, click <strong>Test</strong> to check the connection, then <strong>+ Connect</strong> —
@@ -1165,6 +1627,11 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        holds nothing SoniqBoom plays leaves the library as soon as that is known: playing it (or opening its Track
        Info) says what it holds instead — an Amiga or PC program, a disk image or archive in a format SoniqBoom doesn't
        open — and its playlist entries are kept. An archive that can't be opened is marked <b>corrupt</b>.</p>
+    <p>A tune of an online collection that is also a file in your folders or shares — the same file, known by its
+       checksum (from Modland's checksum list, the HVSC song database, or the tune's own download once it has
+       played) — is one tune with two copies: your copy is the one shown first in <b>Duplicates</b> and the one kept
+       when duplicate copies are hidden, and playing the collection's entry plays your copy, with nothing
+       downloaded.</p>
 
     <h3 id="modland">Modland</h3>
     <p>Switch on <strong>Modland catalogue</strong> and SoniqBoom
@@ -1484,17 +1951,31 @@ bash setup-admin.sh -user bob -disable                                 <span cla
       <div class="card"><span class="ico">📦</span><h4>Game names from archive names</h4><p>In <strong>gear → Metadata → Game names from archive names</strong>, <em>Game from archive names</em> (on by default) names a retro track's game after its archive when the archive's name is a known game of the track's platform, from the included title lists (Wikidata, No-Intro, the MAME software lists, ZXDB) and your HVSC copy. <strong>Download TOSEC</strong> and <strong>Download Redump</strong> add more titles on request. It applies right away and after each scan; turning it off removes only the names it added.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Retro genres</h4><p>A retro track whose file names no genre is listed under the genres SoniqBoom knows for it: what it is — <em>Game</em>, <em>Demo</em>, <em>Cracktro</em>, <em>Music Disk</em>, <em>Diskmag</em> or <em>Scene</em> — and its platform — <em>SID</em>, <em>Amiga</em>, <em>Atari ST</em>, <em>NES</em>, <em>SNES</em>, <em>Game Boy</em>, <em>Mega Drive</em>, <em>PlayStation</em>, <em>ZX Spectrum</em>, <em>AdLib</em>, <em>MIDI</em> and more. They come from the track's game (from any of its game sources), console-rip formats, Demozoo (the demo, cracktro, music disk, diskmag or game released the same year that uses the tune, and the party competition it entered — to add these, use <strong>Download / refresh index</strong> and then <strong>Apply to library</strong> in <strong>gear → Metadata → Scene groups (Demozoo)</strong>), its composer's Demozoo group, HVSC's <em>GAMES</em> and <em>DEMOS</em> folders and folder names such as <em>games</em>, <em>demos</em>, <em>intros</em>, <em>cracktros</em>, <em>musicdisks</em> or <em>parties</em> inside a music folder. In <strong>gear → Metadata → Retro genres</strong>, <em>Game and group names as genres</em> (on by default) also adds the game, the composer's scene groups and the party, so a Subsonic app can browse a game's or a group's tunes by genre; a large library then lists many more genres. A genre in the file's own tags (other than the format words SoniqBoom adds, such as <em>Chiptune</em> or <em>C64</em>), or one you type in Track Info, replaces them. Track Info, the Genres view, genre search (<code>genre:Cracktro</code>) and Subsonic apps list them: an app shows the first one as the song's genre and all of them where it shows several.</p></div>
       <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), turn <em>Use folder art</em> on or off and choose which filenames count as folder art, and toggle ZIP-archive scanning — <em>Scan ZIPs</em> for local folders and <em>Scan ZIPs on remote shares</em> for archives on FTP, SMB and WebDAV shares.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p><p><em>Tracks that can't be played</em> decides what happens to tracks marked <b>can't play</b> (refused the same way twice by their player), <b>corrupt</b> (no engine can decode them) or <b>broken</b> (reported by a listener) — see <a href="#playing">Playing music</a>. Tracks marked <b>glitched</b> or <b>partial</b> still play, and this setting never hides them. <strong>Mark them</strong> (the default) lists them with their badge; <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you open list them, marked; from there a track can still be played or its mark cleared. Either way shuffle, Instant Mix, More like this and the next track skip them, and a track you click still tries to play. While <em>Hide duplicates in search</em> is on, Hide lists a duplicate whose best copy can't be played by the best copy that can — or, when no copy can play right now, by a copy that is listed (one on a drive that isn't connected, marked offline). Open pages update by themselves when the setting changes or a track is marked or its mark is cleared. Both settings can hide at once: a track is left out when either one hides it. The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
+      <div class="card" id="ui-style"><span class="ico">📻</span><h4>Style</h4><p>The equalizer, the Stations view, Playlists, the queue, the player bar, Track Info, the lyrics panel, the full-width visualizer, and the large now-playing cover share one look: <b>Modern</b> or <b>Retro hi-fi</b>, which is the look until you choose one. The <b>Style</b> switch in the equalizer, or <b>Style</b> under <strong>gear → System → Settings</strong> (accounts without admin rights: <strong>gear → Preferences</strong>), changes them all at once, and this browser keeps the choice — other open SoniqBoom tabs switch along. Both looks come in the light and the dark theme. The <a href="#apps">phone page</a> is always Retro hi-fi; this switch doesn't change it.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Dark is the default. Switch to light under <strong>gear → System → Settings → Theme</strong> and press <strong>Save Settings</strong> (accounts without admin rights: <strong>gear → Preferences → Theme</strong>, then <strong>Save</strong>); the choice is saved in this browser. The phone page follows your device's light or dark mode.</p></div>
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and Amiga, HVL, SC68 and PSF tracks show their length once they have played; AdLib and console chiptune rows still learn their length in the background. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. <strong>gear → Renderers → Transcode &amp; render cache</strong> shows how full it is and how much each kind of format takes. Set <em>Cache size (MB)</em> from 256&nbsp;MB to 100&nbsp;GB and press <strong>Apply</strong> — a lower size removes the least recently used entries at once. <strong>Clear transcoded only</strong> frees converted files (DSD, ALAC, AIFF …) and keeps the retro renders; <strong>Clear all conversion cache</strong> empties it.</p></div>
       <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing. On the server (from inside the SoniqBoom folder), <code>.venv/bin/soniqboom fetch-ffmpeg</code> downloads that ffmpeg too (<code>--force</code> downloads it again even when it is current); restart SoniqBoom afterwards.</p><p>If a renderer is installed somewhere SoniqBoom doesn't look, give its full path under <strong>gear → Renderers → Renderer binaries</strong> (uade123, gme, adplay, psgplay, sc68, zxtune123) and press <strong>Save paths</strong>; leave a field empty to find it automatically. The paths of sidplayfp, fluidsynth and openmpt123 go in <code>SoniqBoom.conf</code> under <code>renderers</code> (<code>sidplayfp_path</code>, <code>fluidsynth_path</code>, <code>openmpt123_path</code>).</p></div>
       <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — tracks, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later with <code>soniqboom import</code>. Back up the data folder too, for user accounts and Subsonic app state, and <code>SoniqBoom.conf</code> for your shares and admin settings (see <a href="#manage">Back up &amp; restore</a>).</p></div>
-      <div class="card"><span class="ico">🎚️</span><h4>This browser's preferences</h4><p>Some settings are kept per browser: <em>Crossfade</em>, <em>Preload buffer</em> (wait until this many seconds are buffered before a track starts), <em>“Converting…” notice delay</em> (how long a conversion may take before the notice shows), <em>Let shuffle repeat tracks you've heard</em>, <em>Sync the play queue across devices</em>, the visualization switches and <em>Theme</em>. Admins find them under <strong>gear → System → Settings</strong>; for other accounts the gear opens <strong>Preferences</strong> with the same choices, plus the account's Subsonic app password and API keys.</p></div>
-      <div class="card"><span class="ico">✨</span><h4>Visualizations</h4><p>Under <strong>gear → System → Settings → Visualizations</strong>: <em>Enable visualizations</em> switches every animation on or off; <em>Now-playing</em> turns the player's VU meters, the signal chain and the full-width visualizer (its CRT scope included) on or off; <em>Admin diagnostics</em> the animated views in the admin panel; <em>VU meter style</em> picks <em>Bars</em> or <em>Circuit board</em>. <em>Play SID in browser</em> (experimental) also renders C64 tunes in this browser to drive their per-voice meter — playback still streams from the server. These choices apply at once to this device. Accounts without admin rights find them in <strong>gear → Preferences</strong> as <em>Visualizations</em>, <em>Now-playing visualizations</em>, <em>VU meter style</em> and <em>Play SID in browser (experimental)</em>, applied when you press <strong>Save</strong>. When your system asks for reduced motion, animations stay still.</p></div>
+      <div class="card"><span class="ico">🎚️</span><h4>This browser's preferences</h4><p>Some settings are kept per browser: <em>Crossfade</em>, <em>Streaming quality</em> (below), <em>Preload buffer</em> (wait until this many seconds are buffered before a track starts), <em>“Converting…” notice delay</em> (how long a conversion may take before the notice shows), <em>Let shuffle repeat tracks you've heard</em>, <em>Sync the play queue across devices</em>, the visualization switches and <em>Theme</em>. Admins find them under <strong>gear → System → Settings</strong>; for other accounts the gear opens <strong>Preferences</strong> with the same choices, plus the account's Subsonic app password and API keys.</p></div>
+      <div class="card"><span class="ico">✨</span><h4>Visualizations</h4><p>Under <strong>gear → System → Settings → Visualizations</strong>: <em>Enable visualizations</em> switches every animation on or off; <em>Now-playing</em> turns the player's VU meters, the signal chain and the full-width visualizer (its CRT scope included) on or off; <em>Admin diagnostics</em> the animated views in the admin panel; <em>VU meter style</em> picks <em>Bars</em> or <em>Circuit board</em> (the Retro hi-fi style shows LED columns and needle meters instead). <em>Play SID in browser</em> (experimental) also renders C64 tunes in this browser to drive their per-voice meter — playback still streams from the server. These choices apply at once to this device. Accounts without admin rights find them in <strong>gear → Preferences</strong> as <em>Visualizations</em>, <em>Now-playing visualizations</em>, <em>VU meter style</em> and <em>Play SID in browser (experimental)</em>, applied when you press <strong>Save</strong>. When your system asks for reduced motion, animations stay still.</p></div>
+      <div class="card"><span class="ico">📶</span><h4>Streaming quality</h4><p>To use less data, for example on a phone on mobile data, set <em>Streaming quality</em> in this browser (<strong>gear → System → Settings</strong>, <strong>gear → Preferences</strong>, or <strong>Settings → Playback</strong> on the phone page): <em>Original</em> (the default) plays every file as it is; <em>High</em>, <em>Normal</em>, <em>Low</em> and <em>Data saver</em> cap music files at 320, 192, 128 or 96&nbsp;kbps: a file above the rate is converted — a lossless or AAC file to MP3, an MP3 or Ogg file in its own format — and a file at or below it plays as it is. Retro tunes, internet radio, tracks downloaded for offline listening and multi-room rooms are not converted. The setting applies from the next track. A track starts at once while the server converts it; a seek to a part not loaded yet waits a moment for the conversion (the <em>Converting…</em> notice shows — its × calls off the seek), and later plays and seeks use the converted file.</p></div>
       <div class="card"><span class="ico">🌐</span><h4>Scene groups (Demozoo)</h4><p>In <strong>gear → Metadata → Scene groups (Demozoo)</strong>, <strong>Download / refresh index</strong> (about 192&nbsp;MB) and then <strong>Apply to library</strong> match each retro composer's name and scene handle against Demozoo and add their scene groups, release years and composers (a name that matches more than one scener is left alone). <strong>Reset enrichment</strong> removes what it added and keeps your own edits; <em>Re-apply automatically after each library scan</em> keeps new tracks covered.</p></div>
       <div class="card"><span class="ico">📜</span><h4>Logs</h4><p>The <strong>gear → Log</strong> tab shows the end of the server log (pick how many lines, or tick <em>Auto-refresh</em>). How much is logged is set under <strong>System → Logging</strong>: <em>Application log</em> (<em>Errors &amp; warnings</em>, <em>Normal</em> or <em>Verbose</em>) and <em>HTTP access log</em> (<em>Off</em>, <em>Problems only</em> or <em>All requests</em>) — both apply at once. The log itself is <code>log/soniqboom.log</code> in the data folder (<code>/data/log</code> in Docker).</p></div>
       <div class="card"><span class="ico">🧹</span><h4>Disk, caches &amp; restart</h4><p><strong>gear → System</strong> shows how much disk the library data, art cache, SoundFonts and remote cache use, and its <strong>Cache Management</strong> buttons empty the art, waveform, aggregation, remote, ZIP-extract and lyrics caches. The ZIP-extract cache holds up to 2&nbsp;GB; to change that, set <code>"zip_extract_cache_max_mb"</code> (in megabytes) in <code>SoniqBoom.conf</code> and restart the server. <strong>Restart SoniqBoom</strong> restarts the server; everyone using the web app stays signed in. <strong>About</strong> shows the version you run, with a link to its source code.</p></div>
+    </div>
+    <div class="fig-2">
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/01-library.png" alt="The library view in the Modern style: All Tracks with format labels, and the player bar playing a tracker module with a level bar for each channel"></div>
+        <figcaption><b>Modern</b> — the library and the player bar.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><div class="chrome"><i></i><i></i><i></i></div>
+          <img src="img/01b-library-retro.png" alt="The same view in the Retro hi-fi style: the oscilloscope as a faint amber trace across the track list, and the player bar with metal keys, an amber waveform and an LED column for each channel in the title display"></div>
+        <figcaption><b>Retro hi-fi</b> — the same view in the other style.</figcaption>
+      </figure>
     </div>
   </section>
 
@@ -1506,7 +1987,8 @@ bash setup-admin.sh -user bob -disable                                 <span cla
     <p>The message says why. Usually its renderer isn't installed (or, after a system upgrade, no longer runs):
        re-run <code>bash install.sh</code> (it installs them all), or install the one package SoniqBoom names in the
        error — <code>sidplayfp</code>, <code>fluidsynth</code>, <code>libopenmpt</code>, <code>uade</code>,
-       <code>libgme</code>, <code>adplay</code>, <code>psgplay</code>, <code>sc68</code> or <code>zxtune123</code>.
+       <code>libgme</code>, <code>adplay</code>, <code>psgplay</code>, <code>sc68</code>, <code>zxtune123</code> or
+       <code>kssrender</code>.
        The HivelyTracker (<code>.hvl</code>) and StSound (Atari&nbsp;ST <code>.ym</code>) engines are built the first
        time such a tune plays; outside Docker that needs a C compiler (HivelyTracker) and a C++ compiler (StSound). A tune that needs a file beside it — an AdLib instrument bank, a PSF rip's
        library file — names the missing file; a damaged file, or a tune that renders nothing but silence, says so.
@@ -1526,7 +2008,10 @@ bash setup-admin.sh -user bob -disable                                 <span cla
        the setting later doesn't change SIDs already in the library.</p>
     <h3>MIDI sounds thin or silent</h3>
     <p>Install or select a SoundFont in <a href="#settings">Settings</a>; MIDI is synthesised from the active
-       <code>.sf2</code> or <code>.sf3</code> bank, and without one a MIDI file reports <em>No soundfont available</em>.</p>
+       <code>.sf2</code> or <code>.sf3</code> bank, and without one a MIDI file reports <em>No soundfont available</em>.
+       When the chosen SoundFont is on a drive that isn't connected (or was moved), a MIDI file doesn't play with
+       another one: it says <em>The chosen SoundFont “…” can't be found</em>, and <strong>gear → Renderers →
+       Soundfonts</strong> says so above the list — reconnect the drive, or choose another SoundFont there.</p>
     <h3>I'm locked out / forgot the admin password</h3>
     <p>After 15 failed sign-ins within 15 minutes, an account is locked for 15 minutes and the sign-in page says
        <em>Too many failed attempts</em> — wait, then try again. To reset a forgotten password, run this on the server

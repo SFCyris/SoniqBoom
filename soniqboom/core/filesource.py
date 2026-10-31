@@ -134,7 +134,7 @@ def scan_root_for_share(share: dict) -> str:
         return f"smb://{host}/{share['share']}"
     if proto == "ftp":
         return f"ftp://{host}{share.get('remote_path', '/')}"
-    if proto in ("webdav", "webdavs", "http", "https"):
+    if proto in ("webdav", "webdavs", "http", "https", "httpindex"):
         return share.get("base_url") or (
             f"{'https' if proto in ('webdavs', 'https') else 'http'}://"
             f"{host}{share.get('remote_path', '/')}"
@@ -175,7 +175,7 @@ def share_endpoint(share: dict) -> tuple[str, str, int]:
     """``(protocol, host, port)`` of the server a configured share lives on —
     shares with the same endpoint share its reachability."""
     proto = (share.get("protocol") or "").lower()
-    if proto in ("webdav", "webdavs", "http", "https"):
+    if proto in ("webdav", "webdavs", "http", "https", "httpindex"):
         from urllib.parse import urlsplit
         url = scan_root_for_share(share)
         parts = urlsplit(url)
@@ -2516,19 +2516,12 @@ def _build_ftp_factory(host: str, port: int, username: str, password: str,
     return _factory
 
 
-def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]:
-    """Compute the effective pool size for ``host:port``.
-
-    Returns ``(max_size, min_size, configured_total, detected_cap)``:
-      * ``max_size`` — what we'll actually use for the pool
-      * ``min_size`` — warm-min floor (capped to max)
-      * ``configured_total`` — scan_budget + stream_budget the user asked for
-      * ``detected_cap`` — the learned server cap, or None if not yet learned
-
-    The clamp rule: if a detected cap exists, ``max_size = min(configured,
-    detected - 1)`` — minus-1 reserves a slot for occasional probes /
-    health checks without tripping the limit.
-    """
+def ftp_lane_budgets(host: str, port: int) -> tuple[int, int, int]:
+    """``(scan, stream, browse)`` connection budgets configured for the FTP
+    server ``host:port``: the canonical ``conf["ftp_pools"]["host:port"]``
+    entry, else a legacy per-share ``ftp_pool`` field of a share on that
+    server, else the ``_FTP_POOL_*_DEFAULT`` values.  Each is at least 1.
+    The detected server cap is not applied here (``_resolve_pool_size``)."""
     # Pool config storage is keyed by ``host:port`` — NOT per-share —
     # because the actual ``_FTPConnectionPool`` registry is keyed by
     # ``(host, port, user, pass, encoding)``.  Six shares on the same
@@ -2590,6 +2583,23 @@ def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]
                     pass
             break
 
+    return scan_budget, stream_budget, browse_budget
+
+
+def _resolve_pool_size(host: str, port: int) -> tuple[int, int, int, int | None]:
+    """Compute the effective pool size for ``host:port``.
+
+    Returns ``(max_size, min_size, configured_total, detected_cap)``:
+      * ``max_size`` — what we'll actually use for the pool
+      * ``min_size`` — warm-min floor (capped to max)
+      * ``configured_total`` — scan_budget + stream_budget the user asked for
+      * ``detected_cap`` — the learned server cap, or None if not yet learned
+
+    The clamp rule: if a detected cap exists, ``max_size = min(configured,
+    detected - 1)`` — minus-1 reserves a slot for occasional probes /
+    health checks without tripping the limit.
+    """
+    scan_budget, stream_budget, browse_budget = ftp_lane_budgets(host, port)
     configured_total = scan_budget + stream_budget + browse_budget
 
     # Detected cap (auto-learned).  Clamp configured total to (cap - 1)
@@ -3775,6 +3785,14 @@ def create_source(share: dict, password: str = "") -> FileSource:
             host=share["host"], username=share.get("username", ""),
             password=password, port=share.get("port") or 21,
             remote_path=share.get("remote_path", "/"),
+        )
+    elif proto == "httpindex":
+        # A web server's folder listing (autoindex): read-only, no WebDAV.
+        from soniqboom.core.filesource_http import HTTPIndexFileSource
+        src = HTTPIndexFileSource(
+            base_url=scan_root_for_share(share),
+            username=share.get("username", ""), password=password,
+            verify_ssl=bool(share.get("verify_ssl", True)),
         )
     elif proto in ("webdav", "webdavs", "http", "https"):
         # WebDAV / Nextcloud / ownCloud / generic HTTP mounts.  Imported

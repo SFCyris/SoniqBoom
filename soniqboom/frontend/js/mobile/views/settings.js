@@ -3,7 +3,8 @@
 
 /**
  * settings.js — Mobile settings: server health, scan dirs (read-only) and the
- * browser-local playback preference.  Use the desktop UI at `/` for admin actions.
+ * browser-local playback preferences.  Use the desktop UI at `/` for admin
+ * actions.  (The phone page is always Retro hi-fi: no Style switch here.)
  */
 import { esc } from './_common.js';
 import { Player } from '../../player.js';
@@ -21,9 +22,9 @@ export function mountSettings(root, ctx) {
       <div class="m-settings-section">
         <h3>Server</h3>
         <div class="m-settings-card" id="m-set-server">
-          <div class="m-settings-row"><span class="label">Status</span><span class="value" id="set-status">Loading…</span></div>
-          <div class="m-settings-row"><span class="label">Version</span><span class="value" id="set-version">—</span></div>
-          <div class="m-settings-row"><span class="label">Tracks</span><span class="value" id="set-tracks">—</span></div>
+          <div class="m-settings-row"><span class="label">Status</span><span class="value m-set-lamp" id="set-status" data-state="wait">Loading…</span></div>
+          <div class="m-settings-row"><span class="label">Version</span><span class="value m-set-vfd" id="set-version">—</span></div>
+          <div class="m-settings-row"><span class="label">Tracks</span><span class="value m-set-vfd" id="set-tracks">—</span></div>
         </div>
       </div>
 
@@ -62,6 +63,14 @@ export function mountSettings(root, ctx) {
       <div class="m-settings-section">
         <h3>Playback</h3>
         <div class="m-settings-card">
+          <label class="m-settings-row" for="set-stream-quality">
+            <span class="label"><span id="set-quality-name">Streaming quality</span>
+              <small id="set-quality-hint">Less data on mobile data. Music files only — retro tunes and radio play as they are. From the next track.</small></span>
+            <select id="set-stream-quality" class="m-settings-select"
+                    aria-labelledby="set-quality-name" aria-describedby="set-quality-hint">
+              <option value="">Original</option><option value="320">High · 320 kbps</option><option value="192">Normal · 192 kbps</option><option value="128">Low · 128 kbps</option><option value="96">Data saver · 96 kbps</option>
+            </select>
+          </label>
           <label class="m-settings-row" for="set-shuffle-replay">
             <span class="label">Let shuffle repeat tracks you’ve heard
               <small>Off: each track plays once per shuffle. This browser only; takes effect the next time you turn shuffle on.</small></span>
@@ -80,7 +89,7 @@ export function mountSettings(root, ctx) {
         <div class="m-settings-card">
           <div class="m-settings-row column">
             <span class="label">Mobile UI</span>
-            <span class="value">Touch-first SoniqBoom shell. Use the desktop UI at <code>/</code> for admin actions, equalizer, and visualizer.</span>
+            <span class="value">Touch-first SoniqBoom for phones and iPads. On an iPad or another large display, the Desktop site key in the top bar opens the desktop interface (admin actions, equalizer, visualizer); there, the &#128241; Phone &amp; iPad interface button in the header comes back here.</span>
           </div>
           <div class="m-settings-row column">
             <span class="label">License</span>
@@ -105,6 +114,13 @@ export function mountSettings(root, ctx) {
   const shufReplay = root.querySelector('#set-shuffle-replay');
   shufReplay.checked = Player.shuffleReplaysPlayed;
   shufReplay.addEventListener('change', () => Player.setShuffleReplaysPlayed(shufReplay.checked));
+  const quality = root.querySelector('#set-stream-quality');
+  quality.value = Player.streamQuality;
+  quality.addEventListener('change', () => {
+    Player.setStreamQuality(quality.value);
+    ctx.toast(quality.value ? `Streaming at up to ${quality.value} kbps from the next track.`
+                            : 'Streaming the original files from the next track.');
+  });
   const qsync = root.querySelector('#set-queue-sync');
   const qsyncRow = root.querySelector('#set-queue-sync-row');
   qsync.checked = Player.queueSync;
@@ -185,6 +201,7 @@ export function mountSettings(root, ctx) {
       const d = await dRes.json();
 
       statusEl.textContent  = h.status === 'ok' ? 'Online' : 'Offline';
+      statusEl.dataset.state = h.status === 'ok' ? 'ok' : 'off';      // (its lamp)
       versionEl.textContent = h.version || '—';
       if (h.version) {   // AGPL-3.0 §13: the source of the version that is running
         root.querySelector('#set-source').href =
@@ -200,17 +217,17 @@ export function mountSettings(root, ctx) {
           // A catalogue root (Settings → Online collections) shows its name.
           const path  = dir.catalogue ? `${dir.label || dir.catalogue} catalogue` : (dir.path || '');
           const stat  = dir.status || 'ok';
-          const color = stat === 'ok' ? 'var(--accent)' : 'var(--danger)';
           return `
             <div class="m-settings-row column">
-              <span class="value" style="font-size:14px">${esc(path)}</span>
-              <span class="label" style="font-size:12px;color:${color}">${esc(stat)}</span>
+              <span class="value m-set-path">${esc(path)}</span>
+              <span class="label m-set-lamp" data-state="${stat === 'ok' ? 'ok' : 'off'}">${esc(stat)}</span>
             </div>
           `;
         }).join('');
       }
     } catch (err) {
       statusEl.textContent = 'Unreachable';
+      statusEl.dataset.state = 'off';
       console.error('Settings refresh failed', err);
     }
   }

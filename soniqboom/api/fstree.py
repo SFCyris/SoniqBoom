@@ -606,7 +606,7 @@ async def get_children(
     # Nothing indexed under this path — fall back to a live listing.  Only now
     # do we touch the filesystem (exists/is_dir + iterdir), which is the slow
     # part on a cold network mount; it covers brand-new and non-audio folders.
-    if not p.exists() or not p.is_dir():
+    if not await asyncio.to_thread(p.is_dir):          # (a stat: off the loop)
         raise HTTPException(404, f"Directory not found: {path}")
 
     children = await loop.run_in_executor(None, _children, p, r)
@@ -663,7 +663,7 @@ async def refresh_subtree(body: dict):
     # at on disk: a path outside every root gets the same 403 whether or not
     # it exists (no probing the server's file system).
     p, matched_root = await _confine_local_async(raw)
-    if not p.exists() or not p.is_dir():
+    if not await asyncio.to_thread(p.is_dir):          # (a stat: off the loop)
         raise HTTPException(404, f"Directory not found: {raw}")
 
     # One refresh per path per 30 s — back-and-forth clicking between
@@ -713,7 +713,7 @@ async def tracks_in_dir(
         _confine_remote(path)
         raise HTTPException(404, f"Directory not found: {path}")
     p, _root = await _confine_local_async(path)
-    if not p.exists() or not p.is_dir():
+    if not await asyncio.to_thread(p.is_dir):          # (a stat: off the loop)
         raise HTTPException(404, f"Directory not found: {path}")
 
     ext_set = {e.lower() for e in SUPPORTED_EXTENSIONS}
@@ -1844,7 +1844,10 @@ async def tracks_with_meta(
         return await _page(result, stable=False)
 
     p, _root = await _confine_local_async(path)
-    if not p.exists() or not p.is_dir():
+    # A folder inside an archive (the tree lists ``…/pack.zip::inner``) is no
+    # folder on disk: it is listed from the store alone, below.
+    in_archive = "::" in str(p)
+    if not in_archive and not await asyncio.to_thread(p.is_dir):   # (a stat: off the loop)
         raise HTTPException(404, f"Directory not found: {path}")
 
     from soniqboom.core.store import get_store
@@ -1896,6 +1899,8 @@ async def tracks_with_meta(
                 if filter_duplicates:
                     direct = _deduped(direct)
                 return await _page(direct)
+    if in_archive:
+        raise HTTPException(404, f"Directory not found: {path}")   # (nothing indexed in it)
     # NOTE: invalidation key is the directory's OWN mtime — not the
     # store's global ``_mutation_seq``.  The cache's job is to skip
     # re-walking THIS directory when its file set hasn't changed; the
@@ -1968,14 +1973,21 @@ async def tracks_with_meta(
         from soniqboom.core.data import get_tracks_batch
         tracks = await get_tracks_batch(track_ids)
 
-        results: list[dict] = []
+        results: list = []
+        unscanned: list[tuple[int, Path]] = []
         for tid, track in zip(track_ids, tracks):
             if track is not None:
                 d = track.model_dump(exclude={"embedding"})
                 d["_scanned"] = True
                 results.append(d)
             else:
-                results.append(_make_stub(id_map[tid]))
+                unscanned.append((len(results), id_map[tid]))
+                results.append(None)
+        if unscanned:
+            # (a stat per file — on a network drive a round trip each: off the loop)
+            stubs = await asyncio.to_thread(lambda: [_make_stub(p) for _i, p in unscanned])
+            for (i, _p), stub in zip(unscanned, stubs):
+                results[i] = stub
 
         # Stash the fully-shaped result alongside files/id_map so the
         # next revisit can skip the metadata fetch + Pydantic dump too.

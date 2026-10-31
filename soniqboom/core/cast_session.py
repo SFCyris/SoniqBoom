@@ -496,7 +496,7 @@ class CastSession:
                 is_cache_ready,
             )
             from soniqboom.core.cast_render import materialize_source
-            from soniqboom.config import settings as _settings, get_active_soundfont
+            from soniqboom.config import settings as _settings, active_soundfont_async
         except Exception:
             log.exception("cast prewarm: import of render helpers failed")
             return
@@ -581,7 +581,7 @@ class CastSession:
                             _render_sid(p, subsong=ss, duration=d),
                     )
                 elif src_ext in _MIDI_EXTS:
-                    sf = get_active_soundfont()
+                    sf = await active_soundfont_async()
                     ck = _ck(
                         track_id=item.track_id, format_type="midi",
                         soundfont_path=str(sf) if sf else "",
@@ -653,9 +653,10 @@ class CastSession:
                             _render_tracker(p, subsong=ss),
                     )
                 elif src_ext in _GME_EXTS_STREAM:
+                    from soniqboom.api.stream import _gme_variant
                     ck = _ck(
                         track_id=item.track_id, format_type="gme",
-                        subsong=_idx,
+                        subsong=_idx, variant=_gme_variant(src_ext),
                     )
                     if await is_cache_ready(ck):
                         continue

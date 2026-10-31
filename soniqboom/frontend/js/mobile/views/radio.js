@@ -5,16 +5,24 @@
  * radio.js — Mobile Internet-radio view.
  *
  * Segments: ★ Favorites / Scene / Browse (search).  Tap a station to play it;
- * tap the star to favourite / un-favourite.
+ * tap the star to favourite / un-favourite.  Above the list: the tuner — a
+ * display with the station that plays (and its play / stop keys) over a dial
+ * whose needle stands at that station's place in the list shown, and the
+ * first eight favourites as numbered preset keys.
  *
  * Playback goes through MobileRadio (radio-player.js), a dedicated <audio>
- * element: it streams the station's own URL DIRECTLY (station → phone) whenever
- * the browser can play it, sparing the server the relay hop, and falls back to
- * /api/stations/relay only when direct isn't viable (mixed content / HLS /
- * playlist wrapper) or fails at runtime.  MobileRadio's 'change'/'state' events
- * drive the mini-player and Now Playing view.
+ * element.  With the Now Playing meters on (``metersOn``) a station plays
+ * through /api/stations/relay on the element routed through the audio graph,
+ * so the meters follow it (WebKit gets the relay as a file, ``file=1`` — it
+ * hands the graph no samples of an endless stream); with them off, or when the
+ * relay can't play it, it streams the station's own URL DIRECTLY (station →
+ * phone) whenever the browser can play it, falling back to the plain relay
+ * when direct isn't viable (mixed content / HLS / playlist wrapper) or fails
+ * at runtime.  Turning the meters on or off re-tunes the playing station.
+ * MobileRadio's 'change'/'state' events drive the mini-player and Now Playing
+ * view.
  */
-import { MobileRadio } from '../radio-player.js';
+import { MobileRadio, metersOn } from '../radio-player.js';
 import { esc } from './_common.js';
 import { createStationLookup, stationQueryKey } from '../../station_lookup.js';
 
@@ -73,6 +81,27 @@ export function mountRadio(root, ctx) {
   });
 
   root.innerHTML = `
+    <div class="m-tuner" id="radio-tuner">
+      <div class="m-tuner-now" id="radio-now" hidden>
+        <div class="m-tuner-vfd m-vfd">
+          <div class="m-tuner-ann" aria-hidden="true">
+            <span class="m-tuner-state" id="radio-now-state">LIVE</span>
+            <span class="m-tuner-flag">STEREO</span>
+            <span class="m-tuner-flag" id="radio-now-codec"></span>
+          </div>
+          <div class="m-tuner-name" id="radio-now-name"></div>
+          <div class="m-tuner-dial" aria-hidden="true">
+            <span class="m-tuner-scale"><i>88</i><i>92</i><i>96</i><i>100</i><i>104</i><i>108</i></span>
+            <span class="m-tuner-needle" id="radio-needle"></span>
+          </div>
+        </div>
+        <div class="m-tuner-keys">
+          <button type="button" class="m-key m-tuner-play" id="radio-now-play" aria-label="Pause">⏸&#xFE0E;</button>
+          <button type="button" class="m-key" id="radio-now-stop" aria-label="Stop">■&#xFE0E;</button>
+        </div>
+      </div>
+      <div class="m-presets" id="radio-presets" role="group" aria-label="Preset stations" hidden></div>
+    </div>
     <div class="m-group-bar" id="radio-tabs">
       <button class="m-group-chip active" data-t="favorites">★ Favorites</button>
       <button class="m-group-chip"        data-t="scene">Scene</button>
@@ -95,6 +124,14 @@ export function mountRadio(root, ctx) {
   const emptyEl  = root.querySelector('#radio-empty');
   const loadEl   = root.querySelector('#radio-loading');
   const statusEl = root.querySelector('#radio-status');
+  const nowEl    = root.querySelector('#radio-now');
+  const nowName  = root.querySelector('#radio-now-name');
+  const nowState = root.querySelector('#radio-now-state');
+  const nowCodec = root.querySelector('#radio-now-codec');
+  const nowPlay  = root.querySelector('#radio-now-play');
+  const needle   = root.querySelector('#radio-needle');
+  const presetsEl = root.querySelector('#radio-presets');
+  let shown = [];                        // the stations the list shows (the dial's band)
   // Said to a screen reader (a live region that is always there: one that is
   // shown only with its message is not read out reliably).  Emptied first, so
   // the same message said again is read again.
@@ -107,6 +144,7 @@ export function mountRadio(root, ctx) {
     const chip = e.target.closest('.m-group-chip');
     if (!chip) return;
     tab = chip.dataset.t;
+    root.dataset.tab = tab;                // (a phone shows the presets beside the other lists only)
     [...tabsBar.children].forEach(c => c.classList.toggle('active', c === chip));
     searchWrap.classList.toggle('hidden', tab !== 'browse');
     if (tab === 'browse') {
@@ -124,6 +162,7 @@ export function mountRadio(root, ctx) {
   function showError(retry) {
     listEl.innerHTML = '';
     emptyEl.innerHTML = `Couldn’t load stations. <button type="button" class="m-retry">Retry</button>`;
+    emptyEl.dataset.kind = 'error';
     emptyEl.querySelector('.m-retry').addEventListener('click', () => { announce(''); retry(); });
     emptyEl.classList.remove('hidden');
     announce('Couldn’t load stations. Retry is below.');
@@ -131,6 +170,7 @@ export function mountRadio(root, ctx) {
 
   function search() {
     const gen = ++loadGen;
+    delete emptyEl.dataset.kind;
     const text = searchIn.value;
     const n = stationQueryKey(text).length;
     if (n < 2) {
@@ -152,6 +192,7 @@ export function mountRadio(root, ctx) {
     if (tab === 'browse') { search(); return; }
     lookup.cancel();
     const gen = ++loadGen;
+    delete emptyEl.dataset.kind;
     loadEl.classList.remove('hidden');
     emptyEl.classList.add('hidden');
     const url = tab === 'favorites' ? '/api/stations/favorites' : '/api/stations/scene';
@@ -172,6 +213,8 @@ export function mountRadio(root, ctx) {
 
   function render(stations) {
     listEl.innerHTML = '';
+    shown = stations;
+    if (tab === 'favorites') paintPresets(stations);
     if (!stations.length) {
       emptyEl.textContent = tab === 'favorites'
         ? 'No favourite stations yet — Browse or open Scene, then tap ☆ to save one.'
@@ -231,7 +274,90 @@ export function mountRadio(root, ctx) {
     listEl.querySelectorAll('.m-radio-row').forEach(r => {
       r.classList.toggle('playing', !!sid && r.dataset.sid === sid);
     });
+    presetsEl.querySelectorAll('.m-preset').forEach(k => {
+      const on = !!sid && k.dataset.sid === sid;
+      k.classList.toggle('playing', on);
+      if (on) k.setAttribute('aria-current', 'true'); else k.removeAttribute('aria-current');
+    });
+    paintTuner();
   }
+
+  // ── Tuner ───────────────────────────────────────────────────────────────
+  // The display: the station on air, LIVE / PAUSE, its codec; the
+  // needle at the station's place in the list shown (outside it: its place by
+  // name hash, so it still moves from station to station).
+  function paintTuner() {
+    const st = MobileRadio.active ? MobileRadio.station : null;
+    nowEl.hidden = !st;
+    if (!st) return;
+    nowName.textContent = st.name || 'Station';
+    const best = (st.streams || [])[0] || {};
+    nowCodec.textContent = [best.codec, best.bitrate ? `${best.bitrate}k` : ''].filter(Boolean).join(' ').toUpperCase();
+    const playing = MobileRadio.playing;
+    nowEl.dataset.state = playing ? 'live' : 'paused';
+    nowState.textContent = playing ? 'LIVE' : 'PAUSE';
+    nowPlay.textContent = playing ? '\u23F8\uFE0E' : '\u25B6\uFE0E';
+    nowPlay.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    const at = shown.findIndex((x) => x && x.sid === st.sid);
+    let f;
+    if (at >= 0) f = shown.length > 1 ? at / (shown.length - 1) : 0.5;
+    else {
+      let h = 0;
+      for (const ch of String(st.sid || st.name || '')) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+      f = (h % 1000) / 999;
+    }
+    needle.style.setProperty('--f', (0.04 + 0.92 * f).toFixed(4));
+  }
+  nowPlay.addEventListener('click', () => MobileRadio.toggle());
+  root.querySelector('#radio-now-stop').addEventListener('click', () => MobileRadio.stop());
+  MobileRadio.on('state', paintTuner);
+
+  // Preset keys: the first eight favourites (read with the Favorites tab, or on
+  // their own while another tab shows).
+  const PRESETS = 8;
+  function paintPresets(favs) {
+    const presets = (favs || []).slice(0, PRESETS);
+    presetsEl.hidden = !presets.length;
+    presetsEl.replaceChildren(...presets.map((st, i) => {
+      const k = document.createElement('button');
+      k.type = 'button';
+      k.className = 'm-preset';
+      k.dataset.sid = st.sid;
+      k.setAttribute('aria-label', `Preset ${i + 1}: ${st.name || 'Station'}`);
+      const n = document.createElement('b');
+      n.textContent = String(i + 1);
+      const name = document.createElement('span');
+      name.textContent = st.name || 'Station';
+      k.append(n, name);
+      k.addEventListener('click', () => playStation(st));
+      return k;
+    }));
+    highlightPlaying();
+  }
+  async function loadPresets() {
+    try {
+      const r = await fetch('/api/stations/favorites');
+      if (!r.ok) return;
+      const favs = await r.json();
+      if (Array.isArray(favs)) paintPresets(favs);
+    } catch (_) { /* the keys keep what they show */ }
+  }
+
+  // The meters setting the playing station was tuned for: a change made here
+  // (a tap — the audio graph may need its gesture) re-tunes a playing
+  // station; a paused one, or a change made in another tab, is tuned in again
+  // when it resumes.
+  let meteredWanted = null;
+  const _stale = () => MobileRadio.active && meteredWanted !== null
+    && metersOn() !== meteredWanted;
+  window.addEventListener('sb:viz-settings', () => {
+    if (_stale() && MobileRadio.playing) playStation(MobileRadio.station);
+  });
+  MobileRadio.onResume = () => {
+    if (!_stale()) return false;
+    playStation(MobileRadio.station);
+    return true;
+  };
 
   async function playStation(st) {
     const c = _pickStream(st);
@@ -246,6 +372,20 @@ export function mountRadio(root, ctx) {
     // is viable; a support-0 pick or a non-direct URL goes through the relay.
     const canDirect = c.support > 0 && _canPlayDirect(directUrl, c.s);
     ctx.toast(`Tuning in — ${st.name || 'station'}`);
+    meteredWanted = metersOn();
+    // WebKit's audio graph hears the relay only as a file, which it is for
+    // MP3 / AAC stations; any other one plays directly (no meters).
+    const webkit = /Apple/.test(navigator.vendor || '');
+    if (meteredWanted && (!webkit || /mp3|aac/i.test(c.s.codec || ''))) {
+      const url = relayUrl + (/Apple/.test(navigator.vendor || '') ? '&file=1' : '');
+      try {
+        await MobileRadio.play(st, url, { metered: true });
+        highlightPlaying();
+        return;
+      } catch (_) {
+        if (MobileRadio.station !== st) return;      // superseded meanwhile
+      }                                              // → as with the meters off
+    }
     try {
       await MobileRadio.play(st, canDirect ? directUrl : relayUrl);
     } catch (err) {
@@ -272,6 +412,7 @@ export function mountRadio(root, ctx) {
         });
         ctx.toast('Added to favourites');
       }
+      loadPresets();
     } catch {
       st.favorite = was;                 // rollback on failure
       btn.textContent = st.favorite ? '★' : '☆';
@@ -280,10 +421,12 @@ export function mountRadio(root, ctx) {
   }
 
   // Re-load favourites when the view is re-shown (a station favourited elsewhere).
-  root.addEventListener('viewactive', () => { if (tab === 'favorites') load(); });
+  root.addEventListener('viewactive', () => { if (tab === 'favorites') load(); else loadPresets(); });
   // Keep the active-row highlight in sync when the station changes (started,
   // switched, or stopped — from here, the mini-player, or Now Playing).
   MobileRadio.on('change', highlightPlaying);
 
+  root.dataset.tab = tab;
+  paintTuner();
   load();   // initial: favourites
 }

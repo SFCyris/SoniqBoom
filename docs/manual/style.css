@@ -176,7 +176,8 @@ figure .frame img { display: block; width: 100%; height: auto; }
 figure figcaption { margin-top: 12px; color: var(--text2); font-size: 14px; font-family: var(--mono); text-align: center; }
 figure figcaption b { color: var(--accent); }
 .fig-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-@media (max-width: 760px) { .fig-2 { grid-template-columns: 1fr; } }
+.fig-2.fig-lp { grid-template-columns: 1.44fr 0.69fr; align-items: start; }  /* a landscape + a portrait shot, same height */
+@media (max-width: 760px) { .fig-2, .fig-2.fig-lp { grid-template-columns: 1fr; } }
 
 /* ── Feature grid / cards ───────────────────────────────────────────── */
 .grid { display: grid; gap: 18px; }
@@ -291,6 +292,7 @@ hr.glow { border: none; height: 1px; background: linear-gradient(90deg, transpar
   border-left: 2px solid transparent; margin-left: -15px; transition: color .15s, border-color .15s;
 }
 .page-toc a .n { color: var(--text2); margin-right: 7px; opacity: .7; }
+.page-toc a.sub { font-size: 11px; padding: 3px 0 3px 37px; }
 .page-toc a:hover { color: var(--text0); }
 .page-toc a.active { color: var(--accent); border-left-color: var(--accent); }
 .page-toc a.active .n { color: var(--accent); opacity: 1; }

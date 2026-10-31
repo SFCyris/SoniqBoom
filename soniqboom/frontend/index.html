@@ -6,6 +6,79 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <!-- Phone / iPad interface pick, before anything else loads or paints.  The
+       server sends phones (by user agent) to /m and pins ?ui=desktop|mobile in
+       the sb_ui cookie; an iPad asks for the desktop site (a Macintosh user
+       agent), so it is told apart here — and this also runs when the service
+       worker answers / from its cache (offline), where the server can't.
+       A pinned choice (sb_ui) always wins.  Sets <html data-sb-touch> on a
+       touch-primary device and data-sb-ui-pinned="desktop" when desktop is
+       pinned: they show the header's #btn-phone-ui. -->
+  <script>
+    (function () {
+      // [ui-detect:begin] pure (no DOM) — tests/js/ui_detect.test.mjs
+      // A phone or tablet: a phone / tablet user agent, an iPad asking for the
+      // desktop site (Macintosh + multi-touch; a Mac has no touch points), or
+      // a coarse primary pointer with touch.  A touch-screen laptop's primary
+      // pointer is its trackpad / mouse (fine), so it is not one.
+      function sbTouchDevice(ua, touchPoints, coarse) {
+        ua = String(ua || '');
+        touchPoints = Number(touchPoints) || 0;
+        if (/\b(?:Android|iPhone|iPod|iPad|Mobile)\b|Opera Mini|IEMobile|FxiOS|EdgiOS/i.test(ua)) return true;
+        if (/\bMacintosh\b/.test(ua) && touchPoints > 1) return true;
+        return !!coarse && touchPoints > 0;
+      }
+      // Which interface / starts with: an explicit ?ui= first (pin = the value
+      // to store; the last ui= and any case of its value, as the server reads
+      // it), then the pinned sb_ui cookie, then the device.  stored: the
+      // cookie already holds the pin (the server set it).
+      function sbUiPick(search, cookie, touch) {
+        var re = /(?:^|[?&])ui=([^&#]*)/g, m, v = null;
+        while ((m = re.exec(String(search || '')))) v = m[1].toLowerCase();
+        var pick = (v === 'desktop' || v === 'mobile') ? v : null;
+        var c = /(?:^|;\s*)sb_ui=(desktop|mobile)(?:;|$)/.exec(String(cookie || ''));
+        var had = c ? c[1] : null;
+        var pinned = pick || had;
+        return { ui: pinned || (touch ? 'mobile' : 'desktop'), pin: pick, pinned: pinned,
+                 stored: !!pick && pick === had };
+      }
+      // The URL without its ui= (kept in the address, Back would pin it again).
+      function sbDropUi(search) {
+        var rest = String(search || '').replace(/^\?/, '').split('&')
+          .filter(function (kv) { return kv && !/^ui(?:=|$)/.test(kv); });
+        return rest.length ? '?' + rest.join('&') : '';
+      }
+      // [ui-detect:end]
+      function sbUiStart(restored) {
+        var de = document.documentElement;
+        var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+        var touch = sbTouchDevice(navigator.userAgent, navigator.maxTouchPoints, coarse);
+        var r = sbUiPick(restored ? '' : location.search, document.cookie, touch);
+        // The server pins ?ui= itself (a year); written here only for a page the
+        // worker served (a cookie written by script may be kept for less).
+        if (r.pin && !r.stored) document.cookie = 'sb_ui=' + r.pin + '; path=/; max-age=31536000; samesite=lax';
+        if (r.pin && history.replaceState) {
+          history.replaceState(history.state, '', location.pathname + sbDropUi(location.search) + location.hash);
+        }
+        if (touch) de.setAttribute('data-sb-touch', ''); else de.removeAttribute('data-sb-touch');
+        if (r.pinned === 'desktop') de.setAttribute('data-sb-ui-pinned', 'desktop');
+        else de.removeAttribute('data-sb-ui-pinned');
+        if (r.ui === 'mobile' && location.pathname === '/') {
+          de.style.visibility = 'hidden';      // no paint of this page on the way out
+          location.replace('/m');
+        } else if (restored) {
+          de.style.visibility = '';
+        }
+      }
+      try {
+        sbUiStart(false);
+        // Back / Forward to a kept copy of this page: the choice may have changed since.
+        window.addEventListener('pageshow', function (e) {
+          if (e.persisted) { try { sbUiStart(true); } catch (_) {} }
+        });
+      } catch (_) { /* no cookies / storage: stay on this page */ }
+    })();
+  </script>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="SoniqBoom">
@@ -53,10 +126,26 @@
       try {
         var t = localStorage.getItem('sb_theme');
         if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+        // The shared UI style (js/ui_style.js) before first paint: no flash of
+        // the other look.  (sb_eq.style seeds it on a first run; else Retro hi-fi.)
+        var u = localStorage.getItem('sb_ui_style');
+        if (u !== 'modern' && u !== 'retro') {
+          var q = JSON.parse(localStorage.getItem('sb_eq') || 'null');
+          u = (q && (q.style === 'modern' || q.style === 'retro')) ? q.style : 'retro';
+        }
+        document.documentElement.setAttribute('data-ui-style', u);
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=123">
+  <link rel="stylesheet" href="/assets/css/app.css?v=143">
+  <link rel="stylesheet" href="/assets/css/stations-styles.css?v=5">
+  <link rel="stylesheet" href="/assets/css/playlist-styles.css?v=2">
+  <link rel="stylesheet" href="/assets/css/player-styles.css?v=6">
+  <link rel="stylesheet" href="/assets/css/queue-styles.css?v=2">
+  <link rel="stylesheet" href="/assets/css/trackinfo-styles.css?v=4">
+  <link rel="stylesheet" href="/assets/css/lyrics-styles.css?v=2">
+  <link rel="stylesheet" href="/assets/css/visualizer-styles.css?v=4">
+  <link rel="stylesheet" href="/assets/css/frame-styles.css?v=4">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -107,8 +196,8 @@
       <div class="search-wrap">
         <input id="search-input" type="search"
                placeholder="Search… try  artist:Ghost  game:uridium  format:FLAC"
-               title='Field search: artist: album: game: album_artist: genre: format: year:>2020 (or <2020, or 2010-2020).  Quote values with spaces.'
-               aria-label="Search library — supports artist:, album:, game:, album_artist:, genre:, year:, format: filters"
+               title='Field search: artist: album: game: album_artist: genre: title: composer: format: folder: path: group: party: status: source: lossless: chip: has: dup: track: disc: year:>2020 (or <2020, or 2010-2020; track:, disc:, rating:, plays:, bpm:, tunes:, channels:, bitdepth:, samplerate: and bitrate: take the same forms), length:>5:00, added:<30d, played:<7d.  Several values: format:flac,alac.  Put - before a term to exclude it (-format:mp3, -live).  Quote values with spaces; quoted words in the text are a phrase ("song of myself").'
+               aria-label="Search library — supports artist:, album:, game:, album_artist:, genre:, title:, composer:, year:, track:, disc:, format:, folder:, path:, group:, party:, status:, source:, lossless:, chip:, has:, dup:, bpm:, tunes:, channels:, bitdepth:, samplerate:, bitrate:, length:, added:, rating:, plays:, played: filters, several values with commas, quoted phrases and - exclusions"
                role="combobox" aria-autocomplete="list" aria-expanded="false"
                aria-controls="search-preview-list"
                autocomplete="off">
@@ -119,7 +208,7 @@
         <button id="search-save-smart" type="button" hidden
                 title="Save this search as a smart playlist (it updates itself)"
                 aria-label="Save current search as a smart playlist"
-                style="font-size:12px;padding:0 10px">&#9889; Save search</button>
+                style="font-size:12px;padding:0 10px">&#9889;<span class="hdr-label"> Save search</span></button>
         <span id="scan-badge" class="scan-badge" hidden></span>
         <span id="user-chip" class="user-chip" hidden>
           <span aria-hidden="true">&#128100;</span>
@@ -128,12 +217,31 @@
                   title="Sign out" aria-label="Sign out"
                   style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:13px;padding:0 0 0 4px">⎋</button>
         </span>
+        <!-- Back to the phone / iPad interface (pins it): shown only on a
+             touch-primary device or once desktop is pinned (the head
+             script's data-sb-touch / data-sb-ui-pinned; app.css). -->
+        <a id="btn-phone-ui" class="header-link" href="/?ui=mobile"
+           title="Phone &amp; iPad interface"
+           aria-label="Switch to the phone and iPad interface">&#128241;</a>
         <button id="btn-welcome" class="btn-help" title="Welcome &amp; tips" aria-label="Show the welcome guide and tips" aria-haspopup="dialog" aria-expanded="false">?</button>
         <a id="btn-docs" class="header-link" href="/manual/" target="_blank" rel="noopener"
            title="User guide &amp; documentation (opens a new tab)"
            aria-label="Open the user guide and documentation in a new tab">&#128214;</a>
         <button id="btn-links" title="Find music — archives & demoscene" aria-label="Find music — archives and demoscene download links" aria-haspopup="dialog">&#127760;</button>
+        <!-- Narrow window (≤900 px, app.css): the user chip, ?, 📖 and 🌐 fold
+             into this menu, at ≤600 px Save search too; its items press the
+             folded keys (app.js). -->
+        <button id="btn-more" type="button" title="More" aria-label="More"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="hdr-more-menu">&#8943;</button>
         <button id="btn-admin" title="Settings" aria-label="Settings"><span class="btn-admin-gear" aria-hidden="true">&#9881;</span></button>
+      </div>
+      <div id="hdr-more-menu" class="hdr-more-menu" role="menu" aria-label="More" hidden>
+        <div id="hdr-more-who" class="hdr-more-who" aria-hidden="true" hidden></div>
+        <button type="button" role="menuitem" class="hdr-more-item" data-press="search-save-smart" id="hdr-more-save" hidden><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8z"/></svg></span>Save search</button>
+        <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-welcome"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M6.3 6.2a1.8 1.8 0 1 1 2.5 1.7c-.5.2-.8.6-.8 1.1v.5"/><path d="M8 11.6v.1"/></svg></span>Welcome &amp; tips</button>
+        <a role="menuitem" class="hdr-more-item" href="/manual/" target="_blank" rel="noopener"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5c2-1 4-1 6 .5 2-1.5 4-1.5 6-.5v9.5c-2-1-4-1-6 .5-2-1.5-4-1.5-6-.5z"/><path d="M8 4v9.5"/></svg></span>User guide</a>
+        <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-links"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M1.8 8h12.4M8 1.8c-2.2 2.4-2.2 10 0 12.4M8 1.8c2.2 2.4 2.2 10 0 12.4"/></svg></span>Find music</button>
+        <button type="button" role="menuitem" class="hdr-more-item" data-press="user-chip-logout" id="hdr-more-logout" hidden><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2.5H3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/><path d="M10 5l3 3-3 3M13 8H6"/></svg></span>Sign out</button>
       </div>
     </header>
 
@@ -153,8 +261,8 @@
             <li data-view="albums"       tabindex="0" role="button">Albums</li>
             <li data-view="genres"       tabindex="0" role="button">Genres</li>
             <li data-view="years"        tabindex="0" role="button">Years</li>
-            <li data-view="scene_groups" tabindex="0" role="button" hidden
-                title="Browse by demoscene group (from Demozoo enrichment)">Scene groups</li>
+            <li data-view="scene"        tabindex="0" role="button" hidden
+                title="Browse retro and scene music by composer, game, platform, demoparty or demoscene group">Scene</li>
             <li data-view="galaxy"       tabindex="0" role="button" title="Explore your library as a galaxy of format clusters — click one to filter to that format">Galaxy</li>
           </ul>
           <div id="browse-filter-wrap" hidden>
@@ -240,6 +348,9 @@
 
         <!-- Group list filter bar (Artists / Albums / Genres / etc.) -->
         <div id="group-filter-bar" hidden>
+          <!-- The Scene view's lists (library.js showScene): one key per list
+               the library has entries for -->
+          <div id="scene-tabs" role="tablist" aria-label="Browse scene music by" hidden></div>
           <span id="group-filter-label"></span>
           <div class="group-filter-search">
             <input id="group-filter-input" type="search" placeholder="Filter…" autocomplete="off">
@@ -270,9 +381,27 @@
         <div id="galaxy-view" class="viz-host" hidden></div>
 
         <canvas id="visualizer-canvas" aria-hidden="true"></canvas>
+        <!-- Large now-playing art (app.js "Now Playing large art display").
+             Looks in css/visualizer-styles.css: Modern = the cover with the
+             title under it (the deck wrappers are display: contents); Retro
+             hi-fi = a turntable (the cover as the record's label, spinning
+             while it plays — data-state / data-motion set by app.js) over a
+             VFD strip. -->
         <div id="now-playing-art" class="now-playing-art" hidden>
-          <img id="now-playing-art-img" alt="Now Playing" decoding="async">
+          <div class="np-deck">
+            <div class="np-platter">
+              <div class="np-record">
+                <img id="now-playing-art-img" alt="Now Playing" decoding="async">
+              </div>
+            </div>
+            <div class="np-tonearm" aria-hidden="true"></div>
+          </div>
           <div class="now-playing-art-info">
+            <div class="np-anns" aria-hidden="true">
+              <span class="np-ann np-ann-play">&#9654; PLAY</span>
+              <span class="np-ann np-ann-pause">&#10073;&#10073; PAUSE</span>
+              <span class="np-ann np-ann-rpm">33&#8531; RPM</span>
+            </div>
             <div id="np-title" class="np-title"></div>
             <div id="np-artist" class="np-artist"></div>
             <div id="np-album" class="np-album"></div>
@@ -291,13 +420,15 @@
             <thead>
               <tr>
                 <th class="col-num">#</th>
+                <th class="col-cover" aria-label="Cover"></th>
                 <th class="col-title"        data-sort="title"        aria-sort="none">Title</th>
-                <th class="col-album-artist" data-sort="album_artist" aria-sort="none">Album Artist</th>
+                <th class="col-album-artist" data-sort="album_artist" aria-sort="none"><span class="th-full">Album Artist</span><span class="th-short">Alb. Artist</span></th>
                 <th class="col-artist"       data-sort="artist"       aria-sort="none">Artist</th>
                 <th class="col-album"        data-sort="album"        aria-sort="none">Album</th>
+                <th class="col-compo"        title="The party competition — its place in it (Demozoo)">Compo</th>
                 <th class="col-track"        data-sort="track_number" aria-sort="none">Track</th>
                 <th class="col-year"         data-sort="year"         aria-sort="none">Year</th>
-                <th class="col-dur"          data-sort="duration"     aria-sort="none">Duration</th>
+                <th class="col-dur"          data-sort="duration"     aria-sort="none"><span class="th-full">Duration</span><span class="th-short">Time</span></th>
                 <th class="col-format"       data-sort="format"       aria-sort="none">Type</th>
                 <th class="col-location"     data-sort="path"         aria-sort="none">Location</th>
                 <th class="col-rating">★</th>
@@ -341,15 +472,28 @@
 
       </main>
 
-      <div id="lyrics-panel" hidden>
-        <div class="lyrics-resize" id="lyrics-resize"></div>
+      <!-- Lyrics panel (js/library.js "Lyrics panel"; looks in css/lyrics-styles.css).
+           data-lyrics = loading | synced | plain | empty | error | radio; Retro hi-fi
+           shows synced lyrics on a VFD teleprompter, plain ones as a printed sheet. -->
+      <div id="lyrics-panel" role="region" aria-labelledby="lyrics-title" data-lyrics="empty" hidden>
+        <div class="lyrics-resize" id="lyrics-resize" role="separator" aria-orientation="vertical"
+             aria-label="Resize the lyrics panel" tabindex="0" title="Drag to resize"></div>
         <div class="lyrics-header">
-          <h3>Lyrics</h3>
+          <h3 id="lyrics-title">Lyrics</h3>
           <span id="lyrics-source" class="lyrics-source"></span>
+          <button id="btn-lyrics-close" class="lyrics-close" type="button" aria-label="Close lyrics" title="Close">&times;</button>
         </div>
-        <div id="lyrics-body" class="lyrics-body">
-          <div id="lyrics-content" class="lyrics-content"></div>
+        <div class="lyrics-window">
+          <div class="lyrics-anns" aria-hidden="true">
+            <span class="lyrics-ann lyrics-ann-sync">SYNC</span>
+            <span class="lyrics-ann lyrics-ann-pause">PAUSE</span>
+            <span id="lyrics-counter" class="lyrics-counter"></span>
+          </div>
+          <div id="lyrics-body" class="lyrics-body">
+            <div id="lyrics-content" class="lyrics-content"></div>
+          </div>
         </div>
+        <div id="lyrics-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
       </div>
 
     </div>
@@ -358,6 +502,9 @@
     <footer id="player-bar">
       <div id="player-art-bg"></div>
       <div id="vu-meters" class="vu-meters" hidden></div>
+      <!-- Retro hi-fi: twin L/R needle meters beside the transport while the VU
+           meter shows (js/player/vu_needles.js places them). -->
+      <div id="vu-needles" class="vu-needles" hidden aria-hidden="true"><canvas class="vu-needle"></canvas><canvas class="vu-needle"></canvas></div>
 
       <div class="player-art-info">
         <div id="player-art" class="art-thumb">
@@ -401,11 +548,12 @@
         <div class="player-extra-controls">
           <button id="btn-shuffle" class="ctrl-toggle" title="Shuffle (S)" aria-label="Shuffle" aria-pressed="false">&#8652;</button>
           <button id="btn-repeat"  class="ctrl-toggle" title="Repeat"  aria-label="Toggle repeat mode">&#8635;</button>
-          <button id="btn-radio"   class="ctrl-toggle" title="Start radio from this track" aria-label="Start an endless radio mix from the current track">&#128251;</button>
+          <button id="btn-radio"   class="ctrl-toggle" title="Start radio from this track" aria-label="Start an endless radio mix from the current track"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5.5 11.5 2"/><rect x="1.5" y="5.5" width="13" height="8.5" rx="1.5"/><circle cx="10.5" cy="9.75" r="2"/><path d="M4 8.5h2.5M4 11h2.5"/></svg></button>
           <button id="btn-download" class="ctrl-toggle" title="Download for offline" aria-label="Download the current track for offline">&#10515;</button>
           <button id="btn-eq"      class="ctrl-toggle" title="Equalizer" aria-label="Equalizer">EQ</button>
           <button id="btn-similar" class="ctrl-toggle" title="More like this" aria-label="More like this" hidden>&#9670;</button>
           <button id="btn-lyrics"  class="ctrl-toggle" title="Lyrics" aria-label="Lyrics"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M4 1h8c.6 0 1 .4 1 1v12c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1V2c0-.6.4-1 1-1z"/><line x1="5.5" y1="4.5" x2="10.5" y2="4.5"/><line x1="5.5" y1="7" x2="10.5" y2="7"/><line x1="5.5" y1="9.5" x2="8.5" y2="9.5"/></svg></button>
+          <button id="btn-np-art" class="ctrl-toggle" title="Now playing (N)" aria-label="Now playing" aria-pressed="false"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="6.3"/><circle cx="8" cy="8" r="2.2"/><circle cx="8" cy="8" r="0.6" fill="currentColor" stroke="none"/></svg></button>
           <!-- Cast picker.  The icon uses the standard "broadcast" glyph that
                every major player (Spotify, YouTube Music, Apple Music) picked
                for the same affordance — Fitts's Law: tap target must be
@@ -433,6 +581,11 @@
           </button>
           <button id="btn-playlist" class="ctrl-toggle" title="Playlists" aria-label="Playlists">&#9836;</button>
           <button id="btn-queue"   class="ctrl-toggle" title="Queue" aria-label="Queue">&#9776;</button>
+          <!-- Narrow window (app.css): radio, download, now-playing view and
+               Cast fold into this menu at ≤1100 px, Lyrics and Playlists too at
+               601–900 px, the equalizer at 601–720 px (app.js _bindFoldMenu). -->
+          <button id="btn-bar-more" class="ctrl-toggle" type="button" title="More" aria-label="More player keys"
+                  aria-haspopup="menu" aria-expanded="false" aria-controls="bar-more-menu">&#8943;</button>
         </div>
         <div class="volume-wrap">
           <!-- 🔉 ``speaker with one wave`` instead of 🔊 ``speaker with three
@@ -445,6 +598,15 @@
       </div>
 
     </footer>
+    <div id="bar-more-menu" class="hdr-more-menu bar-more-menu" role="menu" aria-label="More player keys" hidden>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-radio"><span class="hdr-more-ico" aria-hidden="true"></span>Start radio from this track</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-download"><span class="hdr-more-ico" aria-hidden="true"></span>Download for offline</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-np-art"><span class="hdr-more-ico" aria-hidden="true"></span>Now playing</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-cast"><span class="hdr-more-ico" aria-hidden="true"></span>Cast to device (Beta)</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-eq"><span class="hdr-more-ico" aria-hidden="true"></span>Equalizer</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-lyrics"><span class="hdr-more-ico" aria-hidden="true"></span>Lyrics</button>
+      <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-playlist"><span class="hdr-more-ico" aria-hidden="true"></span>Playlists</button>
+    </div>
   </div>
 
   <!-- ── Welcome / onboarding overlay ───────────────────────────────────── -->
@@ -583,6 +745,12 @@
           <div class="admin-section">
             <h3>&#128193; Music Folders</h3>
             <div class="admin-dir-list" id="admin-dir-list"></div>
+            <!-- One-time length correction of network-share MP3 / Ogg tracks
+                 (core/partial_length.py): one line while it runs, then its
+                 last result.  admin.js polls /api/admin/length-backfill/status
+                 while this tab is visible and the run is going. -->
+            <div id="admin-lenbf-status" class="admin-msg info" role="status"
+                 aria-live="polite" style="display:none"></div>
             <div class="admin-source-toggle">
               <button class="source-tab active" data-source="local">Local Path</button>
               <button class="source-tab" data-source="network">Network Share</button>
@@ -602,6 +770,7 @@
                   <option value="ftp">FTP</option>
                   <option value="webdav">WebDAV (http)</option>
                   <option value="webdavs">WebDAV (https)</option>
+                  <option value="httpindex">Web folder (http / https listing)</option>
                 </select>
                 <input id="net-host" type="text" placeholder="Host (e.g. nas.local)">
                 <input id="net-share" type="text" placeholder="Share name">
@@ -816,6 +985,11 @@
                 <span class="renderer-name">PSF Consoles (zxtune123)</span>
                 <span class="renderer-version" id="renderer-version-zxtune123"></span>
               </div>
+              <div class="renderer-item" id="renderer-kssrender">
+                <span class="renderer-icon" id="renderer-icon-kssrender">&#8943;</span>
+                <span class="renderer-name">MSX / Master System KSS (kssrender)</span>
+                <span class="renderer-version" id="renderer-version-kssrender"></span>
+              </div>
             </div>
             <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
                  in admin.js when the running ffmpeg is missing required
@@ -964,6 +1138,30 @@
                 Clean up auto-imported HVSC folders
               </button>
             </div>
+            <!-- A check / library apply under way and how the last one ended
+                 (GET /api/admin/hvsc/status → download.progress; admin.js
+                 _hvscRenderJob polls while one runs and the card is shown). -->
+            <div id="hvsc-job" class="hvsc-job" tabindex="-1" hidden>
+              <ol class="hvsc-steps" aria-label="Steps">
+                <li data-step="download">Download</li>
+                <li data-step="install">Install</li>
+                <li data-step="apply">Apply to your SID tracks</li>
+              </ol>
+              <div class="hvsc-job-head">
+                <span id="hvsc-job-title" class="hvsc-job-title"></span>
+                <span id="hvsc-job-pct" class="hvsc-job-pct" aria-hidden="true"></span>
+              </div>
+              <div id="hvsc-job-bar" class="hvsc-job-bar" role="progressbar"
+                   aria-labelledby="hvsc-job-title" aria-valuemin="0" aria-valuemax="100">
+                <div class="hvsc-job-fill"></div>
+              </div>
+              <div id="hvsc-job-detail" class="hvsc-job-detail"></div>
+            </div>
+            <div id="hvsc-outcome" class="admin-msg hvsc-outcome" tabindex="-1" hidden>
+              <span id="hvsc-outcome-text"></span>
+              <button id="btn-hvsc-retry" type="button" class="btn-secondary hvsc-outcome-btn" hidden></button>
+            </div>
+            <div id="hvsc-job-live" class="sr-only" role="status" aria-live="polite"></div>
             <p id="hvsc-download-info" class="admin-hint" style="display:none;margin:8px 0 0"></p>
             <div id="admin-hvsc-msg" class="admin-msg" style="display:none"></div>
           </div>
@@ -1059,6 +1257,13 @@
             <div class="admin-setting">
               <label for="setting-path-zxtune123">zxtune123 (PSF consoles)</label>
               <input id="setting-path-zxtune123" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-kssrender">kssrender (MSX / Master System KSS)</label>
+              <input id="setting-path-kssrender" type="text"
                      autocapitalize="off" autocorrect="off" spellcheck="false"
                      placeholder="auto-discover"
                      style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
@@ -1166,13 +1371,17 @@
           <div class="admin-section">
             <h3>&#9881;&#65039; Settings</h3>
             <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
-              Crossfade, preload buffer, “Converting…” notice delay, “Let shuffle repeat tracks you’ve heard” and theme are saved in <strong>this browser only</strong>.
+              Crossfade, streaming quality, preload buffer, “Converting…” notice delay, “Let shuffle repeat tracks you’ve heard” and theme are saved in <strong>this browser only</strong>.
               Everything else here is a server setting and applies to every user.
             </p>
             <div class="admin-settings-grid" id="admin-settings-grid">
               <div class="admin-setting">
                 <label for="setting-crossfade">Crossfade (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
                 <input id="setting-crossfade" type="number" min="0" max="12" step="0.5" value="0">
+              </div>
+              <div class="admin-setting">
+                <label for="setting-stream-quality">Streaming quality <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Lower uses less data — handy on mobile data. Music files above the chosen rate are converted; files at or below it, retro tunes and internet radio play as they are. From the next track. Saved in this browser.">&#9432;</span></label>
+                <select id="setting-stream-quality"><option value="">Original</option><option value="320">High (320 kbps)</option><option value="192">Normal (192 kbps)</option><option value="128">Low (128 kbps)</option><option value="96">Data saver (96 kbps)</option></select>
               </div>
               <div class="admin-setting">
                 <label for="setting-preload-buffer">Preload buffer (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Wait until this many seconds are buffered before starting playback. 0 = disabled">&#9432;</span></label>
@@ -1260,6 +1469,13 @@
                 <select id="setting-theme">
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
+                </select>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-ui-style">Style <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="The look of the player bar, equalizer, Stations, playlists, the queue, Track Info, lyrics, the visualizer and the top bar and sidebar. Retro hi-fi is the default. Saved in this browser.">&#9432;</span></label>
+                <select id="setting-ui-style">
+                  <option value="retro">Retro hi-fi</option>
+                  <option value="modern">Modern</option>
                 </select>
               </div>
             </div>
@@ -1994,6 +2210,7 @@
     <div id="radio-panel">
       <button id="radio-close" class="radio-close" aria-label="Close radio view (Esc)">&times;</button>
       <div id="radio-art-wrap">
+        <span id="radio-art-ph" aria-hidden="true"></span>
         <img id="radio-art" alt="" decoding="async">
         <canvas id="radio-scope" aria-hidden="true"></canvas>
       </div>
@@ -2020,90 +2237,106 @@
   </div>
 
   <!-- ── Equalizer overlay ─────────────────────────────────────────────────── -->
+  <!-- The panel's look is data-eq-style (js/eq/<style>.js renderer + the
+       #eq-panel[data-eq-style="…"] rules in app.css); the gains, presets,
+       bypass and pre-gain are the same whatever the look. -->
   <div id="eq-overlay" class="hidden">
-    <div id="eq-panel">
+    <div id="eq-panel" data-eq-style="modern" data-eq-vfd="on" role="group" tabindex="-1" aria-label="Equalizer">
 
       <div class="eq-header">
-        <span class="eq-title">Equalizer</span>
-        <select id="eq-preset">
-          <option value="flat">Flat</option>
-          <option value="bass">Bass Boost</option>
-          <option value="rock">Rock</option>
-          <option value="pop">Pop</option>
-          <option value="jazz">Jazz</option>
-          <option value="classical">Classical</option>
-          <option value="vocal">Vocal</option>
-          <option value="" disabled hidden>Custom</option>
-        </select>
-        <button id="eq-reset">Reset</button>
-        <button id="eq-close" aria-label="Close equalizer">&times;</button>
+        <div class="eq-heading">
+          <span class="eq-title">Equalizer</span>
+          <span class="eq-np" id="eq-np">Nothing playing</span>
+        </div>
+        <div class="eq-actions">
+          <!-- [eq-style-toggle] The look switch (equalizer.js wires #eq-style;
+               each button names a registered style).  It is the shared UI
+               style (js/ui_style.js): every view with a Modern / Retro hi-fi look follows it. -->
+          <div id="eq-style" class="eq-style-toggle" role="radiogroup" aria-label="Style — shared by every view that has one" title="Style — every view that has one switches along">
+            <span class="eq-style-cap" aria-hidden="true">Style</span>
+            <button type="button" role="radio" data-eq-style="modern" aria-checked="true">Modern</button>
+            <button type="button" role="radio" data-eq-style="retro" aria-checked="false" tabindex="-1">Retro hi-fi</button>
+          </div>
+          <div class="eq-preset-wrap">
+            <button type="button" id="eq-preset" aria-haspopup="listbox" aria-expanded="false" aria-controls="eq-preset-list" title="Preset">
+              <span class="eq-preset-name">Flat</span><span class="eq-preset-caret" aria-hidden="true"></span>
+            </button>
+            <ul id="eq-preset-list" class="eq-preset-list hidden" role="listbox" aria-label="Presets" tabindex="-1">
+              <li role="option" data-preset="flat" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Flat</span></li>
+              <li role="option" data-preset="bass" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Bass Boost</span></li>
+              <li role="option" data-preset="rock" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Rock</span></li>
+              <li role="option" data-preset="pop" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Pop</span></li>
+              <li role="option" data-preset="jazz" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Jazz</span></li>
+              <li role="option" data-preset="classical" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Classical</span></li>
+              <li role="option" data-preset="vocal" aria-selected="false"><svg class="eq-preset-icon" viewBox="0 0 40 14" aria-hidden="true"><path d=""/></svg><span>Vocal</span></li>
+            </ul>
+          </div>
+          <button type="button" id="eq-bypass" aria-pressed="false" title="Bypass — hear the track with every band flat (B)">Bypass</button>
+          <button type="button" id="eq-reset" title="Reset every band to 0 dB">Reset</button>
+          <button type="button" id="eq-close" aria-label="Close equalizer">&times;</button>
+        </div>
       </div>
 
-      <div class="eq-body">
-        <div class="eq-scale">
-          <span>+12</span><span>+6</span><span>0</span><span>&minus;6</span><span>&minus;12</span>
+      <div class="eq-stage" id="eq-stage">
+        <canvas class="eq-canvas" id="eq-canvas" aria-hidden="true"></canvas>
+        <div class="eq-knobs">
+          <div class="eq-band" data-band="0" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="32 Hz gain"></div>
+          <div class="eq-band" data-band="1" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="64 Hz gain"></div>
+          <div class="eq-band" data-band="2" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="125 Hz gain"></div>
+          <div class="eq-band" data-band="3" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="250 Hz gain"></div>
+          <div class="eq-band" data-band="4" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="500 Hz gain"></div>
+          <div class="eq-band" data-band="5" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="1 kHz gain"></div>
+          <div class="eq-band" data-band="6" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="2 kHz gain"></div>
+          <div class="eq-band" data-band="7" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="4 kHz gain"></div>
+          <div class="eq-band" data-band="8" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="8 kHz gain"></div>
+          <div class="eq-band" data-band="9" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0" aria-valuetext="0 dB" aria-label="16 kHz gain"></div>
         </div>
-        <div class="eq-bands">
-          <div class="eq-band" data-band="0">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">32 Hz</span>
-          </div>
-          <div class="eq-band" data-band="1">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">64 Hz</span>
-          </div>
-          <div class="eq-band" data-band="2">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">125 Hz</span>
-          </div>
-          <div class="eq-band" data-band="3">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">250 Hz</span>
-          </div>
-          <div class="eq-band" data-band="4">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">500 Hz</span>
-          </div>
-          <div class="eq-band" data-band="5">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">1 kHz</span>
-          </div>
-          <div class="eq-band" data-band="6">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">2 kHz</span>
-          </div>
-          <div class="eq-band" data-band="7">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">4 kHz</span>
-          </div>
-          <div class="eq-band" data-band="8">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">8 kHz</span>
-          </div>
-          <div class="eq-band" data-band="9">
-            <span class="eq-db-val">0</span>
-            <div class="eq-track"><div class="eq-fill"></div><div class="eq-thumb"></div></div>
-            <span class="eq-freq">16 kHz</span>
-          </div>
+        <div class="eq-readout" id="eq-readout" aria-hidden="true"></div>
+      </div>
+      <span class="sr-only" id="eq-live" aria-live="polite"></span>
+      <div class="eq-labels" id="eq-labels">
+        <div class="eq-band-label" data-band="0" aria-hidden="true"><span class="eq-freq">32</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="1" aria-hidden="true"><span class="eq-freq">64</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="2" aria-hidden="true"><span class="eq-freq">125</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="3" aria-hidden="true"><span class="eq-freq">250</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="4" aria-hidden="true"><span class="eq-freq">500</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="5" aria-hidden="true"><span class="eq-freq">1k</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="6" aria-hidden="true"><span class="eq-freq">2k</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="7" aria-hidden="true"><span class="eq-freq">4k</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="8" aria-hidden="true"><span class="eq-freq">8k</span><span class="eq-db-val">0</span></div>
+        <div class="eq-band-label" data-band="9" aria-hidden="true"><span class="eq-freq">16k</span><span class="eq-db-val">0</span></div>
+      </div>
+      <!-- Retro hi-fi only (app.css shows it in that look): preset keys with
+           lamps — the preset menu's choices — and the Display (VFD) switch. -->
+      <div class="eq-retro-row">
+        <div class="eq-preset-row" id="eq-preset-row" role="radiogroup" aria-label="Presets">
+          <span class="eq-row-cap" aria-hidden="true">Preset</span>
+          <button type="button" role="radio" data-preset="flat" aria-checked="false">Flat</button>
+          <button type="button" role="radio" data-preset="bass" aria-checked="false" aria-label="Bass Boost" tabindex="-1">Bass</button>
+          <button type="button" role="radio" data-preset="rock" aria-checked="false" tabindex="-1">Rock</button>
+          <button type="button" role="radio" data-preset="pop" aria-checked="false" tabindex="-1">Pop</button>
+          <button type="button" role="radio" data-preset="jazz" aria-checked="false" tabindex="-1">Jazz</button>
+          <button type="button" role="radio" data-preset="classical" aria-checked="false" tabindex="-1">Classical</button>
+          <button type="button" role="radio" data-preset="vocal" aria-checked="false" tabindex="-1">Vocal</button>
+          <span class="eq-row-custom" id="eq-preset-custom" hidden>Custom</span>
         </div>
+        <button type="button" id="eq-vfd" aria-pressed="true" title="Display — the response curve over the spectrum">Display</button>
       </div>
 
       <div class="eq-foot">
-        <label class="eq-rg-label" for="eq-rg">Volume leveling</label>
-        <select id="eq-rg" title="ReplayGain — even out loudness across tracks using the track's gain tags">
-          <option value="off">Off</option>
-          <option value="track">Per track</option>
-          <option value="album">Per album</option>
-        </select>
+        <div class="eq-gainstage">
+          <span class="eq-clip" id="eq-clip" role="img" aria-label="Clip lamp: off" title="Lights when the output goes past 0 dBFS (clips)">CLIP</span>
+          <span class="eq-pregain" id="eq-pregain" title="The input is lowered by the curve's highest boost, so a boost leaves headroom">Pre-gain 0 dB</span>
+          <button type="button" id="eq-autogain" disabled title="Lower the pre-gain by what the output went past 0 dBFS">Auto pre-gain</button>
+        </div>
+        <div class="eq-leveling">
+          <label class="eq-rg-label" for="eq-rg">Volume leveling</label>
+          <select id="eq-rg" title="ReplayGain — even out loudness across tracks using the track's gain tags">
+            <option value="off">Off</option>
+            <option value="track">Per track</option>
+            <option value="album">Per album</option>
+          </select>
+        </div>
       </div>
 
     </div>
@@ -2131,11 +2364,13 @@
             <img id="ti-art-img" alt="Album art" loading="lazy" decoding="async" style="display:none">
             <span id="ti-art-ph" class="ti-art-placeholder">&#128266;</span>
           </div>
-          <!-- Quick stats under artwork -->
+          <!-- Quick stats under artwork (Retro: a VFD strip that also shows
+               the length, the SID chip and the renderer — css/trackinfo-styles.css) -->
           <div class="ti-stats">
-            <div class="ti-stat-row"><span id="ti-format">—</span><span id="ti-surround" class="surround-badge" hidden></span></div>
-            <div class="ti-stat-row"><span id="ti-bit-depth">—</span> / <span id="ti-sample-rate">—</span></div>
-            <div class="ti-stat-row"><span id="ti-channels">—</span> · <span id="ti-bitrate">—</span></div>
+            <div class="ti-stat-row"><span id="ti-format">—</span><span id="ti-surround" class="surround-badge" hidden></span><span id="ti-vfd-len" class="ti-vfd-len" aria-hidden="true"></span></div>
+            <div class="ti-stat-row ti-vfd-specs" id="ti-vfd-specs" hidden><span class="ti-vfd-spec" id="ti-vfd-chip-item" aria-hidden="true" hidden><span class="ti-vfd-k">Chip</span> <span id="ti-vfd-chip"></span></span><span class="ti-vfd-spec" id="ti-vfd-renderer-item" hidden><span class="ti-vfd-k">Renderer</span> <span id="ti-vfd-renderer"></span></span></div>
+            <div class="ti-stat-row"><span id="ti-bit-depth">—</span><span class="ti-stat-sep"> / </span><span id="ti-sample-rate">—</span></div>
+            <div class="ti-stat-row"><span id="ti-channels">—</span><span class="ti-stat-sep"> · </span><span id="ti-bitrate">—</span></div>
             <div class="ti-stat-row ti-stat-size"><span id="ti-file-size">—</span></div>
           </div>
         </div>
@@ -2177,6 +2412,7 @@
               <div class="ti-field"><span class="ti-label">Game</span><span class="ti-value" id="ti-game">—</span></div>
               <div class="ti-field"><span class="ti-label">Composer</span><span class="ti-value" id="ti-composer">—</span></div>
               <div class="ti-field"><span class="ti-label">Year</span><span class="ti-value" id="ti-year">—</span></div>
+              <div class="ti-field"><span class="ti-label">Party</span><span class="ti-value" id="ti-party">—</span></div>
             </div>
 
             <div class="ti-section ti-autohide" id="ti-section-numbering">
@@ -2221,7 +2457,7 @@
                   <button type="button" id="ti-sub-playall" class="ti-sub-abtn" title="Play all tunes in order">&#9654; Play all</button>
                   <button type="button" id="ti-sub-addall" class="ti-sub-abtn" title="Add every tune to the play queue">&#65291; <span id="ti-sub-addall-lbl">Add all</span></button>
                   <button type="button" id="ti-sub-addall-pl" class="ti-sub-abtn" title="Add every tune to a playlist">&#9776; Playlist</button>
-                  <button type="button" id="ti-sub-shuffle" class="ti-sub-abtn ti-sub-abtn-icon" title="Shuffle all tunes" aria-label="Shuffle all tunes">&#128256;</button>
+                  <button type="button" id="ti-sub-shuffle" class="ti-sub-abtn ti-sub-abtn-icon" title="Shuffle all tunes" aria-label="Shuffle all tunes"><svg class="ti-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5h2.6c1.5 0 2.4.7 3.2 2l1.4 2.9c.7 1.4 1.7 2.1 3.2 2.1h2.6M1.5 11.5h2.6c1.2 0 2-.5 2.7-1.4M9.2 5.9c.7-.9 1.5-1.4 2.7-1.4h2.6M12.5 2.5l2 2-2 2M12.5 9.5l2 2-2 2"/></svg></button>
                 </span>
               </div>
               <div id="ti-sub-note" class="ti-sub-note" hidden></div>
@@ -2278,7 +2514,7 @@
             <!-- Chapters (E-18) — populated by trackinfo._loadChapters when
                  the file has MP4 chpl atoms or ID3 CHAP frames. -->
             <div id="ti-chapters" class="ti-chapters" hidden></div>
-            <div id="ti-artist-about" hidden style="margin-top:14px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px"></div>
+            <div id="ti-artist-about" hidden></div>
             <div id="ti-tagedit-wrap" style="margin:12px 0 22px"></div>
 
             <!-- Signal path (viz #4) — per-format decode pipeline, mounted
@@ -2309,18 +2545,34 @@
   </div>
 
   <!-- ── Queue panel ───────────────────────────────────────────────────────── -->
-  <div id="queue-panel" class="hidden">
+  <!-- Header (Up next · time left · source · Shuffle / Repeat) over a virtual
+       list of rows (js/queue.js); the looks are css/queue-styles.css. -->
+  <div id="queue-panel" class="hidden" role="region" aria-label="Queue">
     <div class="queue-header">
       <span class="queue-title">Queue <span id="queue-count"></span></span>
       <button id="btn-queue-clear" title="Clear queue">Clear</button>
       <button id="btn-queue-close" aria-label="Close queue">&times;</button>
+    </div>
+    <div id="queue-summary" class="qx-summary" hidden>
+      <div class="qx-vfd">
+        <span class="qx-cap">Up next</span>
+        <span id="queue-upnext" class="qx-upnext"></span>
+        <span id="queue-left" class="qx-left"></span>
+        <span id="queue-counter" class="qx-counter" aria-hidden="true" hidden></span>
+        <span class="qx-anns">
+          <span id="queue-ann-shuffle" class="qx-ann" role="img" aria-label="Shuffle off">Shuffle</span>
+          <span id="queue-ann-repeat" class="qx-ann" role="img" aria-label="Repeat off">Repeat</span>
+        </span>
+      </div>
+      <div id="queue-from" class="qx-from" hidden><span class="qx-from-cap">from</span> <span id="queue-from-text" class="qx-from-text"></span></div>
     </div>
     <div id="queue-offer" class="queue-offer" hidden>
       <span id="queue-offer-text" class="queue-offer-text"></span>
       <button id="btn-queue-offer" type="button">Resume</button>
     </div>
     <div id="queue-list" class="queue-list">
-      <div class="queue-empty">No tracks queued.</div>
+      <div id="queue-rows" class="qx-rows"></div>
+      <div id="queue-status" class="queue-empty">No tracks queued.</div>
     </div>
     <div id="queue-drop-zone" class="queue-drop-zone">
       Drop tracks here to add
@@ -2332,7 +2584,7 @@
     <!-- List-view header: shows when browsing playlists -->
     <div class="playlist-header" id="pl-hdr-list">
       <span class="playlist-title">Playlists</span>
-      <button id="btn-playlist-import" title="Import playlists other users share">Import…</button>
+      <button id="btn-playlist-import" title="Import a playlist file (M3U, XSPF) or playlists other users share">Import…</button>
       <button id="btn-playlist-new" title="New playlist">+ New</button>
       <button id="btn-playlist-close" aria-label="Close playlist panel">&times;</button>
     </div>
@@ -2371,19 +2623,20 @@
         <button id="links-close" aria-label="Close">&times;</button>
       </div>
       <div class="links-body">
-          <!-- Chiptune & tracker archives — external catalogs the user
-               can browse for source files.  We don't ingest them
-               automatically; the operator downloads what they want,
-               drops it in a scan dir, and SoniqBoom indexes it. -->
+          <!-- Chiptune & tracker archives — plain links to the archives'
+               websites (each opens in a new tab); the text says how their
+               files reach the library (music folders, Collections tab). -->
           <div class="admin-section">
             <h3>&#127760; Chiptune &amp; tracker archives</h3>
             <p class="admin-hint" style="margin-bottom:12px">
-              <strong>External links</strong> — each card opens an archive
-              in a new tab.  SoniqBoom does <em>not</em> auto-ingest from
-              these.  Download what you want, drop it in a scan directory,
-              and the renderers (sidplayfp / libgme / openmpt) handle
-              playback.  HVSC metadata + Songlengths wire in via the HVSC
-              panel in Settings.
+              Each card opens the archive&rsquo;s website in a new tab.
+              Files you download there play once they are in one of the
+              library&rsquo;s music folders and the library has scanned
+              them; an administrator sets up the folders in Settings &rarr;
+              Library.  HVSC, Modland, Aminet and
+              scene.org can also be listed in the library without
+              downloading them first: an administrator switches them on in
+              Settings &rarr; Collections.
             </p>
             <ul class="archive-grid" id="archive-grid">
               <li class="archive-card">
@@ -2394,9 +2647,10 @@
                   <span class="archive-text">
                     <span class="archive-name">HVSC</span>
                     <span class="archive-desc">
-                      High Voltage SID Collection &mdash; the canonical
-                      Commodore 64 .sid archive (~60k tunes).  Pair with
-                      Songlengths.md5 for per-tune durations.
+                      High Voltage SID Collection &mdash; the Commodore 64
+                      .sid archive.  Its song lengths and STIL notes are set
+                      up in Settings &rarr; Renderers &rarr; HVSC SID
+                      database.
                     </span>
                     <span class="archive-fmt">.sid / .psid / .rsid</span>
                   </span>
@@ -2410,9 +2664,8 @@
                   <span class="archive-text">
                     <span class="archive-name">The Mod Archive</span>
                     <span class="archive-desc">
-                      Largest tracker module collection on the web
-                      (~280k modules).  Curated genres and Amiga/PC
-                      tracker scene compilations.
+                      Tracker modules from the Amiga and PC scenes,
+                      sorted by genre and artist.
                     </span>
                     <span class="archive-fmt">.mod / .xm / .it / .s3m / &hellip;</span>
                   </span>
@@ -2427,7 +2680,7 @@
                     <span class="archive-name">ZXAART (ZX-Art)</span>
                     <span class="archive-desc">
                       ZX Spectrum AY-3-8910 chiptunes plus demoscene
-                      classics.  AY files render via libgme.
+                      classics.
                     </span>
                     <span class="archive-fmt">.ay</span>
                   </span>
@@ -2441,9 +2694,7 @@
                   <span class="archive-text">
                     <span class="archive-name">SNDH archive</span>
                     <span class="archive-desc">
-                      Atari ST / STe YM2149 chiptunes.  Rendered via
-                      psgplay (built by install.sh); .ym register dumps
-                      play through the bundled ST-Sound engine.
+                      Atari ST / STe YM2149 chiptunes.
                     </span>
                     <span class="archive-fmt">.sndh / .ym</span>
                   </span>
@@ -2457,9 +2708,8 @@
                   <span class="archive-text">
                     <span class="archive-name">AMP / AHX</span>
                     <span class="archive-desc">
-                      Amiga Music Preservation's AHX section.  AHX is
-                      Amiga's 4-channel chiptune format; rendered via
-                      uade123 (.hvl via the bundled HivelyTracker engine).
+                      Amiga Music Preservation's AHX section: AHX and
+                      HivelyTracker chiptunes from the Amiga.
                     </span>
                     <span class="archive-fmt">.ahx / .hvl</span>
                   </span>
@@ -2482,11 +2732,6 @@
                 </a>
               </li>
             </ul>
-            <p class="admin-hint" style="margin-top:8px;font-size:11px;color:var(--text2)">
-              Want a real remote-source ingest of one of these?  Open an
-              issue with the FTP / HTTP listing format and we'll plumb it
-              through the FileSource backend.
-            </p>
           </div>
 
           <!-- Demoscene — latest releases.  Distinct from the format-specific
@@ -2497,9 +2742,9 @@
             <h3>&#10024; Demoscene &mdash; latest releases</h3>
             <p class="admin-hint" style="margin-bottom:12px">
               Where the <strong>newest</strong> scene music lands &mdash; party
-              music-compo entries and fresh uploads.  Same flow as above:
-              download into a scan directory (scene.org also exposes FTP, so a
-              remote FileSource can point straight at it).
+              music-compo entries and fresh uploads.  Files downloaded here
+              play the same way, from a music folder; scene.org is also one
+              of the collections in Settings &rarr; Collections.
             </p>
             <ul class="archive-grid">
               <li class="archive-card">
@@ -2586,6 +2831,7 @@
           <div class="sc-row"><kbd>I</kbd><span>Track info</span></div>
           <div class="sc-row"><kbd>← / →</kbd><span>Previous / next track in Track Info</span></div>
           <div class="sc-row"><kbd>V</kbd><span>Toggle visualizer mode</span></div>
+          <div class="sc-row"><kbd>N</kbd><span>Show / hide the now-playing cover</span></div>
           <div class="sc-row"><kbd>1–6</kbd><span>Library views (All, Artists, …)</span></div>
           <div class="sc-row"><kbd>⌥ 1–6</kbd><span>Smart views (History, Most Played, …)</span></div>
         </div>

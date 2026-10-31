@@ -31,9 +31,9 @@ from test_subsonic_parity import _tr, env  # noqa: F401 — fixture
 _OPERATORS = (
     ("artist", "artist_match"),               # a word start in the name (GitHub #25)
     ("album_artist", "album_artist_match"),
-    ("album", "album"),
+    ("album", "album_match"),                 # a word start in the name (phase 1, A3)
     ("game", "game"),
-    ("genre", "genre"),
+    ("genre", "genre_match"),                 # a word start (phase 2, A6)
     ("format", "format_"),
 )
 _VALUES = ("}", "{", "\\", "a{b}", "{x}", "\\}", "}\\", "{{}}", "x\\", "a\\b",
@@ -63,18 +63,18 @@ def test_mixed_operators_with_escapes_and_free_text():
         r'genre:"R{&}B" format:"x{y}" year:1990-1999 some loader') == {
         "artist_match": "Brace {Band}",
         "album_artist_match": "Back\\Slash",
-        "album": "}",
+        "album_match": "}",
         "game": "{Curly} Quest",
-        "genre": "R{&}B",
+        "genre_match": "R{&}B",
         "format_": "X{Y}",
         "year_min": 1990,
         "year_max": 1999,
         "query": "some loader",
     }
     # A value ending in a backslash does not swallow the next term's brace.
-    assert _roundtrip(r'artist:"x\" album:"{y}"') == {"artist_match": "x\\", "album": "{y}"}
+    assert _roundtrip(r'artist:"x\" album:"{y}"') == {"artist_match": "x\\", "album_match": "{y}"}
     # Unquoted values escape the same way.
-    assert _roundtrip("game:a}b genre:{c") == {"game": "a}b", "genre": "{c"}
+    assert _roundtrip("game:a}b genre:{c") == {"game": "a}b", "genre_match": "{c"}
 
 
 @pytest.mark.parametrize("field,kwarg", [
@@ -153,7 +153,7 @@ def _ids(rows) -> set[str]:
     ('artist:"\\"', {"bslash"}),
     ('album_artist:"Back\\Slash"', {"brace"}),
     ('album:"}"', {"close"}),
-    ('album:"{Curly}"', {"curly"}),
+    ('album:"{Curly}"', {"brace", "curly"}),            # word start: "{Curly} Quest" too
     ('game:"{curly} q"', {"brace"}),                          # prefix
     ('game:"{curly}"', {"brace", "curly"}),
     ('genre:"r{&}b"', {"brace"}),
@@ -185,7 +185,7 @@ async def test_structured_filter_and_format_list_use_the_same_escapes(store):
     ('game:"{curly} quest"', {"brace"}),
     ('artist:"}"', {"close"}),
     ('artist:"\\"', {"bslash"}),
-    ('album:"{Curly}" genre:R', {"curly"}),
+    ('album:"{Curly}" genre:R', {"curly", "brace"}),       # (genre: a word start: R{&}B)
     ('artist:"Brace {Band}" album_artist:"Back\\Slash" format:SPC', {"brace"}),
 ])
 async def test_shuffled_order_resolves_escaped_values(store, q, expect):
@@ -207,7 +207,42 @@ def test_subsonic_search3_resolves_escaped_values(env):
                                    store=env.store, added=9000))
     for q, expect in (('artist:"Brace {Band}"', ["sb1"]),
                       ('artist:"}"', ["sb4"]),
-                      ('album:"{Curly}"', ["sb2"]),
+                      ('album:"{Curly}"', ["sb1", "sb2"]),   # a word start
                       ('artist:"\\" album:"\\"', ["sb3"])):
         res = env.ok("search3.view", query=q)["searchResult3"]
         assert sorted(s["id"] for s in res["song"]) == expect, q
+
+
+def test_type_is_the_format_operator():
+    """``type:`` (the list's Type column) filters like ``format:`` — before, an
+    operator the parser didn't know was dropped and the rest matched alone."""
+    from soniqboom.api.search import search_predicates
+    assert search_predicates("genre:amiga type:ahx") == {"genre_match": "amiga", "format_": "AHX"}
+    assert search_predicates('type:"FastTracker 2"') == search_predicates('format:"FastTracker 2"')
+    assert search_predicates("typewriter") == {"query": "typewriter"}
+    assert search_predicates("type:ahx dream")["query"] == "dream"
+
+
+def test_operator_names_are_read_in_any_case():
+    from soniqboom.api.search import search_predicates
+    assert search_predicates("track:3 Artist:nightwish") == search_predicates("track:3 artist:nightwish")
+    assert search_predicates("TYPE:ahx")["format_"] == "AHX"
+
+
+def test_a_word_colon_value_that_is_no_operator_stays_text():
+    from soniqboom.api.search import search_predicates
+    p = search_predicates("genre:amiga remix:2020")
+    assert p["genre_match"] == "amiga" and "remix" in p["query"]
+
+
+def test_artist_matches_the_album_artist_or_the_artist():
+    from soniqboom.core.store import TrackStore
+    s = TrackStore()
+
+    def tr(i, artist, album_artist=None):
+        return {"id": i, "path": f"/m/{i}.mp3", "title": f"T{i}", "artist": artist,
+                "album_artist": album_artist, "album": "", "format": "MP3", "added_at": 1}
+    s.upsert_tracks_batch([tr("own", "Nightwish"), tr("guest", "Tarja", "Nightwish"),
+                           tr("tagged", "Nightwish", "Nightwish"), tr("other", "Epica")])
+    got = sorted(t["id"] for t in s.filter_tracks(artist_match="nightwish", limit=50))
+    assert got == ["guest", "own", "tagged"]

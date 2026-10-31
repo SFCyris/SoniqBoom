@@ -210,6 +210,7 @@ def test_credential_key_file_survives_a_host_name_change(tmp_path, monkeypatch):
     from soniqboom.core import credentials
     monkeypatch.setattr(credentials, "_key_file_cache", {})
     monkeypatch.setattr(credentials.platform, "node", lambda: "container-a")
+    monkeypatch.delenv("SONIQBOOM_CREDENTIAL_KEY_FILE", raising=False)   # the image sets it
     legacy = credentials.encrypt("legacy-secret")         # machine key (no key file yet)
 
     key_file = tmp_path / "credential.key"

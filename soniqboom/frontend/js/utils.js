@@ -429,6 +429,32 @@ export function isModuleFamily(t) {
  * surround badge in both the track list and the info panel; mirrors the panel's
  * long-form ``_fmtChannels`` label (6→5.1, 8→7.1).
  */
+// ── Party competitions (Demozoo: scene_party / scene_compo / scene_place) ──
+// "1st", "2nd", "3rd", "11th" …
+export function ordinal(n) {
+  const v = Math.abs(n) % 100;
+  const suf = (v >= 11 && v <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' })[v % 10] || 'th';
+  return `${n}${suf}`;
+}
+// A track's place in its competition: "2nd of 9", "2nd", or '' (none known).
+export function compoPlaceLabel(t) {
+  const p = t && t.scene_place;
+  if (!Number.isInteger(p) || p < 1) return '';
+  const n = t.scene_compo_entries;
+  return Number.isInteger(n) && n >= p ? `${ordinal(p)} of ${n}` : ordinal(p);
+}
+// "Revision 2019 · Oldskool Music · 2nd of 9" (``party: false``: without the
+// party — a list that is that party's); '' for a track with no party.
+export function compoLabel(t, { party = true } = {}) {
+  if (!t || !t.scene_party) return '';
+  const parts = [];
+  if (party) parts.push(t.scene_party);
+  if (t.scene_compo) parts.push(t.scene_compo);
+  const place = compoPlaceLabel(t);
+  if (place && t.scene_compo) parts.push(place);
+  return parts.join(' \u00b7 ');
+}
+
 export function surroundLabel(t) {
   if (!t || isModuleFamily(t)) return null;
   const n = t.channels;
@@ -678,4 +704,35 @@ export function staticArtUrl(u) {
   qs.delete('size');
   const rest = qs.toString();
   return `${m[1]}${m[2]}/${size}.jpg${rest ? `?${rest}` : ''}`;
+}
+
+// ── Lyrics (LRC) ───────────────────────────────────────────────────────────
+// LRC ID tags ([ar:…], [ti:…], [offset:…] …) are not lyrics.
+const _LRC_ID_TAG = /^\[(ar|ti|al|au|by|re|ve|ver|tool|la|id|key|length|offset|#)\s*:.*\]\s*$/i;
+const _LRC_OFFSET = /^\[offset\s*:\s*([+-]?\d+)\s*\]\s*$/i;
+
+/**
+ * Parse LRC format into structured lines.
+ * Input: "[00:12.34] Some lyrics line\n[00:16.00] Next line"
+ * Returns: [{ time: 12.34, text: "Some lyrics line" }, ...] in file order;
+ * a line without a time (not an ID tag) comes back with time null.
+ */
+export function parseLRC(raw) {
+  const lines = [];
+  const re = /^\[(\d{1,2}):(\d{2})[.:](\d{2,3})\]\s*(.*)/;
+  // [offset:+n] (ms): a positive offset shows every line n ms sooner.
+  const off = raw.split('\n').map(l => l.trim().match(_LRC_OFFSET)).find(Boolean);
+  const shift = off ? parseInt(off[1], 10) / 1000 : 0;
+  for (const line of raw.split('\n')) {
+    const m = line.match(re);
+    if (m) {
+      const mins = parseInt(m[1], 10);
+      const secs = parseInt(m[2], 10);
+      const ms   = m[3].length === 2 ? parseInt(m[3], 10) * 10 : parseInt(m[3], 10);
+      lines.push({ time: Math.max(0, mins * 60 + secs + ms / 1000 - shift), text: m[4] });
+    } else if (line.trim() && !_LRC_ID_TAG.test(line.trim())) {
+      lines.push({ time: null, text: line.trim() });
+    }
+  }
+  return lines;
 }

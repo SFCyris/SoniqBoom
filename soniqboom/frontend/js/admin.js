@@ -11,6 +11,7 @@ import { STRONG_RULE, passwordHint, passwordProblem,
          strongPasswordsRequired, setStrongPasswordsKnown } from './password-rule.js';
 import { Player }         from './player.js';
 import { Toast, trapFocus } from './utils.js';
+import { getUiStyle, setUiStyle } from './ui_style.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
 // Experimental in-browser SID playback toggle (see sid-wasm-player.js).
 import { sidWasmPlaybackEnabled, setSidWasmPlayback } from './sid-wasm-player.js';
@@ -267,6 +268,7 @@ async function open() {
     loadRendererStatus();
     loadSoundfonts();
     startScanPoller();
+    loadLengthBackfill().catch(() => {});
     _syncRepairStatus?.();
     _syncGameTagStatus?.();
     _showAdminOnlyTabs();
@@ -295,6 +297,7 @@ function close() {
   _hideAllDialogs();
   overlay.classList.add('hidden');
   stopScanPoller();
+  clearTimeout(_lenbfPoll);
   clearTimeout(_mlPoll);
   clearTimeout(_ocPoll);
   // Close the conversion-cache SSE stream on EVERY dismissal path —
@@ -357,7 +360,8 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
     tab.setAttribute('aria-selected', 'true');
     const pane = document.getElementById(tab.dataset.tab);
     if (pane) pane.classList.add('active');
-    // Load tab-specific data on switch
+    // Load tab-specific data on switch (the length-backfill poll stops off Library)
+    loadLengthBackfill().catch(() => {});
     if (tab.dataset.tab === 'tab-collections') {
       loadModlandStatus();
       loadOnlineCollections();
@@ -608,6 +612,87 @@ async function loadFreshness() {
     list.appendChild(row);
   });
 }
+
+// ── Length backfill line ──────────────────────────────────────────────
+//
+// GET /admin/length-backfill/status (core/partial_length.py get_status):
+// one line in Music Folders while the one-time length correction of
+// network-share MP3 / Ogg tracks runs, then its last result.  Re-polled every
+// 3 s only while a run is going, the panel is open on the Library tab and the
+// page is visible; textContent only (share names come from the server).
+let _lenbfPoll = null;
+let _lenbfSeq = 0;
+let _lenbfWasRunning = false;   // a failed poll mid-run tries again
+const _LENBF_POLL_MS = 3000;
+
+function _lenbfVisible() {
+  return _isOpen && !document.hidden
+    && !!document.querySelector('.admin-tab[data-tab="tab-library"][aria-selected="true"]');
+}
+
+function _lenbfText(st) {
+  const n = v => (v || 0).toLocaleString();
+  if (st.running) {
+    const cur = st.current || {};
+    const where = st.label || st.root;
+    if (!where) {
+      return st.waiting_for_scan
+        ? 'Correcting track lengths — waiting for the running scan to finish'
+        : 'Correcting track lengths…';
+    }
+    let t = `Correcting track lengths on ${where}: ${n(cur.checked)} of ${n(cur.total)} checked`
+      + ` · ${n(cur.fixed)} fixed`;
+    if (cur.unreachable) t += ` · ${n(cur.unreachable)} unreachable`;
+    if (st.waiting_for_scan) t += ' (paused while a scan runs)';
+    return t;
+  }
+  const last = st.last;
+  if (!last) return '';
+  const where = last.label ? ` on ${last.label}` : (last.roots > 1 ? ` on ${last.roots} shares` : '');
+  if (!last.checked && last.deferred_roots) {
+    return `Track length check${where} waits until the share is connected`;
+  }
+  let t = `Track lengths checked${where}: ${n(last.checked)} checked · ${n(last.fixed)} fixed`;
+  if (last.unreachable) t += ` · ${n(last.unreachable)} unreachable (tried again after the next scan)`;
+  if (last.deferred_roots && last.roots > 1) {
+    t += ` · ${n(last.deferred_roots)} share(s) still to check once connected or rescanned`;
+  }
+  return t;
+}
+
+async function loadLengthBackfill() {
+  clearTimeout(_lenbfPoll);
+  _lenbfPoll = null;
+  const el = document.getElementById('admin-lenbf-status');
+  if (!el || !_lenbfVisible()) return;
+  const seq = ++_lenbfSeq;
+  let st = null;
+  try {
+    const res = await api('/admin/length-backfill/status');
+    if (res.ok) st = await res.json();
+  } catch { /* retried below while a run was going */ }
+  if (seq !== _lenbfSeq) return;             // a newer poll took over
+  if (!st) {
+    if (_lenbfWasRunning && _lenbfVisible()) {
+      _lenbfPoll = setTimeout(loadLengthBackfill, _LENBF_POLL_MS * 2);
+    }
+    return;
+  }
+  _lenbfWasRunning = !!st.running;
+  const text = _lenbfText(st);
+  el.textContent = text;
+  el.style.display = text ? '' : 'none';
+  const warn = !st.running && st.last && (st.last.unreachable || st.last.deferred_roots);
+  el.className = `admin-msg ${st.running ? 'info' : warn ? 'warn' : 'ok'}`;
+  if (st.running && _lenbfVisible()) {
+    _lenbfPoll = setTimeout(loadLengthBackfill, _LENBF_POLL_MS);
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) loadLengthBackfill().catch(() => {});
+  else { clearTimeout(_lenbfPoll); _lenbfPoll = null; }
+});
 
 async function _checkFreshnessNow(scanRoot, btn) {
   const origText = btn.textContent;
@@ -1134,6 +1219,8 @@ async function pollScanStatus() {
       // Scan finished
       if (section) section.style.display = 'none';
       stopScanPoller();
+      // A finished share scan may have started the length backfill.
+      setTimeout(() => loadLengthBackfill().catch(() => {}), 1500);
       // Fire all done callbacks.  Pass the final status object
       // (including ``last_plan``) so callbacks can show a meaningful
       // toast like "Skipped 16027, deleted 1928 ghosts" instead of
@@ -2171,7 +2258,7 @@ async function loadRendererStatus() {
   try { loadSceneStatus(); } catch (_) { /* defined later */ }
   const names = ['ffmpeg', 'sidplayfp', 'fluidsynth', 'openmpt123',
                  'uade123', 'hvl2wav', 'gme', 'adplay',
-                 'psgplay', 'ym2wav', 'sc68', 'zxtune123'];
+                 'psgplay', 'ym2wav', 'sc68', 'zxtune123', 'kssrender'];
   // Set all to loading state \u2014 ``renderer-loading`` adds a subtle pulse
   // animation so the user sees the row is actively probing rather than
   // frozen at "\u2026".
@@ -2701,11 +2788,19 @@ async function loadSoundfonts() {
 
   try {
     const res = await api('/admin/soundfonts');
-    const { soundfonts, active } = await res.json();
+    const { soundfonts, active, missing } = await res.json();
     list.innerHTML = '';
+    if (missing) {
+      const note = document.createElement('div');
+      note.className = 'admin-hint sf-missing-note';
+      note.setAttribute('role', 'status');
+      note.textContent = `The chosen SoundFont can't be found at ${missing}. MIDI tunes won't play `
+        + 'until its drive is back, or you choose another SoundFont below.';
+      list.appendChild(note);
+    }
 
     if (!soundfonts.length) {
-      list.innerHTML = '<span style="color:var(--text2);font-size:12px">No soundfonts installed.</span>';
+      list.insertAdjacentHTML('beforeend', '<span style="color:var(--text2);font-size:12px">No soundfonts installed.</span>');
     } else {
       soundfonts.forEach(sf => {
         const row = document.createElement('div');
@@ -3608,10 +3703,11 @@ function _openDevicePrefs() {
   backdrop.id = 'device-prefs';
   const dialog = document.createElement('div');
   dialog.className = 'pl-modal-dialog';
+  dialog.style.width = 'min(380px, 92vw)';      // (the shared modal is 300 px: long labels wrapped into their hints)
   dialog.setAttribute('role', 'dialog');
   dialog.setAttribute('aria-modal', 'true');
   dialog.setAttribute('aria-labelledby', 'device-prefs-title');
-  const row = 'display:flex;align-items:center;justify-content:space-between;gap:16px;margin:10px 0 0;font-size:13px';
+  const row = 'display:flex;align-items:center;justify-content:space-between;gap:16px;margin:10px 0 0;font-size:13px;line-height:1.35';
   const hint = 'color:var(--text2,#bbb);font-size:12px;margin:2px 0 8px';
   dialog.innerHTML = `
     <div class="pl-modal-title" id="device-prefs-title">Preferences</div>
@@ -3619,6 +3715,9 @@ function _openDevicePrefs() {
     <label style="${row}" for="dp-crossfade">Crossfade (seconds)
       <input id="dp-crossfade" aria-describedby="dp-crossfade-hint" class="pl-modal-input" type="number" min="0" max="12" step="0.5" style="width:80px;margin:0"></label>
     <div id="dp-crossfade-hint" style="${hint}">Overlap between one track and the next. 0 = off.</div>
+    <label style="${row}" for="dp-quality">Streaming quality
+      <select id="dp-quality" aria-describedby="dp-quality-hint" class="pl-modal-input" style="width:150px;margin:0"><option value="">Original</option><option value="320">High (320 kbps)</option><option value="192">Normal (192 kbps)</option><option value="128">Low (128 kbps)</option><option value="96">Data saver (96 kbps)</option></select></label>
+    <div id="dp-quality-hint" style="${hint}">Lower uses less data — handy on mobile data. Music files above the chosen rate are converted; files at or below it, retro tunes and internet radio play as they are. From the next track.</div>
     <label style="${row}" for="dp-preload">Preload buffer (seconds)
       <input id="dp-preload" aria-describedby="dp-preload-hint" class="pl-modal-input" type="number" min="0" max="30" step="1" style="width:80px;margin:0"></label>
     <div id="dp-preload-hint" style="${hint}">Wait until this much audio is buffered before starting. 0 = off.</div>
@@ -3627,25 +3726,28 @@ function _openDevicePrefs() {
     <div id="dp-delay-hint" style="${hint}">How long a slow conversion (formats your browser can\u2019t play directly, such as DSD or ALAC) may take before the \u201cConverting\u2026\u201d notice appears. Retro and Amiga tracks show \u201cRendering\u2026\u201d after 1 second instead.</div>
     <label style="${row}" for="dp-shuffle-replay">Let shuffle repeat tracks you’ve heard
       <input id="dp-shuffle-replay" aria-describedby="dp-shuffle-replay-hint" type="checkbox"></label>
-    <div id="dp-shuffle-replay-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Off: a shuffle plays each track once before anything repeats. Takes effect the next time you turn shuffle on.</div>
+    <div id="dp-shuffle-replay-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Off: a shuffle plays each track once before anything repeats. Takes effect the next time you turn shuffle on.</div>
     <div id="dp-queue-sync-row"${Player.queueSyncSupported === false ? ' hidden' : ''}>
     <label style="${row}" for="dp-queue-sync">Sync the play queue across devices
       <input id="dp-queue-sync" aria-describedby="dp-queue-sync-hint" type="checkbox"></label>
-    <div id="dp-queue-sync-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Keeps this browser’s queue on the server for your other devices and Subsonic apps, and offers to resume a newer queue saved elsewhere.</div>
+    <div id="dp-queue-sync-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Keeps this browser’s queue on the server for your other devices and Subsonic apps, and offers to resume a newer queue saved elsewhere.</div>
     </div>
     <label style="${row}" for="dp-viz-enabled">Visualizations
       <input id="dp-viz-enabled" aria-describedby="dp-viz-enabled-hint" type="checkbox"></label>
-    <div id="dp-viz-enabled-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Master switch for every animated visualization.</div>
+    <div id="dp-viz-enabled-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Master switch for every animated visualization.</div>
     <label style="${row}" for="dp-viz-nowplaying">Now-playing visualizations
       <input id="dp-viz-nowplaying" aria-describedby="dp-viz-nowplaying-hint" type="checkbox"></label>
-    <div id="dp-viz-nowplaying-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Decode signal-chain, CRT oscilloscope mode and the VU meter skin on the player screen.</div>
+    <div id="dp-viz-nowplaying-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Decode signal-chain, CRT oscilloscope mode and the VU meter skin on the player screen.</div>
     <label style="${row}" for="dp-viz-vustyle">VU meter style
       <select id="dp-viz-vustyle" class="pl-modal-input" style="width:120px;margin:0"><option value="bars">Bars</option><option value="circuit">Circuit board</option></select></label>
     <label style="${row}" for="dp-sid-wasm">Play SID in browser (experimental)
       <input id="dp-sid-wasm" aria-describedby="dp-sid-wasm-hint" type="checkbox"></label>
-    <div id="dp-sid-wasm-hint" style="color:var(--text2,#bbb);font-size:12px;margin:-4px 0 8px">Also renders C64 SID tunes in this browser to drive the per-voice VU meter. Playback still streams from the server.</div>
+    <div id="dp-sid-wasm-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Also renders C64 SID tunes in this browser to drive the per-voice VU meter. Playback still streams from the server.</div>
     <label style="${row}" for="dp-theme">Theme
       <select id="dp-theme" class="pl-modal-input" style="width:120px;margin:0"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+    <label style="${row}" for="dp-ui-style">Style
+      <select id="dp-ui-style" aria-describedby="dp-ui-style-hint" class="pl-modal-input" style="width:120px;margin:0"><option value="retro">Retro hi-fi</option><option value="modern">Modern</option></select></label>
+    <div id="dp-ui-style-hint" style="${hint}">The look of the player bar, equalizer, Stations, playlists, the queue, Track Info, lyrics, the visualizer and the top bar and sidebar.</div>
     <div style="border-top:1px solid var(--glass-border,rgba(255,255,255,.12));margin:14px 0 0;padding-top:10px">
       <div style="color:var(--text2,#bbb);font-size:12px;margin:0 0 8px">Your account (saved on the server):</div>
       <div id="dp-sspw" style="font-size:13px"></div>
@@ -3659,11 +3761,13 @@ function _openDevicePrefs() {
   document.body.appendChild(backdrop);
   const $ = (id) => dialog.querySelector('#' + id);
   $('dp-crossfade').value = _prefValue('sb_crossfade');
+  $('dp-quality').value = Player.streamQuality;
   $('dp-preload').value = _prefValue('sb_preload_buffer');
   $('dp-delay').value = _prefValue('sb_convert_delay');
   $('dp-shuffle-replay').checked = localStorage.getItem('sb_shuffle_replay') === '1';
   $('dp-queue-sync').checked = Player.queueSync;
   $('dp-theme').value = localStorage.getItem('sb_theme') || 'dark';
+  $('dp-ui-style').value = $('dp-ui-style').dataset.loaded = getUiStyle();
   const viz = getVizSettings();
   $('dp-viz-enabled').checked = viz.enabled !== false;
   $('dp-viz-nowplaying').checked = viz.nowPlaying !== false;
@@ -3695,11 +3799,13 @@ function _openDevicePrefs() {
     localStorage.setItem('sb_preload_buffer', String(_readNumPref($('dp-preload'), 'sb_preload_buffer', 0, 30, 'Preload buffer', notes)));
     localStorage.setItem('sb_convert_delay', String(Math.round(_readNumPref($('dp-delay'), 'sb_convert_delay', 0, 30000, '\u201cConverting\u2026\u201d notice delay', notes))));
     localStorage.setItem('sb_shuffle_replay', $('dp-shuffle-replay').checked ? '1' : '0');
+    Player.setStreamQuality($('dp-quality').value);
     Player.setQueueSync($('dp-queue-sync').checked);
     const theme = $('dp-theme').value === 'light' ? 'light' : 'dark';
     localStorage.setItem('sb_theme', theme);
     if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
     else document.documentElement.removeAttribute('data-theme');
+    if ($('dp-ui-style').value !== $('dp-ui-style').dataset.loaded) setUiStyle($('dp-ui-style').value);
     // Visualization preferences (localStorage, applied live like the admin grid's).
     const vuStyle = $('dp-viz-vustyle').value === 'circuit' ? 'circuit' : 'bars';
     setVizSettings({ enabled: $('dp-viz-enabled').checked, nowPlaying: $('dp-viz-nowplaying').checked, vuStyle });
@@ -3739,6 +3845,8 @@ async function loadSettings() {
   const delayEl   = document.getElementById('setting-convert-delay');
   const themeEl   = document.getElementById('setting-theme');
   if (xfadeEl)   xfadeEl.value   = _prefValue('sb_crossfade');
+  const qualityEl = document.getElementById('setting-stream-quality');
+  if (qualityEl) qualityEl.value = Player.streamQuality;
   if (preloadEl) preloadEl.value = _prefValue('sb_preload_buffer');
   if (delayEl)   delayEl.value   = _prefValue('sb_convert_delay');
   const shufReplayEl = document.getElementById('setting-shuffle-replay');
@@ -3748,6 +3856,8 @@ async function loadSettings() {
   const qsyncRow = document.getElementById('setting-queue-sync-row');
   if (qsyncRow) qsyncRow.hidden = Player.queueSyncSupported === false;   // the server has no queue to sync with
   if (themeEl)   themeEl.value   = localStorage.getItem('sb_theme') || 'dark';
+  const styleEl = document.getElementById('setting-ui-style');
+  if (styleEl) styleEl.value = styleEl.dataset.loaded = getUiStyle();
   // Visualization preference controls (client-side, applies live).
   _initVizSettingsUI();
   // Populate the About panel each time settings load (cheap, idempotent)
@@ -3826,7 +3936,7 @@ async function loadSettings() {
     if (sidBoostEl) sidBoostEl.checked = !!r.sid_digiboost;
     // Renderer binary paths (Renderers tab)
     for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
-                        'zxtune123']) {
+                        'zxtune123', 'kssrender']) {
       const el = document.getElementById(`setting-path-${name}`);
       if (el) el.value = r[`${name}_path`] || '';
     }
@@ -3872,6 +3982,8 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   const delay   = Math.round(_readNumPref(document.getElementById('setting-convert-delay'), 'sb_convert_delay', 0, 30000, '\u201cConverting\u2026\u201d notice delay', _notes));
   const theme    = document.getElementById('setting-theme')?.value || 'dark';
   localStorage.setItem('sb_crossfade',      String(xfade));
+  const _qualityEl = document.getElementById('setting-stream-quality');
+  if (_qualityEl) Player.setStreamQuality(_qualityEl.value);                // from the next track
   localStorage.setItem('sb_preload_buffer', String(Math.max(0, preload))); // takes effect on next track
   localStorage.setItem('sb_convert_delay',  String(delay));
   // Read by the player at the next shuffle deal (player.js ``sb_shuffle_replay``).
@@ -3880,6 +3992,9 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   const _qsyncEl = document.getElementById('setting-queue-sync');
   if (_qsyncEl) Player.setQueueSync(_qsyncEl.checked);
   localStorage.setItem('sb_theme', theme);
+  // (only a changed select: the equalizer or another tab may have switched it since)
+  const _styleEl = document.getElementById('setting-ui-style');
+  if (_styleEl && _styleEl.value !== _styleEl.dataset.loaded) { setUiStyle(_styleEl.value); _styleEl.dataset.loaded = _styleEl.value; }
   // Apply the theme immediately so the user sees the flip without reload.
   if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
   else                   document.documentElement.removeAttribute('data-theme');
@@ -3974,8 +4089,9 @@ function _updateNetFormForProtocol() {
   const anonText = document.getElementById('net-anon-text');
   const anonBox = document.getElementById('net-anonymous');
   const webdavRow = document.getElementById('net-webdav-row');
-  const isWebDav = proto === 'webdav' || proto === 'webdavs';
-  // WebDAV uses a single Base-URL field instead of host/share/path.
+  // WebDAV and a web folder listing use a single Base-URL field instead of
+  // host/share/path.
+  const isWebDav = proto === 'webdav' || proto === 'webdavs' || proto === 'httpindex';
   if (webdavRow) webdavRow.style.display = isWebDav ? '' : 'none';
   hostInput.style.display  = isWebDav ? 'none' : '';
   shareInput.style.display = isWebDav ? 'none' : (proto === 'ftp' ? 'none' : '');
@@ -4094,8 +4210,8 @@ function _getNetFormData() {
     password: document.getElementById('net-pass').value,
     alias:    document.getElementById('net-alias').value.trim(),
   };
-  if (proto === 'webdav' || proto === 'webdavs') {
-    // For WebDAV, the user gives us one URL — but the backend (/admin/shares)
+  if (proto === 'webdav' || proto === 'webdavs' || proto === 'httpindex') {
+    // For WebDAV (and a web folder), the user gives us one URL — but the backend (/admin/shares)
     // expects host/share/path-style fields.  Derive them from the URL so the
     // existing share record format stays uniform.
     const raw = (document.getElementById('net-webdav-url').value || '').trim();
@@ -4415,59 +4531,350 @@ function _hvscDate(sec) {
 }
 
 // The download's line under the buttons: which HVSC release, when checked,
-// or why the last check failed and when the next one is.
+// or why the last check failed and when the next one is.  (A failure the
+// job box below explains in its own words is not repeated here.)
 function _hvscDownloadLine(s) {
   const d = s.download || {};
   if (s.source_setting !== 'online') return '';
   if (d.by_collection) return 'Kept up to date by the HVSC online collection (Settings → Online collections).';
-  if (d.running) return 'Downloading from the HVSC mirror…';
-  if (d.offline && !d.checked_at) return 'Offline mode is on — nothing is downloaded.';
+  const p = d.progress || {};
+  if (d.running || _HVSC_ACTIVE.has(p.phase)) return '';
+  if (d.offline && !d.checked_at) return p.phase === 'offline' ? '' : 'Offline mode is on — nothing is downloaded.';
   const parts = [];
-  if (d.index_date) parts.push(`Songlengths dated ${new Date(d.index_date + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`);
-  if (d.checked_at) parts.push(`checked ${_hvscDate(d.checked_at)}`);
-  if (d.error) parts.push(`last check failed: ${d.error}`);
+  if (d.index_date) parts.push(`song lengths dated ${_hvscDay(d.index_date)}`);
+  if (d.checked_at) parts.push(`checked ${_hvscWhen(d.checked_at)}`);
+  if (d.error && p.phase !== 'error') parts.push(`last check failed: ${d.error}`);
   if (d.next_at && (d.error || d.checked_at)) parts.push(`next check ${_hvscDate(d.next_at)}`);
-  return parts.length ? `From 6581.nl · ${parts.join(' · ')}.` : 'Not downloaded yet.';
+  const r = d.last_result;
+  if (r && r.scanned && (!p.phase || p.phase === 'idle')) {
+    // (after a restart: the job box is empty, the last apply is not)
+    parts.push(`applied to ${_hvscN(r.scanned)} SID tracks ${_hvscWhen(r.at)}`);
+  }
+  return parts.length ? `From ${d.mirror || '6581.nl'} · ${parts.join(' · ')}.` : 'Not downloaded yet.';
 }
+
+// ── The check / apply job box ────────────────────────────────────────────
+// GET /admin/hvsc/status → download.progress (core/hvsc_download.progress):
+// phase starting → connecting → downloading (bytes of the Content-Length,
+// file 1 of 2: the song lengths, 2 of 2: the STIL) → checking → installing →
+// loading → applying (SID tracks matched of all, then saving), and how it
+// ended: done / offline / error.  Server-side, so a reload or reopening
+// Settings mid-download shows the same job.  Re-polled every second while one
+// runs, the card is on screen and the page visible.
+const _HVSC_ACTIVE = new Set(['starting', 'connecting', 'downloading', 'checking',
+  'installing', 'loading', 'applying']);
+// (checking the song lengths falls between the two files: still Download)
+const _HVSC_STEP = { starting: 'download', connecting: 'download', downloading: 'download',
+  checking: 'download', installing: 'install', loading: 'apply', applying: 'apply' };
+const _HVSC_STEP_SAY = { done: 'Done: ', now: 'Now: ', todo: 'To do: ' };
+const _HVSC_STEPS = ['download', 'install', 'apply'];
+// No byte for this long while downloading: the box says it is waiting (the
+// server gives up after its own 60 s).
+const _HVSC_QUIET_S = 12;
+let _hvscLastSaid = '';
+let _hvscWasActive = false;     // the last status seen had a job running
+let _hvscLost = 0;              // status polls failed in a row while one ran
+
+function _hvscDay(iso) {
+  return new Date(iso + 'T00:00:00').toLocaleDateString(undefined,
+    { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// A moment as the card says it: the time today, else the date and time.
+function _hvscWhen(sec) {
+  if (!sec) return '';
+  const d = new Date(sec * 1000);
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? `today ${time}`
+    : `${d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })} ${time}`;
+}
+
+function _hvscMB(n) {
+  const mb = (n || 0) / 1e6;
+  return mb >= 10 ? mb.toFixed(0) : mb.toFixed(1);
+}
+
+const _hvscN = v => Number(v || 0).toLocaleString();
+
+// What the job box shows for a running phase: { title, pct (null =
+// indeterminate), detail }.
+function _hvscActiveView(p, mirror) {
+  const step = p.steps ? ` (file ${p.step} of ${p.steps})` : '';
+  const quiet = Math.max(0, (p.now || 0) - (p.updated_at || p.now || 0));
+  const waiting = quiet >= _HVSC_QUIET_S
+    ? ` · no data from ${mirror} for ${Math.round(quiet)} s — still waiting` : '';
+  switch (p.phase) {
+    case 'starting':
+      return { title: 'Starting the download…', pct: null, detail: `From ${mirror}` };
+    case 'connecting':
+      return { title: `Connecting to ${mirror}…`, pct: null,
+               detail: `Asking for the ${p.doc || 'song lengths'}${step}${waiting}` };
+    case 'downloading': {
+      const done = p.done || 0;
+      if (p.total) {
+        const pct = Math.min(100, Math.floor(done * 100 / p.total));
+        return { title: `Downloading the ${p.doc}`, pct,
+                 detail: `${_hvscMB(done)} of ${_hvscMB(p.total)} MB${step}${waiting}` };
+      }
+      return { title: `Downloading the ${p.doc}…`, pct: null,
+               detail: `${_hvscMB(done)} MB so far${step}${waiting}` };
+    }
+    case 'checking':
+      return { title: 'Checking the song lengths…', pct: null, detail: '' };
+    case 'installing':
+      return { title: 'Installing the files…', pct: null,
+               detail: p.tunes ? `${_hvscN(p.tunes)} tunes with song lengths` : '' };
+    case 'loading':
+      return { title: 'Reading the song lengths and STIL…', pct: null,
+               detail: p.tunes ? `${_hvscN(p.tunes)} tunes with song lengths` : '' };
+    case 'applying': {
+      if (p.stage === 'saving') {
+        return { title: `Saving ${_hvscN(p.total)} updated SID track${p.total === 1 ? '' : 's'}…`,
+                 pct: null, detail: '' };
+      }
+      const total = p.total || 0;
+      const pct = total ? Math.min(100, Math.floor((p.done || 0) * 100 / total)) : 100;
+      return { title: 'Applying to your SID tracks', pct,
+               detail: `${_hvscN(p.done)} of ${_hvscN(total)} SID tracks`
+                 + (p.songlengths ? ` · ${_hvscN(p.songlengths)} song lengths, ${_hvscN(p.stil)} STIL entries` : '') };
+    }
+    default:
+      return { title: '', pct: null, detail: '' };
+  }
+}
+
+// How a job ended: { type: ok|warn|err, text, action: null|'retry'|'apply' }.
+function _hvscOutcome(p, d, inUse) {
+  // (a failed check leaves the documents already downloaded in use)
+  const kept = inUse ? ' The HVSC database downloaded before stays in use.' : '';
+  const when = p.finished_at ? _hvscWhen(p.finished_at) : '';
+  if (p.phase === 'offline') {
+    return { type: 'warn', action: null,
+             text: 'Offline mode is on — nothing is downloaded. The HVSC database downloads once offline '
+               + `mode is off (SONIQBOOM_OFFLINE, or "offline" in SoniqBoom.conf).${kept}` };
+  }
+  if (p.phase === 'error') {
+    if (p.error === 'apply') {
+      return { type: 'err', action: 'apply', text: `${p.message}${when ? ` Tried ${when}.` : ''}` };
+    }
+    const wait = p.retry_at && p.retry_at > (p.now || 0);
+    const next = wait ? ` ${d.mirror || 'The mirror'} asked to wait — the next try is possible ${_hvscWhen(p.retry_at)}.`
+      : (d.next_at ? ` The next automatic try: ${_hvscWhen(d.next_at)}.` : '');
+    return { type: 'err', action: wait || p.error === 'superseded' ? null : 'retry',
+             text: `${p.message || 'The download failed.'}${when ? ` Tried ${when}.` : ''}${kept}${next}` };
+  }
+  if (p.phase !== 'done') return null;
+  const r = p.result || {};
+  const docs = r.songlengths
+    ? `${_hvscN(r.songlengths)} song lengths${r.stil ? ` and ${_hvscN(r.stil)} STIL entries` : ''} in use`
+    : 'The HVSC database is in use';
+  let applied = '';
+  if (r.scanned !== undefined) {
+    applied = r.scanned
+      ? `, applied to ${_hvscN(r.scanned)} SID track${r.scanned === 1 ? '' : 's'} (${_hvscN(r.updated)} updated)`
+      : '. There are no SID tracks in your library yet — SID files get their lengths as they are scanned';
+  }
+  if ((r.kind === 'apply' || r.kind === 'reextract') && !r.songlengths && !r.stil
+      && r.scanned !== undefined) {
+    // (a local folder without the documents in it)
+    return { type: 'warn', action: null,
+             text: `No song lengths or STIL were found ${when} — check that the folder is HVSC's `
+               + 'DOCUMENTS folder (it holds Songlengths.md5 and STIL.txt).' };
+  }
+  const extra = [];
+  if (r.skipped_catalogue) {
+    extra.push(`${_hvscN(r.skipped_catalogue)} SID${r.skipped_catalogue === 1 ? '' : 's'} from online `
+      + 'collections get theirs when first played');
+  }
+  const unread = (r.skipped_missing || 0) + (r.skipped_unreadable || 0);
+  if (unread) extra.push(`${_hvscN(unread)} SID file${unread === 1 ? '' : 's'} could not be read`);
+  const tail = extra.length ? ` · ${extra.join(' · ')}` : '';
+  if (p.stil_missing) {
+    return { type: 'warn', action: 'retry',
+             text: `Song lengths downloaded ${when}; the STIL commentary did not come and is asked for again `
+               + `at the next check. ${_hvscN(r.songlengths)} song lengths in use${applied}${tail}.` };
+  }
+  if (r.kind === 'reextract') {
+    return { type: unread ? 'warn' : 'ok', action: null,
+             text: `Done ${when} — ${docs.charAt(0).toLowerCase() + docs.slice(1)}${applied}${tail}.` };
+  }
+  if (p.unchanged) {
+    const dated = d.index_date ? ` (song lengths dated ${_hvscDay(d.index_date)})` : '';
+    return { type: 'ok', action: null,
+             text: `Already up to date${dated} — checked ${when}${applied}${tail}.` };
+  }
+  return { type: unread ? 'warn' : 'ok', action: null, text: `Done ${when} — ${docs}${applied}${tail}.` };
+}
+
+// The step list: done ✓ / now ● / to do ○ (shape and text, not colour only).
+function _hvscPaintSteps(box, phase, ended) {
+  const cur = ended ? null : _HVSC_STEP[phase];
+  const curIdx = cur ? _HVSC_STEPS.indexOf(cur) : _HVSC_STEPS.length;
+  box.querySelectorAll('.hvsc-steps li').forEach((li, i) => {
+    const st = i < curIdx ? 'done' : i === curIdx ? 'now' : 'todo';
+    li.dataset.state = st;
+    let say = li.querySelector('.sr-only');
+    if (!say) {
+      say = document.createElement('span');
+      say.className = 'sr-only';
+      li.prepend(say);
+    }
+    say.textContent = _HVSC_STEP_SAY[st];
+    if (st === 'now') li.setAttribute('aria-current', 'step');
+    else li.removeAttribute('aria-current');
+  });
+}
+
+function _hvscRenderJob(s) {
+  const box = document.getElementById('hvsc-job');
+  const out = document.getElementById('hvsc-outcome');
+  const live = document.getElementById('hvsc-job-live');
+  if (!box || !out) return false;
+  const d = s.download || {};
+  const p = d.progress || {};
+  const active = _HVSC_ACTIVE.has(p.phase);
+  const mirror = d.mirror || '6581.nl';
+  // A job of the online download is the card's while it is chosen; an apply
+  // job (Re-extract, a local folder's Save) shows under either source.
+  const mine = s.source_setting === 'online' && !d.by_collection;
+  const show = active && (mine || p.kind === 'reextract' || p.kind === 'apply');
+  box.hidden = !show;
+  let said = '';
+  if (show) {
+    const v = _hvscActiveView(p, mirror);
+    document.getElementById('hvsc-job-title').textContent = v.title;
+    document.getElementById('hvsc-job-pct').textContent = v.pct === null ? '' : `${v.pct} %`;
+    document.getElementById('hvsc-job-detail').textContent = v.detail;
+    const bar = document.getElementById('hvsc-job-bar');
+    const fill = bar.querySelector('.hvsc-job-fill');
+    bar.classList.toggle('indeterminate', v.pct === null);
+    // (the next file starts at 0: the bar jumps back, it doesn't slide)
+    const back = v.pct !== null && v.pct < Number(bar.dataset.pct || 0);
+    if (back) fill.style.transition = 'none';
+    fill.style.width = v.pct === null ? '' : `${v.pct}%`;
+    if (back) { void fill.offsetWidth; fill.style.transition = ''; }
+    bar.dataset.pct = v.pct === null ? '0' : String(v.pct);
+    if (v.pct === null) {
+      bar.removeAttribute('aria-valuenow');
+      bar.setAttribute('aria-valuetext', v.detail || v.title);
+    } else {
+      bar.setAttribute('aria-valuenow', String(v.pct));
+      bar.setAttribute('aria-valuetext', `${v.pct} % — ${v.detail}`);
+    }
+    // The download / install / apply steps only for a download.
+    box.querySelector('.hvsc-steps').hidden = p.kind !== 'download';
+    _hvscPaintSteps(box, p.phase, false);
+    said = v.title;                              // phases, not every percent
+  }
+  // How the last job ended — shown until the next one starts; an apply's
+  // ending under a local folder too.
+  const o = !active && (mine || (p.kind && p.kind !== 'download'))
+    ? _hvscOutcome(p, d, !!(s.enabled && s.source === 'online')) : null;
+  out.hidden = !o;
+  const btn = document.getElementById('btn-hvsc-retry');
+  if (o) {
+    out.className = `admin-msg hvsc-outcome ${o.type}`;
+    document.getElementById('hvsc-outcome-text').textContent = o.text;
+    btn.hidden = !o.action;
+    btn.dataset.action = o.action || '';
+    btn.textContent = o.action === 'apply' ? 'Apply to SID tracks' : 'Retry';
+    said = o.text;
+  }
+  // (announced: phases and an ending seen happen — not the last ending
+  // found on opening the card)
+  if (live && said && said !== _hvscLastSaid) {
+    if (active || _hvscWasActive) live.textContent = said;
+    _hvscLastSaid = said;
+  }
+  if (!active && _hvscWasActive) {
+    // The job box says how it ended: a Save / Check now line goes.
+    const msg = document.getElementById('admin-hvsc-msg');
+    if (msg && msg.classList.contains('info')) showMsg('admin-hvsc-msg', '');
+  }
+  _hvscWasActive = active;
+  // No double start: Check now and Re-extract wait while a job runs.
+  for (const id of ['btn-hvsc-download-now', 'btn-rescan-sids', 'btn-hvsc-retry']) {
+    const b = document.getElementById(id);
+    if (!b) continue;
+    b.disabled = active;
+    b.title = active ? 'Wait for the HVSC check under way to finish'
+      : (b.dataset.idleTitle ?? b.title);
+  }
+  return active;
+}
+document.querySelectorAll('#btn-hvsc-download-now, #btn-rescan-sids, #btn-hvsc-retry').forEach(b => {
+  b.dataset.idleTitle = b.title;
+});
 
 let _hvscPoll = null;
 let _hvscPolls = 0;
+let _hvscSeq = 0;
+const _HVSC_POLL_MS = 1000;
+
+function _hvscCardShown() {
+  return _isOpen && !document.hidden && !!document.getElementById('hvsc-section')?.offsetParent;
+}
 
 async function loadHvscStatus() {
   const pathEl   = document.getElementById('setting-hvsc-path');
   const statusEl = document.getElementById('hvsc-status');
   const sidHint  = document.getElementById('setting-sid-duration-hint');
   if (!pathEl || !statusEl) return;
+  const seq = ++_hvscSeq;
+  let s;
   try {
     const res = await api('/admin/hvsc/status');
-    if (!res.ok) return;
-    const s = await res.json();
-    pathEl.value = s.local_path ?? s.docs_path ?? '';
+    s = await res.json();
+  } catch {
+    // A job was running: keep asking (the server restarting, a proxy's
+    // 502) — the box says so instead of freezing on the last percentage.
+    if (seq === _hvscSeq && _hvscWasActive && _hvscCardShown()) {
+      _hvscLost++;
+      const det = document.getElementById('hvsc-job-detail');
+      if (det) det.textContent = 'Lost contact with the server — trying again…';
+      clearTimeout(_hvscPoll);
+      _hvscPoll = setTimeout(loadHvscStatus, Math.min(10000, 1000 * 2 ** Math.min(_hvscLost, 4)));
+    }
+    return;
+  }
+  _hvscLost = 0;
+  try {
+    if (seq !== _hvscSeq) return;              // a newer poll took over
+    // (the field keeps what is being typed while a job is polled)
+    if (document.activeElement !== pathEl) pathEl.value = s.local_path ?? s.docs_path ?? '';
     const src = s.source_setting === 'online' ? 'online' : 'local';
+    const first = !_hvscRadioSet;
+    _hvscRadioSet = true;
     _hvscSaved = { src, byCollection: !!(s.download || {}).by_collection };
-    const radio = document.getElementById(`hvsc-source-${src}`);
-    if (radio) radio.checked = true;
+    // (a choice clicked but not saved yet stays while a job is polled)
+    if (first || !_hvscRadioDirty) {
+      const radio = document.getElementById(`hvsc-source-${src}`);
+      if (radio) radio.checked = true;
+    }
     const info = document.getElementById('hvsc-download-info');
     if (info) {
       const line = _hvscDownloadLine(s);
       info.textContent = line;
       info.style.display = line ? '' : 'none';
     }
-    _hvscShowSource(src);
-    // While the first download (or a Check now) runs: look again shortly —
-    // at most a minute, and only while the card is on screen.
+    _hvscShowSource(_hvscRadioDirty ? _hvscSourceChoice() : src);
+    const active = _hvscRenderJob(s);
+    // While a job runs: look again every second — only while the card is
+    // on screen (the Renderers tab opening, or the page coming back, looks
+    // again).  A minute's grace after Save for the first download to begin.
     clearTimeout(_hvscPoll);
+    _hvscPoll = null;
     const d = s.download || {};
-    const onScreen = !!document.getElementById('hvsc-section')?.offsetParent;
-    if (src === 'online' && !d.by_collection && !d.offline && onScreen && _hvscPolls < 30
-        && (d.running || (!s.enabled && !d.error))) {
-      _hvscPolls++;
-      _hvscPoll = setTimeout(loadHvscStatus, 2000);
+    const pending = src === 'online' && !d.by_collection && !d.offline && !s.enabled
+      && !d.error && _hvscPolls < 60;
+    if ((active || pending) && _hvscCardShown()) {
+      _hvscPolls = active ? 0 : _hvscPolls + 1;
+      _hvscPoll = setTimeout(loadHvscStatus, _HVSC_POLL_MS);
     } else {
       _hvscPolls = 0;
     }
     if (s.enabled && (s.songlengths || s.stil)) {
-      statusEl.classList.remove('off');
+      statusEl.classList.remove('off', 'busy');
       statusEl.classList.add('on');
       const from = s.source !== 'online' ? 'loaded'
         : (s.source_setting === 'online' ? 'downloaded' : 'from the online HVSC collection');
@@ -4480,15 +4887,20 @@ async function loadHvscStatus() {
         sidHint.style.color = 'var(--accent)';
       }
     } else if (s.enabled) {
-      statusEl.classList.remove('off');
+      statusEl.classList.remove('off', 'busy');
       statusEl.classList.add('on');
       statusEl.textContent = 'configured (waiting for first lookup)';
       if (sidHint) {
         sidHint.textContent = 'Fallback only — HVSC is configured and overrides this per tune.';
         sidHint.style.color = 'var(--accent)';
       }
+    } else if (pending || (active && (d.progress || {}).kind === 'download')) {
+      // The first download under way: no data yet, but not "disabled" either
+      statusEl.classList.remove('on', 'off');
+      statusEl.classList.add('busy');
+      statusEl.textContent = 'downloading…';
     } else {
-      statusEl.classList.remove('on');
+      statusEl.classList.remove('on', 'busy');
       statusEl.classList.add('off');
       statusEl.textContent = 'disabled';
       if (sidHint) {
@@ -4496,32 +4908,65 @@ async function loadHvscStatus() {
         sidHint.style.color = 'var(--text2)';
       }
     }
+    return s;
   } catch { /* ignore */ }
 }
 
-document.querySelectorAll('input[name="hvsc-source"]').forEach(r =>
-  r.addEventListener('change', () => _hvscShowSource(_hvscSourceChoice())));
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    if (_hvscCardShown()) loadHvscStatus().catch(() => {});
+  } else {
+    clearTimeout(_hvscPoll);
+    _hvscPoll = null;
+  }
+});
 
-document.getElementById('btn-hvsc-download-now')?.addEventListener('click', async (e) => {
-  const btn = e.currentTarget;
-  btn.disabled = true;
-  showMsg('admin-hvsc-msg', 'Checking the HVSC mirror…', 'info');
+let _hvscRadioSet = false;
+let _hvscRadioDirty = false;      // a source clicked, not saved yet
+document.querySelectorAll('input[name="hvsc-source"]').forEach(r =>
+  r.addEventListener('change', () => {
+    _hvscRadioDirty = _hvscSourceChoice() !== _hvscSaved.src;
+    _hvscShowSource(_hvscSourceChoice());
+  }));
+
+// Keyboard focus stays on the card when the clicked button is disabled or
+// hidden by the job it started: the job box (or how it ended) takes it.
+function _hvscKeepFocus() {
+  const f = document.activeElement;
+  if (f && f !== document.body && !f.disabled && f.offsetParent) return;
+  const box = document.getElementById('hvsc-job');
+  const out = document.getElementById('hvsc-outcome');
+  const to = box && !box.hidden ? box : (out && !out.hidden ? out : null);
+  to?.focus({ preventScroll: true });
+}
+
+// Check now / Retry: the check starts on the server and the job box
+// follows it.
+async function _hvscCheckNow() {
+  showMsg('admin-hvsc-msg', '');
   try {
     const res = await api('/admin/hvsc/download-now', { method: 'POST' });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.error) {
-      showMsg('admin-hvsc-msg', `Check failed: ${data.error || data.detail || res.status}`, 'err');
-    } else if (data.unchanged) {
-      showMsg('admin-hvsc-msg', 'Up to date — HVSC has not changed since the last download.', 'ok');
-    } else {
-      showMsg('admin-hvsc-msg', `Downloaded — ${Number(data.tunes || 0).toLocaleString()} tunes with song lengths.`, 'ok');
+    if (data.error) {
+      showMsg('admin-hvsc-msg', `Can't check now: ${data.error}.`, 'err');
     }
   } catch (err) {
     showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
-  } finally {
-    btn.disabled = false;
-    await loadHvscStatus();
   }
+  await loadHvscStatus();
+  _hvscKeepFocus();
+}
+
+document.getElementById('btn-hvsc-download-now')?.addEventListener('click', async (e) => {
+  e.currentTarget.disabled = true;
+  await _hvscCheckNow();
+});
+
+document.getElementById('btn-hvsc-retry')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  if (btn.dataset.action === 'apply') await _hvscReextract();
+  else await _hvscCheckNow();
 });
 
 document.getElementById('btn-save-hvsc')?.addEventListener('click', async () => {
@@ -4537,26 +4982,55 @@ document.getElementById('btn-save-hvsc')?.addEventListener('click', async () => 
       showMsg('admin-hvsc-msg', `Failed: ${data.detail || res.status}`, 'err');
       return;
     }
-    showMsg('admin-hvsc-msg', source === 'online'
-      ? 'Saved. Downloading the HVSC database…' : 'Saved. Reloading database…', 'info');
-    await loadHvscStatus();
+    _hvscRadioDirty = false;
+    showMsg('admin-hvsc-msg', '');
+    const s = (await loadHvscStatus()) || {};
+    const d = s.download || {};
+    const p = d.progress || {};
+    if (source !== 'online') {
+      showMsg('admin-hvsc-msg', path ? 'Saved. Reading the HVSC folder…' : 'Saved — no HVSC database in use.',
+              path ? 'info' : 'ok');
+    } else if (d.by_collection) {
+      showMsg('admin-hvsc-msg', 'Saved. The HVSC online collection keeps the database up to date.', 'ok');
+    } else if (!_HVSC_ACTIVE.has(p.phase) && s.enabled && s.source === 'online') {
+      // Nothing due: the downloaded database stays in use as it is.
+      showMsg('admin-hvsc-msg', 'Saved. The downloaded HVSC database stays in use'
+        + (d.checked_at ? ` (checked ${_hvscWhen(d.checked_at)})` : '')
+        + (d.next_at ? ` — next check ${_hvscWhen(d.next_at)}.` : '.'), 'ok');
+    } else if (!_HVSC_ACTIVE.has(p.phase) && !d.offline && !d.error && d.next_at) {
+      // (a scheduled check ran within the hour: the next one waits)
+      showMsg('admin-hvsc-msg', `Saved. The HVSC database downloads at the next check, `
+        + `${_hvscWhen(d.next_at)} — or click Check now.`, 'info');
+    }
+    // (else the job box below says what happens now)
   } catch (err) {
     showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
   }
 });
 
-document.getElementById('btn-rescan-sids')?.addEventListener('click', async () => {
+// Re-extract SID metadata: the pass runs while the request is open; the job
+// box shows its progress meanwhile and its result after.
+async function _hvscReextract() {
+  showMsg('admin-hvsc-msg', '');
+  const req = api('/admin/hvsc/rescan-sids', { method: 'POST' });
+  setTimeout(() => { loadHvscStatus().then(_hvscKeepFocus).catch(() => {}); }, 300);
   try {
-    const res = await api('/admin/hvsc/rescan-sids', { method: 'POST' });
+    const res = await req;
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      showMsg('admin-hvsc-msg', `Failed: ${data.detail || res.status}`, 'err');
-      return;
+    if (data.busy) showMsg('admin-hvsc-msg', data.message, 'info');
+    else if (data.message && data.scanned === undefined) {
+      showMsg('admin-hvsc-msg', data.message, 'warn');          // HVSC not set up
     }
-    showMsg('admin-hvsc-msg', data.message || 'Re-extract queued.', 'ok');
   } catch (err) {
-    showMsg('admin-hvsc-msg', `Network error: ${err.message}`, 'err');
+    showMsg('admin-hvsc-msg', `Failed: ${err.message}`, 'err');
   }
+  await loadHvscStatus();
+  _hvscKeepFocus();
+}
+
+document.getElementById('btn-rescan-sids')?.addEventListener('click', async (e) => {
+  e.currentTarget.disabled = true;
+  await _hvscReextract();
 });
 
 // Clean up scan-dir rows that an older release auto-imported from the
@@ -4631,7 +5105,7 @@ document.getElementById('btn-save-sidfid')?.addEventListener('click', async () =
 document.getElementById('btn-save-renderer-paths')?.addEventListener('click', async () => {
   const renderers = {};
   for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
-                      'zxtune123']) {
+                      'zxtune123', 'kssrender']) {
     const el = document.getElementById(`setting-path-${name}`);
     if (el) renderers[`${name}_path`] = el.value.trim();
   }
@@ -5078,6 +5552,8 @@ function _renderDemozooStatus(s) {
     else if (Number(s.games) > 0) txt += ` \u00b7 ${Number(s.games).toLocaleString()} game soundtracks`;
     if (s.uses === null && s.games !== null) txt += ' \u00b7 refresh the index to add demo, cracktro and party genres';
     else if (Number(s.uses) > 0) txt += ` \u00b7 ${Number(s.uses).toLocaleString()} tunes with a known use`;
+    if (s.compos === null && s.uses !== null) txt += ' \u00b7 refresh the index to add party competitions and places';
+    else if (Number(s.compos) > 0) txt += ` \u00b7 ${Number(s.compos).toLocaleString()} competition entries`;
   }
   if (s.applying) txt += ' · applying…';
   else if (s.last_apply) {
@@ -5188,7 +5664,8 @@ document.getElementById('md-hvsc-rescan')?.addEventListener('click', async (e) =
   try {
     const res = await api('/admin/hvsc/rescan-sids', { method: 'POST' });
     const s = await res.json().catch(() => null);
-    if (s && !s.error) showMsg('md-hvsc-msg', 'SID length rescan complete.', 'ok');
+    if (s && s.busy) showMsg('md-hvsc-msg', s.message, 'info');     // (one pass at a time)
+    else if (s && !s.error) showMsg('md-hvsc-msg', 'SID length rescan complete.', 'ok');
     else showMsg('md-hvsc-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
     loadMdHvscStatus();
   } catch (err) {
@@ -5888,20 +6365,5 @@ function _passwordError(err) {
   if (m) return _httpStatusError(parseInt(m[1], 10), err.message);
   return err?.message || 'Password update failed.';
 }
-
-// ── Header user chip ────────────────────────────────────────────────────────
-
-(function _wireUserChip() {
-  const chip = document.getElementById('user-chip');
-  const name = document.getElementById('user-chip-name');
-  const out  = document.getElementById('user-chip-logout');
-  if (!chip || !name || !out) return;
-  if (Auth.user) {
-    name.textContent = Auth.user.display_name || Auth.user.username;
-    chip.hidden = false;
-    chip.title = `Signed in as ${Auth.user.username} (${Auth.user.role})`;
-  }
-  out.addEventListener('click', () => Auth.logout());
-})();
 
 export const Admin = { open };

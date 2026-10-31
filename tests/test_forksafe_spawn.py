@@ -230,6 +230,8 @@ def forked(monkeypatch):
     monkeypatch.setattr(forksafe.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(procinfo, "cmdline", lambda pid: next((c.cmd for c in made if c.pid == pid), ""))
     monkeypatch.setattr(forksafe.sys, "platform", "darwin")
+    # The watchdog is started with macOS's posix_spawn layouts (crashes elsewhere)
+    monkeypatch.setattr(forksafe, "_watchdog_wanted", lambda: False)
     return me, plan, made
 
 

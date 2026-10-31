@@ -29,6 +29,7 @@ the p95 first-byte dashboard stays honest.
 """
 from __future__ import annotations
 
+import asyncio as _asyncio
 import logging
 from pathlib import Path
 
@@ -202,11 +203,52 @@ def _cast_delivery(claims: dict, track) -> tuple:
     src_ext = _ext_for(track.path, track)
     src_codec = src_ext.lstrip(".") if src_ext else "?"
     use_native_fastpath = (
-        target_codec is None
+        _from_dlna_server(claims)
+        or target_codec is None
         or target_codec == src_codec
         or (src_ext in _NATIVE_EXTS and not target_codec)
     )
     return target_codec, target_bitrate, target_sample_rate, src_ext, src_codec, use_native_fastpath
+
+
+def _from_dlna_server(claims: dict) -> bool:
+    """A DLNA Media Server browse link (``issue_token(origin="dlna")``): served
+    by the stream endpoint in the codec it names — every format it plays,
+    and a render it encodes while it runs (``stream._serve_live_body``)."""
+    return claims.get("o") == "dlna"
+
+
+def _stream_subsong(claims: dict) -> "int | None":
+    """The tune the stream endpoint plays: a DLNA Media Server link's own
+    (none named: the file's default tune); 0 for every other link."""
+    if _from_dlna_server(claims):
+        sn = claims.get("sn")
+        return int(sn) if sn is not None else None
+    return 0
+
+
+def _stream_request(request: Request, claims: dict) -> Request:
+    """The request the stream endpoint is handed: for a DLNA Media Server
+    link naming tune 0, one whose query names it — ``stream.explicit_wire``
+    takes an in-process 0 as a bare play (the file's default tune) unless the
+    request carries ``subsong``."""
+    if not (_from_dlna_server(claims) and claims.get("sn") == 0):
+        return request
+    return Request({**request.scope, "query_string": b"subsong=0"}, request.receive)
+
+
+def _add_dlna_headers(response: Response, codec: str, claims: dict) -> None:
+    """Attach ``dlna_response_headers`` to ``response``.  A DLNA Media Server
+    link answered without a length (a render encoded while it runs — its
+    HEAD too) offers no seeking: ``DLNA.ORG_OP=00``, ``Accept-Ranges: none``."""
+    seekable = not _from_dlna_server(claims) or (
+        "content-length" in response.headers
+        and response.headers.get("accept-ranges", "bytes") != "none")
+    if not seekable:
+        response.headers["Accept-Ranges"] = "none"
+    for k, v in dlna_response_headers(codec, seekable=seekable).items():
+        if v:
+            response.headers[k] = v
 
 
 @router.head("/cast/{token}/{filename}")
@@ -235,16 +277,15 @@ async def cast_stream_head(token: str, filename: str, request: Request):
         bypass = _set_cast_internal_bypass(True)
         try:
             response = await stream_track_head(
-                track_id=track_id, request=request, subsong=0,
+                track_id=track_id, request=_stream_request(request, claims),
+                subsong=_stream_subsong(claims),
                 target_format=target_codec, max_bitrate_kbps=target_bitrate or 0,
                 target_sample_rate=target_sample_rate or 0, force_transcode=False,
                 sb_session=None, u=None, p=None, s=None, t=None,
             )
         finally:
             _reset_cast_internal_bypass(bypass)
-        for k, v in dlna_response_headers(target_codec or src_codec).items():
-            if v:
-                response.headers[k] = v
+        _add_dlna_headers(response, target_codec or src_codec, claims)
         response.headers.setdefault("Content-Disposition", f'inline; filename="{filename}"')
         return response
     spec = CODECS.get((target_codec or "mp3").lower())
@@ -296,7 +337,8 @@ async def cast_stream(
     # OR a cached transcode already exists, defer to stream_track which
     # handles Range serving + the existing in-flight WAV cache.
     use_native_fastpath = (
-        target_codec is None
+        _from_dlna_server(claims)
+        or target_codec is None
         or target_codec == src_codec
         or (src_ext in _NATIVE_EXTS and not target_codec)
     )
@@ -304,9 +346,14 @@ async def cast_stream(
     cached_path: Path | None = None
     if not use_native_fastpath and target_codec:
         try:
+            # An overloaded tracker render already cached: its transcode is
+            # keyed with the gain that brings it to full scale.
+            gain = await _cached_render_gain(
+                track_id, src_ext, int(claims.get("sn") or 0))
             ck = _ck(
                 track_id=track_id, format_type="transcoded",
                 codec=target_codec, target_rate=target_sample_rate,
+                variant=_gain_variant(gain) or None,
             )
             cached_path = await get_cached(ck)
         except Exception:
@@ -337,9 +384,9 @@ async def cast_stream(
             try:
                 response = await stream_track(
                     track_id=track_id,
-                    request=request,
+                    request=_stream_request(request, claims),
                     seek=0.0,
-                    subsong=0,
+                    subsong=_stream_subsong(claims),
                     file_path=None,
                     target_format=target_codec,
                     max_bitrate_kbps=target_bitrate or 0,
@@ -356,9 +403,7 @@ async def cast_stream(
                 _reset_cast_internal_bypass(bypass_token)
             # Attach DLNA headers based on what we actually delivered.
             delivered = target_codec or src_codec
-            for k, v in dlna_response_headers(delivered).items():
-                if v:
-                    response.headers[k] = v
+            _add_dlna_headers(response, delivered, claims)
             # ContentDisposition with the cosmetic filename — some
             # renderers display this on the TV.
             response.headers.setdefault(
@@ -513,7 +558,7 @@ async def cast_stream(
             if catalogue.is_catalogue_path(track.path):
                 from soniqboom.core import online_catalog
                 online_catalog.merge_after_play(track_id, path_obj)   # (Modland's too)
-        elif not path_obj.exists():
+        elif not await _asyncio.to_thread(path_obj.exists):  # (a stat: off the loop)
             raise HTTPException(410, "Source file no longer on disk.")
 
         # ── Render rendered formats (SID/MIDI/tracker/GME) to WAV ──
@@ -605,9 +650,16 @@ async def cast_stream(
                 # target_sample_rate is forced to 88200 for DSD by the
                 # token-issuing layer (cast_session.play.forced_sr), so
                 # we always thread it through here.
+                # An overloaded tracker render (32-bit float past full
+                # scale) goes out turned down by exactly its overshoot, and
+                # its transcode is keyed so (``stream.render_gain``).
+                render_gain_ = 1.0
+                if was_rendered and live_feed is None:
+                    render_gain_ = await _render_gain_async(path_obj)
                 ck = _ck(
                     track_id=track_id, format_type="transcoded",
                     codec=target_codec, target_rate=target_sample_rate,
+                    variant=_gain_variant(render_gain_) or None,
                 )
                 cache_sink = _ccp(ck, "transcoded")
             except Exception:
@@ -662,6 +714,7 @@ async def cast_stream(
                 ffmpeg_path=settings.ffmpeg_path,
                 on_first_byte=_mark_first_byte,
                 src_feed=live_feed,
+                gain=render_gain_,
             )
 
             # Count bytes for telemetry without buffering — wrap the generator.
@@ -741,6 +794,31 @@ async def cast_stream(
 # A divergent inline copy previously omitted .psid, most tracker extensions,
 # the SID duration, and the live MIDI soundfont, so those keys never matched
 # and the pins silently no-op'd.
+
+
+async def _cached_render_gain(track_id: str, src_ext: str, subsong: int) -> float:
+    """``stream.render_gain`` of the render cast_render would use for this
+    track, when it is cached (1.0 otherwise, and for every non-float render)."""
+    key = _guess_rendered_ck(track_id, src_ext, subsong)
+    if not key:
+        return 1.0
+    from soniqboom.api.stream import _peek_cached_path
+    path = _peek_cached_path(key)
+    if path is None:
+        return 1.0
+    return await _render_gain_async(path)
+
+
+async def _render_gain_async(path) -> float:
+    """``stream.render_gain`` of the WAV at ``path``, off the loop."""
+    import asyncio
+    from soniqboom.api.stream import render_gain
+    return await asyncio.to_thread(render_gain, path)
+
+
+def _gain_variant(gain: float) -> str:
+    from soniqboom.api.stream import _gain_variant as gv
+    return gv(gain)
 
 
 def _guess_rendered_ck(track_id: str, src_ext: str, subsong: int) -> str | None:

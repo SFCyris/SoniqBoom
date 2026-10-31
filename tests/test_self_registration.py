@@ -207,3 +207,12 @@ def test_update_local_conf_writes_under_its_own_lock(tmp_path):
     assert done.wait(5), "update_local_conf deadlocked on its own lock"
     saved = json.loads(path.read_text())
     assert saved["self_registration"] is False and saved["_comment"] == "kept"
+
+
+def test_signing_up_records_the_sign_in(app_client):
+    """The new account is signed in by signing up — its last sign-in is set,
+    so the Users list doesn't say "Never signed in" for a live session."""
+    app, store = app_client
+    r = _register(app, "newbie")
+    assert r.status_code == 200, r.text
+    assert store.get_by_username("newbie").last_login_at

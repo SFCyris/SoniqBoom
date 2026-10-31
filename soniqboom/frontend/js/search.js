@@ -6,6 +6,7 @@
  * Exports: Search singleton
  *
  * Supports advanced syntax: artist:Ghost album:Impera year:>2020 format:FLAC
+ * added:<30d length:>5:00 rating:>=4 plays:0 played:<7d, and -term exclusions
  * Values with spaces: artist:"The Ghost Inside"
  */
 import { Library }             from './library.js';
@@ -389,29 +390,37 @@ function _fmtDur(sec) {
 // about, we highlight that token red so the user understands why the
 // preview is empty.
 // EXACTLY the operators the backend advanced-query parser implements
-// (api/search.py _parse_advanced_query: artist, album_artist, album, game —
-// a case-insensitive prefix match on the game or its other names, or on the
-// title of a SID / Atari ST tune without a sure game — genre, year, format).  title:/composer:/albumartist: used to be listed here too but
-// the backend silently discards them — a query like `artist:Metallica title:One`
-// returned all Metallica tracks, ignoring the title.  Keeping this in lockstep
-// with the backend means unsupported fields now surface an honest "Unknown
-// field" hint instead of wrong results; plain free-text search still matches
-// title/composer text, so nothing is lost.  If the backend gains a field, add
-// it here in the same change.
+// (api/search.py _parse_advanced_query: artist, album_artist, album — a word
+// start in the name — game — a case-insensitive prefix match on the game or
+// its other names, or on the title of a SID / Atari ST tune without a sure
+// game — genre, year, track, disc / disk — the track and disc number —
+// format / type — a format name, a file extension or a family — length,
+// added, rating, plays / played — the signed-in user's plays — folder, path,
+// group, party, status, composer, title, lossless, bitdepth, samplerate,
+// bitrate, source, bpm, tunes, chip, dup, channels, has).  A leading ``-``
+// (``-format:mp3``) excludes; it is not part of the name.  Keeping this in lockstep with the backend means an
+// unsupported field surfaces an honest "Unknown field" hint instead of wrong
+// results (test-guarded: tests/test_search_filters_phase1.py).  If the backend
+// gains a field, add it here in the same change.
 const _SUPPORTED_OPS = new Set([
   'artist', 'album_artist', 'album', 'game',
-  'year', 'genre', 'format',
+  'year', 'track', 'disc', 'disk', 'genre', 'format', 'type',
+  'length', 'added', 'rating', 'plays', 'played',
+  'folder', 'path', 'group', 'party', 'status', 'composer', 'title',
+  'lossless', 'bitdepth', 'samplerate', 'bitrate', 'source',
+  'bpm', 'tunes', 'chip', 'dup', 'channels', 'has',
 ]);
 let _syntaxHintShown = false;
 
 function _detectBadOperators(text) {
   // Match tokens of shape ``word:value`` — quoted values are OK, year:>NNN
-  // and year:<NNN are OK because we accept the operator name (year).  We
-  // strip comparison operators for the lookup.
-  const tokens = text.match(/(\b[a-zA-Z_]+):/g) || [];
+  // and year:<NNN are OK because we accept the operator name (year).  An
+  // exclusion's ``-`` (``-genre:podcast``) is no part of the name, and the
+  // inside of a quoted value (``album:"back on track: 2"``) is no operator.
+  const unquoted = text.replace(/"[^"]*"/g, '""');
   const bad = [];
-  for (const tk of tokens) {
-    const name = tk.slice(0, -1).toLowerCase();
+  for (const m of unquoted.matchAll(/(?:^|[^a-zA-Z0-9_])-?([a-zA-Z_]+):/g)) {
+    const name = m[1].toLowerCase();
     if (!_SUPPORTED_OPS.has(name)) bad.push(name);
   }
   // Dedupe while preserving order
@@ -424,6 +433,9 @@ function _detectBadOperators(text) {
 const _HINT_OPS = [
   ['artist:', 'artist:'], ['album:', 'album:'], ['game:', 'game:'],
   ['year:>', 'year:>2020'], ['format:', 'format:FLAC'],
+  ['added:<', 'added:<30d'], ['length:>', 'length:>5:00'], ['rating:>=', 'rating:>=4'],
+  ['folder:', 'folder:'], ['status:', 'status:broken'], ['source:', 'source:hvsc'],
+  ['bpm:', 'bpm:120-130'], ['has:', 'has:stil'],
 ];
 
 function _insertOperator(op) {
@@ -721,6 +733,19 @@ clear.addEventListener('click', () => {
   _hidePreview();
   Library.showAll();
   input.focus();
+});
+
+// Another view asks for a search (a track row's Artist link): the box shows
+// the query and the full results open, as if it were typed and Entered.
+document.addEventListener('sb:search-for', (e) => {
+  const text = String(e.detail?.q || '');
+  if (!text.trim()) return;
+  clearTimeout(previewTimer);
+  _stationLookup.cancel();
+  input.value = text;
+  clear.hidden = false;
+  input.dispatchEvent(new Event('sb:search-set'));   // (app.js: Save as smart playlist)
+  query(text);
 });
 
 export const Search = { query };
