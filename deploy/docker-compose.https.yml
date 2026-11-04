@@ -24,6 +24,12 @@ services:
       - soniqboom-data:/data
     environment:
       - SONIQBOOM_DATA_DIR=/data
+      # A new deployment's first start switches on the online collections and
+      # downloads the scene information (both "yes" when not set): set "no", or
+      # a list such as hvsc,aminet / hvsc,demozoo.  Later: soniqboom collections add
+      # - SONIQBOOM_COLLECTIONS=yes     # modland, hvsc, aminet, sceneorg
+      #                                 # (the Modland catalogue needs about 1 GB more memory)
+      # - SONIQBOOM_SCENE_INFO=yes      # hvsc, modland, songdb, demozoo
     restart: unless-stopped
     expose:
       - "8080"            # reachable only on the internal compose network

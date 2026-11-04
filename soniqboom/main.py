@@ -2374,6 +2374,14 @@ async def startup():
         hvsc_download.start()
     except Exception:
         log.warning("HVSC download startup failed", exc_info=True)
+    # Online collections and scene information requested outside the web app
+    # (the installer's questions, ``soniqboom collections|scene-info add``, a
+    # new Docker deployment's first start): applied now, new ones picked up.
+    try:
+        from soniqboom.core import setup_requests
+        setup_requests.start()
+    except Exception:
+        log.warning("Setup requests not started", exc_info=True)
 
     # Which tracks can play right now (Settings → "Tracks on unavailable
     # drives"): follow scan-root status changes, re-probe local roots, and
@@ -3114,6 +3122,8 @@ def _background_writer_tasks() -> list:
         extra.extend(online_catalog.all_tasks())   # online collections' jobs / merges
         from soniqboom.core import hvsc_download
         extra.extend(hvsc_download.all_tasks())    # the HVSC documents' weekly check
+        from soniqboom.core import setup_requests
+        extra.extend(setup_requests.all_tasks())   # requested collections / scene downloads
         from soniqboom.api import stream as _stream_mod
         extra.extend(_stream_mod._INFO_READ_TASKS)  # Track Info reads, merge watchers
     except Exception:
@@ -3910,6 +3920,24 @@ def _validate_and_print_banner(host: str, port: int) -> None:
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
+def _first_start_setup() -> None:
+    """A new install started without the installer's questions (a new Docker
+    deployment): request the online collections and the scene information
+    that ``SONIQBOOM_COLLECTIONS`` / ``SONIQBOOM_SCENE_INFO`` choose — both
+    when unset (``core/setup_requests.first_start_defaults``)."""
+    try:
+        from soniqboom.core import setup_requests
+        chosen = setup_requests.first_start_defaults()
+    except Exception:
+        log.warning("First-start setup not decided", exc_info=True)
+        return
+    if chosen is not None:
+        print("New install — online collections: %s; scene information: %s "
+              "(SONIQBOOM_COLLECTIONS / SONIQBOOM_SCENE_INFO)"
+              % (", ".join(chosen["collections"]) or "none",
+                 ", ".join(chosen["scene_info"]) or "none"), flush=True)
+
+
 def cli():
     import argparse
 
@@ -3956,6 +3984,41 @@ def cli():
     svc_dis = svc_sub.add_parser("disable", help="Disable a service")
     svc_dis.add_argument("name", help="Service name (subsonic | multiroom | cast)")
 
+    # ── collections / scene-info list|add, first-run-setup ───────────────────
+    col_p = sub.add_parser(
+        "collections",
+        help="List / add / remove the online collections (Modland, HVSC, Aminet, scene.org)",
+    )
+    col_sub = col_p.add_subparsers(dest="setup_cmd")
+    col_sub.add_parser("list", help="Show the collections and the ones requested")
+    col_add = col_sub.add_parser("add", help="Switch collections on (all when none is named)")
+    col_add.add_argument("names", nargs="*", help="modland | hvsc | aminet | sceneorg | all")
+    col_rm = col_sub.add_parser("remove", help="Switch collections off (name them, or all)")
+    col_rm.add_argument("names", nargs="+", help="modland | hvsc | aminet | sceneorg | all")
+    sci_p = sub.add_parser(
+        "scene-info",
+        help="List / add / remove the scene information (HVSC song lengths, Modland, UADE "
+             "song database, Demozoo)",
+    )
+    sci_sub = sci_p.add_subparsers(dest="setup_cmd")
+    sci_sub.add_parser("list", help="Show the scene information and what is requested")
+    sci_add = sci_sub.add_parser("add", help="Download and apply it (all when none is named)")
+    sci_add.add_argument("names", nargs="*", help="hvsc | modland | songdb | demozoo | all")
+    sci_rm = sci_sub.add_parser(
+        "remove", help="Withdraw what it filled in and delete its download (name it, or all)")
+    sci_rm.add_argument("names", nargs="+", help="hvsc | modland | songdb | demozoo | all")
+    fr_p = sub.add_parser(
+        "first-run-setup",
+        help="Ask once whether to add the online collections and the scene "
+             "information not already there (used by install.sh)",
+    )
+    fr_p.add_argument("--collections", default=None, metavar="yes|no|LIST",
+                      help="Answer without asking (default: ask; without a terminal "
+                           "yes on a new install, nothing on an update)")
+    fr_p.add_argument("--scene-info", default=None, metavar="yes|no|LIST",
+                      help="Answer without asking (default: ask; without a terminal "
+                           "yes on a new install, nothing on an update)")
+
     # Support `soniqboom --port 9090` without explicit 'serve' subcommand
     parser.add_argument("--host", default=None, dest="root_host")
     parser.add_argument("--port", type=int, default=None, dest="root_port")
@@ -3999,6 +4062,19 @@ def cli():
             print("Restart the SoniqBoom server (or use the admin restart) for the change to take effect.")
             return
 
+    if args.cmd in ("collections", "scene-info"):
+        from soniqboom.cli import setup as _setup
+        kind = "collections" if args.cmd == "collections" else "scene_info"
+        if args.setup_cmd == "add":
+            sys.exit(_setup.cmd_add(kind, args.names))
+        if args.setup_cmd == "remove":
+            sys.exit(_setup.cmd_remove(kind, args.names))
+        sys.exit(_setup.cmd_list(kind))
+
+    if args.cmd == "first-run-setup":
+        from soniqboom.cli import setup as _setup
+        sys.exit(_setup.cmd_first_run(args.collections, args.scene_info))
+
     if args.cmd == "fetch-ffmpeg":
         # Locate the standalone helper script.  In a source checkout it sits
         # at ``<repo>/scripts/fetch_ffmpeg.py``; in a wheel install we ship
@@ -4033,6 +4109,7 @@ def cli():
 
     _check_port(host, port)
     _validate_and_print_banner(host, port)
+    _first_start_setup()
 
     # Patch settings so startup handler sees the right values
     settings.host = host

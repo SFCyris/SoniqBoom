@@ -1,16 +1,15 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "soniqboom"
-version = "2.0.0"
+version = "2.0.1"
 description = "Self-hosted music server for personal libraries — FLAC, MP3, Opus, SID, MIDI, plus 20+ tracker formats"
 requires-python = ">=3.11"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
 authors = [{ name = "S.F. Cyris" }]
 classifiers = [
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Sound/Audio :: Players",

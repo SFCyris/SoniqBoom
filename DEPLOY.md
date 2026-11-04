@@ -97,6 +97,16 @@ That's it — the server is running. Go to **Step 2** to open it.
 The **📖** button in the header opens the user guide (also at
 <http://localhost:8080/manual/>).
 
+On its first start, a new deployment (an empty data volume) also switches on the
+**online collections** (Modland, HVSC, Aminet, scene.org — their tunes are listed in
+your library and fetched when you play them; the Modland catalogue needs about 1 GB more
+memory) and downloads the **scene information**
+(HVSC song lengths and STIL, the Modland checksum list, the UADE song database and
+Demozoo, about 250 MB). To leave either out, or pick some, set
+`SONIQBOOM_COLLECTIONS` / `SONIQBOOM_SCENE_INFO` before the first start (see
+[Configuration](#configuration)). To add them later, see
+[Handy commands](#handy-commands).
+
 ---
 
 ## Step 3 — Connect from your phone or another computer
@@ -505,6 +515,8 @@ player cancels that request when you skip to another track.
 | `SONIQBOOM_CREDENTIAL_KEY_FILE` | `/data/credential.key` | The file holding the key saved network-share passwords and last.fm / ListenBrainz logins are encrypted with (set in the image). |
 | `SONIQBOOM_CONF` | not set | Full path of the settings file, e.g. `/data/SoniqBoom.conf` — wins over `XDG_DATA_HOME` for that one file. |
 | `TZ` | container default | Set e.g. `Europe/Berlin` for correct log/scan timestamps. |
+| `SONIQBOOM_COLLECTIONS` | `yes` | Read at a new deployment's first start only: which online collections to switch on — `yes`, `no`, or a comma-separated list of `modland`, `hvsc`, `aminet`, `sceneorg`. Any other value adds none. |
+| `SONIQBOOM_SCENE_INFO` | `yes` | Read at a new deployment's first start only: which scene information to download — `yes`, `no`, or a comma-separated list of `hvsc`, `modland`, `songdb`, `demozoo`. Any other value adds none. |
 | `SONIQBOOM_SUBSONIC_CORS` | `1` | Set to `0` to stop web-based Subsonic players hosted on other sites from calling `/rest`. Native apps are not affected. |
 | `SONIQBOOM_CORS_ORIGINS` | not set | Comma-separated list of web origins (e.g. `https://dashboard.example.com`) allowed to call `/api` from a browser, with the browser's SoniqBoom sign-in. By default only SoniqBoom's own pages can; a page of any other origin — another port of the same host included — can't change anything through `/api` or open its live connections (403). |
 | `SONIQBOOM_FRAME_ANCESTORS` | not set | Space- or comma-separated list of web origins whose pages may show SoniqBoom's web UI in a frame (by default only SoniqBoom's own pages can). |
@@ -553,7 +565,38 @@ docker compose exec soniqboom soniqboom-setadm -user bob -disable
 docker compose exec soniqboom soniqboom services list
                                 # optional services (subsonic, multiroom, cast (Beta),
                                 # dlna_server (Beta)); enable / disable <name>, then restart
+docker compose exec soniqboom soniqboom collections add
+                                # switch on the online collections (all, or name some:
+                                # modland hvsc aminet sceneorg); `collections list` lists them
+docker compose exec soniqboom soniqboom scene-info add
+                                # download the scene information (all, or name some:
+                                # hvsc modland songdb demozoo); `scene-info list` lists them
+docker compose exec soniqboom soniqboom collections remove aminet
+                                # switch a collection off (name one or more, or all)
+docker compose exec soniqboom soniqboom scene-info remove demozoo
+                                # withdraw a source's scene information and delete its
+                                # download (name one or more, or all)
 ```
+
+A running SoniqBoom takes `add` and `remove` within about 10 seconds (after a download it
+is already doing), otherwise its next start does; no restart is needed. `collections remove`
+switches a collection off: its tunes leave the library, while ratings, plays, stars and
+playlist entries stay for when it is added again. `scene-info remove` withdraws what that
+source filled in (your own edits stay), stops applying it after scans and deletes its
+download. Song lengths the UADE song database filled in stay, and so do artist names the
+Modland checksum list filled in, until the file is read again. For `hvsc`, the downloaded
+song lengths and STIL are no longer used for your own SID files — the values already
+stored on your SID tracks stay — and the download is deleted while the HVSC collection is
+off (the collection keeps it for its own tunes). `remove` needs one or more names, or
+`all`. Their progress shows under gear → **Collections** (where each collection can be
+switched off again), gear → **Metadata** and gear → **Renderers → HVSC SID database**.
+
+`add` leaves what is already there as it is, and says so: a collection that is on, or
+that your library already holds as a root folder — a network share of its site or a
+mirror, or a folder named after it (Aminet, Modland, HVSC or C64Music, scene.org) — and
+scene information already downloaded (for HVSC, also when it comes from your HVSC folder
+or the HVSC collection). To add such a collection anyway, switch it on under gear →
+**Collections** (for a share of Modland's own `/pub/modules`, remove that share first).
 
 `soniqboom-setadm` flags are spelled in full (`-user`, `-passwd`, `-role`,
 `-display-name`, `-disable`, `-enable`). With **Require strong passwords** on (gear →
@@ -589,13 +632,15 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
   format still plays.
 - **Memory** scales with library size (the whole index is held in RAM). Budget accordingly
   for six-figure collections.
-- **Modland catalogue** (optional, off by default — gear → **Collections**): the container
+- **Modland catalogue** (optional; a new deployment switches it on unless
+  `SONIQBOOM_COLLECTIONS` leaves it out — gear → **Collections**): the container
   reaches `ftp.modland.com` over HTTPS for the index and over FTP (port 21, passive mode)
   for index updates and for the tunes it downloads — when you play a tune or open its
   Track Info (for most formats), and, with *For tunes shown in lists*, the SC68, SNDH and
   console chiptune files (NSF, NSFe, GBS, HES, KSS, AY, SAP) shown in a list. A firewall in
   front of it must allow both. With the catalogue on, plan for about 1 GB more memory.
-- **Online collections** (optional, each off by default — gear → **Collections**), over
+- **Online collections** (optional; a new deployment switches them on unless
+  `SONIQBOOM_COLLECTIONS` leaves them out — gear → **Collections**), over
   HTTPS: `6581.nl` (HVSC: its song-length list and STIL, then the `.sid` files), `aminet.net`
   (Aminet: its index and category names, then the uploads with their readme) and
   `archive.scene.org` (scene.org: its folder listings, then the files). Each reads its index

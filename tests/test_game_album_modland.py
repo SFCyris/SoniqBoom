@@ -321,3 +321,32 @@ async def test_cleared_artist_the_user_chose_is_not_refilled(env):
     _add(store, "spc", "b" * 32, title="Title", format="SPC", artist="", user_edited=["artist"])
     await sm.apply_to_library()
     assert store.get_track("spc")["artist"] == ""
+
+
+async def test_removing_the_checksum_list_withdraws_what_it_gave(env):
+    """``soniqboom scene-info remove modland``: the place, game and Modland
+    album leave the library's tracks (a tag album and the Modland catalogue's
+    own tunes are kept), the list is deleted, and no later apply runs."""
+    from soniqboom.core import modland_catalog
+    store, _calls = env
+    _add(store, "spc", "b" * 32, title="Title", format="SPC")
+    _add(store, "tagged", "e" * 32, title="Overworld", format="SPC",
+         album="Super Mario World (tag)", album_source="tag")
+    cat_path = modland_catalog.track_path("Protracker/4-Mat/4-mat.mod")
+    store.upsert_track({"id": "cat", "path": cat_path, "title": "4-mat", "artist": "",
+                        "album": "", "format": "ProTracker", "genre": [],
+                        "scene_path": "Protracker/4-Mat/4-mat.mod"})
+    await sm.apply_to_library()
+    t = store.get_track
+    assert t("spc")["scene_path"] and t("spc")["album"] == "Super Mario World"
+    assert t("tagged")["scene_path"]
+    res = await sm.remove_from_library()
+    assert res["error"] is None
+    assert t("spc")["scene_path"] is None and t("spc")["album"] == ""
+    assert t("tagged")["scene_path"] is None
+    assert t("tagged")["album"] == "Super Mario World (tag)"          # the tag stays
+    assert t("cat")["scene_path"] == "Protracker/4-Mat/4-mat.mod"   # the catalogue's own
+    assert not sm.has_index() and not sm._db_path().exists()
+    assert res["index_rows"] == 0
+    with pytest.raises(RuntimeError):
+        sm.collect_updates()                    # (no list: nothing is applied any more)

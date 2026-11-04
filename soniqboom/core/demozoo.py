@@ -206,7 +206,7 @@ def has_index() -> bool:
     """Cheap check for a built local index — no sqlite open (used by the
     post-scan auto-apply to skip work when nothing has been downloaded yet)."""
     try:
-        return _db_path().exists()
+        return _db_path().stat().st_size > 0        # (an empty file is no index)
     except Exception:                                   # noqa: BLE001
         return False
 

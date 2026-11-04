@@ -130,14 +130,18 @@ VENV="$SCRIPT_DIR/.venv"
 # ── CLI options ──────────────────────────────────────────────────────────────
 MODE=install
 SLIM=0
+SETUP_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --clean)   MODE=clean ;;
     --rebuild) MODE=rebuild ;;
     --slim)    SLIM=1 ;;
+    --no-collections) SETUP_ARGS+=(--collections no) ;;
+    --no-scene-info)  SETUP_ARGS+=(--scene-info no) ;;
     -h|--help)
       cat <<'EOF'
-Usage: install.sh [--slim] [--clean | --rebuild | --help]
+Usage: install.sh [--slim] [--no-collections] [--no-scene-info]
+                  [--clean | --rebuild | --help]
 
   (no option)   Install/update SoniqBoom and its renderers (idempotent —
                 already-present renderers are left as-is).
@@ -148,6 +152,17 @@ Usage: install.sh [--slim] [--clean | --rebuild | --help]
                 Sega PSG / YM2612.  Re-run without --slim to add them.
   --rebuild     Delete the from-source renderers, then run the install so they
                 are rebuilt from scratch (combine with --slim to skip zxtune).
+  --no-collections
+                Don't add the online collections (Modland, HVSC, Aminet,
+                scene.org) — without this flag you are asked once (default
+                yes), about the ones not already there.
+  --no-scene-info
+                Don't set up the scene information (HVSC song lengths,
+                Modland checksum list, UADE song database, Demozoo) — without
+                this flag you are asked once (default yes), about the ones
+                not already there.
+                Both can be added later: soniqboom collections add,
+                soniqboom scene-info add.
   --clean       Delete the from-source renderers and exit (no install).
   --help        Show this message.
 
@@ -887,12 +902,13 @@ info "Installing Python dependencies…"
 info "Dependencies installed"
 
 # Install soniqboom package itself.  Use the macos extras only on macOS
-# (pulls pyobjc / rumps for the menubar); plain install on Linux.
+# (pulls pyobjc / rumps for the menubar); plain install on Linux.  (Without
+# setuptools' "Editable installation." note, printed for every editable install.)
 section "SoniqBoom package"
 if [ "$PLATFORM" = "macos" ]; then
-  "$PIP" install -e "$SCRIPT_DIR[macos]" -q
+  PYTHONWARNINGS="ignore:Editable installation" "$PIP" install -e "$SCRIPT_DIR[macos]" -q
 else
-  "$PIP" install -e "$SCRIPT_DIR" -q
+  PYTHONWARNINGS="ignore:Editable installation" "$PIP" install -e "$SCRIPT_DIR" -q
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -935,6 +951,18 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Online collections and scene information
+# ─────────────────────────────────────────────────────────────────────────────
+# Asked once (an update too, from a terminal); what is already there — a
+# collection on, or held by a root folder of the library — is mentioned and
+# left as is.  The answers are requests the server applies.  No terminal
+# (piped / CI): yes on a new install, nothing on an update, unless
+# --no-collections / --no-scene-info.
+section "Online collections and scene information"
+"$VENV/bin/soniqboom" first-run-setup "${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"}" \
+  || warn "Not set up — add them later with:  $VENV/bin/soniqboom collections add  /  scene-info add"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Done
 # ─────────────────────────────────────────────────────────────────────────────
 section "Installation complete"
@@ -945,6 +973,8 @@ echo "  Start SoniqBoom:  bash run.sh"
 echo "  Or directly:      $VENV/bin/soniqboom"
 echo "  Browser UI:       http://127.0.0.1:8080"
 echo "  Manage admin:     bash setup-admin.sh   (create / reset the admin account)"
+echo "  Add collections:  $VENV/bin/soniqboom collections add   (Modland, HVSC, Aminet, scene.org)"
+echo "  Add scene info:   $VENV/bin/soniqboom scene-info add    (HVSC, Modland, UADE song database, Demozoo)"
 echo ""
 if [ "$PLATFORM" = "macos" ]; then
   echo "  Config:           ~/Library/Application Support/SoniqBoom/SoniqBoom.conf"

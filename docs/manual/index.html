@@ -1618,7 +1618,14 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>The admin panel's <strong>Collections</strong> tab adds public music archives to your library without
        copying them: each one is listed from the archive's own index (scene.org from its folders), as a folder of its
        own in the folder tree, browsable and searchable at once, and a tune is downloaded only when you play it (or
-       open its Track Info). Every collection is off until you switch it on.</p>
+       open its Track Info). A new install switches them all on: <code>install.sh</code> asks first (press Enter
+       for yes), and a first start that wasn't asked — a new Docker deployment, the menu-bar app — does it unless
+       <code>SONIQBOOM_COLLECTIONS</code> says otherwise. Updating an existing install, <code>install.sh</code>
+       asks once too (from its terminal), only about what isn't there yet. A collection that is already on, or that
+       your library already holds as a root folder — a network share of the archive's site or a mirror, or a folder
+       named after it (Aminet, Modland, HVSC or C64Music, scene.org) — is mentioned and left as is; switch it on here
+       to add it anyway (for a share of Modland's own <code>/pub/modules</code>, remove that share first). The
+       Modland catalogue needs about 1&nbsp;GB more memory.</p>
     <p>Aminet and scene.org keep most of their music in archives (LHA or ZIP) — one module, or a whole music disk.
        Such an archive is listed as one entry, its format shown as <em>LHA package</em> or <em>ZIP package</em>. When
        you play it or open its Track Info, the archive is downloaded (a large ZIP only in part) and the tunes inside it
@@ -1632,6 +1639,38 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        played) — is one tune with two copies: your copy is the one shown first in <b>Duplicates</b> and the one kept
        when duplicate copies are hidden, and playing the collection's entry plays your copy, with nothing
        downloaded.</p>
+
+    <h3 id="setup-cli">From the command line</h3>
+    <p>The online collections and the scene information (HVSC song lengths and STIL, Modland's checksum list, the
+       UADE song database and Demozoo — about 250&nbsp;MB) can also be added and removed from a terminal on the
+       server, all at once or by name:</p>
+    <pre><code>soniqboom collections add              # modland hvsc aminet sceneorg — all when none is named
+soniqboom scene-info add hvsc demozoo  # hvsc modland songdb demozoo — all when none is named
+soniqboom collections remove aminet    # name one or more, or all
+soniqboom scene-info remove demozoo    # name one or more, or all
+soniqboom collections list             # what there is, and what is still waiting (also scene-info list)</code></pre>
+    <p><code>collections remove</code> switches a collection off: its tunes leave the library, and their ratings,
+       plays, stars and playlist entries stay for when it is added again. <code>scene-info remove</code> withdraws
+       what that source filled in — your own edits stay — stops applying it after scans and deletes its download.
+       Song lengths the UADE song database filled in stay, and so do artist names the Modland checksum list filled
+       in, until the file is read again. For <code>hvsc</code>, the downloaded song lengths and STIL are no longer
+       used for your own SID files — the values already stored on your SID tracks stay — and the download is deleted
+       while the HVSC collection is off (the collection keeps it for its own tunes). <code>remove</code> needs one or
+       more names, or <code>all</code>.</p>
+    <p>A native install runs them as <code>.venv/bin/soniqboom</code> in its folder; in Docker, prefix
+       <code>docker exec soniqboom</code>. A running server takes the request, otherwise its next
+       start does (after a download it is already doing — within about 10&nbsp;seconds otherwise); the progress shows
+       on the <strong>Collections</strong> tab (where each collection can be switched off again), the
+       <strong>Metadata</strong> tab and the <strong>HVSC SID database</strong> card under <strong>Renderers</strong>.
+       <code>add</code> leaves what is already there as it is and says so: a collection that is on or already a
+       root folder of your library, scene information already downloaded (for HVSC, also when it comes from your
+       HVSC folder or the HVSC collection).
+       <code>install.sh</code> asks once, on its terminal — a new install, and an update too (<code>--no-collections</code> and
+       <code>--no-scene-info</code> answer no), a new Docker deployment through <code>SONIQBOOM_COLLECTIONS</code> and
+       <code>SONIQBOOM_SCENE_INFO</code> (<code>yes</code> when not set, <code>no</code>, or a list of names; any
+       other value adds nothing). With the HVSC collection on, its song lengths and STIL serve your own SID files
+       too, and a local HVSC folder found later takes over; without it, the <strong>HVSC SID database</strong> card
+       is set to <em>Download from the internet</em> — choose <em>Local folder</em> there to use your own.</p>
 
     <h3 id="modland">Modland</h3>
     <p>Switch on <strong>Modland catalogue</strong> and SoniqBoom

@@ -22,6 +22,12 @@ services:
       - soniqboom-data:/data    # index, users, settings, caches, SoundFonts, logs (back this up)
     environment:
       - SONIQBOOM_DATA_DIR=/data
+      # A new deployment's first start switches on the online collections and
+      # downloads the scene information (both "yes" when not set): set "no", or
+      # a list such as hvsc,aminet / hvsc,demozoo.  Later: soniqboom collections add
+      # - SONIQBOOM_COLLECTIONS=yes     # modland, hvsc, aminet, sceneorg
+      #                                 # (the Modland catalogue needs about 1 GB more memory)
+      # - SONIQBOOM_SCENE_INFO=yes      # hvsc, modland, songdb, demozoo
       # - TZ=Europe/Berlin
     restart: unless-stopped
 

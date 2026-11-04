@@ -70,7 +70,7 @@ Then open **<http://localhost:8080>** in any browser. That's it. 🎉
 **What each step does:**
 
 1. **Download** — grabs the latest release and unzips it.
-2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. On an interactive terminal it then **asks you to create your admin login** — pick a username and a password; this is the account you'll sign in with. (If it doesn't prompt — for example you pasted all three commands at once — just create the login afterward with `bash setup-admin.sh`. Until the first account exists, the web page only shows how to create it, and the server doesn't check sign-ins, so create it right away.)
+2. **`bash install.sh`** — installs Python, ffmpeg, and the retro-format players for you (Homebrew on macOS; apt / dnf / pacman / zypper on Linux). On a fresh machine it may ask for your **computer password** so it can install those. On an interactive terminal it then **asks you to create your admin login** — pick a username and a password; this is the account you'll sign in with. (If it doesn't prompt — for example you pasted all three commands at once — just create the login afterward with `bash setup-admin.sh`. Until the first account exists, the web page only shows how to create it, and the server doesn't check sign-ins, so create it right away.) It then asks, once (an update too), whether to add the **online collections** (Modland, HVSC, Aminet, scene.org — the Modland catalogue needs about 1 GB more memory) and set up the **scene information** (HVSC song lengths, the Modland checksum list, the UADE song database, Demozoo — about 250 MB) — press Enter for yes; without a terminal a new install gets both and an update nothing. What is already there is mentioned, not asked about and left as is, here and with `collections add` / `scene-info add`: a collection that is on, or that your library already holds as a root folder — a network share of its site or a mirror, or a folder named after it (Aminet, Modland, HVSC or C64Music, scene.org) — and scene information already downloaded (or, for HVSC, already coming from your HVSC folder or the HVSC collection). To add such a collection anyway, switch it on under gear → **Collections** (for a share of Modland's own `/pub/modules`, remove that share first).
 3. **`bash run.sh`** — starts the server in the background and prints the address to open. (If port 8080 is already in use, run `bash run.sh --port 9090` to pick another.) On a Mac it also puts a 🔊 icon in the menu bar to open, start, restart or stop SoniqBoom and show its settings and status; quitting the icon leaves the server running.
 
 > *Prefer git?* `git clone https://github.com/SFCyris/SoniqBoom.git && cd SoniqBoom`, then run steps 2 and 3.
@@ -108,6 +108,8 @@ docker exec soniqboom soniqboom-setadm -user me -passwd 'change-this-password'
 ```
 
 Once you're in, click the **gear icon** (top-right) and add a library folder — `/music` if you mounted it above, or any local / FTP / SMB / WebDAV path or web folder. Internet **Radio** plays right away with no library at all.
+
+A new container (an empty `soniqboom-data` volume) also switches on the online collections (Modland, HVSC, Aminet, scene.org — the Modland catalogue needs about 1 GB more memory) and downloads the scene information (HVSC song lengths, the Modland checksum list, the UADE song database, Demozoo — about 250 MB) on its first start. Add `-e SONIQBOOM_COLLECTIONS=no` and/or `-e SONIQBOOM_SCENE_INFO=no` to the `docker run` command to leave them out, or name some (`-e SONIQBOOM_COLLECTIONS=hvsc,aminet`). A value other than yes, no or a list of those names adds nothing. Later, `docker exec soniqboom soniqboom collections add` and `docker exec soniqboom soniqboom scene-info add` add them (all, or the ones named), and `… collections remove <name>` / `… scene-info remove <name>` take them out again.
 
 **Updating:**
 
@@ -156,6 +158,11 @@ Run these from inside the SoniqBoom folder:
 | **Rebuild the retro-format players** | `bash install.sh --rebuild` |
 | **Delete the built-from-source players** | `bash install.sh --clean` |
 | **Skip the slow zxtune build** (the PSF family, MED 2–4 modules and VGM files using chips libgme lacks won't play) | `bash install.sh --slim` |
+| **Install without** the online collections / the scene information (not asked) | `bash install.sh --no-collections --no-scene-info` |
+| **Add the online collections** (all, or name some: `modland hvsc aminet sceneorg`) | `.venv/bin/soniqboom collections add` |
+| **Add the scene information** (all, or name some: `hvsc modland songdb demozoo`) | `.venv/bin/soniqboom scene-info add` |
+| **Switch an online collection off** (name one or more, or `all`) | `.venv/bin/soniqboom collections remove aminet` |
+| **Remove scene information** — withdraw what it filled in, stop applying it, delete its download (name one or more, or `all`; details in DEPLOY.md → Handy commands) | `.venv/bin/soniqboom scene-info remove demozoo` |
 | **Create your first admin login** | `bash setup-admin.sh` (once an admin exists, it names that account and shows how to reset it) |
 | Create a login or reset its password non-interactively | `bash setup-admin.sh -user alice -passwd 'your-password'` |
 | Disable (or re-enable) an account | `bash setup-admin.sh -user bob -disable` (or `-enable`) |

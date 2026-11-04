@@ -971,6 +971,68 @@ async def apply_to_library(*, auto: bool = False) -> dict:
     return status()
 
 
+async def remove_from_library() -> dict:
+    """Undo the checksum list (``soniqboom scene-info remove modland``):
+    withdraw the Modland place, game names and Modland album it gave the
+    library's tracks (``_withdraw_stale`` — compare-and-set, never a user-edited
+    album; the Modland catalogue's own tunes keep their place, artist names it
+    filled stay until the file is read again), then delete the downloaded list,
+    so no later scan applies it.
+    Waits (bounded) for an apply already running."""
+    import asyncio
+    global _last_auto_sig, _matched_ids
+    for _ in range(600):                                # ~60 s ceiling
+        if not _status["applying"] and not _status["refreshing"]:
+            break
+        await asyncio.sleep(0.1)
+    if _status["applying"] or _status["refreshing"]:
+        return {**status(), "error": "a download or apply of the list is running"}
+    from soniqboom.core import modland_catalog
+    from soniqboom.core.catalogue import is_catalogue_path
+    from soniqboom.core.store import get_store
+    store = get_store()
+    _status.update(applying=True, error=None)
+    freed = False
+    try:
+        batch: list = []
+        expect: dict = {}
+        own = f"{modland_catalog.ROOT}:/"        # (also while it isn't registered)
+        for t in store.all_tracks():
+            p = t.get("path")
+            if str(p or "").startswith(own) or (is_catalogue_path(p)
+                                                and _is_modland_catalogue(p)):
+                continue
+            _withdraw_stale(t, batch, expect)
+        async with fa._get_lock():
+            written: list[str] = []
+            updated, albums, _bumps = await fa._commit_album_updates(
+                [(tid, upd, expect.get(tid)) for tid, upd in batch], written=written)
+            freed = any(upd.get("album") == "" for _tid, upd in batch)
+        if updated:
+            await fa.refresh_album_caches(written)
+        db = _db_path()
+        for f in (db, db.with_suffix(".zip"), db.with_suffix(".building")):
+            f.unlink(missing_ok=True)
+        _last_auto_sig = None
+        _matched_ids = set()
+        _status.update(index_rows=0, index_built_at=0.0,
+                       last_apply={"matched": 0, "updated": updated, "albums": albums,
+                                   "at": time.time()})
+        log.info("Modland checksum list removed: %d track(s) updated (%d album changes)",
+                 updated, albums)
+    except Exception as exc:
+        _status["error"] = f"remove failed: {exc}"
+        log.warning("Modland checksum list not removed: %s", exc)
+    finally:
+        _status["applying"] = False
+    if freed and fa.enabled():
+        try:
+            await fa.apply_folder_albums()
+        except Exception:                               # noqa: BLE001
+            log.debug("folder-album pass after the Modland removal failed", exc_info=True)
+    return status()
+
+
 def _drop_stale_filename_patches(batch: list[tuple[str, dict]], expect: dict,
                                  use_filename_now: bool) -> list[tuple[str, dict]]:
     """The file-name option changed while the join ran: drop the album part
