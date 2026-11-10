@@ -5965,8 +5965,9 @@ async def _drain_scan_queue() -> None:
 def forget_root(path: str) -> None:
     """A scan root was removed: drop it from every queued scan, so a scan
     queued before the removal doesn't re-register and re-index it — and
-    what its scans gave up (``_GiveUps``)."""
-    norm = str(Path(path).resolve())
+    what its scans gave up (``_GiveUps``).  No realpath (a stalled mount
+    would block the caller): ``path`` is the folder list's resolved spelling."""
+    norm = os.path.normpath(os.path.abspath(path))
     try:
         store = get_store()
         for p in {path, norm}:

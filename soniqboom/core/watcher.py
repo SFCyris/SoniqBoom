@@ -586,10 +586,11 @@ async def add_root(root: str) -> None:
 
 
 async def remove_root(root: str) -> None:
-    """Disarm the watch on a removed scan root."""
+    """Disarm the watch on a removed scan root (``root``: the folder list's
+    resolved spelling — no realpath, a stalled mount would block the loop)."""
     if not _state.enabled or not _state.observer:
         return
-    p = str(Path(root).resolve())
+    p = os.path.normpath(os.path.abspath(root))
     _state.roots.discard(p)
     _state.status.pop(p, None)
     _state.handlers.pop(p, None)

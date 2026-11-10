@@ -292,6 +292,10 @@ async def read_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
         from soniqboom.api.search import run_search
         results = await run_search(q, limit=500, uid=uid)
         tracks = [t.model_dump() if hasattr(t, "model_dump") else t for t in results]
+        from soniqboom.core import removals
+        gone = removals.hidden_ids()[0]         # (a folder being removed: listed nowhere)
+        if gone:
+            tracks = [t for t in tracks if t.get("id") not in gone]
         return {**_shown(playlist, uid), "smart": True, "tracks": _mark_offline(tracks)}
 
     entries = playlist.get("track_ids", [])
@@ -300,9 +304,11 @@ async def read_playlist(playlist_id: str, uid: str = Depends(listener_uid)):
     # Resolve each entry to its track dict, in order (duplicates preserved), and
     # attach the 0-based ``subsong`` for subsong entries so the client renders
     # "Tune N".  Bare/default entries carry no subsong.
+    from soniqboom.core import removals
+    gone = removals.hidden_ids()[0] or ()     # (a folder being removed: listed nowhere)
     tracks = []
     for e, t in zip(entries, base):
-        if t is None:
+        if t is None or _entry_id(e) in gone:
             continue
         sub = _entry_sub(e)
         if sub is None:
@@ -420,6 +426,14 @@ async def update_existing_playlist(
                 valid.append(_norm_entry(e))   # keep the subsong, drop nothing valid
             else:
                 dropped.append(tid or "malformed-entry")   # always a string (response shape)
+        # The entries of a folder being removed were not listed to the client:
+        # kept (after the others), so an Undo finds them in the playlist again.
+        from soniqboom.core import removals
+        gone = removals.hidden_ids()[0]
+        if gone:
+            sent = {_entry_id(e) for e in valid}
+            valid += [_norm_entry(e) for e in playlist.get("track_ids", [])
+                      if _entry_id(e) in gone and _entry_id(e) not in sent]
         updates["track_ids"] = valid
     result = await update_playlist(playlist_id, updates)
     if result is None:

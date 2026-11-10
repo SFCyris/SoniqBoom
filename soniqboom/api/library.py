@@ -19,7 +19,7 @@ from soniqboom.config import settings
 from soniqboom.core.data import (
     delete_scan_dir, rebuild_indexes,
     list_hash_lookups, list_scan_dirs, path_hash, resolve_hash,
-    upsert_scan_dir,
+    scan_dir_key, upsert_scan_dir,
 )
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
@@ -553,9 +553,13 @@ async def get_library_dirs():
     """Return all registered scan directories, each with a live-ish reachability
     ``status`` ('ok' / 'unavailable').  The probe is bounded + cached, so a
     stalled mount marks the folder unavailable instead of hanging the request or
-    making it look empty."""
+    making it look empty.  A folder being removed is not listed
+    (``core/removals``)."""
+    from soniqboom.core import removals
     from soniqboom.core.data import refresh_scan_dir_availability
-    return {"dirs": await refresh_scan_dir_availability()}
+    dirs = await refresh_scan_dir_availability()
+    gone = removals.registry()
+    return {"dirs": [d for d in dirs if d.get("path") not in gone] if gone else dirs}
 
 
 @router.post("/dirs")
@@ -570,6 +574,8 @@ async def add_library_dir(body: dict, _admin=Depends(require_admin)):
     path, is_dir = await asyncio.to_thread(_check)
     if not is_dir:
         raise HTTPException(400, f"Directory not found: {path}")
+    from soniqboom.core import removals
+    removals.cancel(path)                   # (added again while its removal waits)
     await upsert_scan_dir(path)
 
     # Store alias in config file if provided
@@ -602,7 +608,7 @@ async def remove_library_dir(body: dict, _admin=Depends(require_admin)):
     raw = body.get("path", "").strip()
     if not raw:
         raise HTTPException(400, "path is required")
-    path = await asyncio.to_thread(lambda: str(Path(raw).expanduser().resolve()))
+    path = await scan_dir_key(raw)          # (no realpath of a listed path: a stalled mount)
     await delete_scan_dir(path)
     try:
         from soniqboom.core import watcher

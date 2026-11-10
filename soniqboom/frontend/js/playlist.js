@@ -410,14 +410,16 @@ async function _openPlaylist(id, name, _focusPanel = true) {
 
 // Which tracks can play changed (a drive / share went offline or came back):
 // the open playlist re-reads its entries for their offline marks, keeping its
-// scroll position (the entries themselves are the same).
-document.addEventListener('soniqboom:availability-changed', async () => {
+// scroll position (the entries themselves are the same) — or, when a music
+// folder was removed or put back, the entries it now lists.
+document.addEventListener('soniqboom:availability-changed', async (e) => {
   const id = _activeId;
   if (!id || tracksEl.hidden) return;
+  const removed = !!(e && e.detail && e.detail.removed);
   try {
     const data = await _api(`/playlists/${id}`);
     if (_activeId !== id || !Array.isArray(data.tracks)
-        || data.tracks.length !== _activeTracks.length) return;
+        || (data.tracks.length !== _activeTracks.length && !removed)) return;
     _activeTracks = data.tracks;
     _renderTracks();
   } catch (_) { /* keep what is shown */ }

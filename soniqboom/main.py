@@ -1218,6 +1218,7 @@ _cast_reaper_task = None
 # Seconds after startup before the one-time upgrade enrichment is scheduled
 # (scanner.schedule_startup_enrichment).
 _STARTUP_ENRICHMENT_DELAY_S = 30.0
+_DEMOZOO_REBUILD_DELAY_S = 90.0     # an older Demozoo index rebuilt (core/demozoo.rebuild_if_outdated)
 _STARTUP_RECONCILE_DELAY_S = 180.0
 _reconcile_handle: "asyncio.TimerHandle | None" = None
 
@@ -2392,6 +2393,13 @@ async def startup():
         availability.install(_avail_store())
     except Exception:
         log.warning("Availability watcher failed to start", exc_info=True)
+    # Music folders / shares whose removal a restart interrupted: hidden
+    # again and finished (``core/removals``).
+    try:
+        from soniqboom.core import removals
+        removals.resume()
+    except Exception:
+        log.warning("Finishing interrupted folder removals failed", exc_info=True)
 
     # One-time enrichment an upgrade needs (a newer Modland apply, the
     # header-game album backfill): schedule the coalescing scene runner —
@@ -2404,6 +2412,16 @@ async def startup():
                                               schedule_startup_enrichment)
     except Exception:
         log.debug("startup enrichment scheduling failed", exc_info=True)
+
+    # A Demozoo index of an older layout lacks the Scene tab's details
+    # (discographies, release details, links): built again once, in the
+    # background, after the first page loads.
+    try:
+        from soniqboom.core import demozoo
+        asyncio.get_running_loop().call_later(_DEMOZOO_REBUILD_DELAY_S,
+                                              demozoo.rebuild_if_outdated)
+    except Exception:
+        log.debug("Demozoo rebuild scheduling failed", exc_info=True)
 
     # Changes made while the server was stopped: the watcher only sees what
     # happens while it runs.  One incremental rescan of the local folders,
@@ -3106,7 +3124,7 @@ async def _set_share_status(scan_root: str, status: str) -> None:
 def _background_writer_tasks() -> list:
     """The tasks outside the scanner that write the store and are stopped
     with the scans (``scanner.stop_background_writers``' ``extra``): the admin
-    API's remote scans and jobs, catalogue builds and merges, the online
+    API's remote scans and jobs, folder removals, catalogue builds and merges, the online
     collections' jobs (told to stop at their next request), Track Info reads."""
     extra: list = []
     try:
@@ -3114,6 +3132,11 @@ def _background_writer_tasks() -> list:
         extra = [*_admin._bg_scan_tasks, *_admin._BG_TASKS]
     except Exception:
         log.debug("admin background tasks not listed", exc_info=True)
+    try:
+        from soniqboom.core import removals
+        extra.extend(removals.tasks())             # folder removals (finished at the next start)
+    except Exception:
+        log.debug("folder removals not listed", exc_info=True)
     try:
         from soniqboom.core import modland_catalog
         extra.extend(modland_catalog._tasks)       # catalogue builds / merges

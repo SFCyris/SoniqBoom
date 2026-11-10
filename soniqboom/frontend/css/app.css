@@ -3568,6 +3568,12 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
   color: var(--text2);
   white-space: nowrap;
 }
+/* A folder / share being removed: Undo while it waits, then a progress bar
+   of its purge on a line of its own (admin.js renderRemovals). */
+.admin-dir-removing { flex-wrap: wrap; }
+.admin-dir-removing .admin-dir-path { color: var(--text2); }
+.admin-dir-removing .ext-progress { flex-basis: 100%; margin-top: 2px; }
+.admin-dir-removing .btn-rm-undo { padding: 3px 10px; font-size: 11px; }
 .btn-danger {
   background: rgba(220,60,60,0.14);
   border: 1px solid rgba(220,60,60,0.25);

@@ -113,7 +113,9 @@ class SubsonicStoreView:
     def __init__(self, store, roots) -> None:
         import hashlib
         object.__setattr__(self, "_s", store)
-        object.__setattr__(self, "_roots", frozenset(roots))
+        # (compared without a trailing "/"; hashed as spelled — a share at a
+        # server's root, ``ftp://host/``, files its tracks under that spelling)
+        object.__setattr__(self, "_roots", frozenset(r.rstrip("/") for r in roots))
         object.__setattr__(self, "_root_hashes",
                            tuple(hashlib.sha256(r.encode()).hexdigest()[:16] for r in roots))
 
@@ -301,10 +303,11 @@ def hidden_ids(store):
 
 def subsonic_store(store):
     """``store`` as Subsonic / DLNA clients may see it: the store itself when
-    no catalogue is hidden from them, else the (cached, stable)
-    ``SubsonicStoreView`` of it."""
-    from soniqboom.core import catalogue
-    roots = catalogue.hidden_roots()
+    no catalogue is hidden from them and no music folder is being removed
+    (``core/removals``), else the (cached, stable) ``SubsonicStoreView`` of
+    it."""
+    from soniqboom.core import catalogue, removals
+    roots = set(catalogue.hidden_roots()) | set(removals.registry(store))
     if not roots:
         return store
     key = (id(store), tuple(sorted(roots)))

@@ -650,8 +650,9 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
   when it is about to play or when you open its Track Info.
 - **Other downloads** you start under gear → **Metadata** reach their own sites over HTTPS:
   `ftp.modland.com` (Scene origin), `raw.githubusercontent.com` and `api.github.com`
-  (song database, and its check for newer data), `data.demozoo.org` (Demozoo) and
-  `www.tosecdev.org` (TOSEC); Redump lists come from `redump.org` over plain HTTP (port 80).
+  (song database, and its check for newer data), `data.demozoo.org` (Demozoo; also once by
+  itself after an update that needs a newer Demozoo index) and `www.tosecdev.org` (TOSEC);
+  Redump lists come from `redump.org` over plain HTTP (port 80).
 - **Other outbound connections**, each only when the feature is used:
   - each radio station's own server, for its stream (the address the station gives, HTTP or
     HTTPS), and, for Subsonic apps, each favourite station's logo address;
@@ -673,7 +674,6 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
   - `musicbrainz.org` and `coverartarchive.org` (its images come from `archive.org`), and
     `api.discogs.com` (and the image address it names) with a Discogs token, for the cover
     of the song a station is playing;
-  - `demozoo.org` for scener and production details (Track Info's **Scene** tab);
   - `api.listenbrainz.org` / `ws.audioscrobbler.com` (last.fm) for scrobbling, once an
     account is connected (a scrobble that couldn't be sent is tried again every minute,
     from startup on);

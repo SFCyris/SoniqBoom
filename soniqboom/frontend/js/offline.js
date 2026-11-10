@@ -79,7 +79,7 @@ export function offlineBadgeHTML(kind) {
     + `<span class="sr-only"> — can't play right now, ${SR_TEXT[k] || SR_TEXT.drive}</span></span>`;
 }
 
-const state = { mode: null, unplayable: null, token: null, marks: null, busy: null, again: false,
+const state = { mode: null, unplayable: null, token: null, marks: null, removing: null, busy: null, again: false,
                 polling: false };
 const POLL_MS = 60000;
 
@@ -167,6 +167,11 @@ async function refresh() {
         if (!j || typeof j.token !== 'string') continue;
         const prevMode = state.mode, prevToken = state.token;
         const prevUnplayable = state.unplayable;
+        // A music folder / share removed (or put back): its tracks leave (or
+        // rejoin) every list — the lists change length, whatever the mode.
+        const prevRemoving = state.removing;
+        state.removing = j.removing ?? null;
+        const removed = prevRemoving !== null && state.removing !== prevRemoving;
         _apply(j.mode || 'mark');
         state.unplayable = j.unplayable_mode === 'hide' ? 'hide' : 'mark';
         if (j.skip_short_tunes !== undefined) _applyShort(j.skip_short_tunes, j.tune_placeholders);
@@ -187,13 +192,14 @@ async function refresh() {
         // "Tracks that can't be played: Hide" (now or before) changes the
         // lists' length too.)
         const unplayHide = state.unplayable === 'hide' || prevUnplayable === 'hide';
-        if (j.mode !== 'show' || prevMode !== 'show' || unplayHide) {
+        if (j.mode !== 'show' || prevMode !== 'show' || unplayHide || removed) {
           try { Player.reanchorOrdered?.(); } catch (_) { /* older cached player.js */ }
         }
         await recheckQueue();
         document.dispatchEvent(new CustomEvent('soniqboom:availability-changed', {
           detail: { mode: j.mode, prevMode, token: j.token, unavailable: j.unavailable || 0,
-                    unplayable: state.unplayable, prevUnplayable: prevUnplayable || state.unplayable },
+                    unplayable: state.unplayable, prevUnplayable: prevUnplayable || state.unplayable,
+                    removed },
         }));
         changed = true;
       } catch (_) { /* the next poll tries again */ }

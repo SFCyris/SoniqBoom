@@ -192,15 +192,17 @@ test('the queue re-anchors after an availability change in Mark mode too', () =>
   const u = src.match(/const unplayHide = ([^\n;]*);/);
   assert.ok(u, 'the unplayHide test not found');
   const hide = new Function('state', 'prevUnplayable', `return (${u[1]});`);
-  const cond = new Function('j', 'prevMode', 'unplayHide', `return (${m[1]});`);
+  const cond = new Function('j', 'prevMode', 'unplayHide', 'removed', `return (${m[1]});`);
   for (const [now, before] of [['mark', 'mark'], ['mark', null], ['hide', 'mark'], ['mark', 'hide'],
                                ['hide', 'hide']]) {
     const uh = hide({ unplayable: now }, before);
     assert.equal(uh, now === 'hide' || before === 'hide', `${before} → ${now}`);
     for (const prev of ['mark', 'hide', 'show']) {
       for (const mode of ['mark', 'hide', 'show']) {
-        assert.equal(cond({ mode }, prev, uh), uh || !(prev === 'show' && mode === 'show'),
+        assert.equal(cond({ mode }, prev, uh, false), uh || !(prev === 'show' && mode === 'show'),
                      `${prev} → ${mode}, can't be played ${before} → ${now}`);
+        // A music folder removed (or put back): the lists change length.
+        assert.equal(cond({ mode }, prev, uh, true), true, `${prev} → ${mode}, removed`);
       }
     }
   }
@@ -299,16 +301,19 @@ test('"Tracks that can\'t be played: Hide" rebuilds the open list and the phone 
   const early = fn.match(/if \(([^\n{}]*)\) return;/);
   assert.ok(uh && lc && early, 'refreshAvailability conditions not found');
   const unplayHide = new Function('unplayable', 'prevUnplayable', `return (${uh[1]});`);
-  const lengths = new Function('mode', 'prevMode', 'unplayHide', `return (${lc[1]});`);
-  const skip = new Function('mode', 'prevMode', 'unplayHide', `return (${early[1]});`);
+  const lengths = new Function('mode', 'prevMode', 'unplayHide', 'removed', `return (${lc[1]});`);
+  const skip = new Function('mode', 'prevMode', 'unplayHide', 'removed', `return (${early[1]});`);
   const M = ['mark', 'hide', 'show'];
   for (const prevMode of M) for (const mode of M) for (const u of ['mark', 'hide']) for (const pu of ['mark', 'hide']) {
     const h = unplayHide(u, pu);
     assert.equal(h, u === 'hide' || pu === 'hide');
-    assert.equal(lengths(mode, prevMode, h), mode === 'hide' || prevMode === 'hide' || h,
+    assert.equal(lengths(mode, prevMode, h, false), mode === 'hide' || prevMode === 'hide' || h,
                  `${prevMode}→${mode}, ${pu}→${u}`);
-    assert.equal(skip(mode, prevMode, h), mode === 'show' && prevMode === 'show' && !h,
+    assert.equal(skip(mode, prevMode, h, false), mode === 'show' && prevMode === 'show' && !h,
                  `${prevMode}→${mode}, ${pu}→${u}`);
+    // A music folder removed (or put back): rebuilt, whatever the mode.
+    assert.equal(lengths(mode, prevMode, h, true), true, `${prevMode}→${mode}, removed`);
+    assert.equal(skip(mode, prevMode, h, true), false, `${prevMode}→${mode}, removed`);
   }
   // The phone's library view re-reads its list under the same rule.
   const mob = read('soniqboom/frontend/js/mobile/views/library.js');

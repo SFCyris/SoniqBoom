@@ -6609,7 +6609,8 @@ async def set_rating(
 # Bios come from core/artistinfo.py (MusicBrainz → Wikipedia, disk-cached) or,
 # for scene musicians, Demozoo.  A cold lookup is several rate-limited network
 # round trips, so a request never waits on it for long: ``_INFO_TIMEOUT_SEC``
-# for a scene musician (Demozoo answers in one call, ~0.4 s cold), only
+# for a scene musician (read from the local Demozoo index, plus at most one
+# Wikipedia summary for a linked article's text or photo), only
 # ``_INFO_TIMEOUT_MB_SEC`` for the MusicBrainz path (four calls behind a 1.1 s
 # rate gate can't finish in a request anyway — the short wait still catches a
 # disk-cache hit or a quick "not found").  The lookup keeps running in the

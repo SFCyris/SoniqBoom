@@ -6010,12 +6010,13 @@ function patchTrack(id, fields) {
 // PLACE: a windowed list refetches the chunks on screen (scroll kept), a
 // folder / group / search / drill reloads keeping its scroll; a smart list
 // re-runs.  When either Hide is (or was) on, the lists and totals change, so a
-// windowed list is rebuilt.
-function refreshAvailability({ mode, prevMode, unplayable, prevUnplayable } = {}) {
+// windowed list is rebuilt — and so it is when a music folder was removed (or
+// put back): its tracks leave (rejoin) every list, whatever the mode.
+function refreshAvailability({ mode, prevMode, unplayable, prevUnplayable, removed } = {}) {
   const unplayHide = unplayable === 'hide' || prevUnplayable === 'hide';
-  const lengthsChange = mode === 'hide' || prevMode === 'hide' || unplayHide;
+  const lengthsChange = mode === 'hide' || prevMode === 'hide' || unplayHide || !!removed;
   // (nothing is flagged or left out)
-  if (mode === 'show' && prevMode === 'show' && !unplayHide) return;
+  if (mode === 'show' && prevMode === 'show' && !unplayHide && !removed) return;
   try {
     if (_currentBrowsePath != null) {
       // A folder lists every file whatever the mode (its length never changes),

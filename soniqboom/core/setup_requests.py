@@ -581,7 +581,9 @@ async def _remove_scene(name: str):
         if not st.get("error"):
             if not await _quiet(demozoo):
                 return BUSY
-            _delete_index(demozoo._db_path(), "demozoo.download.gz")
+            _delete_index(demozoo._db_path(), "demozoo.download.gz", *demozoo.OLD_CACHE_FILES,
+                          demozoo.REBUILD_MARK, "demozoo.sqlite.building",
+                          "demozoo.sqlite.building-journal")
     else:
         return True
     if st.get("error"):

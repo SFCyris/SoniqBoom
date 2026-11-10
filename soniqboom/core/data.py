@@ -401,6 +401,13 @@ async def delete_track_ids(track_ids: list[str]) -> int:
     if not track_ids:
         return 0
     deleted = get_store().delete_track_ids(track_ids)
+    await _drop_art(track_ids, deleted)
+    return deleted
+
+
+async def _drop_art(track_ids: list[str], deleted: int) -> None:
+    """Delete the cached art of removed tracks (``track_ids``; nothing when
+    ``deleted`` is 0)."""
     if deleted:
         # Fire-and-forget: freeing bytes isn't on the critical path.
         try:
@@ -415,7 +422,6 @@ async def delete_track_ids(track_ids: list[str]) -> int:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Art-cache cleanup failed: %s", exc)
-    return deleted
 
 
 # ── Search ───────────────────────────────────────────────────────────────────
@@ -832,11 +838,44 @@ async def upsert_scan_dir(path: str, track_count_val: int | None = None,
 
 
 async def list_scan_dirs() -> list[dict]:
-    return get_store().list_scan_dirs()
+    """The music folders and shares — not those being removed
+    (``core/removals``: listed nowhere)."""
+    from soniqboom.core import removals
+    store = get_store()
+    gone = removals.registry(store)
+    dirs = store.list_scan_dirs()
+    return [d for d in dirs if d.get("path") not in gone] if gone else dirs
 
 
 async def delete_scan_dir(path: str) -> bool:
     return get_store().delete_scan_dir(path)
+
+
+_SCAN_DIR_RESOLVE_S = 5.0
+
+
+async def scan_dir_key(raw: str) -> str:
+    """The scan-dir list's spelling of ``raw`` (a folder being removed or
+    renamed): the list holds resolved paths already, so a listed path — as
+    spelled, or once made absolute — is found without touching the disk (a
+    realpath on a stalled mount blocks).  Otherwise it is resolved off the
+    loop, waiting at most ``_SCAN_DIR_RESOLVE_S``; remote URLs pass through."""
+    import asyncio
+    import os
+    from pathlib import Path
+    from soniqboom.core.filesource import is_remote_path
+    if is_remote_path(raw):
+        return raw
+    listed = {sd.get("path") for sd in get_store().list_scan_dirs()}
+    norm = os.path.normpath(os.path.abspath(os.path.expanduser(raw)))
+    for p in (raw, norm):
+        if p in listed:
+            return p
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(lambda: str(Path(norm).resolve())), _SCAN_DIR_RESOLVE_S)
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        return norm
 
 
 async def set_scan_dir_status(path: str, status: str) -> bool:
@@ -1068,15 +1107,39 @@ async def refresh_local_root_availability() -> int:
     return changed
 
 
-async def delete_tracks_by_scan_root(root_path: str) -> int:
-    """Delete every track under a scan root, plus its cached art."""
+async def delete_tracks_by_scan_root(root_path: str, stop=None) -> int:
+    """Delete every track under a scan root, plus its cached art — in slices
+    (a root of tens of thousands of tracks would otherwise hold the loop for
+    seconds), with the sorted lists rebuilt when the batch section ends.  Stops
+    when the root is added again meanwhile — ``stop()`` says so (default: the
+    root is listed again): its new scan keeps what is left."""
+    import asyncio
+    import time
+    from soniqboom.core import scanner
+    from soniqboom.core.modland_catalog import _DELETE_STEP, _SLICE_S
     h = path_hash(root_path)
     store = get_store()
     ids = list(store.get_track_ids_for_scan_root(h))
     if not ids:
         return 0
-    # Route through the async wrapper so art-cache cleanup runs too.
-    return await delete_track_ids(ids)
+    deleted, i = 0, 0
+    store.enter_batch_mode()
+    try:
+        if stop is None:
+            stop = lambda: root_path in store._scan_dirs        # noqa: E731
+        while i < len(ids) and not stop():
+            t0 = time.perf_counter()
+            while True:                         # (at least one step a slice)
+                part = ids[i:i + _DELETE_STEP]
+                i += len(part)
+                deleted += store.delete_track_ids(part)
+                if i >= len(ids) or time.perf_counter() - t0 >= _SLICE_S:
+                    break
+            await asyncio.sleep(0)
+    finally:
+        await asyncio.shield(scanner._async_exit_batch_mode(store))
+        await _drop_art(ids[:i], deleted)
+    return deleted
 
 
 # ── Config helpers ───────────────────────────────────────────────────────────

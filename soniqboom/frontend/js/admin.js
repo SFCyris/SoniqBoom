@@ -468,11 +468,11 @@ async function loadDirs() {
       api('/admin/dirs'),
       api('/admin/scan/status'),
     ]);
-    const { dirs } = await dirsRes.json();
+    const { dirs, removing = [] } = await dirsRes.json();
     const scanStatus = await statusRes.json().catch(() => ({}));
     const scanActive = !!(scanStatus.running || scanStatus.embedding);
     list.innerHTML = '';
-    if (!dirs.length) {
+    if (!dirs.length && !removing.length) {
       list.innerHTML = '<span style="color:var(--text2);font-size:12px">No folders added yet.</span>';
       // Still try to refresh the FTP pool section in case a recent
       // share-remove cleared everything.
@@ -481,6 +481,7 @@ async function loadDirs() {
       return;
     }
     dirs.forEach(d => renderDirRow(list, d, scanActive));
+    renderRemovals(removing, { quiet: true });   // (after the folders)
     // Refresh the FTP Connection Pools section alongside the dir list
     // so the user always sees current effective caps + detected values
     // when they navigate to the Library tab.
@@ -1003,11 +1004,13 @@ function renderDirRow(list, d, scanActive = false) {
   }
   row.querySelector('.btn-index').addEventListener('click', () => scanDir(d.path, row));
   const dangerBtn = row.querySelector('.btn-danger');
-  dangerBtn.addEventListener('click', async () => {
+  dangerBtn.addEventListener('click', async (ev) => {
+    // (read before disabling it: a disabled button loses the focus in Chromium)
+    const byKey = ev.detail === 0 || document.activeElement === dangerBtn;
     dangerBtn.disabled = true;
     try {
-      if (isNetwork) await removeShare(d.network_share_id, d.path);
-      else await removeDir(d.path);
+      if (isNetwork) await removeShare(d.network_share_id, d.path, row, byKey);
+      else await removeDir(d.path, row, byKey);
     } finally {
       dangerBtn.disabled = false;
     }
@@ -1233,41 +1236,164 @@ async function pollScanStatus() {
   } catch { /* ignore network errors during polling */ }
 }
 
-let _removingDir = false;
+// ── Removing a folder / share ────────────────────────────────────────────────
+// Gone for every listener the moment it is removed (core/removals): its row
+// turns into a "removing" row at once — Undo while the server still waits
+// (``undo_s``), then how many of its tracks are left — and goes when the purge
+// is done.  Rows come from GET /api/admin/dirs ``removing``, followed every
+// 1.5 s while there are any.
+let _rmPoll = null;
 
-async function removeDir(path) {
-  if (_removingDir) return;  // guard against double-click
-  const confirmed = await styledConfirm(
-    `Remove "${path}" from library?\n\nPress OK to also delete all indexed tracks from this folder.`,
-    { title: 'Remove Folder', okLabel: 'Remove' }
-  );
-  if (!confirmed) return;  // user cancelled
-  _removingDir = true;
-  showMsg('admin-dir-msg', '');
+function _rmLabel(r) {
+  return r.alias ? `${r.path} [${r.alias}]` : r.path;
+}
+
+function _rmRowHtml(r) {
+  const waiting = r.state === 'waiting';
+  const total = r.total || 0;
+  const done = Math.max(0, total - (r.left || 0));
+  const what = r.share ? 'Disconnected' : 'Removed';
+  const note = r.state === 'failed'
+    ? `Removal stopped (${r.error || 'error'}) — tried again when SoniqBoom restarts`
+    : waiting
+      ? `${what} — its tracks are no longer listed`
+      : `Removing — ${(r.left || 0).toLocaleString()} of ${total.toLocaleString()} tracks left`;
+  return `
+    <span class="admin-dir-path" title="${esc(r.path)}">${esc(_rmLabel(r))}</span>
+    <span class="admin-dir-note">${esc(note)}</span>
+    ${waiting && r.undo_s > 0 ? '<button class="btn-secondary btn-rm-undo">Undo</button>' : ''}
+    <progress class="ext-progress" max="${Math.max(1, total)}" value="${waiting ? 0 : done}"
+              aria-label="${esc(`Removing ${_rmLabel(r)}`)}"></progress>`;
+}
+
+function _rmRow(path) {
+  return [...document.querySelectorAll('#admin-dir-list .admin-dir-removing')]
+    .find(el => el.dataset.path === path) || null;
+}
+
+function renderRemovals(rows, { quiet = false } = {}) {
+  const list = document.getElementById('admin-dir-list');
+  if (!list) return;
+  const now = new Set(rows.map(r => r.path));
+  for (const el of list.querySelectorAll('.admin-dir-removing')) {
+    if (now.has(el.dataset.path) || el.dataset.pending) continue;
+    const name = el.dataset.label || el.dataset.path;
+    el.remove();                                  // finished (or undone elsewhere)
+    if (!quiet) {
+      showMsg('admin-dir-msg', `${el.dataset.share ? 'Disconnected' : 'Removed'}: ${name}.`, 'ok');
+      document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
+      loadStats().catch(() => {});
+    }
+  }
+  for (const r of rows) {
+    let el = _rmRow(r.path);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'admin-dir-row admin-dir-removing';
+      el.dataset.path = r.path;
+      list.appendChild(el);
+    }
+    delete el.dataset.pending;
+    el.dataset.label = _rmLabel(r);
+    if (r.share) el.dataset.share = '1';
+    // Built once per state; a poll only updates the text and the bar, so a
+    // press on Undo is never lost to a redraw under the pointer.
+    const key = `${r.state}|${r.undo_s > 0}|${r.total}`;
+    if (el.dataset.key !== key) {
+      const hadFocus = el.contains(document.activeElement) || !!el.dataset.focus;
+      delete el.dataset.focus;
+      el.dataset.key = key;
+      el.innerHTML = _rmRowHtml(r);
+      const undo = el.querySelector('.btn-rm-undo');
+      if (undo) {
+        undo.addEventListener('click', () => undoRemoval(r.path, undo));
+        if (hadFocus) undo.focus();               // (the Remove key was used: Undo is next)
+      }
+    } else {
+      const fresh = document.createElement('div');
+      fresh.innerHTML = _rmRowHtml(r);
+      el.querySelector('.admin-dir-note').textContent =
+        fresh.querySelector('.admin-dir-note').textContent;
+      el.querySelector('progress').value = fresh.querySelector('progress').value;
+    }
+  }
+  clearTimeout(_rmPoll);
+  _rmPoll = rows.some(r => r.state !== 'failed') ? setTimeout(pollRemovals, 1500) : null;
+}
+
+async function pollRemovals() {
+  _rmPoll = null;
+  const list = document.getElementById('admin-dir-list');
+  if (!list || !list.isConnected || !list.querySelector('.admin-dir-removing')) return;
   try {
-    const res = await api('/admin/dirs', {
-      method: 'DELETE',
-      body: JSON.stringify({ path, purge_tracks: true }),
-    });
-    const data = await res.json();
-    if (!res.ok) { showMsg('admin-dir-msg', data.detail || 'Error', 'err'); return; }
-    // The backend returns ``purging: true`` because the actual track delete
-    // is async — there's no synchronous count to show.  Previously the UI
-    // pretended to know (and always rendered "0 tracks deleted").  Tell
-    // the truth.
-    const purging = data.purging === true || data.tracks_deleted === undefined;
-    const msg = purging
-      ? 'Folder removed. Tracks are purging in the background.'
-      : `Removed. ${data.tracks_deleted ?? 0} tracks deleted.`;
-    showMsg('admin-dir-msg', msg, 'ok');
+    const res = await api('/admin/dirs');
+    if (res.ok) {
+      renderRemovals((await res.json()).removing || []);
+      return;
+    }
+  } catch { /* the next round tries again */ }
+  clearTimeout(_rmPoll);
+  _rmPoll = setTimeout(pollRemovals, 1500);
+}
+
+async function undoRemoval(path, btn) {
+  btn.disabled = true;
+  try {
+    const res = await api('/admin/dirs/undo', { method: 'POST', body: JSON.stringify({ path }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showMsg('admin-dir-msg', data.detail || 'Could not undo.', 'err');
+      pollRemovals();
+      return;
+    }
+    showMsg('admin-dir-msg', `Restored: ${path}.`, 'ok');
     document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
     await loadDirs();
     await loadStats();
-  } catch { showMsg('admin-dir-msg', 'Network error.', 'err'); }
-  finally { _removingDir = false; }
+  } catch { showMsg('admin-dir-msg', 'Network error.', 'err'); btn.disabled = false; }
 }
 
-let _removingShare = false;
+/** Turn ``row`` into a removing row at once; the request runs behind it.  On
+ *  failure the row comes back with the error. */
+async function _removeNow(row, path, share, request, byKey = false) {
+  const parent = row.parentNode;
+  const next = row.nextSibling;
+  const stand = document.createElement('div');
+  stand.className = 'admin-dir-row admin-dir-removing';
+  stand.dataset.path = path;
+  stand.dataset.pending = '1';                    // (not dropped by a poll meanwhile)
+  if (byKey || row.contains(document.activeElement)) stand.dataset.focus = '1';
+  showMsg('admin-dir-msg', `${share ? 'Disconnecting' : 'Removing'} ${path} — Undo is available for a few seconds.`, 'ok');
+  stand.innerHTML = _rmRowHtml({ path, share, state: 'waiting', undo_s: 0, total: 0, left: 0 });
+  row.replaceWith(stand);
+  try {
+    const res = await request();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Error');
+    if (Array.isArray(data.removing)) {
+      // (a share's server-side key may be spelled differently: the server's rows win)
+      if (!data.removing.some(r => r.path === path)) stand.remove();
+      renderRemovals(data.removing, { quiet: true });
+    } else { stand.remove(); await loadDirs(); }   // (an orphan cleanup: nothing to follow)
+    document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
+    await loadStats();
+  } catch (e) {
+    if (stand.isConnected) {
+      if (next && next.parentNode === parent) parent.insertBefore(row, next);
+      else parent.appendChild(row);
+      stand.remove();
+    }
+    showMsg('admin-dir-msg', e && e.message && e.message !== 'Failed to fetch' ? e.message : 'Network error.', 'err');
+  }
+}
+
+async function removeDir(path, row, byKey = false) {
+  await _removeNow(row, path, false, () => api('/admin/dirs', {
+    method: 'DELETE',
+    body: JSON.stringify({ path, purge_tracks: true }),
+  }), byKey);
+}
+
 
 // ── External sources: the Modland catalogue ──────────────────────────────────
 // One switch per public archive listed in the library from its index (backend:
@@ -1723,30 +1849,13 @@ async function loadOnlineCollections() {
 }
 
 
-async function removeShare(shareId, path) {
-  if (_removingShare) return;  // guard against double-click
-  const confirmed = await styledConfirm(
-    `Disconnect "${path}"?\n\nPress OK to also delete all indexed tracks from this share.`,
-    { title: 'Disconnect Share', okLabel: 'Disconnect' }
-  );
-  if (!confirmed) return;  // user cancelled
-  _removingShare = true;
-  showMsg('admin-dir-msg', '');
-  try {
-    const res = await api('/admin/shares', {
-      method: 'DELETE',
-      // Pass scan_root so the backend can clean up an orphaned scan_dir
-      // even if its share record is missing from conf.
-      body: JSON.stringify({ id: shareId, scan_root: path, purge_tracks: true }),
-    });
-    const data = await res.json();
-    if (!res.ok) { showMsg('admin-dir-msg', data.detail || 'Error', 'err'); return; }
-    showMsg('admin-dir-msg', 'Disconnected. Tracks purging in background.', 'ok');
-    document.dispatchEvent(new CustomEvent('soniqboom:dirs-changed'));
-    await loadDirs();
-    await loadStats();
-  } catch { showMsg('admin-dir-msg', 'Network error.', 'err'); }
-  finally { _removingShare = false; }
+async function removeShare(shareId, path, row, byKey = false) {
+  // Pass scan_root so the backend can clean up an orphaned scan_dir even if
+  // its share record is missing from conf.
+  await _removeNow(row, path, true, () => api('/admin/shares', {
+    method: 'DELETE',
+    body: JSON.stringify({ id: shareId, scan_root: path, purge_tracks: true }),
+  }), byKey);
 }
 
 document.getElementById('btn-admin-add-dir').addEventListener('click', async () => {
@@ -5538,9 +5647,15 @@ document.getElementById('md-songdb-reset')?.addEventListener('click', async (e) 
 
 // ── Metadata tab: Demozoo scene groups + HVSC status/rescan ───────────────────
 
+// (a build under way — this page's or the automatic one after an update — is
+// followed every 3 s until it ends)
+let _dzPoll = null;
+
 function _renderDemozooStatus(s) {
   const line = document.getElementById('md-demozoo-status');
   if (!line) return;
+  clearTimeout(_dzPoll);
+  _dzPoll = (s && s.refreshing && line.isConnected) ? setTimeout(loadDemozooStatus, 3000) : null;
   if (!s || typeof s !== 'object') { line.textContent = 'Index: —'; return; }
   let txt;
   if (s.refreshing)                txt = 'Index: downloading…';
@@ -5554,6 +5669,8 @@ function _renderDemozooStatus(s) {
     else if (Number(s.uses) > 0) txt += ` \u00b7 ${Number(s.uses).toLocaleString()} tunes with a known use`;
     if (s.compos === null && s.uses !== null) txt += ' \u00b7 refresh the index to add party competitions and places';
     else if (Number(s.compos) > 0) txt += ` \u00b7 ${Number(s.compos).toLocaleString()} competition entries`;
+    if (s.productions === null || s.needs_rebuild) txt += ' \u00b7 refresh the index to add the Scene tab\u2019s discographies, release details and links';
+    else if (Number(s.productions) > 0) txt += ` \u00b7 ${Number(s.productions).toLocaleString()} music productions`;
   }
   if (s.applying) txt += ' · applying…';
   else if (s.last_apply) {
@@ -5589,12 +5706,13 @@ async function loadDemozooStatus() {
 document.getElementById('md-demozoo-refresh')?.addEventListener('click', async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
   const line = document.getElementById('md-demozoo-status');
-  if (line) line.textContent = 'Index: downloading (~192 MB — this takes a few minutes)…';
+  if (line) line.textContent = 'Index: downloading (~200 MB — this takes a few minutes)…';
   try {
     const res = await api('/admin/demozoo/refresh-index', { method: 'POST' });
     const s = await res.json().catch(() => null);
     _renderDemozooStatus(s);
-    if (s && !s.error) showMsg('md-demozoo-msg', 'Index refreshed.', 'ok');
+    if (s && s.refreshing) showMsg('md-demozoo-msg', 'The index is already being built \u2014 the line above follows it.', 'ok');
+    else if (s && !s.error) showMsg('md-demozoo-msg', 'Index refreshed.', 'ok');
     else showMsg('md-demozoo-msg', (s && s.error) || `Failed: ${res.status}`, 'err');
   } catch (err) {
     showMsg('md-demozoo-msg', `Refresh failed: ${err.message}`, 'err');

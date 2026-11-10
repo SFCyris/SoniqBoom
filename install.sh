@@ -942,9 +942,16 @@ fi
 # so re-running install.sh never re-prompts.  The CLI self-detects a
 # non-interactive install (piped / CI: no TTY) and prints a hint instead of
 # hanging.  You can re-run this any time with:  bash setup-admin.sh
+# An admin that already exists is mentioned here (--ensure-admin stays silent
+# for run.sh, which calls it on every start).
 section "Admin account"
 SETADM="$VENV/bin/soniqboom-setadm"
 if [ -x "$SETADM" ]; then
+  ADMINS="$("$VENV/bin/python" -c "from soniqboom.config import get_data_dir; from soniqboom.core.users import UserStore; print(', '.join(u.username for u in UserStore(get_data_dir()).list_users() if u.role == 'admin' and u.enabled))" 2>/dev/null || true)"
+  if [ -n "$ADMINS" ]; then
+    info "An admin account already exists ($ADMINS) — left as is."
+    echo "  To add another admin or reset a password:  bash setup-admin.sh"
+  fi
   "$SETADM" --ensure-admin || true
 else
   warn "soniqboom-setadm not found — create an admin later with:  bash setup-admin.sh"

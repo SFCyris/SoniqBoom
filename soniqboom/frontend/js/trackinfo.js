@@ -280,8 +280,11 @@ function _isPlaceholderArtist(name) {
 }
 
 // ``wikiOnly``: a retro / scene track — its Scene tab already shows the
-// Demozoo identity, so the Info pane takes only a Wikipedia article (the bio
-// other artists get, e.g. Ben Daglish), never the same card twice.
+// Demozoo identity, so the Info pane takes only an article: the composer's
+// Demozoo profile notes (``local_bio``, from the server's Demozoo index; with
+// the photo of a Wikipedia article the profile links) or, without notes, a
+// Wikipedia article (the bio other artists get, e.g. Ben Daglish) — never the
+// same card twice.
 async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
   const host = document.getElementById('ti-artist-about');
   if (!host) return;
@@ -321,7 +324,8 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
     const info = await r.json();
     if (_queue[_idx]?.id !== reqTrackId) return;
     if (!info || !info.found || !info.bio) return;
-    if (wikiOnly && info.source !== 'Wikipedia') return;
+    // (a scene composer's own Demozoo profile notes count as an article too)
+    if (wikiOnly && info.source !== 'Wikipedia' && !info.local_bio) return;
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
     // Allow-list the URL SCHEME on hrefs — esc() blocks attribute breakout but
@@ -330,8 +334,9 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
     const safeUrl = (u) => (/^https?:\/\//i.test(String(u == null ? '' : u)) ? String(u) : '');
     const full = info.bio;
     const bio = full.length > 420 ? full.slice(0, 420).replace(/\s+\S*$/, '') + '…' : full;
-    const img = info.image
-      ? `<img src="${esc(info.image)}" alt="${esc(info.title || artist)}" loading="lazy" decoding="async" style="float:left;width:72px;height:72px;object-fit:cover;border-radius:8px;margin:0 12px 8px 0">`
+    const _imgUrl = safeUrl(info.image);
+    const img = _imgUrl
+      ? `<img src="${esc(_imgUrl)}" alt="${esc(info.title || artist)}" loading="lazy" decoding="async" style="float:left;width:72px;height:72px;object-fit:cover;border-radius:8px;margin:0 12px 8px 0">`
       : '';
     const _infoUrl = safeUrl(info.url);
     const link = _infoUrl
@@ -345,8 +350,10 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
       const chip = (l) => {
         const u = safeUrl(l && l.url);
         if (!u) return '';
-        let label = l.class || 'link';
-        try { label = new URL(u).hostname.replace(/^www\./, ''); } catch { /* keep class */ }
+        let label = (l && l.label) || l.class || 'link';
+        if (!(l && l.label)) {
+          try { label = new URL(u).hostname.replace(/^www\./, ''); } catch { /* keep class */ }
+        }
         return `<a href="${esc(u)}" target="_blank" rel="noopener" style="display:inline-block;`
           + `font-size:11px;padding:2px 8px;margin:4px 5px 0 0;border-radius:10px;`
           + `background:var(--surface-2,rgba(255,255,255,.08));color:var(--text-2,#bbb);`
@@ -357,7 +364,13 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
     }
     host.innerHTML =
       `<h4 class="ti-section-hdr ti-about-hdr">About ${esc(info.title || artist)}</h4>` +
-      `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span>${esc(bio)}</span>${link}</div>` +
+      // (pre-line: the paragraphs of a profile's notes stay apart)
+      `<div style="overflow:hidden;font-size:12.5px;line-height:1.55">${img}<span class="ti-about-bio">${esc(bio)}</span>${link}</div>` +
+      (info.local_bio && info.location ? `<div class="ti-about-loc">Location: ${esc(info.location)}</div>` : '') +
+      // (a Demozoo bio with a Wikipedia article's photo: the photo's credit)
+      (_imgUrl && safeUrl(info.image_page)
+        ? `<div class="ti-about-loc">Photo: <a href="${esc(safeUrl(info.image_page))}" target="_blank" rel="noopener">Wikipedia</a></div>`
+        : '') +
       linksHtml;
     host.hidden = false;
     _bioRendered = true;
@@ -371,7 +384,8 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
 
 // ── Scene tab (retro/demoscene tracks) ─────────────────────────────────────────
 // Demozoo-sourced composer identity + discography + this track's release
-// details, fetched from /api/artist/scene (which resolves the scener with the
+// details (from the server's Demozoo index — the export, no request to
+// Demozoo), fetched from /api/artist/scene (which resolves the scener with the
 // same confidence gate as /artist/info).  Baseline module context (Modland
 // origin, format) always shows so the tab is never a dead end, even when the
 // composer doesn't resolve on Demozoo.  When a production matches this track,
@@ -428,13 +442,15 @@ function _renderScene(track, info) {
   let ab = `<div class="ti-scene-artist"><div class="ti-scene-name">${esc(a.real_name || handle)}</div>`;
   const sub = [];
   if (handle && a.real_name && a.real_name.toLowerCase() !== handle.toLowerCase()) sub.push(`“${esc(handle)}”`);
+  if (a.location) sub.push(esc(a.location));
   if (Array.isArray(a.groups) && a.groups.length) sub.push('Member of ' + esc(a.groups.slice(0, 5).join(', ')));
   if (sub.length) ab += `<div class="ti-scene-sub">${sub.join(' · ')}</div>`;
   const seen = new Set([handle.toLowerCase(), (a.real_name || '').toLowerCase()]);
   const aliases = (a.aliases || []).filter(n => n && !seen.has(String(n).toLowerCase()));
   if (aliases.length) ab += `<div class="ti-scene-aka">aka ${esc(aliases.slice(0, 6).join(', '))}</div>`;
+  // (a link's ``label`` is its site — "Bandcamp", "Discogs" — from the index)
   const aChips = [chip(a.url, 'Demozoo')]
-    .concat((a.links || []).slice(0, 12).map(l => chip(l && l.url, hostOf(l && l.url))))
+    .concat((a.links || []).slice(0, 20).map(l => chip(l && l.url, (l && l.label) || hostOf(l && l.url))))
     .filter(Boolean).join('');
   if (aChips) ab += `<div class="ti-scene-chips">${aChips}</div>`;
   ab += `</div>`;
@@ -467,7 +483,7 @@ function _renderScene(track, info) {
       rb += `<div class="ti-scene-compo">🎬 Featured in ${names}</div>`;
     }
     const rChips = [chip(rel.url, 'Demozoo')]
-      .concat((rel.links || []).slice(0, 8).map(l => chip(l && l.url, hostOf(l && l.url))))
+      .concat((rel.links || []).slice(0, 12).map(l => chip(l && l.url, (l && l.label) || hostOf(l && l.url))))
       .filter(Boolean).join('');
     if (rChips) rb += `<div class="ti-scene-chips">${rChips}</div>`;
     rb += `</div>`;

@@ -30,6 +30,7 @@ from soniqboom.core.data import (
     delete_tracks_by_scan_root,
     rebuild_indexes,
     list_scan_dirs,
+    scan_dir_key,
     upsert_scan_dir,
 )
 from soniqboom.core import folder_album as _folder_album
@@ -366,14 +367,15 @@ async def admin_online_catalog_refresh(key: str, _tok: str = Depends(_require_to
 
 @router.get("/demozoo/status")
 async def admin_demozoo_status(_tok: str = Depends(_require_token)):
-    """Demozoo scene-group enrichment state (index name→group rows, last apply)."""
+    """Demozoo scene-group enrichment state (index name→group rows, last apply).
+    Off the event loop (it opens the index; Settings polls it during a build)."""
     from soniqboom.core import demozoo
-    return demozoo.status()
+    return await asyncio.to_thread(demozoo.status)
 
 
 @router.post("/demozoo/refresh-index")
 async def admin_demozoo_refresh(_tok: str = Depends(_require_token)):
-    """Download Demozoo's nightly SQL dump (~192 MB) and rebuild the local
+    """Download Demozoo's nightly SQL dump (~200 MB) and rebuild the local
     name→scene-group sqlite index (unambiguous matches only).  Runs in an
     executor; returns the new status."""
     import asyncio as _asyncio
@@ -418,7 +420,7 @@ async def admin_demozoo_auto_apply(body: dict, _tok: str = Depends(_require_toke
     enabled = raw if isinstance(raw, bool) else \
         str(raw).strip().lower() in ("true", "1", "yes", "on")
     demozoo.set_auto_apply(enabled)
-    return demozoo.status()
+    return await asyncio.to_thread(demozoo.status)
 
 
 @router.get("/songdb/status")
@@ -592,7 +594,21 @@ async def admin_list_dirs(_tok: str = Depends(_require_token)):
                 d["watch"] = st
     except Exception:                                   # noqa: BLE001
         log.debug("watch status for /admin/dirs failed", exc_info=True)
-    return {"dirs": dirs}
+    from soniqboom.core import removals
+    return {"dirs": dirs, "removing": removals.status()}
+
+
+@router.post("/dirs/undo")
+async def admin_undo_remove(body: dict, _tok: str = Depends(_require_token)):
+    """Undo a folder / share removal while it still waits (``core/removals``:
+    409 once it has started)."""
+    from soniqboom.core import removals
+    path = (body.get("path") or "").strip()
+    if not removals.is_removing(path):
+        raise HTTPException(404, "Nothing is being removed there.")
+    if not removals.undo(path):
+        raise HTTPException(409, "Too late to undo: it is being removed.")
+    return {"dirs": await list_scan_dirs(), "removing": removals.status()}
 
 
 @router.post("/dirs")
@@ -606,6 +622,8 @@ async def admin_add_dir(body: dict, _tok: str = Depends(_require_token)):
     path, is_dir = await asyncio.to_thread(_check)
     if not is_dir:
         raise HTTPException(400, f"Directory not found: {path}")
+    from soniqboom.core import removals
+    removals.cancel(path)                   # (added again while its removal waits)
     await upsert_scan_dir(path)
 
     # Honour the scan_zips toggle sent with this request.  The frontend's
@@ -671,7 +689,14 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
     purge = _flag(body.get("purge_tracks", False))
     if not raw:
         raise HTTPException(400, "path is required")
-    path = _normalize_dir_path(raw)
+    path = await scan_dir_key(raw)          # (no realpath on the loop: a stalled mount)
+    if purge and path in get_store()._scan_dirs:
+        # Gone for every listener now; dropped and purged after the undo
+        # window (``core/removals``).
+        from soniqboom.core import removals
+        await removals.begin(path)
+        return {"removed": path, "purging": True, "undo_s": removals.UNDO_S,
+                "dirs": await list_scan_dirs(), "removing": removals.status()}
 
     await delete_scan_dir(path)
 
@@ -686,7 +711,7 @@ async def admin_remove_dir(body: dict, _tok: str = Depends(_require_token)):
         settings.folder_aliases = dict(save_local_conf(conf).get("folder_aliases") or {})
 
     if purge:
-        asyncio.create_task(_bg_purge_tracks(path))
+        _spawn_scan_task(_bg_purge_tracks(path), label=f"purge[{path}]")
 
     # Disarm the filesystem watcher for the removed root.
     try:
@@ -718,7 +743,7 @@ async def admin_update_alias(body: dict, _tok: str = Depends(_require_token)):
     alias = (body.get("alias") or "").strip()
     if not raw:
         raise HTTPException(400, "path is required")
-    path = _normalize_dir_path(raw)
+    path = await scan_dir_key(raw)
 
     from soniqboom.config import load_local_conf, save_local_conf
     conf = load_local_conf()
@@ -1695,19 +1720,6 @@ async def admin_services_set(
 # ── Network shares ──────────────────────────────────────────────────────────
 
 
-def _normalize_dir_path(raw: str) -> str:
-    """Resolve local filesystem paths; pass remote URLs through unchanged.
-
-    Remote scan dirs use protocol URLs (ftp://, smb://, WebDAV http(s)://)
-    as their canonical path key. Running them through ``Path.resolve()``
-    mangles them into nonsense like ``/cwd/ftp:/host/...`` which then never
-    matches the keys stored under ``folder_aliases`` or ``scan_dirs``.
-    """
-    if is_remote_path(raw):
-        return raw
-    return str(Path(raw).expanduser().resolve())
-
-
 def _slug(s: str) -> str:
     """Lowercase, hyphen-only slug for use in share IDs."""
     s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
@@ -1894,6 +1906,8 @@ async def add_share(body: dict, _tok: str = Depends(_require_token)):
     # New (or corrected) credentials: any refused-login back-off is over.
     from soniqboom.core.filesource import reset_share_backoff, share_auth_key
     reset_share_backoff(share_auth_key(share_conf))
+    from soniqboom.core import removals
+    removals.cancel(scan_root)              # (added again while its removal waits)
     register_source(scan_root, source)
 
     from soniqboom.config import save_local_conf
@@ -1974,6 +1988,14 @@ async def remove_share(body: dict, _tok: str = Depends(_require_token)):
 
     if not share:
         log.info("Cleaning up orphaned scan dirs for share %s: %s", share_id, scan_roots)
+    elif purge:
+        # Gone for every listener now; disconnected and purged after the undo
+        # window (``core/removals``).
+        from soniqboom.core import removals
+        for scan_root in scan_roots:
+            await removals.begin(scan_root, share_id=share_id)
+        return {"removed": share_id, "purging": True, "undo_s": removals.UNDO_S,
+                "dirs": await list_scan_dirs(), "removing": removals.status()}
 
     aliases = conf.get("folder_aliases", {})
     for scan_root in scan_roots:
@@ -1990,7 +2012,7 @@ async def remove_share(body: dict, _tok: str = Depends(_require_token)):
             pass  # cache may not be initialised
         aliases.pop(scan_root, None)
         if purge:
-            asyncio.create_task(_bg_purge_tracks(scan_root))
+            _spawn_scan_task(_bg_purge_tracks(scan_root), label=f"purge[{scan_root}]")
 
     conf["folder_aliases"] = aliases
     conf["network_shares"] = shares

@@ -266,10 +266,12 @@ async def test_the_retro_lookup_returns_the_article_for_a_demozoo_scener(monkeyp
     assert out["source"] == "Wikipedia" and out["bio"] == "Article text"
 
 
-def test_the_info_pane_shows_a_retro_bio_only_from_wikipedia():
+def test_the_info_pane_shows_a_retro_bio_only_from_wikipedia_or_the_demozoo_notes():
+    # (the Scene tab shows the Demozoo identity: the Info pane takes an article
+    # only — a Wikipedia page, or the composer's own Demozoo profile notes)
     src = (Path(__file__).resolve().parent.parent / "soniqboom/frontend/js/trackinfo.js").read_text()
     assert "_loadArtistAbout(track, { wikiOnly: _scene });" in src
-    assert "if (wikiOnly && info.source !== 'Wikipedia') return;" in src
+    assert "if (wikiOnly && info.source !== 'Wikipedia' && !info.local_bio) return;" in src
 
 
 @pytest.mark.asyncio

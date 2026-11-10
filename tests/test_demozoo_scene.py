@@ -7,8 +7,8 @@ anywhere and lock the CONFIDENCE-GATE behaviour: a wrong scener or a wrong
 year must never reach the panel.
 
 The tests deliberately exercise the *pure* logic — release title-match,
-refuse-on-ambiguity, year extraction, and the no-raise contract — not the live
-Demozoo API (which is covered by the manual end-to-end verification)."""
+refuse-on-ambiguity, year extraction, and the no-raise contract; the index the
+details are read from is ``test_demozoo_scene_index.py``'s."""
 from __future__ import annotations
 
 import asyncio

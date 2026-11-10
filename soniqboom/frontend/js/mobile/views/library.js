@@ -341,7 +341,7 @@ export function mountLibrary(root, ctx) {
   // Show: the same rows — their flags are re-read in place, the scroll kept.
   document.addEventListener('soniqboom:availability-changed', (e) => {
     const d = (e && e.detail) || {};
-    if (d.mode === 'hide' || d.prevMode === 'hide'
+    if (d.mode === 'hide' || d.prevMode === 'hide' || d.removed
         || d.unplayable === 'hide' || d.prevUnplayable === 'hide') { render(); return; }
     if (mode !== 'tracks' && mode !== 'pltracks') return;
     const list = tracks;

@@ -487,7 +487,9 @@ def _token(store, m: str, snap: "Snapshot") -> str:
     from soniqboom.core import skip_rules
     um = unplay_mode(store)
     cp = f"h{cant_play_ids(store)[1]}" if um == "hide" else "m"
-    return f"{m}:{_BOOT}:{snap.seq}:{skip_rules.token_part(store)}:{cp}"
+    rm, rver = _removing()
+    rp = f":r{rver}" if rm is not None else ""
+    return f"{m}:{_BOOT}:{snap.seq}:{skip_rules.token_part(store)}{rp}:{cp}"
 
 
 # ── What the list endpoints use ──────────────────────────────────────────────
@@ -521,7 +523,7 @@ def unplayable(store=None) -> frozenset | None:
     none."""
     _touch()
     from soniqboom.core import skip_rules
-    rules = skip_rules.skip_ids(store)
+    rules = _union("skip+", skip_rules.skip_ids(store) or None, _removing()[0])
     if mode(store) == "show":
         return rules or None
     u = snapshot(store).unavailable
@@ -552,9 +554,9 @@ def hide_token(store=None):
         snap = snapshot(store)
         off = snap.seq if snap and snap.unavailable else None
     _cp, ver = _hidden_cant_play(store)
-    if ver is None:
-        return off
-    return ("u", ver) if off is None else (off, ver)
+    rm, rver = _removing()
+    base = off if ver is None else (("u", ver) if off is None else (off, ver))
+    return base if rm is None else ("r", rver, base)
 
 
 def primary_swap(store=None, dedup: bool | None = None):
@@ -583,11 +585,18 @@ def primary_swap(store=None, dedup: bool | None = None):
     return store.primary_swap(u, _listed_hidden(store))
 
 
+def _removing() -> tuple[frozenset | None, int]:
+    """The tracks of the music folders / shares being removed
+    (``core/removals``) — left out everywhere, in every mode."""
+    from soniqboom.core import removals
+    return removals.hidden_ids()
+
+
 def _listed_hidden(store) -> frozenset | None:
     """``hidden`` without its side effect (the probe-interest stamp)."""
     off = snapshot(store).unavailable if mode(store) == "hide" else None
     cp, _ver = _hidden_cant_play(store)
-    return _union("hidden", off, cp)
+    return _union("hidden+", _union("hidden", off, cp), _removing()[0])
 
 
 def _swap_set(store) -> frozenset | None:
@@ -596,7 +605,7 @@ def _swap_set(store) -> frozenset | None:
     the tracks that can't be played."""
     off = snapshot(store).unavailable if mode(store) != "show" else None
     cp, _ver = _hidden_cant_play(store)
-    return _union("swap", off, cp)
+    return _union("swap+", _union("swap", off, cp), _removing()[0])
 
 
 def swap_token(store=None):
@@ -615,7 +624,9 @@ def swap_token(store=None):
     snap = snapshot(store)
     off = snap.seq if mode(store) != "show" and snap.unavailable else None
     _cp, ver = _hidden_cant_play(store)
-    return off if ver is None else (off, ver)
+    rm, rver = _removing()
+    base = off if ver is None else (off, ver)
+    return base if rm is None else ("r", rver, base)
 
 
 def offline_marker(store=None) -> Callable[[dict], str | None] | None:
@@ -768,7 +779,7 @@ def player_page(fetch: Callable[[int, int], list], offset: int, limit: int,
     snap = snapshot(store)
     if mode(store) == "show" or not snap.dead:
         snap = None
-    rules = skip_rules.skip_ids(store)
+    rules = _union("skip+", skip_rules.skip_ids(store) or None, _removing()[0])
     if snap is None and not rules:
         off = max(0, int(offset))
         rows = fetch(off, limit)
@@ -805,7 +816,10 @@ def state(store=None) -> dict:
                     "unavailable": len(un & ids) if ids else 0,
                 })
         snap._roots = roots
-    roots = [dict(r) for r in roots]
+    from soniqboom.core import removals
+    gone = removals.registry(store)               # (being removed: no offline banner)
+    roots = [dict(r) for r in roots if r.get("path") not in gone]
+    rm, rver = _removing()
     from soniqboom.core import skip_rules
     return {"mode": m, "token": _token(store, m, snap),
             "unplayable_mode": unplay_mode(store),
@@ -813,7 +827,9 @@ def state(store=None) -> dict:
             "seq": snap.seq, "skip_short_tunes": skip_rules.short_secs(store),
             "marks": skip_rules.marks_gen(),
             "tune_placeholders": skip_rules.placeholder_seconds(),
-            "unavailable": len(snap.unavailable) if snap.dead else 0,
+            "unavailable": (len(snap.unavailable) - (len(snap.unavailable & rm) if rm else 0))
+                           if snap.dead else 0,
+            "removing": rver,
             "roots": roots}
 
 

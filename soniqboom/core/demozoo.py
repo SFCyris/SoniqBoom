@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import collections
 import gzip
+import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -54,6 +56,35 @@ _PARTY = "public.parties_party"                               # party id→name 
 _COMPETITION = "public.parties_competition"                   # competition→party
 _PLACING = "public.parties_competitionplacing"                # production↔competition
 _USE_TABLES = (_PROD_PACK, _PARTY, _COMPETITION, _PLACING)
+# The SCENE tab's details (``_details_from_dump``), read from the export since
+# Demozoo's API asks for a key: a scener's external links, the platforms,
+# release parties and external links of MUSIC productions.
+_REL_LINK = "public.demoscene_releaserexternallink"           # scener↔(link type, parameter)
+_PARTY_RELEASES = "public.parties_party_releases"             # party↔production released there
+_PLATFORM = "public.platforms_platform"                       # platform id→name ("Amiga OCS/ECS")
+_PROD_PLATFORMS = "public.productions_production_platforms"   # M2M production↔platform
+_PROD_LINK = "public.productions_productionlink"              # production↔(link type, parameter)
+_DETAIL_TABLES = (_REL_LINK, _PARTY_RELEASES, _PLATFORM, _PROD_PLATFORMS, _PROD_LINK)
+# The columns of the SCENE tab's own export tables and the profile columns it
+# reads (a missing one is logged; the production / party columns shared with
+# the enrichment are read as before).
+_DETAIL_COLUMNS = {
+    "public.demoscene_releaser": ("notes", "location"),
+    _REL_LINK: ("releaser_id", "link_class", "parameter"),
+    _PARTY_RELEASES: ("party_id", "production_id"),
+    _PLATFORM: ("id", "name"),
+    _PROD_PLATFORMS: ("production_id", "platform_id"),
+    _PROD_LINK: ("production_id", "link_class", "parameter", "is_download_link"),
+}
+# The index's layout (sqlite ``user_version``): an index of an older layout
+# lacks the SCENE tab's details and is built again once (``needs_rebuild``).
+INDEX_SCHEMA = 2
+# The live API's disk cache of earlier versions (glob patterns in the index's
+# folder): removed with a new index.
+OLD_CACHE_FILES = ("scener_*.json", "prod_*.json")
+# The automatic rebuild of an older index (``rebuild_if_outdated``) is tried
+# once per layout: this file (beside the index) names the layout tried.
+REBUILD_MARK = "demozoo.rebuild-tried"
 
 
 def use_kind(type_name: object) -> str | None:
@@ -261,6 +292,8 @@ def status() -> dict:
             "games": _game_rows(db) if exists else None,
             "uses": _use_rows(db) if exists else None,
             "compos": _compo_rows(db) if exists else None,
+            "productions": _prod_rows(db) if exists else None,
+            "needs_rebuild": bool(exists and index_schema() < INDEX_SCHEMA),
             "auto_apply": auto_apply_enabled(),
             "size": db.stat().st_size if exists else 0}
 
@@ -312,6 +345,64 @@ def _compo_rows(db: Path) -> int | None:
             con.close()
     except Exception:                                       # noqa: BLE001
         return None
+
+
+def _prod_rows(db: Path) -> int | None:
+    """Music productions with their details (the SCENE tab's discographies,
+    release details and links); None for an index built before they were."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if not _has_table(con, "music_prod"):
+                return None
+            return con.execute("SELECT COUNT(*) FROM music_prod").fetchone()[0]
+        finally:
+            con.close()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+_rebuild_started = False
+_REBUILD_SCAN_WAIT_S = 600.0
+
+
+def rebuild_if_outdated() -> bool:
+    """At startup (on the event loop): an index of an older layout
+    (``needs_rebuild`` — the SCENE tab's details missing) is built again from
+    the export on a daemon thread (a shutdown never waits for the download;
+    the new index replaces the old file only once it is complete).  Tried
+    ONCE per layout after a finished download (``REBUILD_MARK``: a build the
+    system stopped — out of memory — isn't tried again at every start;
+    Settings → Metadata still offers it; a failed download is tried again at
+    the next start), not while offline, and not during a full scan (asked
+    again in 10 min).  True when started."""
+    global _rebuild_started
+    if _rebuild_started or _status["refreshing"] or not needs_rebuild():
+        return False
+    from soniqboom.core import netpolicy
+    if netpolicy.blocked(DUMP_URL):
+        return False
+    mark = _db_path().with_name(REBUILD_MARK)
+    try:
+        if int(mark.read_text().strip() or 0) >= INDEX_SCHEMA:
+            return False
+    except (OSError, ValueError):
+        pass
+    try:
+        from soniqboom.core.scanner import full_scan_active
+        if full_scan_active():
+            import asyncio
+            asyncio.get_running_loop().call_later(_REBUILD_SCAN_WAIT_S, rebuild_if_outdated)
+            return False
+    except RuntimeError:                                # (no loop: tests)
+        pass
+    _rebuild_started = True
+    log.info("Demozoo index: an older layout — building it again for the Scene tab's details")
+    # The mark is written once the download is in (``mark_rebuild``): a failed
+    # download (no network yet, Demozoo down) is tried again at the next start.
+    threading.Thread(target=refresh_index, kwargs={"mark_rebuild": True},
+                     name="demozoo-rebuild", daemon=True).start()
+    return True
 
 
 def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
@@ -412,15 +503,33 @@ def _norm(s: object) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split()) if isinstance(s, str) else ""
 
 
+_COPY_ESC = re.compile(r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|(.))", re.S)
+_COPY_CHR = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+
+
 def _unesc(v: str) -> str | None:
+    """A COPY text field: ``\\N`` is NULL; backslash escapes are read left to
+    right in one pass (``\\\\t`` is a backslash and a "t", not a tab)."""
     if v == r"\N":
         return None
-    return (v.replace(r"\t", "\t").replace(r"\n", "\n")
-             .replace(r"\r", "\r").replace(r"\\", "\\"))
+    if "\\" not in v:
+        return v
+
+    def _one(m: "re.Match") -> str:
+        if m.group(1):
+            return chr(int(m.group(1), 8))
+        if m.group(2):
+            return chr(int(m.group(2), 16))
+        c = m.group(3)
+        return _COPY_CHR.get(c, c)
+    return _COPY_ESC.sub(_one, v)
 
 
-def _parse_dump(path: Path):
+def _parse_dump(path: Path, details: "dict | None" = None):
     """Stream the pg_dump gzip → ``(unique, ambig, prod_years)``.
+
+    ``details`` (a dict, filled when given): the SCENE tab's rows —
+    ``_details_from_dump``.
 
     ``unique``: ``{normalised_name: (releaser_id, real_name, groups_csv)}`` for
     names that resolve to EXACTLY ONE scener — the confidence gate.  A scener
@@ -457,6 +566,20 @@ def _parse_dump(path: Path):
     placed_in: dict[str, list[str]] = {}        # production_id → [competition id]
     place_of: dict[tuple, int | None] = {}      # (production_id, competition id) → place
     comp_entries: dict[str, int] = {}           # competition id → number of placings
+    # The SCENE tab's details (only when ``details`` is wanted).  The export
+    # lists its tables by name, so a production's supertype is known before its
+    # platforms and links stream past: those keep MUSIC productions only.
+    want_details = details is not None
+    rel_links: list[tuple[str, str, str]] = []      # (releaser id, link type, parameter)
+    party_rel: dict[str, list[str]] = {}            # production id → [party id] released at
+    party_year: dict[str, int | None] = {}          # party id → start year
+    comp_ranking: dict[tuple, str] = {}             # (production, competition) → "1" / "=2"
+    plat_name: dict[str, str] = {}                  # platform id → name
+    prod_plats: dict[str, list[str]] = {}           # music production id → [platform id]
+    prod_links: list[tuple[str, str, str, bool]] = []   # (music production, type, parameter, download)
+    prod_date: dict[str, tuple[str, str]] = {}      # production id → (release date, precision)
+    seen_tables: set[str] = set()
+    seen_cols: dict[str, set[str]] = {}
     cur: str | None = None
     cols: list[str] | None = None
     idx: dict[str, int] = {}
@@ -468,9 +591,12 @@ def _parse_dump(path: Path):
                     if m and (m.group(1) in _TABLES
                               or m.group(1) in (_PROD_AUTHOR, _PROD_TABLE,
                                                 _PROD_SOUNDTRACK, _PROD_TYPES,
-                                                _PROD_TYPE, *_USE_TABLES)):
+                                                _PROD_TYPE, *_USE_TABLES)
+                              or (want_details and m.group(1) in _DETAIL_TABLES)):
                         cur = m.group(1)
+                        seen_tables.add(cur)
                         cols = [c.strip().strip('"') for c in m.group(2).split(",")]
+                        seen_cols[cur] = set(cols)
                         idx = {c: i for i, c in enumerate(cols)}
                 continue
             if line.startswith("\\."):
@@ -502,6 +628,9 @@ def _parse_dump(path: Path):
                 ii, ni = idx.get("id"), idx.get("name")
                 if ii is not None and ni is not None:
                     party_name[parts[ii]] = _unesc(parts[ni]) or ""
+                    si = idx.get("start_date_date")
+                    if si is not None:
+                        party_year[parts[ii]] = _year_of(_unesc(parts[si]))
             elif cur == _COMPETITION:
                 ii, pi = idx.get("id"), idx.get("party_id")
                 if ii is not None and pi is not None:
@@ -517,6 +646,35 @@ def _parse_dump(path: Path):
                     place_of[(parts[pi], parts[ci])] = _place(
                         parts[idx["position"]] if "position" in idx else None,
                         parts[idx["ranking"]] if "ranking" in idx else None)
+                    if want_details and "ranking" in idx:
+                        comp_ranking[(parts[pi], parts[ci])] = (_unesc(parts[idx["ranking"]]) or "").strip()
+            elif cur == _REL_LINK:
+                ri, ki, vi = idx.get("releaser_id"), idx.get("link_class"), idx.get("parameter")
+                if ri is not None and ki is not None and vi is not None:
+                    k, v = _unesc(parts[ki]), _unesc(parts[vi])
+                    if k and v:
+                        rel_links.append((parts[ri], k, v))
+            elif cur == _PARTY_RELEASES:
+                ai, pi = idx.get("party_id"), idx.get("production_id")
+                if ai is not None and pi is not None:
+                    party_rel.setdefault(parts[pi], []).append(parts[ai])
+            elif cur == _PLATFORM:
+                ii, ni = idx.get("id"), idx.get("name")
+                if ii is not None and ni is not None:
+                    plat_name[parts[ii]] = _unesc(parts[ni]) or ""
+            elif cur == _PROD_PLATFORMS:
+                pi, li = idx.get("production_id"), idx.get("platform_id")
+                if pi is not None and li is not None and prod_super.get(parts[pi], "music") == "music":
+                    prod_plats.setdefault(parts[pi], []).append(parts[li])
+            elif cur == _PROD_LINK:
+                pi, ki, vi = idx.get("production_id"), idx.get("link_class"), idx.get("parameter")
+                if pi is not None and ki is not None and vi is not None \
+                        and prod_super.get(parts[pi], "music") == "music":
+                    k, v = _unesc(parts[ki]), _unesc(parts[vi])
+                    di = idx.get("is_download_link")
+                    if k and v:
+                        prod_links.append((parts[pi], k, v,
+                                           di is not None and parts[di] in ("t", "true")))
             elif cur == _PROD_SOUNDTRACK:
                 # ``production_id`` = the DEMO/intro; ``soundtrack_id`` = the
                 # MUSIC it uses.  Invert to music→[demos] for the "featured in"
@@ -543,6 +701,10 @@ def _parse_dump(path: Path):
                         y = _year_of(_unesc(parts[di]))
                         if y:
                             prod_yr[parts[ii]] = y
+                        if want_details and (si is None or prod_super.get(parts[ii]) == "music"):
+                            pr = idx.get("release_date_precision")
+                            prod_date[parts[ii]] = (_unesc(parts[di]) or "",
+                                                    (_unesc(parts[pr]) or "") if pr is not None else "")
             else:
                 rows[cur].append({c: _unesc(v) for c, v in zip(cols, parts)})
 
@@ -662,7 +824,7 @@ def _parse_dump(path: Path):
     # "Featured in" evidence: for each MUSIC production, the demos/intros that
     # used it as their soundtrack — resolved to the demo's title + year for the
     # SCENE tab's release block.  Keyed by the music production's Demozoo id (the
-    # same id the live discography match yields in scene_card).
+    # same id the discography match yields in scene_card).
     prod_soundtrack: list[tuple[int, str, int | None]] = []   # (music_id, demo_title, demo_year)
     for music_id, demo_ids in soundtrack_of.items():
         try:
@@ -742,22 +904,189 @@ def _parse_dump(path: Path):
             if not _isgroup(rel.get(rid, {})):
                 music_uses.append((rid, ytoks_str, ",".join(sorted(kinds)), party,
                                    compo, place, entries))
+    if want_details:
+        missing = [t for t in _DETAIL_TABLES if t not in seen_tables]
+        if missing:
+            log.warning("Demozoo dump: no %s — the Scene tab's details will lack them "
+                        "(the export's tables may have been renamed)", ", ".join(missing))
+        gone = [f"{t}.{c}" for t, want in _DETAIL_COLUMNS.items() if t in seen_cols
+                for c in want if c not in seen_cols[t]]
+        if gone:
+            log.warning("Demozoo dump: no column %s — the Scene tab's details will lack "
+                        "it (the export's columns may have been renamed)", ", ".join(gone))
+        details.update(_details_from_dump(
+            rel=rel, nick_rel=nick_rel, nicks=rows["public.demoscene_nick"],
+            nick_variants=rows["public.demoscene_nickvariant"],
+            memberships=rows["public.demoscene_membership"], rel_links=rel_links,
+            prod_nicks=prod_nicks, prod_title=prod_title, prod_super=prod_super,
+            prod_date=prod_date, prod_types=prod_types, type_name=type_name,
+            prod_plats=prod_plats, plat_name=plat_name, party_rel=party_rel,
+            party_name=party_name, party_year=party_year, placed_in=placed_in,
+            comp_party=comp_party, comp_name=comp_name, place_of=place_of,
+            comp_ranking=comp_ranking, prod_links=prod_links))
     return unique, ambig, prod_years, prod_soundtrack, music_games, music_uses
 
 
-def refresh_index(dump_path: Path | None = None) -> dict:
-    """Download the Demozoo dump (~192 MB) and (re)build the local sqlite index.
+def _details_from_dump(*, rel, nick_rel, nicks, nick_variants, memberships, rel_links,
+                       prod_nicks, prod_title, prod_super, prod_date, prod_types,
+                       type_name, prod_plats, plat_name, party_rel, party_name,
+                       party_year, placed_in, comp_party, comp_name, place_of,
+                       comp_ranking, prod_links) -> dict:
+    """The SCENE tab's rows, keyed by Demozoo id (``refresh_index`` writes
+    them; ``scener_details`` / ``scener_productions`` / ``production_detail``
+    read them):
+
+    * ``sceners``: ``[(releaser_id, name, aliases_json, groups_json,
+      variants_json, notes, location)]`` for every person — the nicks, the
+      groups (current ones first), the nicks' abbreviations and other spellings
+      ("PM"), the profile's notes (as plain text, ``_plain_notes``: converted
+      once here) and location ("Finland");
+    * ``scener_links``: ``[(releaser_id, link type, parameter)]``;
+    * ``prods``: ``[(id, title, release date, year, types, platforms_json)]``
+      (``types``: the type names, comma-separated)
+      for every MUSIC production with an author;
+    * ``authors``: ``[(releaser_id, production_id)]`` — the people and groups
+      credited;
+    * ``parties``: ``[(production_id, party_id, name, year)]`` released at;
+    * ``placings``: ``[(production_id, ranking, competition, party_id,
+      party, year)]``;
+    * ``links``: ``[(production_id, link type, parameter, download)]``.
+    """
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _isgroup(r) -> bool:
+        return (r or {}).get("is_group") in ("t", "true", True, "1")
+
+    aliases: dict[str, list[str]] = collections.defaultdict(list)
+    variants: dict[str, list[str]] = collections.defaultdict(list)
+    for n in nicks:
+        rid, nm = n.get("releaser_id"), (n.get("name") or "").strip()
+        if rid and nm and nm not in aliases[rid]:
+            aliases[rid].append(nm)
+        ab = (n.get("abbreviation") or "").strip()
+        if rid and ab and ab not in variants[rid]:
+            variants[rid].append(ab)
+    for v in nick_variants:                     # ("PM" for "Purple Motion")
+        rid, nm = nick_rel.get(v.get("nick_id")), (v.get("name") or "").strip()
+        if rid and nm and nm not in aliases[rid] and nm not in variants[rid]:
+            variants[rid].append(nm)
+    groups: dict[str, tuple[list, list]] = collections.defaultdict(lambda: ([], []))
+    for m in memberships:
+        g = rel.get(m.get("group_id"))
+        if not (g and _isgroup(g) and g.get("name")):
+            continue
+        cur = (m.get("is_current") or "t") in ("t", "true", True, "1")
+        groups[m.get("member_id")][0 if cur else 1].append(g["name"])
+    sceners = []
+    for rid, r in rel.items():
+        i = _int(rid)
+        if i is None or _isgroup(r):
+            continue
+        now, before = groups.get(rid, ([], []))
+        gs = sorted(set(now), key=str.casefold)
+        gs += sorted(set(before) - set(gs), key=str.casefold)
+        sceners.append((i, r.get("name") or "", json.dumps(aliases.get(rid, [])),
+                        json.dumps(gs), json.dumps(variants.get(rid, [])),
+                        _plain_notes(r.get("notes")), (r.get("location") or "").strip()))
+    scener_links = [(i, k, v) for rid, k, v in rel_links if (i := _int(rid)) is not None]
+
+    prods, authors, keep = [], [], set()
+    for pid, ns in prod_nicks.items():
+        if prod_super and prod_super.get(pid, "music") != "music":
+            continue
+        i = _int(pid)
+        if i is None:
+            continue
+        rids = sorted({nick_rel.get(n) for n in ns} - {None})
+        if not rids:
+            continue
+        keep.add(pid)
+        date, _prec = prod_date.get(pid, ("", ""))
+        tnames = sorted({type_name.get(t, "") for t in prod_types.get(pid, ())} - {""})
+        plats = sorted({plat_name.get(x, "") for x in prod_plats.get(pid, ())} - {""})
+        prods.append((i, prod_title.get(pid) or "", date, _year_of(date),
+                      ", ".join(tnames), json.dumps(plats)))
+        authors.extend((r, i) for r in (_int(x) for x in rids) if r is not None)
+    parties = []
+    for pid in keep:
+        for a in dict.fromkeys(party_rel.get(pid, ())):
+            parties.append((int(pid), _int(a), party_name.get(a, ""), party_year.get(a)))
+    placings = []
+    for pid in keep:
+        for c in dict.fromkeys(placed_in.get(pid, ())):
+            rank = comp_ranking.get((pid, c)) or ""
+            if not rank and place_of.get((pid, c)):
+                rank = str(place_of[(pid, c)])
+            a = comp_party.get(c, "")
+            placings.append((int(pid), rank, comp_name.get(c, ""), _int(a),
+                             party_name.get(a, ""), party_year.get(a)))
+    links = [(int(pid), k, v, 1 if dl else 0) for pid, k, v, dl in prod_links if pid in keep]
+    return {"sceners": sceners, "scener_links": scener_links, "prods": prods,
+            "authors": authors, "parties": parties, "placings": placings, "links": links}
+
+
+def _write_details(con: sqlite3.Connection, d: dict) -> None:
+    """The SCENE tab's tables (``_details_from_dump``), written anew."""
+    spec = (
+        ("scener_detail", "releaser_id INTEGER PRIMARY KEY, name TEXT, aliases TEXT, "
+                          "groups TEXT, variants TEXT, notes TEXT, location TEXT",
+         "sceners", None),
+        ("scener_link", "releaser_id INTEGER, cls TEXT, param TEXT",
+         "scener_links", "releaser_id"),
+        ("music_prod", "id INTEGER PRIMARY KEY, title TEXT, date TEXT, year INTEGER, "
+                       "type TEXT, platforms TEXT", "prods", None),
+        ("prod_author", "releaser_id INTEGER, prod_id INTEGER", "authors", "releaser_id"),
+        ("prod_party", "prod_id INTEGER, party_id INTEGER, name TEXT, year INTEGER",
+         "parties", "prod_id"),
+        ("prod_placing", "prod_id INTEGER, ranking TEXT, competition TEXT, party_id INTEGER, "
+                         "party TEXT, year INTEGER", "placings", "prod_id"),
+        ("prod_link", "prod_id INTEGER, cls TEXT, param TEXT, download INTEGER",
+         "links", "prod_id"),
+    )
+    for table, cols, key, ix in spec:
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+        con.execute(f"CREATE TABLE {table} ({cols})")
+        rows = d.get(key) or []
+        if rows:
+            marks = ",".join("?" * len(rows[0]))
+            con.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", rows)
+        if ix:
+            con.execute(f"CREATE INDEX ix_{table} ON {table}({ix})")
+
+
+def refresh_index(dump_path: Path | None = None, *, mark_rebuild: bool = False) -> dict:
+    """Download the Demozoo dump (~200 MB) and (re)build the local sqlite index.
 
     Blocking (download + parse) — callers ``run_in_executor`` it.  ``dump_path``
-    lets tests pass an already-downloaded dump instead of fetching.
+    lets tests pass an already-downloaded dump instead of fetching.  The index
+    is built in a file of its own and replaces the old one when complete
+    (readers keep the old one until then; a damaged file is replaced too).
+    ``mark_rebuild`` (the automatic rebuild): write ``REBUILD_MARK`` once the
+    download is in.
     """
-    if _status["refreshing"]:
-        return status()
+    if not _refresh_lock.acquire(blocking=False):
+        return status()                                 # (one build at a time)
+    try:
+        return _refresh_index(dump_path, mark_rebuild)
+    finally:
+        _refresh_lock.release()
+
+
+_refresh_lock = threading.Lock()
+
+
+def _refresh_index(dump_path: Path | None, mark_rebuild: bool = False) -> dict:
     from soniqboom.core import netpolicy
     if dump_path is None and netpolicy.blocked(DUMP_URL):
         return {**status(), "error": "Offline mode is on — the Demozoo index can't be downloaded"}
     _status.update(refreshing=True, error=None)
     tmp: Path | None = None
+    db = _db_path()
+    build = db.with_name(db.name + ".building")
     try:
         if dump_path is None:
             tmp = _db_path().with_suffix(".download.gz")
@@ -776,9 +1105,17 @@ def refresh_index(dump_path: Path | None = None) -> dict:
             src = tmp
         else:
             src = dump_path
-        unique, ambig, prod_years, prod_soundtrack, music_games, music_uses = _parse_dump(src)
-        db = _db_path()
-        con = sqlite3.connect(db)
+        if mark_rebuild:
+            try:
+                db.with_name(REBUILD_MARK).write_text(str(INDEX_SCHEMA))
+            except OSError:
+                log.debug("could not write %s", REBUILD_MARK, exc_info=True)
+        details: dict = {}
+        unique, ambig, prod_years, prod_soundtrack, music_games, music_uses = \
+            _parse_dump(src, details)
+        for leftover in (build, build.with_name(build.name + "-journal")):
+            leftover.unlink(missing_ok=True)            # (a build that was stopped)
+        con = sqlite3.connect(build)
         try:
             # ``scener`` keeps the Demozoo releaser id (→ /sceners/{id}/ link) +
             # real name for UNIQUE names; ``ambig_prod`` holds shared-handle
@@ -847,25 +1184,38 @@ def refresh_index(dump_path: Path | None = None) -> dict:
                 except (TypeError, ValueError):
                     continue
             con.executemany("INSERT INTO music_use VALUES (?,?,?,?,?,?,?)", _mu_rows)
+            _write_details(con, details)
+            con.execute(f"PRAGMA user_version = {INDEX_SCHEMA}")
             con.commit()
         finally:
             con.close()
+        os.replace(build, db)                           # (open readers keep the old file)
         _status.update(built_at=int(time.time()), names=len(unique))
+        for pattern in OLD_CACHE_FILES:                 # (the live API's cache)
+            for f in db.parent.glob(pattern):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
         log.info("Demozoo index built: %d unique names + %d shared-handle "
                  "production rows + %d dated music productions + %d soundtrack links "
-                 "+ %d game soundtracks + %d music uses",
+                 "+ %d game soundtracks + %d music uses + %d music productions "
+                 "(%d links) + %d scener links",
                  len(unique), len(ambig), len(prod_years), len(prod_soundtrack),
-                 len(music_games), sum(1 for r in music_uses if r[2] or r[3]))
+                 len(music_games), sum(1 for r in music_uses if r[2] or r[3]),
+                 len(details.get("prods", ())), len(details.get("links", ())),
+                 len(details.get("scener_links", ())))
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = f"refresh failed: {exc}"
         log.warning("Demozoo refresh failed: %s", exc)
     finally:
         _status["refreshing"] = False
-        if tmp is not None:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        for f in (tmp, build, build.with_name(build.name + "-journal")):
+            if f is not None:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
     return status()
 
 
@@ -1181,11 +1531,6 @@ def _has_scener_table(con: sqlite3.Connection) -> bool:
 
 # ── Artist-panel lookup (Demozoo-first identity for retro/scene music) ────────
 
-# Live per-scener enrichment is cached this long — a scener's id is stable and
-# their links/groups change rarely, so 30 days keeps the API essentially untouched.
-_SCENER_TTL = 30 * 86400
-
-
 def _scener_card(rid: object, real_name: object, groups: object) -> dict:
     return {
         "releaser_id": int(rid),
@@ -1291,83 +1636,164 @@ def lookup_scener(name: str, track_title: str | None = None) -> dict | None:
         return None
 
 
-async def fetch_scener_details(releaser_id: int) -> dict | None:
-    """Best-effort LIVE Demozoo enrichment for a KNOWN releaser id — external
-    links, current groups, aliases — cached to disk for ``_SCENER_TTL``.
+def _detail_con() -> "sqlite3.Connection | None":
+    """A read-only connection to an index holding the SCENE tab's details
+    (``INDEX_SCHEMA``), or None."""
+    db = _db_path()
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:                                   # noqa: BLE001
+        return None
+    try:
+        if _has_table(con, "music_prod"):
+            return con
+    except Exception:                                   # noqa: BLE001
+        pass
+    con.close()
+    return None
 
-    We already hold the exact id (from the offline match), so there is NO
-    name-matching risk here.  Returns ``None`` on any failure so the caller
-    keeps the offline-only card.
-    """
-    import asyncio
-    import json
+
+def index_schema() -> int:
+    """The layout of the index on disk (sqlite ``user_version``; 0: none or
+    built before the layout was numbered)."""
+    db = _db_path()
+    if not db.exists():
+        return 0
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            return int(con.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            con.close()
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
+def needs_rebuild() -> bool:
+    """An index is there, of an older layout than this version writes: its
+    SCENE tab details are missing until it is built again."""
+    return has_index() and index_schema() < INDEX_SCHEMA
+
+
+# (a link target may hold one level of parentheses: …/wiki/Foo_(musician))
+_MD_TARGET = r"\((?:[^()\s]|\([^()\s]*\))*(?:\s+\"[^\"]*\")?\)"
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]" + _MD_TARGET)
+# (link words may hold one level of brackets: "[[pouet.net thread]](…)")
+_MD_LINK = re.compile(r"\[((?:[^\[\]]|\[[^\[\]]*\])*)\]" + _MD_TARGET)
+# footnotes ("…for Gate.[^1]" … "[^1]: Bruno's Music Box II by Gate"): kept as [1]
+_MD_FOOT_DEF = re.compile(r"(?m)^[ \t]{0,3}\[\^([^\]\s]+)\]:[ \t]*")
+_MD_FOOT = re.compile(r"\[\^([^\]\s]+)\]")
+_MD_REF_LINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
+_MD_REF_DEF = re.compile(r"(?m)^[ \t]{0,3}\[[^\]]+\]:[ \t]*\S+.*$")
+_MD_AUTOLINK = re.compile(r"<((?:https?|mailto):[^>\s]+)>", re.I)
+_MD_BR = re.compile(r"<br\s*/?>", re.I)
+_MD_TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>")
+_MD_ESC = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>|~])")
+# (emphasis may run over a line break, never over a paragraph)
+_MD_STRONG = re.compile(r"(\*\*|__)(?=\S)((?:(?!\n\n).)+?)(?<=\S)\1", re.S)
+_MD_EM = re.compile(r"(?<![\w*])([*_])(?=[^\s*_])((?:(?!\n\n).)+?)(?<=[^\s*_])\1(?![\w*])", re.S)
+_MD_CODE = re.compile(r"`([^`]*)`")
+_MD_ESCAPED = ""                      # (an escaped character, until the end)
+
+
+_NOTES_CAP = 10_000                             # (the longest profile: ~7,000 characters)
+
+
+def _plain_notes(md: object) -> str:
+    """A Demozoo profile's notes (Markdown) as plain text: a link keeps its
+    words, a footnote is kept as ``[1]`` (its text as a ``[1] …`` line),
+    images, tags and reference definitions go, emphasis and code marks
+    go (a lone ``*`` — "5*" — stays), list bullets, headings and quote marks
+    go, a backslash-escaped character stays as written, paragraphs stay."""
+    if not isinstance(md, str) or not md.strip():
+        return ""
+    t = md[:_NOTES_CAP].replace("\r\n", "\n").replace(_MD_ESCAPED, "")
+    t = _MD_ESC.sub(lambda m: _MD_ESCAPED + format(ord(m.group(1)), "x") + ";", t)
+    t = _MD_FOOT_DEF.sub(r"[\1] ", t)
+    t = _MD_FOOT.sub(r"[\1]", t)
+    t = _MD_IMAGE.sub("", t)
+    t = _MD_LINK.sub(r"\1", t)
+    t = _MD_REF_DEF.sub("", t)
+    t = _MD_REF_LINK.sub(r"\1", t)
+    t = _MD_AUTOLINK.sub(r"\1", t)
+    t = _MD_BR.sub("\n", t)
+    t = _MD_TAG.sub("", t)
+    t = _MD_CODE.sub(r"\1", t)
+    t = _MD_STRONG.sub(r"\2", t)
+    t = _MD_EM.sub(r"\2", t)
+    t = re.sub(r"(?m)^[ \t]*(?:>[ \t]?)+", "", t)
+    t = re.sub(r"(?m)^[ \t]*(?:[-*+]|#+)[ \t]+", "", t)
+    t = re.sub(_MD_ESCAPED + r"([0-9a-f]+);", lambda m: chr(int(m.group(1), 16)), t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"(?m)^ | $", "", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def _links_of(rows) -> list[dict]:
+    """``[(link type, parameter[, download])]`` as links, in Demozoo's order
+    (external before downloads; the plain web address first, then by type),
+    without the types Demozoo no longer shows and without repeats."""
+    from soniqboom.core.demozoo_links import ARCHIVED, link, sort_key
+    rows = sorted((r for r in rows if r[0] not in ARCHIVED),
+                  key=lambda r: (r[2] if len(r) > 2 else 0, sort_key(r[0])))
+    out, seen = [], set()
+    for r in rows:
+        lk = link(r[0], r[1])
+        if lk and lk["url"] not in seen:
+            seen.add(lk["url"])
+            out.append(lk)
+    return out
+
+
+def scener_details(releaser_id: object) -> dict | None:
+    """A scener's details from the index — ``{name, aliases, groups, variants,
+    notes, location, links, demozoo_url}`` (``variants``: abbreviations and
+    other spellings of the nicks; ``notes``: the profile's notes as plain text;
+    ``links``: ``[{url, label, class}]``, ``demozoo_links``);
+    None when the index has no details (an older layout) or no such scener."""
     try:
         rid = int(releaser_id)
     except (TypeError, ValueError):
         return None
-    cache = _db_path().parent / f"scener_{rid}.json"
-    try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < _SCENER_TTL:
-            return json.loads(cache.read_text("utf-8"))
-    except Exception:                                    # noqa: BLE001
-        pass
-    url = f"https://demozoo.org/api/v1/releasers/{rid}/"
-
-    def _get() -> dict:
-        from soniqboom.core import netpolicy
-        netpolicy.check(url)
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "SoniqBoom (+demozoo artist enrichment)"})
-        with urllib.request.urlopen(req, timeout=8) as r:  # noqa: S310 — fixed HTTPS host
-            return json.load(r)
-
-    try:
-        data = await asyncio.get_running_loop().run_in_executor(None, _get)
-        # Parse INSIDE the try — a 200 with a non-dict body (``null``, a list)
-        # or a wrong-shaped member_of/nicks/external_links must yield None (the
-        # documented no-raise contract), NOT raise past artist_card and discard
-        # the confident offline identity into the MusicBrainz mislink.
-        if not isinstance(data, dict):
-            return None
-        groups = [(m.get("group") or {}).get("name")
-                  for m in (data.get("member_of") or []) if isinstance(m, dict)]
-        out = {
-            "name": data.get("name"),
-            "aliases": [n.get("name") for n in (data.get("nicks") or [])
-                        if isinstance(n, dict) and n.get("name")],
-            "groups": [g for g in groups if g],
-            "links": [{"class": lk.get("link_class"), "url": lk.get("url")}
-                      for lk in (data.get("external_links") or [])
-                      if isinstance(lk, dict) and lk.get("url")],
-            "demozoo_url": data.get("demozoo_url") or f"https://demozoo.org/sceners/{rid}/",
-        }
-    except Exception as exc:                             # noqa: BLE001 — never raise; caller keeps the offline card
-        log.debug("Demozoo scener %s fetch/parse failed: %s", rid, exc)
+    con = _detail_con()
+    if con is None:
         return None
-    # Only cache a response that actually carries enrichment — a thin/degraded
-    # 200 (name null, no groups/links) must NOT be pinned for the 30-day TTL;
-    # returning it uncached lets a later panel open retry once the API recovers.
-    if out.get("name") or out.get("groups") or out.get("links"):
-        try:
-            cache.write_text(json.dumps(out), "utf-8")
-        except Exception:                                # noqa: BLE001
-            pass
-    return out
+    try:
+        row = con.execute("SELECT name, aliases, groups, variants, notes, location "
+                          "FROM scener_detail "
+                          "WHERE releaser_id = ?", (rid,)).fetchone()
+        if row is None:
+            return None
+        links = _links_of(con.execute("SELECT cls, param FROM scener_link "
+                                      "WHERE releaser_id = ? ORDER BY rowid", (rid,)))
+        return {"name": row[0], "aliases": json.loads(row[1] or "[]"),
+                "groups": json.loads(row[2] or "[]"),
+                "variants": json.loads(row[3] or "[]"),
+                "notes": row[4] or "", "location": row[5] or "", "links": links,
+                "demozoo_url": f"https://demozoo.org/sceners/{rid}/"}
+    except Exception:                                   # noqa: BLE001 — the offline card stays
+        log.debug("Demozoo scener %s details failed", rid, exc_info=True)
+        return None
+    finally:
+        con.close()
+
+
+async def fetch_scener_details(releaser_id: int) -> dict | None:
+    """``scener_details`` off the event loop (the name the SCENE tab and the
+    artist card call it by — it was a live API call until Demozoo's API asked
+    for a key; the export carries the same)."""
+    import asyncio
+    return await asyncio.to_thread(scener_details, releaser_id)
 
 
 # ── SCENE-tab enrichment (discography + release details) ──────────────────────
 # The retro-track SCENE tab surfaces a composer's Demozoo discography and — when
 # the current track matches ONE of their productions — that production's release
-# details.  Sourced LIVE (the ``releasers/{id}/productions/`` + ``productions/
-# {id}/`` API) rather than the offline dump so no giant per-scener production
-# table has to be built into the local sqlite (and no 190 MB reindex is needed
-# to get it); every response is disk-cached for ``_SCENER_TTL``, exactly like
-# ``fetch_scener_details``, so a scener/production is fetched at most once a month
-# and only when a user actually opens that track's info panel.
-_API_BASE = "https://demozoo.org/api/v1/"
-_PROD_PAGE_CAP = 3          # follow at most this many discography pages (cold)
-
-
+# details.  Read from the index (``_details_from_dump``: the export's MUSIC
+# productions with their platforms, release parties, placings and links) — no
+# request to Demozoo's API, which asks for a key since November 2026.
 def _year_of(release_date: object) -> int | None:
     """First plausible 4-digit year in a Demozoo date ("1997-08-05", "2017", or
     ``None``) → ``int``, else ``None`` (dates are free-form / partial upstream)."""
@@ -1381,166 +1807,84 @@ def _year_of(release_date: object) -> int | None:
     return None
 
 
-async def fetch_scener_productions(releaser_id: int) -> list[dict] | None:
-    """LIVE Demozoo discography for a KNOWN releaser id — their MUSIC
-    productions ``[{id, title, year, type, platforms, url}]``, newest first,
-    disk-cached for ``_SCENER_TTL``.  ``None`` on failure so the caller shows an
-    identity-only card.  Music-only (``supertype == "music"``): the panel is a
-    music track's "more by this artist", and the release match below only ever
-    needs the composer's music."""
-    import asyncio
-    import json
+def scener_productions(releaser_id: object) -> list[dict] | None:
+    """A scener's MUSIC productions from the index ``[{id, title, year, type,
+    platforms, url}]`` — all of them (the release match needs every one; the
+    panel shows the first few), newest first (undated last); None when the
+    index has no details (an older layout)."""
     try:
         rid = int(releaser_id)
     except (TypeError, ValueError):
         return None
-    cache = _db_path().parent / f"scener_{rid}_prods.json"
-    try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < _SCENER_TTL:
-            return json.loads(cache.read_text("utf-8"))
-    except Exception:                                    # noqa: BLE001
-        pass
-
-    def _get() -> list[dict]:
-        out: list[dict] = []
-        url: str | None = f"{_API_BASE}releasers/{rid}/productions/"
-        pages = 0
-        while url and pages < _PROD_PAGE_CAP:
-            from soniqboom.core import netpolicy
-            netpolicy.check(url)
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "SoniqBoom (+demozoo discography)"})
-            with urllib.request.urlopen(req, timeout=8) as r:  # noqa: S310 — fixed HTTPS host
-                data = json.load(r)
-            # ``releasers/{id}/productions/`` returns a BARE LIST of the whole
-            # discography in one response; the generic ``/productions/`` list
-            # endpoint is paginated (``{results, next}``).  Accept either so an
-            # upstream shape change can't silently empty the panel.
-            if isinstance(data, list):
-                results, nxt = data, None
-            elif isinstance(data, dict):
-                results, nxt = (data.get("results") or []), data.get("next")
-            else:
-                break
-            for p in results:
-                if not isinstance(p, dict) or p.get("supertype") != "music":
-                    continue
-                types = [t.get("name") for t in (p.get("types") or [])
-                         if isinstance(t, dict) and t.get("name")]
-                plats = [pl.get("name") for pl in (p.get("platforms") or [])
-                         if isinstance(pl, dict) and pl.get("name")]
-                out.append({
-                    "id": p.get("id"),
-                    "title": p.get("title") or "",
-                    "year": _year_of(p.get("release_date")),
-                    "type": types[0] if types else "",
-                    "platforms": plats,
-                    "url": p.get("demozoo_url") or "",
-                })
-            # Only follow pagination back into the same trusted API host.
-            url = nxt if isinstance(nxt, str) and nxt.startswith(_API_BASE) else None
-            pages += 1
-        return out
-
-    try:
-        prods = await asyncio.get_running_loop().run_in_executor(None, _get)
-    except Exception as exc:                             # noqa: BLE001 — never raise
-        log.debug("Demozoo productions %s fetch failed: %s", rid, exc)
+    con = _detail_con()
+    if con is None:
         return None
-    prods.sort(key=lambda p: (p.get("year") or 0), reverse=True)   # newest first
-    if prods:
-        try:
-            cache.write_text(json.dumps(prods), "utf-8")
-        except Exception:                                # noqa: BLE001
-            pass
-    return prods
+    try:
+        rows = con.execute(
+            "SELECT p.id, p.title, p.year, p.type, p.platforms, p.date FROM prod_author a "
+            "JOIN music_prod p ON p.id = a.prod_id WHERE a.releaser_id = ? "
+            "ORDER BY (p.date IS NULL OR p.date = ''), p.date DESC, p.id DESC",
+            (rid,)).fetchall()
+        return [{"id": pid, "title": title or "", "year": year, "type": typ or "",
+                 "platforms": json.loads(plats or "[]"),
+                 "url": f"https://demozoo.org/productions/{pid}/"}
+                for pid, title, year, typ, plats, _date in rows]
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo productions of %s failed", rid, exc_info=True)
+        return None
+    finally:
+        con.close()
 
 
-async def fetch_production_detail(production_id: int) -> dict | None:
-    """LIVE Demozoo detail for ONE production — canonical release date/year,
-    type, platform, release parties, competition placing(s), and external /
-    download links — disk-cached for ``_SCENER_TTL``.  ``None`` on failure."""
+async def fetch_scener_productions(releaser_id: int) -> list[dict] | None:
+    """``scener_productions`` off the event loop."""
     import asyncio
-    import json
+    return await asyncio.to_thread(scener_productions, releaser_id)
+
+
+def production_detail(production_id: object) -> dict | None:
+    """ONE music production's release details from the index — year, type,
+    platforms, release parties, competition placings, external and download
+    links (``demozoo_links``); None when unknown or the index has no details."""
     try:
         pid = int(production_id)
     except (TypeError, ValueError):
         return None
-    cache = _db_path().parent / f"prod_{pid}.json"
-    try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < _SCENER_TTL:
-            return json.loads(cache.read_text("utf-8"))
-    except Exception:                                    # noqa: BLE001
-        pass
-
-    def _get() -> dict:
-        from soniqboom.core import netpolicy
-        netpolicy.check(_API_BASE)
-        req = urllib.request.Request(
-            f"{_API_BASE}productions/{pid}/",
-            headers={"User-Agent": "SoniqBoom (+demozoo production)"})
-        with urllib.request.urlopen(req, timeout=8) as r:  # noqa: S310 — fixed HTTPS host
-            return json.load(r)
-
-    try:
-        data = await asyncio.get_running_loop().run_in_executor(None, _get)
-        if not isinstance(data, dict):
-            return None
-        types = [t.get("name") for t in (data.get("types") or [])
-                 if isinstance(t, dict) and t.get("name")]
-        plats = [pl.get("name") for pl in (data.get("platforms") or [])
-                 if isinstance(pl, dict) and pl.get("name")]
-        parties = [{"name": pt.get("name"), "year": _year_of(pt.get("start_date")),
-                    "url": pt.get("demozoo_url") or ""}
-                   for pt in (data.get("release_parties") or [])
-                   if isinstance(pt, dict) and pt.get("name")]
-        placings: list[dict] = []
-        for pl in (data.get("competition_placings") or []):
-            if not isinstance(pl, dict):
-                continue
-            comp = pl.get("competition") if isinstance(pl.get("competition"), dict) else {}
-            party = comp.get("party") if isinstance(comp.get("party"), dict) else {}
-            rank = pl.get("ranking") or (str(pl.get("position")) if pl.get("position") else "")
-            placings.append({
-                "rank": rank,
-                "competition": comp.get("name") or "",
-                "party": party.get("name") or "",
-                "year": _year_of(party.get("start_date")),
-                "url": party.get("demozoo_url") or "",
-            })
-
-        def _links(key: str) -> list[dict]:
-            return [{"class": lk.get("link_class"), "url": lk.get("url")}
-                    for lk in (data.get(key) or [])
-                    if isinstance(lk, dict) and lk.get("url")]
-
-        out = {
-            "id": pid,
-            "title": data.get("title") or "",
-            "year": _year_of(data.get("release_date")),
-            "type": types[0] if types else "",
-            "platforms": plats,
-            "parties": parties,
-            "placings": placings,
-            "links": _links("external_links") + _links("download_links"),
-            "url": data.get("demozoo_url") or f"https://demozoo.org/productions/{pid}/",
-        }
-    except Exception as exc:                             # noqa: BLE001 — never raise
-        log.debug("Demozoo production %s fetch failed: %s", pid, exc)
+    con = _detail_con()
+    if con is None:
         return None
-    # Only pin a response that actually carries release detail — a thin/degraded
-    # 200 (null release_date, no placings/parties/links) must NOT be cached for
-    # the 30-day TTL, or it would suppress the year overwrite (and the whole
-    # release block, via the year backfill in scene_card) long after Demozoo
-    # recovers.  Mirrors the fetch_scener_details / fetch_scener_productions
-    # thin-response guards.
-    if out.get("year") or out.get("type") or out.get("platforms") \
-            or out.get("placings") or out.get("parties") or out.get("links"):
-        try:
-            cache.write_text(json.dumps(out), "utf-8")
-        except Exception:                                # noqa: BLE001
-            pass
-    return out
+    try:
+        row = con.execute("SELECT title, year, type, platforms FROM music_prod WHERE id = ?",
+                          (pid,)).fetchone()
+        if row is None:
+            return None
+        parties = [{"name": n, "year": y,
+                    "url": f"https://demozoo.org/parties/{a}/" if a else ""}
+                   for a, n, y in con.execute(
+                       "SELECT party_id, name, year FROM prod_party WHERE prod_id = ? "
+                       "ORDER BY year, name", (pid,)) if n]
+        placings = [{"rank": rank or "", "competition": comp or "", "party": party or "",
+                     "year": y, "url": f"https://demozoo.org/parties/{a}/" if a else ""}
+                    for rank, comp, a, party, y in con.execute(
+                        "SELECT ranking, competition, party_id, party, year FROM prod_placing "
+                        "WHERE prod_id = ? ORDER BY year, party", (pid,))]
+        links = _links_of(con.execute("SELECT cls, param, download FROM prod_link "
+                                      "WHERE prod_id = ? ORDER BY rowid", (pid,)))
+        return {"id": pid, "title": row[0] or "", "year": row[1], "type": row[2] or "",
+                "platforms": json.loads(row[3] or "[]"), "parties": parties,
+                "placings": placings, "links": links,
+                "url": f"https://demozoo.org/productions/{pid}/"}
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo production %s detail failed", pid, exc_info=True)
+        return None
+    finally:
+        con.close()
+
+
+async def fetch_production_detail(production_id: int) -> dict | None:
+    """``production_detail`` off the event loop."""
+    import asyncio
+    return await asyncio.to_thread(production_detail, production_id)
 
 
 def _production_soundtracks(music_id: object, limit: int = 6) -> list[dict]:
@@ -1854,15 +2198,36 @@ def _resolve_title(con: sqlite3.Connection, ttoks: frozenset, seeds: list,
     return card
 
 
+_NAMED_RE = (re.compile(r"^(?P<rest>.+?)\s+(?:-|–|—|by)\s+(?P<who>[^-–—]+)$", re.I),
+             re.compile(r"^(?P<who>[^-–—]+?)\s+(?:-|–|—)\s+(?P<rest>.+)$"))
+
+
+def _title_naming(title: object, names) -> frozenset | None:
+    """The tokens of ``title`` without the composer it names — "Starshine -
+    PM" → {"starshine"} when "PM" is one of ``names`` — set off by " - " / " by "
+    (after the title) or " - " (before it); None when it names none of them."""
+    if not isinstance(title, str):
+        return None
+    own = {_norm(n) for n in names if isinstance(n, str) and _norm(n)}
+    for rx in _NAMED_RE:
+        m = rx.match(title.strip())
+        if m and _norm(m.group("who")) in own:
+            rest = _year_toks(_destylize(m.group("rest")))
+            if rest:
+                return rest
+    return None
+
+
 async def _scene_card_from_base(base: dict, name: str,
                                 track_title: str | None) -> dict:
-    """Shared LIVE enrichment for an ALREADY-resolved Demozoo identity — the
-    scener's discography plus, when the current track matches exactly ONE of
-    their productions by title, that production's release details (year overwrite,
-    type, platform, party, placing, links).  Every live call is disk-cached; any
-    failure degrades to identity-only.  Never raises.  ``base`` is the offline
-    identity (``{releaser_id, real_name, groups, url}``); ``name`` is the display
-    handle.  Returns ``{found, artist, discography, release}``.
+    """The SCENE tab's details for an ALREADY-resolved Demozoo identity, from
+    the index — the scener's aliases, groups and links, their music
+    discography plus, when the current track matches exactly ONE of their
+    productions by title, that production's release details (year overwrite,
+    type, platform, party, placing, links).  An index without the details (an
+    older layout) degrades to identity-only.  Never raises.  ``base`` is the
+    identity (``{releaser_id, real_name, groups, url}``); ``name`` is the
+    display handle.  Returns ``{found, artist, discography, release}``.
     """
     import asyncio
     try:
@@ -1884,6 +2249,7 @@ async def _scene_card_from_base(base: dict, name: str,
             "groups": groups,
             "aliases": aliases,
             "links": links,
+            "location": (details or {}).get("location") or "",
             "url": base["url"],
         }
         prods = prods or []
@@ -1891,34 +2257,47 @@ async def _scene_card_from_base(base: dict, name: str,
         # (refuse >1: two matches ⇒ ambiguous, no year overwrite).
         release = None
         ttoks = _title_toks(_destylize(track_title))     # "][" → "ii" so a module's
-        if len(ttoks) >= 2 and prods:                    # "Unreal ][" matches "Unreal II"
+        winners: list = []                               # "Unreal ][" matches "Unreal II"
+        if len(ttoks) >= 2 and prods:
             winners = [p for p in prods
                        if _toks_match(ttoks, _title_toks(p.get("title")))]
-            if len(winners) == 1:
-                w = winners[0]
-                detail = await fetch_production_detail(w.get("id")) if w.get("id") else None
-                if detail:
-                    # Backfill year/type/platform/title from the discography row
-                    # when the detail response omits them — a thin production
-                    # detail (null release_date, no types) must never suppress
-                    # the year overwrite when the list row carried the year.
-                    release = dict(detail)
-                    release["year"] = detail.get("year") or w.get("year")
-                    release["type"] = detail.get("type") or w.get("type") or ""
-                    release["platforms"] = detail.get("platforms") or w.get("platforms") or []
-                    release["title"] = detail.get("title") or w.get("title") or ""
-                else:
-                    release = {
-                        "id": w.get("id"), "title": w.get("title"),
-                        "year": w.get("year"), "type": w.get("type"),
-                        "platforms": w.get("platforms") or [], "parties": [],
-                        "placings": [], "links": [], "url": w.get("url") or "",
-                    }
-                # "Featured in": demos/intros that used this track as their
-                # soundtrack — the reverse link the live API doesn't expose,
-                # read from the offline index (empty on a pre-soundtrack index).
-                if release is not None and w.get("id"):
-                    release["featured_in"] = _production_soundtracks(w.get("id"))
+        if not winners and prods:
+            # A title that names its composer after " - " / " by " (or before
+            # " - "): "Starshine - PM", "Mosaic by Purple Motion".  The rest
+            # must be EXACTLY one production's title, digits kept ("Starshine
+            # 2 - PM" is no "Starshine").
+            rest = _title_naming(track_title, (name, base.get("real_name"),
+                                               *(details or {}).get("aliases", ()),
+                                               *(details or {}).get("variants", ())))
+            if rest:
+                exact = [p for p in prods if _year_toks(p.get("title")) == rest]
+                if len(exact) == 1:
+                    winners = exact
+        if len(winners) == 1:
+            w = winners[0]
+            detail = await fetch_production_detail(w.get("id")) if w.get("id") else None
+            if detail:
+                # Backfill year/type/platform/title from the discography row
+                # when the detail response omits them — a thin production
+                # detail (null release_date, no types) must never suppress
+                # the year overwrite when the list row carried the year.
+                release = dict(detail)
+                release["year"] = detail.get("year") or w.get("year")
+                release["type"] = detail.get("type") or w.get("type") or ""
+                release["platforms"] = detail.get("platforms") or w.get("platforms") or []
+                release["title"] = detail.get("title") or w.get("title") or ""
+            else:
+                release = {
+                    "id": w.get("id"), "title": w.get("title"),
+                    "year": w.get("year"), "type": w.get("type"),
+                    "platforms": w.get("platforms") or [], "parties": [],
+                    "placings": [], "links": [], "url": w.get("url") or "",
+                }
+            # "Featured in": demos/intros that used this track as their
+            # soundtrack — the reverse link, from the index (empty on a
+            # pre-soundtrack index).
+            if release is not None and w.get("id"):
+                release["featured_in"] = _production_soundtracks(w.get("id"))
         # Discography — newest-first music, minus the current release (shown in
         # its own block), capped for the panel.
         rel_id = release.get("id") if release else None
@@ -1986,8 +2365,9 @@ async def artist_card(name: str, track_title: str | None = None) -> dict | None:
 
     ``track_title`` is the module we're viewing — it disambiguates a SHARED
     handle by matching the track against the candidate sceners' Demozoo
-    productions.  Combines the offline index (identity, groups, ``/sceners/{id}/``
-    link) with best-effort live enrichment (external links).  Shaped for the
+    productions.  Combines the identity (groups, ``/sceners/{id}/`` link) with
+    the scener's details from the index (external links, notes, location).
+    Shaped for the
     existing ``/artist/info`` renderer (``{name, found, bio, image, url,
     source}``) plus ``groups``/``links`` extras the panel renders as chips.
     """
@@ -1997,13 +2377,17 @@ async def artist_card(name: str, track_title: str | None = None) -> dict | None:
     details = await fetch_scener_details(base["releaser_id"])
     groups = base["groups"]
     links: list[dict] = []
+    notes = location = ""
     if details:
         groups = details.get("groups") or groups
         links = details.get("links") or []
+        notes, location = details.get("notes") or "", details.get("location") or ""
     real = base.get("real_name") or ""
     bits: list[str] = []
     if real and _norm(real) != _norm(name):
         bits.append(real)
+    if location:
+        bits.append(location)
     if groups:
         bits.append("Member of " + ", ".join(groups[:5]))
     bio = " — ".join(bits) if bits else f"Demoscene musician “{name}”."
@@ -2011,7 +2395,13 @@ async def artist_card(name: str, track_title: str | None = None) -> dict | None:
         "name": name,
         "found": True,
         "title": name,
-        "bio": bio,
+        # The profile's own notes when Demozoo has them (``local_bio``: the
+        # panel shows them as the bio, read from the index; a Wikipedia article
+        # the profile links gives only its photo — artistinfo); else who they
+        # are, from the identity.
+        "bio": notes or bio,
+        "local_bio": bool(notes),
+        "location": location,
         "image": None,
         "url": base["url"],
         "source": "Demozoo",
@@ -2059,12 +2449,12 @@ async def apply_to_library(*, force: bool = False) -> dict:
     from soniqboom.core.store import get_store
     global _last_apply_sig, _matched_ids, _stamped_ids
     if _status["applying"]:
-        return {**status(), "error": "apply already running"}
+        return {**(await asyncio.to_thread(status)), "error": "apply already running"}
     store = get_store()
     inputs = (_index_sig(),)
     changed = enrich_delta.changes(store, _last_apply_sig, inputs, force=force)
     if changed is not None and not changed:
-        return {**status(), "skipped": "unchanged", "matched": 0, "updated": 0}
+        return {**(await asyncio.to_thread(status)), "skipped": "unchanged", "matched": 0, "updated": 0}
     _status.update(applying=True, error=None)
     try:
         loop = asyncio.get_running_loop()
@@ -2112,10 +2502,10 @@ async def apply_to_library(*, force: bool = False) -> dict:
         _status["last_apply"] = {
             "matched": matched, "updated": updated, "at": int(time.time()),
         }
-        return {**status(), "matched": matched, "updated": updated}
+        return {**(await asyncio.to_thread(status)), "matched": matched, "updated": updated}
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = str(exc)
-        return {**status(), "error": str(exc)}
+        return {**(await asyncio.to_thread(status)), "error": str(exc)}
     finally:
         _status["applying"] = False
 
@@ -2190,7 +2580,7 @@ async def reset_to_file_state() -> dict:
             break                                       # no await before the
         await asyncio.sleep(0.1)                         # claim below → atomic
     if _status["applying"]:
-        return {**status(), "error": "apply already running"}
+        return {**(await asyncio.to_thread(status)), "error": "apply already running"}
     _status.update(applying=True, error=None)
     try:
         loop = asyncio.get_running_loop()
@@ -2207,9 +2597,9 @@ async def reset_to_file_state() -> dict:
                 from soniqboom.core.folder_album import refresh_album_caches
                 await refresh_album_caches([tid for tid, _upd in batch])
         _status["last_reset"] = {"cleared": cleared, "at": int(time.time())}
-        return {**status(), "cleared": cleared}
+        return {**(await asyncio.to_thread(status)), "cleared": cleared}
     except Exception as exc:                            # noqa: BLE001
         _status["error"] = str(exc)
-        return {**status(), "error": str(exc)}
+        return {**(await asyncio.to_thread(status)), "error": str(exc)}
     finally:
         _status["applying"] = False

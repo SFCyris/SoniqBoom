@@ -244,11 +244,13 @@ async def _wiki_summary(title: str) -> dict | None:
 _WIKI_LINK_RE = re.compile(r"^https?://([a-z]{2,3})(?:\.m)?\.wikipedia\.org/wiki/([^?#]+)", re.I)
 
 
-async def _with_wikipedia(card: dict) -> dict:
+async def _with_wikipedia(card: dict, *, photo_only: bool = False) -> dict:
     """A Demozoo scener ``card`` whose profile links a Wikipedia article
     (e.g. Ben Daglish) shown with that article's summary, picture and link —
     the bio other artists get — keeping the card's groups and link chips.
-    English first; cached like any artist's record."""
+    ``photo_only`` (a profile with notes, the bio): only the article's picture
+    is taken, with the article's address as ``image_page`` (the panel credits
+    the photo to it).  English first; cached like any artist's record."""
     from urllib.parse import unquote
     found = []
     for link in card.get("links") or ():
@@ -281,6 +283,9 @@ async def _with_wikipedia(card: dict) -> dict:
         _write_cache(key, rec)
     if not rec.get("found"):
         return card
+    if photo_only:                                          # (``image_page``: the photo's credit)
+        return {**card, "image": rec.get("image"), "image_page": rec.get("url")} \
+            if rec.get("image") else card
     return {**card, "title": rec.get("title") or card.get("title"), "bio": rec.get("bio"),
             "image": rec.get("image"), "url": rec.get("url") or card.get("url"),
             "source": "Wikipedia"}
@@ -337,15 +342,17 @@ async def get_artist_info(
         return {"name": name, "found": False}
 
     if is_retro:
-        # Demozoo-first for scene music.  Built fresh each call (the offline
-        # sqlite lookup is microseconds; the live per-scener enrichment is
-        # itself disk-cached), so it doesn't share the MusicBrainz name-cache
-        # and can never serve a mainstream bio for a scene handle.
+        # Demozoo-first for scene music.  Built fresh each call (the index
+        # lookups are microseconds), so it doesn't share the MusicBrainz
+        # name-cache and can never serve a mainstream bio for a scene handle.
         try:
             from soniqboom.core import demozoo
             card = await demozoo.artist_card(name, track_title=track)
             if card is not None:
-                return await _with_wikipedia(card)
+                # The profile's notes from the Demozoo index are the bio (a
+                # linked Wikipedia article gives only its picture); a profile
+                # without notes gets the article.
+                return await _with_wikipedia(card, photo_only=bool(card.get("local_bio")))
         except Exception:                       # noqa: BLE001 — never break the panel
             log.debug("Demozoo artist_card failed for %r", name, exc_info=True)
 
